@@ -8,5 +8,6 @@ publish.workspace = true
 [dependencies]
 rhi-types.workspace = true
 rhi-vulkan.workspace = true
+rhi-d3d12.workspace = true
 engine-core.workspace = true
 engine-platform.workspace = true

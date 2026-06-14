@@ -73,10 +73,11 @@ engine/                 # cargo workspace root
 - `ash` 백엔드로 삼각형 렌더(dynamic rendering) → 프레임 루프, 스왑체인 present, 동기화
 - **완료 기준**: Vulkan으로 삼각형(RTX 2070 SUPER 검증). 검증 레이어는 "있으면 켜기"
 
-### Phase 2 — D3D12 백엔드 패리티
-- 동일 RHI 인터페이스로 `windows-rs` D3D12 백엔드 구현, 같은 삼각형 렌더
-- 추상화가 두 API에서 성립하는지 검증, 누수되는 부분 리팩터
-- **완료 기준**: 런타임 플래그로 D3D12/Vulkan 전환, 동일 결과
+### Phase 2 — D3D12 백엔드 패리티 — ✅ 완료
+세부: [phase-2-d3d12.md](phase-2-d3d12.md)
+- `windows-rs` D3D12 백엔드(`rhi-d3d12`) + 파사드 `D3d12` 변형, 같은 삼각형 렌더
+- 동기화 임피던스(세마포어 no-op, 펜스 에뮬레이션) 흡수로 파사드 무변경 검증
+- **완료 기준**: `--backend d3d12|vulkan` 런타임 전환, 양쪽 동일 결과 (RTX 2070 SUPER 검증)
 
 ### Phase 3 — ImGui 통합
 - imgui-rs + 커스텀 RHI 렌더 백엔드(정점/인덱스 버퍼, 폰트 텍스처)
