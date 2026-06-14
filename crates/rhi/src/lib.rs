@@ -163,6 +163,14 @@ impl Device {
             Self::D3d12(d) => d.wait_idle(),
         }
     }
+
+    /// The backend this device dispatches to.
+    pub fn backend(&self) -> BackendKind {
+        match self {
+            Self::Vulkan(_) => BackendKind::Vulkan,
+            Self::D3d12(_) => BackendKind::D3d12,
+        }
+    }
 }
 
 impl Swapchain {

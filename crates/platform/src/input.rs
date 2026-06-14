@@ -13,6 +13,8 @@ pub struct Input {
     pos: (i32, i32),
     frame_start_pos: (i32, i32),
     has_mouse: bool,
+    wheel: f32,
+    chars: Vec<char>,
 }
 
 impl Input {
@@ -43,10 +45,32 @@ impl Input {
         )
     }
 
-    /// Latch the frame's starting cursor position; call once before pumping
-    /// messages so [`mouse_delta`](Self::mouse_delta) measures this frame only.
+    /// Accumulated mouse wheel delta this frame (in notches; +up).
+    #[inline]
+    pub fn wheel_delta(&self) -> f32 {
+        self.wheel
+    }
+
+    /// Characters typed this frame (from `WM_CHAR`).
+    #[inline]
+    pub fn chars(&self) -> &[char] {
+        &self.chars
+    }
+
+    /// Latch the frame's starting cursor position and clear per-frame
+    /// accumulators (wheel, typed characters). Call once before pumping messages.
     pub(crate) fn begin_frame(&mut self) {
         self.frame_start_pos = self.pos;
+        self.wheel = 0.0;
+        self.chars.clear();
+    }
+
+    pub(crate) fn add_wheel(&mut self, delta: f32) {
+        self.wheel += delta;
+    }
+
+    pub(crate) fn push_char(&mut self, ch: char) {
+        self.chars.push(ch);
     }
 
     pub(crate) fn set_key(&mut self, vk: usize, down: bool) {
@@ -78,6 +102,8 @@ impl Default for Input {
             pos: (0, 0),
             frame_start_pos: (0, 0),
             has_mouse: false,
+            wheel: 0.0,
+            chars: Vec::new(),
         }
     }
 }

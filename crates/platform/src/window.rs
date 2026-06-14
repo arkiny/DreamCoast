@@ -229,6 +229,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 state.input.set_mouse_pos(x, y);
                 LRESULT(0)
             }
+            WM_MOUSEWHEEL => {
+                let raw = ((wparam.0 >> 16) & 0xFFFF) as i16;
+                state.input.add_wheel(raw as f32 / 120.0);
+                LRESULT(0)
+            }
+            WM_CHAR => {
+                if let Some(ch) = char::from_u32(wparam.0 as u32) {
+                    state.input.push_char(ch);
+                }
+                LRESULT(0)
+            }
             WM_LBUTTONDOWN => {
                 state.input.set_button(0, true);
                 LRESULT(0)

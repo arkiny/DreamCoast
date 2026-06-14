@@ -79,10 +79,11 @@ engine/                 # cargo workspace root
 - 동기화 임피던스(세마포어 no-op, 펜스 에뮬레이션) 흡수로 파사드 무변경 검증
 - **완료 기준**: `--backend d3d12|vulkan` 런타임 전환, 양쪽 동일 결과 (RTX 2070 SUPER 검증)
 
-### Phase 3 — ImGui 통합
-- imgui-rs + 커스텀 RHI 렌더 백엔드(정점/인덱스 버퍼, 폰트 텍스처)
-- 백엔드 전환·통계·파라미터 조정용 디버그 UI 스캐폴딩
-- **완료 기준**: 두 백엔드 모두에서 ImGui 도킹 UI 동작
+### Phase 3 — ImGui 통합 + 바인드리스 기반 — ✅ 완료
+세부: [phase-3-imgui.md](phase-3-imgui.md)
+- RHI에 버퍼/텍스처/**바인드리스 디스크립터**(Vulkan descriptor-indexing / D3D12 unbounded SRV table) 도입
+- `crates/gui`: imgui-rs + 커스텀 RHI 렌더러(폰트 atlas=바인드리스 텍스처) + Win32 입력 브리지
+- **완료 기준**: 두 백엔드 모두 삼각형 위 ImGui 창(데모/통계/클리어색) 동작 (도킹은 이후로 연기)
 
 ### Phase 4 — 셰이더 시스템 + 에셋 파이프라인
 - Slang 리플렉션, 핫리로드, 파이프라인 캐시

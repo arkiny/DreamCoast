@@ -1,6 +1,6 @@
 # Phase 3 — ImGui 통합 + 바인드리스 기반 세부 계획
 
-> 상위 로드맵: [ROADMAP.md](ROADMAP.md). **상태: 🚧 진행 중**
+> 상위 로드맵: [ROADMAP.md](ROADMAP.md). **상태: ✅ 완료** (RTX 2070 SUPER, 두 백엔드 검증)
 > ⚠️ 가장 큰 Phase. ImGui가 RHI에 버퍼/텍스처/바인드리스/정점입력/블렌딩/푸시상수를 처음 도입.
 > 구현 순서: (A) RHI 확장 → 텍스처 1장 바인드리스 샘플링 검증 → (B) gui 크레이트.
 
@@ -41,12 +41,24 @@ RHI의 **버퍼·텍스처·바인드리스 디스크립터 모델**("bindless-f
 ## D. sandbox
 - 삼각형 draw 후 같은 패스에 ImGui 렌더. 데모 창 + FPS/백엔드 + 클리어색 슬라이더.
 
-## 검증
-1. build/clippy/fmt 두 백엔드 통과.
-2. `--backend vulkan|d3d12` ImGui 창 + 입력 + 폰트(바인드리스 샘플링) 정상, 레이어 오류 0.
-3. 육안 확인은 직접 실행.
+## 검증 결과
 
-## 리스크/메모
-- A부터 텍스처 1장 샘플링으로 작게 검증 후 gui 연결.
-- Slang push_constant→D3D12 root constants, 바인드리스 register 매핑은 attribute로 조정.
-- 메모리 할당자/유저 ImTextureID/도킹은 이후 Phase.
+| 항목 | 결과 |
+|---|---|
+| `cargo build` / `clippy -D warnings` / `fmt --check` | ✅ |
+| 텍스처드 쿼드 스모크 (바인드리스 샘플링) | ✅ 두 백엔드 |
+| `--backend d3d12` / `--backend vulkan` ImGui | ✅ 폰트 atlas(바인드리스) + 데모 창 + 클리어색/FPS, 렌더 루프 무오류 |
+
+- 창 픽셀 자동 캡처는 Windows foreground 제약으로 불가 → `cargo run -p sandbox -- --backend d3d12` 육안 확인.
+- ImGui 창에서 클리어색 슬라이더가 배경색을 실시간 변경(입력 브리지 동작 확인).
+
+## 구현 메모 / 해결한 이슈
+- **D3D12 PSO `E_INVALIDARG`**: 바인드리스 SRV 범위는 unbounded(`NumDescriptors=u32::MAX`)여야 하고,
+  `imgui.slang`에 명시적 `register(t0/s0/b0)`가 있어야 함(없으면 PSO 생성 실패).
+- **NDC y-flip**: ortho 투영의 scale/translate.y가 Vulkan(아래로 +)과 D3D12(위로 +)에서 반대.
+- **동적 버퍼 수명**: 정점/인덱스 버퍼를 frame-in-flight별로 보관하고 필요 시 grow(해당 프레임 펜스가
+  재사용 전 대기를 보장).
+- 메모리 할당자/유저 ImTextureID/도킹/키보드 전체 매핑은 이후 Phase.
+
+## 다음 단계
+- Phase 4: 셰이더 시스템(리플렉션/핫리로드) + glTF/텍스처 에셋 파이프라인.
