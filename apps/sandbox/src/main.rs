@@ -33,19 +33,37 @@ fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
 fn main() -> anyhow::Result<()> {
     init_logging();
 
-    // Phase 1 requires the compiled triangle shaders (see docs/phase-1-rhi-vulkan.md).
-    let vs = engine_shader::triangle_vs_spirv().ok_or_else(|| {
-        anyhow!("triangle vertex SPIR-V unavailable — install slangc and rebuild")
+    let backend = select_backend();
+    info!("requested backend: {backend:?}");
+
+    // Each backend consumes its own bytecode: SPIR-V for Vulkan, DXIL for D3D12.
+    let (vs, fs) = match backend {
+        BackendKind::Vulkan => (
+            engine_shader::triangle_vs_spirv(),
+            engine_shader::triangle_fs_spirv(),
+        ),
+        BackendKind::D3d12 => (
+            engine_shader::triangle_vs_dxil(),
+            engine_shader::triangle_fs_dxil(),
+        ),
+    };
+    let vs = vs.ok_or_else(|| {
+        anyhow!(
+            "triangle vertex shader unavailable for {backend:?} — install slangc/DXC and rebuild"
+        )
     })?;
-    let fs = engine_shader::triangle_fs_spirv().ok_or_else(|| {
-        anyhow!("triangle fragment SPIR-V unavailable — install slangc and rebuild")
+    let fs = fs.ok_or_else(|| {
+        anyhow!(
+            "triangle fragment shader unavailable for {backend:?} — install slangc/DXC and rebuild"
+        )
     })?;
 
-    let mut window = Window::new("Engine Sandbox — Vulkan Triangle", 1280, 720)?;
+    let title = format!("Engine Sandbox — {backend:?} Triangle");
+    let mut window = Window::new(&title, 1280, 720)?;
     let (w, h) = window.size();
 
     let instance = Instance::new(
-        BackendKind::Vulkan,
+        backend,
         &window,
         &InstanceDesc {
             app_name: "engine-sandbox".into(),
@@ -158,4 +176,25 @@ fn build_render_finished(device: &Device, count: u32) -> anyhow::Result<Vec<Sema
     (0..count)
         .map(|_| device.create_semaphore().map_err(Into::into))
         .collect()
+}
+
+/// Pick the backend: OS default (Windows -> D3D12, else Vulkan), overridable
+/// with `--backend vulkan|d3d12`.
+fn select_backend() -> BackendKind {
+    let mut backend = if cfg!(windows) {
+        BackendKind::D3d12
+    } else {
+        BackendKind::Vulkan
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--backend" {
+            match args.next().as_deref() {
+                Some("vulkan") => backend = BackendKind::Vulkan,
+                Some("d3d12") => backend = BackendKind::D3d12,
+                other => tracing::warn!("unknown --backend value {other:?}; using default"),
+            }
+        }
+    }
+    backend
 }

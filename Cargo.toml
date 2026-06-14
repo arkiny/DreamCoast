@@ -6,6 +6,7 @@ members = [
     "crates/shader",
     "crates/rhi-types",
     "crates/rhi-vulkan",
+    "crates/rhi-d3d12",
     "crates/rhi",
     "apps/sandbox",
 ]
@@ -23,6 +24,7 @@ engine-platform = { path = "crates/platform" }
 engine-shader = { path = "crates/shader" }
 rhi-types = { path = "crates/rhi-types" }
 rhi-vulkan = { path = "crates/rhi-vulkan" }
+rhi-d3d12 = { path = "crates/rhi-d3d12" }
 rhi = { path = "crates/rhi" }
 
 # External

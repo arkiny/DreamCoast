@@ -160,8 +160,20 @@ version = "0.0.0"
 dependencies = [
  "engine-core",
  "engine-platform",
+ "rhi-d3d12",
  "rhi-types",
  "rhi-vulkan",
+]
+
+[[package]]
+name = "rhi-d3d12"
+version = "0.0.0"
+dependencies = [
+ "engine-core",
+ "engine-platform",
+ "rhi-types",
+ "tracing",
+ "windows",
 ]
 
 [[package]]
