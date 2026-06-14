@@ -1,5 +1,5 @@
 [package]
-name = "sandbox"
+name = "engine-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,5 @@ publish.workspace = true
 engine-core.workspace = true
 engine-platform.workspace = true
 engine-shader.workspace = true
-engine-gui.workspace = true
 rhi.workspace = true
-anyhow.workspace = true
-tracing.workspace = true
+imgui.workspace = true

@@ -1,25 +1,24 @@
 //! Sandbox: the playground executable.
 //!
-//! Phase 1 scope: open a window and draw `triangle.slang` through the `rhi`
-//! facade (Vulkan backend). Demonstrates the full frame loop — acquire, record
-//! (dynamic rendering), submit, present — plus swapchain recreation on resize.
+//! Phase 3 scope: draw `triangle.slang` and a Dear ImGui overlay through the
+//! `rhi` facade, on either backend (`--backend vulkan|d3d12`).
 
-use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use engine_core::init_logging;
+use engine_gui::{Gui, imgui};
 use engine_platform::Window;
 use rhi::{
-    BackendKind, BlendMode, BufferDesc, BufferUsage, ClearColor, Device, Extent2D, Format,
-    GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology, Rect2D,
-    Semaphore, SwapchainDesc, TextureDesc, VertexLayout,
+    BackendKind, BlendMode, ClearColor, Device, Extent2D, Format, GraphicsPipelineDesc, Instance,
+    InstanceDesc, PresentMode, PrimitiveTopology, Semaphore, SwapchainDesc, VertexLayout,
 };
 use tracing::info;
 
 /// Number of frames the CPU may record ahead of the GPU.
 const FRAMES_IN_FLIGHT: usize = 2;
 
-/// Swapchain color format used by both the swapchain and the pipeline.
+/// Swapchain color format used by the swapchain and pipelines.
 const COLOR_FORMAT: Format = Format::Bgra8Srgb;
 
 fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
@@ -37,7 +36,6 @@ fn main() -> anyhow::Result<()> {
     let backend = select_backend();
     info!("requested backend: {backend:?}");
 
-    // Each backend consumes its own bytecode: SPIR-V for Vulkan, DXIL for D3D12.
     let (vs, fs) = match backend {
         BackendKind::Vulkan => (
             engine_shader::triangle_vs_spirv(),
@@ -48,18 +46,10 @@ fn main() -> anyhow::Result<()> {
             engine_shader::triangle_fs_dxil(),
         ),
     };
-    let vs = vs.ok_or_else(|| {
-        anyhow!(
-            "triangle vertex shader unavailable for {backend:?} — install slangc/DXC and rebuild"
-        )
-    })?;
-    let fs = fs.ok_or_else(|| {
-        anyhow!(
-            "triangle fragment shader unavailable for {backend:?} — install slangc/DXC and rebuild"
-        )
-    })?;
+    let vs = vs.ok_or_else(|| anyhow!("triangle vertex shader unavailable for {backend:?}"))?;
+    let fs = fs.ok_or_else(|| anyhow!("triangle fragment shader unavailable for {backend:?}"))?;
 
-    let title = format!("Engine Sandbox — {backend:?} Triangle");
+    let title = format!("Engine Sandbox — {backend:?}");
     let mut window = Window::new(&title, 1280, 720)?;
     let (w, h) = window.size();
 
@@ -91,37 +81,7 @@ fn main() -> anyhow::Result<()> {
         bindless: false,
     })?;
 
-    // --- Bindless smoke test: a textured quad over the triangle ---
-    let (quad_vs, quad_fs) = match backend {
-        BackendKind::Vulkan => (
-            engine_shader::imgui_vs_spirv(),
-            engine_shader::imgui_fs_spirv(),
-        ),
-        BackendKind::D3d12 => (
-            engine_shader::imgui_vs_dxil(),
-            engine_shader::imgui_fs_dxil(),
-        ),
-    };
-    let quad_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: quad_vs.ok_or_else(|| anyhow!("imgui vs unavailable"))?,
-        fragment_bytes: quad_fs.ok_or_else(|| anyhow!("imgui fs unavailable"))?,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_format: swapchain.format(),
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::ImGui,
-        blend: BlendMode::AlphaBlend,
-        push_constant_size: 20,
-        bindless: true,
-    })?;
-    let checker = make_checker_texture(&device)?;
-    let (quad_vbuf, quad_ibuf) = make_quad_buffers(&device)?;
-    let mut quad_pc = [0u8; 20];
-    quad_pc[0..4].copy_from_slice(&1.0f32.to_le_bytes()); // scale.x
-    quad_pc[4..8].copy_from_slice(&1.0f32.to_le_bytes()); // scale.y
-    quad_pc[8..12].copy_from_slice(&0.0f32.to_le_bytes()); // translate.x
-    quad_pc[12..16].copy_from_slice(&0.0f32.to_le_bytes()); // translate.y
-    quad_pc[16..20].copy_from_slice(&checker.bindless_index().to_le_bytes());
+    let mut gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
 
     // Per-frame-in-flight resources.
     let mut command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
@@ -132,16 +92,16 @@ fn main() -> anyhow::Result<()> {
         image_available.push(device.create_semaphore()?);
         in_flight.push(device.create_fence(true)?);
     }
-    // One render-finished semaphore per swapchain image (avoids WSI reuse hazards).
     let mut render_finished = build_render_finished(&device, swapchain.image_count())?;
 
-    // Discard the resize flag raised by the initial WM_SIZE during window
-    // creation; the first swapchain already matches the current size.
+    // Discard the resize flag raised by the initial WM_SIZE during creation.
     let _ = window.take_resized();
 
     info!("entering render loop");
     let mut frame = 0usize;
     let mut needs_recreate = false;
+    let mut last = Instant::now();
+    let mut clear = [0.02f32, 0.02, 0.06];
 
     while !window.should_close() {
         window.pump_events();
@@ -151,8 +111,7 @@ fn main() -> anyhow::Result<()> {
 
         let (cw, ch) = window.size();
         if cw == 0 || ch == 0 {
-            // Minimized: skip rendering until restored.
-            std::thread::sleep(Duration::from_millis(16));
+            std::thread::sleep(std::time::Duration::from_millis(16));
             continue;
         }
 
@@ -161,6 +120,27 @@ fn main() -> anyhow::Result<()> {
             swapchain.recreate(&swapchain_desc(Extent2D::new(cw, ch)))?;
             render_finished = build_render_finished(&device, swapchain.image_count())?;
             needs_recreate = false;
+        }
+
+        // Update + build the UI for this frame.
+        let now = Instant::now();
+        let dt = (now - last).as_secs_f32();
+        last = now;
+        {
+            let ui = gui.new_frame(dt, [cw as f32, ch as f32], window.input());
+            ui.window("Engine")
+                .size([280.0, 140.0], imgui::Condition::FirstUseEver)
+                .build(|| {
+                    ui.text(format!("backend: {backend:?}"));
+                    ui.text(format!("size: {cw} x {ch}"));
+                    ui.text(format!(
+                        "{:.1} FPS ({:.2} ms)",
+                        1.0 / dt.max(1e-4),
+                        dt * 1000.0
+                    ));
+                    ui.separator();
+                    ui.color_edit3("clear", &mut clear);
+                });
         }
 
         let fence = &in_flight[frame];
@@ -182,9 +162,9 @@ fn main() -> anyhow::Result<()> {
             &swapchain,
             image_index,
             ClearColor {
-                r: 0.02,
-                g: 0.02,
-                b: 0.06,
+                r: clear[0],
+                g: clear[1],
+                b: clear[2],
                 a: 1.0,
             },
         );
@@ -192,18 +172,7 @@ fn main() -> anyhow::Result<()> {
         cmd.bind_graphics_pipeline(&pipeline);
         cmd.draw(3, 1);
 
-        // Bindless smoke test: textured quad.
-        cmd.bind_graphics_pipeline(&quad_pipeline);
-        cmd.push_constants(&quad_pc);
-        cmd.bind_vertex_buffer(&quad_vbuf, 20);
-        cmd.bind_index_buffer(&quad_ibuf, false);
-        cmd.set_scissor(Rect2D {
-            x: 0,
-            y: 0,
-            width: cw,
-            height: ch,
-        });
-        cmd.draw_indexed(6, 0, 0);
+        gui.render(&device, cmd, frame)?;
 
         cmd.end_rendering();
         cmd.transition_to_present(&swapchain, image_index);
@@ -221,65 +190,6 @@ fn main() -> anyhow::Result<()> {
     device.wait_idle()?;
     info!("shutting down");
     Ok(())
-}
-
-/// An 8x8 magenta/black checkerboard RGBA8 texture (bindless smoke test).
-fn make_checker_texture(device: &Device) -> anyhow::Result<rhi::Texture> {
-    const N: u32 = 8;
-    let mut pixels = Vec::with_capacity((N * N * 4) as usize);
-    for y in 0..N {
-        for x in 0..N {
-            let on = (x + y) % 2 == 0;
-            let rgba = if on {
-                [255, 0, 255, 255]
-            } else {
-                [16, 16, 16, 255]
-            };
-            pixels.extend_from_slice(&rgba);
-        }
-    }
-    Ok(device.create_texture(
-        &TextureDesc {
-            width: N,
-            height: N,
-            format: Format::Rgba8Unorm,
-        },
-        &pixels,
-    )?)
-}
-
-/// A unit quad (two triangles) in NDC with full UVs and white vertex color,
-/// in ImGui `ImDrawVert` layout (pos f32x2, uv f32x2, color unorm8x4).
-fn make_quad_buffers(device: &Device) -> anyhow::Result<(rhi::Buffer, rhi::Buffer)> {
-    fn vtx(out: &mut Vec<u8>, x: f32, y: f32, u: f32, v: f32) {
-        out.extend_from_slice(&x.to_le_bytes());
-        out.extend_from_slice(&y.to_le_bytes());
-        out.extend_from_slice(&u.to_le_bytes());
-        out.extend_from_slice(&v.to_le_bytes());
-        out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-    }
-    let mut verts = Vec::new();
-    vtx(&mut verts, -0.9, -0.9, 0.0, 0.0);
-    vtx(&mut verts, -0.4, -0.9, 1.0, 0.0);
-    vtx(&mut verts, -0.4, -0.4, 1.0, 1.0);
-    vtx(&mut verts, -0.9, -0.4, 0.0, 1.0);
-    let indices: [u16; 6] = [0, 1, 2, 2, 3, 0];
-    let mut idx_bytes = Vec::new();
-    for i in indices {
-        idx_bytes.extend_from_slice(&i.to_le_bytes());
-    }
-
-    let vbuf = device.create_buffer(&BufferDesc {
-        size: verts.len() as u64,
-        usage: BufferUsage::Vertex,
-    })?;
-    vbuf.write(&verts)?;
-    let ibuf = device.create_buffer(&BufferDesc {
-        size: idx_bytes.len() as u64,
-        usage: BufferUsage::Index,
-    })?;
-    ibuf.write(&idx_bytes)?;
-    Ok((vbuf, ibuf))
 }
 
 fn build_render_finished(device: &Device, count: u32) -> anyhow::Result<Vec<Semaphore>> {
