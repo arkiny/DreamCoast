@@ -43,5 +43,13 @@
 - 메모: push 상수 68B(mat4+u32). 컬럼메이저 mvp(`to_cols_array`) + HLSL `mul(mvp,pos)`. Vulkan은 proj.y 반전.
   glTF 샘플은 `assets/`(gitignore)에 런타임 확보.
 
+## 샘플 에셋 / 라이선스
+- `tools/fetch-assets.ps1`이 [Khronos glTF Sample Assets](https://github.com/KhronosGroup/glTF-Sample-Assets/blob/main/Models/Models.md)에서
+  **CC0 1.0(퍼블릭 도메인)** 모델만 받아 `assets/`(gitignore)에 배치하고 `assets/CREDITS.md`(출처/저자) 생성.
+  - 기본: Avocado(default `model.glb`), BoomBox, Lantern — 모두 CC0, Microsoft/sbtron.
+  - CC-BY인 BoxTextured 등은 출처표기 의무가 있어 기본에서 제외(필요 시 `--model`로 직접 지정).
+- 실행: `pwsh tools/fetch-assets.ps1` → `cargo run -p sandbox`(기본 model.glb) 또는 `-- --model assets/Lantern.glb`.
+- 에셋 미확보 시 sandbox는 `unit_cube` + 체커로 자동 폴백.
+
 ## 다음 단계
 - Phase 5(렌더그래프) 또는 Slang 리플렉션/핫리로드.

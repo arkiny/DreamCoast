@@ -50,17 +50,18 @@ fn main() -> anyhow::Result<()> {
     let fs = fs.ok_or_else(|| anyhow!("mesh fragment shader unavailable for {backend:?}"))?;
 
     // Load a glTF model if present, else fall back to a procedural cube.
-    let model = match engine_asset::load_gltf(MODEL_PATH) {
+    let model_path = model_path();
+    let model = match engine_asset::load_gltf(&model_path) {
         Ok(m) => {
             info!(
-                "loaded {MODEL_PATH}: {} verts, {} indices",
+                "loaded {model_path}: {} verts, {} indices",
                 m.vertices.len(),
                 m.indices.len()
             );
             m
         }
         Err(e) => {
-            info!("no glTF ({e}); using procedural cube");
+            info!("no glTF at {model_path} ({e}); using procedural cube");
             engine_asset::unit_cube()
         }
     };
@@ -317,6 +318,19 @@ fn build_render_finished(device: &Device, count: u32) -> anyhow::Result<Vec<Sema
     (0..count)
         .map(|_| device.create_semaphore().map_err(Into::into))
         .collect()
+}
+
+/// Model path: `--model <path>` or the default `assets/model.glb`.
+fn model_path() -> String {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--model"
+            && let Some(p) = args.next()
+        {
+            return p;
+        }
+    }
+    MODEL_PATH.to_string()
 }
 
 fn select_backend() -> BackendKind {
