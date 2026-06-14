@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/platform",
+    "crates/shader",
+    "crates/rhi-types",
+    "crates/rhi-vulkan",
+    "crates/rhi",
+    "apps/sandbox",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+engine-core = { path = "crates/core" }
+engine-platform = { path = "crates/platform" }
+engine-shader = { path = "crates/shader" }
+rhi-types = { path = "crates/rhi-types" }
+rhi-vulkan = { path = "crates/rhi-vulkan" }
+rhi = { path = "crates/rhi" }
+
+# External
+windows = "0.62"
+ash = "0.38"
+glam = "0.30"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"

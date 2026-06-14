@@ -1,0 +1,9 @@
+[package]
+name = "engine-shader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
