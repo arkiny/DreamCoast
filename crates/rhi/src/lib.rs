@@ -50,6 +50,8 @@ backend_enum!(/// A host-visible buffer (vertex/index).
     Buffer => rhi_vulkan::VulkanBuffer, rhi_d3d12::D3d12Buffer);
 backend_enum!(/// A sampled 2D texture registered in the bindless table.
     Texture => rhi_vulkan::VulkanTexture, rhi_d3d12::D3d12Texture);
+backend_enum!(/// A depth buffer for the mesh pass.
+    DepthBuffer => rhi_vulkan::VulkanDepthBuffer, rhi_d3d12::D3d12DepthBuffer);
 
 impl Buffer {
     /// Copy bytes into the buffer (host-visible).
@@ -133,6 +135,13 @@ impl Device {
         match self {
             Self::Vulkan(d) => Ok(Texture::Vulkan(d.create_texture(desc, pixels)?)),
             Self::D3d12(d) => Ok(Texture::D3d12(d.create_texture(desc, pixels)?)),
+        }
+    }
+
+    pub fn create_depth_buffer(&self, extent: Extent2D) -> Result<DepthBuffer> {
+        match self {
+            Self::Vulkan(d) => Ok(DepthBuffer::Vulkan(d.create_depth_buffer(extent)?)),
+            Self::D3d12(d) => Ok(DepthBuffer::D3d12(d.create_depth_buffer(extent)?)),
         }
     }
 
@@ -246,10 +255,28 @@ impl CommandBuffer {
         }
     }
 
-    pub fn begin_rendering(&self, swapchain: &Swapchain, image_index: u32, clear: ClearColor) {
-        match (self, swapchain) {
-            (Self::Vulkan(c), Swapchain::Vulkan(s)) => c.begin_rendering(s, image_index, clear),
-            (Self::D3d12(c), Swapchain::D3d12(s)) => c.begin_rendering(s, image_index, clear),
+    /// Begin a render pass. `color_clear = Some` clears the color attachment,
+    /// `None` loads it (overlay pass). `depth = Some` attaches + clears depth.
+    pub fn begin_rendering(
+        &self,
+        swapchain: &Swapchain,
+        image_index: u32,
+        color_clear: Option<ClearColor>,
+        depth: Option<&DepthBuffer>,
+    ) {
+        match (self, swapchain, depth) {
+            (Self::Vulkan(c), Swapchain::Vulkan(s), None) => {
+                c.begin_rendering(s, image_index, color_clear, None)
+            }
+            (Self::Vulkan(c), Swapchain::Vulkan(s), Some(DepthBuffer::Vulkan(d))) => {
+                c.begin_rendering(s, image_index, color_clear, Some(d))
+            }
+            (Self::D3d12(c), Swapchain::D3d12(s), None) => {
+                c.begin_rendering(s, image_index, color_clear, None)
+            }
+            (Self::D3d12(c), Swapchain::D3d12(s), Some(DepthBuffer::D3d12(d))) => {
+                c.begin_rendering(s, image_index, color_clear, Some(d))
+            }
             _ => unreachable!("{MIXED}"),
         }
     }

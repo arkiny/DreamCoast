@@ -9,6 +9,7 @@ members = [
     "crates/rhi-d3d12",
     "crates/rhi",
     "crates/gui",
+    "crates/asset",
     "apps/sandbox",
 ]
 
@@ -28,12 +29,15 @@ rhi-vulkan = { path = "crates/rhi-vulkan" }
 rhi-d3d12 = { path = "crates/rhi-d3d12" }
 rhi = { path = "crates/rhi" }
 engine-gui = { path = "crates/gui" }
+engine-asset = { path = "crates/asset" }
 
 # External
 windows = "0.62"
 ash = "0.38"
 glam = "0.30"
 imgui = "0.12"
+gltf = "1"
+image = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"

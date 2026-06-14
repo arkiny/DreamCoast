@@ -85,10 +85,11 @@ engine/                 # cargo workspace root
 - `crates/gui`: imgui-rs + 커스텀 RHI 렌더러(폰트 atlas=바인드리스 텍스처) + Win32 입력 브리지
 - **완료 기준**: 두 백엔드 모두 삼각형 위 ImGui 창(데모/통계/클리어색) 동작 (도킹은 이후로 연기)
 
-### Phase 4 — 셰이더 시스템 + 에셋 파이프라인
-- Slang 리플렉션, 핫리로드, 파이프라인 캐시
-- glTF 메시/머티리얼 로딩, 텍스처(KTX2/DDS) 로딩
-- **완료 기준**: glTF 모델이 텍스처와 함께 화면에 표시
+### Phase 4 — 에셋 파이프라인 + 메시 렌더링 — ✅ 완료
+세부: [phase-4-assets.md](phase-4-assets.md)
+- RHI 깊이 버퍼 + 메시 정점 레이아웃, glam 카메라(궤도, 백엔드별 y-flip)
+- `crates/asset`: gltf+image로 glTF 로딩(+큐브 폴백), mesh.slang(lambert+바인드리스)
+- **완료 기준**: glTF 모델이 텍스처와 함께 깊이 정확히 표시(두 백엔드). 리플렉션/핫리로드는 분리(이후)
 
 ### Phase 5 — 렌더그래프 / 프레임그래프
 - 패스 선언 API, transient 리소스 할당·aliasing, 자동 배리어/상태 전이

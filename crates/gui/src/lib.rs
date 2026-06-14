@@ -85,6 +85,8 @@ impl Gui {
             blend: BlendMode::AlphaBlend,
             push_constant_size: 20,
             bindless: true,
+            depth_test: false,
+            depth_format: None,
         })?;
 
         let frames = (0..frames_in_flight)

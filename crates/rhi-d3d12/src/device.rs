@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use engine_core::EngineError;
-use rhi_types::{BufferDesc, Format, GraphicsPipelineDesc, SwapchainDesc, TextureDesc};
+use rhi_types::{BufferDesc, Extent2D, Format, GraphicsPipelineDesc, SwapchainDesc, TextureDesc};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::{
@@ -21,6 +21,7 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::core::{Interface, PCWSTR};
 
 use crate::command::D3d12CommandBuffer;
+use crate::depth::D3d12DepthBuffer;
 use crate::instance::{D3d12Instance, d3d_err};
 use crate::pipeline::D3d12GraphicsPipeline;
 use crate::swapchain::D3d12Swapchain;
@@ -222,6 +223,10 @@ impl D3d12Device {
         pixels: &[u8],
     ) -> Result<D3d12Texture, EngineError> {
         D3d12Texture::new(self.shared.clone(), desc, pixels)
+    }
+
+    pub fn create_depth_buffer(&self, extent: Extent2D) -> Result<D3d12DepthBuffer, EngineError> {
+        D3d12DepthBuffer::new(self.shared.clone(), extent)
     }
 
     pub fn create_fence(&self, signaled: bool) -> Result<D3d12Fence, EngineError> {

@@ -5,9 +5,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use ash::vk;
 use engine_core::EngineError;
-use rhi_types::{BufferDesc, GraphicsPipelineDesc, SwapchainDesc, TextureDesc};
+use rhi_types::{BufferDesc, Extent2D, GraphicsPipelineDesc, SwapchainDesc, TextureDesc};
 
 use crate::buffer::VulkanBuffer;
+use crate::depth::VulkanDepthBuffer;
 use crate::instance::{InstanceShared, VulkanInstance};
 use crate::pipeline::VulkanGraphicsPipeline;
 use crate::swapchain::VulkanSwapchain;
@@ -309,6 +310,11 @@ impl VulkanDevice {
         pixels: &[u8],
     ) -> Result<VulkanTexture, EngineError> {
         VulkanTexture::new(self.shared.clone(), desc, pixels)
+    }
+
+    /// Create a depth buffer sized to `extent`.
+    pub fn create_depth_buffer(&self, extent: Extent2D) -> Result<VulkanDepthBuffer, EngineError> {
+        VulkanDepthBuffer::new(self.shared.clone(), extent)
     }
 
     /// Create a fence, optionally already signaled.

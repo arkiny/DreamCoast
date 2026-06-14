@@ -9,8 +9,8 @@ use rhi_types::{ClearColor, Rect2D};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_INDEX_BUFFER_VIEW, D3D12_RESOURCE_BARRIER,
-    D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_CLEAR_FLAG_DEPTH, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_INDEX_BUFFER_VIEW,
+    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
     D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATES,
     D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT,
@@ -19,6 +19,7 @@ use windows::Win32::Graphics::Direct3D12::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
 
 use crate::buffer::D3d12Buffer;
+use crate::depth::D3d12DepthBuffer;
 use crate::device::DeviceShared;
 use crate::instance::d3d_err;
 use crate::pipeline::D3d12GraphicsPipeline;
@@ -84,12 +85,31 @@ impl D3d12CommandBuffer {
         );
     }
 
-    pub fn begin_rendering(&self, swapchain: &D3d12Swapchain, image_index: u32, clear: ClearColor) {
+    /// Begin a render pass. `color_clear = Some` clears color, `None` loads it
+    /// (overlay pass). `depth = Some` binds + clears the depth target.
+    pub fn begin_rendering(
+        &self,
+        swapchain: &D3d12Swapchain,
+        image_index: u32,
+        color_clear: Option<ClearColor>,
+        depth: Option<&D3d12DepthBuffer>,
+    ) {
         let rtv = swapchain.rtv_handle(image_index);
-        let color = [clear.r, clear.g, clear.b, clear.a];
         unsafe {
-            self.list.OMSetRenderTargets(1, Some(&rtv), false, None);
-            self.list.ClearRenderTargetView(rtv, &color, None);
+            match depth {
+                Some(d) => {
+                    let dsv = d.dsv();
+                    self.list
+                        .OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+                    self.list
+                        .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+                }
+                None => self.list.OMSetRenderTargets(1, Some(&rtv), false, None),
+            }
+            if let Some(c) = color_clear {
+                self.list
+                    .ClearRenderTargetView(rtv, &[c.r, c.g, c.b, c.a], None);
+            }
         }
     }
 

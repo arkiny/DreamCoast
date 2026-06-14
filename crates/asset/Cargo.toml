@@ -1,0 +1,10 @@
+[package]
+name = "engine-asset"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+engine-core.workspace = true
+gltf.workspace = true
