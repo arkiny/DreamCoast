@@ -39,6 +39,8 @@ pub enum Format {
     Rgba8Unorm,
     /// 8-bit RGBA, sRGB.
     Rgba8Srgb,
+    /// 32-bit float depth.
+    Depth32Float,
 }
 
 /// Swapchain present/pacing mode.
@@ -112,6 +114,8 @@ pub enum VertexLayout {
     None,
     /// Dear ImGui's `ImDrawVert`: position f32x2, uv f32x2, color unorm8x4 (20-byte stride).
     ImGui,
+    /// Mesh vertex: position f32x3, normal f32x3, uv f32x2 (32-byte stride).
+    Mesh,
 }
 
 /// Color blending mode for the single color attachment.
@@ -145,6 +149,10 @@ pub struct GraphicsPipelineDesc<'a> {
     pub push_constant_size: u32,
     /// Whether the pipeline binds the device's bindless texture table.
     pub bindless: bool,
+    /// Enable depth test + write (compare LESS).
+    pub depth_test: bool,
+    /// Depth attachment format the pipeline renders against (`None` = no depth).
+    pub depth_format: Option<Format>,
 }
 
 /// Intended use of a buffer. All Phase 3 buffers are host-visible (mappable) for

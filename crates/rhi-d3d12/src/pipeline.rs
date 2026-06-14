@@ -9,15 +9,15 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::{
     D3D_ROOT_SIGNATURE_VERSION_1, D3D12_BLEND_DESC, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE,
     D3D12_BLEND_OP_ADD, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_ZERO, D3D12_COLOR_WRITE_ENABLE_ALL,
-    D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_NEVER,
+    D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_LESS, D3D12_COMPARISON_FUNC_NEVER,
     D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF, D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC,
-    D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_DESCRIPTOR_RANGE, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
-    D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_FILL_MODE_SOLID, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-    D3D12_INPUT_ELEMENT_DESC, D3D12_INPUT_LAYOUT_DESC, D3D12_LOGIC_OP_NOOP,
-    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC, D3D12_RENDER_TARGET_BLEND_DESC,
-    D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER,
-    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+    D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_DESCRIPTOR_RANGE,
+    D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_FILL_MODE_SOLID,
+    D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, D3D12_INPUT_ELEMENT_DESC, D3D12_INPUT_LAYOUT_DESC,
+    D3D12_LOGIC_OP_NOOP, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC,
+    D3D12_RENDER_TARGET_BLEND_DESC, D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR_TABLE,
+    D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
     D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_SIGNATURE_DESC,
     D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, D3D12_SHADER_BYTECODE,
     D3D12_SHADER_VISIBILITY_ALL, D3D12_SHADER_VISIBILITY_PIXEL,
@@ -26,7 +26,8 @@ use windows::Win32::Graphics::Direct3D12::{
     ID3D12RootSignature,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT,
+    DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::core::s;
 
@@ -57,11 +58,20 @@ impl D3d12GraphicsPipeline {
                 input_elem(s!("TEXCOORD"), DXGI_FORMAT_R32G32_FLOAT, 8),
                 input_elem(s!("COLOR"), DXGI_FORMAT_R8G8B8A8_UNORM, 16),
             ];
+            let mesh_elems = [
+                input_elem(s!("POSITION"), DXGI_FORMAT_R32G32B32_FLOAT, 0),
+                input_elem(s!("NORMAL"), DXGI_FORMAT_R32G32B32_FLOAT, 12),
+                input_elem(s!("TEXCOORD"), DXGI_FORMAT_R32G32_FLOAT, 24),
+            ];
             let input_layout = match desc.vertex_layout {
                 VertexLayout::None => D3D12_INPUT_LAYOUT_DESC::default(),
                 VertexLayout::ImGui => D3D12_INPUT_LAYOUT_DESC {
                     pInputElementDescs: imgui_elems.as_ptr(),
                     NumElements: imgui_elems.len() as u32,
+                },
+                VertexLayout::Mesh => D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: mesh_elems.as_ptr(),
+                    NumElements: mesh_elems.len() as u32,
                 },
             };
 
@@ -75,7 +85,7 @@ impl D3d12GraphicsPipeline {
                 PS: shader_bytecode(desc.fragment_bytes),
                 RasterizerState: rasterizer_default(),
                 BlendState: blend_state(desc.blend),
-                DepthStencilState: depth_disabled(),
+                DepthStencilState: depth_state(desc.depth_test),
                 SampleMask: u32::MAX,
                 InputLayout: input_layout,
                 PrimitiveTopologyType: topology,
@@ -87,6 +97,10 @@ impl D3d12GraphicsPipeline {
                 ..Default::default()
             };
             pso_desc.RTVFormats[0] = to_dxgi_format(desc.color_format);
+            pso_desc.DSVFormat = match desc.depth_format {
+                Some(f) => to_dxgi_format(f),
+                None => DXGI_FORMAT_UNKNOWN,
+            };
 
             let pso: ID3D12PipelineState = device
                 .device
@@ -280,11 +294,19 @@ fn blend_state(mode: BlendMode) -> D3D12_BLEND_DESC {
     }
 }
 
-fn depth_disabled() -> D3D12_DEPTH_STENCIL_DESC {
+fn depth_state(test: bool) -> D3D12_DEPTH_STENCIL_DESC {
     D3D12_DEPTH_STENCIL_DESC {
-        DepthEnable: false.into(),
-        DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
-        DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+        DepthEnable: test.into(),
+        DepthWriteMask: if test {
+            D3D12_DEPTH_WRITE_MASK_ALL
+        } else {
+            D3D12_DEPTH_WRITE_MASK_ZERO
+        },
+        DepthFunc: if test {
+            D3D12_COMPARISON_FUNC_LESS
+        } else {
+            D3D12_COMPARISON_FUNC_ALWAYS
+        },
         StencilEnable: false.into(),
         ..Default::default()
     }

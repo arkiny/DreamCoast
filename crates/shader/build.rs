@@ -51,6 +51,18 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "imgui_fs",
     },
+    Job {
+        src: "mesh.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "mesh_vs",
+    },
+    Job {
+        src: "mesh.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "mesh_fs",
+    },
 ];
 
 /// (slang target name, output file extension, generated accessor suffix, required).

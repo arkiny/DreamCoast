@@ -20,4 +20,8 @@ pub enum EngineError {
     /// A graphics backend (RHI) operation failed. Wired up in Phase 1.
     #[error("rhi error: {0}")]
     Rhi(String),
+
+    /// Asset loading (glTF, image) failed.
+    #[error("asset error: {0}")]
+    Asset(String),
 }

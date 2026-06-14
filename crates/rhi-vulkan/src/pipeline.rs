@@ -119,6 +119,32 @@ unsafe fn build(
                     .vertex_binding_descriptions(&vtx_bindings)
                     .vertex_attribute_descriptions(&vtx_attrs)
             }
+            VertexLayout::Mesh => {
+                vtx_bindings = [vk::VertexInputBindingDescription::default()
+                    .binding(0)
+                    .stride(32)
+                    .input_rate(vk::VertexInputRate::VERTEX)];
+                vtx_attrs = [
+                    vk::VertexInputAttributeDescription::default()
+                        .location(0)
+                        .binding(0)
+                        .format(vk::Format::R32G32B32_SFLOAT)
+                        .offset(0),
+                    vk::VertexInputAttributeDescription::default()
+                        .location(1)
+                        .binding(0)
+                        .format(vk::Format::R32G32B32_SFLOAT)
+                        .offset(12),
+                    vk::VertexInputAttributeDescription::default()
+                        .location(2)
+                        .binding(0)
+                        .format(vk::Format::R32G32_SFLOAT)
+                        .offset(24),
+                ];
+                vk::PipelineVertexInputStateCreateInfo::default()
+                    .vertex_binding_descriptions(&vtx_bindings)
+                    .vertex_attribute_descriptions(&vtx_attrs)
+            }
         };
 
         let topology = match desc.topology {
@@ -175,9 +201,19 @@ unsafe fn build(
             .create_pipeline_layout(&layout_ci, None)
             .map_err(vk_err)?;
 
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(desc.depth_test)
+            .depth_write_enable(desc.depth_test)
+            .depth_compare_op(vk::CompareOp::LESS);
+
         let color_formats = [to_vk_format(desc.color_format)];
-        let mut rendering =
-            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);
+        let depth_format = desc
+            .depth_format
+            .map(to_vk_format)
+            .unwrap_or(vk::Format::UNDEFINED);
+        let mut rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(depth_format);
 
         let pipeline_ci = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
@@ -187,6 +223,7 @@ unsafe fn build(
             .rasterization_state(&rasterization)
             .multisample_state(&multisample)
             .color_blend_state(&color_blend)
+            .depth_stencil_state(&depth_stencil)
             .dynamic_state(&dynamic_state)
             .layout(layout)
             .push_next(&mut rendering);

@@ -8,6 +8,7 @@ use engine_core::EngineError;
 use rhi_types::{ClearColor, Rect2D};
 
 use crate::buffer::VulkanBuffer;
+use crate::depth::VulkanDepthBuffer;
 use crate::device::DeviceShared;
 use crate::pipeline::VulkanGraphicsPipeline;
 use crate::swapchain::VulkanSwapchain;
@@ -96,32 +97,57 @@ impl VulkanCommandBuffer {
         );
     }
 
-    /// Begin dynamic rendering into a swapchain image, clearing it.
+    /// Begin dynamic rendering. `color_clear = Some` clears the color attachment,
+    /// `None` loads it (overlay pass). `depth = Some` attaches + clears depth.
     pub fn begin_rendering(
         &self,
         swapchain: &VulkanSwapchain,
         image_index: u32,
-        clear: ClearColor,
+        color_clear: Option<ClearColor>,
+        depth: Option<&VulkanDepthBuffer>,
     ) {
-        let clear_value = vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [clear.r, clear.g, clear.b, clear.a],
-            },
+        let (load_op, clear_value) = match color_clear {
+            Some(c) => (
+                vk::AttachmentLoadOp::CLEAR,
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [c.r, c.g, c.b, c.a],
+                    },
+                },
+            ),
+            None => (vk::AttachmentLoadOp::LOAD, vk::ClearValue::default()),
         };
         let color_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(swapchain.view(image_index))
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .load_op(load_op)
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(clear_value);
         let attachments = [color_attachment];
-        let rendering_info = vk::RenderingInfo::default()
+        let mut rendering_info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: swapchain.extent(),
             })
             .layer_count(1)
             .color_attachments(&attachments);
+
+        let depth_attachment;
+        if let Some(d) = depth {
+            depth_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(d.view())
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                });
+            rendering_info = rendering_info.depth_attachment(&depth_attachment);
+        }
+
         unsafe {
             self.device
                 .device

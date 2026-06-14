@@ -16,6 +16,7 @@ use engine_core::EngineError;
 
 mod buffer;
 mod command;
+mod depth;
 mod device;
 mod instance;
 mod pipeline;
@@ -25,6 +26,7 @@ mod texture;
 
 pub use buffer::VulkanBuffer;
 pub use command::VulkanCommandBuffer;
+pub use depth::VulkanDepthBuffer;
 pub use device::{VulkanDevice, VulkanQueue};
 pub use instance::VulkanInstance;
 pub use pipeline::VulkanGraphicsPipeline;
@@ -44,6 +46,7 @@ fn to_vk_format(format: rhi_types::Format) -> vk::Format {
         rhi_types::Format::Bgra8Srgb => vk::Format::B8G8R8A8_SRGB,
         rhi_types::Format::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
         rhi_types::Format::Rgba8Srgb => vk::Format::R8G8B8A8_SRGB,
+        rhi_types::Format::Depth32Float => vk::Format::D32_SFLOAT,
     }
 }
 
