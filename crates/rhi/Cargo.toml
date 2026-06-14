@@ -1,0 +1,12 @@
+[package]
+name = "rhi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rhi-types.workspace = true
+rhi-vulkan.workspace = true
+engine-core.workspace = true
+engine-platform.workspace = true
