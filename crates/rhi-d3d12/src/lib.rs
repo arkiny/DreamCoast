@@ -16,19 +16,23 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
 };
 
+mod buffer;
 mod command;
 mod device;
 mod instance;
 mod pipeline;
 mod swapchain;
 mod sync;
+mod texture;
 
+pub use buffer::D3d12Buffer;
 pub use command::D3d12CommandBuffer;
 pub use device::{D3d12Device, D3d12Queue};
 pub use instance::D3d12Instance;
 pub use pipeline::D3d12GraphicsPipeline;
 pub use swapchain::D3d12Swapchain;
 pub use sync::{D3d12Fence, D3d12Semaphore};
+pub use texture::D3d12Texture;
 
 /// Render/RTV format (includes sRGB write conversion).
 fn to_dxgi_format(format: Format) -> DXGI_FORMAT {

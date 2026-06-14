@@ -10,8 +10,9 @@ use anyhow::anyhow;
 use engine_core::init_logging;
 use engine_platform::Window;
 use rhi::{
-    BackendKind, ClearColor, Device, Extent2D, Format, GraphicsPipelineDesc, Instance,
-    InstanceDesc, PresentMode, PrimitiveTopology, Semaphore, SwapchainDesc,
+    BackendKind, BlendMode, BufferDesc, BufferUsage, ClearColor, Device, Extent2D, Format,
+    GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology, Rect2D,
+    Semaphore, SwapchainDesc, TextureDesc, VertexLayout,
 };
 use tracing::info;
 
@@ -84,7 +85,43 @@ fn main() -> anyhow::Result<()> {
         fragment_entry: "fsMain",
         color_format: swapchain.format(),
         topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::None,
+        blend: BlendMode::Opaque,
+        push_constant_size: 0,
+        bindless: false,
     })?;
+
+    // --- Bindless smoke test: a textured quad over the triangle ---
+    let (quad_vs, quad_fs) = match backend {
+        BackendKind::Vulkan => (
+            engine_shader::imgui_vs_spirv(),
+            engine_shader::imgui_fs_spirv(),
+        ),
+        BackendKind::D3d12 => (
+            engine_shader::imgui_vs_dxil(),
+            engine_shader::imgui_fs_dxil(),
+        ),
+    };
+    let quad_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: quad_vs.ok_or_else(|| anyhow!("imgui vs unavailable"))?,
+        fragment_bytes: quad_fs.ok_or_else(|| anyhow!("imgui fs unavailable"))?,
+        vertex_entry: "vsMain",
+        fragment_entry: "fsMain",
+        color_format: swapchain.format(),
+        topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::ImGui,
+        blend: BlendMode::AlphaBlend,
+        push_constant_size: 20,
+        bindless: true,
+    })?;
+    let checker = make_checker_texture(&device)?;
+    let (quad_vbuf, quad_ibuf) = make_quad_buffers(&device)?;
+    let mut quad_pc = [0u8; 20];
+    quad_pc[0..4].copy_from_slice(&1.0f32.to_le_bytes()); // scale.x
+    quad_pc[4..8].copy_from_slice(&1.0f32.to_le_bytes()); // scale.y
+    quad_pc[8..12].copy_from_slice(&0.0f32.to_le_bytes()); // translate.x
+    quad_pc[12..16].copy_from_slice(&0.0f32.to_le_bytes()); // translate.y
+    quad_pc[16..20].copy_from_slice(&checker.bindless_index().to_le_bytes());
 
     // Per-frame-in-flight resources.
     let mut command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
@@ -154,6 +191,20 @@ fn main() -> anyhow::Result<()> {
         cmd.set_viewport_scissor(&swapchain);
         cmd.bind_graphics_pipeline(&pipeline);
         cmd.draw(3, 1);
+
+        // Bindless smoke test: textured quad.
+        cmd.bind_graphics_pipeline(&quad_pipeline);
+        cmd.push_constants(&quad_pc);
+        cmd.bind_vertex_buffer(&quad_vbuf, 20);
+        cmd.bind_index_buffer(&quad_ibuf, false);
+        cmd.set_scissor(Rect2D {
+            x: 0,
+            y: 0,
+            width: cw,
+            height: ch,
+        });
+        cmd.draw_indexed(6, 0, 0);
+
         cmd.end_rendering();
         cmd.transition_to_present(&swapchain, image_index);
         cmd.end()?;
@@ -170,6 +221,65 @@ fn main() -> anyhow::Result<()> {
     device.wait_idle()?;
     info!("shutting down");
     Ok(())
+}
+
+/// An 8x8 magenta/black checkerboard RGBA8 texture (bindless smoke test).
+fn make_checker_texture(device: &Device) -> anyhow::Result<rhi::Texture> {
+    const N: u32 = 8;
+    let mut pixels = Vec::with_capacity((N * N * 4) as usize);
+    for y in 0..N {
+        for x in 0..N {
+            let on = (x + y) % 2 == 0;
+            let rgba = if on {
+                [255, 0, 255, 255]
+            } else {
+                [16, 16, 16, 255]
+            };
+            pixels.extend_from_slice(&rgba);
+        }
+    }
+    Ok(device.create_texture(
+        &TextureDesc {
+            width: N,
+            height: N,
+            format: Format::Rgba8Unorm,
+        },
+        &pixels,
+    )?)
+}
+
+/// A unit quad (two triangles) in NDC with full UVs and white vertex color,
+/// in ImGui `ImDrawVert` layout (pos f32x2, uv f32x2, color unorm8x4).
+fn make_quad_buffers(device: &Device) -> anyhow::Result<(rhi::Buffer, rhi::Buffer)> {
+    fn vtx(out: &mut Vec<u8>, x: f32, y: f32, u: f32, v: f32) {
+        out.extend_from_slice(&x.to_le_bytes());
+        out.extend_from_slice(&y.to_le_bytes());
+        out.extend_from_slice(&u.to_le_bytes());
+        out.extend_from_slice(&v.to_le_bytes());
+        out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    }
+    let mut verts = Vec::new();
+    vtx(&mut verts, -0.9, -0.9, 0.0, 0.0);
+    vtx(&mut verts, -0.4, -0.9, 1.0, 0.0);
+    vtx(&mut verts, -0.4, -0.4, 1.0, 1.0);
+    vtx(&mut verts, -0.9, -0.4, 0.0, 1.0);
+    let indices: [u16; 6] = [0, 1, 2, 2, 3, 0];
+    let mut idx_bytes = Vec::new();
+    for i in indices {
+        idx_bytes.extend_from_slice(&i.to_le_bytes());
+    }
+
+    let vbuf = device.create_buffer(&BufferDesc {
+        size: verts.len() as u64,
+        usage: BufferUsage::Vertex,
+    })?;
+    vbuf.write(&verts)?;
+    let ibuf = device.create_buffer(&BufferDesc {
+        size: idx_bytes.len() as u64,
+        usage: BufferUsage::Index,
+    })?;
+    ibuf.write(&idx_bytes)?;
+    Ok((vbuf, ibuf))
 }
 
 fn build_render_finished(device: &Device, count: u32) -> anyhow::Result<Vec<Semaphore>> {

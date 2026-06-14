@@ -1,0 +1,87 @@
+//! Host-visible buffers for dynamic per-frame upload (vertex/index).
+
+use std::sync::Arc;
+
+use ash::vk;
+use engine_core::EngineError;
+use rhi_types::{BufferDesc, BufferUsage};
+
+use crate::device::DeviceShared;
+use crate::vk_err;
+
+/// A persistently-mapped, host-visible buffer.
+pub struct VulkanBuffer {
+    device: Arc<DeviceShared>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut u8,
+    size: u64,
+}
+
+impl VulkanBuffer {
+    pub(crate) fn new(device: Arc<DeviceShared>, desc: &BufferDesc) -> Result<Self, EngineError> {
+        unsafe {
+            let usage = match desc.usage {
+                BufferUsage::Vertex => vk::BufferUsageFlags::VERTEX_BUFFER,
+                BufferUsage::Index => vk::BufferUsageFlags::INDEX_BUFFER,
+            };
+            let ci = vk::BufferCreateInfo::default()
+                .size(desc.size)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = device.device.create_buffer(&ci, None).map_err(vk_err)?;
+
+            let req = device.device.get_buffer_memory_requirements(buffer);
+            let mem_type = device.find_memory_type(
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type);
+            let memory = device
+                .device
+                .allocate_memory(&alloc, None)
+                .map_err(vk_err)?;
+            device
+                .device
+                .bind_buffer_memory(buffer, memory, 0)
+                .map_err(vk_err)?;
+
+            let mapped = device
+                .device
+                .map_memory(memory, 0, desc.size, vk::MemoryMapFlags::empty())
+                .map_err(vk_err)? as *mut u8;
+
+            Ok(Self {
+                device,
+                buffer,
+                memory,
+                mapped,
+                size: desc.size,
+            })
+        }
+    }
+
+    /// Copy `data` into the buffer (clamped to its size). Host-coherent, so no
+    /// explicit flush is needed.
+    pub fn write(&self, data: &[u8]) -> Result<(), EngineError> {
+        let n = data.len().min(self.size as usize);
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.mapped, n) };
+        Ok(())
+    }
+
+    pub(crate) fn raw(&self) -> vk::Buffer {
+        self.buffer
+    }
+}
+
+impl Drop for VulkanBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.device.unmap_memory(self.memory);
+            self.device.device.destroy_buffer(self.buffer, None);
+            self.device.device.free_memory(self.memory, None);
+        }
+    }
+}

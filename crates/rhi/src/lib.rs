@@ -46,6 +46,30 @@ backend_enum!(/// A CPU-GPU fence.
     Fence => rhi_vulkan::VulkanFence, rhi_d3d12::D3d12Fence);
 backend_enum!(/// A GPU-GPU binary semaphore (no-op on D3D12).
     Semaphore => rhi_vulkan::VulkanSemaphore, rhi_d3d12::D3d12Semaphore);
+backend_enum!(/// A host-visible buffer (vertex/index).
+    Buffer => rhi_vulkan::VulkanBuffer, rhi_d3d12::D3d12Buffer);
+backend_enum!(/// A sampled 2D texture registered in the bindless table.
+    Texture => rhi_vulkan::VulkanTexture, rhi_d3d12::D3d12Texture);
+
+impl Buffer {
+    /// Copy bytes into the buffer (host-visible).
+    pub fn write(&self, data: &[u8]) -> Result<()> {
+        match self {
+            Self::Vulkan(b) => b.write(data),
+            Self::D3d12(b) => b.write(data),
+        }
+    }
+}
+
+impl Texture {
+    /// Index of this texture in the device's bindless table.
+    pub fn bindless_index(&self) -> u32 {
+        match self {
+            Self::Vulkan(t) => t.bindless_index(),
+            Self::D3d12(t) => t.bindless_index(),
+        }
+    }
+}
 
 impl Instance {
     /// Create an instance for the requested backend.
@@ -95,6 +119,20 @@ impl Device {
         match self {
             Self::Vulkan(d) => Ok(CommandBuffer::Vulkan(d.create_command_buffer()?)),
             Self::D3d12(d) => Ok(CommandBuffer::D3d12(d.create_command_buffer()?)),
+        }
+    }
+
+    pub fn create_buffer(&self, desc: &BufferDesc) -> Result<Buffer> {
+        match self {
+            Self::Vulkan(d) => Ok(Buffer::Vulkan(d.create_buffer(desc)?)),
+            Self::D3d12(d) => Ok(Buffer::D3d12(d.create_buffer(desc)?)),
+        }
+    }
+
+    pub fn create_texture(&self, desc: &TextureDesc, pixels: &[u8]) -> Result<Texture> {
+        match self {
+            Self::Vulkan(d) => Ok(Texture::Vulkan(d.create_texture(desc, pixels)?)),
+            Self::D3d12(d) => Ok(Texture::D3d12(d.create_texture(desc, pixels)?)),
         }
     }
 
@@ -235,6 +273,43 @@ impl CommandBuffer {
         match self {
             Self::Vulkan(c) => c.draw(vertex_count, instance_count),
             Self::D3d12(c) => c.draw(vertex_count, instance_count),
+        }
+    }
+
+    pub fn set_scissor(&self, rect: Rect2D) {
+        match self {
+            Self::Vulkan(c) => c.set_scissor(rect),
+            Self::D3d12(c) => c.set_scissor(rect),
+        }
+    }
+
+    pub fn bind_vertex_buffer(&self, buffer: &Buffer, stride: u32) {
+        match (self, buffer) {
+            (Self::Vulkan(c), Buffer::Vulkan(b)) => c.bind_vertex_buffer(b, stride),
+            (Self::D3d12(c), Buffer::D3d12(b)) => c.bind_vertex_buffer(b, stride),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    pub fn bind_index_buffer(&self, buffer: &Buffer, wide: bool) {
+        match (self, buffer) {
+            (Self::Vulkan(c), Buffer::Vulkan(b)) => c.bind_index_buffer(b, wide),
+            (Self::D3d12(c), Buffer::D3d12(b)) => c.bind_index_buffer(b, wide),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    pub fn push_constants(&self, data: &[u8]) {
+        match self {
+            Self::Vulkan(c) => c.push_constants(data),
+            Self::D3d12(c) => c.push_constants(data),
+        }
+    }
+
+    pub fn draw_indexed(&self, index_count: u32, first_index: u32, vertex_offset: i32) {
+        match self {
+            Self::Vulkan(c) => c.draw_indexed(index_count, first_index, vertex_offset),
+            Self::D3d12(c) => c.draw_indexed(index_count, first_index, vertex_offset),
         }
     }
 }
