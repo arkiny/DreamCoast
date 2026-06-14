@@ -1,11 +1,13 @@
 //! Command buffer recording for the triangle frame.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use ash::vk;
 use engine_core::EngineError;
-use rhi_types::ClearColor;
+use rhi_types::{ClearColor, Rect2D};
 
+use crate::buffer::VulkanBuffer;
 use crate::device::DeviceShared;
 use crate::pipeline::VulkanGraphicsPipeline;
 use crate::swapchain::VulkanSwapchain;
@@ -15,6 +17,8 @@ use crate::{color_subresource_range, vk_err};
 pub struct VulkanCommandBuffer {
     device: Arc<DeviceShared>,
     cmd: vk::CommandBuffer,
+    // Layout of the currently bound pipeline (for push constants).
+    current_layout: Cell<vk::PipelineLayout>,
 }
 
 impl VulkanCommandBuffer {
@@ -29,7 +33,11 @@ impl VulkanCommandBuffer {
                 .allocate_command_buffers(&alloc)
                 .map_err(vk_err)?
         }[0];
-        Ok(Self { device, cmd })
+        Ok(Self {
+            device,
+            cmd,
+            current_layout: Cell::new(vk::PipelineLayout::null()),
+        })
     }
 
     pub(crate) fn raw(&self) -> vk::CommandBuffer {
@@ -149,7 +157,7 @@ impl VulkanCommandBuffer {
         }
     }
 
-    /// Bind a graphics pipeline.
+    /// Bind a graphics pipeline (and its bindless descriptor set, if any).
     pub fn bind_graphics_pipeline(&self, pipeline: &VulkanGraphicsPipeline) {
         unsafe {
             self.device.device.cmd_bind_pipeline(
@@ -157,6 +165,17 @@ impl VulkanCommandBuffer {
                 vk::PipelineBindPoint::GRAPHICS,
                 pipeline.raw(),
             );
+            self.current_layout.set(pipeline.layout());
+            if pipeline.is_bindless() {
+                self.device.device.cmd_bind_descriptor_sets(
+                    self.cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.layout(),
+                    0,
+                    &[self.device.bindless_set],
+                    &[],
+                );
+            }
         }
     }
 
@@ -166,6 +185,72 @@ impl VulkanCommandBuffer {
             self.device
                 .device
                 .cmd_draw(self.cmd, vertex_count, instance_count, 0, 0);
+        }
+    }
+
+    /// Set the scissor rectangle.
+    pub fn set_scissor(&self, rect: Rect2D) {
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D {
+                x: rect.x,
+                y: rect.y,
+            },
+            extent: vk::Extent2D {
+                width: rect.width,
+                height: rect.height,
+            },
+        };
+        unsafe { self.device.device.cmd_set_scissor(self.cmd, 0, &[scissor]) };
+    }
+
+    /// Bind a vertex buffer at binding 0. `stride` is unused (Vulkan takes it
+    /// from the pipeline's vertex layout) — present for facade parity with D3D12.
+    pub fn bind_vertex_buffer(&self, buffer: &VulkanBuffer, _stride: u32) {
+        unsafe {
+            self.device
+                .device
+                .cmd_bind_vertex_buffers(self.cmd, 0, &[buffer.raw()], &[0]);
+        }
+    }
+
+    /// Bind an index buffer (`wide` selects 32-bit indices, else 16-bit).
+    pub fn bind_index_buffer(&self, buffer: &VulkanBuffer, wide: bool) {
+        let ty = if wide {
+            vk::IndexType::UINT32
+        } else {
+            vk::IndexType::UINT16
+        };
+        unsafe {
+            self.device
+                .device
+                .cmd_bind_index_buffer(self.cmd, buffer.raw(), 0, ty);
+        }
+    }
+
+    /// Upload push constants (visible to both stages) for the bound pipeline.
+    pub fn push_constants(&self, data: &[u8]) {
+        unsafe {
+            self.device.device.cmd_push_constants(
+                self.cmd,
+                self.current_layout.get(),
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                data,
+            );
+        }
+    }
+
+    /// Issue an indexed draw.
+    pub fn draw_indexed(&self, index_count: u32, first_index: u32, vertex_offset: i32) {
+        unsafe {
+            self.device.device.cmd_draw_indexed(
+                self.cmd,
+                index_count,
+                1,
+                first_index,
+                vertex_offset,
+                0,
+            );
         }
     }
 

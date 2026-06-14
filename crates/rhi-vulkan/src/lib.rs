@@ -14,19 +14,23 @@ use std::ffi::CStr;
 use ash::vk;
 use engine_core::EngineError;
 
+mod buffer;
 mod command;
 mod device;
 mod instance;
 mod pipeline;
 mod swapchain;
 mod sync;
+mod texture;
 
+pub use buffer::VulkanBuffer;
 pub use command::VulkanCommandBuffer;
 pub use device::{VulkanDevice, VulkanQueue};
 pub use instance::VulkanInstance;
 pub use pipeline::VulkanGraphicsPipeline;
 pub use swapchain::VulkanSwapchain;
 pub use sync::{VulkanFence, VulkanSemaphore};
+pub use texture::VulkanTexture;
 
 /// Map a Vulkan result code into the engine error type.
 fn vk_err(e: vk::Result) -> EngineError {

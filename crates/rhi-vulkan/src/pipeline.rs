@@ -1,4 +1,5 @@
-//! Graphics pipeline for the triangle, using dynamic rendering (no render pass).
+//! Graphics pipeline (dynamic rendering): vertex layout, blending, push
+//! constants, and the bindless descriptor set layout.
 
 use std::ffi::CString;
 use std::io::Cursor;
@@ -6,16 +7,17 @@ use std::sync::Arc;
 
 use ash::vk;
 use engine_core::EngineError;
-use rhi_types::{GraphicsPipelineDesc, PrimitiveTopology};
+use rhi_types::{BlendMode, GraphicsPipelineDesc, PrimitiveTopology, VertexLayout};
 
 use crate::device::DeviceShared;
 use crate::{to_vk_format, vk_err};
 
-/// A compiled graphics pipeline and its (empty) layout.
+/// A compiled graphics pipeline and its layout.
 pub struct VulkanGraphicsPipeline {
     device: Arc<DeviceShared>,
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
+    bindless: bool,
 }
 
 impl VulkanGraphicsPipeline {
@@ -26,8 +28,6 @@ impl VulkanGraphicsPipeline {
         unsafe {
             let vs = create_shader_module(&device.device, desc.vertex_bytes)?;
             let fs = create_shader_module(&device.device, desc.fragment_bytes)?;
-            // Modules can be destroyed once the pipeline is built; ensure cleanup
-            // even on the error paths below.
             let result = build(&device, desc, vs, fs);
             device.device.destroy_shader_module(vs, None);
             device.device.destroy_shader_module(fs, None);
@@ -36,12 +36,21 @@ impl VulkanGraphicsPipeline {
                 device,
                 pipeline,
                 layout,
+                bindless: desc.bindless,
             })
         }
     }
 
     pub(crate) fn raw(&self) -> vk::Pipeline {
         self.pipeline
+    }
+
+    pub(crate) fn layout(&self) -> vk::PipelineLayout {
+        self.layout
+    }
+
+    pub(crate) fn is_bindless(&self) -> bool {
+        self.bindless
     }
 }
 
@@ -79,7 +88,39 @@ unsafe fn build(
                 .name(&fs_entry),
         ];
 
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        // Vertex input (ImGui layout or none).
+        let vtx_bindings;
+        let vtx_attrs;
+        let vertex_input = match desc.vertex_layout {
+            VertexLayout::None => vk::PipelineVertexInputStateCreateInfo::default(),
+            VertexLayout::ImGui => {
+                vtx_bindings = [vk::VertexInputBindingDescription::default()
+                    .binding(0)
+                    .stride(20)
+                    .input_rate(vk::VertexInputRate::VERTEX)];
+                vtx_attrs = [
+                    vk::VertexInputAttributeDescription::default()
+                        .location(0)
+                        .binding(0)
+                        .format(vk::Format::R32G32_SFLOAT)
+                        .offset(0),
+                    vk::VertexInputAttributeDescription::default()
+                        .location(1)
+                        .binding(0)
+                        .format(vk::Format::R32G32_SFLOAT)
+                        .offset(8),
+                    vk::VertexInputAttributeDescription::default()
+                        .location(2)
+                        .binding(0)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .offset(16),
+                ];
+                vk::PipelineVertexInputStateCreateInfo::default()
+                    .vertex_binding_descriptions(&vtx_bindings)
+                    .vertex_attribute_descriptions(&vtx_attrs)
+            }
+        };
+
         let topology = match desc.topology {
             PrimitiveTopology::TriangleList => vk::PrimitiveTopology::TRIANGLE_LIST,
         };
@@ -94,9 +135,21 @@ unsafe fn build(
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .blend_enable(false);
+
+        let color_blend_attachment = match desc.blend {
+            BlendMode::Opaque => vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(false),
+            BlendMode::AlphaBlend => vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .alpha_blend_op(vk::BlendOp::ADD),
+        };
         let attachments = [color_blend_attachment];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
@@ -104,9 +157,22 @@ unsafe fn build(
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
+        // Pipeline layout: bindless set + optional push constants.
+        let set_layouts = [device.bindless_layout];
+        let push_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(desc.push_constant_size)];
+        let mut layout_ci = vk::PipelineLayoutCreateInfo::default();
+        if desc.bindless {
+            layout_ci = layout_ci.set_layouts(&set_layouts);
+        }
+        if desc.push_constant_size > 0 {
+            layout_ci = layout_ci.push_constant_ranges(&push_ranges);
+        }
         let layout = device
             .device
-            .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
+            .create_pipeline_layout(&layout_ci, None)
             .map_err(vk_err)?;
 
         let color_formats = [to_vk_format(desc.color_format)];

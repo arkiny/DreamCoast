@@ -104,11 +104,29 @@ pub struct SwapchainDesc {
     pub image_count: u32,
 }
 
-/// Graphics pipeline parameters for the minimal slice (no vertex input; the
-/// shader synthesizes vertices from the vertex index).
+/// Vertex input layout. Phase 3 only needs the fixed ImGui layout; a general
+/// layout system can come later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VertexLayout {
+    /// No vertex buffers; the shader synthesizes vertices from the vertex index.
+    None,
+    /// Dear ImGui's `ImDrawVert`: position f32x2, uv f32x2, color unorm8x4 (20-byte stride).
+    ImGui,
+}
+
+/// Color blending mode for the single color attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlendMode {
+    /// Opaque (no blending).
+    Opaque,
+    /// Standard src-alpha / one-minus-src-alpha blending (UI).
+    AlphaBlend,
+}
+
+/// Graphics pipeline parameters.
 #[derive(Clone, Copy, Debug)]
 pub struct GraphicsPipelineDesc<'a> {
-    /// Vertex stage SPIR-V (Vulkan) / DXIL (D3D12, later) bytes.
+    /// Vertex stage SPIR-V (Vulkan) / DXIL (D3D12) bytes.
     pub vertex_bytes: &'a [u8],
     /// Fragment/pixel stage bytecode.
     pub fragment_bytes: &'a [u8],
@@ -119,4 +137,44 @@ pub struct GraphicsPipelineDesc<'a> {
     /// Color attachment format (matches the swapchain).
     pub color_format: Format,
     pub topology: PrimitiveTopology,
+    /// Vertex input layout.
+    pub vertex_layout: VertexLayout,
+    /// Color blending.
+    pub blend: BlendMode,
+    /// Size in bytes of the push/root constant block (0 = none). Visible to both stages.
+    pub push_constant_size: u32,
+    /// Whether the pipeline binds the device's bindless texture table.
+    pub bindless: bool,
+}
+
+/// Intended use of a buffer. All Phase 3 buffers are host-visible (mappable) for
+/// per-frame dynamic upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BufferUsage {
+    Vertex,
+    Index,
+}
+
+/// Buffer creation parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct BufferDesc {
+    pub size: u64,
+    pub usage: BufferUsage,
+}
+
+/// 2D sampled texture creation parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct TextureDesc {
+    pub width: u32,
+    pub height: u32,
+    pub format: Format,
+}
+
+/// A scissor / sub-rect in pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect2D {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
