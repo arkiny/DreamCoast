@@ -66,7 +66,10 @@ float4 fsMain(VSOutput input) : SV_Target
 
     float3 irradiance = float3(0.0);
     float num_samples = 0.0;
-    const float delta = 0.045;
+    // Sample a pre-blurred env mip so a coarser hemisphere step stays low-noise
+    // (keeps the per-frame real-time cost down).
+    const float delta = 0.1;
+    const float src_mip = 2.0;
     for (float phi = 0.0; phi < 2.0 * PI; phi += delta)
     {
         for (float theta = 0.0; theta < 0.5 * PI; theta += delta)
@@ -74,7 +77,7 @@ float4 fsMain(VSOutput input) : SV_Target
             // Tangent-space sample -> world.
             float3 tangent = float3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
             float3 sample_dir = tangent.x * right + tangent.y * up + tangent.z * n;
-            float3 c = g_cubes[pc.env_index].SampleLevel(g_sampler, sample_dir, 0.0).rgb;
+            float3 c = g_cubes[pc.env_index].SampleLevel(g_sampler, sample_dir, src_mip).rgb;
             irradiance += c * cos(theta) * sin(theta);
             num_samples += 1.0;
         }

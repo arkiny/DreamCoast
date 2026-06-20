@@ -113,10 +113,13 @@ impl D3d12Buffer {
                 Begin: 0,
                 End: self.size as usize,
             };
-            self.resource.Map(0, Some(&range), Some(&mut ptr)).map_err(d3d_err)?;
+            self.resource
+                .Map(0, Some(&range), Some(&mut ptr))
+                .map_err(d3d_err)?;
             std::ptr::copy_nonoverlapping(ptr as *const u8, dst.as_mut_ptr(), n);
             // Written range empty: the CPU did not modify the buffer.
-            self.resource.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            self.resource
+                .Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
         }
         Ok(())
     }

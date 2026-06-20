@@ -127,6 +127,9 @@ pub enum VertexLayout {
     /// just `POSITION` — declaring only what the shader consumes keeps the
     /// Vulkan validation layer quiet.
     MeshPosition,
+    /// Mesh vertex buffer, position + normal consumed, uv skipped (32-byte
+    /// stride). Used by the environment-capture forward pass.
+    MeshPosNormal,
 }
 
 /// Color blending mode for the single color attachment.

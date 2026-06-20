@@ -11,9 +11,9 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_CLEAR_FLAG_DEPTH, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_INDEX_BUFFER_VIEW,
-    D3D12_RESOURCE_ALIASING_BARRIER, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
-    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_ALIASING_BARRIER, D3D12_RESOURCE_BARRIER,
+    D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
     D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_STATE_COPY_SOURCE,
     D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
     D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATES,
@@ -165,15 +165,21 @@ impl D3d12CommandBuffer {
             match depth {
                 Some(d) => {
                     let dsv = d.dsv();
-                    self.list
-                        .OMSetRenderTargets(rtvs.len() as u32, Some(rtvs.as_ptr()), false, Some(&dsv));
+                    self.list.OMSetRenderTargets(
+                        rtvs.len() as u32,
+                        Some(rtvs.as_ptr()),
+                        false,
+                        Some(&dsv),
+                    );
                     self.list
                         .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
                 }
-                None => {
-                    self.list
-                        .OMSetRenderTargets(rtvs.len() as u32, Some(rtvs.as_ptr()), false, None)
-                }
+                None => self.list.OMSetRenderTargets(
+                    rtvs.len() as u32,
+                    Some(rtvs.as_ptr()),
+                    false,
+                    None,
+                ),
             }
             for ((_, clear), rtv) in targets.iter().zip(&rtvs) {
                 if let Some(c) = clear {
