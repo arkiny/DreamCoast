@@ -242,7 +242,7 @@ float4 fsMain(VSOutput input) : SV_Target
     float3 color = (ambient + lo) * g.ambient.a; // a = exposure
 
     // Debug views (counts.y): 1 albedo, 2 normal, 3 metallic, 4 roughness,
-    // 5 world pos, 6 AO. 0 = lit.
+    // 5 world pos, 6 AO, 7 direct light, 8 IBL ambient. 0 = lit.
     int dbg = g.counts.y;
     if (dbg == 1) color = albedo;
     else if (dbg == 2) color = n * 0.5 + 0.5;
@@ -250,6 +250,8 @@ float4 fsMain(VSOutput input) : SV_Target
     else if (dbg == 4) color = float3(roughness);
     else if (dbg == 5) color = frac(world_pos);
     else if (dbg == 6) color = float3(ao);
+    else if (dbg == 7) color = lo * g.ambient.a;      // direct lighting only
+    else if (dbg == 8) color = ambient * g.ambient.a; // IBL ambient only
 
     return float4(color, 1.0);
 }

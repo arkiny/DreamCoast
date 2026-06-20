@@ -58,7 +58,7 @@ const BRDF_SIZE: u32 = 256;
 const NO_TEXTURE: u32 = u32::MAX;
 const MODEL_PATH: &str = "assets/model.glb";
 
-const DEBUG_VIEWS: [&str; 7] = [
+const DEBUG_VIEWS: [&str; 9] = [
     "Lit",
     "Albedo",
     "Normal",
@@ -66,6 +66,8 @@ const DEBUG_VIEWS: [&str; 7] = [
     "Roughness",
     "Position",
     "AO",
+    "Direct",
+    "IBL",
 ];
 const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 
