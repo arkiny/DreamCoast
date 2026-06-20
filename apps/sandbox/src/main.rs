@@ -1,8 +1,10 @@
 //! Sandbox: the playground executable.
 //!
-//! Phase 4 scope: load a glTF mesh (or a procedural cube fallback) and render it
-//! textured + diffuse-lit with depth, an orbiting camera, and a Dear ImGui
-//! overlay — on either backend (`--backend vulkan|d3d12`).
+//! Builds a render graph each frame: a glTF mesh (or procedural cube fallback)
+//! rendered textured + diffuse-lit with depth into an offscreen target, a
+//! three-pass bloom chain, then a composite to the backbuffer plus a Dear ImGui
+//! overlay. The ImGui panel toggles the post effect and transient memory
+//! aliasing. Runs on either backend (`--backend vulkan|d3d12`).
 
 use std::time::Instant;
 
