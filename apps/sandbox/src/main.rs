@@ -71,6 +71,21 @@ const DEBUG_VIEWS: [&str; 9] = [
 ];
 const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 
+/// One drawable in the sample scene: a mesh + world transform + PBR material.
+struct SceneObject {
+    vbuf: Buffer,
+    ibuf: Buffer,
+    index_count: u32,
+    transform: Mat4,
+    base_color: [f32; 4],
+    metallic: f32,
+    roughness: f32,
+    /// base color, metallic-roughness, normal, emissive bindless indices
+    /// (`NO_TEXTURE` if absent).
+    tex: [u32; 4],
+    casts_shadow: bool,
+}
+
 /// Per-frame globals, mirrored by `Globals` in pbr.slang. All members are 16-byte
 /// vectors so the std140 (Vulkan) and cbuffer (D3D12) layouts agree.
 #[repr(C)]
@@ -385,13 +400,8 @@ fn main() -> anyhow::Result<()> {
         BackendKind::D3d12 => 0,
     };
 
-    // Upload geometry: the model plus a ground plane that catches its shadow.
-    let (vbuf, ibuf, index_count) = upload_mesh(&device, &model)?;
-    let ground = ground_mesh(model_radius * 3.0, 0.0);
-    let (ground_vbuf, ground_ibuf, ground_count) = upload_mesh(&device, &ground)?;
-
-    // Upload material textures (bindless). Base color is sRGB-encoded; the
-    // metallic-roughness and normal maps carry linear data.
+    // Upload material textures for the loaded model (bindless). Base color is
+    // sRGB-encoded; the metallic-roughness and normal maps carry linear data.
     let mut _textures: Vec<Texture> = Vec::new();
     let base_index = match &model.material.base_color {
         Some(im) => upload_texture(&device, &mut _textures, im, Format::Rgba8Srgb)?,
@@ -410,9 +420,75 @@ fn main() -> anyhow::Result<()> {
         Some(im) => upload_texture(&device, &mut _textures, im, Format::Rgba8Unorm)?,
         None => NO_TEXTURE,
     };
-    let base_color_factor = model.material.base_color_factor;
-    let metallic_factor = model.material.metallic_factor;
-    let roughness_factor = model.material.roughness_factor;
+
+    // Build the sample scene: the loaded model at the origin plus a few procedural
+    // objects with varied materials (showing PBR + image-based reflections). A
+    // ground plane (kept separate — it's also the environment-capture geometry)
+    // catches the shadows and grounds the reflections.
+    let r = model_radius;
+    let sphere = dreamcoast_asset::uv_sphere(48, 32);
+    let cube = dreamcoast_asset::unit_cube();
+    let trs =
+        |pos: Vec3, scale: f32| Mat4::from_translation(pos) * Mat4::from_scale(Vec3::splat(scale));
+    let mut scene: Vec<SceneObject> = Vec::new();
+    // Loaded model (its glTF material).
+    let (vbuf, ibuf, index_count) = upload_mesh(&device, &model)?;
+    scene.push(SceneObject {
+        vbuf,
+        ibuf,
+        index_count,
+        transform: Mat4::IDENTITY,
+        base_color: model.material.base_color_factor,
+        metallic: model.material.metallic_factor,
+        roughness: model.material.roughness_factor,
+        tex: [base_index, mr_index, normal_index, NO_TEXTURE],
+        casts_shadow: true,
+    });
+    // Polished chrome sphere.
+    let (sv, si, sc) = upload_mesh(&device, &sphere)?;
+    scene.push(SceneObject {
+        vbuf: sv,
+        ibuf: si,
+        index_count: sc,
+        transform: trs(Vec3::new(-r * 1.9, r * 0.55, r * 0.3), r * 0.55),
+        base_color: [0.95, 0.96, 0.97, 1.0],
+        metallic: 1.0,
+        roughness: 0.08,
+        tex: [NO_TEXTURE; 4],
+        casts_shadow: true,
+    });
+    // Brushed-copper sphere.
+    let (sv2, si2, sc2) = upload_mesh(&device, &sphere)?;
+    scene.push(SceneObject {
+        vbuf: sv2,
+        ibuf: si2,
+        index_count: sc2,
+        transform: trs(Vec3::new(r * 1.9, r * 0.5, -r * 0.4), r * 0.5),
+        base_color: [0.95, 0.64, 0.54, 1.0],
+        metallic: 1.0,
+        roughness: 0.35,
+        tex: [NO_TEXTURE; 4],
+        casts_shadow: true,
+    });
+    // Red dielectric cube.
+    let (cv, ci, cc) = upload_mesh(&device, &cube)?;
+    scene.push(SceneObject {
+        vbuf: cv,
+        ibuf: ci,
+        index_count: cc,
+        transform: Mat4::from_translation(Vec3::new(0.0, r * 0.45, -r * 2.0))
+            * Mat4::from_scale(Vec3::splat(r * 0.45)),
+        base_color: [0.85, 0.25, 0.2, 1.0],
+        metallic: 0.0,
+        roughness: 0.5,
+        tex: [NO_TEXTURE; 4],
+        casts_shadow: true,
+    });
+    let scene_radius = r * 3.0;
+
+    // Ground plane (separate handle: also used by the environment capture).
+    let ground = ground_mesh(scene_radius * 1.3, 0.0);
+    let (ground_vbuf, ground_ibuf, ground_count) = upload_mesh(&device, &ground)?;
 
     // Per-frame globals uniform buffer (one 256-byte slice per frame-in-flight).
     let globals_buffer = device.create_buffer(&BufferDesc {
@@ -575,23 +651,16 @@ fn main() -> anyhow::Result<()> {
             .map(|c| c.include_ui)
             .unwrap_or(true);
 
-        // Orbiting camera framing the model (focused on its mid-height so it
-        // sits nicely above the ground).
-        let focus = Vec3::new(0.0, bounds.height * 0.45, 0.0);
-        let dist = model_radius * 2.4;
-        let eye = focus
-            + Vec3::new(
-                angle.cos() * dist,
-                bounds.height * 0.3 + model_radius * 0.5,
-                angle.sin() * dist,
-            );
+        // Orbiting camera framing the whole sample scene.
+        let focus = Vec3::new(0.0, model_radius * 0.6, 0.0);
+        let dist = scene_radius * 1.6;
+        let eye = focus + Vec3::new(angle.cos() * dist, scene_radius * 0.55, angle.sin() * dist);
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
         let mut proj = Mat4::perspective_rh(60f32.to_radians(), cw as f32 / ch as f32, 0.05, 100.0);
         if backend == BackendKind::Vulkan {
             proj.y_axis.y *= -1.0; // Vulkan clip-space Y points down
         }
         let view_proj = proj * view;
-        let mvp = view_proj.to_cols_array();
         // For reconstructing background view rays (skybox) in the lighting pass.
         let inv_view_proj = view_proj.inverse().to_cols_array();
 
@@ -608,7 +677,7 @@ fn main() -> anyhow::Result<()> {
                         1.0 / dt.max(1e-4),
                         dt * 1000.0
                     ));
-                    ui.text(format!("model: {index_count} indices"));
+                    ui.text(format!("scene: {} objects + ground", scene.len()));
                     ui.separator();
                     ui.combo_simple_string("Debug view", &mut debug_view, &DEBUG_VIEWS);
                     ui.input_float3("Sun dir", &mut sun_dir).build();
@@ -640,11 +709,11 @@ fn main() -> anyhow::Result<()> {
         };
         fence.reset()?;
 
-        // Directional light view-projection: an orthographic box centered on the
-        // model, looking from the sun toward it. Backend-neutral (the pbr shader
-        // handles the Vulkan/D3D12 shadow-UV flip).
-        let shadow_center = Vec3::new(0.0, bounds.height * 0.5, 0.0);
-        let light_view_proj = light_view_proj(sun_dir, shadow_center, model_radius);
+        // Directional light view-projection: an orthographic box covering the
+        // whole scene, looking from the sun toward it. Backend-neutral (the pbr
+        // shader handles the Vulkan/D3D12 shadow-UV flip).
+        let shadow_center = Vec3::new(0.0, model_radius * 0.5, 0.0);
+        let light_vp = light_view_proj(sun_dir, shadow_center, scene_radius);
 
         // Write this frame's globals slice.
         let r = model_radius;
@@ -672,7 +741,7 @@ fn main() -> anyhow::Result<()> {
                 [0.0, 0.0, 0.0, 0.0],
                 [0.0, 0.0, 0.0, 0.0],
             ],
-            light_view_proj,
+            light_view_proj: light_vp.to_cols_array(),
             shadow: [shadow_bias, 1.0 / SHADOW_SIZE as f32, 0.0, 0.0],
             inv_view_proj,
             ibl: ibl_indices,
@@ -737,13 +806,20 @@ fn main() -> anyhow::Result<()> {
                 reads: vec![],
             },
             |ctx| {
-                // The model is the shadow caster (the ground is a flat receiver).
+                // Scene objects are the shadow casters (the ground is a flat
+                // receiver). Each draws with its own light-space MVP.
                 let cmd = ctx.cmd();
                 cmd.bind_graphics_pipeline(&shadow_pipeline);
-                cmd.push_constants(&mat4_bytes(&light_view_proj));
-                cmd.bind_vertex_buffer(&vbuf, 32);
-                cmd.bind_index_buffer(&ibuf, true);
-                cmd.draw_indexed(index_count, 0, 0);
+                for obj in &scene {
+                    if !obj.casts_shadow {
+                        continue;
+                    }
+                    let lmvp = (light_vp * obj.transform).to_cols_array();
+                    cmd.push_constants(&mat4_bytes(&lmvp));
+                    cmd.bind_vertex_buffer(&obj.vbuf, 32);
+                    cmd.bind_index_buffer(&obj.ibuf, true);
+                    cmd.draw_indexed(obj.index_count, 0, 0);
+                }
                 Ok(())
             },
         );
@@ -762,26 +838,30 @@ fn main() -> anyhow::Result<()> {
             |ctx| {
                 let cmd = ctx.cmd();
                 cmd.bind_graphics_pipeline(&gbuffer_pipeline);
-                // Model (its own PBR material, or the UI metallic/roughness
-                // override — drop the m/r texture so the factors apply directly).
-                let (m, rgh, model_mr) = if override_material {
-                    (metallic_override, roughness_override, NO_TEXTURE)
-                } else {
-                    (metallic_factor, roughness_factor, mr_index)
-                };
-                cmd.push_constants(&gbuffer_push(
-                    mvp,
-                    base_color_factor,
-                    m,
-                    rgh,
-                    [base_index, model_mr, normal_index, NO_TEXTURE],
-                ));
-                cmd.bind_vertex_buffer(&vbuf, 32);
-                cmd.bind_index_buffer(&ibuf, true);
-                cmd.draw_indexed(index_count, 0, 0);
+                // Each scene object with its own transform + PBR material. The UI
+                // material override (for IBL inspection) replaces metallic/roughness
+                // and drops the m/r texture so the factors apply directly.
+                for obj in &scene {
+                    let obj_mvp = (view_proj * obj.transform).to_cols_array();
+                    let (m, rgh, mr_tex) = if override_material {
+                        (metallic_override, roughness_override, NO_TEXTURE)
+                    } else {
+                        (obj.metallic, obj.roughness, obj.tex[1])
+                    };
+                    cmd.push_constants(&gbuffer_push(
+                        obj_mvp,
+                        obj.base_color,
+                        m,
+                        rgh,
+                        [obj.tex[0], mr_tex, obj.tex[2], obj.tex[3]],
+                    ));
+                    cmd.bind_vertex_buffer(&obj.vbuf, 32);
+                    cmd.bind_index_buffer(&obj.ibuf, true);
+                    cmd.draw_indexed(obj.index_count, 0, 0);
+                }
                 // Ground plane (plain matte material, no textures).
                 cmd.push_constants(&gbuffer_push(
-                    mvp,
+                    view_proj.to_cols_array(),
                     [0.8, 0.8, 0.8, 1.0],
                     0.0,
                     0.9,
@@ -966,7 +1046,7 @@ fn mat4_bytes(m: &[f32; 16]) -> [u8; 64] {
 /// looking from the sun's direction toward it. Returned column-major (glam's
 /// `to_cols_array`), matching the shader's `mul(M, v)` convention. No Vulkan
 /// Y-flip — the pbr shader handles the per-backend shadow-UV flip.
-fn light_view_proj(sun_dir: [f32; 3], center: Vec3, radius: f32) -> [f32; 16] {
+fn light_view_proj(sun_dir: [f32; 3], center: Vec3, radius: f32) -> Mat4 {
     let dir = Vec3::new(sun_dir[0], sun_dir[1], sun_dir[2]).normalize_or_zero();
     let dir = if dir == Vec3::ZERO { Vec3::Y } else { dir };
     let dist = radius * 4.0;
@@ -980,7 +1060,7 @@ fn light_view_proj(sun_dir: [f32; 3], center: Vec3, radius: f32) -> [f32; 16] {
     let view = Mat4::look_at_rh(light_pos, center, up);
     let half = radius * 1.6;
     let proj = Mat4::orthographic_rh(-half, half, -half, half, 0.1, dist + radius * 2.0);
-    (proj * view).to_cols_array()
+    proj * view
 }
 
 /// The pipelines + cubemaps used to (re)generate the IBL environment chain, plus
@@ -1288,9 +1368,6 @@ struct ModelBounds {
     /// Bounding-sphere radius (always 1.0 after normalization) — the unit the
     /// camera, ground, lights, and shadow box are sized in.
     radius: f32,
-    /// Model height (AABB extent along +Y) after normalization; the model rests
-    /// on y = 0.
-    height: f32,
 }
 
 /// Normalize a mesh into canonical units: recenter its footprint on the origin,
@@ -1318,10 +1395,7 @@ fn normalize_on_ground(model: &mut MeshData) -> ModelBounds {
         v.pos[1] = (v.pos[1] - base) * s;
         v.pos[2] = (v.pos[2] - cz) * s;
     }
-    ModelBounds {
-        radius: 1.0,
-        height: (sy * s).max(1e-3),
-    }
+    ModelBounds { radius: 1.0 }
 }
 
 /// 8x8 magenta/grey checker (fallback base color).
