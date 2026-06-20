@@ -10,6 +10,7 @@ members = [
     "crates/rhi",
     "crates/gui",
     "crates/asset",
+    "crates/render",
     "apps/sandbox",
 ]
 
@@ -30,6 +31,7 @@ rhi-d3d12 = { path = "crates/rhi-d3d12" }
 rhi = { path = "crates/rhi" }
 engine-gui = { path = "crates/gui" }
 engine-asset = { path = "crates/asset" }
+engine-render = { path = "crates/render" }
 
 # External
 windows = "0.62"

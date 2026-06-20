@@ -91,9 +91,12 @@ engine/                 # cargo workspace root
 - `crates/asset`: gltf+image로 glTF 로딩(+큐브 폴백), mesh.slang(lambert+바인드리스)
 - **완료 기준**: glTF 모델이 텍스처와 함께 깊이 정확히 표시(두 백엔드). 리플렉션/핫리로드는 분리(이후)
 
-### Phase 5 — 렌더그래프 / 프레임그래프
-- 패스 선언 API, transient 리소스 할당·aliasing, 자동 배리어/상태 전이
-- **완료 기준**: 멀티 패스(예: 오프스크린 → 포스트) 그래프가 두 백엔드에서 동작
+### Phase 5 — 렌더그래프 / 프레임그래프 — ✅ 완료
+세부: [phase-5-render-graph.md](phase-5-render-graph.md)
+- 패스 선언 API, 의존성 DAG + 위상정렬 + dead-pass culling, transient 리소스 lifetime·aliasing, 자동 배리어/상태 전이
+- RHI 오프스크린 렌더 타깃(어태치먼트+바인드리스) + `TransientHeap`(placed/aliased) 도입, `crates/render` 추가
+- 데모: 블룸 체인(scene→blur×3→composite) + ImGui 포스트 토글/aliasing 토글
+- **완료 기준**: 멀티 패스(오프스크린 → 포스트) 그래프가 두 백엔드에서 동작 (RTX 2070 SUPER)
 
 ### Phase 6 — PBR 렌더러 (Forward+/Deferred)
 - G-buffer, PBR BRDF, 라이팅, 섀도우 맵, IBL, 톤매핑/포스트

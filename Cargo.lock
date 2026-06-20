@@ -144,6 +144,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-render"
+version = "0.0.0"
+dependencies = [
+ "engine-core",
+ "rhi",
+ "tracing",
+]
+
+[[package]]
 name = "engine-shader"
 version = "0.0.0"
 
@@ -510,6 +519,7 @@ dependencies = [
  "engine-core",
  "engine-gui",
  "engine-platform",
+ "engine-render",
  "engine-shader",
  "rhi",
  "tracing",

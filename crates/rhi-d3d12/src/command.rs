@@ -5,16 +5,18 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use engine_core::EngineError;
-use rhi_types::{ClearColor, Rect2D};
+use rhi_types::{ClearColor, Extent2D, Rect2D};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_CLEAR_FLAG_DEPTH, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_INDEX_BUFFER_VIEW,
-    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATES,
-    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT,
-    ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12Resource,
+    D3D12_RESOURCE_ALIASING_BARRIER, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
+    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+    D3D12_RESOURCE_BARRIER_TYPE_ALIASING, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
+    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER,
+    D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT, ID3D12CommandAllocator, ID3D12GraphicsCommandList,
+    ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
 
@@ -23,6 +25,7 @@ use crate::depth::D3d12DepthBuffer;
 use crate::device::DeviceShared;
 use crate::instance::d3d_err;
 use crate::pipeline::D3d12GraphicsPipeline;
+use crate::render_target::D3d12RenderTarget;
 use crate::swapchain::D3d12Swapchain;
 
 /// A primary command list (+ its allocator), reset and re-recorded each frame.
@@ -113,11 +116,115 @@ impl D3d12CommandBuffer {
         }
     }
 
+    /// Begin a render pass into an offscreen color target (+ optional depth). The
+    /// target must already be in `RENDER_TARGET` state (see
+    /// [`Self::rt_to_render_target`]).
+    pub fn begin_rendering_target(
+        &self,
+        target: &D3d12RenderTarget,
+        color_clear: Option<ClearColor>,
+        depth: Option<&D3d12DepthBuffer>,
+    ) {
+        let rtv = target.rtv_handle();
+        unsafe {
+            match depth {
+                Some(d) => {
+                    let dsv = d.dsv();
+                    self.list
+                        .OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+                    self.list
+                        .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+                }
+                None => self.list.OMSetRenderTargets(1, Some(&rtv), false, None),
+            }
+            if let Some(c) = color_clear {
+                self.list
+                    .ClearRenderTargetView(rtv, &[c.r, c.g, c.b, c.a], None);
+            }
+        }
+    }
+
+    /// Transition an offscreen target into `RENDER_TARGET` for writing.
+    pub fn rt_to_render_target(&self, target: &D3d12RenderTarget) {
+        let before = target.state();
+        if before == D3D12_RESOURCE_STATE_RENDER_TARGET {
+            return;
+        }
+        self.barrier(
+            target.resource(),
+            before,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        );
+        target.set_state(D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+
+    /// Prepare an aliased target for writing into shared heap memory: an aliasing
+    /// barrier that discards the previous tenant, then a transition to
+    /// `RENDER_TARGET` (the full-screen draw that follows reinitializes it).
+    pub fn aliasing_barrier(&self, target: &D3d12RenderTarget) {
+        let aliasing = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Aliasing: ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                    pResourceBefore: ManuallyDrop::new(None),
+                    pResourceAfter: unsafe { std::mem::transmute_copy(target.resource()) },
+                }),
+            },
+        };
+        unsafe { self.list.ResourceBarrier(&[aliasing]) };
+        let before = target.state();
+        if before != D3D12_RESOURCE_STATE_RENDER_TARGET {
+            self.barrier(
+                target.resource(),
+                before,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            );
+            target.set_state(D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+    }
+
+    /// Transition an offscreen target into `PIXEL_SHADER_RESOURCE` for sampling.
+    pub fn rt_to_sampled(&self, target: &D3d12RenderTarget) {
+        let before = target.state();
+        if before == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+            return;
+        }
+        self.barrier(
+            target.resource(),
+            before,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        );
+        target.set_state(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+
     /// No-op on D3D12 (render targets are set directly; no render pass object).
     pub fn end_rendering(&self) {}
 
     pub fn set_viewport_scissor(&self, swapchain: &D3d12Swapchain) {
         let extent = swapchain.extent();
+        let viewport = D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: extent.width as f32,
+            Height: extent.height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let scissor = RECT {
+            left: 0,
+            top: 0,
+            right: extent.width as i32,
+            bottom: extent.height as i32,
+        };
+        unsafe {
+            self.list.RSSetViewports(&[viewport]);
+            self.list.RSSetScissorRects(&[scissor]);
+        }
+    }
+
+    /// Set viewport and scissor to cover an arbitrary extent (offscreen target).
+    pub fn set_viewport_scissor_extent(&self, extent: Extent2D) {
         let viewport = D3D12_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,

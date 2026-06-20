@@ -52,6 +52,10 @@ backend_enum!(/// A sampled 2D texture registered in the bindless table.
     Texture => rhi_vulkan::VulkanTexture, rhi_d3d12::D3d12Texture);
 backend_enum!(/// A depth buffer for the mesh pass.
     DepthBuffer => rhi_vulkan::VulkanDepthBuffer, rhi_d3d12::D3d12DepthBuffer);
+backend_enum!(/// An offscreen color render target (attachment + bindless sampled).
+    RenderTarget => rhi_vulkan::VulkanRenderTarget, rhi_d3d12::D3d12RenderTarget);
+backend_enum!(/// A heap that transient render targets alias into at graph-computed offsets.
+    TransientHeap => rhi_vulkan::VulkanTransientHeap, rhi_d3d12::D3d12TransientHeap);
 
 impl Buffer {
     /// Copy bytes into the buffer (host-visible).
@@ -65,6 +69,16 @@ impl Buffer {
 
 impl Texture {
     /// Index of this texture in the device's bindless table.
+    pub fn bindless_index(&self) -> u32 {
+        match self {
+            Self::Vulkan(t) => t.bindless_index(),
+            Self::D3d12(t) => t.bindless_index(),
+        }
+    }
+}
+
+impl RenderTarget {
+    /// Index of this render target in the device's bindless table.
     pub fn bindless_index(&self) -> u32 {
         match self {
             Self::Vulkan(t) => t.bindless_index(),
@@ -142,6 +156,47 @@ impl Device {
         match self {
             Self::Vulkan(d) => Ok(DepthBuffer::Vulkan(d.create_depth_buffer(extent)?)),
             Self::D3d12(d) => Ok(DepthBuffer::D3d12(d.create_depth_buffer(extent)?)),
+        }
+    }
+
+    pub fn create_render_target(&self, desc: &RenderTargetDesc) -> Result<RenderTarget> {
+        match self {
+            Self::Vulkan(d) => Ok(RenderTarget::Vulkan(d.create_render_target(desc)?)),
+            Self::D3d12(d) => Ok(RenderTarget::D3d12(d.create_render_target(desc)?)),
+        }
+    }
+
+    /// Memory footprint of an aliasable render target (for graph alias planning).
+    pub fn render_target_memory(&self, desc: &RenderTargetDesc) -> Result<MemoryRequirements> {
+        match self {
+            Self::Vulkan(d) => d.render_target_memory(desc),
+            Self::D3d12(d) => d.render_target_memory(desc),
+        }
+    }
+
+    /// Create a transient heap of `size` bytes for aliased render targets.
+    pub fn create_transient_heap(&self, size: u64) -> Result<TransientHeap> {
+        match self {
+            Self::Vulkan(d) => Ok(TransientHeap::Vulkan(d.create_transient_heap(size)?)),
+            Self::D3d12(d) => Ok(TransientHeap::D3d12(d.create_transient_heap(size)?)),
+        }
+    }
+
+    /// Create a render target aliased into `heap` at `offset`.
+    pub fn create_aliased_target(
+        &self,
+        heap: &TransientHeap,
+        offset: u64,
+        desc: &RenderTargetDesc,
+    ) -> Result<RenderTarget> {
+        match (self, heap) {
+            (Self::Vulkan(d), TransientHeap::Vulkan(h)) => Ok(RenderTarget::Vulkan(
+                d.create_aliased_target(h, offset, desc)?,
+            )),
+            (Self::D3d12(d), TransientHeap::D3d12(h)) => Ok(RenderTarget::D3d12(
+                d.create_aliased_target(h, offset, desc)?,
+            )),
+            _ => unreachable!("{MIXED}"),
         }
     }
 
@@ -281,6 +336,32 @@ impl CommandBuffer {
         }
     }
 
+    /// Begin a render pass into an offscreen color target. `color_clear = Some`
+    /// clears it, `None` loads it. `depth = Some` attaches + clears depth. The
+    /// target must be in render-target state (see [`Self::rt_to_render_target`]).
+    pub fn begin_rendering_target(
+        &self,
+        target: &RenderTarget,
+        color_clear: Option<ClearColor>,
+        depth: Option<&DepthBuffer>,
+    ) {
+        match (self, target, depth) {
+            (Self::Vulkan(c), RenderTarget::Vulkan(t), None) => {
+                c.begin_rendering_target(t, color_clear, None)
+            }
+            (Self::Vulkan(c), RenderTarget::Vulkan(t), Some(DepthBuffer::Vulkan(d))) => {
+                c.begin_rendering_target(t, color_clear, Some(d))
+            }
+            (Self::D3d12(c), RenderTarget::D3d12(t), None) => {
+                c.begin_rendering_target(t, color_clear, None)
+            }
+            (Self::D3d12(c), RenderTarget::D3d12(t), Some(DepthBuffer::D3d12(d))) => {
+                c.begin_rendering_target(t, color_clear, Some(d))
+            }
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
     pub fn end_rendering(&self) {
         match self {
             Self::Vulkan(c) => c.end_rendering(),
@@ -292,6 +373,42 @@ impl CommandBuffer {
         match (self, swapchain) {
             (Self::Vulkan(c), Swapchain::Vulkan(s)) => c.set_viewport_scissor(s),
             (Self::D3d12(c), Swapchain::D3d12(s)) => c.set_viewport_scissor(s),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Set viewport and scissor to cover an arbitrary extent (offscreen target).
+    pub fn set_viewport_scissor_extent(&self, extent: Extent2D) {
+        match self {
+            Self::Vulkan(c) => c.set_viewport_scissor_extent(extent),
+            Self::D3d12(c) => c.set_viewport_scissor_extent(extent),
+        }
+    }
+
+    /// Transition an offscreen target into render-target state for writing.
+    pub fn rt_to_render_target(&self, target: &RenderTarget) {
+        match (self, target) {
+            (Self::Vulkan(c), RenderTarget::Vulkan(t)) => c.rt_to_render_target(t),
+            (Self::D3d12(c), RenderTarget::D3d12(t)) => c.rt_to_render_target(t),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Transition an offscreen target into shader-read state for sampling.
+    pub fn rt_to_sampled(&self, target: &RenderTarget) {
+        match (self, target) {
+            (Self::Vulkan(c), RenderTarget::Vulkan(t)) => c.rt_to_sampled(t),
+            (Self::D3d12(c), RenderTarget::D3d12(t)) => c.rt_to_sampled(t),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Discard an aliased target's shared memory and ready it for writing (issued
+    /// before the first write of a target that reuses another's heap region).
+    pub fn aliasing_barrier(&self, target: &RenderTarget) {
+        match (self, target) {
+            (Self::Vulkan(c), RenderTarget::Vulkan(t)) => c.aliasing_barrier(t),
+            (Self::D3d12(c), RenderTarget::D3d12(t)) => c.aliasing_barrier(t),
             _ => unreachable!("{MIXED}"),
         }
     }

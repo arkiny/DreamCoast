@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use ash::vk;
 use engine_core::EngineError;
-use rhi_types::{ClearColor, Rect2D};
+use rhi_types::{ClearColor, Extent2D, Rect2D};
 
 use crate::buffer::VulkanBuffer;
 use crate::depth::VulkanDepthBuffer;
 use crate::device::DeviceShared;
 use crate::pipeline::VulkanGraphicsPipeline;
+use crate::render_target::VulkanRenderTarget;
 use crate::swapchain::VulkanSwapchain;
 use crate::{color_subresource_range, vk_err};
 
@@ -155,6 +156,64 @@ impl VulkanCommandBuffer {
         };
     }
 
+    /// Begin dynamic rendering into an offscreen color target (+ optional depth).
+    /// The target must already be in `COLOR_ATTACHMENT_OPTIMAL` (see
+    /// [`Self::rt_to_render_target`]).
+    pub fn begin_rendering_target(
+        &self,
+        target: &VulkanRenderTarget,
+        color_clear: Option<ClearColor>,
+        depth: Option<&VulkanDepthBuffer>,
+    ) {
+        let (load_op, clear_value) = match color_clear {
+            Some(c) => (
+                vk::AttachmentLoadOp::CLEAR,
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [c.r, c.g, c.b, c.a],
+                    },
+                },
+            ),
+            None => (vk::AttachmentLoadOp::LOAD, vk::ClearValue::default()),
+        };
+        let color_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(target.view())
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(load_op)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(clear_value);
+        let attachments = [color_attachment];
+        let mut rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: target.extent(),
+            })
+            .layer_count(1)
+            .color_attachments(&attachments);
+
+        let depth_attachment;
+        if let Some(d) = depth {
+            depth_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(d.view())
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                });
+            rendering_info = rendering_info.depth_attachment(&depth_attachment);
+        }
+
+        unsafe {
+            self.device
+                .device
+                .cmd_begin_rendering(self.cmd, &rendering_info)
+        };
+    }
+
     /// End dynamic rendering.
     pub fn end_rendering(&self) {
         unsafe { self.device.device.cmd_end_rendering(self.cmd) };
@@ -181,6 +240,94 @@ impl VulkanCommandBuffer {
                 .cmd_set_viewport(self.cmd, 0, &[viewport]);
             self.device.device.cmd_set_scissor(self.cmd, 0, &[scissor]);
         }
+    }
+
+    /// Set viewport and scissor to cover an arbitrary extent (offscreen target).
+    pub fn set_viewport_scissor_extent(&self, extent: Extent2D) {
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: extent.width as f32,
+            height: extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: extent.width,
+                height: extent.height,
+            },
+        };
+        unsafe {
+            self.device
+                .device
+                .cmd_set_viewport(self.cmd, 0, &[viewport]);
+            self.device.device.cmd_set_scissor(self.cmd, 0, &[scissor]);
+        }
+    }
+
+    /// Transition an offscreen target into `COLOR_ATTACHMENT_OPTIMAL` for writing.
+    pub fn rt_to_render_target(&self, target: &VulkanRenderTarget) {
+        let old = target.layout();
+        if old == vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+            return;
+        }
+        let (src_access, src_stage) = if old == vk::ImageLayout::UNDEFINED {
+            (
+                vk::AccessFlags::empty(),
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+            )
+        } else {
+            (
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            )
+        };
+        self.image_barrier(
+            target.image(),
+            old,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            src_access,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            src_stage,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        );
+        target.set_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    }
+
+    /// Prepare an aliased target for writing into shared heap memory: a single
+    /// `UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL` barrier that discards whatever the
+    /// previous tenant left and waits for that tenant's reads/writes to finish.
+    pub fn aliasing_barrier(&self, target: &VulkanRenderTarget) {
+        self.image_barrier(
+            target.image(),
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::SHADER_READ,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        );
+        target.set_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    }
+
+    /// Transition an offscreen target into `SHADER_READ_ONLY_OPTIMAL` for sampling.
+    pub fn rt_to_sampled(&self, target: &VulkanRenderTarget) {
+        if target.layout() == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            return;
+        }
+        self.image_barrier(
+            target.image(),
+            target.layout(),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        );
+        target.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
 
     /// Bind a graphics pipeline (and its bindless descriptor set, if any).

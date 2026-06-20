@@ -4,7 +4,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use engine_core::EngineError;
-use rhi_types::{BufferDesc, Extent2D, Format, GraphicsPipelineDesc, SwapchainDesc, TextureDesc};
+use rhi_types::{
+    BufferDesc, Extent2D, Format, GraphicsPipelineDesc, MemoryRequirements, RenderTargetDesc,
+    SwapchainDesc, TextureDesc,
+};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::{
@@ -24,6 +27,7 @@ use crate::command::D3d12CommandBuffer;
 use crate::depth::D3d12DepthBuffer;
 use crate::instance::{D3d12Instance, d3d_err};
 use crate::pipeline::D3d12GraphicsPipeline;
+use crate::render_target::{self, D3d12RenderTarget, D3d12TransientHeap};
 use crate::swapchain::D3d12Swapchain;
 use crate::sync::{D3d12Fence, D3d12Semaphore};
 use crate::texture::D3d12Texture;
@@ -227,6 +231,33 @@ impl D3d12Device {
 
     pub fn create_depth_buffer(&self, extent: Extent2D) -> Result<D3d12DepthBuffer, EngineError> {
         D3d12DepthBuffer::new(self.shared.clone(), extent)
+    }
+
+    pub fn create_render_target(
+        &self,
+        desc: &RenderTargetDesc,
+    ) -> Result<D3d12RenderTarget, EngineError> {
+        D3d12RenderTarget::new(self.shared.clone(), desc)
+    }
+
+    pub fn render_target_memory(
+        &self,
+        desc: &RenderTargetDesc,
+    ) -> Result<MemoryRequirements, EngineError> {
+        render_target::render_target_memory(&self.shared, desc)
+    }
+
+    pub fn create_transient_heap(&self, size: u64) -> Result<D3d12TransientHeap, EngineError> {
+        D3d12TransientHeap::new(self.shared.clone(), size)
+    }
+
+    pub fn create_aliased_target(
+        &self,
+        heap: &D3d12TransientHeap,
+        offset: u64,
+        desc: &RenderTargetDesc,
+    ) -> Result<D3d12RenderTarget, EngineError> {
+        D3d12RenderTarget::new_aliased(self.shared.clone(), heap, offset, desc)
     }
 
     pub fn create_fence(&self, signaled: bool) -> Result<D3d12Fence, EngineError> {
