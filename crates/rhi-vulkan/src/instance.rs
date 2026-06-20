@@ -1,6 +1,7 @@
 //! Vulkan instance, debug messenger, Win32 surface, and physical-device choice.
 
 use std::ffi::CStr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ash::vk;
@@ -54,6 +55,19 @@ impl VulkanInstance {
     /// Create an instance + surface and select a suitable physical device.
     pub fn new(window: &Window, desc: &InstanceDesc) -> Result<Self, EngineError> {
         unsafe {
+            // Validation is a development aid only: shipping (release) builds
+            // compile it out entirely. `cfg!(debug_assertions)` is const-false in
+            // release, so the layer setup, manifest probing, and debug messenger
+            // below are statically unreachable and stripped from the binary.
+            let want_validation = cfg!(debug_assertions) && desc.validation;
+
+            // Point the loader at the locally-fetched standalone validation layer
+            // (tools/vulkan-layers/, see tools/fetch-vulkan-layers.py) before it
+            // enumerates layers, so validation works without a system SDK install.
+            if want_validation {
+                add_local_layer_path();
+            }
+
             let entry = ash::Entry::load()
                 .map_err(|e| EngineError::Rhi(format!("failed to load Vulkan loader: {e}")))?;
 
@@ -63,18 +77,18 @@ impl VulkanInstance {
                 .application_name(&app_name)
                 .api_version(vk::API_VERSION_1_3);
 
-            // Validation layer is enabled only if requested AND present.
+            // Validation layer is enabled only if wanted AND present.
             let validation_name = c"VK_LAYER_KHRONOS_validation";
-            let has_validation = desc.validation
+            let has_validation = want_validation
                 && entry
                     .enumerate_instance_layer_properties()
                     .map_err(vk_err)?
                     .iter()
                     .any(|l| CStr::from_ptr(l.layer_name.as_ptr()) == validation_name);
-            if desc.validation && !has_validation {
+            if want_validation && !has_validation {
                 tracing::warn!(
                     "validation requested but VK_LAYER_KHRONOS_validation not found; \
-                     running without it (set VK_LAYER_PATH to a standalone layer)"
+                     run tools/fetch-vulkan-layers.py or set VK_LAYER_PATH"
                 );
             }
 
@@ -154,6 +168,45 @@ impl VulkanInstance {
     /// The backend this instance dispatches to.
     pub fn backend(&self) -> rhi_types::BackendKind {
         rhi_types::BackendKind::Vulkan
+    }
+}
+
+/// If a standalone validation layer manifest is present in a known location, add
+/// its directory to `VK_ADD_LAYER_PATH` so the loader discovers the layer. Looks
+/// at `$ENGINE_VK_LAYER_DIR`, then the in-repo `tools/vulkan-layers/` (resolved
+/// both from the build-time workspace root and the current directory).
+fn add_local_layer_path() {
+    const MANIFEST: &str = "VkLayer_khronos_validation.json";
+    let candidates = [
+        std::env::var_os("ENGINE_VK_LAYER_DIR").map(PathBuf::from),
+        Some(PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/vulkan-layers"
+        ))),
+        Some(PathBuf::from("tools/vulkan-layers")),
+    ];
+
+    let Some(dir) = candidates
+        .into_iter()
+        .flatten()
+        .find(|d| d.join(MANIFEST).is_file())
+    else {
+        return;
+    };
+
+    // Prepend our directory, preserving any existing search path.
+    let mut paths = vec![dir.clone()];
+    if let Some(existing) = std::env::var_os("VK_ADD_LAYER_PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    match std::env::join_paths(&paths) {
+        Ok(joined) => {
+            // SAFE: called once at startup before any threads touch the env or the
+            // Vulkan loader reads it.
+            unsafe { std::env::set_var("VK_ADD_LAYER_PATH", &joined) };
+            tracing::debug!("using local Vulkan layer at {}", dir.display());
+        }
+        Err(e) => tracing::warn!("could not set VK_ADD_LAYER_PATH: {e}"),
     }
 }
 
