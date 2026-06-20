@@ -330,7 +330,14 @@ fn create_bindless(
 /// and set. Bound as set 1 by PBR pipelines.
 fn create_globals(
     device: &ash::Device,
-) -> Result<(vk::DescriptorPool, vk::DescriptorSetLayout, vk::DescriptorSet), EngineError> {
+) -> Result<
+    (
+        vk::DescriptorPool,
+        vk::DescriptorSetLayout,
+        vk::DescriptorSet,
+    ),
+    EngineError,
+> {
     unsafe {
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .binding(0)

@@ -41,10 +41,14 @@ const GB_POSITION_FMT: Format = Format::Rgba16Float;
 const GLOBALS_SLICE: u64 = 512;
 /// Directional shadow map resolution (square).
 const SHADOW_SIZE: u32 = 2048;
-/// Environment cubemap face resolution (square).
+/// Environment cubemap face resolution (square) and its full mip chain. The
+/// prefilter convolution samples these mips so a roughness lookup needs only
+/// ~32-64 samples instead of hundreds.
 const ENV_SIZE: u32 = 256;
-/// Diffuse irradiance cubemap face resolution.
-const IRRADIANCE_SIZE: u32 = 32;
+const ENV_MIPS: u32 = ENV_SIZE.ilog2() + 1;
+/// Diffuse irradiance cubemap face resolution (small — it is very low frequency,
+/// and kept cheap for per-frame real-time capture).
+const IRRADIANCE_SIZE: u32 = 16;
 /// Specular prefilter cubemap face resolution (mip 0) and roughness mip count.
 const PREFILTER_SIZE: u32 = 128;
 const PREFILTER_MIPS: u32 = 5;
@@ -157,7 +161,12 @@ fn main() -> anyhow::Result<()> {
         fragment_bytes: gb_fs,
         vertex_entry: "vsMain",
         fragment_entry: "fsMain",
-        color_formats: &[GB_ALBEDO_FMT, GB_NORMAL_FMT, GB_MATERIAL_FMT, GB_POSITION_FMT],
+        color_formats: &[
+            GB_ALBEDO_FMT,
+            GB_NORMAL_FMT,
+            GB_MATERIAL_FMT,
+            GB_POSITION_FMT,
+        ],
         topology: PrimitiveTopology::TriangleList,
         vertex_layout: VertexLayout::Mesh,
         blend: BlendMode::Opaque,
@@ -267,6 +276,32 @@ fn main() -> anyhow::Result<()> {
         depth_format: None,
     })?;
 
+    // Capture pipeline: forward-renders scene geometry into the env cube faces
+    // (camera-based real-time capture), simple direct lighting only.
+    let (cap_vs, cap_fs) = load_shader_pair(
+        backend,
+        dreamcoast_shader::capture_vs_spirv,
+        dreamcoast_shader::capture_fs_spirv,
+        dreamcoast_shader::capture_vs_dxil,
+        dreamcoast_shader::capture_fs_dxil,
+        "capture",
+    )?;
+    let capture_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: cap_vs,
+        fragment_bytes: cap_fs,
+        vertex_entry: "vsMain",
+        fragment_entry: "fsMain",
+        color_formats: &[HDR_FORMAT],
+        topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::MeshPosNormal,
+        blend: BlendMode::Opaque,
+        push_constant_size: 112, // mvp(64) + base_color(16) + sun(16) + misc(16)
+        bindless: true,
+        uniform_buffer: false,
+        depth_test: false,
+        depth_format: None,
+    })?;
+
     // Irradiance pipeline: convolves the env cube into a diffuse-irradiance cube.
     let (irr_vs, irr_fs) = load_shader_pair(
         backend,
@@ -310,7 +345,7 @@ fn main() -> anyhow::Result<()> {
         topology: PrimitiveTopology::TriangleList,
         vertex_layout: VertexLayout::None,
         blend: BlendMode::Opaque,
-        push_constant_size: 16, // face + flip_y + env_index + roughness
+        push_constant_size: 20, // face + flip_y + env_index + roughness + env_mips
         bindless: true,
         uniform_buffer: false,
         depth_test: false,
@@ -405,6 +440,11 @@ fn main() -> anyhow::Result<()> {
     let mut debug_view: usize = 0;
     let mut post_mode: usize = 0;
     let mut aliasing = true;
+    // Real-time environment capture: re-capture the env chain every frame (so the
+    // sky/IBL track the live sun); when off, re-capture only when the sun changes.
+    let mut realtime_env = true;
+    let mut env_captured = false;
+    let mut last_sun = (sun_dir, sun_intensity);
 
     let mut command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
     let mut image_available = Vec::with_capacity(FRAMES_IN_FLIGHT);
@@ -424,7 +464,7 @@ fn main() -> anyhow::Result<()> {
     let env_cube = device.create_cubemap(&CubemapDesc {
         size: ENV_SIZE,
         format: HDR_FORMAT,
-        mip_levels: 1,
+        mip_levels: ENV_MIPS,
     })?;
     let irradiance_cube = device.create_cubemap(&CubemapDesc {
         size: IRRADIANCE_SIZE,
@@ -443,17 +483,29 @@ fn main() -> anyhow::Result<()> {
     })?;
     let ibl = IblResources {
         sky_pipeline: &sky_pipeline,
+        capture_pipeline: &capture_pipeline,
         irradiance_pipeline: &irradiance_pipeline,
         prefilter_pipeline: &prefilter_pipeline,
         env_cube: &env_cube,
         irradiance_cube: &irradiance_cube,
         prefilter_cube: &prefilter_cube,
+        ground_vbuf: &ground_vbuf,
+        ground_ibuf: &ground_ibuf,
+        ground_count,
     };
     {
+        // The BRDF LUT is sky-independent — generate it once. The environment
+        // chain is (re)captured per frame inside the render loop.
         let gen_cmd = device.create_command_buffer()?;
         let gen_fence = device.create_fence(false)?;
-        generate_environment(&queue, &gen_cmd, &gen_fence, &ibl, sun_dir, sun_intensity, flip_y)?;
-        generate_brdf_lut(&queue, &gen_cmd, &gen_fence, &brdf_pipeline, &brdf_lut, flip_y)?;
+        generate_brdf_lut(
+            &queue,
+            &gen_cmd,
+            &gen_fence,
+            &brdf_pipeline,
+            &brdf_lut,
+            flip_y,
+        )?;
     }
     let ibl_indices = [
         env_cube.bindless_index() as i32,
@@ -569,6 +621,7 @@ fn main() -> anyhow::Result<()> {
                     ui.slider("Metallic", 0.0, 1.0, &mut metallic_override);
                     ui.slider("Roughness", 0.0, 1.0, &mut roughness_override);
                     ui.separator();
+                    ui.checkbox("Real-time env capture", &mut realtime_env);
                     ui.combo_simple_string("Post effect", &mut post_mode, &POST_EFFECTS);
                     ui.checkbox("Transient aliasing", &mut aliasing);
                 });
@@ -627,6 +680,25 @@ fn main() -> anyhow::Result<()> {
 
         let cmd = &command_buffers[frame];
         cmd.begin()?;
+
+        // (Re)capture the environment chain into its cubemaps before the main
+        // graph samples them. Every frame when real-time is on; otherwise only
+        // the first frame and whenever the sun changes.
+        let sun_changed = (sun_dir, sun_intensity) != last_sun;
+        if realtime_env || !env_captured || sun_changed {
+            record_environment_capture(
+                cmd,
+                &ibl,
+                eye,
+                sun_dir,
+                sun_intensity,
+                ambient,
+                flip_y,
+                backend == BackendKind::Vulkan,
+            );
+            env_captured = true;
+            last_sun = (sun_dir, sun_intensity);
+        }
 
         // Build the deferred render graph:
         //   gbuffer (4 MRT + depth) -> lighting (HDR) -> tonemap (backbuffer) -> ui
@@ -798,9 +870,7 @@ fn main() -> anyhow::Result<()> {
         queue.submit(cmd, &image_available[frame], signal, fence)?;
 
         // Wait for the GPU (copy included), read the buffer back, and save a PNG.
-        if let (Some(cap), Some((buf, layout))) =
-            (capture_this_frame.as_ref(), readback.as_ref())
-        {
+        if let (Some(cap), Some((buf, layout))) = (capture_this_frame.as_ref(), readback.as_ref()) {
             fence.wait()?;
             let mut bytes = vec![0u8; layout.size as usize];
             buf.read_into(&mut bytes)?;
@@ -831,7 +901,10 @@ fn main() -> anyhow::Result<()> {
 /// View the globals struct as bytes for upload.
 fn globals_bytes(g: &Globals) -> &[u8] {
     unsafe {
-        std::slice::from_raw_parts(g as *const Globals as *const u8, std::mem::size_of::<Globals>())
+        std::slice::from_raw_parts(
+            g as *const Globals as *const u8,
+            std::mem::size_of::<Globals>(),
+        )
     }
 }
 
@@ -908,41 +981,76 @@ fn light_view_proj(sun_dir: [f32; 3], center: Vec3, radius: f32) -> [f32; 16] {
     (proj * view).to_cols_array()
 }
 
-/// The pipelines + cubemaps used to (re)generate the IBL environment chain.
+/// The pipelines + cubemaps used to (re)generate the IBL environment chain, plus
+/// the scene geometry captured into the env cube (camera-based reflections).
 struct IblResources<'a> {
     sky_pipeline: &'a GraphicsPipeline,
+    capture_pipeline: &'a GraphicsPipeline,
     irradiance_pipeline: &'a GraphicsPipeline,
     prefilter_pipeline: &'a GraphicsPipeline,
     env_cube: &'a Cubemap,
     irradiance_cube: &'a Cubemap,
     prefilter_cube: &'a Cubemap,
+    /// Ground plane (a shadow/reflection receiver) captured into env mip 0.
+    ground_vbuf: &'a Buffer,
+    ground_ibuf: &'a Buffer,
+    ground_count: u32,
 }
 
-/// Regenerate the environment chain: procedural sky → env cube, then convolve it
-/// into the diffuse-irradiance cube and the per-roughness specular prefilter cube
-/// (each map left shader-readable). Reusable — call again when the sky changes
-/// (future real-time atmospheric model / dynamic probe). The BRDF LUT is
-/// sky-independent (see [`generate_brdf_lut`]).
-fn generate_environment(
-    queue: &Queue,
+/// Record the environment chain into an already-open command buffer (no submit):
+/// procedural sky → env cube (full mip chain), then convolve into the
+/// diffuse-irradiance cube and the per-roughness specular prefilter cube (each
+/// left shader-readable). Recorded each frame before the main graph, so the
+/// lighting pass samples a fresh environment (real-time capture). The BRDF LUT is
+/// sky-independent and generated once (see [`generate_brdf_lut`]).
+#[allow(clippy::too_many_arguments)]
+fn record_environment_capture(
     cmd: &CommandBuffer,
-    fence: &Fence,
     ibl: &IblResources,
+    camera_pos: Vec3,
     sun_dir: [f32; 3],
     sun_intensity: f32,
+    ambient: f32,
     flip_y: u32,
-) -> anyhow::Result<()> {
+    vulkan: bool,
+) {
     let env_index = ibl.env_cube.bindless_index();
-    cmd.begin()?;
+    let env_mips = ibl.env_cube.mip_levels();
 
-    // 1. Procedural sky -> environment cube.
+    // 1. Procedural sky -> environment cube, every mip (the sky is procedural and
+    // position-independent, so each mip is just a lower-res render — no
+    // downsample/self-sample hazard; the prefilter samples this mip chain).
     cmd.cube_to_color(ibl.env_cube);
+    for mip in 0..env_mips {
+        let size = (ENV_SIZE >> mip).max(1);
+        for face in 0..6u32 {
+            cmd.begin_rendering_cube_face(ibl.env_cube, face, mip, Some(ClearColor::BLACK));
+            cmd.set_viewport_scissor_extent(Extent2D::new(size, size));
+            cmd.bind_graphics_pipeline(ibl.sky_pipeline);
+            cmd.push_constants(&sky_push(sun_dir, sun_intensity, face, flip_y));
+            cmd.draw(3, 1);
+            cmd.end_rendering();
+        }
+    }
+
+    // 1b. Scene (ground plane) into env mip 0 from the camera position, so
+    // reflective surfaces reflect the live scene. A single flat quad needs no
+    // depth, and excluding the reflective model avoids self-reflection recursion.
+    let face_vp = cube_face_view_proj(camera_pos, vulkan);
     for face in 0..6u32 {
-        cmd.begin_rendering_cube_face(ibl.env_cube, face, 0, Some(ClearColor::BLACK));
+        cmd.begin_rendering_cube_face(ibl.env_cube, face, 0, None); // load the sky
         cmd.set_viewport_scissor_extent(Extent2D::new(ENV_SIZE, ENV_SIZE));
-        cmd.bind_graphics_pipeline(ibl.sky_pipeline);
-        cmd.push_constants(&sky_push(sun_dir, sun_intensity, face, flip_y));
-        cmd.draw(3, 1);
+        cmd.bind_graphics_pipeline(ibl.capture_pipeline);
+        cmd.push_constants(&capture_push(
+            face_vp[face as usize],
+            [0.8, 0.8, 0.8, 1.0],
+            sun_dir,
+            sun_intensity,
+            ambient,
+        ));
+        cmd.bind_vertex_buffer(ibl.ground_vbuf, 32);
+        cmd.bind_index_buffer(ibl.ground_ibuf, true);
+        cmd.draw_indexed(ibl.ground_count, 0, 0);
         cmd.end_rendering();
     }
     cmd.cube_to_sampled(ibl.env_cube);
@@ -972,18 +1080,14 @@ fn generate_environment(
             cmd.begin_rendering_cube_face(ibl.prefilter_cube, face, mip, Some(ClearColor::BLACK));
             cmd.set_viewport_scissor_extent(Extent2D::new(size, size));
             cmd.bind_graphics_pipeline(ibl.prefilter_pipeline);
-            cmd.push_constants(&cube_gen_push(face, flip_y, env_index, roughness));
+            cmd.push_constants(&prefilter_push(
+                face, flip_y, env_index, roughness, env_mips,
+            ));
             cmd.draw(3, 1);
             cmd.end_rendering();
         }
     }
     cmd.cube_to_sampled(ibl.prefilter_cube);
-
-    cmd.end()?;
-    queue.submit_oneshot(cmd, fence)?;
-    fence.wait()?;
-    fence.reset()?; // leave unsignaled for reuse
-    Ok(())
 }
 
 /// Integrate the environment-BRDF LUT (sky-independent; generate once).
@@ -1013,6 +1117,51 @@ fn generate_brdf_lut(
     Ok(())
 }
 
+/// The 6 cube-face view-projections from `eye` (90° FOV, aspect 1), matching the
+/// `TextureCube` face convention. The Vulkan clip-space Y flip keeps the captured
+/// faces oriented the same as the procedural sky on both backends.
+fn cube_face_view_proj(eye: Vec3, vulkan: bool) -> [[f32; 16]; 6] {
+    let dirs = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+    let ups = [-Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z, -Vec3::Y, -Vec3::Y];
+    let mut proj = Mat4::perspective_rh(90f32.to_radians(), 1.0, 0.05, 100.0);
+    if vulkan {
+        proj.y_axis.y *= -1.0;
+    }
+    let mut out = [[0.0f32; 16]; 6];
+    for i in 0..6 {
+        let view = Mat4::look_at_rh(eye, eye + dirs[i], ups[i]);
+        out[i] = (proj * view).to_cols_array();
+    }
+    out
+}
+
+/// Pack the capture push block: mvp(64) + base_color(16) + sun(16, xyz dir + w
+/// intensity) + misc(16, x = ambient) = 112 bytes.
+fn capture_push(
+    mvp: [f32; 16],
+    base_color: [f32; 4],
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    ambient: f32,
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
+    for (i, f) in mvp.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    for (i, f) in base_color.iter().enumerate() {
+        let o = 64 + i * 4;
+        pc[o..o + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    let n = normalize3(sun_dir);
+    for (i, f) in n.iter().take(3).enumerate() {
+        let o = 80 + i * 4;
+        pc[o..o + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    pc[92..96].copy_from_slice(&sun_intensity.to_le_bytes());
+    pc[96..100].copy_from_slice(&ambient.to_le_bytes());
+    pc
+}
+
 /// Pack the sky push block: sun float4 (xyz dir, w intensity) + face + flip_y +
 /// pad (32 bytes).
 fn sky_push(sun_dir: [f32; 3], intensity: f32, face: u32, flip_y: u32) -> [u8; 32] {
@@ -1027,14 +1176,31 @@ fn sky_push(sun_dir: [f32; 3], intensity: f32, face: u32, flip_y: u32) -> [u8; 3
     pc
 }
 
-/// Pack the irradiance/prefilter push block: face + flip_y + env_index +
-/// roughness (16 bytes; irradiance ignores roughness).
+/// Pack the irradiance push block: face + flip_y + env_index + pad (16 bytes).
 fn cube_gen_push(face: u32, flip_y: u32, env_index: u32, roughness: f32) -> [u8; 16] {
     let mut pc = [0u8; 16];
     pc[0..4].copy_from_slice(&face.to_le_bytes());
     pc[4..8].copy_from_slice(&flip_y.to_le_bytes());
     pc[8..12].copy_from_slice(&env_index.to_le_bytes());
     pc[12..16].copy_from_slice(&roughness.to_le_bytes());
+    pc
+}
+
+/// Pack the prefilter push block: face + flip_y + env_index + roughness +
+/// env_mips (20 bytes — env_mips drives the mip-based importance sampling).
+fn prefilter_push(
+    face: u32,
+    flip_y: u32,
+    env_index: u32,
+    roughness: f32,
+    env_mips: u32,
+) -> [u8; 20] {
+    let mut pc = [0u8; 20];
+    pc[0..4].copy_from_slice(&face.to_le_bytes());
+    pc[4..8].copy_from_slice(&flip_y.to_le_bytes());
+    pc[8..12].copy_from_slice(&env_index.to_le_bytes());
+    pc[12..16].copy_from_slice(&roughness.to_le_bytes());
+    pc[16..20].copy_from_slice(&env_mips.to_le_bytes());
     pc
 }
 

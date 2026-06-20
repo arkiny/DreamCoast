@@ -18,6 +18,7 @@ struct PushConstants
     uint flip_y;
     uint env_index;
     float roughness;
+    uint env_mips; // env cube mip count (for mip-based importance sampling)
 };
 
 [[vk::push_constant]]
@@ -88,24 +89,48 @@ float3 importance_sample_ggx(float2 xi, float3 n, float roughness)
     return normalize(tangent * h.x + bitangent * h.y + n * h.z);
 }
 
+// GGX normal distribution (alpha = roughness^2).
+float distribution_ggx(float n_dot_h, float roughness)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-7);
+}
+
 [shader("fragment")]
 float4 fsMain(VSOutput input) : SV_Target
 {
     float3 n = cube_direction(pc.face, input.uv);
-    float3 v = n;
+    float3 v = n; // split-sum: N = V = R
 
-    const uint SAMPLE_COUNT = 256u;
+    // Mirror reflection (roughness ~ 0): just the sharp environment.
+    if (pc.roughness < 0.01)
+        return float4(g_cubes[pc.env_index].SampleLevel(g_sampler, n, 0.0).rgb, 1.0);
+
+    // Mip-based importance sampling: pick a source mip per sample by its solid
+    // angle vs the texel solid angle, so 32-64 samples suffice without fireflies
+    // (the env cube provides the mip chain).
+    uint cube_size = 1u << (pc.env_mips - 1u);
+    float solid_angle_texel = 4.0 * PI / (6.0 * float(cube_size) * float(cube_size)) * 2.0;
+    uint num_samples = pc.roughness < 0.1 ? 32u : 64u;
+
     float3 prefiltered = float3(0.0);
     float total_weight = 0.0;
-    for (uint i = 0u; i < SAMPLE_COUNT; ++i)
+    for (uint i = 0u; i < num_samples; ++i)
     {
-        float2 xi = hammersley(i, SAMPLE_COUNT);
+        float2 xi = hammersley(i, num_samples);
         float3 h = importance_sample_ggx(xi, n, pc.roughness);
         float3 l = normalize(2.0 * dot(v, h) * h - v);
         float n_dot_l = dot(n, l);
         if (n_dot_l > 0.0)
         {
-            prefiltered += g_cubes[pc.env_index].SampleLevel(g_sampler, l, 0.0).rgb * n_dot_l;
+            float n_dot_h = saturate(dot(n, h));
+            float pdf = distribution_ggx(n_dot_h, pc.roughness) * 0.25;
+            float solid_angle_sample = 1.0 / (float(num_samples) * pdf + 1e-6);
+            float mip = 0.5 * log2(solid_angle_sample / solid_angle_texel);
+            mip = clamp(mip, 0.0, float(pc.env_mips - 1u));
+            prefiltered += g_cubes[pc.env_index].SampleLevel(g_sampler, l, mip).rgb * n_dot_l;
             total_weight += n_dot_l;
         }
     }

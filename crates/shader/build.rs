@@ -76,6 +76,18 @@ const JOBS: &[Job] = &[
         key: "sky_fs",
     },
     Job {
+        src: "capture.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "capture_vs",
+    },
+    Job {
+        src: "capture.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "capture_fs",
+    },
+    Job {
         src: "irradiance.slang",
         entry: "vsMain",
         stage: "vertex",

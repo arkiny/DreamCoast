@@ -465,7 +465,10 @@ impl VulkanCommandBuffer {
             return;
         }
         let (src_access, src_stage) = if old == vk::ImageLayout::UNDEFINED {
-            (vk::AccessFlags::empty(), vk::PipelineStageFlags::TOP_OF_PIPE)
+            (
+                vk::AccessFlags::empty(),
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+            )
         } else {
             (
                 vk::AccessFlags::SHADER_READ,

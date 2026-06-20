@@ -119,7 +119,7 @@ engine/                 # cargo workspace root
 - 기법 전환용 샘플 브라우저(샌드박스) 완성
 - **완료 기준**: 프로파일러 + 캡처 툴 연동, 샌드박스에서 기법 자유 전환
 
-### Phase 10 — Virtual Geometry (Nanite-style) — 🧪 실험적 / 계획
+### Phase 10 — Virtual Geometry — 🧪 실험적 / 계획
 세부: [phase-10-virtual-geometry.md](phase-10-virtual-geometry.md)
 - 클러스터 LOD DAG(meshlet 그룹 단순화) + 뷰 종속 컷 선택 + GPU 컬링/HZB 2-pass 오클루전 +
   컴퓨트 SW 래스터 + 비저빌리티 버퍼 → 머티리얼 해석으로 **Phase 6 디퍼드 G-buffer** 재사용

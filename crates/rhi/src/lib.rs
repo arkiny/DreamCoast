@@ -558,7 +558,9 @@ impl CommandBuffer {
         clear: Option<ClearColor>,
     ) {
         match (self, cube) {
-            (Self::Vulkan(c), Cubemap::Vulkan(m)) => c.begin_rendering_cube_face(m, face, mip, clear),
+            (Self::Vulkan(c), Cubemap::Vulkan(m)) => {
+                c.begin_rendering_cube_face(m, face, mip, clear)
+            }
             (Self::D3d12(c), Cubemap::D3d12(m)) => c.begin_rendering_cube_face(m, face, mip, clear),
             _ => unreachable!("{MIXED}"),
         }
@@ -721,9 +723,7 @@ impl Queue {
     /// one-off startup work (e.g. IBL cubemap generation).
     pub fn submit_oneshot(&self, cmd: &CommandBuffer, fence: &Fence) -> Result<()> {
         match (self, cmd, fence) {
-            (Self::Vulkan(q), CommandBuffer::Vulkan(c), Fence::Vulkan(f)) => {
-                q.submit_oneshot(c, f)
-            }
+            (Self::Vulkan(q), CommandBuffer::Vulkan(c), Fence::Vulkan(f)) => q.submit_oneshot(c, f),
             (Self::D3d12(q), CommandBuffer::D3d12(c), Fence::D3d12(f)) => q.submit_oneshot(c, f),
             _ => unreachable!("{MIXED}"),
         }

@@ -95,7 +95,7 @@ float3 fresnel_schlick(float cos_theta, float3 f0)
     return f0 + (1.0 - f0) * pow(saturate(1.0 - cos_theta), 5.0);
 }
 
-// Fresnel with a roughness term, for the IBL ambient (Sébastien Lagarde).
+// Fresnel with a roughness term, for the IBL ambient.
 float3 fresnel_schlick_roughness(float cos_theta, float3 f0, float roughness)
 {
     float3 fr = max(float3(1.0 - roughness), f0);

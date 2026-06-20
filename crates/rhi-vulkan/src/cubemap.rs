@@ -53,7 +53,10 @@ impl VulkanCubemap {
                 .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .initial_layout(vk::ImageLayout::UNDEFINED);
-            let image = device.device.create_image(&image_ci, None).map_err(vk_err)?;
+            let image = device
+                .device
+                .create_image(&image_ci, None)
+                .map_err(vk_err)?;
 
             let req = device.device.get_image_memory_requirements(image);
             let mem_type = device
@@ -61,7 +64,10 @@ impl VulkanCubemap {
             let alloc = vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(mem_type);
-            let memory = device.device.allocate_memory(&alloc, None).map_err(vk_err)?;
+            let memory = device
+                .device
+                .allocate_memory(&alloc, None)
+                .map_err(vk_err)?;
             device
                 .device
                 .bind_image_memory(image, memory, 0)
@@ -164,7 +170,9 @@ impl Drop for VulkanCubemap {
             for &v in &self.face_views {
                 self.device.device.destroy_image_view(v, None);
             }
-            self.device.device.destroy_image_view(self.sample_view, None);
+            self.device
+                .device
+                .destroy_image_view(self.sample_view, None);
             self.device.device.destroy_image(self.image, None);
             self.device.device.free_memory(self.memory, None);
         }

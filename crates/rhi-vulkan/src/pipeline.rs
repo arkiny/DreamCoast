@@ -180,6 +180,33 @@ unsafe fn build(
                     .vertex_binding_descriptions(&vtx_bindings)
                     .vertex_attribute_descriptions(&vtx_attrs[..1])
             }
+            VertexLayout::MeshPosNormal => {
+                vtx_bindings = [vk::VertexInputBindingDescription::default()
+                    .binding(0)
+                    .stride(32)
+                    .input_rate(vk::VertexInputRate::VERTEX)];
+                // Position + normal only (the capture VS skips uv).
+                vtx_attrs = [
+                    vk::VertexInputAttributeDescription::default()
+                        .location(0)
+                        .binding(0)
+                        .format(vk::Format::R32G32B32_SFLOAT)
+                        .offset(0),
+                    vk::VertexInputAttributeDescription::default()
+                        .location(1)
+                        .binding(0)
+                        .format(vk::Format::R32G32B32_SFLOAT)
+                        .offset(12),
+                    vk::VertexInputAttributeDescription::default()
+                        .location(2)
+                        .binding(0)
+                        .format(vk::Format::R32G32_SFLOAT)
+                        .offset(24),
+                ];
+                vk::PipelineVertexInputStateCreateInfo::default()
+                    .vertex_binding_descriptions(&vtx_bindings)
+                    .vertex_attribute_descriptions(&vtx_attrs[..2])
+            }
         };
 
         let topology = match desc.topology {
@@ -247,8 +274,12 @@ unsafe fn build(
             .depth_write_enable(desc.depth_test)
             .depth_compare_op(vk::CompareOp::LESS);
 
-        let color_formats: Vec<vk::Format> =
-            desc.color_formats.iter().copied().map(to_vk_format).collect();
+        let color_formats: Vec<vk::Format> = desc
+            .color_formats
+            .iter()
+            .copied()
+            .map(to_vk_format)
+            .collect();
         let depth_format = desc
             .depth_format
             .map(to_vk_format)
