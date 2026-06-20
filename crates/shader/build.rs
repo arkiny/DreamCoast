@@ -63,6 +63,30 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "mesh_fs",
     },
+    Job {
+        src: "post.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "post_vs",
+    },
+    Job {
+        src: "post.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "post_fs",
+    },
+    Job {
+        src: "blur.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "blur_vs",
+    },
+    Job {
+        src: "blur.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "blur_fs",
+    },
 ];
 
 /// (slang target name, output file extension, generated accessor suffix, required).

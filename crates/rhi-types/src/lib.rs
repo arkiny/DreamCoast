@@ -83,7 +83,9 @@ impl ClearColor {
 pub struct InstanceDesc {
     /// Application name reported to the API.
     pub app_name: String,
-    /// Request validation/debug layers when available.
+    /// Request validation/debug layers when available. Honored only in
+    /// development builds — shipping (release) builds compile validation out
+    /// regardless of this flag (see the Vulkan backend's instance setup).
     pub validation: bool,
 }
 
@@ -176,6 +178,26 @@ pub struct TextureDesc {
     pub width: u32,
     pub height: u32,
     pub format: Format,
+}
+
+/// Offscreen color render-target creation parameters. The target is usable both
+/// as a color attachment and as a bindless sampled texture (render-graph passes
+/// write it, later passes sample it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderTargetDesc {
+    pub width: u32,
+    pub height: u32,
+    pub format: Format,
+}
+
+/// GPU memory footprint of a resource, used by the render graph to plan transient
+/// aliasing (placing non-overlapping-lifetime targets at shared heap offsets).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryRequirements {
+    /// Required size in bytes.
+    pub size: u64,
+    /// Required start alignment in bytes.
+    pub alignment: u64,
 }
 
 /// A scissor / sub-rect in pixels.

@@ -5,12 +5,16 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use ash::vk;
 use engine_core::EngineError;
-use rhi_types::{BufferDesc, Extent2D, GraphicsPipelineDesc, SwapchainDesc, TextureDesc};
+use rhi_types::{
+    BufferDesc, Extent2D, GraphicsPipelineDesc, MemoryRequirements, RenderTargetDesc,
+    SwapchainDesc, TextureDesc,
+};
 
 use crate::buffer::VulkanBuffer;
 use crate::depth::VulkanDepthBuffer;
 use crate::instance::{InstanceShared, VulkanInstance};
 use crate::pipeline::VulkanGraphicsPipeline;
+use crate::render_target::{self, VulkanRenderTarget, VulkanTransientHeap};
 use crate::swapchain::VulkanSwapchain;
 use crate::sync::{VulkanFence, VulkanSemaphore};
 use crate::texture::VulkanTexture;
@@ -58,9 +62,14 @@ impl DeviceShared {
                 .shader_sampled_image_array_non_uniform_indexing(true)
                 .descriptor_binding_partially_bound(true)
                 .descriptor_binding_sampled_image_update_after_bind(true);
+            // SV_VertexID full-screen-triangle shaders (triangle/post/blur) compile
+            // to SPIR-V using the DrawParameters capability.
+            let mut features11 =
+                vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut features13)
-                .push_next(&mut features12);
+                .push_next(&mut features12)
+                .push_next(&mut features11);
 
             let device_ci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(std::slice::from_ref(&queue_ci))
@@ -315,6 +324,37 @@ impl VulkanDevice {
     /// Create a depth buffer sized to `extent`.
     pub fn create_depth_buffer(&self, extent: Extent2D) -> Result<VulkanDepthBuffer, EngineError> {
         VulkanDepthBuffer::new(self.shared.clone(), extent)
+    }
+
+    /// Create an offscreen color render target (attachment + bindless sampled).
+    pub fn create_render_target(
+        &self,
+        desc: &RenderTargetDesc,
+    ) -> Result<VulkanRenderTarget, EngineError> {
+        VulkanRenderTarget::new(self.shared.clone(), desc)
+    }
+
+    /// Memory footprint of an aliasable render target (for graph alias planning).
+    pub fn render_target_memory(
+        &self,
+        desc: &RenderTargetDesc,
+    ) -> Result<MemoryRequirements, EngineError> {
+        render_target::render_target_memory(&self.shared, desc)
+    }
+
+    /// Create a transient heap of `size` bytes for aliased render targets.
+    pub fn create_transient_heap(&self, size: u64) -> Result<VulkanTransientHeap, EngineError> {
+        VulkanTransientHeap::new(self.shared.clone(), size)
+    }
+
+    /// Create a render target aliased into `heap` at `offset`.
+    pub fn create_aliased_target(
+        &self,
+        heap: &VulkanTransientHeap,
+        offset: u64,
+        desc: &RenderTargetDesc,
+    ) -> Result<VulkanRenderTarget, EngineError> {
+        VulkanRenderTarget::new_aliased(self.shared.clone(), heap, offset, desc)
     }
 
     /// Create a fence, optionally already signaled.
