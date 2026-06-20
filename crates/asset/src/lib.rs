@@ -234,3 +234,42 @@ pub fn unit_cube() -> MeshData {
         material: Material::default(),
     }
 }
+
+/// A unit UV sphere centered at the origin (radius 1) with smooth outward
+/// normals. Good for showing off PBR / image-based reflections.
+pub fn uv_sphere(segments: u32, rings: u32) -> MeshData {
+    let segments = segments.max(3);
+    let rings = rings.max(2);
+    let mut vertices = Vec::with_capacity(((segments + 1) * (rings + 1)) as usize);
+    for r in 0..=rings {
+        let v = r as f32 / rings as f32;
+        let phi = v * std::f32::consts::PI; // 0 (top) .. PI (bottom)
+        let (sin_phi, cos_phi) = phi.sin_cos();
+        for s in 0..=segments {
+            let u = s as f32 / segments as f32;
+            let theta = u * std::f32::consts::TAU;
+            let (sin_theta, cos_theta) = theta.sin_cos();
+            // Radius 1, so the position doubles as the outward normal.
+            let pos = [sin_phi * cos_theta, cos_phi, sin_phi * sin_theta];
+            vertices.push(MeshVertex {
+                pos,
+                normal: pos,
+                uv: [u, v],
+            });
+        }
+    }
+    let stride = segments + 1;
+    let mut indices = Vec::with_capacity((segments * rings * 6) as usize);
+    for r in 0..rings {
+        for s in 0..segments {
+            let a = r * stride + s;
+            let b = a + stride;
+            indices.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+        }
+    }
+    MeshData {
+        vertices,
+        indices,
+        material: Material::default(),
+    }
+}
