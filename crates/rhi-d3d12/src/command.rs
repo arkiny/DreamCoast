@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use rhi_types::{ClearColor, Extent2D, Rect2D};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;

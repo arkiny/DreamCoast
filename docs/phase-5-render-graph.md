@@ -24,7 +24,7 @@ PBR·컴퓨트·RT 등 이후 모든 기법이 이 위에 얹힌다.
 - D3D12(`render_target.rs`): `ALLOW_RENDER_TARGET` 리소스 + 1-슬롯 RTV 힙 + 바인드리스 SRV,
   추적 상태 `Cell<RESOURCE_STATES>`. 배리어는 `RENDER_TARGET ↔ PIXEL_SHADER_RESOURCE`(중복 시 no-op).
 
-## B. crates/render (`engine-render`, `rhi`에만 의존)
+## B. crates/render (`dreamcoast-render`, `rhi`에만 의존)
 - `RenderGraph<'a>`: `import_backbuffer` / `create_color` / `create_depth` / `add_pass(PassInfo, record)`.
   record 클로저 = `FnMut(&mut PassContext) -> Result<()>`; `PassContext`는 `cmd()` + `sampled_index(id)`(read 리소스 바인드리스 인덱스).
 - `compile()`: RAW/WAW/WAR 엣지 DAG(선언 순서상 acyclic) → Kahn 위상정렬 → 백버퍼 도달 불가 패스 culling →

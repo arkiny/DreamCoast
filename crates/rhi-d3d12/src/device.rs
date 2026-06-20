@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use rhi_types::{
     BufferDesc, Extent2D, Format, GraphicsPipelineDesc, MemoryRequirements, RenderTargetDesc,
     SwapchainDesc, TextureDesc,

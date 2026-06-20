@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ash::vk;
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use rhi_types::{
     BufferDesc, Extent2D, GraphicsPipelineDesc, MemoryRequirements, RenderTargetDesc,
     SwapchainDesc, TextureDesc,

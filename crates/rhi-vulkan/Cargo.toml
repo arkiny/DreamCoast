@@ -7,8 +7,8 @@ publish.workspace = true
 
 [dependencies]
 rhi-types.workspace = true
-engine-core.workspace = true
-engine-platform.workspace = true
+dreamcoast-core.workspace = true
+dreamcoast-platform.workspace = true
 ash.workspace = true
 tracing.workspace = true
 

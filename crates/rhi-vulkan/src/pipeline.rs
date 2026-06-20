@@ -6,7 +6,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use ash::vk;
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use rhi_types::{BlendMode, GraphicsPipelineDesc, PrimitiveTopology, VertexLayout};
 
 use crate::device::DeviceShared;

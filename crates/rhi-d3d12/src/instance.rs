@@ -2,8 +2,8 @@
 
 use std::rc::Rc;
 
-use engine_core::EngineError;
-use engine_platform::Window;
+use dreamcoast_core::EngineError;
+use dreamcoast_platform::Window;
 use rhi_types::InstanceDesc;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;

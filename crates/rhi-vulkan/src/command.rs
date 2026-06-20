@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use ash::vk;
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use rhi_types::{ClearColor, Extent2D, Rect2D};
 
 use crate::buffer::VulkanBuffer;

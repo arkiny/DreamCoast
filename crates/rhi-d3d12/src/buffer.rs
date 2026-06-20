@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use rhi_types::BufferDesc;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES,

@@ -6,12 +6,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-engine-core.workspace = true
-engine-platform.workspace = true
-engine-shader.workspace = true
-engine-gui.workspace = true
-engine-asset.workspace = true
-engine-render.workspace = true
+dreamcoast-core.workspace = true
+dreamcoast-platform.workspace = true
+dreamcoast-shader.workspace = true
+dreamcoast-gui.workspace = true
+dreamcoast-asset.workspace = true
+dreamcoast-render.workspace = true
 rhi.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use rhi_types::Extent2D;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_CLEAR_VALUE, D3D12_CLEAR_VALUE_0, D3D12_CPU_DESCRIPTOR_HANDLE,

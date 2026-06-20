@@ -8,7 +8,7 @@
 //! inserts the RT<->sampled barriers automatically, and invokes each pass's
 //! record closure inside the right render pass.
 //!
-//! The graph depends only on the `rhi` facade (like `engine-gui`); all GPU code
+//! The graph depends only on the `rhi` facade (like `dreamcoast-gui`); all GPU code
 //! lives in the backends. Transient *memory aliasing* (Phase 5.3) layers on top
 //! of the lifetime analysis computed here.
 //!
@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use rhi::{
     ClearColor, CommandBuffer, DepthBuffer, Device, Extent2D, Format, RenderTarget,
     RenderTargetDesc, Swapchain, TransientHeap,

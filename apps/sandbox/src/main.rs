@@ -7,12 +7,12 @@
 use std::time::Instant;
 
 use anyhow::anyhow;
-use engine_asset::MeshData;
-use engine_core::glam::{Mat4, Vec3};
-use engine_core::init_logging;
-use engine_gui::{Gui, imgui};
-use engine_platform::Window;
-use engine_render::{PassInfo, RenderGraph, ResourcePool};
+use dreamcoast_asset::MeshData;
+use dreamcoast_core::glam::{Mat4, Vec3};
+use dreamcoast_core::init_logging;
+use dreamcoast_gui::{Gui, imgui};
+use dreamcoast_platform::Window;
+use dreamcoast_render::{PassInfo, RenderGraph, ResourcePool};
 use rhi::{
     BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, Device, Extent2D, Format,
     GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology, Semaphore,
@@ -42,17 +42,20 @@ fn main() -> anyhow::Result<()> {
 
     let (vs, fs) = match backend {
         BackendKind::Vulkan => (
-            engine_shader::mesh_vs_spirv(),
-            engine_shader::mesh_fs_spirv(),
+            dreamcoast_shader::mesh_vs_spirv(),
+            dreamcoast_shader::mesh_fs_spirv(),
         ),
-        BackendKind::D3d12 => (engine_shader::mesh_vs_dxil(), engine_shader::mesh_fs_dxil()),
+        BackendKind::D3d12 => (
+            dreamcoast_shader::mesh_vs_dxil(),
+            dreamcoast_shader::mesh_fs_dxil(),
+        ),
     };
     let vs = vs.ok_or_else(|| anyhow!("mesh vertex shader unavailable for {backend:?}"))?;
     let fs = fs.ok_or_else(|| anyhow!("mesh fragment shader unavailable for {backend:?}"))?;
 
     // Load a glTF model if present, else fall back to a procedural cube.
     let model_path = model_path();
-    let model = match engine_asset::load_gltf(&model_path) {
+    let model = match dreamcoast_asset::load_gltf(&model_path) {
         Ok(m) => {
             info!(
                 "loaded {model_path}: {} verts, {} indices",
@@ -63,12 +66,12 @@ fn main() -> anyhow::Result<()> {
         }
         Err(e) => {
             info!("no glTF at {model_path} ({e}); using procedural cube");
-            engine_asset::unit_cube()
+            dreamcoast_asset::unit_cube()
         }
     };
     let model_radius = bounding_radius(&model);
 
-    let title = format!("Engine Sandbox — {backend:?}");
+    let title = format!("DreamCoast Sandbox — {backend:?}");
     let mut window = Window::new(&title, 1280, 720)?;
     let (w, h) = window.size();
 
@@ -76,7 +79,7 @@ fn main() -> anyhow::Result<()> {
         backend,
         &window,
         &InstanceDesc {
-            app_name: "engine-sandbox".into(),
+            app_name: "dreamcoast-sandbox".into(),
             validation: true,
         },
     )?;
@@ -103,10 +106,10 @@ fn main() -> anyhow::Result<()> {
     // Full-screen bloom-blur pipeline (one link of the chain; reused H/V/H).
     let (blur_vs, blur_fs) = load_shader_pair(
         backend,
-        engine_shader::blur_vs_spirv,
-        engine_shader::blur_fs_spirv,
-        engine_shader::blur_vs_dxil,
-        engine_shader::blur_fs_dxil,
+        dreamcoast_shader::blur_vs_spirv,
+        dreamcoast_shader::blur_fs_spirv,
+        dreamcoast_shader::blur_vs_dxil,
+        dreamcoast_shader::blur_fs_dxil,
         "blur",
     )?;
     let blur_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
@@ -127,10 +130,10 @@ fn main() -> anyhow::Result<()> {
     // Composite pipeline (scene + bloom + tonemap -> backbuffer).
     let (post_vs, post_fs) = load_shader_pair(
         backend,
-        engine_shader::post_vs_spirv,
-        engine_shader::post_fs_spirv,
-        engine_shader::post_vs_dxil,
-        engine_shader::post_fs_dxil,
+        dreamcoast_shader::post_vs_spirv,
+        dreamcoast_shader::post_fs_spirv,
+        dreamcoast_shader::post_vs_dxil,
+        dreamcoast_shader::post_fs_dxil,
         "post",
     )?;
     let post_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
@@ -239,7 +242,7 @@ fn main() -> anyhow::Result<()> {
 
         {
             let ui = gui.new_frame(dt, [cw as f32, ch as f32], window.input());
-            ui.window("Engine")
+            ui.window("DreamCoast")
                 .size([300.0, 150.0], imgui::Condition::FirstUseEver)
                 .build(|| {
                     ui.text(format!("backend: {backend:?}"));

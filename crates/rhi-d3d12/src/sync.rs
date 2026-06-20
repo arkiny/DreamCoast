@@ -8,7 +8,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::{D3D12_FENCE_FLAG_NONE, ID3D12Fence};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};

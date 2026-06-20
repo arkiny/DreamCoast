@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use ash::vk;
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use rhi_types::{BufferDesc, BufferUsage};
 
 use crate::device::DeviceShared;

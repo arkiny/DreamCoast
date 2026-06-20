@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use rhi_types::{MemoryRequirements, RenderTargetDesc};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_DESCRIPTOR_HEAP_DESC,
