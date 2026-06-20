@@ -98,11 +98,12 @@ engine/                 # cargo workspace root
 - 데모: 블룸 체인(scene→blur×3→composite) + ImGui 포스트 토글/aliasing 토글
 - **완료 기준**: 멀티 패스(오프스크린 → 포스트) 그래프가 두 백엔드에서 동작 (RTX 2070 SUPER)
 
-### Phase 6 — PBR 렌더러 (Deferred) — 🚧 진행 중
+### Phase 6 — PBR 렌더러 (Deferred) — ✅ 완료
 세부: [phase-6-pbr.md](phase-6-pbr.md)
-- G-buffer, PBR BRDF, 라이팅, 섀도우 맵, IBL, 톤매핑/포스트 (디퍼드 경로)
-- 전제: 렌더그래프/RHI에 MRT, HDR 포맷, per-frame uniform buffer, 샘플 가능 depth, cubemap 도입
-- **완료 기준**: 디퍼드 PBR 씬 렌더(직접광+섀도우+IBL+톤매핑), 두 백엔드 동일 결과
+- G-buffer, PBR BRDF, 라이팅, 섀도우 맵(PCF), IBL(irradiance/prefilter/BRDF LUT), 톤매핑/포스트 (디퍼드 경로)
+- 전제 도입 완료: 렌더그래프/RHI에 MRT, HDR 포맷, per-frame uniform buffer, 샘플 가능 depth, cubemap
+- 추가: 스왑체인 readback → PNG 스크린샷 툴, **카메라 기준 실시간 환경 캡처**([realtime-env-capture.md](realtime-env-capture.md))
+- **완료 기준 달성**: 디퍼드 PBR 씬 렌더(직접광+PCF 섀도우+IBL+톤매핑), 두 백엔드 픽셀 일치, Vulkan 검증 클린
 
 ### Phase 7 — 컴퓨트 / GPGPU
 - 렌더그래프 위 컴퓨트 패스, 예제(GPU 컬링, 파티클 시뮬레이션, 포스트프로세싱)
