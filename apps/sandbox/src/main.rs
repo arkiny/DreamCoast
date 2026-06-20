@@ -1,31 +1,87 @@
 //! Sandbox: the playground executable.
 //!
-//! Builds a render graph each frame: a glTF mesh (or procedural cube fallback)
-//! rendered textured + diffuse-lit with depth into an offscreen target, a
-//! three-pass bloom chain, then a composite to the backbuffer plus a Dear ImGui
-//! overlay. The ImGui panel toggles the post effect and transient memory
-//! aliasing. Runs on either backend (`--backend vulkan|d3d12`).
+//! Builds a deferred-PBR render graph each frame: a G-buffer fill pass
+//! rasterizes the glTF mesh (or procedural cube fallback) into four MRT targets
+//! (albedo, world normal, metallic/roughness/AO, world position) with depth; a
+//! full-screen lighting pass reads the G-buffer and shades it with a
+//! Cook-Torrance BRDF (one directional sun + a few point lights) into a linear
+//! HDR target; a tonemap pass maps that to the backbuffer; and a Dear ImGui
+//! overlay exposes the lighting controls and a G-buffer debug view. Runs on
+//! either backend (`--backend vulkan|d3d12`).
 
 use std::time::Instant;
 
 use anyhow::anyhow;
-use dreamcoast_asset::MeshData;
+use dreamcoast_asset::{ImageData, MeshData, MeshVertex};
 use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_core::init_logging;
 use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
 use dreamcoast_render::{PassInfo, RenderGraph, ResourcePool};
 use rhi::{
-    BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, Device, Extent2D, Format,
-    GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology, Semaphore,
-    SwapchainDesc, Texture, TextureDesc, VertexLayout,
+    BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, CommandBuffer, Cubemap,
+    CubemapDesc, Device, Extent2D, Fence, Format, GraphicsPipeline, GraphicsPipelineDesc, Instance,
+    InstanceDesc, PresentMode, PrimitiveTopology, Queue, ReadbackLayout, Semaphore, SwapchainDesc,
+    Texture, TextureDesc, VertexLayout,
 };
 use tracing::info;
 
 const FRAMES_IN_FLIGHT: usize = 2;
-const COLOR_FORMAT: Format = Format::Bgra8Srgb;
+const COLOR_FORMAT: Format = Format::Bgra8Srgb; // swapchain / backbuffer
 const DEPTH_FORMAT: Format = Format::Depth32Float;
+const HDR_FORMAT: Format = Format::Rgba16Float; // linear HDR lighting target
+// G-buffer attachment formats.
+const GB_ALBEDO_FMT: Format = Format::Rgba8Unorm;
+const GB_NORMAL_FMT: Format = Format::Rgba16Float;
+const GB_MATERIAL_FMT: Format = Format::Rgba8Unorm;
+const GB_POSITION_FMT: Format = Format::Rgba16Float;
+/// Per-frame globals slice size (256-byte aligned for D3D12 root CBV / Vulkan
+/// dynamic UBO offset). 512 holds the lighting globals plus the light
+/// view-projection matrix.
+const GLOBALS_SLICE: u64 = 512;
+/// Directional shadow map resolution (square).
+const SHADOW_SIZE: u32 = 2048;
+/// Environment cubemap face resolution (square).
+const ENV_SIZE: u32 = 256;
+/// Diffuse irradiance cubemap face resolution.
+const IRRADIANCE_SIZE: u32 = 32;
+/// Specular prefilter cubemap face resolution (mip 0) and roughness mip count.
+const PREFILTER_SIZE: u32 = 128;
+const PREFILTER_MIPS: u32 = 5;
+/// BRDF integration LUT resolution.
+const BRDF_SIZE: u32 = 256;
+/// Sentinel for "this material texture is absent — use the scalar factor".
+const NO_TEXTURE: u32 = u32::MAX;
 const MODEL_PATH: &str = "assets/model.glb";
+
+const DEBUG_VIEWS: [&str; 7] = [
+    "Lit",
+    "Albedo",
+    "Normal",
+    "Metallic",
+    "Roughness",
+    "Position",
+    "AO",
+];
+const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
+
+/// Per-frame globals, mirrored by `Globals` in pbr.slang. All members are 16-byte
+/// vectors so the std140 (Vulkan) and cbuffer (D3D12) layouts agree.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Globals {
+    camera_pos: [f32; 4],
+    sun_direction: [f32; 4],
+    sun_color: [f32; 4],
+    ambient: [f32; 4],
+    counts: [i32; 4], // x point count, y debug view, w shadows enabled
+    point_pos: [[f32; 4]; 4],
+    point_color: [[f32; 4]; 4],
+    light_view_proj: [f32; 16], // world -> light clip (shadow lookup)
+    shadow: [f32; 4],           // x depth bias, y texel size (1 / SHADOW_SIZE)
+    inv_view_proj: [f32; 16],   // clip -> world (skybox ray reconstruction)
+    ibl: [i32; 4],              // x env, y irradiance, z prefilter, w BRDF (-1 = none)
+}
 
 fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
     SwapchainDesc {
@@ -42,22 +98,16 @@ fn main() -> anyhow::Result<()> {
     let backend = select_backend();
     info!("requested backend: {backend:?}");
 
-    let (vs, fs) = match backend {
-        BackendKind::Vulkan => (
-            dreamcoast_shader::mesh_vs_spirv(),
-            dreamcoast_shader::mesh_fs_spirv(),
-        ),
-        BackendKind::D3d12 => (
-            dreamcoast_shader::mesh_vs_dxil(),
-            dreamcoast_shader::mesh_fs_dxil(),
-        ),
-    };
-    let vs = vs.ok_or_else(|| anyhow!("mesh vertex shader unavailable for {backend:?}"))?;
-    let fs = fs.ok_or_else(|| anyhow!("mesh fragment shader unavailable for {backend:?}"))?;
+    // Screenshot mode: `--screenshot[/-clean] <path>` renders a few frames then
+    // captures + exits; otherwise F2 captures interactively.
+    let captures = screenshot_captures();
+    let screenshot_mode = !captures.is_empty();
+    const VK_F2: u16 = 0x71;
+    const SCREENSHOT_WARMUP: u64 = 3;
 
     // Load a glTF model if present, else fall back to a procedural cube.
     let model_path = model_path();
-    let model = match dreamcoast_asset::load_gltf(&model_path) {
+    let mut model = match dreamcoast_asset::load_gltf(&model_path) {
         Ok(m) => {
             info!(
                 "loaded {model_path}: {} verts, {} indices",
@@ -71,7 +121,10 @@ fn main() -> anyhow::Result<()> {
             dreamcoast_asset::unit_cube()
         }
     };
-    let model_radius = bounding_radius(&model);
+    // Normalize the model (recenter on origin, base at y=0, unit bounding radius)
+    // so framing, ground, lights, and the shadow box use model-independent units.
+    let bounds = normalize_on_ground(&mut model);
+    let model_radius = bounds.radius;
 
     let title = format!("DreamCoast Sandbox — {backend:?}");
     let mut window = Window::new(&title, 1280, 720)?;
@@ -90,46 +143,82 @@ fn main() -> anyhow::Result<()> {
 
     let mut swapchain = device.create_swapchain(&swapchain_desc(Extent2D::new(w, h)))?;
 
-    let pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: vs,
-        fragment_bytes: fs,
+    // G-buffer fill pipeline: mesh -> 4 MRT (+ depth).
+    let (gb_vs, gb_fs) = load_shader_pair(
+        backend,
+        dreamcoast_shader::gbuffer_vs_spirv,
+        dreamcoast_shader::gbuffer_fs_spirv,
+        dreamcoast_shader::gbuffer_vs_dxil,
+        dreamcoast_shader::gbuffer_fs_dxil,
+        "gbuffer",
+    )?;
+    let gbuffer_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: gb_vs,
+        fragment_bytes: gb_fs,
         vertex_entry: "vsMain",
         fragment_entry: "fsMain",
-        color_format: swapchain.format(),
+        color_formats: &[GB_ALBEDO_FMT, GB_NORMAL_FMT, GB_MATERIAL_FMT, GB_POSITION_FMT],
         topology: PrimitiveTopology::TriangleList,
         vertex_layout: VertexLayout::Mesh,
         blend: BlendMode::Opaque,
-        push_constant_size: 68, // mat4 (64) + u32 tex_index (4)
+        push_constant_size: 112, // mat4(64) + base_color(16) + mr(16) + tex u32x4(16)
         bindless: true,
+        uniform_buffer: false,
         depth_test: true,
         depth_format: Some(DEPTH_FORMAT),
     })?;
 
-    // Full-screen bloom-blur pipeline (one link of the chain; reused H/V/H).
-    let (blur_vs, blur_fs) = load_shader_pair(
+    // Shadow pipeline: depth-only, rasterizes the mesh from the light's POV.
+    let (shadow_vs, shadow_fs) = load_shader_pair(
         backend,
-        dreamcoast_shader::blur_vs_spirv,
-        dreamcoast_shader::blur_fs_spirv,
-        dreamcoast_shader::blur_vs_dxil,
-        dreamcoast_shader::blur_fs_dxil,
-        "blur",
+        dreamcoast_shader::shadow_vs_spirv,
+        dreamcoast_shader::shadow_fs_spirv,
+        dreamcoast_shader::shadow_vs_dxil,
+        dreamcoast_shader::shadow_fs_dxil,
+        "shadow",
     )?;
-    let blur_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: blur_vs,
-        fragment_bytes: blur_fs,
+    let shadow_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: shadow_vs,
+        fragment_bytes: shadow_fs,
         vertex_entry: "vsMain",
         fragment_entry: "fsMain",
-        color_format: COLOR_FORMAT,
+        color_formats: &[], // depth-only
+        topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::MeshPosition,
+        blend: BlendMode::Opaque,
+        push_constant_size: 64, // light_mvp mat4
+        bindless: true,         // for the root-constants param (push constants)
+        uniform_buffer: false,
+        depth_test: true,
+        depth_format: Some(DEPTH_FORMAT),
+    })?;
+
+    // Deferred lighting pipeline: full-screen, reads G-buffer + globals -> HDR.
+    let (pbr_vs, pbr_fs) = load_shader_pair(
+        backend,
+        dreamcoast_shader::pbr_vs_spirv,
+        dreamcoast_shader::pbr_fs_spirv,
+        dreamcoast_shader::pbr_vs_dxil,
+        dreamcoast_shader::pbr_fs_dxil,
+        "pbr",
+    )?;
+    let pbr_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: pbr_vs,
+        fragment_bytes: pbr_fs,
+        vertex_entry: "vsMain",
+        fragment_entry: "fsMain",
+        color_formats: &[HDR_FORMAT],
         topology: PrimitiveTopology::TriangleList,
         vertex_layout: VertexLayout::None,
         blend: BlendMode::Opaque,
-        push_constant_size: 20, // u32 src + u32 flip_y + float2 dir + f32 threshold
+        push_constant_size: 24, // 4 G-buffer indices + flip_y + shadow_index
         bindless: true,
+        uniform_buffer: true,
         depth_test: false,
         depth_format: None,
     })?;
 
-    // Composite pipeline (scene + bloom + tonemap -> backbuffer).
+    // Tonemap pipeline: HDR -> backbuffer (sRGB).
     let (post_vs, post_fs) = load_shader_pair(
         backend,
         dreamcoast_shader::post_vs_spirv,
@@ -143,52 +232,179 @@ fn main() -> anyhow::Result<()> {
         fragment_bytes: post_fs,
         vertex_entry: "vsMain",
         fragment_entry: "fsMain",
-        color_format: swapchain.format(),
+        color_formats: &[swapchain.format()],
         topology: PrimitiveTopology::TriangleList,
         vertex_layout: VertexLayout::None,
         blend: BlendMode::Opaque,
-        push_constant_size: 16, // u32 scene + u32 bloom + u32 mode + u32 flip_y
+        push_constant_size: 16, // hdr_index + mode + flip_y + pad
         bindless: true,
+        uniform_buffer: false,
         depth_test: false,
         depth_format: None,
     })?;
-    // Clip-space Y orientation for the fullscreen-triangle passes (matches the
-    // mesh pass's per-backend proj.y flip).
-    let post_flip_y: u32 = match backend {
+    // Sky pipeline: renders the procedural sky into each environment cube face.
+    let (sky_vs, sky_fs) = load_shader_pair(
+        backend,
+        dreamcoast_shader::sky_vs_spirv,
+        dreamcoast_shader::sky_fs_spirv,
+        dreamcoast_shader::sky_vs_dxil,
+        dreamcoast_shader::sky_fs_dxil,
+        "sky",
+    )?;
+    let sky_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: sky_vs,
+        fragment_bytes: sky_fs,
+        vertex_entry: "vsMain",
+        fragment_entry: "fsMain",
+        color_formats: &[Format::Rgba16Float],
+        topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::None,
+        blend: BlendMode::Opaque,
+        push_constant_size: 32, // sun float4 + face + flip_y + pad
+        bindless: true,         // for the root-constants param (push constants)
+        uniform_buffer: false,
+        depth_test: false,
+        depth_format: None,
+    })?;
+
+    // Irradiance pipeline: convolves the env cube into a diffuse-irradiance cube.
+    let (irr_vs, irr_fs) = load_shader_pair(
+        backend,
+        dreamcoast_shader::irradiance_vs_spirv,
+        dreamcoast_shader::irradiance_fs_spirv,
+        dreamcoast_shader::irradiance_vs_dxil,
+        dreamcoast_shader::irradiance_fs_dxil,
+        "irradiance",
+    )?;
+    let irradiance_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: irr_vs,
+        fragment_bytes: irr_fs,
+        vertex_entry: "vsMain",
+        fragment_entry: "fsMain",
+        color_formats: &[HDR_FORMAT],
+        topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::None,
+        blend: BlendMode::Opaque,
+        push_constant_size: 16, // face + flip_y + env_index + pad
+        bindless: true,
+        uniform_buffer: false,
+        depth_test: false,
+        depth_format: None,
+    })?;
+
+    // Prefilter pipeline: GGX-prefilters the env cube per roughness mip.
+    let (pre_vs, pre_fs) = load_shader_pair(
+        backend,
+        dreamcoast_shader::prefilter_vs_spirv,
+        dreamcoast_shader::prefilter_fs_spirv,
+        dreamcoast_shader::prefilter_vs_dxil,
+        dreamcoast_shader::prefilter_fs_dxil,
+        "prefilter",
+    )?;
+    let prefilter_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: pre_vs,
+        fragment_bytes: pre_fs,
+        vertex_entry: "vsMain",
+        fragment_entry: "fsMain",
+        color_formats: &[HDR_FORMAT],
+        topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::None,
+        blend: BlendMode::Opaque,
+        push_constant_size: 16, // face + flip_y + env_index + roughness
+        bindless: true,
+        uniform_buffer: false,
+        depth_test: false,
+        depth_format: None,
+    })?;
+
+    // BRDF LUT pipeline: integrates the environment-BRDF terms into an Rg16Float 2D.
+    let (brdf_vs, brdf_fs) = load_shader_pair(
+        backend,
+        dreamcoast_shader::brdf_vs_spirv,
+        dreamcoast_shader::brdf_fs_spirv,
+        dreamcoast_shader::brdf_vs_dxil,
+        dreamcoast_shader::brdf_fs_dxil,
+        "brdf",
+    )?;
+    let brdf_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: brdf_vs,
+        fragment_bytes: brdf_fs,
+        vertex_entry: "vsMain",
+        fragment_entry: "fsMain",
+        color_formats: &[Format::Rg16Float],
+        topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::None,
+        blend: BlendMode::Opaque,
+        push_constant_size: 16, // flip_y + pad
+        bindless: true,
+        uniform_buffer: false,
+        depth_test: false,
+        depth_format: None,
+    })?;
+
+    // Clip-space Y orientation for the full-screen passes (Vulkan = 1, D3D12 = 0).
+    let flip_y: u32 = match backend {
         BackendKind::Vulkan => 1,
         BackendKind::D3d12 => 0,
     };
 
-    // Upload geometry + base-color texture (bindless).
+    // Upload geometry: the model plus a ground plane that catches its shadow.
     let (vbuf, ibuf, index_count) = upload_mesh(&device, &model)?;
-    let _base_color: Texture;
-    let tex_index;
-    if let Some(img) = &model.base_color {
-        let t = device.create_texture(
-            &TextureDesc {
-                width: img.width,
-                height: img.height,
-                format: Format::Rgba8Unorm,
-            },
-            &img.rgba8,
-        )?;
-        tex_index = t.bindless_index();
-        _base_color = t;
-    } else {
-        let t = make_checker_texture(&device)?;
-        tex_index = t.bindless_index();
-        _base_color = t;
-    }
+    let ground = ground_mesh(model_radius * 3.0, 0.0);
+    let (ground_vbuf, ground_ibuf, ground_count) = upload_mesh(&device, &ground)?;
+
+    // Upload material textures (bindless). Base color is sRGB-encoded; the
+    // metallic-roughness and normal maps carry linear data.
+    let mut _textures: Vec<Texture> = Vec::new();
+    let base_index = match &model.material.base_color {
+        Some(im) => upload_texture(&device, &mut _textures, im, Format::Rgba8Srgb)?,
+        None => {
+            let t = make_checker_texture(&device)?;
+            let i = t.bindless_index();
+            _textures.push(t);
+            i
+        }
+    };
+    let mr_index = match &model.material.metallic_roughness {
+        Some(im) => upload_texture(&device, &mut _textures, im, Format::Rgba8Unorm)?,
+        None => NO_TEXTURE,
+    };
+    let normal_index = match &model.material.normal {
+        Some(im) => upload_texture(&device, &mut _textures, im, Format::Rgba8Unorm)?,
+        None => NO_TEXTURE,
+    };
+    let base_color_factor = model.material.base_color_factor;
+    let metallic_factor = model.material.metallic_factor;
+    let roughness_factor = model.material.roughness_factor;
+
+    // Per-frame globals uniform buffer (one 256-byte slice per frame-in-flight).
+    let globals_buffer = device.create_buffer(&BufferDesc {
+        size: GLOBALS_SLICE * FRAMES_IN_FLIGHT as u64,
+        usage: BufferUsage::Uniform,
+    })?;
+    device.set_globals_buffer(&globals_buffer, GLOBALS_SLICE);
 
     let mut gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
 
-    // One render-graph transient pool per frame-in-flight: a pool's resources are
-    // reused only after that frame slot's fence has signaled, so reusing them is
-    // free of cross-frame read/write hazards.
+    // One render-graph transient pool per frame-in-flight (reused only after the
+    // frame slot's fence has signaled — no cross-frame hazards).
     let mut pools: Vec<ResourcePool> = (0..FRAMES_IN_FLIGHT).map(|_| ResourcePool::new()).collect();
+
+    // UI-controlled lighting state.
+    let mut sun_dir = [0.4f32, 0.8, 0.4];
+    let mut sun_intensity = 3.0f32;
+    let mut ambient = 0.04f32;
+    let mut exposure = 1.0f32;
+    let mut point_lights_on = true;
+    let mut shadows_on = true;
+    let mut shadow_bias = 0.0015f32;
+    // Override the model's metallic/roughness (to inspect IBL on the avocado).
+    let mut override_material = false;
+    let mut metallic_override = 1.0f32;
+    let mut roughness_override = 0.15f32;
+    let mut debug_view: usize = 0;
     let mut post_mode: usize = 0;
     let mut aliasing = true;
-    const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 
     let mut command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
     let mut image_available = Vec::with_capacity(FRAMES_IN_FLIGHT);
@@ -200,12 +416,61 @@ fn main() -> anyhow::Result<()> {
     }
     let mut render_finished = build_render_finished(&device, swapchain.image_count())?;
 
+    // IBL resource set. The environment cube holds the procedural sky; the
+    // irradiance / prefilter cubes and BRDF LUT are derived from it. The env +
+    // irradiance + prefilter generation is reusable (call again to re-capture
+    // when the sky changes — a future real-time atmospheric model); the BRDF LUT
+    // is sky-independent and generated once.
+    let env_cube = device.create_cubemap(&CubemapDesc {
+        size: ENV_SIZE,
+        format: HDR_FORMAT,
+        mip_levels: 1,
+    })?;
+    let irradiance_cube = device.create_cubemap(&CubemapDesc {
+        size: IRRADIANCE_SIZE,
+        format: HDR_FORMAT,
+        mip_levels: 1,
+    })?;
+    let prefilter_cube = device.create_cubemap(&CubemapDesc {
+        size: PREFILTER_SIZE,
+        format: HDR_FORMAT,
+        mip_levels: PREFILTER_MIPS,
+    })?;
+    let brdf_lut = device.create_render_target(&rhi::RenderTargetDesc {
+        width: BRDF_SIZE,
+        height: BRDF_SIZE,
+        format: Format::Rg16Float,
+    })?;
+    let ibl = IblResources {
+        sky_pipeline: &sky_pipeline,
+        irradiance_pipeline: &irradiance_pipeline,
+        prefilter_pipeline: &prefilter_pipeline,
+        env_cube: &env_cube,
+        irradiance_cube: &irradiance_cube,
+        prefilter_cube: &prefilter_cube,
+    };
+    {
+        let gen_cmd = device.create_command_buffer()?;
+        let gen_fence = device.create_fence(false)?;
+        generate_environment(&queue, &gen_cmd, &gen_fence, &ibl, sun_dir, sun_intensity, flip_y)?;
+        generate_brdf_lut(&queue, &gen_cmd, &gen_fence, &brdf_pipeline, &brdf_lut, flip_y)?;
+    }
+    let ibl_indices = [
+        env_cube.bindless_index() as i32,
+        irradiance_cube.bindless_index() as i32,
+        prefilter_cube.bindless_index() as i32,
+        brdf_lut.bindless_index() as i32,
+    ];
+
     let _ = window.take_resized();
     info!("entering render loop");
     let mut frame = 0usize;
+    let mut frame_no = 0u64;
+    let mut f2_prev = false;
     let mut needs_recreate = false;
     let mut last = Instant::now();
-    let mut angle = 0.0f32;
+    // Fixed view in screenshot mode for reproducible output.
+    let mut angle = if screenshot_mode { 0.7 } else { 0.0 };
 
     while !window.should_close() {
         window.pump_events();
@@ -230,31 +495,79 @@ fn main() -> anyhow::Result<()> {
         let now = Instant::now();
         let dt = (now - last).as_secs_f32();
         last = now;
-        angle += dt * 0.6;
+        if !screenshot_mode {
+            angle += dt * 0.6; // hold a fixed view when capturing
+        }
 
-        // Orbiting camera looking at the model.
-        let dist = model_radius * 3.0;
-        let eye = Vec3::new(angle.cos() * dist, model_radius * 1.2, angle.sin() * dist);
-        let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
+        // Decide whether this frame produces a screenshot: a scheduled capture in
+        // screenshot mode (after warmup), or an F2 rising edge interactively.
+        let f2 = window.input().key_down(VK_F2);
+        let f2_pressed = f2 && !f2_prev;
+        f2_prev = f2;
+        let capture_this_frame: Option<Capture> = if screenshot_mode {
+            frame_no
+                .checked_sub(SCREENSHOT_WARMUP)
+                .and_then(|i| captures.get(i as usize).cloned())
+        } else if f2_pressed {
+            Some(Capture {
+                path: interactive_screenshot_path(),
+                include_ui: true,
+            })
+        } else {
+            None
+        };
+        let include_ui = capture_this_frame
+            .as_ref()
+            .map(|c| c.include_ui)
+            .unwrap_or(true);
+
+        // Orbiting camera framing the model (focused on its mid-height so it
+        // sits nicely above the ground).
+        let focus = Vec3::new(0.0, bounds.height * 0.45, 0.0);
+        let dist = model_radius * 2.4;
+        let eye = focus
+            + Vec3::new(
+                angle.cos() * dist,
+                bounds.height * 0.3 + model_radius * 0.5,
+                angle.sin() * dist,
+            );
+        let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
         let mut proj = Mat4::perspective_rh(60f32.to_radians(), cw as f32 / ch as f32, 0.05, 100.0);
         if backend == BackendKind::Vulkan {
             proj.y_axis.y *= -1.0; // Vulkan clip-space Y points down
         }
-        let mvp = (proj * view).to_cols_array();
+        let view_proj = proj * view;
+        let mvp = view_proj.to_cols_array();
+        // For reconstructing background view rays (skybox) in the lighting pass.
+        let inv_view_proj = view_proj.inverse().to_cols_array();
 
-        {
+        // Skip the whole ImGui frame (NewFrame/Render must stay balanced) when
+        // capturing a clean screenshot.
+        if include_ui {
             let ui = gui.new_frame(dt, [cw as f32, ch as f32], window.input());
             ui.window("DreamCoast")
-                .size([300.0, 150.0], imgui::Condition::FirstUseEver)
+                .size([320.0, 320.0], imgui::Condition::FirstUseEver)
                 .build(|| {
                     ui.text(format!("backend: {backend:?}"));
-                    ui.text(format!("size: {cw} x {ch}"));
                     ui.text(format!(
                         "{:.1} FPS ({:.2} ms)",
                         1.0 / dt.max(1e-4),
                         dt * 1000.0
                     ));
                     ui.text(format!("model: {index_count} indices"));
+                    ui.separator();
+                    ui.combo_simple_string("Debug view", &mut debug_view, &DEBUG_VIEWS);
+                    ui.input_float3("Sun dir", &mut sun_dir).build();
+                    ui.slider("Sun intensity", 0.0, 10.0, &mut sun_intensity);
+                    ui.slider("Ambient", 0.0, 0.5, &mut ambient);
+                    ui.slider("Exposure", 0.1, 4.0, &mut exposure);
+                    ui.checkbox("Point lights", &mut point_lights_on);
+                    ui.checkbox("Shadows", &mut shadows_on);
+                    ui.slider("Shadow bias", 0.0, 0.01, &mut shadow_bias);
+                    ui.separator();
+                    ui.checkbox("Override material", &mut override_material);
+                    ui.slider("Metallic", 0.0, 1.0, &mut metallic_override);
+                    ui.slider("Roughness", 0.0, 1.0, &mut roughness_override);
                     ui.separator();
                     ui.combo_simple_string("Post effect", &mut post_mode, &POST_EFFECTS);
                     ui.checkbox("Transient aliasing", &mut aliasing);
@@ -272,108 +585,190 @@ fn main() -> anyhow::Result<()> {
         };
         fence.reset()?;
 
+        // Directional light view-projection: an orthographic box centered on the
+        // model, looking from the sun toward it. Backend-neutral (the pbr shader
+        // handles the Vulkan/D3D12 shadow-UV flip).
+        let shadow_center = Vec3::new(0.0, bounds.height * 0.5, 0.0);
+        let light_view_proj = light_view_proj(sun_dir, shadow_center, model_radius);
+
+        // Write this frame's globals slice.
+        let r = model_radius;
+        let point_intensity = r * r * 8.0;
+        let globals = Globals {
+            camera_pos: [eye.x, eye.y, eye.z, 0.0],
+            sun_direction: normalize3(sun_dir),
+            sun_color: [1.0, 1.0, 1.0, sun_intensity],
+            ambient: [ambient, ambient, ambient, exposure],
+            counts: [
+                if point_lights_on { 2 } else { 0 },
+                debug_view as i32,
+                (PREFILTER_MIPS - 1) as i32, // prefilter max LOD
+                shadows_on as i32,
+            ],
+            point_pos: [
+                [r * 2.0, r * 1.5, 0.0, 0.0],
+                [-r * 2.0, r * 1.0, r * 1.5, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ],
+            point_color: [
+                [1.0, 0.35, 0.2, point_intensity],
+                [0.3, 0.5, 1.0, point_intensity],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ],
+            light_view_proj,
+            shadow: [shadow_bias, 1.0 / SHADOW_SIZE as f32, 0.0, 0.0],
+            inv_view_proj,
+            ibl: ibl_indices,
+        };
+        let globals_offset = frame as u64 * GLOBALS_SLICE;
+        globals_buffer.write_at(globals_offset, globals_bytes(&globals))?;
+
         let cmd = &command_buffers[frame];
         cmd.begin()?;
 
-        // Build the frame's render graph:
-        //   scene -> bloom_h0 -> bloom_v -> bloom_h1 -> composite -> ImGui
-        // The three bloom links create transient targets with partially disjoint
-        // lifetimes, which the graph's transient aliasing reuses.
+        // Build the deferred render graph:
+        //   gbuffer (4 MRT + depth) -> lighting (HDR) -> tonemap (backbuffer) -> ui
         let extent = Extent2D::new(cw, ch);
-        let dir_h = [2.0 / cw as f32, 0.0];
-        let dir_v = [0.0, 2.0 / ch as f32];
-
         let mut graph = RenderGraph::new();
         let backbuffer = graph.import_backbuffer(swapchain.format(), extent);
-        let scene = graph.create_color("scene", COLOR_FORMAT, extent);
-        let scene_depth = graph.create_depth("scene_depth", extent);
-        let bloom_a = graph.create_color("bloom_a", COLOR_FORMAT, extent);
-        let bloom_b = graph.create_color("bloom_b", COLOR_FORMAT, extent);
-        let bloom_c = graph.create_color("bloom_c", COLOR_FORMAT, extent);
+        let g_albedo = graph.create_color("g_albedo", GB_ALBEDO_FMT, extent);
+        let g_normal = graph.create_color("g_normal", GB_NORMAL_FMT, extent);
+        let g_material = graph.create_color("g_material", GB_MATERIAL_FMT, extent);
+        let g_position = graph.create_color("g_position", GB_POSITION_FMT, extent);
+        let g_depth = graph.create_depth("g_depth", extent);
+        let shadow_map = graph.create_depth("shadow_map", Extent2D::new(SHADOW_SIZE, SHADOW_SIZE));
+        let hdr = graph.create_color("hdr", HDR_FORMAT, extent);
 
-        let scene_clear = ClearColor {
-            r: 0.02,
-            g: 0.02,
-            b: 0.06,
+        let sky = ClearColor {
+            r: ambient,
+            g: ambient,
+            b: ambient,
             a: 1.0,
         };
+        let zero = ClearColor {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        };
+        // Shadow pass: rasterize the mesh from the light's POV into the depth-only
+        // shadow map (the lighting pass samples it).
         graph.add_pass(
             PassInfo {
-                name: "scene",
-                color: Some((scene, Some(scene_clear))),
-                depth: Some(scene_depth),
+                name: "shadow",
+                colors: vec![],
+                depth: Some(shadow_map),
                 reads: vec![],
             },
             |ctx| {
+                // The model is the shadow caster (the ground is a flat receiver).
                 let cmd = ctx.cmd();
-                cmd.bind_graphics_pipeline(&pipeline);
-                cmd.push_constants(&mesh_push_constants(mvp, tex_index));
+                cmd.bind_graphics_pipeline(&shadow_pipeline);
+                cmd.push_constants(&mat4_bytes(&light_view_proj));
                 cmd.bind_vertex_buffer(&vbuf, 32);
                 cmd.bind_index_buffer(&ibuf, true);
                 cmd.draw_indexed(index_count, 0, 0);
                 Ok(())
             },
         );
-        // Three blur links: bright-pass + horizontal, then vertical, then horizontal.
-        let blur_pipeline_ref = &blur_pipeline;
-        for (name, dst, src, dir, threshold) in [
-            ("bloom_h0", bloom_a, scene, dir_h, 0.6f32),
-            ("bloom_v", bloom_b, bloom_a, dir_v, 0.0),
-            ("bloom_h1", bloom_c, bloom_b, dir_h, 0.0),
-        ] {
-            graph.add_pass(
-                PassInfo {
-                    name,
-                    color: Some((dst, None)),
-                    depth: None,
-                    reads: vec![src],
-                },
-                move |ctx| {
-                    let src_index = ctx.sampled_index(src);
-                    let cmd = ctx.cmd();
-                    cmd.bind_graphics_pipeline(blur_pipeline_ref);
-                    cmd.push_constants(&blur_push_constants(
-                        src_index,
-                        post_flip_y,
-                        dir,
-                        threshold,
-                    ));
-                    cmd.draw(3, 1);
-                    Ok(())
-                },
-            );
-        }
         graph.add_pass(
             PassInfo {
-                name: "composite",
-                color: Some((backbuffer, Some(ClearColor::BLACK))),
-                depth: None,
-                reads: vec![scene, bloom_c],
+                name: "gbuffer",
+                colors: vec![
+                    (g_albedo, Some(sky)),
+                    (g_normal, Some(ClearColor::BLACK)),
+                    (g_material, Some(ClearColor::BLACK)),
+                    (g_position, Some(zero)), // alpha 0 marks "no geometry"
+                ],
+                depth: Some(g_depth),
+                reads: vec![],
             },
             |ctx| {
-                let scene_index = ctx.sampled_index(scene);
-                let bloom_index = ctx.sampled_index(bloom_c);
                 let cmd = ctx.cmd();
-                cmd.bind_graphics_pipeline(&post_pipeline);
-                cmd.push_constants(&post_push_constants(
-                    scene_index,
-                    bloom_index,
-                    post_mode as u32,
-                    post_flip_y,
+                cmd.bind_graphics_pipeline(&gbuffer_pipeline);
+                // Model (its own PBR material, or the UI metallic/roughness
+                // override — drop the m/r texture so the factors apply directly).
+                let (m, rgh, model_mr) = if override_material {
+                    (metallic_override, roughness_override, NO_TEXTURE)
+                } else {
+                    (metallic_factor, roughness_factor, mr_index)
+                };
+                cmd.push_constants(&gbuffer_push(
+                    mvp,
+                    base_color_factor,
+                    m,
+                    rgh,
+                    [base_index, model_mr, normal_index, NO_TEXTURE],
                 ));
+                cmd.bind_vertex_buffer(&vbuf, 32);
+                cmd.bind_index_buffer(&ibuf, true);
+                cmd.draw_indexed(index_count, 0, 0);
+                // Ground plane (plain matte material, no textures).
+                cmd.push_constants(&gbuffer_push(
+                    mvp,
+                    [0.8, 0.8, 0.8, 1.0],
+                    0.0,
+                    0.9,
+                    [NO_TEXTURE; 4],
+                ));
+                cmd.bind_vertex_buffer(&ground_vbuf, 32);
+                cmd.bind_index_buffer(&ground_ibuf, true);
+                cmd.draw_indexed(ground_count, 0, 0);
+                Ok(())
+            },
+        );
+        graph.add_pass(
+            PassInfo {
+                name: "lighting",
+                colors: vec![(hdr, Some(ClearColor::BLACK))],
+                depth: None,
+                reads: vec![g_albedo, g_normal, g_material, g_position, shadow_map],
+            },
+            |ctx| {
+                let indices = [
+                    ctx.sampled_index(g_albedo),
+                    ctx.sampled_index(g_normal),
+                    ctx.sampled_index(g_material),
+                    ctx.sampled_index(g_position),
+                ];
+                let shadow_index = ctx.sampled_index(shadow_map);
+                let cmd = ctx.cmd();
+                cmd.set_globals(&globals_buffer, globals_offset);
+                cmd.bind_graphics_pipeline(&pbr_pipeline);
+                cmd.push_constants(&pbr_push(indices, flip_y, shadow_index));
                 cmd.draw(3, 1);
                 Ok(())
             },
         );
         graph.add_pass(
             PassInfo {
-                name: "ui",
-                color: Some((backbuffer, None)),
+                name: "tonemap",
+                colors: vec![(backbuffer, Some(ClearColor::BLACK))],
                 depth: None,
-                reads: vec![],
+                reads: vec![hdr],
             },
-            |ctx| gui.render(&device, ctx.cmd(), frame),
+            |ctx| {
+                let hdr_index = ctx.sampled_index(hdr);
+                let cmd = ctx.cmd();
+                cmd.bind_graphics_pipeline(&post_pipeline);
+                cmd.push_constants(&post_push(hdr_index, post_mode as u32, flip_y));
+                cmd.draw(3, 1);
+                Ok(())
+            },
         );
+        if include_ui {
+            graph.add_pass(
+                PassInfo {
+                    name: "ui",
+                    colors: vec![(backbuffer, None)],
+                    depth: None,
+                    reads: vec![],
+                },
+                |ctx| gui.render(&device, ctx.cmd(), frame),
+            );
+        }
         graph.execute(
             &device,
             &mut pools[frame],
@@ -383,14 +778,49 @@ fn main() -> anyhow::Result<()> {
             aliasing,
         )?;
 
+        // For a screenshot, copy the just-rendered backbuffer into a readback
+        // buffer in the same command buffer (before it ends).
+        let readback = if capture_this_frame.is_some() {
+            let layout = device.swapchain_readback_layout(&swapchain);
+            let buf = device.create_buffer(&BufferDesc {
+                size: layout.size,
+                usage: BufferUsage::Readback,
+            })?;
+            cmd.copy_swapchain_to_buffer(&swapchain, image_index, &buf);
+            Some((buf, layout))
+        } else {
+            None
+        };
+
         cmd.end()?;
 
         let signal = &render_finished[image_index as usize];
         queue.submit(cmd, &image_available[frame], signal, fence)?;
+
+        // Wait for the GPU (copy included), read the buffer back, and save a PNG.
+        if let (Some(cap), Some((buf, layout))) =
+            (capture_this_frame.as_ref(), readback.as_ref())
+        {
+            fence.wait()?;
+            let mut bytes = vec![0u8; layout.size as usize];
+            buf.read_into(&mut bytes)?;
+            save_screenshot(&cap.path, &bytes, layout)?;
+            info!(
+                "saved screenshot {} ({}x{}, ui={})",
+                cap.path, layout.width, layout.height, cap.include_ui
+            );
+        }
+
         if queue.present(&swapchain, image_index, signal)? {
             needs_recreate = true;
         }
         frame = (frame + 1) % FRAMES_IN_FLIGHT;
+        frame_no += 1;
+
+        // In screenshot mode, exit once every requested capture is saved.
+        if screenshot_mode && frame_no >= SCREENSHOT_WARMUP + captures.len() as u64 {
+            break;
+        }
     }
 
     device.wait_idle()?;
@@ -398,34 +828,222 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Pack the mesh push-constant block: column-major mvp (64B) + tex_index (4B).
-fn mesh_push_constants(mvp: [f32; 16], tex_index: u32) -> [u8; 68] {
-    let mut pc = [0u8; 68];
+/// View the globals struct as bytes for upload.
+fn globals_bytes(g: &Globals) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(g as *const Globals as *const u8, std::mem::size_of::<Globals>())
+    }
+}
+
+fn normalize3(v: [f32; 3]) -> [f32; 4] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-5);
+    [v[0] / len, v[1] / len, v[2] / len, 0.0]
+}
+
+/// Pack the G-buffer push block: mvp(64) + base_color(16) + metallic/roughness(16)
+/// + texture indices u32x4 (16) = 112 bytes.
+fn gbuffer_push(
+    mvp: [f32; 16],
+    base_color: [f32; 4],
+    metallic: f32,
+    roughness: f32,
+    tex: [u32; 4],
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
     for (i, f) in mvp.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
-    pc[64..68].copy_from_slice(&tex_index.to_le_bytes());
+    for (i, f) in base_color.iter().enumerate() {
+        let o = 64 + i * 4;
+        pc[o..o + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    pc[80..84].copy_from_slice(&metallic.to_le_bytes());
+    pc[84..88].copy_from_slice(&roughness.to_le_bytes());
+    for (i, t) in tex.iter().enumerate() {
+        let o = 96 + i * 4;
+        pc[o..o + 4].copy_from_slice(&t.to_le_bytes());
+    }
     pc
 }
 
-/// Pack the composite push block: scene_index + bloom_index + mode + flip_y (16B).
-fn post_push_constants(scene_index: u32, bloom_index: u32, mode: u32, flip_y: u32) -> [u8; 16] {
+/// Pack the lighting push block: 4 G-buffer indices + flip_y + shadow_index
+/// (24 bytes).
+fn pbr_push(indices: [u32; 4], flip_y: u32, shadow_index: u32) -> [u8; 24] {
+    let mut pc = [0u8; 24];
+    for (i, v) in indices.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[16..20].copy_from_slice(&flip_y.to_le_bytes());
+    pc[20..24].copy_from_slice(&shadow_index.to_le_bytes());
+    pc
+}
+
+/// View a column-major 4x4 matrix as push-constant bytes.
+fn mat4_bytes(m: &[f32; 16]) -> [u8; 64] {
+    let mut pc = [0u8; 64];
+    for (i, f) in m.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    pc
+}
+
+/// Directional-light view-projection: an orthographic box centered on `center`,
+/// looking from the sun's direction toward it. Returned column-major (glam's
+/// `to_cols_array`), matching the shader's `mul(M, v)` convention. No Vulkan
+/// Y-flip — the pbr shader handles the per-backend shadow-UV flip.
+fn light_view_proj(sun_dir: [f32; 3], center: Vec3, radius: f32) -> [f32; 16] {
+    let dir = Vec3::new(sun_dir[0], sun_dir[1], sun_dir[2]).normalize_or_zero();
+    let dir = if dir == Vec3::ZERO { Vec3::Y } else { dir };
+    let dist = radius * 4.0;
+    let light_pos = center + dir * dist;
+    // Avoid a degenerate up vector when the light is near-vertical.
+    let up = if dir.dot(Vec3::Y).abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let view = Mat4::look_at_rh(light_pos, center, up);
+    let half = radius * 1.6;
+    let proj = Mat4::orthographic_rh(-half, half, -half, half, 0.1, dist + radius * 2.0);
+    (proj * view).to_cols_array()
+}
+
+/// The pipelines + cubemaps used to (re)generate the IBL environment chain.
+struct IblResources<'a> {
+    sky_pipeline: &'a GraphicsPipeline,
+    irradiance_pipeline: &'a GraphicsPipeline,
+    prefilter_pipeline: &'a GraphicsPipeline,
+    env_cube: &'a Cubemap,
+    irradiance_cube: &'a Cubemap,
+    prefilter_cube: &'a Cubemap,
+}
+
+/// Regenerate the environment chain: procedural sky → env cube, then convolve it
+/// into the diffuse-irradiance cube and the per-roughness specular prefilter cube
+/// (each map left shader-readable). Reusable — call again when the sky changes
+/// (future real-time atmospheric model / dynamic probe). The BRDF LUT is
+/// sky-independent (see [`generate_brdf_lut`]).
+fn generate_environment(
+    queue: &Queue,
+    cmd: &CommandBuffer,
+    fence: &Fence,
+    ibl: &IblResources,
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    flip_y: u32,
+) -> anyhow::Result<()> {
+    let env_index = ibl.env_cube.bindless_index();
+    cmd.begin()?;
+
+    // 1. Procedural sky -> environment cube.
+    cmd.cube_to_color(ibl.env_cube);
+    for face in 0..6u32 {
+        cmd.begin_rendering_cube_face(ibl.env_cube, face, 0, Some(ClearColor::BLACK));
+        cmd.set_viewport_scissor_extent(Extent2D::new(ENV_SIZE, ENV_SIZE));
+        cmd.bind_graphics_pipeline(ibl.sky_pipeline);
+        cmd.push_constants(&sky_push(sun_dir, sun_intensity, face, flip_y));
+        cmd.draw(3, 1);
+        cmd.end_rendering();
+    }
+    cmd.cube_to_sampled(ibl.env_cube);
+
+    // 2. Env -> diffuse irradiance cube.
+    cmd.cube_to_color(ibl.irradiance_cube);
+    for face in 0..6u32 {
+        cmd.begin_rendering_cube_face(ibl.irradiance_cube, face, 0, Some(ClearColor::BLACK));
+        cmd.set_viewport_scissor_extent(Extent2D::new(IRRADIANCE_SIZE, IRRADIANCE_SIZE));
+        cmd.bind_graphics_pipeline(ibl.irradiance_pipeline);
+        cmd.push_constants(&cube_gen_push(face, flip_y, env_index, 0.0));
+        cmd.draw(3, 1);
+        cmd.end_rendering();
+    }
+    cmd.cube_to_sampled(ibl.irradiance_cube);
+
+    // 3. Env -> specular prefilter cube (one roughness per mip).
+    cmd.cube_to_color(ibl.prefilter_cube);
+    for mip in 0..PREFILTER_MIPS {
+        let roughness = if PREFILTER_MIPS > 1 {
+            mip as f32 / (PREFILTER_MIPS - 1) as f32
+        } else {
+            0.0
+        };
+        let size = (PREFILTER_SIZE >> mip).max(1);
+        for face in 0..6u32 {
+            cmd.begin_rendering_cube_face(ibl.prefilter_cube, face, mip, Some(ClearColor::BLACK));
+            cmd.set_viewport_scissor_extent(Extent2D::new(size, size));
+            cmd.bind_graphics_pipeline(ibl.prefilter_pipeline);
+            cmd.push_constants(&cube_gen_push(face, flip_y, env_index, roughness));
+            cmd.draw(3, 1);
+            cmd.end_rendering();
+        }
+    }
+    cmd.cube_to_sampled(ibl.prefilter_cube);
+
+    cmd.end()?;
+    queue.submit_oneshot(cmd, fence)?;
+    fence.wait()?;
+    fence.reset()?; // leave unsignaled for reuse
+    Ok(())
+}
+
+/// Integrate the environment-BRDF LUT (sky-independent; generate once).
+fn generate_brdf_lut(
+    queue: &Queue,
+    cmd: &CommandBuffer,
+    fence: &Fence,
+    brdf_pipeline: &GraphicsPipeline,
+    brdf_lut: &rhi::RenderTarget,
+    flip_y: u32,
+) -> anyhow::Result<()> {
+    cmd.begin()?;
+    cmd.rt_to_render_target(brdf_lut);
+    cmd.begin_rendering_target(brdf_lut, Some(ClearColor::BLACK), None);
+    cmd.set_viewport_scissor_extent(Extent2D::new(BRDF_SIZE, BRDF_SIZE));
+    cmd.bind_graphics_pipeline(brdf_pipeline);
+    let mut push = [0u8; 16];
+    push[0..4].copy_from_slice(&flip_y.to_le_bytes());
+    cmd.push_constants(&push);
+    cmd.draw(3, 1);
+    cmd.end_rendering();
+    cmd.rt_to_sampled(brdf_lut);
+    cmd.end()?;
+    queue.submit_oneshot(cmd, fence)?;
+    fence.wait()?;
+    fence.reset()?;
+    Ok(())
+}
+
+/// Pack the sky push block: sun float4 (xyz dir, w intensity) + face + flip_y +
+/// pad (32 bytes).
+fn sky_push(sun_dir: [f32; 3], intensity: f32, face: u32, flip_y: u32) -> [u8; 32] {
+    let n = normalize3(sun_dir);
+    let mut pc = [0u8; 32];
+    for (i, v) in n.iter().take(3).enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[12..16].copy_from_slice(&intensity.to_le_bytes());
+    pc[16..20].copy_from_slice(&face.to_le_bytes());
+    pc[20..24].copy_from_slice(&flip_y.to_le_bytes());
+    pc
+}
+
+/// Pack the irradiance/prefilter push block: face + flip_y + env_index +
+/// roughness (16 bytes; irradiance ignores roughness).
+fn cube_gen_push(face: u32, flip_y: u32, env_index: u32, roughness: f32) -> [u8; 16] {
     let mut pc = [0u8; 16];
-    pc[0..4].copy_from_slice(&scene_index.to_le_bytes());
-    pc[4..8].copy_from_slice(&bloom_index.to_le_bytes());
-    pc[8..12].copy_from_slice(&mode.to_le_bytes());
-    pc[12..16].copy_from_slice(&flip_y.to_le_bytes());
+    pc[0..4].copy_from_slice(&face.to_le_bytes());
+    pc[4..8].copy_from_slice(&flip_y.to_le_bytes());
+    pc[8..12].copy_from_slice(&env_index.to_le_bytes());
+    pc[12..16].copy_from_slice(&roughness.to_le_bytes());
     pc
 }
 
-/// Pack the blur push block: src_index + flip_y + direction.xy + threshold (20B).
-fn blur_push_constants(src_index: u32, flip_y: u32, dir: [f32; 2], threshold: f32) -> [u8; 20] {
-    let mut pc = [0u8; 20];
-    pc[0..4].copy_from_slice(&src_index.to_le_bytes());
-    pc[4..8].copy_from_slice(&flip_y.to_le_bytes());
-    pc[8..12].copy_from_slice(&dir[0].to_le_bytes());
-    pc[12..16].copy_from_slice(&dir[1].to_le_bytes());
-    pc[16..20].copy_from_slice(&threshold.to_le_bytes());
+/// Pack the tonemap push block: hdr_index + mode + flip_y + pad (16 bytes).
+fn post_push(hdr_index: u32, mode: u32, flip_y: u32) -> [u8; 16] {
+    let mut pc = [0u8; 16];
+    pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&mode.to_le_bytes());
+    pc[8..12].copy_from_slice(&flip_y.to_le_bytes());
     pc
 }
 
@@ -455,13 +1073,87 @@ fn upload_mesh(device: &Device, model: &MeshData) -> anyhow::Result<(Buffer, Buf
     Ok((vbuf, ibuf, model.indices.len() as u32))
 }
 
-fn bounding_radius(model: &MeshData) -> f32 {
-    model
-        .vertices
-        .iter()
-        .map(|v| (v.pos[0] * v.pos[0] + v.pos[1] * v.pos[1] + v.pos[2] * v.pos[2]).sqrt())
-        .fold(0.0f32, f32::max)
-        .max(0.5)
+/// Create a sampled texture from decoded image data and return its bindless index,
+/// keeping the texture alive in `store`.
+fn upload_texture(
+    device: &Device,
+    store: &mut Vec<Texture>,
+    img: &ImageData,
+    format: Format,
+) -> anyhow::Result<u32> {
+    let t = device.create_texture(
+        &TextureDesc {
+            width: img.width,
+            height: img.height,
+            format,
+        },
+        &img.rgba8,
+    )?;
+    let idx = t.bindless_index();
+    store.push(t);
+    Ok(idx)
+}
+
+/// A large horizontal quad at height `y` (normal up, +Y), used as a shadow
+/// receiver. `half` is half its side length. Built on the mesh vertex layout so
+/// it shares the G-buffer / shadow pipelines.
+fn ground_mesh(half: f32, y: f32) -> MeshData {
+    let v = |x: f32, z: f32, u: f32, w: f32| MeshVertex {
+        pos: [x, y, z],
+        normal: [0.0, 1.0, 0.0],
+        uv: [u, w],
+    };
+    MeshData {
+        vertices: vec![
+            v(-half, -half, 0.0, 0.0),
+            v(half, -half, 1.0, 0.0),
+            v(half, half, 1.0, 1.0),
+            v(-half, half, 0.0, 1.0),
+        ],
+        indices: vec![0, 1, 2, 0, 2, 3],
+        material: dreamcoast_asset::Material::default(),
+    }
+}
+
+/// Framing bounds of the normalized model.
+struct ModelBounds {
+    /// Bounding-sphere radius (always 1.0 after normalization) — the unit the
+    /// camera, ground, lights, and shadow box are sized in.
+    radius: f32,
+    /// Model height (AABB extent along +Y) after normalization; the model rests
+    /// on y = 0.
+    height: f32,
+}
+
+/// Normalize a mesh into canonical units: recenter its footprint on the origin,
+/// rest its base on `y = 0`, and uniformly scale so its bounding-sphere radius is
+/// 1.0. glTF models vary wildly in authored scale/placement (this avocado is
+/// sub-0.1 units, off the origin); normalizing keeps the camera/near-far planes,
+/// ground, lights, and shadow box in comfortable, model-independent units.
+fn normalize_on_ground(model: &mut MeshData) -> ModelBounds {
+    let mut min = [f32::MAX; 3];
+    let mut max = [f32::MIN; 3];
+    for v in &model.vertices {
+        for i in 0..3 {
+            min[i] = min[i].min(v.pos[i]);
+            max[i] = max[i].max(v.pos[i]);
+        }
+    }
+    let cx = (min[0] + max[0]) * 0.5;
+    let cz = (min[2] + max[2]) * 0.5;
+    let base = min[1];
+    let (sx, sy, sz) = (max[0] - min[0], max[1] - min[1], max[2] - min[2]);
+    let radius = (0.5 * (sx * sx + sy * sy + sz * sz).sqrt()).max(1e-6);
+    let s = 1.0 / radius; // normalize the bounding-sphere radius to 1.0
+    for v in &mut model.vertices {
+        v.pos[0] = (v.pos[0] - cx) * s;
+        v.pos[1] = (v.pos[1] - base) * s;
+        v.pos[2] = (v.pos[2] - cz) * s;
+    }
+    ModelBounds {
+        radius: 1.0,
+        height: (sy * s).max(1e-3),
+    }
 }
 
 /// 8x8 magenta/grey checker (fallback base color).
@@ -482,7 +1174,7 @@ fn make_checker_texture(device: &Device) -> anyhow::Result<Texture> {
         &TextureDesc {
             width: N,
             height: N,
-            format: Format::Rgba8Unorm,
+            format: Format::Rgba8Srgb,
         },
         &pixels,
     )?)
@@ -511,6 +1203,65 @@ fn build_render_finished(device: &Device, count: u32) -> anyhow::Result<Vec<Sema
     (0..count)
         .map(|_| device.create_semaphore().map_err(Into::into))
         .collect()
+}
+
+/// A requested screenshot: output path + whether to include the ImGui overlay.
+#[derive(Clone)]
+struct Capture {
+    path: String,
+    include_ui: bool,
+}
+
+/// Parse `--screenshot <path>` (with UI overlay) and `--screenshot-clean <path>`
+/// (3D only) flags into capture requests, in argument order. Presence of any
+/// puts the app in headless screenshot mode (render a few frames, capture, exit).
+fn screenshot_captures() -> Vec<Capture> {
+    let mut out = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let include_ui = match arg.as_str() {
+            "--screenshot" => true,
+            "--screenshot-clean" => false,
+            _ => continue,
+        };
+        if let Some(path) = args.next() {
+            out.push(Capture { path, include_ui });
+        }
+    }
+    out
+}
+
+/// Auto-generated path for an interactive (F2) screenshot.
+fn interactive_screenshot_path() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("screenshot_{secs}.png")
+}
+
+/// Save BGRA readback bytes (rows padded to `layout.row_pitch`) as a PNG. The
+/// swapchain stores sRGB-encoded bytes, so they map straight to a PNG after the
+/// B<->R channel swap; padding is dropped per row.
+fn save_screenshot(path: &str, data: &[u8], layout: &ReadbackLayout) -> anyhow::Result<()> {
+    let w = layout.width as usize;
+    let h = layout.height as usize;
+    let pitch = layout.row_pitch as usize;
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let src = &data[y * pitch..y * pitch + w * 4];
+        let dst = &mut rgba[y * w * 4..(y + 1) * w * 4];
+        for x in 0..w {
+            dst[x * 4] = src[x * 4 + 2]; // R <- B
+            dst[x * 4 + 1] = src[x * 4 + 1]; // G
+            dst[x * 4 + 2] = src[x * 4]; // B <- R
+            dst[x * 4 + 3] = src[x * 4 + 3]; // A
+        }
+    }
+    let img = image::RgbaImage::from_raw(layout.width, layout.height, rgba)
+        .ok_or_else(|| anyhow!("screenshot buffer size mismatch"))?;
+    img.save(path)?;
+    Ok(())
 }
 
 /// Model path: `--model <path>` or the default `assets/model.glb`.

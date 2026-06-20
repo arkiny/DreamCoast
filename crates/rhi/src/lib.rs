@@ -54,6 +54,8 @@ backend_enum!(/// A depth buffer for the mesh pass.
     DepthBuffer => rhi_vulkan::VulkanDepthBuffer, rhi_d3d12::D3d12DepthBuffer);
 backend_enum!(/// An offscreen color render target (attachment + bindless sampled).
     RenderTarget => rhi_vulkan::VulkanRenderTarget, rhi_d3d12::D3d12RenderTarget);
+backend_enum!(/// A render-target cubemap (6 faces + bindless `TextureCube`), for IBL.
+    Cubemap => rhi_vulkan::VulkanCubemap, rhi_d3d12::D3d12Cubemap);
 backend_enum!(/// A heap that transient render targets alias into at graph-computed offsets.
     TransientHeap => rhi_vulkan::VulkanTransientHeap, rhi_d3d12::D3d12TransientHeap);
 
@@ -63,6 +65,25 @@ impl Buffer {
         match self {
             Self::Vulkan(b) => b.write(data),
             Self::D3d12(b) => b.write(data),
+        }
+    }
+
+    /// Copy bytes into the buffer at `offset` (for per-frame uniform slices).
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        match self {
+            Self::Vulkan(b) => b.write_at(offset, data),
+            Self::D3d12(b) => b.write_at(offset, data),
+        }
+    }
+
+    /// Copy bytes out of the buffer into `dst` (for `Readback` buffers).
+    pub fn read_into(&self, dst: &mut [u8]) -> Result<()> {
+        match self {
+            Self::Vulkan(b) => {
+                b.read_into(dst);
+                Ok(())
+            }
+            Self::D3d12(b) => b.read_into(dst),
         }
     }
 }
@@ -83,6 +104,42 @@ impl RenderTarget {
         match self {
             Self::Vulkan(t) => t.bindless_index(),
             Self::D3d12(t) => t.bindless_index(),
+        }
+    }
+}
+
+impl DepthBuffer {
+    /// Index of this depth buffer in the device's bindless table (shadow map).
+    pub fn bindless_index(&self) -> u32 {
+        match self {
+            Self::Vulkan(d) => d.bindless_index(),
+            Self::D3d12(d) => d.bindless_index(),
+        }
+    }
+}
+
+impl Cubemap {
+    /// Index of this cubemap in the device's bindless cube table.
+    pub fn bindless_index(&self) -> u32 {
+        match self {
+            Self::Vulkan(c) => c.bindless_index(),
+            Self::D3d12(c) => c.bindless_index(),
+        }
+    }
+
+    /// Number of mip levels.
+    pub fn mip_levels(&self) -> u32 {
+        match self {
+            Self::Vulkan(c) => c.mip_levels(),
+            Self::D3d12(c) => c.mip_levels(),
+        }
+    }
+
+    /// Edge length of `mip` (`size >> mip`, at least 1).
+    pub fn mip_size(&self, mip: u32) -> u32 {
+        match self {
+            Self::Vulkan(c) => c.mip_size(mip),
+            Self::D3d12(c) => c.mip_size(mip),
         }
     }
 }
@@ -145,6 +202,17 @@ impl Device {
         }
     }
 
+    /// Register the per-frame globals uniform buffer. `slice_size` is one frame's
+    /// slice (selected per-frame via [`CommandBuffer::set_globals`]). On D3D12 this
+    /// is a no-op (the globals are bound as a root CBV by GPU address per draw).
+    pub fn set_globals_buffer(&self, buffer: &Buffer, slice_size: u64) {
+        match (self, buffer) {
+            (Self::Vulkan(d), Buffer::Vulkan(b)) => d.set_globals_buffer(b, slice_size),
+            (Self::D3d12(_), Buffer::D3d12(_)) => {}
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
     pub fn create_texture(&self, desc: &TextureDesc, pixels: &[u8]) -> Result<Texture> {
         match self {
             Self::Vulkan(d) => Ok(Texture::Vulkan(d.create_texture(desc, pixels)?)),
@@ -163,6 +231,25 @@ impl Device {
         match self {
             Self::Vulkan(d) => Ok(RenderTarget::Vulkan(d.create_render_target(desc)?)),
             Self::D3d12(d) => Ok(RenderTarget::D3d12(d.create_render_target(desc)?)),
+        }
+    }
+
+    /// Create a render-target cubemap (6 faces, `mip_levels` each) for IBL.
+    pub fn create_cubemap(&self, desc: &CubemapDesc) -> Result<Cubemap> {
+        match self {
+            Self::Vulkan(d) => Ok(Cubemap::Vulkan(d.create_cubemap(desc)?)),
+            Self::D3d12(d) => Ok(Cubemap::D3d12(d.create_cubemap(desc)?)),
+        }
+    }
+
+    /// CPU memory layout for reading a swapchain image back to the host (for
+    /// screenshots). Use it to size a [`BufferUsage::Readback`] buffer and to skip
+    /// per-row padding after [`CommandBuffer::copy_swapchain_to_buffer`].
+    pub fn swapchain_readback_layout(&self, swapchain: &Swapchain) -> ReadbackLayout {
+        match (self, swapchain) {
+            (Self::Vulkan(d), Swapchain::Vulkan(s)) => d.swapchain_readback_layout(s),
+            (Self::D3d12(d), Swapchain::D3d12(s)) => d.swapchain_readback_layout(s),
+            _ => unreachable!("{MIXED}"),
         }
     }
 
@@ -362,10 +449,147 @@ impl CommandBuffer {
         }
     }
 
+    /// Begin a render pass into N offscreen color targets (MRT) + optional depth.
+    /// Each `Some(clear)` clears its target, `None` loads. All targets must be in
+    /// render-target state (see [`Self::rt_to_render_target`]). `targets` must be
+    /// non-empty and all from the same backend as this command buffer.
+    pub fn begin_rendering_targets(
+        &self,
+        targets: &[(&RenderTarget, Option<ClearColor>)],
+        depth: Option<&DepthBuffer>,
+    ) {
+        match self {
+            Self::Vulkan(c) => {
+                let vk_targets: Vec<_> = targets
+                    .iter()
+                    .map(|(t, clear)| match t {
+                        RenderTarget::Vulkan(t) => (t, *clear),
+                        _ => unreachable!("{MIXED}"),
+                    })
+                    .collect();
+                match depth {
+                    None => c.begin_rendering_targets(&vk_targets, None),
+                    Some(DepthBuffer::Vulkan(d)) => c.begin_rendering_targets(&vk_targets, Some(d)),
+                    _ => unreachable!("{MIXED}"),
+                }
+            }
+            Self::D3d12(c) => {
+                let dx_targets: Vec<_> = targets
+                    .iter()
+                    .map(|(t, clear)| match t {
+                        RenderTarget::D3d12(t) => (t, *clear),
+                        _ => unreachable!("{MIXED}"),
+                    })
+                    .collect();
+                match depth {
+                    None => c.begin_rendering_targets(&dx_targets, None),
+                    Some(DepthBuffer::D3d12(d)) => c.begin_rendering_targets(&dx_targets, Some(d)),
+                    _ => unreachable!("{MIXED}"),
+                }
+            }
+        }
+    }
+
+    /// Select the per-frame globals slice for the next PBR pipeline bind. `offset`
+    /// is the byte offset of this frame's slice within the globals buffer
+    /// registered via [`Device::set_globals_buffer`].
+    pub fn set_globals(&self, buffer: &Buffer, offset: u64) {
+        match (self, buffer) {
+            (Self::Vulkan(c), Buffer::Vulkan(_)) => c.set_globals(offset as u32),
+            (Self::D3d12(c), Buffer::D3d12(b)) => c.set_globals(b.gpu_va() + offset),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Begin a depth-only render pass into `depth` (a shadow map): no color
+    /// targets, depth cleared + stored. The depth must already be in
+    /// depth-attachment state (see [`Self::depth_to_render_target`]).
+    pub fn begin_rendering_depth_only(&self, depth: &DepthBuffer) {
+        match (self, depth) {
+            (Self::Vulkan(c), DepthBuffer::Vulkan(d)) => c.begin_rendering_depth_only(d),
+            (Self::D3d12(c), DepthBuffer::D3d12(d)) => c.begin_rendering_depth_only(d),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Transition a depth buffer into depth-attachment state for writing.
+    pub fn depth_to_render_target(&self, depth: &DepthBuffer) {
+        match (self, depth) {
+            (Self::Vulkan(c), DepthBuffer::Vulkan(d)) => c.depth_to_render_target(d),
+            (Self::D3d12(c), DepthBuffer::D3d12(d)) => c.depth_to_render_target(d),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Transition a depth buffer into shader-read state for sampling.
+    pub fn depth_to_sampled(&self, depth: &DepthBuffer) {
+        match (self, depth) {
+            (Self::Vulkan(c), DepthBuffer::Vulkan(d)) => c.depth_to_sampled(d),
+            (Self::D3d12(c), DepthBuffer::D3d12(d)) => c.depth_to_sampled(d),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Transition a whole cubemap into render-target state for writing its faces.
+    pub fn cube_to_color(&self, cube: &Cubemap) {
+        match (self, cube) {
+            (Self::Vulkan(c), Cubemap::Vulkan(m)) => c.cube_to_color(m),
+            (Self::D3d12(c), Cubemap::D3d12(m)) => c.cube_to_color(m),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Transition a whole cubemap into shader-read state for sampling.
+    pub fn cube_to_sampled(&self, cube: &Cubemap) {
+        match (self, cube) {
+            (Self::Vulkan(c), Cubemap::Vulkan(m)) => c.cube_to_sampled(m),
+            (Self::D3d12(c), Cubemap::D3d12(m)) => c.cube_to_sampled(m),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Begin a render pass into one (face, mip) of a cubemap. The cubemap must
+    /// already be in render-target state (see [`Self::cube_to_color`]).
+    pub fn begin_rendering_cube_face(
+        &self,
+        cube: &Cubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+    ) {
+        match (self, cube) {
+            (Self::Vulkan(c), Cubemap::Vulkan(m)) => c.begin_rendering_cube_face(m, face, mip, clear),
+            (Self::D3d12(c), Cubemap::D3d12(m)) => c.begin_rendering_cube_face(m, face, mip, clear),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
     pub fn end_rendering(&self) {
         match self {
             Self::Vulkan(c) => c.end_rendering(),
             Self::D3d12(c) => c.end_rendering(),
+        }
+    }
+
+    /// Copy a rendered swapchain image into a `Readback` buffer for screenshots.
+    /// Call right after the render graph executes (the backbuffer is in present
+    /// state); the image is restored to present state afterward. Submit the
+    /// command buffer, wait for the fence, then [`Buffer::read_into`] and decode
+    /// using [`Device::swapchain_readback_layout`].
+    pub fn copy_swapchain_to_buffer(
+        &self,
+        swapchain: &Swapchain,
+        image_index: u32,
+        buffer: &Buffer,
+    ) {
+        match (self, swapchain, buffer) {
+            (Self::Vulkan(c), Swapchain::Vulkan(s), Buffer::Vulkan(b)) => {
+                c.copy_swapchain_to_buffer(s, image_index, b)
+            }
+            (Self::D3d12(c), Swapchain::D3d12(s), Buffer::D3d12(b)) => {
+                c.copy_swapchain_to_buffer(s, image_index, b)
+            }
+            _ => unreachable!("{MIXED}"),
         }
     }
 
@@ -489,6 +713,18 @@ impl Queue {
                 Semaphore::D3d12(s),
                 Fence::D3d12(f),
             ) => q.submit(c, w, s, f),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Submit one command buffer with no semaphore sync, signaling `fence`. For
+    /// one-off startup work (e.g. IBL cubemap generation).
+    pub fn submit_oneshot(&self, cmd: &CommandBuffer, fence: &Fence) -> Result<()> {
+        match (self, cmd, fence) {
+            (Self::Vulkan(q), CommandBuffer::Vulkan(c), Fence::Vulkan(f)) => {
+                q.submit_oneshot(c, f)
+            }
+            (Self::D3d12(q), CommandBuffer::D3d12(c), Fence::D3d12(f)) => q.submit_oneshot(c, f),
             _ => unreachable!("{MIXED}"),
         }
     }

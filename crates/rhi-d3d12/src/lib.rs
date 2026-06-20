@@ -14,10 +14,12 @@ use rhi_types::Format;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
     DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+    DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
 };
 
 mod buffer;
 mod command;
+mod cubemap;
 mod depth;
 mod device;
 mod instance;
@@ -29,6 +31,7 @@ mod texture;
 
 pub use buffer::D3d12Buffer;
 pub use command::D3d12CommandBuffer;
+pub use cubemap::D3d12Cubemap;
 pub use depth::D3d12DepthBuffer;
 pub use device::{D3d12Device, D3d12Queue};
 pub use instance::D3d12Instance;
@@ -45,6 +48,8 @@ fn to_dxgi_format(format: Format) -> DXGI_FORMAT {
         Format::Bgra8Srgb => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
         Format::Rgba8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
         Format::Rgba8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        Format::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        Format::Rg16Float => DXGI_FORMAT_R16G16_FLOAT,
         Format::Depth32Float => DXGI_FORMAT_D32_FLOAT,
     }
 }
@@ -56,6 +61,8 @@ fn to_dxgi_swapchain_format(format: Format) -> DXGI_FORMAT {
     match format {
         Format::Bgra8Unorm | Format::Bgra8Srgb => DXGI_FORMAT_B8G8R8A8_UNORM,
         Format::Rgba8Unorm | Format::Rgba8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM,
+        Format::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        Format::Rg16Float => DXGI_FORMAT_R16G16_FLOAT,
         Format::Depth32Float => DXGI_FORMAT_D32_FLOAT,
     }
 }

@@ -17,10 +17,10 @@
 //! let backbuffer = graph.import_backbuffer(swapchain.format(), extent);
 //! let scene = graph.create_color("scene", scene_format, extent);
 //! let depth = graph.create_depth("depth", extent);
-//! graph.add_pass(PassInfo { name: "scene", color: Some((scene, Some(clear))),
+//! graph.add_pass(PassInfo { name: "scene", colors: vec![(scene, Some(clear))],
 //!                           depth: Some(depth), reads: vec![] },
 //!                |ctx| { /* draw mesh */ });
-//! graph.add_pass(PassInfo { name: "post", color: Some((backbuffer, None)),
+//! graph.add_pass(PassInfo { name: "post", colors: vec![(backbuffer, None)],
 //!                           depth: None, reads: vec![scene] },
 //!                |ctx| { /* sample ctx.sampled_index(scene) */ });
 //! graph.execute(&device, &mut pool, &cmd, &swapchain, image_index, true)?;
@@ -63,9 +63,10 @@ struct Resource {
 /// What a pass does to a resource.
 struct PassNode<'a> {
     name: String,
-    /// Single color attachment + its load behavior (`Some(clear)` clears,
-    /// `None` loads).
-    color: Option<(ResourceId, Option<ClearColor>)>,
+    /// Color attachments written by the pass, in attachment order. Each carries
+    /// its load behavior (`Some(clear)` clears, `None` loads). Multiple entries
+    /// drive MRT (e.g. a G-buffer fill). A backbuffer pass has exactly one.
+    colors: Vec<(ResourceId, Option<ClearColor>)>,
     depth: Option<ResourceId>,
     reads: Vec<ResourceId>,
     record: RecordFn<'a>,
@@ -74,9 +75,9 @@ struct PassNode<'a> {
 /// Declarative description of a pass (everything but the record closure).
 pub struct PassInfo<'a> {
     pub name: &'a str,
-    /// Color attachment written by the pass, with `Some(clear)` to clear or
-    /// `None` to load.
-    pub color: Option<(ResourceId, Option<ClearColor>)>,
+    /// Color attachments written by the pass, in attachment order. `Some(clear)`
+    /// clears, `None` loads. One element is the common case; multiple drive MRT.
+    pub colors: Vec<(ResourceId, Option<ClearColor>)>,
     /// Depth attachment written by the pass (always cleared).
     pub depth: Option<ResourceId>,
     /// Resources sampled by the pass.
@@ -162,7 +163,7 @@ impl<'a> RenderGraph<'a> {
     ) {
         self.passes.push(PassNode {
             name: info.name.to_string(),
-            color: info.color,
+            colors: info.colors,
             depth: info.depth,
             reads: info.reads,
             record: Box::new(record),
@@ -351,57 +352,81 @@ impl<'a> RenderGraph<'a> {
         // Phase 2 — record (immutable pool access).
         let mut backbuffer_is_rt = false;
         for &pass_idx in &compiled.schedule {
-            // Barriers: reads -> sampled.
+            // Barriers: reads -> sampled (color targets and depth/shadow maps).
             for &r in &self.passes[pass_idx].reads {
                 if let Some(loc) = color_locs.get(&r) {
                     cmd.rt_to_sampled(pool.color_target(loc));
+                } else if let Some(&slot) = depth_slots.get(&r) {
+                    cmd.depth_to_sampled(pool.depth(slot));
                 }
             }
 
-            // Resolve the color attachment and transition it for writing.
-            let (color, clear) = self.passes[pass_idx]
-                .color
-                .expect("pass has no color target");
-            let color_res = &self.resources[color.0];
-            let extent = color_res.extent;
-            if color_res.backbuffer {
-                if !backbuffer_is_rt {
-                    cmd.transition_to_render_target(swapchain, image_index);
-                    backbuffer_is_rt = true;
-                }
-            } else {
-                let target = pool.color_target(&color_locs[&color]);
-                if alias_barrier.get(&color).copied().unwrap_or(false) {
-                    cmd.aliasing_barrier(target);
-                } else {
-                    cmd.rt_to_render_target(target);
-                }
-            }
-
-            // Begin the render pass.
+            // Transition this pass's depth attachment for writing (a shadow map
+            // reused across frames may be in shader-read from the prior frame).
             let depth_ref = self.passes[pass_idx]
                 .depth
                 .map(|d| pool.depth(depth_slots[&d]));
-            if color_res.backbuffer {
-                cmd.begin_rendering(swapchain, image_index, clear, depth_ref);
-                cmd.set_viewport_scissor(swapchain);
-            } else {
-                cmd.begin_rendering_target(
-                    pool.color_target(&color_locs[&color]),
-                    clear,
-                    depth_ref,
-                );
-                cmd.set_viewport_scissor_extent(extent);
+            if let Some(d) = depth_ref {
+                cmd.depth_to_render_target(d);
             }
 
-            // Build the sampled-index map for the pass and run its record closure.
+            // Resolve the color attachments, transition them for writing, and
+            // begin the render pass. A depth-only pass (no colors) is a shadow
+            // map; the backbuffer (when written) is always a single attachment;
+            // other offscreen passes may write 1..N (MRT).
+            let colors = &self.passes[pass_idx].colors;
+            let extent = if colors.is_empty() {
+                let depth_id = self.passes[pass_idx]
+                    .depth
+                    .expect("depth-only pass needs a depth attachment");
+                let d = depth_ref.expect("depth-only pass needs a depth attachment");
+                cmd.begin_rendering_depth_only(d);
+                let extent = self.resources[depth_id.0].extent;
+                cmd.set_viewport_scissor_extent(extent);
+                extent
+            } else {
+                let first_res = &self.resources[colors[0].0.0];
+                let extent = first_res.extent;
+                if first_res.backbuffer {
+                    let clear = colors[0].1;
+                    if !backbuffer_is_rt {
+                        cmd.transition_to_render_target(swapchain, image_index);
+                        backbuffer_is_rt = true;
+                    }
+                    cmd.begin_rendering(swapchain, image_index, clear, depth_ref);
+                    cmd.set_viewport_scissor(swapchain);
+                } else {
+                    for &(id, _) in colors {
+                        let target = pool.color_target(&color_locs[&id]);
+                        if alias_barrier.get(&id).copied().unwrap_or(false) {
+                            cmd.aliasing_barrier(target);
+                        } else {
+                            cmd.rt_to_render_target(target);
+                        }
+                    }
+                    let targets: Vec<(&RenderTarget, Option<ClearColor>)> = colors
+                        .iter()
+                        .map(|&(id, clear)| (pool.color_target(&color_locs[&id]), clear))
+                        .collect();
+                    cmd.begin_rendering_targets(&targets, depth_ref);
+                    cmd.set_viewport_scissor_extent(extent);
+                }
+                extent
+            };
+
+            // Build the sampled-index map for the pass (color targets and
+            // depth/shadow maps) and run its record closure.
             let sampled: HashMap<ResourceId, u32> = self.passes[pass_idx]
                 .reads
                 .iter()
                 .filter_map(|&r| {
-                    color_locs
-                        .get(&r)
-                        .map(|loc| (r, pool.color_target(loc).bindless_index()))
+                    if let Some(loc) = color_locs.get(&r) {
+                        Some((r, pool.color_target(loc).bindless_index()))
+                    } else {
+                        depth_slots
+                            .get(&r)
+                            .map(|&slot| (r, pool.depth(slot).bindless_index()))
+                    }
                 })
                 .collect();
             let mut ctx = PassContext {
@@ -569,9 +594,9 @@ struct Placement {
 }
 
 impl PassNode<'_> {
-    /// Resources this pass writes (color + depth).
+    /// Resources this pass writes (color attachments + depth).
     fn writes(&self) -> impl Iterator<Item = ResourceId> + '_ {
-        self.color.map(|(id, _)| id).into_iter().chain(self.depth)
+        self.colors.iter().map(|(id, _)| *id).chain(self.depth)
     }
 
     /// All resources this pass touches (writes + reads).
@@ -580,9 +605,7 @@ impl PassNode<'_> {
     }
 
     fn writes_backbuffer(&self, resources: &[Resource]) -> bool {
-        self.color
-            .map(|(id, _)| resources[id.0].backbuffer)
-            .unwrap_or(false)
+        self.colors.iter().any(|(id, _)| resources[id.0].backbuffer)
     }
 }
 

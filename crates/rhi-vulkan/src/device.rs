@@ -6,11 +6,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use ash::vk;
 use dreamcoast_core::EngineError;
 use rhi_types::{
-    BufferDesc, Extent2D, GraphicsPipelineDesc, MemoryRequirements, RenderTargetDesc,
-    SwapchainDesc, TextureDesc,
+    BufferDesc, CubemapDesc, Extent2D, GraphicsPipelineDesc, MemoryRequirements, ReadbackLayout,
+    RenderTargetDesc, SwapchainDesc, TextureDesc,
 };
 
 use crate::buffer::VulkanBuffer;
+use crate::cubemap::VulkanCubemap;
 use crate::depth::VulkanDepthBuffer;
 use crate::instance::{InstanceShared, VulkanInstance};
 use crate::pipeline::VulkanGraphicsPipeline;
@@ -21,8 +22,11 @@ use crate::texture::VulkanTexture;
 use crate::vk_err;
 use crate::{VulkanCommandBuffer, command};
 
-/// Size of the bindless sampled-image table.
+/// Size of the bindless sampled-image (2D) table.
 pub(crate) const BINDLESS_COUNT: u32 = 1024;
+/// Size of the bindless cubemap table (binding 2 / register space 1). Its index
+/// space is separate from the 2D table and starts at 0.
+pub(crate) const CUBE_COUNT: u32 = 64;
 
 /// Device-level objects shared (via `Arc`) by every GPU resource so each can
 /// destroy itself before the device is torn down.
@@ -41,6 +45,13 @@ pub(crate) struct DeviceShared {
     pub bindless_set: vk::DescriptorSet,
     pub bindless_sampler: vk::Sampler,
     bindless_next: AtomicU32,
+    cube_next: AtomicU32,
+    // Per-frame globals (set 1): one UNIFORM_BUFFER_DYNAMIC binding, written once
+    // to point at the app's globals buffer; the per-frame slice is selected by a
+    // dynamic offset at bind time. Only PBR pipelines bind this set.
+    pub globals_pool: vk::DescriptorPool,
+    pub globals_layout: vk::DescriptorSetLayout,
+    pub globals_set: vk::DescriptorSet,
 }
 
 impl DeviceShared {
@@ -95,6 +106,7 @@ impl DeviceShared {
 
             let (bindless_pool, bindless_layout, bindless_set, bindless_sampler) =
                 create_bindless(&device)?;
+            let (globals_pool, globals_layout, globals_set) = create_globals(&device)?;
 
             Ok(Self {
                 instance: instance.shared.clone(),
@@ -109,6 +121,10 @@ impl DeviceShared {
                 bindless_set,
                 bindless_sampler,
                 bindless_next: AtomicU32::new(0),
+                cube_next: AtomicU32::new(0),
+                globals_pool,
+                globals_layout,
+                globals_set,
             })
         }
     }
@@ -146,6 +162,39 @@ impl DeviceShared {
             .image_info(&infos);
         unsafe { self.device.update_descriptor_sets(&[write], &[]) };
         index
+    }
+
+    /// Register a cubemap (CUBE) image view in the bindless table (binding 2),
+    /// returning its index in the (separate, 0-based) cube index space.
+    pub(crate) fn register_sampled_cube(&self, view: vk::ImageView) -> u32 {
+        let index = self.cube_next.fetch_add(1, Ordering::Relaxed);
+        let image_info = vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let infos = [image_info];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.bindless_set)
+            .dst_binding(2)
+            .dst_array_element(index)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(&infos);
+        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+        index
+    }
+
+    /// Point the globals set (set 1) at `buffer`; `range` is one frame's slice
+    /// size (the per-frame offset is applied as a dynamic offset at bind time).
+    pub(crate) fn set_globals_buffer(&self, buffer: vk::Buffer, range: u64) {
+        let info = [vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .offset(0)
+            .range(range)];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.globals_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+            .buffer_info(&info);
+        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
     }
 
     /// Record + submit a one-time command buffer and wait for completion.
@@ -205,6 +254,8 @@ fn create_bindless(
         let sampler_ci = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
+            // Trilinear: prefilter cubemaps sample a roughness mip via SampleLevel.
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
@@ -224,11 +275,20 @@ fn create_bindless(
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT)
                 .immutable_samplers(&immutable),
+            // Binding 2: cubemap (CUBE-view) array. Its own 0-based index space
+            // (shader samples it as `g_cubes[]`, separate from `g_textures[]`).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(CUBE_COUNT)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let flags = [
             vk::DescriptorBindingFlags::PARTIALLY_BOUND
                 | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
             vk::DescriptorBindingFlags::empty(),
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
         ];
         let mut flags_ci =
             vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
@@ -243,7 +303,7 @@ fn create_bindless(
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(BINDLESS_COUNT),
+                .descriptor_count(BINDLESS_COUNT + CUBE_COUNT), // bindings 0 + 2
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1),
@@ -266,6 +326,42 @@ fn create_bindless(
     }
 }
 
+/// Build the globals descriptor pool, set layout (one dynamic UBO at binding 0),
+/// and set. Bound as set 1 by PBR pipelines.
+fn create_globals(
+    device: &ash::Device,
+) -> Result<(vk::DescriptorPool, vk::DescriptorSetLayout, vk::DescriptorSet), EngineError> {
+    unsafe {
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
+        let layout_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let layout = device
+            .create_descriptor_set_layout(&layout_ci, None)
+            .map_err(vk_err)?;
+
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+            .descriptor_count(1)];
+        let pool_ci = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        let pool = device
+            .create_descriptor_pool(&pool_ci, None)
+            .map_err(vk_err)?;
+
+        let layouts = [layout];
+        let alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(&layouts);
+        let set = device.allocate_descriptor_sets(&alloc).map_err(vk_err)?[0];
+
+        Ok((pool, layout, set))
+    }
+}
+
 impl Drop for DeviceShared {
     fn drop(&mut self) {
         unsafe {
@@ -274,6 +370,9 @@ impl Drop for DeviceShared {
                 .destroy_descriptor_pool(self.bindless_pool, None);
             self.device
                 .destroy_descriptor_set_layout(self.bindless_layout, None);
+            self.device.destroy_descriptor_pool(self.globals_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.globals_layout, None);
             self.device.destroy_sampler(self.bindless_sampler, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
@@ -311,6 +410,12 @@ impl VulkanDevice {
         VulkanBuffer::new(self.shared.clone(), desc)
     }
 
+    /// Register the per-frame globals buffer with the globals descriptor set.
+    /// `slice_size` is one frame's slice (selected via dynamic offset at bind).
+    pub fn set_globals_buffer(&self, buffer: &VulkanBuffer, slice_size: u64) {
+        self.shared.set_globals_buffer(buffer.raw(), slice_size);
+    }
+
     /// Create a sampled 2D texture, upload `pixels`, and register it in the
     /// bindless table.
     pub fn create_texture(
@@ -324,6 +429,23 @@ impl VulkanDevice {
     /// Create a depth buffer sized to `extent`.
     pub fn create_depth_buffer(&self, extent: Extent2D) -> Result<VulkanDepthBuffer, EngineError> {
         VulkanDepthBuffer::new(self.shared.clone(), extent)
+    }
+
+    pub fn create_cubemap(&self, desc: &CubemapDesc) -> Result<VulkanCubemap, EngineError> {
+        VulkanCubemap::new(self.shared.clone(), desc)
+    }
+
+    /// CPU memory layout for reading a swapchain image back to the host. Vulkan
+    /// packs rows tightly (`row_pitch = width * 4`).
+    pub fn swapchain_readback_layout(&self, swapchain: &VulkanSwapchain) -> ReadbackLayout {
+        let e = swapchain.extent();
+        let row_pitch = e.width * 4;
+        ReadbackLayout {
+            width: e.width,
+            height: e.height,
+            row_pitch,
+            size: row_pitch as u64 * e.height as u64,
+        }
     }
 
     /// Create an offscreen color render target (attachment + bindless sampled).
@@ -405,6 +527,23 @@ impl VulkanQueue {
                 .wait_dst_stage_mask(&wait_stages)
                 .command_buffers(&command_buffers)
                 .signal_semaphores(&signal_semaphores);
+            self.shared
+                .device
+                .queue_submit(self.shared.queue, &[submit], fence.raw())
+                .map_err(vk_err)
+        }
+    }
+
+    /// Submit one command buffer with no semaphore sync, signaling `fence` on
+    /// completion. For one-off startup work (e.g. IBL cubemap generation).
+    pub fn submit_oneshot(
+        &self,
+        cmd: &VulkanCommandBuffer,
+        fence: &VulkanFence,
+    ) -> Result<(), EngineError> {
+        unsafe {
+            let command_buffers = [cmd.raw()];
+            let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
             self.shared
                 .device
                 .queue_submit(self.shared.queue, &[submit], fence.raw())
