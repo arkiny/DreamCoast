@@ -96,4 +96,6 @@ Render Hardware Interface layer kept as their own sub-namespace.
 
 ## License
 
-MIT OR Apache-2.0
+DreamCoast is released under the [MIT License](LICENSE). Licenses of the
+third-party libraries and tools it uses are listed in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
