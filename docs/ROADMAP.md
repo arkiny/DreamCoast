@@ -98,9 +98,11 @@ engine/                 # cargo workspace root
 - 데모: 블룸 체인(scene→blur×3→composite) + ImGui 포스트 토글/aliasing 토글
 - **완료 기준**: 멀티 패스(오프스크린 → 포스트) 그래프가 두 백엔드에서 동작 (RTX 2070 SUPER)
 
-### Phase 6 — PBR 렌더러 (Forward+/Deferred)
-- G-buffer, PBR BRDF, 라이팅, 섀도우 맵, IBL, 톤매핑/포스트
-- **완료 기준**: PBR 씬 렌더 + 디퍼드/포워드+ 경로
+### Phase 6 — PBR 렌더러 (Deferred) — 🚧 진행 중
+세부: [phase-6-pbr.md](phase-6-pbr.md)
+- G-buffer, PBR BRDF, 라이팅, 섀도우 맵, IBL, 톤매핑/포스트 (디퍼드 경로)
+- 전제: 렌더그래프/RHI에 MRT, HDR 포맷, per-frame uniform buffer, 샘플 가능 depth, cubemap 도입
+- **완료 기준**: 디퍼드 PBR 씬 렌더(직접광+섀도우+IBL+톤매핑), 두 백엔드 동일 결과
 
 ### Phase 7 — 컴퓨트 / GPGPU
 - 렌더그래프 위 컴퓨트 패스, 예제(GPU 컬링, 파티클 시뮬레이션, 포스트프로세싱)
@@ -116,6 +118,14 @@ engine/                 # cargo workspace root
 - GPU 프로파일링(타임스탬프 쿼리), 디버그 마커(PIX/RenderDoc/NSight), 검증 레이어 토글
 - 기법 전환용 샘플 브라우저(샌드박스) 완성
 - **완료 기준**: 프로파일러 + 캡처 툴 연동, 샌드박스에서 기법 자유 전환
+
+### Phase 10 — Virtual Geometry (Nanite-style) — 🧪 실험적 / 계획
+세부: [phase-10-virtual-geometry.md](phase-10-virtual-geometry.md)
+- 클러스터 LOD DAG(meshlet 그룹 단순화) + 뷰 종속 컷 선택 + GPU 컬링/HZB 2-pass 오클루전 +
+  컴퓨트 SW 래스터 + 비저빌리티 버퍼 → 머티리얼 해석으로 **Phase 6 디퍼드 G-buffer** 재사용
+- 전제: **Phase 7(컴퓨트/GPU-driven)**. 신규 RHI: 메시 셰이더, 64-bit 아토믹, 인다이렉트 카운트,
+  BDA. 외부 의존 `meshopt`(+선택 `metis`) 사용자 승인 필요
+- **완료 기준**: 고밀도 메시가 화면 적응 LOD로 크랙/팝핑 없이 렌더, SW/HW 경로 seam 없음, 두 백엔드 일치
 
 ## 의존성 위험 / 미결 사항 (세부 계획에서 해소)
 

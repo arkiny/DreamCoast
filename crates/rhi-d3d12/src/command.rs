@@ -1,5 +1,6 @@
 //! Command allocator + graphics command list recording for the triangle frame.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::rc::Rc;
@@ -12,15 +13,19 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_CLEAR_FLAG_DEPTH, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_INDEX_BUFFER_VIEW,
     D3D12_RESOURCE_ALIASING_BARRIER, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
-    D3D12_RESOURCE_BARRIER_TYPE_ALIASING, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
-    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_STATE_COPY_SOURCE,
+    D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATES,
+    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
     D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT, ID3D12CommandAllocator, ID3D12GraphicsCommandList,
     ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
 
 use crate::buffer::D3d12Buffer;
+use crate::cubemap::D3d12Cubemap;
 use crate::depth::D3d12DepthBuffer;
 use crate::device::DeviceShared;
 use crate::instance::d3d_err;
@@ -33,6 +38,8 @@ pub struct D3d12CommandBuffer {
     device: Rc<DeviceShared>,
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
+    // GPU VA of the per-frame globals slice for the next PBR pipeline bind.
+    globals_va: Cell<u64>,
 }
 
 impl D3d12CommandBuffer {
@@ -52,6 +59,7 @@ impl D3d12CommandBuffer {
                 device,
                 allocator,
                 list,
+                globals_va: Cell::new(0),
             })
         }
     }
@@ -142,6 +150,119 @@ impl D3d12CommandBuffer {
                     .ClearRenderTargetView(rtv, &[c.r, c.g, c.b, c.a], None);
             }
         }
+    }
+
+    /// Begin a render pass into N offscreen color targets (MRT) plus optional
+    /// depth. Each target's `Some(clear)` clears it, `None` loads. All targets
+    /// must already be in `RENDER_TARGET` state. `targets` must be non-empty.
+    pub fn begin_rendering_targets(
+        &self,
+        targets: &[(&D3d12RenderTarget, Option<ClearColor>)],
+        depth: Option<&D3d12DepthBuffer>,
+    ) {
+        let rtvs: Vec<_> = targets.iter().map(|(t, _)| t.rtv_handle()).collect();
+        unsafe {
+            match depth {
+                Some(d) => {
+                    let dsv = d.dsv();
+                    self.list
+                        .OMSetRenderTargets(rtvs.len() as u32, Some(rtvs.as_ptr()), false, Some(&dsv));
+                    self.list
+                        .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+                }
+                None => {
+                    self.list
+                        .OMSetRenderTargets(rtvs.len() as u32, Some(rtvs.as_ptr()), false, None)
+                }
+            }
+            for ((_, clear), rtv) in targets.iter().zip(&rtvs) {
+                if let Some(c) = clear {
+                    self.list
+                        .ClearRenderTargetView(*rtv, &[c.r, c.g, c.b, c.a], None);
+                }
+            }
+        }
+    }
+
+    /// Begin a render pass into a depth-only target (a shadow map): no color
+    /// targets, depth is cleared. The depth must already be in `DEPTH_WRITE` (see
+    /// [`Self::depth_to_render_target`]).
+    pub fn begin_rendering_depth_only(&self, depth: &D3d12DepthBuffer) {
+        let dsv = depth.dsv();
+        unsafe {
+            self.list.OMSetRenderTargets(0, None, false, Some(&dsv));
+            self.list
+                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+        }
+    }
+
+    /// Transition a depth buffer into `DEPTH_WRITE` for writing (a shadow map
+    /// reused across frames may currently be in shader-read).
+    pub fn depth_to_render_target(&self, depth: &D3d12DepthBuffer) {
+        let before = depth.state();
+        if before == D3D12_RESOURCE_STATE_DEPTH_WRITE {
+            return;
+        }
+        self.barrier(depth.resource(), before, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        depth.set_state(D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    }
+
+    /// Transition a whole cubemap into `RENDER_TARGET` for writing its faces/mips
+    /// (the IBL generation passes).
+    pub fn cube_to_color(&self, cube: &D3d12Cubemap) {
+        let before = cube.state();
+        if before == D3D12_RESOURCE_STATE_RENDER_TARGET {
+            return;
+        }
+        self.barrier(cube.resource(), before, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cube.set_state(D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+
+    /// Transition a whole cubemap into `PIXEL_SHADER_RESOURCE` for sampling.
+    pub fn cube_to_sampled(&self, cube: &D3d12Cubemap) {
+        let before = cube.state();
+        if before == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+            return;
+        }
+        self.barrier(
+            cube.resource(),
+            before,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        );
+        cube.set_state(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+
+    /// Begin a render pass into one (face, mip) of a cubemap. The cubemap must
+    /// already be in `RENDER_TARGET` (see [`Self::cube_to_color`]).
+    pub fn begin_rendering_cube_face(
+        &self,
+        cube: &D3d12Cubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+    ) {
+        let rtv = cube.rtv_handle(face, mip);
+        unsafe {
+            self.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            if let Some(c) = clear {
+                self.list
+                    .ClearRenderTargetView(rtv, &[c.r, c.g, c.b, c.a], None);
+            }
+        }
+    }
+
+    /// Transition a depth buffer into `PIXEL_SHADER_RESOURCE` for sampling.
+    pub fn depth_to_sampled(&self, depth: &D3d12DepthBuffer) {
+        let before = depth.state();
+        if before == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+            return;
+        }
+        self.barrier(
+            depth.resource(),
+            before,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        );
+        depth.set_state(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
 
     /// Transition an offscreen target into `RENDER_TARGET` for writing.
@@ -245,6 +366,70 @@ impl D3d12CommandBuffer {
         }
     }
 
+    /// Copy a rendered swapchain image into a host-readable readback buffer (for
+    /// screenshots). The image must be in `PRESENT` (the state the render graph
+    /// leaves it in); it is restored to that state afterward. The buffer receives
+    /// rows padded to `GetCopyableFootprints`' 256-byte pitch.
+    pub fn copy_swapchain_to_buffer(
+        &self,
+        swapchain: &D3d12Swapchain,
+        image_index: u32,
+        buffer: &D3d12Buffer,
+    ) {
+        let src_res = swapchain.buffer(image_index);
+        unsafe {
+            let desc = src_res.GetDesc();
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut num_rows = 0u32;
+            let mut row_size = 0u64;
+            let mut total = 0u64;
+            self.device.device.GetCopyableFootprints(
+                &desc,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                Some(&mut num_rows),
+                Some(&mut row_size),
+                Some(&mut total),
+            );
+
+            self.barrier(
+                src_res,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            );
+
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(buffer.resource()))),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(src_res))),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            self.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+
+            self.barrier(
+                src_res,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_PRESENT,
+            );
+        }
+    }
+
+    /// Select the per-frame globals slice (GPU VA) used by the next PBR pipeline
+    /// bind (root CBV at param 2).
+    pub fn set_globals(&self, va: u64) {
+        self.globals_va.set(va);
+    }
+
     pub fn bind_graphics_pipeline(&self, pipeline: &D3d12GraphicsPipeline) {
         unsafe {
             if pipeline.is_bindless() {
@@ -256,6 +441,10 @@ impl D3d12CommandBuffer {
             if pipeline.is_bindless() {
                 self.list
                     .SetGraphicsRootDescriptorTable(0, self.device.srv_gpu_start());
+            }
+            if pipeline.uses_uniform() {
+                self.list
+                    .SetGraphicsRootConstantBufferView(2, self.globals_va.get());
             }
             self.list.SetPipelineState(pipeline.pso());
             self.list

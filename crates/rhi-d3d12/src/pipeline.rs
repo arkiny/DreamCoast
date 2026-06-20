@@ -12,12 +12,13 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_LESS, D3D12_COMPARISON_FUNC_NEVER,
     D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF, D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC,
     D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_DESCRIPTOR_RANGE,
-    D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_FILL_MODE_SOLID,
+    D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_FILL_MODE_SOLID,
     D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, D3D12_INPUT_ELEMENT_DESC, D3D12_INPUT_LAYOUT_DESC,
     D3D12_LOGIC_OP_NOOP, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC,
-    D3D12_RENDER_TARGET_BLEND_DESC, D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR_TABLE,
-    D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+    D3D12_RENDER_TARGET_BLEND_DESC, D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR,
+    D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
+    D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_ROOT_PARAMETER_TYPE_CBV,
     D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_SIGNATURE_DESC,
     D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, D3D12_SHADER_BYTECODE,
     D3D12_SHADER_VISIBILITY_ALL, D3D12_SHADER_VISIBILITY_PIXEL,
@@ -31,7 +32,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::core::s;
 
-use crate::device::DeviceShared;
+use crate::device::{BINDLESS_COUNT, CUBE_COUNT, DeviceShared};
 use crate::instance::d3d_err;
 use crate::to_dxgi_format;
 
@@ -42,6 +43,7 @@ pub struct D3d12GraphicsPipeline {
     root_signature: ID3D12RootSignature,
     pso: ID3D12PipelineState,
     bindless: bool,
+    uniform_buffer: bool,
 }
 
 impl D3d12GraphicsPipeline {
@@ -73,6 +75,11 @@ impl D3d12GraphicsPipeline {
                     pInputElementDescs: mesh_elems.as_ptr(),
                     NumElements: mesh_elems.len() as u32,
                 },
+                // Same interleaved mesh buffer, only POSITION (shadow pass).
+                VertexLayout::MeshPosition => D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: mesh_elems.as_ptr(),
+                    NumElements: 1,
+                },
             };
 
             let topology = match desc.topology {
@@ -89,14 +96,16 @@ impl D3d12GraphicsPipeline {
                 SampleMask: u32::MAX,
                 InputLayout: input_layout,
                 PrimitiveTopologyType: topology,
-                NumRenderTargets: 1,
+                NumRenderTargets: desc.color_formats.len() as u32,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
                 },
                 ..Default::default()
             };
-            pso_desc.RTVFormats[0] = to_dxgi_format(desc.color_format);
+            for (i, &fmt) in desc.color_formats.iter().enumerate() {
+                pso_desc.RTVFormats[i] = to_dxgi_format(fmt);
+            }
             pso_desc.DSVFormat = match desc.depth_format {
                 Some(f) => to_dxgi_format(f),
                 None => DXGI_FORMAT_UNKNOWN,
@@ -112,6 +121,7 @@ impl D3d12GraphicsPipeline {
                 root_signature,
                 pso,
                 bindless: desc.bindless,
+                uniform_buffer: desc.uniform_buffer,
             })
         }
     }
@@ -126,6 +136,10 @@ impl D3d12GraphicsPipeline {
 
     pub(crate) fn is_bindless(&self) -> bool {
         self.bindless
+    }
+
+    pub(crate) fn uses_uniform(&self) -> bool {
+        self.uniform_buffer
     }
 }
 
@@ -150,22 +164,36 @@ fn create_root_signature(
             );
         }
 
-        // Bindless: SRV table (t0, unbounded-ish) + 32-bit root constants (b0) + static sampler (s0).
-        let srv_range = D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-            // Unbounded range (shader declares `Texture2D g_textures[]`).
-            NumDescriptors: u32::MAX,
-            BaseShaderRegister: 0,
-            RegisterSpace: 0,
-            OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
-        };
-        let params = [
+        // Bindless: one SRV table holding two ranges over the same heap — the 2D
+        // textures (`Texture2D g_textures[] : t0,space0`, heap [0,BINDLESS_COUNT))
+        // and the cubemaps (`TextureCube g_cubes[] : t0,space1`, offset to the
+        // reserved cube region so the shader indexes it 0-based) — plus 32-bit
+        // root constants (b0) and a static sampler (s0).
+        let srv_ranges = [
+            D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: BINDLESS_COUNT,
+                BaseShaderRegister: 0,
+                RegisterSpace: 0,
+                OffsetInDescriptorsFromTableStart: 0,
+            },
+            D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: CUBE_COUNT,
+                BaseShaderRegister: 0,
+                RegisterSpace: 1,
+                OffsetInDescriptorsFromTableStart: BINDLESS_COUNT,
+            },
+        ];
+        // params[0] = SRV table (t0), params[1] = 32-bit root constants (b0).
+        // params[2] = root CBV (b1) for the per-frame globals, when opted in.
+        let mut params = vec![
             D3D12_ROOT_PARAMETER {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                 Anonymous: D3D12_ROOT_PARAMETER_0 {
                     DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                        NumDescriptorRanges: 1,
-                        pDescriptorRanges: &srv_range,
+                        NumDescriptorRanges: srv_ranges.len() as u32,
+                        pDescriptorRanges: srv_ranges.as_ptr(),
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
@@ -182,6 +210,18 @@ fn create_root_signature(
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
         ];
+        if desc.uniform_buffer {
+            params.push(D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR {
+                        ShaderRegister: 1,
+                        RegisterSpace: 0,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         let sampler = D3D12_STATIC_SAMPLER_DESC {
             Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
             AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,

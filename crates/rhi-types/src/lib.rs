@@ -39,6 +39,10 @@ pub enum Format {
     Rgba8Unorm,
     /// 8-bit RGBA, sRGB.
     Rgba8Srgb,
+    /// 16-bit float RGBA (HDR color, world-space normals).
+    Rgba16Float,
+    /// 16-bit float RG (BRDF integration LUT).
+    Rg16Float,
     /// 32-bit float depth.
     Depth32Float,
 }
@@ -118,6 +122,11 @@ pub enum VertexLayout {
     ImGui,
     /// Mesh vertex: position f32x3, normal f32x3, uv f32x2 (32-byte stride).
     Mesh,
+    /// Mesh vertex buffer, but only the position attribute is consumed (32-byte
+    /// stride). Used by the depth-only shadow pass, whose vertex shader reads
+    /// just `POSITION` — declaring only what the shader consumes keeps the
+    /// Vulkan validation layer quiet.
+    MeshPosition,
 }
 
 /// Color blending mode for the single color attachment.
@@ -140,8 +149,10 @@ pub struct GraphicsPipelineDesc<'a> {
     pub vertex_entry: &'a str,
     /// Fragment entry-point name.
     pub fragment_entry: &'a str,
-    /// Color attachment format (matches the swapchain).
-    pub color_format: Format,
+    /// Color attachment formats, in attachment order. A single element is the
+    /// common case (swapchain/offscreen); multiple drive MRT (G-buffer). An
+    /// empty slice is a depth-only pipeline (shadow pass).
+    pub color_formats: &'a [Format],
     pub topology: PrimitiveTopology,
     /// Vertex input layout.
     pub vertex_layout: VertexLayout,
@@ -151,6 +162,9 @@ pub struct GraphicsPipelineDesc<'a> {
     pub push_constant_size: u32,
     /// Whether the pipeline binds the device's bindless texture table.
     pub bindless: bool,
+    /// Whether the pipeline binds the per-frame globals uniform buffer (camera,
+    /// lights, shadow, IBL). Only the deferred PBR passes opt in.
+    pub uniform_buffer: bool,
     /// Enable depth test + write (compare LESS).
     pub depth_test: bool,
     /// Depth attachment format the pipeline renders against (`None` = no depth).
@@ -163,6 +177,11 @@ pub struct GraphicsPipelineDesc<'a> {
 pub enum BufferUsage {
     Vertex,
     Index,
+    /// Per-frame globals (constant/uniform buffer).
+    Uniform,
+    /// GPU-writable, CPU-readable staging buffer for reading rendered images back
+    /// to the host (e.g. saving a screenshot).
+    Readback,
 }
 
 /// Buffer creation parameters.
@@ -170,6 +189,31 @@ pub enum BufferUsage {
 pub struct BufferDesc {
     pub size: u64,
     pub usage: BufferUsage,
+}
+
+/// CPU-side memory layout of an image copied into a readback buffer. `row_pitch`
+/// may exceed `width * 4` because backends pad rows to an alignment (D3D12 needs
+/// 256-byte rows); consumers must skip the padding per row. Pixels are 8-bit
+/// BGRA in the swapchain's order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadbackLayout {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per row in the readback buffer (>= `width * 4`).
+    pub row_pitch: u32,
+    /// Total buffer size needed, in bytes.
+    pub size: u64,
+}
+
+/// Render-target cubemap creation parameters (6 faces, `mip_levels` each). Used
+/// for the IBL environment map and its derived irradiance / prefilter maps.
+#[derive(Clone, Copy, Debug)]
+pub struct CubemapDesc {
+    /// Edge length of each face at mip 0.
+    pub size: u32,
+    pub format: Format,
+    /// Number of mip levels (e.g. roughness levels for a prefilter map).
+    pub mip_levels: u32,
 }
 
 /// 2D sampled texture creation parameters.

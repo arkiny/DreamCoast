@@ -8,7 +8,8 @@ use dreamcoast_core::EngineError;
 use rhi_types::{ClearColor, Extent2D, Rect2D};
 
 use crate::buffer::VulkanBuffer;
-use crate::depth::VulkanDepthBuffer;
+use crate::cubemap::VulkanCubemap;
+use crate::depth::{VulkanDepthBuffer, depth_subresource_range};
 use crate::device::DeviceShared;
 use crate::pipeline::VulkanGraphicsPipeline;
 use crate::render_target::VulkanRenderTarget;
@@ -21,6 +22,8 @@ pub struct VulkanCommandBuffer {
     cmd: vk::CommandBuffer,
     // Layout of the currently bound pipeline (for push constants).
     current_layout: Cell<vk::PipelineLayout>,
+    // Dynamic offset into the globals buffer for the next PBR pipeline bind.
+    globals_offset: Cell<u32>,
 }
 
 impl VulkanCommandBuffer {
@@ -39,6 +42,7 @@ impl VulkanCommandBuffer {
             device,
             cmd,
             current_layout: Cell::new(vk::PipelineLayout::null()),
+            globals_offset: Cell::new(0),
         })
     }
 
@@ -214,6 +218,99 @@ impl VulkanCommandBuffer {
         };
     }
 
+    /// Begin dynamic rendering into N offscreen color targets (MRT) plus optional
+    /// depth. Each target's `Some(clear)` clears it, `None` loads. All targets must
+    /// already be in `COLOR_ATTACHMENT_OPTIMAL`. The render area is taken from the
+    /// first color target. `targets` must be non-empty.
+    pub fn begin_rendering_targets(
+        &self,
+        targets: &[(&VulkanRenderTarget, Option<ClearColor>)],
+        depth: Option<&VulkanDepthBuffer>,
+    ) {
+        let extent = targets[0].0.extent();
+        let color_attachments: Vec<vk::RenderingAttachmentInfo> = targets
+            .iter()
+            .map(|(t, clear)| {
+                let (load_op, clear_value) = match clear {
+                    Some(c) => (
+                        vk::AttachmentLoadOp::CLEAR,
+                        vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [c.r, c.g, c.b, c.a],
+                            },
+                        },
+                    ),
+                    None => (vk::AttachmentLoadOp::LOAD, vk::ClearValue::default()),
+                };
+                vk::RenderingAttachmentInfo::default()
+                    .image_view(t.view())
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(load_op)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .clear_value(clear_value)
+            })
+            .collect();
+        let mut rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent,
+            })
+            .layer_count(1)
+            .color_attachments(&color_attachments);
+
+        let depth_attachment;
+        if let Some(d) = depth {
+            depth_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(d.view())
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                });
+            rendering_info = rendering_info.depth_attachment(&depth_attachment);
+        }
+
+        unsafe {
+            self.device
+                .device
+                .cmd_begin_rendering(self.cmd, &rendering_info)
+        };
+    }
+
+    /// Begin dynamic rendering into a depth-only target (a shadow map): no color
+    /// attachments, depth is cleared and **stored** so a later pass can sample it.
+    /// The depth image must already be in `DEPTH_ATTACHMENT_OPTIMAL` (see
+    /// [`Self::depth_to_render_target`]).
+    pub fn begin_rendering_depth_only(&self, depth: &VulkanDepthBuffer) {
+        let depth_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(depth.view())
+            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            });
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: depth.extent(),
+            })
+            .layer_count(1)
+            .depth_attachment(&depth_attachment);
+        unsafe {
+            self.device
+                .device
+                .cmd_begin_rendering(self.cmd, &rendering_info)
+        };
+    }
+
     /// End dynamic rendering.
     pub fn end_rendering(&self) {
         unsafe { self.device.device.cmd_end_rendering(self.cmd) };
@@ -330,7 +427,209 @@ impl VulkanCommandBuffer {
         target.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
 
-    /// Bind a graphics pipeline (and its bindless descriptor set, if any).
+    /// Transition a depth buffer into `DEPTH_ATTACHMENT_OPTIMAL` for writing (a
+    /// shadow map reused across frames may currently be in shader-read).
+    pub fn depth_to_render_target(&self, depth: &VulkanDepthBuffer) {
+        let old = depth.layout();
+        if old == vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL {
+            return;
+        }
+        let (src_access, src_stage) = if old == vk::ImageLayout::UNDEFINED {
+            (
+                vk::AccessFlags::empty(),
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+            )
+        } else {
+            (
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            )
+        };
+        self.depth_image_barrier(
+            depth.image(),
+            old,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            src_access,
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            src_stage,
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        );
+        depth.set_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
+    }
+
+    /// Transition a whole cubemap into `COLOR_ATTACHMENT_OPTIMAL` for writing its
+    /// faces/mips (the IBL generation passes).
+    pub fn cube_to_color(&self, cube: &VulkanCubemap) {
+        let old = cube.layout();
+        if old == vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+            return;
+        }
+        let (src_access, src_stage) = if old == vk::ImageLayout::UNDEFINED {
+            (vk::AccessFlags::empty(), vk::PipelineStageFlags::TOP_OF_PIPE)
+        } else {
+            (
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            )
+        };
+        self.cube_image_barrier(
+            cube,
+            old,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            src_access,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            src_stage,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        );
+        cube.set_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    }
+
+    /// Transition a whole cubemap into `SHADER_READ_ONLY_OPTIMAL` for sampling.
+    pub fn cube_to_sampled(&self, cube: &VulkanCubemap) {
+        if cube.layout() == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            return;
+        }
+        self.cube_image_barrier(
+            cube,
+            cube.layout(),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        );
+        cube.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    /// Begin dynamic rendering into one (face, mip) of a cubemap. The cubemap must
+    /// already be in `COLOR_ATTACHMENT_OPTIMAL` (see [`Self::cube_to_color`]).
+    pub fn begin_rendering_cube_face(
+        &self,
+        cube: &VulkanCubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+    ) {
+        let (load_op, clear_value) = match clear {
+            Some(c) => (
+                vk::AttachmentLoadOp::CLEAR,
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [c.r, c.g, c.b, c.a],
+                    },
+                },
+            ),
+            None => (vk::AttachmentLoadOp::LOAD, vk::ClearValue::default()),
+        };
+        let attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(cube.render_view(face, mip))
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(load_op)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(clear_value);
+        let attachments = [attachment];
+        let size = cube.mip_size(mip);
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: size,
+                    height: size,
+                },
+            })
+            .layer_count(1)
+            .color_attachments(&attachments);
+        unsafe {
+            self.device
+                .device
+                .cmd_begin_rendering(self.cmd, &rendering_info)
+        };
+    }
+
+    /// Transition a depth buffer into `SHADER_READ_ONLY_OPTIMAL` for sampling.
+    pub fn depth_to_sampled(&self, depth: &VulkanDepthBuffer) {
+        if depth.layout() == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            return;
+        }
+        self.depth_image_barrier(
+            depth.image(),
+            depth.layout(),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        );
+        depth.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    /// Copy a rendered swapchain image into a host-visible readback buffer (for
+    /// screenshots). The image must be in `PRESENT_SRC_KHR` (the state the render
+    /// graph leaves it in); it is restored to that layout afterward. Rows are
+    /// tightly packed (`row_pitch = width * 4`).
+    pub fn copy_swapchain_to_buffer(
+        &self,
+        swapchain: &VulkanSwapchain,
+        image_index: u32,
+        buffer: &VulkanBuffer,
+    ) {
+        let image = swapchain.image(image_index);
+        let extent = swapchain.extent();
+
+        self.image_barrier(
+            image,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::TRANSFER,
+        );
+
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0) // tightly packed
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            });
+        unsafe {
+            self.device.device.cmd_copy_image_to_buffer(
+                self.cmd,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer.raw(),
+                &[region],
+            );
+        }
+
+        self.image_barrier(
+            image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+        );
+    }
+
+    /// Select the per-frame globals slice (dynamic offset) used by the next PBR
+    /// pipeline bind.
+    pub fn set_globals(&self, offset: u32) {
+        self.globals_offset.set(offset);
+    }
+
+    /// Bind a graphics pipeline (and its bindless set 0 + globals set 1, if any).
     pub fn bind_graphics_pipeline(&self, pipeline: &VulkanGraphicsPipeline) {
         unsafe {
             self.device.device.cmd_bind_pipeline(
@@ -347,6 +646,16 @@ impl VulkanCommandBuffer {
                     0,
                     &[self.device.bindless_set],
                     &[],
+                );
+            }
+            if pipeline.uses_uniform() {
+                self.device.device.cmd_bind_descriptor_sets(
+                    self.cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.layout(),
+                    1,
+                    &[self.device.globals_set],
+                    &[self.globals_offset.get()],
                 );
             }
         }
@@ -447,6 +756,79 @@ impl VulkanCommandBuffer {
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(image)
             .subresource_range(color_subresource_range());
+        unsafe {
+            self.device.device.cmd_pipeline_barrier(
+                self.cmd,
+                src_stage,
+                dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cube_image_barrier(
+        &self,
+        cube: &VulkanCubemap,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+        src_access: vk::AccessFlags,
+        dst_access: vk::AccessFlags,
+        src_stage: vk::PipelineStageFlags,
+        dst_stage: vk::PipelineStageFlags,
+    ) {
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: cube.mip_levels(),
+            base_array_layer: 0,
+            layer_count: 6,
+        };
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(cube.image())
+            .subresource_range(range);
+        unsafe {
+            self.device.device.cmd_pipeline_barrier(
+                self.cmd,
+                src_stage,
+                dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn depth_image_barrier(
+        &self,
+        image: vk::Image,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+        src_access: vk::AccessFlags,
+        dst_access: vk::AccessFlags,
+        src_stage: vk::PipelineStageFlags,
+        dst_stage: vk::PipelineStageFlags,
+    ) {
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(depth_subresource_range());
         unsafe {
             self.device.device.cmd_pipeline_barrier(
                 self.cmd,

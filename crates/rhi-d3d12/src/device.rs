@@ -5,8 +5,8 @@ use std::rc::Rc;
 
 use dreamcoast_core::EngineError;
 use rhi_types::{
-    BufferDesc, Extent2D, Format, GraphicsPipelineDesc, MemoryRequirements, RenderTargetDesc,
-    SwapchainDesc, TextureDesc,
+    BufferDesc, CubemapDesc, Extent2D, Format, GraphicsPipelineDesc, MemoryRequirements,
+    ReadbackLayout, RenderTargetDesc, SwapchainDesc, TextureDesc,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -15,15 +15,19 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
     D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_FENCE_FLAG_NONE, D3D12_GPU_DESCRIPTOR_HANDLE,
-    D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
-    D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_TEX2D_SRV, D3D12CreateDevice, ID3D12CommandList,
-    ID3D12CommandQueue, ID3D12DescriptorHeap, ID3D12Device, ID3D12Fence, ID3D12Resource,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_SHADER_RESOURCE_VIEW_DESC,
+    D3D12_SHADER_RESOURCE_VIEW_DESC_0, D3D12_SRV_DIMENSION_TEXTURE2D,
+    D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEX2D_SRV, D3D12_TEXCUBE_SRV, D3D12CreateDevice,
+    ID3D12CommandList, ID3D12CommandQueue, ID3D12DescriptorHeap, ID3D12Device, ID3D12Fence,
+    ID3D12Resource,
 };
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT;
 use windows::Win32::Graphics::Dxgi::IDXGIFactory6;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::{Interface, PCWSTR};
 
 use crate::command::D3d12CommandBuffer;
+use crate::cubemap::D3d12Cubemap;
 use crate::depth::D3d12DepthBuffer;
 use crate::instance::{D3d12Instance, d3d_err};
 use crate::pipeline::D3d12GraphicsPipeline;
@@ -33,8 +37,12 @@ use crate::sync::{D3d12Fence, D3d12Semaphore};
 use crate::texture::D3d12Texture;
 use crate::{D3d12Buffer, to_dxgi_format};
 
-/// Size of the bindless SRV table.
+/// Size of the bindless 2D-texture SRV table (heap slots `0..BINDLESS_COUNT`).
 pub(crate) const BINDLESS_COUNT: u32 = 1024;
+/// Size of the bindless cubemap SRV table (heap slots
+/// `BINDLESS_COUNT..BINDLESS_COUNT+CUBE_COUNT`, register space 1). Its index
+/// space is separate from the 2D table and starts at 0.
+pub(crate) const CUBE_COUNT: u32 = 64;
 
 /// Device-level objects shared (via `Rc`) by every GPU resource.
 pub(crate) struct DeviceShared {
@@ -46,6 +54,7 @@ pub(crate) struct DeviceShared {
     pub srv_heap: ID3D12DescriptorHeap,
     pub srv_size: u32,
     srv_next: Cell<u32>,
+    cube_next: Cell<u32>,
     // A dedicated fence for `wait_idle`.
     idle_fence: ID3D12Fence,
     idle_event: HANDLE,
@@ -82,7 +91,7 @@ impl DeviceShared {
             // Shader-visible bindless SRV heap.
             let heap_desc = D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: BINDLESS_COUNT,
+                NumDescriptors: BINDLESS_COUNT + CUBE_COUNT,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             };
@@ -100,6 +109,7 @@ impl DeviceShared {
                 srv_heap,
                 srv_size,
                 srv_next: Cell::new(0),
+                cube_next: Cell::new(0),
                 idle_fence,
                 idle_event,
                 idle_value: Cell::new(0),
@@ -129,6 +139,71 @@ impl DeviceShared {
                     MostDetailedMip: 0,
                     MipLevels: 1,
                     PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        unsafe {
+            self.device
+                .CreateShaderResourceView(resource, Some(&srv), handle)
+        };
+        index
+    }
+
+    /// Create an `R32_FLOAT` SRV for a typeless depth `resource` at the next
+    /// bindless slot (so a depth buffer can be sampled as a shadow map); returns
+    /// its index.
+    pub(crate) fn register_sampled_depth(&self, resource: &ID3D12Resource) -> u32 {
+        let index = self.srv_next.get();
+        self.srv_next.set(index + 1);
+        let cpu = unsafe { self.srv_heap.GetCPUDescriptorHandleForHeapStart() };
+        let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: cpu.ptr + (index as usize) * (self.srv_size as usize),
+        };
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        unsafe {
+            self.device
+                .CreateShaderResourceView(resource, Some(&srv), handle)
+        };
+        index
+    }
+
+    /// Create a `TEXTURECUBE` SRV for `resource` in the reserved cube heap region
+    /// (slot `BINDLESS_COUNT + index`); returns the 0-based cube index. The cube
+    /// root range is offset to `BINDLESS_COUNT`, so the shader indexes it 0-based.
+    pub(crate) fn register_sampled_cube(
+        &self,
+        resource: &ID3D12Resource,
+        format: Format,
+        mip_levels: u32,
+    ) -> u32 {
+        let index = self.cube_next.get();
+        self.cube_next.set(index + 1);
+        let slot = BINDLESS_COUNT + index;
+        let cpu = unsafe { self.srv_heap.GetCPUDescriptorHandleForHeapStart() };
+        let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: cpu.ptr + (slot as usize) * (self.srv_size as usize),
+        };
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: to_dxgi_format(format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCube: D3D12_TEXCUBE_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: mip_levels,
                     ResourceMinLODClamp: 0.0,
                 },
             },
@@ -233,6 +308,38 @@ impl D3d12Device {
         D3d12DepthBuffer::new(self.shared.clone(), extent)
     }
 
+    pub fn create_cubemap(&self, desc: &CubemapDesc) -> Result<D3d12Cubemap, EngineError> {
+        D3d12Cubemap::new(self.shared.clone(), desc)
+    }
+
+    /// CPU memory layout for reading a swapchain image back to the host. D3D12
+    /// pads each row to 256 bytes (`GetCopyableFootprints`).
+    pub fn swapchain_readback_layout(&self, swapchain: &D3d12Swapchain) -> ReadbackLayout {
+        unsafe {
+            let desc = swapchain.buffer(0).GetDesc();
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut num_rows = 0u32;
+            let mut row_size = 0u64;
+            let mut total = 0u64;
+            self.shared.device.GetCopyableFootprints(
+                &desc,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                Some(&mut num_rows),
+                Some(&mut row_size),
+                Some(&mut total),
+            );
+            ReadbackLayout {
+                width: desc.Width as u32,
+                height: desc.Height,
+                row_pitch: footprint.Footprint.RowPitch,
+                size: total,
+            }
+        }
+    }
+
     pub fn create_render_target(
         &self,
         desc: &RenderTargetDesc,
@@ -292,6 +399,26 @@ impl D3d12Queue {
         cmd: &D3d12CommandBuffer,
         _wait: &D3d12Semaphore,
         _signal: &D3d12Semaphore,
+        fence: &D3d12Fence,
+    ) -> Result<(), EngineError> {
+        unsafe {
+            let list: ID3D12CommandList = cmd.list().cast().map_err(d3d_err)?;
+            self.shared.queue.ExecuteCommandLists(&[Some(list)]);
+            let value = fence.next_value();
+            self.shared
+                .queue
+                .Signal(fence.raw(), value)
+                .map_err(d3d_err)?;
+            fence.set_target(value);
+            Ok(())
+        }
+    }
+
+    /// Execute a command list with no semaphore sync, signaling `fence`. For
+    /// one-off startup work (e.g. IBL cubemap generation).
+    pub fn submit_oneshot(
+        &self,
+        cmd: &D3d12CommandBuffer,
         fence: &D3d12Fence,
     ) -> Result<(), EngineError> {
         unsafe {

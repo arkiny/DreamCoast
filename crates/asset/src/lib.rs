@@ -22,11 +22,41 @@ pub struct ImageData {
     pub rgba8: Vec<u8>,
 }
 
+/// A metallic-roughness PBR material: scalar factors plus optional textures.
+/// Textures that are `None` mean "use the factor". Color-space note: `base_color`
+/// and `emissive` are sRGB-encoded (sample as sRGB → linear); `metallic_roughness`
+/// (G=roughness, B=metallic per glTF) and `normal` carry linear data.
+pub struct Material {
+    pub base_color_factor: [f32; 4],
+    pub metallic_factor: f32,
+    pub roughness_factor: f32,
+    pub emissive_factor: [f32; 3],
+    pub base_color: Option<ImageData>,
+    pub metallic_roughness: Option<ImageData>,
+    pub normal: Option<ImageData>,
+    pub emissive: Option<ImageData>,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            base_color_factor: [1.0, 1.0, 1.0, 1.0],
+            metallic_factor: 0.0,
+            roughness_factor: 0.6,
+            emissive_factor: [0.0, 0.0, 0.0],
+            base_color: None,
+            metallic_roughness: None,
+            normal: None,
+            emissive: None,
+        }
+    }
+}
+
 /// CPU-side mesh ready for upload.
 pub struct MeshData {
     pub vertices: Vec<MeshVertex>,
     pub indices: Vec<u32>,
-    pub base_color: Option<ImageData>,
+    pub material: Material,
 }
 
 /// Load the first mesh primitive of a glTF/GLB file (positions, normals,
@@ -72,17 +102,30 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<MeshData, EngineError> {
         })
         .collect();
 
-    let base_color = prim
-        .material()
-        .pbr_metallic_roughness()
-        .base_color_texture()
-        .and_then(|info| images.get(info.texture().source().index()))
-        .map(image_to_rgba8);
+    let mat = prim.material();
+    let pbr = mat.pbr_metallic_roughness();
+    let tex = |info: Option<gltf::texture::Info>| {
+        info.and_then(|i| images.get(i.texture().source().index()))
+            .map(image_to_rgba8)
+    };
+    let material = Material {
+        base_color_factor: pbr.base_color_factor(),
+        metallic_factor: pbr.metallic_factor(),
+        roughness_factor: pbr.roughness_factor(),
+        emissive_factor: mat.emissive_factor(),
+        base_color: tex(pbr.base_color_texture()),
+        metallic_roughness: tex(pbr.metallic_roughness_texture()),
+        normal: mat
+            .normal_texture()
+            .and_then(|n| images.get(n.texture().source().index()))
+            .map(image_to_rgba8),
+        emissive: tex(mat.emissive_texture()),
+    };
 
     Ok(MeshData {
         vertices,
         indices,
-        base_color,
+        material,
     })
 }
 
@@ -188,6 +231,6 @@ pub fn unit_cube() -> MeshData {
     MeshData {
         vertices,
         indices,
-        base_color: None,
+        material: Material::default(),
     }
 }

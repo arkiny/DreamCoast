@@ -13,6 +13,10 @@
 # Downloaded sample assets (fetched at runtime; cube fallback otherwise)
 /assets/
 
+# Screenshot output (--screenshot[/-clean] flags, F2 captures)
+/tmp/
+/screenshot_*.png
+
 # IDE / OS
 .vscode/
 .idea/

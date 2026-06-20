@@ -1,11 +1,14 @@
-// Composite pass: combines the offscreen scene color with the blurred bloom
-// chain result and applies a selectable tonemap/effect, writing to the
-// backbuffer. The final node of the render graph's color chain.
+// Tonemap pass: reads the linear-HDR lighting result and maps it to the
+// backbuffer with an ACES filmic curve (exposure is already applied in the
+// lighting pass). Optional debug effects (grayscale/vignette) are retained from
+// the Phase 5 composite. The backbuffer is an sRGB target, so the hardware does
+// the linear→sRGB encode on write. This is the final node of the render graph's
+// color chain.
 //
 // Bindless layout mirrors imgui.slang: a sampled-texture array (t0/binding 0) +
-// a static sampler (s0/binding 1), indexed by root/push constants (b0). The
-// vertex shader synthesizes a full-screen triangle from SV_VertexID; `flip_y`
-// selects clip-space Y orientation per backend (D3D12 = 0, Vulkan = 1).
+// a static sampler (s0/binding 1), indexed by push constants (b0). The vertex
+// shader synthesizes a full-screen triangle from SV_VertexID; `flip_y` selects
+// clip-space Y orientation per backend (D3D12 = 0, Vulkan = 1).
 
 struct VSOutput
 {
@@ -15,10 +18,10 @@ struct VSOutput
 
 struct PushConstants
 {
-    uint scene_index; // bindless index of the scene color target
-    uint bloom_index; // bindless index of the blurred bloom target
-    uint mode;        // 0 = none, 1 = grayscale, 2 = vignette
-    uint flip_y;      // 0 = D3D12 (Y up), 1 = Vulkan (Y down)
+    uint hdr_index; // bindless index of the HDR lighting target
+    uint mode;      // 0 = none, 1 = grayscale, 2 = vignette
+    uint flip_y;    // 0 = D3D12 (Y up), 1 = Vulkan (Y down)
+    uint pad;
 };
 
 [[vk::push_constant]]
@@ -42,12 +45,18 @@ VSOutput vsMain(uint id: SV_VertexID)
     return o;
 }
 
+// Narkowicz ACES filmic approximation.
+float3 aces(float3 x)
+{
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
 [shader("fragment")]
 float4 fsMain(VSOutput input) : SV_Target
 {
-    float3 scene = g_textures[pc.scene_index].Sample(g_sampler, input.uv).rgb;
-    float3 bloom = g_textures[pc.bloom_index].Sample(g_sampler, input.uv).rgb;
-    float3 color = scene + bloom * 0.6; // additive bloom
+    float3 hdr = g_textures[pc.hdr_index].Sample(g_sampler, input.uv).rgb;
+    float3 color = aces(hdr);
 
     if (pc.mode == 1)
     {

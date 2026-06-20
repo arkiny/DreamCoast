@@ -24,6 +24,8 @@ impl VulkanBuffer {
             let usage = match desc.usage {
                 BufferUsage::Vertex => vk::BufferUsageFlags::VERTEX_BUFFER,
                 BufferUsage::Index => vk::BufferUsageFlags::INDEX_BUFFER,
+                BufferUsage::Uniform => vk::BufferUsageFlags::UNIFORM_BUFFER,
+                BufferUsage::Readback => vk::BufferUsageFlags::TRANSFER_DST,
             };
             let ci = vk::BufferCreateInfo::default()
                 .size(desc.size)
@@ -69,6 +71,28 @@ impl VulkanBuffer {
         let n = data.len().min(self.size as usize);
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.mapped, n) };
         Ok(())
+    }
+
+    /// Copy `data` into the buffer at `offset` (for per-frame slices).
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), EngineError> {
+        if offset + data.len() as u64 > self.size {
+            return Err(EngineError::Rhi("buffer write_at out of bounds".into()));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.mapped.add(offset as usize),
+                data.len(),
+            )
+        };
+        Ok(())
+    }
+
+    /// Copy out of the buffer into `dst` (clamped to its size), for readback.
+    /// Host-coherent, so no explicit invalidate is needed.
+    pub fn read_into(&self, dst: &mut [u8]) {
+        let n = dst.len().min(self.size as usize);
+        unsafe { std::ptr::copy_nonoverlapping(self.mapped, dst.as_mut_ptr(), n) };
     }
 
     pub(crate) fn raw(&self) -> vk::Buffer {

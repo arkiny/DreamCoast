@@ -18,6 +18,7 @@ pub struct VulkanGraphicsPipeline {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     bindless: bool,
+    uniform_buffer: bool,
 }
 
 impl VulkanGraphicsPipeline {
@@ -37,6 +38,7 @@ impl VulkanGraphicsPipeline {
                 pipeline,
                 layout,
                 bindless: desc.bindless,
+                uniform_buffer: desc.uniform_buffer,
             })
         }
     }
@@ -51,6 +53,10 @@ impl VulkanGraphicsPipeline {
 
     pub(crate) fn is_bindless(&self) -> bool {
         self.bindless
+    }
+
+    pub(crate) fn uses_uniform(&self) -> bool {
+        self.uniform_buffer
     }
 }
 
@@ -145,6 +151,35 @@ unsafe fn build(
                     .vertex_binding_descriptions(&vtx_bindings)
                     .vertex_attribute_descriptions(&vtx_attrs)
             }
+            VertexLayout::MeshPosition => {
+                vtx_bindings = [vk::VertexInputBindingDescription::default()
+                    .binding(0)
+                    .stride(32)
+                    .input_rate(vk::VertexInputRate::VERTEX)];
+                // Same interleaved mesh buffer, but only POSITION is declared
+                // (the shadow VS consumes nothing else). `vtx_attrs` shares a type
+                // across arms, so build all three and bind just the first.
+                vtx_attrs = [
+                    vk::VertexInputAttributeDescription::default()
+                        .location(0)
+                        .binding(0)
+                        .format(vk::Format::R32G32B32_SFLOAT)
+                        .offset(0),
+                    vk::VertexInputAttributeDescription::default()
+                        .location(1)
+                        .binding(0)
+                        .format(vk::Format::R32G32B32_SFLOAT)
+                        .offset(12),
+                    vk::VertexInputAttributeDescription::default()
+                        .location(2)
+                        .binding(0)
+                        .format(vk::Format::R32G32_SFLOAT)
+                        .offset(24),
+                ];
+                vk::PipelineVertexInputStateCreateInfo::default()
+                    .vertex_binding_descriptions(&vtx_bindings)
+                    .vertex_attribute_descriptions(&vtx_attrs[..1])
+            }
         };
 
         let topology = match desc.topology {
@@ -176,15 +211,21 @@ unsafe fn build(
                 .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                 .alpha_blend_op(vk::BlendOp::ADD),
         };
-        let attachments = [color_blend_attachment];
+        // One blend state per color attachment (same blend for all MRT outputs).
+        let attachments = vec![color_blend_attachment; desc.color_formats.len()];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-        // Pipeline layout: bindless set + optional push constants.
-        let set_layouts = [device.bindless_layout];
+        // Pipeline layout: bindless set (0) + optional globals set (1) + optional
+        // push constants.
+        let set_layouts: Vec<vk::DescriptorSetLayout> = if desc.uniform_buffer {
+            vec![device.bindless_layout, device.globals_layout]
+        } else {
+            vec![device.bindless_layout]
+        };
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
@@ -206,7 +247,8 @@ unsafe fn build(
             .depth_write_enable(desc.depth_test)
             .depth_compare_op(vk::CompareOp::LESS);
 
-        let color_formats = [to_vk_format(desc.color_format)];
+        let color_formats: Vec<vk::Format> =
+            desc.color_formats.iter().copied().map(to_vk_format).collect();
         let depth_format = desc
             .depth_format
             .map(to_vk_format)
