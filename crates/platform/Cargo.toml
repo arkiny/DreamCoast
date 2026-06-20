@@ -1,12 +1,12 @@
 [package]
-name = "engine-platform"
+name = "dreamcoast-platform"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-engine-core.workspace = true
+dreamcoast-core.workspace = true
 tracing.workspace = true
 
 [dependencies.windows]

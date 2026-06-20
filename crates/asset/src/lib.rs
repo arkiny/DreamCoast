@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 
 /// A mesh vertex (matches `rhi::VertexLayout::Mesh`: 32-byte stride).
 #[repr(C)]

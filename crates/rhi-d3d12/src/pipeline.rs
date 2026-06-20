@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use rhi_types::{BlendMode, GraphicsPipelineDesc, PrimitiveTopology, VertexLayout};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::{

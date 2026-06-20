@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ash::vk;
-use engine_core::EngineError;
-use engine_platform::Window;
+use dreamcoast_core::EngineError;
+use dreamcoast_platform::Window;
 use rhi_types::InstanceDesc;
 
 use crate::device::{DeviceShared, VulkanDevice};

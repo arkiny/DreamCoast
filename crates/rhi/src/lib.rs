@@ -12,8 +12,8 @@
 
 pub use rhi_types::*;
 
-use engine_core::EngineError;
-use engine_platform::Window;
+use dreamcoast_core::EngineError;
+use dreamcoast_platform::Window;
 
 type Result<T> = std::result::Result<T, EngineError>;
 

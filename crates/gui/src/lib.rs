@@ -6,8 +6,8 @@
 
 pub use imgui;
 
-use engine_core::EngineError;
-use engine_platform::Input;
+use dreamcoast_core::EngineError;
+use dreamcoast_platform::Input;
 use imgui::{Context, DrawCmd, DrawData, DrawIdx, DrawVert};
 use rhi::{
     BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, CommandBuffer, Device, Format,
@@ -62,12 +62,12 @@ impl Gui {
         let backend = device.backend();
         let (vs, fs) = match backend {
             BackendKind::Vulkan => (
-                engine_shader::imgui_vs_spirv(),
-                engine_shader::imgui_fs_spirv(),
+                dreamcoast_shader::imgui_vs_spirv(),
+                dreamcoast_shader::imgui_fs_spirv(),
             ),
             BackendKind::D3d12 => (
-                engine_shader::imgui_vs_dxil(),
-                engine_shader::imgui_fs_dxil(),
+                dreamcoast_shader::imgui_vs_dxil(),
+                dreamcoast_shader::imgui_fs_dxil(),
             ),
         };
         let vs = vs.ok_or_else(|| EngineError::Shader("imgui vertex shader unavailable".into()))?;

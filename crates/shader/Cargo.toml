@@ -1,5 +1,5 @@
 [package]
-name = "engine-shader"
+name = "dreamcoast-shader"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -11,7 +11,7 @@
 
 use std::ffi::c_void;
 
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };

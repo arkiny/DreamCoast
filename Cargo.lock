@@ -106,15 +106,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "engine-asset"
+name = "dreamcoast-asset"
 version = "0.0.0"
 dependencies = [
- "engine-core",
+ "dreamcoast-core",
  "gltf",
 ]
 
 [[package]]
-name = "engine-core"
+name = "dreamcoast-core"
 version = "0.0.0"
 dependencies = [
  "glam",
@@ -124,36 +124,36 @@ dependencies = [
 ]
 
 [[package]]
-name = "engine-gui"
+name = "dreamcoast-gui"
 version = "0.0.0"
 dependencies = [
- "engine-core",
- "engine-platform",
- "engine-shader",
+ "dreamcoast-core",
+ "dreamcoast-platform",
+ "dreamcoast-shader",
  "imgui",
  "rhi",
 ]
 
 [[package]]
-name = "engine-platform"
+name = "dreamcoast-platform"
 version = "0.0.0"
 dependencies = [
- "engine-core",
+ "dreamcoast-core",
  "tracing",
  "windows",
 ]
 
 [[package]]
-name = "engine-render"
+name = "dreamcoast-render"
 version = "0.0.0"
 dependencies = [
- "engine-core",
+ "dreamcoast-core",
  "rhi",
  "tracing",
 ]
 
 [[package]]
-name = "engine-shader"
+name = "dreamcoast-shader"
 version = "0.0.0"
 
 [[package]]
@@ -476,8 +476,8 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "rhi"
 version = "0.0.0"
 dependencies = [
- "engine-core",
- "engine-platform",
+ "dreamcoast-core",
+ "dreamcoast-platform",
  "rhi-d3d12",
  "rhi-types",
  "rhi-vulkan",
@@ -487,8 +487,8 @@ dependencies = [
 name = "rhi-d3d12"
 version = "0.0.0"
 dependencies = [
- "engine-core",
- "engine-platform",
+ "dreamcoast-core",
+ "dreamcoast-platform",
  "rhi-types",
  "tracing",
  "windows",
@@ -503,8 +503,8 @@ name = "rhi-vulkan"
 version = "0.0.0"
 dependencies = [
  "ash",
- "engine-core",
- "engine-platform",
+ "dreamcoast-core",
+ "dreamcoast-platform",
  "rhi-types",
  "tracing",
  "windows",
@@ -515,12 +515,12 @@ name = "sandbox"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "engine-asset",
- "engine-core",
- "engine-gui",
- "engine-platform",
- "engine-render",
- "engine-shader",
+ "dreamcoast-asset",
+ "dreamcoast-core",
+ "dreamcoast-gui",
+ "dreamcoast-platform",
+ "dreamcoast-render",
+ "dreamcoast-shader",
  "rhi",
  "tracing",
 ]

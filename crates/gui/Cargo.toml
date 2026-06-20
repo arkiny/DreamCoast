@@ -1,13 +1,13 @@
 [package]
-name = "engine-gui"
+name = "dreamcoast-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-engine-core.workspace = true
-engine-platform.workspace = true
-engine-shader.workspace = true
+dreamcoast-core.workspace = true
+dreamcoast-platform.workspace = true
+dreamcoast-shader.workspace = true
 rhi.workspace = true
 imgui.workspace = true

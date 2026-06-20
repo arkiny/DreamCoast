@@ -12,7 +12,7 @@
 use std::ffi::CStr;
 
 use ash::vk;
-use engine_core::EngineError;
+use dreamcoast_core::EngineError;
 
 mod buffer;
 mod command;

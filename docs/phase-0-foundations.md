@@ -82,7 +82,7 @@ D:\Playground\
 | `cargo build` (워크스페이스 전체) | ✅ |
 | `cargo fmt --check` | ✅ |
 | `cargo clippy --all-targets -- -D warnings` | ✅ |
-| `cargo test -p engine-core` (Pool 2개) | ✅ |
+| `cargo test -p dreamcoast-core` (Pool 2개) | ✅ |
 | `cargo run -p sandbox` | ✅ 1280×720 창 생성·리사이즈 로그·정상 종료, 패닉 없음 |
 | slangc 미설치 시 빌드 비차단(경고+스킵) | ✅ |
 

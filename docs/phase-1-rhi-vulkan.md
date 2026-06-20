@@ -29,7 +29,7 @@ RHI 표면·동기화·스왑체인·파이프라인 패턴이 이후 D3D12(Phas
 ```
 crates/
 ├── rhi-types/     # 백엔드 무관 plain 타입 (deps 없음)
-├── rhi-vulkan/    # ash 기반 Vulkan 구현. deps: rhi-types, engine-core, ash, windows, engine-shader
+├── rhi-vulkan/    # ash 기반 Vulkan 구현. deps: rhi-types, dreamcoast-core, ash, windows, dreamcoast-shader
 └── rhi/           # enum-dispatch 파사드 + rhi-types 재노출. deps: rhi-types, rhi-vulkan
 ```
 
@@ -53,7 +53,7 @@ crates/
 3. Physical device/Queue family (graphics+present+swapchain+Vulkan13 features)
 4. Device/Queue (`VK_KHR_swapchain`, Vulkan13Features{dynamic_rendering, synchronization2})
 5. Swapchain (B8G8R8A8_SRGB 우선, FIFO, min+1, 이미지 뷰; 재생성 헬퍼)
-6. Pipeline (engine-shader SPIR-V, PipelineRenderingCreateInfo, 정점입력 없음, 동적 viewport/scissor)
+6. Pipeline (dreamcoast-shader SPIR-V, PipelineRenderingCreateInfo, 정점입력 없음, 동적 viewport/scissor)
 7. Commands/Sync (커맨드 풀+버퍼, 프레임 인플라이트 2)
 8. Frame loop (acquire → 배리어 UNDEFINED→COLOR → begin_rendering(clear) → draw(3) → end →
    배리어 COLOR→PRESENT → submit → present; OUT_OF_DATE/resize 시 재생성)

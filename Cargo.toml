@@ -22,16 +22,16 @@ publish = false
 
 [workspace.dependencies]
 # Internal crates
-engine-core = { path = "crates/core" }
-engine-platform = { path = "crates/platform" }
-engine-shader = { path = "crates/shader" }
+dreamcoast-core = { path = "crates/core" }
+dreamcoast-platform = { path = "crates/platform" }
+dreamcoast-shader = { path = "crates/shader" }
 rhi-types = { path = "crates/rhi-types" }
 rhi-vulkan = { path = "crates/rhi-vulkan" }
 rhi-d3d12 = { path = "crates/rhi-d3d12" }
 rhi = { path = "crates/rhi" }
-engine-gui = { path = "crates/gui" }
-engine-asset = { path = "crates/asset" }
-engine-render = { path = "crates/render" }
+dreamcoast-gui = { path = "crates/gui" }
+dreamcoast-asset = { path = "crates/asset" }
+dreamcoast-render = { path = "crates/render" }
 
 # External
 windows = "0.62"
