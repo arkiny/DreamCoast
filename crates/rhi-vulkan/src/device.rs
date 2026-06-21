@@ -60,6 +60,16 @@ pub(crate) struct DeviceShared {
     pub globals_pool: vk::DescriptorPool,
     pub globals_layout: vk::DescriptorSetLayout,
     pub globals_set: vk::DescriptorSet,
+    // Async compute (Phase 7): a queue from a dedicated compute family (when one
+    // exists) for work that overlaps the graphics queue, plus its command pool.
+    // `graphics_family`/`compute_family` drive CONCURRENT sharing for cross-queue
+    // storage buffers. When no dedicated family exists, the compute queue is the
+    // graphics queue (no real overlap, but the cross-queue path still works).
+    pub graphics_family: u32,
+    pub compute_family: u32,
+    pub compute_queue: vk::Queue,
+    pub compute_command_pool: vk::CommandPool,
+    pub has_dedicated_compute: bool,
 }
 
 impl DeviceShared {
@@ -67,9 +77,34 @@ impl DeviceShared {
         unsafe {
             let qfi = instance.queue_family_index;
             let priorities = [1.0f32];
-            let queue_ci = vk::DeviceQueueCreateInfo::default()
+
+            // Find a dedicated async-compute family (COMPUTE without GRAPHICS); fall
+            // back to the graphics family if none exists.
+            let raw_inst = &instance.shared.instance;
+            let families =
+                raw_inst.get_physical_device_queue_family_properties(instance.physical_device);
+            let dedicated_compute = families.iter().enumerate().find_map(|(i, f)| {
+                let i = i as u32;
+                let has_compute = f.queue_flags.contains(vk::QueueFlags::COMPUTE);
+                let has_graphics = f.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+                (has_compute && !has_graphics && i != qfi).then_some(i)
+            });
+            let compute_family = dedicated_compute.unwrap_or(qfi);
+            let has_dedicated_compute = dedicated_compute.is_some();
+
+            // One queue from the graphics family, plus one from a distinct compute
+            // family when available.
+            let gfx_ci = vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(qfi)
                 .queue_priorities(&priorities);
+            let cmp_ci = vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(compute_family)
+                .queue_priorities(&priorities);
+            let queue_cis = if has_dedicated_compute {
+                vec![gfx_ci, cmp_ci]
+            } else {
+                vec![gfx_ci]
+            };
 
             let device_extensions = [ash::khr::swapchain::NAME.as_ptr()];
             let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
@@ -100,24 +135,34 @@ impl DeviceShared {
                 .push_next(&mut features11);
 
             let device_ci = vk::DeviceCreateInfo::default()
-                .queue_create_infos(std::slice::from_ref(&queue_ci))
+                .queue_create_infos(&queue_cis)
                 .enabled_extension_names(&device_extensions)
                 .push_next(&mut features2);
 
             let raw = &instance.shared.instance;
-            tracing::debug!("creating logical device (qfi={qfi})");
+            tracing::debug!(
+                "creating logical device (gfx qfi={qfi}, compute qfi={compute_family}, \
+                 dedicated={has_dedicated_compute})"
+            );
             let device = raw
                 .create_device(instance.physical_device, &device_ci, None)
                 .map_err(vk_err)?;
             tracing::debug!("logical device created");
             let queue = device.get_device_queue(qfi, 0);
+            let compute_queue = device.get_device_queue(compute_family, 0);
             let swapchain_loader = ash::khr::swapchain::Device::new(raw, &device);
 
             let pool_ci = vk::CommandPoolCreateInfo::default()
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
                 .queue_family_index(qfi);
             let command_pool = device.create_command_pool(&pool_ci, None).map_err(vk_err)?;
-            tracing::debug!("command pool created");
+            let compute_pool_ci = vk::CommandPoolCreateInfo::default()
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                .queue_family_index(compute_family);
+            let compute_command_pool = device
+                .create_command_pool(&compute_pool_ci, None)
+                .map_err(vk_err)?;
+            tracing::debug!("command pools created");
 
             let mem_props = raw.get_physical_device_memory_properties(instance.physical_device);
 
@@ -144,6 +189,11 @@ impl DeviceShared {
                 globals_pool,
                 globals_layout,
                 globals_set,
+                graphics_family: qfi,
+                compute_family,
+                compute_queue,
+                compute_command_pool,
+                has_dedicated_compute,
             })
         }
     }
@@ -468,6 +518,10 @@ impl Drop for DeviceShared {
                 .destroy_descriptor_set_layout(self.globals_layout, None);
             self.device.destroy_sampler(self.bindless_sampler, None);
             self.device.destroy_command_pool(self.command_pool, None);
+            if self.has_dedicated_compute {
+                self.device
+                    .destroy_command_pool(self.compute_command_pool, None);
+            }
             self.device.destroy_device(None);
         }
     }
@@ -605,9 +659,55 @@ impl VulkanDevice {
         }
     }
 
+    /// Allocate a command buffer on the async-compute queue family (Phase 7).
+    pub fn create_compute_command_buffer(&self) -> Result<VulkanCommandBuffer, EngineError> {
+        command::VulkanCommandBuffer::new_compute(self.shared.clone())
+    }
+
+    /// The async-compute queue (a dedicated compute family when one exists).
+    pub fn compute_queue(&self) -> VulkanComputeQueue {
+        VulkanComputeQueue {
+            shared: self.shared.clone(),
+        }
+    }
+
+    /// Whether a dedicated async-compute queue family is in use (else the compute
+    /// queue aliases the graphics queue and there is no real overlap).
+    pub fn has_async_compute(&self) -> bool {
+        self.shared.has_dedicated_compute
+    }
+
     /// Block until the device is idle (used before teardown / swapchain rebuild).
     pub fn wait_idle(&self) -> Result<(), EngineError> {
         unsafe { self.shared.device.device_wait_idle().map_err(vk_err) }
+    }
+}
+
+/// The device's async-compute queue (Phase 7).
+pub struct VulkanComputeQueue {
+    pub(crate) shared: Arc<DeviceShared>,
+}
+
+impl VulkanComputeQueue {
+    /// Submit async-compute work, signaling `signal` on completion (the graphics
+    /// queue waits on it). No wait, no fence: frame pacing is carried transitively
+    /// by the graphics fence the graphics submit signals.
+    pub fn submit(
+        &self,
+        cmd: &VulkanCommandBuffer,
+        signal: &VulkanSemaphore,
+    ) -> Result<(), EngineError> {
+        unsafe {
+            let command_buffers = [cmd.raw()];
+            let signal_semaphores = [signal.raw()];
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores);
+            self.shared
+                .device
+                .queue_submit(self.shared.compute_queue, &[submit], vk::Fence::null())
+                .map_err(vk_err)
+        }
     }
 }
 
@@ -629,6 +729,37 @@ impl VulkanQueue {
         unsafe {
             let wait_semaphores = [wait.raw()];
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let signal_semaphores = [signal.raw()];
+            let command_buffers = [cmd.raw()];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores);
+            self.shared
+                .device
+                .queue_submit(self.shared.queue, &[submit], fence.raw())
+                .map_err(vk_err)
+        }
+    }
+
+    /// Submit, additionally waiting on `compute_wait` (the async-compute queue's
+    /// completion semaphore) at the vertex stage (where the particle draw reads the
+    /// compute-written buffer), before signaling `signal`/`fence` (Phase 7).
+    pub fn submit_async(
+        &self,
+        cmd: &VulkanCommandBuffer,
+        wait: &VulkanSemaphore,
+        compute_wait: &VulkanSemaphore,
+        signal: &VulkanSemaphore,
+        fence: &VulkanFence,
+    ) -> Result<(), EngineError> {
+        unsafe {
+            let wait_semaphores = [wait.raw(), compute_wait.raw()];
+            let wait_stages = [
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::VERTEX_SHADER,
+            ];
             let signal_semaphores = [signal.raw()];
             let command_buffers = [cmd.raw()];
             let submit = vk::SubmitInfo::default()

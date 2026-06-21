@@ -301,7 +301,7 @@ fn main() -> anyhow::Result<()> {
     let particle_sim_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
         compute_bytes: particle_sim_cs,
         compute_entry: "csMain",
-        push_constant_size: 20, // buffer_index + count + dt + time + init
+        push_constant_size: 24, // read_index + write_index + count + dt + time + init
         bindless: true,
     })?;
     let (pd_vs, pd_fs) = load_shader_pair(
@@ -327,24 +327,39 @@ fn main() -> anyhow::Result<()> {
         depth_test: false,
         depth_format: None,
     })?;
-    let particle_buffer = device.create_storage_buffer(&StorageBufferDesc {
-        size: (PARTICLE_COUNT * 32) as u64,
-        stride: 32,
-        indirect: false,
-    })?;
-    // Seed the particle buffer once (init dispatch).
+    // Two ping-pong particle buffers: the sim reads one and writes the other so a
+    // frame's compute never clobbers the buffer a still-in-flight previous frame's
+    // draw is reading (the WAR hazard async compute would otherwise expose).
+    let particle_buffers = [
+        device.create_storage_buffer(&StorageBufferDesc {
+            size: (PARTICLE_COUNT * 32) as u64,
+            stride: 32,
+            indirect: false,
+        })?,
+        device.create_storage_buffer(&StorageBufferDesc {
+            size: (PARTICLE_COUNT * 32) as u64,
+            stride: 32,
+            indirect: false,
+        })?,
+    ];
+    // Seed both buffers once (init dispatch into each) so the first frame's read
+    // source is valid whichever parity it starts on.
     {
         let init_cmd = device.create_command_buffer()?;
         init_cmd.begin()?;
         init_cmd.bind_compute_pipeline(&particle_sim_pipeline);
-        init_cmd.push_constants_compute(&particle_sim_push(
-            particle_buffer.storage_index(),
-            PARTICLE_COUNT as u32,
-            0.0,
-            0.0,
-            1,
-        ));
-        init_cmd.dispatch((PARTICLE_COUNT as u32).div_ceil(64), 1, 1);
+        for buf in &particle_buffers {
+            let idx = buf.storage_index();
+            init_cmd.push_constants_compute(&particle_sim_push(
+                idx,
+                idx,
+                PARTICLE_COUNT as u32,
+                0.0,
+                0.0,
+                1,
+            ));
+            init_cmd.dispatch((PARTICLE_COUNT as u32).div_ceil(64), 1, 1);
+        }
         init_cmd.end()?;
         let fence = device.create_fence(false)?;
         device.queue().submit_oneshot(&init_cmd, &fence)?;
@@ -671,6 +686,12 @@ fn main() -> anyhow::Result<()> {
     let mut compute_post = std::env::var_os("P7_COMPUTE_POST").is_some();
     // Phase 7: GPU particle simulation (compute-updated buffer, instanced draw).
     let mut particles_on = std::env::var_os("P7_PARTICLES").is_some();
+    // Run the particle sim on the async-compute queue (overlapping graphics) when a
+    // dedicated compute queue exists. Off / unsupported -> the sim runs as a graph
+    // compute pass on the graphics queue (single-queue path), with identical output.
+    let async_compute_supported = device.has_async_compute();
+    let mut async_compute_on = async_compute_supported
+        && (std::env::var_os("ASYNC_COMPUTE").is_some() || !screenshot_mode);
     // Phase 7: GPU frustum culling -> indirect draw of a cube instance grid.
     let mut gpu_cull = std::env::var_os("P7_CULL").is_some();
     // Real-time environment capture: re-capture the env chain every frame (so the
@@ -689,10 +710,19 @@ fn main() -> anyhow::Result<()> {
     let mut command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
     let mut image_available = Vec::with_capacity(FRAMES_IN_FLIGHT);
     let mut in_flight = Vec::with_capacity(FRAMES_IN_FLIGHT);
+    // Async-compute resources: a command buffer on the compute queue per frame,
+    // plus a semaphore the compute submit signals and the graphics submit waits on
+    // (so the particle draw sees the compute-written buffer). Only used when a
+    // dedicated compute queue exists and the async toggle is on.
+    let compute_queue = device.compute_queue();
+    let mut compute_command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
+    let mut compute_done = Vec::with_capacity(FRAMES_IN_FLIGHT);
     for _ in 0..FRAMES_IN_FLIGHT {
         command_buffers.push(device.create_command_buffer()?);
         image_available.push(device.create_semaphore()?);
         in_flight.push(device.create_fence(true)?);
+        compute_command_buffers.push(device.create_compute_command_buffer()?);
+        compute_done.push(device.create_semaphore()?);
     }
     let mut render_finished = build_render_finished(&device, swapchain.image_count())?;
 
@@ -800,6 +830,9 @@ fn main() -> anyhow::Result<()> {
     let mut last = Instant::now();
     // Accumulated wall-clock time, for the particle simulation's respawn hashing.
     let mut elapsed = 0.0f32;
+    // Ping-pong parity for the particle buffers: each simulated frame writes
+    // `particle_buffers[parity]` reading `[parity ^ 1]`, then flips.
+    let mut particle_parity = 0usize;
     // Fixed view in screenshot mode for reproducible output.
     let mut angle = if screenshot_mode { 0.7 } else { 0.0 };
 
@@ -913,6 +946,11 @@ fn main() -> anyhow::Result<()> {
                     ui.text("Compute / GPGPU (Phase 7)");
                     ui.checkbox("Compute post (blur)", &mut compute_post);
                     ui.checkbox("GPU particles", &mut particles_on);
+                    if async_compute_supported {
+                        ui.checkbox("  - async compute queue", &mut async_compute_on);
+                    } else {
+                        ui.text_disabled("  - async compute (no dedicated queue)");
+                    }
                     ui.checkbox("GPU culling (indirect)", &mut gpu_cull);
                 });
         }
@@ -1175,9 +1213,20 @@ fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-        if let Some(particles_ext) = particles_ext {
+        // Pick this frame's ping-pong buffers: read the previous write, write the
+        // other. The draw pass (recorded later) reads `particle_write`.
+        let particle_read = particle_parity ^ 1;
+        let particle_write = particle_parity;
+        // Run the sim on the async-compute queue this frame? (Else it's a graph
+        // compute pass on the graphics queue, below.) Decided once here so the
+        // compute-cmd recording + submit path after the graph match. The async
+        // recording itself happens after `graph.execute` (the compute command
+        // buffer is independent of the graphics graph).
+        let async_sim = particles_on && async_compute_supported && async_compute_on;
+        if let (false, Some(particles_ext)) = (async_sim, particles_ext) {
             let sim = &particle_sim_pipeline;
-            let buf = &particle_buffer;
+            let src = &particle_buffers[particle_read];
+            let dst = &particle_buffers[particle_write];
             graph.add_compute_pass(
                 ComputePassInfo {
                     name: "particle_sim",
@@ -1188,7 +1237,8 @@ fn main() -> anyhow::Result<()> {
                     let cmd = ctx.cmd();
                     cmd.bind_compute_pipeline(sim);
                     cmd.push_constants_compute(&particle_sim_push(
-                        buf.storage_index(),
+                        src.storage_index(),
+                        dst.storage_index(),
                         PARTICLE_COUNT as u32,
                         sim_dt,
                         elapsed,
@@ -1196,10 +1246,14 @@ fn main() -> anyhow::Result<()> {
                     ));
                     cmd.dispatch((PARTICLE_COUNT as u32).div_ceil(64), 1, 1);
                     // Order the write before the draw pass's vertex-stage read.
-                    cmd.storage_buffer_barrier(buf);
+                    cmd.storage_buffer_barrier(dst);
                     Ok(())
                 },
             );
+        }
+        // Next simulated frame swaps which buffer is source vs destination.
+        if particles_on {
+            particle_parity ^= 1;
         }
 
         // Phase 7 GPU culling: reset the indirect args, frustum-cull the instance
@@ -1344,7 +1398,7 @@ fn main() -> anyhow::Result<()> {
         // stage. Declared after tonemap so the WAW on the backbuffer orders it last.
         if let Some(particles_ext) = particles_ext {
             let draw = &particle_draw_pipeline;
-            let buf = &particle_buffer;
+            let buf = &particle_buffers[particle_write];
             let vp = view_proj.to_cols_array();
             graph.add_pass(
                 PassInfo {
@@ -1407,7 +1461,35 @@ fn main() -> anyhow::Result<()> {
         cmd.end()?;
 
         let signal = &render_finished[image_index as usize];
-        queue.submit(cmd, &image_available[frame], signal, fence)?;
+        if async_sim {
+            // Record the particle sim into this frame's compute command buffer and
+            // run it on the compute queue (overlapping graphics), signaling
+            // `compute_done`; the graphics submit GPU-waits on it so the particle
+            // draw's vertex-stage read sees the freshly written buffer.
+            let ccmd = &compute_command_buffers[frame];
+            ccmd.begin()?;
+            ccmd.bind_compute_pipeline(&particle_sim_pipeline);
+            ccmd.push_constants_compute(&particle_sim_push(
+                particle_buffers[particle_read].storage_index(),
+                particle_buffers[particle_write].storage_index(),
+                PARTICLE_COUNT as u32,
+                sim_dt,
+                elapsed,
+                0,
+            ));
+            ccmd.dispatch((PARTICLE_COUNT as u32).div_ceil(64), 1, 1);
+            ccmd.end()?;
+            compute_queue.submit(ccmd, &compute_done[frame])?;
+            queue.submit_async(
+                cmd,
+                &image_available[frame],
+                &compute_done[frame],
+                signal,
+                fence,
+            )?;
+        } else {
+            queue.submit(cmd, &image_available[frame], signal, fence)?;
+        }
 
         // Wait for the GPU (copy included), read the buffer back, and save a PNG.
         if let (Some(cap), Some((buf, layout))) = (capture_this_frame.as_ref(), readback.as_ref()) {
@@ -1831,13 +1913,21 @@ fn post_push(hdr_index: u32, mode: u32, flip_y: u32) -> [u8; 16] {
 }
 
 /// Pack the particle-sim push block: buffer_index + count + dt + time + init.
-fn particle_sim_push(buffer_index: u32, count: u32, dt: f32, time: f32, init: u32) -> [u8; 20] {
-    let mut pc = [0u8; 20];
-    pc[0..4].copy_from_slice(&buffer_index.to_le_bytes());
-    pc[4..8].copy_from_slice(&count.to_le_bytes());
-    pc[8..12].copy_from_slice(&dt.to_le_bytes());
-    pc[12..16].copy_from_slice(&time.to_le_bytes());
-    pc[16..20].copy_from_slice(&init.to_le_bytes());
+fn particle_sim_push(
+    read_index: u32,
+    write_index: u32,
+    count: u32,
+    dt: f32,
+    time: f32,
+    init: u32,
+) -> [u8; 24] {
+    let mut pc = [0u8; 24];
+    pc[0..4].copy_from_slice(&read_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&write_index.to_le_bytes());
+    pc[8..12].copy_from_slice(&count.to_le_bytes());
+    pc[12..16].copy_from_slice(&dt.to_le_bytes());
+    pc[16..20].copy_from_slice(&time.to_le_bytes());
+    pc[20..24].copy_from_slice(&init.to_le_bytes());
     pc
 }
 

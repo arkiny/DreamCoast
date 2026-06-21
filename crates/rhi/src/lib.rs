@@ -36,6 +36,8 @@ backend_enum!(/// A logical device: the factory for GPU resources.
     Device => rhi_vulkan::VulkanDevice, rhi_d3d12::D3d12Device);
 backend_enum!(/// A submission/present queue.
     Queue => rhi_vulkan::VulkanQueue, rhi_d3d12::D3d12Queue);
+backend_enum!(/// An async-compute queue overlapping the graphics queue (Phase 7).
+    ComputeQueue => rhi_vulkan::VulkanComputeQueue, rhi_d3d12::D3d12ComputeQueue);
 backend_enum!(/// A window swapchain.
     Swapchain => rhi_vulkan::VulkanSwapchain, rhi_d3d12::D3d12Swapchain);
 backend_enum!(/// A graphics pipeline.
@@ -223,6 +225,32 @@ impl Device {
         match self {
             Self::Vulkan(d) => Ok(CommandBuffer::Vulkan(d.create_command_buffer()?)),
             Self::D3d12(d) => Ok(CommandBuffer::D3d12(d.create_command_buffer()?)),
+        }
+    }
+
+    /// Allocate a command buffer for the async-compute queue (Phase 7).
+    pub fn create_compute_command_buffer(&self) -> Result<CommandBuffer> {
+        match self {
+            Self::Vulkan(d) => Ok(CommandBuffer::Vulkan(d.create_compute_command_buffer()?)),
+            Self::D3d12(d) => Ok(CommandBuffer::D3d12(d.create_compute_command_buffer()?)),
+        }
+    }
+
+    /// The async-compute queue, for work that overlaps the graphics queue (Phase 7).
+    pub fn compute_queue(&self) -> ComputeQueue {
+        match self {
+            Self::Vulkan(d) => ComputeQueue::Vulkan(d.compute_queue()),
+            Self::D3d12(d) => ComputeQueue::D3d12(d.compute_queue()),
+        }
+    }
+
+    /// Whether a dedicated async-compute queue is available (else compute work
+    /// would alias the graphics queue with no real overlap). D3D12 always exposes
+    /// a COMPUTE queue; Vulkan depends on a dedicated compute family (Phase 7).
+    pub fn has_async_compute(&self) -> bool {
+        match self {
+            Self::Vulkan(d) => d.has_async_compute(),
+            Self::D3d12(d) => d.has_async_compute(),
         }
     }
 
@@ -866,6 +894,40 @@ impl Queue {
         }
     }
 
+    /// Submit graphics work that consumes async-compute output (Phase 7). The
+    /// graphics queue GPU-waits on the compute queue's completion (`compute_wait`
+    /// on Vulkan; a cross-queue fence on D3D12, where the semaphores are no-ops)
+    /// before running, so the draw sees the compute-written buffer. Also waits on
+    /// `wait` (image-acquired) and signals `signal`/`fence` like `submit`.
+    pub fn submit_async(
+        &self,
+        cmd: &CommandBuffer,
+        wait: &Semaphore,
+        compute_wait: &Semaphore,
+        signal: &Semaphore,
+        fence: &Fence,
+    ) -> Result<()> {
+        match (self, cmd, wait, compute_wait, signal, fence) {
+            (
+                Self::Vulkan(q),
+                CommandBuffer::Vulkan(c),
+                Semaphore::Vulkan(w),
+                Semaphore::Vulkan(cw),
+                Semaphore::Vulkan(s),
+                Fence::Vulkan(f),
+            ) => q.submit_async(c, w, cw, s, f),
+            (
+                Self::D3d12(q),
+                CommandBuffer::D3d12(c),
+                Semaphore::D3d12(w),
+                Semaphore::D3d12(_cw),
+                Semaphore::D3d12(s),
+                Fence::D3d12(f),
+            ) => q.submit_async(c, w, s, f),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
     /// Submit one command buffer with no semaphore sync, signaling `fence`. For
     /// one-off startup work (e.g. IBL cubemap generation).
     pub fn submit_oneshot(&self, cmd: &CommandBuffer, fence: &Fence) -> Result<()> {
@@ -890,6 +952,19 @@ impl Queue {
             (Self::D3d12(q), Swapchain::D3d12(s), Semaphore::D3d12(w)) => {
                 q.present(s, image_index, w)
             }
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+}
+
+impl ComputeQueue {
+    /// Submit async-compute work, signaling `signal` on completion. The graphics
+    /// queue's `submit_async` waits on `signal` before reading the compute output.
+    /// On D3D12 the semaphore is a no-op (a cross-queue fence carries the sync).
+    pub fn submit(&self, cmd: &CommandBuffer, signal: &Semaphore) -> Result<()> {
+        match (self, cmd, signal) {
+            (Self::Vulkan(q), CommandBuffer::Vulkan(c), Semaphore::Vulkan(s)) => q.submit(c, s),
+            (Self::D3d12(q), CommandBuffer::D3d12(c), Semaphore::D3d12(s)) => q.submit(c, s),
             _ => unreachable!("{MIXED}"),
         }
     }

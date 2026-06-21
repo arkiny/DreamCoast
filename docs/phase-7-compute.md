@@ -154,7 +154,8 @@ Phase 7은 여기에 **컴퓨트 패스**와 **read-write(UAV/storage) 리소스
 
 ## 알려진 한계 / 이후 작업 (예정)
 
-- **async compute 미도입**(단일 그래픽스 큐) — 별도 컴퓨트 큐는 Phase 9 폴리시로 연기.
+- **async compute** — Phase 7은 단일 그래픽스 큐로 구현. 별도 컴퓨트 큐(파티클 sim 오버랩)는 이후
+  폴리시로 분리 구현 ✅: [async-compute.md](async-compute.md) 참조(단일 큐 경로는 폴백으로 보존).
 - 바인드리스 슬롯 monotonic(상한) — storage 테이블도 free-list 없음(Phase 5에서 이월된 과제).
 - 파티클은 단일 버퍼 in-place(더블 버퍼/정렬/충돌 없음) — 데모 수준.
 - 컬링은 프러스텀만(오클루전/HZB는 Phase 10).
