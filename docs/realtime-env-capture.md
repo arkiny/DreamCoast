@@ -40,6 +40,16 @@
   반사(하단), 양 백엔드 픽셀 일치. 면별 90° 뷰프로젝션 + Vulkan flip로 면 정렬.
 - **RT4 — 마무리 ✅:** UI 토글, `MeshPosNormal` 정점 레이아웃(검증 클린), 문서/메모리. 배경
   스카이 분리는 **불필요 확인**(지면은 env 하반구에만, 배경은 상반구→하늘). FPS/검증 클린.
+- **RT5 — 멀티바운스(더블 버퍼) ✅:** env/irradiance/prefilter 큐브를 **2벌 핑퐁**. 매 프레임
+  씬을 write 세트에 캡처할 때, 그 표면을 **read 세트(이전 프레임)의 IBL**(split-sum:
+  irradiance·albedo + prefilter·(F·LUT.x+LUT.y))로 셰이딩 → 반사 물체가 반사 안에서도 반사로
+  보임(멀티바운스). 캡처는 항상 *다른* 세트를 읽으므로 재귀/스톨 없음, 수 프레임에 걸쳐 수렴.
+  메인 라이팅은 항상 갓 쓴 write 세트 샘플. 패리티는 **실제 캡처 시에만** 전진(스킵 프레임은
+  마지막 write 세트 유지 → 깜빡임 없음). 루프 진입 전 두 세트를 단일바운스로 1회 초기화(첫
+  프레임이 미초기화 메모리 샘플 방지). `capture.slang` push 112→208B(+model/eye/metallic/
+  roughness/이전 IBL 인덱스; RTX 2070 maxPushConstants 256 이내). UI "Multi-bounce
+  reflections" 토글(off=이전 단일바운스 단일 큐브 동작). 검증: 양 백엔드 픽셀 일치, Vulkan
+  검증 클린, on/off 픽셀 diff가 크롬 구 영역에 국한(2차 반사라 거친 표면은 거의 불변).
 
 ## 알려진 한계 / 차후
 - 캡처 씬 = 지면 평면만(자기 반사 회피). 모델 등 볼록 지오메트리를 넣으려면 **깊이 버퍼 또는

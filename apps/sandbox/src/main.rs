@@ -312,7 +312,7 @@ fn main() -> anyhow::Result<()> {
         topology: PrimitiveTopology::TriangleList,
         vertex_layout: VertexLayout::MeshPosNormal,
         blend: BlendMode::Opaque,
-        push_constant_size: 112, // mvp(64) + base_color(16) + sun(16) + misc(16)
+        push_constant_size: 208, // mvp+model(128) + base_color(16) + sun(16) + misc(16) + eye(16) + ibl(16)
         bindless: true,
         uniform_buffer: false,
         depth_test: true, // occlusion when capturing the scene into the cube
@@ -521,8 +521,15 @@ fn main() -> anyhow::Result<()> {
     // Real-time environment capture: re-capture the env chain every frame (so the
     // sky/IBL track the live sun); when off, re-capture only when the sun changes.
     let mut realtime_env = true;
+    // Multi-bounce: shade captured surfaces with IBL from the previous frame's
+    // cube set, so reflective surfaces appear reflective inside reflections.
+    let mut multibounce = true;
     let mut env_captured = false;
     let mut last_sun = (sun_dir, sun_intensity);
+    // Ping-pong parity for the two cube sets; advances only when a capture
+    // actually happens, so a skipped frame keeps sampling the last written set.
+    let mut env_parity = 0usize;
+    let mut last_written = 0usize;
 
     let mut command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
     let mut image_available = Vec::with_capacity(FRAMES_IN_FLIGHT);
@@ -539,21 +546,32 @@ fn main() -> anyhow::Result<()> {
     // irradiance + prefilter generation is reusable (call again to re-capture
     // when the sky changes — a future real-time atmospheric model); the BRDF LUT
     // is sky-independent and generated once.
-    let env_cube = device.create_cubemap(&CubemapDesc {
-        size: ENV_SIZE,
-        format: HDR_FORMAT,
-        mip_levels: ENV_MIPS,
-    })?;
-    let irradiance_cube = device.create_cubemap(&CubemapDesc {
-        size: IRRADIANCE_SIZE,
-        format: HDR_FORMAT,
-        mip_levels: 1,
-    })?;
-    let prefilter_cube = device.create_cubemap(&CubemapDesc {
-        size: PREFILTER_SIZE,
-        format: HDR_FORMAT,
-        mip_levels: PREFILTER_MIPS,
-    })?;
+    // Double-buffered environment cube sets for multi-bounce reflections. Each
+    // frame captures the scene into the "write" set while shading those captured
+    // surfaces with IBL from the "read" set (the previous frame), so reflective
+    // surfaces reflect other reflective surfaces. The sets ping-pong; the main
+    // lighting pass always samples the freshly written set. The BRDF LUT is
+    // sky-independent so it stays single.
+    let make_cube_set = || -> anyhow::Result<CubeSet> {
+        Ok(CubeSet {
+            env: device.create_cubemap(&CubemapDesc {
+                size: ENV_SIZE,
+                format: HDR_FORMAT,
+                mip_levels: ENV_MIPS,
+            })?,
+            irradiance: device.create_cubemap(&CubemapDesc {
+                size: IRRADIANCE_SIZE,
+                format: HDR_FORMAT,
+                mip_levels: 1,
+            })?,
+            prefilter: device.create_cubemap(&CubemapDesc {
+                size: PREFILTER_SIZE,
+                format: HDR_FORMAT,
+                mip_levels: PREFILTER_MIPS,
+            })?,
+        })
+    };
+    let cube_sets = [make_cube_set()?, make_cube_set()?];
     // Depth buffer for capturing scene geometry into the env cube faces.
     let capture_depth = device.create_depth_buffer(Extent2D::new(ENV_SIZE, ENV_SIZE))?;
     let brdf_lut = device.create_render_target(&rhi::RenderTargetDesc {
@@ -561,14 +579,12 @@ fn main() -> anyhow::Result<()> {
         height: BRDF_SIZE,
         format: Format::Rg16Float,
     })?;
+    let brdf_index = brdf_lut.bindless_index() as i32;
     let ibl = IblResources {
         sky_pipeline: &sky_pipeline,
         capture_pipeline: &capture_pipeline,
         irradiance_pipeline: &irradiance_pipeline,
         prefilter_pipeline: &prefilter_pipeline,
-        env_cube: &env_cube,
-        irradiance_cube: &irradiance_cube,
-        prefilter_cube: &prefilter_cube,
         ground_vbuf: &ground_vbuf,
         ground_ibuf: &ground_ibuf,
         ground_count,
@@ -587,12 +603,37 @@ fn main() -> anyhow::Result<()> {
             flip_y,
         )?;
     }
-    let ibl_indices = [
-        env_cube.bindless_index() as i32,
-        irradiance_cube.bindless_index() as i32,
-        prefilter_cube.bindless_index() as i32,
-        brdf_lut.bindless_index() as i32,
-    ];
+    // Initialize both cube sets once (single-bounce, no previous environment) so
+    // the first multi-bounce frame reads valid data instead of uninitialized
+    // memory. Uses an approximate camera; the render loop immediately recaptures
+    // with the live camera.
+    {
+        let boot_eye = Vec3::new(0.0, model_radius * 0.6, 0.0)
+            + Vec3::new(scene_radius * 1.6, scene_radius * 0.55, 0.0);
+        let init_cmd = device.create_command_buffer()?;
+        let init_fence = device.create_fence(false)?;
+        init_cmd.begin()?;
+        for set in &cube_sets {
+            record_environment_capture(
+                &init_cmd,
+                &ibl,
+                set,
+                None,
+                brdf_index,
+                &scene,
+                &capture_depth,
+                boot_eye,
+                sun_dir,
+                sun_intensity,
+                ambient,
+                flip_y,
+                backend == BackendKind::Vulkan,
+            );
+        }
+        init_cmd.end()?;
+        queue.submit_oneshot(&init_cmd, &init_fence)?;
+        init_fence.wait()?;
+    }
 
     let _ = window.take_resized();
     info!("entering render loop");
@@ -695,6 +736,7 @@ fn main() -> anyhow::Result<()> {
                     ui.slider("Roughness", 0.0, 1.0, &mut roughness_override);
                     ui.separator();
                     ui.checkbox("Real-time env capture", &mut realtime_env);
+                    ui.checkbox("Multi-bounce reflections", &mut multibounce);
                     ui.combo_simple_string("Post effect", &mut post_mode, &POST_EFFECTS);
                     ui.checkbox("Transient aliasing", &mut aliasing);
                 });
@@ -710,6 +752,54 @@ fn main() -> anyhow::Result<()> {
             }
         };
         fence.reset()?;
+
+        let cmd = &command_buffers[frame];
+        cmd.begin()?;
+
+        // (Re)capture the environment into the "write" cube set before the main
+        // graph samples it: every frame when real-time is on, otherwise only the
+        // first frame and whenever the sun changes. With multi-bounce on, the
+        // captured surfaces are shaded with IBL from the "read" set (the previous
+        // frame), so reflective surfaces reflect each other; the parity advances
+        // only on an actual capture, so a skipped frame keeps the last written set.
+        let sun_changed = (sun_dir, sun_intensity) != last_sun;
+        if realtime_env || !env_captured || sun_changed {
+            let write = env_parity % 2;
+            let read = 1 - write;
+            let prev = if multibounce && env_captured {
+                Some(&cube_sets[read])
+            } else {
+                None
+            };
+            record_environment_capture(
+                cmd,
+                &ibl,
+                &cube_sets[write],
+                prev,
+                brdf_index,
+                &scene,
+                &capture_depth,
+                eye,
+                sun_dir,
+                sun_intensity,
+                ambient,
+                flip_y,
+                backend == BackendKind::Vulkan,
+            );
+            last_written = write;
+            env_parity += 1;
+            env_captured = true;
+            last_sun = (sun_dir, sun_intensity);
+        }
+
+        // The main lighting pass samples the most recently written set.
+        let write_set = &cube_sets[last_written];
+        let ibl_indices = [
+            write_set.env.bindless_index() as i32,
+            write_set.irradiance.bindless_index() as i32,
+            write_set.prefilter.bindless_index() as i32,
+            brdf_index,
+        ];
 
         // Directional light view-projection: an orthographic box covering the
         // whole scene, looking from the sun toward it. Backend-neutral (the pbr
@@ -750,30 +840,6 @@ fn main() -> anyhow::Result<()> {
         };
         let globals_offset = frame as u64 * GLOBALS_SLICE;
         globals_buffer.write_at(globals_offset, globals_bytes(&globals))?;
-
-        let cmd = &command_buffers[frame];
-        cmd.begin()?;
-
-        // (Re)capture the environment chain into its cubemaps before the main
-        // graph samples them. Every frame when real-time is on; otherwise only
-        // the first frame and whenever the sun changes.
-        let sun_changed = (sun_dir, sun_intensity) != last_sun;
-        if realtime_env || !env_captured || sun_changed {
-            record_environment_capture(
-                cmd,
-                &ibl,
-                &scene,
-                &capture_depth,
-                eye,
-                sun_dir,
-                sun_intensity,
-                ambient,
-                flip_y,
-                backend == BackendKind::Vulkan,
-            );
-            env_captured = true;
-            last_sun = (sun_dir, sun_intensity);
-        }
 
         // Build the deferred render graph:
         //   gbuffer (4 MRT + depth) -> lighting (HDR) -> tonemap (backbuffer) -> ui
@@ -1069,14 +1135,19 @@ fn light_view_proj(sun_dir: [f32; 3], center: Vec3, radius: f32) -> Mat4 {
 
 /// The pipelines + cubemaps used to (re)generate the IBL environment chain, plus
 /// the scene geometry captured into the env cube (camera-based reflections).
+/// One double-buffered environment: the captured cube plus its diffuse and
+/// specular convolutions. Two of these ping-pong each frame for multi-bounce.
+struct CubeSet {
+    env: Cubemap,
+    irradiance: Cubemap,
+    prefilter: Cubemap,
+}
+
 struct IblResources<'a> {
     sky_pipeline: &'a GraphicsPipeline,
     capture_pipeline: &'a GraphicsPipeline,
     irradiance_pipeline: &'a GraphicsPipeline,
     prefilter_pipeline: &'a GraphicsPipeline,
-    env_cube: &'a Cubemap,
-    irradiance_cube: &'a Cubemap,
-    prefilter_cube: &'a Cubemap,
     /// Ground plane (a shadow/reflection receiver) captured into env mip 0.
     ground_vbuf: &'a Buffer,
     ground_ibuf: &'a Buffer,
@@ -1093,6 +1164,9 @@ struct IblResources<'a> {
 fn record_environment_capture(
     cmd: &CommandBuffer,
     ibl: &IblResources,
+    write: &CubeSet,
+    prev: Option<&CubeSet>,
+    brdf_index: i32,
     scene: &[SceneObject],
     capture_depth: &rhi::DepthBuffer,
     camera_pos: Vec3,
@@ -1102,17 +1176,28 @@ fn record_environment_capture(
     flip_y: u32,
     vulkan: bool,
 ) {
-    let env_index = ibl.env_cube.bindless_index();
-    let env_mips = ibl.env_cube.mip_levels();
+    let env_index = write.env.bindless_index();
+    let env_mips = write.env.mip_levels();
+    let prefilter_max_lod = (PREFILTER_MIPS - 1) as f32;
+    // Previous frame's convolved cubes (multi-bounce IBL source); -1 = single
+    // bounce (capture surfaces with flat ambient only).
+    let prev_ibl = match prev {
+        Some(p) => [
+            p.irradiance.bindless_index() as i32,
+            p.prefilter.bindless_index() as i32,
+            brdf_index,
+        ],
+        None => [-1, -1, -1],
+    };
 
     // 1. Procedural sky -> environment cube, every mip (the sky is procedural and
     // position-independent, so each mip is just a lower-res render — no
     // downsample/self-sample hazard; the prefilter samples this mip chain).
-    cmd.cube_to_color(ibl.env_cube);
+    cmd.cube_to_color(&write.env);
     for mip in 0..env_mips {
         let size = (ENV_SIZE >> mip).max(1);
         for face in 0..6u32 {
-            cmd.begin_rendering_cube_face(ibl.env_cube, face, mip, Some(ClearColor::BLACK));
+            cmd.begin_rendering_cube_face(&write.env, face, mip, Some(ClearColor::BLACK));
             cmd.set_viewport_scissor_extent(Extent2D::new(size, size));
             cmd.bind_graphics_pipeline(ibl.sky_pipeline);
             cmd.push_constants(&sky_push(sun_dir, sun_intensity, face, flip_y));
@@ -1123,35 +1208,48 @@ fn record_environment_capture(
 
     // 1b. Scene (ground + objects) into env mip 0 from the camera position, with
     // a depth buffer for correct occlusion, so reflective surfaces reflect the
-    // live scene. Capture shading is direct-light only (no IBL) → no recursion;
-    // a convex object barely samples its own captured pixels, so a single shared
-    // cube is fine.
+    // live scene. Captured surfaces are shaded with direct sun + IBL from the
+    // previous frame's cubes (multi-bounce) — never the cube being written, so
+    // there is no recursion.
     let face_vp = cube_face_view_proj(camera_pos, vulkan);
     cmd.depth_to_render_target(capture_depth);
     for face in 0..6u32 {
-        cmd.begin_rendering_cube_face_depth(ibl.env_cube, face, 0, None, capture_depth);
+        cmd.begin_rendering_cube_face_depth(&write.env, face, 0, None, capture_depth);
         cmd.set_viewport_scissor_extent(Extent2D::new(ENV_SIZE, ENV_SIZE));
         cmd.bind_graphics_pipeline(ibl.capture_pipeline);
-        // Ground.
+        // Ground (matte receiver; identity model).
         cmd.push_constants(&capture_push(
             face_vp[face as usize].to_cols_array(),
+            Mat4::IDENTITY.to_cols_array(),
             [0.8, 0.8, 0.8, 1.0],
+            0.0,
+            0.9,
             sun_dir,
             sun_intensity,
             ambient,
+            camera_pos,
+            prefilter_max_lod,
+            prev_ibl,
         ));
         cmd.bind_vertex_buffer(ibl.ground_vbuf, 32);
         cmd.bind_index_buffer(ibl.ground_ibuf, true);
         cmd.draw_indexed(ibl.ground_count, 0, 0);
-        // Scene objects (direct-lit; metallic/roughness ignored in the capture).
+        // Scene objects (their real metallic/roughness so reflective surfaces
+        // appear reflective inside the reflection).
         for obj in scene {
             let mvp = (face_vp[face as usize] * obj.transform).to_cols_array();
             cmd.push_constants(&capture_push(
                 mvp,
+                obj.transform.to_cols_array(),
                 obj.base_color,
+                obj.metallic,
+                obj.roughness,
                 sun_dir,
                 sun_intensity,
                 ambient,
+                camera_pos,
+                prefilter_max_lod,
+                prev_ibl,
             ));
             cmd.bind_vertex_buffer(&obj.vbuf, 32);
             cmd.bind_index_buffer(&obj.ibuf, true);
@@ -1159,22 +1257,22 @@ fn record_environment_capture(
         }
         cmd.end_rendering();
     }
-    cmd.cube_to_sampled(ibl.env_cube);
+    cmd.cube_to_sampled(&write.env);
 
     // 2. Env -> diffuse irradiance cube.
-    cmd.cube_to_color(ibl.irradiance_cube);
+    cmd.cube_to_color(&write.irradiance);
     for face in 0..6u32 {
-        cmd.begin_rendering_cube_face(ibl.irradiance_cube, face, 0, Some(ClearColor::BLACK));
+        cmd.begin_rendering_cube_face(&write.irradiance, face, 0, Some(ClearColor::BLACK));
         cmd.set_viewport_scissor_extent(Extent2D::new(IRRADIANCE_SIZE, IRRADIANCE_SIZE));
         cmd.bind_graphics_pipeline(ibl.irradiance_pipeline);
         cmd.push_constants(&cube_gen_push(face, flip_y, env_index, 0.0));
         cmd.draw(3, 1);
         cmd.end_rendering();
     }
-    cmd.cube_to_sampled(ibl.irradiance_cube);
+    cmd.cube_to_sampled(&write.irradiance);
 
     // 3. Env -> specular prefilter cube (one roughness per mip).
-    cmd.cube_to_color(ibl.prefilter_cube);
+    cmd.cube_to_color(&write.prefilter);
     for mip in 0..PREFILTER_MIPS {
         let roughness = if PREFILTER_MIPS > 1 {
             mip as f32 / (PREFILTER_MIPS - 1) as f32
@@ -1183,7 +1281,7 @@ fn record_environment_capture(
         };
         let size = (PREFILTER_SIZE >> mip).max(1);
         for face in 0..6u32 {
-            cmd.begin_rendering_cube_face(ibl.prefilter_cube, face, mip, Some(ClearColor::BLACK));
+            cmd.begin_rendering_cube_face(&write.prefilter, face, mip, Some(ClearColor::BLACK));
             cmd.set_viewport_scissor_extent(Extent2D::new(size, size));
             cmd.bind_graphics_pipeline(ibl.prefilter_pipeline);
             cmd.push_constants(&prefilter_push(
@@ -1193,7 +1291,7 @@ fn record_environment_capture(
             cmd.end_rendering();
         }
     }
-    cmd.cube_to_sampled(ibl.prefilter_cube);
+    cmd.cube_to_sampled(&write.prefilter);
 }
 
 /// Integrate the environment-BRDF LUT (sky-independent; generate once).
@@ -1241,30 +1339,55 @@ fn cube_face_view_proj(eye: Vec3, vulkan: bool) -> [Mat4; 6] {
     out
 }
 
-/// Pack the capture push block: mvp(64) + base_color(16) + sun(16, xyz dir + w
-/// intensity) + misc(16, x = ambient) = 112 bytes.
+/// Pack the capture push block (208 bytes). Layout: mvp(64), model(64),
+/// base_color(16), sun(16 — xyz dir, w intensity), misc(16 — x ambient,
+/// y roughness, z metallic, w prefilter max LOD), eye(16 — xyz), ibl(16 — int4
+/// irradiance/prefilter/BRDF indices, -1 = no previous environment).
+#[allow(clippy::too_many_arguments)]
 fn capture_push(
     mvp: [f32; 16],
+    model: [f32; 16],
     base_color: [f32; 4],
+    metallic: f32,
+    roughness: f32,
     sun_dir: [f32; 3],
     sun_intensity: f32,
     ambient: f32,
-) -> [u8; 112] {
-    let mut pc = [0u8; 112];
+    eye: Vec3,
+    prefilter_max_lod: f32,
+    ibl: [i32; 3],
+) -> [u8; 208] {
+    let mut pc = [0u8; 208];
     for (i, f) in mvp.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
-    for (i, f) in base_color.iter().enumerate() {
+    for (i, f) in model.iter().enumerate() {
         let o = 64 + i * 4;
+        pc[o..o + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    for (i, f) in base_color.iter().enumerate() {
+        let o = 128 + i * 4;
         pc[o..o + 4].copy_from_slice(&f.to_le_bytes());
     }
     let n = normalize3(sun_dir);
     for (i, f) in n.iter().take(3).enumerate() {
-        let o = 80 + i * 4;
+        let o = 144 + i * 4;
         pc[o..o + 4].copy_from_slice(&f.to_le_bytes());
     }
-    pc[92..96].copy_from_slice(&sun_intensity.to_le_bytes());
-    pc[96..100].copy_from_slice(&ambient.to_le_bytes());
+    pc[156..160].copy_from_slice(&sun_intensity.to_le_bytes());
+    // misc: x ambient, y roughness, z metallic, w prefilter max LOD.
+    pc[160..164].copy_from_slice(&ambient.to_le_bytes());
+    pc[164..168].copy_from_slice(&roughness.to_le_bytes());
+    pc[168..172].copy_from_slice(&metallic.to_le_bytes());
+    pc[172..176].copy_from_slice(&prefilter_max_lod.to_le_bytes());
+    // eye: xyz capture/camera position.
+    pc[176..180].copy_from_slice(&eye.x.to_le_bytes());
+    pc[180..184].copy_from_slice(&eye.y.to_le_bytes());
+    pc[184..188].copy_from_slice(&eye.z.to_le_bytes());
+    // ibl: int4 previous-frame irradiance / prefilter / BRDF indices.
+    pc[192..196].copy_from_slice(&ibl[0].to_le_bytes());
+    pc[196..200].copy_from_slice(&ibl[1].to_le_bytes());
+    pc[200..204].copy_from_slice(&ibl[2].to_le_bytes());
     pc
 }
 
