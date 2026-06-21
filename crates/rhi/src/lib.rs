@@ -40,6 +40,8 @@ backend_enum!(/// A window swapchain.
     Swapchain => rhi_vulkan::VulkanSwapchain, rhi_d3d12::D3d12Swapchain);
 backend_enum!(/// A graphics pipeline.
     GraphicsPipeline => rhi_vulkan::VulkanGraphicsPipeline, rhi_d3d12::D3d12GraphicsPipeline);
+backend_enum!(/// A compute pipeline (Phase 7).
+    ComputePipeline => rhi_vulkan::VulkanComputePipeline, rhi_d3d12::D3d12ComputePipeline);
 backend_enum!(/// A primary command buffer.
     CommandBuffer => rhi_vulkan::VulkanCommandBuffer, rhi_d3d12::D3d12CommandBuffer);
 backend_enum!(/// A CPU-GPU fence.
@@ -48,6 +50,8 @@ backend_enum!(/// A GPU-GPU binary semaphore (no-op on D3D12).
     Semaphore => rhi_vulkan::VulkanSemaphore, rhi_d3d12::D3d12Semaphore);
 backend_enum!(/// A host-visible buffer (vertex/index).
     Buffer => rhi_vulkan::VulkanBuffer, rhi_d3d12::D3d12Buffer);
+backend_enum!(/// A device-local storage buffer (UAV) for compute (Phase 7).
+    StorageBuffer => rhi_vulkan::VulkanStorageBuffer, rhi_d3d12::D3d12StorageBuffer);
 backend_enum!(/// A sampled 2D texture registered in the bindless table.
     Texture => rhi_vulkan::VulkanTexture, rhi_d3d12::D3d12Texture);
 backend_enum!(/// A depth buffer for the mesh pass.
@@ -94,6 +98,26 @@ impl Texture {
         match self {
             Self::Vulkan(t) => t.bindless_index(),
             Self::D3d12(t) => t.bindless_index(),
+        }
+    }
+}
+
+impl StorageBuffer {
+    /// Index of this buffer in the device's bindless storage-buffer table.
+    pub fn storage_index(&self) -> u32 {
+        match self {
+            Self::Vulkan(b) => b.storage_index(),
+            Self::D3d12(b) => b.storage_index(),
+        }
+    }
+}
+
+impl RenderTarget {
+    /// Bindless storage-image (UAV) index, if created with `storage`.
+    pub fn storage_index(&self) -> Option<u32> {
+        match self {
+            Self::Vulkan(t) => t.storage_index(),
+            Self::D3d12(t) => t.storage_index(),
         }
     }
 }
@@ -188,6 +212,13 @@ impl Device {
         }
     }
 
+    pub fn create_compute_pipeline(&self, desc: &ComputePipelineDesc) -> Result<ComputePipeline> {
+        match self {
+            Self::Vulkan(d) => Ok(ComputePipeline::Vulkan(d.create_compute_pipeline(desc)?)),
+            Self::D3d12(d) => Ok(ComputePipeline::D3d12(d.create_compute_pipeline(desc)?)),
+        }
+    }
+
     pub fn create_command_buffer(&self) -> Result<CommandBuffer> {
         match self {
             Self::Vulkan(d) => Ok(CommandBuffer::Vulkan(d.create_command_buffer()?)),
@@ -199,6 +230,14 @@ impl Device {
         match self {
             Self::Vulkan(d) => Ok(Buffer::Vulkan(d.create_buffer(desc)?)),
             Self::D3d12(d) => Ok(Buffer::D3d12(d.create_buffer(desc)?)),
+        }
+    }
+
+    /// Create a device-local storage buffer (UAV) for compute (Phase 7).
+    pub fn create_storage_buffer(&self, desc: &StorageBufferDesc) -> Result<StorageBuffer> {
+        match self {
+            Self::Vulkan(d) => Ok(StorageBuffer::Vulkan(d.create_storage_buffer(desc)?)),
+            Self::D3d12(d) => Ok(StorageBuffer::D3d12(d.create_storage_buffer(desc)?)),
         }
     }
 
@@ -673,6 +712,92 @@ impl CommandBuffer {
         match self {
             Self::Vulkan(c) => c.draw(vertex_count, instance_count),
             Self::D3d12(c) => c.draw(vertex_count, instance_count),
+        }
+    }
+
+    /// Bind a compute pipeline (and its bindless tables, if any).
+    pub fn bind_compute_pipeline(&self, pipeline: &ComputePipeline) {
+        match (self, pipeline) {
+            (Self::Vulkan(c), ComputePipeline::Vulkan(p)) => c.bind_compute_pipeline(p),
+            (Self::D3d12(c), ComputePipeline::D3d12(p)) => c.bind_compute_pipeline(p),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Dispatch the bound compute pipeline over `(x, y, z)` workgroups.
+    pub fn dispatch(&self, x: u32, y: u32, z: u32) {
+        match self {
+            Self::Vulkan(c) => c.dispatch(x, y, z),
+            Self::D3d12(c) => c.dispatch(x, y, z),
+        }
+    }
+
+    /// Upload push/root constants for the bound **compute** pipeline.
+    pub fn push_constants_compute(&self, data: &[u8]) {
+        match self {
+            Self::Vulkan(c) => c.push_constants_compute(data),
+            Self::D3d12(c) => c.push_constants_compute(data),
+        }
+    }
+
+    /// Transition a storage render target into compute-writable state.
+    pub fn rt_to_storage(&self, target: &RenderTarget) {
+        match (self, target) {
+            (Self::Vulkan(c), RenderTarget::Vulkan(t)) => c.rt_to_storage(t),
+            (Self::D3d12(c), RenderTarget::D3d12(t)) => c.rt_to_storage(t),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Transition a storage image from compute-write into shader-read for sampling.
+    pub fn storage_to_sampled(&self, target: &RenderTarget) {
+        match (self, target) {
+            (Self::Vulkan(c), RenderTarget::Vulkan(t)) => c.storage_to_sampled(t),
+            (Self::D3d12(c), RenderTarget::D3d12(t)) => c.storage_to_sampled(t),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// UAV barrier ordering a compute write to a storage buffer before later reads.
+    pub fn storage_buffer_barrier(&self, buffer: &StorageBuffer) {
+        match (self, buffer) {
+            (Self::Vulkan(c), StorageBuffer::Vulkan(b)) => c.storage_buffer_barrier(b),
+            (Self::D3d12(c), StorageBuffer::D3d12(b)) => c.storage_buffer_barrier(b),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Transition a storage buffer (compute write) into indirect-args state for
+    /// `draw_indexed_indirect`.
+    pub fn storage_buffer_to_indirect(&self, buffer: &StorageBuffer) {
+        match (self, buffer) {
+            (Self::Vulkan(c), StorageBuffer::Vulkan(b)) => c.storage_buffer_to_indirect(b),
+            (Self::D3d12(c), StorageBuffer::D3d12(b)) => c.storage_buffer_to_indirect(b),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Transition a storage buffer back into compute-writable state (next frame).
+    pub fn storage_buffer_to_storage(&self, buffer: &StorageBuffer) {
+        match (self, buffer) {
+            (Self::Vulkan(c), StorageBuffer::Vulkan(b)) => c.storage_buffer_to_storage(b),
+            (Self::D3d12(c), StorageBuffer::D3d12(b)) => c.storage_buffer_to_storage(b),
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Issue an indexed indirect draw reading args from `buffer` at `offset`
+    /// (a `draw_count`-element array of `[index_count, instance_count, first_index,
+    /// vertex_offset, first_instance]`).
+    pub fn draw_indexed_indirect(&self, buffer: &StorageBuffer, offset: u64, draw_count: u32) {
+        match (self, buffer) {
+            (Self::Vulkan(c), StorageBuffer::Vulkan(b)) => {
+                c.draw_indexed_indirect(b, offset, draw_count)
+            }
+            (Self::D3d12(c), StorageBuffer::D3d12(b)) => {
+                c.draw_indexed_indirect(b, offset, draw_count)
+            }
+            _ => unreachable!("{MIXED}"),
         }
     }
 

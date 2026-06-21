@@ -27,6 +27,12 @@ pub(crate) const BINDLESS_COUNT: u32 = 1024;
 /// Size of the bindless cubemap table (binding 2 / register space 1). Its index
 /// space is separate from the 2D table and starts at 0.
 pub(crate) const CUBE_COUNT: u32 = 64;
+/// Size of the bindless storage-image (UAV) table (binding 3). Compute writes
+/// these; its index space is separate and 0-based (Phase 7).
+pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
+/// Size of the bindless storage-buffer (UAV) table (binding 4). Compute/vertex
+/// read-write these; separate 0-based index space (Phase 7).
+pub(crate) const STORAGE_BUFFER_COUNT: u32 = 64;
 
 /// Device-level objects shared (via `Arc`) by every GPU resource so each can
 /// destroy itself before the device is torn down.
@@ -46,6 +52,8 @@ pub(crate) struct DeviceShared {
     pub bindless_sampler: vk::Sampler,
     bindless_next: AtomicU32,
     cube_next: AtomicU32,
+    storage_image_next: AtomicU32,
+    storage_buffer_next: AtomicU32,
     // Per-frame globals (set 1): one UNIFORM_BUFFER_DYNAMIC binding, written once
     // to point at the app's globals buffer; the per-frame slice is selected by a
     // dynamic offset at bind time. Only PBR pipelines bind this set.
@@ -67,17 +75,24 @@ impl DeviceShared {
             let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
                 .dynamic_rendering(true)
                 .synchronization2(true);
-            // Descriptor indexing for bindless sampled images.
+            // Descriptor indexing for bindless sampled images + storage (Phase 7).
             let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
                 .runtime_descriptor_array(true)
                 .shader_sampled_image_array_non_uniform_indexing(true)
                 .descriptor_binding_partially_bound(true)
-                .descriptor_binding_sampled_image_update_after_bind(true);
+                .descriptor_binding_sampled_image_update_after_bind(true)
+                .descriptor_binding_storage_image_update_after_bind(true)
+                .descriptor_binding_storage_buffer_update_after_bind(true);
             // SV_VertexID full-screen-triangle shaders (triangle/post/blur) compile
             // to SPIR-V using the DrawParameters capability.
             let mut features11 =
                 vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+            // Compute writes to storage images whose SPIR-V `OpTypeImage` carries no
+            // format qualifier (Slang emits `Unknown` for `RWTexture2D<float4>`).
+            let base_features = vk::PhysicalDeviceFeatures::default()
+                .shader_storage_image_write_without_format(true);
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
+                .features(base_features)
                 .push_next(&mut features13)
                 .push_next(&mut features12)
                 .push_next(&mut features11);
@@ -122,6 +137,8 @@ impl DeviceShared {
                 bindless_sampler,
                 bindless_next: AtomicU32::new(0),
                 cube_next: AtomicU32::new(0),
+                storage_image_next: AtomicU32::new(0),
+                storage_buffer_next: AtomicU32::new(0),
                 globals_pool,
                 globals_layout,
                 globals_set,
@@ -178,6 +195,43 @@ impl DeviceShared {
             .dst_array_element(index)
             .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
             .image_info(&infos);
+        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+        index
+    }
+
+    /// Register a storage-image (UAV) view in the bindless table (binding 3),
+    /// returning its index in the separate 0-based storage-image space. Compute
+    /// writes it (image layout GENERAL).
+    pub(crate) fn register_storage_image(&self, view: vk::ImageView) -> u32 {
+        let index = self.storage_image_next.fetch_add(1, Ordering::Relaxed);
+        let image_info = vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let infos = [image_info];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.bindless_set)
+            .dst_binding(3)
+            .dst_array_element(index)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(&infos);
+        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+        index
+    }
+
+    /// Register a storage-buffer (UAV) in the bindless table (binding 4),
+    /// returning its index in the separate 0-based storage-buffer space.
+    pub(crate) fn register_storage_buffer(&self, buffer: vk::Buffer, range: u64) -> u32 {
+        let index = self.storage_buffer_next.fetch_add(1, Ordering::Relaxed);
+        let info = [vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .offset(0)
+            .range(range)];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.bindless_set)
+            .dst_binding(4)
+            .dst_array_element(index)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&info);
         unsafe { self.device.update_descriptor_sets(&[write], &[]) };
         index
     }
@@ -263,17 +317,22 @@ fn create_bindless(
         let sampler = device.create_sampler(&sampler_ci, None).map_err(vk_err)?;
         let immutable = [sampler];
 
+        // Sampled images/samplers/cubes are read by fragment AND compute (Phase 7
+        // compute passes sample textures). Storage image/buffer are written by
+        // compute; the storage buffer is also read by the vertex stage (particle
+        // vertex-pull).
+        let sampled_stages = vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE;
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                 .descriptor_count(BINDLESS_COUNT)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                .stage_flags(sampled_stages),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
                 .descriptor_type(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .stage_flags(sampled_stages)
                 .immutable_samplers(&immutable),
             // Binding 2: cubemap (CUBE-view) array. Its own 0-based index space
             // (shader samples it as `g_cubes[]`, separate from `g_textures[]`).
@@ -281,14 +340,33 @@ fn create_bindless(
                 .binding(2)
                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                 .descriptor_count(CUBE_COUNT)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                .stage_flags(sampled_stages),
+            // Binding 3: storage-image (UAV) array, written by compute. 0-based.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(STORAGE_IMAGE_COUNT)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            // Binding 4: storage-buffer (UAV) array. Read-write in compute, read in
+            // the vertex stage (particle draw). 0-based.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(STORAGE_BUFFER_COUNT)
+                .stage_flags(
+                    vk::ShaderStageFlags::COMPUTE
+                        | vk::ShaderStageFlags::VERTEX
+                        | vk::ShaderStageFlags::FRAGMENT,
+                ),
         ];
+        let dynamic = vk::DescriptorBindingFlags::PARTIALLY_BOUND
+            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
         let flags = [
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+            dynamic,
             vk::DescriptorBindingFlags::empty(),
-            vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+            dynamic,
+            dynamic,
+            dynamic,
         ];
         let mut flags_ci =
             vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
@@ -307,6 +385,12 @@ fn create_bindless(
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(STORAGE_IMAGE_COUNT), // binding 3
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(STORAGE_BUFFER_COUNT), // binding 4
         ];
         let pool_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
@@ -407,6 +491,14 @@ impl VulkanDevice {
         VulkanGraphicsPipeline::new(self.shared.clone(), desc)
     }
 
+    /// Create a compute pipeline (Phase 7).
+    pub fn create_compute_pipeline(
+        &self,
+        desc: &rhi_types::ComputePipelineDesc,
+    ) -> Result<crate::pipeline::VulkanComputePipeline, EngineError> {
+        crate::pipeline::VulkanComputePipeline::new(self.shared.clone(), desc)
+    }
+
     /// Allocate a primary command buffer from the device's pool.
     pub fn create_command_buffer(&self) -> Result<VulkanCommandBuffer, EngineError> {
         command::VulkanCommandBuffer::new(self.shared.clone())
@@ -415,6 +507,14 @@ impl VulkanDevice {
     /// Create a host-visible buffer.
     pub fn create_buffer(&self, desc: &BufferDesc) -> Result<VulkanBuffer, EngineError> {
         VulkanBuffer::new(self.shared.clone(), desc)
+    }
+
+    /// Create a device-local storage buffer (UAV) for compute (Phase 7).
+    pub fn create_storage_buffer(
+        &self,
+        desc: &rhi_types::StorageBufferDesc,
+    ) -> Result<crate::buffer::VulkanStorageBuffer, EngineError> {
+        crate::buffer::VulkanStorageBuffer::new(self.shared.clone(), desc)
     }
 
     /// Register the per-frame globals buffer with the globals descriptor set.

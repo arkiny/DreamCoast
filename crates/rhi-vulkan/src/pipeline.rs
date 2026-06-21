@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use ash::vk;
 use dreamcoast_core::EngineError;
-use rhi_types::{BlendMode, GraphicsPipelineDesc, PrimitiveTopology, VertexLayout};
+use rhi_types::{
+    BlendMode, ComputePipelineDesc, GraphicsPipelineDesc, PrimitiveTopology, VertexLayout,
+};
 
 use crate::device::DeviceShared;
 use crate::{to_vk_format, vk_err};
@@ -306,6 +308,98 @@ unsafe fn build(
             .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
             .map_err(|(_, e)| vk_err(e))?;
 
+        Ok((pipelines[0], layout))
+    }
+}
+
+/// A compiled compute pipeline and its layout (Phase 7).
+pub struct VulkanComputePipeline {
+    device: Arc<DeviceShared>,
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    bindless: bool,
+}
+
+impl VulkanComputePipeline {
+    pub(crate) fn new(
+        device: Arc<DeviceShared>,
+        desc: &ComputePipelineDesc,
+    ) -> Result<Self, EngineError> {
+        unsafe {
+            let cs = create_shader_module(&device.device, desc.compute_bytes)?;
+            let result = build_compute(&device, desc, cs);
+            device.device.destroy_shader_module(cs, None);
+            let (pipeline, layout) = result?;
+            Ok(Self {
+                device,
+                pipeline,
+                layout,
+                bindless: desc.bindless,
+            })
+        }
+    }
+
+    pub(crate) fn raw(&self) -> vk::Pipeline {
+        self.pipeline
+    }
+
+    pub(crate) fn layout(&self) -> vk::PipelineLayout {
+        self.layout
+    }
+
+    pub(crate) fn is_bindless(&self) -> bool {
+        self.bindless
+    }
+}
+
+impl Drop for VulkanComputePipeline {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .device
+                .destroy_pipeline_layout(self.layout, None);
+        }
+    }
+}
+
+unsafe fn build_compute(
+    device: &DeviceShared,
+    desc: &ComputePipelineDesc,
+    cs: vk::ShaderModule,
+) -> Result<(vk::Pipeline, vk::PipelineLayout), EngineError> {
+    unsafe {
+        let entry =
+            CString::new(desc.compute_entry).map_err(|e| EngineError::Rhi(e.to_string()))?;
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(cs)
+            .name(&entry);
+
+        let set_layouts = [device.bindless_layout];
+        let push_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(desc.push_constant_size)];
+        let mut layout_ci = vk::PipelineLayoutCreateInfo::default();
+        if desc.bindless {
+            layout_ci = layout_ci.set_layouts(&set_layouts);
+        }
+        if desc.push_constant_size > 0 {
+            layout_ci = layout_ci.push_constant_ranges(&push_ranges);
+        }
+        let layout = device
+            .device
+            .create_pipeline_layout(&layout_ci, None)
+            .map_err(vk_err)?;
+
+        let pipeline_ci = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(layout);
+        let pipelines = device
+            .device
+            .create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
+            .map_err(|(_, e)| vk_err(e))?;
         Ok((pipelines[0], layout))
     }
 }

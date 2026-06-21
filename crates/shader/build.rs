@@ -183,6 +183,12 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "blur_fs",
     },
+    Job {
+        src: "post_compute.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "post_compute_cs",
+    },
 ];
 
 /// (slang target name, output file extension, generated accessor suffix, required).

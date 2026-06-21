@@ -14,22 +14,24 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_ALIASING_BARRIER, D3D12_RESOURCE_BARRIER,
     D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
-    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_STATE_COPY_SOURCE,
-    D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATES,
-    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
-    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-    D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT, ID3D12CommandAllocator, ID3D12GraphicsCommandList,
-    ID3D12Resource,
+    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_TYPE_UAV,
+    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET,
+    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATES,
+    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER, D3D12_TEXTURE_COPY_LOCATION,
+    D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT,
+    ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
 
-use crate::buffer::D3d12Buffer;
+use crate::buffer::{D3d12Buffer, D3d12StorageBuffer};
 use crate::cubemap::D3d12Cubemap;
 use crate::depth::D3d12DepthBuffer;
 use crate::device::DeviceShared;
 use crate::instance::d3d_err;
-use crate::pipeline::D3d12GraphicsPipeline;
+use crate::pipeline::{D3d12ComputePipeline, D3d12GraphicsPipeline};
 use crate::render_target::D3d12RenderTarget;
 use crate::swapchain::D3d12Swapchain;
 
@@ -489,6 +491,107 @@ impl D3d12CommandBuffer {
         }
     }
 
+    /// Transition a storage render target into `UNORDERED_ACCESS` for compute.
+    pub fn rt_to_storage(&self, target: &D3d12RenderTarget) {
+        let before = target.state();
+        if before == D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            return;
+        }
+        self.barrier(
+            target.resource(),
+            before,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        target.set_state(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    /// Transition a storage image from `UNORDERED_ACCESS` into
+    /// `PIXEL_SHADER_RESOURCE` for sampling by a later graphics pass.
+    pub fn storage_to_sampled(&self, target: &D3d12RenderTarget) {
+        self.rt_to_sampled(target);
+    }
+
+    /// UAV barrier on a storage buffer: order a compute write before later reads.
+    pub fn storage_buffer_barrier(&self, buffer: &D3d12StorageBuffer) {
+        self.uav_barrier(buffer.resource());
+    }
+
+    /// Transition a storage buffer from `UNORDERED_ACCESS` (compute write) into
+    /// `INDIRECT_ARGUMENT` for `draw_indexed_indirect`.
+    pub fn storage_buffer_to_indirect(&self, buffer: &D3d12StorageBuffer) {
+        let before = buffer.state();
+        if before == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT {
+            return;
+        }
+        self.barrier(
+            buffer.resource(),
+            before,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        );
+        buffer.set_state(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    }
+
+    /// Transition a storage buffer back into `UNORDERED_ACCESS` (e.g. before the
+    /// next frame's compute write).
+    pub fn storage_buffer_to_storage(&self, buffer: &D3d12StorageBuffer) {
+        let before = buffer.state();
+        if before == D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            return;
+        }
+        self.barrier(
+            buffer.resource(),
+            before,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        buffer.set_state(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    fn uav_barrier(&self, resource: &ID3D12Resource) {
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: unsafe { std::mem::transmute_copy(resource) },
+                }),
+            },
+        };
+        unsafe { self.list.ResourceBarrier(&[barrier]) };
+    }
+
+    /// Bind a compute pipeline (root signature + bindless table + PSO).
+    pub fn bind_compute_pipeline(&self, pipeline: &D3d12ComputePipeline) {
+        unsafe {
+            if pipeline.is_bindless() {
+                let heaps = [Some(self.device.srv_heap.clone())];
+                self.list.SetDescriptorHeaps(&heaps);
+            }
+            self.list.SetComputeRootSignature(pipeline.root_signature());
+            if pipeline.is_bindless() {
+                self.list
+                    .SetComputeRootDescriptorTable(0, self.device.srv_gpu_start());
+            }
+            self.list.SetPipelineState(pipeline.pso());
+        }
+    }
+
+    /// Dispatch the bound compute pipeline over `(x, y, z)` thread groups.
+    pub fn dispatch(&self, x: u32, y: u32, z: u32) {
+        unsafe { self.list.Dispatch(x, y, z) };
+    }
+
+    /// Upload root (push) constants for the bound compute pipeline (param 1).
+    pub fn push_constants_compute(&self, data: &[u8]) {
+        unsafe {
+            self.list.SetComputeRoot32BitConstants(
+                1,
+                (data.len() / 4) as u32,
+                data.as_ptr() as *const c_void,
+                0,
+            );
+        }
+    }
+
     /// Set the scissor rectangle.
     pub fn set_scissor(&self, rect: Rect2D) {
         let scissor = RECT {
@@ -541,6 +644,23 @@ impl D3d12CommandBuffer {
         unsafe {
             self.list
                 .DrawIndexedInstanced(index_count, 1, first_index, vertex_offset, 0);
+        }
+    }
+
+    /// Issue `draw_count` indexed indirect draws (`ExecuteIndirect`) reading
+    /// 20-byte `D3D12_DRAW_INDEXED_ARGUMENTS` records from `buffer` at `offset`.
+    /// The buffer must be in `INDIRECT_ARGUMENT` state (see
+    /// [`Self::storage_buffer_to_indirect`]).
+    pub fn draw_indexed_indirect(&self, buffer: &D3d12StorageBuffer, offset: u64, draw_count: u32) {
+        unsafe {
+            self.list.ExecuteIndirect(
+                &self.device.indirect_draw_signature,
+                draw_count,
+                buffer.resource(),
+                offset,
+                None,
+                0,
+            );
         }
     }
 

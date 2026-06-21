@@ -174,8 +174,24 @@ pub struct GraphicsPipelineDesc<'a> {
     pub depth_format: Option<Format>,
 }
 
-/// Intended use of a buffer. All Phase 3 buffers are host-visible (mappable) for
-/// per-frame dynamic upload.
+/// Compute pipeline parameters (Phase 7). A single compute stage; binds the
+/// bindless table (sampled + storage) when `bindless`, plus optional push
+/// constants. No vertex input, no attachments.
+#[derive(Clone, Copy, Debug)]
+pub struct ComputePipelineDesc<'a> {
+    /// Compute stage SPIR-V (Vulkan) / DXIL (D3D12) bytes.
+    pub compute_bytes: &'a [u8],
+    /// Compute entry-point name.
+    pub compute_entry: &'a str,
+    /// Size in bytes of the push/root constant block (0 = none).
+    pub push_constant_size: u32,
+    /// Whether the pipeline binds the device's bindless tables.
+    pub bindless: bool,
+}
+
+/// Intended use of a buffer. All these buffers are host-visible (mappable) for
+/// per-frame dynamic upload or host readback. GPU-local read-write storage lives
+/// in the dedicated [`StorageBufferDesc`] type (Phase 7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferUsage {
     Vertex,
@@ -185,6 +201,22 @@ pub enum BufferUsage {
     /// GPU-writable, CPU-readable staging buffer for reading rendered images back
     /// to the host (e.g. saving a screenshot).
     Readback,
+}
+
+/// A GPU-local read-write storage buffer (UAV / `STORAGE_BUFFER`), registered in
+/// the bindless storage-buffer table and addressed by index (Phase 7). Written by
+/// compute and (for particles) read by the vertex stage; seeded on the GPU, not
+/// from the host. `indirect` additionally allows use as a `draw_indexed_indirect`
+/// argument buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct StorageBufferDesc {
+    /// Total size in bytes.
+    pub size: u64,
+    /// Element stride in bytes (for the structured-buffer view); the buffer holds
+    /// `size / stride` elements.
+    pub stride: u32,
+    /// Also usable as an indirect draw-argument buffer.
+    pub indirect: bool,
 }
 
 /// Buffer creation parameters.
@@ -229,12 +261,15 @@ pub struct TextureDesc {
 
 /// Offscreen color render-target creation parameters. The target is usable both
 /// as a color attachment and as a bindless sampled texture (render-graph passes
-/// write it, later passes sample it).
+/// write it, later passes sample it). When `storage` is set, it additionally gets
+/// a UAV + a bindless storage-image index so a compute pass can write it (Phase 7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderTargetDesc {
     pub width: u32,
     pub height: u32,
     pub format: Format,
+    /// Also create an unordered-access view (compute-writable storage image).
+    pub storage: bool,
 }
 
 /// GPU memory footprint of a resource, used by the render graph to plan transient

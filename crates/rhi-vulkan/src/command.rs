@@ -7,11 +7,11 @@ use ash::vk;
 use dreamcoast_core::EngineError;
 use rhi_types::{ClearColor, Extent2D, Rect2D};
 
-use crate::buffer::VulkanBuffer;
+use crate::buffer::{VulkanBuffer, VulkanStorageBuffer};
 use crate::cubemap::VulkanCubemap;
 use crate::depth::{VulkanDepthBuffer, depth_subresource_range};
 use crate::device::DeviceShared;
-use crate::pipeline::VulkanGraphicsPipeline;
+use crate::pipeline::{VulkanComputePipeline, VulkanGraphicsPipeline};
 use crate::render_target::VulkanRenderTarget;
 use crate::swapchain::VulkanSwapchain;
 use crate::{color_subresource_range, vk_err};
@@ -724,6 +724,165 @@ impl VulkanCommandBuffer {
         }
     }
 
+    /// Transition a storage render target into `GENERAL` for compute writes.
+    pub fn rt_to_storage(&self, target: &VulkanRenderTarget) {
+        let old = target.layout();
+        if old == vk::ImageLayout::GENERAL {
+            return;
+        }
+        let (src_access, src_stage) = match old {
+            vk::ImageLayout::UNDEFINED => (
+                vk::AccessFlags::empty(),
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+            ),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            ),
+            _ => (
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            ),
+        };
+        self.image_barrier(
+            target.image(),
+            old,
+            vk::ImageLayout::GENERAL,
+            src_access,
+            vk::AccessFlags::SHADER_WRITE,
+            src_stage,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+        );
+        target.set_layout(vk::ImageLayout::GENERAL);
+    }
+
+    /// Transition a storage image from `GENERAL` (compute write) into
+    /// `SHADER_READ_ONLY_OPTIMAL` for sampling by a later graphics pass.
+    pub fn storage_to_sampled(&self, target: &VulkanRenderTarget) {
+        if target.layout() == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            return;
+        }
+        self.image_barrier(
+            target.image(),
+            target.layout(),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        );
+        target.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    /// UAV barrier on a storage buffer: order a compute write before any later
+    /// shader read (compute / vertex / fragment).
+    pub fn storage_buffer_barrier(&self, buffer: &VulkanStorageBuffer) {
+        self.buffer_memory_barrier(
+            buffer.raw(),
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER
+                | vk::PipelineStageFlags::VERTEX_SHADER
+                | vk::PipelineStageFlags::FRAGMENT_SHADER,
+        );
+    }
+
+    /// Order a compute write to an indirect-args buffer before its consumption by
+    /// `draw_indexed_indirect`.
+    pub fn storage_buffer_to_indirect(&self, buffer: &VulkanStorageBuffer) {
+        self.buffer_memory_barrier(
+            buffer.raw(),
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::INDIRECT_COMMAND_READ,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::DRAW_INDIRECT,
+        );
+    }
+
+    /// Order a buffer's prior reads (indirect / vertex / compute) before the next
+    /// frame's compute write back to it.
+    pub fn storage_buffer_to_storage(&self, buffer: &VulkanStorageBuffer) {
+        self.buffer_memory_barrier(
+            buffer.raw(),
+            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::PipelineStageFlags::DRAW_INDIRECT
+                | vk::PipelineStageFlags::VERTEX_SHADER
+                | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+        );
+    }
+
+    fn buffer_memory_barrier(
+        &self,
+        buffer: vk::Buffer,
+        src_access: vk::AccessFlags,
+        dst_access: vk::AccessFlags,
+        src_stage: vk::PipelineStageFlags,
+        dst_stage: vk::PipelineStageFlags,
+    ) {
+        let barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(buffer)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        unsafe {
+            self.device.device.cmd_pipeline_barrier(
+                self.cmd,
+                src_stage,
+                dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[barrier],
+                &[],
+            );
+        }
+    }
+
+    /// Bind a compute pipeline (and its bindless set 0, if any).
+    pub fn bind_compute_pipeline(&self, pipeline: &VulkanComputePipeline) {
+        unsafe {
+            self.device.device.cmd_bind_pipeline(
+                self.cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline.raw(),
+            );
+            self.current_layout.set(pipeline.layout());
+            if pipeline.is_bindless() {
+                self.device.device.cmd_bind_descriptor_sets(
+                    self.cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipeline.layout(),
+                    0,
+                    &[self.device.bindless_set],
+                    &[],
+                );
+            }
+        }
+    }
+
+    /// Dispatch the bound compute pipeline over `(x, y, z)` workgroups.
+    pub fn dispatch(&self, x: u32, y: u32, z: u32) {
+        unsafe { self.device.device.cmd_dispatch(self.cmd, x, y, z) };
+    }
+
+    /// Upload push constants for the bound compute pipeline (COMPUTE stage).
+    pub fn push_constants_compute(&self, data: &[u8]) {
+        unsafe {
+            self.device.device.cmd_push_constants(
+                self.cmd,
+                self.current_layout.get(),
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                data,
+            );
+        }
+    }
+
     /// Issue a non-indexed draw.
     pub fn draw(&self, vertex_count: u32, instance_count: u32) {
         unsafe {
@@ -795,6 +954,26 @@ impl VulkanCommandBuffer {
                 first_index,
                 vertex_offset,
                 0,
+            );
+        }
+    }
+
+    /// Issue `draw_count` indexed indirect draws reading `VkDrawIndexedIndirectCommand`
+    /// (20-byte) records from `buffer` starting at `offset`. The buffer must be in
+    /// indirect-read state (see [`Self::storage_buffer_to_indirect`]).
+    pub fn draw_indexed_indirect(
+        &self,
+        buffer: &VulkanStorageBuffer,
+        offset: u64,
+        draw_count: u32,
+    ) {
+        unsafe {
+            self.device.device.cmd_draw_indexed_indirect(
+                self.cmd,
+                buffer.raw(),
+                offset,
+                draw_count,
+                20,
             );
         }
     }
