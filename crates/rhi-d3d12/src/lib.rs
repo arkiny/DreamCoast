@@ -33,7 +33,7 @@ pub use buffer::{D3d12Buffer, D3d12StorageBuffer};
 pub use command::D3d12CommandBuffer;
 pub use cubemap::D3d12Cubemap;
 pub use depth::D3d12DepthBuffer;
-pub use device::{D3d12Device, D3d12Queue};
+pub use device::{D3d12ComputeQueue, D3d12Device, D3d12Queue};
 pub use instance::D3d12Instance;
 pub use pipeline::{D3d12ComputePipeline, D3d12GraphicsPipeline};
 pub use render_target::{D3d12RenderTarget, D3d12TransientHeap};

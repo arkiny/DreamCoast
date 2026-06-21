@@ -11,18 +11,19 @@ use rhi_types::{
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_BUFFER_UAV, D3D12_BUFFER_UAV_FLAG_RAW, D3D12_COMMAND_LIST_TYPE_DIRECT,
-    D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_COMMAND_SIGNATURE_DESC,
-    D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-    D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_FENCE_FLAG_NONE, D3D12_GPU_DESCRIPTOR_HANDLE,
-    D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_SHADER_RESOURCE_VIEW_DESC,
-    D3D12_SHADER_RESOURCE_VIEW_DESC_0, D3D12_SRV_DIMENSION_TEXTURE2D,
-    D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEX2D_SRV, D3D12_TEX2D_UAV, D3D12_TEXCUBE_SRV,
-    D3D12_UAV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_UNORDERED_ACCESS_VIEW_DESC,
-    D3D12_UNORDERED_ACCESS_VIEW_DESC_0, D3D12CreateDevice, ID3D12CommandList, ID3D12CommandQueue,
-    ID3D12CommandSignature, ID3D12DescriptorHeap, ID3D12Device, ID3D12Fence, ID3D12Resource,
+    D3D12_BUFFER_UAV, D3D12_BUFFER_UAV_FLAG_RAW, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE,
+    D3D12_COMMAND_SIGNATURE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
+    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, D3D12_DESCRIPTOR_HEAP_DESC,
+    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+    D3D12_FENCE_FLAG_NONE, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_INDIRECT_ARGUMENT_DESC,
+    D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
+    D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEX2D_SRV,
+    D3D12_TEX2D_UAV, D3D12_TEXCUBE_SRV, D3D12_UAV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_TEXTURE2D,
+    D3D12_UNORDERED_ACCESS_VIEW_DESC, D3D12_UNORDERED_ACCESS_VIEW_DESC_0, D3D12CreateDevice,
+    ID3D12CommandList, ID3D12CommandQueue, ID3D12CommandSignature, ID3D12DescriptorHeap,
+    ID3D12Device, ID3D12Fence, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS};
 use windows::Win32::Graphics::Dxgi::IDXGIFactory6;
@@ -74,6 +75,12 @@ pub(crate) struct DeviceShared {
     storage_buffer_next: Cell<u32>,
     // Command signature for indexed indirect draws (`ExecuteIndirect`, Phase 7).
     pub indirect_draw_signature: ID3D12CommandSignature,
+    // Async compute (Phase 7): a COMPUTE-type queue overlapping the DIRECT queue,
+    // and a fence the compute queue signals / the graphics queue waits on (GPU
+    // cross-queue sync). `async_value` holds the last value signaled.
+    pub compute_queue: ID3D12CommandQueue,
+    pub async_fence: ID3D12Fence,
+    async_value: Cell<u64>,
     // A dedicated fence for `wait_idle`.
     idle_fence: ID3D12Fence,
     idle_event: HANDLE,
@@ -101,6 +108,20 @@ impl DeviceShared {
             };
             let queue: ID3D12CommandQueue =
                 device.CreateCommandQueue(&queue_desc).map_err(d3d_err)?;
+
+            // Async-compute queue (COMPUTE type) + a cross-queue sync fence.
+            let compute_queue_desc = D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                Priority: 0,
+                Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
+                NodeMask: 0,
+            };
+            let compute_queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&compute_queue_desc)
+                .map_err(d3d_err)?;
+            let async_fence: ID3D12Fence = device
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .map_err(d3d_err)?;
 
             let idle_fence: ID3D12Fence = device
                 .CreateFence(0, D3D12_FENCE_FLAG_NONE)
@@ -151,6 +172,9 @@ impl DeviceShared {
                 storage_image_next: Cell::new(0),
                 storage_buffer_next: Cell::new(0),
                 indirect_draw_signature,
+                compute_queue,
+                async_fence,
+                async_value: Cell::new(0),
                 idle_fence,
                 idle_event,
                 idle_value: Cell::new(0),
@@ -404,6 +428,23 @@ impl D3d12Device {
         D3d12CommandBuffer::new(self.shared.clone())
     }
 
+    /// Allocate a COMPUTE-type command buffer for the async-compute queue (Phase 7).
+    pub fn create_compute_command_buffer(&self) -> Result<D3d12CommandBuffer, EngineError> {
+        D3d12CommandBuffer::new_compute(self.shared.clone())
+    }
+
+    /// The async-compute queue (Phase 7).
+    pub fn compute_queue(&self) -> D3d12ComputeQueue {
+        D3d12ComputeQueue {
+            shared: self.shared.clone(),
+        }
+    }
+
+    /// D3D12 always exposes a separate COMPUTE queue, so async compute is available.
+    pub fn has_async_compute(&self) -> bool {
+        true
+    }
+
     pub fn create_buffer(&self, desc: &BufferDesc) -> Result<D3d12Buffer, EngineError> {
         D3d12Buffer::new(self.shared.clone(), desc)
     }
@@ -506,6 +547,34 @@ impl D3d12Device {
     }
 }
 
+/// The device's async-compute (COMPUTE-type) queue (Phase 7).
+pub struct D3d12ComputeQueue {
+    pub(crate) shared: Rc<DeviceShared>,
+}
+
+impl D3d12ComputeQueue {
+    /// Execute compute work on the compute queue and signal the cross-queue fence;
+    /// the graphics queue's `submit_async` GPU-waits on this. `signal` (a no-op
+    /// D3D12 semaphore) is for facade parity with Vulkan.
+    pub fn submit(
+        &self,
+        cmd: &D3d12CommandBuffer,
+        _signal: &D3d12Semaphore,
+    ) -> Result<(), EngineError> {
+        unsafe {
+            let list: ID3D12CommandList = cmd.list().cast().map_err(d3d_err)?;
+            self.shared.compute_queue.ExecuteCommandLists(&[Some(list)]);
+            let value = self.shared.async_value.get() + 1;
+            self.shared.async_value.set(value);
+            self.shared
+                .compute_queue
+                .Signal(&self.shared.async_fence, value)
+                .map_err(d3d_err)?;
+            Ok(())
+        }
+    }
+}
+
 /// The device's DIRECT queue.
 pub struct D3d12Queue {
     pub(crate) shared: Rc<DeviceShared>,
@@ -522,6 +591,35 @@ impl D3d12Queue {
         fence: &D3d12Fence,
     ) -> Result<(), EngineError> {
         unsafe {
+            let list: ID3D12CommandList = cmd.list().cast().map_err(d3d_err)?;
+            self.shared.queue.ExecuteCommandLists(&[Some(list)]);
+            let value = fence.next_value();
+            self.shared
+                .queue
+                .Signal(fence.raw(), value)
+                .map_err(d3d_err)?;
+            fence.set_target(value);
+            Ok(())
+        }
+    }
+
+    /// Execute on the graphics queue, first GPU-waiting on the async-compute
+    /// queue's last signal (so the particle draw sees the compute-written buffer),
+    /// then signaling `fence` (Phase 7). Semaphores are D3D12 no-ops.
+    pub fn submit_async(
+        &self,
+        cmd: &D3d12CommandBuffer,
+        _wait: &D3d12Semaphore,
+        _signal: &D3d12Semaphore,
+        fence: &D3d12Fence,
+    ) -> Result<(), EngineError> {
+        unsafe {
+            // GPU-side wait: the graphics queue blocks until the compute queue has
+            // signaled its latest value.
+            self.shared
+                .queue
+                .Wait(&self.shared.async_fence, self.shared.async_value.get())
+                .map_err(d3d_err)?;
             let list: ID3D12CommandList = cmd.list().cast().map_err(d3d_err)?;
             self.shared.queue.ExecuteCommandLists(&[Some(list)]);
             let value = fence.next_value();

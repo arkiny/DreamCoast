@@ -132,10 +132,17 @@ impl VulkanStorageBuffer {
             if desc.indirect {
                 usage |= vk::BufferUsageFlags::INDIRECT_BUFFER;
             }
-            let ci = vk::BufferCreateInfo::default()
-                .size(desc.size)
-                .usage(usage)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            // Storage buffers may be touched by both the graphics and async-compute
+            // queues; CONCURRENT sharing across the two families avoids per-use queue
+            // ownership transfers (only meaningful when the families differ).
+            let families = [device.graphics_family, device.compute_family];
+            let mut ci = vk::BufferCreateInfo::default().size(desc.size).usage(usage);
+            ci = if device.has_dedicated_compute {
+                ci.sharing_mode(vk::SharingMode::CONCURRENT)
+                    .queue_family_indices(&families)
+            } else {
+                ci.sharing_mode(vk::SharingMode::EXCLUSIVE)
+            };
             let buffer = device.device.create_buffer(&ci, None).map_err(vk_err)?;
 
             let req = device.device.get_buffer_memory_requirements(buffer);

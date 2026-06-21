@@ -20,6 +20,8 @@ use crate::{color_subresource_range, vk_err};
 pub struct VulkanCommandBuffer {
     device: Arc<DeviceShared>,
     cmd: vk::CommandBuffer,
+    // Pool this buffer was allocated from (graphics or async-compute).
+    pool: vk::CommandPool,
     // Layout of the currently bound pipeline (for push constants).
     current_layout: Cell<vk::PipelineLayout>,
     // Dynamic offset into the globals buffer for the next PBR pipeline bind.
@@ -28,8 +30,19 @@ pub struct VulkanCommandBuffer {
 
 impl VulkanCommandBuffer {
     pub(crate) fn new(device: Arc<DeviceShared>) -> Result<Self, EngineError> {
+        let pool = device.command_pool;
+        Self::from_pool(device, pool)
+    }
+
+    /// Allocate a command buffer on the async-compute family's pool (Phase 7).
+    pub(crate) fn new_compute(device: Arc<DeviceShared>) -> Result<Self, EngineError> {
+        let pool = device.compute_command_pool;
+        Self::from_pool(device, pool)
+    }
+
+    fn from_pool(device: Arc<DeviceShared>, pool: vk::CommandPool) -> Result<Self, EngineError> {
         let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(device.command_pool)
+            .command_pool(pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
         let cmd = unsafe {
@@ -41,6 +54,7 @@ impl VulkanCommandBuffer {
         Ok(Self {
             device,
             cmd,
+            pool,
             current_layout: Cell::new(vk::PipelineLayout::null()),
             globals_offset: Cell::new(0),
         })
@@ -1090,7 +1104,7 @@ impl Drop for VulkanCommandBuffer {
         unsafe {
             self.device
                 .device
-                .free_command_buffers(self.device.command_pool, &[self.cmd]);
+                .free_command_buffers(self.pool, &[self.cmd]);
         }
     }
 }

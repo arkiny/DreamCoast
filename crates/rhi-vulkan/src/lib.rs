@@ -30,7 +30,7 @@ pub use buffer::{VulkanBuffer, VulkanStorageBuffer};
 pub use command::VulkanCommandBuffer;
 pub use cubemap::VulkanCubemap;
 pub use depth::VulkanDepthBuffer;
-pub use device::{VulkanDevice, VulkanQueue};
+pub use device::{VulkanComputeQueue, VulkanDevice, VulkanQueue};
 pub use instance::VulkanInstance;
 pub use pipeline::{VulkanComputePipeline, VulkanGraphicsPipeline};
 pub use render_target::{VulkanRenderTarget, VulkanTransientHeap};

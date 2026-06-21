@@ -120,6 +120,7 @@ engine/                 # cargo workspace root
 ### Phase 9 — 툴링 & 마무리
 - GPU 프로파일링(타임스탬프 쿼리), 디버그 마커(PIX/RenderDoc/NSight), 검증 레이어 토글
 - 기법 전환용 샘플 브라우저(샌드박스) 완성
+- **async compute** (전용 컴퓨트 큐로 파티클 sim 오버랩) ✅ 선행 완료: [async-compute.md](async-compute.md)
 - **완료 기준**: 프로파일러 + 캡처 툴 연동, 샌드박스에서 기법 자유 전환
 
 ### Phase 10 — Virtual Geometry — 🧪 실험적 / 계획
