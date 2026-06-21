@@ -16,9 +16,10 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_SIGNATURE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
     D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, D3D12_DESCRIPTOR_HEAP_DESC,
     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-    D3D12_FENCE_FLAG_NONE, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_INDIRECT_ARGUMENT_DESC,
+    D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_DATA_D3D12_OPTIONS5, D3D12_FENCE_FLAG_NONE,
+    D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_INDIRECT_ARGUMENT_DESC,
     D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
+    D3D12_RAYTRACING_TIER_1_1, D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
     D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEX2D_SRV,
     D3D12_TEX2D_UAV, D3D12_TEXCUBE_SRV, D3D12_UAV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_TEXTURE2D,
     D3D12_UNORDERED_ACCESS_VIEW_DESC, D3D12_UNORDERED_ACCESS_VIEW_DESC_0, D3D12CreateDevice,
@@ -85,6 +86,8 @@ pub(crate) struct DeviceShared {
     idle_fence: ID3D12Fence,
     idle_event: HANDLE,
     idle_value: Cell<u64>,
+    // Hardware ray tracing (Phase 8): true when DXR Tier >= 1.1 is supported.
+    has_raytracing: bool,
 }
 
 impl DeviceShared {
@@ -99,6 +102,19 @@ impl DeviceShared {
             .map_err(d3d_err)?;
             let device =
                 device.ok_or_else(|| EngineError::Rhi("CreateDevice returned null".into()))?;
+
+            // Hardware ray tracing (Phase 8): DXR needs RaytracingTier >= 1.1
+            // (inline ray query path) and ID3D12Device5 / GraphicsCommandList4,
+            // which are queried/cast where used. Gate so non-RT devices still work.
+            let mut options5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+            let has_raytracing = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS5,
+                    &mut options5 as *mut _ as *mut core::ffi::c_void,
+                    std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS5>() as u32,
+                )
+                .is_ok()
+                && options5.RaytracingTier.0 >= D3D12_RAYTRACING_TIER_1_1.0;
 
             let queue_desc = D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -178,6 +194,7 @@ impl DeviceShared {
                 idle_fence,
                 idle_event,
                 idle_value: Cell::new(0),
+                has_raytracing,
             })
         }
     }
@@ -443,6 +460,11 @@ impl D3d12Device {
     /// D3D12 always exposes a separate COMPUTE queue, so async compute is available.
     pub fn has_async_compute(&self) -> bool {
         true
+    }
+
+    /// Whether hardware ray tracing (DXR Tier >= 1.1) is available (Phase 8).
+    pub fn has_raytracing(&self) -> bool {
+        self.shared.has_raytracing
     }
 
     pub fn create_buffer(&self, desc: &BufferDesc) -> Result<D3d12Buffer, EngineError> {

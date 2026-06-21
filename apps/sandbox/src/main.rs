@@ -167,6 +167,11 @@ fn main() -> anyhow::Result<()> {
     )?;
     let device = instance.create_device()?;
     let queue = device.queue();
+    info!(
+        "device capabilities: async_compute={}, raytracing={}",
+        device.has_async_compute(),
+        device.has_raytracing()
+    );
 
     let mut swapchain = device.create_swapchain(&swapchain_desc(Extent2D::new(w, h)))?;
 

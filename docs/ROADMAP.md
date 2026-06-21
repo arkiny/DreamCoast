@@ -111,11 +111,13 @@ engine/                 # cargo workspace root
 - 신규 RHI: 컴퓨트 파이프라인/dispatch, storage image·storage buffer(바인드리스 UAV), indirect draw, 컴퓨트 가시 바인드리스
 - **완료 기준 달성**: 세 컴퓨트 기법이 렌더 패스와 연동, 두 백엔드 픽셀 일치, Vulkan 검증 클린
 
-### Phase 8 — 레이트레이싱
+### Phase 8 — 레이트레이싱 — 🚧 진행 중
+세부: [phase-8-raytracing.md](phase-8-raytracing.md)
 - RHI에 가속 구조(BLAS/TLAS), RT 파이프라인, Shader Binding Table 추상화 추가
 - DXR + VK_KHR_ray_tracing 양 백엔드 구현
-- 예제: RT 섀도우/AO/반사, 간단한 패스트레이서
-- **완료 기준**: 두 백엔드에서 하드웨어 RT 결과 일치
+- **2단계**: 인라인 ray query(RayQuery / VK_KHR_ray_query) 먼저 → 풀 RT 파이프라인 + SBT
+- 예제: **간단 패스트레이서** (디퓨즈 GI 누적; 인라인·파이프라인 두 경로로 검증)
+- **완료 기준**: 두 백엔드에서 하드웨어 RT 결과 일치 (인라인 ≈ 파이프라인)
 
 ### Phase 9 — 툴링 & 마무리
 - GPU 프로파일링(타임스탬프 쿼리), 디버그 마커(PIX/RenderDoc/NSight), 검증 레이어 토글

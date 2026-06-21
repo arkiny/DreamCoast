@@ -254,6 +254,15 @@ impl Device {
         }
     }
 
+    /// Whether hardware ray tracing is available (Vulkan KHR ray-tracing
+    /// extensions / D3D12 DXR Tier >= 1.1) (Phase 8).
+    pub fn has_raytracing(&self) -> bool {
+        match self {
+            Self::Vulkan(d) => d.has_raytracing(),
+            Self::D3d12(d) => d.has_raytracing(),
+        }
+    }
+
     pub fn create_buffer(&self, desc: &BufferDesc) -> Result<Buffer> {
         match self {
             Self::Vulkan(d) => Ok(Buffer::Vulkan(d.create_buffer(desc)?)),
