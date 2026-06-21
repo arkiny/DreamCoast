@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use anyhow::anyhow;
 use dreamcoast_asset::{ImageData, MeshData, MeshVertex};
-use dreamcoast_core::glam::{Mat4, Vec3};
+use dreamcoast_core::glam::{Mat4, Vec3, Vec4};
 use dreamcoast_core::init_logging;
 use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
@@ -44,6 +44,9 @@ const GLOBALS_SLICE: u64 = 512;
 const SHADOW_SIZE: u32 = 2048;
 /// GPU particle count (Phase 7 fountain demo); 32 bytes each.
 const PARTICLE_COUNT: usize = 4096;
+/// GPU-culling instance grid: `GRID_DIM x GRID_DIM` cube instances (Phase 7).
+const GRID_DIM: u32 = 16;
+const GRID_COUNT: u32 = GRID_DIM * GRID_DIM;
 /// Environment cubemap face resolution (square) and its full mip chain. The
 /// prefilter convolution samples these mips so a roughness lookup needs only
 /// ~32-64 samples instead of hundreds.
@@ -347,6 +350,70 @@ fn main() -> anyhow::Result<()> {
         device.queue().submit_oneshot(&init_cmd, &fence)?;
         fence.wait()?;
     }
+
+    // GPU frustum culling (Phase 7): a compute pass tests a cube instance grid
+    // against the frustum and writes an indirect draw; the draw renders only the
+    // visible instances. `cull_args` is the indirect-args buffer (also UAV, for the
+    // atomic InstanceCount); `cull_visible` is the visible-index list.
+    let cull_grid_cube = dreamcoast_asset::unit_cube();
+    let (cube_vbuf, cube_ibuf, cube_index_count) = upload_mesh(&device, &cull_grid_cube)?;
+    let cull_args = device.create_storage_buffer(&StorageBufferDesc {
+        size: 32, // 5 u32 args (+pad), used as draw_indexed_indirect source
+        stride: 4,
+        indirect: true,
+    })?;
+    let cull_visible = device.create_storage_buffer(&StorageBufferDesc {
+        size: (GRID_COUNT * 4) as u64,
+        stride: 4,
+        indirect: false,
+    })?;
+    let cull_reset_cs = load_compute_shader(
+        backend,
+        dreamcoast_shader::cull_reset_cs_spirv,
+        dreamcoast_shader::cull_reset_cs_dxil,
+        "cull_reset",
+    )?;
+    let cull_reset_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
+        compute_bytes: cull_reset_cs,
+        compute_entry: "csReset",
+        push_constant_size: 128,
+        bindless: true,
+    })?;
+    let cull_cs = load_compute_shader(
+        backend,
+        dreamcoast_shader::cull_cs_spirv,
+        dreamcoast_shader::cull_cs_dxil,
+        "cull",
+    )?;
+    let cull_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
+        compute_bytes: cull_cs,
+        compute_entry: "csCull",
+        push_constant_size: 128,
+        bindless: true,
+    })?;
+    let (cd_vs, cd_fs) = load_shader_pair(
+        backend,
+        dreamcoast_shader::cull_draw_vs_spirv,
+        dreamcoast_shader::cull_draw_fs_spirv,
+        dreamcoast_shader::cull_draw_vs_dxil,
+        dreamcoast_shader::cull_draw_fs_dxil,
+        "cull_draw",
+    )?;
+    let cull_draw_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: cd_vs,
+        fragment_bytes: cd_fs,
+        vertex_entry: "vsMain",
+        fragment_entry: "fsMain",
+        color_formats: &[swapchain.format()],
+        topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::MeshPosNormal,
+        blend: BlendMode::Opaque,
+        push_constant_size: 112, // view_proj + sun_dir + grid params
+        bindless: true,
+        uniform_buffer: false,
+        depth_test: true,
+        depth_format: Some(DEPTH_FORMAT),
+    })?;
 
     // Sky pipeline: renders the procedural sky into each environment cube face.
     let (sky_vs, sky_fs) = load_shader_pair(
@@ -793,11 +860,16 @@ fn main() -> anyhow::Result<()> {
         let dist = scene_radius * 1.6;
         let eye = focus + Vec3::new(angle.cos() * dist, scene_radius * 0.55, angle.sin() * dist);
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
-        let mut proj = Mat4::perspective_rh(60f32.to_radians(), cw as f32 / ch as f32, 0.05, 100.0);
+        let proj_noflip =
+            Mat4::perspective_rh(60f32.to_radians(), cw as f32 / ch as f32, 0.05, 100.0);
+        let mut proj = proj_noflip;
         if backend == BackendKind::Vulkan {
             proj.y_axis.y *= -1.0; // Vulkan clip-space Y points down
         }
         let view_proj = proj * view;
+        // Frustum culling uses the Y-flip-free matrix so the visible set (and the
+        // indirect draw count) is identical on both backends.
+        let cull_view_proj = proj_noflip * view;
         // Camera basis in world space (for billboarding the GPU particles).
         let inv_view = view.inverse();
         let cam_right = inv_view.x_axis.truncate();
@@ -1130,6 +1202,88 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
+        // Phase 7 GPU culling: reset the indirect args, frustum-cull the instance
+        // grid into a visible list + draw count, then draw indirectly. The args and
+        // visible buffers are external resources sequencing the three passes.
+        // A compact grid floating above the scene, so the scene stays visible and
+        // orbiting the camera culls cubes off the frustum edges.
+        let grid_spacing = scene_radius * 0.14;
+        let grid_height = scene_radius * 1.15;
+        let cube_scale = scene_radius * 0.045;
+        let cube_radius = cube_scale * 0.5 * 3.0_f32.sqrt();
+        let cull_res = if gpu_cull {
+            Some((
+                graph.import_external("cull_args"),
+                graph.import_external("cull_visible"),
+            ))
+        } else {
+            None
+        };
+        if let Some((args_ext, visible_ext)) = cull_res {
+            let planes = frustum_planes(cull_view_proj);
+            let reset = &cull_reset_pipeline;
+            let cull = &cull_pipeline;
+            let args = &cull_args;
+            let visible = &cull_visible;
+            let icount = cube_index_count;
+            // Reset pass: clear the args header (and recycle args from last frame's
+            // indirect state back to UAV).
+            graph.add_compute_pass(
+                ComputePassInfo {
+                    name: "cull_reset",
+                    storage_writes: vec![args_ext],
+                    reads: vec![],
+                },
+                move |ctx| {
+                    let cmd = ctx.cmd();
+                    cmd.storage_buffer_to_storage(args); // INDIRECT (prev frame) -> UAV
+                    cmd.bind_compute_pipeline(reset);
+                    cmd.push_constants_compute(&cull_push(
+                        &planes,
+                        args.storage_index(),
+                        visible.storage_index(),
+                        GRID_COUNT,
+                        GRID_DIM,
+                        grid_spacing,
+                        cube_radius,
+                        grid_height,
+                        icount,
+                    ));
+                    cmd.dispatch(1, 1, 1);
+                    cmd.storage_buffer_barrier(args); // order reset before cull
+                    Ok(())
+                },
+            );
+            // Cull pass: append visible instances + atomically bump InstanceCount.
+            graph.add_compute_pass(
+                ComputePassInfo {
+                    name: "cull",
+                    storage_writes: vec![args_ext, visible_ext],
+                    reads: vec![],
+                },
+                move |ctx| {
+                    let cmd = ctx.cmd();
+                    cmd.bind_compute_pipeline(cull);
+                    cmd.push_constants_compute(&cull_push(
+                        &planes,
+                        args.storage_index(),
+                        visible.storage_index(),
+                        GRID_COUNT,
+                        GRID_DIM,
+                        grid_spacing,
+                        cube_radius,
+                        grid_height,
+                        icount,
+                    ));
+                    cmd.dispatch(GRID_COUNT.div_ceil(64), 1, 1);
+                    // Order the writes before the indirect draw / vertex read.
+                    cmd.storage_buffer_barrier(visible);
+                    cmd.storage_buffer_to_indirect(args);
+                    Ok(())
+                },
+            );
+        }
+
         // Tonemap samples the compute-post output when enabled, else raw HDR.
         let tonemap_src = hdr_post.unwrap_or(hdr);
         graph.add_pass(
@@ -1148,6 +1302,43 @@ fn main() -> anyhow::Result<()> {
                 Ok(())
             },
         );
+        // Phase 7 GPU-culling draw: indirect, instanced render of the visible cube
+        // grid over the tonemapped image, with its own depth buffer.
+        if let Some((args_ext, visible_ext)) = cull_res {
+            let cull_depth = graph.create_depth("cull_depth", extent);
+            let draw = &cull_draw_pipeline;
+            let args = &cull_args;
+            let visible = &cull_visible;
+            let vbuf = &cube_vbuf;
+            let ibuf = &cube_ibuf;
+            let vp = view_proj.to_cols_array();
+            graph.add_pass(
+                PassInfo {
+                    name: "cull_draw",
+                    colors: vec![(backbuffer, None)],
+                    depth: Some(cull_depth),
+                    reads: vec![args_ext, visible_ext],
+                },
+                move |ctx| {
+                    let cmd = ctx.cmd();
+                    cmd.bind_graphics_pipeline(draw);
+                    cmd.push_constants(&cull_draw_push(
+                        &vp,
+                        sun_dir,
+                        visible.storage_index(),
+                        GRID_DIM,
+                        grid_spacing,
+                        cube_scale,
+                        grid_height,
+                    ));
+                    cmd.bind_vertex_buffer(vbuf, 32);
+                    cmd.bind_index_buffer(ibuf, true);
+                    cmd.draw_indexed_indirect(args, 0, 1);
+                    Ok(())
+                },
+            );
+        }
+
         // Phase 7 particle draw: instanced billboards composited over the tonemapped
         // image (alpha blend), reading the compute-updated buffer in the vertex
         // stage. Declared after tonemap so the WAW on the backbuffer orders it last.
@@ -1673,6 +1864,81 @@ fn particle_draw_push(
     pc[96..100].copy_from_slice(&buffer_index.to_le_bytes());
     pc[100..104].copy_from_slice(&count.to_le_bytes());
     pc[104..108].copy_from_slice(&size.to_le_bytes());
+    pc
+}
+
+/// Extract the six normalized, inward-facing frustum planes from a view-proj
+/// matrix (Gribb-Hartmann; near plane uses row2 for [0,1] clip depth). Use a
+/// Y-flip-free matrix so culling is identical on both backends.
+fn frustum_planes(vp: Mat4) -> [[f32; 4]; 6] {
+    let r0 = Vec4::new(vp.x_axis.x, vp.y_axis.x, vp.z_axis.x, vp.w_axis.x);
+    let r1 = Vec4::new(vp.x_axis.y, vp.y_axis.y, vp.z_axis.y, vp.w_axis.y);
+    let r2 = Vec4::new(vp.x_axis.z, vp.y_axis.z, vp.z_axis.z, vp.w_axis.z);
+    let r3 = Vec4::new(vp.x_axis.w, vp.y_axis.w, vp.z_axis.w, vp.w_axis.w);
+    let raw = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2];
+    let mut out = [[0.0f32; 4]; 6];
+    for (i, p) in raw.iter().enumerate() {
+        let len = p.truncate().length().max(1e-6);
+        let n = *p / len;
+        out[i] = [n.x, n.y, n.z, n.w];
+    }
+    out
+}
+
+/// Pack the cull push block (128 bytes): 6 planes + buffer indices + grid params.
+#[allow(clippy::too_many_arguments)]
+fn cull_push(
+    planes: &[[f32; 4]; 6],
+    args_index: u32,
+    visible_index: u32,
+    count: u32,
+    grid_dim: u32,
+    spacing: f32,
+    cube_radius: f32,
+    y_height: f32,
+    index_count: u32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    for (i, pl) in planes.iter().enumerate() {
+        for (j, v) in pl.iter().enumerate() {
+            let o = i * 16 + j * 4;
+            pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    pc[96..100].copy_from_slice(&args_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&visible_index.to_le_bytes());
+    pc[104..108].copy_from_slice(&count.to_le_bytes());
+    pc[108..112].copy_from_slice(&grid_dim.to_le_bytes());
+    pc[112..116].copy_from_slice(&spacing.to_le_bytes());
+    pc[116..120].copy_from_slice(&cube_radius.to_le_bytes());
+    pc[120..124].copy_from_slice(&y_height.to_le_bytes());
+    pc[124..128].copy_from_slice(&index_count.to_le_bytes());
+    pc
+}
+
+/// Pack the cull-draw push block (112 bytes): view_proj + sun_dir + grid params.
+#[allow(clippy::too_many_arguments)]
+fn cull_draw_push(
+    view_proj: &[f32; 16],
+    sun_dir: [f32; 3],
+    visible_index: u32,
+    grid_dim: u32,
+    spacing: f32,
+    cube_scale: f32,
+    y_height: f32,
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
+    for (i, v) in view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&sun_dir[0].to_le_bytes());
+    pc[68..72].copy_from_slice(&sun_dir[1].to_le_bytes());
+    pc[72..76].copy_from_slice(&sun_dir[2].to_le_bytes());
+    pc[80..84].copy_from_slice(&visible_index.to_le_bytes());
+    pc[84..88].copy_from_slice(&grid_dim.to_le_bytes());
+    pc[88..92].copy_from_slice(&spacing.to_le_bytes());
+    pc[92..96].copy_from_slice(&cube_scale.to_le_bytes());
+    pc[96..100].copy_from_slice(&y_height.to_le_bytes());
     pc
 }
 

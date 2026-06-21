@@ -207,6 +207,30 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "particle_draw_fs",
     },
+    Job {
+        src: "cull.slang",
+        entry: "csReset",
+        stage: "compute",
+        key: "cull_reset_cs",
+    },
+    Job {
+        src: "cull.slang",
+        entry: "csCull",
+        stage: "compute",
+        key: "cull_cs",
+    },
+    Job {
+        src: "cull_draw.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "cull_draw_vs",
+    },
+    Job {
+        src: "cull_draw.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "cull_draw_fs",
+    },
 ];
 
 /// (slang target name, output file extension, generated accessor suffix, required).
