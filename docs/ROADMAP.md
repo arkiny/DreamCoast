@@ -105,11 +105,11 @@ engine/                 # cargo workspace root
 - 추가: 스왑체인 readback → PNG 스크린샷 툴, **카메라 기준 실시간 환경 캡처**([realtime-env-capture.md](realtime-env-capture.md))
 - **완료 기준 달성**: 디퍼드 PBR 씬 렌더(직접광+PCF 섀도우+IBL+톤매핑), 두 백엔드 픽셀 일치, Vulkan 검증 클린
 
-### Phase 7 — 컴퓨트 / GPGPU — 🚧 계획
+### Phase 7 — 컴퓨트 / GPGPU — ✅ 완료
 세부: [phase-7-compute.md](phase-7-compute.md)
 - 렌더그래프 위 **1급 컴퓨트 패스** + read-write(UAV/storage) 리소스, 예제 셋(컴퓨트 포스트프로세싱, GPU 파티클 시뮬레이션, GPU 컬링+indirect draw)
 - 신규 RHI: 컴퓨트 파이프라인/dispatch, storage image·storage buffer(바인드리스 UAV), indirect draw, 컴퓨트 가시 바인드리스
-- **완료 기준**: 컴퓨트 기반 효과가 렌더 패스와 연동 (두 백엔드 일치, Vulkan 검증 클린)
+- **완료 기준 달성**: 세 컴퓨트 기법이 렌더 패스와 연동, 두 백엔드 픽셀 일치, Vulkan 검증 클린
 
 ### Phase 8 — 레이트레이싱
 - RHI에 가속 구조(BLAS/TLAS), RT 파이프라인, Shader Binding Table 추상화 추가

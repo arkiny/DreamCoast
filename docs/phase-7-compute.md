@@ -1,6 +1,6 @@
 # Phase 7 — 컴퓨트 / GPGPU 세부 계획
 
-> 상위 로드맵: [ROADMAP.md](ROADMAP.md). **상태: 🚧 계획 (승인 대기)** — 구현 전 사인오프 단계.
+> 상위 로드맵: [ROADMAP.md](ROADMAP.md). **상태: ✅ 완료** (RTX 2070 SUPER, 두 백엔드 / 빌드·fmt·clippy(-D warnings)·런타임 + **Vulkan 검증 레이어 클린** 검증, M4–M6 스크린샷 픽셀 일치).
 > 전제: Phase 6(디퍼드 PBR + 렌더그래프) ✅ 완료. 이 Phase는 Phase 8(RT)·Phase 10(Virtual Geometry)의 전제다.
 
 ## Context
@@ -137,6 +137,20 @@ Phase 7은 여기에 **컴퓨트 패스**와 **read-write(UAV/storage) 리소스
 - 두 백엔드 `--backend vulkan|d3d12` 실행 + `--screenshot[-clean]`로 PNG 캡처 후 Read로 시각 확인, 픽셀 일치.
 - `VK_LOADER_LAYERS_DISABLE="~implicit~"` Vulkan 검증 레이어 클린(컴퓨트 PSO·UAV 배리어·indirect 모두 VUID 없음).
 - 리포지토리 주석/문서에 **타사 엔진/상표명 미사용**(사용자 라이선스 요구) — 표준 기법명으로 기술.
+- 헤드리스 캡처 토글: `P7_COMPUTE_POST` / `P7_PARTICLES` / `P7_CULL` 환경변수로 각 데모 초기 on
+  (UI 체크박스의 초기값). 예: `P7_CULL=1 cargo run -p sandbox -- --backend d3d12 --screenshot-clean tmp/x.png`.
+
+## 검증 결과 (✅ 완료)
+
+- **M4 컴퓨트 포스트:** HDR→storage image 3×3 블러→톤매핑. on/off 비교로 블러 가시(엣지 소프트), D3D12≡Vulkan.
+  Vulkan: `descriptorBindingStorage{Image,Buffer}UpdateAfterBind` + `shaderStorageImageWriteWithoutFormat` 활성 필요.
+- **M5 GPU 파티클:** 4096개, 1회 init dispatch 시드 후 매 프레임 컴퓨트 적분(중력+바운스+해시 리스폰),
+  인스턴스 빌보드 드로우(정점 단계 storage-buffer UAV 읽기). 분수 모양 동일, D3D12≡Vulkan.
+  Vulkan: `vertexPipelineStoresAndAtomics` 활성 필요(정점 단계 UAV 읽기).
+- **M6 GPU 컬링:** 16×16 큐브 그리드, reset→cull 컴퓨트(atomic InstanceCount)→indirect 드로우.
+  프러스텀 평면은 Y-flip 없는 view-proj에서 CPU 추출 → 두 백엔드 가시 집합/드로우 카운트 동일, 렌더는 백엔드별
+  view-proj. 떠 있는 슬래브가 프러스텀에 잘려 컬링 가시화, D3D12≡Vulkan.
+- **회귀:** 데모 전부 off(기본)일 때 Phase 6 씬과 동일(둘 다), 검증 클린.
 
 ## 알려진 한계 / 이후 작업 (예정)
 
