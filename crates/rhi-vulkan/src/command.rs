@@ -549,6 +549,66 @@ impl VulkanCommandBuffer {
         };
     }
 
+    /// Begin rendering into one (face, mip) of a cubemap **with a depth buffer**
+    /// (clears depth), for capturing scene geometry. Color is loaded if
+    /// `clear = None`. The cube must be in `COLOR_ATTACHMENT_OPTIMAL` and the
+    /// depth in `DEPTH_ATTACHMENT_OPTIMAL` (see `cube_to_color`/`depth_to_render_target`).
+    pub fn begin_rendering_cube_face_depth(
+        &self,
+        cube: &VulkanCubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+        depth: &VulkanDepthBuffer,
+    ) {
+        let (load_op, clear_value) = match clear {
+            Some(c) => (
+                vk::AttachmentLoadOp::CLEAR,
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [c.r, c.g, c.b, c.a],
+                    },
+                },
+            ),
+            None => (vk::AttachmentLoadOp::LOAD, vk::ClearValue::default()),
+        };
+        let color = vk::RenderingAttachmentInfo::default()
+            .image_view(cube.render_view(face, mip))
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(load_op)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(clear_value);
+        let colors = [color];
+        let depth_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(depth.view())
+            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .clear_value(vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            });
+        let size = cube.mip_size(mip);
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: size,
+                    height: size,
+                },
+            })
+            .layer_count(1)
+            .color_attachments(&colors)
+            .depth_attachment(&depth_attachment);
+        unsafe {
+            self.device
+                .device
+                .cmd_begin_rendering(self.cmd, &rendering_info)
+        };
+    }
+
     /// Transition a depth buffer into `SHADER_READ_ONLY_OPTIMAL` for sampling.
     pub fn depth_to_sampled(&self, depth: &VulkanDepthBuffer) {
         if depth.layout() == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {

@@ -201,7 +201,10 @@ float4 fsMain(VSOutput input) : SV_Target
             float4 far = mul(g.inv_view_proj, float4(ndc, 1.0, 1.0));
             float3 world = far.xyz / far.w;
             float3 dir = normalize(world - g.camera_pos.xyz);
-            float3 sky = g_cubes[g.ibl.x].SampleLevel(g_sampler, dir, 0.0).rgb;
+            // Mip 1+ holds sky only (scene geometry is captured into mip 0), so the
+            // skybox stays clean sky; the gradient is low-frequency so half-res is
+            // imperceptible.
+            float3 sky = g_cubes[g.ibl.x].SampleLevel(g_sampler, dir, 1.0).rgb;
             return float4(sky * g.ambient.a, 1.0); // a = exposure
         }
         return float4(g.ambient.rgb, 1.0);

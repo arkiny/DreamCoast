@@ -257,6 +257,31 @@ impl D3d12CommandBuffer {
         }
     }
 
+    /// Begin rendering into one (face, mip) of a cubemap **with a depth buffer**
+    /// (clears depth), for capturing scene geometry. Color is loaded if
+    /// `clear = None`. Cube must be in `RENDER_TARGET`, depth in `DEPTH_WRITE`.
+    pub fn begin_rendering_cube_face_depth(
+        &self,
+        cube: &D3d12Cubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+        depth: &D3d12DepthBuffer,
+    ) {
+        let rtv = cube.rtv_handle(face, mip);
+        let dsv = depth.dsv();
+        unsafe {
+            self.list
+                .OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+            self.list
+                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+            if let Some(c) = clear {
+                self.list
+                    .ClearRenderTargetView(rtv, &[c.r, c.g, c.b, c.a], None);
+            }
+        }
+    }
+
     /// Transition a depth buffer into `PIXEL_SHADER_RESOURCE` for sampling.
     pub fn depth_to_sampled(&self, depth: &D3d12DepthBuffer) {
         let before = depth.state();

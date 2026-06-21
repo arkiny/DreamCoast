@@ -315,8 +315,8 @@ fn main() -> anyhow::Result<()> {
         push_constant_size: 112, // mvp(64) + base_color(16) + sun(16) + misc(16)
         bindless: true,
         uniform_buffer: false,
-        depth_test: false,
-        depth_format: None,
+        depth_test: true, // occlusion when capturing the scene into the cube
+        depth_format: Some(DEPTH_FORMAT),
     })?;
 
     // Irradiance pipeline: convolves the env cube into a diffuse-irradiance cube.
@@ -450,7 +450,7 @@ fn main() -> anyhow::Result<()> {
         vbuf: sv,
         ibuf: si,
         index_count: sc,
-        transform: trs(Vec3::new(-r * 1.9, r * 0.55, r * 0.3), r * 0.55),
+        transform: trs(Vec3::new(-r * 1.7, r * 0.75, r * 0.5), r * 0.75),
         base_color: [0.95, 0.96, 0.97, 1.0],
         metallic: 1.0,
         roughness: 0.08,
@@ -554,6 +554,8 @@ fn main() -> anyhow::Result<()> {
         format: HDR_FORMAT,
         mip_levels: PREFILTER_MIPS,
     })?;
+    // Depth buffer for capturing scene geometry into the env cube faces.
+    let capture_depth = device.create_depth_buffer(Extent2D::new(ENV_SIZE, ENV_SIZE))?;
     let brdf_lut = device.create_render_target(&rhi::RenderTargetDesc {
         width: BRDF_SIZE,
         height: BRDF_SIZE,
@@ -760,6 +762,8 @@ fn main() -> anyhow::Result<()> {
             record_environment_capture(
                 cmd,
                 &ibl,
+                &scene,
+                &capture_depth,
                 eye,
                 sun_dir,
                 sun_intensity,
@@ -1089,6 +1093,8 @@ struct IblResources<'a> {
 fn record_environment_capture(
     cmd: &CommandBuffer,
     ibl: &IblResources,
+    scene: &[SceneObject],
+    capture_depth: &rhi::DepthBuffer,
     camera_pos: Vec3,
     sun_dir: [f32; 3],
     sun_intensity: f32,
@@ -1115,16 +1121,20 @@ fn record_environment_capture(
         }
     }
 
-    // 1b. Scene (ground plane) into env mip 0 from the camera position, so
-    // reflective surfaces reflect the live scene. A single flat quad needs no
-    // depth, and excluding the reflective model avoids self-reflection recursion.
+    // 1b. Scene (ground + objects) into env mip 0 from the camera position, with
+    // a depth buffer for correct occlusion, so reflective surfaces reflect the
+    // live scene. Capture shading is direct-light only (no IBL) → no recursion;
+    // a convex object barely samples its own captured pixels, so a single shared
+    // cube is fine.
     let face_vp = cube_face_view_proj(camera_pos, vulkan);
+    cmd.depth_to_render_target(capture_depth);
     for face in 0..6u32 {
-        cmd.begin_rendering_cube_face(ibl.env_cube, face, 0, None); // load the sky
+        cmd.begin_rendering_cube_face_depth(ibl.env_cube, face, 0, None, capture_depth);
         cmd.set_viewport_scissor_extent(Extent2D::new(ENV_SIZE, ENV_SIZE));
         cmd.bind_graphics_pipeline(ibl.capture_pipeline);
+        // Ground.
         cmd.push_constants(&capture_push(
-            face_vp[face as usize],
+            face_vp[face as usize].to_cols_array(),
             [0.8, 0.8, 0.8, 1.0],
             sun_dir,
             sun_intensity,
@@ -1133,6 +1143,20 @@ fn record_environment_capture(
         cmd.bind_vertex_buffer(ibl.ground_vbuf, 32);
         cmd.bind_index_buffer(ibl.ground_ibuf, true);
         cmd.draw_indexed(ibl.ground_count, 0, 0);
+        // Scene objects (direct-lit; metallic/roughness ignored in the capture).
+        for obj in scene {
+            let mvp = (face_vp[face as usize] * obj.transform).to_cols_array();
+            cmd.push_constants(&capture_push(
+                mvp,
+                obj.base_color,
+                sun_dir,
+                sun_intensity,
+                ambient,
+            ));
+            cmd.bind_vertex_buffer(&obj.vbuf, 32);
+            cmd.bind_index_buffer(&obj.ibuf, true);
+            cmd.draw_indexed(obj.index_count, 0, 0);
+        }
         cmd.end_rendering();
     }
     cmd.cube_to_sampled(ibl.env_cube);
@@ -1202,17 +1226,17 @@ fn generate_brdf_lut(
 /// The 6 cube-face view-projections from `eye` (90° FOV, aspect 1), matching the
 /// `TextureCube` face convention. The Vulkan clip-space Y flip keeps the captured
 /// faces oriented the same as the procedural sky on both backends.
-fn cube_face_view_proj(eye: Vec3, vulkan: bool) -> [[f32; 16]; 6] {
+fn cube_face_view_proj(eye: Vec3, vulkan: bool) -> [Mat4; 6] {
     let dirs = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
     let ups = [-Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z, -Vec3::Y, -Vec3::Y];
     let mut proj = Mat4::perspective_rh(90f32.to_radians(), 1.0, 0.05, 100.0);
     if vulkan {
         proj.y_axis.y *= -1.0;
     }
-    let mut out = [[0.0f32; 16]; 6];
+    let mut out = [Mat4::IDENTITY; 6];
     for i in 0..6 {
         let view = Mat4::look_at_rh(eye, eye + dirs[i], ups[i]);
-        out[i] = (proj * view).to_cols_array();
+        out[i] = proj * view;
     }
     out
 }

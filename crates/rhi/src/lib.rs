@@ -566,6 +566,28 @@ impl CommandBuffer {
         }
     }
 
+    /// Begin rendering into one (face, mip) of a cubemap with a depth buffer
+    /// (clears depth), for capturing scene geometry. The cube must be in
+    /// render-target state, the depth in depth-attachment state.
+    pub fn begin_rendering_cube_face_depth(
+        &self,
+        cube: &Cubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+        depth: &DepthBuffer,
+    ) {
+        match (self, cube, depth) {
+            (Self::Vulkan(c), Cubemap::Vulkan(m), DepthBuffer::Vulkan(d)) => {
+                c.begin_rendering_cube_face_depth(m, face, mip, clear, d)
+            }
+            (Self::D3d12(c), Cubemap::D3d12(m), DepthBuffer::D3d12(d)) => {
+                c.begin_rendering_cube_face_depth(m, face, mip, clear, d)
+            }
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
     pub fn end_rendering(&self) {
         match self {
             Self::Vulkan(c) => c.end_rendering(),
