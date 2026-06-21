@@ -46,6 +46,8 @@ pub struct VulkanRenderTarget {
     memory: Memory,
     view: vk::ImageView,
     index: u32,
+    /// Bindless storage-image (UAV) index, when created with `storage` (Phase 7).
+    storage_index: Option<u32>,
     extent: vk::Extent2D,
     /// Current image layout, updated by the barrier helpers.
     layout: Cell<vk::ImageLayout>,
@@ -117,12 +119,20 @@ impl VulkanRenderTarget {
         // The bindless descriptor records SHADER_READ_ONLY_OPTIMAL; the graph
         // guarantees the image is in that layout before a sampling pass.
         let index = device.register_sampled_image(view);
+        // Storage images additionally get a UAV descriptor (GENERAL layout) so a
+        // compute pass can write them.
+        let storage_index = if desc.storage {
+            Some(device.register_storage_image(view))
+        } else {
+            None
+        };
         Ok(Self {
             device,
             image,
             memory,
             view,
             index,
+            storage_index,
             extent,
             layout: Cell::new(vk::ImageLayout::UNDEFINED),
         })
@@ -151,6 +161,11 @@ impl VulkanRenderTarget {
     /// Index of this target in the device's bindless table.
     pub fn bindless_index(&self) -> u32 {
         self.index
+    }
+
+    /// Bindless storage-image (UAV) index, if created with `storage`.
+    pub fn storage_index(&self) -> Option<u32> {
+        self.storage_index
     }
 }
 
@@ -182,6 +197,10 @@ unsafe fn create_image(
     } else {
         vk::ImageCreateFlags::empty()
     };
+    let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED;
+    if desc.storage {
+        usage |= vk::ImageUsageFlags::STORAGE;
+    }
     let image_ci = vk::ImageCreateInfo::default()
         .flags(flags)
         .image_type(vk::ImageType::TYPE_2D)
@@ -195,7 +214,7 @@ unsafe fn create_image(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+        .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let image = unsafe { device.device.create_image(&image_ci, None) }.map_err(vk_err)?;
@@ -235,6 +254,7 @@ impl VulkanTransientHeap {
                     width: 16,
                     height: 16,
                     format: rhi_types::Format::Rgba8Unorm,
+                    storage: false,
                 },
                 true,
             )?;

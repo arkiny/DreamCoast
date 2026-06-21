@@ -26,13 +26,13 @@ mod swapchain;
 mod sync;
 mod texture;
 
-pub use buffer::VulkanBuffer;
+pub use buffer::{VulkanBuffer, VulkanStorageBuffer};
 pub use command::VulkanCommandBuffer;
 pub use cubemap::VulkanCubemap;
 pub use depth::VulkanDepthBuffer;
 pub use device::{VulkanDevice, VulkanQueue};
 pub use instance::VulkanInstance;
-pub use pipeline::VulkanGraphicsPipeline;
+pub use pipeline::{VulkanComputePipeline, VulkanGraphicsPipeline};
 pub use render_target::{VulkanRenderTarget, VulkanTransientHeap};
 pub use swapchain::VulkanSwapchain;
 pub use sync::{VulkanFence, VulkanSemaphore};

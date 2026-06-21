@@ -11,17 +11,20 @@ use rhi_types::{
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE,
+    D3D12_BUFFER_UAV, D3D12_BUFFER_UAV_FLAG_RAW, D3D12_COMMAND_LIST_TYPE_DIRECT,
+    D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_COMMAND_SIGNATURE_DESC,
     D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
     D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_FENCE_FLAG_NONE, D3D12_GPU_DESCRIPTOR_HANDLE,
+    D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_SHADER_RESOURCE_VIEW_DESC,
     D3D12_SHADER_RESOURCE_VIEW_DESC_0, D3D12_SRV_DIMENSION_TEXTURE2D,
-    D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEX2D_SRV, D3D12_TEXCUBE_SRV, D3D12CreateDevice,
-    ID3D12CommandList, ID3D12CommandQueue, ID3D12DescriptorHeap, ID3D12Device, ID3D12Fence,
-    ID3D12Resource,
+    D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEX2D_SRV, D3D12_TEX2D_UAV, D3D12_TEXCUBE_SRV,
+    D3D12_UAV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    D3D12_UNORDERED_ACCESS_VIEW_DESC_0, D3D12CreateDevice, ID3D12CommandList, ID3D12CommandQueue,
+    ID3D12CommandSignature, ID3D12DescriptorHeap, ID3D12Device, ID3D12Fence, ID3D12Resource,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS};
 use windows::Win32::Graphics::Dxgi::IDXGIFactory6;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::{Interface, PCWSTR};
@@ -43,6 +46,18 @@ pub(crate) const BINDLESS_COUNT: u32 = 1024;
 /// `BINDLESS_COUNT..BINDLESS_COUNT+CUBE_COUNT`, register space 1). Its index
 /// space is separate from the 2D table and starts at 0.
 pub(crate) const CUBE_COUNT: u32 = 64;
+/// Size of the bindless storage-image UAV table (Phase 7), in the heap region
+/// right after the cubes. Separate 0-based index space (`u0, space0`).
+pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
+/// Size of the bindless storage-buffer UAV table (Phase 7), after the storage
+/// images. Separate 0-based index space (`u0, space1`).
+pub(crate) const STORAGE_BUFFER_COUNT: u32 = 64;
+/// Heap offset where the storage-image UAV region begins.
+pub(crate) const STORAGE_IMAGE_BASE: u32 = BINDLESS_COUNT + CUBE_COUNT;
+/// Heap offset where the storage-buffer UAV region begins.
+pub(crate) const STORAGE_BUFFER_BASE: u32 = STORAGE_IMAGE_BASE + STORAGE_IMAGE_COUNT;
+/// Total descriptors in the shader-visible bindless heap.
+pub(crate) const HEAP_DESCRIPTORS: u32 = STORAGE_BUFFER_BASE + STORAGE_BUFFER_COUNT;
 
 /// Device-level objects shared (via `Rc`) by every GPU resource.
 pub(crate) struct DeviceShared {
@@ -55,6 +70,10 @@ pub(crate) struct DeviceShared {
     pub srv_size: u32,
     srv_next: Cell<u32>,
     cube_next: Cell<u32>,
+    storage_image_next: Cell<u32>,
+    storage_buffer_next: Cell<u32>,
+    // Command signature for indexed indirect draws (`ExecuteIndirect`, Phase 7).
+    pub indirect_draw_signature: ID3D12CommandSignature,
     // A dedicated fence for `wait_idle`.
     idle_fence: ID3D12Fence,
     idle_event: HANDLE,
@@ -91,7 +110,7 @@ impl DeviceShared {
             // Shader-visible bindless SRV heap.
             let heap_desc = D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: BINDLESS_COUNT + CUBE_COUNT,
+                NumDescriptors: HEAP_DESCRIPTORS,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             };
@@ -99,6 +118,25 @@ impl DeviceShared {
                 device.CreateDescriptorHeap(&heap_desc).map_err(d3d_err)?;
             let srv_size =
                 device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+            // Command signature: one DRAW_INDEXED argument, 20-byte stride (matches
+            // VkDrawIndexedIndirectCommand so one compute shader fills both APIs).
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
+                ..Default::default()
+            };
+            let sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: 20,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &arg,
+                NodeMask: 0,
+            };
+            let mut indirect_draw_signature: Option<ID3D12CommandSignature> = None;
+            device
+                .CreateCommandSignature(&sig_desc, None, &mut indirect_draw_signature)
+                .map_err(d3d_err)?;
+            let indirect_draw_signature = indirect_draw_signature
+                .ok_or_else(|| EngineError::Rhi("command signature null".into()))?;
             tracing::debug!("D3D12 device + queue ready");
 
             Ok(Self {
@@ -110,6 +148,9 @@ impl DeviceShared {
                 srv_size,
                 srv_next: Cell::new(0),
                 cube_next: Cell::new(0),
+                storage_image_next: Cell::new(0),
+                storage_buffer_next: Cell::new(0),
+                indirect_draw_signature,
                 idle_fence,
                 idle_event,
                 idle_value: Cell::new(0),
@@ -215,6 +256,70 @@ impl DeviceShared {
         index
     }
 
+    /// CPU handle for bindless heap `slot`.
+    fn cpu_handle(&self, slot: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let cpu = unsafe { self.srv_heap.GetCPUDescriptorHandleForHeapStart() };
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: cpu.ptr + (slot as usize) * (self.srv_size as usize),
+        }
+    }
+
+    /// Create a Texture2D UAV for `resource` in the reserved storage-image heap
+    /// region; returns the 0-based storage-image index (Phase 7).
+    pub(crate) fn register_storage_image(&self, resource: &ID3D12Resource, format: Format) -> u32 {
+        let index = self.storage_image_next.get();
+        self.storage_image_next.set(index + 1);
+        let handle = self.cpu_handle(STORAGE_IMAGE_BASE + index);
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: to_dxgi_format(format),
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_UAV {
+                    MipSlice: 0,
+                    PlaneSlice: 0,
+                },
+            },
+        };
+        unsafe {
+            self.device
+                .CreateUnorderedAccessView(resource, None, Some(&uav), handle);
+        }
+        index
+    }
+
+    /// Create a raw (byte-address) UAV for `resource` in the reserved storage-buffer
+    /// heap region; returns the 0-based storage-buffer index. Raw views let one
+    /// bindless array hold heterogeneous data (particles, instances, indirect args,
+    /// counters) addressed by byte offset (Phase 7). `size_bytes` must be a
+    /// multiple of 4.
+    pub(crate) fn register_storage_buffer(
+        &self,
+        resource: &ID3D12Resource,
+        size_bytes: u64,
+    ) -> u32 {
+        let index = self.storage_buffer_next.get();
+        self.storage_buffer_next.set(index + 1);
+        let handle = self.cpu_handle(STORAGE_BUFFER_BASE + index);
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: (size_bytes / 4) as u32,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        unsafe {
+            self.device
+                .CreateUnorderedAccessView(resource, None, Some(&uav), handle);
+        }
+        index
+    }
+
     /// Record + submit a one-time command list and wait for completion.
     pub(crate) fn immediate_submit(
         &self,
@@ -288,12 +393,27 @@ impl D3d12Device {
         D3d12GraphicsPipeline::new(self.shared.clone(), desc)
     }
 
+    pub fn create_compute_pipeline(
+        &self,
+        desc: &rhi_types::ComputePipelineDesc,
+    ) -> Result<crate::pipeline::D3d12ComputePipeline, EngineError> {
+        crate::pipeline::D3d12ComputePipeline::new(self.shared.clone(), desc)
+    }
+
     pub fn create_command_buffer(&self) -> Result<D3d12CommandBuffer, EngineError> {
         D3d12CommandBuffer::new(self.shared.clone())
     }
 
     pub fn create_buffer(&self, desc: &BufferDesc) -> Result<D3d12Buffer, EngineError> {
         D3d12Buffer::new(self.shared.clone(), desc)
+    }
+
+    /// Create a device-local storage buffer (UAV) for compute (Phase 7).
+    pub fn create_storage_buffer(
+        &self,
+        desc: &rhi_types::StorageBufferDesc,
+    ) -> Result<crate::buffer::D3d12StorageBuffer, EngineError> {
+        crate::buffer::D3d12StorageBuffer::new(self.shared.clone(), desc)
     }
 
     pub fn create_texture(

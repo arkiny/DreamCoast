@@ -17,6 +17,7 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES,
     D3D12_HEAP_TYPE_DEFAULT, D3D12_MEMORY_POOL_UNKNOWN, D3D12_RESOURCE_DESC,
     D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAGS,
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET,
     D3D12_RESOURCE_STATES, D3D12_TEXTURE_LAYOUT_UNKNOWN, ID3D12DescriptorHeap, ID3D12Heap,
     ID3D12Resource,
@@ -38,6 +39,8 @@ pub struct D3d12RenderTarget {
     heap: Option<ID3D12Heap>,
     rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
     index: u32,
+    /// Bindless storage-image (UAV) index, when created with `storage` (Phase 7).
+    storage_index: Option<u32>,
     /// Current resource state, updated by the barrier helpers.
     state: Cell<D3D12_RESOURCE_STATES>,
 }
@@ -114,6 +117,11 @@ impl D3d12RenderTarget {
             let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
             device.device.CreateRenderTargetView(&resource, None, rtv);
             let index = device.register_texture(&resource, desc.format);
+            let storage_index = if desc.storage {
+                Some(device.register_storage_image(&resource, desc.format))
+            } else {
+                None
+            };
             Ok(Self {
                 device,
                 resource,
@@ -121,6 +129,7 @@ impl D3d12RenderTarget {
                 heap,
                 rtv,
                 index,
+                storage_index,
                 state: Cell::new(initial),
             })
         }
@@ -146,6 +155,11 @@ impl D3d12RenderTarget {
     pub fn bindless_index(&self) -> u32 {
         self.index
     }
+
+    /// Bindless storage-image (UAV) index, if created with `storage`.
+    pub fn storage_index(&self) -> Option<u32> {
+        self.storage_index
+    }
 }
 
 fn default_heap() -> D3D12_HEAP_PROPERTIES {
@@ -159,6 +173,10 @@ fn default_heap() -> D3D12_HEAP_PROPERTIES {
 }
 
 fn resource_desc(desc: &RenderTargetDesc) -> D3D12_RESOURCE_DESC {
+    let mut flags: D3D12_RESOURCE_FLAGS = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if desc.storage {
+        flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    }
     D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         Alignment: 0,
@@ -172,7 +190,7 @@ fn resource_desc(desc: &RenderTargetDesc) -> D3D12_RESOURCE_DESC {
             Quality: 0,
         },
         Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        Flags: flags,
     }
 }
 

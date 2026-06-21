@@ -17,12 +17,12 @@ use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_core::init_logging;
 use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
-use dreamcoast_render::{PassInfo, RenderGraph, ResourcePool};
+use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourcePool};
 use rhi::{
-    BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, CommandBuffer, Cubemap,
-    CubemapDesc, Device, Extent2D, Fence, Format, GraphicsPipeline, GraphicsPipelineDesc, Instance,
-    InstanceDesc, PresentMode, PrimitiveTopology, Queue, ReadbackLayout, Semaphore, SwapchainDesc,
-    Texture, TextureDesc, VertexLayout,
+    BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, CommandBuffer,
+    ComputePipelineDesc, Cubemap, CubemapDesc, Device, Extent2D, Fence, Format, GraphicsPipeline,
+    GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology, Queue,
+    ReadbackLayout, Semaphore, SwapchainDesc, Texture, TextureDesc, VertexLayout,
 };
 use tracing::info;
 
@@ -268,6 +268,21 @@ fn main() -> anyhow::Result<()> {
         depth_test: false,
         depth_format: None,
     })?;
+    // Compute post-process pipeline (Phase 7): blurs the HDR target into a
+    // storage image between the lighting and tonemap passes.
+    let post_compute_cs = load_compute_shader(
+        backend,
+        dreamcoast_shader::post_compute_cs_spirv,
+        dreamcoast_shader::post_compute_cs_dxil,
+        "post_compute",
+    )?;
+    let post_compute_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
+        compute_bytes: post_compute_cs,
+        compute_entry: "csMain",
+        push_constant_size: 16, // hdr_index + out_index + width + height
+        bindless: true,
+    })?;
+
     // Sky pipeline: renders the procedural sky into each environment cube face.
     let (sky_vs, sky_fs) = load_shader_pair(
         backend,
@@ -518,6 +533,14 @@ fn main() -> anyhow::Result<()> {
     let mut debug_view: usize = 0;
     let mut post_mode: usize = 0;
     let mut aliasing = true;
+    // Phase 7: route the HDR result through a compute post-process (3x3 blur into
+    // a storage image) before tonemapping. Initial state seedable via env var so
+    // headless screenshots can exercise each demo (`P7_COMPUTE_POST=1`, etc.).
+    let mut compute_post = std::env::var_os("P7_COMPUTE_POST").is_some();
+    // Phase 7: GPU particle simulation (compute-updated buffer, instanced draw).
+    let mut particles_on = std::env::var_os("P7_PARTICLES").is_some();
+    // Phase 7: GPU frustum culling -> indirect draw of a cube instance grid.
+    let mut gpu_cull = std::env::var_os("P7_CULL").is_some();
     // Real-time environment capture: re-capture the env chain every frame (so the
     // sky/IBL track the live sun); when off, re-capture only when the sun changes.
     let mut realtime_env = true;
@@ -578,6 +601,7 @@ fn main() -> anyhow::Result<()> {
         width: BRDF_SIZE,
         height: BRDF_SIZE,
         format: Format::Rg16Float,
+        storage: false,
     })?;
     let brdf_index = brdf_lut.bindless_index() as i32;
     let ibl = IblResources {
@@ -739,6 +763,11 @@ fn main() -> anyhow::Result<()> {
                     ui.checkbox("Multi-bounce reflections", &mut multibounce);
                     ui.combo_simple_string("Post effect", &mut post_mode, &POST_EFFECTS);
                     ui.checkbox("Transient aliasing", &mut aliasing);
+                    ui.separator();
+                    ui.text("Compute / GPGPU (Phase 7)");
+                    ui.checkbox("Compute post (blur)", &mut compute_post);
+                    ui.checkbox("GPU particles", &mut particles_on);
+                    ui.checkbox("GPU culling (indirect)", &mut gpu_cull);
                 });
         }
 
@@ -853,6 +882,13 @@ fn main() -> anyhow::Result<()> {
         let g_depth = graph.create_depth("g_depth", extent);
         let shadow_map = graph.create_depth("shadow_map", Extent2D::new(SHADOW_SIZE, SHADOW_SIZE));
         let hdr = graph.create_color("hdr", HDR_FORMAT, extent);
+        // Phase 7: compute post writes the blurred HDR into a storage image that
+        // the tonemap pass samples instead of the raw `hdr` target.
+        let hdr_post = if compute_post {
+            Some(graph.create_storage_image("hdr_post", HDR_FORMAT, extent))
+        } else {
+            None
+        };
 
         let sky = ClearColor {
             r: ambient,
@@ -966,15 +1002,37 @@ fn main() -> anyhow::Result<()> {
                 Ok(())
             },
         );
+        // Phase 7 compute post: blur `hdr` into the `hdr_post` storage image.
+        if let Some(hdr_post) = hdr_post {
+            let post_cp = &post_compute_pipeline;
+            graph.add_compute_pass(
+                ComputePassInfo {
+                    name: "post_compute",
+                    storage_writes: vec![hdr_post],
+                    reads: vec![hdr],
+                },
+                move |ctx| {
+                    let in_index = ctx.sampled_index(hdr);
+                    let out_index = ctx.storage_index(hdr_post);
+                    let cmd = ctx.cmd();
+                    cmd.bind_compute_pipeline(post_cp);
+                    cmd.push_constants_compute(&post_compute_push(in_index, out_index, cw, ch));
+                    cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                    Ok(())
+                },
+            );
+        }
+        // Tonemap samples the compute-post output when enabled, else raw HDR.
+        let tonemap_src = hdr_post.unwrap_or(hdr);
         graph.add_pass(
             PassInfo {
                 name: "tonemap",
                 colors: vec![(backbuffer, Some(ClearColor::BLACK))],
                 depth: None,
-                reads: vec![hdr],
+                reads: vec![tonemap_src],
             },
             |ctx| {
-                let hdr_index = ctx.sampled_index(hdr);
+                let hdr_index = ctx.sampled_index(tonemap_src);
                 let cmd = ctx.cmd();
                 cmd.bind_graphics_pipeline(&post_pipeline);
                 cmd.push_constants(&post_push(hdr_index, post_mode as u32, flip_y));
@@ -1442,6 +1500,16 @@ fn post_push(hdr_index: u32, mode: u32, flip_y: u32) -> [u8; 16] {
     pc
 }
 
+/// Pack the compute-post push block: hdr_index + out_index + width + height.
+fn post_compute_push(hdr_index: u32, out_index: u32, width: u32, height: u32) -> [u8; 16] {
+    let mut pc = [0u8; 16];
+    pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&out_index.to_le_bytes());
+    pc[8..12].copy_from_slice(&width.to_le_bytes());
+    pc[12..16].copy_from_slice(&height.to_le_bytes());
+    pc
+}
+
 fn upload_mesh(device: &Device, model: &MeshData) -> anyhow::Result<(Buffer, Buffer, u32)> {
     let vbytes = unsafe {
         std::slice::from_raw_parts(
@@ -1586,6 +1654,20 @@ fn load_shader_pair(
     let vs = vs.ok_or_else(|| anyhow!("{name} vertex shader unavailable for {backend:?}"))?;
     let fs = fs.ok_or_else(|| anyhow!("{name} fragment shader unavailable for {backend:?}"))?;
     Ok((vs, fs))
+}
+
+/// Fetch single-stage (compute) bytecode for `backend`, erroring if unavailable.
+fn load_compute_shader(
+    backend: BackendKind,
+    cs_spirv: fn() -> Option<&'static [u8]>,
+    cs_dxil: fn() -> Option<&'static [u8]>,
+    name: &str,
+) -> anyhow::Result<&'static [u8]> {
+    let cs = match backend {
+        BackendKind::Vulkan => cs_spirv(),
+        BackendKind::D3d12 => cs_dxil(),
+    };
+    cs.ok_or_else(|| anyhow!("{name} compute shader unavailable for {backend:?}"))
 }
 
 fn build_render_finished(device: &Device, count: u32) -> anyhow::Result<Vec<Semaphore>> {

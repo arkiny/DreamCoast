@@ -45,6 +45,17 @@ pub struct ResourceId(usize);
 enum ResourceKind {
     Color,
     Depth,
+    /// An app-owned resource (e.g. a persistent storage buffer) tracked only for
+    /// scheduling/culling — never realized or barriered by the graph. Its real
+    /// barriers are issued explicitly in record closures (Phase 7).
+    External,
+}
+
+/// Whether a pass runs on the graphics or compute pipeline (Phase 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassKind {
+    Graphics,
+    Compute,
 }
 
 /// A virtual resource: a transient texture the graph allocates, or the imported
@@ -58,17 +69,23 @@ struct Resource {
     /// `true` for the imported swapchain image (realized from the swapchain, not
     /// the pool).
     backbuffer: bool,
+    /// `true` for a compute-writable storage image (UAV); the realized render
+    /// target gets a storage bindless index and the graph emits UAV barriers.
+    storage: bool,
 }
 
 /// What a pass does to a resource.
 struct PassNode<'a> {
     name: String,
+    kind: PassKind,
     /// Color attachments written by the pass, in attachment order. Each carries
     /// its load behavior (`Some(clear)` clears, `None` loads). Multiple entries
     /// drive MRT (e.g. a G-buffer fill). A backbuffer pass has exactly one.
     colors: Vec<(ResourceId, Option<ClearColor>)>,
     depth: Option<ResourceId>,
     reads: Vec<ResourceId>,
+    /// Resources written via UAV (storage images / external storage buffers).
+    storage_writes: Vec<ResourceId>,
     record: RecordFn<'a>,
 }
 
@@ -84,25 +101,42 @@ pub struct PassInfo<'a> {
     pub reads: Vec<ResourceId>,
 }
 
+/// Declarative description of a compute pass (Phase 7).
+pub struct ComputePassInfo<'a> {
+    pub name: &'a str,
+    /// Storage images / external storage buffers written via UAV by this pass.
+    pub storage_writes: Vec<ResourceId>,
+    /// Sampled textures + external storage buffers read by this pass.
+    pub reads: Vec<ResourceId>,
+}
+
 /// Per-pass context handed to a record closure during execution.
 pub struct PassContext<'a> {
     cmd: &'a CommandBuffer,
     sampled: HashMap<ResourceId, u32>,
+    storage: HashMap<ResourceId, u32>,
     extent: Extent2D,
 }
 
 impl<'a> PassContext<'a> {
-    /// The frame command buffer (a render pass is already open).
+    /// The frame command buffer (for a graphics pass a render pass is already open;
+    /// for a compute pass no render pass is open — bind a compute pipeline).
     pub fn cmd(&self) -> &CommandBuffer {
         self.cmd
     }
 
-    /// Bindless table index of a resource this pass declared as a read.
+    /// Bindless sampled index of a resource this pass declared as a read.
     pub fn sampled_index(&self, id: ResourceId) -> u32 {
         self.sampled[&id]
     }
 
-    /// Extent of the pass's color attachment (viewport/scissor are already set).
+    /// Bindless storage-image (UAV) index of a storage resource this pass writes.
+    pub fn storage_index(&self, id: ResourceId) -> u32 {
+        self.storage[&id]
+    }
+
+    /// Extent of the pass's color attachment, or of a compute pass's first storage
+    /// write target (viewport/scissor are already set for graphics passes).
     pub fn extent(&self) -> Extent2D {
         self.extent
     }
@@ -129,6 +163,7 @@ impl<'a> RenderGraph<'a> {
             extent,
             format,
             backbuffer: true,
+            storage: false,
         })
     }
 
@@ -140,6 +175,26 @@ impl<'a> RenderGraph<'a> {
             extent,
             format,
             backbuffer: false,
+            storage: false,
+        })
+    }
+
+    /// Declare a transient compute-writable storage image (UAV + sampled). A
+    /// compute pass writes it (declared in `storage_writes`); a later graphics
+    /// pass samples it like any color target (Phase 7).
+    pub fn create_storage_image(
+        &mut self,
+        name: &str,
+        format: Format,
+        extent: Extent2D,
+    ) -> ResourceId {
+        self.push_resource(Resource {
+            name: name.to_string(),
+            kind: ResourceKind::Color,
+            extent,
+            format,
+            backbuffer: false,
+            storage: true,
         })
     }
 
@@ -151,6 +206,22 @@ impl<'a> RenderGraph<'a> {
             extent,
             format: Format::Depth32Float,
             backbuffer: false,
+            storage: false,
+        })
+    }
+
+    /// Import an app-owned resource (e.g. a persistent storage buffer) for
+    /// dependency tracking only. The graph schedules passes that read/write it in
+    /// order and keeps them from being culled, but never realizes or barriers it —
+    /// the record closures issue its UAV/indirect barriers explicitly (Phase 7).
+    pub fn import_external(&mut self, name: &str) -> ResourceId {
+        self.push_resource(Resource {
+            name: name.to_string(),
+            kind: ResourceKind::External,
+            extent: Extent2D::default(),
+            format: Format::Rgba8Unorm,
+            backbuffer: false,
+            storage: false,
         })
     }
 
@@ -163,9 +234,31 @@ impl<'a> RenderGraph<'a> {
     ) {
         self.passes.push(PassNode {
             name: info.name.to_string(),
+            kind: PassKind::Graphics,
             colors: info.colors,
             depth: info.depth,
             reads: info.reads,
+            storage_writes: Vec::new(),
+            record: Box::new(record),
+        });
+    }
+
+    /// Add a compute pass. It writes `storage_writes` (storage images / external
+    /// storage buffers via UAV) and reads `reads` (sampled textures + external
+    /// storage buffers). No attachments; the record closure binds a compute
+    /// pipeline and dispatches (Phase 7).
+    pub fn add_compute_pass(
+        &mut self,
+        info: ComputePassInfo,
+        record: impl FnMut(&mut PassContext) -> Result<(), EngineError> + 'a,
+    ) {
+        self.passes.push(PassNode {
+            name: info.name.to_string(),
+            kind: PassKind::Compute,
+            colors: Vec::new(),
+            depth: None,
+            reads: info.reads,
+            storage_writes: info.storage_writes,
             record: Box::new(record),
         });
     }
@@ -332,7 +425,9 @@ impl<'a> RenderGraph<'a> {
                 match res.kind {
                     ResourceKind::Color => {
                         if let std::collections::hash_map::Entry::Vacant(e) = color_locs.entry(r) {
-                            if aliasing {
+                            // Storage images need a dedicated (UAV-capable) allocation;
+                            // only plain color transients alias.
+                            if aliasing && !res.storage {
                                 e.insert(ColorLoc::Aliased(r));
                             } else {
                                 let desc = render_target_desc(res);
@@ -345,6 +440,8 @@ impl<'a> RenderGraph<'a> {
                             e.insert(pool.acquire_depth(device, res.extent)?);
                         }
                     }
+                    // External resources are app-owned: never realized.
+                    ResourceKind::External => {}
                 }
             }
         }
@@ -352,13 +449,67 @@ impl<'a> RenderGraph<'a> {
         // Phase 2 — record (immutable pool access).
         let mut backbuffer_is_rt = false;
         for &pass_idx in &compiled.schedule {
-            // Barriers: reads -> sampled (color targets and depth/shadow maps).
+            // Barriers: reads -> sampled. A storage image read after a compute
+            // write transitions from UAV/GENERAL; plain color/depth from attachment.
             for &r in &self.passes[pass_idx].reads {
                 if let Some(loc) = color_locs.get(&r) {
-                    cmd.rt_to_sampled(pool.color_target(loc));
+                    if self.resources[r.0].storage {
+                        cmd.storage_to_sampled(pool.color_target(loc));
+                    } else {
+                        cmd.rt_to_sampled(pool.color_target(loc));
+                    }
                 } else if let Some(&slot) = depth_slots.get(&r) {
                     cmd.depth_to_sampled(pool.depth(slot));
                 }
+            }
+
+            // Sampled-index map (color targets + depth/shadow maps), shared by both
+            // pass kinds.
+            let sampled: HashMap<ResourceId, u32> = self.passes[pass_idx]
+                .reads
+                .iter()
+                .filter_map(|&r| {
+                    if let Some(loc) = color_locs.get(&r) {
+                        Some((r, pool.color_target(loc).bindless_index()))
+                    } else {
+                        depth_slots
+                            .get(&r)
+                            .map(|&slot| (r, pool.depth(slot).bindless_index()))
+                    }
+                })
+                .collect();
+
+            // Compute pass: transition storage-image writes to UAV, then dispatch
+            // (no render pass). External storage-buffer writes barrier explicitly in
+            // the closure.
+            if self.passes[pass_idx].kind == PassKind::Compute {
+                for &w in &self.passes[pass_idx].storage_writes {
+                    if let Some(loc) = color_locs.get(&w) {
+                        cmd.rt_to_storage(pool.color_target(loc));
+                    }
+                }
+                let storage: HashMap<ResourceId, u32> = self.passes[pass_idx]
+                    .storage_writes
+                    .iter()
+                    .filter_map(|&w| {
+                        color_locs
+                            .get(&w)
+                            .and_then(|loc| pool.color_target(loc).storage_index().map(|i| (w, i)))
+                    })
+                    .collect();
+                let extent = self.passes[pass_idx]
+                    .storage_writes
+                    .iter()
+                    .find_map(|&w| color_locs.get(&w).map(|_| self.resources[w.0].extent))
+                    .unwrap_or_default();
+                let mut ctx = PassContext {
+                    cmd,
+                    sampled,
+                    storage,
+                    extent,
+                };
+                (self.passes[pass_idx].record)(&mut ctx)?;
+                continue;
             }
 
             // Transition this pass's depth attachment for writing (a shadow map
@@ -414,24 +565,11 @@ impl<'a> RenderGraph<'a> {
                 extent
             };
 
-            // Build the sampled-index map for the pass (color targets and
-            // depth/shadow maps) and run its record closure.
-            let sampled: HashMap<ResourceId, u32> = self.passes[pass_idx]
-                .reads
-                .iter()
-                .filter_map(|&r| {
-                    if let Some(loc) = color_locs.get(&r) {
-                        Some((r, pool.color_target(loc).bindless_index()))
-                    } else {
-                        depth_slots
-                            .get(&r)
-                            .map(|&slot| (r, pool.depth(slot).bindless_index()))
-                    }
-                })
-                .collect();
+            // Run the graphics pass's record closure.
             let mut ctx = PassContext {
                 cmd,
                 sampled,
+                storage: HashMap::new(),
                 extent,
             };
             (self.passes[pass_idx].record)(&mut ctx)?;
@@ -463,7 +601,9 @@ impl<'a> RenderGraph<'a> {
         let mut items = Vec::new();
         for (&id, &(first, last)) in &compiled.lifetimes {
             let res = &self.resources[id.0];
-            if res.backbuffer || res.kind != ResourceKind::Color {
+            // Storage images carry a UAV and are not RT-DS-only, so they can't live
+            // in the aliasing heap; they get dedicated pooled allocations.
+            if res.backbuffer || res.kind != ResourceKind::Color || res.storage {
                 continue;
             }
             let desc = render_target_desc(res);
@@ -565,6 +705,7 @@ fn render_target_desc(res: &Resource) -> RenderTargetDesc {
         width: res.extent.width,
         height: res.extent.height,
         format: res.format,
+        storage: res.storage,
     }
 }
 
@@ -594,9 +735,13 @@ struct Placement {
 }
 
 impl PassNode<'_> {
-    /// Resources this pass writes (color attachments + depth).
+    /// Resources this pass writes (color attachments + depth + UAV storage).
     fn writes(&self) -> impl Iterator<Item = ResourceId> + '_ {
-        self.colors.iter().map(|(id, _)| *id).chain(self.depth)
+        self.colors
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(self.depth)
+            .chain(self.storage_writes.iter().copied())
     }
 
     /// All resources this pass touches (writes + reads).

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ash::vk;
 use dreamcoast_core::EngineError;
-use rhi_types::{BufferDesc, BufferUsage};
+use rhi_types::{BufferDesc, BufferUsage, StorageBufferDesc};
 
 use crate::device::DeviceShared;
 use crate::vk_err;
@@ -104,6 +104,78 @@ impl Drop for VulkanBuffer {
     fn drop(&mut self) {
         unsafe {
             self.device.device.unmap_memory(self.memory);
+            self.device.device.destroy_buffer(self.buffer, None);
+            self.device.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// A device-local read-write storage buffer (UAV / `STORAGE_BUFFER`), registered
+/// in the bindless storage-buffer table. Written by compute, optionally used as
+/// an indirect-draw argument buffer (Phase 7).
+pub struct VulkanStorageBuffer {
+    device: Arc<DeviceShared>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    index: u32,
+}
+
+impl VulkanStorageBuffer {
+    pub(crate) fn new(
+        device: Arc<DeviceShared>,
+        desc: &StorageBufferDesc,
+    ) -> Result<Self, EngineError> {
+        unsafe {
+            let mut usage = vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::TRANSFER_SRC;
+            if desc.indirect {
+                usage |= vk::BufferUsageFlags::INDIRECT_BUFFER;
+            }
+            let ci = vk::BufferCreateInfo::default()
+                .size(desc.size)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = device.device.create_buffer(&ci, None).map_err(vk_err)?;
+
+            let req = device.device.get_buffer_memory_requirements(buffer);
+            let mem_type = device
+                .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type);
+            let memory = device
+                .device
+                .allocate_memory(&alloc, None)
+                .map_err(vk_err)?;
+            device
+                .device
+                .bind_buffer_memory(buffer, memory, 0)
+                .map_err(vk_err)?;
+
+            let index = device.register_storage_buffer(buffer, desc.size);
+            Ok(Self {
+                device,
+                buffer,
+                memory,
+                index,
+            })
+        }
+    }
+
+    /// Index of this buffer in the bindless storage-buffer table.
+    pub fn storage_index(&self) -> u32 {
+        self.index
+    }
+
+    pub(crate) fn raw(&self) -> vk::Buffer {
+        self.buffer
+    }
+}
+
+impl Drop for VulkanStorageBuffer {
+    fn drop(&mut self) {
+        unsafe {
             self.device.device.destroy_buffer(self.buffer, None);
             self.device.device.free_memory(self.memory, None);
         }

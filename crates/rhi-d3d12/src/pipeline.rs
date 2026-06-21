@@ -10,9 +10,10 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D_ROOT_SIGNATURE_VERSION_1, D3D12_BLEND_DESC, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE,
     D3D12_BLEND_OP_ADD, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_ZERO, D3D12_COLOR_WRITE_ENABLE_ALL,
     D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_LESS, D3D12_COMPARISON_FUNC_NEVER,
-    D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF, D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC,
-    D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_DESCRIPTOR_RANGE,
-    D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_FILL_MODE_SOLID, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+    D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
+    D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_WRITE_MASK_ALL,
+    D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_DESCRIPTOR_RANGE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+    D3D12_DESCRIPTOR_RANGE_TYPE_UAV, D3D12_FILL_MODE_SOLID, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
     D3D12_GRAPHICS_PIPELINE_STATE_DESC, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
     D3D12_INPUT_ELEMENT_DESC, D3D12_INPUT_LAYOUT_DESC, D3D12_LOGIC_OP_NOOP,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC, D3D12_RENDER_TARGET_BLEND_DESC,
@@ -20,7 +21,7 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
     D3D12_ROOT_PARAMETER_TYPE_CBV, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
     D3D12_ROOT_SIGNATURE_DESC, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
-    D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL, D3D12_SHADER_VISIBILITY_PIXEL,
+    D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL,
     D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK, D3D12_STATIC_SAMPLER_DESC,
     D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12SerializeRootSignature, ID3D12PipelineState,
     ID3D12RootSignature,
@@ -31,9 +32,13 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::core::s;
 
-use crate::device::{BINDLESS_COUNT, CUBE_COUNT, DeviceShared};
+use crate::device::{
+    BINDLESS_COUNT, CUBE_COUNT, DeviceShared, STORAGE_BUFFER_BASE, STORAGE_BUFFER_COUNT,
+    STORAGE_IMAGE_BASE, STORAGE_IMAGE_COUNT,
+};
 use crate::instance::d3d_err;
 use crate::to_dxgi_format;
+use rhi_types::ComputePipelineDesc;
 
 /// A graphics pipeline: its root signature and pipeline state object.
 pub struct D3d12GraphicsPipeline {
@@ -168,39 +173,25 @@ fn create_root_signature(
             );
         }
 
-        // Bindless: one SRV table holding two ranges over the same heap — the 2D
-        // textures (`Texture2D g_textures[] : t0,space0`, heap [0,BINDLESS_COUNT))
-        // and the cubemaps (`TextureCube g_cubes[] : t0,space1`, offset to the
-        // reserved cube region so the shader indexes it 0-based) — plus 32-bit
-        // root constants (b0) and a static sampler (s0).
-        let srv_ranges = [
-            D3D12_DESCRIPTOR_RANGE {
-                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                NumDescriptors: BINDLESS_COUNT,
-                BaseShaderRegister: 0,
-                RegisterSpace: 0,
-                OffsetInDescriptorsFromTableStart: 0,
-            },
-            D3D12_DESCRIPTOR_RANGE {
-                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                NumDescriptors: CUBE_COUNT,
-                BaseShaderRegister: 0,
-                RegisterSpace: 1,
-                OffsetInDescriptorsFromTableStart: BINDLESS_COUNT,
-            },
-        ];
-        // params[0] = SRV table (t0), params[1] = 32-bit root constants (b0).
+        // Bindless: one table over the shared heap with four ranges — 2D textures
+        // (`t0,space0`), cubemaps (`t0,space1`), storage images (`u0,space0`), and
+        // storage buffers (`u0,space1`), each offset to its reserved heap region so
+        // the shader indexes it 0-based — plus 32-bit root constants (b0) and a
+        // static sampler (s0). Visibility ALL: the vertex stage reads storage
+        // buffers (particle vertex-pull) and pixel reads textures.
+        let ranges = bindless_ranges();
+        // params[0] = bindless table, params[1] = 32-bit root constants (b0).
         // params[2] = root CBV (b1) for the per-frame globals, when opted in.
         let mut params = vec![
             D3D12_ROOT_PARAMETER {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                 Anonymous: D3D12_ROOT_PARAMETER_0 {
                     DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                        NumDescriptorRanges: srv_ranges.len() as u32,
-                        pDescriptorRanges: srv_ranges.as_ptr(),
+                        NumDescriptorRanges: ranges.len() as u32,
+                        pDescriptorRanges: ranges.as_ptr(),
                     },
                 },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
             D3D12_ROOT_PARAMETER {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
@@ -239,7 +230,7 @@ fn create_root_signature(
             MaxLOD: f32::MAX,
             ShaderRegister: 0,
             RegisterSpace: 0,
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         };
         serialize_and_create(
             device,
@@ -249,6 +240,158 @@ fn create_root_signature(
                 NumStaticSamplers: 1,
                 pStaticSamplers: &sampler,
                 Flags: flags,
+            },
+        )
+    }
+}
+
+/// The four bindless descriptor-table ranges shared by graphics and compute root
+/// signatures (SRV textures/cubes + UAV storage images/buffers), each offset to
+/// its reserved heap region.
+fn bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 4] {
+    [
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: BINDLESS_COUNT,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        },
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: CUBE_COUNT,
+            BaseShaderRegister: 0,
+            RegisterSpace: 1,
+            OffsetInDescriptorsFromTableStart: BINDLESS_COUNT,
+        },
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: STORAGE_IMAGE_COUNT,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: STORAGE_IMAGE_BASE,
+        },
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: STORAGE_BUFFER_COUNT,
+            BaseShaderRegister: 0,
+            RegisterSpace: 1,
+            OffsetInDescriptorsFromTableStart: STORAGE_BUFFER_BASE,
+        },
+    ]
+}
+
+/// A compute pipeline: its (bindless) root signature and compute PSO.
+pub struct D3d12ComputePipeline {
+    #[allow(dead_code)]
+    device: Rc<DeviceShared>,
+    root_signature: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    bindless: bool,
+}
+
+impl D3d12ComputePipeline {
+    pub(crate) fn new(
+        device: Rc<DeviceShared>,
+        desc: &ComputePipelineDesc,
+    ) -> Result<Self, EngineError> {
+        unsafe {
+            let root_signature = create_compute_root_signature(&device, desc)?;
+            let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root_signature),
+                CS: shader_bytecode(desc.compute_bytes),
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = device
+                .device
+                .CreateComputePipelineState(&pso_desc)
+                .map_err(d3d_err)?;
+            Ok(Self {
+                device,
+                root_signature,
+                pso,
+                bindless: desc.bindless,
+            })
+        }
+    }
+
+    pub(crate) fn root_signature(&self) -> &ID3D12RootSignature {
+        &self.root_signature
+    }
+
+    pub(crate) fn pso(&self) -> &ID3D12PipelineState {
+        &self.pso
+    }
+
+    pub(crate) fn is_bindless(&self) -> bool {
+        self.bindless
+    }
+}
+
+fn create_compute_root_signature(
+    device: &DeviceShared,
+    desc: &ComputePipelineDesc,
+) -> Result<ID3D12RootSignature, EngineError> {
+    unsafe {
+        if !desc.bindless {
+            return serialize_and_create(
+                device,
+                &D3D12_ROOT_SIGNATURE_DESC {
+                    NumParameters: 0,
+                    pParameters: std::ptr::null(),
+                    NumStaticSamplers: 0,
+                    pStaticSamplers: std::ptr::null(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                },
+            );
+        }
+        let ranges = bindless_ranges();
+        let params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: ranges.len() as u32,
+                        pDescriptorRanges: ranges.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                        Num32BitValues: desc.push_constant_size / 4,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let sampler = D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MipLODBias: 0.0,
+            MaxAnisotropy: 0,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+            MinLOD: 0.0,
+            MaxLOD: f32::MAX,
+            ShaderRegister: 0,
+            RegisterSpace: 0,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        serialize_and_create(
+            device,
+            &D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 1,
+                pStaticSamplers: &sampler,
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
             },
         )
     }
