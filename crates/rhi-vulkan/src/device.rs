@@ -70,6 +70,9 @@ pub(crate) struct DeviceShared {
     pub compute_queue: vk::Queue,
     pub compute_command_pool: vk::CommandPool,
     pub has_dedicated_compute: bool,
+    // Hardware ray tracing (Phase 8): true when the acceleration-structure +
+    // ray-query + ray-tracing-pipeline extensions are enabled.
+    pub has_raytracing: bool,
 }
 
 impl DeviceShared {
@@ -106,18 +109,45 @@ impl DeviceShared {
                 vec![gfx_ci]
             };
 
-            let device_extensions = [ash::khr::swapchain::NAME.as_ptr()];
+            // Hardware ray tracing (Phase 8): enable the acceleration-structure +
+            // ray-query + ray-tracing-pipeline extensions when the physical device
+            // supports all of them (plus the deferred-host-operations dependency).
+            // Gated so devices without RT still create a valid logical device.
+            let rt_extensions = [
+                ash::khr::acceleration_structure::NAME,
+                ash::khr::ray_tracing_pipeline::NAME,
+                ash::khr::ray_query::NAME,
+                ash::khr::deferred_host_operations::NAME,
+            ];
+            let supported_exts = raw_inst
+                .enumerate_device_extension_properties(instance.physical_device)
+                .unwrap_or_default();
+            let has_raytracing = rt_extensions.iter().all(|name| {
+                supported_exts
+                    .iter()
+                    .any(|e| e.extension_name_as_c_str() == Ok(name))
+            });
+
+            let mut device_extensions = vec![ash::khr::swapchain::NAME.as_ptr()];
+            if has_raytracing {
+                for name in &rt_extensions {
+                    device_extensions.push(name.as_ptr());
+                }
+            }
             let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
                 .dynamic_rendering(true)
                 .synchronization2(true);
             // Descriptor indexing for bindless sampled images + storage (Phase 7).
+            // Buffer device address (vertex/index/AS addresses) is needed for ray
+            // tracing (Phase 8); enabled only when RT is available.
             let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
                 .runtime_descriptor_array(true)
                 .shader_sampled_image_array_non_uniform_indexing(true)
                 .descriptor_binding_partially_bound(true)
                 .descriptor_binding_sampled_image_update_after_bind(true)
                 .descriptor_binding_storage_image_update_after_bind(true)
-                .descriptor_binding_storage_buffer_update_after_bind(true);
+                .descriptor_binding_storage_buffer_update_after_bind(true)
+                .buffer_device_address(has_raytracing);
             // SV_VertexID full-screen-triangle shaders (triangle/post/blur) compile
             // to SPIR-V using the DrawParameters capability.
             let mut features11 =
@@ -128,11 +158,27 @@ impl DeviceShared {
                 .shader_storage_image_write_without_format(true)
                 // The particle draw's vertex stage reads a storage buffer (UAV).
                 .vertex_pipeline_stores_and_atomics(true);
+            // RT feature structs (Phase 8) — only chained when the extensions are
+            // enabled, else validation rejects the unsupported feature structs.
+            let mut accel_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+                .acceleration_structure(true);
+            let mut ray_query_features =
+                vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+            let mut rt_pipeline_features =
+                vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
+                    .ray_tracing_pipeline(true);
+
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
                 .features(base_features)
                 .push_next(&mut features13)
                 .push_next(&mut features12)
                 .push_next(&mut features11);
+            if has_raytracing {
+                features2 = features2
+                    .push_next(&mut accel_features)
+                    .push_next(&mut ray_query_features)
+                    .push_next(&mut rt_pipeline_features);
+            }
 
             let device_ci = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_cis)
@@ -142,7 +188,7 @@ impl DeviceShared {
             let raw = &instance.shared.instance;
             tracing::debug!(
                 "creating logical device (gfx qfi={qfi}, compute qfi={compute_family}, \
-                 dedicated={has_dedicated_compute})"
+                 dedicated={has_dedicated_compute}, raytracing={has_raytracing})"
             );
             let device = raw
                 .create_device(instance.physical_device, &device_ci, None)
@@ -194,6 +240,7 @@ impl DeviceShared {
                 compute_queue,
                 compute_command_pool,
                 has_dedicated_compute,
+                has_raytracing,
             })
         }
     }
@@ -675,6 +722,12 @@ impl VulkanDevice {
     /// queue aliases the graphics queue and there is no real overlap).
     pub fn has_async_compute(&self) -> bool {
         self.shared.has_dedicated_compute
+    }
+
+    /// Whether hardware ray tracing is available (acceleration-structure +
+    /// ray-query + ray-tracing-pipeline extensions enabled) (Phase 8).
+    pub fn has_raytracing(&self) -> bool {
+        self.shared.has_raytracing
     }
 
     /// Block until the device is idle (used before teardown / swapchain rebuild).
