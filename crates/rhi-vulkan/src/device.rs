@@ -90,7 +90,9 @@ impl DeviceShared {
             // Compute writes to storage images whose SPIR-V `OpTypeImage` carries no
             // format qualifier (Slang emits `Unknown` for `RWTexture2D<float4>`).
             let base_features = vk::PhysicalDeviceFeatures::default()
-                .shader_storage_image_write_without_format(true);
+                .shader_storage_image_write_without_format(true)
+                // The particle draw's vertex stage reads a storage buffer (UAV).
+                .vertex_pipeline_stores_and_atomics(true);
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
                 .features(base_features)
                 .push_next(&mut features13)

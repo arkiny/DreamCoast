@@ -22,7 +22,8 @@ use rhi::{
     BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, CommandBuffer,
     ComputePipelineDesc, Cubemap, CubemapDesc, Device, Extent2D, Fence, Format, GraphicsPipeline,
     GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology, Queue,
-    ReadbackLayout, Semaphore, SwapchainDesc, Texture, TextureDesc, VertexLayout,
+    ReadbackLayout, Semaphore, StorageBufferDesc, SwapchainDesc, Texture, TextureDesc,
+    VertexLayout,
 };
 use tracing::info;
 
@@ -41,6 +42,8 @@ const GB_POSITION_FMT: Format = Format::Rgba16Float;
 const GLOBALS_SLICE: u64 = 512;
 /// Directional shadow map resolution (square).
 const SHADOW_SIZE: u32 = 2048;
+/// GPU particle count (Phase 7 fountain demo); 32 bytes each.
+const PARTICLE_COUNT: usize = 4096;
 /// Environment cubemap face resolution (square) and its full mip chain. The
 /// prefilter convolution samples these mips so a roughness lookup needs only
 /// ~32-64 samples instead of hundreds.
@@ -282,6 +285,68 @@ fn main() -> anyhow::Result<()> {
         push_constant_size: 16, // hdr_index + out_index + width + height
         bindless: true,
     })?;
+
+    // GPU particle simulation (Phase 7): a persistent storage buffer the sim
+    // compute pass updates in-place each frame and the draw pass reads in its
+    // vertex stage. Seeded once via a one-shot compute dispatch.
+    let particle_sim_cs = load_compute_shader(
+        backend,
+        dreamcoast_shader::particle_sim_cs_spirv,
+        dreamcoast_shader::particle_sim_cs_dxil,
+        "particle_sim",
+    )?;
+    let particle_sim_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
+        compute_bytes: particle_sim_cs,
+        compute_entry: "csMain",
+        push_constant_size: 20, // buffer_index + count + dt + time + init
+        bindless: true,
+    })?;
+    let (pd_vs, pd_fs) = load_shader_pair(
+        backend,
+        dreamcoast_shader::particle_draw_vs_spirv,
+        dreamcoast_shader::particle_draw_fs_spirv,
+        dreamcoast_shader::particle_draw_vs_dxil,
+        dreamcoast_shader::particle_draw_fs_dxil,
+        "particle_draw",
+    )?;
+    let particle_draw_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: pd_vs,
+        fragment_bytes: pd_fs,
+        vertex_entry: "vsMain",
+        fragment_entry: "fsMain",
+        color_formats: &[swapchain.format()],
+        topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::None, // vertex-pull from the storage buffer
+        blend: BlendMode::AlphaBlend,
+        push_constant_size: 112, // view_proj + cam_right + cam_up + buffer/count/size/pad
+        bindless: true,
+        uniform_buffer: false,
+        depth_test: false,
+        depth_format: None,
+    })?;
+    let particle_buffer = device.create_storage_buffer(&StorageBufferDesc {
+        size: (PARTICLE_COUNT * 32) as u64,
+        stride: 32,
+        indirect: false,
+    })?;
+    // Seed the particle buffer once (init dispatch).
+    {
+        let init_cmd = device.create_command_buffer()?;
+        init_cmd.begin()?;
+        init_cmd.bind_compute_pipeline(&particle_sim_pipeline);
+        init_cmd.push_constants_compute(&particle_sim_push(
+            particle_buffer.storage_index(),
+            PARTICLE_COUNT as u32,
+            0.0,
+            0.0,
+            1,
+        ));
+        init_cmd.dispatch((PARTICLE_COUNT as u32).div_ceil(64), 1, 1);
+        init_cmd.end()?;
+        let fence = device.create_fence(false)?;
+        device.queue().submit_oneshot(&init_cmd, &fence)?;
+        fence.wait()?;
+    }
 
     // Sky pipeline: renders the procedural sky into each environment cube face.
     let (sky_vs, sky_fs) = load_shader_pair(
@@ -666,6 +731,8 @@ fn main() -> anyhow::Result<()> {
     let mut f2_prev = false;
     let mut needs_recreate = false;
     let mut last = Instant::now();
+    // Accumulated wall-clock time, for the particle simulation's respawn hashing.
+    let mut elapsed = 0.0f32;
     // Fixed view in screenshot mode for reproducible output.
     let mut angle = if screenshot_mode { 0.7 } else { 0.0 };
 
@@ -692,6 +759,9 @@ fn main() -> anyhow::Result<()> {
         let now = Instant::now();
         let dt = (now - last).as_secs_f32();
         last = now;
+        elapsed += dt;
+        // Clamp the sim step so a long stall (e.g. resize) can't explode particles.
+        let sim_dt = dt.clamp(0.0, 1.0 / 30.0);
         if !screenshot_mode {
             angle += dt * 0.6; // hold a fixed view when capturing
         }
@@ -728,6 +798,10 @@ fn main() -> anyhow::Result<()> {
             proj.y_axis.y *= -1.0; // Vulkan clip-space Y points down
         }
         let view_proj = proj * view;
+        // Camera basis in world space (for billboarding the GPU particles).
+        let inv_view = view.inverse();
+        let cam_right = inv_view.x_axis.truncate();
+        let cam_up = inv_view.y_axis.truncate();
         // For reconstructing background view rays (skybox) in the lighting pass.
         let inv_view_proj = view_proj.inverse().to_cols_array();
 
@@ -1022,6 +1096,40 @@ fn main() -> anyhow::Result<()> {
                 },
             );
         }
+        // Phase 7 GPU particles: a compute pass advances the persistent particle
+        // buffer; an external graph resource sequences it before the draw pass.
+        let particles_ext = if particles_on {
+            Some(graph.import_external("particles"))
+        } else {
+            None
+        };
+        if let Some(particles_ext) = particles_ext {
+            let sim = &particle_sim_pipeline;
+            let buf = &particle_buffer;
+            graph.add_compute_pass(
+                ComputePassInfo {
+                    name: "particle_sim",
+                    storage_writes: vec![particles_ext],
+                    reads: vec![],
+                },
+                move |ctx| {
+                    let cmd = ctx.cmd();
+                    cmd.bind_compute_pipeline(sim);
+                    cmd.push_constants_compute(&particle_sim_push(
+                        buf.storage_index(),
+                        PARTICLE_COUNT as u32,
+                        sim_dt,
+                        elapsed,
+                        0,
+                    ));
+                    cmd.dispatch((PARTICLE_COUNT as u32).div_ceil(64), 1, 1);
+                    // Order the write before the draw pass's vertex-stage read.
+                    cmd.storage_buffer_barrier(buf);
+                    Ok(())
+                },
+            );
+        }
+
         // Tonemap samples the compute-post output when enabled, else raw HDR.
         let tonemap_src = hdr_post.unwrap_or(hdr);
         graph.add_pass(
@@ -1040,6 +1148,37 @@ fn main() -> anyhow::Result<()> {
                 Ok(())
             },
         );
+        // Phase 7 particle draw: instanced billboards composited over the tonemapped
+        // image (alpha blend), reading the compute-updated buffer in the vertex
+        // stage. Declared after tonemap so the WAW on the backbuffer orders it last.
+        if let Some(particles_ext) = particles_ext {
+            let draw = &particle_draw_pipeline;
+            let buf = &particle_buffer;
+            let vp = view_proj.to_cols_array();
+            graph.add_pass(
+                PassInfo {
+                    name: "particle_draw",
+                    colors: vec![(backbuffer, None)],
+                    depth: None,
+                    reads: vec![particles_ext],
+                },
+                move |ctx| {
+                    let cmd = ctx.cmd();
+                    cmd.bind_graphics_pipeline(draw);
+                    cmd.push_constants(&particle_draw_push(
+                        &vp,
+                        cam_right,
+                        cam_up,
+                        buf.storage_index(),
+                        PARTICLE_COUNT as u32,
+                        0.05,
+                    ));
+                    cmd.draw(6, PARTICLE_COUNT as u32);
+                    Ok(())
+                },
+            );
+        }
+
         if include_ui {
             graph.add_pass(
                 PassInfo {
@@ -1497,6 +1636,43 @@ fn post_push(hdr_index: u32, mode: u32, flip_y: u32) -> [u8; 16] {
     pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
     pc[4..8].copy_from_slice(&mode.to_le_bytes());
     pc[8..12].copy_from_slice(&flip_y.to_le_bytes());
+    pc
+}
+
+/// Pack the particle-sim push block: buffer_index + count + dt + time + init.
+fn particle_sim_push(buffer_index: u32, count: u32, dt: f32, time: f32, init: u32) -> [u8; 20] {
+    let mut pc = [0u8; 20];
+    pc[0..4].copy_from_slice(&buffer_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&count.to_le_bytes());
+    pc[8..12].copy_from_slice(&dt.to_le_bytes());
+    pc[12..16].copy_from_slice(&time.to_le_bytes());
+    pc[16..20].copy_from_slice(&init.to_le_bytes());
+    pc
+}
+
+/// Pack the particle-draw push block: view_proj(64) + cam_right(16) + cam_up(16)
+/// + buffer_index + count + size + pad (16) = 112 bytes.
+fn particle_draw_push(
+    view_proj: &[f32; 16],
+    cam_right: Vec3,
+    cam_up: Vec3,
+    buffer_index: u32,
+    count: u32,
+    size: f32,
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
+    for (i, v) in view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&cam_right.x.to_le_bytes());
+    pc[68..72].copy_from_slice(&cam_right.y.to_le_bytes());
+    pc[72..76].copy_from_slice(&cam_right.z.to_le_bytes());
+    pc[80..84].copy_from_slice(&cam_up.x.to_le_bytes());
+    pc[84..88].copy_from_slice(&cam_up.y.to_le_bytes());
+    pc[88..92].copy_from_slice(&cam_up.z.to_le_bytes());
+    pc[96..100].copy_from_slice(&buffer_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&count.to_le_bytes());
+    pc[104..108].copy_from_slice(&size.to_le_bytes());
     pc
 }
 

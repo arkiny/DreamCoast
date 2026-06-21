@@ -189,6 +189,24 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "post_compute_cs",
     },
+    Job {
+        src: "particle_sim.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "particle_sim_cs",
+    },
+    Job {
+        src: "particle_draw.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "particle_draw_vs",
+    },
+    Job {
+        src: "particle_draw.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "particle_draw_fs",
+    },
 ];
 
 /// (slang target name, output file extension, generated accessor suffix, required).
