@@ -8,7 +8,7 @@
 //! M0 implements the clear path (begin → begin_rendering(clear) → end_rendering →
 //! present → submit). Draw / pipeline / resource methods land in M2+.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -17,18 +17,19 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLRenderStages,
-    MTLResource, MTLResourceUsage, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
-    MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLViewport,
+    MTLCommandQueue, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLRenderPassColorAttachmentDescriptor,
+    MTLRenderPassDepthAttachmentDescriptor, MTLRenderPassDescriptor, MTLRenderStages, MTLResource,
+    MTLResourceUsage, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLViewport,
 };
 use objc2_quartz_core::CAMetalDrawable;
 use rhi_types::{ClearColor, Extent2D, Rect2D};
 
 use crate::device::DeviceShared;
 use crate::resources::{
-    BINDLESS_BUFFER_INDEX, MetalBuffer, MetalComputePipeline, MetalCubemap, MetalDepthBuffer,
-    MetalGraphicsPipeline, MetalRenderTarget, MetalStorageBuffer, PUSH_CONSTANT_INDEX,
-    VERTEX_BUFFER_INDEX,
+    BINDLESS_BUFFER_INDEX, BINDLESS_BUFFER_INDEX_WITH_GLOBALS, GLOBALS_BUFFER_INDEX, MetalBuffer,
+    MetalComputePipeline, MetalCubemap, MetalDepthBuffer, MetalGraphicsPipeline, MetalRenderTarget,
+    MetalStorageBuffer, PUSH_CONSTANT_INDEX, VERTEX_BUFFER_INDEX,
 };
 use crate::swapchain::MetalSwapchain;
 use crate::{Result, rhi_err};
@@ -44,6 +45,9 @@ pub struct MetalCommandBuffer {
     /// Index buffer + width bound by `bind_index_buffer`; consumed by
     /// `draw_indexed` (Metal takes the index buffer at draw time, not bind time).
     index_buffer: RefCell<Option<BoundIndexBuffer>>,
+    /// Byte offset into the globals UBO selected by `set_globals`; applied when a
+    /// `uses_globals` pipeline is bound.
+    globals_offset: Cell<u32>,
 }
 
 impl MetalCommandBuffer {
@@ -54,7 +58,18 @@ impl MetalCommandBuffer {
             encoder: RefCell::new(None),
             present: RefCell::new(None),
             index_buffer: RefCell::new(None),
+            globals_offset: Cell::new(0),
         }
+    }
+
+    /// Create a render command encoder for `pass` and stash it as the current one.
+    fn start_encoder(&self, pass: &MTLRenderPassDescriptor) {
+        let cmd = self.cmd.borrow();
+        let cmd = cmd.as_ref().expect("begin_rendering* without begin");
+        let enc = cmd
+            .renderCommandEncoderWithDescriptor(pass)
+            .expect("failed to create render command encoder");
+        *self.encoder.borrow_mut() = Some(enc);
     }
 
     pub fn begin(&self) -> Result<()> {
@@ -187,57 +202,115 @@ impl MetalCommandBuffer {
         }
     }
 
-    // ---- Implemented in later milestones (M2+) -----------------------------
+    // ---- Offscreen render targets / MRT / shadow / cubemaps (M4) -----------
 
+    /// Begin rendering into one offscreen color target (+ optional depth). Depth is
+    /// cleared and discarded (`DontCare`) — only the shadow pass stores depth.
     pub fn begin_rendering_target(
         &self,
-        _target: &MetalRenderTarget,
-        _color_clear: Option<ClearColor>,
-        _depth: Option<&MetalDepthBuffer>,
+        target: &MetalRenderTarget,
+        color_clear: Option<ClearColor>,
+        depth: Option<&MetalDepthBuffer>,
     ) {
-        unimplemented!("Metal offscreen targets: milestone M4")
+        let pass = MTLRenderPassDescriptor::new();
+        let attach = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        attach.setTexture(Some(&target.texture));
+        config_color(&attach, color_clear);
+        if let Some(d) = depth {
+            config_depth(&pass.depthAttachment(), &d.texture, MTLStoreAction::DontCare);
+        }
+        self.start_encoder(&pass);
     }
 
+    /// Begin rendering into N offscreen color targets (MRT, e.g. the 4-attachment
+    /// G-buffer) + optional depth. Each target clears if `Some`, else loads.
     pub fn begin_rendering_targets(
         &self,
-        _targets: &[(&MetalRenderTarget, Option<ClearColor>)],
-        _depth: Option<&MetalDepthBuffer>,
+        targets: &[(&MetalRenderTarget, Option<ClearColor>)],
+        depth: Option<&MetalDepthBuffer>,
     ) {
-        unimplemented!("Metal MRT: milestone M4")
+        let pass = MTLRenderPassDescriptor::new();
+        let attachments = pass.colorAttachments();
+        for (i, (target, clear)) in targets.iter().enumerate() {
+            let attach = unsafe { attachments.objectAtIndexedSubscript(i) };
+            attach.setTexture(Some(&target.texture));
+            config_color(&attach, *clear);
+        }
+        if let Some(d) = depth {
+            config_depth(&pass.depthAttachment(), &d.texture, MTLStoreAction::DontCare);
+        }
+        self.start_encoder(&pass);
     }
 
-    pub fn set_globals(&self, _offset: u32) {
-        unimplemented!("Metal globals binding: milestone M4")
+    /// Select the per-frame globals byte offset for the next `uses_globals` bind.
+    pub fn set_globals(&self, offset: u32) {
+        self.globals_offset.set(offset);
     }
 
-    pub fn begin_rendering_depth_only(&self, _depth: &MetalDepthBuffer) {
-        unimplemented!("Metal shadow pass: milestone M4")
+    /// Begin a depth-only pass into a shadow map: no color attachments, depth
+    /// cleared and **stored** so the lighting pass can sample it.
+    pub fn begin_rendering_depth_only(&self, depth: &MetalDepthBuffer) {
+        let pass = MTLRenderPassDescriptor::new();
+        config_depth(&pass.depthAttachment(), &depth.texture, MTLStoreAction::Store);
+        self.start_encoder(&pass);
     }
 
-    pub fn depth_to_render_target(&self, _depth: &MetalDepthBuffer) {}
-    pub fn depth_to_sampled(&self, _depth: &MetalDepthBuffer) {}
-    pub fn cube_to_color(&self, _cube: &MetalCubemap) {}
-    pub fn cube_to_sampled(&self, _cube: &MetalCubemap) {}
+    /// Render-graph transition hooks. On Metal these toggle bindless residency:
+    /// `*_to_render_target` drops a resource from the resident set before it is
+    /// written as an attachment; `*_to_sampled` makes it resident before a sampling
+    /// pass. Hazards across encoders (write→sample, aliasing) are tracked by Metal
+    /// automatically (tracked placement heap), so no explicit barrier is needed.
+    pub fn depth_to_render_target(&self, depth: &MetalDepthBuffer) {
+        self.shared.set_resident(&depth.texture, false);
+    }
+    pub fn depth_to_sampled(&self, depth: &MetalDepthBuffer) {
+        self.shared.set_resident(&depth.texture, true);
+    }
+    pub fn cube_to_color(&self, cube: &MetalCubemap) {
+        self.shared.set_resident(&cube.texture, false);
+    }
+    pub fn cube_to_sampled(&self, cube: &MetalCubemap) {
+        self.shared.set_resident(&cube.texture, true);
+    }
 
+    /// Begin rendering into one (face, mip) of a cubemap (color only). Metal selects
+    /// the subresource via the attachment's slice (face) + level (mip), so no
+    /// per-(face, mip) view is needed (unlike Vulkan).
     pub fn begin_rendering_cube_face(
         &self,
-        _cube: &MetalCubemap,
-        _face: u32,
-        _mip: u32,
-        _clear: Option<ClearColor>,
+        cube: &MetalCubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
     ) {
-        unimplemented!("Metal cubemap rendering: milestone M4")
+        let pass = MTLRenderPassDescriptor::new();
+        let attach = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        attach.setTexture(Some(&cube.texture));
+        attach.setSlice(face as usize);
+        attach.setLevel(mip as usize);
+        config_color(&attach, clear);
+        self.start_encoder(&pass);
     }
 
+    /// Begin rendering into one (face, mip) of a cubemap **with a depth buffer**
+    /// (for capturing scene geometry with correct occlusion). Depth is cleared and
+    /// discarded.
     pub fn begin_rendering_cube_face_depth(
         &self,
-        _cube: &MetalCubemap,
-        _face: u32,
-        _mip: u32,
-        _clear: Option<ClearColor>,
-        _depth: &MetalDepthBuffer,
+        cube: &MetalCubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+        depth: &MetalDepthBuffer,
     ) {
-        unimplemented!("Metal cubemap rendering: milestone M4")
+        let pass = MTLRenderPassDescriptor::new();
+        let attach = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        attach.setTexture(Some(&cube.texture));
+        attach.setSlice(face as usize);
+        attach.setLevel(mip as usize);
+        config_color(&attach, clear);
+        config_depth(&pass.depthAttachment(), &depth.texture, MTLStoreAction::DontCare);
+        self.start_encoder(&pass);
     }
 
     /// Blit the current drawable's texture into `buffer` (tightly packed BGRA8) so
@@ -279,9 +352,17 @@ impl MetalCommandBuffer {
         blit.endEncoding();
     }
 
-    pub fn rt_to_render_target(&self, _target: &MetalRenderTarget) {}
-    pub fn rt_to_sampled(&self, _target: &MetalRenderTarget) {}
-    pub fn aliasing_barrier(&self, _target: &MetalRenderTarget) {}
+    pub fn rt_to_render_target(&self, target: &MetalRenderTarget) {
+        self.shared.set_resident(&target.texture, false);
+    }
+    pub fn rt_to_sampled(&self, target: &MetalRenderTarget) {
+        self.shared.set_resident(&target.texture, true);
+    }
+    pub fn aliasing_barrier(&self, target: &MetalRenderTarget) {
+        // The target is about to be written; drop it from the resident set (tracked
+        // placement heap handles the aliasing hazard automatically).
+        self.shared.set_resident(&target.texture, false);
+    }
 
     pub fn bind_graphics_pipeline(&self, pipeline: &MetalGraphicsPipeline) {
         if let Some(enc) = self.encoder.borrow().as_ref() {
@@ -289,19 +370,44 @@ impl MetalCommandBuffer {
             if let Some(ds) = pipeline.depth_stencil.as_ref() {
                 enc.setDepthStencilState(Some(ds));
             }
+            // Per-frame globals UBO (camera/lights/shadow/IBL) for the PBR lighting
+            // pass: bound at GLOBALS_BUFFER_INDEX with the offset from `set_globals`.
+            if pipeline.uses_globals {
+                if let Some(globals) = self.shared.globals_buffer() {
+                    let offset = self.globals_offset.get() as usize;
+                    unsafe {
+                        enc.setVertexBuffer_offset_atIndex(
+                            Some(&globals),
+                            offset,
+                            GLOBALS_BUFFER_INDEX,
+                        );
+                        enc.setFragmentBuffer_offset_atIndex(
+                            Some(&globals),
+                            offset,
+                            GLOBALS_BUFFER_INDEX,
+                        );
+                    }
+                }
+            }
             if pipeline.bindless {
-                // Bind the bindless argument buffer at [[buffer(1)]] for both stages
-                // (the vertex stage may index it too on other shaders).
+                // The globals UBO (if any) sits at buffer(1), so the bindless block
+                // shifts to buffer(2) for `uses_globals` pipelines; otherwise it is
+                // at buffer(1). Bound to both stages (the vertex stage may index it).
+                let bindless_index = if pipeline.uses_globals {
+                    BINDLESS_BUFFER_INDEX_WITH_GLOBALS
+                } else {
+                    BINDLESS_BUFFER_INDEX
+                };
                 unsafe {
                     enc.setVertexBuffer_offset_atIndex(
                         Some(&self.shared.arg_buffer),
                         0,
-                        BINDLESS_BUFFER_INDEX,
+                        bindless_index,
                     );
                     enc.setFragmentBuffer_offset_atIndex(
                         Some(&self.shared.arg_buffer),
                         0,
-                        BINDLESS_BUFFER_INDEX,
+                        bindless_index,
                     );
                 }
                 // Resources referenced indirectly through an argument buffer must be
@@ -433,4 +539,35 @@ impl MetalCommandBuffer {
             );
         }
     }
+}
+
+/// Configure a color attachment: `Some(clear)` clears it, `None` loads; always
+/// stored (every offscreen/cube/MRT target is read by a later pass).
+fn config_color(attach: &MTLRenderPassColorAttachmentDescriptor, clear: Option<ClearColor>) {
+    match clear {
+        Some(c) => {
+            attach.setLoadAction(MTLLoadAction::Clear);
+            attach.setClearColor(MTLClearColor {
+                red: c.r as f64,
+                green: c.g as f64,
+                blue: c.b as f64,
+                alpha: c.a as f64,
+            });
+        }
+        None => attach.setLoadAction(MTLLoadAction::Load),
+    }
+    attach.setStoreAction(MTLStoreAction::Store);
+}
+
+/// Configure a depth attachment: always cleared to far (1.0); `store` is `Store`
+/// for the shadow map (sampled later) or `DontCare` otherwise.
+fn config_depth(
+    da: &MTLRenderPassDepthAttachmentDescriptor,
+    texture: &Retained<ProtocolObject<dyn MTLTexture>>,
+    store: MTLStoreAction,
+) {
+    da.setTexture(Some(texture));
+    da.setLoadAction(MTLLoadAction::Clear);
+    da.setClearDepth(1.0);
+    da.setStoreAction(store);
 }

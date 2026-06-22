@@ -58,7 +58,14 @@ cargo run -p sandbox -- --backend metal --triangle-test --frames 60   # headless
 cargo run -p sandbox -- --backend metal --triangle-test --screenshot tri.png  # capture + exit
 cargo run -p sandbox -- --backend metal --mesh-test           # M3 textured bindless mesh + ImGui
 cargo run -p sandbox -- --backend metal --mesh-test --screenshot mesh.png  # capture + exit
+cargo run -p sandbox -- --backend metal                        # M4 full deferred-PBR scene
+cargo run -p sandbox -- --backend metal --screenshot scene.png # M4 scene + ImGui, capture + exit
+cargo run -p sandbox -- --backend metal --screenshot-clean scene.png  # M4 scene, 3D only
 ```
+
+The flagless real renderer (M4) needs `assets/model.glb` (`tools/fetch-assets.sh`).
+Phase-7 compute extras (`P7_COMPUTE_POST` / `P7_PARTICLES` / `P7_CULL`) are M5 on
+Metal and stay off there.
 
 `--triangle-test` and `--mesh-test` are cross-backend
 (`--backend vulkan|d3d12|metal`); enable the Metal validation layers for a stricter
@@ -98,10 +105,12 @@ smoke test:
   metallib accessors were wired. Verified by `--mesh-test --screenshot` (textured
   Avocado + ImGui overlay) under the Metal API + GPU validation layers. **Details +
   the cross-backend decision are below.**
-- **M4 — render targets + PBR:** *in progress.* Goal: the full deferred-PBR
-  render graph runs on Metal (`--backend metal --screenshot` of the real scene, no
-  `--*-test` flag). See "M4 plan + progress" below. **M5 — compute/async/indirect:**
-  pending.
+- **M4 — render targets + PBR:** **done.** The full deferred-PBR render graph runs
+  on Metal — `--backend metal --screenshot` of the real scene (shadow → G-buffer →
+  IBL capture/convolve → lighting → tonemap, + ImGui) renders correctly and clean
+  under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`. See "M4 plan + progress" below.
+  **M5 — compute/async/indirect:** pending (compute pipelines/storage buffers are
+  inert placeholders on Metal, gated off in the sandbox via `compute_supported`).
 
 ## Resume notes for M4+ (implementation pointers)
 
@@ -321,3 +330,56 @@ the flagless real renderer. All cross-backend (`--backend vulkan|d3d12|metal`).
   `particle_draw`, `cull`, `cull_draw` — loose `g_textures[]` + storage buffers,
   migrate in M5). **Vulkan/D3D12 parity pending the Windows RTX 2070 SUPER box** (same
   risk profile as M3). **Step 1 done; next is step 2 (Metal globals-UBO path).**
+
+- **Steps 2–6 — DONE (deferred scene runs on Metal, verified on this box).**
+  Implemented together in `rhi-metal` (+ a sandbox gate); all verified at once by the
+  real `--backend metal --screenshot` deferred render, clean under
+  `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`.
+  - **Step 2 — globals UBO.** `set_globals_buffer` stores the buffer in
+    `DeviceShared`; `set_globals(offset)` stashes a byte offset in a `Cell`;
+    `MetalGraphicsPipeline.uses_globals` (= `desc.uniform_buffer`) makes
+    `bind_graphics_pipeline` bind the globals UBO at `GLOBALS_BUFFER_INDEX = 1` and
+    shift the bindless argument buffer to `buffer(2)`
+    (`BINDLESS_BUFFER_INDEX_WITH_GLOBALS`) — matching `pbr.slang`'s MSL.
+  - **Step 3 — render targets + MRT.** `MetalRenderTarget` = `MTLTexture`
+    (`RenderTarget | ShaderRead`, `Private`) registered in the texture table;
+    `begin_rendering_target` / `begin_rendering_targets` (the 4-attachment G-buffer).
+    No explicit barriers — Metal's encoder-boundary hazard tracking handles
+    write→sample; the graph's `rt_to_*` hooks instead toggle **bindless residency**
+    (see below).
+  - **Step 4 — shadow pass.** `begin_rendering_depth_only` (depth attachment only,
+    `Store`); `depth_to_sampled` makes the shadow map resident so `pbr` samples it as
+    `g.textures[shadow_index]`.
+  - **Step 5 — cubemaps + IBL.** `MetalCubemap` = `MTLTextureType::Cube` (6 faces,
+    mipped) in the cube table (`bindless.slang` cube `i` → argument-buffer slot
+    `BINDLESS_COUNT + 1 + i`; the argument buffer was enlarged by `CUBE_COUNT`).
+    `begin_rendering_cube_face[_depth]` selects the subresource via the color
+    attachment's `setSlice(face)` + `setLevel(mip)` (no per-(face, mip) view needed,
+    unlike Vulkan). Sky → env (full mip chain) → scene capture → irradiance →
+    prefilter all run; reflections + ambient match.
+  - **Step 6 — transient heap / aliasing.** `render_target_memory` via
+    `heapTextureSizeAndAlignWithDescriptor`; `create_transient_heap` =
+    `MTLHeapType::Placement` + **`Tracked`** hazard mode (so aliasing/RAW hazards are
+    automatic and `aliasing_barrier` stays a no-op); `create_aliased_target` =
+    `heap.newTextureWithDescriptor:offset:`. The graph's default `aliasing = true`
+    path is exercised.
+  - **Bindless residency model (the one non-obvious design choice).** Render targets
+    / cubemaps / shadow maps are both attachments (written) and bindless sampled
+    (read), but Metal forbids `useResource` on a texture that is the current render
+    target. So residency is **toggled by the render-graph transition hooks**:
+    `*_to_sampled` adds a resource to the resident set (made resident at the next
+    bindless `bind_graphics_pipeline`), `*_to_render_target` / `cube_to_color` /
+    `aliasing_barrier` drop it before it is written. Static textures
+    (`create_texture`) stay resident for the app's lifetime. This mirrors the Vulkan
+    layout transitions 1:1 and never makes an attachment resident in its own pass.
+  - **Sandbox gate.** The Phase-7 compute features (post blur / GPU particles / GPU
+    culling) are M5 on Metal. `compute_supported = backend != Metal` forces those
+    flags off, gates the particle seed dispatch + the `particle_draw` / `cull_draw`
+    pipelines (their metallibs are still `None`), and `load_shader_pair` /
+    `load_compute_shader` now feed the Metal path the `*_metallib()` accessors. The
+    compute pipelines / storage buffers create as inert placeholders (never
+    dispatched on Metal).
+  - **Vulkan/D3D12 parity:** the shared shaders changed in step 1 (already flagged);
+    steps 2–6 are Metal-backend-only Rust + a backend-neutral sandbox gate, so they
+    do not alter the Windows backends. Still **verify the step-1 shader changes on
+    the Windows RTX 2070 SUPER box.**
