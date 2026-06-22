@@ -2,6 +2,12 @@
 //
 // The model matrix is identity (the sandbox orbits the camera, not the model),
 // so input normals are already world-space.
+//
+// Bindless resources (`g.textures[]` / `g.samp`) come from the shared
+// `ParameterBlock` in `bindless.slang` — a Metal argument buffer / Vulkan
+// descriptor set 0 / D3D12 descriptor table from one source.
+
+#include "bindless.slang"
 
 struct VSInput
 {
@@ -26,12 +32,6 @@ struct PushConstants
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
 
-[[vk::binding(0, 0)]]
-Texture2D g_textures[] : register(t0, space0);
-
-[[vk::binding(1, 0)]]
-SamplerState g_sampler : register(s0, space0);
-
 [shader("vertex")]
 VSOutput vsMain(VSInput input)
 {
@@ -48,6 +48,6 @@ float4 fsMain(VSOutput input) : SV_Target
     float3 n = normalize(input.normal);
     float3 l = normalize(float3(0.4, 0.8, 0.4));
     float diffuse = max(dot(n, l), 0.0) * 0.85 + 0.15;
-    float4 base = g_textures[pc.tex_index].Sample(g_sampler, input.uv);
+    float4 base = g.textures[pc.tex_index].Sample(g.samp, input.uv);
     return float4(base.rgb * diffuse, base.a);
 }

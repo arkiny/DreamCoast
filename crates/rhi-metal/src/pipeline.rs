@@ -11,8 +11,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBlendFactor, MTLBlendOperation, MTLDevice, MTLFunction, MTLLibrary,
-    MTLRenderPipelineDescriptor, MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
+    MTLBlendFactor, MTLBlendOperation, MTLCompareFunction, MTLDepthStencilDescriptor, MTLDevice,
+    MTLFunction, MTLLibrary, MTLRenderPipelineDescriptor, MTLVertexDescriptor, MTLVertexFormat,
+    MTLVertexStepFunction,
 };
 use rhi_types::{BlendMode, GraphicsPipelineDesc, VertexLayout};
 
@@ -58,7 +59,29 @@ pub(crate) fn build(
     let state = device
         .newRenderPipelineStateWithDescriptor_error(&pd)
         .map_err(|e| rhi_err(format!("newRenderPipelineState failed: {e}")))?;
-    Ok(MetalGraphicsPipeline { state })
+
+    // Depth test/write is render *state* (an `MTLDepthStencilState`), separate from
+    // the pipeline's depth attachment format; build one for depth-testing passes so
+    // `bind_graphics_pipeline` can set it. `LessEqual` + write-on matches the Vulkan
+    // / D3D12 depth setup.
+    let depth_stencil = if desc.depth_test {
+        let dsd = MTLDepthStencilDescriptor::new();
+        dsd.setDepthCompareFunction(MTLCompareFunction::LessEqual);
+        dsd.setDepthWriteEnabled(true);
+        Some(
+            device
+                .newDepthStencilStateWithDescriptor(&dsd)
+                .ok_or_else(|| rhi_err("newDepthStencilState failed"))?,
+        )
+    } else {
+        None
+    };
+
+    Ok(MetalGraphicsPipeline {
+        state,
+        bindless: desc.bindless,
+        depth_stencil,
+    })
 }
 
 /// Create an `MTLLibrary` from a `.metallib` blob and fetch `entry` from it.

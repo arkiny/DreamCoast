@@ -69,8 +69,10 @@ impl Gui {
                 dreamcoast_shader::imgui_vs_dxil(),
                 dreamcoast_shader::imgui_fs_dxil(),
             ),
-            // Metal metallib accessors are wired in milestone M3 (ImGui on Metal).
-            BackendKind::Metal => (None, None),
+            BackendKind::Metal => (
+                dreamcoast_shader::imgui_vs_metallib(),
+                dreamcoast_shader::imgui_fs_metallib(),
+            ),
         };
         let vs = vs.ok_or_else(|| EngineError::Shader("imgui vertex shader unavailable".into()))?;
         let fs =

@@ -17,17 +17,18 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPrimitiveType,
-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLScissorRect, MTLSize, MTLStoreAction,
-    MTLTexture, MTLViewport,
+    MTLCommandQueue, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLRenderStages,
+    MTLResource, MTLResourceUsage, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLViewport,
 };
 use objc2_quartz_core::CAMetalDrawable;
 use rhi_types::{ClearColor, Extent2D, Rect2D};
 
 use crate::device::DeviceShared;
 use crate::resources::{
-    MetalBuffer, MetalComputePipeline, MetalCubemap, MetalDepthBuffer, MetalGraphicsPipeline,
-    MetalRenderTarget, MetalStorageBuffer, PUSH_CONSTANT_INDEX, VERTEX_BUFFER_INDEX,
+    BINDLESS_BUFFER_INDEX, MetalBuffer, MetalComputePipeline, MetalCubemap, MetalDepthBuffer,
+    MetalGraphicsPipeline, MetalRenderTarget, MetalStorageBuffer, PUSH_CONSTANT_INDEX,
+    VERTEX_BUFFER_INDEX,
 };
 use crate::swapchain::MetalSwapchain;
 use crate::{Result, rhi_err};
@@ -114,7 +115,7 @@ impl MetalCommandBuffer {
         swapchain: &MetalSwapchain,
         _image_index: u32,
         color_clear: Option<ClearColor>,
-        _depth: Option<&MetalDepthBuffer>,
+        depth: Option<&MetalDepthBuffer>,
     ) {
         let drawable = swapchain
             .current_drawable()
@@ -138,6 +139,16 @@ impl MetalCommandBuffer {
             None => attach.setLoadAction(MTLLoadAction::Load),
         }
         attach.setStoreAction(MTLStoreAction::Store);
+
+        // Depth attachment: clear to far (1.0) and discard after the pass (M3 does
+        // not sample the depth buffer; the shadow pass keeps it in M4).
+        if let Some(depth) = depth {
+            let da = pass.depthAttachment();
+            da.setTexture(Some(&depth.texture));
+            da.setLoadAction(MTLLoadAction::Clear);
+            da.setClearDepth(1.0);
+            da.setStoreAction(MTLStoreAction::DontCare);
+        }
 
         let cmd = self.cmd.borrow();
         let cmd = cmd.as_ref().expect("begin_rendering without begin");
@@ -275,6 +286,35 @@ impl MetalCommandBuffer {
     pub fn bind_graphics_pipeline(&self, pipeline: &MetalGraphicsPipeline) {
         if let Some(enc) = self.encoder.borrow().as_ref() {
             enc.setRenderPipelineState(&pipeline.state);
+            if let Some(ds) = pipeline.depth_stencil.as_ref() {
+                enc.setDepthStencilState(Some(ds));
+            }
+            if pipeline.bindless {
+                // Bind the bindless argument buffer at [[buffer(1)]] for both stages
+                // (the vertex stage may index it too on other shaders).
+                unsafe {
+                    enc.setVertexBuffer_offset_atIndex(
+                        Some(&self.shared.arg_buffer),
+                        0,
+                        BINDLESS_BUFFER_INDEX,
+                    );
+                    enc.setFragmentBuffer_offset_atIndex(
+                        Some(&self.shared.arg_buffer),
+                        0,
+                        BINDLESS_BUFFER_INDEX,
+                    );
+                }
+                // Resources referenced indirectly through an argument buffer must be
+                // made resident explicitly, or the GPU may not have them mapped.
+                for tex in self.shared.resident_textures().iter() {
+                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**tex);
+                    enc.useResource_usage_stages(
+                        res,
+                        MTLResourceUsage::Read,
+                        MTLRenderStages::Fragment,
+                    );
+                }
+            }
         }
     }
 
@@ -346,13 +386,24 @@ impl MetalCommandBuffer {
 
     /// Upload push constants to both stages at [`PUSH_CONSTANT_INDEX`]. Setting the
     /// fragment slot too is harmless when only the vertex stage declares the block.
+    ///
+    /// Metal validates `setBytes` length against the shader argument's
+    /// *alignment-padded* size: e.g. the ImGui `{float2, float2, uint}` block is 20
+    /// bytes of data but Metal rounds it to 24 (8-byte alignment) and rejects a
+    /// 20-byte upload. Copy into a zero-padded buffer rounded up to 16 so the length
+    /// always covers any trailing padding — over-providing is allowed, under is not.
     pub fn push_constants(&self, data: &[u8]) {
         if let Some(enc) = self.encoder.borrow().as_ref() {
-            let ptr = NonNull::new(data.as_ptr() as *mut std::ffi::c_void)
+            let mut buf = [0u8; 256];
+            let len = data.len();
+            assert!(len <= buf.len(), "push constant block too large for Metal");
+            buf[..len].copy_from_slice(data);
+            let padded = (len + 15) & !15;
+            let ptr = NonNull::new(buf.as_ptr() as *mut std::ffi::c_void)
                 .expect("push_constants data pointer is null");
             unsafe {
-                enc.setVertexBytes_length_atIndex(ptr, data.len(), PUSH_CONSTANT_INDEX);
-                enc.setFragmentBytes_length_atIndex(ptr, data.len(), PUSH_CONSTANT_INDEX);
+                enc.setVertexBytes_length_atIndex(ptr, padded, PUSH_CONSTANT_INDEX);
+                enc.setFragmentBytes_length_atIndex(ptr, padded, PUSH_CONSTANT_INDEX);
             }
         }
     }
