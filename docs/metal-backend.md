@@ -212,15 +212,22 @@ MTL_SHADER_VALIDATION=1`. Compute/culling/particles/indirect/storage buffers sta
 **Ordered steps** (each verified by a cross-backend `--*-test` flag, mirroring M0–M3):
 
 1. **Shader migration to `ParameterBlock` (the cross-backend risk — do first,
-   independently).** The M4 shaders are still loose-global so `metallib` fails →
-   `None` accessors. Migrate `gbuffer`, `pbr`, `capture`, `irradiance`, `prefilter`,
-   `brdf`, `sky`, `shadow`, `post`, `blur`. Sub-points:
+   independently). — DONE (see progress log).** The M4 shaders were loose-global so
+   `metallib` failed → `None` accessors. Migrated `gbuffer`, `pbr`, `capture`,
+   `irradiance`, `prefilter`, `post`, `blur` (`brdf`/`sky`/`shadow` had no bindless
+   resources and already compiled). Sub-points:
    - Add `TextureCube cubes[N]` to the `Bindless` struct in `bindless.slang` (pbr
      samples `g_cubes[]` at a separate `space1` today — fold it into the block).
-   - **Globals-using shaders bump the block to set 2** (`[[buffer(2)]]` on Metal):
-     a loose globals `ConstantBuffer` at set 1 pushes the `ParameterBlock` past it.
-     `pbr.slang` has globals; the IBL gen shaders mostly drive cube faces via push
-     constants — check each.
+   - **Globals-using shaders: block stays Vulkan set 0, Metal `[[buffer(2)]]`.**
+     ~~A loose globals `ConstantBuffer` at set 1 pushes the `ParameterBlock` to set
+     2.~~ *Corrected empirically during the `pbr` migration (Slang 2026.11):* the
+     `[[vk::binding(0,0)]]` pin holds the block at **descriptor set 0** even with the
+     globals UBO at set 1, so the Vulkan layout is byte-for-byte the old loose-global
+     one (textures b0, samp b1, cubes b2 on set 0; globals set 1) — **`rhi-vulkan`
+     untouched**. Only the *Metal buffer index* shifts: the globals UBO takes
+     `[[buffer(1)]]`, pushing the bindless argument buffer to `[[buffer(2)]]` (vs
+     `[[buffer(1)]]` for non-globals shaders). `pbr.slang` has globals; the IBL gen
+     shaders mostly drive cube faces via push constants — check each.
    - After every shader: `slangc -target spirv-asm` and confirm the **descriptor
      set/binding layout is unchanged** (Vulkan safe). It will NOT be byte-identical:
      the array goes unbounded→`[1024]` and `RuntimeDescriptorArray` /
@@ -261,5 +268,56 @@ the flagless real renderer. All cross-backend (`--backend vulkan|d3d12|metal`).
   builds clean. SPIR-V: **VS byte-identical**, **FS descriptor layout identical**
   (set 0, binding 0 = textures, binding 1 = sampler) with the bounded-array /
   dropped-`SPV_EXT_descriptor_indexing` change noted above. **Vulkan/D3D12 parity
-  pending the Windows box** (same as M3). Next: migrate the remaining step-1 shaders
-  (`pbr` is the first globals→set-2 case; add `cubes[]` to `Bindless` for it).
+  pending the Windows box** (same as M3).
+
+- **Step 1 — `cubes[]` folded into `Bindless` + `pbr.slang` migrated (done,
+  verified on this macOS box).** Added `TextureCube cubes[64]` to the shared
+  `Bindless` struct (matches `CUBE_COUNT` in `rhi-vulkan`); the cube array now lives
+  inside the block instead of a separate loose `g_cubes[]` at `space1`. `pbr.slang`
+  switched to `#include "bindless.slang"` — `g.textures[]` / `g.cubes[]` / `g.samp`
+  — and its globals UBO renamed `g`→`globals` (the block owns the name `g` and the
+  whole set). Verified:
+  - `pbr_{vs,fs}_metallib()` now return `Some` (`pbr_fs` was `None`).
+  - **The globals→set-2 prediction was wrong** (see step 1 above): `pbr_fs` SPIR-V is
+    **identical to the loose-global baseline** — block at set 0 (textures b0, samp b1,
+    cubes b2), globals at set 1 — so `rhi-vulkan` needs no change. Metal MSL confirms
+    `pc`=`buffer(0)`, `globals`=`buffer(1)`, bindless block=`buffer(2)`.
+  - **No regression** from the shared-struct change: `mesh`/`imgui`/`gbuffer` SPIR-V
+    stays at (set 0, textures b0, samp b1) — Slang drops the unused cube binding —
+    and all still compile to `metallib`.
+  - **Vulkan/D3D12 parity pending the Windows RTX 2070 SUPER box** (same risk profile
+    as M3: bounded array + dropped `SPV_EXT_descriptor_indexing`; D3D12 sampler-in-
+    table). Next: remaining step-1 shaders (`capture`, `irradiance`, `prefilter`,
+    `brdf`, `sky`, `shadow`, `post`, `blur`) — `capture`/`irradiance`/`prefilter`
+    still fail `metallib` on the loose `g_cubes[]`, the same fix applies. Then step 2
+    (Metal globals-UBO path: bind globals at `buffer(1)`, bindless at `buffer(2)` for
+    `uses_globals` pipelines).
+
+- **Step 1 — COMPLETE: remaining shaders migrated (done, verified on this macOS
+  box).** Migrated the last loose-global shaders to `#include "bindless.slang"`:
+  - `post` / `blur`: `g_textures[]`+`g_sampler` → `g.textures[]`/`g.samp` (no
+    cubes/globals, exactly like `mesh`/`imgui`).
+  - `capture`: `g_textures[]`+`g_sampler`+`g_cubes[]` → `g.textures[]`/`g.cubes[]`/
+    `g.samp` (no globals UBO — it drives faces via push constants).
+  - `irradiance` / `prefilter`: `g_sampler`+`g_cubes[]` → `g.samp`/`g.cubes[]`. These
+    use **only** the sampler + cube array (not `textures`), so the unused `textures`
+    member sits *before* the used ones in the block. **Verified the block still
+    reserves the full descriptor set:** `samp` stays at binding 1 and `cubes` at
+    binding 2 (Slang does **not** compact the unused leading binding away) — SPIR-V
+    descriptor layout byte-for-byte the loose-global baseline. This was the one real
+    layout risk in step 1 and it held.
+  - `brdf` / `sky` / `shadow` have **no** bindless resources (push constants only) and
+    already compiled to `metallib` — no change, confirmed `Some`.
+
+  Verified on this box: `post`/`blur`/`capture`/`irradiance`/`prefilter` `_fs_metallib`
+  now return `Some` (were `None`); full `cargo build` clean. SPIR-V: every migrated
+  shader's set/binding layout is **identical to its pre-migration baseline** (captured
+  via `slangc -target spirv-asm` before/after) — only the member name changed
+  (`g_sampler`→`g_samp`), with the same bounded-array / dropped-
+  `SPV_EXT_descriptor_indexing` change as M3. Metal MSL confirms these non-globals
+  shaders bind push constants at `[[buffer(0)]]` and the bindless argument buffer at
+  `[[buffer(1)]]` (the M3 `BINDLESS_BUFFER_INDEX`). **The only `metallib` `None`
+  accessors left are the M5 compute/storage shaders** (`post_compute`, `particle_sim`,
+  `particle_draw`, `cull`, `cull_draw` — loose `g_textures[]` + storage buffers,
+  migrate in M5). **Vulkan/D3D12 parity pending the Windows RTX 2070 SUPER box** (same
+  risk profile as M3). **Step 1 done; next is step 2 (Metal globals-UBO path).**

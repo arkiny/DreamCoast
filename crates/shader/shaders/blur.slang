@@ -4,7 +4,11 @@
 // progressively blurred image. The first link extracts bright areas via
 // `threshold` (later links pass 0).
 //
-// Bindless layout + the full-screen-triangle vertex shader match post.slang.
+// Bindless layout + the full-screen-triangle vertex shader match post.slang: the
+// shared `ParameterBlock` (`g.textures[]` / `g.samp`) at set 0 (Metal
+// `[[buffer(1)]]`); SPIR-V layout identical to the old loose-global form.
+
+#include "bindless.slang"
 
 struct VSOutput
 {
@@ -23,12 +27,6 @@ struct PushConstants
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
 
-[[vk::binding(0, 0)]]
-Texture2D g_textures[] : register(t0, space0);
-
-[[vk::binding(1, 0)]]
-SamplerState g_sampler : register(s0, space0);
-
 [shader("vertex")]
 VSOutput vsMain(uint id: SV_VertexID)
 {
@@ -43,7 +41,7 @@ VSOutput vsMain(uint id: SV_VertexID)
 
 float3 tap(float2 uv, float threshold)
 {
-    float3 c = g_textures[pc.src_index].Sample(g_sampler, uv).rgb;
+    float3 c = g.textures[pc.src_index].Sample(g.samp, uv).rgb;
     if (threshold > 0.0)
     {
         // Soft-knee bright-pass extraction.

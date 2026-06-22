@@ -5,10 +5,15 @@
 // the linear→sRGB encode on write. This is the final node of the render graph's
 // color chain.
 //
-// Bindless layout mirrors imgui.slang: a sampled-texture array (t0/binding 0) +
-// a static sampler (s0/binding 1), indexed by push constants (b0). The vertex
-// shader synthesizes a full-screen triangle from SV_VertexID; `flip_y` selects
-// clip-space Y orientation per backend (D3D12 = 0, Vulkan = 1).
+// Bindless layout mirrors imgui.slang: the shared `ParameterBlock` in
+// `bindless.slang` (`g.textures[]` / `g.samp`), indexed by push constants (b0).
+// No globals/cubes here, so the block stays at set 0 (textures b0, samp b1) — the
+// SPIR-V layout is identical to the previous loose-global form (Vulkan untouched),
+// and on Metal it binds at `[[buffer(1)]]`. The vertex shader synthesizes a
+// full-screen triangle from SV_VertexID; `flip_y` selects clip-space Y orientation
+// per backend (D3D12 = 0, Vulkan = 1).
+
+#include "bindless.slang"
 
 struct VSOutput
 {
@@ -26,12 +31,6 @@ struct PushConstants
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
-
-[[vk::binding(0, 0)]]
-Texture2D g_textures[] : register(t0, space0);
-
-[[vk::binding(1, 0)]]
-SamplerState g_sampler : register(s0, space0);
 
 [shader("vertex")]
 VSOutput vsMain(uint id: SV_VertexID)
@@ -55,7 +54,7 @@ float3 aces(float3 x)
 [shader("fragment")]
 float4 fsMain(VSOutput input) : SV_Target
 {
-    float3 hdr = g_textures[pc.hdr_index].Sample(g_sampler, input.uv).rgb;
+    float3 hdr = g.textures[pc.hdr_index].Sample(g.samp, input.uv).rgb;
     float3 color = aces(hdr);
 
     if (pc.mode == 1)

@@ -2,6 +2,15 @@
 // normal), integrate the cosine-weighted hemisphere of the environment cubemap.
 // The result, sampled by a normal in pbr.slang, gives the diffuse IBL term.
 // Rendered one fullscreen draw per cube face.
+//
+// The source environment is sampled bindlessly through the shared `ParameterBlock`
+// in `bindless.slang` (`g.cubes[]` / `g.samp`), indexed by push constants (b0).
+// This shader uses only the cube array + sampler (not `textures`), but the block
+// reserves the full descriptor set so `samp` stays at binding 1 and `cubes` at
+// binding 2 — matching the previous loose-global layout (Vulkan untouched); on
+// Metal it binds at `[[buffer(1)]]`.
+
+#include "bindless.slang"
 
 static const float PI = 3.14159265359;
 
@@ -21,12 +30,6 @@ struct PushConstants
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
-
-[[vk::binding(1, 0)]]
-SamplerState g_sampler : register(s0, space0);
-
-[[vk::binding(2, 0)]]
-TextureCube g_cubes[] : register(t0, space1);
 
 [shader("vertex")]
 VSOutput vsMain(uint id: SV_VertexID)
@@ -77,7 +80,7 @@ float4 fsMain(VSOutput input) : SV_Target
             // Tangent-space sample -> world.
             float3 tangent = float3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
             float3 sample_dir = tangent.x * right + tangent.y * up + tangent.z * n;
-            float3 c = g_cubes[pc.env_index].SampleLevel(g_sampler, sample_dir, src_mip).rgb;
+            float3 c = g.cubes[pc.env_index].SampleLevel(g.samp, sample_dir, src_mip).rgb;
             irradiance += c * cos(theta) * sin(theta);
             num_samples += 1.0;
         }

@@ -9,6 +9,15 @@
 //
 // Output is linear HDR radiance (no exposure — the main lighting pass applies
 // exposure once when it samples this environment).
+//
+// Resources are sampled bindlessly through the shared `ParameterBlock` in
+// `bindless.slang` (`g.textures[]` for the BRDF LUT, `g.cubes[]` for the previous
+// irradiance/prefilter probes, `g.samp`), indexed by push constants (b0). There is
+// no globals UBO, so the block stays at set 0 (textures b0, samp b1, cubes b2) —
+// SPIR-V identical to the old loose-global layout (Vulkan untouched); on Metal it
+// binds at `[[buffer(1)]]`.
+
+#include "bindless.slang"
 
 static const float PI = 3.14159265359;
 
@@ -40,15 +49,6 @@ struct PushConstants
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
-
-[[vk::binding(0, 0)]]
-Texture2D g_textures[] : register(t0, space0);
-
-[[vk::binding(1, 0)]]
-SamplerState g_sampler : register(s0, space0);
-
-[[vk::binding(2, 0)]]
-TextureCube g_cubes[] : register(t0, space1);
 
 [shader("vertex")]
 VSOutput vsMain(VSInput input)
@@ -123,12 +123,12 @@ float3 ambient_ibl(float3 n, float3 v, float3 albedo, float metallic,
     float3 f = fresnel_schlick_roughness(n_dot_v, f0, roughness);
     float3 kd = (1.0 - f) * (1.0 - metallic);
 
-    float3 irradiance = g_cubes[pc.ibl.x].SampleLevel(g_sampler, n, 0.0).rgb;
+    float3 irradiance = g.cubes[pc.ibl.x].SampleLevel(g.samp, n, 0.0).rgb;
     float3 diffuse = irradiance * albedo;
 
     float max_lod = pc.misc.w;
-    float3 prefiltered = g_cubes[pc.ibl.y].SampleLevel(g_sampler, r, roughness * max_lod).rgb;
-    float2 brdf = g_textures[pc.ibl.z].SampleLevel(g_sampler, float2(n_dot_v, roughness), 0.0).rg;
+    float3 prefiltered = g.cubes[pc.ibl.y].SampleLevel(g.samp, r, roughness * max_lod).rgb;
+    float2 brdf = g.textures[pc.ibl.z].SampleLevel(g.samp, float2(n_dot_v, roughness), 0.0).rg;
     float3 specular = prefiltered * (f * brdf.x + brdf.y);
 
     return kd * diffuse + specular;
