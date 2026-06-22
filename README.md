@@ -77,7 +77,7 @@ toolchain setup: [`docs/metal-backend.md`](docs/metal-backend.md).
 - [x] **M0** — Cross-platform skeleton: Cocoa/`CAMetalLayer` window + clear loop
 - [x] **M1** — Slang → `metallib` shader pipeline
 - [x] **M2** — Triangle (graphics pipeline + draw)
-- [ ] **M3** — Bindless (argument buffers) + textures + ImGui
+- [x] **M3** — Bindless (argument buffers) + textures + ImGui
 - [ ] **M4** — Render targets + render graph + PBR deferred
 - [ ] **M5** — Compute / async compute / indirect draw
 
@@ -87,11 +87,12 @@ toolchain setup: [`docs/metal-backend.md`](docs/metal-backend.md).
 # Windows
 cargo run -p sandbox -- --backend vulkan   # or: --backend d3d12
 
-# macOS (Metal) — defaults to Metal; the full deferred renderer needs M3+
-# (bindless), so use the clear/triangle test loops for now (toolchain setup in
-# docs/metal-backend.md):
+# macOS (Metal) — defaults to Metal; the full deferred renderer needs M4+
+# (render graph / PBR), so use the per-milestone test loops for now (toolchain
+# setup in docs/metal-backend.md):
 cargo run -p sandbox -- --backend metal --clear-test      # M0 clear loop
 cargo run -p sandbox -- --backend metal --triangle-test   # M2 RGB triangle
+cargo run -p sandbox -- --backend metal --mesh-test       # M3 textured bindless mesh + ImGui
 ```
 
 Shaders compile via Slang's `slangc`, resolved from `tools/slang/`, the `SLANGC`

@@ -1,9 +1,11 @@
 // ImGui / textured-2D shader. Also drives the Phase 3 bindless smoke test.
 //
-// Bindless: a sampled-texture array indexed by a push/root constant. On SPIR-V
-// the [[vk::binding]] attributes place the array at set 0 binding 0 and the
-// sampler at binding 1; on DXIL Slang assigns t0 (table), s0 (static sampler),
-// and b0 (root constants).
+// Bindless: a sampled-texture array indexed by a push/root constant, supplied by
+// the shared `ParameterBlock` in `bindless.slang` — set 0 / binding 0 (textures)
+// + binding 1 (sampler) on SPIR-V, a Metal argument buffer at [[buffer(1)]], and
+// a D3D12 descriptor table from one source.
+
+#include "bindless.slang"
 
 struct VSInput
 {
@@ -26,16 +28,9 @@ struct PushConstants
     uint tex_index;
 };
 
-// Registers are pinned for D3D12 (must match the root signature: SRV table t0,
-// static sampler s0, root constants b0); vk::binding/vk::push_constant drive SPIR-V.
+// Root constants stay at b0; vk::push_constant drives SPIR-V.
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
-
-[[vk::binding(0, 0)]]
-Texture2D g_textures[] : register(t0, space0);
-
-[[vk::binding(1, 0)]]
-SamplerState g_sampler : register(s0, space0);
 
 [shader("vertex")]
 VSOutput vsMain(VSInput input)
@@ -50,5 +45,5 @@ VSOutput vsMain(VSInput input)
 [shader("fragment")]
 float4 fsMain(VSOutput input) : SV_Target
 {
-    return input.col * g_textures[pc.tex_index].Sample(g_sampler, input.uv);
+    return input.col * g.textures[pc.tex_index].Sample(g.samp, input.uv);
 }

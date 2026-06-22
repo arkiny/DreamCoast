@@ -56,23 +56,26 @@ cargo run -p sandbox -- --backend metal --clear-test --frames 60   # headless sm
 cargo run -p sandbox -- --backend metal --triangle-test       # M2 RGB triangle
 cargo run -p sandbox -- --backend metal --triangle-test --frames 60   # headless
 cargo run -p sandbox -- --backend metal --triangle-test --screenshot tri.png  # capture + exit
+cargo run -p sandbox -- --backend metal --mesh-test           # M3 textured bindless mesh + ImGui
+cargo run -p sandbox -- --backend metal --mesh-test --screenshot mesh.png  # capture + exit
 ```
 
-`--triangle-test` is cross-backend (`--backend vulkan|d3d12|metal`); enable the
-Metal validation layers for a stricter smoke test:
-`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo run -p sandbox -- --backend metal --triangle-test --frames 30`.
+`--triangle-test` and `--mesh-test` are cross-backend
+(`--backend vulkan|d3d12|metal`); enable the Metal validation layers for a stricter
+smoke test:
+`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo run -p sandbox -- --backend metal --mesh-test --screenshot mesh.png`.
 
 ## Milestone status
 
 - **M0 — skeleton/clear:** done. Cocoa window + `CAMetalLayer` swapchain +
   acquire→clear→present verified.
 - **M1 — Slang→metallib:** done. `build.rs` emits `*_metallib` accessors; the
-  triangle and most vertex shaders compile. **Known issue (deferred to M3):** the
-  bindless shaders (`g_textures[]` / `g_cubes[]` unbounded arrays) fail Metal
-  compilation — *"flexible array member … is not at the end of struct"*. Metal
-  argument buffers need a different unbounded-array declaration / binding model
-  than the SPIR-V/DXIL descriptor-indexing path; this is addressed when the Metal
-  bindless tables land in M3.
+  triangle and most vertex shaders compile. **Bindless blocker (resolved for
+  `mesh`/`imgui` in M3):** loose unbounded `g_textures[]` / `g_cubes[]` arrays fail
+  Metal compilation — *"flexible array member … is not at the end of struct"*. The
+  fix is a bounded `ParameterBlock` (see M3 below). The cube/storage shaders still
+  carry the loose-global form and stay `None`-on-metallib until they migrate in
+  M4/M5.
 - **M2 — triangle:** done. `MTLRenderPipelineState` from per-stage metallib
   blobs (`MTLLibrary` via `dispatch_data_t`, entry by name), host-visible
   `MTLBuffer` (vertex/index/uniform), vertex descriptor for every `VertexLayout`,
@@ -86,10 +89,18 @@ Metal validation layers for a stricter smoke test:
   Bytes`) — Slang's `[[buffer(0)]]` when no globals/bindless precede them — and the
   vertex buffer at index `30`. The globals (M4) and bindless (M3) paths shift
   Slang's index assignment and will revisit this; see `resources.rs`.
-- **M3 — bindless + textures + ImGui**, **M4 — render targets + PBR**,
-  **M5 — compute/async/indirect:** pending.
+- **M3 — bindless + textures + ImGui:** done. The `mesh.slang` / `imgui.slang`
+  bindless arrays were migrated to a shared `ParameterBlock` (`bindless.slang`),
+  which compiles to a Metal argument buffer; `MetalDevice` builds a tier-2 argument
+  buffer (`MTLResourceID` handles, no encoder), `create_texture` /
+  `create_depth_buffer` upload + register into it, depth testing got an
+  `MTLDepthStencilState`, and `gui` (already RHI-agnostic) renders on Metal once its
+  metallib accessors were wired. Verified by `--mesh-test --screenshot` (textured
+  Avocado + ImGui overlay) under the Metal API + GPU validation layers. **Details +
+  the cross-backend decision are below.**
+- **M4 — render targets + PBR**, **M5 — compute/async/indirect:** pending.
 
-## Resume notes for M3+ (implementation pointers)
+## Resume notes for M4+ (implementation pointers)
 
 State to know when picking this up in a fresh session:
 
@@ -100,9 +111,13 @@ State to know when picking this up in a fresh session:
   closest to Metal). The exact method contract every Metal type must satisfy is the
   `Metal(...)` arms in `crates/rhi/src/lib.rs`.
 - **Current stubs:** `crates/rhi-metal/src/{device,command,resources}.rs` have
-  `unimplemented!("…milestone Mx")` markers for everything past M2. Implemented:
-  M0 (instance/device/swapchain/clear/fence/semaphore/queue submit+present) and
-  M2 (graphics pipelines in `pipeline.rs`, buffers, draw path).
+  `unimplemented!("…milestone Mx")` markers for everything past M3. Implemented:
+  M0 (instance/device/swapchain/clear/fence/semaphore/queue submit+present),
+  M2 (graphics pipelines, buffers, draw path), and M3 (bindless argument buffer,
+  textures + depth, depth-stencil state, ImGui). M4 next: offscreen render targets,
+  cubemaps, transient heap/aliasing, globals UBO, the MRT/render-graph passes — plus
+  migrating the cube/storage shaders to `ParameterBlock` (they land at a different
+  set/buffer index than `mesh`/`imgui`; see the M3 bindless section).
 - **objc2 0.3 notes:** most property getters/setters are *safe* (no `unsafe`); the
   few that need `unsafe` (e.g. `NSWindow::setReleasedWhenClosed`,
   `objectAtIndexedSubscript`, the `setVertexBytes`/`drawPrimitives` family) the
@@ -118,49 +133,68 @@ State to know when picking this up in a fresh session:
 - **Entry names:** Slang's Metal target *preserves* the entry name (`vsMain` /
   `fsMain`), so `library.newFunctionWithName("vsMain")` works directly.
 
-### M3 next (bindless + textures + ImGui) — blocker resolved by spike
+### M3 bindless (done) — what shipped, and the cross-backend decision
 
-**Spike conclusion (Slang 2026.11): wrap bindless resources in a single
-`ParameterBlock<T>` with _bounded_ arrays.** This compiles to a Metal argument
-buffer *and* still to SPIR-V from one source. Worked example (compiles to both
-`metallib` and `spirv`):
+**Shader model: a shared `ParameterBlock<Bindless>` in `bindless.slang`**, included
+by `mesh.slang` + `imgui.slang` (the only bindless shaders Metal compiles in M3).
+It compiles to a Metal argument buffer, a Vulkan descriptor set, and a D3D12
+descriptor table from one source:
 
 ```hlsl
-struct Bindless {
-    Texture2D                 textures[16384];
-    TextureCube               cubes[256];
-    StructuredBuffer<Particle> buffers[256];
-    SamplerState              samp;
-};
-ParameterBlock<Bindless> g;          // Metal: argument buffer at [[buffer(N)]]
-// usage: g.textures[idx].Sample(g.samp, uv)
+struct Bindless { Texture2D textures[1024]; SamplerState samp; };
+[[vk::binding(0, 0)]] ParameterBlock<Bindless> g;   // usage: g.textures[i].Sample(g.samp, uv)
 ```
 
-What was tried and why it failed (so nobody re-walks it):
-- **Unbounded `Texture2D g_textures[]` as loose globals (current shaders):** Slang
-  aggregates loose globals into one struct ordered *pointers → textures → samplers*;
-  the unbounded array becomes a C flexible-array member with the sampler trailing →
-  *"flexible array member … not at end of struct."* Reordering bindings/spaces does
-  **not** help (order is by type category, not space). Forcing the array last (via
-  ParameterBlock) then trips *"flexible array members are a C99 feature"* and the
-  struct can't be a `[[buffer]]` param at all. `-Xmetal -Wno-c99-extensions` does
-  not suppress it.
-- **Slang `DescriptorHandle<T>` / `.Handle` bindless:** not lowered for the Metal
-  target in 2026.11 (`E36107: unavailable features in entry point`), even with
-  `metallib_3_1` / `sm_6_6` capabilities.
-- **Bounded array as a loose global (not in a ParameterBlock):** fails with *"no
-  texture resource location available"* — Metal can't give 16384 individual
-  function-argument slots; the argument buffer (ParameterBlock) is required.
+**Why only `mesh` + `imgui` migrated (not all 10 bindless shaders).** Empirically
+(via `slangc` reflection + `spirv-asm`, Slang 2026.11): a `ParameterBlock` with **no
+globals present** lands at **descriptor set 0** with `textures`=binding 0,
+`samp`=binding 1 — *byte-identical* to the previous loose-global layout, so
+**`rhi-vulkan` is unchanged** and the shared `bindless_set` still matches every
+shader (migrated or not). `mesh`/`imgui` have no globals, so they qualify. The
+globals-using shaders (`pbr`, `gbuffer`, `capture`, `prefilter`, `irradiance`,
+`blur`, `post`, …) are **not** Metal targets until M4/M5; when they migrate, note
+that a loose globals `ConstantBuffer` at set 1 **bumps** the `ParameterBlock` to set
+2 — so *that* migration is the bigger cross-backend change the original spike warned
+about. Defer it to the milestone that needs it.
 
-**Integration cost for M3:** converting the shaders to `ParameterBlock` changes the
-descriptor model on Vulkan & D3D12 too (a ParameterBlock is its own descriptor set
-/ register space), so `rhi-vulkan` and `rhi-d3d12` bindless layouts must be
-re-validated — that's the bulk of the M3 work, not the Metal side. The Metal side
-then binds the argument buffer with `setVertex/FragmentBuffer` at its slot and
-populates it with `MTLArgumentEncoder` (or `MTLResourceID` writes on Metal 3).
+**Pins that matter (verified, don't re-walk):**
+- `[[vk::binding(0, 0)]]` on the **block** pins it to set 0 even though the push
+  constant declares `register(b0, space0)` (which otherwise reserves space 0 and
+  bumps the block to set 1). Pinning the *inner members* (`[[vk::binding]]` or
+  `register()` on `textures`/`samp`) instead **bumps the whole block's space** —
+  don't.
+- The sampler must live **inside** the block (a ParameterBlock owns its whole
+  descriptor set; a loose sampler can't share set 0). On Vulkan this is still set 0 /
+  binding 1 (matches the old immutable sampler). The original spike's unbounded
+  loose-global attempts and `DescriptorHandle<T>` both failed on the Metal target —
+  the bounded ParameterBlock is the only path.
 
-- **Buffer-index convention to revisit:** push constants sit at buffer 0 today
-  (`PUSH_CONSTANT_INDEX`); the bindless argument buffer lands at the next free index
-  (the spike showed it at `[[buffer(1)]]`, push at `[[buffer(0)]]`). M3/M4 need a
-  deliberate index map across bindless table, globals, and push constants. The
-  vertex buffer is parked at index 30 to stay clear of those low indices.
+**Windows parity is NOT verified (macOS-only box).** SPIR-V is confirmed unchanged
+here (so Vulkan should need no change). **D3D12: the sampler moves from a static
+sampler into the bindless table** (a ParameterBlock sampler is a table entry), so
+`rhi-d3d12`'s root signature for `imgui`/`mesh` needs that tweak — **verify on the
+RTX 2070 SUPER**. DXIL can't be compiled on macOS (no DXC), so this could not be
+checked in the M3 session.
+
+**Metal argument buffer (tier-2, no encoder).** Apple Silicon → argument buffers
+tier 2: `DeviceShared` allocates a shared `MTLBuffer` and writes 8-byte
+`MTLResourceID` handles directly — texture slots `0..BINDLESS_COUNT`, the shared
+sampler at slot `BINDLESS_COUNT` (Slang's id for `samp`). `create_texture` /
+`create_depth_buffer` register handles; `bind_graphics_pipeline` binds the buffer at
+`[[buffer(1)]]` for bindless pipelines and `useResource`s the sampled textures
+(argument-buffer resources need explicit residency). See `device.rs` (`register` /
+`write_handle`) and `command.rs` (`bind_graphics_pipeline`).
+
+**Buffer-index map (M3):** push constants `[[buffer(0)]]` (`PUSH_CONSTANT_INDEX`),
+bindless argument buffer `[[buffer(1)]]` (`BINDLESS_BUFFER_INDEX`), vertex buffer at
+30. Globals (M4) will take the next low index and shift the bindless slot for the
+globals-using shaders (their block is at set 2 / `[[buffer(2)]]`).
+
+**Gotchas hit in M3 (reuse):**
+- A depth-less pipeline (ImGui) **cannot** be bound in a render pass that has a depth
+  attachment — Metal validates the pipeline's `depthAttachmentPixelFormat` against
+  the pass. `--mesh-test` runs the mesh in a depth pass, then ImGui in a second
+  color-load pass (mirrors the engine's geometry-then-UI structure).
+- Metal validates `setBytes` length against the shader argument's *alignment-padded*
+  size (ImGui's `{float2, float2, uint}` is 20 bytes of data but Metal wants 24).
+  `command.rs::push_constants` rounds the upload up to 16 to always cover the pad.

@@ -49,3 +49,16 @@ pub(crate) fn pixel_format(format: Format) -> MTLPixelFormat {
         Format::Depth32Float => MTLPixelFormat::Depth32Float,
     }
 }
+
+/// Bytes per pixel for a [`Format`], for computing a texture upload's row pitch.
+pub(crate) fn bytes_per_pixel(format: Format) -> usize {
+    match format {
+        Format::Bgra8Unorm
+        | Format::Bgra8Srgb
+        | Format::Rgba8Unorm
+        | Format::Rgba8Srgb
+        | Format::Rg16Float
+        | Format::Depth32Float => 4,
+        Format::Rgba16Float => 8,
+    }
+}
