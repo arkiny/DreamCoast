@@ -11,6 +11,7 @@
 
 mod command;
 mod device;
+mod pipeline;
 mod resources;
 mod swapchain;
 mod sync;

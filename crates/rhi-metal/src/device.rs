@@ -5,7 +5,9 @@ use std::rc::Rc;
 use dreamcoast_platform::Window;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions,
+};
 use objc2_quartz_core::CAMetalLayer;
 use rhi_types::{
     BackendKind, BufferDesc, ComputePipelineDesc, CubemapDesc, Extent2D, GraphicsPipelineDesc,
@@ -25,8 +27,7 @@ use crate::{Result, rhi_err};
 /// Device state shared (via `Rc`) by every resource created from a device, so the
 /// `MTLDevice` / command queue / layer outlive the resources that reference them.
 pub(crate) struct DeviceShared {
-    // Used from M2 onward to create pipelines, buffers, and textures.
-    #[allow(dead_code)]
+    // Creates pipelines, buffers, and (later) textures.
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pub layer: Retained<CAMetalLayer>,
@@ -130,9 +131,9 @@ impl MetalDevice {
 
     pub fn create_graphics_pipeline(
         &self,
-        _desc: &GraphicsPipelineDesc,
+        desc: &GraphicsPipelineDesc,
     ) -> Result<MetalGraphicsPipeline> {
-        unimplemented!("Metal graphics pipelines: milestone M2")
+        crate::pipeline::build(&self.shared.device, desc)
     }
 
     pub fn create_compute_pipeline(
@@ -142,8 +143,15 @@ impl MetalDevice {
         unimplemented!("Metal compute pipelines: milestone M5")
     }
 
-    pub fn create_buffer(&self, _desc: &BufferDesc) -> Result<MetalBuffer> {
-        unimplemented!("Metal buffers: milestone M2")
+    pub fn create_buffer(&self, desc: &BufferDesc) -> Result<MetalBuffer> {
+        // All these buffers are host-visible (per-frame dynamic upload / readback),
+        // so shared storage gives the CPU a direct pointer via `contents()`.
+        let buffer = self
+            .shared
+            .device
+            .newBufferWithLength_options(desc.size as usize, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| rhi_err("newBufferWithLength failed"))?;
+        Ok(MetalBuffer::new(buffer, desc.size))
     }
 
     pub fn create_storage_buffer(&self, _desc: &StorageBufferDesc) -> Result<MetalStorageBuffer> {

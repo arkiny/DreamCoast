@@ -9,14 +9,17 @@
 //! present → submit). Draw / pipeline / resource methods land in M2+.
 
 use std::cell::RefCell;
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLLoadAction,
-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLStoreAction,
+    MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
+    MTLCommandQueue, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLScissorRect, MTLSize, MTLStoreAction,
+    MTLTexture, MTLViewport,
 };
 use objc2_quartz_core::CAMetalDrawable;
 use rhi_types::{ClearColor, Extent2D, Rect2D};
@@ -24,16 +27,22 @@ use rhi_types::{ClearColor, Extent2D, Rect2D};
 use crate::device::DeviceShared;
 use crate::resources::{
     MetalBuffer, MetalComputePipeline, MetalCubemap, MetalDepthBuffer, MetalGraphicsPipeline,
-    MetalRenderTarget, MetalStorageBuffer,
+    MetalRenderTarget, MetalStorageBuffer, PUSH_CONSTANT_INDEX, VERTEX_BUFFER_INDEX,
 };
 use crate::swapchain::MetalSwapchain;
 use crate::{Result, rhi_err};
+
+/// A bound index buffer plus its width flag (`true` = 32-bit indices).
+type BoundIndexBuffer = (Retained<ProtocolObject<dyn MTLBuffer>>, bool);
 
 pub struct MetalCommandBuffer {
     shared: Rc<DeviceShared>,
     cmd: RefCell<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
     encoder: RefCell<Option<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>>>,
     present: RefCell<Option<Retained<ProtocolObject<dyn CAMetalDrawable>>>>,
+    /// Index buffer + width bound by `bind_index_buffer`; consumed by
+    /// `draw_indexed` (Metal takes the index buffer at draw time, not bind time).
+    index_buffer: RefCell<Option<BoundIndexBuffer>>,
 }
 
 impl MetalCommandBuffer {
@@ -43,6 +52,7 @@ impl MetalCommandBuffer {
             cmd: RefCell::new(None),
             encoder: RefCell::new(None),
             present: RefCell::new(None),
+            index_buffer: RefCell::new(None),
         }
     }
 
@@ -55,6 +65,7 @@ impl MetalCommandBuffer {
         *self.cmd.borrow_mut() = Some(cb);
         *self.encoder.borrow_mut() = None;
         *self.present.borrow_mut() = None;
+        *self.index_buffer.borrow_mut() = None;
         Ok(())
     }
 
@@ -142,11 +153,28 @@ impl MetalCommandBuffer {
         }
     }
 
-    pub fn set_viewport_scissor(&self, _swapchain: &MetalSwapchain) {
-        // Encoder defaults to the full attachment; explicit viewport lands in M2.
+    pub fn set_viewport_scissor(&self, swapchain: &MetalSwapchain) {
+        self.set_viewport_scissor_extent(swapchain.extent_2d());
     }
 
-    pub fn set_viewport_scissor_extent(&self, _extent: Extent2D) {}
+    pub fn set_viewport_scissor_extent(&self, extent: Extent2D) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            enc.setViewport(MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: extent.width as f64,
+                height: extent.height as f64,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+            enc.setScissorRect(MTLScissorRect {
+                x: 0,
+                y: 0,
+                width: extent.width as usize,
+                height: extent.height as usize,
+            });
+        }
+    }
 
     // ---- Implemented in later milestones (M2+) -----------------------------
 
@@ -201,25 +229,66 @@ impl MetalCommandBuffer {
         unimplemented!("Metal cubemap rendering: milestone M4")
     }
 
+    /// Blit the current drawable's texture into `buffer` (tightly packed BGRA8) so
+    /// the host can read the rendered frame back. Recorded onto this frame's command
+    /// buffer; the readback is valid once the buffer completes (the submit fence).
+    /// Requires the layer to be non-`framebufferOnly` (see `swapchain.rs`).
     pub fn copy_swapchain_to_buffer(
         &self,
-        _swapchain: &MetalSwapchain,
+        swapchain: &MetalSwapchain,
         _image_index: u32,
-        _buffer: &MetalBuffer,
+        buffer: &MetalBuffer,
     ) {
-        unimplemented!("Metal screenshot readback: milestone M6")
+        let drawable = swapchain
+            .current_drawable()
+            .expect("copy_swapchain_to_buffer without an acquired drawable");
+        let texture = drawable.texture();
+        let cmd = self.cmd.borrow();
+        let cmd = cmd
+            .as_ref()
+            .expect("copy_swapchain_to_buffer without begin");
+        let blit = cmd
+            .blitCommandEncoder()
+            .expect("failed to create blit command encoder");
+        let width = texture.width();
+        let height = texture.height();
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                &texture,
+                0,
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLSize { width, height, depth: 1 },
+                &buffer.buffer,
+                0,
+                width * 4,
+                width * height * 4,
+            );
+        }
+        blit.endEncoding();
     }
 
     pub fn rt_to_render_target(&self, _target: &MetalRenderTarget) {}
     pub fn rt_to_sampled(&self, _target: &MetalRenderTarget) {}
     pub fn aliasing_barrier(&self, _target: &MetalRenderTarget) {}
 
-    pub fn bind_graphics_pipeline(&self, _pipeline: &MetalGraphicsPipeline) {
-        unimplemented!("Metal graphics pipelines: milestone M2")
+    pub fn bind_graphics_pipeline(&self, pipeline: &MetalGraphicsPipeline) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            enc.setRenderPipelineState(&pipeline.state);
+        }
     }
 
-    pub fn draw(&self, _vertex_count: u32, _instance_count: u32) {
-        unimplemented!("Metal draw: milestone M2")
+    pub fn draw(&self, vertex_count: u32, instance_count: u32) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            unsafe {
+                enc.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                    MTLPrimitiveType::Triangle,
+                    0,
+                    vertex_count as usize,
+                    instance_count as usize,
+                );
+            }
+        }
     }
 
     pub fn bind_compute_pipeline(&self, _pipeline: &MetalComputePipeline) {
@@ -249,23 +318,68 @@ impl MetalCommandBuffer {
         unimplemented!("Metal indirect draw: milestone M5")
     }
 
-    pub fn set_scissor(&self, _rect: Rect2D) {
-        unimplemented!("Metal scissor: milestone M2")
+    pub fn set_scissor(&self, rect: Rect2D) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            enc.setScissorRect(MTLScissorRect {
+                x: rect.x.max(0) as usize,
+                y: rect.y.max(0) as usize,
+                width: rect.width as usize,
+                height: rect.height as usize,
+            });
+        }
     }
 
-    pub fn bind_vertex_buffer(&self, _buffer: &MetalBuffer, _stride: u32) {
-        unimplemented!("Metal vertex buffers: milestone M2")
+    /// Bind the vertex buffer at [`VERTEX_BUFFER_INDEX`]. `stride` is unused (the
+    /// pipeline's vertex descriptor carries it) — present for facade parity.
+    pub fn bind_vertex_buffer(&self, buffer: &MetalBuffer, _stride: u32) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            unsafe {
+                enc.setVertexBuffer_offset_atIndex(Some(&buffer.buffer), 0, VERTEX_BUFFER_INDEX);
+            }
+        }
     }
 
-    pub fn bind_index_buffer(&self, _buffer: &MetalBuffer, _wide: bool) {
-        unimplemented!("Metal index buffers: milestone M2")
+    /// Stash the index buffer for the next `draw_indexed` (`wide` = 32-bit indices).
+    pub fn bind_index_buffer(&self, buffer: &MetalBuffer, wide: bool) {
+        *self.index_buffer.borrow_mut() = Some((buffer.buffer.clone(), wide));
     }
 
-    pub fn push_constants(&self, _data: &[u8]) {
-        unimplemented!("Metal push constants: milestone M2")
+    /// Upload push constants to both stages at [`PUSH_CONSTANT_INDEX`]. Setting the
+    /// fragment slot too is harmless when only the vertex stage declares the block.
+    pub fn push_constants(&self, data: &[u8]) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            let ptr = NonNull::new(data.as_ptr() as *mut std::ffi::c_void)
+                .expect("push_constants data pointer is null");
+            unsafe {
+                enc.setVertexBytes_length_atIndex(ptr, data.len(), PUSH_CONSTANT_INDEX);
+                enc.setFragmentBytes_length_atIndex(ptr, data.len(), PUSH_CONSTANT_INDEX);
+            }
+        }
     }
 
-    pub fn draw_indexed(&self, _index_count: u32, _first_index: u32, _vertex_offset: i32) {
-        unimplemented!("Metal indexed draw: milestone M2")
+    pub fn draw_indexed(&self, index_count: u32, first_index: u32, vertex_offset: i32) {
+        let enc = self.encoder.borrow();
+        let Some(enc) = enc.as_ref() else { return };
+        let index_buffer = self.index_buffer.borrow();
+        let (buffer, wide) = index_buffer
+            .as_ref()
+            .expect("draw_indexed without bind_index_buffer");
+        let (index_type, index_size) = if *wide {
+            (MTLIndexType::UInt32, 4)
+        } else {
+            (MTLIndexType::UInt16, 2)
+        };
+        unsafe {
+            enc.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
+                MTLPrimitiveType::Triangle,
+                index_count as usize,
+                index_type,
+                buffer,
+                first_index as usize * index_size,
+                1,
+                vertex_offset as isize,
+                0,
+            );
+        }
     }
 }

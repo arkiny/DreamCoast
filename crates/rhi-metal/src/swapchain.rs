@@ -78,6 +78,9 @@ impl MetalSwapchain {
 fn configure_layer(shared: &DeviceShared, desc: &SwapchainDesc) {
     let layer = &shared.layer;
     layer.setPixelFormat(pixel_format_for_swapchain(desc.format));
+    // Allow blitting the drawable into a readback buffer (screenshots). Drawables
+    // are framebuffer-only by default, which forbids using them as a copy source.
+    layer.setFramebufferOnly(false);
     layer.setDrawableSize(NSSize::new(
         desc.extent.width as f64,
         desc.extent.height as f64,

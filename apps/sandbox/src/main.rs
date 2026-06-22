@@ -182,6 +182,12 @@ fn main() -> anyhow::Result<()> {
         return run_clear_test(&mut window, &device, &mut swapchain);
     }
 
+    // M2 backend bring-up: clear + a single hardcoded-triangle pipeline (no vertex
+    // buffers, push constants, or bindless). Validates pipeline creation + draw.
+    if triangle_test_enabled() {
+        return run_triangle_test(backend, &mut window, &device, &mut swapchain);
+    }
+
     // G-buffer fill pipeline: mesh -> 4 MRT (+ depth).
     let (gb_vs, gb_fs) = load_shader_pair(
         backend,
@@ -2395,6 +2401,152 @@ fn run_clear_test(
     }
     device.wait_idle()?;
     info!("clear-test exited after {frames} frame(s)");
+    Ok(())
+}
+
+/// Whether `--triangle-test` was passed: run the clear loop plus a single
+/// hardcoded-triangle pipeline (M2 of the Metal backend bring-up). Exercises
+/// pipeline creation + draw without vertex buffers, push constants, or bindless.
+fn triangle_test_enabled() -> bool {
+    std::env::args().skip(1).any(|a| a == "--triangle-test")
+}
+
+/// Minimal render loop that draws the RGB triangle on a clear background. Like
+/// [`run_clear_test`] but builds a pipeline from `triangle.slang` and issues a
+/// 3-vertex draw each frame. Cross-backend (selects spirv/dxil/metallib).
+fn run_triangle_test(
+    backend: BackendKind,
+    window: &mut Window,
+    device: &Device,
+    swapchain: &mut Swapchain,
+) -> anyhow::Result<()> {
+    let (vs, fs) = match backend {
+        BackendKind::Vulkan => (
+            dreamcoast_shader::triangle_vs_spirv(),
+            dreamcoast_shader::triangle_fs_spirv(),
+        ),
+        BackendKind::D3d12 => (
+            dreamcoast_shader::triangle_vs_dxil(),
+            dreamcoast_shader::triangle_fs_dxil(),
+        ),
+        BackendKind::Metal => (
+            dreamcoast_shader::triangle_vs_metallib(),
+            dreamcoast_shader::triangle_fs_metallib(),
+        ),
+    };
+    let vs = vs.ok_or_else(|| anyhow!("triangle vertex shader unavailable for {backend:?}"))?;
+    let fs = fs.ok_or_else(|| anyhow!("triangle fragment shader unavailable for {backend:?}"))?;
+
+    let pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: vs,
+        fragment_bytes: fs,
+        vertex_entry: "vsMain",
+        fragment_entry: "fsMain",
+        color_formats: &[COLOR_FORMAT],
+        topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::None,
+        blend: BlendMode::Opaque,
+        push_constant_size: 0,
+        bindless: false,
+        uniform_buffer: false,
+        depth_test: false,
+        depth_format: None,
+    })?;
+
+    let queue = device.queue();
+    let cmd = device.create_command_buffer()?;
+    let image_available = device.create_semaphore()?;
+    let render_finished = device.create_semaphore()?;
+    let fence = device.create_fence(true)?;
+
+    // `--screenshot[-clean] <path>`: capture the rendered frame to a PNG after a
+    // short warmup, then exit. Lets the triangle path self-verify headlessly.
+    let captures = screenshot_captures();
+    const CAPTURE_FRAME: u64 = 2;
+    let max_frames = clear_test_max_frames();
+    info!("running triangle-test loop (press ESC or close the window to exit)");
+    let mut frames = 0u64;
+    let _ = window.take_resized();
+    while !window.should_close() {
+        if let Some(max) = max_frames
+            && frames >= max
+        {
+            break;
+        }
+        window.pump_events();
+        let (w, h) = window.size();
+        if w == 0 || h == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            continue;
+        }
+        if window.take_resized() {
+            device.wait_idle()?;
+            swapchain.recreate(&swapchain_desc(Extent2D::new(w, h)))?;
+        }
+
+        fence.wait()?;
+        let image_index = match swapchain.acquire_next_image(&image_available)? {
+            Some(i) => i,
+            None => {
+                swapchain.recreate(&swapchain_desc(Extent2D::new(w, h)))?;
+                continue;
+            }
+        };
+        fence.reset()?;
+
+        let color = ClearColor {
+            r: 0.1,
+            g: 0.1,
+            b: 0.12,
+            a: 1.0,
+        };
+        cmd.begin()?;
+        cmd.transition_to_render_target(swapchain, image_index);
+        cmd.begin_rendering(swapchain, image_index, Some(color), None);
+        cmd.set_viewport_scissor(swapchain);
+        cmd.bind_graphics_pipeline(&pipeline);
+        cmd.draw(3, 1);
+        cmd.end_rendering();
+
+        // On the capture frame, copy the backbuffer into a readback buffer in this
+        // same command buffer (before it ends).
+        let capture = (!captures.is_empty() && frames == CAPTURE_FRAME).then(|| &captures[0]);
+        let readback = if capture.is_some() {
+            let layout = device.swapchain_readback_layout(swapchain);
+            let buf = device.create_buffer(&BufferDesc {
+                size: layout.size,
+                usage: BufferUsage::Readback,
+            })?;
+            cmd.copy_swapchain_to_buffer(swapchain, image_index, &buf);
+            Some((buf, layout))
+        } else {
+            None
+        };
+
+        cmd.transition_to_present(swapchain, image_index);
+        cmd.end()?;
+        queue.submit(&cmd, &image_available, &render_finished, &fence)?;
+
+        if let (Some(cap), Some((buf, layout))) = (capture, readback.as_ref()) {
+            fence.wait()?;
+            let mut bytes = vec![0u8; layout.size as usize];
+            buf.read_into(&mut bytes)?;
+            save_screenshot(&cap.path, &bytes, layout)?;
+            info!(
+                "saved triangle screenshot {} ({}x{})",
+                cap.path, layout.width, layout.height
+            );
+        }
+
+        queue.present(swapchain, image_index, &render_finished)?;
+        frames += 1;
+
+        if capture.is_some() {
+            break;
+        }
+    }
+    device.wait_idle()?;
+    info!("triangle-test exited after {frames} frame(s)");
     Ok(())
 }
 
