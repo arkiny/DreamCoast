@@ -3,6 +3,15 @@
 // at a given roughness. Each prefilter mip holds a successively rougher
 // convolution; pbr.slang samples it at a roughness-derived LOD. Rendered one
 // fullscreen draw per (face, mip).
+//
+// The source environment is sampled bindlessly through the shared `ParameterBlock`
+// in `bindless.slang` (`g.cubes[]` / `g.samp`), indexed by push constants (b0).
+// Only the cube array + sampler are used (not `textures`), but the block reserves
+// the full descriptor set so `samp` stays at binding 1 and `cubes` at binding 2 —
+// matching the previous loose-global layout (Vulkan untouched); on Metal it binds
+// at `[[buffer(1)]]`.
+
+#include "bindless.slang"
 
 static const float PI = 3.14159265359;
 
@@ -23,12 +32,6 @@ struct PushConstants
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
-
-[[vk::binding(1, 0)]]
-SamplerState g_sampler : register(s0, space0);
-
-[[vk::binding(2, 0)]]
-TextureCube g_cubes[] : register(t0, space1);
 
 [shader("vertex")]
 VSOutput vsMain(uint id: SV_VertexID)
@@ -106,7 +109,7 @@ float4 fsMain(VSOutput input) : SV_Target
 
     // Mirror reflection (roughness ~ 0): just the sharp environment.
     if (pc.roughness < 0.01)
-        return float4(g_cubes[pc.env_index].SampleLevel(g_sampler, n, 0.0).rgb, 1.0);
+        return float4(g.cubes[pc.env_index].SampleLevel(g.samp, n, 0.0).rgb, 1.0);
 
     // Mip-based importance sampling: pick a source mip per sample by its solid
     // angle vs the texel solid angle, so 32-64 samples suffice without fireflies
@@ -130,7 +133,7 @@ float4 fsMain(VSOutput input) : SV_Target
             float solid_angle_sample = 1.0 / (float(num_samples) * pdf + 1e-6);
             float mip = 0.5 * log2(solid_angle_sample / solid_angle_texel);
             mip = clamp(mip, 0.0, float(pc.env_mips - 1u));
-            prefiltered += g_cubes[pc.env_index].SampleLevel(g_sampler, l, mip).rgb * n_dot_l;
+            prefiltered += g.cubes[pc.env_index].SampleLevel(g.samp, l, mip).rgb * n_dot_l;
             total_weight += n_dot_l;
         }
     }

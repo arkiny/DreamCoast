@@ -3,9 +3,21 @@
 // metallic-roughness BRDF for one directional ("sun") light plus a few point
 // lights. Output is linear HDR; tonemapping happens later (post.slang).
 //
-// G-buffer textures are sampled bindlessly (t0/binding 0 array, indexed by push
-// constants b0). Per-frame camera + light data comes from the globals uniform
-// buffer (set 1 / b1).
+// G-buffer textures and the IBL cubemaps are sampled bindlessly through the
+// shared `ParameterBlock` in `bindless.slang` (`g.textures[]` / `g.cubes[]` /
+// `g.samp`), indexed by push constants (b0). Per-frame camera + light data comes
+// from a loose globals uniform buffer (set 1 / b1) named `globals` — the block
+// owns set 0, so the globals UBO cannot share it.
+//
+// Layout: the block pins to set 0 even with the globals UBO at set 1
+// (`[[vk::binding(0,0)]]`), so the SPIR-V descriptor layout is identical to the
+// previous loose-global form (textures b0, samp b1, cubes b2 on set 0; globals on
+// set 1) — Vulkan untouched. On Metal the globals UBO takes `[[buffer(1)]]` and
+// the bindless argument buffer lands at `[[buffer(2)]]`. The bounded-array /
+// dropped-`SPV_EXT_descriptor_indexing` change is the same as the M3 mesh/imgui
+// migration (Vulkan/D3D12 parity pending the Windows box).
+
+#include "bindless.slang"
 
 static const float PI = 3.14159265359;
 
@@ -46,16 +58,7 @@ struct Globals
 ConstantBuffer<PushConstants> pc : register(b0, space0);
 
 [[vk::binding(0, 1)]]
-ConstantBuffer<Globals> g : register(b1, space0);
-
-[[vk::binding(0, 0)]]
-Texture2D g_textures[] : register(t0, space0);
-
-[[vk::binding(1, 0)]]
-SamplerState g_sampler : register(s0, space0);
-
-[[vk::binding(2, 0)]]
-TextureCube g_cubes[] : register(t0, space1);
+ConstantBuffer<Globals> globals : register(b1, space0);
 
 [shader("vertex")]
 VSOutput vsMain(uint id: SV_VertexID)
@@ -108,20 +111,20 @@ float3 fresnel_schlick_roughness(float cos_theta, float3 f0, float roughness)
 float3 ambient_ibl(float3 n, float3 v, float3 albedo, float metallic,
                    float roughness, float ao, float3 f0)
 {
-    if (g.ibl.y < 0)
-        return g.ambient.rgb * albedo * ao;
+    if (globals.ibl.y < 0)
+        return globals.ambient.rgb * albedo * ao;
 
     float n_dot_v = max(dot(n, v), 1e-4);
     float3 r = reflect(-v, n);
     float3 f = fresnel_schlick_roughness(n_dot_v, f0, roughness);
     float3 kd = (1.0 - f) * (1.0 - metallic);
 
-    float3 irradiance = g_cubes[g.ibl.y].SampleLevel(g_sampler, n, 0.0).rgb;
+    float3 irradiance = g.cubes[globals.ibl.y].SampleLevel(g.samp, n, 0.0).rgb;
     float3 diffuse = irradiance * albedo;
 
-    float max_lod = float(g.counts.z);
-    float3 prefiltered = g_cubes[g.ibl.z].SampleLevel(g_sampler, r, roughness * max_lod).rgb;
-    float2 brdf = g_textures[g.ibl.w].SampleLevel(g_sampler, float2(n_dot_v, roughness), 0.0).rg;
+    float max_lod = float(globals.counts.z);
+    float3 prefiltered = g.cubes[globals.ibl.z].SampleLevel(g.samp, r, roughness * max_lod).rgb;
+    float2 brdf = g.textures[globals.ibl.w].SampleLevel(g.samp, float2(n_dot_v, roughness), 0.0).rg;
     float3 specular = prefiltered * (f * brdf.x + brdf.y);
 
     return (kd * diffuse + specular) * ao;
@@ -132,10 +135,10 @@ float3 ambient_ibl(float3 n, float3 v, float3 albedo, float metallic,
 // are disabled or the point falls outside the light frustum.
 float sun_shadow(float3 world_pos)
 {
-    if (g.counts.w == 0)
+    if (globals.counts.w == 0)
         return 1.0;
 
-    float4 lc = mul(g.light_view_proj, float4(world_pos, 1.0));
+    float4 lc = mul(globals.light_view_proj, float4(world_pos, 1.0));
     float3 proj = lc.xyz / lc.w; // ortho: w = 1
     float2 uv;
     uv.x = proj.x * 0.5 + 0.5;
@@ -147,8 +150,8 @@ float sun_shadow(float3 world_pos)
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || proj.z > 1.0)
         return 1.0;
 
-    float bias = g.shadow.x;
-    float texel = g.shadow.y;
+    float bias = globals.shadow.x;
+    float texel = globals.shadow.y;
     float current = proj.z - bias;
 
     float sum = 0.0;
@@ -157,7 +160,7 @@ float sun_shadow(float3 world_pos)
         for (int y = -1; y <= 1; ++y)
         {
             float2 o = float2(x, y) * texel;
-            float closest = g_textures[pc.shadow_index].Sample(g_sampler, uv + o).r;
+            float closest = g.textures[pc.shadow_index].Sample(g.samp, uv + o).r;
             sum += current <= closest ? 1.0 : 0.0;
         }
     }
@@ -185,29 +188,29 @@ float3 shade(float3 n, float3 v, float3 l, float3 radiance, float3 albedo,
 [shader("fragment")]
 float4 fsMain(VSOutput input) : SV_Target
 {
-    float4 albedo_ao = g_textures[pc.albedo_index].Sample(g_sampler, input.uv);
-    float3 normal = g_textures[pc.normal_index].Sample(g_sampler, input.uv).xyz;
-    float4 mat = g_textures[pc.material_index].Sample(g_sampler, input.uv);
-    float4 pos = g_textures[pc.position_index].Sample(g_sampler, input.uv);
+    float4 albedo_ao = g.textures[pc.albedo_index].Sample(g.samp, input.uv);
+    float3 normal = g.textures[pc.normal_index].Sample(g.samp, input.uv).xyz;
+    float4 mat = g.textures[pc.material_index].Sample(g.samp, input.uv);
+    float4 pos = g.textures[pc.position_index].Sample(g.samp, input.uv);
 
     // Background (no geometry written): position.w stays 0. Sample the environment
     // cubemap along the view ray (skybox), or fall back to flat ambient.
     if (pos.w < 0.5)
     {
-        if (g.ibl.x >= 0)
+        if (globals.ibl.x >= 0)
         {
             float sy = pc.flip_y != 0 ? 1.0 : -1.0;
             float2 ndc = float2(input.uv.x * 2.0 - 1.0, (input.uv.y * 2.0 - 1.0) * sy);
-            float4 far = mul(g.inv_view_proj, float4(ndc, 1.0, 1.0));
+            float4 far = mul(globals.inv_view_proj, float4(ndc, 1.0, 1.0));
             float3 world = far.xyz / far.w;
-            float3 dir = normalize(world - g.camera_pos.xyz);
+            float3 dir = normalize(world - globals.camera_pos.xyz);
             // Mip 1+ holds sky only (scene geometry is captured into mip 0), so the
             // skybox stays clean sky; the gradient is low-frequency so half-res is
             // imperceptible.
-            float3 sky = g_cubes[g.ibl.x].SampleLevel(g_sampler, dir, 1.0).rgb;
-            return float4(sky * g.ambient.a, 1.0); // a = exposure
+            float3 sky = g.cubes[globals.ibl.x].SampleLevel(g.samp, dir, 1.0).rgb;
+            return float4(sky * globals.ambient.a, 1.0); // a = exposure
         }
-        return float4(g.ambient.rgb, 1.0);
+        return float4(globals.ambient.rgb, 1.0);
     }
 
     float3 albedo = albedo_ao.rgb;
@@ -216,45 +219,45 @@ float4 fsMain(VSOutput input) : SV_Target
     float ao = mat.b;
     float3 world_pos = pos.xyz;
     float3 n = normalize(normal);
-    float3 v = normalize(g.camera_pos.xyz - world_pos);
+    float3 v = normalize(globals.camera_pos.xyz - world_pos);
     float3 f0 = lerp(float3(0.04), albedo, metallic);
 
     float3 lo = float3(0.0);
 
     // Directional sun (attenuated by the shadow map).
     {
-        float3 l = normalize(g.sun_direction.xyz);
-        float3 radiance = g.sun_color.rgb * g.sun_color.a;
+        float3 l = normalize(globals.sun_direction.xyz);
+        float3 radiance = globals.sun_color.rgb * globals.sun_color.a;
         lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0)
             * sun_shadow(world_pos);
     }
 
     // Point lights.
-    int count = min(g.counts.x, 4);
+    int count = min(globals.counts.x, 4);
     for (int i = 0; i < count; ++i)
     {
-        float3 to_light = g.point_pos[i].xyz - world_pos;
+        float3 to_light = globals.point_pos[i].xyz - world_pos;
         float dist = length(to_light);
         float3 l = to_light / max(dist, 1e-4);
         float atten = 1.0 / max(dist * dist, 1e-4);
-        float3 radiance = g.point_color[i].rgb * g.point_color[i].a * atten;
+        float3 radiance = globals.point_color[i].rgb * globals.point_color[i].a * atten;
         lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
     }
 
     float3 ambient = ambient_ibl(n, v, albedo, metallic, roughness, ao, f0);
-    float3 color = (ambient + lo) * g.ambient.a; // a = exposure
+    float3 color = (ambient + lo) * globals.ambient.a; // a = exposure
 
     // Debug views (counts.y): 1 albedo, 2 normal, 3 metallic, 4 roughness,
     // 5 world pos, 6 AO, 7 direct light, 8 IBL ambient. 0 = lit.
-    int dbg = g.counts.y;
+    int dbg = globals.counts.y;
     if (dbg == 1) color = albedo;
     else if (dbg == 2) color = n * 0.5 + 0.5;
     else if (dbg == 3) color = float3(metallic);
     else if (dbg == 4) color = float3(roughness);
     else if (dbg == 5) color = frac(world_pos);
     else if (dbg == 6) color = float3(ao);
-    else if (dbg == 7) color = lo * g.ambient.a;      // direct lighting only
-    else if (dbg == 8) color = ambient * g.ambient.a; // IBL ambient only
+    else if (dbg == 7) color = lo * globals.ambient.a;      // direct lighting only
+    else if (dbg == 8) color = ambient * globals.ambient.a; // IBL ambient only
 
     return float4(color, 1.0);
 }

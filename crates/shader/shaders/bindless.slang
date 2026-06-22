@@ -27,15 +27,28 @@
 // on D3D12 the sampler moves from a static sampler into the bindless table — a
 // root-signature tweak to validate on the Windows box.
 //
-// M3 declares only `textures` + `samp` (all the textured mesh + ImGui path needs).
-// Cube and storage arrays join this struct when the cube/compute shaders migrate
-// to the ParameterBlock in M4 / M5.
+// M3 declared only `textures` + `samp`. M4 folds in the `cubes[]` array (used by
+// `pbr` and the IBL gen shaders), which previously lived as a separate loose
+// `g_cubes[]` at `space1`. Storage arrays join in M5 when the compute shaders
+// migrate.
+//
+// Adding `cubes` is layout-safe for the M3 shaders: Slang drops the unused cube
+// binding from `mesh`/`imgui`/`gbuffer` (their SPIR-V stays set 0 / bindings 0,1),
+// so `rhi-vulkan` is untouched. In a globals-using shader (`pbr`) the block still
+// pins to **set 0** via `[[vk::binding(0,0)]]` even with a loose globals UBO at
+// set 1 — matching the previous loose-global layout exactly (Vulkan unchanged).
+// On Metal the loose globals takes `[[buffer(1)]]`, pushing this argument buffer
+// to `[[buffer(2)]]` for globals shaders (non-globals shaders keep it at
+// `[[buffer(1)]]`); verified via `slangc` reflection on this macOS box.
 
-// Must match BINDLESS_COUNT in rhi-vulkan / rhi-d3d12 (`device.rs`).
+// Counts must match BINDLESS_COUNT / CUBE_COUNT in rhi-vulkan / rhi-d3d12
+// (`device.rs`). Cubes share the descriptor set but have their own 0-based index
+// space (binding 2), separate from `textures[]` (binding 0).
 struct Bindless
 {
     Texture2D    textures[1024];
     SamplerState samp;
+    TextureCube  cubes[64];
 };
 
 [[vk::binding(0, 0)]]
