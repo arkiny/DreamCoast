@@ -98,7 +98,10 @@ smoke test:
   metallib accessors were wired. Verified by `--mesh-test --screenshot` (textured
   Avocado + ImGui overlay) under the Metal API + GPU validation layers. **Details +
   the cross-backend decision are below.**
-- **M4 — render targets + PBR**, **M5 — compute/async/indirect:** pending.
+- **M4 — render targets + PBR:** *in progress.* Goal: the full deferred-PBR
+  render graph runs on Metal (`--backend metal --screenshot` of the real scene, no
+  `--*-test` flag). See "M4 plan + progress" below. **M5 — compute/async/indirect:**
+  pending.
 
 ## Resume notes for M4+ (implementation pointers)
 
@@ -198,3 +201,65 @@ globals-using shaders (their block is at set 2 / `[[buffer(2)]]`).
 - Metal validates `setBytes` length against the shader argument's *alignment-padded*
   size (ImGui's `{float2, float2, uint}` is 20 bytes of data but Metal wants 24).
   `command.rs::push_constants` rounds the upload up to 16 to always cover the pad.
+
+## M4 plan + progress
+
+**Goal / done-when:** the full deferred-PBR render graph runs end-to-end on Metal
+— `cargo run -p sandbox -- --backend metal --screenshot scene.png` produces the same
+shadowed + IBL-lit result as Vulkan, clean under `MTL_DEBUG_LAYER=1
+MTL_SHADER_VALIDATION=1`. Compute/culling/particles/indirect/storage buffers stay M5.
+
+**Ordered steps** (each verified by a cross-backend `--*-test` flag, mirroring M0–M3):
+
+1. **Shader migration to `ParameterBlock` (the cross-backend risk — do first,
+   independently).** The M4 shaders are still loose-global so `metallib` fails →
+   `None` accessors. Migrate `gbuffer`, `pbr`, `capture`, `irradiance`, `prefilter`,
+   `brdf`, `sky`, `shadow`, `post`, `blur`. Sub-points:
+   - Add `TextureCube cubes[N]` to the `Bindless` struct in `bindless.slang` (pbr
+     samples `g_cubes[]` at a separate `space1` today — fold it into the block).
+   - **Globals-using shaders bump the block to set 2** (`[[buffer(2)]]` on Metal):
+     a loose globals `ConstantBuffer` at set 1 pushes the `ParameterBlock` past it.
+     `pbr.slang` has globals; the IBL gen shaders mostly drive cube faces via push
+     constants — check each.
+   - After every shader: `slangc -target spirv-asm` and confirm the **descriptor
+     set/binding layout is unchanged** (Vulkan safe). It will NOT be byte-identical:
+     the array goes unbounded→`[1024]` and `RuntimeDescriptorArray` /
+     `SPV_EXT_descriptor_indexing` drop out — *exactly the M3 mesh/imgui change*, so
+     same risk profile (Vulkan/D3D12 parity pending the Windows RTX 2070 SUPER box).
+2. **Globals UBO path.** `MetalDevice::set_globals_buffer` (store the buffer in
+   `DeviceShared`), `MetalCommandBuffer::set_globals(offset)` (stash offset in a
+   `Cell`, bind globals buffer in `bind_graphics_pipeline` at a new
+   `GLOBALS_BUFFER_INDEX`). Add a `uses_globals` flag to `MetalGraphicsPipeline`.
+   Update the buffer-index map in `resources.rs` (push 0, globals 1, bindless block 2
+   for globals shaders, vertex 30).
+3. **Offscreen render targets + MRT.** `MetalRenderTarget` =
+   `MTLTexture{RenderTarget|ShaderRead, Private}` + bindless slot; `create_render_target`;
+   `begin_rendering_target` / `begin_rendering_targets` (G-buffer = 4 color
+   attachments). Barriers (`rt_to_sampled` etc.) likely stay no-ops — Metal's
+   encoder-boundary hazard tracking handles read-after-write; confirm with validation.
+4. **Shadow pass.** `begin_rendering_depth_only` (depth attachment only, store
+   action `Store` — M3 used `DontCare`), then sample the depth in `pbr` (register the
+   M3-reserved depth slot for residency in `depth_to_sampled`).
+5. **Cubemaps + IBL.** `MetalCubemap` = `MTLTextureType::Cube`, 6 layers, mipped.
+   Metal is simpler than the Vulkan per-(face,mip) views: render via the color
+   attachment's `setSlice(face)` + `setLevel(mip)` directly. Wire
+   `begin_rendering_cube_face[_depth]`, `mip_levels`, `mip_size`.
+6. **Transient heap / aliasing + post.** Use `MTLHeapType::Placement` so Vulkan's
+   offset model maps 1:1: `heapTextureSizeAndAlign` → `render_target_memory`,
+   `heap.newTexture(descriptor, offset:)` → `create_aliased_target`. Then post
+   (tonemap/bloom) and the full deferred scene runs.
+
+Suggested verification flags: `--gbuffer-test`, `--shadow-test`, `--ibl-test`, then
+the flagless real renderer. All cross-backend (`--backend vulkan|d3d12|metal`).
+
+### M4 progress log
+
+- **Step 1 — `gbuffer.slang` migrated (done, verified on this macOS box).** Replaced
+  the loose `g_textures[]` / `g_sampler` with `#include "bindless.slang"` + `g.textures[]`
+  / `g.samp` (no globals → block stays at **set 0**, like mesh/imgui). Verified:
+  `gbuffer_{vs,fs}_metallib()` now return `Some` (were `None`); `dreamcoast-shader`
+  builds clean. SPIR-V: **VS byte-identical**, **FS descriptor layout identical**
+  (set 0, binding 0 = textures, binding 1 = sampler) with the bounded-array /
+  dropped-`SPV_EXT_descriptor_indexing` change noted above. **Vulkan/D3D12 parity
+  pending the Windows box** (same as M3). Next: migrate the remaining step-1 shaders
+  (`pbr` is the first globals→set-2 case; add `cubes[]` to `Bindless` for it).
