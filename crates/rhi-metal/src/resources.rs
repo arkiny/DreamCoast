@@ -1,25 +1,61 @@
 //! GPU resource types for the Metal backend.
 //!
-//! These are placeholders for M0 (the empty-window / clear milestone): the types
-//! exist so the `rhi` facade's `Metal` variant type-checks, but their contents
-//! and behavior are filled in by later milestones (buffers/pipelines in M2,
-//! textures/depth in M3, render targets/cubemaps/heaps in M4, storage buffers in
-//! M5). Methods that the facade forwards are stubbed with `unimplemented!`.
+//! M2 fills in buffers ([`MetalBuffer`]) and graphics pipelines
+//! ([`MetalGraphicsPipeline`]); the remaining types are placeholders whose
+//! contents and behavior arrive in later milestones (textures/depth in M3, render
+//! targets/cubemaps/heaps in M4, storage buffers in M5). Methods that the facade
+//! forwards but that aren't implemented yet are stubbed with `unimplemented!`.
 
-/// A host-visible buffer (vertex / index / uniform / readback). (M2)
-pub struct MetalBuffer;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLBuffer, MTLRenderPipelineState};
+
+/// Metal buffer-argument index that Slang assigns to the push-constant block
+/// (`[[buffer(0)]]`) when no globals/bindless arguments precede it. The globals
+/// (M4) and bindless (M3) paths shift this and will revisit the convention.
+pub(crate) const PUSH_CONSTANT_INDEX: usize = 0;
+
+/// Buffer index the vertex descriptor binds the (single) vertex buffer at. Placed
+/// at the top of Metal's 0..=30 buffer range so it never collides with the
+/// low-index argument buffers (push constants, globals).
+pub(crate) const VERTEX_BUFFER_INDEX: usize = 30;
+
+/// A host-visible buffer (vertex / index / uniform / readback). Backed by a
+/// shared-storage `MTLBuffer` so the CPU can write it directly each frame. (M2)
+pub struct MetalBuffer {
+    pub(crate) buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    size: u64,
+}
 
 impl MetalBuffer {
-    pub fn write(&self, _data: &[u8]) -> crate::Result<()> {
-        unimplemented!("Metal buffers: milestone M2")
+    pub(crate) fn new(buffer: Retained<ProtocolObject<dyn MTLBuffer>>, size: u64) -> Self {
+        Self { buffer, size }
     }
 
-    pub fn write_at(&self, _offset: u64, _data: &[u8]) -> crate::Result<()> {
-        unimplemented!("Metal buffers: milestone M2")
+    pub fn write(&self, data: &[u8]) -> crate::Result<()> {
+        self.write_at(0, data)
     }
 
-    pub fn read_into(&self, _dst: &mut [u8]) -> crate::Result<()> {
-        unimplemented!("Metal readback: milestone M6")
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> crate::Result<()> {
+        if offset + data.len() as u64 > self.size {
+            return Err(crate::rhi_err("buffer write_at out of bounds"));
+        }
+        // Shared storage: `contents()` is a CPU-visible pointer to the buffer's
+        // memory; copy into it (no flush needed for shared mode).
+        let dst = self.buffer.contents().as_ptr() as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(offset as usize), data.len());
+        }
+        Ok(())
+    }
+
+    /// Copy out of the buffer into `dst` (clamped to its size). Shared storage, so
+    /// the CPU sees GPU writes once the command buffer that wrote it has completed.
+    pub fn read_into(&self, dst: &mut [u8]) -> crate::Result<()> {
+        let n = dst.len().min(self.size as usize);
+        let src = self.buffer.contents().as_ptr() as *const u8;
+        unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), n) };
+        Ok(())
     }
 }
 
@@ -83,8 +119,10 @@ impl MetalCubemap {
 /// A heap that transient render targets alias into. (M4)
 pub struct MetalTransientHeap;
 
-/// A graphics pipeline (`MTLRenderPipelineState`). (M2)
-pub struct MetalGraphicsPipeline;
+/// A compiled graphics pipeline (`MTLRenderPipelineState`). (M2)
+pub struct MetalGraphicsPipeline {
+    pub(crate) state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+}
 
 /// A compute pipeline (`MTLComputePipelineState`). (M5)
 pub struct MetalComputePipeline;
