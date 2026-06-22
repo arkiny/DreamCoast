@@ -172,6 +172,10 @@ fn main() -> anyhow::Result<()> {
         device.has_async_compute(),
         device.has_raytracing()
     );
+    // Phase-7 compute (post blur / GPU particles / GPU culling) is M5 on Metal; the
+    // M4 deferred-PBR scene runs without it. Gate compute dispatch + seeding off so
+    // the Metal backend never hits an `unimplemented!` compute path.
+    let compute_supported = !matches!(backend, BackendKind::Metal);
 
     let mut swapchain = device.create_swapchain(&swapchain_desc(Extent2D::new(w, h)))?;
 
@@ -209,6 +213,8 @@ fn main() -> anyhow::Result<()> {
         dreamcoast_shader::gbuffer_fs_spirv,
         dreamcoast_shader::gbuffer_vs_dxil,
         dreamcoast_shader::gbuffer_fs_dxil,
+        dreamcoast_shader::gbuffer_vs_metallib,
+        dreamcoast_shader::gbuffer_fs_metallib,
         "gbuffer",
     )?;
     let gbuffer_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
@@ -239,6 +245,8 @@ fn main() -> anyhow::Result<()> {
         dreamcoast_shader::shadow_fs_spirv,
         dreamcoast_shader::shadow_vs_dxil,
         dreamcoast_shader::shadow_fs_dxil,
+        dreamcoast_shader::shadow_vs_metallib,
+        dreamcoast_shader::shadow_fs_metallib,
         "shadow",
     )?;
     let shadow_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
@@ -264,6 +272,8 @@ fn main() -> anyhow::Result<()> {
         dreamcoast_shader::pbr_fs_spirv,
         dreamcoast_shader::pbr_vs_dxil,
         dreamcoast_shader::pbr_fs_dxil,
+        dreamcoast_shader::pbr_vs_metallib,
+        dreamcoast_shader::pbr_fs_metallib,
         "pbr",
     )?;
     let pbr_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
@@ -289,6 +299,8 @@ fn main() -> anyhow::Result<()> {
         dreamcoast_shader::post_fs_spirv,
         dreamcoast_shader::post_vs_dxil,
         dreamcoast_shader::post_fs_dxil,
+        dreamcoast_shader::post_vs_metallib,
+        dreamcoast_shader::post_fs_metallib,
         "post",
     )?;
     let post_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
@@ -336,29 +348,38 @@ fn main() -> anyhow::Result<()> {
         push_constant_size: 24, // read_index + write_index + count + dt + time + init
         bindless: true,
     })?;
-    let (pd_vs, pd_fs) = load_shader_pair(
-        backend,
-        dreamcoast_shader::particle_draw_vs_spirv,
-        dreamcoast_shader::particle_draw_fs_spirv,
-        dreamcoast_shader::particle_draw_vs_dxil,
-        dreamcoast_shader::particle_draw_fs_dxil,
-        "particle_draw",
-    )?;
-    let particle_draw_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: pd_vs,
-        fragment_bytes: pd_fs,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_formats: &[swapchain.format()],
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::None, // vertex-pull from the storage buffer
-        blend: BlendMode::AlphaBlend,
-        push_constant_size: 112, // view_proj + cam_right + cam_up + buffer/count/size/pad
-        bindless: true,
-        uniform_buffer: false,
-        depth_test: false,
-        depth_format: None,
-    })?;
+    // The particle-draw pipeline pulls vertices from the compute-written buffer, so
+    // it only exists where compute does (M5 on Metal — `particle_draw` has no
+    // metallib yet). `None` on Metal; the feature flag stays off there.
+    let particle_draw_pipeline = if compute_supported {
+        let (pd_vs, pd_fs) = load_shader_pair(
+            backend,
+            dreamcoast_shader::particle_draw_vs_spirv,
+            dreamcoast_shader::particle_draw_fs_spirv,
+            dreamcoast_shader::particle_draw_vs_dxil,
+            dreamcoast_shader::particle_draw_fs_dxil,
+            dreamcoast_shader::particle_draw_vs_metallib,
+            dreamcoast_shader::particle_draw_fs_metallib,
+            "particle_draw",
+        )?;
+        Some(device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            vertex_bytes: pd_vs,
+            fragment_bytes: pd_fs,
+            vertex_entry: "vsMain",
+            fragment_entry: "fsMain",
+            color_formats: &[swapchain.format()],
+            topology: PrimitiveTopology::TriangleList,
+            vertex_layout: VertexLayout::None, // vertex-pull from the storage buffer
+            blend: BlendMode::AlphaBlend,
+            push_constant_size: 112, // view_proj + cam_right + cam_up + buffer/count/size/pad
+            bindless: true,
+            uniform_buffer: false,
+            depth_test: false,
+            depth_format: None,
+        })?)
+    } else {
+        None
+    };
     // Two ping-pong particle buffers: the sim reads one and writes the other so a
     // frame's compute never clobbers the buffer a still-in-flight previous frame's
     // draw is reading (the WAR hazard async compute would otherwise expose).
@@ -375,8 +396,9 @@ fn main() -> anyhow::Result<()> {
         })?,
     ];
     // Seed both buffers once (init dispatch into each) so the first frame's read
-    // source is valid whichever parity it starts on.
-    {
+    // source is valid whichever parity it starts on. Skipped on Metal (compute is
+    // M5; the particle feature stays off there).
+    if compute_supported {
         let init_cmd = device.create_command_buffer()?;
         init_cmd.begin()?;
         init_cmd.bind_compute_pipeline(&particle_sim_pipeline);
@@ -438,29 +460,37 @@ fn main() -> anyhow::Result<()> {
         push_constant_size: 128,
         bindless: true,
     })?;
-    let (cd_vs, cd_fs) = load_shader_pair(
-        backend,
-        dreamcoast_shader::cull_draw_vs_spirv,
-        dreamcoast_shader::cull_draw_fs_spirv,
-        dreamcoast_shader::cull_draw_vs_dxil,
-        dreamcoast_shader::cull_draw_fs_dxil,
-        "cull_draw",
-    )?;
-    let cull_draw_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: cd_vs,
-        fragment_bytes: cd_fs,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_formats: &[swapchain.format()],
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::MeshPosNormal,
-        blend: BlendMode::Opaque,
-        push_constant_size: 112, // view_proj + sun_dir + grid params
-        bindless: true,
-        uniform_buffer: false,
-        depth_test: true,
-        depth_format: Some(DEPTH_FORMAT),
-    })?;
+    // The cull-draw pipeline draws the GPU-culled instance list indirectly, so it
+    // is compute-only (M5 on Metal). `None` on Metal; the feature flag stays off.
+    let cull_draw_pipeline = if compute_supported {
+        let (cd_vs, cd_fs) = load_shader_pair(
+            backend,
+            dreamcoast_shader::cull_draw_vs_spirv,
+            dreamcoast_shader::cull_draw_fs_spirv,
+            dreamcoast_shader::cull_draw_vs_dxil,
+            dreamcoast_shader::cull_draw_fs_dxil,
+            dreamcoast_shader::cull_draw_vs_metallib,
+            dreamcoast_shader::cull_draw_fs_metallib,
+            "cull_draw",
+        )?;
+        Some(device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            vertex_bytes: cd_vs,
+            fragment_bytes: cd_fs,
+            vertex_entry: "vsMain",
+            fragment_entry: "fsMain",
+            color_formats: &[swapchain.format()],
+            topology: PrimitiveTopology::TriangleList,
+            vertex_layout: VertexLayout::MeshPosNormal,
+            blend: BlendMode::Opaque,
+            push_constant_size: 112, // view_proj + sun_dir + grid params
+            bindless: true,
+            uniform_buffer: false,
+            depth_test: true,
+            depth_format: Some(DEPTH_FORMAT),
+        })?)
+    } else {
+        None
+    };
 
     // Sky pipeline: renders the procedural sky into each environment cube face.
     let (sky_vs, sky_fs) = load_shader_pair(
@@ -469,6 +499,8 @@ fn main() -> anyhow::Result<()> {
         dreamcoast_shader::sky_fs_spirv,
         dreamcoast_shader::sky_vs_dxil,
         dreamcoast_shader::sky_fs_dxil,
+        dreamcoast_shader::sky_vs_metallib,
+        dreamcoast_shader::sky_fs_metallib,
         "sky",
     )?;
     let sky_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
@@ -495,6 +527,8 @@ fn main() -> anyhow::Result<()> {
         dreamcoast_shader::capture_fs_spirv,
         dreamcoast_shader::capture_vs_dxil,
         dreamcoast_shader::capture_fs_dxil,
+        dreamcoast_shader::capture_vs_metallib,
+        dreamcoast_shader::capture_fs_metallib,
         "capture",
     )?;
     let capture_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
@@ -520,6 +554,8 @@ fn main() -> anyhow::Result<()> {
         dreamcoast_shader::irradiance_fs_spirv,
         dreamcoast_shader::irradiance_vs_dxil,
         dreamcoast_shader::irradiance_fs_dxil,
+        dreamcoast_shader::irradiance_vs_metallib,
+        dreamcoast_shader::irradiance_fs_metallib,
         "irradiance",
     )?;
     let irradiance_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
@@ -545,6 +581,8 @@ fn main() -> anyhow::Result<()> {
         dreamcoast_shader::prefilter_fs_spirv,
         dreamcoast_shader::prefilter_vs_dxil,
         dreamcoast_shader::prefilter_fs_dxil,
+        dreamcoast_shader::prefilter_vs_metallib,
+        dreamcoast_shader::prefilter_fs_metallib,
         "prefilter",
     )?;
     let prefilter_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
@@ -570,6 +608,8 @@ fn main() -> anyhow::Result<()> {
         dreamcoast_shader::brdf_fs_spirv,
         dreamcoast_shader::brdf_vs_dxil,
         dreamcoast_shader::brdf_fs_dxil,
+        dreamcoast_shader::brdf_vs_metallib,
+        dreamcoast_shader::brdf_fs_metallib,
         "brdf",
     )?;
     let brdf_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
@@ -717,9 +757,9 @@ fn main() -> anyhow::Result<()> {
     // Phase 7: route the HDR result through a compute post-process (3x3 blur into
     // a storage image) before tonemapping. Initial state seedable via env var so
     // headless screenshots can exercise each demo (`P7_COMPUTE_POST=1`, etc.).
-    let mut compute_post = std::env::var_os("P7_COMPUTE_POST").is_some();
+    let mut compute_post = compute_supported && std::env::var_os("P7_COMPUTE_POST").is_some();
     // Phase 7: GPU particle simulation (compute-updated buffer, instanced draw).
-    let mut particles_on = std::env::var_os("P7_PARTICLES").is_some();
+    let mut particles_on = compute_supported && std::env::var_os("P7_PARTICLES").is_some();
     // Run the particle sim on the async-compute queue (overlapping graphics) when a
     // dedicated compute queue exists. Off / unsupported -> the sim runs as a graph
     // compute pass on the graphics queue (single-queue path), with identical output.
@@ -727,7 +767,7 @@ fn main() -> anyhow::Result<()> {
     let mut async_compute_on = async_compute_supported
         && (std::env::var_os("ASYNC_COMPUTE").is_some() || !screenshot_mode);
     // Phase 7: GPU frustum culling -> indirect draw of a cube instance grid.
-    let mut gpu_cull = std::env::var_os("P7_CULL").is_some();
+    let mut gpu_cull = compute_supported && std::env::var_os("P7_CULL").is_some();
     // Real-time environment capture: re-capture the env chain every frame (so the
     // sky/IBL track the live sun); when off, re-capture only when the sun changes.
     let mut realtime_env = true;
@@ -1394,7 +1434,7 @@ fn main() -> anyhow::Result<()> {
         // grid over the tonemapped image, with its own depth buffer.
         if let Some((args_ext, visible_ext)) = cull_res {
             let cull_depth = graph.create_depth("cull_depth", extent);
-            let draw = &cull_draw_pipeline;
+            let draw = cull_draw_pipeline.as_ref().expect("cull requires compute support");
             let args = &cull_args;
             let visible = &cull_visible;
             let vbuf = &cube_vbuf;
@@ -1431,7 +1471,9 @@ fn main() -> anyhow::Result<()> {
         // image (alpha blend), reading the compute-updated buffer in the vertex
         // stage. Declared after tonemap so the WAW on the backbuffer orders it last.
         if let Some(particles_ext) = particles_ext {
-            let draw = &particle_draw_pipeline;
+            let draw = particle_draw_pipeline
+                .as_ref()
+                .expect("particles require compute support");
             let buf = &particle_buffers[particle_write];
             let vp = view_proj.to_cols_array();
             graph.add_pass(
@@ -2205,20 +2247,21 @@ fn make_checker_texture(device: &Device) -> anyhow::Result<Texture> {
 
 /// Fetch the (vertex, fragment) bytecode for `backend` from a shader's four
 /// generated accessors, erroring if unavailable.
+#[allow(clippy::too_many_arguments)]
 fn load_shader_pair(
     backend: BackendKind,
     vs_spirv: fn() -> Option<&'static [u8]>,
     fs_spirv: fn() -> Option<&'static [u8]>,
     vs_dxil: fn() -> Option<&'static [u8]>,
     fs_dxil: fn() -> Option<&'static [u8]>,
+    vs_metallib: fn() -> Option<&'static [u8]>,
+    fs_metallib: fn() -> Option<&'static [u8]>,
     name: &str,
 ) -> anyhow::Result<(&'static [u8], &'static [u8])> {
     let (vs, fs) = match backend {
         BackendKind::Vulkan => (vs_spirv(), fs_spirv()),
         BackendKind::D3d12 => (vs_dxil(), fs_dxil()),
-        // Metal metallib accessors are wired in milestone M1/M2; until then the
-        // Metal path runs `--clear-test` (no pipelines).
-        BackendKind::Metal => (None, None),
+        BackendKind::Metal => (vs_metallib(), fs_metallib()),
     };
     let vs = vs.ok_or_else(|| anyhow!("{name} vertex shader unavailable for {backend:?}"))?;
     let fs = fs.ok_or_else(|| anyhow!("{name} fragment shader unavailable for {backend:?}"))?;
@@ -2235,8 +2278,10 @@ fn load_compute_shader(
     let cs = match backend {
         BackendKind::Vulkan => cs_spirv(),
         BackendKind::D3d12 => cs_dxil(),
-        // See `load_shader_pair`: Metal metallib accessors arrive in M1/M5.
-        BackendKind::Metal => None,
+        // Compute is M5 on Metal: the compute metallibs are still `None` and the
+        // pipeline is an inert placeholder (never dispatched — gated by
+        // `compute_supported`). Hand it empty bytes so setup links.
+        BackendKind::Metal => Some(&[][..]),
     };
     cs.ok_or_else(|| anyhow!("{name} compute shader unavailable for {backend:?}"))
 }

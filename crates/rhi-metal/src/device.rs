@@ -10,9 +10,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceID, MTLResourceOptions, MTLSamplerAddressMode,
-    MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState, MTLSize,
-    MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLOrigin, MTLPixelFormat,
+    MTLRegion, MTLResourceID, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerDescriptor,
+    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState, MTLSize, MTLStorageMode,
+    MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 use objc2_quartz_core::CAMetalLayer;
 use rhi_types::{
@@ -35,6 +36,12 @@ use crate::{Result, bytes_per_pixel, pixel_format, rhi_err};
 /// `bindless.slang`; the shared sampler occupies the slot just past it.
 pub(crate) const BINDLESS_COUNT: u32 = 1024;
 
+/// Size of the bindless cubemap table. Matches `CUBE_COUNT` in rhi-vulkan /
+/// rhi-d3d12 and the `Bindless.cubes[64]` array in `bindless.slang`. The cubes
+/// follow the sampler in the argument buffer, so cube `i` lives at handle slot
+/// `BINDLESS_COUNT + 1 + i` (Slang lays the struct out textures, samp, cubes).
+pub(crate) const CUBE_COUNT: u32 = 64;
+
 /// Device state shared (via `Rc`) by every resource created from a device, so the
 /// `MTLDevice` / command queue / layer outlive the resources that reference them.
 pub(crate) struct DeviceShared {
@@ -51,9 +58,18 @@ pub(crate) struct DeviceShared {
     /// Next free bindless texture slot. `Cell`: the Metal backend is single-threaded
     /// (`Rc`, not `Arc`), so no atomics are needed.
     tex_next: Cell<u32>,
-    /// Sampled textures that must be made resident (`useResource`) while the bindless
-    /// table is bound. Depth attachments are registered for their slot but kept out
-    /// of this list (they are render targets, not sampled, in M3).
+    /// Next free bindless cube slot (0-based; the handle lands at argument-buffer
+    /// slot `BINDLESS_COUNT + 1 + index`).
+    cube_next: Cell<u32>,
+    /// The per-frame globals UBO (camera/lights/shadow/IBL), set once via
+    /// [`MetalDevice::set_globals_buffer`]; bound at [`GLOBALS_BUFFER_INDEX`] with a
+    /// per-draw byte offset for `uses_globals` pipelines.
+    globals: RefCell<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    /// Textures that must be made resident (`useResource`) while the bindless table
+    /// is bound. Static sampled textures (`create_texture`) stay here for the app's
+    /// lifetime; render targets / cubemaps / shadow maps are toggled in and out by
+    /// the render graph's `*_to_sampled` / `*_to_render_target` transition hooks, so
+    /// a resource is never made resident while it is an attachment in the same pass.
     resident: RefCell<Vec<Retained<ProtocolObject<dyn MTLTexture>>>>,
 }
 
@@ -79,6 +95,45 @@ impl DeviceShared {
             self.resident.borrow_mut().push(texture);
         }
         index
+    }
+
+    /// Register a cubemap in the bindless cube table, returning its 0-based cube
+    /// index. The handle lands at argument-buffer slot `BINDLESS_COUNT + 1 + index`
+    /// (textures, then the sampler, then the cubes — see `bindless.slang`). Not made
+    /// resident here; the `cube_to_sampled` hook does that before it is sampled.
+    fn register_cube(&self, texture: Retained<ProtocolObject<dyn MTLTexture>>) -> u32 {
+        let index = self.cube_next.get();
+        self.cube_next.set(index + 1);
+        // The owning MetalCubemap keeps the texture alive; the argument buffer just
+        // records its 8-byte handle.
+        self.write_handle(BINDLESS_COUNT + 1 + index, texture.gpuResourceID());
+        index
+    }
+
+    /// Add or remove `texture` from the resident set (idempotent). Called by the
+    /// render graph's transition hooks: `*_to_sampled` makes a target resident
+    /// before a sampling pass, `*_to_render_target` drops it before it is written as
+    /// an attachment (Metal forbids `useResource` on the current render target).
+    pub(crate) fn set_resident(
+        &self,
+        texture: &Retained<ProtocolObject<dyn MTLTexture>>,
+        resident: bool,
+    ) {
+        let mut list = self.resident.borrow_mut();
+        let ptr = Retained::as_ptr(texture);
+        let pos = list.iter().position(|t| Retained::as_ptr(t) == ptr);
+        match (resident, pos) {
+            (true, None) => list.push(texture.clone()),
+            (false, Some(i)) => {
+                list.swap_remove(i);
+            }
+            _ => {}
+        }
+    }
+
+    /// The per-frame globals UBO, if one has been set.
+    pub(crate) fn globals_buffer(&self) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
+        self.globals.borrow().clone()
     }
 
     /// The sampled textures to make resident before a bindless draw.
@@ -113,9 +168,11 @@ impl MetalInstance {
             .ok_or_else(|| rhi_err("newCommandQueue failed"))?;
 
         // Bindless argument buffer: BINDLESS_COUNT texture handles + one sampler
-        // handle, each an 8-byte MTLResourceID. Shared storage = CPU-writable.
+        // handle + CUBE_COUNT cube handles, each an 8-byte MTLResourceID, in that
+        // order (matches the `Bindless { textures, samp, cubes }` struct layout).
+        // Shared storage = CPU-writable.
         let handle_size = std::mem::size_of::<MTLResourceID>();
-        let arg_len = (BINDLESS_COUNT as usize + 1) * handle_size;
+        let arg_len = (BINDLESS_COUNT as usize + 1 + CUBE_COUNT as usize) * handle_size;
         let arg_buffer = self
             .device
             .newBufferWithLength_options(arg_len, MTLResourceOptions::StorageModeShared)
@@ -141,6 +198,8 @@ impl MetalInstance {
             arg_buffer,
             sampler,
             tex_next: Cell::new(0),
+            cube_next: Cell::new(0),
+            globals: RefCell::new(None),
             resident: RefCell::new(Vec::new()),
         });
         // The sampler sits at the slot just past the texture array (Slang assigns it
@@ -222,11 +281,15 @@ impl MetalDevice {
         crate::pipeline::build(&self.shared.device, desc)
     }
 
+    /// M4: returns an inert placeholder so the sandbox's *unconditional* Phase-7
+    /// setup links and the deferred (non-compute) scene runs. Actual compute
+    /// **execution** is M5 — `bind_compute_pipeline` / `dispatch` still
+    /// `unimplemented!`, and the sandbox gates every dispatch off on Metal.
     pub fn create_compute_pipeline(
         &self,
         _desc: &ComputePipelineDesc,
     ) -> Result<MetalComputePipeline> {
-        unimplemented!("Metal compute pipelines: milestone M5")
+        Ok(MetalComputePipeline)
     }
 
     pub fn create_buffer(&self, desc: &BufferDesc) -> Result<MetalBuffer> {
@@ -240,12 +303,19 @@ impl MetalDevice {
         Ok(MetalBuffer::new(buffer, desc.size))
     }
 
+    /// M4: inert placeholder (see [`Self::create_compute_pipeline`]) — the deferred
+    /// scene creates the Phase-7 storage buffers unconditionally but never reads or
+    /// writes them on Metal. Real storage buffers (UAV + bindless slot) land in M5.
     pub fn create_storage_buffer(&self, _desc: &StorageBufferDesc) -> Result<MetalStorageBuffer> {
-        unimplemented!("Metal storage buffers: milestone M5")
+        Ok(MetalStorageBuffer)
     }
 
-    pub fn set_globals_buffer(&self, _buffer: &MetalBuffer, _slice_size: u64) {
-        // Implemented with the PBR globals path in M4.
+    /// Store the per-frame globals UBO. `slice_size` is unused on Metal (the
+    /// per-draw byte offset is passed explicitly to `set_globals`); the buffer is
+    /// bound at [`crate::resources::GLOBALS_BUFFER_INDEX`] for `uses_globals`
+    /// pipelines.
+    pub fn set_globals_buffer(&self, buffer: &MetalBuffer, _slice_size: u64) {
+        *self.shared.globals.borrow_mut() = Some(buffer.buffer.clone());
     }
 
     /// Create a sampled 2D texture, upload `pixels`, and register it in the bindless
@@ -310,12 +380,64 @@ impl MetalDevice {
         Ok(MetalDepthBuffer::new(texture, index))
     }
 
-    pub fn create_render_target(&self, _desc: &RenderTargetDesc) -> Result<MetalRenderTarget> {
-        unimplemented!("Metal render targets: milestone M4")
+    /// Build the texture descriptor for an offscreen color target (render
+    /// attachment + bindless sampled, `Private` storage). Shared by the owned,
+    /// memory-query, and heap-aliased paths so their size/alignment agree.
+    fn render_target_descriptor(&self, desc: &RenderTargetDesc) -> Retained<MTLTextureDescriptor> {
+        let td = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                pixel_format(desc.format),
+                desc.width.max(1) as usize,
+                desc.height.max(1) as usize,
+                false,
+            )
+        };
+        let mut usage = MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead;
+        if desc.storage {
+            // Compute-writable (Phase 7); the storage bindless slot lands in M5.
+            usage |= MTLTextureUsage::ShaderWrite;
+        }
+        td.setUsage(usage);
+        td.setStorageMode(MTLStorageMode::Private);
+        td
     }
 
-    pub fn create_cubemap(&self, _desc: &CubemapDesc) -> Result<MetalCubemap> {
-        unimplemented!("Metal cubemaps: milestone M4")
+    /// Create an offscreen color render target (color attachment + bindless
+    /// sampled) with its own dedicated allocation.
+    pub fn create_render_target(&self, desc: &RenderTargetDesc) -> Result<MetalRenderTarget> {
+        let td = self.render_target_descriptor(desc);
+        let texture = self
+            .shared
+            .device
+            .newTextureWithDescriptor(&td)
+            .ok_or_else(|| rhi_err("render target newTexture failed"))?;
+        let index = self.shared.register(texture.clone(), false);
+        Ok(MetalRenderTarget::new(texture, index, None))
+    }
+
+    /// Create a render-target cubemap (6 faces, `mip_levels` each) usable as a
+    /// per-(face, mip) attachment and a bindless `TextureCube`.
+    pub fn create_cubemap(&self, desc: &CubemapDesc) -> Result<MetalCubemap> {
+        let size = desc.size.max(1);
+        let mip_levels = desc.mip_levels.max(1);
+        let td = unsafe {
+            MTLTextureDescriptor::textureCubeDescriptorWithPixelFormat_size_mipmapped(
+                pixel_format(desc.format),
+                size as usize,
+                mip_levels > 1,
+            )
+        };
+        unsafe { td.setMipmapLevelCount(mip_levels as usize) };
+        td.setTextureType(MTLTextureType::TypeCube);
+        td.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        td.setStorageMode(MTLStorageMode::Private);
+        let texture = self
+            .shared
+            .device
+            .newTextureWithDescriptor(&td)
+            .ok_or_else(|| rhi_err("cubemap newTexture failed"))?;
+        let index = self.shared.register_cube(texture.clone());
+        Ok(MetalCubemap::new(texture, index, size, mip_levels))
     }
 
     pub fn swapchain_readback_layout(
@@ -331,21 +453,48 @@ impl MetalDevice {
         }
     }
 
-    pub fn render_target_memory(&self, _desc: &RenderTargetDesc) -> Result<MemoryRequirements> {
-        unimplemented!("Metal transient aliasing: milestone M4")
+    /// Memory footprint of an aliasable render target, for the graph's transient
+    /// heap planning. Uses the same descriptor as `create_aliased_target` so the
+    /// size/alignment match the placement allocation.
+    pub fn render_target_memory(&self, desc: &RenderTargetDesc) -> Result<MemoryRequirements> {
+        let td = self.render_target_descriptor(desc);
+        let sa = self.shared.device.heapTextureSizeAndAlignWithDescriptor(&td);
+        Ok(MemoryRequirements {
+            size: sa.size as u64,
+            alignment: sa.align as u64,
+        })
     }
 
-    pub fn create_transient_heap(&self, _size: u64) -> Result<MetalTransientHeap> {
-        unimplemented!("Metal transient heap: milestone M4")
+    /// Create a placement heap of `size` bytes that transient targets alias into at
+    /// graph-computed offsets. `Placement` maps Vulkan's explicit-offset model 1:1;
+    /// `Tracked` lets Metal insert the aliasing/RAW hazards automatically, so the
+    /// graph's `aliasing_barrier` / `rt_to_*` hooks can stay no-ops.
+    pub fn create_transient_heap(&self, size: u64) -> Result<MetalTransientHeap> {
+        let hd = MTLHeapDescriptor::new();
+        hd.setType(MTLHeapType::Placement);
+        hd.setStorageMode(MTLStorageMode::Private);
+        hd.setHazardTrackingMode(MTLHazardTrackingMode::Tracked);
+        hd.setSize(size.max(1) as usize);
+        let heap = self
+            .shared
+            .device
+            .newHeapWithDescriptor(&hd)
+            .ok_or_else(|| rhi_err("newHeapWithDescriptor failed"))?;
+        Ok(MetalTransientHeap { heap })
     }
 
+    /// Create a render target aliased into `heap` at `offset` (placement heap).
     pub fn create_aliased_target(
         &self,
-        _heap: &MetalTransientHeap,
-        _offset: u64,
-        _desc: &RenderTargetDesc,
+        heap: &MetalTransientHeap,
+        offset: u64,
+        desc: &RenderTargetDesc,
     ) -> Result<MetalRenderTarget> {
-        unimplemented!("Metal transient aliasing: milestone M4")
+        let td = self.render_target_descriptor(desc);
+        let texture = unsafe { heap.heap.newTextureWithDescriptor_offset(&td, offset as usize) }
+            .ok_or_else(|| rhi_err("heap newTextureWithDescriptor_offset failed"))?;
+        let index = self.shared.register(texture.clone(), false);
+        Ok(MetalRenderTarget::new(texture, index, None))
     }
 }
 

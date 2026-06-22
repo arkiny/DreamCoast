@@ -80,6 +80,7 @@ pub(crate) fn build(
     Ok(MetalGraphicsPipeline {
         state,
         bindless: desc.bindless,
+        uses_globals: desc.uniform_buffer,
         depth_stencil,
     })
 }
