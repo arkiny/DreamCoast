@@ -17,9 +17,10 @@
 | 언어/빌드 | Rust (workspace, cargo) |
 | Vulkan 백엔드 | `ash` (raw Vulkan) |
 | D3D12 백엔드 | `windows` crate (windows-rs, raw D3D12) |
-| RHI | 직접 설계 (두 백엔드를 추상화하는 자체 계층) |
-| 플랫폼 | Windows 전용 |
-| 셰이더 | Slang → DXIL(D3D12) + SPIR-V(Vulkan) 동시 컴파일 |
+| Metal 백엔드 | `objc2` / `objc2-metal` (raw Metal, macOS) |
+| RHI | 직접 설계 (모든 백엔드를 추상화하는 자체 계층) |
+| 플랫폼 | Windows (Vulkan/D3D12) · macOS (Metal) |
+| 셰이더 | Slang → DXIL(D3D12) + SPIR-V(Vulkan) + metallib(Metal) 동시 컴파일 |
 | UI | Dear ImGui (`imgui` crate + 커스텀 RHI 렌더 백엔드) |
 | 수학 | `glam` (SIMD, de-facto 표준) |
 | 목표 기법 | PBR/디퍼드 · 레이트레이싱(DXR/VK_KHR) · 컴퓨트/GPGPU · 렌더그래프 |
@@ -132,6 +133,18 @@ engine/                 # cargo workspace root
 - 전제: **Phase 7(컴퓨트/GPU-driven)**. 신규 RHI: 메시 셰이더, 64-bit 아토믹, 인다이렉트 카운트,
   BDA. 외부 의존 `meshopt`(+선택 `metis`) 사용자 승인 필요
 - **완료 기준**: 고밀도 메시가 화면 적응 LOD로 크랙/팝핑 없이 렌더, SW/HW 경로 seam 없음, 두 백엔드 일치
+
+### macOS / Metal 백엔드 — 🚧 진행 중
+세부: [metal-backend.md](metal-backend.md)
+- 네이티브 Metal 백엔드(`crates/rhi-metal`, `objc2`)를 동일한 enum-dispatch RHI 뒤에 추가.
+  플랫폼 레이어는 macOS에서 손수 작성한 Cocoa/AppKit 창 + `CAMetalLayer`. 패리티 목표는
+  **Phase 7까지**(Phase 8 레이트레이싱은 현재 범위 외 — Metal에서 `has_raytracing()=false`).
+- 백엔드는 OS별 `#[cfg]` 게이팅: Windows=Vulkan+D3D12, macOS=Metal. `rhi-vulkan`/`rhi-d3d12`는
+  `#![cfg(windows)]`, `rhi-metal`은 macOS 전용.
+- 마일스톤: **M0** 골격+클리어 ✅ · **M1** Slang→metallib ✅ · **M2** 삼각형 · **M3** 바인드리스
+  (argument buffer)+텍스처+ImGui · **M4** 렌더타깃+PBR · **M5** 컴퓨트/async/인다이렉트
+- 미결: 바인드리스 무한 배열(`g_textures[]`)이 Metal에서 *"flexible array member not at end of
+  struct"*로 실패 → argument buffer 바인딩 모델 재설계 필요(M3에서 해소)
 
 ## 의존성 위험 / 미결 사항 (세부 계획에서 해소)
 

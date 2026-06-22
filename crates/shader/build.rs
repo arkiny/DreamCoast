@@ -235,14 +235,26 @@ const JOBS: &[Job] = &[
 
 /// (slang target name, output file extension, generated accessor suffix, required).
 ///
-/// SPIR-V is required (Vulkan, the active backend). DXIL is optional for now:
-/// Slang emits it via a bundled DXC (`dxcompiler.dll`) which the standalone
-/// release may omit, and D3D12 only arrives in Phase 2. A DXIL failure is
-/// downgraded to a warning + `None` accessor rather than failing the build.
+/// Which targets are actually compiled depends on the build target OS (see
+/// `targets_for_os`): Windows builds SPIR-V (Vulkan) + DXIL (D3D12); macOS builds
+/// `metallib` (Metal). SPIR-V is required on Windows; DXIL and metallib are
+/// optional (a failure — e.g. a missing DXC / Metal toolchain — is downgraded to a
+/// warning + `None` accessor rather than failing the build).
 const TARGETS: &[(&str, &str, &str, bool)] = &[
     ("spirv", "spv", "spirv", true),
     ("dxil", "dxil", "dxil", false),
+    ("metallib", "metallib", "metallib", false),
 ];
+
+/// Whether `target` should be compiled for the given build `target_os`. Each
+/// platform only builds the bytecode its RHI backend consumes (Windows: SPIR-V +
+/// DXIL; macOS: metallib); accessors for the rest are emitted as `None`.
+fn target_selected(target: &str, target_os: &str) -> bool {
+    match target_os {
+        "macos" => target == "metallib",
+        _ => target == "spirv" || target == "dxil",
+    }
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -260,7 +272,7 @@ fn main() {
     let Some(slangc) = find_slangc(&manifest_dir) else {
         println!(
             "cargo:warning=slangc not found — shaders will be unavailable. Set SLANGC, place \
-             slangc.exe in tools/slang/bin/, or add it to PATH. Releases: \
+             slangc (slangc.exe on Windows) in tools/slang/bin/, or add it to PATH. Releases: \
              https://github.com/shader-slang/slang/releases"
         );
         emit_all_none(&mut generated);
@@ -269,19 +281,33 @@ fn main() {
     };
     println!("cargo:warning=using slangc at {}", slangc.display());
 
+    // Build target OS (set by Cargo for build scripts) selects which bytecode
+    // targets to compile (Windows: spirv+dxil; macOS: metallib).
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
     for job in JOBS {
         let src_path = shader_dir.join(job.src);
         for (target, ext, suffix, required) in TARGETS {
+            // Emit a `None` accessor for targets this platform doesn't use, so the
+            // generated `<key>_<suffix>()` function always exists.
+            if !target_selected(target, &target_os) {
+                emit_none(&mut generated, job.key, suffix);
+                continue;
+            }
+
             let out_path = out_dir.join(format!("{}.{}", job.key, ext));
-            let profile = "sm_6_5";
 
             let mut command = Command::new(&slangc);
             command
                 .arg(&src_path)
                 .args(["-target", target])
-                .args(["-profile", profile])
                 .args(["-entry", job.entry])
                 .args(["-stage", job.stage]);
+            // The HLSL shader profile applies to the SPIR-V / DXIL targets; the
+            // Metal target derives everything it needs from the stage.
+            if *target == "spirv" || *target == "dxil" {
+                command.args(["-profile", "sm_6_5"]);
+            }
             // By default Slang names the SPIR-V entry point "main"; preserve the
             // real name so the pipeline can bind it by entry name.
             if *target == "spirv" {
@@ -329,9 +355,16 @@ fn find_slangc(manifest_dir: &Path) -> Option<PathBuf> {
         }
     }
 
+    // The slangc binary runs on the host, so its name follows the host OS.
+    let exe = if cfg!(windows) {
+        "slangc.exe"
+    } else {
+        "slangc"
+    };
+
     // Workspace root is two levels up from crates/shader.
     if let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent) {
-        let vendored = workspace_root.join("tools/slang/bin/slangc.exe");
+        let vendored = workspace_root.join("tools/slang/bin").join(exe);
         if vendored.is_file() {
             return Some(vendored);
         }
@@ -342,7 +375,7 @@ fn find_slangc(manifest_dir: &Path) -> Option<PathBuf> {
     }
 
     if let Ok(sdk) = std::env::var("VULKAN_SDK") {
-        let sdk_slangc = PathBuf::from(sdk).join("Bin/slangc.exe");
+        let sdk_slangc = PathBuf::from(sdk).join("Bin").join(exe);
         if sdk_slangc.is_file() {
             return Some(sdk_slangc);
         }

@@ -7,7 +7,14 @@ publish.workspace = true
 
 [dependencies]
 rhi-types.workspace = true
-rhi-vulkan.workspace = true
-rhi-d3d12.workspace = true
 dreamcoast-core.workspace = true
 dreamcoast-platform.workspace = true
+
+# Windows backends: Vulkan (ash) + Direct3D 12 (windows-rs).
+[target.'cfg(windows)'.dependencies]
+rhi-vulkan.workspace = true
+rhi-d3d12.workspace = true
+
+# macOS backend: native Metal.
+[target.'cfg(target_os = "macos")'.dependencies]
+rhi-metal.workspace = true

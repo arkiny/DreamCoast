@@ -8,6 +8,11 @@
 //! Object lifetimes are managed with `Arc`: an [`InstanceShared`] outlives the
 //! [`DeviceShared`] that references it, and every GPU resource holds an
 //! `Arc<DeviceShared>` so it can destroy itself in `Drop` before the device.
+//!
+//! Windows-only for now (it builds a Win32 Vulkan surface): the whole crate is
+//! empty on other targets so the workspace still builds on macOS (where the
+//! `rhi` facade selects the Metal backend).
+#![cfg(windows)]
 
 use std::ffi::CStr;
 

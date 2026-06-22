@@ -1,10 +1,23 @@
-//! Platform layer: native Win32 windowing and input.
+//! Platform layer: native windowing and input.
 //!
-//! Windows-only by design (see `docs/ROADMAP.md`). The rest of the engine depends on
-//! [`Window`] for a surface to render into and [`Input`] for user interaction.
+//! Hand-rolled per OS (no third-party windowing crate), matching the engine's
+//! "own the render loop" philosophy:
+//!   - Windows: Win32 (`window.rs`).
+//!   - macOS: Cocoa/AppKit + a `CAMetalLayer`-backed view (`window_macos.rs`).
+//!
+//! The rest of the engine depends on [`Window`] for a surface to render into and
+//! [`Input`] for user interaction. [`Input`] is platform-agnostic (the per-OS
+//! window modules feed it raw events through its `pub(crate)` setters).
 
 mod input;
-mod window;
-
 pub use input::Input;
+
+#[cfg(windows)]
+mod window;
+#[cfg(windows)]
 pub use window::Window;
+
+#[cfg(target_os = "macos")]
+mod window_macos;
+#[cfg(target_os = "macos")]
+pub use window_macos::Window;

@@ -9,7 +9,8 @@ publish.workspace = true
 dreamcoast-core.workspace = true
 tracing.workspace = true
 
-[dependencies.windows]
+# Win32 windowing (Windows only).
+[target.'cfg(windows)'.dependencies.windows]
 workspace = true
 features = [
     "Win32_Foundation",
@@ -18,3 +19,10 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_UI_Input_KeyboardAndMouse",
 ]
+
+# Cocoa/AppKit windowing + CAMetalLayer (macOS only).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+objc2-quartz-core.workspace = true

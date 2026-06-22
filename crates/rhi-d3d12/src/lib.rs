@@ -9,6 +9,10 @@
 //! binary fence). D3D12 has only a monotonic `ID3D12Fence` and no semaphores, so
 //! [`D3d12Semaphore`] is a no-op and [`D3d12Fence`] emulates binary-fence
 //! semantics with a monotonic counter + a Win32 event (see `sync.rs`).
+//!
+//! Windows-only: the whole crate is empty on other targets so the workspace
+//! still builds on macOS (where the `rhi` facade selects the Metal backend).
+#![cfg(windows)]
 
 use rhi_types::Format;
 use windows::Win32::Graphics::Dxgi::Common::{

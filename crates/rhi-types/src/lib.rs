@@ -8,10 +8,12 @@
 /// Which graphics backend a facade object is dispatching to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
-    /// Vulkan via `ash`.
+    /// Vulkan via `ash` (Windows).
     Vulkan,
-    /// Direct3D 12 via `windows` (Phase 2).
+    /// Direct3D 12 via `windows` (Phase 2, Windows).
     D3d12,
+    /// Metal via `objc2-metal` (macOS).
+    Metal,
 }
 
 /// A 2D size in pixels.

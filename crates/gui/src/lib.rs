@@ -69,6 +69,8 @@ impl Gui {
                 dreamcoast_shader::imgui_vs_dxil(),
                 dreamcoast_shader::imgui_fs_dxil(),
             ),
+            // Metal metallib accessors are wired in milestone M3 (ImGui on Metal).
+            BackendKind::Metal => (None, None),
         };
         let vs = vs.ok_or_else(|| EngineError::Shader("imgui vertex shader unavailable".into()))?;
         let fs =
@@ -208,7 +210,8 @@ impl Gui {
         let tx: f32 = -1.0;
         let (sy, ty): (f32, f32) = match self.backend {
             BackendKind::Vulkan => (2.0 / disp_h, -1.0),
-            BackendKind::D3d12 => (-2.0 / disp_h, 1.0),
+            // Metal shares D3D12's clip-space convention (top-left origin).
+            BackendKind::D3d12 | BackendKind::Metal => (-2.0 / disp_h, 1.0),
         };
 
         cmd.bind_graphics_pipeline(&self.pipeline);

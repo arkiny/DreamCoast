@@ -1,13 +1,17 @@
 # DreamCoast
 
-> A from-scratch Rust graphics engine (raw Vulkan + D3D12), built as a human–AI
-> pair-programming experiment.
+> A from-scratch Rust graphics engine (raw Vulkan + D3D12 + Metal), built as a
+> human–AI pair-programming experiment.
 
 DreamCoast is a custom renderer + engine layered directly on **raw Vulkan
-(`ash`)** and **raw Direct3D 12 (`windows-rs`)** — no `wgpu`, no engine
-framework. The goal is to deeply understand explicit GPU APIs (synchronization,
-descriptors, bindless, the render graph, ray tracing) by implementing them by
-hand, behind a single self-designed RHI.
+(`ash`)**, **raw Direct3D 12 (`windows-rs`)**, and **raw Metal (`objc2`)** — no
+`wgpu`, no engine framework. The goal is to deeply understand explicit GPU APIs
+(synchronization, descriptors, bindless, the render graph, ray tracing) by
+implementing them by hand, behind a single self-designed RHI.
+
+The Windows backends (Vulkan + D3D12) cover Phases 0–8; a native **Metal backend
+for macOS** is being brought up in parallel — see
+[`docs/metal-backend.md`](docs/metal-backend.md).
 
 ## Built with an AI agent
 
@@ -40,11 +44,12 @@ off of.
 | Language | Rust (cargo workspace) |
 | Vulkan   | `ash` (raw Vulkan 1.3, dynamic rendering) |
 | D3D12    | `windows-rs` (raw D3D12) |
-| RHI      | hand-rolled, enum-dispatch over both backends, bindless-first |
-| Shaders  | Slang → SPIR-V + DXIL (single source) |
+| Metal    | `objc2` / `objc2-metal` (raw Metal, macOS) |
+| RHI      | hand-rolled, enum-dispatch over all backends, bindless-first |
+| Shaders  | Slang → SPIR-V + DXIL + metallib (single source) |
 | UI       | Dear ImGui via a custom RHI renderer |
 | Math     | `glam` |
-| Platform | Windows |
+| Platform | Windows (Vulkan/D3D12) · macOS (Metal) |
 
 ## Status
 
@@ -62,27 +67,52 @@ Backend parity is a hard rule: every milestone must produce identical results on
 - [ ] **Phase 8** — Ray tracing (DXR + VK_KHR)
 - [ ] **Phase 9** — Tooling & profiling
 
+### Metal backend (macOS)
+
+A native Metal backend brought up in milestones, targeting parity **through
+Phase 7** (Phase 8 ray tracing on Metal is out of scope for now). Details and
+toolchain setup: [`docs/metal-backend.md`](docs/metal-backend.md).
+
+- [x] **M0** — Cross-platform skeleton: Cocoa/`CAMetalLayer` window + clear loop
+- [x] **M1** — Slang → `metallib` shader pipeline
+- [ ] **M2** — Triangle (graphics pipeline + draw)
+- [ ] **M3** — Bindless (argument buffers) + textures + ImGui
+- [ ] **M4** — Render targets + render graph + PBR deferred
+- [ ] **M5** — Compute / async compute / indirect draw
+
 ## Build & run
 
 ```bash
+# Windows
 cargo run -p sandbox -- --backend vulkan   # or: --backend d3d12
+
+# macOS (Metal) — defaults to Metal; M2+ rendering is in progress, so use the
+# clear-test loop for now (see docs/metal-backend.md for toolchain setup):
+cargo run -p sandbox -- --backend metal --clear-test
 ```
 
 Shaders compile via Slang's `slangc`, resolved from `tools/slang/`, the `SLANGC`
 env var, or `PATH` (see [`docs/phase-0-foundations.md`](docs/phase-0-foundations.md)).
+On macOS, metallib generation also needs the Xcode Metal toolchain
+(`xcodebuild -downloadComponent MetalToolchain`); full setup is in
+[`docs/metal-backend.md`](docs/metal-backend.md).
 Vulkan validation layers are optional and **dev-only** (compiled out of release
 builds) — see [`docs/vulkan-validation-setup.md`](docs/vulkan-validation-setup.md).
+
+Sample glTF assets (CC0) are fetched at runtime, not committed:
+`tools/fetch-assets.sh` (macOS/Linux) or `pwsh tools/fetch-assets.ps1` (Windows).
 
 ## Workspace layout
 
 ```
 crates/
 ├── core/        # dreamcoast-core      — logging, errors, handle/pool, math re-export
-├── platform/    # dreamcoast-platform  — Win32 windowing + input
-├── shader/      # dreamcoast-shader    — Slang → SPIR-V/DXIL build pipeline
+├── platform/    # dreamcoast-platform  — Win32 (Windows) + Cocoa (macOS) windowing + input
+├── shader/      # dreamcoast-shader    — Slang → SPIR-V/DXIL/metallib build pipeline
 ├── rhi-types/   # rhi-types            — backend-agnostic RHI descriptors/enums
-├── rhi-vulkan/  # rhi-vulkan           — ash Vulkan backend
-├── rhi-d3d12/   # rhi-d3d12            — windows-rs D3D12 backend
+├── rhi-vulkan/  # rhi-vulkan           — ash Vulkan backend (Windows)
+├── rhi-d3d12/   # rhi-d3d12            — windows-rs D3D12 backend (Windows)
+├── rhi-metal/   # rhi-metal            — objc2 Metal backend (macOS)
 ├── rhi/         # rhi                  — enum-dispatch RHI facade
 ├── gui/         # dreamcoast-gui       — Dear ImGui + custom RHI renderer
 ├── asset/       # dreamcoast-asset     — glTF / image loading
