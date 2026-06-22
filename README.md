@@ -9,7 +9,8 @@ DreamCoast is a custom renderer + engine layered directly on **raw Vulkan
 (synchronization, descriptors, bindless, the render graph, ray tracing) by
 implementing them by hand, behind a single self-designed RHI.
 
-The Windows backends (Vulkan + D3D12) cover Phases 0–8; a native **Metal backend
+The Windows backends (Vulkan + D3D12) are complete through Phase 7 (PBR deferred,
+compute/GPGPU) with Phase 8 (ray tracing) in progress; a native **Metal backend
 for macOS** is being brought up in parallel — see
 [`docs/metal-backend.md`](docs/metal-backend.md).
 
@@ -62,9 +63,9 @@ Backend parity is a hard rule: every milestone must produce identical results on
 - [x] **Phase 3** — Dear ImGui + bindless descriptors
 - [x] **Phase 4** — Asset pipeline + textured mesh rendering (glTF, depth, camera)
 - [x] **Phase 5** — Render graph + transient memory aliasing
-- [ ] **Phase 6** — PBR renderer (forward+/deferred)
-- [ ] **Phase 7** — Compute / GPGPU
-- [ ] **Phase 8** — Ray tracing (DXR + VK_KHR)
+- [x] **Phase 6** — PBR deferred renderer (Cook-Torrance, IBL, shadows)
+- [x] **Phase 7** — Compute / GPGPU (async compute, GPU particles, GPU culling + indirect draw)
+- [ ] **Phase 8** — Ray tracing (DXR + VK_KHR) — 🚧 in progress (device infrastructure + capability gating done)
 - [ ] **Phase 9** — Tooling & profiling
 
 ### Metal backend (macOS)
