@@ -118,15 +118,49 @@ State to know when picking this up in a fresh session:
 - **Entry names:** Slang's Metal target *preserves* the entry name (`vsMain` /
   `fsMain`), so `library.newFunctionWithName("vsMain")` works directly.
 
-### M3 next (bindless + textures + ImGui)
-- **Blocker:** the bindless shaders (`g_textures[]` / `g_cubes[]`) still fail Metal
-  compilation (*"flexible array member … not at end of struct"*) — `build.rs`
-  emits `None` for their `*_metallib` accessors. M3 must rework the bindless
-  declaration into Metal argument buffers; until then only non-bindless pipelines
-  (triangle) have shader bytes on macOS.
+### M3 next (bindless + textures + ImGui) — blocker resolved by spike
+
+**Spike conclusion (Slang 2026.11): wrap bindless resources in a single
+`ParameterBlock<T>` with _bounded_ arrays.** This compiles to a Metal argument
+buffer *and* still to SPIR-V from one source. Worked example (compiles to both
+`metallib` and `spirv`):
+
+```hlsl
+struct Bindless {
+    Texture2D                 textures[16384];
+    TextureCube               cubes[256];
+    StructuredBuffer<Particle> buffers[256];
+    SamplerState              samp;
+};
+ParameterBlock<Bindless> g;          // Metal: argument buffer at [[buffer(N)]]
+// usage: g.textures[idx].Sample(g.samp, uv)
+```
+
+What was tried and why it failed (so nobody re-walks it):
+- **Unbounded `Texture2D g_textures[]` as loose globals (current shaders):** Slang
+  aggregates loose globals into one struct ordered *pointers → textures → samplers*;
+  the unbounded array becomes a C flexible-array member with the sampler trailing →
+  *"flexible array member … not at end of struct."* Reordering bindings/spaces does
+  **not** help (order is by type category, not space). Forcing the array last (via
+  ParameterBlock) then trips *"flexible array members are a C99 feature"* and the
+  struct can't be a `[[buffer]]` param at all. `-Xmetal -Wno-c99-extensions` does
+  not suppress it.
+- **Slang `DescriptorHandle<T>` / `.Handle` bindless:** not lowered for the Metal
+  target in 2026.11 (`E36107: unavailable features in entry point`), even with
+  `metallib_3_1` / `sm_6_6` capabilities.
+- **Bounded array as a loose global (not in a ParameterBlock):** fails with *"no
+  texture resource location available"* — Metal can't give 16384 individual
+  function-argument slots; the argument buffer (ParameterBlock) is required.
+
+**Integration cost for M3:** converting the shaders to `ParameterBlock` changes the
+descriptor model on Vulkan & D3D12 too (a ParameterBlock is its own descriptor set
+/ register space), so `rhi-vulkan` and `rhi-d3d12` bindless layouts must be
+re-validated — that's the bulk of the M3 work, not the Metal side. The Metal side
+then binds the argument buffer with `setVertex/FragmentBuffer` at its slot and
+populates it with `MTLArgumentEncoder` (or `MTLResourceID` writes on Metal 3).
+
 - **Buffer-index convention to revisit:** push constants sit at buffer 0 today
-  (`PUSH_CONSTANT_INDEX`), but Slang shifts indices when a globals cbuffer or
-  argument buffer precedes the push block (probe showed globals→`buffer(0)`,
-  push→`buffer(1)`). M3/M4 will need a deliberate index map across bindless table,
-  globals, and push constants. The vertex buffer is parked at index 30 to stay
-  clear of those low indices.
+  (`PUSH_CONSTANT_INDEX`); the bindless argument buffer lands at the next free index
+  (the spike showed it at `[[buffer(1)]]`, push at `[[buffer(0)]]`). M3/M4 need a
+  deliberate index map across bindless table, globals, and push constants. The
+  vertex buffer is parked at index 30 to stay clear of those low indices.
