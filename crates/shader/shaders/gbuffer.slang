@@ -4,9 +4,13 @@
 // lighting. The model matrix is identity (the sandbox orbits the camera), so
 // input positions/normals are already world-space.
 //
-// Bindless layout mirrors mesh.slang: a sampled-texture array (t0/binding 0) +
-// a static sampler (s0/binding 1), indexed by push constants (b0). A texture
-// index of 0xFFFFFFFF means "absent — use the scalar factor".
+// Bindless resources (`g.textures[]` / `g.samp`) come from the shared
+// `ParameterBlock` in `bindless.slang` (Metal argument buffer / Vulkan
+// descriptor set 0 / D3D12 table). No globals here, so the block lands at set 0
+// — byte-identical SPIR-V to the previous loose-global form (Vulkan untouched).
+// A texture index of 0xFFFFFFFF means "absent — use the scalar factor".
+
+#include "bindless.slang"
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
 
@@ -44,12 +48,6 @@ struct PushConstants
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
 
-[[vk::binding(0, 0)]]
-Texture2D g_textures[] : register(t0, space0);
-
-[[vk::binding(1, 0)]]
-SamplerState g_sampler : register(s0, space0);
-
 [shader("vertex")]
 VSOutput vsMain(VSInput input)
 {
@@ -84,14 +82,14 @@ GBufferOut fsMain(VSOutput input)
 {
     float3 albedo = pc.base_color_factor.rgb;
     if (pc.tex.x != NO_TEXTURE)
-        albedo *= g_textures[pc.tex.x].Sample(g_sampler, input.uv).rgb;
+        albedo *= g.textures[pc.tex.x].Sample(g.samp, input.uv).rgb;
 
     float metallic = pc.mr_factor.x;
     float roughness = pc.mr_factor.y;
     if (pc.tex.y != NO_TEXTURE)
     {
         // glTF metallic-roughness: G = roughness, B = metallic.
-        float3 mr = g_textures[pc.tex.y].Sample(g_sampler, input.uv).rgb;
+        float3 mr = g.textures[pc.tex.y].Sample(g.samp, input.uv).rgb;
         roughness *= mr.g;
         metallic *= mr.b;
     }
@@ -99,7 +97,7 @@ GBufferOut fsMain(VSOutput input)
     float3 n = normalize(input.world_normal);
     if (pc.tex.z != NO_TEXTURE)
     {
-        float3 tn = g_textures[pc.tex.z].Sample(g_sampler, input.uv).rgb * 2.0 - 1.0;
+        float3 tn = g.textures[pc.tex.z].Sample(g.samp, input.uv).rgb * 2.0 - 1.0;
         n = apply_normal_map(n, input.world_pos, input.uv, tn);
     }
 
