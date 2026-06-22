@@ -7,6 +7,7 @@ members = [
     "crates/rhi-types",
     "crates/rhi-vulkan",
     "crates/rhi-d3d12",
+    "crates/rhi-metal",
     "crates/rhi",
     "crates/gui",
     "crates/asset",
@@ -28,6 +29,7 @@ dreamcoast-shader = { path = "crates/shader" }
 rhi-types = { path = "crates/rhi-types" }
 rhi-vulkan = { path = "crates/rhi-vulkan" }
 rhi-d3d12 = { path = "crates/rhi-d3d12" }
+rhi-metal = { path = "crates/rhi-metal" }
 rhi = { path = "crates/rhi" }
 dreamcoast-gui = { path = "crates/gui" }
 dreamcoast-asset = { path = "crates/asset" }
@@ -36,6 +38,12 @@ dreamcoast-render = { path = "crates/render" }
 # External
 windows = "0.62"
 ash = "0.38"
+# Apple / Metal (macOS backend)
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-metal = "0.3"
+objc2-quartz-core = "0.3"
 glam = "0.30"
 imgui = "0.12"
 gltf = "1"

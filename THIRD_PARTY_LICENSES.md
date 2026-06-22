@@ -14,6 +14,7 @@ compatible with redistribution under MIT.
 |-------|---------|---------|
 | [`ash`](https://github.com/ash-rs/ash) | 0.38 | MIT OR Apache-2.0 |
 | [`windows`](https://github.com/microsoft/windows-rs) / `windows-core` | 0.62 | MIT OR Apache-2.0 |
+| [`objc2`](https://github.com/madsmtm/objc2) / `objc2-foundation` / `objc2-app-kit` / `objc2-metal` / `objc2-quartz-core` (macOS) | 0.6 / 0.3 | MIT OR Apache-2.0 |
 | [`glam`](https://github.com/bitshifter/glam-rs) | 0.30 | MIT OR Apache-2.0 |
 | [`imgui`](https://github.com/imgui-rs/imgui-rs) / `imgui-sys` | 0.12 | MIT OR Apache-2.0 |
 | [`gltf`](https://github.com/gltf-rs/gltf) | 1.4 | MIT OR Apache-2.0 |
@@ -43,9 +44,12 @@ binary. They live in the gitignored `tools/` directory and are obtained
 separately.
 
 - **[Slang](https://github.com/shader-slang/slang)** (`slangc`) — Apache-2.0.
-  Compiles `.slang` shaders to SPIR-V and DXIL.
+  Compiles `.slang` shaders to SPIR-V and DXIL (Windows) and `metallib` (macOS).
 - **DXC / DirectXShaderCompiler** (`dxcompiler`, bundled with Slang for DXIL
   output) — Apache-2.0 WITH LLVM-exception.
+- **Apple Metal toolchain** (`xcrun metal`, from Xcode) — Apple SDK license.
+  Invoked by Slang on macOS to produce `metallib`; not part of this repo and not
+  shipped in the binary.
 
 ## Development-only (never shipped)
 

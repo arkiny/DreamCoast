@@ -1,0 +1,20 @@
+[package]
+name = "rhi-metal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rhi-types.workspace = true
+dreamcoast-core.workspace = true
+dreamcoast-platform.workspace = true
+
+# The Metal backend is macOS-only; on other targets this crate is empty so the
+# workspace still builds (the `rhi` facade only depends on it under cfg(macos)).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
+objc2-quartz-core.workspace = true
+tracing.workspace = true

@@ -22,7 +22,7 @@ use rhi::{
     BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, CommandBuffer,
     ComputePipelineDesc, Cubemap, CubemapDesc, Device, Extent2D, Fence, Format, GraphicsPipeline,
     GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology, Queue,
-    ReadbackLayout, Semaphore, StorageBufferDesc, SwapchainDesc, Texture, TextureDesc,
+    ReadbackLayout, Semaphore, StorageBufferDesc, Swapchain, SwapchainDesc, Texture, TextureDesc,
     VertexLayout,
 };
 use tracing::info;
@@ -174,6 +174,13 @@ fn main() -> anyhow::Result<()> {
     );
 
     let mut swapchain = device.create_swapchain(&swapchain_desc(Extent2D::new(w, h)))?;
+
+    // M0 backend bring-up: a minimal acquire→clear→present loop that needs no
+    // pipelines or shaders. The Metal backend defaults through this until the
+    // triangle/PBR milestones implement pipelines.
+    if clear_test_enabled() {
+        return run_clear_test(&mut window, &device, &mut swapchain);
+    }
 
     // G-buffer fill pipeline: mesh -> 4 MRT (+ depth).
     let (gb_vs, gb_fs) = load_shader_pair(
@@ -561,10 +568,12 @@ fn main() -> anyhow::Result<()> {
         depth_format: None,
     })?;
 
-    // Clip-space Y orientation for the full-screen passes (Vulkan = 1, D3D12 = 0).
+    // Clip-space Y orientation for the full-screen passes (Vulkan = 1, D3D12 /
+    // Metal = 0; both have a Y-up NDC with a top-left framebuffer origin).
     let flip_y: u32 = match backend {
         BackendKind::Vulkan => 1,
         BackendKind::D3d12 => 0,
+        BackendKind::Metal => 0,
     };
 
     // Upload material textures for the loaded model (bindless). Base color is
@@ -2187,6 +2196,9 @@ fn load_shader_pair(
     let (vs, fs) = match backend {
         BackendKind::Vulkan => (vs_spirv(), fs_spirv()),
         BackendKind::D3d12 => (vs_dxil(), fs_dxil()),
+        // Metal metallib accessors are wired in milestone M1/M2; until then the
+        // Metal path runs `--clear-test` (no pipelines).
+        BackendKind::Metal => (None, None),
     };
     let vs = vs.ok_or_else(|| anyhow!("{name} vertex shader unavailable for {backend:?}"))?;
     let fs = fs.ok_or_else(|| anyhow!("{name} fragment shader unavailable for {backend:?}"))?;
@@ -2203,6 +2215,8 @@ fn load_compute_shader(
     let cs = match backend {
         BackendKind::Vulkan => cs_spirv(),
         BackendKind::D3d12 => cs_dxil(),
+        // See `load_shader_pair`: Metal metallib accessors arrive in M1/M5.
+        BackendKind::Metal => None,
     };
     cs.ok_or_else(|| anyhow!("{name} compute shader unavailable for {backend:?}"))
 }
@@ -2288,6 +2302,8 @@ fn model_path() -> String {
 fn select_backend() -> BackendKind {
     let mut backend = if cfg!(windows) {
         BackendKind::D3d12
+    } else if cfg!(target_os = "macos") {
+        BackendKind::Metal
     } else {
         BackendKind::Vulkan
     };
@@ -2297,9 +2313,98 @@ fn select_backend() -> BackendKind {
             match args.next().as_deref() {
                 Some("vulkan") => backend = BackendKind::Vulkan,
                 Some("d3d12") => backend = BackendKind::D3d12,
+                Some("metal") => backend = BackendKind::Metal,
                 other => tracing::warn!("unknown --backend value {other:?}; using default"),
             }
         }
     }
     backend
+}
+
+/// Whether `--clear-test` was passed: run the minimal clear-screen loop (M0 of
+/// the Metal backend bring-up) instead of the full deferred renderer. Exercises
+/// only window + swapchain + command-buffer clear, which is all the Metal backend
+/// implements until the triangle/pipeline milestones land.
+fn clear_test_enabled() -> bool {
+    std::env::args().skip(1).any(|a| a == "--clear-test")
+}
+
+/// Minimal render loop: acquire → clear to an animated color → present. Used to
+/// validate a backend's window/swapchain/command path before pipelines exist.
+fn run_clear_test(
+    window: &mut Window,
+    device: &Device,
+    swapchain: &mut Swapchain,
+) -> anyhow::Result<()> {
+    let queue = device.queue();
+    let cmd = device.create_command_buffer()?;
+    let image_available = device.create_semaphore()?;
+    let render_finished = device.create_semaphore()?;
+    let fence = device.create_fence(true)?;
+
+    // Optional `--frames N`: render N frames then exit (non-interactive smoke
+    // test). Without it, run until ESC / window close.
+    let max_frames = clear_test_max_frames();
+    info!("running clear-test loop (press ESC or close the window to exit)");
+    let mut t = 0.0f32;
+    let mut frames = 0u64;
+    let _ = window.take_resized();
+    while !window.should_close() {
+        if let Some(max) = max_frames
+            && frames >= max
+        {
+            break;
+        }
+        window.pump_events();
+        let (w, h) = window.size();
+        if w == 0 || h == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            continue;
+        }
+        if window.take_resized() {
+            device.wait_idle()?;
+            swapchain.recreate(&swapchain_desc(Extent2D::new(w, h)))?;
+        }
+
+        fence.wait()?;
+        let image_index = match swapchain.acquire_next_image(&image_available)? {
+            Some(i) => i,
+            None => {
+                swapchain.recreate(&swapchain_desc(Extent2D::new(w, h)))?;
+                continue;
+            }
+        };
+        fence.reset()?;
+
+        let color = ClearColor {
+            r: 0.15,
+            g: 0.5 + 0.35 * t.sin(),
+            b: 0.35,
+            a: 1.0,
+        };
+        cmd.begin()?;
+        cmd.transition_to_render_target(swapchain, image_index);
+        cmd.begin_rendering(swapchain, image_index, Some(color), None);
+        cmd.end_rendering();
+        cmd.transition_to_present(swapchain, image_index);
+        cmd.end()?;
+        queue.submit(&cmd, &image_available, &render_finished, &fence)?;
+        queue.present(swapchain, image_index, &render_finished)?;
+        t += 0.02;
+        frames += 1;
+    }
+    device.wait_idle()?;
+    info!("clear-test exited after {frames} frame(s)");
+    Ok(())
+}
+
+/// `--frames N` cap for the clear-test loop (smoke testing); `None` = unlimited.
+fn clear_test_max_frames() -> Option<u64> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--frames" {
+            return args.next().and_then(|v| v.parse().ok());
+        }
+    }
+    None
 }
