@@ -955,7 +955,7 @@ fn main() -> anyhow::Result<()> {
     let mut sun_dir = [0.4f32, 0.8, 0.4];
     let mut sun_intensity = 3.0f32;
     let mut ambient = 0.04f32;
-    let mut exposure = 1.0f32;
+    let mut exposure = 0.6f32;
     let mut point_lights_on = true;
     let mut shadows_on = true;
     let mut shadow_bias = 0.0015f32;
@@ -1857,6 +1857,10 @@ fn main() -> anyhow::Result<()> {
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active,
         // else the compute-post output when enabled, else raw HDR.
         let tonemap_src = rt_out.or(hdr_post).unwrap_or(hdr);
+        // The rasterized HDR already bakes exposure into the lighting pass; the
+        // path-traced output carries raw scene radiance, so apply the camera
+        // exposure here before the filmic curve (else the bright sky + sun blow out).
+        let tm_exposure = if pt_active { exposure } else { 1.0 };
         graph.add_pass(
             PassInfo {
                 name: "tonemap",
@@ -1868,7 +1872,7 @@ fn main() -> anyhow::Result<()> {
                 let hdr_index = ctx.sampled_index(tonemap_src);
                 let cmd = ctx.cmd();
                 cmd.bind_graphics_pipeline(&post_pipeline);
-                cmd.push_constants(&post_push(hdr_index, post_mode as u32, flip_y));
+                cmd.push_constants(&post_push(hdr_index, post_mode as u32, flip_y, tm_exposure));
                 cmd.draw(3, 1);
                 Ok(())
             },
@@ -2425,11 +2429,12 @@ fn prefilter_push(
 }
 
 /// Pack the tonemap push block: hdr_index + mode + flip_y + pad (16 bytes).
-fn post_push(hdr_index: u32, mode: u32, flip_y: u32) -> [u8; 16] {
+fn post_push(hdr_index: u32, mode: u32, flip_y: u32, exposure: f32) -> [u8; 16] {
     let mut pc = [0u8; 16];
     pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
     pc[4..8].copy_from_slice(&mode.to_le_bytes());
     pc[8..12].copy_from_slice(&flip_y.to_le_bytes());
+    pc[12..16].copy_from_slice(&exposure.to_le_bytes());
     pc
 }
 
