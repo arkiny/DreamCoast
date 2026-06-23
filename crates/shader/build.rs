@@ -306,6 +306,7 @@ fn main() {
     // Shared includes are not in JOBS but several shaders `#include` them; watch
     // them explicitly so edits trigger a recompile of the including shaders.
     println!("cargo:rerun-if-changed=shaders/bindless.slang");
+    println!("cargo:rerun-if-changed=shaders/rt_common.slang");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());

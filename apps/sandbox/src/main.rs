@@ -882,14 +882,22 @@ fn main() -> anyhow::Result<()> {
     // MUST match the TLAS instance custom_index order (scene objects, then ground).
     // `_rt_geometry` keeps the geometry buffers alive for the program's lifetime.
     let (rt_instance_table, _rt_geometry) = if rt_scene.is_some() {
-        // (mesh, albedo) per instance, in TLAS instance order (objects, then ground).
-        let ground_albedo = [0.8f32, 0.8, 0.8, 0.0];
-        let entries: [(&MeshData, [f32; 4]); 5] = [
-            (&model, scene[0].base_color),
-            (&sphere, scene[1].base_color),
-            (&sphere, scene[2].base_color),
-            (&cube, scene[3].base_color),
-            (&ground, ground_albedo),
+        // (mesh, material) per instance, in TLAS instance order (objects, then
+        // ground). Materials mirror the rasterizer's so the path tracer shades with
+        // the same metallic-roughness PBR model.
+        let mat_of = |o: &SceneObject| PtMaterial {
+            base_color: o.base_color,
+            metallic: o.metallic,
+            roughness: o.roughness,
+            ao: 1.0,
+            tex: o.tex,
+        };
+        let entries: [(&MeshData, PtMaterial); 5] = [
+            (&model, mat_of(&scene[0])),
+            (&sphere, mat_of(&scene[1])),
+            (&sphere, mat_of(&scene[2])),
+            (&cube, mat_of(&scene[3])),
+            (&ground, PtMaterial::diffuse([0.8, 0.8, 0.8, 0.0])),
         ];
         let (table, geometry) = build_pt_instance_table(&device, &entries)?;
         info!("path-tracer instance table: {} instances", entries.len());
@@ -930,7 +938,11 @@ fn main() -> anyhow::Result<()> {
             })
             .collect();
         let scene = device.build_raytracing_scene(&geoms, &instances)?;
-        let entries: Vec<(&MeshData, [f32; 4])> = meshes.iter().map(|(m, a)| (m, *a)).collect();
+        // The Cornell box is all matte diffuse (emissive ceiling via base_color.a).
+        let entries: Vec<(&MeshData, PtMaterial)> = meshes
+            .iter()
+            .map(|(m, a)| (m, PtMaterial::diffuse(*a)))
+            .collect();
         let (table, geometry) = build_pt_instance_table(&device, &entries)?;
         info!("cornell-box scene built: {} instances", meshes.len());
         (Some(scene), Some(table), geometry)
@@ -2675,13 +2687,40 @@ fn index_bytes(m: &MeshData) -> &[u8] {
 /// `{ vertex SB index, index SB index, pad, pad, albedo.rgb, emissive }`. The
 /// entry order must match the scene's TLAS instance custom_index order. Returns
 /// the table plus the geometry buffers (kept alive by the caller).
+/// Per-instance material for the path tracer's hit shading (mirrors the glTF
+/// metallic-roughness model used by the rasterizer). `base_color.a` is the
+/// emissive scale; `tex` holds bindless indices for base-color / metallic-
+/// roughness / normal / emissive maps (`NO_TEXTURE` if absent).
+#[derive(Clone, Copy)]
+struct PtMaterial {
+    base_color: [f32; 4],
+    metallic: f32,
+    roughness: f32,
+    ao: f32,
+    tex: [u32; 4],
+}
+
+impl PtMaterial {
+    /// A matte diffuse material (no metallic/specular, no textures); `base_color.a`
+    /// is the emissive scale.
+    fn diffuse(base_color: [f32; 4]) -> Self {
+        Self {
+            base_color,
+            metallic: 0.0,
+            roughness: 1.0,
+            ao: 1.0,
+            tex: [NO_TEXTURE; 4],
+        }
+    }
+}
+
 fn build_pt_instance_table(
     device: &Device,
-    entries: &[(&MeshData, [f32; 4])],
+    entries: &[(&MeshData, PtMaterial)],
 ) -> anyhow::Result<(rhi::StorageBuffer, Vec<rhi::StorageBuffer>)> {
     let mut geometry: Vec<rhi::StorageBuffer> = Vec::with_capacity(entries.len() * 2);
-    let mut records: Vec<u8> = Vec::with_capacity(entries.len() * 32);
-    for (mesh, albedo) in entries {
+    let mut records: Vec<u8> = Vec::with_capacity(entries.len() * 64);
+    for (mesh, mat) in entries {
         let vb = vertex_bytes(mesh);
         let ib = index_bytes(mesh);
         let vsb = device.create_storage_buffer_init(
@@ -2700,20 +2739,29 @@ fn build_pt_instance_table(
             },
             ib,
         )?;
-        records.extend_from_slice(&vsb.storage_index().to_le_bytes());
-        records.extend_from_slice(&isb.storage_index().to_le_bytes());
+        // 64-byte record matching `Instance` in rt_common.slang.
+        records.extend_from_slice(&vsb.storage_index().to_le_bytes()); // vtx
+        records.extend_from_slice(&isb.storage_index().to_le_bytes()); // idx
+        records.extend_from_slice(&mat.tex[0].to_le_bytes()); // tex_base
+        records.extend_from_slice(&mat.tex[1].to_le_bytes()); // tex_mr
+        for c in mat.base_color {
+            records.extend_from_slice(&c.to_le_bytes()); // base_color (16)
+        }
+        records.extend_from_slice(&mat.metallic.to_le_bytes()); // params.x
+        records.extend_from_slice(&mat.roughness.to_le_bytes()); // params.y
+        records.extend_from_slice(&mat.ao.to_le_bytes()); // params.z
+        records.extend_from_slice(&0f32.to_le_bytes()); // params.w
+        records.extend_from_slice(&mat.tex[2].to_le_bytes()); // tex_normal
+        records.extend_from_slice(&mat.tex[3].to_le_bytes()); // tex_emissive
         records.extend_from_slice(&0u32.to_le_bytes()); // pad0
         records.extend_from_slice(&0u32.to_le_bytes()); // pad1
-        for c in albedo {
-            records.extend_from_slice(&c.to_le_bytes());
-        }
         geometry.push(vsb);
         geometry.push(isb);
     }
     let table = device.create_storage_buffer_init(
         &StorageBufferDesc {
             size: records.len() as u64,
-            stride: 32,
+            stride: 64,
             indirect: false,
         },
         &records,
