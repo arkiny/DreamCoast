@@ -1,7 +1,8 @@
 # 패스트레이서 정밀화 — Ground-Truth PBR 계획
 
-> 상위: [phase-8-raytracing.md](phase-8-raytracing.md) (Phase 8 ✅). **상태: 📝 계획 / 사인오프 대상.**
+> 상위: [phase-8-raytracing.md](phase-8-raytracing.md) (Phase 8 ✅). **상태: 🚧 진행 중 — G1·G2 ✅, G3~G5 남음.**
 > 후속 트랙으로, Phase 8의 "디퓨즈 GI only" 한계를 해소한다.
+> 공유 PT 코드는 `crates/shader/shaders/rt_common.slang`(rt_path/rt_pipeline가 include) — 인라인≡파이프라인 비트 동일 유지.
 
 ## 목표 (사용자 확정)
 
@@ -30,13 +31,16 @@
 
 ## 마일스톤 (각 게이트: build+fmt+clippy `-D warnings` + 두 백엔드(VK≡DX) + Vulkan VUID 0 + 인라인≡파이프라인 + 스크린샷; 인라인/파이프라인 두 경로 동시 갱신)
 
-### G1 — 머티리얼 데이터 패리티
+### G1 — 머티리얼 데이터 패리티 ✅ (커밋됨)
 - 인스턴스 테이블 레코드 확장: `{ vtx, idx, base_color(rgb)+? , metallic, roughness, emissive, ao, tex 인덱스[base,mr,normal,emissive] }`.
   현재 32B → 48~64B로. 호스트 패킹(`build_pt_instance_table`) + 셰이더 `Instance` 구조 동시 갱신.
 - 샘플 씬·Cornell 양쪽에서 `SceneObject`의 metallic/roughness/텍스처를 그대로 채운다.
 - **검증**: hit에서 머티리얼을 읽어 metallic/roughness 디버그 시각화(예: roughness를 그레이로) → 두 백엔드 일치.
 
-### G2 — 마이크로페이싯 BSDF + 중요도 샘플링 (반사 등장)
+### G2 — 마이크로페이싯 BSDF + 중요도 샘플링 (반사 등장) ✅ (커밋됨)
+> 구현 완료: 정확한 Smith-GGX G1(래스터 근사 아님), GGX VNDF 정반사 IS(가중 F·G1(l)), 코사인 디퓨즈,
+> Fresnel 가중 로브 선택, 태양 NEE=풀 BSDF. 검증: 인라인≡파이프라인 avg≤0.0005·VK≡DX avg≤0.0004·검증 클린.
+> 참고: PT 금속이 래스터보다 덜 쨍한 것은 물리(밝은 흰 바닥/하늘 정확 반사) vs 래스터 IBL 근사 차이(정상).
 - 래스터와 **동일한** D(GGX)/G(Smith, height-correlated)/F(Schlick) 평가. `F0=lerp(0.04,base,metallic)`,
   `diffuse=(1-metallic)*base/π`. 에너지 보존(kd=(1-F)(1-metallic)).
 - 바운스 샘플링: **GGX VNDF**(visible normal) 정반사 + 코사인 디퓨즈, Fresnel 가중 로브 선택, 정확한 pdf 반환.
