@@ -39,7 +39,12 @@ impl MetalFence {
     }
 
     pub fn wait(&self) -> Result<()> {
-        if let Some(cmd) = self.cmd.borrow().as_ref() {
+        // Take ownership before waiting so the completed command buffer (and the
+        // drawable retained by its presentation) is released as soon as the wait
+        // returns. Merely borrowing it here leaves the previous frame alive until
+        // `reset`; if nextDrawable fails before reset, the drawable pool can remain
+        // permanently exhausted.
+        if let Some(cmd) = self.cmd.borrow_mut().take() {
             cmd.waitUntilCompleted();
         }
         Ok(())

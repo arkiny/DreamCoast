@@ -160,7 +160,7 @@ impl MetalCommandBuffer {
     }
 
     pub fn transition_to_present(&self, swapchain: &MetalSwapchain, _image_index: u32) {
-        *self.present.borrow_mut() = swapchain.current_drawable();
+        *self.present.borrow_mut() = swapchain.take_current_drawable();
     }
 
     // ---- Render passes -----------------------------------------------------
@@ -380,8 +380,13 @@ impl MetalCommandBuffer {
         _image_index: u32,
         buffer: &MetalBuffer,
     ) {
+        // The render graph transitions the backbuffer to present before the app
+        // optionally records its screenshot blit. At that point ownership has
+        // already moved out of the swapchain into `self.present`, so accept either
+        // location without adding a long-lived second owner.
         let drawable = swapchain
             .current_drawable()
+            .or_else(|| self.present.borrow().clone())
             .expect("copy_swapchain_to_buffer without an acquired drawable");
         let texture = drawable.texture();
         let cmd = self.cmd.borrow();
