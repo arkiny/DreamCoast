@@ -174,6 +174,17 @@ RTX 2070 SUPER, 디버그 빌드(검증 레이어 on). 패스트레이서는 누
   기존 경로에 영향 없음.
 - `cargo build` + `cargo fmt --all` + `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` 클린.
 
+### 스크린샷 (풀 RT 파이프라인 경로, Vulkan)
+
+Cornell 박스 — 발광 천장 1개로만 조명되는 폐쇄 공간. 적/녹 벽이 박스·바닥으로 번지는 컬러 블리딩(디퓨즈
+전역 조명)과 소프트 섀도우가 raygen/closesthit 바운스 루프로 형성된다(인라인 경로와 픽셀 근사 일치):
+
+![RT pipeline path tracer — Cornell box global illumination](images/rt-pathtrace-cornell.png)
+
+야외 샘플 씬 — 태양(섀도우 레이) + 하늘(miss) + 디퓨즈 바운스 GI:
+
+![RT pipeline path tracer — outdoor sample scene](images/rt-pathtrace-scene.png)
+
 ## 검증 전략 (전 마일스톤 공통)
 
 - `cargo fmt --all`, `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` clean.
