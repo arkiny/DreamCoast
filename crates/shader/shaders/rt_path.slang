@@ -58,8 +58,12 @@ float rnd(inout uint s)
     return float(pcg(s) & 0xFFFFFFu) / float(0x1000000);
 }
 
-// Gradient sky + HDR sun disk (matches the procedural sky used for capture).
-float3 sky(float3 dir, float3 sun_dir, float sun_i)
+// Gradient sky + HDR sun disk. `with_sun` adds the bright sun disk; it is only
+// enabled for primary (camera) rays. Diffuse bounce rays use `with_sun = false`
+// because the sun's contribution is already added analytically as a direct light
+// (the shadow-ray term) — sampling the disk again would double-count the sun and
+// inject fireflies (the standard "sun is a delta light for diffuse" treatment).
+float3 sky(float3 dir, float3 sun_dir, float sun_i, bool with_sun)
 {
     float up = dir.y;
     float3 zenith = float3(0.04, 0.16, 0.55);
@@ -67,8 +71,11 @@ float3 sky(float3 dir, float3 sun_dir, float sun_i)
     float3 ground = float3(0.16, 0.15, 0.14);
     float3 col = up >= 0.0 ? lerp(horizon, zenith, pow(saturate(up), 0.45))
                            : lerp(horizon, ground, saturate(-up * 6.0));
-    float c = saturate(dot(dir, sun_dir));
-    col += sun_i * (pow(c, 4000.0) * 6.0 + pow(c, 32.0) * 0.4);
+    if (with_sun)
+    {
+        float c = saturate(dot(dir, sun_dir));
+        col += sun_i * (pow(c, 4000.0) * 6.0 + pow(c, 32.0) * 0.4);
+    }
     return col;
 }
 
@@ -131,8 +138,9 @@ float3 trace(float3 origin, float3 dir, float3 sun_dir, bool cornell, inout uint
         q.Proceed();
         if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
         {
+            // Sun disk only on the primary ray; bounces get the sun analytically.
             if (!cornell)
-                radiance += throughput * sky(ray.Direction, sun_dir, pc.sun.w);
+                radiance += throughput * sky(ray.Direction, sun_dir, pc.sun.w, bounce == 0u);
             break;
         }
 

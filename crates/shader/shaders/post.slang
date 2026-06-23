@@ -26,7 +26,7 @@ struct PushConstants
     uint hdr_index; // bindless index of the HDR lighting target
     uint mode;      // 0 = none, 1 = grayscale, 2 = vignette
     uint flip_y;    // 0 = D3D12 (Y up), 1 = Vulkan (Y down)
-    uint pad;
+    float exposure; // camera exposure applied before the filmic curve (1 = none)
 };
 
 [[vk::push_constant]]
@@ -55,7 +55,10 @@ float3 aces(float3 x)
 float4 fsMain(VSOutput input) : SV_Target
 {
     float3 hdr = g.textures[pc.hdr_index].Sample(g.samp, input.uv).rgb;
-    float3 color = aces(hdr);
+    // Camera exposure before the filmic curve. The rasterized HDR already bakes
+    // exposure into the lighting pass (so it passes 1.0 here); the path-traced
+    // output carries raw scene radiance and is exposed at this stage instead.
+    float3 color = aces(hdr * pc.exposure);
 
     if (pc.mode == 1)
     {
