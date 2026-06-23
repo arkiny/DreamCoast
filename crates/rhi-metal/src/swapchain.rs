@@ -39,6 +39,10 @@ impl MetalSwapchain {
     }
 
     pub fn acquire_next_image(&self, _signal: &MetalSemaphore) -> Result<Option<u32>> {
+        // A drawable must never survive into the next acquire. The normal path
+        // moves it into the command buffer in `transition_to_present`; clearing it
+        // here also recovers safely if recording was abandoned before that point.
+        *self.current.borrow_mut() = None;
         match self.shared.layer.nextDrawable() {
             Some(drawable) => {
                 *self.current.borrow_mut() = Some(drawable);
@@ -71,6 +75,16 @@ impl MetalSwapchain {
     /// The drawable acquired this frame (for the command buffer to render/present).
     pub(crate) fn current_drawable(&self) -> Option<Retained<ProtocolObject<dyn CAMetalDrawable>>> {
         self.current.borrow().clone()
+    }
+
+    /// Move the acquired drawable into the command buffer that will present it.
+    ///
+    /// Keeping another retained reference in the swapchain after submission can
+    /// exhaust CAMetalLayer's small drawable pool on a slower GPU/display path.
+    pub(crate) fn take_current_drawable(
+        &self,
+    ) -> Option<Retained<ProtocolObject<dyn CAMetalDrawable>>> {
+        self.current.borrow_mut().take()
     }
 }
 
