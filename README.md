@@ -87,14 +87,15 @@ toolchain setup: [`docs/metal-backend.md`](docs/metal-backend.md).
 # Windows
 cargo run -p sandbox -- --backend vulkan   # or: --backend d3d12
 
-# macOS (Metal) — defaults to Metal; the full deferred-PBR renderer runs (M4),
-# plus the Phase-7 compute demos / async compute (M5). Toolchain setup in
-# docs/metal-backend.md.
-cargo run -p sandbox -- --backend metal                    # M4 full deferred-PBR scene
-cargo run -p sandbox -- --backend metal --clear-test      # M0 clear loop
-cargo run -p sandbox -- --backend metal --triangle-test   # M2 RGB triangle
-cargo run -p sandbox -- --backend metal --mesh-test       # M3 textured bindless mesh + ImGui
+# macOS — defaults to Metal
+cargo run -p sandbox -- --backend metal
 ```
+
+On macOS the Metal backend runs the full deferred-PBR renderer plus the Phase-7
+compute demos / async compute. The per-milestone bring-up flags
+(`--clear-test` / `--triangle-test` / `--mesh-test`), the compute-demo env toggles,
+and the Metal toolchain setup are documented in
+[`docs/metal-backend.md`](docs/metal-backend.md).
 
 Shaders compile via Slang's `slangc`, resolved from `tools/slang/`, the `SLANGC`
 env var, or `PATH` (see [`docs/phase-0-foundations.md`](docs/phase-0-foundations.md)).
