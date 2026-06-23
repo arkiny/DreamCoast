@@ -231,6 +231,18 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "cull_draw_fs",
     },
+    Job {
+        src: "rt_trace.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "rt_trace_cs",
+    },
+    Job {
+        src: "rt_path.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "rt_path_cs",
+    },
 ];
 
 /// (slang target name, output file extension, generated accessor suffix, required).

@@ -25,6 +25,11 @@ pub use resources::{
 pub use swapchain::MetalSwapchain;
 pub use sync::{MetalFence, MetalSemaphore};
 
+/// Placeholder ray-tracing scene type so the `rhi` facade's `RaytracingScene`
+/// enum has a Metal variant. Hardware ray tracing is deferred on Metal
+/// (Phase 8), so this is never constructed (`has_raytracing()` is false).
+pub struct MetalRaytracingScene;
+
 use dreamcoast_core::EngineError;
 use objc2_metal::MTLPixelFormat;
 use rhi_types::Format;

@@ -19,6 +19,7 @@ use std::ffi::CStr;
 use ash::vk;
 use dreamcoast_core::EngineError;
 
+mod accel;
 mod buffer;
 mod command;
 mod cubemap;
@@ -31,6 +32,7 @@ mod swapchain;
 mod sync;
 mod texture;
 
+pub use accel::VulkanRaytracingScene;
 pub use buffer::{VulkanBuffer, VulkanStorageBuffer};
 pub use command::VulkanCommandBuffer;
 pub use cubemap::VulkanCubemap;

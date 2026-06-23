@@ -19,11 +19,11 @@ use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
 use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourcePool};
 use rhi::{
-    BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, CommandBuffer,
-    ComputePipelineDesc, Cubemap, CubemapDesc, Device, Extent2D, Fence, Format, GraphicsPipeline,
-    GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology, Queue,
-    ReadbackLayout, Semaphore, StorageBufferDesc, Swapchain, SwapchainDesc, Texture, TextureDesc,
-    VertexLayout,
+    BackendKind, BlasGeometry, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor,
+    CommandBuffer, ComputePipelineDesc, Cubemap, CubemapDesc, Device, Extent2D, Fence, Format,
+    GraphicsPipeline, GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology,
+    Queue, ReadbackLayout, RtGeometry, Semaphore, StorageBufferDesc, Swapchain, SwapchainDesc,
+    Texture, TextureDesc, TlasInstance, VertexLayout,
 };
 use tracing::info;
 
@@ -82,6 +82,8 @@ struct SceneObject {
     vbuf: Buffer,
     ibuf: Buffer,
     index_count: u32,
+    /// Vertex count (for the BLAS build's `max_vertex`, Phase 8).
+    vertex_count: u32,
     transform: Mat4,
     base_color: [f32; 4],
     metallic: f32,
@@ -333,6 +335,49 @@ fn main() -> anyhow::Result<()> {
         bindless: true,
         threads_per_group: [8, 8, 1],
     })?;
+
+    // Phase 8 M3: inline ray-query trace pipeline (compute + `RayQuery`). Only on
+    // RT-capable devices; the bindless block then carries the scene TLAS (binding
+    // 5 / `t1088,space1`).
+    let rt_trace_pipeline = if device.has_raytracing() {
+        let rt_trace_cs = load_compute_shader(
+            backend,
+            dreamcoast_shader::rt_trace_cs_spirv,
+            dreamcoast_shader::rt_trace_cs_dxil,
+            dreamcoast_shader::rt_trace_cs_metallib,
+            "rt_trace",
+        )?;
+        Some(device.create_compute_pipeline(&ComputePipelineDesc {
+            compute_bytes: rt_trace_cs,
+            compute_entry: "csMain",
+            push_constant_size: 112, // inv_view_proj + cam_pos + sun_dir + out/w/h/pad
+            bindless: true,
+            threads_per_group: [8, 8, 1],
+        })?)
+    } else {
+        None
+    };
+
+    // Phase 8 M4: inline path tracer (diffuse GI bounce loop + progressive
+    // accumulation). Shares the bindless TLAS + geometry storage buffers.
+    let rt_path_pipeline = if device.has_raytracing() {
+        let rt_path_cs = load_compute_shader(
+            backend,
+            dreamcoast_shader::rt_path_cs_spirv,
+            dreamcoast_shader::rt_path_cs_dxil,
+            dreamcoast_shader::rt_path_cs_metallib,
+            "rt_path",
+        )?;
+        Some(device.create_compute_pipeline(&ComputePipelineDesc {
+            compute_bytes: rt_path_cs,
+            compute_entry: "csMain",
+            push_constant_size: 128, // inv_view_proj + cam_pos + sun + 2x uint4
+            bindless: true,
+            threads_per_group: [8, 8, 1],
+        })?)
+    } else {
+        None
+    };
 
     // GPU particle simulation (Phase 7): a persistent storage buffer the sim
     // compute pass updates in-place each frame and the draw pass reads in its
@@ -680,6 +725,7 @@ fn main() -> anyhow::Result<()> {
         vbuf,
         ibuf,
         index_count,
+        vertex_count: model.vertices.len() as u32,
         transform: Mat4::IDENTITY,
         base_color: model.material.base_color_factor,
         metallic: model.material.metallic_factor,
@@ -693,6 +739,7 @@ fn main() -> anyhow::Result<()> {
         vbuf: sv,
         ibuf: si,
         index_count: sc,
+        vertex_count: sphere.vertices.len() as u32,
         transform: trs(Vec3::new(-r * 1.7, r * 0.75, r * 0.5), r * 0.75),
         base_color: [0.95, 0.96, 0.97, 1.0],
         metallic: 1.0,
@@ -706,6 +753,7 @@ fn main() -> anyhow::Result<()> {
         vbuf: sv2,
         ibuf: si2,
         index_count: sc2,
+        vertex_count: sphere.vertices.len() as u32,
         transform: trs(Vec3::new(r * 1.9, r * 0.5, -r * 0.4), r * 0.5),
         base_color: [0.95, 0.64, 0.54, 1.0],
         metallic: 1.0,
@@ -719,6 +767,7 @@ fn main() -> anyhow::Result<()> {
         vbuf: cv,
         ibuf: ci,
         index_count: cc,
+        vertex_count: cube.vertices.len() as u32,
         transform: Mat4::from_translation(Vec3::new(0.0, r * 0.45, -r * 2.0))
             * Mat4::from_scale(Vec3::splat(r * 0.45)),
         base_color: [0.85, 0.25, 0.2, 1.0],
@@ -732,6 +781,122 @@ fn main() -> anyhow::Result<()> {
     // Ground plane (separate handle: also used by the environment capture).
     let ground = ground_mesh(scene_radius * 1.3, 0.0);
     let (ground_vbuf, ground_ibuf, ground_count) = upload_mesh(&device, &ground)?;
+
+    // Hardware ray tracing (Phase 8): build one BLAS per scene mesh + ground and a
+    // TLAS over their instances, then register the TLAS in the bindless table so
+    // the inline-trace compute pass (M3) can trace it. `rt_scene` outlives the
+    // frame loop (the TLAS must stay alive while it is bound).
+    let rt_scene = if device.has_raytracing() {
+        let mut geoms: Vec<RtGeometry> = scene
+            .iter()
+            .map(|o| RtGeometry {
+                vertex_buffer: &o.vbuf,
+                index_buffer: &o.ibuf,
+                geometry: BlasGeometry {
+                    vertex_count: o.vertex_count,
+                    vertex_stride: 32,
+                    index_count: o.index_count,
+                },
+            })
+            .collect();
+        geoms.push(RtGeometry {
+            vertex_buffer: &ground_vbuf,
+            index_buffer: &ground_ibuf,
+            geometry: BlasGeometry {
+                vertex_count: ground.vertices.len() as u32,
+                vertex_stride: 32,
+                index_count: ground_count,
+            },
+        });
+        let instances: Vec<TlasInstance> = (0..geoms.len())
+            .map(|i| TlasInstance {
+                blas_index: i as u32,
+                transform: mat4_to_3x4(if i < scene.len() {
+                    scene[i].transform
+                } else {
+                    Mat4::IDENTITY
+                }),
+                custom_index: i as u32,
+                mask: 0xFF,
+            })
+            .collect();
+        match device.build_raytracing_scene(&geoms, &instances) {
+            Ok(s) => {
+                device.bind_tlas(&s);
+                info!("ray-tracing scene built: {} BLAS + 1 TLAS", geoms.len());
+                Some(s)
+            }
+            Err(e) => {
+                tracing::error!("ray-tracing scene build failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Phase 8 M4: per-instance geometry storage buffers + instance table for the
+    // path tracer's hit shading. One vertex + one index storage buffer per
+    // instance (read as raw byte-address buffers in the shader), plus a table
+    // mapping InstanceID -> { vertex SB index, index SB index, albedo }. The order
+    // MUST match the TLAS instance custom_index order (scene objects, then ground).
+    // `_rt_geometry` keeps the geometry buffers alive for the program's lifetime.
+    let (rt_instance_table, _rt_geometry) = if rt_scene.is_some() {
+        // (mesh, albedo) per instance, in TLAS instance order (objects, then ground).
+        let ground_albedo = [0.8f32, 0.8, 0.8, 0.0];
+        let entries: [(&MeshData, [f32; 4]); 5] = [
+            (&model, scene[0].base_color),
+            (&sphere, scene[1].base_color),
+            (&sphere, scene[2].base_color),
+            (&cube, scene[3].base_color),
+            (&ground, ground_albedo),
+        ];
+        let (table, geometry) = build_pt_instance_table(&device, &entries)?;
+        info!("path-tracer instance table: {} instances", entries.len());
+        (Some(table), geometry)
+    } else {
+        (None, Vec::new())
+    };
+
+    // Phase 8 M4: an alternate Cornell-box scene for the path tracer (strong color
+    // bleeding from the red/green walls, area-light GI). Built once: its own BLAS
+    // per quad/box + TLAS + instance table. The host-visible vertex/index buffers
+    // are only needed during the BLAS build, so they drop at the end of this block.
+    let (cornell_scene, cornell_table, _cornell_geometry) = if device.has_raytracing() {
+        let meshes = dreamcoast_asset::cornell_box();
+        let mut hostbufs: Vec<(Buffer, Buffer, u32, u32)> = Vec::with_capacity(meshes.len());
+        for (m, _) in &meshes {
+            let (vb, ib, ic) = upload_mesh(&device, m)?;
+            hostbufs.push((vb, ib, ic, m.vertices.len() as u32));
+        }
+        let geoms: Vec<RtGeometry> = hostbufs
+            .iter()
+            .map(|(vb, ib, ic, vc)| RtGeometry {
+                vertex_buffer: vb,
+                index_buffer: ib,
+                geometry: BlasGeometry {
+                    vertex_count: *vc,
+                    vertex_stride: 32,
+                    index_count: *ic,
+                },
+            })
+            .collect();
+        let instances: Vec<TlasInstance> = (0..geoms.len() as u32)
+            .map(|i| TlasInstance {
+                blas_index: i,
+                transform: mat4_to_3x4(Mat4::IDENTITY), // geometry already world-space
+                custom_index: i,
+                mask: 0xFF,
+            })
+            .collect();
+        let scene = device.build_raytracing_scene(&geoms, &instances)?;
+        let entries: Vec<(&MeshData, [f32; 4])> = meshes.iter().map(|(m, a)| (m, *a)).collect();
+        let (table, geometry) = build_pt_instance_table(&device, &entries)?;
+        info!("cornell-box scene built: {} instances", meshes.len());
+        (Some(scene), Some(table), geometry)
+    } else {
+        (None, None, Vec::new())
+    };
 
     // Per-frame globals uniform buffer (one 256-byte slice per frame-in-flight).
     let globals_buffer = device.create_buffer(&BufferDesc {
@@ -775,6 +940,20 @@ fn main() -> anyhow::Result<()> {
         && (std::env::var_os("ASYNC_COMPUTE").is_some() || !screenshot_mode);
     // Phase 7: GPU frustum culling -> indirect draw of a cube instance grid.
     let mut gpu_cull = compute_supported && std::env::var_os("P7_CULL").is_some();
+    // Phase 8 M3: replace the rasterized image with an inline ray-query trace
+    // (primary hit instance color modulated by a hardware shadow ray). Requires a
+    // built RT scene; headless toggle via `P8_PATHTRACE`.
+    let mut path_trace = rt_trace_pipeline.is_some()
+        && rt_scene.is_some()
+        && std::env::var_os("P8_PATHTRACE").is_some();
+    // Debug mode: show the M3 single-bounce trace viz (instance color + RT shadow)
+    // instead of the M4 path tracer. Headless toggle via `P8_RT_DEBUG`.
+    let mut rt_debug = device.has_raytracing() && std::env::var_os("P8_RT_DEBUG").is_some();
+    // Cornell-box scene for the path tracer (strong color bleeding). Headless
+    // toggle via `P8_CORNELL`; uses a fixed front-facing camera.
+    let mut cornell = cornell_scene.is_some() && std::env::var_os("P8_CORNELL").is_some();
+    // Samples per path-trace dispatch (accumulated progressively across frames).
+    let path_spp: u32 = 8;
     // Real-time environment capture: re-capture the env chain every frame (so the
     // sky/IBL track the live sun); when off, re-capture only when the sun changes.
     let mut realtime_env = true;
@@ -916,6 +1095,17 @@ fn main() -> anyhow::Result<()> {
     let mut particle_parity = 0usize;
     // Fixed view in screenshot mode for reproducible output.
     let mut angle = if screenshot_mode { 0.7 } else { 0.0 };
+    // Path-tracer progressive accumulation (Phase 8 M4): a persistent float4-per-
+    // pixel sum buffer, reset when the view/lighting/resolution changes. Extra
+    // headless warmup frames let the static-camera screenshot converge.
+    let mut path_accum: Option<rhi::StorageBuffer> = None;
+    let mut accum_extent = (0u32, 0u32);
+    let mut accum_frame = 0u32;
+    let mut last_pt_key: Option<[u32; 8]> = None;
+    // Which scene's TLAS is currently bound to the bindless slot (None = open
+    // scene, the startup default). Switching rebinds (wait_idle) the TLAS.
+    let mut bound_cornell = false;
+    const PATHTRACE_WARMUP: u64 = 64;
 
     while !window.should_close() {
         window.pump_events();
@@ -947,6 +1137,14 @@ fn main() -> anyhow::Result<()> {
             angle += dt * 0.6; // hold a fixed view when capturing
         }
 
+        // Path-trace screenshots need a long warmup so the static-camera
+        // accumulation converges before the frame is captured.
+        let warmup = if path_trace && !rt_debug {
+            PATHTRACE_WARMUP
+        } else {
+            SCREENSHOT_WARMUP
+        };
+
         // Decide whether this frame produces a screenshot: a scheduled capture in
         // screenshot mode (after warmup), or an F2 rising edge interactively.
         let f2 = window.input().key_down(VK_F2);
@@ -954,7 +1152,7 @@ fn main() -> anyhow::Result<()> {
         f2_prev = f2;
         let capture_this_frame: Option<Capture> = if screenshot_mode {
             frame_no
-                .checked_sub(SCREENSHOT_WARMUP)
+                .checked_sub(warmup)
                 .and_then(|i| captures.get(i as usize).cloned())
         } else if f2_pressed {
             Some(Capture {
@@ -1033,6 +1231,26 @@ fn main() -> anyhow::Result<()> {
                         ui.text_disabled("  - async compute (no dedicated queue)");
                     }
                     ui.checkbox("GPU culling (indirect)", &mut gpu_cull);
+                    if rt_path_pipeline.is_some() && rt_scene.is_some() {
+                        ui.separator();
+                        ui.text("Ray tracing (Phase 8)");
+                        ui.checkbox("Path trace (inline ray query)", &mut path_trace);
+                        if path_trace {
+                            ui.checkbox("  - debug: instance + shadow viz", &mut rt_debug);
+                            if !rt_debug {
+                                if cornell_scene.is_some() {
+                                    ui.checkbox("  - Cornell box", &mut cornell);
+                                }
+                                ui.text(format!(
+                                    "  - {} spp accumulated",
+                                    accum_frame.saturating_mul(path_spp)
+                                ));
+                            }
+                        }
+                    } else {
+                        ui.separator();
+                        ui.text_disabled("Ray tracing (unsupported)");
+                    }
                 });
         }
 
@@ -1137,6 +1355,65 @@ fn main() -> anyhow::Result<()> {
 
         // Build the deferred render graph:
         //   gbuffer (4 MRT + depth) -> lighting (HDR) -> tonemap (backbuffer) -> ui
+        // Phase 8 M4: manage the path tracer's persistent accumulation buffer and
+        // reset key BEFORE building the render graph — the fallible buffer
+        // (re)allocation must not sit on a `?` early-return path while the graph
+        // holds borrows of transient resources.
+        let pt_active =
+            path_trace && !rt_debug && rt_path_pipeline.is_some() && rt_instance_table.is_some();
+        // The path tracer uses the Cornell scene (fixed front camera) when toggled,
+        // else the orbiting open scene. `pt_eye` / `pt_inv_vp` feed the trace rays.
+        let use_cornell = pt_active && cornell && cornell_scene.is_some();
+        let (pt_eye, pt_inv_vp) = if use_cornell {
+            let c_eye = Vec3::new(0.0, 1.0, 3.2);
+            let c_view = Mat4::look_at_rh(c_eye, Vec3::new(0.0, 1.0, 0.0), Vec3::Y);
+            let mut c_proj =
+                Mat4::perspective_rh(40f32.to_radians(), cw as f32 / ch as f32, 0.05, 100.0);
+            if backend == BackendKind::Vulkan {
+                c_proj.y_axis.y *= -1.0;
+            }
+            (c_eye, (c_proj * c_view).inverse().to_cols_array())
+        } else {
+            (eye, inv_view_proj)
+        };
+        if pt_active {
+            // Switch the bound TLAS when toggling scenes (rare → wait_idle is fine).
+            if bound_cornell != use_cornell {
+                device.wait_idle()?;
+                if use_cornell {
+                    device.bind_tlas(cornell_scene.as_ref().unwrap());
+                } else if let Some(s) = rt_scene.as_ref() {
+                    device.bind_tlas(s);
+                }
+                bound_cornell = use_cornell;
+                accum_frame = 0;
+            }
+            if accum_extent != (cw, ch) {
+                device.wait_idle()?;
+                path_accum = Some(device.create_storage_buffer(&StorageBufferDesc {
+                    size: (cw as u64) * (ch as u64) * 16,
+                    stride: 16,
+                    indirect: false,
+                })?);
+                accum_extent = (cw, ch);
+                accum_frame = 0;
+            }
+            let key = [
+                pt_eye.x.to_bits(),
+                pt_eye.y.to_bits(),
+                pt_eye.z.to_bits(),
+                sun_dir[0].to_bits(),
+                sun_dir[1].to_bits(),
+                sun_dir[2].to_bits(),
+                sun_intensity.to_bits(),
+                (cw.wrapping_mul(0x9E37_79B1).wrapping_add(ch)) ^ (use_cornell as u32),
+            ];
+            if last_pt_key != Some(key) {
+                accum_frame = 0;
+                last_pt_key = Some(key);
+            }
+        }
+
         let extent = Extent2D::new(cw, ch);
         let mut graph = RenderGraph::new();
         let backbuffer = graph.import_backbuffer(swapchain.format(), extent);
@@ -1419,8 +1696,95 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        // Tonemap samples the compute-post output when enabled, else raw HDR.
-        let tonemap_src = hdr_post.unwrap_or(hdr);
+        // Phase 8 ray tracing: M4 inline path tracer (default) or the M3 trace viz
+        // (debug). The chosen compute pass writes a storage image the tonemap pass
+        // displays in place of the rasterized HDR. (`pt_active` + the accumulation
+        // buffer were prepared above, before the graph was built.)
+        let rt_on = path_trace && (rt_path_pipeline.is_some() || rt_trace_pipeline.is_some());
+        let rt_out = if rt_on {
+            Some(graph.create_storage_image("rt_out", HDR_FORMAT, extent))
+        } else {
+            None
+        };
+        if let Some(rt_out) = rt_out {
+            if pt_active {
+                let rt_pipe = rt_path_pipeline.as_ref().unwrap();
+                // Index only (no borrow held into the graph closure — that would
+                // over-extend the graph's lifetime vs. the transient resources).
+                let accum_index = path_accum.as_ref().unwrap().storage_index();
+                let inst_index = if use_cornell {
+                    cornell_table.as_ref().unwrap().storage_index()
+                } else {
+                    rt_instance_table.as_ref().unwrap().storage_index()
+                };
+                // External resource so the graph orders the accumulation write (and
+                // inserts a barrier before the next frame's read).
+                let accum_ext = graph.import_external("rt_accum");
+                let inv_vp = pt_inv_vp;
+                let cam = pt_eye;
+                let sun = sun_dir;
+                let sun_i = sun_intensity;
+                // bit0 = Vulkan Y-flip, bit1 = Cornell env mode (no sun, black bg).
+                let flip = flip_y | if use_cornell { 2 } else { 0 };
+                let frame_idx = accum_frame;
+                let spp = path_spp;
+                graph.add_compute_pass(
+                    ComputePassInfo {
+                        name: "rt_path",
+                        storage_writes: vec![rt_out, accum_ext],
+                        reads: vec![],
+                    },
+                    move |ctx| {
+                        let out_index = ctx.storage_index(rt_out);
+                        let cmd = ctx.cmd();
+                        cmd.bind_compute_pipeline(rt_pipe);
+                        cmd.push_constants_compute(&rt_path_push(
+                            &inv_vp,
+                            cam,
+                            sun,
+                            sun_i,
+                            out_index,
+                            accum_index,
+                            inst_index,
+                            frame_idx,
+                            cw,
+                            ch,
+                            flip,
+                            spp,
+                        ));
+                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                        Ok(())
+                    },
+                );
+                accum_frame += 1;
+            } else if let Some(rt_pipe) = rt_trace_pipeline.as_ref() {
+                let inv_vp = inv_view_proj;
+                let cam = eye;
+                let sun = sun_dir;
+                let flip = flip_y;
+                graph.add_compute_pass(
+                    ComputePassInfo {
+                        name: "rt_trace",
+                        storage_writes: vec![rt_out],
+                        reads: vec![],
+                    },
+                    move |ctx| {
+                        let out_index = ctx.storage_index(rt_out);
+                        let cmd = ctx.cmd();
+                        cmd.bind_compute_pipeline(rt_pipe);
+                        cmd.push_constants_compute(&rt_trace_push(
+                            &inv_vp, cam, sun, out_index, cw, ch, flip,
+                        ));
+                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                        Ok(())
+                    },
+                );
+            }
+        }
+
+        // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active,
+        // else the compute-post output when enabled, else raw HDR.
+        let tonemap_src = rt_out.or(hdr_post).unwrap_or(hdr);
         graph.add_pass(
             PassInfo {
                 name: "tonemap",
@@ -1595,7 +1959,7 @@ fn main() -> anyhow::Result<()> {
         frame_no += 1;
 
         // In screenshot mode, exit once every requested capture is saved.
-        if screenshot_mode && frame_no >= SCREENSHOT_WARMUP + captures.len() as u64 {
+        if screenshot_mode && frame_no >= warmup + captures.len() as u64 {
             break;
         }
     }
@@ -2117,6 +2481,76 @@ fn cull_draw_push(
     pc
 }
 
+/// Pack the inline ray-query trace push block (Phase 8 M3): inv_view_proj (64) +
+/// cam_pos (16, xyz) + sun_dir (16, xyz) + out_index/width/height/flip_y (16).
+fn rt_trace_push(
+    inv_view_proj: &[f32; 16],
+    cam_pos: Vec3,
+    sun_dir: [f32; 3],
+    out_index: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&cam_pos.x.to_le_bytes());
+    pc[68..72].copy_from_slice(&cam_pos.y.to_le_bytes());
+    pc[72..76].copy_from_slice(&cam_pos.z.to_le_bytes());
+    let sun = normalize3(sun_dir);
+    pc[80..84].copy_from_slice(&sun[0].to_le_bytes());
+    pc[84..88].copy_from_slice(&sun[1].to_le_bytes());
+    pc[88..92].copy_from_slice(&sun[2].to_le_bytes());
+    pc[96..100].copy_from_slice(&out_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&width.to_le_bytes());
+    pc[104..108].copy_from_slice(&height.to_le_bytes());
+    pc[108..112].copy_from_slice(&flip_y.to_le_bytes());
+    pc
+}
+
+/// Pack the path-tracer push block (Phase 8 M4, 128 bytes): inv_view_proj (64) +
+/// cam_pos (16) + sun dir+intensity (16) + (out, accum, inst, frame) (16) +
+/// (width, height, flip_y, spp) (16).
+#[allow(clippy::too_many_arguments)]
+fn rt_path_push(
+    inv_view_proj: &[f32; 16],
+    cam_pos: Vec3,
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    out_index: u32,
+    accum_index: u32,
+    inst_index: u32,
+    frame: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    spp: u32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&cam_pos.x.to_le_bytes());
+    pc[68..72].copy_from_slice(&cam_pos.y.to_le_bytes());
+    pc[72..76].copy_from_slice(&cam_pos.z.to_le_bytes());
+    let sun = normalize3(sun_dir);
+    pc[80..84].copy_from_slice(&sun[0].to_le_bytes());
+    pc[84..88].copy_from_slice(&sun[1].to_le_bytes());
+    pc[88..92].copy_from_slice(&sun[2].to_le_bytes());
+    pc[92..96].copy_from_slice(&sun_intensity.to_le_bytes());
+    pc[96..100].copy_from_slice(&out_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&accum_index.to_le_bytes());
+    pc[104..108].copy_from_slice(&inst_index.to_le_bytes());
+    pc[108..112].copy_from_slice(&frame.to_le_bytes());
+    pc[112..116].copy_from_slice(&width.to_le_bytes());
+    pc[116..120].copy_from_slice(&height.to_le_bytes());
+    pc[120..124].copy_from_slice(&flip_y.to_le_bytes());
+    pc[124..128].copy_from_slice(&spp.to_le_bytes());
+    pc
+}
+
 /// Pack the compute-post push block: hdr_index + out_index + width + height.
 fn post_compute_push(hdr_index: u32, out_index: u32, width: u32, height: u32) -> [u8; 16] {
     let mut pc = [0u8; 16];
@@ -2125,6 +2559,89 @@ fn post_compute_push(hdr_index: u32, out_index: u32, width: u32, height: u32) ->
     pc[8..12].copy_from_slice(&width.to_le_bytes());
     pc[12..16].copy_from_slice(&height.to_le_bytes());
     pc
+}
+
+/// Convert a column-major glam [`Mat4`] object-to-world transform into the
+/// row-major 3x4 (12-float) form acceleration-structure instances expect (Phase 8).
+fn mat4_to_3x4(m: Mat4) -> [f32; 12] {
+    let c = m.to_cols_array(); // column-major: [c0(0..4), c1(4..8), c2(8..12), c3(12..16)]
+    [
+        c[0], c[4], c[8], c[12], // row 0
+        c[1], c[5], c[9], c[13], // row 1
+        c[2], c[6], c[10], c[14], // row 2
+    ]
+}
+
+/// Raw bytes of a mesh's vertex array (32-byte vertices), for uploading geometry
+/// into a ray-tracing storage buffer the path tracer reads (Phase 8 M4).
+fn vertex_bytes(m: &MeshData) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            m.vertices.as_ptr() as *const u8,
+            std::mem::size_of_val(m.vertices.as_slice()),
+        )
+    }
+}
+
+/// Raw bytes of a mesh's u32 index array (Phase 8 M4).
+fn index_bytes(m: &MeshData) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            m.indices.as_ptr() as *const u8,
+            std::mem::size_of_val(m.indices.as_slice()),
+        )
+    }
+}
+
+/// Upload per-instance path-tracer geometry (vertex + index storage buffers) and
+/// build the instance table (Phase 8 M4): one 32-byte record per entry holding
+/// `{ vertex SB index, index SB index, pad, pad, albedo.rgb, emissive }`. The
+/// entry order must match the scene's TLAS instance custom_index order. Returns
+/// the table plus the geometry buffers (kept alive by the caller).
+fn build_pt_instance_table(
+    device: &Device,
+    entries: &[(&MeshData, [f32; 4])],
+) -> anyhow::Result<(rhi::StorageBuffer, Vec<rhi::StorageBuffer>)> {
+    let mut geometry: Vec<rhi::StorageBuffer> = Vec::with_capacity(entries.len() * 2);
+    let mut records: Vec<u8> = Vec::with_capacity(entries.len() * 32);
+    for (mesh, albedo) in entries {
+        let vb = vertex_bytes(mesh);
+        let ib = index_bytes(mesh);
+        let vsb = device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: vb.len() as u64,
+                stride: 32,
+                indirect: false,
+            },
+            vb,
+        )?;
+        let isb = device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: ib.len() as u64,
+                stride: 4,
+                indirect: false,
+            },
+            ib,
+        )?;
+        records.extend_from_slice(&vsb.storage_index().to_le_bytes());
+        records.extend_from_slice(&isb.storage_index().to_le_bytes());
+        records.extend_from_slice(&0u32.to_le_bytes()); // pad0
+        records.extend_from_slice(&0u32.to_le_bytes()); // pad1
+        for c in albedo {
+            records.extend_from_slice(&c.to_le_bytes());
+        }
+        geometry.push(vsb);
+        geometry.push(isb);
+    }
+    let table = device.create_storage_buffer_init(
+        &StorageBufferDesc {
+            size: records.len() as u64,
+            stride: 32,
+            indirect: false,
+        },
+        &records,
+    )?;
+    Ok((table, geometry))
 }
 
 fn upload_mesh(device: &Device, model: &MeshData) -> anyhow::Result<(Buffer, Buffer, u32)> {

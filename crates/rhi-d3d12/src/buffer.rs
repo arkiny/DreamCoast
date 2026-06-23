@@ -205,6 +205,92 @@ impl D3d12StorageBuffer {
         }
     }
 
+    /// Create a DEFAULT-heap storage buffer seeded with host `data` via an UPLOAD
+    /// staging copy (Phase 8: ray-tracing geometry + instance table). Uploaded
+    /// once at scene setup through a one-shot transfer; ends in UAV state.
+    pub(crate) fn new_init(
+        device: Rc<DeviceShared>,
+        desc: &StorageBufferDesc,
+        data: &[u8],
+    ) -> Result<Self, EngineError> {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_TRANSITION_BARRIER,
+        };
+        let sb = Self::new(device.clone(), desc)?;
+        unsafe {
+            // UPLOAD staging buffer (CPU writes, GPU copies to the DEFAULT target).
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+                CreationNodeMask: 1,
+                VisibleNodeMask: 1,
+            };
+            let res_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Alignment: 0,
+                Width: desc.size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_NONE,
+            };
+            let mut staging: Option<ID3D12Resource> = None;
+            device
+                .device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &res_desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut staging,
+                )
+                .map_err(d3d_err)?;
+            let staging = staging.ok_or_else(|| EngineError::Rhi("staging null".into()))?;
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            staging.Map(0, None, Some(&mut ptr)).map_err(d3d_err)?;
+            let n = data.len().min(desc.size as usize);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, n);
+            staging.Unmap(0, None);
+
+            let transition = |from, to| D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(Some(std::mem::transmute_copy(
+                            &sb.resource,
+                        ))),
+                        Subresource: 0,
+                        StateBefore: from,
+                        StateAfter: to,
+                    }),
+                },
+            };
+            device.immediate_submit(|list| {
+                list.ResourceBarrier(&[transition(
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                list.CopyBufferRegion(&sb.resource, 0, &staging, 0, desc.size);
+                list.ResourceBarrier(&[transition(
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            })?;
+        }
+        Ok(sb)
+    }
+
     /// Index of this buffer in the bindless storage-buffer table.
     pub fn storage_index(&self) -> u32 {
         self.index

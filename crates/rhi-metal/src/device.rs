@@ -445,6 +445,18 @@ impl MetalDevice {
         Ok(MetalStorageBuffer::new(buffer, index))
     }
 
+    /// Host-seeded storage buffer (Phase 8 RT geometry). Unimplemented on Metal —
+    /// hardware ray tracing is deferred, so the path tracer never calls this.
+    pub fn create_storage_buffer_init(
+        &self,
+        _desc: &StorageBufferDesc,
+        _data: &[u8],
+    ) -> Result<MetalStorageBuffer> {
+        Err(rhi_err(
+            "storage-buffer host upload is not implemented on Metal (Phase 8 deferred)",
+        ))
+    }
+
     /// Store the per-frame globals UBO. `slice_size` is unused on Metal (the
     /// per-draw byte offset is passed explicitly to `set_globals`); the buffer is
     /// bound at [`crate::resources::GLOBALS_BUFFER_INDEX`] for `uses_globals`

@@ -21,12 +21,23 @@ pub struct VulkanBuffer {
 impl VulkanBuffer {
     pub(crate) fn new(device: Arc<DeviceShared>, desc: &BufferDesc) -> Result<Self, EngineError> {
         unsafe {
-            let usage = match desc.usage {
+            let mut usage = match desc.usage {
                 BufferUsage::Vertex => vk::BufferUsageFlags::VERTEX_BUFFER,
                 BufferUsage::Index => vk::BufferUsageFlags::INDEX_BUFFER,
                 BufferUsage::Uniform => vk::BufferUsageFlags::UNIFORM_BUFFER,
                 BufferUsage::Readback => vk::BufferUsageFlags::TRANSFER_DST,
             };
+            // When hardware ray tracing is available, vertex/index buffers double as
+            // bottom-level acceleration-structure build inputs (Phase 8): the BLAS
+            // build reads their device addresses, so they need the device-address +
+            // AS-build-input usages and a device-address-flagged allocation. Additive
+            // and gated, so non-RT devices are unaffected.
+            let rt_geometry = device.has_raytracing
+                && matches!(desc.usage, BufferUsage::Vertex | BufferUsage::Index);
+            if rt_geometry {
+                usage |= vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+            }
             let ci = vk::BufferCreateInfo::default()
                 .size(desc.size)
                 .usage(usage)
@@ -38,9 +49,14 @@ impl VulkanBuffer {
                 req.memory_type_bits,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )?;
-            let alloc = vk::MemoryAllocateInfo::default()
+            let mut flags_info = vk::MemoryAllocateFlagsInfo::default()
+                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let mut alloc = vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(mem_type);
+            if rt_geometry {
+                alloc = alloc.push_next(&mut flags_info);
+            }
             let memory = device
                 .device
                 .allocate_memory(&alloc, None)
@@ -97,6 +113,14 @@ impl VulkanBuffer {
 
     pub(crate) fn raw(&self) -> vk::Buffer {
         self.buffer
+    }
+
+    /// GPU device address of this buffer (Phase 8 BLAS build input). Valid only
+    /// when the buffer was created on an RT-capable device with a vertex/index
+    /// usage (see `new`); otherwise the address query is invalid.
+    pub(crate) fn device_address(&self) -> u64 {
+        let info = vk::BufferDeviceAddressInfo::default().buffer(self.buffer);
+        unsafe { self.device.device.get_buffer_device_address(&info) }
     }
 }
 
@@ -168,6 +192,59 @@ impl VulkanStorageBuffer {
                 index,
             })
         }
+    }
+
+    /// Create a device-local storage buffer seeded with host `data` via a staging
+    /// copy (Phase 8: ray-tracing geometry + instance table read by the path
+    /// tracer). Uploaded once at scene setup through a one-shot transfer.
+    pub(crate) fn new_init(
+        device: Arc<DeviceShared>,
+        desc: &StorageBufferDesc,
+        data: &[u8],
+    ) -> Result<Self, EngineError> {
+        let sb = Self::new(device.clone(), desc)?;
+        unsafe {
+            // Host-visible staging buffer, copied into the device-local target.
+            let ci = vk::BufferCreateInfo::default()
+                .size(desc.size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let staging = device.device.create_buffer(&ci, None).map_err(vk_err)?;
+            let req = device.device.get_buffer_memory_requirements(staging);
+            let mem_type = device.find_memory_type(
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type);
+            let mem = device
+                .device
+                .allocate_memory(&alloc, None)
+                .map_err(vk_err)?;
+            device
+                .device
+                .bind_buffer_memory(staging, mem, 0)
+                .map_err(vk_err)?;
+            let ptr = device
+                .device
+                .map_memory(mem, 0, desc.size, vk::MemoryMapFlags::empty())
+                .map_err(vk_err)? as *mut u8;
+            let n = data.len().min(desc.size as usize);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, n);
+            device.device.unmap_memory(mem);
+
+            device.immediate_submit(|cmd| {
+                let region = vk::BufferCopy::default().size(desc.size);
+                device
+                    .device
+                    .cmd_copy_buffer(cmd, staging, sb.buffer, &[region]);
+            })?;
+
+            device.device.destroy_buffer(staging, None);
+            device.device.free_memory(mem, None);
+        }
+        Ok(sb)
     }
 
     /// Index of this buffer in the bindless storage-buffer table.

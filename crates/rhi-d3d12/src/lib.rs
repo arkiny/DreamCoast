@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
 };
 
+mod accel;
 mod buffer;
 mod command;
 mod cubemap;
@@ -33,6 +34,7 @@ mod swapchain;
 mod sync;
 mod texture;
 
+pub use accel::D3d12RaytracingScene;
 pub use buffer::{D3d12Buffer, D3d12StorageBuffer};
 pub use command::D3d12CommandBuffer;
 pub use cubemap::D3d12Cubemap;

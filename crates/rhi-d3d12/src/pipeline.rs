@@ -34,7 +34,7 @@ use windows::core::s;
 
 use crate::device::{
     BINDLESS_COUNT, CUBE_COUNT, DeviceShared, STORAGE_BUFFER_BASE, STORAGE_BUFFER_COUNT,
-    STORAGE_IMAGE_BASE, STORAGE_IMAGE_COUNT,
+    STORAGE_IMAGE_BASE, STORAGE_IMAGE_COUNT, TLAS_SLOT,
 };
 use crate::instance::d3d_err;
 use crate::to_dxgi_format;
@@ -261,7 +261,12 @@ fn create_root_signature(
 /// The shared sampler is the static sampler at `s0,space1` (see the root-signature
 /// builders). Each range keeps its own heap region (the `*_BASE` offsets), so the
 /// device binds — and the shader indexes — each array 0-based.
-fn bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 4] {
+///
+/// A fifth range covers the scene TLAS SRV at `t{BINDLESS_COUNT+CUBE_COUNT},
+/// space1` (Phase 8). It is always present so every bindless root signature stays
+/// uniform; non-RT pipelines simply never reference it (and the slot stays empty
+/// on devices without a built scene).
+fn bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 5] {
     [
         D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
@@ -292,6 +297,14 @@ fn bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 4] {
             BaseShaderRegister: STORAGE_IMAGE_COUNT,
             RegisterSpace: 1,
             OffsetInDescriptorsFromTableStart: STORAGE_BUFFER_BASE,
+        },
+        // Scene TLAS SRV at t{BINDLESS_COUNT+CUBE_COUNT}, space1 (Phase 8).
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: BINDLESS_COUNT + CUBE_COUNT,
+            RegisterSpace: 1,
+            OffsetInDescriptorsFromTableStart: TLAS_SLOT,
         },
     ]
 }
