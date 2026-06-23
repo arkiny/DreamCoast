@@ -77,6 +77,24 @@ P7_PARTICLES=1 ASYNC_COMPUTE=1 cargo run -p sandbox -- --backend metal --screens
 smoke test:
 `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo run -p sandbox -- --backend metal --mesh-test --screenshot mesh.png`.
 
+## Screenshots
+
+Captured on the Apple Silicon M3 box via `--backend metal --screenshot-clean` under
+`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`.
+
+**M4 — deferred-PBR scene** (shadow → G-buffer → IBL → lighting → tonemap):
+
+![Metal M4 deferred-PBR scene](images/metal-m4-deferred-pbr.png)
+
+**M5 — Phase-7 compute demos** (`P7_COMPUTE_POST` / `P7_PARTICLES` / `P7_CULL`):
+
+| Compute post-process | GPU particles | GPU cull + indirect draw |
+| --- | --- | --- |
+| ![Metal M5 compute post](images/metal-m5-compute-post.png) | ![Metal M5 GPU particles](images/metal-m5-particles.png) | ![Metal M5 GPU cull + indirect](images/metal-m5-cull-indirect.png) |
+
+(The `P7_PARTICLES=1 ASYNC_COMPUTE=1` async-compute path renders the same fountain as
+the single-queue particle path.)
+
 ## Milestone status
 
 - **M0 — skeleton/clear:** done. Cocoa window + `CAMetalLayer` swapchain +
