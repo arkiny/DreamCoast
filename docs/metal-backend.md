@@ -388,10 +388,12 @@ the flagless real renderer. All cross-backend (`--backend vulkan|d3d12|metal`).
     `load_compute_shader` now feed the Metal path the `*_metallib()` accessors. The
     compute pipelines / storage buffers create as inert placeholders (never
     dispatched on Metal).
-  - **Vulkan/D3D12 parity:** the shared shaders changed in step 1 (already flagged);
-    steps 2–6 are Metal-backend-only Rust + a backend-neutral sandbox gate, so they
-    do not alter the Windows backends. Still **verify the step-1 shader changes on
-    the Windows RTX 2070 SUPER box.**
+  - **Vulkan/D3D12 parity:** the shared shaders changed in step 1; steps 2–6 are
+    Metal-backend-only Rust + a backend-neutral sandbox gate, so they do not alter the
+    Windows backends. **Verified on the Windows RTX 2070 SUPER box** — commit
+    `1d61ef4` aligned the D3D12 graphics root signature to the `ParameterBlock`
+    `space1` bindless layout; Vulkan + D3D12 render the deferred-PBR scene
+    pixel-identically to Metal.
 
 ## M5 plan + progress
 
@@ -411,8 +413,8 @@ the 5 compute shaders to `metallib`** — not new design.
   `g.storage_*[]`. All five now compile to `metallib` (were the last `None`
   accessors). **SPIR-V descriptor layout byte-identical to the loose-global baseline**
   (storage image stays set 0 / binding 3, storage buffer binding 4; only the sampler
-  member name changed `g_sampler`→`g_samp`) — same risk profile as M3/M4, **Windows
-  parity pending the RTX 2070 SUPER box.** MSL: the argument-buffer struct is
+  member name changed `g_sampler`→`g_samp`) — same risk profile as M3/M4. MSL: the
+  argument-buffer struct is
   `textures[1024]/samp/cubes[64]/storage_images[64]/storage_buffers[64]` (no
   compaction); storage-image entries are `MTLResourceID`s, storage-buffer entries are
   `device` pointers (GPU addresses).
@@ -469,8 +471,13 @@ the 5 compute shaders to `metallib`** — not new design.
   hazards, validation clean. The single-queue path (graph compute pass + `submit`) is
   preserved as the fallback.
 
-- **Vulkan/D3D12 parity:** only the step-1 shader changes touch the shared shaders
-  (same bounded-array / dropped-`SPV_EXT_descriptor_indexing` change as M3/M4; storage
-  bindings unchanged). Steps 2–6 are Metal-backend-only Rust + the backend-neutral
-  `compute_supported = true` flip, so they don't alter the Windows backends. **Verify
-  the step-1 shader changes + the ungate on the Windows RTX 2070 SUPER box.**
+- **Vulkan/D3D12 parity — VERIFIED on the Windows RTX 2070 SUPER box.** Only the
+  step-1 shader change touches the shared shaders (same bounded-array /
+  dropped-`SPV_EXT_descriptor_indexing` change as M3/M4; storage bindings unchanged);
+  steps 2–6 are Metal-backend-only Rust + the backend-neutral `compute_supported =
+  true` flip. As predicted, folding the storage arrays into the `ParameterBlock`
+  required the D3D12 **compute** root signature to move to the `space1` bindless
+  layout: commit `48e03d3` unified both (graphics + compute) root signatures on it
+  (mirroring the M4 graphics fix `1d61ef4`). All three Phase-7 demos pass on Vulkan +
+  D3D12, and that fix is `rhi-d3d12`-only (`cfg(windows)`) so it caused **no Metal
+  regression** (re-verified on `main`). **All three backends are at Phase-7 parity.**
