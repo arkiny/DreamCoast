@@ -172,10 +172,9 @@ fn main() -> anyhow::Result<()> {
         device.has_async_compute(),
         device.has_raytracing()
     );
-    // Phase-7 compute (post blur / GPU particles / GPU culling) is M5 on Metal; the
-    // M4 deferred-PBR scene runs without it. Gate compute dispatch + seeding off so
-    // the Metal backend never hits an `unimplemented!` compute path.
-    let compute_supported = !matches!(backend, BackendKind::Metal);
+    // Phase-7 compute (post blur / GPU particles / GPU culling) is implemented on
+    // all three backends (Metal compute landed in M5).
+    let compute_supported = true;
 
     let mut swapchain = device.create_swapchain(&swapchain_desc(Extent2D::new(w, h)))?;
 
@@ -324,6 +323,7 @@ fn main() -> anyhow::Result<()> {
         backend,
         dreamcoast_shader::post_compute_cs_spirv,
         dreamcoast_shader::post_compute_cs_dxil,
+        dreamcoast_shader::post_compute_cs_metallib,
         "post_compute",
     )?;
     let post_compute_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
@@ -331,6 +331,7 @@ fn main() -> anyhow::Result<()> {
         compute_entry: "csMain",
         push_constant_size: 16, // hdr_index + out_index + width + height
         bindless: true,
+        threads_per_group: [8, 8, 1],
     })?;
 
     // GPU particle simulation (Phase 7): a persistent storage buffer the sim
@@ -340,6 +341,7 @@ fn main() -> anyhow::Result<()> {
         backend,
         dreamcoast_shader::particle_sim_cs_spirv,
         dreamcoast_shader::particle_sim_cs_dxil,
+        dreamcoast_shader::particle_sim_cs_metallib,
         "particle_sim",
     )?;
     let particle_sim_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
@@ -347,6 +349,7 @@ fn main() -> anyhow::Result<()> {
         compute_entry: "csMain",
         push_constant_size: 24, // read_index + write_index + count + dt + time + init
         bindless: true,
+        threads_per_group: [64, 1, 1],
     })?;
     // The particle-draw pipeline pulls vertices from the compute-written buffer, so
     // it only exists where compute does (M5 on Metal — `particle_draw` has no
@@ -440,6 +443,7 @@ fn main() -> anyhow::Result<()> {
         backend,
         dreamcoast_shader::cull_reset_cs_spirv,
         dreamcoast_shader::cull_reset_cs_dxil,
+        dreamcoast_shader::cull_reset_cs_metallib,
         "cull_reset",
     )?;
     let cull_reset_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
@@ -447,11 +451,13 @@ fn main() -> anyhow::Result<()> {
         compute_entry: "csReset",
         push_constant_size: 128,
         bindless: true,
+        threads_per_group: [1, 1, 1],
     })?;
     let cull_cs = load_compute_shader(
         backend,
         dreamcoast_shader::cull_cs_spirv,
         dreamcoast_shader::cull_cs_dxil,
+        dreamcoast_shader::cull_cs_metallib,
         "cull",
     )?;
     let cull_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
@@ -459,6 +465,7 @@ fn main() -> anyhow::Result<()> {
         compute_entry: "csCull",
         push_constant_size: 128,
         bindless: true,
+        threads_per_group: [64, 1, 1],
     })?;
     // The cull-draw pipeline draws the GPU-culled instance list indirectly, so it
     // is compute-only (M5 on Metal). `None` on Metal; the feature flag stays off.
@@ -1434,7 +1441,9 @@ fn main() -> anyhow::Result<()> {
         // grid over the tonemapped image, with its own depth buffer.
         if let Some((args_ext, visible_ext)) = cull_res {
             let cull_depth = graph.create_depth("cull_depth", extent);
-            let draw = cull_draw_pipeline.as_ref().expect("cull requires compute support");
+            let draw = cull_draw_pipeline
+                .as_ref()
+                .expect("cull requires compute support");
             let args = &cull_args;
             let visible = &cull_visible;
             let vbuf = &cube_vbuf;
@@ -2273,15 +2282,13 @@ fn load_compute_shader(
     backend: BackendKind,
     cs_spirv: fn() -> Option<&'static [u8]>,
     cs_dxil: fn() -> Option<&'static [u8]>,
+    cs_metallib: fn() -> Option<&'static [u8]>,
     name: &str,
 ) -> anyhow::Result<&'static [u8]> {
     let cs = match backend {
         BackendKind::Vulkan => cs_spirv(),
         BackendKind::D3d12 => cs_dxil(),
-        // Compute is M5 on Metal: the compute metallibs are still `None` and the
-        // pipeline is an inert placeholder (never dispatched — gated by
-        // `compute_supported`). Hand it empty bytes so setup links.
-        BackendKind::Metal => Some(&[][..]),
+        BackendKind::Metal => cs_metallib(),
     };
     cs.ok_or_else(|| anyhow!("{name} compute shader unavailable for {backend:?}"))
 }

@@ -23,8 +23,7 @@ struct PushConstants
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
 
-[[vk::binding(4, 0)]]
-RWByteAddressBuffer g_storage_buffers[] : register(u0, space1);
+#include "bindless.slang"
 
 // Integer hash -> 3 pseudo-random floats in [0,1).
 float3 hash3(uint n)
@@ -44,8 +43,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         return;
 
     uint base = i * 32;
-    RWByteAddressBuffer src = g_storage_buffers[pc.read_index];
-    RWByteAddressBuffer dst = g_storage_buffers[pc.write_index];
+    RWByteAddressBuffer src = g.storage_buffers[pc.read_index];
+    RWByteAddressBuffer dst = g.storage_buffers[pc.write_index];
 
     float3 pos = src.Load<float3>(base + 0);
     float life = src.Load<float>(base + 12);

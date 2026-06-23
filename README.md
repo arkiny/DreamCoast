@@ -79,7 +79,7 @@ toolchain setup: [`docs/metal-backend.md`](docs/metal-backend.md).
 - [x] **M2** — Triangle (graphics pipeline + draw)
 - [x] **M3** — Bindless (argument buffers) + textures + ImGui
 - [x] **M4** — Render targets + render graph + PBR deferred (shadow → G-buffer → IBL → lighting → tonemap)
-- [ ] **M5** — Compute / async compute / indirect draw
+- [x] **M5** — Compute / async compute / indirect draw
 
 ## Build & run
 
@@ -87,8 +87,8 @@ toolchain setup: [`docs/metal-backend.md`](docs/metal-backend.md).
 # Windows
 cargo run -p sandbox -- --backend vulkan   # or: --backend d3d12
 
-# macOS (Metal) — defaults to Metal; the full deferred-PBR renderer runs (M4).
-# Compute extras (Phase 7) are M5-pending on Metal. Toolchain setup in
+# macOS (Metal) — defaults to Metal; the full deferred-PBR renderer runs (M4),
+# plus the Phase-7 compute demos / async compute (M5). Toolchain setup in
 # docs/metal-backend.md.
 cargo run -p sandbox -- --backend metal                    # M4 full deferred-PBR scene
 cargo run -p sandbox -- --backend metal --clear-test      # M0 clear loop

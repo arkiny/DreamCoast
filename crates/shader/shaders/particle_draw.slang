@@ -18,8 +18,7 @@ struct PushConstants
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
 
-[[vk::binding(4, 0)]]
-RWByteAddressBuffer g_storage_buffers[] : register(u0, space1);
+#include "bindless.slang"
 
 struct VSOutput
 {
@@ -37,8 +36,8 @@ static const float2 CORNERS[6] = {
 VSOutput vsMain(uint vid: SV_VertexID, uint iid: SV_InstanceID)
 {
     uint base = iid * 32;
-    float3 ppos = g_storage_buffers[pc.buffer_index].Load<float3>(base + 0);
-    float life = g_storage_buffers[pc.buffer_index].Load<float>(base + 12);
+    float3 ppos = g.storage_buffers[pc.buffer_index].Load<float3>(base + 0);
+    float life = g.storage_buffers[pc.buffer_index].Load<float>(base + 12);
 
     float2 c = CORNERS[vid];
     // Dead particles collapse to a point (invisible).

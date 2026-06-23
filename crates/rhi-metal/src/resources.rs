@@ -8,7 +8,10 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLDepthStencilState, MTLHeap, MTLRenderPipelineState, MTLTexture};
+use objc2_metal::{
+    MTLBuffer, MTLComputePipelineState, MTLDepthStencilState, MTLHeap, MTLRenderPipelineState,
+    MTLSize, MTLTexture,
+};
 
 /// Metal buffer-argument index that Slang assigns to the push-constant block.
 /// The bindless `ParameterBlock` carries the `[[vk::binding(0, 0)]]` pin (see
@@ -78,12 +81,24 @@ impl MetalBuffer {
     }
 }
 
-/// A device-local storage buffer (UAV) for compute. (M5)
-pub struct MetalStorageBuffer;
+/// A device-local (`Private`) storage buffer (UAV) for compute. Its 8-byte GPU
+/// address is written into the bindless argument buffer's storage-buffer region
+/// (`g.storage_buffers[storage_index]`); compute writes it and the particle / cull
+/// draw passes read it in their vertex stage. Kept permanently resident on the
+/// device (made `useResource` on every bindless compute/graphics encoder). (M5)
+pub struct MetalStorageBuffer {
+    pub(crate) buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    index: u32,
+}
 
 impl MetalStorageBuffer {
+    pub(crate) fn new(buffer: Retained<ProtocolObject<dyn MTLBuffer>>, index: u32) -> Self {
+        Self { buffer, index }
+    }
+
+    /// Index of this buffer in the bindless storage-buffer table.
     pub fn storage_index(&self) -> u32 {
-        unimplemented!("Metal storage buffers: milestone M5")
+        self.index
     }
 }
 
@@ -218,5 +233,14 @@ pub struct MetalGraphicsPipeline {
     pub(crate) depth_stencil: Option<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
 }
 
-/// A compute pipeline (`MTLComputePipelineState`). (M5)
-pub struct MetalComputePipeline;
+/// A compiled compute pipeline (`MTLComputePipelineState`) plus the threadgroup
+/// size from the shader's `[numthreads]` (MSL kernels don't bake it in, unlike
+/// SPIR-V/DXIL), and whether it binds the device's bindless argument buffer. (M5)
+pub struct MetalComputePipeline {
+    pub(crate) state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Threads per threadgroup; combined with the `dispatch(x, y, z)` threadgroup
+    /// counts to call `dispatchThreadgroups:threadsPerThreadgroup:`.
+    pub(crate) threads_per_group: MTLSize,
+    /// Bind the bindless argument buffer + make storage resources resident.
+    pub(crate) bindless: bool,
+}

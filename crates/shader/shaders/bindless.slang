@@ -29,26 +29,35 @@
 //
 // M3 declared only `textures` + `samp`. M4 folds in the `cubes[]` array (used by
 // `pbr` and the IBL gen shaders), which previously lived as a separate loose
-// `g_cubes[]` at `space1`. Storage arrays join in M5 when the compute shaders
-// migrate.
+// `g_cubes[]` at `space1`. M5 folds in the read-write storage arrays used by the
+// compute shaders (`post_compute`, `particle_sim`/`particle_draw`, `cull`/
+// `cull_draw`), which previously lived as loose `g_storage_images[]` (binding 3)
+// and `g_storage_buffers[]` (binding 4, `space1`).
 //
-// Adding `cubes` is layout-safe for the M3 shaders: Slang drops the unused cube
-// binding from `mesh`/`imgui`/`gbuffer` (their SPIR-V stays set 0 / bindings 0,1),
-// so `rhi-vulkan` is untouched. In a globals-using shader (`pbr`) the block still
+// Adding members is layout-safe for shaders that don't use them: Slang drops the
+// unused binding (e.g. `mesh`/`imgui`/`gbuffer` keep set 0 / bindings 0,1), so
+// `rhi-vulkan` is untouched. In a globals-using shader (`pbr`) the block still
 // pins to **set 0** via `[[vk::binding(0,0)]]` even with a loose globals UBO at
 // set 1 — matching the previous loose-global layout exactly (Vulkan unchanged).
 // On Metal the loose globals takes `[[buffer(1)]]`, pushing this argument buffer
 // to `[[buffer(2)]]` for globals shaders (non-globals shaders keep it at
 // `[[buffer(1)]]`); verified via `slangc` reflection on this macOS box.
+//
+// Members are assigned sequential set-0 bindings in declaration order (Slang does
+// not compact unused leading members away — verified in M4), so the order here
+// must stay textures(0) / samp(1) / cubes(2) / storage_images(3) /
+// storage_buffers(4) to match the rhi-vulkan / rhi-d3d12 descriptor layout.
 
-// Counts must match BINDLESS_COUNT / CUBE_COUNT in rhi-vulkan / rhi-d3d12
-// (`device.rs`). Cubes share the descriptor set but have their own 0-based index
-// space (binding 2), separate from `textures[]` (binding 0).
+// Counts must match BINDLESS_COUNT / CUBE_COUNT / STORAGE_IMAGE_COUNT /
+// STORAGE_BUFFER_COUNT in rhi-vulkan / rhi-d3d12 (`device.rs`). Each array has its
+// own 0-based index space (its binding), separate from the others.
 struct Bindless
 {
-    Texture2D    textures[1024];
-    SamplerState samp;
-    TextureCube  cubes[64];
+    Texture2D           textures[1024];      // binding 0 — sampled images
+    SamplerState        samp;                // binding 1 — shared sampler
+    TextureCube         cubes[64];           // binding 2 — sampled cubemaps
+    RWTexture2D<float4> storage_images[64];  // binding 3 — storage images (UAV)
+    RWByteAddressBuffer storage_buffers[64]; // binding 4 — storage buffers (UAV)
 };
 
 [[vk::binding(0, 0)]]

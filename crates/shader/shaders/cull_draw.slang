@@ -21,8 +21,7 @@ struct PushConstants
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
 
-[[vk::binding(4, 0)]]
-RWByteAddressBuffer g_storage_buffers[] : register(u0, space1);
+#include "bindless.slang"
 
 struct VSInput
 {
@@ -40,7 +39,7 @@ struct VSOutput
 [shader("vertex")]
 VSOutput vsMain(VSInput input, uint iid: SV_InstanceID)
 {
-    uint inst = g_storage_buffers[pc.visible_index].Load<uint>(iid * 4);
+    uint inst = g.storage_buffers[pc.visible_index].Load<uint>(iid * 4);
 
     uint gx = inst % pc.grid_dim;
     uint gz = inst / pc.grid_dim;

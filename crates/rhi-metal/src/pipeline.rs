@@ -12,12 +12,12 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLCompareFunction, MTLDepthStencilDescriptor, MTLDevice,
-    MTLFunction, MTLLibrary, MTLRenderPipelineDescriptor, MTLVertexDescriptor, MTLVertexFormat,
-    MTLVertexStepFunction,
+    MTLFunction, MTLLibrary, MTLRenderPipelineDescriptor, MTLSize, MTLVertexDescriptor,
+    MTLVertexFormat, MTLVertexStepFunction,
 };
-use rhi_types::{BlendMode, GraphicsPipelineDesc, VertexLayout};
+use rhi_types::{BlendMode, ComputePipelineDesc, GraphicsPipelineDesc, VertexLayout};
 
-use crate::resources::{MetalGraphicsPipeline, VERTEX_BUFFER_INDEX};
+use crate::resources::{MetalComputePipeline, MetalGraphicsPipeline, VERTEX_BUFFER_INDEX};
 use crate::{Result, pixel_format, rhi_err};
 
 /// Compile a graphics pipeline from per-stage metallib blobs + render state.
@@ -82,6 +82,27 @@ pub(crate) fn build(
         bindless: desc.bindless,
         uses_globals: desc.uniform_buffer,
         depth_stencil,
+    })
+}
+
+/// Compile a compute pipeline from a metallib blob + the shader's threadgroup size.
+pub(crate) fn build_compute(
+    device: &ProtocolObject<dyn MTLDevice>,
+    desc: &ComputePipelineDesc,
+) -> Result<MetalComputePipeline> {
+    let cs = load_function(device, desc.compute_bytes, desc.compute_entry)?;
+    let state = device
+        .newComputePipelineStateWithFunction_error(&cs)
+        .map_err(|e| rhi_err(format!("newComputePipelineState failed: {e}")))?;
+    let [x, y, z] = desc.threads_per_group;
+    Ok(MetalComputePipeline {
+        state,
+        threads_per_group: MTLSize {
+            width: x.max(1) as usize,
+            height: y.max(1) as usize,
+            depth: z.max(1) as usize,
+        },
+        bindless: desc.bindless,
     })
 }
 
