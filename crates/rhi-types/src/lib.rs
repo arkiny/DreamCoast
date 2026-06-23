@@ -289,6 +289,48 @@ pub struct MemoryRequirements {
     pub alignment: u64,
 }
 
+/// One bottom-level acceleration-structure (BLAS) input: a single opaque
+/// triangle mesh described by its vertex/index counts and layout (Phase 8). The
+/// actual vertex/index buffers are passed as backend handles at build time; this
+/// carries only the plain shape data. Positions are assumed `f32x3` at byte
+/// offset 0 of a `vertex_stride`-byte vertex (the engine's `Mesh` layout).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlasGeometry {
+    /// Number of vertices in the vertex buffer.
+    pub vertex_count: u32,
+    /// Vertex stride in bytes (positions read from offset 0).
+    pub vertex_stride: u32,
+    /// Number of 32-bit indices (triangle list, so a multiple of 3).
+    pub index_count: u32,
+}
+
+/// One top-level acceleration-structure (TLAS) instance (Phase 8): references a
+/// BLAS (by its index in the scene's geometry list) and places it in the world
+/// with a row-major 3x4 transform. `custom_index` is readable in the hit shader
+/// (`InstanceID`) to look up per-instance geometry/material; `mask` is the ray
+/// visibility mask (0xFF = visible to all rays).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TlasInstance {
+    /// Index into the scene's geometry/BLAS list.
+    pub blas_index: u32,
+    /// Row-major 3x4 object-to-world transform (12 floats).
+    pub transform: [f32; 12],
+    /// 24-bit value exposed to the hit shader as `InstanceID`/instance custom index.
+    pub custom_index: u32,
+    /// 8-bit ray visibility mask.
+    pub mask: u8,
+}
+
+/// GPU memory footprint of an acceleration structure plus the scratch buffer its
+/// build needs, returned by the backend's prebuild query (Phase 8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccelSizes {
+    /// Bytes for the acceleration-structure buffer.
+    pub accel_size: u64,
+    /// Bytes for the transient build scratch buffer.
+    pub scratch_size: u64,
+}
+
 /// A scissor / sub-rect in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect2D {

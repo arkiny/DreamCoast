@@ -20,13 +20,15 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_INDIRECT_ARGUMENT_DESC,
     D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     D3D12_RAYTRACING_TIER_1_1, D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
-    D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEX2D_SRV,
-    D3D12_TEX2D_UAV, D3D12_TEXCUBE_SRV, D3D12_UAV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_TEXTURE2D,
-    D3D12_UNORDERED_ACCESS_VIEW_DESC, D3D12_UNORDERED_ACCESS_VIEW_DESC_0, D3D12CreateDevice,
-    ID3D12CommandList, ID3D12CommandQueue, ID3D12CommandSignature, ID3D12DescriptorHeap,
-    ID3D12Device, ID3D12Fence, ID3D12Resource,
+    D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE, D3D12_SRV_DIMENSION_TEXTURE2D,
+    D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEX2D_SRV, D3D12_TEX2D_UAV, D3D12_TEXCUBE_SRV,
+    D3D12_UAV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    D3D12_UNORDERED_ACCESS_VIEW_DESC_0, D3D12CreateDevice, ID3D12CommandList, ID3D12CommandQueue,
+    ID3D12CommandSignature, ID3D12DescriptorHeap, ID3D12Device, ID3D12Fence, ID3D12Resource,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_UNKNOWN,
+};
 use windows::Win32::Graphics::Dxgi::IDXGIFactory6;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::{Interface, PCWSTR};
@@ -58,8 +60,12 @@ pub(crate) const STORAGE_BUFFER_COUNT: u32 = 64;
 pub(crate) const STORAGE_IMAGE_BASE: u32 = BINDLESS_COUNT + CUBE_COUNT;
 /// Heap offset where the storage-buffer UAV region begins.
 pub(crate) const STORAGE_BUFFER_BASE: u32 = STORAGE_IMAGE_BASE + STORAGE_IMAGE_COUNT;
+/// Heap offset of the single scene-TLAS SRV (Phase 8). One slot after the
+/// storage-buffer region; the shader sees it at `t{BINDLESS_COUNT+CUBE_COUNT},
+/// space1` (a `RaytracingAccelerationStructure`).
+pub(crate) const TLAS_SLOT: u32 = STORAGE_BUFFER_BASE + STORAGE_BUFFER_COUNT;
 /// Total descriptors in the shader-visible bindless heap.
-pub(crate) const HEAP_DESCRIPTORS: u32 = STORAGE_BUFFER_BASE + STORAGE_BUFFER_COUNT;
+pub(crate) const HEAP_DESCRIPTORS: u32 = TLAS_SLOT + 1;
 
 /// Device-level objects shared (via `Rc`) by every GPU resource.
 pub(crate) struct DeviceShared {
@@ -297,6 +303,29 @@ impl DeviceShared {
         index
     }
 
+    /// Create the scene-TLAS SRV (`RaytracingAccelerationStructure`) at the
+    /// reserved [`TLAS_SLOT`], referencing the TLAS by GPU virtual address
+    /// (an AS SRV binds no resource — `None` — and carries the VA in the desc).
+    /// Phase 8 M3.
+    pub(crate) fn register_tlas(&self, gpu_va: u64) {
+        let handle = self.cpu_handle(TLAS_SLOT);
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                RaytracingAccelerationStructure:
+                    windows::Win32::Graphics::Direct3D12::D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV {
+                        Location: gpu_va,
+                    },
+            },
+        };
+        unsafe {
+            self.device
+                .CreateShaderResourceView(None, Some(&srv), handle)
+        };
+    }
+
     /// CPU handle for bindless heap `slot`.
     fn cpu_handle(&self, slot: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let cpu = unsafe { self.srv_heap.GetCPUDescriptorHandleForHeapStart() };
@@ -445,6 +474,22 @@ impl D3d12Device {
         D3d12CommandBuffer::new(self.shared.clone())
     }
 
+    /// Build the scene's acceleration structures (BLAS per mesh + one TLAS) in a
+    /// one-shot DIRECT-queue submission (static scene, Phase 8 M2).
+    pub fn build_raytracing_scene(
+        &self,
+        geometries: &[(&D3d12Buffer, &D3d12Buffer, rhi_types::BlasGeometry)],
+        instances: &[rhi_types::TlasInstance],
+    ) -> Result<crate::accel::D3d12RaytracingScene, EngineError> {
+        crate::accel::D3d12RaytracingScene::build(self.shared.clone(), geometries, instances)
+    }
+
+    /// Register the scene TLAS in the bindless heap so shaders can trace it
+    /// (Phase 8 M3). Call once after building a static scene.
+    pub fn bind_tlas(&self, scene: &crate::accel::D3d12RaytracingScene) {
+        self.shared.register_tlas(scene.tlas_gpu_va());
+    }
+
     /// Allocate a COMPUTE-type command buffer for the async-compute queue (Phase 7).
     pub fn create_compute_command_buffer(&self) -> Result<D3d12CommandBuffer, EngineError> {
         D3d12CommandBuffer::new_compute(self.shared.clone())
@@ -477,6 +522,16 @@ impl D3d12Device {
         desc: &rhi_types::StorageBufferDesc,
     ) -> Result<crate::buffer::D3d12StorageBuffer, EngineError> {
         crate::buffer::D3d12StorageBuffer::new(self.shared.clone(), desc)
+    }
+
+    /// Create a storage buffer seeded with host data (Phase 8: RT geometry +
+    /// instance table read by the path tracer).
+    pub fn create_storage_buffer_init(
+        &self,
+        desc: &rhi_types::StorageBufferDesc,
+        data: &[u8],
+    ) -> Result<crate::buffer::D3d12StorageBuffer, EngineError> {
+        crate::buffer::D3d12StorageBuffer::new_init(self.shared.clone(), desc, data)
     }
 
     pub fn create_texture(

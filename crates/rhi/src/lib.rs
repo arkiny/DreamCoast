@@ -74,6 +74,16 @@ backend_enum!(/// A render-target cubemap (6 faces + bindless `TextureCube`), fo
     Cubemap => rhi_vulkan::VulkanCubemap, rhi_d3d12::D3d12Cubemap, rhi_metal::MetalCubemap);
 backend_enum!(/// A heap that transient render targets alias into at graph-computed offsets.
     TransientHeap => rhi_vulkan::VulkanTransientHeap, rhi_d3d12::D3d12TransientHeap, rhi_metal::MetalTransientHeap);
+backend_enum!(/// A built ray-tracing scene: BLAS per mesh + one TLAS (Phase 8).
+    RaytracingScene => rhi_vulkan::VulkanRaytracingScene, rhi_d3d12::D3d12RaytracingScene, rhi_metal::MetalRaytracingScene);
+
+/// One mesh's geometry for a BLAS build: its vertex + index buffers plus the
+/// plain shape data (Phase 8). Pairs facade [`Buffer`] handles with [`BlasGeometry`].
+pub struct RtGeometry<'a> {
+    pub vertex_buffer: &'a Buffer,
+    pub index_buffer: &'a Buffer,
+    pub geometry: BlasGeometry,
+}
 
 impl Buffer {
     /// Copy bytes into the buffer (host-visible).
@@ -377,6 +387,64 @@ impl Device {
         }
     }
 
+    /// Build the scene's acceleration structures (BLAS per mesh + one TLAS) for a
+    /// static scene (Phase 8). Requires [`Self::has_raytracing`]. `instances`
+    /// reference geometries by index (`blas_index`). Metal returns an error
+    /// (hardware ray tracing deferred).
+    pub fn build_raytracing_scene(
+        &self,
+        geometries: &[RtGeometry],
+        instances: &[TlasInstance],
+    ) -> Result<RaytracingScene> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => {
+                let geos: Vec<_> = geometries
+                    .iter()
+                    .map(|g| match (g.vertex_buffer, g.index_buffer) {
+                        (Buffer::Vulkan(v), Buffer::Vulkan(i)) => (v, i, g.geometry),
+                        _ => unreachable!("{MIXED}"),
+                    })
+                    .collect();
+                Ok(RaytracingScene::Vulkan(
+                    d.build_raytracing_scene(&geos, instances)?,
+                ))
+            }
+            #[cfg(windows)]
+            Self::D3d12(d) => {
+                let geos: Vec<_> = geometries
+                    .iter()
+                    .map(|g| match (g.vertex_buffer, g.index_buffer) {
+                        (Buffer::D3d12(v), Buffer::D3d12(i)) => (v, i, g.geometry),
+                        _ => unreachable!("{MIXED}"),
+                    })
+                    .collect();
+                Ok(RaytracingScene::D3d12(
+                    d.build_raytracing_scene(&geos, instances)?,
+                ))
+            }
+            #[cfg(target_os = "macos")]
+            Self::Metal(_) => Err(EngineError::Rhi(
+                "hardware ray tracing is not supported on Metal (Phase 8 deferred)".into(),
+            )),
+        }
+    }
+
+    /// Register a built scene's TLAS in the bindless table so shaders can trace it
+    /// (Phase 8 M3). Call once after [`Self::build_raytracing_scene`].
+    pub fn bind_tlas(&self, scene: &RaytracingScene) {
+        match (self, scene) {
+            #[cfg(windows)]
+            (Self::Vulkan(d), RaytracingScene::Vulkan(s)) => d.bind_tlas(s),
+            #[cfg(windows)]
+            (Self::D3d12(d), RaytracingScene::D3d12(s)) => d.bind_tlas(s),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(_), RaytracingScene::Metal(_)) => {}
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
     /// Create a device-local storage buffer (UAV) for compute (Phase 7).
     pub fn create_storage_buffer(&self, desc: &StorageBufferDesc) -> Result<StorageBuffer> {
         match self {
@@ -386,6 +454,29 @@ impl Device {
             Self::D3d12(d) => Ok(StorageBuffer::D3d12(d.create_storage_buffer(desc)?)),
             #[cfg(target_os = "macos")]
             Self::Metal(d) => Ok(StorageBuffer::Metal(d.create_storage_buffer(desc)?)),
+        }
+    }
+
+    /// Create a device-local storage buffer seeded with host `data` (Phase 8: RT
+    /// geometry + per-instance table read by the path tracer).
+    pub fn create_storage_buffer_init(
+        &self,
+        desc: &StorageBufferDesc,
+        data: &[u8],
+    ) -> Result<StorageBuffer> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => Ok(StorageBuffer::Vulkan(
+                d.create_storage_buffer_init(desc, data)?,
+            )),
+            #[cfg(windows)]
+            Self::D3d12(d) => Ok(StorageBuffer::D3d12(
+                d.create_storage_buffer_init(desc, data)?,
+            )),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => Ok(StorageBuffer::Metal(
+                d.create_storage_buffer_init(desc, data)?,
+            )),
         }
     }
 

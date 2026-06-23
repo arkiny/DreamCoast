@@ -73,6 +73,9 @@ pub(crate) struct DeviceShared {
     // Hardware ray tracing (Phase 8): true when the acceleration-structure +
     // ray-query + ray-tracing-pipeline extensions are enabled.
     pub has_raytracing: bool,
+    // Acceleration-structure extension function loader (`vkCmdBuildAcceleration
+    // StructuresKHR` etc.); `Some` only when `has_raytracing` (Phase 8).
+    pub accel_loader: Option<ash::khr::acceleration_structure::Device>,
 }
 
 impl DeviceShared {
@@ -161,7 +164,11 @@ impl DeviceShared {
             // RT feature structs (Phase 8) — only chained when the extensions are
             // enabled, else validation rejects the unsupported feature structs.
             let mut accel_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
-                .acceleration_structure(true);
+                .acceleration_structure(true)
+                // Lets the TLAS descriptor (bindless binding 5) be updated after
+                // bind, so switching the bound scene (e.g. Cornell toggle) doesn't
+                // invalidate in-flight command buffers (Phase 8 M4).
+                .descriptor_binding_acceleration_structure_update_after_bind(true);
             let mut ray_query_features =
                 vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
             let mut rt_pipeline_features =
@@ -197,6 +204,8 @@ impl DeviceShared {
             let queue = device.get_device_queue(qfi, 0);
             let compute_queue = device.get_device_queue(compute_family, 0);
             let swapchain_loader = ash::khr::swapchain::Device::new(raw, &device);
+            let accel_loader =
+                has_raytracing.then(|| ash::khr::acceleration_structure::Device::new(raw, &device));
 
             let pool_ci = vk::CommandPoolCreateInfo::default()
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
@@ -213,7 +222,7 @@ impl DeviceShared {
             let mem_props = raw.get_physical_device_memory_properties(instance.physical_device);
 
             let (bindless_pool, bindless_layout, bindless_set, bindless_sampler) =
-                create_bindless(&device)?;
+                create_bindless(&device, has_raytracing)?;
             let (globals_pool, globals_layout, globals_set) = create_globals(&device)?;
 
             Ok(Self {
@@ -241,6 +250,7 @@ impl DeviceShared {
                 compute_command_pool,
                 has_dedicated_compute,
                 has_raytracing,
+                accel_loader,
             })
         }
     }
@@ -335,6 +345,23 @@ impl DeviceShared {
         index
     }
 
+    /// Write the scene TLAS into the bindless set (binding 5) for inline ray
+    /// query (Phase 8 M3). The acceleration-structure write goes through a
+    /// `pNext` struct; the main write's `descriptor_count` must still be set.
+    pub(crate) fn register_tlas(&self, tlas: vk::AccelerationStructureKHR) {
+        let accels = [tlas];
+        let mut as_write = vk::WriteDescriptorSetAccelerationStructureKHR::default()
+            .acceleration_structures(&accels);
+        let mut write = vk::WriteDescriptorSet::default()
+            .dst_set(self.bindless_set)
+            .dst_binding(5)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+            .push_next(&mut as_write);
+        write.descriptor_count = 1;
+        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+    }
+
     /// Point the globals set (set 1) at `buffer`; `range` is one frame's slice
     /// size (the per-frame offset is applied as a dynamic offset at bind time).
     pub(crate) fn set_globals_buffer(&self, buffer: vk::Buffer, range: u64) {
@@ -394,6 +421,7 @@ impl DeviceShared {
 /// Build the bindless descriptor pool, set layout, set, and immutable sampler.
 fn create_bindless(
     device: &ash::Device,
+    has_raytracing: bool,
 ) -> Result<
     (
         vk::DescriptorPool,
@@ -421,7 +449,9 @@ fn create_bindless(
         // compute; the storage buffer is also read by the vertex stage (particle
         // vertex-pull).
         let sampled_stages = vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE;
-        let bindings = [
+        let dynamic = vk::DescriptorBindingFlags::PARTIALLY_BOUND
+            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
+        let mut bindings = vec![
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
@@ -458,15 +488,28 @@ fn create_bindless(
                         | vk::ShaderStageFlags::FRAGMENT,
                 ),
         ];
-        let dynamic = vk::DescriptorBindingFlags::PARTIALLY_BOUND
-            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
-        let flags = [
+        let mut flags = vec![
             dynamic,
             vk::DescriptorBindingFlags::empty(),
             dynamic,
             dynamic,
             dynamic,
         ];
+        // Binding 5: scene TLAS (single acceleration structure) for inline ray
+        // query, only on RT-capable devices (the descriptor type needs the
+        // acceleration-structure extension). Shaders that don't trace drop it.
+        if has_raytracing {
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(5)
+                    .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            );
+            // UPDATE_AFTER_BIND so the bound scene's TLAS can be swapped at runtime
+            // (Cornell toggle) without invalidating in-flight command buffers.
+            flags.push(dynamic);
+        }
         let mut flags_ci =
             vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
         let layout_ci = vk::DescriptorSetLayoutCreateInfo::default()
@@ -477,7 +520,7 @@ fn create_bindless(
             .create_descriptor_set_layout(&layout_ci, None)
             .map_err(vk_err)?;
 
-        let pool_sizes = [
+        let mut pool_sizes = vec![
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
                 .descriptor_count(BINDLESS_COUNT + CUBE_COUNT), // bindings 0 + 2
@@ -491,6 +534,13 @@ fn create_bindless(
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(STORAGE_BUFFER_COUNT), // binding 4
         ];
+        if has_raytracing {
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                    .descriptor_count(1), // binding 5
+            );
+        }
         let pool_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
             .max_sets(1)
@@ -602,6 +652,22 @@ impl VulkanDevice {
         crate::pipeline::VulkanComputePipeline::new(self.shared.clone(), desc)
     }
 
+    /// Build the scene's acceleration structures (BLAS per mesh + one TLAS) in a
+    /// one-shot graphics-queue submission (static scene, Phase 8 M2).
+    pub fn build_raytracing_scene(
+        &self,
+        geometries: &[(&VulkanBuffer, &VulkanBuffer, rhi_types::BlasGeometry)],
+        instances: &[rhi_types::TlasInstance],
+    ) -> Result<crate::accel::VulkanRaytracingScene, EngineError> {
+        crate::accel::VulkanRaytracingScene::build(self.shared.clone(), geometries, instances)
+    }
+
+    /// Register the scene TLAS in the bindless set so shaders can trace it
+    /// (Phase 8 M3). Call once after building a static scene.
+    pub fn bind_tlas(&self, scene: &crate::accel::VulkanRaytracingScene) {
+        self.shared.register_tlas(scene.tlas());
+    }
+
     /// Allocate a primary command buffer from the device's pool.
     pub fn create_command_buffer(&self) -> Result<VulkanCommandBuffer, EngineError> {
         command::VulkanCommandBuffer::new(self.shared.clone())
@@ -618,6 +684,16 @@ impl VulkanDevice {
         desc: &rhi_types::StorageBufferDesc,
     ) -> Result<crate::buffer::VulkanStorageBuffer, EngineError> {
         crate::buffer::VulkanStorageBuffer::new(self.shared.clone(), desc)
+    }
+
+    /// Create a storage buffer seeded with host data (Phase 8: RT geometry +
+    /// instance table read by the path tracer).
+    pub fn create_storage_buffer_init(
+        &self,
+        desc: &rhi_types::StorageBufferDesc,
+        data: &[u8],
+    ) -> Result<crate::buffer::VulkanStorageBuffer, EngineError> {
+        crate::buffer::VulkanStorageBuffer::new_init(self.shared.clone(), desc, data)
     }
 
     /// Register the per-frame globals buffer with the globals descriptor set.
