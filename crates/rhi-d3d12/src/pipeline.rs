@@ -173,19 +173,13 @@ fn create_root_signature(
             );
         }
 
-        // Bindless: one table over the shared heap with four ranges. The SRV arrays
-        // — 2D textures (`t0,space1`) + cubemaps (`t1024,space1`) — live in register
-        // space 1 because graphics shaders bind them through a Slang `ParameterBlock`
-        // (`bindless.slang`), which lands in space1: space0 holds the loose `b0` push
-        // constants + `b1` globals, so the block (a whole space) takes the next one,
-        // packing the 64 cubes directly after the 1024 textures (`t1024`). The UAV
-        // arrays — storage images (`u0,space0`) + storage buffers (`u0,space1`) — are
-        // still loose globals (compute not yet migrated; particle/cull draw vertex-
-        // pull their buffers at `u0,space1`). Each range is offset to its reserved
-        // heap region so the shader indexes it 0-based — plus 32-bit root constants
-        // (b0) and a static sampler (`s0,space1`, inside the block). Visibility ALL:
-        // the vertex stage reads storage buffers (vertex-pull) and pixel reads textures.
-        let ranges = graphics_bindless_ranges();
+        // Bindless: one table over the shared heap with four ranges (textures, cubes,
+        // storage images, storage buffers), all in register space 1 via the shared
+        // `ParameterBlock` (see `bindless_ranges`) — plus 32-bit root constants (b0),
+        // an optional globals CBV (b1), and a static sampler (`s0,space1`, inside the
+        // block). Visibility ALL: the vertex stage reads storage buffers (particle/
+        // cull vertex-pull) and the pixel stage reads textures.
+        let ranges = bindless_ranges();
         // params[0] = bindless table, params[1] = 32-bit root constants (b0).
         // params[2] = root CBV (b1) for the per-frame globals, when opted in.
         let mut params = vec![
@@ -235,8 +229,8 @@ fn create_root_signature(
             MinLOD: 0.0,
             MaxLOD: f32::MAX,
             ShaderRegister: 0,
-            // space1: the sampler lives inside the graphics `ParameterBlock` (see
-            // `graphics_bindless_ranges`), alongside the texture/cube SRVs.
+            // space1: the sampler lives inside the shared `ParameterBlock` (see
+            // `bindless_ranges`), alongside the texture/cube SRVs.
             RegisterSpace: 1,
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         };
@@ -253,63 +247,21 @@ fn create_root_signature(
     }
 }
 
-/// The two UAV ranges (storage images at `u0,space0`, storage buffers at
-/// `u0,space1`) shared verbatim by the graphics and compute root signatures — the
-/// storage shaders are still loose globals (not yet migrated to a `ParameterBlock`).
-/// Each is offset to its reserved heap region so the shader indexes it 0-based.
-fn storage_uav_ranges() -> [D3D12_DESCRIPTOR_RANGE; 2] {
-    [
-        D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-            NumDescriptors: STORAGE_IMAGE_COUNT,
-            BaseShaderRegister: 0,
-            RegisterSpace: 0,
-            OffsetInDescriptorsFromTableStart: STORAGE_IMAGE_BASE,
-        },
-        D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-            NumDescriptors: STORAGE_BUFFER_COUNT,
-            BaseShaderRegister: 0,
-            RegisterSpace: 1,
-            OffsetInDescriptorsFromTableStart: STORAGE_BUFFER_BASE,
-        },
-    ]
-}
-
-/// Bindless ranges for the **compute** root signature. The (not-yet-migrated)
-/// compute shaders bind their SRVs as loose globals: 2D textures at `t0,space0`,
-/// cubemaps at `t0,space1` (its own space). UAV storage ranges follow.
+/// The four bindless descriptor-table ranges, shared verbatim by the graphics and
+/// compute root signatures. Every shader binds these through a single Slang
+/// `ParameterBlock` (`bindless.slang`), which the DXIL backend places in register
+/// **space 1** (space0 holds the loose `b0` push constants + the optional `b1`
+/// globals CBV, so the block — a whole space — takes the next one). The block packs
+/// its members into consecutive registers within that space:
+///   * 2D textures     — `t0,space1`    (1024 SRVs)
+///   * cubemaps        — `t1024,space1` (64 SRVs, right after the textures)
+///   * storage images  — `u0,space1`    (64 UAVs)
+///   * storage buffers — `u64,space1`   (64 UAVs, right after the storage images)
+///
+/// The shared sampler is the static sampler at `s0,space1` (see the root-signature
+/// builders). Each range keeps its own heap region (the `*_BASE` offsets), so the
+/// device binds — and the shader indexes — each array 0-based.
 fn bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 4] {
-    let uav = storage_uav_ranges();
-    [
-        D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-            NumDescriptors: BINDLESS_COUNT,
-            BaseShaderRegister: 0,
-            RegisterSpace: 0,
-            OffsetInDescriptorsFromTableStart: 0,
-        },
-        D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-            NumDescriptors: CUBE_COUNT,
-            BaseShaderRegister: 0,
-            RegisterSpace: 1,
-            OffsetInDescriptorsFromTableStart: BINDLESS_COUNT,
-        },
-        uav[0],
-        uav[1],
-    ]
-}
-
-/// Bindless ranges for the **graphics** root signature. Graphics shaders bind the
-/// SRVs through a Slang `ParameterBlock` (`bindless.slang`), which the DXIL backend
-/// places in register space 1, packing the cube array directly after the 1024
-/// textures: 2D textures at `t0,space1`, cubemaps at `t1024,space1`. The cube range
-/// keeps its own heap region (offset `BINDLESS_COUNT`), so the device still binds
-/// cubes 0-based at slot `BINDLESS_COUNT + index`. UAV storage ranges are shared
-/// with compute (particle/cull draw vertex-pull their buffers at `u0,space1`).
-fn graphics_bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 4] {
-    let uav = storage_uav_ranges();
     [
         D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
@@ -325,8 +277,22 @@ fn graphics_bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 4] {
             RegisterSpace: 1,
             OffsetInDescriptorsFromTableStart: BINDLESS_COUNT,
         },
-        uav[0],
-        uav[1],
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: STORAGE_IMAGE_COUNT,
+            BaseShaderRegister: 0,
+            RegisterSpace: 1,
+            OffsetInDescriptorsFromTableStart: STORAGE_IMAGE_BASE,
+        },
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: STORAGE_BUFFER_COUNT,
+            // Storage buffers share the UAV register space with the storage images,
+            // so they start at `u{STORAGE_IMAGE_COUNT}` (the shader packs them after).
+            BaseShaderRegister: STORAGE_IMAGE_COUNT,
+            RegisterSpace: 1,
+            OffsetInDescriptorsFromTableStart: STORAGE_BUFFER_BASE,
+        },
     ]
 }
 
@@ -430,7 +396,9 @@ fn create_compute_root_signature(
             MinLOD: 0.0,
             MaxLOD: f32::MAX,
             ShaderRegister: 0,
-            RegisterSpace: 0,
+            // space1: the sampler lives inside the shared `ParameterBlock` (see
+            // `bindless_ranges`), matching the compute shaders' migrated layout.
+            RegisterSpace: 1,
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         };
         serialize_and_create(
