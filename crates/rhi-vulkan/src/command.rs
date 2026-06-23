@@ -738,6 +738,18 @@ impl VulkanCommandBuffer {
         }
     }
 
+    /// Pipeline stages that read/write storage resources: compute always, plus the
+    /// ray-tracing stages on RT-capable devices (the path-tracer pipeline writes its
+    /// output image + accumulation buffer from the raygen stage, Phase 8 M5).
+    /// Widening a barrier's stage scope is always safe; it just covers the RT case.
+    fn storage_stages(&self) -> vk::PipelineStageFlags {
+        let mut s = vk::PipelineStageFlags::COMPUTE_SHADER;
+        if self.device.has_raytracing {
+            s |= vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR;
+        }
+        s
+    }
+
     /// Transition a storage render target into `GENERAL` for compute writes.
     pub fn rt_to_storage(&self, target: &VulkanRenderTarget) {
         let old = target.layout();
@@ -765,7 +777,7 @@ impl VulkanCommandBuffer {
             src_access,
             vk::AccessFlags::SHADER_WRITE,
             src_stage,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
+            self.storage_stages(),
         );
         target.set_layout(vk::ImageLayout::GENERAL);
     }
@@ -782,7 +794,7 @@ impl VulkanCommandBuffer {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::AccessFlags::SHADER_WRITE,
             vk::AccessFlags::SHADER_READ,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
+            self.storage_stages(),
             vk::PipelineStageFlags::FRAGMENT_SHADER,
         );
         target.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -795,8 +807,8 @@ impl VulkanCommandBuffer {
             buffer.raw(),
             vk::AccessFlags::SHADER_WRITE,
             vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER
+            self.storage_stages(),
+            self.storage_stages()
                 | vk::PipelineStageFlags::VERTEX_SHADER
                 | vk::PipelineStageFlags::FRAGMENT_SHADER,
         );
@@ -894,6 +906,62 @@ impl VulkanCommandBuffer {
                 0,
                 data,
             );
+        }
+    }
+
+    /// Bind a ray-tracing pipeline and the shared bindless set (Phase 8 M5).
+    pub fn bind_raytracing_pipeline(
+        &self,
+        pipeline: &crate::rt_pipeline::VulkanRaytracingPipeline,
+    ) {
+        unsafe {
+            self.device.device.cmd_bind_pipeline(
+                self.cmd,
+                vk::PipelineBindPoint::RAY_TRACING_KHR,
+                pipeline.raw(),
+            );
+            self.current_layout.set(pipeline.layout());
+            self.device.device.cmd_bind_descriptor_sets(
+                self.cmd,
+                vk::PipelineBindPoint::RAY_TRACING_KHR,
+                pipeline.layout(),
+                0,
+                &[self.device.bindless_set],
+                &[],
+            );
+        }
+    }
+
+    /// Upload push constants for the bound ray-tracing pipeline (RT stages).
+    pub fn push_constants_rt(&self, data: &[u8]) {
+        unsafe {
+            self.device.device.cmd_push_constants(
+                self.cmd,
+                self.current_layout.get(),
+                vk::ShaderStageFlags::RAYGEN_KHR
+                    | vk::ShaderStageFlags::CLOSEST_HIT_KHR
+                    | vk::ShaderStageFlags::MISS_KHR,
+                0,
+                data,
+            );
+        }
+    }
+
+    /// Trace a `width` x `height` grid of rays through the bound RT pipeline's SBT.
+    pub fn trace_rays(
+        &self,
+        pipeline: &crate::rt_pipeline::VulkanRaytracingPipeline,
+        width: u32,
+        height: u32,
+    ) {
+        let loader = self
+            .device
+            .rt_pipeline_loader
+            .as_ref()
+            .expect("ray tracing pipeline loader (RT-capable device)");
+        let (raygen, miss, hit, callable) = pipeline.regions();
+        unsafe {
+            loader.cmd_trace_rays(self.cmd, raygen, miss, hit, callable, width, height, 1);
         }
     }
 

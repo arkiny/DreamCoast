@@ -243,7 +243,36 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "rt_path_cs",
     },
+    // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
+    // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
+    // see the profile selection below.
+    Job {
+        src: "rt_pipeline.slang",
+        entry: "rgMain",
+        stage: "raygeneration",
+        key: "rt_pipeline_rgen",
+    },
+    Job {
+        src: "rt_pipeline.slang",
+        entry: "msMain",
+        stage: "miss",
+        key: "rt_pipeline_miss",
+    },
+    Job {
+        src: "rt_pipeline.slang",
+        entry: "chMain",
+        stage: "closesthit",
+        key: "rt_pipeline_chit",
+    },
 ];
+
+/// Whether `stage` is a ray-tracing stage (compiled to a DXIL library).
+fn is_rt_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "raygeneration" | "miss" | "closesthit" | "anyhit" | "intersection" | "callable"
+    )
+}
 
 /// (slang target name, output file extension, generated accessor suffix, required).
 ///
@@ -319,9 +348,21 @@ fn main() {
                 .args(["-entry", job.entry])
                 .args(["-stage", job.stage]);
             // The HLSL shader profile applies to the SPIR-V / DXIL targets; the
-            // Metal target derives everything it needs from the stage.
-            if *target == "spirv" || *target == "dxil" {
+            // Metal target derives everything it needs from the stage. Ray-tracing
+            // stages compile to a DXIL *library* (lib_6_5+) — inline `RayQuery`
+            // inside a hit shader requires >= 6.5; SPIR-V uses the same `sm_6_5`
+            // profile as every other stage (the RT capability comes from the stage).
+            if *target == "spirv" {
                 command.args(["-profile", "sm_6_5"]);
+            } else if *target == "dxil" {
+                command.args([
+                    "-profile",
+                    if is_rt_stage(job.stage) {
+                        "lib_6_5"
+                    } else {
+                        "sm_6_5"
+                    },
+                ]);
             }
             // By default Slang names the SPIR-V entry point "main"; preserve the
             // real name so the pipeline can bind it by entry name.

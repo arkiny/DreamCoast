@@ -404,7 +404,7 @@ unsafe fn build_compute(
     }
 }
 
-fn create_shader_module(
+pub(crate) fn create_shader_module(
     device: &ash::Device,
     bytes: &[u8],
 ) -> Result<vk::ShaderModule, EngineError> {

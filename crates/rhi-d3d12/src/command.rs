@@ -23,9 +23,10 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
     D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT, ID3D12CommandAllocator, ID3D12GraphicsCommandList,
-    ID3D12Resource,
+    ID3D12GraphicsCommandList4, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
+use windows::core::Interface;
 
 use crate::buffer::{D3d12Buffer, D3d12StorageBuffer};
 use crate::cubemap::D3d12Cubemap;
@@ -602,6 +603,50 @@ impl D3d12CommandBuffer {
                 data.as_ptr() as *const c_void,
                 0,
             );
+        }
+    }
+
+    /// Bind a ray-tracing state object + its global root signature, the shared
+    /// bindless heap/table, and the state object (Phase 8 M5). The RT pipeline
+    /// binds through the compute root-signature slots (`DispatchRays` reads them).
+    pub fn bind_raytracing_pipeline(&self, pipeline: &crate::rt_pipeline::D3d12RaytracingPipeline) {
+        unsafe {
+            let heaps = [Some(self.device.srv_heap.clone())];
+            self.list.SetDescriptorHeaps(&heaps);
+            self.list.SetComputeRootSignature(pipeline.root_signature());
+            self.list
+                .SetComputeRootDescriptorTable(0, self.device.srv_gpu_start());
+            let list4: ID3D12GraphicsCommandList4 =
+                self.list.cast().expect("CommandList4 (DXR available)");
+            list4.SetPipelineState1(pipeline.state_object());
+        }
+    }
+
+    /// Upload root (push) constants for the bound RT pipeline (param 1) — same root
+    /// constant slot as compute.
+    pub fn push_constants_rt(&self, data: &[u8]) {
+        unsafe {
+            self.list.SetComputeRoot32BitConstants(
+                1,
+                (data.len() / 4) as u32,
+                data.as_ptr() as *const c_void,
+                0,
+            );
+        }
+    }
+
+    /// Trace a `width` x `height` grid of rays through the bound RT pipeline's SBT.
+    pub fn trace_rays(
+        &self,
+        pipeline: &crate::rt_pipeline::D3d12RaytracingPipeline,
+        width: u32,
+        height: u32,
+    ) {
+        unsafe {
+            let desc = pipeline.dispatch_desc(width, height);
+            let list4: ID3D12GraphicsCommandList4 =
+                self.list.cast().expect("CommandList4 (DXR available)");
+            list4.DispatchRays(&desc);
         }
     }
 

@@ -266,7 +266,7 @@ fn create_root_signature(
 /// space1` (Phase 8). It is always present so every bindless root signature stays
 /// uniform; non-RT pipelines simply never reference it (and the slot stays empty
 /// on devices without a built scene).
-fn bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 5] {
+pub(crate) fn bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 5] {
     [
         D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
@@ -427,7 +427,7 @@ fn create_compute_root_signature(
     }
 }
 
-unsafe fn serialize_and_create(
+pub(crate) unsafe fn serialize_and_create(
     device: &DeviceShared,
     rs_desc: &D3D12_ROOT_SIGNATURE_DESC,
 ) -> Result<ID3D12RootSignature, EngineError> {

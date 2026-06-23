@@ -76,6 +76,13 @@ pub(crate) struct DeviceShared {
     // Acceleration-structure extension function loader (`vkCmdBuildAcceleration
     // StructuresKHR` etc.); `Some` only when `has_raytracing` (Phase 8).
     pub accel_loader: Option<ash::khr::acceleration_structure::Device>,
+    // Ray-tracing-pipeline extension loader (`vkCreateRayTracingPipelinesKHR`,
+    // `vkGetRayTracingShaderGroupHandlesKHR`, `vkCmdTraceRaysKHR`) and the SBT
+    // record sizing it requires; `Some` only when `has_raytracing` (Phase 8 M5).
+    pub rt_pipeline_loader: Option<ash::khr::ray_tracing_pipeline::Device>,
+    pub rt_handle_size: u32,
+    pub rt_handle_alignment: u32,
+    pub rt_base_alignment: u32,
 }
 
 impl DeviceShared {
@@ -206,6 +213,21 @@ impl DeviceShared {
             let swapchain_loader = ash::khr::swapchain::Device::new(raw, &device);
             let accel_loader =
                 has_raytracing.then(|| ash::khr::acceleration_structure::Device::new(raw, &device));
+            let rt_pipeline_loader =
+                has_raytracing.then(|| ash::khr::ray_tracing_pipeline::Device::new(raw, &device));
+            // Shader-group handle size + alignment drive the SBT record layout.
+            let (rt_handle_size, rt_handle_alignment, rt_base_alignment) = if has_raytracing {
+                let mut rt_props = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+                let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut rt_props);
+                raw.get_physical_device_properties2(instance.physical_device, &mut props2);
+                (
+                    rt_props.shader_group_handle_size,
+                    rt_props.shader_group_handle_alignment,
+                    rt_props.shader_group_base_alignment,
+                )
+            } else {
+                (0, 0, 0)
+            };
 
             let pool_ci = vk::CommandPoolCreateInfo::default()
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
@@ -251,6 +273,10 @@ impl DeviceShared {
                 has_dedicated_compute,
                 has_raytracing,
                 accel_loader,
+                rt_pipeline_loader,
+                rt_handle_size,
+                rt_handle_alignment,
+                rt_base_alignment,
             })
         }
     }
@@ -449,6 +475,18 @@ fn create_bindless(
         // compute; the storage buffer is also read by the vertex stage (particle
         // vertex-pull).
         let sampled_stages = vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE;
+        // Storage image/buffer + the TLAS are also accessed by the ray-tracing
+        // pipeline stages (Phase 8 M5): raygen writes the output image and reads the
+        // accumulation/instance buffers + traces the TLAS; closest-hit reads geometry
+        // buffers + traces an inline shadow ray. Only added on RT-capable devices
+        // (the stage bits require the ray-tracing pipeline extension).
+        let rt_stages = if has_raytracing {
+            vk::ShaderStageFlags::RAYGEN_KHR
+                | vk::ShaderStageFlags::CLOSEST_HIT_KHR
+                | vk::ShaderStageFlags::MISS_KHR
+        } else {
+            vk::ShaderStageFlags::empty()
+        };
         let dynamic = vk::DescriptorBindingFlags::PARTIALLY_BOUND
             | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
         let mut bindings = vec![
@@ -475,7 +513,7 @@ fn create_bindless(
                 .binding(3)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(STORAGE_IMAGE_COUNT)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                .stage_flags(vk::ShaderStageFlags::COMPUTE | rt_stages),
             // Binding 4: storage-buffer (UAV) array. Read-write in compute, read in
             // the vertex stage (particle draw). 0-based.
             vk::DescriptorSetLayoutBinding::default()
@@ -485,7 +523,8 @@ fn create_bindless(
                 .stage_flags(
                     vk::ShaderStageFlags::COMPUTE
                         | vk::ShaderStageFlags::VERTEX
-                        | vk::ShaderStageFlags::FRAGMENT,
+                        | vk::ShaderStageFlags::FRAGMENT
+                        | rt_stages,
                 ),
         ];
         let mut flags = vec![
@@ -504,7 +543,7 @@ fn create_bindless(
                     .binding(5)
                     .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
                     .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE | rt_stages),
             );
             // UPDATE_AFTER_BIND so the bound scene's TLAS can be swapped at runtime
             // (Cornell toggle) without invalidating in-flight command buffers.
@@ -650,6 +689,14 @@ impl VulkanDevice {
         desc: &rhi_types::ComputePipelineDesc,
     ) -> Result<crate::pipeline::VulkanComputePipeline, EngineError> {
         crate::pipeline::VulkanComputePipeline::new(self.shared.clone(), desc)
+    }
+
+    /// Create a hardware ray-tracing pipeline + shader binding table (Phase 8 M5).
+    pub fn create_raytracing_pipeline(
+        &self,
+        desc: &rhi_types::RaytracingPipelineDesc,
+    ) -> Result<crate::rt_pipeline::VulkanRaytracingPipeline, EngineError> {
+        crate::rt_pipeline::VulkanRaytracingPipeline::new(self.shared.clone(), desc)
     }
 
     /// Build the scene's acceleration structures (BLAS per mesh + one TLAS) in a
