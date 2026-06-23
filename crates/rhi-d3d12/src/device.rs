@@ -474,6 +474,14 @@ impl D3d12Device {
         D3d12CommandBuffer::new(self.shared.clone())
     }
 
+    /// Create a hardware ray-tracing pipeline (state object) + SBT (Phase 8 M5).
+    pub fn create_raytracing_pipeline(
+        &self,
+        desc: &rhi_types::RaytracingPipelineDesc,
+    ) -> Result<crate::rt_pipeline::D3d12RaytracingPipeline, EngineError> {
+        crate::rt_pipeline::D3d12RaytracingPipeline::new(self.shared.clone(), desc)
+    }
+
     /// Build the scene's acceleration structures (BLAS per mesh + one TLAS) in a
     /// one-shot DIRECT-queue submission (static scene, Phase 8 M2).
     pub fn build_raytracing_scene(

@@ -76,6 +76,8 @@ backend_enum!(/// A heap that transient render targets alias into at graph-compu
     TransientHeap => rhi_vulkan::VulkanTransientHeap, rhi_d3d12::D3d12TransientHeap, rhi_metal::MetalTransientHeap);
 backend_enum!(/// A built ray-tracing scene: BLAS per mesh + one TLAS (Phase 8).
     RaytracingScene => rhi_vulkan::VulkanRaytracingScene, rhi_d3d12::D3d12RaytracingScene, rhi_metal::MetalRaytracingScene);
+backend_enum!(/// A hardware ray-tracing pipeline + shader binding table (Phase 8 M5).
+    RaytracingPipeline => rhi_vulkan::VulkanRaytracingPipeline, rhi_d3d12::D3d12RaytracingPipeline, rhi_metal::MetalRaytracingPipeline);
 
 /// One mesh's geometry for a BLAS build: its vertex + index buffers plus the
 /// plain shape data (Phase 8). Pairs facade [`Buffer`] handles with [`BlasGeometry`].
@@ -423,6 +425,28 @@ impl Device {
                     d.build_raytracing_scene(&geos, instances)?,
                 ))
             }
+            #[cfg(target_os = "macos")]
+            Self::Metal(_) => Err(EngineError::Rhi(
+                "hardware ray tracing is not supported on Metal (Phase 8 deferred)".into(),
+            )),
+        }
+    }
+
+    /// Create a hardware ray-tracing pipeline + shader binding table (Phase 8 M5).
+    /// Requires [`Self::has_raytracing`]. Metal returns an error (RT deferred).
+    pub fn create_raytracing_pipeline(
+        &self,
+        desc: &RaytracingPipelineDesc,
+    ) -> Result<RaytracingPipeline> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => Ok(RaytracingPipeline::Vulkan(
+                d.create_raytracing_pipeline(desc)?,
+            )),
+            #[cfg(windows)]
+            Self::D3d12(d) => Ok(RaytracingPipeline::D3d12(
+                d.create_raytracing_pipeline(desc)?,
+            )),
             #[cfg(target_os = "macos")]
             Self::Metal(_) => Err(EngineError::Rhi(
                 "hardware ray tracing is not supported on Metal (Phase 8 deferred)".into(),
@@ -1216,6 +1240,47 @@ impl CommandBuffer {
             Self::D3d12(c) => c.push_constants_compute(data),
             #[cfg(target_os = "macos")]
             Self::Metal(c) => c.push_constants_compute(data),
+        }
+    }
+
+    /// Bind a ray-tracing pipeline + its shader binding table and the bindless
+    /// tables (Phase 8 M5).
+    pub fn bind_raytracing_pipeline(&self, pipeline: &RaytracingPipeline) {
+        match (self, pipeline) {
+            #[cfg(windows)]
+            (Self::Vulkan(c), RaytracingPipeline::Vulkan(p)) => c.bind_raytracing_pipeline(p),
+            #[cfg(windows)]
+            (Self::D3d12(c), RaytracingPipeline::D3d12(p)) => c.bind_raytracing_pipeline(p),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(_), RaytracingPipeline::Metal(_)) => {}
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Upload push/root constants for the bound **ray-tracing** pipeline.
+    pub fn push_constants_rt(&self, data: &[u8]) {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(c) => c.push_constants_rt(data),
+            #[cfg(windows)]
+            Self::D3d12(c) => c.push_constants_rt(data),
+            #[cfg(target_os = "macos")]
+            Self::Metal(_) => {}
+        }
+    }
+
+    /// Trace a `width` x `height` grid of rays through the bound RT pipeline's SBT.
+    pub fn trace_rays(&self, pipeline: &RaytracingPipeline, width: u32, height: u32) {
+        match (self, pipeline) {
+            #[cfg(windows)]
+            (Self::Vulkan(c), RaytracingPipeline::Vulkan(p)) => c.trace_rays(p, width, height),
+            #[cfg(windows)]
+            (Self::D3d12(c), RaytracingPipeline::D3d12(p)) => c.trace_rays(p, width, height),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(_), RaytracingPipeline::Metal(_)) => {}
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
         }
     }
 

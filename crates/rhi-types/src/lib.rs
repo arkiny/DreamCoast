@@ -196,6 +196,28 @@ pub struct ComputePipelineDesc<'a> {
     pub threads_per_group: [u32; 3],
 }
 
+/// A hardware ray-tracing pipeline (Phase 8 M5): one raygen, one miss, and one
+/// closest-hit shader, assembled into a single shader binding table (one raygen
+/// record / one miss record / one hit group). Bytes are SPIR-V (Vulkan) or a DXIL
+/// library (D3D12); the three entry points come from the same `.slang` source.
+pub struct RaytracingPipelineDesc<'a> {
+    /// Ray-generation shader bytes (SPIR-V) / DXIL library bytes (D3D12).
+    pub raygen_bytes: &'a [u8],
+    pub raygen_entry: &'a str,
+    /// Miss shader bytes (SPIR-V) / DXIL library bytes (D3D12).
+    pub miss_bytes: &'a [u8],
+    pub miss_entry: &'a str,
+    /// Closest-hit shader bytes (SPIR-V) / DXIL library bytes (D3D12).
+    pub closesthit_bytes: &'a [u8],
+    pub closesthit_entry: &'a str,
+    /// Size in bytes of the push/root constant block (0 = none).
+    pub push_constant_size: u32,
+    /// Maximum ray payload size in bytes (D3D12 shader config; Vulkan derives it).
+    pub max_payload_size: u32,
+    /// Maximum hit-attribute size in bytes (barycentrics = 8).
+    pub max_attribute_size: u32,
+}
+
 /// Intended use of a buffer. All these buffers are host-visible (mappable) for
 /// per-frame dynamic upload or host readback. GPU-local read-write storage lives
 /// in the dedicated [`StorageBufferDesc`] type (Phase 7).

@@ -30,6 +30,10 @@ pub use sync::{MetalFence, MetalSemaphore};
 /// (Phase 8), so this is never constructed (`has_raytracing()` is false).
 pub struct MetalRaytracingScene;
 
+/// Placeholder ray-tracing pipeline type so the `rhi` facade's
+/// `RaytracingPipeline` enum has a Metal variant (Phase 8 M5, deferred on Metal).
+pub struct MetalRaytracingPipeline;
+
 use dreamcoast_core::EngineError;
 use objc2_metal::MTLPixelFormat;
 use rhi_types::Format;

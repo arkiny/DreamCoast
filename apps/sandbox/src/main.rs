@@ -22,8 +22,8 @@ use rhi::{
     BackendKind, BlasGeometry, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor,
     CommandBuffer, ComputePipelineDesc, Cubemap, CubemapDesc, Device, Extent2D, Fence, Format,
     GraphicsPipeline, GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology,
-    Queue, ReadbackLayout, RtGeometry, Semaphore, StorageBufferDesc, Swapchain, SwapchainDesc,
-    Texture, TextureDesc, TlasInstance, VertexLayout,
+    Queue, RaytracingPipelineDesc, ReadbackLayout, RtGeometry, Semaphore, StorageBufferDesc,
+    Swapchain, SwapchainDesc, Texture, TextureDesc, TlasInstance, VertexLayout,
 };
 use tracing::info;
 
@@ -374,6 +374,46 @@ fn main() -> anyhow::Result<()> {
             push_constant_size: 128, // inv_view_proj + cam_pos + sun + 2x uint4
             bindless: true,
             threads_per_group: [8, 8, 1],
+        })?)
+    } else {
+        None
+    };
+
+    // Phase 8 M5: the same path tracer via the hardware ray-tracing *pipeline*
+    // (raygen / miss / closest-hit + shader binding table). Reproduces the inline
+    // tracer's image so the two RT abstractions can be cross-checked.
+    let rt_pt_pipeline = if device.has_raytracing() {
+        let rgen = load_compute_shader(
+            backend,
+            dreamcoast_shader::rt_pipeline_rgen_spirv,
+            dreamcoast_shader::rt_pipeline_rgen_dxil,
+            || None,
+            "rt_pipeline_rgen",
+        )?;
+        let miss = load_compute_shader(
+            backend,
+            dreamcoast_shader::rt_pipeline_miss_spirv,
+            dreamcoast_shader::rt_pipeline_miss_dxil,
+            || None,
+            "rt_pipeline_miss",
+        )?;
+        let chit = load_compute_shader(
+            backend,
+            dreamcoast_shader::rt_pipeline_chit_spirv,
+            dreamcoast_shader::rt_pipeline_chit_dxil,
+            || None,
+            "rt_pipeline_chit",
+        )?;
+        Some(device.create_raytracing_pipeline(&RaytracingPipelineDesc {
+            raygen_bytes: rgen,
+            raygen_entry: "rgMain",
+            miss_bytes: miss,
+            miss_entry: "msMain",
+            closesthit_bytes: chit,
+            closesthit_entry: "chMain",
+            push_constant_size: 128, // matches rt_path / rt_pipeline PushConstants
+            max_payload_size: 64,    // float3 x4 + 2x uint, padded
+            max_attribute_size: 8,   // barycentrics (float2)
         })?)
     } else {
         None
@@ -952,6 +992,11 @@ fn main() -> anyhow::Result<()> {
     // Cornell-box scene for the path tracer (strong color bleeding). Headless
     // toggle via `P8_CORNELL`; uses a fixed front-facing camera.
     let mut cornell = cornell_scene.is_some() && std::env::var_os("P8_CORNELL").is_some();
+    // Phase 8 M5: drive the path tracer through the full RT pipeline + SBT instead
+    // of the inline compute ray query (same image). Headless toggle via
+    // `P8_PATHTRACE_PIPELINE`; ignored when no RT pipeline is available.
+    let mut path_trace_pipeline =
+        rt_pt_pipeline.is_some() && std::env::var_os("P8_PATHTRACE_PIPELINE").is_some();
     // Samples per path-trace dispatch (accumulated progressively across frames).
     let path_spp: u32 = 8;
     // Real-time environment capture: re-capture the env chain every frame (so the
@@ -1241,9 +1286,20 @@ fn main() -> anyhow::Result<()> {
                                 if cornell_scene.is_some() {
                                     ui.checkbox("  - Cornell box", &mut cornell);
                                 }
+                                if rt_pt_pipeline.is_some() {
+                                    ui.checkbox(
+                                        "  - pipeline + SBT (vs inline)",
+                                        &mut path_trace_pipeline,
+                                    );
+                                }
                                 ui.text(format!(
-                                    "  - {} spp accumulated",
-                                    accum_frame.saturating_mul(path_spp)
+                                    "  - {} spp accumulated ({})",
+                                    accum_frame.saturating_mul(path_spp),
+                                    if path_trace_pipeline {
+                                        "pipeline"
+                                    } else {
+                                        "inline"
+                                    }
                                 ));
                             }
                         }
@@ -1709,6 +1765,13 @@ fn main() -> anyhow::Result<()> {
         if let Some(rt_out) = rt_out {
             if pt_active {
                 let rt_pipe = rt_path_pipeline.as_ref().unwrap();
+                // M5: when enabled, drive the same path tracer through the RT pipeline
+                // + SBT instead of the inline compute ray query (`None` = inline).
+                let rt_pt = if path_trace_pipeline {
+                    rt_pt_pipeline.as_ref()
+                } else {
+                    None
+                };
                 // Index only (no borrow held into the graph closure — that would
                 // over-extend the graph's lifetime vs. the transient resources).
                 let accum_index = path_accum.as_ref().unwrap().storage_index();
@@ -1737,8 +1800,7 @@ fn main() -> anyhow::Result<()> {
                     move |ctx| {
                         let out_index = ctx.storage_index(rt_out);
                         let cmd = ctx.cmd();
-                        cmd.bind_compute_pipeline(rt_pipe);
-                        cmd.push_constants_compute(&rt_path_push(
+                        let push = rt_path_push(
                             &inv_vp,
                             cam,
                             sun,
@@ -1751,8 +1813,18 @@ fn main() -> anyhow::Result<()> {
                             ch,
                             flip,
                             spp,
-                        ));
-                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                        );
+                        if let Some(rt_pt) = rt_pt {
+                            // Full RT pipeline path (raygen/miss/hit + SBT).
+                            cmd.bind_raytracing_pipeline(rt_pt);
+                            cmd.push_constants_rt(&push);
+                            cmd.trace_rays(rt_pt, cw, ch);
+                        } else {
+                            // Inline ray-query compute path.
+                            cmd.bind_compute_pipeline(rt_pipe);
+                            cmd.push_constants_compute(&push);
+                            cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                        }
                         Ok(())
                     },
                 );

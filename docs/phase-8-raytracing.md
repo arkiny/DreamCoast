@@ -1,6 +1,6 @@
 # Phase 8 — 레이트레이싱 세부 계획
 
-> 상위 로드맵: [ROADMAP.md](ROADMAP.md). **상태: 🚧 계획 / 착수 예정.**
+> 상위 로드맵: [ROADMAP.md](ROADMAP.md). **상태: ✅ 완료** (M1–M6, 두 백엔드 검증). 검증 결과는 아래 [검증 결과](#검증-결과-m1m6) 참조.
 > 전제: [Phase 7](phase-7-compute.md) ✅ (컴퓨트/GPU-driven, 바인드리스 storage, async compute) + [Phase 6](phase-6-pbr.md) ✅ (디퍼드 G-buffer, IBL). Phase 8은 Phase 10(Virtual Geometry)과 무관하게 독립적인 하드웨어 RT 트랙이다.
 
 ## Context
@@ -87,7 +87,7 @@ custom index**로 인덱싱. hit에서 primitive 인덱스 → 정점 3개 → b
 
 ## 마일스톤 (각 게이트: build + fmt + clippy `-D warnings` + 두 백엔드 + Vulkan 검증 클린 + 스크린샷)
 
-### M1 — RT 디바이스 인프라 + 능력 게이팅
+### M1 — RT 디바이스 인프라 + 능력 게이팅 ✅
 
 - **Vulkan**: device 확장 추가(`VK_KHR_acceleration_structure`, `VK_KHR_ray_query`,
   `VK_KHR_ray_tracing_pipeline`, `VK_KHR_deferred_host_operations`), 피처 활성(`accelerationStructure`,
@@ -97,7 +97,7 @@ custom index**로 인덱싱. hit에서 primitive 인덱스 → 정점 3개 → b
 - **파사드**: `Device::has_raytracing() -> bool`(양 백엔드 능력 통일). 버퍼에 device-address/UAV usage 확장.
 - **검증**: 확장/피처 활성 + 디바이스 생성이 검증 클린, `has_raytracing()`가 RTX 2070에서 true.
 
-### M2 — 가속 구조 (BLAS / TLAS) + 인스턴스 테이블
+### M2 — 가속 구조 (BLAS / TLAS) + 인스턴스 테이블 ✅
 
 - **rhi-types**: `BlasDesc`, `TlasInstance`, `TlasDesc`. `BufferUsage`에 AS storage / device-address 플래그.
 - **RHI**: `RaytracingScene`(AS 버퍼 + 스크래치 소유), `Device::accel_prebuild_sizes`,
@@ -106,14 +106,14 @@ custom index**로 인덱싱. hit에서 primitive 인덱스 → 정점 3개 → b
 - **검증**: 샘플 씬(스피어/큐브/아보카도)에서 BLAS×N + TLAS 빌드가 검증 클린(빌드 VUID·D3D12 디버그 없음).
   AS는 아직 트레이스 안 함 — 빌드 성공 + 배리어까지.
 
-### M3 — 인라인 ray query: TLAS 트레이스 검증
+### M3 — 인라인 ray query: TLAS 트레이스 검증 ✅
 
 - TLAS를 셰이더에 바인딩(결정 #4). 컴퓨트 셰이더가 G-buffer world pos에서 카메라/태양으로 `RayQuery` 트레이스.
 - **최소 검증 결과**: primary-hit instanceID 시각화 또는 **RT 섀도우**(태양으로 그림자 레이 → hit이면 그늘)를
   풀스크린 storage image에 write → 표시. (패스트레이서 전 단계 — 트레이스 경로/hit 접근이 도는지 격리 검증.)
 - **검증**: 두 백엔드 동일 트레이스 결과, 검증 클린.
 
-### M4 — 인라인 패스트레이서 (컴퓨트 + RayQuery)
+### M4 — 인라인 패스트레이서 (컴퓨트 + RayQuery) ✅
 
 - 결정 #5의 패스트레이서를 **인라인 ray query**로: 카메라 레이 → 바운스 루프(직접광 + 섀도우 레이 + 디퓨즈
   바운스) → env miss → 누적 storage image. hit 셰이딩은 인스턴스 테이블(결정 #3)로 머티리얼/normal 조회.
@@ -121,7 +121,7 @@ custom index**로 인덱싱. hit에서 primitive 인덱스 → 정점 3개 → b
 - **검증**: 정적 카메라에서 수렴(노이즈 감소), 코넬-박스류 또는 샘플 씬에서 전역 조명(컬러 블리딩) 가시,
   두 백엔드 일치(고정 시드·고정 프레임 스크린샷).
 
-### M5 — 풀 RT 파이프라인 + SBT (같은 패스트레이서)
+### M5 — 풀 RT 파이프라인 + SBT (같은 패스트레이서) ✅
 
 - **셰이더 빌드 확장**(결정 #6): RT 라이브러리 잡(raygen/miss/closesthit 다중 엔트리) → SPIR-V + DXIL 라이브러리.
 - **RT 파이프라인 + SBT**:
@@ -131,16 +131,48 @@ custom index**로 인덱싱. hit에서 primitive 인덱스 → 정점 3개 → b
     `ID3D12GraphicsCommandList4::DispatchRays`.
   - **파사드**: `RaytracingPipeline`, `ShaderBindingTable`, `CommandBuffer::trace_rays(w,h)` — SBT 레이아웃을
     양 API 공통화(레코드 stride/정렬 차이 흡수).
-- 패스트레이서를 파이프라인 경로로 재현(raygen=카메라 레이/누적, miss=env, closesthit=머티리얼 셰이딩+바운스).
-- **검증**: 파이프라인 결과가 **인라인 결과와 픽셀 근사 일치**(같은 씬/시드), 두 백엔드 일치, 검증 클린.
+- 패스트레이서를 파이프라인 경로로 재현(raygen=카메라 레이/바운스 루프/누적, miss=sky, closesthit=머티리얼
+  셰이딩+인라인 섀도우 RayQuery+다음 바운스). `MaxTraceRecursionDepth = 1`(루프는 raygen에서 재발행, 재귀 아님).
+- **구현 노트 (계획 대비 변경)**:
+  - **DXIL 라이브러리 프로파일은 `lib_6_5`** — 계획의 `lib_6_3`은 hit 셰이더 내 인라인 `RayQuery`를 거부한다
+    (`AllocateRayQuery not valid in shader model lib_6_3`). SPIR-V는 다른 스테이지와 동일하게 `sm_6_5`
+    (`-fvk-use-entrypoint-name`). `build.rs`의 `is_rt_stage()`가 RT 스테이지에서만 DXIL 프로파일을 올린다.
+  - **DXIL 라이브러리 export 이름 = 언맹글 엔트리명**(`rgMain`/`msMain`/`chMain`) — hit group/SBT가 그대로 참조.
+  - **SBT는 1 raygen / 1 miss / 1 hit group**, 결정 #6대로 섀도우는 인라인 RayQuery로 분리.
+  - **공유 바인드리스 레이아웃**(set 0)을 RT 파이프라인에서 재사용 — Vulkan binding 3/4/5에 RAYGEN|CLOSEST_HIT|MISS
+    스테이지 가시성 추가, D3D12 글로벌 루트시그는 컴퓨트 루트시그와 동형. 스토리지 배리어 스테이지를 RAYGEN까지
+    확장(RT 가능 디바이스 한정)해 raygen UAV 쓰기의 동기화 갭을 닫음.
+  - **파사드**: `RaytracingPipelineDesc`/`RaytracingPipeline` + `CommandBuffer::{bind_raytracing_pipeline,
+    push_constants_rt, trace_rays(w,h)}`. 푸시상수/누적 버퍼/출력 storage image는 인라인 경로와 동일하게 공유.
+- **검증**: 파이프라인 결과가 인라인 결과와 픽셀 근사 일치, 두 백엔드 일치, 검증 클린 — 아래 [검증 결과](#검증-결과-m1m6).
 
-### M6 — 마무리
+### M6 — 마무리 ✅
 
-- 인라인 vs 파이프라인 토글(ImGui), 성능/수렴 표시, `docs/phase-8-raytracing.md` 검증/한계 채우기,
-  `docs/ROADMAP.md` Phase 8 → ✅, 백로그 메모리 갱신, 커밋.
+- 인라인 vs 파이프라인 토글(ImGui "  - pipeline + SBT (vs inline)" + `P8_PATHTRACE_PIPELINE`)은 M5에서 동봉.
+- `docs/phase-8-raytracing.md` 검증/한계 채움, `docs/ROADMAP.md` Phase 8 → ✅, 백로그 메모리 갱신, 커밋.
 - 전 백엔드 build + fmt + clippy(`-D warnings`) + Vulkan 검증 클린, 스크린샷 두 백엔드 일치.
 
 ---
+
+## 검증 결과 (M1–M6)
+
+RTX 2070 SUPER, 디버그 빌드(검증 레이어 on). 패스트레이서는 누적 64프레임 고정(`PATHTRACE_WARMUP`),
+고정 카메라/시드. 인라인 = 컴퓨트 RayQuery, 파이프라인 = raygen/miss/closesthit + SBT.
+
+| 비교 | 야외 씬(sky+sun+shadow+GI) | Cornell 박스(emissive GI) |
+|---|---|---|
+| 파이프라인 ≈ 인라인 (Vulkan) | avg 0.0003/채널, max 5 | avg 0.0008/채널, max 14 |
+| 파이프라인 ≈ 인라인 (D3D12) | avg 0.0002/채널, max 5 | — |
+| **VK ≡ DX (파이프라인)** | avg 0.0002/채널, max 5 | **avg 0.0000/채널, max 1** |
+| VK ≡ DX (인라인, 기준선) | avg 0.0003/채널, max 5 | — |
+
+- 두 경로 결과가 인라인 교차백엔드 기준선과 동일한 수준으로 일치 → 두 RHI RT 추상화(인라인/파이프라인)가
+  모두 정확함을 강하게 시사.
+- **Vulkan VUID 0**(AS 빌드 / ray_query / ray_tracing_pipeline / SBT / device-address / RT 스테이지 배리어),
+  **D3D12 디버그 클린**(state object / DispatchRays / SBT, live-object 없음).
+- 회귀: 래스터 + 파티클 + 컴퓨트 포스트(비-RT 경로) 검증 클린 — 바인드리스 스테이지 플래그 추가·배리어 확장이
+  기존 경로에 영향 없음.
+- `cargo build` + `cargo fmt --all` + `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` 클린.
 
 ## 검증 전략 (전 마일스톤 공통)
 
