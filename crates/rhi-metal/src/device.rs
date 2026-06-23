@@ -42,12 +42,39 @@ pub(crate) const BINDLESS_COUNT: u32 = 1024;
 /// `BINDLESS_COUNT + 1 + i` (Slang lays the struct out textures, samp, cubes).
 pub(crate) const CUBE_COUNT: u32 = 64;
 
+/// Size of the bindless storage-image (UAV) table. Matches `STORAGE_IMAGE_COUNT`
+/// in rhi-vulkan / rhi-d3d12 and `Bindless.storage_images[64]`; storage image `i`
+/// lives at handle slot `STORAGE_IMAGE_BASE + i` (M5).
+pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
+
+/// Size of the bindless storage-buffer (UAV) table. Matches `STORAGE_BUFFER_COUNT`
+/// in rhi-vulkan / rhi-d3d12 and `Bindless.storage_buffers[64]`; storage buffer `i`
+/// lives at handle slot `STORAGE_BUFFER_BASE + i` (M5).
+pub(crate) const STORAGE_BUFFER_COUNT: u32 = 64;
+
+/// First argument-buffer slot of the storage-image region. Mirrors the
+/// `Bindless { textures[1024], samp, cubes[64], storage_images[64],
+/// storage_buffers[64] }` layout: textures `0..BINDLESS_COUNT`, sampler at
+/// `BINDLESS_COUNT`, cubes next, then storage images, then storage buffers.
+pub(crate) const STORAGE_IMAGE_BASE: u32 = BINDLESS_COUNT + 1 + CUBE_COUNT;
+
+/// First argument-buffer slot of the storage-buffer region (just past the
+/// storage images).
+pub(crate) const STORAGE_BUFFER_BASE: u32 = STORAGE_IMAGE_BASE + STORAGE_IMAGE_COUNT;
+
+/// Total number of 8-byte handle slots in the bindless argument buffer.
+pub(crate) const ARG_BUFFER_SLOTS: u32 = STORAGE_BUFFER_BASE + STORAGE_BUFFER_COUNT;
+
 /// Device state shared (via `Rc`) by every resource created from a device, so the
 /// `MTLDevice` / command queue / layer outlive the resources that reference them.
 pub(crate) struct DeviceShared {
     // Creates pipelines, buffers, textures, and samplers.
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    /// A second command queue for async compute (M5). Apple GPUs overlap compute
+    /// with graphics across queues; cross-queue ordering uses an `MTLSharedEvent`
+    /// (see [`MetalComputeQueue::submit`] / [`MetalQueue::submit_async`]).
+    pub compute_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pub layer: Retained<CAMetalLayer>,
     /// The bindless `ParameterBlock<Bindless>` argument buffer. Tier-2 layout: an
     /// array of 8-byte `MTLResourceID` handles — texture slots `0..BINDLESS_COUNT`,
@@ -61,6 +88,12 @@ pub(crate) struct DeviceShared {
     /// Next free bindless cube slot (0-based; the handle lands at argument-buffer
     /// slot `BINDLESS_COUNT + 1 + index`).
     cube_next: Cell<u32>,
+    /// Next free bindless storage-image slot (0-based; handle at
+    /// `STORAGE_IMAGE_BASE + index`).
+    storage_img_next: Cell<u32>,
+    /// Next free bindless storage-buffer slot (0-based; handle at
+    /// `STORAGE_BUFFER_BASE + index`).
+    storage_buf_next: Cell<u32>,
     /// The per-frame globals UBO (camera/lights/shadow/IBL), set once via
     /// [`MetalDevice::set_globals_buffer`]; bound at [`GLOBALS_BUFFER_INDEX`] with a
     /// per-draw byte offset for `uses_globals` pipelines.
@@ -71,6 +104,16 @@ pub(crate) struct DeviceShared {
     /// the render graph's `*_to_sampled` / `*_to_render_target` transition hooks, so
     /// a resource is never made resident while it is an attachment in the same pass.
     resident: RefCell<Vec<Retained<ProtocolObject<dyn MTLTexture>>>>,
+    /// Storage images (UAV) currently in compute-write state: made resident with
+    /// `Read | Write` on bindless compute encoders. Toggled by the render graph's
+    /// `rt_to_storage` (enter UAV) / `storage_to_sampled` (back to sampled `Read`)
+    /// hooks, so a storage image is never both a UAV-resident and sampled-resident.
+    storage_resident: RefCell<Vec<Retained<ProtocolObject<dyn MTLTexture>>>>,
+    /// Every storage buffer ever created. They are persistent (seeded on the GPU,
+    /// never reallocated), so they stay permanently resident — made `useResource`
+    /// (`Read | Write` on compute, `Read` on the particle/cull draw vertex stage)
+    /// on every bindless encoder.
+    storage_buffers: RefCell<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
 }
 
 impl DeviceShared {
@@ -110,6 +153,55 @@ impl DeviceShared {
         index
     }
 
+    /// Register a storage image (UAV) in the bindless storage-image table,
+    /// returning its 0-based index (handle at `STORAGE_IMAGE_BASE + index`). Like a
+    /// cube it is not made resident here; `rt_to_storage` does that before a compute
+    /// pass writes it.
+    fn register_storage_image(&self, texture: &Retained<ProtocolObject<dyn MTLTexture>>) -> u32 {
+        let index = self.storage_img_next.get();
+        self.storage_img_next.set(index + 1);
+        self.write_handle(STORAGE_IMAGE_BASE + index, texture.gpuResourceID());
+        index
+    }
+
+    /// Register a storage buffer (UAV) in the bindless storage-buffer table,
+    /// returning its 0-based index. Tier-2 argument buffers encode a buffer entry as
+    /// its 8-byte GPU virtual address (the MSL `device T*`), not an `MTLResourceID`.
+    /// The buffer is kept permanently resident.
+    fn register_storage_buffer(&self, buffer: &Retained<ProtocolObject<dyn MTLBuffer>>) -> u32 {
+        let index = self.storage_buf_next.get();
+        self.storage_buf_next.set(index + 1);
+        let slot = STORAGE_BUFFER_BASE + index;
+        let n = std::mem::size_of::<u64>();
+        let addr = buffer.gpuAddress();
+        unsafe {
+            let dst = (self.arg_buffer.contents().as_ptr() as *mut u8).add(slot as usize * n);
+            std::ptr::copy_nonoverlapping((&addr as *const u64).cast::<u8>(), dst, n);
+        }
+        self.storage_buffers.borrow_mut().push(buffer.clone());
+        index
+    }
+
+    /// Move a storage image into (`storage = true`) or out of (`false`) the
+    /// compute-write resident set. Idempotent. Called by `rt_to_storage` /
+    /// `storage_to_sampled`.
+    pub(crate) fn set_storage_resident(
+        &self,
+        texture: &Retained<ProtocolObject<dyn MTLTexture>>,
+        storage: bool,
+    ) {
+        let mut list = self.storage_resident.borrow_mut();
+        let ptr = Retained::as_ptr(texture);
+        let pos = list.iter().position(|t| Retained::as_ptr(t) == ptr);
+        match (storage, pos) {
+            (true, None) => list.push(texture.clone()),
+            (false, Some(i)) => {
+                list.swap_remove(i);
+            }
+            _ => {}
+        }
+    }
+
     /// Add or remove `texture` from the resident set (idempotent). Called by the
     /// render graph's transition hooks: `*_to_sampled` makes a target resident
     /// before a sampling pass, `*_to_render_target` drops it before it is written as
@@ -142,6 +234,21 @@ impl DeviceShared {
     ) -> std::cell::Ref<'_, Vec<Retained<ProtocolObject<dyn MTLTexture>>>> {
         self.resident.borrow()
     }
+
+    /// The storage images (UAV) to make `Read | Write`-resident before a bindless
+    /// compute dispatch.
+    pub(crate) fn storage_resident_textures(
+        &self,
+    ) -> std::cell::Ref<'_, Vec<Retained<ProtocolObject<dyn MTLTexture>>>> {
+        self.storage_resident.borrow()
+    }
+
+    /// The storage buffers (UAV), all permanently resident.
+    pub(crate) fn storage_buffers(
+        &self,
+    ) -> std::cell::Ref<'_, Vec<Retained<ProtocolObject<dyn MTLBuffer>>>> {
+        self.storage_buffers.borrow()
+    }
 }
 
 /// A Metal instance: owns the system `MTLDevice` and the window's `CAMetalLayer`.
@@ -166,13 +273,18 @@ impl MetalInstance {
             .device
             .newCommandQueue()
             .ok_or_else(|| rhi_err("newCommandQueue failed"))?;
+        let compute_queue = self
+            .device
+            .newCommandQueue()
+            .ok_or_else(|| rhi_err("newCommandQueue (compute) failed"))?;
 
-        // Bindless argument buffer: BINDLESS_COUNT texture handles + one sampler
-        // handle + CUBE_COUNT cube handles, each an 8-byte MTLResourceID, in that
-        // order (matches the `Bindless { textures, samp, cubes }` struct layout).
+        // Bindless argument buffer: one 8-byte handle per slot, laid out to match
+        // the `Bindless { textures[1024], samp, cubes[64], storage_images[64],
+        // storage_buffers[64] }` struct (texture/sampler/cube/storage-image entries
+        // are MTLResourceIDs; storage-buffer entries are GPU addresses, also 8 bytes).
         // Shared storage = CPU-writable.
         let handle_size = std::mem::size_of::<MTLResourceID>();
-        let arg_len = (BINDLESS_COUNT as usize + 1 + CUBE_COUNT as usize) * handle_size;
+        let arg_len = ARG_BUFFER_SLOTS as usize * handle_size;
         let arg_buffer = self
             .device
             .newBufferWithLength_options(arg_len, MTLResourceOptions::StorageModeShared)
@@ -194,13 +306,18 @@ impl MetalInstance {
         let shared = Rc::new(DeviceShared {
             device: self.device.clone(),
             queue,
+            compute_queue,
             layer: self.layer.clone(),
             arg_buffer,
             sampler,
             tex_next: Cell::new(0),
             cube_next: Cell::new(0),
+            storage_img_next: Cell::new(0),
+            storage_buf_next: Cell::new(0),
             globals: RefCell::new(None),
             resident: RefCell::new(Vec::new()),
+            storage_resident: RefCell::new(Vec::new()),
+            storage_buffers: RefCell::new(Vec::new()),
         });
         // The sampler sits at the slot just past the texture array (Slang assigns it
         // id `BINDLESS_COUNT` in the argument-buffer struct).
@@ -238,11 +355,19 @@ impl MetalDevice {
     }
 
     pub fn create_command_buffer(&self) -> Result<MetalCommandBuffer> {
-        Ok(MetalCommandBuffer::new(self.shared.clone()))
+        Ok(MetalCommandBuffer::new(
+            self.shared.clone(),
+            self.shared.queue.clone(),
+        ))
     }
 
+    /// A command buffer that records onto the dedicated compute queue (M5 async
+    /// compute). Used for the particle sim that overlaps the graphics frame.
     pub fn create_compute_command_buffer(&self) -> Result<MetalCommandBuffer> {
-        Ok(MetalCommandBuffer::new(self.shared.clone()))
+        Ok(MetalCommandBuffer::new(
+            self.shared.clone(),
+            self.shared.compute_queue.clone(),
+        ))
     }
 
     pub fn create_fence(&self, signaled: bool) -> Result<MetalFence> {
@@ -250,12 +375,13 @@ impl MetalDevice {
     }
 
     pub fn create_semaphore(&self) -> Result<MetalSemaphore> {
-        Ok(MetalSemaphore::new())
+        MetalSemaphore::new(&self.shared.device)
     }
 
-    /// Metal supports multiple command queues; async compute lands in M5.
+    /// Apple GPUs overlap compute on a dedicated queue with graphics; cross-queue
+    /// ordering is handled by an `MTLSharedEvent` (M5).
     pub fn has_async_compute(&self) -> bool {
-        false
+        true
     }
 
     /// Metal ray tracing (Phase 8) is out of scope for the M0–M5 parity effort.
@@ -281,15 +407,13 @@ impl MetalDevice {
         crate::pipeline::build(&self.shared.device, desc)
     }
 
-    /// M4: returns an inert placeholder so the sandbox's *unconditional* Phase-7
-    /// setup links and the deferred (non-compute) scene runs. Actual compute
-    /// **execution** is M5 — `bind_compute_pipeline` / `dispatch` still
-    /// `unimplemented!`, and the sandbox gates every dispatch off on Metal.
+    /// Compile a compute pipeline (`MTLComputePipelineState`) from the metallib
+    /// blob + the shader's threadgroup size (M5).
     pub fn create_compute_pipeline(
         &self,
-        _desc: &ComputePipelineDesc,
+        desc: &ComputePipelineDesc,
     ) -> Result<MetalComputePipeline> {
-        Ok(MetalComputePipeline)
+        crate::pipeline::build_compute(&self.shared.device, desc)
     }
 
     pub fn create_buffer(&self, desc: &BufferDesc) -> Result<MetalBuffer> {
@@ -303,11 +427,22 @@ impl MetalDevice {
         Ok(MetalBuffer::new(buffer, desc.size))
     }
 
-    /// M4: inert placeholder (see [`Self::create_compute_pipeline`]) — the deferred
-    /// scene creates the Phase-7 storage buffers unconditionally but never reads or
-    /// writes them on Metal. Real storage buffers (UAV + bindless slot) land in M5.
-    pub fn create_storage_buffer(&self, _desc: &StorageBufferDesc) -> Result<MetalStorageBuffer> {
-        Ok(MetalStorageBuffer)
+    /// Create a device-local (`Private`) read-write storage buffer (UAV) and
+    /// register it in the bindless storage-buffer table. Seeded on the GPU (a
+    /// compute init dispatch), not from the host, so `Private` is fine; `indirect`
+    /// needs no special Metal flag (any buffer can be a `drawIndexedPrimitives`
+    /// indirect source). The buffer is kept resident for the device's lifetime (M5).
+    pub fn create_storage_buffer(&self, desc: &StorageBufferDesc) -> Result<MetalStorageBuffer> {
+        let buffer = self
+            .shared
+            .device
+            .newBufferWithLength_options(
+                desc.size.max(1) as usize,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .ok_or_else(|| rhi_err("storage buffer alloc failed"))?;
+        let index = self.shared.register_storage_buffer(&buffer);
+        Ok(MetalStorageBuffer::new(buffer, index))
     }
 
     /// Store the per-frame globals UBO. `slice_size` is unused on Metal (the
@@ -394,7 +529,8 @@ impl MetalDevice {
         };
         let mut usage = MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead;
         if desc.storage {
-            // Compute-writable (Phase 7); the storage bindless slot lands in M5.
+            // Compute-writable (Phase 7): also gets a storage-image bindless slot in
+            // `create_render_target` / `create_aliased_target` (M5).
             usage |= MTLTextureUsage::ShaderWrite;
         }
         td.setUsage(usage);
@@ -412,7 +548,12 @@ impl MetalDevice {
             .newTextureWithDescriptor(&td)
             .ok_or_else(|| rhi_err("render target newTexture failed"))?;
         let index = self.shared.register(texture.clone(), false);
-        Ok(MetalRenderTarget::new(texture, index, None))
+        // A storage (UAV) target also gets a storage-image bindless slot so compute
+        // can write `g.storage_images[storage_index]` (M5).
+        let storage_index = desc
+            .storage
+            .then(|| self.shared.register_storage_image(&texture));
+        Ok(MetalRenderTarget::new(texture, index, storage_index))
     }
 
     /// Create a render-target cubemap (6 faces, `mip_levels` each) usable as a
@@ -458,7 +599,10 @@ impl MetalDevice {
     /// size/alignment match the placement allocation.
     pub fn render_target_memory(&self, desc: &RenderTargetDesc) -> Result<MemoryRequirements> {
         let td = self.render_target_descriptor(desc);
-        let sa = self.shared.device.heapTextureSizeAndAlignWithDescriptor(&td);
+        let sa = self
+            .shared
+            .device
+            .heapTextureSizeAndAlignWithDescriptor(&td);
         Ok(MemoryRequirements {
             size: sa.size as u64,
             alignment: sa.align as u64,
@@ -491,10 +635,16 @@ impl MetalDevice {
         desc: &RenderTargetDesc,
     ) -> Result<MetalRenderTarget> {
         let td = self.render_target_descriptor(desc);
-        let texture = unsafe { heap.heap.newTextureWithDescriptor_offset(&td, offset as usize) }
-            .ok_or_else(|| rhi_err("heap newTextureWithDescriptor_offset failed"))?;
+        let texture = unsafe {
+            heap.heap
+                .newTextureWithDescriptor_offset(&td, offset as usize)
+        }
+        .ok_or_else(|| rhi_err("heap newTextureWithDescriptor_offset failed"))?;
         let index = self.shared.register(texture.clone(), false);
-        Ok(MetalRenderTarget::new(texture, index, None))
+        let storage_index = desc
+            .storage
+            .then(|| self.shared.register_storage_image(&texture));
+        Ok(MetalRenderTarget::new(texture, index, storage_index))
     }
 }
 
@@ -516,15 +666,27 @@ impl MetalQueue {
         Ok(())
     }
 
+    /// Submit the graphics command buffer so it GPU-waits on the async compute
+    /// queue's `compute_wait` event before running. Metal can only encode a wait
+    /// into a command buffer's command stream (no queue-level wait), and the
+    /// graphics buffer is already fully recorded by now — so the wait goes on a
+    /// tiny *leading* command buffer committed to the graphics queue first. Command
+    /// buffers in one queue execute in commit order, so the real graphics buffer
+    /// does not start until the leading wait resolves (compute finished writing the
+    /// particle buffer the draw's vertex stage reads). `wait` (image-available) and
+    /// `signal` (render-finished) are unused, as on the single-queue path.
     pub fn submit_async(
         &self,
         cmd: &MetalCommandBuffer,
         _wait: &MetalSemaphore,
-        _compute_wait: &MetalSemaphore,
+        compute_wait: &MetalSemaphore,
         _signal: &MetalSemaphore,
         fence: &MetalFence,
     ) -> Result<()> {
-        // Real cross-queue overlap arrives in M5; for now run it inline.
+        if let Some(waiter) = self.shared.queue.commandBuffer() {
+            waiter.encodeWaitForEvent_value(compute_wait.event(), compute_wait.current_value());
+            waiter.commit();
+        }
         let committed = cmd.commit();
         fence.set(committed);
         Ok(())
@@ -550,15 +712,19 @@ impl MetalQueue {
     }
 }
 
-/// The async-compute queue (M5). For now it shares the single queue.
+/// The dedicated async-compute queue (M5).
 pub struct MetalComputeQueue {
     shared: Rc<DeviceShared>,
 }
 
 impl MetalComputeQueue {
-    pub fn submit(&self, cmd: &MetalCommandBuffer, _signal: &MetalSemaphore) -> Result<()> {
+    /// Submit `cmd` (recorded onto the compute queue) and signal `signal`'s shared
+    /// event with a fresh monotonic value, so the graphics queue's `submit_async`
+    /// can wait on it. No wait/fence here — frame pacing is handled transitively by
+    /// the graphics submit's fence.
+    pub fn submit(&self, cmd: &MetalCommandBuffer, signal: &MetalSemaphore) -> Result<()> {
         let _ = &self.shared;
-        cmd.commit();
+        cmd.commit_signaling(signal.event(), signal.next_value());
         Ok(())
     }
 }

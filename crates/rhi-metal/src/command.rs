@@ -15,10 +15,11 @@ use std::rc::Rc;
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLEvent;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPrimitiveType,
-    MTLRenderCommandEncoder, MTLRenderPassColorAttachmentDescriptor,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLIndexType, MTLLoadAction, MTLOrigin,
+    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassColorAttachmentDescriptor,
     MTLRenderPassDepthAttachmentDescriptor, MTLRenderPassDescriptor, MTLRenderStages, MTLResource,
     MTLResourceUsage, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLViewport,
 };
@@ -39,8 +40,13 @@ type BoundIndexBuffer = (Retained<ProtocolObject<dyn MTLBuffer>>, bool);
 
 pub struct MetalCommandBuffer {
     shared: Rc<DeviceShared>,
+    /// The queue this buffer records onto (graphics or the dedicated compute queue).
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     cmd: RefCell<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
     encoder: RefCell<Option<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>>>,
+    /// The current compute command encoder (a compute pass / dispatch). Only one of
+    /// `encoder` / `compute_encoder` is ever open at a time.
+    compute_encoder: RefCell<Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>>,
     present: RefCell<Option<Retained<ProtocolObject<dyn CAMetalDrawable>>>>,
     /// Index buffer + width bound by `bind_index_buffer`; consumed by
     /// `draw_indexed` (Metal takes the index buffer at draw time, not bind time).
@@ -48,22 +54,47 @@ pub struct MetalCommandBuffer {
     /// Byte offset into the globals UBO selected by `set_globals`; applied when a
     /// `uses_globals` pipeline is bound.
     globals_offset: Cell<u32>,
+    /// Threadgroup size of the bound compute pipeline, used by `dispatch` to turn
+    /// threadgroup counts into `dispatchThreadgroups:threadsPerThreadgroup:`.
+    pipeline_threads: Cell<MTLSize>,
 }
 
 impl MetalCommandBuffer {
-    pub(crate) fn new(shared: Rc<DeviceShared>) -> Self {
+    pub(crate) fn new(
+        shared: Rc<DeviceShared>,
+        queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    ) -> Self {
         Self {
             shared,
+            queue,
             cmd: RefCell::new(None),
             encoder: RefCell::new(None),
+            compute_encoder: RefCell::new(None),
             present: RefCell::new(None),
             index_buffer: RefCell::new(None),
             globals_offset: Cell::new(0),
+            pipeline_threads: Cell::new(MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            }),
+        }
+    }
+
+    /// End whichever encoder (render or compute) is currently open. Compute passes
+    /// have no explicit `end_rendering`, so the next encoder start closes them.
+    fn end_any_encoder(&self) {
+        if let Some(enc) = self.encoder.borrow_mut().take() {
+            enc.endEncoding();
+        }
+        if let Some(enc) = self.compute_encoder.borrow_mut().take() {
+            enc.endEncoding();
         }
     }
 
     /// Create a render command encoder for `pass` and stash it as the current one.
     fn start_encoder(&self, pass: &MTLRenderPassDescriptor) {
+        self.end_any_encoder();
         let cmd = self.cmd.borrow();
         let cmd = cmd.as_ref().expect("begin_rendering* without begin");
         let enc = cmd
@@ -74,31 +105,40 @@ impl MetalCommandBuffer {
 
     pub fn begin(&self) -> Result<()> {
         let cb = self
-            .shared
             .queue
             .commandBuffer()
             .ok_or_else(|| rhi_err("commandBuffer() returned nil"))?;
         *self.cmd.borrow_mut() = Some(cb);
         *self.encoder.borrow_mut() = None;
+        *self.compute_encoder.borrow_mut() = None;
         *self.present.borrow_mut() = None;
         *self.index_buffer.borrow_mut() = None;
         Ok(())
     }
 
     pub fn end(&self) -> Result<()> {
-        if let Some(enc) = self.encoder.borrow_mut().take() {
-            enc.endEncoding();
-        }
+        self.end_any_encoder();
         Ok(())
+    }
+
+    /// End any open encoder, signal `event` to `value` (cross-queue ordering for
+    /// async compute), and commit. Used by [`crate::device::MetalComputeQueue`].
+    pub(crate) fn commit_signaling(&self, event: &ProtocolObject<dyn MTLEvent>, value: u64) {
+        self.end_any_encoder();
+        let cb = self
+            .cmd
+            .borrow_mut()
+            .take()
+            .expect("commit_signaling() without begin()");
+        cb.encodeSignalEvent_value(event, value);
+        cb.commit();
     }
 
     /// Commit the recorded work (ending any open encoder and recording the
     /// deferred drawable present), returning the committed command buffer so a
     /// fence can block on it. Called from the queue submit paths.
     pub(crate) fn commit(&self) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
-        if let Some(enc) = self.encoder.borrow_mut().take() {
-            enc.endEncoding();
-        }
+        self.end_any_encoder();
         let cb = self
             .cmd
             .borrow_mut()
@@ -165,6 +205,7 @@ impl MetalCommandBuffer {
             da.setStoreAction(MTLStoreAction::DontCare);
         }
 
+        self.end_any_encoder();
         let cmd = self.cmd.borrow();
         let cmd = cmd.as_ref().expect("begin_rendering without begin");
         let enc = cmd
@@ -217,7 +258,11 @@ impl MetalCommandBuffer {
         attach.setTexture(Some(&target.texture));
         config_color(&attach, color_clear);
         if let Some(d) = depth {
-            config_depth(&pass.depthAttachment(), &d.texture, MTLStoreAction::DontCare);
+            config_depth(
+                &pass.depthAttachment(),
+                &d.texture,
+                MTLStoreAction::DontCare,
+            );
         }
         self.start_encoder(&pass);
     }
@@ -237,7 +282,11 @@ impl MetalCommandBuffer {
             config_color(&attach, *clear);
         }
         if let Some(d) = depth {
-            config_depth(&pass.depthAttachment(), &d.texture, MTLStoreAction::DontCare);
+            config_depth(
+                &pass.depthAttachment(),
+                &d.texture,
+                MTLStoreAction::DontCare,
+            );
         }
         self.start_encoder(&pass);
     }
@@ -251,7 +300,11 @@ impl MetalCommandBuffer {
     /// cleared and **stored** so the lighting pass can sample it.
     pub fn begin_rendering_depth_only(&self, depth: &MetalDepthBuffer) {
         let pass = MTLRenderPassDescriptor::new();
-        config_depth(&pass.depthAttachment(), &depth.texture, MTLStoreAction::Store);
+        config_depth(
+            &pass.depthAttachment(),
+            &depth.texture,
+            MTLStoreAction::Store,
+        );
         self.start_encoder(&pass);
     }
 
@@ -309,7 +362,11 @@ impl MetalCommandBuffer {
         attach.setSlice(face as usize);
         attach.setLevel(mip as usize);
         config_color(&attach, clear);
-        config_depth(&pass.depthAttachment(), &depth.texture, MTLStoreAction::DontCare);
+        config_depth(
+            &pass.depthAttachment(),
+            &depth.texture,
+            MTLStoreAction::DontCare,
+        );
         self.start_encoder(&pass);
     }
 
@@ -372,21 +429,21 @@ impl MetalCommandBuffer {
             }
             // Per-frame globals UBO (camera/lights/shadow/IBL) for the PBR lighting
             // pass: bound at GLOBALS_BUFFER_INDEX with the offset from `set_globals`.
-            if pipeline.uses_globals {
-                if let Some(globals) = self.shared.globals_buffer() {
-                    let offset = self.globals_offset.get() as usize;
-                    unsafe {
-                        enc.setVertexBuffer_offset_atIndex(
-                            Some(&globals),
-                            offset,
-                            GLOBALS_BUFFER_INDEX,
-                        );
-                        enc.setFragmentBuffer_offset_atIndex(
-                            Some(&globals),
-                            offset,
-                            GLOBALS_BUFFER_INDEX,
-                        );
-                    }
+            if pipeline.uses_globals
+                && let Some(globals) = self.shared.globals_buffer()
+            {
+                let offset = self.globals_offset.get() as usize;
+                unsafe {
+                    enc.setVertexBuffer_offset_atIndex(
+                        Some(&globals),
+                        offset,
+                        GLOBALS_BUFFER_INDEX,
+                    );
+                    enc.setFragmentBuffer_offset_atIndex(
+                        Some(&globals),
+                        offset,
+                        GLOBALS_BUFFER_INDEX,
+                    );
                 }
             }
             if pipeline.bindless {
@@ -420,6 +477,16 @@ impl MetalCommandBuffer {
                         MTLRenderStages::Fragment,
                     );
                 }
+                // Storage buffers the vertex stage pulls from (particle / cull draw
+                // read `g.storage_buffers[i]` in `vsMain`); compute wrote them.
+                for buf in self.shared.storage_buffers().iter() {
+                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
+                    enc.useResource_usage_stages(
+                        res,
+                        MTLResourceUsage::Read,
+                        MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+                    );
+                }
             }
         }
     }
@@ -437,31 +504,127 @@ impl MetalCommandBuffer {
         }
     }
 
-    pub fn bind_compute_pipeline(&self, _pipeline: &MetalComputePipeline) {
-        unimplemented!("Metal compute: milestone M5")
+    /// Begin a compute dispatch: end any open encoder, open a fresh compute command
+    /// encoder, set the pipeline, and (for bindless pipelines) bind the argument
+    /// buffer + make the storage resources resident. One encoder per
+    /// `bind_compute_pipeline` call means consecutive compute passes (e.g. cull
+    /// reset → cull) sit on separate encoders, so Metal's automatic hazard tracking
+    /// orders their reads/writes (the `storage_buffer_*` barriers stay no-ops).
+    /// `threads_per_group` is stashed for the following `dispatch`.
+    pub fn bind_compute_pipeline(&self, pipeline: &MetalComputePipeline) {
+        self.end_any_encoder();
+        let enc = {
+            let cmd = self.cmd.borrow();
+            let cmd = cmd.as_ref().expect("bind_compute_pipeline without begin");
+            cmd.computeCommandEncoder()
+                .expect("failed to create compute command encoder")
+        };
+        enc.setComputePipelineState(&pipeline.state);
+        if pipeline.bindless {
+            unsafe {
+                enc.setBuffer_offset_atIndex(
+                    Some(&self.shared.arg_buffer),
+                    0,
+                    BINDLESS_BUFFER_INDEX,
+                );
+            }
+            // Make argument-buffer-referenced resources resident: sampled inputs
+            // (Read), storage images being written (Read | Write), and the storage
+            // buffers (Read | Write).
+            for tex in self.shared.resident_textures().iter() {
+                let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**tex);
+                enc.useResource_usage(res, MTLResourceUsage::Read);
+            }
+            for tex in self.shared.storage_resident_textures().iter() {
+                let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**tex);
+                enc.useResource_usage(res, MTLResourceUsage::Read | MTLResourceUsage::Write);
+            }
+            for buf in self.shared.storage_buffers().iter() {
+                let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
+                enc.useResource_usage(res, MTLResourceUsage::Read | MTLResourceUsage::Write);
+            }
+        }
+        self.pipeline_threads.set(pipeline.threads_per_group);
+        *self.compute_encoder.borrow_mut() = Some(enc);
     }
 
-    pub fn dispatch(&self, _x: u32, _y: u32, _z: u32) {
-        unimplemented!("Metal compute: milestone M5")
+    /// Dispatch `x * y * z` threadgroups of the bound pipeline's threadgroup size.
+    pub fn dispatch(&self, x: u32, y: u32, z: u32) {
+        if let Some(enc) = self.compute_encoder.borrow().as_ref() {
+            let groups = MTLSize {
+                width: x as usize,
+                height: y as usize,
+                depth: z as usize,
+            };
+            enc.dispatchThreadgroups_threadsPerThreadgroup(groups, self.pipeline_threads.get());
+        }
     }
 
-    pub fn push_constants_compute(&self, _data: &[u8]) {
-        unimplemented!("Metal compute: milestone M5")
+    /// Upload compute push constants at [`PUSH_CONSTANT_INDEX`] (padded up to 16,
+    /// like the graphics path).
+    pub fn push_constants_compute(&self, data: &[u8]) {
+        if let Some(enc) = self.compute_encoder.borrow().as_ref() {
+            let mut buf = [0u8; 256];
+            let len = data.len();
+            assert!(
+                len <= buf.len(),
+                "compute push constant block too large for Metal"
+            );
+            buf[..len].copy_from_slice(data);
+            let padded = (len + 15) & !15;
+            let ptr = NonNull::new(buf.as_ptr() as *mut std::ffi::c_void)
+                .expect("push_constants_compute data pointer is null");
+            unsafe {
+                enc.setBytes_length_atIndex(ptr, padded, PUSH_CONSTANT_INDEX);
+            }
+        }
     }
 
-    pub fn rt_to_storage(&self, _target: &MetalRenderTarget) {}
-    pub fn storage_to_sampled(&self, _target: &MetalRenderTarget) {}
+    /// Render-graph storage transitions. On a single queue Metal tracks the
+    /// compute-write → graphics-read and compute → compute hazards across encoder
+    /// boundaries automatically, so the buffer barriers are no-ops; the storage
+    /// *image* hooks only need to toggle which residency set the target is in
+    /// (sampled `Read` vs UAV `Read | Write`).
+    pub fn rt_to_storage(&self, target: &MetalRenderTarget) {
+        self.shared.set_resident(&target.texture, false);
+        self.shared.set_storage_resident(&target.texture, true);
+    }
+    pub fn storage_to_sampled(&self, target: &MetalRenderTarget) {
+        self.shared.set_storage_resident(&target.texture, false);
+        self.shared.set_resident(&target.texture, true);
+    }
     pub fn storage_buffer_barrier(&self, _buffer: &MetalStorageBuffer) {}
     pub fn storage_buffer_to_indirect(&self, _buffer: &MetalStorageBuffer) {}
     pub fn storage_buffer_to_storage(&self, _buffer: &MetalStorageBuffer) {}
 
-    pub fn draw_indexed_indirect(
-        &self,
-        _buffer: &MetalStorageBuffer,
-        _offset: u64,
-        _draw_count: u32,
-    ) {
-        unimplemented!("Metal indirect draw: milestone M5")
+    /// Issue `draw_count` indexed draws sourced from `buffer` at `offset`. Metal's
+    /// indirect-args struct (`MTLDrawIndexedPrimitivesIndirectArguments`) matches
+    /// the Vulkan / D3D12 5×u32 layout the cull compute shader writes; one Metal
+    /// call draws one command, so loop for `draw_count > 1`.
+    pub fn draw_indexed_indirect(&self, buffer: &MetalStorageBuffer, offset: u64, draw_count: u32) {
+        let enc = self.encoder.borrow();
+        let Some(enc) = enc.as_ref() else { return };
+        let index_buffer = self.index_buffer.borrow();
+        let (ibuf, wide) = index_buffer
+            .as_ref()
+            .expect("draw_indexed_indirect without bind_index_buffer");
+        let index_type = if *wide {
+            MTLIndexType::UInt32
+        } else {
+            MTLIndexType::UInt16
+        };
+        for i in 0..draw_count as u64 {
+            unsafe {
+                enc.drawIndexedPrimitives_indexType_indexBuffer_indexBufferOffset_indirectBuffer_indirectBufferOffset(
+                    MTLPrimitiveType::Triangle,
+                    index_type,
+                    ibuf,
+                    0,
+                    &buffer.buffer,
+                    (offset + i * 20) as usize,
+                );
+            }
+        }
     }
 
     pub fn set_scissor(&self, rect: Rect2D) {

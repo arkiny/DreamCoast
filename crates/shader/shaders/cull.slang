@@ -25,8 +25,7 @@ struct PushConstants
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
 
-[[vk::binding(4, 0)]]
-RWByteAddressBuffer g_storage_buffers[] : register(u0, space1);
+#include "bindless.slang"
 
 // World-space center of grid instance `i`.
 float3 instance_center(uint i)
@@ -43,7 +42,7 @@ void csReset(uint3 tid: SV_DispatchThreadID)
 {
     // Header: index_count, instance_count=0, first_index=0, vertex_offset=0,
     // first_instance=0.
-    RWByteAddressBuffer args = g_storage_buffers[pc.args_index];
+    RWByteAddressBuffer args = g.storage_buffers[pc.args_index];
     args.Store4(0, uint4(pc.index_count, 0, 0, 0));
     args.Store(16, 0);
 }
@@ -69,6 +68,6 @@ void csCull(uint3 tid: SV_DispatchThreadID)
 
     // Append this instance and bump the draw's InstanceCount (offset 4).
     uint slot;
-    g_storage_buffers[pc.args_index].InterlockedAdd(4, 1, slot);
-    g_storage_buffers[pc.visible_index].Store(slot * 4, i);
+    g.storage_buffers[pc.args_index].InterlockedAdd(4, 1, slot);
+    g.storage_buffers[pc.visible_index].Store(slot * 4, i);
 }

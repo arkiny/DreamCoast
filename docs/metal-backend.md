@@ -64,8 +64,13 @@ cargo run -p sandbox -- --backend metal --screenshot-clean scene.png  # M4 scene
 ```
 
 The flagless real renderer (M4) needs `assets/model.glb` (`tools/fetch-assets.sh`).
-Phase-7 compute extras (`P7_COMPUTE_POST` / `P7_PARTICLES` / `P7_CULL`) are M5 on
-Metal and stay off there.
+The Phase-7 compute demos (M5) are cross-backend env toggles on the real scene:
+```sh
+P7_COMPUTE_POST=1 cargo run -p sandbox -- --backend metal --screenshot-clean post.png  # compute blur
+P7_PARTICLES=1    cargo run -p sandbox -- --backend metal --screenshot-clean parts.png # GPU particles
+P7_CULL=1         cargo run -p sandbox -- --backend metal --screenshot-clean cull.png  # GPU cull + indirect
+P7_PARTICLES=1 ASYNC_COMPUTE=1 cargo run -p sandbox -- --backend metal --screenshot-clean async.png
+```
 
 `--triangle-test` and `--mesh-test` are cross-backend
 (`--backend vulkan|d3d12|metal`); enable the Metal validation layers for a stricter
@@ -109,8 +114,12 @@ smoke test:
   on Metal — `--backend metal --screenshot` of the real scene (shadow → G-buffer →
   IBL capture/convolve → lighting → tonemap, + ImGui) renders correctly and clean
   under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`. See "M4 plan + progress" below.
-  **M5 — compute/async/indirect:** pending (compute pipelines/storage buffers are
-  inert placeholders on Metal, gated off in the sandbox via `compute_supported`).
+- **M5 — compute / async compute / indirect draw:** **done.** All three Phase-7
+  compute demos run on Metal — compute post-process (HDR→storage-image blur→sample),
+  GPU particles (compute sim → vertex-pull billboard draw), and GPU frustum culling
+  (compute cull → `draw_indexed_indirect`) — plus real **async compute** (a dedicated
+  `MTLCommandQueue` with `MTLSharedEvent` cross-queue sync). Verified clean under the
+  validation layers; see "M5 plan + progress" below.
 
 ## Resume notes for M4+ (implementation pointers)
 
@@ -383,3 +392,85 @@ the flagless real renderer. All cross-backend (`--backend vulkan|d3d12|metal`).
     steps 2–6 are Metal-backend-only Rust + a backend-neutral sandbox gate, so they
     do not alter the Windows backends. Still **verify the step-1 shader changes on
     the Windows RTX 2070 SUPER box.**
+
+## M5 plan + progress
+
+**Goal / done-when:** the three Phase-7 compute demos + async compute run on Metal,
+clean under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`, and the demos-off scene
+matches M4 (regression). Phase 7 / async-compute were already shipped on Vulkan/D3D12
+and the shaders + render-graph compute passes + sandbox wiring (toggles, ping-pong)
+are backend-neutral, so M5 is mostly **filling the Metal backend stubs + migrating
+the 5 compute shaders to `metallib`** — not new design.
+
+**Done (verified on this macOS M3 box):**
+
+- **Step 1 — compute shaders → `metallib`.** Folded `RWTexture2D storage_images[64]`
+  (binding 3) + `RWByteAddressBuffer storage_buffers[64]` (binding 4) into the shared
+  `Bindless` block in `bindless.slang`, and migrated `post_compute`, `particle_sim`,
+  `particle_draw`, `cull`, `cull_draw` from loose `g_storage_*[]` globals to
+  `g.storage_*[]`. All five now compile to `metallib` (were the last `None`
+  accessors). **SPIR-V descriptor layout byte-identical to the loose-global baseline**
+  (storage image stays set 0 / binding 3, storage buffer binding 4; only the sampler
+  member name changed `g_sampler`→`g_samp`) — same risk profile as M3/M4, **Windows
+  parity pending the RTX 2070 SUPER box.** MSL: the argument-buffer struct is
+  `textures[1024]/samp/cubes[64]/storage_images[64]/storage_buffers[64]` (no
+  compaction); storage-image entries are `MTLResourceID`s, storage-buffer entries are
+  `device` pointers (GPU addresses).
+
+- **Step 2 — compute pipeline + dispatch.** `ComputePipelineDesc.threads_per_group`
+  (MSL kernels don't bake `[numthreads]` in, unlike SPIR-V/DXIL; the sandbox fills it
+  per shader — post 8×8×1, sim/cull 64×1×1, reset 1×1×1). `MetalComputePipeline` =
+  `MTLComputePipelineState` + threadgroup size; `pipeline::build_compute`.
+  `bind_compute_pipeline` ends any open encoder, opens a fresh
+  `MTLComputeCommandEncoder`, binds the argument buffer at `BINDLESS_BUFFER_INDEX`
+  (buffer(1) — no globals in compute) and makes storage resources resident.
+  `dispatch` = `dispatchThreadgroups:threadsPerThreadgroup:`; `push_constants_compute`
+  = `setBytes` (16-padded). **One encoder per `bind_compute_pipeline`** so consecutive
+  compute passes (cull reset → cull) sit on separate encoders and Metal's automatic
+  hazard tracking orders them (the `storage_buffer_*` barriers stay no-ops, like M4's
+  encoder-boundary model).
+
+- **Step 3 — storage resources (UAV).** Argument buffer enlarged by
+  `STORAGE_IMAGE_COUNT + STORAGE_BUFFER_COUNT` (= 64 + 64); `register_storage_image`
+  (writes the texture's `gpuResourceID`) / `register_storage_buffer` (writes the
+  buffer's `gpuAddress` — tier-2 buffer entries are addresses, not resource IDs).
+  `create_render_target` / `create_aliased_target` allocate a storage-image bindless
+  slot when `desc.storage` (the `RenderTarget` already got `ShaderWrite` usage in M4);
+  `create_storage_buffer` = `StorageModePrivate` `MTLBuffer` (GPU-seeded, no host
+  upload). **Residency model:** storage buffers stay permanently resident
+  (`Read|Write` on compute encoders, `Read` on the particle/cull draw vertex stage);
+  storage images toggle into a `storage_resident` set via `rt_to_storage` /
+  `storage_to_sampled` (the M4 sampled-residency hooks, extended). Barriers stay
+  no-ops on the single queue.
+
+- **Step 4 — indirect draw.** `draw_indexed_indirect` =
+  `drawIndexedPrimitives:indexType:indexBuffer:…:indirectBuffer:indirectBufferOffset:`.
+  Metal's `MTLDrawIndexedPrimitivesIndirectArguments` is the same 5×u32 / 20-byte
+  layout the cull compute shader writes; `BufferUsage::Indirect` needs no special
+  Metal flag (any private buffer is a valid indirect source). One call per command, so
+  loop for `draw_count > 1` (cull uses a single args record).
+
+- **Step 5 — ungate + demos.** `compute_supported = true` (all backends now support
+  compute); `load_compute_shader` feeds the Metal path the `*_cs_metallib()`
+  accessors. All three demos verified by `P7_* --screenshot-clean` + Read, clean under
+  the validation layers; demos-off = M4 scene (regression).
+
+- **Step 6 — async compute.** `MetalSemaphore` now wraps an `MTLSharedEvent` (+ a
+  monotonic value); a dedicated compute `MTLCommandQueue` lives in `DeviceShared`;
+  `has_async_compute()` = true; `create_compute_command_buffer` records onto the
+  compute queue. `MetalComputeQueue::submit` ends the encoder, `encodeSignalEvent`s a
+  fresh value, and commits on the compute queue. **Cross-queue wait:** Metal can only
+  encode a wait into a command buffer's stream (no queue-level wait à la D3D12
+  `queue->Wait`), and the graphics buffer is already fully recorded by `submit_async`
+  time — so the wait goes on a tiny **leading** command buffer committed to the
+  graphics queue *before* the real one (command buffers in a queue execute in commit
+  order, so the graphics work doesn't start until the wait resolves). Verified
+  `P7_PARTICLES=1 ASYNC_COMPUTE=1` — the fountain matches the single-queue path, no
+  hazards, validation clean. The single-queue path (graph compute pass + `submit`) is
+  preserved as the fallback.
+
+- **Vulkan/D3D12 parity:** only the step-1 shader changes touch the shared shaders
+  (same bounded-array / dropped-`SPV_EXT_descriptor_indexing` change as M3/M4; storage
+  bindings unchanged). Steps 2–6 are Metal-backend-only Rust + the backend-neutral
+  `compute_supported = true` flip, so they don't alter the Windows backends. **Verify
+  the step-1 shader changes + the ungate on the Windows RTX 2070 SUPER box.**

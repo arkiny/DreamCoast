@@ -3,9 +3,11 @@
 // image (UAV) that the tonemap pass then samples. Demonstrates a compute effect
 // wired into the render graph between the lighting and tonemap passes.
 //
-// Bindless layout extends post.slang: sampled textures (t0/binding 0) + sampler
-// (s0/binding 1) for the input, plus a storage-image array (u0/binding 3) for the
-// output, indexed by push constants (b0). Dispatched over 8x8 thread groups.
+// Bindless layout (shared `Bindless` block): sampled textures (binding 0) +
+// sampler (binding 1) for the input, plus the storage-image array (binding 3) for
+// the output, indexed by push constants (b0). Dispatched over 8x8 thread groups.
+
+#include "bindless.slang"
 
 struct PushConstants
 {
@@ -17,15 +19,6 @@ struct PushConstants
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
-
-[[vk::binding(0, 0)]]
-Texture2D g_textures[] : register(t0, space0);
-
-[[vk::binding(1, 0)]]
-SamplerState g_sampler : register(s0, space0);
-
-[[vk::binding(3, 0)]]
-RWTexture2D<float4> g_storage_images[] : register(u0, space0);
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -45,10 +38,10 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         for (int dx = -1; dx <= 1; dx++)
         {
             float2 o = float2(float(dx), float(dy)) * texel;
-            sum += g_textures[pc.hdr_index].SampleLevel(g_sampler, uv + o, 0).rgb;
+            sum += g.textures[pc.hdr_index].SampleLevel(g.samp, uv + o, 0).rgb;
         }
     }
     sum /= 9.0;
 
-    g_storage_images[pc.out_index][tid.xy] = float4(sum, 1.0);
+    g.storage_images[pc.out_index][tid.xy] = float4(sum, 1.0);
 }

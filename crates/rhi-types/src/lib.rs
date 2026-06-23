@@ -189,6 +189,11 @@ pub struct ComputePipelineDesc<'a> {
     pub push_constant_size: u32,
     /// Whether the pipeline binds the device's bindless tables.
     pub bindless: bool,
+    /// Threads per threadgroup (the shader's `[numthreads(x, y, z)]`). Vulkan and
+    /// D3D12 bake this into the shader, so they ignore it; Metal's MSL kernels do
+    /// not, so the backend needs it to turn a `dispatch(x, y, z)` (threadgroup
+    /// counts) into `dispatchThreadgroups:threadsPerThreadgroup:`.
+    pub threads_per_group: [u32; 3],
 }
 
 /// Intended use of a buffer. All these buffers are host-visible (mappable) for
