@@ -298,6 +298,11 @@ impl MetalInstance {
         sd.setMipFilter(MTLSamplerMipFilter::Linear);
         sd.setSAddressMode(MTLSamplerAddressMode::Repeat);
         sd.setTAddressMode(MTLSamplerAddressMode::Repeat);
+        // Required because the sampler is encoded into the bindless argument buffer
+        // via `gpuResourceID()` below. Without this, `gpuResourceID()` is invalid for
+        // argument-buffer use and Metal shader validation (MTL_SHADER_VALIDATION=1)
+        // faults on the sampler slot.
+        sd.setSupportArgumentBuffers(true);
         let sampler = self
             .device
             .newSamplerStateWithDescriptor(&sd)
