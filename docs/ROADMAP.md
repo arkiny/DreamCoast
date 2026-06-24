@@ -124,11 +124,14 @@ engine/                 # cargo workspace root
   [rt-pbr-parity.md](rt-pbr-parity.md) (full metallic-roughness BSDF·VNDF IS·NEE·러시안 룰렛·디스크 태양광·
   텍스처/노멀맵; 래스터 vs PT 비교 하니스 `tools/rt-compare.py`). 래스터가 수렴해야 할 정답.
 
-### Phase 9 — 툴링 & 마무리
-- GPU 프로파일링(타임스탬프 쿼리), 디버그 마커(PIX/RenderDoc/NSight), 검증 레이어 토글
-- 기법 전환용 샘플 브라우저(샌드박스) 완성
+### Phase 9 — 툴링 & 마무리 — ✅ 완료
+세부: [phase-9-tooling.md](phase-9-tooling.md)
+- GPU 프로파일링(패스별 타임스탬프 쿼리) ✅, 디버그 마커 + 오브젝트 네이밍(RenderDoc/PIX/NSight) ✅,
+  검증 레이어 토글(`--no-validation` 런치 플래그) ✅
+- 기법 전환용 샘플 브라우저(샌드박스 collapsing 섹션) ✅
 - **async compute** (전용 컴퓨트 큐로 파티클 sim 오버랩) ✅ 선행 완료: [async-compute.md](async-compute.md)
-- **완료 기준**: 프로파일러 + 캡처 툴 연동, 샌드박스에서 기법 자유 전환
+- **완료 기준 달성**: 패스별 GPU ms 프로파일러 + 디버그 마커가 두 백엔드에서 동작(검증 클린),
+  샌드박스에서 기법 자유 전환. M1·M2·M3 모두 완료.
 
 ### Phase 10 — Virtual Geometry — 🧪 실험적 / 계획
 세부: [phase-10-virtual-geometry.md](phase-10-virtual-geometry.md)

@@ -80,9 +80,18 @@ RenderDoc/PIX/NSight 캡처에서 패스/리소스가 이름으로 보이게.
 - **검증:** Vulkan 검증 잡음 0, D3D12 디버그 클린. RenderDoc/PIX 캡처에서 이름 확인은 **사용자 수동**
   (캡처 툴은 이 환경에서 스크립트 불가) — 마커 코드는 검증 레이어가 라벨 밸런스/objectType를 잡아준다.
 
-## M3 — 샘플 브라우저 + 검증 토글
+## M3 — 샘플 브라우저 + 검증 토글  ✅ 완료
 
 흩어진 기법 토글을 일관된 "샘플 브라우저"로 정리.
+
+**구현 완료 (샌드박스, RHI 무변경):**
+- **샘플 브라우저:** 평평하던 토글 더미를 `collapsing_header` 섹션으로 카테고리화 —
+  Lighting / Material override / IBL · Environment / Compute (Phase 7) / Ray tracing (Phase 8) /
+  Profiling & debug (Phase 9). 핵심 그룹(Lighting, Profiling)은 기본 펼침. 헤드리스 env 토글 유지.
+- **검증 토글:** 인스턴스 레벨이라 런타임 토글 불가 → 런치 플래그 `--no-validation`(`validation_enabled()`)로
+  노출, UI 헤더에 `validation: on/off` 상태 표시. 릴리스는 항상 컴파일 아웃.
+- **검증:** build+fmt+clippy(-D warnings) clean. 브라우저 UI 정상(collapsing 섹션), `--no-validation`
+  Vulkan 클린 실행(검증 메신저 미생성). 기존 토글 동작 보존.
 
 - **샌드박스 UI:** 현재 산재한 체크박스/콤보(PBR·IBL·섀도우·머티리얼 오버라이드, 컴퓨트 3종,
   RT/PT/Cornell, async)를 **씬/기법 셀렉터**(좌측 리스트 + 설명 + 해당 토글만 노출)로 재구성.
