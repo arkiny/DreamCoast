@@ -52,6 +52,7 @@ struct Globals
     float4 shadow;        // x = depth bias, y = texel size (1 / shadow map size)
     float4x4 inv_view_proj; // clip -> world (skybox ray reconstruction)
     int4 ibl;             // x env, y irradiance, z prefilter, w BRDF LUT (-1 = none)
+    float4 probe;         // xyz = reflection-probe centre, w = proxy sphere radius (0 = off)
 };
 
 [[vk::push_constant]]
@@ -108,7 +109,7 @@ float3 fresnel_schlick_roughness(float cos_theta, float3 f0, float roughness)
 // Image-based ambient: diffuse from the irradiance cube + specular from the
 // prefilter cube and BRDF LUT (split-sum). Falls back to flat ambient when no
 // IBL is bound.
-float3 ambient_ibl(float3 n, float3 v, float3 albedo, float metallic,
+float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float metallic,
                    float roughness, float ao, float3 f0)
 {
     if (globals.ibl.y < 0)
@@ -116,6 +117,28 @@ float3 ambient_ibl(float3 n, float3 v, float3 albedo, float metallic,
 
     float n_dot_v = max(dot(n, v), 1e-4);
     float3 r = reflect(-v, n);
+
+    // Sphere-proxy parallax correction: the reflection probe is a single cubemap
+    // captured at `probe.xyz`, but this surface is elsewhere, so the raw reflection
+    // vector samples the wrong part of the cube (the reflected ground/horizon slides
+    // up the object). Intersect the reflection ray with a proxy sphere around the
+    // probe and re-anchor the lookup direction to that hit, as point-of-interest
+    // probes do, so the reflected scene lines up with the actual geometry.
+    float pradius = globals.probe.w;
+    if (pradius > 0.0)
+    {
+        float3 oc = world_pos - globals.probe.xyz;
+        float b = dot(oc, r);
+        float c2 = dot(oc, oc) - pradius * pradius;
+        float disc = b * b - c2;
+        if (disc > 0.0)
+        {
+            float t = -b + sqrt(disc); // exit point along the reflection ray
+            if (t > 0.0)
+                r = normalize((world_pos + r * t) - globals.probe.xyz);
+        }
+    }
+
     float3 f = fresnel_schlick_roughness(n_dot_v, f0, roughness);
     float3 kd = (1.0 - f) * (1.0 - metallic);
 
@@ -244,7 +267,7 @@ float4 fsMain(VSOutput input) : SV_Target
         lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
     }
 
-    float3 ambient = ambient_ibl(n, v, albedo, metallic, roughness, ao, f0);
+    float3 ambient = ambient_ibl(n, v, world_pos, albedo, metallic, roughness, ao, f0);
     float3 color = (ambient + lo) * globals.ambient.a; // a = exposure
 
     // Debug views (counts.y): 1 albedo, 2 normal, 3 metallic, 4 roughness,
