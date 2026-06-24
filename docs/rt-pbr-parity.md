@@ -1,6 +1,6 @@
 # 패스트레이서 정밀화 — Ground-Truth PBR 계획
 
-> 상위: [phase-8-raytracing.md](phase-8-raytracing.md) (Phase 8 ✅). **상태: 🚧 진행 중 — G1·G2·G4 ✅, G3·G5 남음.**
+> 상위: [phase-8-raytracing.md](phase-8-raytracing.md) (Phase 8 ✅). **상태: 🚧 진행 중 — G1·G2·G3·G4 ✅, G5 남음.**
 > 후속 트랙으로, Phase 8의 "디퓨즈 GI only" 한계를 해소한다.
 > 공유 PT 코드는 `crates/shader/shaders/rt_common.slang`(rt_path/rt_pipeline가 include) — 인라인≡파이프라인 비트 동일 유지.
 
@@ -48,12 +48,17 @@
 - **검증**: 금속(거칠기 0.08)·거친 금속·유전체 구 비교, 래스터의 IBL 반사와 **시각적으로 일관**(정답은 더 정확).
   인라인≡파이프라인, VK≡DX.
 
-### G3 — 무편향 추정기 정밀화 (Ground Truth 핵심)
-- **MIS**(BSDF 샘플 ↔ 광원 NEE)로 태양·포인트광·발광면 결합 — 저분산·무편향(파워 휴리스틱).
-- **러시안 룰렛**(N바운스 후 throughput 기반 확률 종료) → 무편향으로 깊은 경로 허용(8~16+ 바운스).
-- **태양을 디스크 광원**(유한 입체각)으로 → 물리적 소프트 섀도우. 포인트광 NEE 추가(래스터 패리티).
-- 펌웨어 결정성 유지(시드·샘플 순서 고정). 파이어플라이 클램프는 **무편향 위해 기본 off**(옵션).
-- **검증**: 분산 감소(수렴) 측정, 소프트 섀도우 가시, 동일 씬에서 노이즈가 균일 누적으로 줄어듦.
+### G3 — 무편향 추정기 정밀화 (Ground Truth 핵심) ✅ (커밋됨)
+- **러시안 룰렛** ✅ — `RR_START_BOUNCE`(3) 이후 throughput 기반 확률 종료, `MAX_BOUNCES` 4→8.
+  무편향으로 깊은 경로 허용. (상수는 rt_common.slang에 공유.)
+- **태양 디스크 광원** ✅ — `sample_cone`으로 sun 콘(반각 ~1.1°, `SUN_COS_MAX`) 내 방향을 NEE 샘플 →
+  물리적 소프트 섀도우. 디스크 복사휘도 L·Ω = pc.sun.w라 기여 = eval_bsdf·sun.w·ndl(에너지 보존).
+- RNG 순서 인라인≡파이프라인 동일 유지(바운스당 NEE 콘 2 + BSDF 3 + RR 1; 파이프라인은 chMain이 5,
+  rgMain이 RR 1 소비). 파이어플라이 클램프 없음(무편향).
+- **검증 ✅**: 인라인≡파이프라인 avg≤0.0010, VK≡DX avg≤0.0010, Cornell VK≡DX 0.0000, Vulkan VUID 0,
+  소프트 섀도우 가시(접촉 그림자 페넘브라).
+- **이월(G5/후속)**: MIS(BSDF↔광원)는 편향이 아닌 분산 저감이라 누적 수렴으로 대체 — 글로시 태양 하이라이트
+  노이즈가 거슬리면 추가. 포인트광 NEE도 후속(현재 태양+하늘+발광만).
 
 ### G4 — 텍스처 머티리얼 + 노멀 매핑 ✅ (Metal inline + M7 검증됨)
 - hit에서 보간 UV로 base_color(sRGB)·metallic-roughness(linear)·emissive 텍스처를 샘플한다.
