@@ -919,8 +919,12 @@ fn main() -> anyhow::Result<()> {
         // (mesh, material) per instance, in TLAS instance order (objects, then
         // ground). Materials mirror the rasterizer's so the path tracer shades with
         // the same metallic-roughness PBR model.
+        // base_color.a is the path tracer's emissive scale (the Cornell light uses
+        // it). The sample-scene objects are NOT emitters — their .a is just opacity —
+        // so zero it, else e.g. the chrome sphere emits its own base color and reads
+        // as a glowing white ball instead of a mirror.
         let mat_of = |o: &SceneObject| PtMaterial {
-            base_color: o.base_color,
+            base_color: [o.base_color[0], o.base_color[1], o.base_color[2], 0.0],
             metallic: o.metallic,
             roughness: o.roughness,
             ao: 1.0,

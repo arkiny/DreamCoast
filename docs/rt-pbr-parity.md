@@ -73,17 +73,23 @@
 - **나란히 비교 하니스**: `tools/rt-compare.py RASTER.png PT.png OUT.png` → `래스터 | 패스트레이서 | 차이×4`
   몽타주 + 픽셀 차이 통계(평균/최대/임계 초과 비율). 같은 고정 카메라로 캡처(헤드리스 `--screenshot-clean`):
   ```
-  cargo run -p sandbox -- --backend vulkan --screenshot-clean tmp/raster.png            # 래스터
-  P8_PATHTRACE=1 cargo run -p sandbox -- --backend vulkan --screenshot-clean tmp/pt.png # PT(수렴)
+  NO_POINT_LIGHTS=1 cargo run -p sandbox -- --backend vulkan --screenshot-clean tmp/raster.png  # 래스터(공정 비교)
+  P8_PATHTRACE=1 cargo run -p sandbox -- --backend vulkan --screenshot-clean tmp/pt.png          # PT(수렴)
   python tools/rt-compare.py tmp/raster.png tmp/pt.png docs/images/rt-vs-raster.png
   ```
 
 ![Rasterizer vs ground-truth path tracer (raster | PT | diff x4)](images/rt-vs-raster.png)
 
-- **비교 결과 (샘플 씬, 동일 카메라)**: 평균 절대차 9.1/채널, >8 차이 22%, >32 차이 6%. 카메라/배경/위치는
-  완전 정렬(PT 카메라 = 래스터 `view_proj`의 역행렬). **차이의 대부분은 두 금속 구**(차이 패널에서 가장 밝음):
-  래스터는 split-sum IBL 큐브(근사) 반사, PT는 실제 광선추적 반사 → PT가 정답. 그 외 소프트 vs PCF 그림자,
-  디퓨즈 GI 컬러 블리딩. 디퓨즈 표면(아보카도·큐브)은 두 렌더러가 거의 일치. → **래스터 개선의 정량 기준 확보.**
+- **공정 비교를 막던 두 차이를 먼저 제거**(노출 아님):
+  1. **포인트광** — 래스터는 포인트광 2개가 기본 ON, PT엔 없음. `NO_POINT_LIGHTS=1`로 끄면 전반적
+     밝기차(>8 비율)가 22%→10%로 급감. (PT에 포인트광 NEE 추가는 후속.)
+  2. **PT 발광 버그** — 샘플 씬 객체의 `base_color.a`(=불투명 알파, 1.0)가 발광 스케일로 쓰여 **모든 객체가
+     자기 base_color를 발광** → 크롬 구가 거울이 아니라 흰 발광구로 보였음. 호스트에서 샘플 객체의 a=0으로
+     수정(Cornell 라이트의 a는 유지). 수정 후 크롬이 정상 금속 거울이 됨.
+- **비교 결과 (수정 후, 포인트광 OFF, 동일 카메라)**: 평균 절대차 **4.0/채널**(이전 9.1), >8 **6.4%**, >32 **2.7%**.
+  카메라/배경/위치 완전 정렬(PT 카메라 = 래스터 `view_proj` 역행렬). 남은 차이는 **금속 구 반사**가 대부분:
+  래스터 split-sum IBL 큐브(이웃 객체 미반영, 매끈) vs PT 실제 광선추적 반사(아보카도·큐브가 정확히 비침) →
+  **PT가 정답**, 차이 = 래스터 IBL의 근본 한계(닫으려면 하이브리드 RT 반사 필요). 디퓨즈 표면은 거의 일치.
 - **양 백엔드 패리티(전 게이트 누적)**: 인라인≡파이프라인 avg≤0.0010, VK≡DX avg≤0.0010, Cornell VK≡DX 0.0000,
   Vulkan VUID 0 / D3D12 디버그 클린, build+fmt+clippy(`-D warnings`) 클린.
 
