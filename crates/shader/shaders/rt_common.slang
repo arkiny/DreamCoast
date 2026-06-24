@@ -325,15 +325,24 @@ uint wrap_texel(int p, uint size)
     return uint(r < 0 ? r + s : r);
 }
 
+// The material index varies per ray (per hit instance); a sampled-image array
+// accessed with a non-uniform index needs the NonUniform decoration or Vulkan
+// reads the wrong descriptor in the ray-tracing stages (compute happens to be
+// uniform per workgroup, so it works there without it; D3D12 is lenient).
+// Metal indexes argument-buffer arrays non-uniformly without any decoration, and
+// Slang's Metal target rejects the intrinsic (E36107), so build.rs defines
+// RT_METAL_TARGET for the direct slangc->metallib compile to drop it there.
+#ifdef RT_METAL_TARGET
+#define RT_NONUNIFORM(i) (i)
+#else
+#define RT_NONUNIFORM(i) NonUniformResourceIndex(i)
+#endif
+
 float4 load_texture_wrapped(uint tex, int2 p, uint width, uint height)
 {
     int x = int(wrap_texel(p.x, width));
     int y = int(wrap_texel(p.y, height));
-    // The material index varies per ray (per hit instance); a sampled-image array
-    // accessed with a non-uniform index needs the NonUniform decoration or Vulkan
-    // reads the wrong descriptor in the ray-tracing stages (compute happens to be
-    // uniform per workgroup, so it works there without it; D3D12 is lenient).
-    return g.textures[NonUniformResourceIndex(tex)].Load(int3(x, y, 0));
+    return g.textures[RT_NONUNIFORM(tex)].Load(int3(x, y, 0));
 }
 
 // Ray shaders have no screen-space derivatives, and the M7 converter path does
@@ -342,7 +351,7 @@ float4 sample_texture_bilinear(uint tex, float2 uv)
 {
     uint width;
     uint height;
-    g.textures[NonUniformResourceIndex(tex)].GetDimensions(width, height);
+    g.textures[RT_NONUNIFORM(tex)].GetDimensions(width, height);
     if (width == 0u || height == 0u)
         return float4(1, 1, 1, 1);
 

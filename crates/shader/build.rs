@@ -419,6 +419,14 @@ fn main() {
                 .args(["-target", target])
                 .args(["-entry", job.entry])
                 .args(["-stage", job.stage]);
+            // Slang's Metal target rejects the `NonUniformResourceIndex` intrinsic
+            // (E36107) that SPIR-V/DXIL need for per-ray descriptor selection; Metal
+            // indexes argument-buffer arrays non-uniformly without it. Drop the
+            // decoration only for the direct metallib compile (inline `csMain`). The
+            // M7 RT-pipeline path goes through DXC, so it keeps the decoration.
+            if *target == "metallib" {
+                command.args(["-D", "RT_METAL_TARGET=1"]);
+            }
             // The HLSL shader profile applies to the SPIR-V / DXIL targets; the
             // Metal target derives everything it needs from the stage. Ray-tracing
             // stages compile to a DXIL *library* (lib_6_5+) — inline `RayQuery`
