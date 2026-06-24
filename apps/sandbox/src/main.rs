@@ -162,12 +162,16 @@ fn main() -> anyhow::Result<()> {
     let mut window = Window::new(&title, 1280, 720)?;
     let (w, h) = window.size();
 
+    // Validation is a launch-time choice (instance-level): on by default, off via
+    // `--no-validation`. In release builds the backend compiles validation out
+    // regardless, so `validation_on` is only meaningful in debug builds.
+    let validation_on = validation_enabled();
     let instance = Instance::new(
         backend,
         &window,
         &InstanceDesc {
             app_name: "dreamcoast-sandbox".into(),
-            validation: true,
+            validation: validation_on,
         },
     )?;
     let device = instance.create_device()?;
@@ -1325,78 +1329,98 @@ fn main() -> anyhow::Result<()> {
                         dt * 1000.0
                     ));
                     ui.text(format!("scene: {} objects + ground", scene.len()));
+                    ui.text(format!(
+                        "validation: {}",
+                        if validation_on { "on" } else { "off" }
+                    ));
                     ui.separator();
-                    ui.checkbox("GPU profiler", &mut profiler_on);
-                    if profiler_on {
-                        if gpu_timings.is_empty() {
-                            ui.text_disabled("  (measuring…)");
+
+                    // Sample browser: each technique group is a collapsing section,
+                    // so the sandbox reads as a catalog of techniques rather than a
+                    // flat wall of toggles. Core groups default open.
+                    use imgui::TreeNodeFlags;
+                    let open = TreeNodeFlags::DEFAULT_OPEN;
+
+                    if ui.collapsing_header("Lighting", open) {
+                        ui.combo_simple_string("Debug view", &mut debug_view, &DEBUG_VIEWS);
+                        ui.input_float3("Sun dir", &mut sun_dir).build();
+                        ui.slider("Sun intensity", 0.0, 10.0, &mut sun_intensity);
+                        ui.slider("Ambient", 0.0, 0.5, &mut ambient);
+                        ui.slider("Exposure", 0.1, 4.0, &mut exposure);
+                        ui.checkbox("Point lights", &mut point_lights_on);
+                        ui.checkbox("Shadows", &mut shadows_on);
+                        ui.slider("Shadow bias", 0.0, 0.01, &mut shadow_bias);
+                    }
+
+                    if ui.collapsing_header("Material override", TreeNodeFlags::empty()) {
+                        ui.checkbox("Override material", &mut override_material);
+                        ui.slider("Metallic", 0.0, 1.0, &mut metallic_override);
+                        ui.slider("Roughness", 0.0, 1.0, &mut roughness_override);
+                    }
+
+                    if ui.collapsing_header("IBL / Environment", TreeNodeFlags::empty()) {
+                        ui.checkbox("Real-time env capture", &mut realtime_env);
+                        ui.checkbox("Multi-bounce reflections", &mut multibounce);
+                        ui.combo_simple_string("Post effect", &mut post_mode, &POST_EFFECTS);
+                        ui.checkbox("Transient aliasing", &mut aliasing);
+                    }
+
+                    if ui.collapsing_header("Compute / GPGPU (Phase 7)", TreeNodeFlags::empty()) {
+                        ui.checkbox("Compute post (blur)", &mut compute_post);
+                        ui.checkbox("GPU particles", &mut particles_on);
+                        if async_compute_supported {
+                            ui.checkbox("  - async compute queue", &mut async_compute_on);
                         } else {
-                            let mut total = 0.0;
-                            for (name, ms) in &gpu_timings {
-                                ui.text(format!("  {name:<9} {ms:6.3} ms"));
-                                total += ms;
-                            }
-                            ui.text(format!("  {:<9} {total:6.3} ms", "total"));
+                            ui.text_disabled("  - async compute (no dedicated queue)");
                         }
+                        ui.checkbox("GPU culling (indirect)", &mut gpu_cull);
                     }
-                    ui.separator();
-                    ui.combo_simple_string("Debug view", &mut debug_view, &DEBUG_VIEWS);
-                    ui.input_float3("Sun dir", &mut sun_dir).build();
-                    ui.slider("Sun intensity", 0.0, 10.0, &mut sun_intensity);
-                    ui.slider("Ambient", 0.0, 0.5, &mut ambient);
-                    ui.slider("Exposure", 0.1, 4.0, &mut exposure);
-                    ui.checkbox("Point lights", &mut point_lights_on);
-                    ui.checkbox("Shadows", &mut shadows_on);
-                    ui.slider("Shadow bias", 0.0, 0.01, &mut shadow_bias);
-                    ui.separator();
-                    ui.checkbox("Override material", &mut override_material);
-                    ui.slider("Metallic", 0.0, 1.0, &mut metallic_override);
-                    ui.slider("Roughness", 0.0, 1.0, &mut roughness_override);
-                    ui.separator();
-                    ui.checkbox("Real-time env capture", &mut realtime_env);
-                    ui.checkbox("Multi-bounce reflections", &mut multibounce);
-                    ui.combo_simple_string("Post effect", &mut post_mode, &POST_EFFECTS);
-                    ui.checkbox("Transient aliasing", &mut aliasing);
-                    ui.separator();
-                    ui.text("Compute / GPGPU (Phase 7)");
-                    ui.checkbox("Compute post (blur)", &mut compute_post);
-                    ui.checkbox("GPU particles", &mut particles_on);
-                    if async_compute_supported {
-                        ui.checkbox("  - async compute queue", &mut async_compute_on);
-                    } else {
-                        ui.text_disabled("  - async compute (no dedicated queue)");
-                    }
-                    ui.checkbox("GPU culling (indirect)", &mut gpu_cull);
+
                     if rt_path_pipeline.is_some() && rt_scene.is_some() {
-                        ui.separator();
-                        ui.text("Ray tracing (Phase 8)");
-                        ui.checkbox("Path trace (inline ray query)", &mut path_trace);
-                        if path_trace {
-                            ui.checkbox("  - debug: instance + shadow viz", &mut rt_debug);
-                            if !rt_debug {
-                                if cornell_scene.is_some() {
-                                    ui.checkbox("  - Cornell box", &mut cornell);
-                                }
-                                if rt_pt_pipeline.is_some() {
-                                    ui.checkbox(
-                                        "  - pipeline + SBT (vs inline)",
-                                        &mut path_trace_pipeline,
-                                    );
-                                }
-                                ui.text(format!(
-                                    "  - {} spp accumulated ({})",
-                                    accum_frame.saturating_mul(path_spp),
-                                    if path_trace_pipeline {
-                                        "pipeline"
-                                    } else {
-                                        "inline"
+                        if ui.collapsing_header("Ray tracing (Phase 8)", TreeNodeFlags::empty()) {
+                            ui.checkbox("Path trace (inline ray query)", &mut path_trace);
+                            if path_trace {
+                                ui.checkbox("  - debug: instance + shadow viz", &mut rt_debug);
+                                if !rt_debug {
+                                    if cornell_scene.is_some() {
+                                        ui.checkbox("  - Cornell box", &mut cornell);
                                     }
-                                ));
+                                    if rt_pt_pipeline.is_some() {
+                                        ui.checkbox(
+                                            "  - pipeline + SBT (vs inline)",
+                                            &mut path_trace_pipeline,
+                                        );
+                                    }
+                                    ui.text(format!(
+                                        "  - {} spp accumulated ({})",
+                                        accum_frame.saturating_mul(path_spp),
+                                        if path_trace_pipeline {
+                                            "pipeline"
+                                        } else {
+                                            "inline"
+                                        }
+                                    ));
+                                }
                             }
                         }
                     } else {
-                        ui.separator();
                         ui.text_disabled("Ray tracing (unsupported)");
+                    }
+
+                    if ui.collapsing_header("Profiling & debug (Phase 9)", open) {
+                        ui.checkbox("GPU profiler", &mut profiler_on);
+                        if profiler_on {
+                            if gpu_timings.is_empty() {
+                                ui.text_disabled("  (measuring…)");
+                            } else {
+                                let mut total = 0.0;
+                                for (name, ms) in &gpu_timings {
+                                    ui.text(format!("  {name:<9} {ms:6.3} ms"));
+                                    total += ms;
+                                }
+                                ui.text(format!("  {:<9} {total:6.3} ms", "total"));
+                            }
+                        }
                     }
                 });
         }
@@ -3152,6 +3176,15 @@ fn select_backend() -> BackendKind {
         }
     }
     backend
+}
+
+/// Whether the Vulkan validation layer / debug-utils messenger should be enabled
+/// (Phase 9 M3). Defaults on; `--no-validation` turns it off (useful when running
+/// under a capture tool that injects its own layers, or to measure layer-free
+/// timings). Validation is instance-level, so this is a launch flag, not a live
+/// toggle; in release builds it is always compiled out regardless.
+fn validation_enabled() -> bool {
+    !std::env::args().skip(1).any(|a| a == "--no-validation")
 }
 
 /// Whether `--clear-test` was passed: run the minimal clear-screen loop (M0 of
