@@ -17,7 +17,7 @@ use dreamcoast_core::glam::{Mat4, Vec3, Vec4};
 use dreamcoast_core::init_logging;
 use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
-use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourcePool};
+use dreamcoast_render::{ComputePassInfo, GraphProfiler, PassInfo, RenderGraph, ResourcePool};
 use rhi::{
     BackendKind, BlasGeometry, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor,
     CommandBuffer, ComputePipelineDesc, Cubemap, CubemapDesc, Device, Extent2D, Fence, Format,
@@ -1076,13 +1076,25 @@ fn main() -> anyhow::Result<()> {
     let compute_queue = device.compute_queue();
     let mut compute_command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
     let mut compute_done = Vec::with_capacity(FRAMES_IN_FLIGHT);
+    // GPU profiler: one timestamp query heap per frame in flight (read back after
+    // that slot's fence, so the results never stall the GPU). MAX_QUERIES covers
+    // (scheduled passes + 1) boundaries with headroom (Phase 9 M1).
+    const MAX_QUERIES: u32 = 32;
+    let mut query_heaps = Vec::with_capacity(FRAMES_IN_FLIGHT);
     for _ in 0..FRAMES_IN_FLIGHT {
         command_buffers.push(device.create_command_buffer()?);
         image_available.push(device.create_semaphore()?);
         in_flight.push(device.create_fence(true)?);
         compute_command_buffers.push(device.create_compute_command_buffer()?);
         compute_done.push(device.create_semaphore()?);
+        query_heaps.push(device.create_query_heap(MAX_QUERIES)?);
     }
+    // Profiler state: per-slot recorded pass names (to interpret the next readback)
+    // + the most recent per-pass GPU milliseconds (for the ImGui table). Off by
+    // default; toggled in the UI.
+    let mut profiler_on = std::env::var("PROFILE_GPU").is_ok();
+    let mut slot_pass_names: Vec<Vec<String>> = vec![Vec::new(); FRAMES_IN_FLIGHT];
+    let mut gpu_timings: Vec<(String, f32)> = Vec::new();
     let mut render_finished = build_render_finished(&device, swapchain.image_count())?;
 
     // IBL resource set. The environment cube holds the procedural sky; the
@@ -1303,6 +1315,20 @@ fn main() -> anyhow::Result<()> {
                     ));
                     ui.text(format!("scene: {} objects + ground", scene.len()));
                     ui.separator();
+                    ui.checkbox("GPU profiler", &mut profiler_on);
+                    if profiler_on {
+                        if gpu_timings.is_empty() {
+                            ui.text_disabled("  (measuring…)");
+                        } else {
+                            let mut total = 0.0;
+                            for (name, ms) in &gpu_timings {
+                                ui.text(format!("  {name:<9} {ms:6.3} ms"));
+                                total += ms;
+                            }
+                            ui.text(format!("  {:<9} {total:6.3} ms", "total"));
+                        }
+                    }
+                    ui.separator();
                     ui.combo_simple_string("Debug view", &mut debug_view, &DEBUG_VIEWS);
                     ui.input_float3("Sun dir", &mut sun_dir).build();
                     ui.slider("Sun intensity", 0.0, 10.0, &mut sun_intensity);
@@ -1366,6 +1392,25 @@ fn main() -> anyhow::Result<()> {
 
         let fence = &in_flight[frame];
         fence.wait()?;
+
+        // This slot's previous submission is now complete, so its timestamp
+        // queries are ready: read them back and turn the tick boundaries into
+        // per-pass GPU milliseconds for the profiler UI (shown next frame).
+        if profiler_on && !slot_pass_names[frame].is_empty() {
+            let heap = &query_heaps[frame];
+            let ticks = heap.read();
+            let period_ns = heap.period_ns();
+            let names = &slot_pass_names[frame];
+            gpu_timings = names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let dt = ticks[i + 1].saturating_sub(ticks[i]);
+                    (name.clone(), dt as f32 * period_ns * 1e-6)
+                })
+                .collect();
+        }
+
         let image_index = match swapchain.acquire_next_image(&image_available[frame])? {
             Some(i) => i,
             None => {
@@ -2032,6 +2077,7 @@ fn main() -> anyhow::Result<()> {
                 |ctx| gui.render(&device, ctx.cmd(), frame),
             );
         }
+        let mut profiler = profiler_on.then(|| GraphProfiler::new(&query_heaps[frame]));
         graph.execute(
             &device,
             &mut pools[frame],
@@ -2039,7 +2085,14 @@ fn main() -> anyhow::Result<()> {
             &swapchain,
             image_index,
             aliasing,
+            profiler.as_mut(),
         )?;
+        // Remember this slot's scheduled pass names so the next readback (after
+        // this frame's fence) can pair them with the timestamp boundaries.
+        slot_pass_names[frame] = match &profiler {
+            Some(p) => p.names.clone(),
+            None => Vec::new(),
+        };
 
         // For a screenshot, copy the just-rendered backbuffer into a readback
         // buffer in the same command buffer (before it ends).

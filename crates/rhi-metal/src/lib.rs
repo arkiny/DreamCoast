@@ -13,6 +13,7 @@ mod accel;
 mod command;
 mod device;
 mod pipeline;
+mod query;
 mod resources;
 mod rt_pipeline;
 mod swapchain;
@@ -21,6 +22,7 @@ mod sync;
 pub use accel::MetalRaytracingScene;
 pub use command::MetalCommandBuffer;
 pub use device::{MetalComputeQueue, MetalDevice, MetalInstance, MetalQueue};
+pub use query::MetalQueryHeap;
 pub use resources::{
     MetalBuffer, MetalComputePipeline, MetalCubemap, MetalDepthBuffer, MetalGraphicsPipeline,
     MetalRenderTarget, MetalStorageBuffer, MetalTexture, MetalTransientHeap,

@@ -12,6 +12,7 @@ use crate::cubemap::VulkanCubemap;
 use crate::depth::{VulkanDepthBuffer, depth_subresource_range};
 use crate::device::DeviceShared;
 use crate::pipeline::{VulkanComputePipeline, VulkanGraphicsPipeline};
+use crate::query::VulkanQueryHeap;
 use crate::render_target::VulkanRenderTarget;
 use crate::swapchain::VulkanSwapchain;
 use crate::{color_subresource_range, vk_err};
@@ -89,6 +90,33 @@ impl VulkanCommandBuffer {
                 .map_err(vk_err)
         }
     }
+
+    /// Reset `count` timestamp queries before they are (re)written this frame.
+    /// Must be recorded outside a render pass (this is called at graph start).
+    pub fn reset_queries(&self, heap: &VulkanQueryHeap, first: u32, count: u32) {
+        unsafe {
+            self.device
+                .device
+                .cmd_reset_query_pool(self.cmd, heap.raw(), first, count);
+        }
+    }
+
+    /// Write a timestamp into query `index` at the bottom of the pipe (records the
+    /// completion point of all prior work — pass boundary timing).
+    pub fn write_timestamp(&self, heap: &VulkanQueryHeap, index: u32) {
+        unsafe {
+            self.device.device.cmd_write_timestamp(
+                self.cmd,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                heap.raw(),
+                index,
+            );
+        }
+    }
+
+    /// Resolve written queries into their readback buffer. No-op on Vulkan
+    /// (results are read directly from the pool); present for backend symmetry.
+    pub fn resolve_queries(&self, _heap: &VulkanQueryHeap, _count: u32) {}
 
     /// Transition a swapchain image `UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL`.
     pub fn transition_to_render_target(&self, swapchain: &VulkanSwapchain, image_index: u32) {

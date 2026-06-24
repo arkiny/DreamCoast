@@ -12,18 +12,18 @@ use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_CLEAR_FLAG_DEPTH, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_LIST_TYPE_COMPUTE,
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_INDEX_BUFFER_VIEW, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    D3D12_RESOURCE_ALIASING_BARRIER, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
-    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
-    D3D12_RESOURCE_BARRIER_TYPE_ALIASING, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-    D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATE_COPY_SOURCE,
-    D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
-    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-    D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER,
-    D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
-    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-    D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT, ID3D12CommandAllocator, ID3D12GraphicsCommandList,
-    ID3D12GraphicsCommandList4, ID3D12Resource,
+    D3D12_QUERY_TYPE_TIMESTAMP, D3D12_RESOURCE_ALIASING_BARRIER, D3D12_RESOURCE_BARRIER,
+    D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_TYPE_UAV,
+    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET,
+    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATES,
+    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER, D3D12_TEXTURE_COPY_LOCATION,
+    D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT,
+    ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList4, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
 use windows::core::Interface;
@@ -94,6 +94,33 @@ impl D3d12CommandBuffer {
 
     pub fn end(&self) -> Result<(), EngineError> {
         unsafe { self.list.Close().map_err(d3d_err) }
+    }
+
+    /// Reset timestamp queries before reuse. No-op on D3D12 (queries are
+    /// overwritten directly); present for backend symmetry with Vulkan.
+    pub fn reset_queries(&self, _heap: &crate::query::D3d12QueryHeap, _first: u32, _count: u32) {}
+
+    /// Write a timestamp into query `index` (`EndQuery` — timestamp queries need
+    /// no `BeginQuery`).
+    pub fn write_timestamp(&self, heap: &crate::query::D3d12QueryHeap, index: u32) {
+        unsafe {
+            self.list
+                .EndQuery(heap.heap(), D3D12_QUERY_TYPE_TIMESTAMP, index);
+        }
+    }
+
+    /// Resolve `count` written queries into the heap's readback buffer.
+    pub fn resolve_queries(&self, heap: &crate::query::D3d12QueryHeap, count: u32) {
+        unsafe {
+            self.list.ResolveQueryData(
+                heap.heap(),
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                0,
+                count,
+                heap.readback(),
+                0,
+            );
+        }
     }
 
     pub fn transition_to_render_target(&self, swapchain: &D3d12Swapchain, image_index: u32) {

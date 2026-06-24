@@ -125,6 +125,11 @@ impl MetalCommandBuffer {
         Ok(())
     }
 
+    /// Timestamp query recording (Phase 9 M1) — no-ops on the Metal stub.
+    pub fn reset_queries(&self, _heap: &crate::query::MetalQueryHeap, _first: u32, _count: u32) {}
+    pub fn write_timestamp(&self, _heap: &crate::query::MetalQueryHeap, _index: u32) {}
+    pub fn resolve_queries(&self, _heap: &crate::query::MetalQueryHeap, _count: u32) {}
+
     /// End any open encoder, signal `event` to `value` (cross-queue ordering for
     /// async compute), and commit. Used by [`crate::device::MetalComputeQueue`].
     pub(crate) fn commit_signaling(&self, event: &ProtocolObject<dyn MTLEvent>, value: u64) {

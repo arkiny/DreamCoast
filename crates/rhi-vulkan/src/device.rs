@@ -722,6 +722,14 @@ impl VulkanDevice {
         command::VulkanCommandBuffer::new(self.shared.clone())
     }
 
+    /// Create a timestamp query heap of `count` queries (Phase 9 profiling).
+    pub fn create_query_heap(
+        &self,
+        count: u32,
+    ) -> Result<crate::query::VulkanQueryHeap, EngineError> {
+        crate::query::VulkanQueryHeap::new(self.shared.clone(), count)
+    }
+
     /// Create a host-visible buffer.
     pub fn create_buffer(&self, desc: &BufferDesc) -> Result<VulkanBuffer, EngineError> {
         VulkanBuffer::new(self.shared.clone(), desc)
