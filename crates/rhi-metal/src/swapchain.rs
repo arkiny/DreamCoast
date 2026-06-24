@@ -5,13 +5,13 @@
 //! command buffer can render to and present it) and report a single image index,
 //! since only one drawable is in hand at a time.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSSize;
-use objc2_metal::MTLPixelFormat;
+use objc2_metal::{MTLPixelFormat, MTLTexture};
 use objc2_quartz_core::CAMetalDrawable;
 use rhi_types::{Extent2D, Format, SwapchainDesc};
 
@@ -22,7 +22,7 @@ use crate::{Result, pixel_format};
 pub struct MetalSwapchain {
     shared: Rc<DeviceShared>,
     format: Format,
-    extent: Extent2D,
+    extent: Cell<Extent2D>,
     /// The drawable handed out by the most recent `acquire_next_image`.
     current: RefCell<Option<Retained<ProtocolObject<dyn CAMetalDrawable>>>>,
 }
@@ -33,7 +33,7 @@ impl MetalSwapchain {
         Ok(Self {
             shared,
             format: desc.format,
-            extent: desc.extent,
+            extent: Cell::new(desc.extent),
             current: RefCell::new(None),
         })
     }
@@ -45,6 +45,14 @@ impl MetalSwapchain {
         *self.current.borrow_mut() = None;
         match self.shared.layer.nextDrawable() {
             Some(drawable) => {
+                // The drawable is the single source of truth for this frame's size:
+                // CAMetalLayer can vend an in-flight drawable at the previous
+                // drawableSize for a frame or two after a resize. Record its real
+                // pixel size so the renderer builds its offscreen targets / viewport
+                // to match — no partial "strip" frame.
+                let tex = drawable.texture();
+                self.extent
+                    .set(Extent2D::new(tex.width() as u32, tex.height() as u32));
                 *self.current.borrow_mut() = Some(drawable);
                 Ok(Some(0))
             }
@@ -55,7 +63,7 @@ impl MetalSwapchain {
     pub fn recreate(&mut self, desc: &SwapchainDesc) -> Result<()> {
         configure_layer(&self.shared, desc);
         self.format = desc.format;
-        self.extent = desc.extent;
+        self.extent.set(desc.extent);
         *self.current.borrow_mut() = None;
         Ok(())
     }
@@ -65,7 +73,7 @@ impl MetalSwapchain {
     }
 
     pub fn extent_2d(&self) -> Extent2D {
-        self.extent
+        self.extent.get()
     }
 
     pub fn image_count(&self) -> u32 {

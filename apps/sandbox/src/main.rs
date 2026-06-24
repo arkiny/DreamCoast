@@ -1260,20 +1260,37 @@ fn run() -> anyhow::Result<()> {
         if window.take_resized() {
             needs_recreate = true;
         }
-        let (cw, ch) = window.size();
-        if cw == 0 || ch == 0 {
+        let (ww, wh) = window.size();
+        if ww == 0 || wh == 0 {
             std::thread::sleep(std::time::Duration::from_millis(16));
             continue;
         }
         if needs_recreate {
             device.wait_idle()?;
-            swapchain.recreate(&swapchain_desc(Extent2D::new(cw, ch)))?;
+            swapchain.recreate(&swapchain_desc(Extent2D::new(ww, wh)))?;
             for p in &mut pools {
                 p.clear(); // transient extents changed; drop cached targets
             }
             render_finished = build_render_finished(&device, swapchain.image_count())?;
             needs_recreate = false;
         }
+
+        // Acquire the drawable up front: its *actual* pixel size is the single
+        // source of truth for this whole frame (ImGui display size, camera aspect,
+        // render extent, viewport). A failed acquire skips here, BEFORE the ImGui
+        // frame is started, so NewFrame/Render stay balanced (skipping after
+        // new_frame() trips an ImGui assertion).
+        let image_index = match swapchain.acquire_next_image(&image_available[frame])? {
+            Some(i) => i,
+            None => {
+                needs_recreate = true;
+                continue;
+            }
+        };
+        let (cw, ch) = {
+            let e = swapchain.extent_2d();
+            (e.width, e.height)
+        };
 
         let now = Instant::now();
         let dt = (now - last).as_secs_f32();
@@ -1468,13 +1485,6 @@ fn run() -> anyhow::Result<()> {
                 .collect();
         }
 
-        let image_index = match swapchain.acquire_next_image(&image_available[frame])? {
-            Some(i) => i,
-            None => {
-                needs_recreate = true;
-                continue;
-            }
-        };
         fence.reset()?;
 
         let cmd = &command_buffers[frame];
