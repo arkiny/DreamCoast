@@ -110,6 +110,7 @@ struct Globals {
     shadow: [f32; 4],           // x depth bias, y texel size (1 / SHADOW_SIZE)
     inv_view_proj: [f32; 16],   // clip -> world (skybox ray reconstruction)
     ibl: [i32; 4],              // x env, y irradiance, z prefilter, w BRDF (-1 = none)
+    probe: [f32; 4],            // xyz reflection-probe centre, w proxy sphere radius (0 = off)
 }
 
 fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
@@ -1398,7 +1399,12 @@ fn main() -> anyhow::Result<()> {
                 brdf_index,
                 &scene,
                 &capture_depth,
-                eye,
+                // Capture the reflection probe at the scene centre, NOT the camera:
+                // a camera-anchored probe gives every reflective surface a parallax
+                // error (the reflected ground/horizon slides up the spheres as the
+                // camera moves). A fixed probe near the objects keeps reflections
+                // stable and roughly correct for surfaces around the centre.
+                focus,
                 sun_dir,
                 sun_intensity,
                 ambient,
@@ -1456,6 +1462,9 @@ fn main() -> anyhow::Result<()> {
             shadow: [shadow_bias, 1.0 / SHADOW_SIZE as f32, 0.0, 0.0],
             inv_view_proj,
             ibl: ibl_indices,
+            // Reflection-probe centre (matches the env-capture eye) + proxy sphere
+            // radius for parallax-corrected specular IBL.
+            probe: [focus.x, focus.y, focus.z, scene_radius * 1.5],
         };
         let globals_offset = frame as u64 * GLOBALS_SLICE;
         globals_buffer.write_at(globals_offset, globals_bytes(&globals))?;
