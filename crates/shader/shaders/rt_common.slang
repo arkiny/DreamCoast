@@ -306,7 +306,11 @@ float4 load_texture_wrapped(uint tex, int2 p, uint width, uint height)
 {
     int x = int(wrap_texel(p.x, width));
     int y = int(wrap_texel(p.y, height));
-    return g.textures[tex].Load(int3(x, y, 0));
+    // The material index varies per ray (per hit instance); a sampled-image array
+    // accessed with a non-uniform index needs the NonUniform decoration or Vulkan
+    // reads the wrong descriptor in the ray-tracing stages (compute happens to be
+    // uniform per workgroup, so it works there without it; D3D12 is lenient).
+    return g.textures[NonUniformResourceIndex(tex)].Load(int3(x, y, 0));
 }
 
 // Ray shaders have no screen-space derivatives, and the M7 converter path does
@@ -315,7 +319,7 @@ float4 sample_texture_bilinear(uint tex, float2 uv)
 {
     uint width;
     uint height;
-    g.textures[tex].GetDimensions(width, height);
+    g.textures[NonUniformResourceIndex(tex)].GetDimensions(width, height);
     if (width == 0u || height == 0u)
         return float4(1, 1, 1, 1);
 

@@ -470,16 +470,12 @@ fn create_bindless(
         let sampler = device.create_sampler(&sampler_ci, None).map_err(vk_err)?;
         let immutable = [sampler];
 
-        // Sampled images/samplers/cubes are read by fragment AND compute (Phase 7
-        // compute passes sample textures). Storage image/buffer are written by
-        // compute; the storage buffer is also read by the vertex stage (particle
-        // vertex-pull).
-        let sampled_stages = vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE;
-        // Storage image/buffer + the TLAS are also accessed by the ray-tracing
-        // pipeline stages (Phase 8 M5): raygen writes the output image and reads the
-        // accumulation/instance buffers + traces the TLAS; closest-hit reads geometry
-        // buffers + traces an inline shadow ray. Only added on RT-capable devices
-        // (the stage bits require the ray-tracing pipeline extension).
+        // The ray-tracing pipeline stages also touch the bindless tables (Phase 8):
+        // raygen writes the output image and reads the accumulation/instance buffers
+        // + traces the TLAS; closest-hit reads geometry buffers, traces an inline
+        // shadow ray, and (ground-truth PBR track) samples base-color / MR / normal /
+        // emissive textures. Only added on RT-capable devices (the stage bits require
+        // the ray-tracing pipeline extension).
         let rt_stages = if has_raytracing {
             vk::ShaderStageFlags::RAYGEN_KHR
                 | vk::ShaderStageFlags::CLOSEST_HIT_KHR
@@ -487,6 +483,12 @@ fn create_bindless(
         } else {
             vk::ShaderStageFlags::empty()
         };
+        // Sampled images/samplers/cubes are read by fragment AND compute (Phase 7
+        // compute passes sample textures) AND the RT stages (closest-hit material
+        // textures). Storage image/buffer are written by compute; the storage buffer
+        // is also read by the vertex stage (particle vertex-pull).
+        let sampled_stages =
+            vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE | rt_stages;
         let dynamic = vk::DescriptorBindingFlags::PARTIALLY_BOUND
             | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
         let mut bindings = vec![
