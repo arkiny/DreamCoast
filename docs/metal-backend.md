@@ -644,9 +644,11 @@ The RT-pipeline shaders are converted to `metallib` **at build time** and embedd
 neither DXC nor the converter ships in the engine runtime. So both are **build-time
 tools**, handled like the existing `slangc` / Vulkan-SDK dependencies:
 
-- **DXC** — LLVM/NCSA + MIT (permissive). We build it from source; the build tree
-  lives under `tools/dxc-src/` (gitignored). A future `tools/build-dxc.sh` can
-  reproduce it; redistribution of our build is permitted by the license.
+- **DXC** — LLVM/NCSA + MIT (permissive). We build it from source via
+  **`tools/build-dxc.sh`** (clones DXC, pip-installs `cmake`/`ninja` locally,
+  configures with the converter auto-detected, builds `dxc` + `libdxcompiler.dylib`);
+  the build tree lives under `tools/dxc-src/` (gitignored). Redistribution of our
+  build is permitted by the license.
 - **Metal Shader Converter** (`libmetalirconverter`, headers Apache-2.0) — Apple
   tool, installed once from the Apple developer site (or already present as a Metal
   toolchain component). Used only at build time (no runtime redistribution of Apple's
