@@ -30,12 +30,16 @@ use crate::device::DeviceShared;
 use crate::resources::MetalBuffer;
 use crate::{Result, rhi_err};
 
+// Metal Shader Converter reserves shader handle/table index 0 as the null handle.
+pub(crate) const RT_PIPELINE_INTERSECTION_FUNCTION_OFFSET: u32 = 1;
+
 /// A built scene's acceleration structures: N BLAS + one TLAS. Owns all backing
 /// objects for the scene's lifetime. The TLAS is bound in the shader (the inline
 /// `RayQuery` path); the BLASes must outlive the TLAS that references them.
 pub struct MetalRaytracingScene {
     blases: Vec<Retained<ProtocolObject<dyn MTLAccelerationStructure>>>,
     tlas: Retained<ProtocolObject<dyn MTLAccelerationStructure>>,
+    instance_count: usize,
     /// The instance-descriptor buffer the TLAS build read; kept alive for parity
     /// with the other backends (Metal copies it during the build, but holding it is
     /// cheap and matches the Vulkan/D3D12 ownership model).
@@ -47,6 +51,10 @@ impl MetalRaytracingScene {
     /// table's `tlas` slot (the inline path traces `g.tlas`).
     pub(crate) fn tlas_resource_id(&self) -> MTLResourceID {
         self.tlas.gpuResourceID()
+    }
+
+    pub(crate) fn instance_count(&self) -> usize {
+        self.instance_count
     }
 
     /// Every acceleration structure (TLAS + all BLAS) for residency. When the TLAS
@@ -135,7 +143,7 @@ impl MetalRaytracingScene {
                     transformationMatrix: packed_4x3(&inst.transform),
                     options: MTLAccelerationStructureInstanceOptions::DisableTriangleCulling,
                     mask: inst.mask as u32,
-                    intersectionFunctionTableOffset: 0,
+                    intersectionFunctionTableOffset: RT_PIPELINE_INTERSECTION_FUNCTION_OFFSET,
                     accelerationStructureIndex: inst.blas_index,
                     userID: inst.custom_index,
                 };
@@ -203,6 +211,7 @@ impl MetalRaytracingScene {
         Ok(Self {
             blases,
             tlas,
+            instance_count: instances.len(),
             _instance_buffer: instance_buffer,
         })
     }

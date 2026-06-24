@@ -281,3 +281,139 @@ float3 hit_normal(Instance inst, uint prim, float2 bary)
     float b0 = 1.0 - bary.x - bary.y;
     return normalize(n0 * b0 + n1 * bary.x + n2 * bary.y);
 }
+
+// Barycentric-interpolated UV for material texture lookup.
+float2 hit_uv(Instance inst, uint prim, float2 bary)
+{
+    uint i0 = g.storage_buffers[inst.idx].Load(prim * 12u + 0u);
+    uint i1 = g.storage_buffers[inst.idx].Load(prim * 12u + 4u);
+    uint i2 = g.storage_buffers[inst.idx].Load(prim * 12u + 8u);
+    float2 uv0 = asfloat(g.storage_buffers[inst.vtx].Load2(i0 * 32u + 24u));
+    float2 uv1 = asfloat(g.storage_buffers[inst.vtx].Load2(i1 * 32u + 24u));
+    float2 uv2 = asfloat(g.storage_buffers[inst.vtx].Load2(i2 * 32u + 24u));
+    float b0 = 1.0 - bary.x - bary.y;
+    return uv0 * b0 + uv1 * bary.x + uv2 * bary.y;
+}
+
+uint wrap_texel(int p, uint size)
+{
+    int s = int(size);
+    int r = p % s;
+    return uint(r < 0 ? r + s : r);
+}
+
+float4 load_texture_wrapped(uint tex, int2 p, uint width, uint height)
+{
+    int x = int(wrap_texel(p.x, width));
+    int y = int(wrap_texel(p.y, height));
+    return g.textures[tex].Load(int3(x, y, 0));
+}
+
+// Ray shaders have no screen-space derivatives, and the M7 converter path does
+// not yet bind a sampler heap. Use an explicit repeat/bilinear fetch over mip 0.
+float4 sample_texture_bilinear(uint tex, float2 uv)
+{
+    uint width;
+    uint height;
+    g.textures[tex].GetDimensions(width, height);
+    if (width == 0u || height == 0u)
+        return float4(1, 1, 1, 1);
+
+    float2 p = frac(uv) * float2(width, height) - 0.5;
+    int2 i0 = int2(floor(p));
+    float2 f = frac(p);
+    float4 c00 = load_texture_wrapped(tex, i0, width, height);
+    float4 c10 = load_texture_wrapped(tex, i0 + int2(1, 0), width, height);
+    float4 c01 = load_texture_wrapped(tex, i0 + int2(0, 1), width, height);
+    float4 c11 = load_texture_wrapped(tex, i0 + int2(1, 1), width, height);
+    return lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
+}
+
+float3 hit_shading_normal(Instance inst, uint prim, float2 bary, float3 geom_n, float2 uv)
+{
+    if (inst.tex_normal == NO_TEXTURE)
+        return geom_n;
+
+    float3 tangent_normal = sample_texture_bilinear(inst.tex_normal, uv).xyz * 2.0 - 1.0;
+    if (dot(tangent_normal, tangent_normal) < 1e-6)
+        return geom_n;
+
+    uint i0 = g.storage_buffers[inst.idx].Load(prim * 12u + 0u);
+    uint i1 = g.storage_buffers[inst.idx].Load(prim * 12u + 4u);
+    uint i2 = g.storage_buffers[inst.idx].Load(prim * 12u + 8u);
+    float3 p0 = asfloat(g.storage_buffers[inst.vtx].Load3(i0 * 32u + 0u));
+    float3 p1 = asfloat(g.storage_buffers[inst.vtx].Load3(i1 * 32u + 0u));
+    float3 p2 = asfloat(g.storage_buffers[inst.vtx].Load3(i2 * 32u + 0u));
+    float2 uv0 = asfloat(g.storage_buffers[inst.vtx].Load2(i0 * 32u + 24u));
+    float2 uv1 = asfloat(g.storage_buffers[inst.vtx].Load2(i1 * 32u + 24u));
+    float2 uv2 = asfloat(g.storage_buffers[inst.vtx].Load2(i2 * 32u + 24u));
+
+    float3 e1 = p1 - p0;
+    float3 e2 = p2 - p0;
+    float2 duv1 = uv1 - uv0;
+    float2 duv2 = uv2 - uv0;
+    float det = duv1.x * duv2.y - duv1.y * duv2.x;
+
+    float3 t;
+    float3 b;
+    if (abs(det) > 1e-8)
+    {
+        float inv_det = 1.0 / det;
+        t = (e1 * duv2.y - e2 * duv1.y) * inv_det;
+        b = (e2 * duv1.x - e1 * duv2.x) * inv_det;
+        if (dot(t, t) < 1e-8 || dot(b, b) < 1e-8)
+        {
+            onb(geom_n, t, b);
+        }
+        else
+        {
+            t = normalize(t - geom_n * dot(geom_n, t));
+            b = normalize(b - geom_n * dot(geom_n, b));
+            if (dot(cross(t, b), geom_n) < 0.0)
+                b = -b;
+        }
+    }
+    else
+    {
+        onb(geom_n, t, b);
+    }
+
+    float3 mapped = normalize(tangent_normal.x * t + tangent_normal.y * b + tangent_normal.z * geom_n);
+    return dot(mapped, geom_n) < 0.0 ? -mapped : mapped;
+}
+
+struct RtMaterialSample
+{
+    float3 base_color;
+    float metallic;
+    float roughness;
+    float ao;
+    float3 emissive;
+};
+
+RtMaterialSample sample_material(Instance inst, float2 uv)
+{
+    RtMaterialSample m;
+    m.base_color = inst.base_color.rgb;
+    if (inst.tex_base != NO_TEXTURE)
+        m.base_color *= sample_texture_bilinear(inst.tex_base, uv).rgb;
+
+    m.metallic = inst.params.x;
+    m.roughness = inst.params.y;
+    if (inst.tex_mr != NO_TEXTURE)
+    {
+        // glTF metallic-roughness: G = roughness, B = metallic.
+        float3 mr = sample_texture_bilinear(inst.tex_mr, uv).rgb;
+        m.roughness *= mr.g;
+        m.metallic *= mr.b;
+    }
+
+    m.ao = inst.params.z;
+    m.emissive = m.base_color * inst.base_color.a;
+    if (inst.tex_emissive != NO_TEXTURE)
+        m.emissive += sample_texture_bilinear(inst.tex_emissive, uv).rgb * inst.base_color.a;
+
+    m.metallic = saturate(m.metallic);
+    m.roughness = clamp(m.roughness, 0.02, 1.0);
+    return m;
+}

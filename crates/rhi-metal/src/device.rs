@@ -72,6 +72,17 @@ pub(crate) const TLAS_SLOT: u32 = STORAGE_BUFFER_BASE + STORAGE_BUFFER_COUNT;
 /// slot past the storage buffers for the TLAS handle).
 pub(crate) const ARG_BUFFER_SLOTS: u32 = TLAS_SLOT + 1;
 
+type MetalTextureHandle = Retained<ProtocolObject<dyn MTLTexture>>;
+type SampledTextureSlots = Vec<Option<MetalTextureHandle>>;
+type CubeTextureSlots = Vec<Option<MetalTextureHandle>>;
+type StorageImageSlots = Vec<Option<MetalTextureHandle>>;
+
+#[derive(Clone)]
+pub(crate) struct RtTlasBinding {
+    pub header: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub contributions: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
 /// Device state shared (via `Rc`) by every resource created from a device, so the
 /// `MTLDevice` / command queue / layer outlive the resources that reference them.
 pub(crate) struct DeviceShared {
@@ -111,11 +122,23 @@ pub(crate) struct DeviceShared {
     /// the render graph's `*_to_sampled` / `*_to_render_target` transition hooks, so
     /// a resource is never made resident while it is an attachment in the same pass.
     resident: RefCell<Vec<Retained<ProtocolObject<dyn MTLTexture>>>>,
+    /// Sampled 2D texture slots by bindless index. The M7 Metal Shader Converter
+    /// RT-pipeline path writes its own descriptor table, so it needs slot-indexed
+    /// texture objects in addition to the current residency list.
+    sampled_textures: RefCell<SampledTextureSlots>,
+    /// Cubemap slots by bindless cube index, for the converter descriptor table's
+    /// cube SRV range.
+    cube_textures: RefCell<CubeTextureSlots>,
     /// Storage images (UAV) currently in compute-write state: made resident with
     /// `Read | Write` on bindless compute encoders. Toggled by the render graph's
     /// `rt_to_storage` (enter UAV) / `storage_to_sampled` (back to sampled `Read`)
     /// hooks, so a storage image is never both a UAV-resident and sampled-resident.
     storage_resident: RefCell<Vec<Retained<ProtocolObject<dyn MTLTexture>>>>,
+    /// Storage image slots by bindless UAV index. The M7 Metal Shader Converter
+    /// root signature uses an explicit descriptor table, so the RT-pipeline path
+    /// needs the texture object for each registered UAV slot instead of only the
+    /// current resident set.
+    storage_images: RefCell<StorageImageSlots>,
     /// Every storage buffer ever created. They are persistent (seeded on the GPU,
     /// never reallocated), so they stay permanently resident — made `useResource`
     /// (`Read | Write` on compute, `Read` on the particle/cull draw vertex stage)
@@ -127,6 +150,10 @@ pub(crate) struct DeviceShared {
     /// argument buffer (Metal requires the instance AS *and* each referenced
     /// primitive AS to be resident). Permanent for the scene's lifetime. (Phase 8)
     rt_resident: RefCell<Vec<Retained<ProtocolObject<dyn MTLAccelerationStructure>>>>,
+    /// Converter ABI binding for the currently bound TLAS. Unlike the M6 inline
+    /// path, Metal Shader Converter descriptor tables point at a small GPU header
+    /// that wraps the `MTLResourceID` plus instance-hit-group contributions.
+    rt_tlas: RefCell<Option<RtTlasBinding>>,
 }
 
 impl DeviceShared {
@@ -147,6 +174,13 @@ impl DeviceShared {
         let index = self.tex_next.get();
         self.tex_next.set(index + 1);
         self.write_handle(index, texture.gpuResourceID());
+        {
+            let mut textures = self.sampled_textures.borrow_mut();
+            if textures.len() <= index as usize {
+                textures.resize_with(index as usize + 1, || None);
+            }
+            textures[index as usize] = Some(texture.clone());
+        }
         if resident {
             self.resident.borrow_mut().push(texture);
         }
@@ -163,6 +197,11 @@ impl DeviceShared {
         // The owning MetalCubemap keeps the texture alive; the argument buffer just
         // records its 8-byte handle.
         self.write_handle(BINDLESS_COUNT + 1 + index, texture.gpuResourceID());
+        let mut cubes = self.cube_textures.borrow_mut();
+        if cubes.len() <= index as usize {
+            cubes.resize_with(index as usize + 1, || None);
+        }
+        cubes[index as usize] = Some(texture);
         index
     }
 
@@ -174,6 +213,11 @@ impl DeviceShared {
         let index = self.storage_img_next.get();
         self.storage_img_next.set(index + 1);
         self.write_handle(STORAGE_IMAGE_BASE + index, texture.gpuResourceID());
+        let mut images = self.storage_images.borrow_mut();
+        if images.len() <= index as usize {
+            images.resize_with(index as usize + 1, || None);
+        }
+        images[index as usize] = Some(texture.clone());
         index
     }
 
@@ -248,12 +292,27 @@ impl DeviceShared {
         self.resident.borrow()
     }
 
+    /// Registered sampled 2D textures by bindless texture index.
+    pub(crate) fn sampled_textures(&self) -> std::cell::Ref<'_, SampledTextureSlots> {
+        self.sampled_textures.borrow()
+    }
+
+    /// Registered cubemaps by bindless cube index.
+    pub(crate) fn cube_textures(&self) -> std::cell::Ref<'_, CubeTextureSlots> {
+        self.cube_textures.borrow()
+    }
+
     /// The storage images (UAV) to make `Read | Write`-resident before a bindless
     /// compute dispatch.
     pub(crate) fn storage_resident_textures(
         &self,
     ) -> std::cell::Ref<'_, Vec<Retained<ProtocolObject<dyn MTLTexture>>>> {
         self.storage_resident.borrow()
+    }
+
+    /// Registered storage images by storage-image index (converter descriptor table).
+    pub(crate) fn storage_images(&self) -> std::cell::Ref<'_, StorageImageSlots> {
+        self.storage_images.borrow()
     }
 
     /// The storage buffers (UAV), all permanently resident.
@@ -269,6 +328,67 @@ impl DeviceShared {
         &self,
     ) -> std::cell::Ref<'_, Vec<Retained<ProtocolObject<dyn MTLAccelerationStructure>>>> {
         self.rt_resident.borrow()
+    }
+
+    pub(crate) fn rt_tlas_binding(&self) -> Option<RtTlasBinding> {
+        self.rt_tlas.borrow().clone()
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RtAccelerationStructureHeader {
+    acceleration_structure_id: u64,
+    address_of_instance_contributions: u64,
+    pad0: [u64; 4],
+    pad1: [u32; 3],
+}
+
+pub(crate) fn resource_id_bits(id: MTLResourceID) -> u64 {
+    unsafe { std::mem::transmute::<MTLResourceID, u64>(id) }
+}
+
+fn create_rt_tlas_binding(
+    shared: &Rc<DeviceShared>,
+    scene: &crate::MetalRaytracingScene,
+) -> RtTlasBinding {
+    let header = shared
+        .device
+        .newBufferWithLength_options(
+            std::mem::size_of::<RtAccelerationStructureHeader>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+        .expect("RT pipeline TLAS header alloc failed");
+    let contribution_count = scene.instance_count().max(1);
+    let contributions = shared
+        .device
+        .newBufferWithLength_options(
+            contribution_count * std::mem::size_of::<u32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+        .expect("RT pipeline TLAS contribution alloc failed");
+
+    let header_value = RtAccelerationStructureHeader {
+        acceleration_structure_id: resource_id_bits(scene.tlas_resource_id()),
+        address_of_instance_contributions: contributions.gpuAddress(),
+        ..Default::default()
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&header_value as *const RtAccelerationStructureHeader).cast::<u8>(),
+            header.contents().as_ptr() as *mut u8,
+            std::mem::size_of::<RtAccelerationStructureHeader>(),
+        );
+        std::ptr::write_bytes(
+            contributions.contents().as_ptr() as *mut u8,
+            0,
+            contribution_count * std::mem::size_of::<u32>(),
+        );
+    }
+
+    RtTlasBinding {
+        header,
+        contributions,
     }
 }
 
@@ -342,9 +462,13 @@ impl MetalInstance {
             storage_buf_next: Cell::new(0),
             globals: RefCell::new(None),
             resident: RefCell::new(Vec::new()),
+            sampled_textures: RefCell::new(Vec::new()),
+            cube_textures: RefCell::new(Vec::new()),
             storage_resident: RefCell::new(Vec::new()),
+            storage_images: RefCell::new(Vec::new()),
             storage_buffers: RefCell::new(Vec::new()),
             rt_resident: RefCell::new(Vec::new()),
+            rt_tlas: RefCell::new(None),
         });
         // The sampler sits at the slot just past the texture array (Slang assigns it
         // id `BINDLESS_COUNT` in the argument-buffer struct).
@@ -419,11 +543,10 @@ impl MetalDevice {
     }
 
     /// Whether a DXR-style ray-tracing *pipeline* (raygen/miss/closesthit + SBT,
-    /// `trace_rays`) is available. Always false on Metal — Metal hardware ray
-    /// tracing is inline-only (`DispatchRays` has no equivalent), so the path tracer
-    /// uses the inline `rt_path` compute path. (See `docs/metal-backend.md`.)
+    /// `trace_rays`) is available via Metal Shader Converter's kernel raygen +
+    /// visible-function-table ABI.
     pub fn supports_rt_pipeline(&self) -> bool {
-        false
+        self.has_raytracing()
     }
 
     /// Build the scene's BLAS (one per geometry) + a single TLAS and return the
@@ -442,6 +565,8 @@ impl MetalDevice {
     pub fn bind_tlas(&self, scene: &crate::MetalRaytracingScene) {
         self.shared
             .write_handle(TLAS_SLOT, scene.tlas_resource_id());
+        let binding = create_rt_tlas_binding(&self.shared, scene);
+        *self.shared.rt_tlas.borrow_mut() = Some(binding);
         let mut resident = self.shared.rt_resident.borrow_mut();
         for accel in scene.acceleration_structures() {
             resident.push(accel.clone());
@@ -473,6 +598,13 @@ impl MetalDevice {
         desc: &ComputePipelineDesc,
     ) -> Result<MetalComputePipeline> {
         crate::pipeline::build_compute(&self.shared.device, desc)
+    }
+
+    pub fn create_raytracing_pipeline(
+        &self,
+        desc: &rhi_types::RaytracingPipelineDesc,
+    ) -> Result<crate::MetalRaytracingPipeline> {
+        crate::rt_pipeline::MetalRaytracingPipeline::new(self.shared.clone(), desc)
     }
 
     pub fn create_buffer(&self, desc: &BufferDesc) -> Result<MetalBuffer> {

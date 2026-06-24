@@ -9,9 +9,10 @@ DreamCoast is a custom renderer + engine layered directly on **raw Vulkan
 (synchronization, descriptors, bindless, the render graph, ray tracing) by
 implementing them by hand, behind a single self-designed RHI.
 
-The Windows backends (Vulkan + D3D12) are complete through Phase 7 (PBR deferred,
-compute/GPGPU) with Phase 8 (ray tracing) in progress; a native **Metal backend
-for macOS** is being brought up in parallel — see
+The Windows backends (Vulkan + D3D12) are complete through Phase 8 (hardware ray
+tracing); a native **Metal backend for macOS** is being brought up in parallel and
+now covers Phase 7 plus Phase 8 inline ray tracing, with an experimental Metal
+Shader Converter RT-pipeline path — see
 [`docs/metal-backend.md`](docs/metal-backend.md).
 
 ## Built with an AI agent
@@ -65,14 +66,15 @@ Backend parity is a hard rule: every milestone must produce identical results on
 - [x] **Phase 5** — Render graph + transient memory aliasing
 - [x] **Phase 6** — PBR deferred renderer (Cook-Torrance, IBL, shadows)
 - [x] **Phase 7** — Compute / GPGPU (async compute, GPU particles, GPU culling + indirect draw)
-- [ ] **Phase 8** — Ray tracing (DXR + VK_KHR) — 🚧 in progress (device infrastructure + capability gating done)
+- [x] **Phase 8** — Ray tracing (DXR + VK_KHR) — inline ray query + full RT pipeline/SBT
 - [ ] **Phase 9** — Tooling & profiling
 
 ### Metal backend (macOS)
 
 A native Metal backend brought up in milestones, targeting parity **through
-Phase 7** (Phase 8 ray tracing on Metal is out of scope for now). Details and
-toolchain setup: [`docs/metal-backend.md`](docs/metal-backend.md).
+Phase 7** plus Phase 8 inline ray tracing. M7 adds an experimental Metal Shader
+Converter path for the DXR-style RT pipeline/SBT. Details and toolchain setup:
+[`docs/metal-backend.md`](docs/metal-backend.md).
 
 - [x] **M0** — Cross-platform skeleton: Cocoa/`CAMetalLayer` window + clear loop
 - [x] **M1** — Slang → `metallib` shader pipeline
@@ -80,6 +82,8 @@ toolchain setup: [`docs/metal-backend.md`](docs/metal-backend.md).
 - [x] **M3** — Bindless (argument buffers) + textures + ImGui
 - [x] **M4** — Render targets + render graph + PBR deferred (shadow → G-buffer → IBL → lighting → tonemap)
 - [x] **M5** — Compute / async compute / indirect draw
+- [x] **M6** — Phase 8 inline ray tracing (`RayQuery`)
+- [x] **M7** — Metal Shader Converter RT-pipeline plumbing (compile-verified; runtime screenshot pending)
 
 ## Build & run
 
@@ -91,8 +95,10 @@ cargo run -p sandbox -- --backend vulkan   # or: --backend d3d12
 cargo run -p sandbox -- --backend metal
 ```
 
-On macOS the Metal backend runs the full deferred-PBR renderer plus the Phase-7
-compute demos / async compute. The per-milestone bring-up flags
+On macOS the Metal backend runs the full deferred-PBR renderer, the Phase-7
+compute demos / async compute, and Phase-8 inline ray tracing. The experimental
+RT-pipeline path uses Apple Metal Shader Converter when its build-time tools are
+available. The per-milestone bring-up flags
 (`--clear-test` / `--triangle-test` / `--mesh-test`), the compute-demo env toggles,
 and the Metal toolchain setup are documented in
 [`docs/metal-backend.md`](docs/metal-backend.md).

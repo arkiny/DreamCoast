@@ -1,0 +1,69 @@
+{
+  "RootSignature": {
+    "Flags": "IRRootSignatureFlagNone",
+    "NumParameters": 2,
+    "NumStaticSamplers": 0,
+    "Parameters": [
+      {
+        "DescriptorTable": {
+          "DescriptorRanges": [
+            {
+              "BaseShaderRegister": 0,
+              "Flags": "IRDescriptorRangeFlagDataStatic",
+              "NumDescriptors": 1024,
+              "OffsetInDescriptorsFromTableStart": 0,
+              "RangeType": "IRDescriptorRangeTypeSRV",
+              "RegisterSpace": 1
+            },
+            {
+              "BaseShaderRegister": 1024,
+              "Flags": "IRDescriptorRangeFlagDataStatic",
+              "NumDescriptors": 64,
+              "OffsetInDescriptorsFromTableStart": 1024,
+              "RangeType": "IRDescriptorRangeTypeSRV",
+              "RegisterSpace": 1
+            },
+            {
+              "BaseShaderRegister": 0,
+              "Flags": "IRDescriptorRangeFlagDataStatic",
+              "NumDescriptors": 64,
+              "OffsetInDescriptorsFromTableStart": 1088,
+              "RangeType": "IRDescriptorRangeTypeUAV",
+              "RegisterSpace": 1
+            },
+            {
+              "BaseShaderRegister": 64,
+              "Flags": "IRDescriptorRangeFlagDataStatic",
+              "NumDescriptors": 64,
+              "OffsetInDescriptorsFromTableStart": 1152,
+              "RangeType": "IRDescriptorRangeTypeUAV",
+              "RegisterSpace": 1
+            },
+            {
+              "BaseShaderRegister": 1088,
+              "Flags": "IRDescriptorRangeFlagDataStatic",
+              "NumDescriptors": 1,
+              "OffsetInDescriptorsFromTableStart": 1216,
+              "RangeType": "IRDescriptorRangeTypeSRV",
+              "RegisterSpace": 1
+            }
+          ],
+          "NumDescriptorRanges": 5
+        },
+        "ParameterType": "IRRootParameterTypeDescriptorTable",
+        "ShaderVisibility": "IRShaderVisibilityAll"
+      },
+      {
+        "Constants": {
+          "Num32BitValues": 32,
+          "RegisterSpace": 0,
+          "ShaderRegister": 0
+        },
+        "ParameterType": "IRRootParameterType32BitConstants",
+        "ShaderVisibility": "IRShaderVisibilityAll"
+      }
+    ],
+    "StaticSamplers": []
+  },
+  "version": "IRRootSignatureVersion_1_1"
+}

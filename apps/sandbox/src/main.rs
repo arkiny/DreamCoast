@@ -379,31 +379,47 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    let rt_pipeline_shaders_available = match backend {
+        BackendKind::Metal => {
+            dreamcoast_shader::rt_pipeline_rgen_metallib().is_some()
+                && dreamcoast_shader::rt_pipeline_miss_metallib().is_some()
+                && dreamcoast_shader::rt_pipeline_chit_metallib().is_some()
+                && dreamcoast_shader::rt_pipeline_dispatch_metallib().is_some()
+                && dreamcoast_shader::rt_pipeline_isect_metallib().is_some()
+        }
+        _ => true,
+    };
+
+    let rt_pipeline_requested = std::env::var_os("P8_PATHTRACE_PIPELINE").is_some();
+
     // Phase 8 M5: the same path tracer via the hardware ray-tracing *pipeline*
     // (raygen / miss / closest-hit + shader binding table). Reproduces the inline
     // tracer's image so the two RT abstractions can be cross-checked. Gated on
-    // `supports_rt_pipeline()` — false on Metal (inline-only hardware ray tracing,
-    // no DXR-style SBT dispatch), so the inline `rt_path` path is used there.
-    let rt_pt_pipeline = if device.supports_rt_pipeline() {
+    // `supports_rt_pipeline()`; on Metal the shader bytes are optional because the
+    // converter/DXC toolchain may not be installed on every development machine.
+    let rt_pt_pipeline = if rt_pipeline_requested
+        && device.supports_rt_pipeline()
+        && rt_pipeline_shaders_available
+    {
         let rgen = load_compute_shader(
             backend,
             dreamcoast_shader::rt_pipeline_rgen_spirv,
             dreamcoast_shader::rt_pipeline_rgen_dxil,
-            || None,
+            dreamcoast_shader::rt_pipeline_rgen_metallib,
             "rt_pipeline_rgen",
         )?;
         let miss = load_compute_shader(
             backend,
             dreamcoast_shader::rt_pipeline_miss_spirv,
             dreamcoast_shader::rt_pipeline_miss_dxil,
-            || None,
+            dreamcoast_shader::rt_pipeline_miss_metallib,
             "rt_pipeline_miss",
         )?;
         let chit = load_compute_shader(
             backend,
             dreamcoast_shader::rt_pipeline_chit_spirv,
             dreamcoast_shader::rt_pipeline_chit_dxil,
-            || None,
+            dreamcoast_shader::rt_pipeline_chit_metallib,
             "rt_pipeline_chit",
         )?;
         Some(device.create_raytracing_pipeline(&RaytracingPipelineDesc {
@@ -413,6 +429,18 @@ fn main() -> anyhow::Result<()> {
             miss_entry: "msMain",
             closesthit_bytes: chit,
             closesthit_entry: "chMain",
+            metal_ray_dispatch_bytes: if backend == BackendKind::Metal {
+                dreamcoast_shader::rt_pipeline_dispatch_metallib()
+            } else {
+                None
+            },
+            metal_ray_dispatch_entry: Some("RaygenIndirection"),
+            metal_intersection_bytes: if backend == BackendKind::Metal {
+                dreamcoast_shader::rt_pipeline_isect_metallib()
+            } else {
+                None
+            },
+            metal_intersection_entry: Some("irconverter.wrapper.intersection.function.triangle"),
             push_constant_size: 128, // matches rt_path / rt_pipeline PushConstants
             max_payload_size: 64,    // float3 x4 + 2x uint, padded
             max_attribute_size: 8,   // barycentrics (float2)
@@ -750,6 +778,10 @@ fn main() -> anyhow::Result<()> {
         Some(im) => upload_texture(&device, &mut _textures, im, Format::Rgba8Unorm)?,
         None => NO_TEXTURE,
     };
+    let emissive_index = match &model.material.emissive {
+        Some(im) => upload_texture(&device, &mut _textures, im, Format::Rgba8Srgb)?,
+        None => NO_TEXTURE,
+    };
 
     // Build the sample scene: the loaded model at the origin plus a few procedural
     // objects with varied materials (showing PBR + image-based reflections). A
@@ -772,7 +804,7 @@ fn main() -> anyhow::Result<()> {
         base_color: model.material.base_color_factor,
         metallic: model.material.metallic_factor,
         roughness: model.material.roughness_factor,
-        tex: [base_index, mr_index, normal_index, NO_TEXTURE],
+        tex: [base_index, mr_index, normal_index, emissive_index],
         casts_shadow: true,
     });
     // Polished chrome sphere.
@@ -1009,8 +1041,7 @@ fn main() -> anyhow::Result<()> {
     // Phase 8 M5: drive the path tracer through the full RT pipeline + SBT instead
     // of the inline compute ray query (same image). Headless toggle via
     // `P8_PATHTRACE_PIPELINE`; ignored when no RT pipeline is available.
-    let mut path_trace_pipeline =
-        rt_pt_pipeline.is_some() && std::env::var_os("P8_PATHTRACE_PIPELINE").is_some();
+    let mut path_trace_pipeline = rt_pt_pipeline.is_some() && rt_pipeline_requested;
     // Samples per path-trace dispatch (accumulated progressively across frames).
     let path_spp: u32 = 8;
     // Real-time environment capture: re-capture the env chain every frame (so the
@@ -2684,11 +2715,6 @@ fn index_bytes(m: &MeshData) -> &[u8] {
     }
 }
 
-/// Upload per-instance path-tracer geometry (vertex + index storage buffers) and
-/// build the instance table (Phase 8 M4): one 32-byte record per entry holding
-/// `{ vertex SB index, index SB index, pad, pad, albedo.rgb, emissive }`. The
-/// entry order must match the scene's TLAS instance custom_index order. Returns
-/// the table plus the geometry buffers (kept alive by the caller).
 /// Per-instance material for the path tracer's hit shading (mirrors the glTF
 /// metallic-roughness model used by the rasterizer). `base_color.a` is the
 /// emissive scale; `tex` holds bindless indices for base-color / metallic-

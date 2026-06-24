@@ -50,16 +50,20 @@ void chMain(inout Payload p, BuiltInTriangleIntersectionAttributes attr)
     float3 sun_dir = normalize(pc.sun.xyz);
 
     Instance inst = load_instance(InstanceID());
-    float3 n = hit_normal(inst, PrimitiveIndex(), attr.barycentrics);
+    uint prim = PrimitiveIndex();
+    float2 material_uv = hit_uv(inst, prim, attr.barycentrics);
+    RtMaterialSample mat = sample_material(inst, material_uv);
+    float3 n = hit_normal(inst, prim, attr.barycentrics);
     float3 wdir = WorldRayDirection();
     if (dot(n, wdir) > 0.0)
         n = -n; // face the incoming ray (two-sided)
+    n = hit_shading_normal(inst, prim, attr.barycentrics, n, material_uv);
     float3 hit = WorldRayOrigin() + wdir * RayTCurrent();
     float3 v = -wdir;
-    Surf surf = make_surf(inst.base_color.rgb, inst.params.x, inst.params.y);
+    Surf surf = make_surf(mat.base_color, mat.metallic, mat.roughness);
 
     // Emissive surfaces add light directly.
-    float3 radiance = inst.base_color.rgb * inst.base_color.a;
+    float3 radiance = mat.emissive;
 
     // Direct sun light (next-event estimation: full BSDF toward the sun) with a
     // hardware shadow ray (outdoor mode only; the Cornell box is lit purely by its

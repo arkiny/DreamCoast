@@ -14,6 +14,7 @@ mod command;
 mod device;
 mod pipeline;
 mod resources;
+mod rt_pipeline;
 mod swapchain;
 mod sync;
 
@@ -24,15 +25,9 @@ pub use resources::{
     MetalBuffer, MetalComputePipeline, MetalCubemap, MetalDepthBuffer, MetalGraphicsPipeline,
     MetalRenderTarget, MetalStorageBuffer, MetalTexture, MetalTransientHeap,
 };
+pub use rt_pipeline::MetalRaytracingPipeline;
 pub use swapchain::MetalSwapchain;
 pub use sync::{MetalFence, MetalSemaphore};
-
-/// Placeholder ray-tracing pipeline type so the `rhi` facade's
-/// `RaytracingPipeline` enum has a Metal variant. The DXR-style RT pipeline + SBT
-/// (`DispatchRays`) has no Metal equivalent — Metal hardware ray tracing is
-/// inline-only — so this is never constructed (`create_raytracing_pipeline`
-/// returns an error on Metal; the inline `rt_path` compute path is used instead).
-pub struct MetalRaytracingPipeline;
 
 use dreamcoast_core::EngineError;
 use objc2_metal::MTLPixelFormat;

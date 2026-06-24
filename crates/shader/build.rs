@@ -14,6 +14,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const RT_PIPELINE_ISECT_KEY: &str = "rt_pipeline_isect";
+const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
+
 /// One shader entry point to compile.
 struct Job {
     /// Source file under `shaders/`.
@@ -307,10 +310,15 @@ fn main() {
     // them explicitly so edits trigger a recompile of the including shaders.
     println!("cargo:rerun-if-changed=shaders/bindless.slang");
     println!("cargo:rerun-if-changed=shaders/rt_common.slang");
+    println!("cargo:rerun-if-changed=shaders/rt_pipeline_metal_rootsig.json");
+    println!("cargo:rerun-if-env-changed=DXC");
+    println!("cargo:rerun-if-env-changed=METAL_SHADERCONVERTER");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let shader_dir = manifest_dir.join("shaders");
+    let shader_tool_home = out_dir.join("shader-tool-home");
+    std::fs::create_dir_all(shader_tool_home.join(".cache")).unwrap();
 
     let mut generated = String::new();
 
@@ -329,6 +337,8 @@ fn main() {
     // Build target OS (set by Cargo for build scripts) selects which bytecode
     // targets to compile (Windows: spirv+dxil; macOS: metallib).
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let mut rt_pipeline_isect_emitted = false;
+    let mut rt_pipeline_dispatch_emitted = false;
 
     for job in JOBS {
         let src_path = shader_dir.join(job.src);
@@ -337,12 +347,73 @@ fn main() {
             // generated `<key>_<suffix>()` function always exists.
             if !target_selected(target, &target_os) {
                 emit_none(&mut generated, job.key, suffix);
+                if *target == "metallib" && is_rt_stage(job.stage) {
+                    emit_text_none(&mut generated, job.key, "metal_reflection");
+                }
                 continue;
             }
 
             let out_path = out_dir.join(format!("{}.{}", job.key, ext));
 
-            let mut command = Command::new(&slangc);
+            if *target == "metallib" && is_rt_stage(job.stage) {
+                match compile_rt_pipeline_metal(MetalRtCompileRequest {
+                    manifest_dir: &manifest_dir,
+                    shader_dir: &shader_dir,
+                    src_path: &src_path,
+                    slangc: &slangc,
+                    shader_tool_home: &shader_tool_home,
+                    job,
+                    out_dir: &out_dir,
+                    out_path: &out_path,
+                }) {
+                    Ok(output) => {
+                        emit_some(&mut generated, job.key, suffix, &out_path);
+                        emit_text_some(
+                            &mut generated,
+                            job.key,
+                            "metal_reflection",
+                            &output.reflection_path,
+                        );
+                        if let Some(intersection_path) = output.intersection_path {
+                            emit_some(
+                                &mut generated,
+                                RT_PIPELINE_ISECT_KEY,
+                                "metallib",
+                                &intersection_path,
+                            );
+                            rt_pipeline_isect_emitted = true;
+                        }
+                        if let Some(dispatch_path) = output.dispatch_path {
+                            emit_some(
+                                &mut generated,
+                                RT_PIPELINE_DISPATCH_KEY,
+                                "metallib",
+                                &dispatch_path,
+                            );
+                            rt_pipeline_dispatch_emitted = true;
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "cargo:warning={} [{}/metal-rt-pipeline] skipped (optional target unavailable): {e}",
+                            job.src, job.entry
+                        );
+                        emit_none(&mut generated, job.key, suffix);
+                        emit_text_none(&mut generated, job.key, "metal_reflection");
+                        if job.stage == "closesthit" {
+                            emit_none(&mut generated, RT_PIPELINE_ISECT_KEY, "metallib");
+                            rt_pipeline_isect_emitted = true;
+                        }
+                        if job.stage == "raygeneration" {
+                            emit_none(&mut generated, RT_PIPELINE_DISPATCH_KEY, "metallib");
+                            rt_pipeline_dispatch_emitted = true;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let mut command = slang_command(&slangc, &shader_tool_home);
             command
                 .arg(&src_path)
                 .args(["-target", target])
@@ -396,8 +467,18 @@ fn main() {
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
                 emit_none(&mut generated, job.key, suffix);
+                if *target == "metallib" && is_rt_stage(job.stage) {
+                    emit_text_none(&mut generated, job.key, "metal_reflection");
+                }
             }
         }
+    }
+
+    if !rt_pipeline_isect_emitted {
+        emit_none(&mut generated, RT_PIPELINE_ISECT_KEY, "metallib");
+    }
+    if !rt_pipeline_dispatch_emitted {
+        emit_none(&mut generated, RT_PIPELINE_DISPATCH_KEY, "metallib");
     }
 
     std::fs::write(out_dir.join("shaders.rs"), generated).unwrap();
@@ -441,6 +522,233 @@ fn find_slangc(manifest_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+fn slang_command(slangc: &Path, tool_home: &Path) -> Command {
+    let mut command = Command::new(slangc);
+    // Apple `metal` (invoked by Slang's `-target metallib`) writes clang module
+    // cache files below HOME. Keep that cache inside Cargo's OUT_DIR so sandboxed
+    // builds can compile `metal_types` instead of trying `~/.cache/clang`.
+    command.env("HOME", tool_home);
+    command.env("XDG_CACHE_HOME", tool_home.join(".cache"));
+    command
+}
+
+/// Compile the DXR-style RT pipeline shaders to Metal via Apple's Metal Shader
+/// Converter. Slang's Metal target cannot compile DXR pipeline stages directly,
+/// but it can emit HLSL per entry point; DXC compiles that HLSL to DXIL, then the
+/// converter produces a `.metallib` plus reflection for the converter TLAB.
+struct MetalRtCompileOutput {
+    reflection_path: PathBuf,
+    intersection_path: Option<PathBuf>,
+    dispatch_path: Option<PathBuf>,
+}
+
+struct MetalRtCompileRequest<'a> {
+    manifest_dir: &'a Path,
+    shader_dir: &'a Path,
+    src_path: &'a Path,
+    slangc: &'a Path,
+    shader_tool_home: &'a Path,
+    job: &'a Job,
+    out_dir: &'a Path,
+    out_path: &'a Path,
+}
+
+fn compile_rt_pipeline_metal(
+    request: MetalRtCompileRequest<'_>,
+) -> std::result::Result<MetalRtCompileOutput, String> {
+    let dxc = find_dxc(request.manifest_dir).ok_or_else(|| {
+        "DXC not found (set DXC, build tools/dxc-src with tools/build-dxc.sh, or add dxc to PATH)"
+            .to_string()
+    })?;
+    let converter = find_metal_shaderconverter().ok_or_else(|| {
+        "metal-shaderconverter not found (set METAL_SHADERCONVERTER or add it to PATH)".to_string()
+    })?;
+    let rootsig = request.shader_dir.join("rt_pipeline_metal_rootsig.json");
+    if !rootsig.is_file() {
+        return Err(format!("{} missing", rootsig.display()));
+    }
+
+    let hlsl_path = request.out_dir.join(format!("{}.hlsl", request.job.key));
+    let dxil_path = request
+        .out_dir
+        .join(format!("{}.metal.dxil", request.job.key));
+    let reflection_path = request
+        .out_dir
+        .join(format!("{}.metal.json", request.job.key));
+
+    let slang_output = slang_command(request.slangc, request.shader_tool_home)
+        .arg(request.src_path)
+        .args(["-target", "hlsl"])
+        .args(["-entry", request.job.entry])
+        .args(["-stage", request.job.stage])
+        .args(["-profile", "lib_6_5"])
+        .arg("-o")
+        .arg(&hlsl_path)
+        .output()
+        .map_err(|e| format!("failed to launch slangc for HLSL: {e}"))?;
+    if !slang_output.status.success() {
+        return Err(format!(
+            "slangc HLSL failed:\n{}\n{}",
+            String::from_utf8_lossy(&slang_output.stdout),
+            String::from_utf8_lossy(&slang_output.stderr)
+        ));
+    }
+
+    let dxc_output = Command::new(&dxc)
+        .arg(&hlsl_path)
+        .args(["-T", "lib_6_5"])
+        .args(["-E", request.job.entry])
+        .arg("-Fo")
+        .arg(&dxil_path)
+        .output()
+        .map_err(|e| format!("failed to launch dxc: {e}"))?;
+    if !dxc_output.status.success() {
+        return Err(format!(
+            "dxc failed:\n{}\n{}",
+            String::from_utf8_lossy(&dxc_output.stdout),
+            String::from_utf8_lossy(&dxc_output.stderr)
+        ));
+    }
+
+    let mut converter_cmd = Command::new(&converter);
+    converter_cmd
+        .arg(&dxil_path)
+        .args(["--entry-point", request.job.entry])
+        .arg("--root-signature")
+        .arg(&rootsig)
+        .args(["--rt-maximum-attribute-size-in-bytes", "8"])
+        .arg("--rt-enable-function-groups")
+        .arg("--output-reflection-file")
+        .arg(&reflection_path)
+        .arg("-o")
+        .arg(request.out_path);
+    if request.job.stage == "raygeneration" {
+        converter_cmd.arg("--rt-ray-generation-compilation=kernel");
+    } else if request.job.stage == "closesthit" {
+        converter_cmd.arg("--rt-hit-group-type=triangles");
+    }
+
+    let converter_output = converter_cmd
+        .output()
+        .map_err(|e| format!("failed to launch metal-shaderconverter: {e}"))?;
+    if !converter_output.status.success() {
+        return Err(format!(
+            "metal-shaderconverter failed:\n{}\n{}",
+            String::from_utf8_lossy(&converter_output.stdout),
+            String::from_utf8_lossy(&converter_output.stderr)
+        ));
+    }
+
+    let intersection_path = if request.job.stage == "closesthit" {
+        let path = request
+            .out_dir
+            .join(format!("{RT_PIPELINE_ISECT_KEY}.metallib"));
+        let synth_output = Command::new(&converter)
+            .arg(&dxil_path)
+            .args(["--entry-point", request.job.entry])
+            .arg("--root-signature")
+            .arg(&rootsig)
+            .args(["--rt-maximum-attribute-size-in-bytes", "8"])
+            .arg("--rt-enable-function-groups")
+            .arg("--synthesize-indirect-intersection-function")
+            .arg("--rt-hit-group-type=triangles")
+            .arg("-o")
+            .arg(&path)
+            .output()
+            .map_err(|e| format!("failed to launch metal-shaderconverter synth: {e}"))?;
+        if !synth_output.status.success() {
+            return Err(format!(
+                "metal-shaderconverter synth failed:\n{}\n{}",
+                String::from_utf8_lossy(&synth_output.stdout),
+                String::from_utf8_lossy(&synth_output.stderr)
+            ));
+        }
+        Some(path)
+    } else {
+        None
+    };
+
+    let dispatch_path = if request.job.stage == "raygeneration" {
+        let path = request
+            .out_dir
+            .join(format!("{RT_PIPELINE_DISPATCH_KEY}.metallib"));
+        let synth_output = Command::new(&converter)
+            .arg(&dxil_path)
+            .args(["--entry-point", request.job.entry])
+            .arg("--root-signature")
+            .arg(&rootsig)
+            .args(["--rt-maximum-attribute-size-in-bytes", "8"])
+            .arg("--rt-enable-function-groups")
+            .arg("--synthesize-indirect-ray-dispatch")
+            .arg("-o")
+            .arg(&path)
+            .output()
+            .map_err(|e| format!("failed to launch metal-shaderconverter dispatch synth: {e}"))?;
+        if !synth_output.status.success() {
+            return Err(format!(
+                "metal-shaderconverter dispatch synth failed:\n{}\n{}",
+                String::from_utf8_lossy(&synth_output.stdout),
+                String::from_utf8_lossy(&synth_output.stderr)
+            ));
+        }
+        Some(path)
+    } else {
+        None
+    };
+
+    Ok(MetalRtCompileOutput {
+        reflection_path,
+        intersection_path,
+        dispatch_path,
+    })
+}
+
+fn find_dxc(manifest_dir: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("DXC") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    let exe = if cfg!(windows) { "dxc.exe" } else { "dxc" };
+    if let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent) {
+        let local = workspace_root.join("tools/dxc-src/build/bin").join(exe);
+        if local.is_file() {
+            return Some(local);
+        }
+        let vendored = workspace_root.join("tools/dxc/bin").join(exe);
+        if vendored.is_file() {
+            return Some(vendored);
+        }
+    }
+
+    if Command::new("dxc").arg("--version").output().is_ok() {
+        return Some(PathBuf::from("dxc"));
+    }
+
+    None
+}
+
+fn find_metal_shaderconverter() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("METAL_SHADERCONVERTER") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    if Command::new("metal-shaderconverter")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        return Some(PathBuf::from("metal-shaderconverter"));
+    }
+
+    None
+}
+
 /// Emit an accessor that returns the compiled bytes.
 fn emit_some(out: &mut String, key: &str, suffix: &str, path: &Path) {
     // include_bytes! accepts forward slashes on Windows; normalize to avoid
@@ -453,11 +761,29 @@ fn emit_some(out: &mut String, key: &str, suffix: &str, path: &Path) {
     ));
 }
 
+/// Emit an accessor that returns generated UTF-8 text (reflection JSON, etc.).
+fn emit_text_some(out: &mut String, key: &str, suffix: &str, path: &Path) {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    out.push_str(&format!(
+        "/// Compiled `{key}` ({suffix}) text.\n\
+         pub fn {key}_{suffix}() -> Option<&'static str> {{ \
+         Some(include_str!(\"{normalized}\")) }}\n"
+    ));
+}
+
 /// Emit a single stub accessor that returns `None`.
 fn emit_none(out: &mut String, key: &str, suffix: &str) {
     out.push_str(&format!(
         "/// Compiled `{key}` ({suffix}) bytecode (unavailable).\n\
          pub fn {key}_{suffix}() -> Option<&'static [u8]> {{ None }}\n"
+    ));
+}
+
+/// Emit a text stub accessor that returns `None`.
+fn emit_text_none(out: &mut String, key: &str, suffix: &str) {
+    out.push_str(&format!(
+        "/// Compiled `{key}` ({suffix}) text (unavailable).\n\
+         pub fn {key}_{suffix}() -> Option<&'static str> {{ None }}\n"
     ));
 }
 
@@ -467,5 +793,10 @@ fn emit_all_none(out: &mut String) {
         for (_, _, suffix, _) in TARGETS {
             emit_none(out, job.key, suffix);
         }
+        if is_rt_stage(job.stage) {
+            emit_text_none(out, job.key, "metal_reflection");
+        }
     }
+    emit_none(out, RT_PIPELINE_ISECT_KEY, "metallib");
+    emit_none(out, RT_PIPELINE_DISPATCH_KEY, "metallib");
 }
