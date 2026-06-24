@@ -138,6 +138,21 @@ engine/                 # cargo workspace root
   BDA. 외부 의존 `meshopt`(+선택 `metis`) 사용자 승인 필요
 - **완료 기준**: 고밀도 메시가 화면 적응 LOD로 크랙/팝핑 없이 렌더, SW/HW 경로 seam 없음, 두 백엔드 일치
 
+### Phase 11 — 소프트웨어 레이트레이싱 + Distance-Field GI — 🧪 실험적 / 계획
+세부: [phase-11-distance-field-gi.md](phase-11-distance-field-gi.md)
+하드웨어 RT(Phase 8) 없이도 동작하는, **컴퓨트 기반 소프트웨어 레이트레이싱 → 전역 거리장(Global
+Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/AO를 구현한다. 전제: **Phase 7
+(컴퓨트/GPU-driven)**. Phase 8 HW RT와는 별개 경로(저사양/넓은 씬용 근사 GI).
+- **Stage A — 컴퓨트 소프트웨어 레이트레이싱:** HW RT 파이프라인 없이 컴퓨트 셰이더로 레이를 추적
+  (거리장 ray-marching, 또는 컴퓨트 BVH 트래버설). Phase 8과 동일 씬에서 결과 대조 가능한 기반.
+- **Stage B — Global Distance Field:** per-mesh SDF(메시 거리장) 베이크 → 카메라 주변을 덮는 **전역
+  거리장 볼륨**(클립맵/스파스 볼륨 텍스처)으로 머지. 동적 오브젝트는 매 프레임/저빈도 갱신.
+- **Stage C — Stochastic Lighting:** GDF에 대해 stochastic(몬테카를로) 샘플링으로 GI(디퓨즈
+  바운스)·AO·러프 반사를 ray-march + **시공간 디노이즈**(temporal accumulation + 공간 필터).
+  스크린-스페이스 프로브/래디언스 캐시 구조는 Stage C 세부에서 확정.
+- **완료 기준**: 동적 씬에서 HW RT 없이 GDF 기반 GI/AO가 두 백엔드에서 동작, 패스트레이서(Phase 8)
+  레퍼런스 대비 그럴듯하게 수렴, 검증 클린.
+
 ### macOS / Metal 백엔드 — 🚧 진행 중
 세부: [metal-backend.md](metal-backend.md)
 - 네이티브 Metal 백엔드(`crates/rhi-metal`, `objc2`)를 동일한 enum-dispatch RHI 뒤에 추가.
