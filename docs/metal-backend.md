@@ -601,8 +601,8 @@ RTX 2070 SUPER box per the verification-split convention.
 
 ## M7 (validated) — RT pipeline via Metal Shader Converter
 
-A genuine DXR-style RT-pipeline path on Metal, the way Unreal does it on Apple
-Silicon: convert the DXR shaders with Apple's **Metal Shader Converter**, which
+A genuine DXR-style RT-pipeline path on Metal on Apple Silicon: convert the DXR
+shaders with Apple's **Metal Shader Converter**, which
 emulates the DXR shader table on `MTLVisibleFunctionTable` /
 `MTLIntersectionFunctionTable`, and drive it with an `MTLComputePipelineState`
 (raygen) + a function-table `trace_rays`. This reproduces the inline path tracer's
