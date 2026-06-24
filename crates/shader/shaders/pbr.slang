@@ -52,7 +52,9 @@ struct Globals
     float4 shadow;        // x = depth bias, y = texel size (1 / shadow map size)
     float4x4 inv_view_proj; // clip -> world (skybox ray reconstruction)
     int4 ibl;             // x env, y irradiance, z prefilter, w BRDF LUT (-1 = none)
-    float4 probe;         // xyz = reflection-probe centre, w = proxy sphere radius (0 = off)
+    float4 probe;         // xyz = reflection-probe capture centre, w = parallax on (1) / off (0)
+    float4 probe_box_min; // xyz = reflection proxy AABB min corner (w unused)
+    float4 probe_box_max; // xyz = reflection proxy AABB max corner (w unused)
 };
 
 [[vk::push_constant]]
@@ -118,24 +120,26 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
     float n_dot_v = max(dot(n, v), 1e-4);
     float3 r = reflect(-v, n);
 
-    // Sphere-proxy parallax correction: the reflection probe is a single cubemap
+    // Box-proxy parallax correction: the reflection probe is a single cubemap
     // captured at `probe.xyz`, but this surface is elsewhere, so the raw reflection
     // vector samples the wrong part of the cube (the reflected ground/horizon slides
-    // up the object). Intersect the reflection ray with a proxy sphere around the
-    // probe and re-anchor the lookup direction to that hit, as point-of-interest
-    // probes do, so the reflected scene lines up with the actual geometry.
-    float pradius = globals.probe.w;
-    if (pradius > 0.0)
+    // around as the surface moves). Model the captured scene as an axis-aligned box
+    // (floor at the ground plane, walls/ceiling at the captured extent), intersect
+    // the reflection ray with that box, and re-anchor the lookup to the exit point
+    // relative to the capture centre. A box fits the flat ground far better than a
+    // sphere proxy, which mapped floor reflections up toward the horizon and
+    // darkened them.
+    if (globals.probe.w > 0.0)
     {
-        float3 oc = world_pos - globals.probe.xyz;
-        float b = dot(oc, r);
-        float c2 = dot(oc, oc) - pradius * pradius;
-        float disc = b * b - c2;
-        if (disc > 0.0)
+        float3 inv_r = 1.0 / r;
+        float3 t1 = (globals.probe_box_min.xyz - world_pos) * inv_r;
+        float3 t2 = (globals.probe_box_max.xyz - world_pos) * inv_r;
+        float3 t_far = max(t1, t2);
+        float t = min(min(t_far.x, t_far.y), t_far.z); // box exit distance
+        if (t > 0.0)
         {
-            float t = -b + sqrt(disc); // exit point along the reflection ray
-            if (t > 0.0)
-                r = normalize((world_pos + r * t) - globals.probe.xyz);
+            float3 hit = world_pos + r * t;
+            r = normalize(hit - globals.probe.xyz);
         }
     }
 
