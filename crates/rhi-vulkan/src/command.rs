@@ -118,6 +118,24 @@ impl VulkanCommandBuffer {
     /// (results are read directly from the pool); present for backend symmetry.
     pub fn resolve_queries(&self, _heap: &VulkanQueryHeap, _count: u32) {}
 
+    /// Open a named debug-marker region (shown as a group in RenderDoc/NSight
+    /// captures). No-op unless the debug-utils loader is active (debug build +
+    /// validation). Must be balanced with [`Self::end_debug_label`].
+    pub fn begin_debug_label(&self, name: &str) {
+        if let Some(du) = &self.device.debug_utils {
+            let cname = std::ffi::CString::new(name).unwrap_or_default();
+            let label = vk::DebugUtilsLabelEXT::default().label_name(&cname);
+            unsafe { du.cmd_begin_debug_utils_label(self.cmd, &label) };
+        }
+    }
+
+    /// Close the most recently opened debug-marker region.
+    pub fn end_debug_label(&self) {
+        if let Some(du) = &self.device.debug_utils {
+            unsafe { du.cmd_end_debug_utils_label(self.cmd) };
+        }
+    }
+
     /// Transition a swapchain image `UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL`.
     pub fn transition_to_render_target(&self, swapchain: &VulkanSwapchain, image_index: u32) {
         self.image_barrier(

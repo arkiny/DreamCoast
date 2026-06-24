@@ -163,6 +163,11 @@ impl VulkanRenderTarget {
         self.index
     }
 
+    /// Tag this target's image with a debug name (Phase 9 M2).
+    pub fn set_name(&self, name: &str) {
+        self.device.set_image_name(self.image, name);
+    }
+
     /// Bindless storage-image (UAV) index, if created with `storage`.
     pub fn storage_index(&self) -> Option<u32> {
         self.storage_index

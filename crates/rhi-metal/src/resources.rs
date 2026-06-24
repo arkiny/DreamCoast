@@ -135,6 +135,9 @@ impl MetalDepthBuffer {
     pub fn bindless_index(&self) -> u32 {
         self.index
     }
+
+    /// Debug name (Phase 9 M2) — no-op on the Metal stub.
+    pub fn set_name(&self, _name: &str) {}
 }
 
 /// An offscreen color render target: an `MTLTexture` usable both as a color
@@ -170,6 +173,9 @@ impl MetalRenderTarget {
     pub fn storage_index(&self) -> Option<u32> {
         self.storage_index
     }
+
+    /// Debug name (Phase 9 M2) — no-op on the Metal stub.
+    pub fn set_name(&self, _name: &str) {}
 }
 
 /// A render-target cubemap for IBL: a 6-face, optionally mipped `MTLTextureType::Cube`
@@ -210,6 +216,9 @@ impl MetalCubemap {
     pub fn mip_size(&self, mip: u32) -> u32 {
         (self.size >> mip).max(1)
     }
+
+    /// Debug name (Phase 9 M2) — no-op on the Metal stub.
+    pub fn set_name(&self, _name: &str) {}
 }
 
 /// A placement heap that transient render targets alias into at graph-computed

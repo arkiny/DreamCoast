@@ -123,6 +123,30 @@ impl D3d12CommandBuffer {
         }
     }
 
+    /// Open a named debug-marker region (shown as a group in PIX/RenderDoc
+    /// captures). Encoded as a null-terminated ANSI string (metadata = 1 =
+    /// `PIX_EVENT_ANSI_VERSION`). Debug builds only; balance with
+    /// [`Self::end_debug_label`].
+    pub fn begin_debug_label(&self, name: &str) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let mut bytes = name.as_bytes().to_vec();
+        bytes.push(0);
+        unsafe {
+            self.list
+                .BeginEvent(1, Some(bytes.as_ptr() as *const c_void), bytes.len() as u32);
+        }
+    }
+
+    /// Close the most recently opened debug-marker region.
+    pub fn end_debug_label(&self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        unsafe { self.list.EndEvent() };
+    }
+
     pub fn transition_to_render_target(&self, swapchain: &D3d12Swapchain, image_index: u32) {
         self.barrier(
             swapchain.buffer(image_index),

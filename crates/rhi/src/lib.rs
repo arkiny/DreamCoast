@@ -182,6 +182,18 @@ impl RenderTarget {
             Self::Metal(t) => t.bindless_index(),
         }
     }
+
+    /// Tag this target with a debug name for GPU captures (Phase 9 M2).
+    pub fn set_name(&self, name: &str) {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(t) => t.set_name(name),
+            #[cfg(windows)]
+            Self::D3d12(t) => t.set_name(name),
+            #[cfg(target_os = "macos")]
+            Self::Metal(t) => t.set_name(name),
+        }
+    }
 }
 
 impl DepthBuffer {
@@ -194,6 +206,18 @@ impl DepthBuffer {
             Self::D3d12(d) => d.bindless_index(),
             #[cfg(target_os = "macos")]
             Self::Metal(d) => d.bindless_index(),
+        }
+    }
+
+    /// Tag this depth buffer with a debug name for GPU captures (Phase 9 M2).
+    pub fn set_name(&self, name: &str) {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => d.set_name(name),
+            #[cfg(windows)]
+            Self::D3d12(d) => d.set_name(name),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => d.set_name(name),
         }
     }
 }
@@ -232,6 +256,18 @@ impl Cubemap {
             Self::D3d12(c) => c.mip_size(mip),
             #[cfg(target_os = "macos")]
             Self::Metal(c) => c.mip_size(mip),
+        }
+    }
+
+    /// Tag this cubemap with a debug name for GPU captures (Phase 9 M2).
+    pub fn set_name(&self, name: &str) {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(c) => c.set_name(name),
+            #[cfg(windows)]
+            Self::D3d12(c) => c.set_name(name),
+            #[cfg(target_os = "macos")]
+            Self::Metal(c) => c.set_name(name),
         }
     }
 }
@@ -894,6 +930,31 @@ impl CommandBuffer {
             (Self::Metal(c), QueryHeap::Metal(h)) => c.resolve_queries(h, count),
             #[cfg(windows)]
             _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Open a named debug-marker region for GPU captures (RenderDoc/PIX/NSight).
+    /// Debug builds only; balance with [`Self::end_debug_label`] (Phase 9 M2).
+    pub fn begin_debug_label(&self, name: &str) {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(c) => c.begin_debug_label(name),
+            #[cfg(windows)]
+            Self::D3d12(c) => c.begin_debug_label(name),
+            #[cfg(target_os = "macos")]
+            Self::Metal(c) => c.begin_debug_label(name),
+        }
+    }
+
+    /// Close the most recently opened debug-marker region.
+    pub fn end_debug_label(&self) {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(c) => c.end_debug_label(),
+            #[cfg(windows)]
+            Self::D3d12(c) => c.end_debug_label(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(c) => c.end_debug_label(),
         }
     }
 

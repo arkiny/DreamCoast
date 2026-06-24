@@ -497,6 +497,10 @@ impl<'a> RenderGraph<'a> {
                 cmd.write_timestamp(p.heap, idx);
                 p.names.push(self.passes[pass_idx].name.clone());
             }
+            // Name this pass's region for GPU captures (RenderDoc/PIX/NSight). The
+            // barriers + draws below land inside the marker; closed at the end of
+            // both the compute and graphics paths.
+            cmd.begin_debug_label(&self.passes[pass_idx].name);
             // Barriers: reads -> sampled. A storage image read after a compute
             // write transitions from UAV/GENERAL; plain color/depth from attachment.
             for &r in &self.passes[pass_idx].reads {
@@ -557,6 +561,7 @@ impl<'a> RenderGraph<'a> {
                     extent,
                 };
                 (self.passes[pass_idx].record)(&mut ctx)?;
+                cmd.end_debug_label();
                 continue;
             }
 
@@ -622,6 +627,7 @@ impl<'a> RenderGraph<'a> {
             };
             (self.passes[pass_idx].record)(&mut ctx)?;
             cmd.end_rendering();
+            cmd.end_debug_label();
         }
 
         // Final timestamp boundary, then resolve the whole heap (D3D12) for readback.

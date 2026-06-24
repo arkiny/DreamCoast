@@ -130,6 +130,11 @@ impl MetalCommandBuffer {
     pub fn write_timestamp(&self, _heap: &crate::query::MetalQueryHeap, _index: u32) {}
     pub fn resolve_queries(&self, _heap: &crate::query::MetalQueryHeap, _count: u32) {}
 
+    /// Debug-marker regions (Phase 9 M2) — no-ops on the Metal stub (Metal uses
+    /// per-encoder `pushDebugGroup`, not a command-buffer-level label).
+    pub fn begin_debug_label(&self, _name: &str) {}
+    pub fn end_debug_label(&self) {}
+
     /// End any open encoder, signal `event` to `value` (cross-queue ordering for
     /// async compute), and commit. Used by [`crate::device::MetalComputeQueue`].
     pub(crate) fn commit_signaling(&self, event: &ProtocolObject<dyn MTLEvent>, value: u64) {

@@ -1137,6 +1137,17 @@ fn main() -> anyhow::Result<()> {
         storage: false,
     })?;
     let brdf_index = brdf_lut.bindless_index() as i32;
+    // Name the persistent IBL resources so GPU captures (RenderDoc/PIX) show
+    // readable identifiers instead of anonymous "Texture N" (Phase 9 M2; debug
+    // builds only — the backends no-op these in release).
+    brdf_lut.set_name("ibl_brdf_lut");
+    capture_depth.set_name("ibl_capture_depth");
+    for (i, set) in cube_sets.iter().enumerate() {
+        set.env.set_name(&format!("ibl_env_cube[{i}]"));
+        set.irradiance
+            .set_name(&format!("ibl_irradiance_cube[{i}]"));
+        set.prefilter.set_name(&format!("ibl_prefilter_cube[{i}]"));
+    }
     let ibl = IblResources {
         sky_pipeline: &sky_pipeline,
         capture_pipeline: &capture_pipeline,
