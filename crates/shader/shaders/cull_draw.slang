@@ -64,5 +64,6 @@ float4 fsMain(VSOutput input) : SV_Target
     float3 n = normalize(input.normal);
     float ndl = saturate(dot(n, normalize(pc.sun_dir.xyz)));
     float3 color = input.tint * (0.25 + 0.75 * ndl);
-    return float4(color, 1.0);
+    // UNORM backbuffer — encode sRGB (see linear_to_srgb in bindless.slang).
+    return float4(linear_to_srgb(color), 1.0);
 }

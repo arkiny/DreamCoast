@@ -66,3 +66,19 @@ struct Bindless
 
 [[vk::binding(0, 0)]]
 ParameterBlock<Bindless> g;
+
+// Linear → sRGB OETF (gamma encode). The swapchain/backbuffer is a UNORM surface,
+// not sRGB: GPU capture & overlay layers (RenderDoc, OBS, Steam, …) force
+// VK_IMAGE_USAGE_STORAGE onto swapchain images so they can read them back, and an
+// sRGB surface format can never support storage — so an sRGB backbuffer makes
+// those layers fail (RenderDoc hard-crashes at vkCreateSwapchainKHR). With a UNORM
+// surface the hardware no longer encodes on write, so every pass that writes the
+// backbuffer applies this transfer function explicitly. ImGui is the exception:
+// its vertex colors are authored in gamma space and pass straight through, which
+// is correct on a UNORM surface (and was subtly too bright on the old sRGB one).
+float3 linear_to_srgb(float3 c)
+{
+    float3 lo = c * 12.92;
+    float3 hi = 1.055 * pow(max(c, float3(0.0)), 1.0 / 2.4) - 0.055;
+    return lerp(lo, hi, step(float3(0.0031308), c));
+}
