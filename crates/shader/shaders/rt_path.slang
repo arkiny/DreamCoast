@@ -45,15 +45,20 @@ float3 trace(float3 origin, float3 dir, float3 sun_dir, bool cornell, inout uint
         }
 
         Instance inst = load_instance(q.CommittedInstanceID());
-        float3 n = hit_normal(inst, q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics());
+        uint prim = q.CommittedPrimitiveIndex();
+        float2 bary = q.CommittedTriangleBarycentrics();
+        float2 material_uv = hit_uv(inst, prim, bary);
+        RtMaterialSample mat = sample_material(inst, material_uv);
+        float3 n = hit_normal(inst, prim, bary);
         if (dot(n, ray.Direction) > 0.0)
             n = -n; // face the incoming ray (two-sided)
+        n = hit_shading_normal(inst, prim, bary, n, material_uv);
         float3 hit = ray.Origin + ray.Direction * q.CommittedRayT();
         float3 v = -ray.Direction;
-        Surf surf = make_surf(inst.base_color.rgb, inst.params.x, inst.params.y);
+        Surf surf = make_surf(mat.base_color, mat.metallic, mat.roughness);
 
         // Emissive surfaces add light directly.
-        radiance += throughput * inst.base_color.rgb * inst.base_color.a;
+        radiance += throughput * mat.emissive;
 
         // Direct sun light (next-event estimation: evaluate the full BSDF toward the
         // sun) with a hardware shadow ray (outdoor mode only; the Cornell box is lit

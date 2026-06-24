@@ -32,6 +32,7 @@ use crate::resources::{
     MetalComputePipeline, MetalCubemap, MetalDepthBuffer, MetalGraphicsPipeline, MetalRenderTarget,
     MetalStorageBuffer, PUSH_CONSTANT_INDEX, VERTEX_BUFFER_INDEX,
 };
+use crate::rt_pipeline::MetalRaytracingPipeline;
 use crate::swapchain::MetalSwapchain;
 use crate::{Result, rhi_err};
 
@@ -57,6 +58,7 @@ pub struct MetalCommandBuffer {
     /// Threadgroup size of the bound compute pipeline, used by `dispatch` to turn
     /// threadgroup counts into `dispatchThreadgroups:threadsPerThreadgroup:`.
     pipeline_threads: Cell<MTLSize>,
+    rt_push_constants: RefCell<Vec<u8>>,
 }
 
 impl MetalCommandBuffer {
@@ -78,6 +80,7 @@ impl MetalCommandBuffer {
                 height: 1,
                 depth: 1,
             }),
+            rt_push_constants: RefCell::new(Vec::new()),
         }
     }
 
@@ -113,6 +116,7 @@ impl MetalCommandBuffer {
         *self.compute_encoder.borrow_mut() = None;
         *self.present.borrow_mut() = None;
         *self.index_buffer.borrow_mut() = None;
+        self.rt_push_constants.borrow_mut().clear();
         Ok(())
     }
 
@@ -589,6 +593,43 @@ impl MetalCommandBuffer {
             unsafe {
                 enc.setBytes_length_atIndex(ptr, padded, PUSH_CONSTANT_INDEX);
             }
+        }
+    }
+
+    /// Bind a Metal Shader Converter RT pipeline. The converter raygen is a compute
+    /// kernel, so this opens a compute encoder just like [`Self::bind_compute_pipeline`].
+    pub fn bind_raytracing_pipeline(&self, pipeline: &MetalRaytracingPipeline) {
+        self.end_any_encoder();
+        let enc = {
+            let cmd = self.cmd.borrow();
+            let cmd = cmd
+                .as_ref()
+                .expect("bind_raytracing_pipeline without begin");
+            cmd.computeCommandEncoder()
+                .expect("failed to create RT compute command encoder")
+        };
+        enc.setComputePipelineState(pipeline.state());
+        self.pipeline_threads.set(pipeline.threads_per_group());
+        *self.compute_encoder.borrow_mut() = Some(enc);
+    }
+
+    pub fn push_constants_rt(&self, data: &[u8]) {
+        let mut push = self.rt_push_constants.borrow_mut();
+        push.clear();
+        push.extend_from_slice(data);
+    }
+
+    pub fn trace_rays(&self, pipeline: &MetalRaytracingPipeline, width: u32, height: u32) {
+        if let Some(enc) = self.compute_encoder.borrow().as_ref() {
+            pipeline
+                .encode_dispatch(
+                    &self.shared,
+                    enc,
+                    &self.rt_push_constants.borrow(),
+                    width,
+                    height,
+                )
+                .expect("Metal trace_rays encode failed");
         }
     }
 

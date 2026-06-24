@@ -1,6 +1,6 @@
 # 패스트레이서 정밀화 — Ground-Truth PBR 계획
 
-> 상위: [phase-8-raytracing.md](phase-8-raytracing.md) (Phase 8 ✅). **상태: 🚧 진행 중 — G1·G2 ✅, G3~G5 남음.**
+> 상위: [phase-8-raytracing.md](phase-8-raytracing.md) (Phase 8 ✅). **상태: 🚧 진행 중 — G1·G2·G4 ✅, G3·G5 남음.**
 > 후속 트랙으로, Phase 8의 "디퓨즈 GI only" 한계를 해소한다.
 > 공유 PT 코드는 `crates/shader/shaders/rt_common.slang`(rt_path/rt_pipeline가 include) — 인라인≡파이프라인 비트 동일 유지.
 
@@ -17,17 +17,17 @@
 
 | 항목 | 래스터 `pbr.slang` | 패스트레이서 (현재) | 목표 |
 |---|---|---|---|
-| BRDF | Cook-Torrance (GGX D / Smith G / Schlick F) | **Lambert 디퓨즈만** | 동일 Cook-Torrance + 정반사 |
-| 머티리얼 | base_color·metallic·roughness·ao·emissive (+텍스처) | albedo(rgb)+emissive만 | 전체 metallic-roughness |
-| 금속/정반사 | F0=lerp(0.04,albedo,metallic), 정반사 IBL | 없음 | GGX 정반사 로브 → **실반사** |
+| BRDF | Cook-Torrance (GGX D / Smith G / Schlick F) | Cook-Torrance + GGX VNDF | 동일 Cook-Torrance + 정반사 |
+| 머티리얼 | base_color·metallic·roughness·ao·emissive (+텍스처) | metallic-roughness + base/mr/normal/emissive 텍스처 | 전체 metallic-roughness |
+| 금속/정반사 | F0=lerp(0.04,albedo,metallic), 정반사 IBL | GGX 정반사 로브 | GGX 정반사 로브 → **실반사** |
 | 간접광 | split-sum IBL(근사 큐브) | 디퓨즈 바운스 | **경로추적 GI/반사(정답)** |
 | 직접광 | 태양(PCF 섀도우)+포인트광 | 태양(섀도우 레이)만 | 태양(디스크)+포인트광 NEE+MIS |
-| 노멀 | 화면공간 미분 TBN + 노멀맵 | 보간 지오메트리 노멀 | 탄젠트 노멀맵(텍스처 머티리얼) |
-| 텍스처 | base/mr/normal/emissive 샘플 | 없음 | hit에서 UV 보간 후 샘플 |
+| 노멀 | 화면공간 미분 TBN + 노멀맵 | 삼각형 pos/UV 기반 hit-time TBN + 노멀맵 | 탄젠트 노멀맵(텍스처 머티리얼) |
+| 텍스처 | base/mr/normal/emissive 샘플 | hit UV 보간 + mip0 repeat/bilinear `Load` 샘플 | hit에서 UV 보간 후 샘플 |
 | 추정기 | — | 코사인 바운스, 고정 4바운스 | **MIS + 러시안룰렛 + 디스크광** |
 
 핵심: 정점 레이아웃 32B에 **UV가 이미 포함**(offset 24)되어 hit에서 텍스처 샘플 가능. 탄젠트는 없음 →
-삼각형 3정점(pos+uv)으로 hit에서 계산하거나 별도 버퍼. 인스턴스 테이블만 확장하면 됨(현재 32B 레코드).
+삼각형 3정점(pos+uv)으로 hit에서 계산하거나 별도 버퍼. 인스턴스 테이블은 현재 64B 레코드로 확장됨.
 
 ## 마일스톤 (각 게이트: build+fmt+clippy `-D warnings` + 두 백엔드(VK≡DX) + Vulkan VUID 0 + 인라인≡파이프라인 + 스크린샷; 인라인/파이프라인 두 경로 동시 갱신)
 
@@ -55,10 +55,14 @@
 - 펌웨어 결정성 유지(시드·샘플 순서 고정). 파이어플라이 클램프는 **무편향 위해 기본 off**(옵션).
 - **검증**: 분산 감소(수렴) 측정, 소프트 섀도우 가시, 동일 씬에서 노이즈가 균일 누적으로 줄어듦.
 
-### G4 — 텍스처 머티리얼 + 노멀 매핑
-- hit에서 보간 UV로 base_color(sRGB)·metallic-roughness(linear)·emissive 텍스처 샘플(기존 바인드리스 텍스처 테이블).
+### G4 — 텍스처 머티리얼 + 노멀 매핑 ✅ (Metal inline + M7 검증됨)
+- hit에서 보간 UV로 base_color(sRGB)·metallic-roughness(linear)·emissive 텍스처를 샘플한다.
+  RT 셰이더는 파생값이 없고 Metal M7 경로가 아직 sampler heap을 바인딩하지 않으므로, mip0 `Texture2D.Load`
+  기반 repeat/bilinear 샘플러를 `rt_common.slang`에 둔다.
 - 탄젠트: 삼각형 3정점(pos+uv)에서 hit-time 계산 → 탄젠트공간 노멀맵 적용(아보카도 모델이 노멀맵 보유).
-- **검증**: 아보카도가 패스트레이서에서도 텍스처/노멀 디테일을 보임, 래스터와 일관.
+- Metal Shader Converter M7은 별도 descriptor table에 sampled texture/cube/storage/TLAS 범위를 채운다.
+  검증: `cargo check -p dreamcoast-shader`, `cargo check -p sandbox`,
+  `cargo clippy -p rhi -p sandbox --all-targets`, Metal inline/M7 screenshot, M7 validation layer clean.
 
 ### G5 — 검증 + 문서화
 - **나란히 비교 하니스**: 같은 카메라/조명에서 패스트레이서(수렴) vs 래스터 PBR 스크린샷 + 수치 차이.

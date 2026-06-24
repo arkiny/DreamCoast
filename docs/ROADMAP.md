@@ -138,14 +138,20 @@ engine/                 # cargo workspace root
 ### macOS / Metal 백엔드 — 🚧 진행 중
 세부: [metal-backend.md](metal-backend.md)
 - 네이티브 Metal 백엔드(`crates/rhi-metal`, `objc2`)를 동일한 enum-dispatch RHI 뒤에 추가.
-  플랫폼 레이어는 macOS에서 손수 작성한 Cocoa/AppKit 창 + `CAMetalLayer`. 패리티 목표는
-  **Phase 7까지**(Phase 8 레이트레이싱은 현재 범위 외 — Metal에서 `has_raytracing()=false`).
+  플랫폼 레이어는 macOS에서 손수 작성한 Cocoa/AppKit 창 + `CAMetalLayer`. 현재 목표는
+  **Phase 7 + Phase 8 inline RT**까지의 macOS 실행 패리티와, Metal Shader Converter를 통한
+  DXR-style RT pipeline 경로의 실험적 연결.
 - 백엔드는 OS별 `#[cfg]` 게이팅: Windows=Vulkan+D3D12, macOS=Metal. `rhi-vulkan`/`rhi-d3d12`는
   `#![cfg(windows)]`, `rhi-metal`은 macOS 전용.
-- 마일스톤: **M0** 골격+클리어 ✅ · **M1** Slang→metallib ✅ · **M2** 삼각형 · **M3** 바인드리스
-  (argument buffer)+텍스처+ImGui · **M4** 렌더타깃+PBR · **M5** 컴퓨트/async/인다이렉트
-- 미결: 바인드리스 무한 배열(`g_textures[]`)이 Metal에서 *"flexible array member not at end of
-  struct"*로 실패 → argument buffer 바인딩 모델 재설계 필요(M3에서 해소)
+- 마일스톤: **M0** 골격+클리어 ✅ · **M1** Slang→metallib ✅ · **M2** 삼각형 ✅ · **M3** 바인드리스
+  (argument buffer)+텍스처+ImGui ✅ · **M4** 렌더타깃+PBR ✅ · **M5** 컴퓨트/async/인다이렉트 ✅ ·
+  **M6** inline ray tracing ✅ · **M7** Metal Shader Converter RT pipeline plumbing ✅
+- 최근 수정: 일반 Slang→`metallib` 경로가 Apple `metal`의 clang module cache를 `~/.cache` 아래에
+  쓰려다 sandbox에서 실패하던 문제는 shader build가 `HOME`/`XDG_CACHE_HOME`을 `OUT_DIR`로
+  고정하도록 해결. M7 runtime은 SBT stride artifact를 고친 뒤 inline/pipeline screenshot 및
+  Metal API+GPU validation layer까지 통과. RT 텍스처 머티리얼은 hit UV 보간 + mip0 `Load`
+  기반 bilinear 샘플링으로 base/mr/normal/emissive를 inline과 M7 양쪽에 적용했고, M7
+  converter descriptor table도 sampled texture/cube/storage/TLAS 범위를 채우도록 갱신.
 
 ## 의존성 위험 / 미결 사항 (세부 계획에서 해소)
 

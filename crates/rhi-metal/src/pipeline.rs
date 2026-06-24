@@ -107,7 +107,7 @@ pub(crate) fn build_compute(
 }
 
 /// Create an `MTLLibrary` from a `.metallib` blob and fetch `entry` from it.
-fn load_function(
+pub(crate) fn load_function(
     device: &ProtocolObject<dyn MTLDevice>,
     bytes: &[u8],
     entry: &str,

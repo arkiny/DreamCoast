@@ -459,7 +459,8 @@ impl Device {
     }
 
     /// Create a hardware ray-tracing pipeline + shader binding table (Phase 8 M5).
-    /// Requires [`Self::has_raytracing`]. Metal returns an error (RT deferred).
+    /// Requires [`Self::has_raytracing`]. On Metal this is backed by Metal Shader
+    /// Converter's kernel raygen + visible-function-table ABI.
     pub fn create_raytracing_pipeline(
         &self,
         desc: &RaytracingPipelineDesc,
@@ -474,14 +475,9 @@ impl Device {
                 d.create_raytracing_pipeline(desc)?,
             )),
             #[cfg(target_os = "macos")]
-            Self::Metal(_) => {
-                let _ = desc;
-                Err(EngineError::Rhi(
-                    "Metal hardware ray tracing is inline-only; the DXR-style pipeline + SBT \
-                     has no Metal equivalent (use the inline rt_path compute path)"
-                        .into(),
-                ))
-            }
+            Self::Metal(d) => Ok(RaytracingPipeline::Metal(
+                d.create_raytracing_pipeline(desc)?,
+            )),
         }
     }
 
@@ -1283,7 +1279,7 @@ impl CommandBuffer {
             #[cfg(windows)]
             (Self::D3d12(c), RaytracingPipeline::D3d12(p)) => c.bind_raytracing_pipeline(p),
             #[cfg(target_os = "macos")]
-            (Self::Metal(_), RaytracingPipeline::Metal(_)) => {}
+            (Self::Metal(c), RaytracingPipeline::Metal(p)) => c.bind_raytracing_pipeline(p),
             #[cfg(windows)]
             _ => unreachable!("{MIXED}"),
         }
@@ -1297,9 +1293,7 @@ impl CommandBuffer {
             #[cfg(windows)]
             Self::D3d12(c) => c.push_constants_rt(data),
             #[cfg(target_os = "macos")]
-            Self::Metal(_) => {
-                let _ = data;
-            }
+            Self::Metal(c) => c.push_constants_rt(data),
         }
     }
 
@@ -1311,9 +1305,7 @@ impl CommandBuffer {
             #[cfg(windows)]
             (Self::D3d12(c), RaytracingPipeline::D3d12(p)) => c.trace_rays(p, width, height),
             #[cfg(target_os = "macos")]
-            (Self::Metal(_), RaytracingPipeline::Metal(_)) => {
-                let _ = (width, height);
-            }
+            (Self::Metal(c), RaytracingPipeline::Metal(p)) => c.trace_rays(p, width, height),
             #[cfg(windows)]
             _ => unreachable!("{MIXED}"),
         }

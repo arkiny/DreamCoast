@@ -210,6 +210,14 @@ pub struct RaytracingPipelineDesc<'a> {
     /// Closest-hit shader bytes (SPIR-V) / DXIL library bytes (D3D12).
     pub closesthit_bytes: &'a [u8],
     pub closesthit_entry: &'a str,
+    /// Metal Shader Converter synthesized indirect ray-dispatch kernel.
+    /// Other backends ignore this optional wrapper.
+    pub metal_ray_dispatch_bytes: Option<&'a [u8]>,
+    pub metal_ray_dispatch_entry: Option<&'a str>,
+    /// Metal Shader Converter synthesized indirect triangle-intersection function.
+    /// Other backends ignore this optional wrapper.
+    pub metal_intersection_bytes: Option<&'a [u8]>,
+    pub metal_intersection_entry: Option<&'a str>,
     /// Size in bytes of the push/root constant block (0 = none).
     pub push_constant_size: u32,
     /// Maximum ray payload size in bytes (D3D12 shader config; Vulkan derives it).
