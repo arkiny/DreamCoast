@@ -28,13 +28,17 @@ pub(crate) struct InstanceShared {
     pub surface_loader: ash::khr::surface::Instance,
     pub surface: vk::SurfaceKHR,
     debug: Option<DebugState>,
+    // VK_EXT_debug_utils is enabled (command labels + object names usable),
+    // independent of whether the validation messenger (`debug`) is active.
+    has_debug_utils: bool,
 }
 
 impl InstanceShared {
-    /// Whether the debug-utils messenger is active (debug build + validation on).
-    /// Gates creating the device-level debug-utils loader for labels/object names.
-    pub(crate) fn debug_enabled(&self) -> bool {
-        self.debug.is_some()
+    /// Whether VK_EXT_debug_utils is enabled, so the device-level loader for
+    /// command labels / object names can be created. Independent of the validation
+    /// messenger — true in debug builds even with validation off.
+    pub(crate) fn debug_utils_enabled(&self) -> bool {
+        self.has_debug_utils
     }
 }
 
@@ -100,6 +104,22 @@ impl VulkanInstance {
                 );
             }
 
+            // Debug-utils (command labels + object names for GPU captures) is
+            // enabled in debug builds whenever the loader offers it, INDEPENDENT of
+            // the validation layer. A capture tool (RenderDoc) frequently fails when
+            // the app also force-enables its own validation layer, so the user runs
+            // with `--no-validation`; decoupling keeps named pass regions / resources
+            // visible in the capture even then.
+            let want_debug_utils = cfg!(debug_assertions);
+            let has_debug_utils = want_debug_utils
+                && entry
+                    .enumerate_instance_extension_properties(None)
+                    .map(|exts| {
+                        exts.iter()
+                            .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::debug_utils::NAME))
+                    })
+                    .unwrap_or(false);
+
             let mut layers = Vec::new();
             let mut extensions = vec![
                 ash::khr::surface::NAME.as_ptr(),
@@ -107,6 +127,8 @@ impl VulkanInstance {
             ];
             if has_validation {
                 layers.push(validation_name.as_ptr());
+            }
+            if has_debug_utils {
                 extensions.push(ash::ext::debug_utils::NAME.as_ptr());
             }
 
@@ -116,7 +138,7 @@ impl VulkanInstance {
                 .enabled_extension_names(&extensions);
             let instance = entry.create_instance(&create_info, None).map_err(vk_err)?;
 
-            let debug = if has_validation {
+            let debug = if has_validation && has_debug_utils {
                 let loader = ash::ext::debug_utils::Instance::new(&entry, &instance);
                 let ci = vk::DebugUtilsMessengerCreateInfoEXT::default()
                     .message_severity(
@@ -158,6 +180,7 @@ impl VulkanInstance {
                     surface_loader,
                     surface,
                     debug,
+                    has_debug_utils,
                 }),
                 physical_device,
                 queue_family_index,

@@ -228,7 +228,7 @@ impl DeviceShared {
             // the instance enabled VK_EXT_debug_utils (debug build + validation).
             let debug_utils = instance
                 .shared
-                .debug_enabled()
+                .debug_utils_enabled()
                 .then(|| ash::ext::debug_utils::Device::new(raw, &device));
             // Shader-group handle size + alignment drive the SBT record layout.
             let (rt_handle_size, rt_handle_alignment, rt_base_alignment) = if has_raytracing {
