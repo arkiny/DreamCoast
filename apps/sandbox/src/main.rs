@@ -28,7 +28,12 @@ use rhi::{
 use tracing::info;
 
 const FRAMES_IN_FLIGHT: usize = 2;
-const COLOR_FORMAT: Format = Format::Bgra8Srgb; // swapchain / backbuffer
+// Swapchain / backbuffer. UNORM, not sRGB: GPU capture & overlay layers
+// (RenderDoc, OBS, …) force VK_IMAGE_USAGE_STORAGE onto swapchain images, which an
+// sRGB surface format can never support — an sRGB backbuffer makes RenderDoc
+// hard-crash at swapchain creation. The final passes encode sRGB in-shader
+// instead (see `linear_to_srgb` in bindless.slang).
+const COLOR_FORMAT: Format = Format::Bgra8Unorm;
 const DEPTH_FORMAT: Format = Format::Depth32Float;
 const HDR_FORMAT: Format = Format::Rgba16Float; // linear HDR lighting target
 // G-buffer attachment formats.
@@ -125,8 +130,25 @@ fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
 }
 
 fn main() -> anyhow::Result<()> {
+    // `--log-file <path>` mirrors logs to a file (the logging layer reads the env
+    // var). It's a CLI flag, not just the env var, because GPU capture launchers
+    // (RenderDoc's UI env editor) mangle environment values but pass command-line
+    // arguments through cleanly. SAFE: set once at startup before any threads.
+    if let Some(path) = log_file_path() {
+        unsafe { std::env::set_var("DREAMCOAST_LOG_FILE", path) };
+    }
     init_logging();
+    // Log any fatal error before it propagates: under a GPU capture tool
+    // (RenderDoc) stdout/stderr are redirected away, so a bare `Err` return would
+    // vanish. With `DREAMCOAST_LOG_FILE` set this lands the real cause in the file.
+    let result = run();
+    if let Err(e) = &result {
+        tracing::error!("fatal: {e:?}");
+    }
+    result
+}
 
+fn run() -> anyhow::Result<()> {
     let backend = select_backend();
     info!("requested backend: {backend:?}");
 
@@ -300,7 +322,7 @@ fn main() -> anyhow::Result<()> {
         depth_format: None,
     })?;
 
-    // Tonemap pipeline: HDR -> backbuffer (sRGB).
+    // Tonemap pipeline: HDR -> backbuffer (encodes sRGB in-shader; UNORM target).
     let (post_vs, post_fs) = load_shader_pair(
         backend,
         dreamcoast_shader::post_vs_spirv,
@@ -3154,6 +3176,17 @@ fn model_path() -> String {
         }
     }
     MODEL_PATH.to_string()
+}
+
+/// `--log-file <path>`: mirror logs to a file (see `main`). `None` when absent.
+fn log_file_path() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--log-file" {
+            return args.next();
+        }
+    }
+    None
 }
 
 fn select_backend() -> BackendKind {

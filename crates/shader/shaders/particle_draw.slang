@@ -61,5 +61,6 @@ float4 fsMain(VSOutput input) : SV_Target
     float a = falloff * falloff * saturate(input.life);
     // Hot core (yellow) fading to ember (orange-red) as life runs out.
     float3 color = lerp(float3(1.0, 0.35, 0.1), float3(1.0, 0.9, 0.5), saturate(input.life));
-    return float4(color, a);
+    // UNORM backbuffer — encode sRGB (see linear_to_srgb in bindless.slang).
+    return float4(linear_to_srgb(color), a);
 }

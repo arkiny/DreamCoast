@@ -1,9 +1,9 @@
 // Tonemap pass: reads the linear-HDR lighting result and maps it to the
 // backbuffer with an ACES filmic curve (exposure is already applied in the
 // lighting pass). Optional debug effects (grayscale/vignette) are retained from
-// the Phase 5 composite. The backbuffer is an sRGB target, so the hardware does
-// the linear→sRGB encode on write. This is the final node of the render graph's
-// color chain.
+// the Phase 5 composite. The backbuffer is a UNORM target (see `linear_to_srgb`
+// in bindless.slang for why), so this pass applies the linear-to-sRGB encode
+// itself. This is the final node of the render graph's color chain.
 //
 // Bindless layout mirrors imgui.slang: the shared `ParameterBlock` in
 // `bindless.slang` (`g.textures[]` / `g.samp`), indexed by push constants (b0).
@@ -72,5 +72,6 @@ float4 fsMain(VSOutput input) : SV_Target
         color *= vignette;
     }
 
-    return float4(color, 1.0);
+    // UNORM backbuffer — encode sRGB here (the hardware no longer does it).
+    return float4(linear_to_srgb(color), 1.0);
 }
