@@ -16,7 +16,7 @@
 
 #include "rt_common.slang"
 
-static const uint MAX_BOUNCES = 4;
+// MAX_BOUNCES / RR_START_BOUNCE / SUN_COS_MAX live in rt_common.slang.
 
 // Trace a single path and return its radiance. `cornell` switches to an enclosed
 // box lit only by emissive surfaces (black background, no sun).
@@ -60,22 +60,29 @@ float3 trace(float3 origin, float3 dir, float3 sun_dir, bool cornell, inout uint
         // Emissive surfaces add light directly.
         radiance += throughput * mat.emissive;
 
-        // Direct sun light (next-event estimation: evaluate the full BSDF toward the
-        // sun) with a hardware shadow ray (outdoor mode only; the Cornell box is lit
-        // purely by its emissive ceiling via the bounce loop).
-        float ndl = dot(n, sun_dir);
-        if (!cornell && ndl > 0.0)
+        // Direct sun light (next-event estimation: full BSDF toward a direction
+        // sampled on the sun disk, so shadows are soft) with a hardware shadow ray
+        // (outdoor mode only; the Cornell box is lit purely by its emissive ceiling).
+        // The cone sample is taken for every outdoor hit (even back-facing) so the
+        // RNG stream stays in lockstep with the pipeline path. Disk irradiance is
+        // pc.sun.w (L*Ω), so the contribution is just eval_bsdf * sun.w * ndl.
+        if (!cornell)
         {
-            RayDesc sray;
-            sray.Origin = hit + n * 0.002;
-            sray.Direction = sun_dir;
-            sray.TMin = 0.001;
-            sray.TMax = 10000.0;
-            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
-            sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, sray);
-            sq.Proceed();
-            if (sq.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
-                radiance += throughput * eval_bsdf(n, v, sun_dir, surf) * pc.sun.w * ndl;
+            float3 wl = sample_cone(sun_dir, SUN_COS_MAX, rng);
+            float ndl = dot(n, wl);
+            if (ndl > 0.0)
+            {
+                RayDesc sray;
+                sray.Origin = hit + n * 0.002;
+                sray.Direction = wl;
+                sray.TMin = 0.001;
+                sray.TMax = 10000.0;
+                RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
+                sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, sray);
+                sq.Proceed();
+                if (sq.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+                    radiance += throughput * eval_bsdf(n, v, wl, surf) * pc.sun.w * ndl;
+            }
         }
 
         // Importance-sample the BSDF for the next bounce (diffuse or specular lobe).
@@ -83,6 +90,17 @@ float3 trace(float3 origin, float3 dir, float3 sun_dir, bool cornell, inout uint
         if (!bs.valid)
             break;
         throughput *= bs.weight;
+
+        // Russian roulette: unbiased termination once paths get deep, so MAX_BOUNCES
+        // can be large without the cost of always tracing every bounce.
+        if (bounce >= RR_START_BOUNCE)
+        {
+            float surv = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
+            if (rnd(rng) >= surv)
+                break;
+            throughput /= surv;
+        }
+
         ray.Origin = hit + n * 0.002;
         ray.Direction = bs.dir;
         ray.TMin = 0.001;

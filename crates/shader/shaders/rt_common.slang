@@ -10,6 +10,15 @@ static const float PI = 3.14159265358979;
 static const float INV_PI = 0.31830988618379;
 static const uint NO_TEXTURE = 0xFFFFFFFFu;
 
+// Path-tracer transport controls (shared so the inline and pipeline paths match).
+// Russian roulette keeps the estimator unbiased while allowing deep paths: after
+// RR_START_BOUNCE bounces a path survives with probability ~ its throughput.
+static const uint MAX_BOUNCES = 8u;
+static const uint RR_START_BOUNCE = 3u;
+// The sun is a finite disk light (not a delta direction) so shadows have a soft
+// penumbra. `SUN_COS_MAX` is the cosine of its angular radius (~1.1 degrees).
+static const float SUN_COS_MAX = 0.9998;
+
 // Push constants shared by both path-tracer entry points.
 struct PushConstants
 {
@@ -100,6 +109,20 @@ float3 cosine_hemisphere(float3 n, inout uint rng)
 float luminance(float3 c)
 {
     return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+// Uniformly sample a direction within a cone of half-angle acos(cos_max) about
+// `dir` (for sampling the sun disk in next-event estimation). Consumes 2 RNG draws.
+float3 sample_cone(float3 dir, float cos_max, inout uint rng)
+{
+    float u1 = rnd(rng);
+    float u2 = rnd(rng);
+    float ct = 1.0 - u1 * (1.0 - cos_max);
+    float st = sqrt(saturate(1.0 - ct * ct));
+    float phi = 2.0 * PI * u2;
+    float3 t, b;
+    onb(dir, t, b);
+    return normalize(t * (st * cos(phi)) + b * (st * sin(phi)) + dir * ct);
 }
 
 // ---- Microfacet BSDF (Cook-Torrance, GGX) -------------------------------------

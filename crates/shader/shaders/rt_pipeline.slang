@@ -15,7 +15,7 @@
 
 #include "rt_common.slang"
 
-static const uint MAX_BOUNCES = 4;
+// MAX_BOUNCES / RR_START_BOUNCE / SUN_COS_MAX live in rt_common.slang.
 
 // Bounce-loop state carried between the raygen loop and the hit/miss shaders.
 struct Payload
@@ -65,22 +65,27 @@ void chMain(inout Payload p, BuiltInTriangleIntersectionAttributes attr)
     // Emissive surfaces add light directly.
     float3 radiance = mat.emissive;
 
-    // Direct sun light (next-event estimation: full BSDF toward the sun) with a
-    // hardware shadow ray (outdoor mode only; the Cornell box is lit purely by its
-    // emissive ceiling via the bounce loop).
-    float ndl = dot(n, sun_dir);
-    if (!cornell && ndl > 0.0)
+    // Direct sun light (next-event estimation: full BSDF toward a direction sampled
+    // on the sun disk, so shadows are soft) with a hardware shadow ray (outdoor mode
+    // only; the Cornell box is lit purely by its emissive ceiling). The cone sample
+    // is taken for every outdoor hit so the RNG stream matches the inline path.
+    if (!cornell)
     {
-        RayDesc sray;
-        sray.Origin = hit + n * 0.002;
-        sray.Direction = sun_dir;
-        sray.TMin = 0.001;
-        sray.TMax = 10000.0;
-        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
-        sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, sray);
-        sq.Proceed();
-        if (sq.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
-            radiance += eval_bsdf(n, v, sun_dir, surf) * pc.sun.w * ndl;
+        float3 wl = sample_cone(sun_dir, SUN_COS_MAX, p.rng);
+        float ndl = dot(n, wl);
+        if (ndl > 0.0)
+        {
+            RayDesc sray;
+            sray.Origin = hit + n * 0.002;
+            sray.Direction = wl;
+            sray.TMin = 0.001;
+            sray.TMax = 10000.0;
+            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
+            sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, sray);
+            sq.Proceed();
+            if (sq.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+                radiance += eval_bsdf(n, v, wl, surf) * pc.sun.w * ndl;
+        }
     }
 
     p.radiance = radiance;
@@ -142,6 +147,18 @@ void rgMain()
             if (p.done != 0u)
                 break;
             throughput *= p.atten;
+
+            // Russian roulette: unbiased deep-path termination (matches the inline
+            // path's RNG order — the hit shader advanced p.rng for NEE + BSDF, this
+            // RR draw comes next).
+            if (bounce >= RR_START_BOUNCE)
+            {
+                float surv = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
+                if (rnd(rng) >= surv)
+                    break;
+                throughput /= surv;
+            }
+
             ray.Origin = p.next_origin;
             ray.Direction = p.next_dir;
             ray.TMin = 0.001;
