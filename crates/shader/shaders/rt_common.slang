@@ -302,7 +302,16 @@ float3 hit_normal(Instance inst, uint prim, float2 bary)
     float3 n1 = asfloat(g.storage_buffers[inst.vtx].Load3(i1 * 32u + 12u));
     float3 n2 = asfloat(g.storage_buffers[inst.vtx].Load3(i2 * 32u + 12u));
     float b0 = 1.0 - bary.x - bary.y;
-    return normalize(n0 * b0 + n1 * bary.x + n2 * bary.y);
+    float3 n = n0 * b0 + n1 * bary.x + n2 * bary.y;
+    // The Metal Shader Converter RT-pipeline path occasionally hands the closest-hit
+    // shader an out-of-range PrimitiveIndex/InstanceID for a few rays (floor-biased,
+    // non-deterministic). That fetches degenerate vertex data and makes this
+    // normalize() non-finite; a NaN normal yields NaN BSDF radiance which the
+    // persistent accumulator then bakes into a permanent black speckle. Reject the
+    // non-finite/degenerate case (never a valid hit) so it can't poison shading.
+    // Valid hits keep the exact normalize() result, so inline == pipeline is intact.
+    float len2 = dot(n, n);
+    return (len2 > 1e-12 && len2 < 1e12) ? normalize(n) : float3(0, 1, 0);
 }
 
 // Barycentric-interpolated UV for material texture lookup.
@@ -415,6 +424,10 @@ float3 hit_shading_normal(Instance inst, uint prim, float2 bary, float3 geom_n, 
     }
 
     float3 mapped = normalize(tangent_normal.x * t + tangent_normal.y * b + tangent_normal.z * geom_n);
+    // Fall back to the (already sanitized) geometric normal if the tangent-space
+    // basis degenerated to a non-finite mapped normal (same bad-attribute origin).
+    if (!all(isfinite(mapped)))
+        return geom_n;
     return dot(mapped, geom_n) < 0.0 ? -mapped : mapped;
 }
 
