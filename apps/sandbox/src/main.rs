@@ -110,7 +110,9 @@ struct Globals {
     shadow: [f32; 4],           // x depth bias, y texel size (1 / SHADOW_SIZE)
     inv_view_proj: [f32; 16],   // clip -> world (skybox ray reconstruction)
     ibl: [i32; 4],              // x env, y irradiance, z prefilter, w BRDF (-1 = none)
-    probe: [f32; 4],            // xyz reflection-probe centre, w proxy sphere radius (0 = off)
+    probe: [f32; 4],            // xyz reflection-probe capture centre, w parallax on (1) / off (0)
+    probe_box_min: [f32; 4],    // xyz reflection proxy AABB min corner
+    probe_box_max: [f32; 4],    // xyz reflection proxy AABB max corner
 }
 
 fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
@@ -1462,9 +1464,19 @@ fn main() -> anyhow::Result<()> {
             shadow: [shadow_bias, 1.0 / SHADOW_SIZE as f32, 0.0, 0.0],
             inv_view_proj,
             ibl: ibl_indices,
-            // Reflection-probe centre (matches the env-capture eye) + proxy sphere
-            // radius for parallax-corrected specular IBL.
-            probe: [focus.x, focus.y, focus.z, scene_radius * 1.5],
+            // Reflection-probe centre (matches the env-capture eye) + a box proxy
+            // for parallax-corrected specular IBL. The box floor sits on the ground
+            // plane (y = 0) and its walls/ceiling match the captured ground extent,
+            // so reflected-floor rays re-anchor onto the actual flat ground instead
+            // of a sphere that bent them up to the (darker) horizon.
+            probe: [focus.x, focus.y, focus.z, 1.0],
+            probe_box_min: [-scene_radius * 1.3, 0.0, -scene_radius * 1.3, 0.0],
+            probe_box_max: [
+                scene_radius * 1.3,
+                scene_radius * 2.0,
+                scene_radius * 1.3,
+                0.0,
+            ],
         };
         let globals_offset = frame as u64 * GLOBALS_SLICE;
         globals_buffer.write_at(globals_offset, globals_bytes(&globals))?;
