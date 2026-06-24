@@ -9,11 +9,12 @@ use dreamcoast_platform::Window;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLOrigin, MTLPixelFormat,
-    MTLRegion, MTLResourceID, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerDescriptor,
-    MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState, MTLSize, MTLStorageMode,
-    MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
+    MTLAccelerationStructure, MTLBuffer, MTLCommandBuffer, MTLCommandQueue,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor,
+    MTLHeapType, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceID, MTLResourceOptions,
+    MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
+    MTLSamplerState, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
+    MTLTextureUsage,
 };
 use objc2_quartz_core::CAMetalLayer;
 use rhi_types::{
@@ -62,8 +63,14 @@ pub(crate) const STORAGE_IMAGE_BASE: u32 = BINDLESS_COUNT + 1 + CUBE_COUNT;
 /// storage images).
 pub(crate) const STORAGE_BUFFER_BASE: u32 = STORAGE_IMAGE_BASE + STORAGE_IMAGE_COUNT;
 
-/// Total number of 8-byte handle slots in the bindless argument buffer.
-pub(crate) const ARG_BUFFER_SLOTS: u32 = STORAGE_BUFFER_BASE + STORAGE_BUFFER_COUNT;
+/// Argument-buffer slot of the scene TLAS (the `Bindless.tlas` member, declared
+/// last in `bindless.slang`, after the storage buffers). Present only on RT-capable
+/// devices; written by [`MetalDevice::bind_tlas`] (Phase 8).
+pub(crate) const TLAS_SLOT: u32 = STORAGE_BUFFER_BASE + STORAGE_BUFFER_COUNT;
+
+/// Total number of 8-byte handle slots in the bindless argument buffer (one extra
+/// slot past the storage buffers for the TLAS handle).
+pub(crate) const ARG_BUFFER_SLOTS: u32 = TLAS_SLOT + 1;
 
 /// Device state shared (via `Rc`) by every resource created from a device, so the
 /// `MTLDevice` / command queue / layer outlive the resources that reference them.
@@ -114,6 +121,12 @@ pub(crate) struct DeviceShared {
     /// (`Read | Write` on compute, `Read` on the particle/cull draw vertex stage)
     /// on every bindless encoder.
     storage_buffers: RefCell<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    /// Acceleration structures (TLAS + BLAS) bound via [`MetalDevice::bind_tlas`].
+    /// They must be made resident (`useResource`) on the inline path tracer's
+    /// compute encoder, since the TLAS is reached indirectly through the bindless
+    /// argument buffer (Metal requires the instance AS *and* each referenced
+    /// primitive AS to be resident). Permanent for the scene's lifetime. (Phase 8)
+    rt_resident: RefCell<Vec<Retained<ProtocolObject<dyn MTLAccelerationStructure>>>>,
 }
 
 impl DeviceShared {
@@ -249,6 +262,14 @@ impl DeviceShared {
     ) -> std::cell::Ref<'_, Vec<Retained<ProtocolObject<dyn MTLBuffer>>>> {
         self.storage_buffers.borrow()
     }
+
+    /// The acceleration structures to make resident before tracing through the
+    /// bindless `g.tlas` (Phase 8 inline path).
+    pub(crate) fn rt_acceleration_structures(
+        &self,
+    ) -> std::cell::Ref<'_, Vec<Retained<ProtocolObject<dyn MTLAccelerationStructure>>>> {
+        self.rt_resident.borrow()
+    }
 }
 
 /// A Metal instance: owns the system `MTLDevice` and the window's `CAMetalLayer`.
@@ -323,6 +344,7 @@ impl MetalInstance {
             resident: RefCell::new(Vec::new()),
             storage_resident: RefCell::new(Vec::new()),
             storage_buffers: RefCell::new(Vec::new()),
+            rt_resident: RefCell::new(Vec::new()),
         });
         // The sampler sits at the slot just past the texture array (Slang assigns it
         // id `BINDLESS_COUNT` in the argument-buffer struct).
@@ -389,9 +411,41 @@ impl MetalDevice {
         true
     }
 
-    /// Metal ray tracing (Phase 8) is out of scope for the M0–M5 parity effort.
+    /// Hardware ray tracing (Phase 8): true on Apple GPUs that support the
+    /// `metal::raytracing` inline ray-query API (Apple7+ / Metal 3). The inline
+    /// `RayQuery` path tracer traces the bindless `g.tlas`.
     pub fn has_raytracing(&self) -> bool {
+        self.shared.device.supportsRaytracing()
+    }
+
+    /// Whether a DXR-style ray-tracing *pipeline* (raygen/miss/closesthit + SBT,
+    /// `trace_rays`) is available. Always false on Metal — Metal hardware ray
+    /// tracing is inline-only (`DispatchRays` has no equivalent), so the path tracer
+    /// uses the inline `rt_path` compute path. (See `docs/metal-backend.md`.)
+    pub fn supports_rt_pipeline(&self) -> bool {
         false
+    }
+
+    /// Build the scene's BLAS (one per geometry) + a single TLAS and return the
+    /// owning [`MetalRaytracingScene`]. Bind it once with [`Self::bind_tlas`].
+    pub fn build_raytracing_scene(
+        &self,
+        geometries: &[(&MetalBuffer, &MetalBuffer, rhi_types::BlasGeometry)],
+        instances: &[rhi_types::TlasInstance],
+    ) -> Result<crate::MetalRaytracingScene> {
+        crate::MetalRaytracingScene::build(&self.shared, geometries, instances)
+    }
+
+    /// Register a built scene's TLAS in the bindless argument buffer (`g.tlas`) so
+    /// the inline path tracer can trace it, and keep the scene's acceleration
+    /// structures resident for the compute encoder.
+    pub fn bind_tlas(&self, scene: &crate::MetalRaytracingScene) {
+        self.shared
+            .write_handle(TLAS_SLOT, scene.tlas_resource_id());
+        let mut resident = self.shared.rt_resident.borrow_mut();
+        for accel in scene.acceleration_structures() {
+            resident.push(accel.clone());
+        }
     }
 
     pub fn wait_idle(&self) -> Result<()> {
@@ -450,16 +504,30 @@ impl MetalDevice {
         Ok(MetalStorageBuffer::new(buffer, index))
     }
 
-    /// Host-seeded storage buffer (Phase 8 RT geometry). Unimplemented on Metal —
-    /// hardware ray tracing is deferred, so the path tracer never calls this.
+    /// Host-seeded storage buffer (Phase 8 RT geometry + per-instance table read by
+    /// the path tracer). Apple Silicon is unified-memory, so a `Shared` buffer is
+    /// CPU-writable directly (no staging blit); register it in the bindless
+    /// storage-buffer table like [`Self::create_storage_buffer`].
     pub fn create_storage_buffer_init(
         &self,
-        _desc: &StorageBufferDesc,
-        _data: &[u8],
+        desc: &StorageBufferDesc,
+        data: &[u8],
     ) -> Result<MetalStorageBuffer> {
-        Err(rhi_err(
-            "storage-buffer host upload is not implemented on Metal (Phase 8 deferred)",
-        ))
+        let len = (desc.size.max(1) as usize).max(data.len());
+        let buffer = self
+            .shared
+            .device
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| rhi_err("storage buffer (init) alloc failed"))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                buffer.contents().as_ptr() as *mut u8,
+                data.len(),
+            );
+        }
+        let index = self.shared.register_storage_buffer(&buffer);
+        Ok(MetalStorageBuffer::new(buffer, index))
     }
 
     /// Store the per-frame globals UBO. `slice_size` is unused on Metal (the

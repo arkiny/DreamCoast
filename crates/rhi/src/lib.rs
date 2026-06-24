@@ -378,6 +378,22 @@ impl Device {
         }
     }
 
+    /// Whether a DXR-style ray-tracing *pipeline* (raygen/miss/closesthit + SBT,
+    /// [`CommandBuffer::trace_rays`]) is available. True on Vulkan/D3D12 when ray
+    /// tracing is supported; always false on Metal, whose hardware ray tracing is
+    /// inline-only (`DispatchRays` has no equivalent — the path tracer runs through
+    /// the inline `rt_path` compute path). Callers gate the RT-pipeline path on this.
+    pub fn supports_rt_pipeline(&self) -> bool {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => d.has_raytracing(),
+            #[cfg(windows)]
+            Self::D3d12(d) => d.has_raytracing(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => d.supports_rt_pipeline(),
+        }
+    }
+
     pub fn create_buffer(&self, desc: &BufferDesc) -> Result<Buffer> {
         match self {
             #[cfg(windows)]
@@ -426,9 +442,19 @@ impl Device {
                 ))
             }
             #[cfg(target_os = "macos")]
-            Self::Metal(_) => Err(EngineError::Rhi(
-                "hardware ray tracing is not supported on Metal (Phase 8 deferred)".into(),
-            )),
+            Self::Metal(d) => {
+                let geos: Vec<_> = geometries
+                    .iter()
+                    .map(|g| {
+                        let Buffer::Metal(v) = g.vertex_buffer;
+                        let Buffer::Metal(i) = g.index_buffer;
+                        (v, i, g.geometry)
+                    })
+                    .collect();
+                Ok(RaytracingScene::Metal(
+                    d.build_raytracing_scene(&geos, instances)?,
+                ))
+            }
         }
     }
 
@@ -448,9 +474,14 @@ impl Device {
                 d.create_raytracing_pipeline(desc)?,
             )),
             #[cfg(target_os = "macos")]
-            Self::Metal(_) => Err(EngineError::Rhi(
-                "hardware ray tracing is not supported on Metal (Phase 8 deferred)".into(),
-            )),
+            Self::Metal(_) => {
+                let _ = desc;
+                Err(EngineError::Rhi(
+                    "Metal hardware ray tracing is inline-only; the DXR-style pipeline + SBT \
+                     has no Metal equivalent (use the inline rt_path compute path)"
+                        .into(),
+                ))
+            }
         }
     }
 
@@ -463,7 +494,7 @@ impl Device {
             #[cfg(windows)]
             (Self::D3d12(d), RaytracingScene::D3d12(s)) => d.bind_tlas(s),
             #[cfg(target_os = "macos")]
-            (Self::Metal(_), RaytracingScene::Metal(_)) => {}
+            (Self::Metal(d), RaytracingScene::Metal(s)) => d.bind_tlas(s),
             #[cfg(windows)]
             _ => unreachable!("{MIXED}"),
         }
@@ -1266,7 +1297,9 @@ impl CommandBuffer {
             #[cfg(windows)]
             Self::D3d12(c) => c.push_constants_rt(data),
             #[cfg(target_os = "macos")]
-            Self::Metal(_) => {}
+            Self::Metal(_) => {
+                let _ = data;
+            }
         }
     }
 
@@ -1278,7 +1311,9 @@ impl CommandBuffer {
             #[cfg(windows)]
             (Self::D3d12(c), RaytracingPipeline::D3d12(p)) => c.trace_rays(p, width, height),
             #[cfg(target_os = "macos")]
-            (Self::Metal(_), RaytracingPipeline::Metal(_)) => {}
+            (Self::Metal(_), RaytracingPipeline::Metal(_)) => {
+                let _ = (width, height);
+            }
             #[cfg(windows)]
             _ => unreachable!("{MIXED}"),
         }

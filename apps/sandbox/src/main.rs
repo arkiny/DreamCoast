@@ -381,8 +381,10 @@ fn main() -> anyhow::Result<()> {
 
     // Phase 8 M5: the same path tracer via the hardware ray-tracing *pipeline*
     // (raygen / miss / closest-hit + shader binding table). Reproduces the inline
-    // tracer's image so the two RT abstractions can be cross-checked.
-    let rt_pt_pipeline = if device.has_raytracing() {
+    // tracer's image so the two RT abstractions can be cross-checked. Gated on
+    // `supports_rt_pipeline()` — false on Metal (inline-only hardware ray tracing,
+    // no DXR-style SBT dispatch), so the inline `rt_path` path is used there.
+    let rt_pt_pipeline = if device.supports_rt_pipeline() {
         let rgen = load_compute_shader(
             backend,
             dreamcoast_shader::rt_pipeline_rgen_spirv,

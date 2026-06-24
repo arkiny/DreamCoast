@@ -41,3 +41,7 @@ Icon
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# DirectX Shader Compiler build (Track 2 RT pipeline toolchain; not committed)
+/tools/dxc-src/
+/tools/dxc/
