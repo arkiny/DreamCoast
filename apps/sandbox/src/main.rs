@@ -1002,7 +1002,9 @@ fn main() -> anyhow::Result<()> {
     let mut sun_intensity = 3.0f32;
     let mut ambient = 0.04f32;
     let mut exposure = 0.6f32;
-    let mut point_lights_on = true;
+    // On by default; `NO_POINT_LIGHTS=1` disables them (the path tracer has no point
+    // lights, so a fair raster-vs-ground-truth comparison turns these off).
+    let mut point_lights_on = std::env::var_os("NO_POINT_LIGHTS").is_none();
     let mut shadows_on = true;
     let mut shadow_bias = 0.0015f32;
     // Override the model's metallic/roughness (to inspect IBL on the avocado).
