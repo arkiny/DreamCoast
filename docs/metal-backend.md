@@ -224,6 +224,14 @@ sampler at slot `BINDLESS_COUNT` (Slang's id for `samp`). `create_texture` /
 (argument-buffer resources need explicit residency). See `device.rs` (`register` /
 `write_handle`) and `command.rs` (`bind_graphics_pipeline`).
 
+**Gotcha — sampler in an argument buffer needs `supportArgumentBuffers`.** The shared
+sampler is encoded into the bindless argument buffer via `sampler.gpuResourceID()`, so
+its `MTLSamplerDescriptor` **must** set `setSupportArgumentBuffers(true)` (`device.rs`).
+Without it the resource ID is invalid for argument-buffer use; the symptom is silent
+until you run under the validation layers, where
+`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` faults on the sampler slot. Always smoke-test
+Metal changes with both flags on (see "Running"/"Screenshots").
+
 **Buffer-index map (M3):** push constants `[[buffer(0)]]` (`PUSH_CONSTANT_INDEX`),
 bindless argument buffer `[[buffer(1)]]` (`BINDLESS_BUFFER_INDEX`), vertex buffer at
 30. Globals (M4) will take the next low index and shift the bindless slot for the
