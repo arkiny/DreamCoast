@@ -474,6 +474,14 @@ impl D3d12Device {
         D3d12CommandBuffer::new(self.shared.clone())
     }
 
+    /// Create a timestamp query heap of `count` queries (Phase 9 profiling).
+    pub fn create_query_heap(
+        &self,
+        count: u32,
+    ) -> Result<crate::query::D3d12QueryHeap, EngineError> {
+        crate::query::D3d12QueryHeap::new(self.shared.clone(), count)
+    }
+
     /// Create a hardware ray-tracing pipeline (state object) + SBT (Phase 8 M5).
     pub fn create_raytracing_pipeline(
         &self,

@@ -78,6 +78,8 @@ backend_enum!(/// A built ray-tracing scene: BLAS per mesh + one TLAS (Phase 8).
     RaytracingScene => rhi_vulkan::VulkanRaytracingScene, rhi_d3d12::D3d12RaytracingScene, rhi_metal::MetalRaytracingScene);
 backend_enum!(/// A hardware ray-tracing pipeline + shader binding table (Phase 8 M5).
     RaytracingPipeline => rhi_vulkan::VulkanRaytracingPipeline, rhi_d3d12::D3d12RaytracingPipeline, rhi_metal::MetalRaytracingPipeline);
+backend_enum!(/// A GPU timestamp query heap for per-pass profiling (Phase 9 M1).
+    QueryHeap => rhi_vulkan::VulkanQueryHeap, rhi_d3d12::D3d12QueryHeap, rhi_metal::MetalQueryHeap);
 
 /// One mesh's geometry for a BLAS build: its vertex + index buffers plus the
 /// plain shape data (Phase 8). Pairs facade [`Buffer`] handles with [`BlasGeometry`].
@@ -234,6 +236,45 @@ impl Cubemap {
     }
 }
 
+impl QueryHeap {
+    /// Number of timestamp slots in the heap.
+    pub fn count(&self) -> u32 {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(h) => h.count(),
+            #[cfg(windows)]
+            Self::D3d12(h) => h.count(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(h) => h.count(),
+        }
+    }
+
+    /// Nanoseconds per timestamp tick (multiply tick deltas by this for ns).
+    pub fn period_ns(&self) -> f32 {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(h) => h.period_ns(),
+            #[cfg(windows)]
+            Self::D3d12(h) => h.period_ns(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(h) => h.period_ns(),
+        }
+    }
+
+    /// Read all raw timestamp ticks. Call only after the submission that wrote
+    /// them has completed (e.g. after the frame fence).
+    pub fn read(&self) -> Vec<u64> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(h) => h.read(),
+            #[cfg(windows)]
+            Self::D3d12(h) => h.read(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(h) => h.read(),
+        }
+    }
+}
+
 impl Instance {
     /// Create an instance for the requested backend. Returns an error if the
     /// backend is not available on the current platform.
@@ -322,6 +363,19 @@ impl Device {
             Self::D3d12(d) => Ok(CommandBuffer::D3d12(d.create_command_buffer()?)),
             #[cfg(target_os = "macos")]
             Self::Metal(d) => Ok(CommandBuffer::Metal(d.create_command_buffer()?)),
+        }
+    }
+
+    /// Create a GPU timestamp query heap of `count` queries for per-pass profiling
+    /// (Phase 9 M1). Pair with [`RenderGraph::execute`]'s profiler argument.
+    pub fn create_query_heap(&self, count: u32) -> Result<QueryHeap> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => Ok(QueryHeap::Vulkan(d.create_query_heap(count)?)),
+            #[cfg(windows)]
+            Self::D3d12(d) => Ok(QueryHeap::D3d12(d.create_query_heap(count)?)),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => Ok(QueryHeap::Metal(d.create_query_heap(count)?)),
         }
     }
 
@@ -795,6 +849,51 @@ impl CommandBuffer {
             Self::D3d12(c) => c.end(),
             #[cfg(target_os = "macos")]
             Self::Metal(c) => c.end(),
+        }
+    }
+
+    /// Reset `count` timestamp queries (from `first`) before they are rewritten
+    /// this frame. Record once at frame start, outside any render pass. No-op on
+    /// D3D12 (Phase 9 M1).
+    pub fn reset_queries(&self, heap: &QueryHeap, first: u32, count: u32) {
+        match (self, heap) {
+            #[cfg(windows)]
+            (Self::Vulkan(c), QueryHeap::Vulkan(h)) => c.reset_queries(h, first, count),
+            #[cfg(windows)]
+            (Self::D3d12(c), QueryHeap::D3d12(h)) => c.reset_queries(h, first, count),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(c), QueryHeap::Metal(h)) => c.reset_queries(h, first, count),
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Write a timestamp into query `index` at the current pipeline tail.
+    pub fn write_timestamp(&self, heap: &QueryHeap, index: u32) {
+        match (self, heap) {
+            #[cfg(windows)]
+            (Self::Vulkan(c), QueryHeap::Vulkan(h)) => c.write_timestamp(h, index),
+            #[cfg(windows)]
+            (Self::D3d12(c), QueryHeap::D3d12(h)) => c.write_timestamp(h, index),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(c), QueryHeap::Metal(h)) => c.write_timestamp(h, index),
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Resolve `count` written timestamp queries into the heap's readback buffer
+    /// (after the last write, before submit). No-op on Vulkan.
+    pub fn resolve_queries(&self, heap: &QueryHeap, count: u32) {
+        match (self, heap) {
+            #[cfg(windows)]
+            (Self::Vulkan(c), QueryHeap::Vulkan(h)) => c.resolve_queries(h, count),
+            #[cfg(windows)]
+            (Self::D3d12(c), QueryHeap::D3d12(h)) => c.resolve_queries(h, count),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(c), QueryHeap::Metal(h)) => c.resolve_queries(h, count),
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
         }
     }
 

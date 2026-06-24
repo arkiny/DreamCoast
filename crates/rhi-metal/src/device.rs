@@ -512,6 +512,11 @@ impl MetalDevice {
         ))
     }
 
+    /// Create a timestamp query heap (Phase 9 profiling — stub on Metal).
+    pub fn create_query_heap(&self, count: u32) -> Result<crate::query::MetalQueryHeap> {
+        crate::query::MetalQueryHeap::new(count)
+    }
+
     /// A command buffer that records onto the dedicated compute queue (M5 async
     /// compute). Used for the particle sim that overlaps the graphics frame.
     pub fn create_compute_command_buffer(&self) -> Result<MetalCommandBuffer> {

@@ -23,16 +23,39 @@
 //! graph.add_pass(PassInfo { name: "post", colors: vec![(backbuffer, None)],
 //!                           depth: None, reads: vec![scene] },
 //!                |ctx| { /* sample ctx.sampled_index(scene) */ });
-//! graph.execute(&device, &mut pool, &cmd, &swapchain, image_index, true)?;
+//! graph.execute(&device, &mut pool, &cmd, &swapchain, image_index, true, None)?;
 //! ```
 
 use std::collections::HashMap;
 
 use dreamcoast_core::EngineError;
 use rhi::{
-    ClearColor, CommandBuffer, DepthBuffer, Device, Extent2D, Format, RenderTarget,
+    ClearColor, CommandBuffer, DepthBuffer, Device, Extent2D, Format, QueryHeap, RenderTarget,
     RenderTargetDesc, Swapchain, TransientHeap,
 };
+
+/// Collects per-pass GPU timestamps during [`RenderGraph::execute`].
+///
+/// The caller supplies a [`QueryHeap`] (sized `>= scheduled_passes + 1`). The
+/// graph writes a timestamp at the start of each scheduled pass plus one final
+/// boundary, so pass `i`'s GPU duration is `ticks[i + 1] - ticks[i]`. After the
+/// frame's fence signals, read the heap and pair the ticks with [`Self::names`]
+/// (scheduled order). Pass `Some` to profile, `None` to skip (zero overhead).
+pub struct GraphProfiler<'a> {
+    heap: &'a QueryHeap,
+    /// Scheduled pass names, in order; index `i` is bracketed by query `i..i+1`.
+    pub names: Vec<String>,
+}
+
+impl<'a> GraphProfiler<'a> {
+    /// Create a profiler writing into `heap`.
+    pub fn new(heap: &'a QueryHeap) -> Self {
+        Self {
+            heap,
+            names: Vec::new(),
+        }
+    }
+}
 
 /// A pass's record closure: records draw commands, may fail (e.g. per-frame uploads).
 type RecordFn<'a> = Box<dyn FnMut(&mut PassContext) -> Result<(), EngineError> + 'a>;
@@ -378,6 +401,7 @@ impl<'a> RenderGraph<'a> {
     /// are placed into a shared heap by [`Self::plan_aliasing`] so targets with
     /// non-overlapping lifetimes reuse memory; otherwise each gets its own
     /// dedicated allocation.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute(
         mut self,
         device: &Device,
@@ -386,6 +410,7 @@ impl<'a> RenderGraph<'a> {
         swapchain: &Swapchain,
         image_index: u32,
         aliasing: bool,
+        mut profiler: Option<&mut GraphProfiler>,
     ) -> Result<(), EngineError> {
         let compiled = self.compile();
         if tracing::enabled!(tracing::Level::TRACE) {
@@ -447,8 +472,31 @@ impl<'a> RenderGraph<'a> {
         }
 
         // Phase 2 — record (immutable pool access).
+        //
+        // Profiling: write a timestamp at the start of each scheduled pass plus
+        // one final boundary, so pass i's GPU time is ticks[i+1]-ticks[i]. Only
+        // when the heap has room for every boundary; reset the pool first (Vulkan
+        // requires it, outside any render pass — we are between phases here).
+        let profile = profiler
+            .as_ref()
+            .map(|p| p.heap.count() as usize > compiled.schedule.len())
+            .unwrap_or(false);
+        if let (true, Some(p)) = (profile, profiler.as_mut()) {
+            p.names.clear();
+            // Reset the whole pool (not just the boundaries we write): the host
+            // reads all `count` slots back, and Vulkan requires every queried slot
+            // to have been reset since creation.
+            cmd.reset_queries(p.heap, 0, p.heap.count());
+        }
+
         let mut backbuffer_is_rt = false;
         for &pass_idx in &compiled.schedule {
+            // Timestamp this pass's start boundary (query index = passes seen so far).
+            if let (true, Some(p)) = (profile, profiler.as_mut()) {
+                let idx = p.names.len() as u32;
+                cmd.write_timestamp(p.heap, idx);
+                p.names.push(self.passes[pass_idx].name.clone());
+            }
             // Barriers: reads -> sampled. A storage image read after a compute
             // write transitions from UAV/GENERAL; plain color/depth from attachment.
             for &r in &self.passes[pass_idx].reads {
@@ -574,6 +622,13 @@ impl<'a> RenderGraph<'a> {
             };
             (self.passes[pass_idx].record)(&mut ctx)?;
             cmd.end_rendering();
+        }
+
+        // Final timestamp boundary, then resolve the whole heap (D3D12) for readback.
+        if let (true, Some(p)) = (profile, profiler.as_mut()) {
+            let count = p.names.len() as u32;
+            cmd.write_timestamp(p.heap, count);
+            cmd.resolve_queries(p.heap, count + 1);
         }
 
         if backbuffer_is_rt {
