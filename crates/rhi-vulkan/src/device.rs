@@ -83,6 +83,9 @@ pub(crate) struct DeviceShared {
     pub rt_handle_size: u32,
     pub rt_handle_alignment: u32,
     pub rt_base_alignment: u32,
+    // Device-level debug-utils loader for command labels + object names; `Some`
+    // only in debug builds with validation (Phase 9 M2).
+    pub debug_utils: Option<ash::ext::debug_utils::Device>,
 }
 
 impl DeviceShared {
@@ -215,6 +218,12 @@ impl DeviceShared {
                 has_raytracing.then(|| ash::khr::acceleration_structure::Device::new(raw, &device));
             let rt_pipeline_loader =
                 has_raytracing.then(|| ash::khr::ray_tracing_pipeline::Device::new(raw, &device));
+            // Device-level debug-utils loader (cmd labels + object names), only when
+            // the instance enabled VK_EXT_debug_utils (debug build + validation).
+            let debug_utils = instance
+                .shared
+                .debug_enabled()
+                .then(|| ash::ext::debug_utils::Device::new(raw, &device));
             // Shader-group handle size + alignment drive the SBT record layout.
             let (rt_handle_size, rt_handle_alignment, rt_base_alignment) = if has_raytracing {
                 let mut rt_props = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
@@ -277,7 +286,25 @@ impl DeviceShared {
                 rt_handle_size,
                 rt_handle_alignment,
                 rt_base_alignment,
+                debug_utils,
             })
+        }
+    }
+
+    /// Tag a Vulkan image with a debug name (shown in capture tools). No-op
+    /// unless the debug-utils loader is active (debug build + validation).
+    pub(crate) fn set_image_name(&self, image: vk::Image, name: &str) {
+        if let Some(du) = &self.debug_utils {
+            let cname = match std::ffi::CString::new(name) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let info = vk::DebugUtilsObjectNameInfoEXT::default()
+                .object_handle(image)
+                .object_name(&cname);
+            unsafe {
+                let _ = du.set_debug_utils_object_name(&info);
+            }
         }
     }
 

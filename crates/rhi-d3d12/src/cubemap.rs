@@ -180,4 +180,15 @@ impl D3d12Cubemap {
     pub fn bindless_index(&self) -> u32 {
         self.index
     }
+
+    /// Tag this cubemap's resource with a debug name (Phase 9 M2).
+    pub fn set_name(&self, name: &str) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let wide = windows::core::HSTRING::from(name);
+        unsafe {
+            let _ = self.resource.SetName(&wide);
+        }
+    }
 }

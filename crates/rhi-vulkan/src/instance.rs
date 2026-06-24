@@ -30,6 +30,14 @@ pub(crate) struct InstanceShared {
     debug: Option<DebugState>,
 }
 
+impl InstanceShared {
+    /// Whether the debug-utils messenger is active (debug build + validation on).
+    /// Gates creating the device-level debug-utils loader for labels/object names.
+    pub(crate) fn debug_enabled(&self) -> bool {
+        self.debug.is_some()
+    }
+}
+
 impl Drop for InstanceShared {
     fn drop(&mut self) {
         unsafe {

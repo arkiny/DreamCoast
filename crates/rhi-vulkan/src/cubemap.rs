@@ -162,6 +162,11 @@ impl VulkanCubemap {
     pub fn bindless_index(&self) -> u32 {
         self.index
     }
+
+    /// Tag this cubemap's image with a debug name (Phase 9 M2).
+    pub fn set_name(&self, name: &str) {
+        self.device.set_image_name(self.image, name);
+    }
 }
 
 impl Drop for VulkanCubemap {
