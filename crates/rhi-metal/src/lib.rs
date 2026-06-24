@@ -9,6 +9,7 @@
 //! Built incrementally per the Metal milestones (M0 = device + swapchain clear).
 #![cfg(target_os = "macos")]
 
+mod accel;
 mod command;
 mod device;
 mod pipeline;
@@ -16,6 +17,7 @@ mod resources;
 mod swapchain;
 mod sync;
 
+pub use accel::MetalRaytracingScene;
 pub use command::MetalCommandBuffer;
 pub use device::{MetalComputeQueue, MetalDevice, MetalInstance, MetalQueue};
 pub use resources::{
@@ -25,13 +27,11 @@ pub use resources::{
 pub use swapchain::MetalSwapchain;
 pub use sync::{MetalFence, MetalSemaphore};
 
-/// Placeholder ray-tracing scene type so the `rhi` facade's `RaytracingScene`
-/// enum has a Metal variant. Hardware ray tracing is deferred on Metal
-/// (Phase 8), so this is never constructed (`has_raytracing()` is false).
-pub struct MetalRaytracingScene;
-
 /// Placeholder ray-tracing pipeline type so the `rhi` facade's
-/// `RaytracingPipeline` enum has a Metal variant (Phase 8 M5, deferred on Metal).
+/// `RaytracingPipeline` enum has a Metal variant. The DXR-style RT pipeline + SBT
+/// (`DispatchRays`) has no Metal equivalent — Metal hardware ray tracing is
+/// inline-only — so this is never constructed (`create_raytracing_pipeline`
+/// returns an error on Metal; the inline `rt_path` compute path is used instead).
 pub struct MetalRaytracingPipeline;
 
 use dreamcoast_core::EngineError;

@@ -2,9 +2,13 @@
 
 A native Metal RHI backend (`crates/rhi-metal`) so the engine runs on macOS
 alongside the Windows Vulkan / D3D12 backends, sharing the same enum-dispatch
-`rhi` facade, render graph, GUI, and assets. Target parity: **through Phase 7**
-(triangle → mesh → PBR deferred → compute/async/indirect). Phase 8 ray tracing on
-Metal is out of scope for now (`Device::has_raytracing()` returns `false`).
+`rhi` facade, render graph, GUI, and assets. Parity: **through Phase 7**
+(triangle → mesh → PBR deferred → compute/async/indirect) **plus Phase 8 inline
+ray tracing** (M6, below) — `Device::has_raytracing()` is now `true` on RT-capable
+Apple GPUs. **Metal hardware ray tracing is inline-only**: it has no DXR-style
+ray-tracing pipeline + shader binding table (`DispatchRays`), so the path tracer
+runs through the inline `RayQuery` compute path, and `Device::supports_rt_pipeline()`
+returns `false` (see M6).
 
 ## Platform layout
 
@@ -138,6 +142,20 @@ the single-queue particle path.)
   (compute cull → `draw_indexed_indirect`) — plus real **async compute** (a dedicated
   `MTLCommandQueue` with `MTLSharedEvent` cross-queue sync). Verified clean under the
   validation layers; see "M5 plan + progress" below.
+- **M6 — Phase 8 inline ray tracing:** **done.** Hardware AS build
+  (`MTLPrimitiveAccelerationStructureDescriptor` BLAS per mesh +
+  `MTLInstanceAccelerationStructureDescriptor` TLAS, `crates/rhi-metal/src/accel.rs`),
+  the TLAS bound into the bindless argument buffer's `tlas` slot, and the inline
+  `RayQuery` path tracer (`rt_path.slang`) + RT-shadow/instance debug
+  (`rt_trace.slang`) all run on Metal — including the **RT-PBR G1/G2** Cook-Torrance
+  BSDF + GGX reflections, which ride along through the shared `rt_common.slang`.
+  Verified: outdoor scene (sun + sky + diffuse GI + reflections), Cornell box
+  (emissive-ceiling color-bleed GI), and RT soft shadows, all clean under
+  `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`. **The DXR-style RT pipeline + SBT (M5
+  on Vulkan/D3D12) has no Metal equivalent** — Slang's Metal target rejects all three
+  DXR stages (`DispatchRaysIndex` / `BuiltInTriangleIntersectionAttributes` /
+  `WorldRayDirection`), so `supports_rt_pipeline()` is `false` and the inline path is
+  Metal's RT path. See "M6 plan + progress" below.
 
 ## Resume notes for M4+ (implementation pointers)
 
@@ -507,3 +525,148 @@ the 5 compute shaders to `metallib`** — not new design.
   (mirroring the M4 graphics fix `1d61ef4`). All three Phase-7 demos pass on Vulkan +
   D3D12, and that fix is `rhi-d3d12`-only (`cfg(windows)`) so it caused **no Metal
   regression** (re-verified on `main`). **All three backends are at Phase-7 parity.**
+
+## M6 plan + progress (Phase 8 inline ray tracing)
+
+**Goal / done-when:** the Phase 8 path tracer runs on Metal — AS build + TLAS trace
++ the inline `RayQuery` path tracer (`rt_path`) and the M3 RT-debug path
+(`rt_trace`), including RT-PBR G1/G2 — clean under `MTL_DEBUG_LAYER=1
+MTL_SHADER_VALIDATION=1`, demos-off scene unchanged (regression).
+
+**Feasibility (slangc 2026.11):** the inline `RayQuery` shaders compile to Metal
+cleanly (`RayQuery` → `metal::raytracing::intersection_query`; `g.tlas` becomes an
+`acceleration_structure<instancing>` member of the bindless argument buffer in the
+slot after `storage_buffers`). The **DXR pipeline** shaders (`rt_pipeline.slang`) do
+**not** — Slang rejects `DispatchRaysIndex` (raygen),
+`BuiltInTriangleIntersectionAttributes` (closesthit) and `WorldRayDirection` (miss)
+for the Metal target. Metal HW ray tracing is inline-only; there is no SBT dispatch.
+
+**What shipped:**
+- **`crates/rhi-metal/src/accel.rs` (`MetalRaytracingScene`).** BLAS per geometry
+  (`MTLAccelerationStructureTriangleGeometryDescriptor` →
+  `MTLPrimitiveAccelerationStructureDescriptor`), one TLAS over instances
+  (`MTLAccelerationStructureUserIDInstanceDescriptor[]` +
+  `MTLInstanceAccelerationStructureDescriptor`), built in one `commit` +
+  `waitUntilCompleted` (BLAS encoder, then a TLAS encoder so the TLAS build is
+  ordered after the BLASes it references). Metal needs **no** special buffer usage
+  for AS geometry inputs (unlike Vulkan device-address / D3D12).
+- **`device.rs`.** `has_raytracing()` = `supportsRaytracing()`;
+  `supports_rt_pipeline()` = `false`. `TLAS_SLOT` (= old `ARG_BUFFER_SLOTS`) added,
+  argument buffer grown by one slot. `bind_tlas` writes the TLAS `gpuResourceID` into
+  the `tlas` slot and stores the scene's AS objects in `rt_resident`.
+  `create_storage_buffer_init` implemented (Shared buffer, host-seeded) for the RT
+  geometry + per-instance material table.
+- **`command.rs`.** `bind_compute_pipeline` makes the TLAS + every BLAS resident
+  (`useResource(.., Read)`) — Metal requires the instance AS *and* each referenced
+  primitive AS resident when the TLAS is reached indirectly through an argument
+  buffer.
+- **Facade / sandbox.** `build_raytracing_scene` / `bind_tlas` Metal arms wired;
+  `Device::supports_rt_pipeline()` added; the sandbox gates `rt_pt_pipeline` (the SBT
+  path) on it so `P8_PATHTRACE_PIPELINE` is inert on Metal.
+
+**Pins / gotchas (verified — don't re-walk):**
+- **`MTLAccelerationStructureGeometryDescriptor` geometry must be marked
+  `setOpaque(true)`** (it defaults to non-opaque on this toolchain). The inline
+  `RayQuery` does a single `next()`, which auto-commits only **opaque** hits — with
+  non-opaque geometry every ray reports a *miss* (symptom: the path tracer renders
+  only sky/Cornell-black, no geometry, with **zero validation warnings**). This is
+  the Metal equivalent of Vulkan's explicit `GeometryFlagsKHR::OPAQUE`.
+- **Instance transform** is the **transpose** of the engine's row-major 3×4
+  (`TlasInstance.transform`) into Metal's column-major `MTLPackedFloat4x3`
+  (`accel.rs::packed_4x3`).
+- **`CommittedInstanceID()` → `get_committed_user_instance_id()`**, so instances use
+  the **UserID** descriptor type (`setInstanceDescriptorType(UserID)`) with
+  `userID = custom_index`. The Default descriptor type would not carry the custom
+  index.
+- The `tlas` argument-buffer slot is one 8-byte `MTLResourceID` past the storage
+  buffers (id 1217 with the 1024/64/64/64 table sizes); AS resource IDs are small
+  handles like textures (e.g. `6`), not GPU addresses.
+
+**Verification (this macOS M3 box):** `cargo build` + `cargo fmt --all` +
+`RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` clean.
+`P8_PATHTRACE=1 --backend metal --screenshot-clean` (outdoor scene: sun + sky +
+diffuse GI + GGX reflections), `P8_PATHTRACE=1 P8_CORNELL=1` (Cornell color-bleed
+GI), `P8_PATHTRACE=1 P8_RT_DEBUG=1` (RT soft shadows + instance viz), and the
+demos-off scene (M5 regression) all render correctly under
+`MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`. Vulkan/D3D12 are unaffected (the
+shared shaders were already in place from Phase 8; the facade RT-pipeline no-op arms
+just consume their args). Cross-backend pixel parity is validated on the Windows
+RTX 2070 SUPER box per the verification-split convention.
+
+## M7 (in progress) — RT pipeline via Metal Shader Converter
+
+A genuine DXR-style RT-pipeline path on Metal, the way Unreal does it on Apple
+Silicon: convert the DXR shaders with Apple's **Metal Shader Converter**, which
+emulates the DXR shader table on `MTLVisibleFunctionTable` /
+`MTLIntersectionFunctionTable`, and drive it with an `MTLComputePipelineState`
+(raygen) + a function-table `trace_rays`. This reproduces the inline path tracer's
+image through a separate GPU path (the `P8_PATHTRACE_PIPELINE` toggle, currently
+Metal-inert via `supports_rt_pipeline() == false`).
+
+### Toolchain PoC — gate PASSED (feasible, no hard blockers)
+
+Verified end-to-end on this macOS M3 box:
+
+- **DXC built from source with `-metal`.** `tools/dxc-src/` (gitignored) — DirectX
+  Shader Compiler configured via CMake (`find_package(MetalIRConverter)` auto-enables
+  `ENABLE_METAL_CODEGEN` when the converter headers/lib are at `/usr/local`), built
+  with pip-installed `cmake`+`ninja` (no Homebrew/sudo). Produces `dxc` +
+  `libdxcompiler.dylib`.
+- **`metal-shaderconverter` 4.0.0** is already installed (`/usr/local/bin`, with
+  `libmetalirconverter.dylib` + headers under `/usr/local`).
+- **Unsigned DXIL is accepted** by the converter (macOS has no Windows `dxil.dll`
+  signer) — the biggest feared blocker is resolved.
+- **The converter handles DXR shaders** (raygen / miss / closesthit), **per entry
+  point** (`--entry-point=`).
+
+Constraints discovered (shape the M7 implementation):
+
+1. **`dxc -metal` one-step does NOT support shader libraries** ("Shader libraries
+   unsupported in Metal (yet)") → must run the standalone `metal-shaderconverter` on
+   DXIL, per entry point, not the integrated `dxc -metal` flag.
+2. **RT conversion requires a `--root-signature` JSON** (mandatory) describing how the
+   shaders' `register(b0)` / `space1` bindings map into Metal's **top-level argument
+   buffer (TLAB)**.
+3. **The converter's binding model (TLAB, a D3D12 root-signature → Metal argument
+   buffer) is separate from the engine's hand-rolled `Bindless` argument buffer.** So
+   the RT-pipeline path needs its own resource-binding plumbing (build a TLAB,
+   populate it with the same TLAS / instance table / storage buffers / output image).
+4. **Slang → DXIL on macOS** does not yet work here: Slang refuses to load the built
+   `libdxcompiler.dylib` (it exports `DxcCreateInstance`, but Slang still reports a
+   load failure — likely wants the DXIL validator or a version handshake). Slang's
+   `-target hlsl` emits one self-contained unit *per entry point* (duplicate global
+   decls), so it isn't a single mergeable DXR library either. Resolve by fixing the
+   Slang→DXC load or splitting/merging to per-entry DXIL via the `dxc` CLU directly.
+
+### Distribution / licensing (build-time toolchain, like `slangc`)
+
+The RT-pipeline shaders are converted to `metallib` **at build time** and embedded;
+neither DXC nor the converter ships in the engine runtime. So both are **build-time
+tools**, handled like the existing `slangc` / Vulkan-SDK dependencies:
+
+- **DXC** — LLVM/NCSA + MIT (permissive). We build it from source; the build tree
+  lives under `tools/dxc-src/` (gitignored). A future `tools/build-dxc.sh` can
+  reproduce it; redistribution of our build is permitted by the license.
+- **Metal Shader Converter** (`libmetalirconverter`, headers Apache-2.0) — Apple
+  tool, installed once from the Apple developer site (or already present as a Metal
+  toolchain component). Used only at build time (no runtime redistribution of Apple's
+  library). Documented as an optional dependency: absent → the RT-pipeline `metallib`
+  accessors are `None` and `supports_rt_pipeline()` stays `false` (the inline path is
+  unaffected), mirroring the existing "build still succeeds without the toolchain"
+  pattern.
+
+### Remaining work (next session)
+
+- **(A) Shader build.** Per-entry DXIL for `rt_pipeline` (fix Slang→DXC or split the
+  HLSL) + a root-signature JSON matching the `space1` bindless layout → converter →
+  three Metal functions + reflection. Wire into `crates/shader/build.rs` (optional,
+  `None` when the toolchain is absent).
+- **(B) `crates/rhi-metal/src/rt_pipeline.rs`.** Build the converter TLAB and populate
+  it with the engine's TLAS / instance table / storage buffers / output image; build
+  the raygen `MTLComputePipelineState` + `MTLVisibleFunctionTable` /
+  `MTLIntersectionFunctionTable` (the emulated SBT for miss/closesthit); implement
+  `trace_rays(w, h)` = dispatch the raygen kernel with the TLAB bound.
+- **(C) Facade / sandbox.** Route the Metal arms of `create_raytracing_pipeline` /
+  `bind_raytracing_pipeline` / `push_constants_rt` / `trace_rays` to the real impl;
+  flip `supports_rt_pipeline()` to `true`; verify the pipeline image ≈ the inline
+  image (`P8_PATHTRACE_PIPELINE`), validation-clean.

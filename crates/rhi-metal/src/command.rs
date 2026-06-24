@@ -548,6 +548,13 @@ impl MetalCommandBuffer {
                 let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
                 enc.useResource_usage(res, MTLResourceUsage::Read | MTLResourceUsage::Write);
             }
+            // Acceleration structures traced through the bindless `g.tlas` (the
+            // inline path tracer): the TLAS *and* every referenced BLAS must be
+            // resident, since they are reached indirectly via the argument buffer.
+            for accel in self.shared.rt_acceleration_structures().iter() {
+                let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**accel);
+                enc.useResource_usage(res, MTLResourceUsage::Read);
+            }
         }
         self.pipeline_threads.set(pipeline.threads_per_group);
         *self.compute_encoder.borrow_mut() = Some(enc);
