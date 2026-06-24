@@ -112,14 +112,18 @@ impl DeviceShared {
             // Hardware ray tracing (Phase 8): DXR needs RaytracingTier >= 1.1
             // (inline ray query path) and ID3D12Device5 / GraphicsCommandList4,
             // which are queried/cast where used. Gate so non-RT devices still work.
+            // `DREAMCOAST_NO_RAYTRACING` forces RT off (parity with Vulkan) so a
+            // capture tool that lacks DXR support can grab the raster path.
+            let force_no_rt = std::env::var_os("DREAMCOAST_NO_RAYTRACING").is_some();
             let mut options5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
-            let has_raytracing = device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_D3D12_OPTIONS5,
-                    &mut options5 as *mut _ as *mut core::ffi::c_void,
-                    std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS5>() as u32,
-                )
-                .is_ok()
+            let has_raytracing = !force_no_rt
+                && device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS5,
+                        &mut options5 as *mut _ as *mut core::ffi::c_void,
+                        std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS5>() as u32,
+                    )
+                    .is_ok()
                 && options5.RaytracingTier.0 >= D3D12_RAYTRACING_TIER_1_1.0;
 
             let queue_desc = D3D12_COMMAND_QUEUE_DESC {

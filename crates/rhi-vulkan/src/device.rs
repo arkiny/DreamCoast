@@ -135,11 +135,17 @@ impl DeviceShared {
             let supported_exts = raw_inst
                 .enumerate_device_extension_properties(instance.physical_device)
                 .unwrap_or_default();
-            let has_raytracing = rt_extensions.iter().all(|name| {
-                supported_exts
-                    .iter()
-                    .any(|e| e.extension_name_as_c_str() == Ok(name))
-            });
+            // `DREAMCOAST_NO_RAYTRACING` forces RT off so the RT extensions are not
+            // enabled at device creation. Capture tools that lack KHR ray-tracing
+            // support (e.g. older RenderDoc) otherwise fail device creation / the
+            // startup acceleration-structure build; the raster path needs no RT.
+            let force_no_rt = std::env::var_os("DREAMCOAST_NO_RAYTRACING").is_some();
+            let has_raytracing = !force_no_rt
+                && rt_extensions.iter().all(|name| {
+                    supported_exts
+                        .iter()
+                        .any(|e| e.extension_name_as_c_str() == Ok(name))
+                });
 
             let mut device_extensions = vec![ash::khr::swapchain::NAME.as_ptr()];
             if has_raytracing {
