@@ -1,6 +1,6 @@
 # 패스트레이서 정밀화 — Ground-Truth PBR 계획
 
-> 상위: [phase-8-raytracing.md](phase-8-raytracing.md) (Phase 8 ✅). **상태: 🚧 진행 중 — G1·G2·G3·G4 ✅, G5 남음.**
+> 상위: [phase-8-raytracing.md](phase-8-raytracing.md) (Phase 8 ✅). **상태: ✅ 완료 — G1~G5 전부.**
 > 후속 트랙으로, Phase 8의 "디퓨즈 GI only" 한계를 해소한다.
 > 공유 PT 코드는 `crates/shader/shaders/rt_common.slang`(rt_path/rt_pipeline가 include) — 인라인≡파이프라인 비트 동일 유지.
 
@@ -69,11 +69,36 @@
   검증: `cargo check -p dreamcoast-shader`, `cargo check -p sandbox`,
   `cargo clippy -p rhi -p sandbox --all-targets`, Metal inline/M7 screenshot, M7 validation layer clean.
 
-### G5 — 검증 + 문서화
-- **나란히 비교 하니스**: 같은 카메라/조명에서 패스트레이서(수렴) vs 래스터 PBR 스크린샷 + 수치 차이.
-  패스트레이서를 레퍼런스로, 래스터의 IBL 근사 오차를 문서화(향후 래스터 개선의 기준).
-- 인라인≡파이프라인(픽셀 근사), VK≡DX, Vulkan VUID 0 / D3D12 디버그 클린.
-- `docs/rt-pbr-parity.md` 검증/한계 채우기, `phase-8-raytracing.md`의 "디퓨즈 only" 한계 → 해소 표기, ROADMAP 메모.
+### G5 — 검증 + 문서화 ✅ (커밋됨)
+- **나란히 비교 하니스**: `tools/rt-compare.py RASTER.png PT.png OUT.png` → `래스터 | 패스트레이서 | 차이×4`
+  몽타주 + 픽셀 차이 통계(평균/최대/임계 초과 비율). 같은 고정 카메라로 캡처(헤드리스 `--screenshot-clean`):
+  ```
+  cargo run -p sandbox -- --backend vulkan --screenshot-clean tmp/raster.png            # 래스터
+  P8_PATHTRACE=1 cargo run -p sandbox -- --backend vulkan --screenshot-clean tmp/pt.png # PT(수렴)
+  python tools/rt-compare.py tmp/raster.png tmp/pt.png docs/images/rt-vs-raster.png
+  ```
+
+![Rasterizer vs ground-truth path tracer (raster | PT | diff x4)](images/rt-vs-raster.png)
+
+- **비교 결과 (샘플 씬, 동일 카메라)**: 평균 절대차 9.1/채널, >8 차이 22%, >32 차이 6%. 카메라/배경/위치는
+  완전 정렬(PT 카메라 = 래스터 `view_proj`의 역행렬). **차이의 대부분은 두 금속 구**(차이 패널에서 가장 밝음):
+  래스터는 split-sum IBL 큐브(근사) 반사, PT는 실제 광선추적 반사 → PT가 정답. 그 외 소프트 vs PCF 그림자,
+  디퓨즈 GI 컬러 블리딩. 디퓨즈 표면(아보카도·큐브)은 두 렌더러가 거의 일치. → **래스터 개선의 정량 기준 확보.**
+- **양 백엔드 패리티(전 게이트 누적)**: 인라인≡파이프라인 avg≤0.0010, VK≡DX avg≤0.0010, Cornell VK≡DX 0.0000,
+  Vulkan VUID 0 / D3D12 디버그 클린, build+fmt+clippy(`-D warnings`) 클린.
+
+## 검증 / 한계 (완료 시점)
+
+- **달성**: 패스트레이서가 래스터와 동일한 glTF metallic-roughness 머티리얼(텍스처/노멀맵 포함)을 쓰고,
+  물리 정확 Cook-Torrance BSDF(정확한 Smith G)·VNDF 중요도 샘플링·NEE·러시안 룰렛·디스크 태양광으로
+  **무편향 누적 레퍼런스**가 됐다. 인라인/파이프라인/Metal 세 경로 + 양 백엔드 일치.
+- **한계 (후속, 의도적 범위 밖)**:
+  - **MIS 없음** — BSDF↔광원 결합 다중중요도샘플링 미구현. 편향이 아니라 분산 문제(누적으로 수렴)지만,
+    완전 거울+작은 태양의 정반사 하이라이트가 노이즈가 큼. 큰 면광/환경 IS 도입 시 함께 추가 권장.
+  - **포인트광 미반영** — 현재 직접광은 태양(디스크)+하늘(env)+발광면. 래스터의 포인트광은 PT NEE에 미추가.
+  - **단일 산란 디퓨즈/정반사만** — 굴절·투명·SSS·이방성·클리어코트·볼류메트릭 없음.
+  - **디노이즈 없음** — 누적 수렴 의존(정지 카메라). 실시간 디노이저는 범위 밖.
+  - **정적 씬** — Phase 8의 일회성 AS 빌드 가정 그대로(동적 리빌드/refit 없음).
 
 ## 설계 메모 / 위험
 - **인라인·파이프라인 동시 유지**: 모든 BSDF/샘플링 코드는 두 셰이더(`rt_path.slang`/`rt_pipeline.slang`)에

@@ -217,6 +217,8 @@ Cornell 박스 — 발광 천장 1개로만 조명되는 폐쇄 공간. 적/녹 
 ## 알려진 한계 / 이후 작업 (예정)
 
 - 정적 씬 가정(AS 빌드 일회성) — 동적 리빌드/refit·압축은 후속.
-- 디퓨즈 GI only(완전 BSDF·굴절·NEE·MIS 없음), 디노이즈 없음(누적 의존).
+- ~~디퓨즈 GI only~~ → **해소**: 후속 트랙 [rt-pbr-parity.md](rt-pbr-parity.md)에서 풀 metallic-roughness PBR
+  (Cook-Torrance + VNDF IS + NEE + 러시안 룰렛 + 디스크 태양광 + 텍스처/노멀맵)로 확장, 무편향 Ground-Truth화.
+  남은 한계(MIS·포인트광·굴절·디노이즈)는 그 문서 참조. 디노이즈 없음(누적 의존)은 유지.
 - RT 파이프라인은 단순 SBT(1 raygen / 1 miss / 1 hit group) — 머티리얼별 hit 그룹·다중 miss는 후속.
 - (이월) 런타임 Slang 리플렉션/핫리로드 — 빌드타임 임베드 유지.
