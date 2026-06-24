@@ -120,6 +120,9 @@ engine/                 # cargo workspace root
 - 예제: **간단 패스트레이서** (디퓨즈 GI 누적; 인라인·파이프라인 두 경로로 검증)
 - **완료 기준 달성**: 두 백엔드에서 하드웨어 RT 결과 일치 — 인라인 ≈ 파이프라인(픽셀 근사),
   VK ≡ DX(파이프라인 Cornell avg 0.0000/max 1), Vulkan 검증 클린 / D3D12 디버그 클린
+- **후속(완료)**: 패스트레이서를 무편향 **Ground-Truth PBR** 레퍼런스로 확장 —
+  [rt-pbr-parity.md](rt-pbr-parity.md) (full metallic-roughness BSDF·VNDF IS·NEE·러시안 룰렛·디스크 태양광·
+  텍스처/노멀맵; 래스터 vs PT 비교 하니스 `tools/rt-compare.py`). 래스터가 수렴해야 할 정답.
 
 ### Phase 9 — 툴링 & 마무리
 - GPU 프로파일링(타임스탬프 쿼리), 디버그 마커(PIX/RenderDoc/NSight), 검증 레이어 토글
