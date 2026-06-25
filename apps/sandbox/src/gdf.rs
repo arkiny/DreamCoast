@@ -41,7 +41,23 @@ pub(crate) struct GdfSystem {
     bake_tri_count: u32,
     /// (table, instance count) for the merge; `None` without a volume.
     instances: Option<(StorageBuffer, u32)>,
+    /// Stage C1: world-space GDF of the actual sample scene. The scene's object
+    /// triangles are fused into one world-space soup and brute-force baked into this
+    /// volume over the scene AABB (the per-mesh-SDF + clipmap merge for dynamic
+    /// objects is a later refinement); the ground is added analytically at trace time.
+    scene_gdf: Option<Volume>,
+    scene_vtx: Option<StorageBuffer>,
+    scene_idx: Option<StorageBuffer>,
+    scene_tri_count: u32,
+    /// World-space AABB the `scene_gdf` voxel grid maps to.
+    scene_aabb_min: [f32; 3],
+    scene_aabb_max: [f32; 3],
 }
+
+/// Scene-GDF volume edge length (cube). Coarser than `VOLUME_DIM`: the fused
+/// brute-force bake is O(voxels·tris) over the whole scene, so a 48³ grid keeps the
+/// one-time bake well under the GPU watchdog while staying ample for low-frequency GI.
+const SCENE_DIM: u32 = 48;
 
 impl GdfSystem {
     pub(crate) fn new(
@@ -128,7 +144,7 @@ impl GdfSystem {
             dreamcoast_shader::gdf_trace_cs_dxil,
             dreamcoast_shader::gdf_trace_cs_metallib,
             "gdf_trace",
-            128,
+            160,
             [8, 8, 1],
         )?;
         let sdf_pipeline = compute(
@@ -230,7 +246,165 @@ impl GdfSystem {
             bake_idx,
             bake_tri_count,
             instances,
+            scene_gdf: None,
+            scene_vtx: None,
+            scene_idx: None,
+            scene_tri_count: 0,
+            scene_aabb_min: [0.0; 3],
+            scene_aabb_max: [0.0; 3],
         })
+    }
+
+    /// Stage C1: register the fused world-space scene geometry (a single triangle soup
+    /// of all opaque scene objects, already transformed to world space) + its world
+    /// AABB, and allocate the scene GDF volume. The bake itself runs once on the graph
+    /// (`record_scene_build`). No-op when compute is unsupported.
+    pub(crate) fn build_scene_sdf(
+        &mut self,
+        device: &Device,
+        fused_vtx: &[u8],
+        fused_idx: &[u8],
+        tri_count: u32,
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+    ) -> anyhow::Result<()> {
+        if self.gdf.is_none() {
+            return Ok(()); // compute unsupported (no volumes created)
+        }
+        self.scene_gdf = Some(device.create_volume(&VolumeDesc {
+            width: SCENE_DIM,
+            height: SCENE_DIM,
+            depth: SCENE_DIM,
+            format: Format::R32Float,
+        })?);
+        self.scene_vtx = Some(device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: fused_vtx.len() as u64,
+                stride: 32,
+                indirect: false,
+            },
+            fused_vtx,
+        )?);
+        self.scene_idx = Some(device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: fused_idx.len() as u64,
+                stride: 4,
+                indirect: false,
+            },
+            fused_idx,
+        )?);
+        self.scene_tri_count = tri_count;
+        self.scene_aabb_min = aabb_min;
+        self.scene_aabb_max = aabb_max;
+        Ok(())
+    }
+
+    pub(crate) fn has_scene_sdf(&self) -> bool {
+        self.scene_gdf.is_some()
+    }
+
+    /// Stage C1: build the world-space scene GDF (fused brute-force bake, once) then SW
+    /// ray-trace it from the live camera — the validation that the world GDF matches the
+    /// rasterized scene. Reuses the Stage-A/B4 trace machinery (now reading the world
+    /// volume over the scene AABB, ground at y=0). Returns the output storage image.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_scene_gdf<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        extent: Extent2D,
+        eye: Vec3,
+        inv_view_proj: [f32; 16],
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        cw: u32,
+        ch: u32,
+        flip_y: u32,
+        build: bool,
+    ) -> ResourceId {
+        let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
+        let tracep = self.trace_pipeline.as_ref().expect("gdf trace pipeline");
+        let out = graph.create_storage_image("scene_gdf_out", HDR_FORMAT, extent);
+        let gdf_ext = graph.import_external("scene_gdf");
+        let aabb_min = self.scene_aabb_min;
+        let aabb_max = self.scene_aabb_max;
+        if build {
+            self.record_scene_bake(graph, gdf_ext);
+        }
+        let sampled = vol.sampled_index();
+        // Sample clamp = AABB diagonal: exceeds the field's true max distance so the
+        // march never wrongly clamps (the fused bake fills every voxel — no sparse
+        // sentinel), while keeping the empty-space step bounded.
+        let diag = {
+            let d = [
+                aabb_max[0] - aabb_min[0],
+                aabb_max[1] - aabb_min[1],
+                aabb_max[2] - aabb_min[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "scene_gdf_trace",
+                storage_writes: vec![out],
+                reads: vec![gdf_ext],
+            },
+            move |ctx| {
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(vol);
+                cmd.bind_compute_pipeline(tracep);
+                cmd.push_constants_compute(&gdf_trace_push(
+                    &inv_view_proj,
+                    eye,
+                    sun_dir,
+                    sun_intensity,
+                    out_index,
+                    cw,
+                    ch,
+                    flip_y,
+                    sampled,
+                    0, // mode 0: sample the baked GDF (no analytic reference)
+                    aabb_min,
+                    aabb_max,
+                    0.0, // world ground plane at y = 0
+                    diag,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
+    /// The fused scene bake pass: brute-force the world-space triangle soup into the
+    /// scene GDF over the scene AABB (Stage C1).
+    fn record_scene_bake<'a>(&'a self, graph: &mut RenderGraph<'a>, gdf_ext: ResourceId) {
+        let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
+        let bakep = self.bake_pipeline.as_ref().expect("bake pipeline");
+        let vtx = self.scene_vtx.as_ref().expect("scene vtx").storage_index();
+        let idx = self.scene_idx.as_ref().expect("scene idx").storage_index();
+        let storage = vol.storage_index();
+        let tri_count = self.scene_tri_count;
+        let aabb_min = self.scene_aabb_min;
+        let aabb_max = self.scene_aabb_max;
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "scene_sdf_bake",
+                storage_writes: vec![gdf_ext],
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.volume_to_storage(vol);
+                cmd.bind_compute_pipeline(bakep);
+                cmd.push_constants_compute(&sdf_bake_push(
+                    storage, SCENE_DIM, tri_count, vtx, idx, aabb_min, aabb_max,
+                ));
+                let g = SCENE_DIM.div_ceil(4);
+                cmd.dispatch(g, g, g);
+                Ok(())
+            },
+        );
     }
 
     // Feature-availability predicates (drive the UI checkboxes + toggle defaults).
@@ -430,6 +604,10 @@ impl GdfSystem {
                     flip_y,
                     gdf_sampled,
                     mode,
+                    [0.0, 0.0, 0.0], // unit-cube GDF extent (B4)
+                    [1.0, 1.0, 1.0],
+                    0.2,             // ground plane height
+                    0.6,             // sample clamp (> unit-cube field max)
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
@@ -457,7 +635,13 @@ impl GdfSystem {
                 cmd.volume_to_storage(vol);
                 cmd.bind_compute_pipeline(bakep);
                 cmd.push_constants_compute(&sdf_bake_push(
-                    storage, VOLUME_DIM, tri_count, vtx, idx,
+                    storage,
+                    VOLUME_DIM,
+                    tri_count,
+                    vtx,
+                    idx,
+                    [0.0, 0.0, 0.0],
+                    [1.0, 1.0, 1.0],
                 ));
                 let g = VOLUME_DIM.div_ceil(4);
                 cmd.dispatch(g, g, g);

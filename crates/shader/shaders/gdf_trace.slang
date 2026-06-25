@@ -18,13 +18,8 @@
 
 #include "bindless.slang"
 
-// The GDF world extent: the unit cube, matching B3's merge AABB. When the clipmap
-// becomes multi-level/configurable these move into the push block.
-static const float3 GDF_MIN = float3(0.0, 0.0, 0.0);
-static const float3 GDF_MAX = float3(1.0, 1.0, 1.0);
-// Ground plane height; the verification sphere (centre 0.5, radius 0.3) rests on it.
-static const float GROUND_Y = 0.2;
 // The analytic field the bake came from (B2): a sphere at the unit-cube centre.
+// Only used by the `mode` bit0 reference path (the B4 unit-cube correctness check).
 static const float3 REF_CENTRE = float3(0.5, 0.5, 0.5);
 static const float REF_RADIUS = 0.3;
 
@@ -41,10 +36,18 @@ struct GdfPush
     uint mode;              // bit0: 1 = analytic reference field instead of the GDF
     uint pad0;
     uint pad1;
+    // The GDF world extent (the volume's AABB) + ground plane height in .w. B4 passes
+    // the unit cube + 0.2; Stage C1 passes the world scene AABB + ground y=0.
+    float4 aabb_min;        // xyz volume min, w = ground plane Y
+    float4 aabb_max;        // xyz volume max
 };
 
 [[vk::push_constant]]
 ConstantBuffer<GdfPush> pc : register(b0, space0);
+
+#define GDF_MIN (pc.aabb_min.xyz)
+#define GDF_MAX (pc.aabb_max.xyz)
+#define GROUND_Y (pc.aabb_min.w)
 
 // Distance to the baked geometry inside the GDF box — the trilinear sample, or the
 // analytic field it was baked from when mode bit0 is set. Outside the box there is no
@@ -60,9 +63,9 @@ float geo_inside(float3 p)
     if (any(uvw < 0.0) || any(uvw > 1.0))
         return 1e3; // outside the box: no geometry here
     // Clamp the sample so a sparse GDF's empty-voxel sentinel can't make the march
-    // overshoot; 0.6 exceeds the true max distance of the full-coverage field, so the
-    // verification sphere is unaffected.
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, 0.6);
+    // overshoot. The clamp (aabb_max.w) exceeds the field's true max distance — 0.6 for
+    // the unit-cube B4 field, the world extent for the C1 scene field.
+    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
 }
 
 // Geometry distance for the *primary* march: like `geo_inside`, but outside the box it
@@ -81,7 +84,7 @@ float geo_march(float3 p)
         float box = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
         return max(box, 0.003); // never below the hit epsilon -> box is not a surface
     }
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, 0.6);
+    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
 }
 
 // Scene distance for the primary march (geometry-with-box-proxy unioned with ground).

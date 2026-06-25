@@ -335,16 +335,20 @@ pub(crate) fn volume_push(
     pc
 }
 
-/// Pack the Phase 11 Stage B2 SDF-bake push block (64 bytes): vol_storage, dim,
-/// tri_count, vtx_index, idx_index, pad0, then float4 aabb_min / aabb_max (16-byte
-/// aligned, so 8 bytes of padding precede them). The volume's AABB is the unit cube
-/// — matching B1's analytic fill so the baked sphere is pixel-comparable.
+/// Pack the Phase 11 SDF-bake push block (64 bytes): vol_storage, dim, tri_count,
+/// vtx_index, idx_index, pad0, then float4 aabb_min / aabb_max (16-byte aligned, so 8
+/// bytes of padding precede them) — the world-space extent the volume's voxel grid maps
+/// to. B2 passes the unit cube (baked sphere pixel-comparable to B1's analytic fill);
+/// C1 passes the world scene AABB for the fused scene bake.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sdf_bake_push(
     vol_storage: u32,
     dim: u32,
     tri_count: u32,
     vtx_index: u32,
     idx_index: u32,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
 ) -> [u8; 64] {
     let mut pc = [0u8; 64];
     pc[0..4].copy_from_slice(&vol_storage.to_le_bytes());
@@ -353,13 +357,12 @@ pub(crate) fn sdf_bake_push(
     pc[12..16].copy_from_slice(&vtx_index.to_le_bytes());
     pc[16..20].copy_from_slice(&idx_index.to_le_bytes());
     // pc[20..32]: pad0 + alignment padding to the float4 boundary.
-    // aabb_min = (0,0,0,0), aabb_max = (1,1,1,0): the unit-cube volume extent.
-    pc[32..36].copy_from_slice(&0.0f32.to_le_bytes());
-    pc[36..40].copy_from_slice(&0.0f32.to_le_bytes());
-    pc[40..44].copy_from_slice(&0.0f32.to_le_bytes());
-    pc[48..52].copy_from_slice(&1.0f32.to_le_bytes());
-    pc[52..56].copy_from_slice(&1.0f32.to_le_bytes());
-    pc[56..60].copy_from_slice(&1.0f32.to_le_bytes());
+    for (i, v) in aabb_min.iter().enumerate() {
+        pc[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in aabb_max.iter().enumerate() {
+        pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
     pc
 }
 
@@ -386,10 +389,12 @@ pub(crate) fn gdf_merge_push(
     pc
 }
 
-/// Pack the Phase 11 Stage B4 GDF-trace push block (128 bytes): inv_view_proj (64) +
-/// cam_pos (16) + sun dir+intensity (16) + (out, width, height, flip_y) (16) +
-/// (gdf_sampled, mode, pad, pad) (16). `mode` bit0 swaps the GDF sample for the
-/// analytic reference field. Same head layout as `sdf_trace_push`.
+/// Pack the Phase 11 GDF-trace push block (160 bytes): inv_view_proj (64) + cam_pos
+/// (16) + sun dir+intensity (16) + (out, width, height, flip_y) (16) + (gdf_sampled,
+/// mode, pad, pad) (16) + aabb_min.xyz/ground_y (16) + aabb_max.xyz/dist_clamp (16).
+/// `mode` bit0 swaps the GDF sample for the analytic reference field. The GDF world
+/// extent + ground height + sample clamp move with the field (B4 unit cube vs. C1
+/// scene). Same head layout as `sdf_trace_push`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gdf_trace_push(
     inv_view_proj: &[f32; 16],
@@ -402,8 +407,12 @@ pub(crate) fn gdf_trace_push(
     flip_y: u32,
     gdf_sampled: u32,
     mode: u32,
-) -> [u8; 128] {
-    let mut pc = [0u8; 128];
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+    ground_y: f32,
+    dist_clamp: f32,
+) -> [u8; 160] {
+    let mut pc = [0u8; 160];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -421,6 +430,16 @@ pub(crate) fn gdf_trace_push(
     pc[108..112].copy_from_slice(&flip_y.to_le_bytes());
     pc[112..116].copy_from_slice(&gdf_sampled.to_le_bytes());
     pc[116..120].copy_from_slice(&mode.to_le_bytes());
+    // aabb_min.xyz + ground_y in .w
+    for (i, v) in aabb_min.iter().enumerate() {
+        pc[128 + i * 4..132 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[140..144].copy_from_slice(&ground_y.to_le_bytes());
+    // aabb_max.xyz + sample clamp in .w
+    for (i, v) in aabb_max.iter().enumerate() {
+        pc[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[156..160].copy_from_slice(&dist_clamp.to_le_bytes());
     pc
 }
 
