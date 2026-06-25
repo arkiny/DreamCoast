@@ -53,6 +53,9 @@ pub(crate) fn pixel_format(format: Format) -> MTLPixelFormat {
         Format::Rgba16Float => MTLPixelFormat::RGBA16Float,
         Format::Rg16Float => MTLPixelFormat::RG16Float,
         Format::Depth32Float => MTLPixelFormat::Depth32Float,
+        // Single-channel 32-bit float: signed distance for the Phase 11 volume
+        // (`Texture3D<float>` / `RWTexture3D<float>` in `bindless.slang`).
+        Format::R32Float => MTLPixelFormat::R32Float,
     }
 }
 
@@ -64,7 +67,8 @@ pub(crate) fn bytes_per_pixel(format: Format) -> usize {
         | Format::Rgba8Unorm
         | Format::Rgba8Srgb
         | Format::Rg16Float
-        | Format::Depth32Float => 4,
+        | Format::Depth32Float
+        | Format::R32Float => 4,
         Format::Rgba16Float => 8,
     }
 }
