@@ -9,10 +9,11 @@ DreamCoast is a custom renderer + engine layered directly on **raw Vulkan
 (synchronization, descriptors, bindless, the render graph, ray tracing) by
 implementing them by hand, behind a single self-designed RHI.
 
-The Windows backends (Vulkan + D3D12) are complete through Phase 8 (hardware ray
-tracing); a native **Metal backend for macOS** is being brought up in parallel and
-now covers Phase 7 plus Phase 8 inline ray tracing, with an experimental Metal
-Shader Converter RT-pipeline path — see
+The Windows backends (Vulkan + D3D12) are complete through Phase 9 (tooling &
+profiling), with Phases 10–13 (virtual geometry, software-RT distance-field GI,
+cooked-asset pipeline, scene graph) planned. A native **Metal backend for macOS**
+is being brought up in parallel and now covers Phase 7 plus Phase 8 inline ray
+tracing, with an experimental Metal Shader Converter RT-pipeline path — see
 [`docs/metal-backend.md`](docs/metal-backend.md).
 
 ## Built with an AI agent
@@ -25,7 +26,7 @@ backends, and keeps the plans honest.
 
 The process is part of the artifact:
 
-- **[`docs/ROADMAP.md`](docs/ROADMAP.md)** — the macro plan (10 phases).
+- **[`docs/ROADMAP.md`](docs/ROADMAP.md)** — the macro plan (Phases 0–13 + Metal backend).
 - **[`docs/phase-N-*.md`](docs/)** — a detailed, reviewed plan written and signed
   off *before* each phase is implemented.
 - Each phase lands as its own commit, verified on both backends.
@@ -67,7 +68,11 @@ Backend parity is a hard rule: every milestone must produce identical results on
 - [x] **Phase 6** — PBR deferred renderer (Cook-Torrance, IBL, shadows)
 - [x] **Phase 7** — Compute / GPGPU (async compute, GPU particles, GPU culling + indirect draw)
 - [x] **Phase 8** — Ray tracing (DXR + VK_KHR) — inline ray query + full RT pipeline/SBT
-- [ ] **Phase 9** — Tooling & profiling
+- [x] **Phase 9** — Tooling & profiling (per-pass GPU timestamps, debug markers, validation toggle, sample browser)
+- [ ] **Phase 10** — Virtual geometry (cluster-LOD, GPU culling/HZB, SW raster) — experimental / planned
+- [ ] **Phase 11** — Software ray tracing + distance-field GI — Stage A done; B/C planned
+- [ ] **Phase 12** — Cooked-asset pipeline (`.dcasset`) + shader bytecode cook cache — planned
+- [ ] **Phase 13** — Scene graph + level streaming — planned
 
 ### Metal backend (macOS)
 
@@ -83,7 +88,7 @@ Converter path for the DXR-style RT pipeline/SBT. Details and toolchain setup:
 - [x] **M4** — Render targets + render graph + PBR deferred (shadow → G-buffer → IBL → lighting → tonemap)
 - [x] **M5** — Compute / async compute / indirect draw
 - [x] **M6** — Phase 8 inline ray tracing (`RayQuery`)
-- [x] **M7** — Metal Shader Converter RT-pipeline plumbing (compile-verified; runtime screenshot pending)
+- [x] **M7** — Metal Shader Converter RT-pipeline plumbing (runtime-verified: inline/pipeline screenshots + Metal API/GPU validation clean)
 
 ## Build & run
 
