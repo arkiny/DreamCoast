@@ -68,7 +68,12 @@ Feature groups (setup line / loop line):
   draw pipelines, and the grid's cube mesh. `import` declares the external graph
   resources, `record_cull` adds the reset + cull compute passes, `record_draw` the
   indirect draw (its own depth). Per-frame grid placement passed as a `CullGrid`.
-- **R3 — `swrt.rs` / `GdfSystem`** (Phase-11 volumes/bake/merge/trace/view).
+- **R3 — `gdf.rs` / `GdfSystem`. DONE.** The largest bundle: owns both volumes, the
+  bake mesh, the instance table, and all six Stage-A/B compute pipelines. One
+  `record_*` per feature (sdf trace / volume test / bake view / gdf view / gdf trace),
+  each returning the output image; shared `build_gdf` (bake + merge) and `view_volume`
+  helpers cut the duplication. The frame loop keeps the mutual-exclusion gating and the
+  build-once flags, passing `build: bool` in (the flag set in `run()` after the call).
 - **R4 — `rt.rs` / `RtSystem`** (HW RT + path tracer + Cornell).
 - **R5 — `ibl.rs` / `IblSystem`** (fold the IBL resources in beside the existing fns).
 - **R6 — `deferred.rs` / `DeferredRenderer`** (the PBR backbone).
