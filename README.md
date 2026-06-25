@@ -11,10 +11,10 @@ implementing them by hand, behind a single self-designed RHI.
 
 The Windows backends (Vulkan + D3D12) are complete through Phase 9 (tooling &
 profiling), with Phases 10–13 (virtual geometry, software-RT distance-field GI,
-cooked-asset pipeline, scene graph) planned. A native **Metal backend for macOS**
-is being brought up in parallel and now covers Phase 7 plus Phase 8 inline ray
-tracing, with an experimental Metal Shader Converter RT-pipeline path — see
-[`docs/metal-backend.md`](docs/metal-backend.md).
+cooked-asset pipeline, scene graph) planned. The native **Metal backend for macOS**
+is at near-full parity — including Phase-8 ray tracing (inline `RayQuery` **and** the
+DXR-style RT pipeline via Metal Shader Converter); the main gap is the Phase-9
+profiling / marker tooling. See [`docs/metal-backend.md`](docs/metal-backend.md).
 
 ## Built with an AI agent
 
@@ -76,19 +76,22 @@ Backend parity is a hard rule: every milestone must produce identical results on
 
 ### Metal backend (macOS)
 
-A native Metal backend brought up in milestones, targeting parity **through
-Phase 7** plus Phase 8 inline ray tracing. M7 adds an experimental Metal Shader
-Converter path for the DXR-style RT pipeline/SBT. Details and toolchain setup:
-[`docs/metal-backend.md`](docs/metal-backend.md).
+The Metal backend (`crates/rhi-metal`) shares the same `rhi` facade, render graph,
+GUI, and assets, so it tracks the phase list above rather than carrying a separate
+milestone roadmap. It is at near-full parity with the Windows backends: the
+deferred-PBR renderer, the Phase-7 compute / async / indirect-draw demos, Phase-8
+ray tracing via **both** the inline `RayQuery` path and the DXR-style RT pipeline
+(through Apple Metal Shader Converter), and the Phase-11 Stage A/B software-RT +
+distance-field-volume work all run on Metal. Toolchain setup and per-milestone
+bring-up notes live in [`docs/metal-backend.md`](docs/metal-backend.md).
 
-- [x] **M0** — Cross-platform skeleton: Cocoa/`CAMetalLayer` window + clear loop
-- [x] **M1** — Slang → `metallib` shader pipeline
-- [x] **M2** — Triangle (graphics pipeline + draw)
-- [x] **M3** — Bindless (argument buffers) + textures + ImGui
-- [x] **M4** — Render targets + render graph + PBR deferred (shadow → G-buffer → IBL → lighting → tonemap)
-- [x] **M5** — Compute / async compute / indirect draw
-- [x] **M6** — Phase 8 inline ray tracing (`RayQuery`)
-- [x] **M7** — Metal Shader Converter RT-pipeline plumbing (runtime-verified: inline/pipeline screenshots + Metal API/GPU validation clean)
+**Not (yet) on Metal:**
+
+- **Phase 9 tooling** — GPU timestamp profiling and debug markers / object naming are
+  stubbed (no-ops); the sample browser and validation toggles work as elsewhere.
+- **RT pipeline is opt-in** — the DXR-style RT pipeline needs optional build-time
+  tools (Apple Metal Shader Converter + a locally built `dxc`). Without them Metal
+  falls back to the inline `RayQuery` path, the default on every backend.
 
 ## Build & run
 
@@ -101,9 +104,9 @@ cargo run -p sandbox -- --backend metal
 ```
 
 On macOS the Metal backend runs the full deferred-PBR renderer, the Phase-7
-compute demos / async compute, and Phase-8 inline ray tracing. The experimental
-RT-pipeline path uses Apple Metal Shader Converter when its build-time tools are
-available. The per-milestone bring-up flags
+compute demos / async compute, and Phase-8 ray tracing. The inline `RayQuery` path
+is the default; the DXR-style RT pipeline additionally runs through Apple Metal
+Shader Converter when its build-time tools are available. The per-milestone bring-up flags
 (`--clear-test` / `--triangle-test` / `--mesh-test`), the compute-demo env toggles,
 and the Metal toolchain setup are documented in
 [`docs/metal-backend.md`](docs/metal-backend.md).
