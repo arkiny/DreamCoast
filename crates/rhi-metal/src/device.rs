@@ -68,9 +68,31 @@ pub(crate) const STORAGE_BUFFER_BASE: u32 = STORAGE_IMAGE_BASE + STORAGE_IMAGE_C
 /// devices; written by [`MetalDevice::bind_tlas`] (Phase 8).
 pub(crate) const TLAS_SLOT: u32 = STORAGE_BUFFER_BASE + STORAGE_BUFFER_COUNT;
 
-/// Total number of 8-byte handle slots in the bindless argument buffer (one extra
-/// slot past the storage buffers for the TLAS handle).
-pub(crate) const ARG_BUFFER_SLOTS: u32 = TLAS_SLOT + 1;
+/// Size of the bindless sampled-volume (3D SRV) table. Matches `VOLUME_COUNT` in
+/// rhi-vulkan / rhi-d3d12 and `Bindless.volumes[64]` in `bindless.slang` (Phase 11
+/// Stage B distance fields, trilinear-sampled by the SW ray marcher).
+pub(crate) const VOLUME_COUNT: u32 = 64;
+
+/// Size of the bindless storage-volume (3D UAV) table. Matches
+/// `STORAGE_VOLUME_COUNT` and `Bindless.storage_volumes[64]`; the SDF bake / GDF
+/// merge compute shaders write these.
+pub(crate) const STORAGE_VOLUME_COUNT: u32 = 64;
+
+/// First argument-buffer slot of the sampled-volume region. The volumes follow the
+/// TLAS in declaration order, and Slang's Metal target keeps the `tlas` member in
+/// the argument-buffer struct even for shaders that never trace (it does not compact
+/// unused members), so `volumes` lands one slot past the TLAS — matching the MSL
+/// layout `... storage_buffers[64], tlas, volumes[64], storage_volumes[64]`.
+pub(crate) const VOLUME_BASE: u32 = TLAS_SLOT + 1;
+
+/// First argument-buffer slot of the storage-volume region (just past the sampled
+/// volumes).
+pub(crate) const STORAGE_VOLUME_BASE: u32 = VOLUME_BASE + VOLUME_COUNT;
+
+/// Total number of 8-byte handle slots in the bindless argument buffer: textures,
+/// sampler, cubes, storage images, storage buffers, the TLAS slot, then the sampled
+/// + storage volume tables (Phase 11 Stage B).
+pub(crate) const ARG_BUFFER_SLOTS: u32 = STORAGE_VOLUME_BASE + STORAGE_VOLUME_COUNT;
 
 type MetalTextureHandle = Retained<ProtocolObject<dyn MTLTexture>>;
 type SampledTextureSlots = Vec<Option<MetalTextureHandle>>;
@@ -112,6 +134,12 @@ pub(crate) struct DeviceShared {
     /// Next free bindless storage-buffer slot (0-based; handle at
     /// `STORAGE_BUFFER_BASE + index`).
     storage_buf_next: Cell<u32>,
+    /// Next free bindless sampled-volume slot (0-based; handle at
+    /// `VOLUME_BASE + index`). Phase 11 Stage B.
+    volume_next: Cell<u32>,
+    /// Next free bindless storage-volume (UAV) slot (0-based; handle at
+    /// `STORAGE_VOLUME_BASE + index`). Phase 11 Stage B.
+    storage_volume_next: Cell<u32>,
     /// The per-frame globals UBO (camera/lights/shadow/IBL), set once via
     /// [`MetalDevice::set_globals_buffer`]; bound at [`GLOBALS_BUFFER_INDEX`] with a
     /// per-draw byte offset for `uses_globals` pipelines.
@@ -236,6 +264,29 @@ impl DeviceShared {
             std::ptr::copy_nonoverlapping((&addr as *const u64).cast::<u8>(), dst, n);
         }
         self.storage_buffers.borrow_mut().push(buffer.clone());
+        index
+    }
+
+    /// Register a 3D volume texture in the bindless sampled-volume table
+    /// (`volumes[]`, handle at `VOLUME_BASE + index`), returning its 0-based index.
+    /// Like a cube it is not made resident here; `volume_to_sampled` does that before
+    /// the SW ray marcher samples it. The owning `MetalVolume` keeps the texture
+    /// alive (the argument buffer just records its 8-byte handle). Phase 11 Stage B.
+    fn register_volume(&self, texture: &Retained<ProtocolObject<dyn MTLTexture>>) -> u32 {
+        let index = self.volume_next.get();
+        self.volume_next.set(index + 1);
+        self.write_handle(VOLUME_BASE + index, texture.gpuResourceID());
+        index
+    }
+
+    /// Register a 3D volume texture in the bindless storage-volume (UAV) table
+    /// (`storage_volumes[]`, handle at `STORAGE_VOLUME_BASE + index`), returning its
+    /// 0-based index. Made resident with `Read | Write` by `volume_to_storage` before
+    /// a bake/merge compute pass writes it. Phase 11 Stage B.
+    fn register_storage_volume(&self, texture: &Retained<ProtocolObject<dyn MTLTexture>>) -> u32 {
+        let index = self.storage_volume_next.get();
+        self.storage_volume_next.set(index + 1);
+        self.write_handle(STORAGE_VOLUME_BASE + index, texture.gpuResourceID());
         index
     }
 
@@ -460,6 +511,8 @@ impl MetalInstance {
             cube_next: Cell::new(0),
             storage_img_next: Cell::new(0),
             storage_buf_next: Cell::new(0),
+            volume_next: Cell::new(0),
+            storage_volume_next: Cell::new(0),
             globals: RefCell::new(None),
             resident: RefCell::new(Vec::new()),
             sampled_textures: RefCell::new(Vec::new()),
@@ -771,13 +824,44 @@ impl MetalDevice {
         td
     }
 
-    /// Create a 3D (volume) texture (Phase 11 Stage B). **Stub** — implemented on
-    /// the Windows backends first; the Metal argument buffer needs the volume tables.
+    /// Create a 3D (volume) texture (Phase 11 Stage B distance fields), registered in
+    /// both bindless volume tables: `storage_volumes[]` (UAV) for the SDF bake / GDF
+    /// merge compute writes and `volumes[]` (SRV) for trilinear sampling by the SW ray
+    /// marcher. `Private` storage (GPU-only — the bake seeds it, no host upload);
+    /// `ShaderRead | ShaderWrite` for the sampled + UAV uses. One `MTLTexture`,
+    /// registered in both tables (the Vulkan single-view / D3D12 SRV+UAV mirror).
+    /// Residency is toggled per use by `volume_to_storage` / `volume_to_sampled`,
+    /// like the 2D storage render target.
     pub fn create_volume(
         &self,
-        _desc: &rhi_types::VolumeDesc,
+        desc: &rhi_types::VolumeDesc,
     ) -> Result<crate::resources::MetalVolume> {
-        unimplemented!("Phase 11 Stage B: 3D volume textures not yet on the Metal backend")
+        let td = MTLTextureDescriptor::new();
+        td.setTextureType(MTLTextureType::Type3D);
+        td.setPixelFormat(pixel_format(desc.format));
+        // The dimension setters are `unsafe` in objc2-metal (the 2D path bakes them
+        // into the `texture2DDescriptor…` constructor instead); a 3D texture has no
+        // such convenience constructor, so set them directly.
+        unsafe {
+            td.setWidth(desc.width.max(1) as usize);
+            td.setHeight(desc.height.max(1) as usize);
+            td.setDepth(desc.depth.max(1) as usize);
+            td.setMipmapLevelCount(1);
+        }
+        td.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
+        td.setStorageMode(MTLStorageMode::Private);
+        let texture = self
+            .shared
+            .device
+            .newTextureWithDescriptor(&td)
+            .ok_or_else(|| rhi_err("volume newTexture failed"))?;
+        let sampled_index = self.shared.register_volume(&texture);
+        let storage_index = self.shared.register_storage_volume(&texture);
+        Ok(crate::resources::MetalVolume::new(
+            texture,
+            sampled_index,
+            storage_index,
+        ))
     }
 
     /// Create an offscreen color render target (color attachment + bindless
