@@ -1,4 +1,4 @@
-// Phase 11 Stage A (A1) — compute software ray tracing via SDF sphere tracing.
+// Phase 11 Stage A (A1+A2) — compute software ray tracing via SDF sphere tracing.
 //
 // A compute shader that traces one primary camera ray per pixel against an
 // *analytic* signed-distance-field scene (spheres / box / ground plane) by sphere
@@ -123,6 +123,47 @@ float3 sky(float3 dir, float3 sun_dir, float sun_i)
     return col;
 }
 
+// Penumbra soft shadow by sphere tracing toward the light (Inigo Quilez): march a
+// shadow ray and track the closest the ray passes to any surface, scaled by 1/t, to
+// approximate how much of the (finite) sun disk is occluded. `k` sets the penumbra
+// hardness (larger = sharper); tuned to roughly match the path tracer's ~1.1° disk
+// sun. Returns a [0,1] visibility factor with soft edges (A2 — replaces A1's none).
+float soft_shadow(float3 origin, float3 dir, float k)
+{
+    float res = 1.0;
+    float t = 0.02; // start off the surface to avoid self-shadowing
+    const float MAX_T = 40.0;
+    for (int i = 0; i < 96; i++)
+    {
+        float h = scene_dist(origin + dir * t);
+        if (h < 0.001)
+            return 0.0; // fully occluded
+        res = min(res, k * h / t);
+        t += clamp(h, 0.01, 0.4);
+        if (t > MAX_T)
+            break;
+    }
+    return saturate(res);
+}
+
+// Marched ambient occlusion (Inigo Quilez 5-tap): step short distances along the
+// surface normal and compare the expected free distance to the actual field value;
+// where the field falls short, geometry is nearby and the point is occluded. Scales
+// the sky ambient so creases/contacts darken (A2).
+float calc_ao(float3 p, float3 n)
+{
+    float occ = 0.0;
+    float sca = 1.0;
+    for (int i = 0; i < 5; i++)
+    {
+        float h = 0.01 + 0.12 * float(i) / 4.0;
+        float d = scene_dist(p + n * h);
+        occ += (h - d) * sca;
+        sca *= 0.95;
+    }
+    return saturate(1.0 - 3.0 * occ);
+}
+
 // Sphere-trace a ray; returns true on a surface hit and writes the hit point.
 bool sphere_trace(float3 origin, float3 dir, out float3 hit_p)
 {
@@ -173,12 +214,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         scene_sdf(hit_p, mat);
         float3 n = scene_normal(hit_p);
         float3 albedo = material_albedo(mat);
-        // A1 = primary visibility + gradient-normal shading: Lambert sun + a simple
-        // hemisphere sky ambient (no shadows / AO yet — those are A2). The raw
-        // radiance is exposed + tonemapped downstream.
+        // A2 = soft shadows + AO on top of A1's Lambert sun + hemisphere sky ambient.
+        // The sun term is gated by a sphere-traced penumbra shadow; the sky ambient
+        // is modulated by marched ambient occlusion. Raw radiance is exposed +
+        // tonemapped downstream.
         float ndl = max(dot(n, sun_dir), 0.0);
-        float3 direct = albedo * sun_i * ndl;
-        float3 ambient = albedo * lerp(0.15, 0.35, saturate(n.y * 0.5 + 0.5));
+        float shadow = ndl > 0.0 ? soft_shadow(hit_p + n * 0.002, sun_dir, 24.0) : 1.0;
+        float ao = calc_ao(hit_p, n);
+        float3 direct = albedo * sun_i * ndl * shadow;
+        float3 ambient = albedo * lerp(0.15, 0.35, saturate(n.y * 0.5 + 0.5)) * ao;
         color = direct + ambient;
     }
     else

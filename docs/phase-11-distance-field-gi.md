@@ -37,6 +37,21 @@ HW RT 파이프라인(Phase 8) 없이 컴퓨트 셰이더로 레이를 추적하
   SPIR-V/DXIL fp contraction 차이; mean 0.0002/ch). Vulkan VUID 0. SDF-off 기본 래스터 씬 byte-identical
   (회귀 없음). 한계: 아보카도 메시는 구 프록시, 위치는 근사 — 메시 픽셀 매치는 Stage B(GDF 베이크)에서.
 
+### A2 — 소프트 섀도우 + AO ✅ (양 백엔드 검증)
+- `sdf_trace.slang`에 두 SDF-march 보조 함수 추가:
+  - `soft_shadow(origin, dir, k)` — 태양 방향으로 shadow ray를 sphere-trace하며 표면 최근접 거리를
+    `k*h/t`로 추적(Inigo Quilez penumbra). [0,1] 가시성 = 부드러운 그림자 가장자리. `k=24`로 PT의 ~1.1°
+    디스크 태양 penumbra에 근사. (히트가 나오면 0 = 완전 차폐.)
+  - `calc_ao(p, n)` — 노멀 방향 5탭 마칭으로 기대 자유거리 vs 실제 필드값 비교(IQ AO). 스카이 앰비언트를
+    변조해 접촉부/주름이 어두워짐.
+- 셰이딩: 태양 항 `*= shadow`(ndl>0일 때만 trace), 스카이 앰비언트 `*= ao`. A1 대비 추가만 — 1차 가시성/
+  노멀/스카이는 동일.
+- **검증(RTX 2070 SUPER):** build+fmt+clippy(-D warnings) 클린. VK·DX 각 구·박스 아래 **소프트 컨택트
+  섀도우 + AO 어두워짐** 정상(태양 좌상단 방향과 일치). **VK≡DX: 920k 중 1픽셀만 >2**(엣지; mean
+  0.0003/ch, max 61). Vulkan VUID 0. A1→A2 차이는 섀도우/AO 영역에 국한(mean 1.24/ch). 스크린샷
+  tmp/sdf2-{vk,dx}.png. **Stage A 기계(컴퓨트 1차+2차 SDF march) 완성** — A3(컴퓨트 BVH 삼각형)은 선택,
+  거리장 GI 정합을 위해 Stage B(GDF 베이크)로 바로 진행 가능.
+
 ## Stage B — Global Distance Field
 - **per-mesh SDF 베이크:** 각 메시를 3D 거리장 텍스처로(컴퓨트, 점→삼각형 거리 / 또는 voxelize+JFA).
 - **전역 머지:** 카메라 주변을 덮는 **GDF 클립맵**(여러 해상도 레벨의 3D 볼륨)으로 per-mesh SDF를
