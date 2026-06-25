@@ -378,6 +378,19 @@ fn run() -> anyhow::Result<()> {
     } else {
         None
     };
+    // Phase 11 Stage B (B3): a second volume for the merged global distance field. The
+    // B2 bake fills `volume_res` (the per-mesh SDF); the merge composites instances of
+    // it into this `gdf_res` (world-space GDF), which the slice view then displays.
+    let gdf_res = if compute_supported {
+        Some(device.create_volume(&VolumeDesc {
+            width: VOLUME_DIM,
+            height: VOLUME_DIM,
+            depth: VOLUME_DIM,
+            format: Format::R32Float,
+        })?)
+    } else {
+        None
+    };
     let volume_fill_pipeline = if compute_supported {
         let cs = load_compute_shader(
             backend,
@@ -464,6 +477,71 @@ fn run() -> anyhow::Result<()> {
             compute_bytes: cs,
             compute_entry: "bakeMain",
             push_constant_size: 64,
+            bindless: true,
+            threads_per_group: [4, 4, 4],
+        })?)
+    } else {
+        None
+    };
+
+    // Phase 11 Stage B (B3): instance table + merge pipeline for the global distance
+    // field. Each record places one instance of the baked per-mesh SDF (`volume_res`)
+    // into the world-space GDF AABB (the unit cube here). `P11_GDF_INSTANCES=1` lays
+    // down a single whole-cube instance (which must reproduce the B2 bake exactly — the
+    // regression anchor); otherwise three smaller spheres demonstrate the min-merge.
+    let gdf_instances = if let Some(vol) = volume_res.as_ref() {
+        let sampled = vol.sampled_index();
+        let single = std::env::var_os("P11_GDF_INSTANCES")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        // (origin, extent): the world box this instance's [0,1] bake volume maps onto.
+        // The bake box is the unit cube, so dist_scale == extent (uniform). One sphere
+        // filling the cube is the B2-identical case; the trio are half-size boxes.
+        let placements: &[([f32; 3], f32)] = if single {
+            &[([0.0, 0.0, 0.0], 1.0)]
+        } else {
+            &[
+                ([0.05, 0.30, 0.25], 0.5),
+                ([0.45, 0.20, 0.25], 0.5),
+                ([0.25, 0.50, 0.25], 0.5),
+            ]
+        };
+        let mut records = Vec::with_capacity(placements.len() * 32);
+        for (origin, extent) in placements {
+            let inv = 1.0 / extent;
+            records.extend_from_slice(&origin[0].to_le_bytes());
+            records.extend_from_slice(&origin[1].to_le_bytes());
+            records.extend_from_slice(&origin[2].to_le_bytes());
+            records.extend_from_slice(&extent.to_le_bytes()); // dist_scale
+            records.extend_from_slice(&inv.to_le_bytes());
+            records.extend_from_slice(&inv.to_le_bytes());
+            records.extend_from_slice(&inv.to_le_bytes());
+            records.extend_from_slice(&sampled.to_le_bytes());
+        }
+        let buf = device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: records.len() as u64,
+                stride: 32,
+                indirect: false,
+            },
+            &records,
+        )?;
+        Some((buf, placements.len() as u32))
+    } else {
+        None
+    };
+    let gdf_merge_pipeline = if compute_supported {
+        let cs = load_compute_shader(
+            backend,
+            dreamcoast_shader::gdf_merge_cs_spirv,
+            dreamcoast_shader::gdf_merge_cs_dxil,
+            dreamcoast_shader::gdf_merge_cs_metallib,
+            "gdf_merge",
+        )?;
+        Some(device.create_compute_pipeline(&ComputePipelineDesc {
+            compute_bytes: cs,
+            compute_entry: "mergeMain",
+            push_constant_size: 48,
             bindless: true,
             threads_per_group: [4, 4, 4],
         })?)
@@ -1216,6 +1294,14 @@ fn run() -> anyhow::Result<()> {
     // it runs once (`sdf_bake_done`), and later frames just view the baked volume.
     let mut sdf_bake = sdf_bake_pipeline.is_some() && std::env::var_os("P11_SDF_BAKE").is_some();
     let mut sdf_bake_done = false;
+    // Phase 11 Stage B (B3): merge per-mesh SDF instances into the global distance
+    // field, then view a slice. Headless toggle via `P11_GDF_MERGE`. Like the bake it
+    // builds the field once (`gdf_merge_done`); the merge depends on the B2 bake, so it
+    // also drives the bake when enabled.
+    let mut gdf_merge = gdf_merge_pipeline.is_some()
+        && gdf_instances.is_some()
+        && std::env::var_os("P11_GDF_MERGE").is_some();
+    let mut gdf_merge_done = false;
     // Phase 8 M5: drive the path tracer through the full RT pipeline + SBT instead
     // of the inline compute ray query (same image). Headless toggle via
     // `P8_PATHTRACE_PIPELINE`; ignored when no RT pipeline is available.
@@ -1621,6 +1707,14 @@ fn run() -> anyhow::Result<()> {
                             }
                             if sdf_bake {
                                 ui.text_disabled("  - Stage B2: baked sphere ≈ analytic");
+                            }
+                        }
+                        if gdf_merge_pipeline.is_some() && gdf_instances.is_some() {
+                            if ui.checkbox("GDF merge (instances, slice view)", &mut gdf_merge) {
+                                gdf_merge_done = false; // re-merge when re-enabled
+                            }
+                            if gdf_merge {
+                                ui.text_disabled("  - Stage B3: min-merged instances");
                             }
                         }
                     }
@@ -2404,6 +2498,128 @@ fn run() -> anyhow::Result<()> {
             None
         };
 
+        // Phase 11 Stage B (B3): bake the per-mesh SDF, merge its instances into the
+        // global distance field, then view a slice — all through reused passes (B2 bake,
+        // this merge, B1 view). Bake + merge run once (`gdf_merge_done`); later frames
+        // re-view the persistent GDF. Pixel-comparable across backends (VK ≡ DX).
+        let gdf_out = if gdf_merge
+            && rt_out.is_none()
+            && sdf_out.is_none()
+            && vol_out.is_none()
+            && bake_out.is_none()
+        {
+            if let (
+                Some(vol),
+                Some(gdf),
+                Some(bakep),
+                Some(mergep),
+                Some(viewp),
+                Some(vtx),
+                Some(idx),
+                Some((insts, inst_count)),
+            ) = (
+                volume_res.as_ref(),
+                gdf_res.as_ref(),
+                sdf_bake_pipeline.as_ref(),
+                gdf_merge_pipeline.as_ref(),
+                volume_view_pipeline.as_ref(),
+                bake_vtx.as_ref(),
+                bake_idx.as_ref(),
+                gdf_instances.as_ref(),
+            ) {
+                let out = graph.create_storage_image("gdf_out", HDR_FORMAT, extent);
+                let vol_ext = graph.import_external("volume");
+                let gdf_ext = graph.import_external("gdf");
+                let vol_storage = vol.storage_index();
+                let gdf_storage = gdf.storage_index();
+                let gdf_sampled = gdf.sampled_index();
+                let dim = VOLUME_DIM;
+                if !gdf_merge_done {
+                    let vtx_index = vtx.storage_index();
+                    let idx_index = idx.storage_index();
+                    let tri_count = bake_tri_count;
+                    let inst_table = insts.storage_index();
+                    let inst_n = *inst_count;
+                    // B2 bake → per-mesh SDF in `volume_res`.
+                    graph.add_compute_pass(
+                        ComputePassInfo {
+                            name: "gdf_bake",
+                            storage_writes: vec![vol_ext],
+                            reads: vec![],
+                        },
+                        move |ctx| {
+                            let cmd = ctx.cmd();
+                            cmd.volume_to_storage(vol);
+                            cmd.bind_compute_pipeline(bakep);
+                            cmd.push_constants_compute(&sdf_bake_push(
+                                vol_storage,
+                                dim,
+                                tri_count,
+                                vtx_index,
+                                idx_index,
+                            ));
+                            let g = dim.div_ceil(4);
+                            cmd.dispatch(g, g, g);
+                            Ok(())
+                        },
+                    );
+                    // B3 merge: sample the per-mesh SDF per instance → min into the GDF.
+                    graph.add_compute_pass(
+                        ComputePassInfo {
+                            name: "gdf_merge",
+                            storage_writes: vec![gdf_ext],
+                            reads: vec![vol_ext],
+                        },
+                        move |ctx| {
+                            let cmd = ctx.cmd();
+                            cmd.volume_to_sampled(vol); // read the baked per-mesh SDF
+                            cmd.volume_to_storage(gdf); // write the GDF
+                            cmd.bind_compute_pipeline(mergep);
+                            cmd.push_constants_compute(&gdf_merge_push(
+                                gdf_storage,
+                                dim,
+                                inst_table,
+                                inst_n,
+                            ));
+                            let g = dim.div_ceil(4);
+                            cmd.dispatch(g, g, g);
+                            Ok(())
+                        },
+                    );
+                    gdf_merge_done = true;
+                }
+                graph.add_compute_pass(
+                    ComputePassInfo {
+                        name: "gdf_view",
+                        storage_writes: vec![out],
+                        reads: vec![gdf_ext],
+                    },
+                    move |ctx| {
+                        let out_index = ctx.storage_index(out);
+                        let cmd = ctx.cmd();
+                        cmd.volume_to_sampled(gdf);
+                        cmd.bind_compute_pipeline(viewp);
+                        cmd.push_constants_compute(&volume_push(
+                            gdf_storage,
+                            gdf_sampled,
+                            dim,
+                            out_index,
+                            cw,
+                            ch,
+                            0.5,
+                        ));
+                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                        Ok(())
+                    },
+                );
+                Some(out)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active,
         // else the SW-RT SDF trace, else the Stage-B volume slice, else compute-post,
         // else HDR.
@@ -2411,6 +2627,7 @@ fn run() -> anyhow::Result<()> {
             .or(sdf_out)
             .or(vol_out)
             .or(bake_out)
+            .or(gdf_out)
             .or(hdr_post)
             .unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the
@@ -3236,6 +3453,24 @@ fn sdf_bake_push(
     pc[48..52].copy_from_slice(&1.0f32.to_le_bytes());
     pc[52..56].copy_from_slice(&1.0f32.to_le_bytes());
     pc[56..60].copy_from_slice(&1.0f32.to_le_bytes());
+    pc
+}
+
+/// Pack the Phase 11 Stage B3 GDF-merge push block (48 bytes): gdf_storage, dim,
+/// inst_table, inst_count, then float4 aabb_min / aabb_max (the GDF world extent;
+/// the unit cube here, matching the per-mesh bake box so a whole-cube single
+/// instance reproduces the B2 bake exactly).
+fn gdf_merge_push(gdf_storage: u32, dim: u32, inst_table: u32, inst_count: u32) -> [u8; 48] {
+    let mut pc = [0u8; 48];
+    pc[0..4].copy_from_slice(&gdf_storage.to_le_bytes());
+    pc[4..8].copy_from_slice(&dim.to_le_bytes());
+    pc[8..12].copy_from_slice(&inst_table.to_le_bytes());
+    pc[12..16].copy_from_slice(&inst_count.to_le_bytes());
+    // aabb_min = (0,0,0,0): the float4 is 16-byte aligned at offset 16.
+    // aabb_max = (1,1,1,0): the unit-cube GDF extent.
+    pc[32..36].copy_from_slice(&1.0f32.to_le_bytes());
+    pc[36..40].copy_from_slice(&1.0f32.to_le_bytes());
+    pc[40..44].copy_from_slice(&1.0f32.to_le_bytes());
     pc
 }
 
