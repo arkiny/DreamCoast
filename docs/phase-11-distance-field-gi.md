@@ -146,11 +146,41 @@ HW RT 파이프라인(Phase 8) 없이 컴퓨트 셰이더로 레이를 추적하
 > 결과가 Phase 12 M2의 SDF 청크로 영속화된다. (메시 직렬화 M1은 Phase 11과 독립적으로 먼저 가능.)
 
 ## Stage C — Stochastic Lighting
-- GDF를 ray-march해 **디퓨즈 GI(1+ 바운스)·AO·러프 반사**를 stochastic(몬테카를로) 샘플.
-- **시공간 디노이즈:** temporal accumulation(재투영) + 공간 필터. 스크린-스페이스 프로브 /
-  래디언스 캐시 / per-pixel 중 구조는 이 스테이지에서 확정.
-- 머티리얼 히트 셰이딩: GDF는 거리만 → 표면 머티리얼/라이팅은 surface cache 또는 근사 필요(설계 항목).
-- 결과를 디퓨드 라이팅(Phase 6)의 ambient/GI 항으로 합성.
+GDF를 ray-march해 **디퓨즈 GI(1+ 바운스)·AO·러프 반사**를 stochastic 샘플하고, 결과를 디퍼드
+라이팅(Phase 6)의 ambient/GI 항으로 합성한다. Stage B의 GDF는 *단위 큐브 데모*(고정 카메라)였으므로
+Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실제 디퍼드 G-buffer**에서 march한다.
+
+마일스톤(각 양 백엔드 + 검증 클린 게이트, phase-by-phase 승인):
+
+### C1 — 월드 공간 씬 GDF ✅ (양 백엔드 검증)
+- 샘플 씬의 불투명 오브젝트(아보카도/구×2/큐브)를 **하나의 월드 공간 삼각형 수프로 융합** → 씬 AABB
+  위에 brute-force 베이크(`sdf_bake.slang` 재사용, AABB를 push로 일반화)하여 단일 월드 GDF 볼륨 생성.
+  per-mesh SDF + 클립맵 머지(동적 오브젝트)는 후속 정제; 지면은 트레이스 시 해석적 평면(y=0)으로 min-union.
+  TDR 회피로 `SCENE_DIM=48`(융합 ~6.8k tris × 48³ ≈ B2 베이크와 동급). 융합은 App에서 정점/노멀을 월드로
+  변환(이동+균등스케일이라 노멀 통과), 디스조인트 오브젝트라 closest-triangle 부호 = union SDF.
+- 검증은 `gdf_trace.slang`을 **라이브 궤도 카메라**로 트레이스(AABB/지면/거리클램프를 push로 이동,
+  B4 단위큐브 경로는 동일 값 전달로 무회귀). 토글 env `P11_SCENE_GDF` + UI "Scene GDF (world, live camera)".
+- **검증(RTX 2070 SUPER):** build+clippy(-D warnings) 클린. 라이브 카메라 트레이스가 래스터 씬 레이아웃과
+  일치 — **아보카도 실루엣이 실제 메시 베이크**(A1 구 프록시 한계 해소), 구·큐브가 정확한 월드 위치에
+  지면 위 소프트 컨택트 섀도우+AO와 함께 렌더. **VK≡DX: 921,600px 중 >8 차이 16px**(B4와 동일 — iterative
+  march의 SPIR-V/DXIL sub-ULP step 차이, 거리장 자체는 동일). 기본 래스터/B4 무회귀(default 1px, B4 17px).
+  한계: 48³ 복셀화 패싯 + 단위큐브 튜닝된 march/AO 상수(C2에서 G-buffer march로 정밀화).
+
+### C2 — GDF AO → 디퍼드 ambient (다음)
+- G-buffer(월드 pos+노멀)에서 씬 GDF를 ray-march해 AO 산출 → 라이팅 패스의 ambient/IBL 항에 곱셈 합성.
+  GDF가 실제 렌더에 처음 영향. 패스트레이서 AO 레퍼런스 대조.
+
+### C3 — 디퓨즈 GI 1바운스 (stochastic)
+- G-buffer 표면에서 코사인-반구 레이를 GDF에 sphere-trace → 히트 셰이딩 → 간접 디퓨즈 누적(노이지).
+- **설계 포크 — GDF 히트 셰이딩:** GDF는 거리만 보유. (A) 히트에서 gradient 노멀+태양(소프트섀도우)+스카이로
+  재조명, 상수 알베도(최소 인프라, B4 히트 셰이딩 재사용) / (B) surface cache(라디언스 아틀라스/카드, 정확) /
+  (C) 스크린스페이스 샘플+폴백. C3 도달 시 확정(권장 시작점 A).
+
+### C4 — 시공간 디노이즈
+- temporal 재투영(히스토리 누적) + 공간 필터(à-trous/bilateral)로 noisy GI 정리.
+
+### C5 (선택) — 러프 반사
+- GGX 샘플 GDF 레이로 광택 반사.
 
 ## 미결 / 설계 항목
 - GDF 표현(클립맵 레벨 수/해상도), 메모리 예산.

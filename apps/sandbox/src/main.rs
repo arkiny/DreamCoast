@@ -347,6 +347,8 @@ struct App {
     gdf_merge: bool,
     gdf_merge_done: bool,
     gdf_trace: bool,
+    scene_gdf: bool,
+    scene_gdf_done: bool,
     path_trace_pipeline: bool,
     realtime_env: bool,
     multibounce: bool,
@@ -397,8 +399,9 @@ impl App {
         let deferred = DeferredRenderer::new(&device, backend, swapchain.format())?;
 
         // Phase 11 software ray tracing + global distance field (Stage A analytic
-        // trace, Stage B volumes / SDF bake / GDF merge / GDF trace). See `gdf.rs`.
-        let gdf = GdfSystem::new(&device, backend, compute_supported)?;
+        // trace, Stage B volumes / SDF bake / GDF merge / GDF trace, Stage C1 world
+        // scene GDF). See `gdf.rs`. The scene GDF is registered after the scene is built.
+        let mut gdf = GdfSystem::new(&device, backend, compute_supported)?;
 
         // GPU particle system (Phase 7): a persistent ping-pong buffer pair advanced
         // by a compute pass and drawn as instanced billboards (see `particle.rs`).
@@ -533,6 +536,54 @@ impl App {
             ground_count,
         )?;
 
+        // Stage C1: fuse the opaque scene objects into one world-space triangle soup
+        // and register it as the scene GDF (baked once on the graph). Ground is handled
+        // analytically at trace time. Transforms are translation + uniform scale, so
+        // normals carry through (re-normalized after the 3x3). The avocado/spheres/cube
+        // are disjoint, so the closest-triangle sign convention gives the union SDF.
+        if gdf.has_gdf_trace() {
+            let objs: [(&MeshData, Mat4); 4] = [
+                (model, Mat4::IDENTITY),
+                (&sphere, scene[1].transform),
+                (&sphere, scene[2].transform),
+                (&cube, scene[3].transform),
+            ];
+            let mut fused_v: Vec<u8> = Vec::new();
+            let mut fused_i: Vec<u8> = Vec::new();
+            let mut base: u32 = 0;
+            let mut amin = [f32::MAX; 3];
+            let mut amax = [f32::MIN; 3];
+            for (m, xf) in objs {
+                for v in &m.vertices {
+                    let p = xf.transform_point3(Vec3::from(v.pos));
+                    let n = xf.transform_vector3(Vec3::from(v.normal)).normalize_or_zero();
+                    amin = [amin[0].min(p.x), amin[1].min(p.y), amin[2].min(p.z)];
+                    amax = [amax[0].max(p.x), amax[1].max(p.y), amax[2].max(p.z)];
+                    fused_v.extend_from_slice(&p.x.to_le_bytes());
+                    fused_v.extend_from_slice(&p.y.to_le_bytes());
+                    fused_v.extend_from_slice(&p.z.to_le_bytes());
+                    fused_v.extend_from_slice(&n.x.to_le_bytes());
+                    fused_v.extend_from_slice(&n.y.to_le_bytes());
+                    fused_v.extend_from_slice(&n.z.to_le_bytes());
+                    fused_v.extend_from_slice(&v.uv[0].to_le_bytes());
+                    fused_v.extend_from_slice(&v.uv[1].to_le_bytes());
+                }
+                for &ix in &m.indices {
+                    fused_i.extend_from_slice(&(ix + base).to_le_bytes());
+                }
+                base += m.vertices.len() as u32;
+            }
+            // Pad the AABB by 10% per axis so the zero-isosurface isn't clipped at the
+            // volume edge (≥0.05 world units).
+            for i in 0..3 {
+                let pad = ((amax[i] - amin[i]) * 0.1).max(0.05);
+                amin[i] -= pad;
+                amax[i] += pad;
+            }
+            let tri_count = (fused_i.len() / 4 / 3) as u32;
+            gdf.build_scene_sdf(&device, &fused_v, &fused_i, tri_count, amin, amax)?;
+        }
+
         let gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
 
         // One render-graph transient pool per frame-in-flight (reused only after the
@@ -570,6 +621,8 @@ impl App {
         let gdf_merge = gdf.has_merge() && std::env::var_os("P11_GDF_MERGE").is_some();
         let gdf_trace = gdf.has_gdf_trace() && std::env::var_os("P11_GDF_TRACE").is_some();
         let gdf_trace_analytic = std::env::var_os("P11_GDF_ANALYTIC").is_some();
+        // Stage C1: trace the world-space scene GDF from the live camera.
+        let scene_gdf = gdf.has_scene_sdf() && std::env::var_os("P11_SCENE_GDF").is_some();
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -691,6 +744,8 @@ impl App {
             gdf_merge,
             gdf_merge_done: false,
             gdf_trace,
+            scene_gdf,
+            scene_gdf_done: false,
             path_trace_pipeline,
             realtime_env: true,
             multibounce: true,
@@ -880,6 +935,7 @@ impl App {
                 gdf_merge,
                 gdf_merge_done,
                 gdf_trace,
+                scene_gdf,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1010,6 +1066,12 @@ impl App {
                             ui.checkbox("GDF SW ray trace (compute)", gdf_trace);
                             if *gdf_trace {
                                 ui.text_disabled("  - Stage B4: sphere-march baked GDF");
+                            }
+                        }
+                        if gdf.has_scene_sdf() {
+                            ui.checkbox("Scene GDF (world, live camera)", scene_gdf);
+                            if *scene_gdf {
+                                ui.text_disabled("  - Stage C1: fused world scene SDF");
                             }
                         }
                     }
@@ -1378,25 +1440,56 @@ impl App {
             None
         };
 
+        // Phase 11 Stage C1: world-space scene GDF traced from the live camera (build
+        // the fused scene SDF once, then SW ray-trace it) — validates the world GDF
+        // matches the rasterized scene. Only when the other replacements are off.
+        let scene_gdf_out = if self.scene_gdf
+            && rt_out.is_none()
+            && sdf_out.is_none()
+            && vol_out.is_none()
+            && bake_out.is_none()
+            && gdf_out.is_none()
+            && gdf_trace_out.is_none()
+        {
+            let out = self.gdf.record_scene_gdf(
+                &mut graph,
+                extent,
+                eye,
+                inv_view_proj,
+                self.sun_dir,
+                self.sun_intensity,
+                cw,
+                ch,
+                self.flip_y,
+                !self.scene_gdf_done,
+            );
+            self.scene_gdf_done = true;
+            Some(out)
+        } else {
+            None
+        };
+
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active, else
-        // the SW-RT SDF trace, else the Stage-B volume slice, else compute-post, else
-        // HDR.
+        // the SW-RT SDF trace, else the Stage-B volume slice, else the Stage-C1 scene
+        // GDF, else compute-post, else HDR.
         let tonemap_src = rt_out
             .or(sdf_out)
             .or(vol_out)
             .or(bake_out)
             .or(gdf_out)
             .or(gdf_trace_out)
+            .or(scene_gdf_out)
             .or(hdr_post)
             .unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the
         // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
         // exposure here before the filmic curve (else the bright sky + sun blow out).
-        let tm_exposure = if pt_active || sdf_out.is_some() || gdf_trace_out.is_some() {
-            self.exposure
-        } else {
-            1.0
-        };
+        let tm_exposure =
+            if pt_active || sdf_out.is_some() || gdf_trace_out.is_some() || scene_gdf_out.is_some() {
+                self.exposure
+            } else {
+                1.0
+            };
         self.deferred.record_tonemap(
             &mut graph,
             backbuffer,
