@@ -44,8 +44,15 @@ Each of these is a separate, reviewed step — do them one at a time, screenshot
 ## Order / status
 
 1. `push.rs` — **DONE** (≈475 lines out; VK/DX default scene unchanged).
-2. `mesh.rs` — next (pure, low risk).
-3. `app.rs` — process plumbing (low risk).
-4. `ibl.rs` — RHI-touching but self-contained.
-5. `consts.rs` — preamble + shared leaves.
-6. `run()` decomposition — separate plan, after the leaves are out.
+2. `mesh.rs` — **DONE** (geometry/asset helpers; `PtMaterial` / `ModelBounds` made `pub(crate)`).
+3. `app.rs` — **DONE** (shader loaders, screenshot/PNG, CLI flag parsing).
+4. `ibl.rs` — next: RHI-touching but self-contained (`CubeSet`, `IblResources`,
+   `record_environment_capture`, `generate_brdf_lut`).
+5. `consts.rs` — preamble + shared leaves (`Globals` / `SceneObject`, `globals_bytes`,
+   `normalize3`, and the small `gbuffer_push` / `pbr_push` / `mat4_bytes` /
+   `light_view_proj` that stayed behind).
+6. The `--clear-test` / `--triangle-test` / `--mesh-test` harnesses are a separate
+   concern (`smoketest.rs`) — extract whenever convenient.
+7. `run()` decomposition — separate plan, after the leaves are out.
+
+main.rs: ~4.6k → ~3.7k lines after steps 1–3.
