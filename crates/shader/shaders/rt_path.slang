@@ -20,10 +20,14 @@
 
 // Trace a single path and return its radiance. `cornell` switches to an enclosed
 // box lit only by emissive surfaces (black background, no sun).
-float3 trace(float3 origin, float3 dir, float3 sun_dir, bool cornell, inout uint rng)
+float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool cornell,
+             inout uint rng)
 {
     float3 radiance = float3(0, 0, 0);
     float3 throughput = float3(1, 1, 1);
+    // Ray-cone footprint: width 0 at the camera, grows by t*spread each segment;
+    // the spread widens on glossy/diffuse bounces so indirect hits use coarse mips.
+    float cone_width = 0.0;
 
     RayDesc ray;
     ray.Origin = origin;
@@ -50,11 +54,16 @@ float3 trace(float3 origin, float3 dir, float3 sun_dir, bool cornell, inout uint
             break; // out-of-range hit (never a valid surface) — terminate the path
         float2 bary = q.CommittedTriangleBarycentrics();
         float2 material_uv = hit_uv(inst, prim, bary);
-        RtMaterialSample mat = sample_material(inst, material_uv);
         float3 n = hit_normal(inst, prim, bary);
         if (dot(n, ray.Direction) > 0.0)
             n = -n; // face the incoming ray (two-sided)
-        n = hit_shading_normal(inst, prim, bary, n, material_uv);
+        // Ray-cone texture LOD: advance the cone to this hit, then derive the LOD
+        // from the cone footprint vs the triangle's world/UV areas.
+        float cos_theta = max(abs(dot(n, ray.Direction)), 1e-3);
+        cone_width += q.CommittedRayT() * cone_spread;
+        float lod_base = hit_lod_base(inst, prim, cone_width, cos_theta);
+        RtMaterialSample mat = sample_material(inst, material_uv, lod_base);
+        n = hit_shading_normal(inst, prim, bary, n, material_uv, lod_base);
         float3 hit = ray.Origin + ray.Direction * q.CommittedRayT();
         float3 v = -ray.Direction;
         Surf surf = make_surf(mat.base_color, mat.metallic, mat.roughness);
@@ -92,6 +101,10 @@ float3 trace(float3 origin, float3 dir, float3 sun_dir, bool cornell, inout uint
         if (!bs.valid)
             break;
         throughput *= bs.weight;
+        // Widen the cone for the next bounce by surface roughness (cheap proxy for
+        // the BSDF lobe spread): mirrors stay tight, rough surfaces blur toward
+        // coarse mips. Specular (roughness ~0) leaves the cone unchanged.
+        cone_spread += mat.roughness * 0.5;
 
         // Russian roulette: unbiased termination once paths get deep, so MAX_BOUNCES
         // can be large without the cost of always tracing every bounce.
@@ -133,9 +146,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         float2 jitter = float2(rnd(rng), rnd(rng)) - 0.5;
         float2 uv = (float2(tid.xy) + 0.5 + jitter) / float2(pc.width, pc.height);
         float2 ndc = float2(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * sy);
-        float4 world = mul(pc.inv_view_proj, float4(ndc, 1.0, 1.0));
-        float3 dir = normalize(world.xyz / world.w - pc.cam_pos.xyz);
-        sum += trace(pc.cam_pos.xyz, dir, sun_dir, cornell, rng);
+        float3 dir = primary_ray_dir(ndc);
+        float cone_spread = primary_cone_spread(ndc);
+        sum += trace(pc.cam_pos.xyz, dir, cone_spread, sun_dir, cornell, rng);
     }
     sum /= float(pc.spp);
 

@@ -2,7 +2,7 @@
   "RootSignature": {
     "Flags": "IRRootSignatureFlagNone",
     "NumParameters": 2,
-    "NumStaticSamplers": 0,
+    "NumStaticSamplers": 1,
     "Parameters": [
       {
         "DescriptorTable": {
@@ -63,7 +63,23 @@
         "ShaderVisibility": "IRShaderVisibilityAll"
       }
     ],
-    "StaticSamplers": []
+    "StaticSamplers": [
+      {
+        "Filter": "IRFilterMinMagMipLinear",
+        "AddressU": "IRTextureAddressModeWrap",
+        "AddressV": "IRTextureAddressModeWrap",
+        "AddressW": "IRTextureAddressModeWrap",
+        "MipLODBias": 0.0,
+        "MaxAnisotropy": 1,
+        "ComparisonFunc": "IRComparisonFunctionNever",
+        "BorderColor": "IRStaticBorderColorTransparentBlack",
+        "MinLOD": 0.0,
+        "MaxLOD": 3.402823466e+38,
+        "ShaderRegister": 0,
+        "RegisterSpace": 1,
+        "ShaderVisibility": "IRShaderVisibilityAll"
+      }
+    ]
   },
   "version": "IRRootSignatureVersion_1_1"
 }

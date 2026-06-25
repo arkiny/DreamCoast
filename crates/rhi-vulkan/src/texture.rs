@@ -7,7 +7,7 @@ use dreamcoast_core::EngineError;
 use rhi_types::TextureDesc;
 
 use crate::device::DeviceShared;
-use crate::{color_subresource_range, to_vk_format, vk_err};
+use crate::{to_vk_format, vk_err};
 
 /// A device-local sampled texture, registered in the bindless table.
 pub struct VulkanTexture {
@@ -32,12 +32,25 @@ impl VulkanTexture {
                 depth: 1,
             };
 
-            // Device-local image.
+            // CPU-generated mip chain (identical bytes across backends — the
+            // cross-backend-parity rule; see rhi_types::generate_mip_chain).
+            let levels =
+                rhi_types::generate_mip_chain(pixels, desc.width, desc.height, desc.format);
+            let mip_levels = levels.len() as u32;
+            let full_range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: mip_levels,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+
+            // Device-local image with the full mip chain.
             let image_ci = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(format)
                 .extent(extent)
-                .mip_levels(1)
+                .mip_levels(mip_levels)
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
@@ -63,15 +76,37 @@ impl VulkanTexture {
                 .bind_image_memory(image, memory, 0)
                 .map_err(vk_err)?;
 
-            // Staging buffer with the pixel data.
-            let (staging, staging_mem) = create_staging(&device, pixels)?;
+            // One staging buffer holding all mip levels back-to-back; one copy region
+            // per level at its byte offset.
+            let mut staging_bytes: Vec<u8> = Vec::new();
+            let mut regions: Vec<vk::BufferImageCopy> = Vec::with_capacity(levels.len());
+            for (mip, level) in levels.iter().enumerate() {
+                let offset = staging_bytes.len() as u64;
+                staging_bytes.extend_from_slice(level);
+                let w = (desc.width >> mip).max(1);
+                let h = (desc.height >> mip).max(1);
+                regions.push(
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .mip_level(mip as u32)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        )
+                        .image_extent(vk::Extent3D { width: w, height: h, depth: 1 }),
+                );
+            }
+            let (staging, staging_mem) = create_staging(&device, &staging_bytes)?;
 
-            // Upload: transition, copy, transition to shader-read.
+            // Upload: transition all levels, copy each, transition to shader-read.
             device.immediate_submit(|cmd| {
                 image_barrier(
                     &device.device,
                     cmd,
                     image,
+                    full_range,
                     vk::ImageLayout::UNDEFINED,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     vk::AccessFlags::empty(),
@@ -79,26 +114,18 @@ impl VulkanTexture {
                     vk::PipelineStageFlags::TOP_OF_PIPE,
                     vk::PipelineStageFlags::TRANSFER,
                 );
-                let region = vk::BufferImageCopy::default()
-                    .image_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .mip_level(0)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    )
-                    .image_extent(extent);
                 device.device.cmd_copy_buffer_to_image(
                     cmd,
                     staging,
                     image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[region],
+                    &regions,
                 );
                 image_barrier(
                     &device.device,
                     cmd,
                     image,
+                    full_range,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     vk::AccessFlags::TRANSFER_WRITE,
@@ -115,7 +142,7 @@ impl VulkanTexture {
                 .image(image)
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .format(format)
-                .subresource_range(color_subresource_range());
+                .subresource_range(full_range);
             let view = device
                 .device
                 .create_image_view(&view_ci, None)
@@ -191,6 +218,7 @@ fn image_barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,
+    range: vk::ImageSubresourceRange,
     old: vk::ImageLayout,
     new: vk::ImageLayout,
     src_access: vk::AccessFlags,
@@ -206,7 +234,7 @@ fn image_barrier(
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
-        .subresource_range(color_subresource_range());
+        .subresource_range(range);
     unsafe {
         device.cmd_pipeline_barrier(
             cmd,

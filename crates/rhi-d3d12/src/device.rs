@@ -229,7 +229,9 @@ impl DeviceShared {
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Texture2D: D3D12_TEX2D_SRV {
                     MostDetailedMip: 0,
-                    MipLevels: 1,
+                    // -1 = expose all mip levels the resource has (the full chain for
+                    // material textures; still 1 for single-mip resources).
+                    MipLevels: u32::MAX,
                     PlaneSlice: 0,
                     ResourceMinLODClamp: 0.0,
                 },
