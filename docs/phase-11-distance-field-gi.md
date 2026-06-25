@@ -95,10 +95,25 @@ HW RT 파이프라인(Phase 8) 없이 컴퓨트 셰이더로 레이를 추적하
   해석적 구와 **영점 등고선의 얇은(1–2px) 링을 제외하면 완전 일치**(내부/외부 그라데이션 black diff);
   남은 차이는 면분할 메시 등고선이 이상적 구와 서브픽셀 어긋난 것(기대된 테셀레이션 오차). max shade diff 58/255.
 
-### B3 — 전역 클립맵 머지
-- 카메라 주변을 덮는 **GDF 클립맵**(여러 해상도 레벨의 3D 볼륨)으로 per-mesh SDF를 인스턴스 변환과
-  함께 합성(min 결합). 정적은 한 번 베이크, 동적 오브젝트는 매 프레임/저빈도로 영향 영역만 갱신.
-  클립맵 레벨/해상도/메모리 예산은 이 단계에서 확정(미결 항목 참조).
+### B3 — 전역 거리장 머지 ✅ (양 백엔드 검증)
+- `gdf_merge.slang`(`mergeMain`, `[numthreads(4,4,4)]`): GDF voxel당 1스레드, world-space voxel
+  center를 각 인스턴스의 로컬 bake 박스로 변환(`uvw = (p - origin)·inv_extent`) → 인스턴스의
+  per-mesh SDF 볼륨을 트라이리니어 샘플 → bake 거리에 `dist_scale`을 곱해 월드 단위로 환산 →
+  **모든 인스턴스에 대해 min-결합**. 인스턴스는 voxel이 자기 bake 박스 내부(uvw∈[0,1])일 때만 기여
+  (박스 밖은 트라이리니어 clamp가 거리를 과소평가하므로 skip=+inf). 유효 GDF 영역 = 인스턴스 박스들의
+  합집합 — 실제 클립맵이 카메라 주변을 타일링하는 방식 그대로.
+- 인스턴스 테이블은 32B 레코드 storage buffer: `origin`(bake 박스 min 코너의 월드 위치) + `dist_scale`
+  + `inv_extent`(월드 delta→uvw) + per-mesh SDF의 sampled 인덱스. B2 베이크(`volume_res`)를 소스로,
+  머지 타깃은 별도 `gdf_res` 볼륨. 그래프는 bake→merge→view를 `import_external("volume"/"gdf")`로 순서화.
+  bake+merge는 1회(`gdf_merge_done`), 이후 프레임은 영속 GDF를 B1 `volume_view`로 재표시. 토글 env
+  `P11_GDF_MERGE` + UI. 인스턴스 셋은 `P11_GDF_INSTANCES=1`(전체-큐브 단일 = 회귀 앵커) / 기본(반-크기 구 3개).
+- **첫 구현 범위:** 단일 글로벌 레벨 + 정적 인스턴스 1회 머지. **멀티 해상도 클립맵 + 동적 인스턴스
+  per-frame 갱신은 후속 정제**(미결 항목 참조).
+- **검증(RTX 2070 SUPER):** build+fmt+clippy(-D warnings) 클린. **단일 전체-큐브 인스턴스 = B2 베이크
+  볼륨과 픽셀 완전 동일(max 0)** — 머지 변환/샘플/스케일 수학이 정확함을 증명하는 회귀 앵커.
+  3-인스턴스 머지는 각 인스턴스 변환 위치에 구가 배치되고 겹치는 박스에서 min-union 정상. **VK≡DX:
+  녹색 링 분류 밴드(`abs(d)<0.01`) 제외 시 픽셀 완전 동일(max 0)**; 전체 프레임 기준 단 1픽셀만 차이
+  (그 한 픽셀이 링 임계값의 knife-edge에 놓여 백엔드 간 1-ULP로 분류가 뒤집힘 — 거리장 자체는 동일).
 
 ### B4 — GDF SW RT
 - `sdf_trace.slang`의 `scene_dist`/`scene_normal`을 **클립맵 볼륨 트라이리니어 샘플**로 교체
