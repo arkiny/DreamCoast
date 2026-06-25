@@ -53,10 +53,60 @@ HW RT 파이프라인(Phase 8) 없이 컴퓨트 셰이더로 레이를 추적하
   거리장 GI 정합을 위해 Stage B(GDF 베이크)로 바로 진행 가능.
 
 ## Stage B — Global Distance Field
-- **per-mesh SDF 베이크:** 각 메시를 3D 거리장 텍스처로(컴퓨트, 점→삼각형 거리 / 또는 voxelize+JFA).
-- **전역 머지:** 카메라 주변을 덮는 **GDF 클립맵**(여러 해상도 레벨의 3D 볼륨)으로 per-mesh SDF를
-  합성. 정적은 베이크, 동적 오브젝트는 매 프레임/저빈도 갱신(영향 영역만).
-- 신규 RHI 가능성: 3D(볼륨) 텍스처 + UAV, 3D 디스패치. (Phase 7 storage image의 3D 확장.)
+해석적 프리미티브(Stage A)를 **실제 메시 거리장**으로 교체한다. per-mesh SDF를 베이크하고, 카메라 주변을
+덮는 클립맵 3D 볼륨으로 합성한 뒤, Stage A의 sphere-trace를 그 볼륨 샘플로 바꾼다.
+
+마일스톤(각 양 백엔드 + 검증 클린 게이트, phase-by-phase 승인):
+
+### B1 — 3D 볼륨 텍스처 RHI
+- 신규 `Texture3D`(샘플) + `RWTexture3D`(스토리지/UAV)를 `bindless.slang` 블록 + 양 백엔드에 추가:
+  Vulkan `VK_IMAGE_TYPE_3D` + 3D 뷰, D3D12 `Texture3D` SRV/UAV(`D3D12_UAV_DIMENSION_TEXTURE3D`,
+  WSize=depth). 3D 디스패치는 기존 `dispatch(x,y,z)`가 이미 지원. 포맷은 `R16Float`(거리, half) 우선.
+- 검증: 작은 볼륨을 컴퓨트로 채우고 트라이리니어 샘플 → 양 백엔드 일치.
+
+### B2 — per-mesh SDF 베이크
+- 컴퓨트로 각 메시의 로컬 AABB를 N³ 그리드(예 32³~64³)로 보로 voxel당 **부호 있는 거리** 계산.
+  1차 구현: **brute-force 점→삼각형 거리**(voxel center vs 모든 삼각형의 최소 거리). 부호는
+  angle-weighted pseudonormal 또는 ray-stabbing parity(내부/외부). 베이크-타임이므로 단순/정확 우선.
+  최적화(후속): voxelize + **JFA**(jump flooding)로 O(N³ log N).
+- 메시 정점/인덱스는 이미 storage buffer로 GPU 상주(Phase 8 RT geometry 경로 재활용 가능).
+- 검증: 구/박스 메시의 베이크 SDF를 Stage A 해석적 SDF와 대조(거리 오차 ≤ voxel 대각선).
+
+### B3 — 전역 클립맵 머지
+- 카메라 주변을 덮는 **GDF 클립맵**(여러 해상도 레벨의 3D 볼륨)으로 per-mesh SDF를 인스턴스 변환과
+  함께 합성(min 결합). 정적은 한 번 베이크, 동적 오브젝트는 매 프레임/저빈도로 영향 영역만 갱신.
+  클립맵 레벨/해상도/메모리 예산은 이 단계에서 확정(미결 항목 참조).
+
+### B4 — GDF SW RT
+- `sdf_trace.slang`의 `scene_dist`/`scene_normal`을 **클립맵 볼륨 트라이리니어 샘플**로 교체
+  (적절 레벨 선택 + 경계 폴백). 노멀은 볼륨 gradient. Stage A의 march/soft_shadow/AO 로직은 그대로
+  재사용 → 비로소 **실제 메시 지오메트리**를 SW RT.
+- 검증: Phase 8 HW RT / 패스트레이서와 동일 씬 1차 가시성 + 소프트 섀도우 대조.
+
+신규 RHI: 3D(볼륨) 텍스처 + UAV, 3D 디스패치. (Phase 7 storage image의 3D 확장.)
+
+## 쿠킹된 에셋 포맷 — 메시 + 베이크 데이터 직렬화 (사용자 요청, 장기 / 크로스컷팅)
+> 핵심: GDF 베이크만 캐싱하는 게 아니라, **가공된 메시 지오메트리 + 베이크된 GDF(+향후 확장)를 하나의
+> 직렬화된 "에셋"으로 저장/로드**하는 실질적 에셋 파이프라인. 매 실행 glTF 재파싱 + SDF 재베이크를 없앤다.
+
+Phase 11 Stage B가 직접적 동기지만 이건 `crates/asset`의 **크로스컷팅 자산 개념**이다. 현재 `crates/asset`은
+런타임에 glTF→`MeshData`를 파싱한다(즉석). 쿠킹 포맷은 그 `MeshData` + 베이크 부산물을 영속화한다.
+
+- **포맷 `.dcasset`(가칭) 바이너리 컨테이너:**
+  - 헤더 {magic, version, source_hash, flags}
+  - 메시 청크 {vertices(32B 레이아웃), indices(u32), material params, AABB, (후속) tangents/LOD}
+  - 베이크 청크(옵션·확장 가능): **SDF 볼륨**{dims(x,y,z), aabb, format=R16F, voxels} — 첫 베이크 페이로드.
+    향후: BVH, 라이트맵, 미리 계산된 프로브 등 같은 컨테이너에 청크로 추가.
+- **파이프라인:** 소스(glTF) → **cook**(파싱 + Stage B SDF 베이크) → `.dcasset` 기록. 런타임은 `.dcasset`을
+  직접 로드(glTF 파싱·재베이크 없음). cook은 오프라인 툴(`tools/`) 또는 첫 실행 시 lazy.
+- **무효화 키:** `source_hash`(glTF 바이트) + cook 파라미터(SDF 해상도 등) + `version`. 불일치/부재 → 재쿡.
+  위치 gitignored `cache/` 또는 커밋되는 `assets/cooked/`(선택).
+- **결정성:** voxel 데이터는 크로스백엔드 바이트 동일이어야 함(밉 체인 규칙과 동일 — CPU 또는 결정적 컴퓨트
+  베이크). 로드 시 GPU 볼륨/버퍼 업로드는 B1의 3D 텍스처 + 기존 메시 버퍼 경로 재활용.
+- **위치:** RHI-agnostic 직렬화 + cook 로직은 `crates/asset`(glTF/이미지 로딩 옆, `serde`/수동 바이너리),
+  GPU 업로드는 백엔드 texture3D/buffer 경로. 클립맵 동적 부분은 런타임 갱신이라 쿡 대상은 **정적 메시 + SDF**.
+- **삽입 시점:** B2(베이크) 직후가 자연스러움 — 베이크 결과를 곧장 `.dcasset`으로 영속화. 단 메시 직렬화는
+  B와 독립이라 더 일찍(메시만 먼저 쿡) 시작할 수도 있음. 별도 설계 마일스톤으로 분리해 진행.
 
 ## Stage C — Stochastic Lighting
 - GDF를 ray-march해 **디퓨즈 GI(1+ 바운스)·AO·러프 반사**를 stochastic(몬테카를로) 샘플.
