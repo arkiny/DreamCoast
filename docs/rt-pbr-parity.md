@@ -23,7 +23,7 @@
 | 간접광 | split-sum IBL(근사 큐브) | 디퓨즈 바운스 | **경로추적 GI/반사(정답)** |
 | 직접광 | 태양(PCF 섀도우)+포인트광 | 태양(섀도우 레이)만 | 태양(디스크)+포인트광 NEE+MIS |
 | 노멀 | 화면공간 미분 TBN + 노멀맵 | 삼각형 pos/UV 기반 hit-time TBN + 노멀맵 | 탄젠트 노멀맵(텍스처 머티리얼) |
-| 텍스처 | base/mr/normal/emissive 샘플 | hit UV 보간 + mip0 repeat/bilinear `Load` 샘플 | hit에서 UV 보간 후 샘플 |
+| 텍스처 | base/mr/normal/emissive 샘플 | hit UV 보간 + 레이콘 LOD `SampleLevel`(전체 밉 체인) | hit에서 UV 보간 후 샘플 |
 | 추정기 | — | 코사인 바운스, 고정 4바운스 | **MIS + 러시안룰렛 + 디스크광** |
 
 핵심: 정점 레이아웃 32B에 **UV가 이미 포함**(offset 24)되어 hit에서 텍스처 샘플 가능. 탄젠트는 없음 →
@@ -62,8 +62,12 @@
 
 ### G4 — 텍스처 머티리얼 + 노멀 매핑 ✅ (Metal inline + M7 검증됨)
 - hit에서 보간 UV로 base_color(sRGB)·metallic-roughness(linear)·emissive 텍스처를 샘플한다.
-  RT 셰이더는 파생값이 없고 Metal M7 경로가 아직 sampler heap을 바인딩하지 않으므로, mip0 `Texture2D.Load`
-  기반 repeat/bilinear 샘플러를 `rt_common.slang`에 둔다.
+  ~~RT 셰이더는 파생값이 없어 mip0 `Texture2D.Load` 기반 샘플러를 쓴다.~~ **(후속 해소, `bfce4e8`)**
+  텍스처가 전체 밉 체인을 갖도록 바뀌었고(`rhi_types::generate_mip_chain`이 CPU에서 박스 다운샘플 —
+  sRGB는 선형공간 평균, 백엔드 간 바이트 동일), RT 경로는 파생값 대신 **레이콘 LOD**(Akenine-Möller
+  평면 근사: 1차 레이는 픽셀 각폭, 바운스마다 거칠기로 콘이 넓어짐)를 명시 LOD로 넘겨
+  `g.textures[i].SampleLevel(g.samp, uv, lod)`로 샘플한다. 콘 상태는 inline=루프 로컬, pipeline=Payload
+  필드로 운반해 두 경로가 일치. Metal M7도 root signature에 s0,space1 정적 trilinear 샘플러를 추가.
 - 탄젠트: 삼각형 3정점(pos+uv)에서 hit-time 계산 → 탄젠트공간 노멀맵 적용(아보카도 모델이 노멀맵 보유).
 - Metal Shader Converter M7은 별도 descriptor table에 sampled texture/cube/storage/TLAS 범위를 채운다.
   검증: `cargo check -p dreamcoast-shader`, `cargo check -p sandbox`,

@@ -117,12 +117,15 @@ impl D3d12Texture {
             let mut ptr: *mut c_void = std::ptr::null_mut();
             upload.Map(0, None, Some(&mut ptr)).map_err(d3d_err)?;
             let base = ptr as *mut u8;
-            for mip in 0..n {
-                let fp = &footprints[mip];
+            for (((fp, &src_pitch), &rows), level) in footprints
+                .iter()
+                .zip(row_sizes.iter())
+                .zip(num_rows.iter())
+                .zip(levels.iter())
+            {
                 let dst_pitch = fp.Footprint.RowPitch as usize;
-                let src_pitch = row_sizes[mip] as usize;
-                let rows = num_rows[mip] as usize;
-                let level = &levels[mip];
+                let src_pitch = src_pitch as usize;
+                let rows = rows as usize;
                 let dst = base.add(fp.Offset as usize);
                 for row in 0..rows {
                     std::ptr::copy_nonoverlapping(
@@ -136,7 +139,7 @@ impl D3d12Texture {
 
             // Copy each mip upload -> its texture subresource, then transition all to read.
             device.immediate_submit(|list| {
-                for mip in 0..n {
+                for (mip, fp) in footprints.iter().enumerate() {
                     let dst = D3D12_TEXTURE_COPY_LOCATION {
                         pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(&resource))),
                         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -148,7 +151,7 @@ impl D3d12Texture {
                         pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(&upload))),
                         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            PlacedFootprint: footprints[mip],
+                            PlacedFootprint: *fp,
                         },
                     };
                     list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
