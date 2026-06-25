@@ -178,17 +178,31 @@ impl MetalRenderTarget {
     pub fn set_name(&self, _name: &str) {}
 }
 
-/// A 3D (volume) texture for Phase 11 Stage B distance fields. **Stub** — the Metal
-/// argument buffer does not yet carry the `volumes[]` / `storage_volumes[]` tables
-/// (Stage B is implemented on the Windows backends first; the Metal session wires
-/// the argument-buffer slots + 3D `MTLTexture` here). The facade arms exist so the
-/// cross-platform build stays uniform.
+/// A 3D (volume) texture for Phase 11 Stage B distance fields. A single `Private`
+/// 3D `MTLTexture` registered in both bindless volume tables — `storage_volumes[]`
+/// (UAV) for the SDF bake / GDF merge compute writes and `volumes[]` (SRV) for
+/// trilinear sampling by the SW ray marcher (the Vulkan single-view / D3D12 SRV+UAV
+/// mirror). Residency is toggled per use by `volume_to_storage` / `volume_to_sampled`
+/// (see `command.rs`), so it is never both UAV-resident and sampled-resident.
 pub struct MetalVolume {
+    pub(crate) texture: Retained<ProtocolObject<dyn MTLTexture>>,
     sampled_index: u32,
     storage_index: u32,
 }
 
 impl MetalVolume {
+    pub(crate) fn new(
+        texture: Retained<ProtocolObject<dyn MTLTexture>>,
+        sampled_index: u32,
+        storage_index: u32,
+    ) -> Self {
+        Self {
+            texture,
+            sampled_index,
+            storage_index,
+        }
+    }
+
     /// `volumes[]` (sampled) bindless index.
     pub fn sampled_index(&self) -> u32 {
         self.sampled_index

@@ -811,3 +811,70 @@ warnings" cargo clippy --workspace --all-targets` clean. Screenshots (Read-verif
 - Cornell pipeline **VK ≡ DX** mean 0.0000/ch, max 7.
 - Vulkan validation VUID 0 (incl. the RT-pipeline path); D3D12 debug-layer clean.
 - D3D12 texture-upload-loop refactor is byte-identical to the pre-refactor capture.
+
+## Phase 11 Stage B — 3D volume textures / GDF on Metal (done, verified this M3 box)
+
+Phase 11 Stage B (SW ray tracing the **global distance field**) shipped on Vulkan /
+D3D12 first and left the Metal backend a stub
+([phase-11-distance-field-gi.md](phase-11-distance-field-gi.md) B1: "Metal은
+스텁 — argument buffer 볼륨 슬롯은 메탈 세션이 구현"). The `bindless.slang` block
+grew two new arrays — `Texture3D<float> volumes[64]` (binding 6, trilinear-sampled)
+and `RWTexture3D<float> storage_volumes[64]` (binding 7, the SDF-bake / GDF-merge
+UAV) — declared **after** the `tlas` member. Two breakages followed on macOS, both
+fixed here:
+
+- **Compile break.** Stage B added `Format::R32Float` (single-channel signed
+  distance) to `rhi-types`, but `rhi-metal`'s `pixel_format` / `bytes_per_pixel`
+  matches are exhaustive (no wildcard), so the macOS build did **not compile**.
+  Added `R32Float → MTLPixelFormat::R32Float` (4 bpp).
+- **Startup panic.** The sandbox `run()` decomposition moved volume creation into
+  `GdfSystem::new` (`apps/sandbox/src/gdf.rs`), called unconditionally with
+  `compute_supported = true`, so **every** `--backend metal` launch (even the plain
+  scene, no `P11_*`) hit `create_volume`'s `unimplemented!`. Implementing the volume
+  path restores startup.
+
+**What shipped (`crates/rhi-metal`):**
+
+- **Argument-buffer slots (`device.rs`).** `VOLUME_COUNT` / `STORAGE_VOLUME_COUNT`
+  = 64; `VOLUME_BASE = TLAS_SLOT + 1`, `STORAGE_VOLUME_BASE = VOLUME_BASE +
+  VOLUME_COUNT`, `ARG_BUFFER_SLOTS` grown by 128 (now 1346). **Pin (verified via
+  `slangc -target metal`):** even though none of the Phase 11 shaders trace, Slang's
+  Metal target keeps the `tlas` member in the argument-buffer struct (it does **not**
+  compact unused members — the M4 finding, now confirmed for `tlas`), so the MSL
+  layout is `… storage_buffers[64], tlas, volumes[64], storage_volumes[64]` and the
+  Rust fixed slots line up exactly. (If Slang *had* dropped `tlas`, `volumes` would
+  have shifted down one slot — the one real risk, ruled out.)
+- **`create_volume` (`device.rs`).** A single `Private` 3D `MTLTexture`
+  (`MTLTextureType::Type3D`, R32Float, `ShaderRead | ShaderWrite`) registered in both
+  tables via `register_volume` (SRV slot) + `register_storage_volume` (UAV slot) —
+  the Vulkan single-view / D3D12 SRV+UAV mirror.
+- **Residency (`command.rs`).** `volume_to_storage` / `volume_to_sampled` toggle the
+  volume between the UAV `Read | Write` resident set and the sampled `Read` set,
+  exactly like the 2D `rt_to_storage` / `storage_to_sampled` hooks; Metal's
+  encoder-boundary hazard tracking orders the bake-write → marcher-sample on the
+  single queue (no explicit barrier).
+
+**Verification (this macOS M3 box):** `cargo build` + `cargo clippy --workspace
+--all-targets` (`-D warnings`) clean; `rhi-metal` `cargo fmt` clean. All toggles
+captured `--backend metal --screenshot-clean` under `MTL_DEBUG_LAYER=1
+MTL_SHADER_VALIDATION=1`, no validation faults, matching the documented Windows
+results:
+
+- **Default scene** (no `P11_*`) renders the deferred-PBR scene again (startup
+  panic gone; M4–M7 unaffected).
+- **A — `P11_SDF`** (analytic SDF sphere-trace): 3 spheres + box + ground + sky with
+  soft contact shadows + AO.
+- **B1 — `P11_VOLUME_TEST`**: centred-sphere SDF Z-slice (gradient + green
+  zero-isosurface ring).
+- **B2 — `P11_SDF_BAKE`**: baked uv-sphere SDF slice (matches the B1 analytic field).
+- **B3 — `P11_GDF_MERGE`**: 3 instance spheres at their transforms, min-union in
+  overlapping boxes, `+inf` (black) outside the bake boxes.
+- **B4 — `P11_GDF_TRACE` `P11_GDF_INSTANCES=1`**: SW-ray-traced sphere (soft shadow +
+  contact AO, faint 64³ voxel banding) **≈ the analytic reference** (`P11_GDF_ANALYTIC`).
+  (The default sparse 3-instance GDF shows the documented empty-region overshoot —
+  a shared-shader Stage-B limitation, not Metal-specific; the full-coverage instance
+  is the doc's verified-clean config.)
+
+**Cross-backend:** the only shared change is `R32Float` (Stage B already added it to
+the shared `Format` / shaders, verified on Windows); the rest is `rhi-metal`-only
+Rust, so Vulkan / D3D12 are unaffected.
