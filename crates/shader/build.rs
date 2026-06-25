@@ -246,6 +246,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "rt_path_cs",
     },
+    // Phase 11 Stage A (A1): compute software ray tracing via SDF sphere tracing.
+    Job {
+        src: "sdf_trace.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "sdf_trace_cs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.
