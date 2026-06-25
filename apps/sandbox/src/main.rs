@@ -18,7 +18,7 @@ use dreamcoast_platform::Window;
 use dreamcoast_render::{ComputePassInfo, GraphProfiler, PassInfo, RenderGraph, ResourcePool};
 use rhi::{
     BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, ComputePipelineDesc,
-    CubemapDesc, Extent2D, Format, GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode,
+    Extent2D, Format, GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode,
     PrimitiveTopology, SwapchainDesc, Texture, VertexLayout,
 };
 use tracing::info;
@@ -395,142 +395,6 @@ fn run() -> anyhow::Result<()> {
     // visible instances (see `cull.rs`).
     let cull = CullSystem::new(&device, backend, compute_supported, swapchain.format())?;
 
-    // Sky pipeline: renders the procedural sky into each environment cube face.
-    let (sky_vs, sky_fs) = load_shader_pair(
-        backend,
-        dreamcoast_shader::sky_vs_spirv,
-        dreamcoast_shader::sky_fs_spirv,
-        dreamcoast_shader::sky_vs_dxil,
-        dreamcoast_shader::sky_fs_dxil,
-        dreamcoast_shader::sky_vs_metallib,
-        dreamcoast_shader::sky_fs_metallib,
-        "sky",
-    )?;
-    let sky_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: sky_vs,
-        fragment_bytes: sky_fs,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_formats: &[Format::Rgba16Float],
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::None,
-        blend: BlendMode::Opaque,
-        push_constant_size: 32, // sun float4 + face + flip_y + pad
-        bindless: true,         // for the root-constants param (push constants)
-        uniform_buffer: false,
-        depth_test: false,
-        depth_format: None,
-    })?;
-
-    // Capture pipeline: forward-renders scene geometry into the env cube faces
-    // (camera-based real-time capture), simple direct lighting only.
-    let (cap_vs, cap_fs) = load_shader_pair(
-        backend,
-        dreamcoast_shader::capture_vs_spirv,
-        dreamcoast_shader::capture_fs_spirv,
-        dreamcoast_shader::capture_vs_dxil,
-        dreamcoast_shader::capture_fs_dxil,
-        dreamcoast_shader::capture_vs_metallib,
-        dreamcoast_shader::capture_fs_metallib,
-        "capture",
-    )?;
-    let capture_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: cap_vs,
-        fragment_bytes: cap_fs,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_formats: &[HDR_FORMAT],
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::MeshPosNormal,
-        blend: BlendMode::Opaque,
-        push_constant_size: 208, // mvp+model(128) + base_color(16) + sun(16) + misc(16) + eye(16) + ibl(16)
-        bindless: true,
-        uniform_buffer: false,
-        depth_test: true, // occlusion when capturing the scene into the cube
-        depth_format: Some(DEPTH_FORMAT),
-    })?;
-
-    // Irradiance pipeline: convolves the env cube into a diffuse-irradiance cube.
-    let (irr_vs, irr_fs) = load_shader_pair(
-        backend,
-        dreamcoast_shader::irradiance_vs_spirv,
-        dreamcoast_shader::irradiance_fs_spirv,
-        dreamcoast_shader::irradiance_vs_dxil,
-        dreamcoast_shader::irradiance_fs_dxil,
-        dreamcoast_shader::irradiance_vs_metallib,
-        dreamcoast_shader::irradiance_fs_metallib,
-        "irradiance",
-    )?;
-    let irradiance_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: irr_vs,
-        fragment_bytes: irr_fs,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_formats: &[HDR_FORMAT],
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::None,
-        blend: BlendMode::Opaque,
-        push_constant_size: 16, // face + flip_y + env_index + pad
-        bindless: true,
-        uniform_buffer: false,
-        depth_test: false,
-        depth_format: None,
-    })?;
-
-    // Prefilter pipeline: GGX-prefilters the env cube per roughness mip.
-    let (pre_vs, pre_fs) = load_shader_pair(
-        backend,
-        dreamcoast_shader::prefilter_vs_spirv,
-        dreamcoast_shader::prefilter_fs_spirv,
-        dreamcoast_shader::prefilter_vs_dxil,
-        dreamcoast_shader::prefilter_fs_dxil,
-        dreamcoast_shader::prefilter_vs_metallib,
-        dreamcoast_shader::prefilter_fs_metallib,
-        "prefilter",
-    )?;
-    let prefilter_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: pre_vs,
-        fragment_bytes: pre_fs,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_formats: &[HDR_FORMAT],
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::None,
-        blend: BlendMode::Opaque,
-        push_constant_size: 20, // face + flip_y + env_index + roughness + env_mips
-        bindless: true,
-        uniform_buffer: false,
-        depth_test: false,
-        depth_format: None,
-    })?;
-
-    // BRDF LUT pipeline: integrates the environment-BRDF terms into an Rg16Float 2D.
-    let (brdf_vs, brdf_fs) = load_shader_pair(
-        backend,
-        dreamcoast_shader::brdf_vs_spirv,
-        dreamcoast_shader::brdf_fs_spirv,
-        dreamcoast_shader::brdf_vs_dxil,
-        dreamcoast_shader::brdf_fs_dxil,
-        dreamcoast_shader::brdf_vs_metallib,
-        dreamcoast_shader::brdf_fs_metallib,
-        "brdf",
-    )?;
-    let brdf_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: brdf_vs,
-        fragment_bytes: brdf_fs,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_formats: &[Format::Rg16Float],
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::None,
-        blend: BlendMode::Opaque,
-        push_constant_size: 16, // flip_y + pad
-        bindless: true,
-        uniform_buffer: false,
-        depth_test: false,
-        depth_format: None,
-    })?;
-
     // Clip-space Y orientation for the full-screen passes (Vulkan = 1, D3D12 /
     // Metal = 0; both have a Y-up NDC with a top-left framebuffer origin).
     let flip_y: u32 = match backend {
@@ -746,12 +610,6 @@ fn run() -> anyhow::Result<()> {
     // Multi-bounce: shade captured surfaces with IBL from the previous frame's
     // cube set, so reflective surfaces appear reflective inside reflections.
     let mut multibounce = true;
-    let mut env_captured = false;
-    let mut last_sun = (sun_dir, sun_intensity);
-    // Ping-pong parity for the two cube sets; advances only when a capture
-    // actually happens, so a skipped frame keeps sampling the last written set.
-    let mut env_parity = 0usize;
-    let mut last_written = 0usize;
 
     let mut command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
     let mut image_available = Vec::with_capacity(FRAMES_IN_FLIGHT);
@@ -784,111 +642,30 @@ fn run() -> anyhow::Result<()> {
     let mut gpu_timings: Vec<(String, f32)> = Vec::new();
     let mut render_finished = build_render_finished(&device, swapchain.image_count())?;
 
-    // IBL resource set. The environment cube holds the procedural sky; the
-    // irradiance / prefilter cubes and BRDF LUT are derived from it. The env +
-    // irradiance + prefilter generation is reusable (call again to re-capture
-    // when the sky changes — a future real-time atmospheric model); the BRDF LUT
-    // is sky-independent and generated once.
-    // Double-buffered environment cube sets for multi-bounce reflections. Each
-    // frame captures the scene into the "write" set while shading those captured
-    // surfaces with IBL from the "read" set (the previous frame), so reflective
-    // surfaces reflect other reflective surfaces. The sets ping-pong; the main
-    // lighting pass always samples the freshly written set. The BRDF LUT is
-    // sky-independent so it stays single.
-    let make_cube_set = || -> anyhow::Result<CubeSet> {
-        Ok(CubeSet {
-            env: device.create_cubemap(&CubemapDesc {
-                size: ENV_SIZE,
-                format: HDR_FORMAT,
-                mip_levels: ENV_MIPS,
-            })?,
-            irradiance: device.create_cubemap(&CubemapDesc {
-                size: IRRADIANCE_SIZE,
-                format: HDR_FORMAT,
-                mip_levels: 1,
-            })?,
-            prefilter: device.create_cubemap(&CubemapDesc {
-                size: PREFILTER_SIZE,
-                format: HDR_FORMAT,
-                mip_levels: PREFILTER_MIPS,
-            })?,
-        })
-    };
-    let cube_sets = [make_cube_set()?, make_cube_set()?];
-    // Depth buffer for capturing scene geometry into the env cube faces.
-    let capture_depth = device.create_depth_buffer(Extent2D::new(ENV_SIZE, ENV_SIZE))?;
-    let brdf_lut = device.create_render_target(&rhi::RenderTargetDesc {
-        width: BRDF_SIZE,
-        height: BRDF_SIZE,
-        format: Format::Rg16Float,
-        storage: false,
-    })?;
-    let brdf_index = brdf_lut.bindless_index() as i32;
-    // Name the persistent IBL resources so GPU captures (RenderDoc/PIX) show
-    // readable identifiers instead of anonymous "Texture N" (Phase 9 M2; debug
-    // builds only — the backends no-op these in release).
-    brdf_lut.set_name("ibl_brdf_lut");
-    capture_depth.set_name("ibl_capture_depth");
-    for (i, set) in cube_sets.iter().enumerate() {
-        set.env.set_name(&format!("ibl_env_cube[{i}]"));
-        set.irradiance
-            .set_name(&format!("ibl_irradiance_cube[{i}]"));
-        set.prefilter.set_name(&format!("ibl_prefilter_cube[{i}]"));
-    }
-    let ibl = IblResources {
-        sky_pipeline: &sky_pipeline,
-        capture_pipeline: &capture_pipeline,
-        irradiance_pipeline: &irradiance_pipeline,
-        prefilter_pipeline: &prefilter_pipeline,
-        ground_vbuf: &ground_vbuf,
-        ground_ibuf: &ground_ibuf,
+    // Image-based lighting (see `ibl.rs`): the procedural-sky / capture / irradiance
+    // / prefilter / BRDF pipelines, the ping-pong environment cube sets, the capture
+    // depth and the BRDF LUT (generated once on construction). The env chain is
+    // (re)captured per frame inside the render loop via `maybe_capture`.
+    let mut ibl = IblSystem::new(&device, backend, &queue, flip_y, sun_dir, sun_intensity)?;
+    // Seed both cube sets once (single-bounce, no previous environment) so the first
+    // multi-bounce frame reads valid data instead of uninitialized memory. Uses an
+    // approximate camera; the render loop immediately recaptures with the live one.
+    let boot_eye = Vec3::new(0.0, model_radius * 0.6, 0.0)
+        + Vec3::new(scene_radius * 1.6, scene_radius * 0.55, 0.0);
+    ibl.seed(
+        &device,
+        &queue,
+        &scene,
+        &ground_vbuf,
+        &ground_ibuf,
         ground_count,
-    };
-    {
-        // The BRDF LUT is sky-independent — generate it once. The environment
-        // chain is (re)captured per frame inside the render loop.
-        let gen_cmd = device.create_command_buffer()?;
-        let gen_fence = device.create_fence(false)?;
-        generate_brdf_lut(
-            &queue,
-            &gen_cmd,
-            &gen_fence,
-            &brdf_pipeline,
-            &brdf_lut,
-            flip_y,
-        )?;
-    }
-    // Initialize both cube sets once (single-bounce, no previous environment) so
-    // the first multi-bounce frame reads valid data instead of uninitialized
-    // memory. Uses an approximate camera; the render loop immediately recaptures
-    // with the live camera.
-    {
-        let boot_eye = Vec3::new(0.0, model_radius * 0.6, 0.0)
-            + Vec3::new(scene_radius * 1.6, scene_radius * 0.55, 0.0);
-        let init_cmd = device.create_command_buffer()?;
-        let init_fence = device.create_fence(false)?;
-        init_cmd.begin()?;
-        for set in &cube_sets {
-            record_environment_capture(
-                &init_cmd,
-                &ibl,
-                set,
-                None,
-                brdf_index,
-                &scene,
-                &capture_depth,
-                boot_eye,
-                sun_dir,
-                sun_intensity,
-                ambient,
-                flip_y,
-                backend == BackendKind::Vulkan,
-            );
-        }
-        init_cmd.end()?;
-        queue.submit_oneshot(&init_cmd, &init_fence)?;
-        init_fence.wait()?;
-    }
+        boot_eye,
+        sun_dir,
+        sun_intensity,
+        ambient,
+        flip_y,
+        backend == BackendKind::Vulkan,
+    )?;
 
     let _ = window.take_resized();
     info!("entering render loop");
@@ -1188,55 +965,27 @@ fn run() -> anyhow::Result<()> {
         let cmd = &command_buffers[frame];
         cmd.begin()?;
 
-        // (Re)capture the environment into the "write" cube set before the main
-        // graph samples it: every frame when real-time is on, otherwise only the
-        // first frame and whenever the sun changes. With multi-bounce on, the
-        // captured surfaces are shaded with IBL from the "read" set (the previous
-        // frame), so reflective surfaces reflect each other; the parity advances
-        // only on an actual capture, so a skipped frame keeps the last written set.
-        let sun_changed = (sun_dir, sun_intensity) != last_sun;
-        if realtime_env || !env_captured || sun_changed {
-            let write = env_parity % 2;
-            let read = 1 - write;
-            let prev = if multibounce && env_captured {
-                Some(&cube_sets[read])
-            } else {
-                None
-            };
-            record_environment_capture(
-                cmd,
-                &ibl,
-                &cube_sets[write],
-                prev,
-                brdf_index,
-                &scene,
-                &capture_depth,
-                // Capture the reflection probe at the scene centre, NOT the camera:
-                // a camera-anchored probe gives every reflective surface a parallax
-                // error (the reflected ground/horizon slides up the spheres as the
-                // camera moves). A fixed probe near the objects keeps reflections
-                // stable and roughly correct for surfaces around the centre.
-                focus,
-                sun_dir,
-                sun_intensity,
-                ambient,
-                flip_y,
-                backend == BackendKind::Vulkan,
-            );
-            last_written = write;
-            env_parity += 1;
-            env_captured = true;
-            last_sun = (sun_dir, sun_intensity);
-        }
+        // (Re)capture the environment into the "write" cube set before the main graph
+        // samples it (see `ibl.rs`). The reflection probe is fixed at the scene centre
+        // (`focus`), NOT the camera, to avoid per-surface parallax error.
+        ibl.maybe_capture(
+            cmd,
+            realtime_env,
+            multibounce,
+            &scene,
+            &ground_vbuf,
+            &ground_ibuf,
+            ground_count,
+            focus,
+            sun_dir,
+            sun_intensity,
+            ambient,
+            flip_y,
+            backend == BackendKind::Vulkan,
+        );
 
         // The main lighting pass samples the most recently written set.
-        let write_set = &cube_sets[last_written];
-        let ibl_indices = [
-            write_set.env.bindless_index() as i32,
-            write_set.irradiance.bindless_index() as i32,
-            write_set.prefilter.bindless_index() as i32,
-            brdf_index,
-        ];
+        let ibl_indices = ibl.lighting_indices();
 
         // Directional light view-projection: an orthographic box covering the
         // whole scene, looking from the sun toward it. Backend-neutral (the pbr

@@ -83,7 +83,17 @@ Feature groups (setup line / loop line):
   run before the graph build; `record_path` / `record_trace` add the passes (`&'a self`),
   and the loop bumps the accumulation counter at end-of-frame via `advance_accum` (the
   R1 deferral pattern). `cornell_camera` is the fixed front-camera helper.
-- **R5 — `ibl.rs` / `IblSystem`** (fold the IBL resources in beside the existing fns).
+- **R5 — `ibl.rs` / `IblSystem`. DONE.** Folds the IBL *resources* in beside the bake
+  helpers: owns the sky/capture/irradiance/prefilter/BRDF pipelines, the two ping-pong
+  cube sets, the capture depth and the BRDF LUT (generated once in `new`), plus the
+  per-frame ping-pong/capture-decision state. Unlike the graph-pass bundles, the env
+  capture records into the raw command buffer before the graph, so `maybe_capture(&mut
+  self, cmd, …)` holds the ping-pong (`env_parity`/`last_written`/`env_captured`/
+  `last_sun`) and `lighting_indices()` returns the bindless indices the lighting pass
+  samples; `seed()` warms both cube sets at boot. `record_environment_capture` /
+  `generate_brdf_lut` / `CubeSet` / `IblResources` became module-private (only the
+  bundle calls them); the BRDF LUT is held as `_brdf_lut` (kept alive for its bindless
+  slot, not read again).
 - **R6 — `deferred.rs` / `DeferredRenderer`** (the PBR backbone).
 - **R7 — `App::new()` / `App::frame()`.** With features bundled, the residual setup
   + loop is small enough to wrap into an `App` struct; `run()` shrinks to window +
