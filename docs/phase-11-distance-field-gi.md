@@ -85,28 +85,10 @@ HW RT 파이프라인(Phase 8) 없이 컴퓨트 셰이더로 레이를 추적하
 
 신규 RHI: 3D(볼륨) 텍스처 + UAV, 3D 디스패치. (Phase 7 storage image의 3D 확장.)
 
-## 쿠킹된 에셋 포맷 — 메시 + 베이크 데이터 직렬화 (사용자 요청, 장기 / 크로스컷팅)
-> 핵심: GDF 베이크만 캐싱하는 게 아니라, **가공된 메시 지오메트리 + 베이크된 GDF(+향후 확장)를 하나의
-> 직렬화된 "에셋"으로 저장/로드**하는 실질적 에셋 파이프라인. 매 실행 glTF 재파싱 + SDF 재베이크를 없앤다.
-
-Phase 11 Stage B가 직접적 동기지만 이건 `crates/asset`의 **크로스컷팅 자산 개념**이다. 현재 `crates/asset`은
-런타임에 glTF→`MeshData`를 파싱한다(즉석). 쿠킹 포맷은 그 `MeshData` + 베이크 부산물을 영속화한다.
-
-- **포맷 `.dcasset`(가칭) 바이너리 컨테이너:**
-  - 헤더 {magic, version, source_hash, flags}
-  - 메시 청크 {vertices(32B 레이아웃), indices(u32), material params, AABB, (후속) tangents/LOD}
-  - 베이크 청크(옵션·확장 가능): **SDF 볼륨**{dims(x,y,z), aabb, format=R16F, voxels} — 첫 베이크 페이로드.
-    향후: BVH, 라이트맵, 미리 계산된 프로브 등 같은 컨테이너에 청크로 추가.
-- **파이프라인:** 소스(glTF) → **cook**(파싱 + Stage B SDF 베이크) → `.dcasset` 기록. 런타임은 `.dcasset`을
-  직접 로드(glTF 파싱·재베이크 없음). cook은 오프라인 툴(`tools/`) 또는 첫 실행 시 lazy.
-- **무효화 키:** `source_hash`(glTF 바이트) + cook 파라미터(SDF 해상도 등) + `version`. 불일치/부재 → 재쿡.
-  위치 gitignored `cache/` 또는 커밋되는 `assets/cooked/`(선택).
-- **결정성:** voxel 데이터는 크로스백엔드 바이트 동일이어야 함(밉 체인 규칙과 동일 — CPU 또는 결정적 컴퓨트
-  베이크). 로드 시 GPU 볼륨/버퍼 업로드는 B1의 3D 텍스처 + 기존 메시 버퍼 경로 재활용.
-- **위치:** RHI-agnostic 직렬화 + cook 로직은 `crates/asset`(glTF/이미지 로딩 옆, `serde`/수동 바이너리),
-  GPU 업로드는 백엔드 texture3D/buffer 경로. 클립맵 동적 부분은 런타임 갱신이라 쿡 대상은 **정적 메시 + SDF**.
-- **삽입 시점:** B2(베이크) 직후가 자연스러움 — 베이크 결과를 곧장 `.dcasset`으로 영속화. 단 메시 직렬화는
-  B와 독립이라 더 일찍(메시만 먼저 쿡) 시작할 수도 있음. 별도 설계 마일스톤으로 분리해 진행.
+> **GDF 베이크 영속화는 별도 워크스트림으로 승격됨 → [Phase 12 — 에셋 파이프라인](phase-12-asset-pipeline.md).**
+> 사용자 요청대로 SDF 베이크만이 아니라 **메시까지 함께 직렬화하는 쿠킹된 에셋(`.dcasset`)** 개념이라
+> 규모가 커서 `crates/asset`의 크로스컷팅 인프라(독립 Phase)로 분리했다. Stage B의 per-mesh SDF 베이크
+> 결과가 Phase 12 M2의 SDF 청크로 영속화된다. (메시 직렬화 M1은 Phase 11과 독립적으로 먼저 가능.)
 
 ## Stage C — Stochastic Lighting
 - GDF를 ray-march해 **디퓨즈 GI(1+ 바운스)·AO·러프 반사**를 stochastic(몬테카를로) 샘플.

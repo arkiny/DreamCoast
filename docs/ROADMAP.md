@@ -146,8 +146,9 @@ engine/                 # cargo workspace root
 하드웨어 RT(Phase 8) 없이도 동작하는, **컴퓨트 기반 소프트웨어 레이트레이싱 → 전역 거리장(Global
 Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/AO를 구현한다. 전제: **Phase 7
 (컴퓨트/GPU-driven)**. Phase 8 HW RT와는 별개 경로(저사양/넓은 씬용 근사 GI).
-- **Stage A — 컴퓨트 소프트웨어 레이트레이싱:** HW RT 파이프라인 없이 컴퓨트 셰이더로 레이를 추적
-  (거리장 ray-marching, 또는 컴퓨트 BVH 트래버설). Phase 8과 동일 씬에서 결과 대조 가능한 기반.
+- **Stage A — 컴퓨트 소프트웨어 레이트레이싱:** ✅ (A1 1차 가시성 + A2 소프트 섀도우/AO, 양 백엔드 검증).
+  HW RT 없이 컴퓨트로 해석적 SDF 씬을 sphere-trace(`sdf_trace.slang`, env `P11_SDF`). Stage B가 해석적
+  프리미티브를 베이크된 GDF로 교체. (A3 컴퓨트 BVH는 선택.)
 - **Stage B — Global Distance Field:** per-mesh SDF(메시 거리장) 베이크 → 카메라 주변을 덮는 **전역
   거리장 볼륨**(클립맵/스파스 볼륨 텍스처)으로 머지. 동적 오브젝트는 매 프레임/저빈도 갱신.
 - **Stage C — Stochastic Lighting:** GDF에 대해 stochastic(몬테카를로) 샘플링으로 GI(디퓨즈
@@ -155,6 +156,17 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
   스크린-스페이스 프로브/래디언스 캐시 구조는 Stage C 세부에서 확정.
 - **완료 기준**: 동적 씬에서 HW RT 없이 GDF 기반 GI/AO가 두 백엔드에서 동작, 패스트레이서(Phase 8)
   레퍼런스 대비 그럴듯하게 수렴, 검증 클린.
+
+### Phase 12 — 에셋 파이프라인 / 쿠킹된 에셋 — 🧪 실험적 / 계획
+세부: [phase-12-asset-pipeline.md](phase-12-asset-pipeline.md)
+**크로스컷팅 엔진 인프라** — `crates/asset`의 자산 직렬화 계층. 가공된 **메시 지오메트리 + 베이크 데이터
+(SDF, 향후 BVH/라이트맵)를 하나의 `.dcasset` 바이너리로 cook → 저장 → 런타임 직접 로드**. 매 실행
+glTF 재파싱 + SDF 재베이크를 없앤다. Phase 11 Stage B의 GDF 베이크 영속화가 직접 동기.
+- **M1 — 메시 직렬화**(.dcasset 골격: 헤더 + 메시 청크; cook glTF→.dcasset, 런타임 직접 로드). Phase 11과 독립.
+- **M2 — SDF 베이크 청크 통합**(Phase 11 B2 결과 영속화 + 로드). Stage B 이후.
+- **M3 — 확장**(후속·선택: BVH/라이트맵/프로브, 텍스처 참조).
+- **완료 기준**: glTF 재파싱·재베이크 없이 `.dcasset` 로드로 동일 렌더(양 백엔드 일치), startup 가속,
+  베이크 결과 바이트 동일 캐시.
 
 ### macOS / Metal 백엔드 — 🚧 진행 중
 세부: [metal-backend.md](metal-backend.md)
