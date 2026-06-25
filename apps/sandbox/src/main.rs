@@ -1275,6 +1275,16 @@ fn run() -> anyhow::Result<()> {
             needs_recreate = false;
         }
 
+        // Wait for this frame slot's previous submission to finish BEFORE the
+        // acquire below. The acquire reuses `image_available[frame]`, and Vulkan
+        // forbids acquiring with a semaphore that still has a pending wait from
+        // that earlier submit (VUID-vkAcquireNextImageKHR-semaphore-01779). This is
+        // the standard frames-in-flight order: wait → reset → acquire → record →
+        // submit. (D3D12/Metal ignore the semaphore, but the wait still gates reuse
+        // of this slot's command buffer / query heap below.)
+        let fence = &in_flight[frame];
+        fence.wait()?;
+
         // Acquire the drawable up front: its *actual* pixel size is the single
         // source of truth for this whole frame (ImGui display size, camera aspect,
         // render extent, viewport). A failed acquire skips here, BEFORE the ImGui
@@ -1464,12 +1474,10 @@ fn run() -> anyhow::Result<()> {
                 });
         }
 
-        let fence = &in_flight[frame];
-        fence.wait()?;
-
-        // This slot's previous submission is now complete, so its timestamp
-        // queries are ready: read them back and turn the tick boundaries into
-        // per-pass GPU milliseconds for the profiler UI (shown next frame).
+        // This slot's previous submission is complete (waited on `fence` above), so
+        // its timestamp queries are ready: read them back and turn the tick
+        // boundaries into per-pass GPU milliseconds for the profiler UI (shown next
+        // frame).
         if profiler_on && !slot_pass_names[frame].is_empty() {
             let heap = &query_heaps[frame];
             let ticks = heap.read();
