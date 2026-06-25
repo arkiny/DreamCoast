@@ -548,6 +548,26 @@ fn run() -> anyhow::Result<()> {
     } else {
         None
     };
+    // Phase 11 Stage B (B4): software ray trace against the merged GDF — reuses the
+    // Stage-A march/shadow/AO but samples the baked volume instead of analytic SDFs.
+    let gdf_trace_pipeline = if compute_supported {
+        let cs = load_compute_shader(
+            backend,
+            dreamcoast_shader::gdf_trace_cs_spirv,
+            dreamcoast_shader::gdf_trace_cs_dxil,
+            dreamcoast_shader::gdf_trace_cs_metallib,
+            "gdf_trace",
+        )?;
+        Some(device.create_compute_pipeline(&ComputePipelineDesc {
+            compute_bytes: cs,
+            compute_entry: "csMain",
+            push_constant_size: 128, // inv_view_proj + cam + sun + out/w/h/flip + gdf/mode
+            bindless: true,
+            threads_per_group: [8, 8, 1],
+        })?)
+    } else {
+        None
+    };
 
     // Phase 11 Stage A (A1): compute software ray tracing — sphere-traces an analytic
     // SDF scene (no hardware RT / TLAS), so it is gated only on compute support.
@@ -1302,6 +1322,15 @@ fn run() -> anyhow::Result<()> {
         && gdf_instances.is_some()
         && std::env::var_os("P11_GDF_MERGE").is_some();
     let mut gdf_merge_done = false;
+    // Phase 11 Stage B (B4): SW ray trace the merged GDF. Builds the GDF (bake + merge,
+    // once) then sphere-traces it from a fixed camera framing the unit-cube scene.
+    // Headless toggle via `P11_GDF_TRACE`; `P11_GDF_ANALYTIC` swaps the GDF sample for
+    // the analytic field it was baked from (the B4 correctness reference).
+    let mut gdf_trace = gdf_trace_pipeline.is_some()
+        && gdf_merge_pipeline.is_some()
+        && gdf_instances.is_some()
+        && std::env::var_os("P11_GDF_TRACE").is_some();
+    let gdf_trace_analytic = std::env::var_os("P11_GDF_ANALYTIC").is_some();
     // Phase 8 M5: drive the path tracer through the full RT pipeline + SBT instead
     // of the inline compute ray query (same image). Headless toggle via
     // `P8_PATHTRACE_PIPELINE`; ignored when no RT pipeline is available.
@@ -1715,6 +1744,12 @@ fn run() -> anyhow::Result<()> {
                             }
                             if gdf_merge {
                                 ui.text_disabled("  - Stage B3: min-merged instances");
+                            }
+                        }
+                        if gdf_trace_pipeline.is_some() && gdf_instances.is_some() {
+                            ui.checkbox("GDF SW ray trace (compute)", &mut gdf_trace);
+                            if gdf_trace {
+                                ui.text_disabled("  - Stage B4: sphere-march baked GDF");
                             }
                         }
                     }
@@ -2620,6 +2655,144 @@ fn run() -> anyhow::Result<()> {
             None
         };
 
+        // Phase 11 Stage B (B4): SW ray trace the merged GDF. Ensures the GDF is built
+        // (bake + merge, once — shared `gdf_merge_done` with the B3 view), then sphere-
+        // traces it from a fixed camera over the unit-cube scene. `P11_GDF_ANALYTIC`
+        // swaps in the analytic field for the correctness reference. VK ≡ DX.
+        let gdf_trace_out = if gdf_trace
+            && rt_out.is_none()
+            && sdf_out.is_none()
+            && vol_out.is_none()
+            && bake_out.is_none()
+            && gdf_out.is_none()
+        {
+            if let (
+                Some(vol),
+                Some(gdf),
+                Some(bakep),
+                Some(mergep),
+                Some(tracep),
+                Some(vtx),
+                Some(idx),
+                Some((insts, inst_count)),
+            ) = (
+                volume_res.as_ref(),
+                gdf_res.as_ref(),
+                sdf_bake_pipeline.as_ref(),
+                gdf_merge_pipeline.as_ref(),
+                gdf_trace_pipeline.as_ref(),
+                bake_vtx.as_ref(),
+                bake_idx.as_ref(),
+                gdf_instances.as_ref(),
+            ) {
+                let out = graph.create_storage_image("gdf_trace_out", HDR_FORMAT, extent);
+                let vol_ext = graph.import_external("volume");
+                let gdf_ext = graph.import_external("gdf");
+                let vol_storage = vol.storage_index();
+                let gdf_storage = gdf.storage_index();
+                let gdf_sampled = gdf.sampled_index();
+                let dim = VOLUME_DIM;
+                if !gdf_merge_done {
+                    let vtx_index = vtx.storage_index();
+                    let idx_index = idx.storage_index();
+                    let tri_count = bake_tri_count;
+                    let inst_table = insts.storage_index();
+                    let inst_n = *inst_count;
+                    graph.add_compute_pass(
+                        ComputePassInfo {
+                            name: "gdf_bake",
+                            storage_writes: vec![vol_ext],
+                            reads: vec![],
+                        },
+                        move |ctx| {
+                            let cmd = ctx.cmd();
+                            cmd.volume_to_storage(vol);
+                            cmd.bind_compute_pipeline(bakep);
+                            cmd.push_constants_compute(&sdf_bake_push(
+                                vol_storage,
+                                dim,
+                                tri_count,
+                                vtx_index,
+                                idx_index,
+                            ));
+                            let g = dim.div_ceil(4);
+                            cmd.dispatch(g, g, g);
+                            Ok(())
+                        },
+                    );
+                    graph.add_compute_pass(
+                        ComputePassInfo {
+                            name: "gdf_merge",
+                            storage_writes: vec![gdf_ext],
+                            reads: vec![vol_ext],
+                        },
+                        move |ctx| {
+                            let cmd = ctx.cmd();
+                            cmd.volume_to_sampled(vol);
+                            cmd.volume_to_storage(gdf);
+                            cmd.bind_compute_pipeline(mergep);
+                            cmd.push_constants_compute(&gdf_merge_push(
+                                gdf_storage,
+                                dim,
+                                inst_table,
+                                inst_n,
+                            ));
+                            let g = dim.div_ceil(4);
+                            cmd.dispatch(g, g, g);
+                            Ok(())
+                        },
+                    );
+                    gdf_merge_done = true;
+                }
+                // Fixed camera framing the unit-cube GDF scene (same Y-flip convention
+                // as the orbit camera so VK/DX reconstruct identical world rays).
+                let g_eye = Vec3::new(0.5, 0.65, 2.1);
+                let g_view = Mat4::look_at_rh(g_eye, Vec3::new(0.5, 0.42, 0.5), Vec3::Y);
+                let mut g_proj =
+                    Mat4::perspective_rh(35f32.to_radians(), cw as f32 / ch as f32, 0.02, 100.0);
+                if backend == BackendKind::Vulkan {
+                    g_proj.y_axis.y *= -1.0;
+                }
+                let g_inv_vp = (g_proj * g_view).inverse().to_cols_array();
+                let sun = sun_dir;
+                let sun_i = sun_intensity;
+                let flip = flip_y;
+                let mode = u32::from(gdf_trace_analytic);
+                graph.add_compute_pass(
+                    ComputePassInfo {
+                        name: "gdf_trace",
+                        storage_writes: vec![out],
+                        reads: vec![gdf_ext],
+                    },
+                    move |ctx| {
+                        let out_index = ctx.storage_index(out);
+                        let cmd = ctx.cmd();
+                        cmd.volume_to_sampled(gdf);
+                        cmd.bind_compute_pipeline(tracep);
+                        cmd.push_constants_compute(&gdf_trace_push(
+                            &g_inv_vp,
+                            g_eye,
+                            sun,
+                            sun_i,
+                            out_index,
+                            cw,
+                            ch,
+                            flip,
+                            gdf_sampled,
+                            mode,
+                        ));
+                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                        Ok(())
+                    },
+                );
+                Some(out)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active,
         // else the SW-RT SDF trace, else the Stage-B volume slice, else compute-post,
         // else HDR.
@@ -2628,12 +2801,13 @@ fn run() -> anyhow::Result<()> {
             .or(vol_out)
             .or(bake_out)
             .or(gdf_out)
+            .or(gdf_trace_out)
             .or(hdr_post)
             .unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the
         // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
         // exposure here before the filmic curve (else the bright sky + sun blow out).
-        let tm_exposure = if pt_active || sdf_out.is_some() {
+        let tm_exposure = if pt_active || sdf_out.is_some() || gdf_trace_out.is_some() {
             exposure
         } else {
             1.0
@@ -3471,6 +3645,44 @@ fn gdf_merge_push(gdf_storage: u32, dim: u32, inst_table: u32, inst_count: u32) 
     pc[32..36].copy_from_slice(&1.0f32.to_le_bytes());
     pc[36..40].copy_from_slice(&1.0f32.to_le_bytes());
     pc[40..44].copy_from_slice(&1.0f32.to_le_bytes());
+    pc
+}
+
+/// Pack the Phase 11 Stage B4 GDF-trace push block (128 bytes): inv_view_proj (64) +
+/// cam_pos (16) + sun dir+intensity (16) + (out, width, height, flip_y) (16) +
+/// (gdf_sampled, mode, pad, pad) (16). `mode` bit0 swaps the GDF sample for the
+/// analytic reference field. Same head layout as `sdf_trace_push`.
+#[allow(clippy::too_many_arguments)]
+fn gdf_trace_push(
+    inv_view_proj: &[f32; 16],
+    cam_pos: Vec3,
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    gdf_sampled: u32,
+    mode: u32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&cam_pos.x.to_le_bytes());
+    pc[68..72].copy_from_slice(&cam_pos.y.to_le_bytes());
+    pc[72..76].copy_from_slice(&cam_pos.z.to_le_bytes());
+    let sun = normalize3(sun_dir);
+    pc[80..84].copy_from_slice(&sun[0].to_le_bytes());
+    pc[84..88].copy_from_slice(&sun[1].to_le_bytes());
+    pc[88..92].copy_from_slice(&sun[2].to_le_bytes());
+    pc[92..96].copy_from_slice(&sun_intensity.to_le_bytes());
+    pc[96..100].copy_from_slice(&out_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&width.to_le_bytes());
+    pc[104..108].copy_from_slice(&height.to_le_bytes());
+    pc[108..112].copy_from_slice(&flip_y.to_le_bytes());
+    pc[112..116].copy_from_slice(&gdf_sampled.to_le_bytes());
+    pc[116..120].copy_from_slice(&mode.to_le_bytes());
     pc
 }
 

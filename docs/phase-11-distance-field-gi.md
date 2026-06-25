@@ -115,11 +115,28 @@ HW RT 파이프라인(Phase 8) 없이 컴퓨트 셰이더로 레이를 추적하
   녹색 링 분류 밴드(`abs(d)<0.01`) 제외 시 픽셀 완전 동일(max 0)**; 전체 프레임 기준 단 1픽셀만 차이
   (그 한 픽셀이 링 임계값의 knife-edge에 놓여 백엔드 간 1-ULP로 분류가 뒤집힘 — 거리장 자체는 동일).
 
-### B4 — GDF SW RT
-- `sdf_trace.slang`의 `scene_dist`/`scene_normal`을 **클립맵 볼륨 트라이리니어 샘플**로 교체
-  (적절 레벨 선택 + 경계 폴백). 노멀은 볼륨 gradient. Stage A의 march/soft_shadow/AO 로직은 그대로
-  재사용 → 비로소 **실제 메시 지오메트리**를 SW RT.
-- 검증: Phase 8 HW RT / 패스트레이서와 동일 씬 1차 가시성 + 소프트 섀도우 대조.
+### B4 — GDF SW RT ✅ (양 백엔드 검증)
+- `gdf_trace.slang`(`csMain`, `[numthreads(8,8,1)]`): Stage A SW-RT 머신(카메라 레이 생성, sphere-trace
+  march, gradient 노멀, 페넘브라 소프트 섀도우, 마치 AO)을 **그대로** 쓰되 `scene_dist`가 분석적
+  프리미티브 대신 **머지된 GDF 볼륨을 트라이리니어 샘플**(world→uvw, B3 AABB) → 비로소 베이크된 실제
+  지오메트리(B2 베이크→B3 머지→여기)를 SW 레이트레이스. 지면 평면과 min-union해 그림자 리시버 제공.
+- **march용 거리와 occlusion용 거리 분리**가 핵심: 1차 march는 GDF 박스 밖에서 박스 거리로 전진하되
+  박스 경계가 hit이 되지 않게 hit-epsilon 위로 클램프(`geo_march`); AO/섀도우/노멀은 박스를 솔리드로
+  보지 않도록 박스 밖을 +large로 반환(`geo_inside`/`scene_occ`) — 안 그러면 지면에 박스의 정사각
+  등거리선이 찍힌다(개발 중 실제로 관측·수정). 노멀 epsilon은 복셀 크기(~1/64)에 맞춰 셀 간 평균
+  (sub-voxel이면 단일 trilinear 셀만 읽어 표면이 계단짐).
+- 푸시(128B)는 `sdf_trace_push` 헤드 레이아웃 + `gdf_sampled` + `mode`. `mode` bit0은 GDF 샘플을
+  **베이크 원본인 분석적 구로 스왑**(B4 정합 레퍼런스). 카메라는 단위 큐브 씬을 프레이밍하는 고정
+  카메라(궤도 카메라와 동일 Y-flip 규약으로 VK/DX 동일 월드 레이). 토글 env `P11_GDF_TRACE`
+  (+ `P11_GDF_ANALYTIC`, `P11_GDF_INSTANCES=1`로 전체-커버리지 GDF) + UI. 영속 GDF는 1회만 빌드.
+- **검증 범위:** 전체-커버리지(단일 인스턴스) GDF로 검증 — 모든 voxel이 유효 거리라 march가 overshoot
+  없이 견고. **희소 멀티-박스 클립맵의 견고한 트레이싱(빈 영역 거리 채움)은 후속 정제.**
+- **검증(RTX 2070 SUPER):** build+fmt+clippy(-D warnings) 클린. GDF 트레이스가 깔끔한 구(소프트
+  섀도우 + 접촉 AO)를 렌더, **같은 카메라의 분석적 레퍼런스(`mode=1`)와 근접 일치** — 차이는 64³
+  해상도의 표면 셰이딩 미세 밴딩 + 실루엣(>8 차이 1279px), 즉 의도된 복셀화 오차(실루엣/셰이딩 모델은
+  동일). **VK≡DX: 921,600px 중 >8 차이 14px**(모두 구 실루엣/터미네이터의 가장 가파른 노멀 지점 —
+  iterative march의 step 수가 SPIR-V/DXIL 빌드 간 sub-ULP로 갈린 것이지 거리장 차이가 아님; B1–B3는
+  분기 없는 trilinear라 bit-identical, march는 데이터 의존 반복이라 소수 엣지 픽셀 발생).
 
 신규 RHI: 3D(볼륨) 텍스처 + UAV, 3D 디스패치. (Phase 7 storage image의 3D 확장.)
 
