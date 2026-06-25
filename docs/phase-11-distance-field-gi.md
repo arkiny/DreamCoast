@@ -79,13 +79,21 @@ HW RT 파이프라인(Phase 8) 없이 컴퓨트 셰이더로 레이를 추적하
   샘플. Vulkan VUID 0. **bindless 블록에 멤버 추가했지만 기존 래스터 씬 byte-identical(회귀 없음)** —
   Slang이 미사용 binding을 drop. tmp/vol-{vk,dx}.png.
 
-### B2 — per-mesh SDF 베이크
-- 컴퓨트로 각 메시의 로컬 AABB를 N³ 그리드(예 32³~64³)로 보로 voxel당 **부호 있는 거리** 계산.
-  1차 구현: **brute-force 점→삼각형 거리**(voxel center vs 모든 삼각형의 최소 거리). 부호는
-  angle-weighted pseudonormal 또는 ray-stabbing parity(내부/외부). 베이크-타임이므로 단순/정확 우선.
-  최적화(후속): voxelize + **JFA**(jump flooding)로 O(N³ log N).
-- 메시 정점/인덱스는 이미 storage buffer로 GPU 상주(Phase 8 RT geometry 경로 재활용 가능).
-- 검증: 구/박스 메시의 베이크 SDF를 Stage A 해석적 SDF와 대조(거리 오차 ≤ voxel 대각선).
+### B2 — per-mesh SDF 베이크 ✅ (양 백엔드 검증)
+- `sdf_bake.slang`(`bakeMain`, `[numthreads(4,4,4)]`): voxel당 1스레드, voxel center를 볼륨
+  AABB로 매핑 → **brute-force 점→삼각형 최소 거리**(closest-point-on-triangle, Ericson). 부호는
+  최근접 삼각형의 **저장된 정점 노멀**(면-평균, outward)로 결정: `dot(p-q, n) < 0 ⇒ 내부(음수)`.
+  cross(b-a,c-a) 면법선 대신 정점 노멀을 쓴 이유 — uv_sphere 와인딩이 내부 방향이라 부호가 뒤집히고,
+  공유 엣지/정점에서 면법선 방향이 미정의이기 때문(와인딩-독립, 첫 검증에서 부호 반전 발견 후 수정).
+  O(voxels·tris) 1회 베이크(JFA는 후속 최적화).
+- 메시 정점/인덱스는 bindless storage buffer로 업로드 — 래스터/HW RT와 **동일 32B 정점 스트라이드**
+  (pos@0, normal@12)라 지오메트리 1회 업로드로 모든 경로 공유. 베이크 메시는 unit uv-sphere(48×32)를
+  반경 0.3·중심 (0.5,0.5,0.5)로 스케일 → B1의 해석적 중심 구와 동일 필드(직접 대조용). 볼륨 AABB는 단위 큐브.
+- 그래프 통합: 베이크는 비싸므로 1회만(`sdf_bake_done`), 이후 프레임은 B1 `volume_view` 패스 재사용으로
+  슬라이스 표시(베이크↔해석적 픽셀 비교 + VK≡DX). 토글 env `P11_SDF_BAKE` + UI. tonemap 체인에 `bake_out` 추가.
+- **검증(RTX 2070 SUPER):** build 클린. **VK≡DX 픽셀 동일(max 0)** — 결정적 베이크. 베이크 SDF는
+  해석적 구와 **영점 등고선의 얇은(1–2px) 링을 제외하면 완전 일치**(내부/외부 그라데이션 black diff);
+  남은 차이는 면분할 메시 등고선이 이상적 구와 서브픽셀 어긋난 것(기대된 테셀레이션 오차). max shade diff 58/255.
 
 ### B3 — 전역 클립맵 머지
 - 카메라 주변을 덮는 **GDF 클립맵**(여러 해상도 레벨의 3D 볼륨)으로 per-mesh SDF를 인스턴스 변환과

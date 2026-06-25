@@ -415,6 +415,62 @@ fn run() -> anyhow::Result<()> {
         None
     };
 
+    // Phase 11 Stage B (B2): bake a mesh's SDF into the volume. The bake mesh is a
+    // unit uv-sphere scaled to radius 0.3 and centred at (0.5, 0.5, 0.5), so its
+    // baked field matches the analytic centred sphere of the B1 smoke test (the
+    // volume's AABB is the unit cube) — a direct correctness check. Geometry is
+    // uploaded as bindless storage buffers (same 32B vertex stride as the RT path).
+    let (bake_vtx, bake_idx, bake_tri_count) = if compute_supported {
+        let mut sphere = dreamcoast_asset::uv_sphere(48, 32);
+        for v in &mut sphere.vertices {
+            v.pos = [
+                v.pos[0] * 0.3 + 0.5,
+                v.pos[1] * 0.3 + 0.5,
+                v.pos[2] * 0.3 + 0.5,
+            ];
+        }
+        let vb = vertex_bytes(&sphere);
+        let ib = index_bytes(&sphere);
+        let vsb = device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: vb.len() as u64,
+                stride: 32,
+                indirect: false,
+            },
+            vb,
+        )?;
+        let isb = device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: ib.len() as u64,
+                stride: 4,
+                indirect: false,
+            },
+            ib,
+        )?;
+        let tris = (sphere.indices.len() / 3) as u32;
+        (Some(vsb), Some(isb), tris)
+    } else {
+        (None, None, 0u32)
+    };
+    let sdf_bake_pipeline = if compute_supported {
+        let cs = load_compute_shader(
+            backend,
+            dreamcoast_shader::sdf_bake_cs_spirv,
+            dreamcoast_shader::sdf_bake_cs_dxil,
+            dreamcoast_shader::sdf_bake_cs_metallib,
+            "sdf_bake",
+        )?;
+        Some(device.create_compute_pipeline(&ComputePipelineDesc {
+            compute_bytes: cs,
+            compute_entry: "bakeMain",
+            push_constant_size: 64,
+            bindless: true,
+            threads_per_group: [4, 4, 4],
+        })?)
+    } else {
+        None
+    };
+
     // Phase 11 Stage A (A1): compute software ray tracing — sphere-traces an analytic
     // SDF scene (no hardware RT / TLAS), so it is gated only on compute support.
     let sdf_trace_pipeline = if compute_supported {
@@ -1155,6 +1211,11 @@ fn run() -> anyhow::Result<()> {
     // Phase 11 Stage B (B1): 3D volume texture smoke test — fill a volume then view a
     // trilinear-sampled Z slice. Headless toggle via `P11_VOLUME_TEST`.
     let mut volume_test = volume_res.is_some() && std::env::var_os("P11_VOLUME_TEST").is_some();
+    // Phase 11 Stage B (B2): bake a mesh's SDF into the volume, then view a slice.
+    // Headless toggle via `P11_SDF_BAKE`. The bake is expensive (O(voxels*tris)) so
+    // it runs once (`sdf_bake_done`), and later frames just view the baked volume.
+    let mut sdf_bake = sdf_bake_pipeline.is_some() && std::env::var_os("P11_SDF_BAKE").is_some();
+    let mut sdf_bake_done = false;
     // Phase 8 M5: drive the path tracer through the full RT pipeline + SBT instead
     // of the inline compute ray query (same image). Headless toggle via
     // `P8_PATHTRACE_PIPELINE`; ignored when no RT pipeline is available.
@@ -1552,6 +1613,14 @@ fn run() -> anyhow::Result<()> {
                             ui.checkbox("3D volume test (fill + slice view)", &mut volume_test);
                             if volume_test {
                                 ui.text_disabled("  - Stage B RHI smoke test");
+                            }
+                        }
+                        if sdf_bake_pipeline.is_some() {
+                            if ui.checkbox("SDF bake (per-mesh, slice view)", &mut sdf_bake) {
+                                sdf_bake_done = false; // re-bake when re-enabled
+                            }
+                            if sdf_bake {
+                                ui.text_disabled("  - Stage B2: baked sphere ≈ analytic");
                             }
                         }
                     }
@@ -2258,10 +2327,92 @@ fn run() -> anyhow::Result<()> {
             None
         };
 
+        // Phase 11 Stage B (B2): bake a mesh's signed-distance field into the volume,
+        // then view a slice through the same `volume_view` pass B1 uses — so the baked
+        // sphere is pixel-comparable against B1's analytic fill (and VK ≡ DX). The bake
+        // is O(voxels*tris): run it once (`sdf_bake_done`) and only re-view afterwards.
+        let bake_out = if sdf_bake && rt_out.is_none() && sdf_out.is_none() && vol_out.is_none() {
+            if let (Some(vol), Some(bakep), Some(viewp), Some(vtx), Some(idx)) = (
+                volume_res.as_ref(),
+                sdf_bake_pipeline.as_ref(),
+                volume_view_pipeline.as_ref(),
+                bake_vtx.as_ref(),
+                bake_idx.as_ref(),
+            ) {
+                let out = graph.create_storage_image("bake_out", HDR_FORMAT, extent);
+                let vol_ext = graph.import_external("volume");
+                let vol_storage = vol.storage_index();
+                let vol_sampled = vol.sampled_index();
+                let dim = VOLUME_DIM;
+                if !sdf_bake_done {
+                    let vtx_index = vtx.storage_index();
+                    let idx_index = idx.storage_index();
+                    let tri_count = bake_tri_count;
+                    graph.add_compute_pass(
+                        ComputePassInfo {
+                            name: "sdf_bake",
+                            storage_writes: vec![vol_ext],
+                            reads: vec![],
+                        },
+                        move |ctx| {
+                            let cmd = ctx.cmd();
+                            cmd.volume_to_storage(vol);
+                            cmd.bind_compute_pipeline(bakep);
+                            cmd.push_constants_compute(&sdf_bake_push(
+                                vol_storage,
+                                dim,
+                                tri_count,
+                                vtx_index,
+                                idx_index,
+                            ));
+                            let g = dim.div_ceil(4);
+                            cmd.dispatch(g, g, g);
+                            Ok(())
+                        },
+                    );
+                    sdf_bake_done = true;
+                }
+                graph.add_compute_pass(
+                    ComputePassInfo {
+                        name: "sdf_bake_view",
+                        storage_writes: vec![out],
+                        reads: vec![vol_ext],
+                    },
+                    move |ctx| {
+                        let out_index = ctx.storage_index(out);
+                        let cmd = ctx.cmd();
+                        cmd.volume_to_sampled(vol);
+                        cmd.bind_compute_pipeline(viewp);
+                        cmd.push_constants_compute(&volume_push(
+                            vol_storage,
+                            vol_sampled,
+                            dim,
+                            out_index,
+                            cw,
+                            ch,
+                            0.5,
+                        ));
+                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                        Ok(())
+                    },
+                );
+                Some(out)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active,
         // else the SW-RT SDF trace, else the Stage-B volume slice, else compute-post,
         // else HDR.
-        let tonemap_src = rt_out.or(sdf_out).or(vol_out).or(hdr_post).unwrap_or(hdr);
+        let tonemap_src = rt_out
+            .or(sdf_out)
+            .or(vol_out)
+            .or(bake_out)
+            .or(hdr_post)
+            .unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the
         // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
         // exposure here before the filmic curve (else the bright sky + sun blow out).
@@ -3057,6 +3208,34 @@ fn volume_push(
     pc[16..20].copy_from_slice(&width.to_le_bytes());
     pc[20..24].copy_from_slice(&height.to_le_bytes());
     pc[24..28].copy_from_slice(&slice.to_le_bytes());
+    pc
+}
+
+/// Pack the Phase 11 Stage B2 SDF-bake push block (64 bytes): vol_storage, dim,
+/// tri_count, vtx_index, idx_index, pad0, then float4 aabb_min / aabb_max (16-byte
+/// aligned, so 8 bytes of padding precede them). The volume's AABB is the unit cube
+/// — matching B1's analytic fill so the baked sphere is pixel-comparable.
+fn sdf_bake_push(
+    vol_storage: u32,
+    dim: u32,
+    tri_count: u32,
+    vtx_index: u32,
+    idx_index: u32,
+) -> [u8; 64] {
+    let mut pc = [0u8; 64];
+    pc[0..4].copy_from_slice(&vol_storage.to_le_bytes());
+    pc[4..8].copy_from_slice(&dim.to_le_bytes());
+    pc[8..12].copy_from_slice(&tri_count.to_le_bytes());
+    pc[12..16].copy_from_slice(&vtx_index.to_le_bytes());
+    pc[16..20].copy_from_slice(&idx_index.to_le_bytes());
+    // pc[20..32]: pad0 + alignment padding to the float4 boundary.
+    // aabb_min = (0,0,0,0), aabb_max = (1,1,1,0): the unit-cube volume extent.
+    pc[32..36].copy_from_slice(&0.0f32.to_le_bytes());
+    pc[36..40].copy_from_slice(&0.0f32.to_le_bytes());
+    pc[40..44].copy_from_slice(&0.0f32.to_le_bytes());
+    pc[48..52].copy_from_slice(&1.0f32.to_le_bytes());
+    pc[52..56].copy_from_slice(&1.0f32.to_le_bytes());
+    pc[56..60].copy_from_slice(&1.0f32.to_le_bytes());
     pc
 }
 

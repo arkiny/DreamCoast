@@ -266,6 +266,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "volume_view_cs",
     },
+    // Phase 11 Stage B (B2): per-mesh SDF bake into a 3D storage volume.
+    Job {
+        src: "sdf_bake.slang",
+        entry: "bakeMain",
+        stage: "compute",
+        key: "sdf_bake_cs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.
