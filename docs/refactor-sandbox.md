@@ -57,8 +57,13 @@ Feature groups (setup line / loop line):
 
 ### Order (each step: build + clippy + VK/DX screenshot gate, own commit)
 
-- **R1 — `particle.rs` / `ParticleSystem`.** Smallest, self-contained; proves the
-  bundle pattern (new + simulate + draw).
+- **R1 — `particle.rs` / `ParticleSystem`. DONE.** Owns sim+draw pipelines, the
+  ping-pong buffers, and parity; `new` seeds, `record_sim` / `record_draw` add the
+  graph passes (`&'a self` tied to the graph's lifetime), accessors drive the async-
+  compute submit path that stays in `run()`. Parity `advance()` moved to end-of-frame
+  (after the graph's `&self` borrows end — NLL releases them at `graph.execute`).
+  Confirmed the pattern: graph closures capturing `&self.field` compile with the
+  `&'a self` + `RenderGraph<'a>` signature, no extra lifetime gymnastics.
 - **R2 — `cull.rs` / `CullSystem`.**
 - **R3 — `swrt.rs` / `GdfSystem`** (Phase-11 volumes/bake/merge/trace/view).
 - **R4 — `rt.rs` / `RtSystem`** (HW RT + path tracer + Cornell).

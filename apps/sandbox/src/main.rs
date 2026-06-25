@@ -29,10 +29,12 @@ use tracing::info;
 mod app;
 mod ibl;
 mod mesh;
+mod particle;
 mod push;
 use app::*;
 use ibl::*;
 use mesh::*;
+use particle::*;
 use push::*;
 
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -714,94 +716,11 @@ fn run() -> anyhow::Result<()> {
         None
     };
 
-    // GPU particle simulation (Phase 7): a persistent storage buffer the sim
-    // compute pass updates in-place each frame and the draw pass reads in its
-    // vertex stage. Seeded once via a one-shot compute dispatch.
-    let particle_sim_cs = load_compute_shader(
-        backend,
-        dreamcoast_shader::particle_sim_cs_spirv,
-        dreamcoast_shader::particle_sim_cs_dxil,
-        dreamcoast_shader::particle_sim_cs_metallib,
-        "particle_sim",
-    )?;
-    let particle_sim_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
-        compute_bytes: particle_sim_cs,
-        compute_entry: "csMain",
-        push_constant_size: 24, // read_index + write_index + count + dt + time + init
-        bindless: true,
-        threads_per_group: [64, 1, 1],
-    })?;
-    // The particle-draw pipeline pulls vertices from the compute-written buffer, so
-    // it only exists where compute does (M5 on Metal — `particle_draw` has no
-    // metallib yet). `None` on Metal; the feature flag stays off there.
-    let particle_draw_pipeline = if compute_supported {
-        let (pd_vs, pd_fs) = load_shader_pair(
-            backend,
-            dreamcoast_shader::particle_draw_vs_spirv,
-            dreamcoast_shader::particle_draw_fs_spirv,
-            dreamcoast_shader::particle_draw_vs_dxil,
-            dreamcoast_shader::particle_draw_fs_dxil,
-            dreamcoast_shader::particle_draw_vs_metallib,
-            dreamcoast_shader::particle_draw_fs_metallib,
-            "particle_draw",
-        )?;
-        Some(device.create_graphics_pipeline(&GraphicsPipelineDesc {
-            vertex_bytes: pd_vs,
-            fragment_bytes: pd_fs,
-            vertex_entry: "vsMain",
-            fragment_entry: "fsMain",
-            color_formats: &[swapchain.format()],
-            topology: PrimitiveTopology::TriangleList,
-            vertex_layout: VertexLayout::None, // vertex-pull from the storage buffer
-            blend: BlendMode::AlphaBlend,
-            push_constant_size: 112, // view_proj + cam_right + cam_up + buffer/count/size/pad
-            bindless: true,
-            uniform_buffer: false,
-            depth_test: false,
-            depth_format: None,
-        })?)
-    } else {
-        None
-    };
-    // Two ping-pong particle buffers: the sim reads one and writes the other so a
-    // frame's compute never clobbers the buffer a still-in-flight previous frame's
-    // draw is reading (the WAR hazard async compute would otherwise expose).
-    let particle_buffers = [
-        device.create_storage_buffer(&StorageBufferDesc {
-            size: (PARTICLE_COUNT * 32) as u64,
-            stride: 32,
-            indirect: false,
-        })?,
-        device.create_storage_buffer(&StorageBufferDesc {
-            size: (PARTICLE_COUNT * 32) as u64,
-            stride: 32,
-            indirect: false,
-        })?,
-    ];
-    // Seed both buffers once (init dispatch into each) so the first frame's read
-    // source is valid whichever parity it starts on. Skipped on Metal (compute is
-    // M5; the particle feature stays off there).
-    if compute_supported {
-        let init_cmd = device.create_command_buffer()?;
-        init_cmd.begin()?;
-        init_cmd.bind_compute_pipeline(&particle_sim_pipeline);
-        for buf in &particle_buffers {
-            let idx = buf.storage_index();
-            init_cmd.push_constants_compute(&particle_sim_push(
-                idx,
-                idx,
-                PARTICLE_COUNT as u32,
-                0.0,
-                0.0,
-                1,
-            ));
-            init_cmd.dispatch((PARTICLE_COUNT as u32).div_ceil(64), 1, 1);
-        }
-        init_cmd.end()?;
-        let fence = device.create_fence(false)?;
-        device.queue().submit_oneshot(&init_cmd, &fence)?;
-        fence.wait()?;
-    }
+    // GPU particle system (Phase 7): a persistent ping-pong buffer pair advanced by
+    // a compute pass and drawn as instanced billboards (see `particle.rs`). Seeds
+    // both buffers on construction.
+    let mut particles =
+        ParticleSystem::new(&device, backend, compute_supported, swapchain.format())?;
 
     // GPU frustum culling (Phase 7): a compute pass tests a cube instance grid
     // against the frustum and writes an indirect draw; the draw renders only the
@@ -1504,9 +1423,6 @@ fn run() -> anyhow::Result<()> {
     let mut last = Instant::now();
     // Accumulated wall-clock time, for the particle simulation's respawn hashing.
     let mut elapsed = 0.0f32;
-    // Ping-pong parity for the particle buffers: each simulated frame writes
-    // `particle_buffers[parity]` reading `[parity ^ 1]`, then flips.
-    let mut particle_parity = 0usize;
     // Fixed view in screenshot mode for reproducible output.
     let mut angle = if screenshot_mode { 0.7 } else { 0.0 };
     // Path-tracer progressive accumulation (Phase 8 M4): a persistent float4-per-
@@ -2125,10 +2041,11 @@ fn run() -> anyhow::Result<()> {
         } else {
             None
         };
-        // Pick this frame's ping-pong buffers: read the previous write, write the
-        // other. The draw pass (recorded later) reads `particle_write`.
-        let particle_read = particle_parity ^ 1;
-        let particle_write = particle_parity;
+        // This frame's ping-pong buffer indices (read the previous write). Captured
+        // before the end-of-frame `advance()` so the async-submit path and the draw
+        // pass all reference the same pair.
+        let particle_read = particles.read_index();
+        let particle_write = particles.write_index();
         // Run the sim on the async-compute queue this frame? (Else it's a graph
         // compute pass on the graphics queue, below.) Decided once here so the
         // compute-cmd recording + submit path after the graph match. The async
@@ -2136,36 +2053,7 @@ fn run() -> anyhow::Result<()> {
         // buffer is independent of the graphics graph).
         let async_sim = particles_on && async_compute_supported && async_compute_on;
         if let (false, Some(particles_ext)) = (async_sim, particles_ext) {
-            let sim = &particle_sim_pipeline;
-            let src = &particle_buffers[particle_read];
-            let dst = &particle_buffers[particle_write];
-            graph.add_compute_pass(
-                ComputePassInfo {
-                    name: "particle_sim",
-                    storage_writes: vec![particles_ext],
-                    reads: vec![],
-                },
-                move |ctx| {
-                    let cmd = ctx.cmd();
-                    cmd.bind_compute_pipeline(sim);
-                    cmd.push_constants_compute(&particle_sim_push(
-                        src.storage_index(),
-                        dst.storage_index(),
-                        PARTICLE_COUNT as u32,
-                        sim_dt,
-                        elapsed,
-                        0,
-                    ));
-                    cmd.dispatch((PARTICLE_COUNT as u32).div_ceil(64), 1, 1);
-                    // Order the write before the draw pass's vertex-stage read.
-                    cmd.storage_buffer_barrier(dst);
-                    Ok(())
-                },
-            );
-        }
-        // Next simulated frame swaps which buffer is source vs destination.
-        if particles_on {
-            particle_parity ^= 1;
+            particles.record_sim(&mut graph, particles_ext, sim_dt, elapsed);
         }
 
         // Phase 7 GPU culling: reset the indirect args, frustum-cull the instance
@@ -2879,32 +2767,13 @@ fn run() -> anyhow::Result<()> {
         // image (alpha blend), reading the compute-updated buffer in the vertex
         // stage. Declared after tonemap so the WAW on the backbuffer orders it last.
         if let Some(particles_ext) = particles_ext {
-            let draw = particle_draw_pipeline
-                .as_ref()
-                .expect("particles require compute support");
-            let buf = &particle_buffers[particle_write];
-            let vp = view_proj.to_cols_array();
-            graph.add_pass(
-                PassInfo {
-                    name: "particle_draw",
-                    colors: vec![(backbuffer, None)],
-                    depth: None,
-                    reads: vec![particles_ext],
-                },
-                move |ctx| {
-                    let cmd = ctx.cmd();
-                    cmd.bind_graphics_pipeline(draw);
-                    cmd.push_constants(&particle_draw_push(
-                        &vp,
-                        cam_right,
-                        cam_up,
-                        buf.storage_index(),
-                        PARTICLE_COUNT as u32,
-                        0.05,
-                    ));
-                    cmd.draw(6, PARTICLE_COUNT as u32);
-                    Ok(())
-                },
+            particles.record_draw(
+                &mut graph,
+                backbuffer,
+                particles_ext,
+                view_proj.to_cols_array(),
+                cam_right,
+                cam_up,
             );
         }
 
@@ -2960,10 +2829,10 @@ fn run() -> anyhow::Result<()> {
             // draw's vertex-stage read sees the freshly written buffer.
             let ccmd = &compute_command_buffers[frame];
             ccmd.begin()?;
-            ccmd.bind_compute_pipeline(&particle_sim_pipeline);
+            ccmd.bind_compute_pipeline(particles.sim_pipeline());
             ccmd.push_constants_compute(&particle_sim_push(
-                particle_buffers[particle_read].storage_index(),
-                particle_buffers[particle_write].storage_index(),
+                particles.buffer_storage_index(particle_read),
+                particles.buffer_storage_index(particle_write),
                 PARTICLE_COUNT as u32,
                 sim_dt,
                 elapsed,
@@ -2981,6 +2850,11 @@ fn run() -> anyhow::Result<()> {
             )?;
         } else {
             queue.submit(cmd, &image_available[frame], signal, fence)?;
+        }
+        // Swap the particle ping-pong parity for the next simulated frame (deferred to
+        // here so the graph's `&self` borrows have ended — see `particle.rs`).
+        if particles_on {
+            particles.advance();
         }
 
         // Wait for the GPU (copy included), read the buffer back, and save a PNG.
