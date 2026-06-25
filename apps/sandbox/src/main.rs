@@ -365,6 +365,27 @@ fn run() -> anyhow::Result<()> {
         threads_per_group: [8, 8, 1],
     })?;
 
+    // Phase 11 Stage A (A1): compute software ray tracing — sphere-traces an analytic
+    // SDF scene (no hardware RT / TLAS), so it is gated only on compute support.
+    let sdf_trace_pipeline = if compute_supported {
+        let sdf_trace_cs = load_compute_shader(
+            backend,
+            dreamcoast_shader::sdf_trace_cs_spirv,
+            dreamcoast_shader::sdf_trace_cs_dxil,
+            dreamcoast_shader::sdf_trace_cs_metallib,
+            "sdf_trace",
+        )?;
+        Some(device.create_compute_pipeline(&ComputePipelineDesc {
+            compute_bytes: sdf_trace_cs,
+            compute_entry: "csMain",
+            push_constant_size: 112, // inv_view_proj + cam_pos + sun + out/w/h/flip
+            bindless: true,
+            threads_per_group: [8, 8, 1],
+        })?)
+    } else {
+        None
+    };
+
     // Phase 8 M3: inline ray-query trace pipeline (compute + `RayQuery`). Only on
     // RT-capable devices; the bindless block then carries the scene TLAS (binding
     // 5 / `t1088,space1`).
@@ -1077,6 +1098,10 @@ fn run() -> anyhow::Result<()> {
     // Cornell-box scene for the path tracer (strong color bleeding). Headless
     // toggle via `P8_CORNELL`; uses a fixed front-facing camera.
     let mut cornell = cornell_scene.is_some() && std::env::var_os("P8_CORNELL").is_some();
+    // Phase 11 Stage A: replace the rasterized image with a compute software ray
+    // trace of the analytic SDF scene (sphere tracing, no hardware RT). Headless
+    // toggle via `P11_SDF`.
+    let mut sdf_trace = sdf_trace_pipeline.is_some() && std::env::var_os("P11_SDF").is_some();
     // Phase 8 M5: drive the path tracer through the full RT pipeline + SBT instead
     // of the inline compute ray query (same image). Headless toggle via
     // `P8_PATHTRACE_PIPELINE`; ignored when no RT pipeline is available.
@@ -1458,6 +1483,18 @@ fn run() -> anyhow::Result<()> {
                         }
                     } else {
                         ui.text_disabled("Ray tracing (unsupported)");
+                    }
+
+                    if sdf_trace_pipeline.is_some()
+                        && ui.collapsing_header(
+                            "Software ray tracing (Phase 11)",
+                            TreeNodeFlags::empty(),
+                        )
+                    {
+                        ui.checkbox("SDF sphere trace (compute, no HW RT)", &mut sdf_trace);
+                        if sdf_trace {
+                            ui.text_disabled("  - analytic SDF scene (Stage A)");
+                        }
                     }
 
                     if ui.collapsing_header("Profiling & debug (Phase 9)", open) {
@@ -2056,13 +2093,53 @@ fn run() -> anyhow::Result<()> {
             }
         }
 
+        // Phase 11 Stage A: compute software ray trace of the analytic SDF scene,
+        // written to a storage image the tonemap pass displays in place of the HDR
+        // (mirrors the M3 `rt_trace` viz path). Only when the HW-RT path is off.
+        let sdf_out = if sdf_trace && rt_out.is_none() {
+            if let Some(pipe) = sdf_trace_pipeline.as_ref() {
+                let out = graph.create_storage_image("sdf_out", HDR_FORMAT, extent);
+                let inv_vp = inv_view_proj;
+                let cam = eye;
+                let sun = sun_dir;
+                let sun_i = sun_intensity;
+                let flip = flip_y;
+                graph.add_compute_pass(
+                    ComputePassInfo {
+                        name: "sdf_trace",
+                        storage_writes: vec![out],
+                        reads: vec![],
+                    },
+                    move |ctx| {
+                        let out_index = ctx.storage_index(out);
+                        let cmd = ctx.cmd();
+                        cmd.bind_compute_pipeline(pipe);
+                        cmd.push_constants_compute(&sdf_trace_push(
+                            &inv_vp, cam, sun, sun_i, out_index, cw, ch, flip,
+                        ));
+                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                        Ok(())
+                    },
+                );
+                Some(out)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active,
-        // else the compute-post output when enabled, else raw HDR.
-        let tonemap_src = rt_out.or(hdr_post).unwrap_or(hdr);
+        // else the SW-RT SDF trace (Phase 11), else the compute-post output, else HDR.
+        let tonemap_src = rt_out.or(sdf_out).or(hdr_post).unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the
-        // path-traced output carries raw scene radiance, so apply the camera
+        // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
         // exposure here before the filmic curve (else the bright sky + sun blow out).
-        let tm_exposure = if pt_active { exposure } else { 1.0 };
+        let tm_exposure = if pt_active || sdf_out.is_some() {
+            exposure
+        } else {
+            1.0
+        };
         graph.add_pass(
             PassInfo {
                 name: "tonemap",
@@ -2790,6 +2867,39 @@ fn rt_trace_push(
     pc[80..84].copy_from_slice(&sun[0].to_le_bytes());
     pc[84..88].copy_from_slice(&sun[1].to_le_bytes());
     pc[88..92].copy_from_slice(&sun[2].to_le_bytes());
+    pc[96..100].copy_from_slice(&out_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&width.to_le_bytes());
+    pc[104..108].copy_from_slice(&height.to_le_bytes());
+    pc[108..112].copy_from_slice(&flip_y.to_le_bytes());
+    pc
+}
+
+/// Pack the Phase 11 Stage A SDF-trace push block (112 bytes): inv_view_proj (64) +
+/// cam_pos (16) + sun dir+intensity (16) + (out_index, width, height, flip_y) (16).
+/// Same layout as `rt_trace_push` but `sun.w` carries the sun intensity.
+#[allow(clippy::too_many_arguments)]
+fn sdf_trace_push(
+    inv_view_proj: &[f32; 16],
+    cam_pos: Vec3,
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&cam_pos.x.to_le_bytes());
+    pc[68..72].copy_from_slice(&cam_pos.y.to_le_bytes());
+    pc[72..76].copy_from_slice(&cam_pos.z.to_le_bytes());
+    let sun = normalize3(sun_dir);
+    pc[80..84].copy_from_slice(&sun[0].to_le_bytes());
+    pc[84..88].copy_from_slice(&sun[1].to_le_bytes());
+    pc[88..92].copy_from_slice(&sun[2].to_le_bytes());
+    pc[92..96].copy_from_slice(&sun_intensity.to_le_bytes());
     pc[96..100].copy_from_slice(&out_index.to_le_bytes());
     pc[100..104].copy_from_slice(&width.to_le_bytes());
     pc[104..108].copy_from_slice(&height.to_le_bytes());
