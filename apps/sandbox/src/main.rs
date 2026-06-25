@@ -944,7 +944,7 @@ fn run() -> anyhow::Result<()> {
     // mapping InstanceID -> { vertex SB index, index SB index, albedo }. The order
     // MUST match the TLAS instance custom_index order (scene objects, then ground).
     // `_rt_geometry` keeps the geometry buffers alive for the program's lifetime.
-    let (rt_instance_table, _rt_geometry) = if rt_scene.is_some() {
+    let (rt_instance_table, _rt_geometry, rt_instance_count) = if rt_scene.is_some() {
         // (mesh, material) per instance, in TLAS instance order (objects, then
         // ground). Materials mirror the rasterizer's so the path tracer shades with
         // the same metallic-roughness PBR model.
@@ -968,16 +968,18 @@ fn run() -> anyhow::Result<()> {
         ];
         let (table, geometry) = build_pt_instance_table(&device, &entries)?;
         info!("path-tracer instance table: {} instances", entries.len());
-        (Some(table), geometry)
+        (Some(table), geometry, entries.len() as u32)
     } else {
-        (None, Vec::new())
+        (None, Vec::new(), 0u32)
     };
 
     // Phase 8 M4: an alternate Cornell-box scene for the path tracer (strong color
     // bleeding from the red/green walls, area-light GI). Built once: its own BLAS
     // per quad/box + TLAS + instance table. The host-visible vertex/index buffers
     // are only needed during the BLAS build, so they drop at the end of this block.
-    let (cornell_scene, cornell_table, _cornell_geometry) = if device.has_raytracing() {
+    let (cornell_scene, cornell_table, _cornell_geometry, cornell_instance_count) = if device
+        .has_raytracing()
+    {
         let meshes = dreamcoast_asset::cornell_box();
         let mut hostbufs: Vec<(Buffer, Buffer, u32, u32)> = Vec::with_capacity(meshes.len());
         for (m, _) in &meshes {
@@ -1012,9 +1014,9 @@ fn run() -> anyhow::Result<()> {
             .collect();
         let (table, geometry) = build_pt_instance_table(&device, &entries)?;
         info!("cornell-box scene built: {} instances", meshes.len());
-        (Some(scene), Some(table), geometry)
+        (Some(scene), Some(table), geometry, meshes.len() as u32)
     } else {
-        (None, None, Vec::new())
+        (None, None, Vec::new(), 0u32)
     };
 
     // Per-frame globals uniform buffer (one 256-byte slice per frame-in-flight).
@@ -1972,6 +1974,11 @@ fn run() -> anyhow::Result<()> {
                 } else {
                     rt_instance_table.as_ref().unwrap().storage_index()
                 };
+                let inst_count = if use_cornell {
+                    cornell_instance_count
+                } else {
+                    rt_instance_count
+                };
                 // External resource so the graph orders the accumulation write (and
                 // inserts a barrier before the next frame's read).
                 let accum_ext = graph.import_external("rt_accum");
@@ -2000,6 +2007,7 @@ fn run() -> anyhow::Result<()> {
                             out_index,
                             accum_index,
                             inst_index,
+                            inst_count,
                             frame_idx,
                             cw,
                             ch,
@@ -2799,6 +2807,7 @@ fn rt_path_push(
     out_index: u32,
     accum_index: u32,
     inst_index: u32,
+    inst_count: u32,
     frame: u32,
     width: u32,
     height: u32,
@@ -2812,6 +2821,8 @@ fn rt_path_push(
     pc[64..68].copy_from_slice(&cam_pos.x.to_le_bytes());
     pc[68..72].copy_from_slice(&cam_pos.y.to_le_bytes());
     pc[72..76].copy_from_slice(&cam_pos.z.to_le_bytes());
+    // cam_pos.w carries the instance count for the closest-hit bounds check.
+    pc[76..80].copy_from_slice(&(inst_count as f32).to_le_bytes());
     let sun = normalize3(sun_dir);
     pc[80..84].copy_from_slice(&sun[0].to_le_bytes());
     pc[84..88].copy_from_slice(&sun[1].to_le_bytes());
@@ -2936,7 +2947,8 @@ fn build_pt_instance_table(
         records.extend_from_slice(&0f32.to_le_bytes()); // params.w
         records.extend_from_slice(&mat.tex[2].to_le_bytes()); // tex_normal
         records.extend_from_slice(&mat.tex[3].to_le_bytes()); // tex_emissive
-        records.extend_from_slice(&0u32.to_le_bytes()); // pad0
+        let prim_count = (ib.len() / 4 / 3) as u32; // triangle count (PrimitiveIndex bound)
+        records.extend_from_slice(&prim_count.to_le_bytes()); // prim_count
         records.extend_from_slice(&0u32.to_le_bytes()); // pad1
         geometry.push(vsb);
         geometry.push(isb);
