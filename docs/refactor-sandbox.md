@@ -99,9 +99,10 @@ not structural. Each R-step is independently revertible.
 5. `consts.rs` — preamble + shared leaves (`Globals`, `globals_bytes`, `normalize3`,
    and the small `gbuffer_push` / `pbr_push` / `mat4_bytes` / `light_view_proj` that
    stayed behind). Lower value now — defer or fold into a later pass.
-6. The `--clear-test` / `--triangle-test` / `--mesh-test` harnesses are a separate
-   concern (`smoketest.rs`) — extract whenever convenient.
-7. `run()` decomposition — separate plan, after the leaves are out.
+6. `smoketest.rs` — **DONE** (`--clear-test` / `--triangle-test` / `--mesh-test`
+   standalone loops + flag predicates). Self-contained alt entry points; `run()`
+   early-returns into them.
+7. `run()` decomposition — in progress (see plan below); R1 done.
 
-main.rs: ~4.6k → ~3.5k lines after steps 1–4 (push/mesh/app/ibl = ~1.1k lines moved
-into focused, state-free modules).
+main.rs: ~4.6k → ~3.0k lines after the leaf splits + smoketest + R1 (push/mesh/app/
+ibl/particle/smoketest ≈ 1.8k lines moved into focused modules).
