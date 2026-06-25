@@ -95,7 +95,11 @@ impl VulkanTexture {
                                 .base_array_layer(0)
                                 .layer_count(1),
                         )
-                        .image_extent(vk::Extent3D { width: w, height: h, depth: 1 }),
+                        .image_extent(vk::Extent3D {
+                            width: w,
+                            height: h,
+                            depth: 1,
+                        }),
                 );
             }
             let (staging, staging_mem) = create_staging(&device, &staging_bytes)?;

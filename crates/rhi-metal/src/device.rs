@@ -708,17 +708,16 @@ impl MetalDevice {
             let h = (desc.height >> mip).max(1) as usize;
             let region = MTLRegion {
                 origin: MTLOrigin { x: 0, y: 0, z: 0 },
-                size: MTLSize { width: w, height: h, depth: 1 },
+                size: MTLSize {
+                    width: w,
+                    height: h,
+                    depth: 1,
+                },
             };
             let ptr = NonNull::new(level.as_ptr() as *mut c_void)
                 .ok_or_else(|| rhi_err("create_texture: null pixel pointer"))?;
             unsafe {
-                texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                    region,
-                    mip,
-                    ptr,
-                    w * bpp,
-                );
+                texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(region, mip, ptr, w * bpp);
             }
         }
 

@@ -750,3 +750,64 @@ tools**, handled like the existing `slangc` / Vulkan-SDK dependencies:
   exits cleanly with no additional Metal validation error/warning output. The
   user-visible black flicker while validation is enabled remains consistent with
   validation overhead/debug execution, not with a reported validation fault.
+
+## Post-M7 hardening — Windows (Vulkan / D3D12) parity verified
+
+A batch of Metal-session fixes touched shared shaders, `rhi-types`, and the
+backend `texture.rs` upload paths. Each was authored/verified on the macOS M3 box
+with **Windows parity explicitly deferred**; this section records the RTX 2070
+SUPER verification and the one cross-backend regression it surfaced.
+
+**Changes verified:**
+
+- **Texture mip chains + ray-cone LOD** (`bfce4e8`). `rhi_types::generate_mip_chain`
+  box-downsamples mip 0 on the CPU (sRGB averaged in linear space; identical bytes
+  across backends, so no per-driver `generateMipmaps` divergence). `create_texture`
+  now allocates the full chain and uploads every level — D3D12 via
+  `GetCopyableFootprints` over all subresources + a `CopyTextureRegion` per mip
+  (bindless SRV `MipLevels = -1`), Vulkan via one staging buffer + a copy region per
+  level (image / view / barriers span all levels). The path tracer samples with an
+  explicit ray-cone LOD (`SampleLevel`) carried as a loop local (inline) or a Payload
+  field (pipeline).
+- **Out-of-range hit guard** (`43beeaf`, `0d62c2c`). `load_valid_instance` bounds-
+  checks `InstanceID`/`PrimitiveIndex` before any `storage_buffers[].Load`
+  (instance count in `cam_pos.w`, per-instance triangle count in the instance
+  record's former pad); the `hit_normal` `isfinite` guard stays as defense-in-depth
+  for genuinely degenerate geometry. Valid hits are unchanged, so inline ≡ pipeline
+  holds. (Roots out the M7-converter OOB fetch; on Windows it is a no-op for valid
+  hits.)
+- **UNORM backbuffer + in-shader sRGB** (`4e0a1ad`). The swapchain/backbuffer moved
+  from `Bgra8Srgb` to `Bgra8Unorm` (an sRGB surface can't carry the
+  `STORAGE` usage that capture/overlay layers force, which hard-crashed RenderDoc).
+  Both backends now create a plain UNORM surface (D3D12 RTV is `B8G8R8A8_UNORM`, not
+  `_UNORM_SRGB`; Vulkan picks the UNORM surface format) and every backbuffer-writing
+  pass applies `linear_to_srgb` in-shader (`post`, `cull_draw`, `particle_draw`;
+  ImGui keeps its gamma-space passthrough).
+- **Drawable-driven frame size + fence-before-acquire** (`6496bb5`, `1c6e506`).
+  Sandbox-side reorder (acquire → derive extent → record). On Vulkan/D3D12
+  `extent_2d()` still returns the recreate (window) extent, so behavior is unchanged;
+  the added `fence.wait()` before `acquire_next_image` keeps the per-slot
+  `image_available` semaphore legal to reuse (VUID-vkAcquireNextImageKHR-semaphore).
+
+**Regression found & fixed on Windows:**
+
+- **D3D12 RT pipeline `E_INVALIDARG` at `CreateStateObject`.** The ray-cone work
+  grew the pipeline `Payload` by two floats (`cone_width`, `cone_spread`) to 68
+  bytes, but `RaytracingPipelineDesc.max_payload_size` was left at `64`. D3D12
+  rejects a `SHADER_CONFIG.MaxPayloadSizeInBytes` smaller than the shader payload
+  (Metal Shader Converter and Vulkan don't validate the declared size against the
+  SPIR-V/converted payload, so it passed on macOS and on Vulkan). Bumped to `72`
+  (68 rounded up to a multiple of 8) in `apps/sandbox/src/main.rs`.
+- **`clippy::needless_range_loop` + `rustfmt`** in the new `rhi-d3d12` /
+  `rhi-vulkan` / `rhi-metal` / `rhi-types` code. `rhi-d3d12` is `#![cfg(windows)]`
+  so its clippy/fmt could not run on the macOS box; the D3D12 mip-upload loops were
+  rewritten as zipped/enumerated iterators and `cargo fmt --all` reflowed the rest.
+
+**Verification (RTX 2070 SUPER):** `cargo fmt --all --check` + `RUSTFLAGS="-D
+warnings" cargo clippy --workspace --all-targets` clean. Screenshots (Read-verified):
+- Raster deferred scene **VK ≡ DX** mean 0.0001/ch, max 1 (sRGB encode matches).
+- Path tracer, default textured scene, all four combos at noise level:
+  inline≡pipeline and VK≡DX each mean ≤ 0.0010/ch, max ≤ 17.
+- Cornell pipeline **VK ≡ DX** mean 0.0000/ch, max 7.
+- Vulkan validation VUID 0 (incl. the RT-pipeline path); D3D12 debug-layer clean.
+- D3D12 texture-upload-loop refactor is byte-identical to the pre-refactor capture.

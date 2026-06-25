@@ -102,8 +102,13 @@ pub fn generate_mip_chain(mip0: &[u8], width: u32, height: u32, format: Format) 
                     };
                     let avg =
                         (fetch(x0, y0) + fetch(x1, y0) + fetch(x0, y1) + fetch(x1, y1)) * 0.25;
-                    let out = if srgb && c < 3 { linear_to_srgb(avg) } else { avg };
-                    dst[((y * nw + x) * 4 + c) as usize] = (out * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    let out = if srgb && c < 3 {
+                        linear_to_srgb(avg)
+                    } else {
+                        avg
+                    };
+                    dst[((y * nw + x) * 4 + c) as usize] =
+                        (out * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -478,6 +483,10 @@ mod tests {
         }
         let levels = generate_mip_chain(&mip0, 2, 2, Format::Rgba8Srgb);
         // Two black + two white pixels: linear mean 0.5 -> sRGB ~0.7353 -> ~188.
-        assert!(levels[1][0] >= 185 && levels[1][0] <= 192, "got {}", levels[1][0]);
+        assert!(
+            levels[1][0] >= 185 && levels[1][0] <= 192,
+            "got {}",
+            levels[1][0]
+        );
     }
 }
