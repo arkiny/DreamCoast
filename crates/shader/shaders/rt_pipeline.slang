@@ -27,6 +27,8 @@ struct Payload
     uint rng;           // PCG state, advanced by the hit shader's bounce sampling
     uint done;          // 1 = terminate the path (miss or absorbed)
     uint primary;       // 1 = camera ray (miss shows the sun disk), 0 = bounce
+    float cone_width;   // ray-cone footprint at the hit (Σ t*spread), for texture LOD
+    float cone_spread;  // ray-cone spread (full angle), widened per bounce
 };
 
 // ---- Miss: sky (or black for the enclosed Cornell box) ----
@@ -61,12 +63,17 @@ void chMain(inout Payload p, BuiltInTriangleIntersectionAttributes attr)
         return;
     }
     float2 material_uv = hit_uv(inst, prim, attr.barycentrics);
-    RtMaterialSample mat = sample_material(inst, material_uv);
     float3 n = hit_normal(inst, prim, attr.barycentrics);
     float3 wdir = WorldRayDirection();
     if (dot(n, wdir) > 0.0)
         n = -n; // face the incoming ray (two-sided)
-    n = hit_shading_normal(inst, prim, attr.barycentrics, n, material_uv);
+    // Ray-cone texture LOD: advance the cone to this hit (carried in the payload so
+    // it matches the inline path), then derive the LOD from the cone footprint.
+    p.cone_width += RayTCurrent() * p.cone_spread;
+    float cos_theta = max(abs(dot(n, wdir)), 1e-3);
+    float lod_base = hit_lod_base(inst, prim, p.cone_width, cos_theta);
+    RtMaterialSample mat = sample_material(inst, material_uv, lod_base);
+    n = hit_shading_normal(inst, prim, attr.barycentrics, n, material_uv, lod_base);
     float3 hit = WorldRayOrigin() + wdir * RayTCurrent();
     float3 v = -wdir;
     Surf surf = make_surf(mat.base_color, mat.metallic, mat.roughness);
@@ -104,6 +111,9 @@ void chMain(inout Payload p, BuiltInTriangleIntersectionAttributes attr)
     p.next_origin = hit + n * 0.002;
     p.next_dir = bs.dir;
     p.done = bs.valid ? 0u : 1u;
+    // Widen the cone for the next bounce by surface roughness (mirrors the inline
+    // path) so glossy/diffuse bounces sample coarse mips.
+    p.cone_spread += mat.roughness * 0.5;
 }
 
 // ---- Ray generation: per-pixel sampling + bounce loop + accumulation ----
@@ -129,8 +139,11 @@ void rgMain()
         float2 jitter = float2(rnd(rng), rnd(rng)) - 0.5;
         float2 uv = (float2(tid) + 0.5 + jitter) / float2(pc.width, pc.height);
         float2 ndc = float2(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * sy);
-        float4 world = mul(pc.inv_view_proj, float4(ndc, 1.0, 1.0));
-        float3 dir = normalize(world.xyz / world.w - pc.cam_pos.xyz);
+        float3 dir = primary_ray_dir(ndc);
+        // Ray-cone footprint, carried through the bounce loop via the payload so the
+        // pipeline path's texture LOD matches the inline path.
+        float cone_spread = primary_cone_spread(ndc);
+        float cone_width = 0.0;
 
         // Bounce loop: one TraceRay per bounce, state carried in the payload.
         float3 radiance = float3(0, 0, 0);
@@ -150,8 +163,12 @@ void rgMain()
             p.rng = rng;
             p.done = 0u;
             p.primary = bounce == 0u ? 1u : 0u;
+            p.cone_width = cone_width;
+            p.cone_spread = cone_spread;
             TraceRay(g.tlas, RAY_FLAG_NONE, 0xFF, 0, 0, 0, ray, p);
             rng = p.rng;
+            cone_width = p.cone_width;
+            cone_spread = p.cone_spread;
             radiance += throughput * p.radiance;
             if (p.done != 0u)
                 break;

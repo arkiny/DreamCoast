@@ -43,7 +43,13 @@ impl D3d12Texture {
         unsafe {
             let format = to_dxgi_format(desc.format);
 
-            // DEFAULT-heap texture in COPY_DEST.
+            // CPU-generated mip chain (identical bytes across backends — the
+            // cross-backend-parity rule; see rhi_types::generate_mip_chain).
+            let levels =
+                rhi_types::generate_mip_chain(pixels, desc.width, desc.height, desc.format);
+            let mip_levels = levels.len() as u32;
+
+            // DEFAULT-heap texture (full mip chain) in COPY_DEST.
             let default_heap = heap(D3D12_HEAP_TYPE_DEFAULT);
             let tex_desc = D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -51,7 +57,7 @@ impl D3d12Texture {
                 Width: desc.width as u64,
                 Height: desc.height,
                 DepthOrArraySize: 1,
-                MipLevels: 1,
+                MipLevels: mip_levels as u16,
                 Format: format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
@@ -74,23 +80,24 @@ impl D3d12Texture {
                 .map_err(d3d_err)?;
             let resource = tex.ok_or_else(|| EngineError::Rhi("texture was null".into()))?;
 
-            // Copyable footprint for the upload layout.
-            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-            let mut num_rows = 0u32;
-            let mut row_size = 0u64;
+            // Copyable footprints for every subresource (mip).
+            let n = mip_levels as usize;
+            let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+            let mut num_rows = vec![0u32; n];
+            let mut row_sizes = vec![0u64; n];
             let mut total = 0u64;
             device.device.GetCopyableFootprints(
                 &tex_desc,
                 0,
-                1,
+                mip_levels,
                 0,
-                Some(&mut footprint),
-                Some(&mut num_rows),
-                Some(&mut row_size),
+                Some(footprints.as_mut_ptr()),
+                Some(num_rows.as_mut_ptr()),
+                Some(row_sizes.as_mut_ptr()),
                 Some(&mut total),
             );
 
-            // UPLOAD buffer with row-padded pixel data.
+            // UPLOAD buffer holding every mip level, each row-padded to its footprint.
             let upload_heap = heap(D3D12_HEAP_TYPE_UPLOAD);
             let upload_desc = buffer_desc(total);
             let mut upload: Option<ID3D12Resource> = None;
@@ -109,35 +116,43 @@ impl D3d12Texture {
 
             let mut ptr: *mut c_void = std::ptr::null_mut();
             upload.Map(0, None, Some(&mut ptr)).map_err(d3d_err)?;
-            let dst_pitch = footprint.Footprint.RowPitch as usize;
-            let src_pitch = row_size as usize;
-            let base = (ptr as *mut u8).add(footprint.Offset as usize);
-            for row in 0..num_rows as usize {
-                std::ptr::copy_nonoverlapping(
-                    pixels.as_ptr().add(row * src_pitch),
-                    base.add(row * dst_pitch),
-                    src_pitch,
-                );
+            let base = ptr as *mut u8;
+            for mip in 0..n {
+                let fp = &footprints[mip];
+                let dst_pitch = fp.Footprint.RowPitch as usize;
+                let src_pitch = row_sizes[mip] as usize;
+                let rows = num_rows[mip] as usize;
+                let level = &levels[mip];
+                let dst = base.add(fp.Offset as usize);
+                for row in 0..rows {
+                    std::ptr::copy_nonoverlapping(
+                        level.as_ptr().add(row * src_pitch),
+                        dst.add(row * dst_pitch),
+                        src_pitch,
+                    );
+                }
             }
             upload.Unmap(0, None);
 
-            // Copy upload -> texture, then transition to shader-readable.
+            // Copy each mip upload -> its texture subresource, then transition all to read.
             device.immediate_submit(|list| {
-                let dst = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(&resource))),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        SubresourceIndex: 0,
-                    },
-                };
-                let src = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(&upload))),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        PlacedFootprint: footprint,
-                    },
-                };
-                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                for mip in 0..n {
+                    let dst = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(&resource))),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: mip as u32,
+                        },
+                    };
+                    let src = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(&upload))),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: footprints[mip],
+                        },
+                    };
+                    list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                }
                 transition(
                     list,
                     &resource,

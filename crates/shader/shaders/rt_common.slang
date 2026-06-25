@@ -343,11 +343,40 @@ float2 hit_uv(Instance inst, uint prim, float2 bary)
     return uv0 * b0 + uv1 * bary.x + uv2 * bary.y;
 }
 
-uint wrap_texel(int p, uint size)
+// World-space direction of a primary camera ray through clip-space `ndc` (z=1).
+// Shared so the inline and pipeline paths build identical rays + ray cones.
+float3 primary_ray_dir(float2 ndc)
 {
-    int s = int(size);
-    int r = p % s;
-    return uint(r < 0 ? r + s : r);
+    float4 world = mul(pc.inv_view_proj, float4(ndc, 1.0, 1.0));
+    return normalize(world.xyz / world.w - pc.cam_pos.xyz);
+}
+
+// Per-pixel primary ray-cone spread (full angle), from the divergence of two
+// adjacent pixel rays. Drives texture LOD since ray shaders lack derivatives.
+float primary_cone_spread(float2 ndc)
+{
+    float2 ndc_dx = ndc + float2(2.0 / float(pc.width), 0.0);
+    return length(primary_ray_dir(ndc_dx) - primary_ray_dir(ndc));
+}
+
+// Texture-independent ray-cone LOD term for a hit (Akenine-Möller, planar approx).
+// `cone_width` = cone footprint width at the hit (Σ t*spread); `cos_theta` =
+// |n·rayDir|. Per-texture `0.5*log2(w*h)` is added in sample_texture_lod.
+float hit_lod_base(Instance inst, uint prim, float cone_width, float cos_theta)
+{
+    uint i0 = g.storage_buffers[inst.idx].Load(prim * 12u + 0u);
+    uint i1 = g.storage_buffers[inst.idx].Load(prim * 12u + 4u);
+    uint i2 = g.storage_buffers[inst.idx].Load(prim * 12u + 8u);
+    float3 p0 = asfloat(g.storage_buffers[inst.vtx].Load3(i0 * 32u + 0u));
+    float3 p1 = asfloat(g.storage_buffers[inst.vtx].Load3(i1 * 32u + 0u));
+    float3 p2 = asfloat(g.storage_buffers[inst.vtx].Load3(i2 * 32u + 0u));
+    float2 uv0 = asfloat(g.storage_buffers[inst.vtx].Load2(i0 * 32u + 24u));
+    float2 uv1 = asfloat(g.storage_buffers[inst.vtx].Load2(i1 * 32u + 24u));
+    float2 uv2 = asfloat(g.storage_buffers[inst.vtx].Load2(i2 * 32u + 24u));
+    float a_uv = abs((uv1.x - uv0.x) * (uv2.y - uv0.y) - (uv2.x - uv0.x) * (uv1.y - uv0.y));
+    float a_world = length(cross(p1 - p0, p2 - p0));
+    float ratio = a_world > 1e-12 ? a_uv / a_world : 0.0;
+    return 0.5 * log2(max(ratio, 1e-20)) + log2(max(cone_width, 1e-8) / max(cos_theta, 1e-3));
 }
 
 // The material index varies per ray (per hit instance); a sampled-image array
@@ -363,39 +392,28 @@ uint wrap_texel(int p, uint size)
 #define RT_NONUNIFORM(i) NonUniformResourceIndex(i)
 #endif
 
-float4 load_texture_wrapped(uint tex, int2 p, uint width, uint height)
-{
-    int x = int(wrap_texel(p.x, width));
-    int y = int(wrap_texel(p.y, height));
-    return g.textures[RT_NONUNIFORM(tex)].Load(int3(x, y, 0));
-}
-
-// Ray shaders have no screen-space derivatives, and the M7 converter path does
-// not yet bind a sampler heap. Use an explicit repeat/bilinear fetch over mip 0.
-float4 sample_texture_bilinear(uint tex, float2 uv)
+// HW-sampled material fetch at an explicit ray-cone LOD. The shared trilinear/repeat
+// sampler `g.samp` is in the engine bindless block (inline path) and a static sampler
+// in the M7 converter root signature (pipeline path), so both paths mip-filter
+// identically. `lod_base` is the texture-independent term from hit_lod_base.
+float4 sample_texture_lod(uint tex, float2 uv, float lod_base)
 {
     uint width;
     uint height;
     g.textures[RT_NONUNIFORM(tex)].GetDimensions(width, height);
     if (width == 0u || height == 0u)
         return float4(1, 1, 1, 1);
-
-    float2 p = frac(uv) * float2(width, height) - 0.5;
-    int2 i0 = int2(floor(p));
-    float2 f = frac(p);
-    float4 c00 = load_texture_wrapped(tex, i0, width, height);
-    float4 c10 = load_texture_wrapped(tex, i0 + int2(1, 0), width, height);
-    float4 c01 = load_texture_wrapped(tex, i0 + int2(0, 1), width, height);
-    float4 c11 = load_texture_wrapped(tex, i0 + int2(1, 1), width, height);
-    return lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
+    float lod = max(lod_base + 0.5 * log2(float(max(width * height, 1u))), 0.0);
+    return g.textures[RT_NONUNIFORM(tex)].SampleLevel(g.samp, uv, lod);
 }
 
-float3 hit_shading_normal(Instance inst, uint prim, float2 bary, float3 geom_n, float2 uv)
+float3 hit_shading_normal(Instance inst, uint prim, float2 bary, float3 geom_n, float2 uv,
+                          float lod_base)
 {
     if (inst.tex_normal == NO_TEXTURE)
         return geom_n;
 
-    float3 tangent_normal = sample_texture_bilinear(inst.tex_normal, uv).xyz * 2.0 - 1.0;
+    float3 tangent_normal = sample_texture_lod(inst.tex_normal, uv, lod_base).xyz * 2.0 - 1.0;
     if (dot(tangent_normal, tangent_normal) < 1e-6)
         return geom_n;
 
@@ -456,19 +474,19 @@ struct RtMaterialSample
     float3 emissive;
 };
 
-RtMaterialSample sample_material(Instance inst, float2 uv)
+RtMaterialSample sample_material(Instance inst, float2 uv, float lod_base)
 {
     RtMaterialSample m;
     m.base_color = inst.base_color.rgb;
     if (inst.tex_base != NO_TEXTURE)
-        m.base_color *= sample_texture_bilinear(inst.tex_base, uv).rgb;
+        m.base_color *= sample_texture_lod(inst.tex_base, uv, lod_base).rgb;
 
     m.metallic = inst.params.x;
     m.roughness = inst.params.y;
     if (inst.tex_mr != NO_TEXTURE)
     {
         // glTF metallic-roughness: G = roughness, B = metallic.
-        float3 mr = sample_texture_bilinear(inst.tex_mr, uv).rgb;
+        float3 mr = sample_texture_lod(inst.tex_mr, uv, lod_base).rgb;
         m.roughness *= mr.g;
         m.metallic *= mr.b;
     }
@@ -476,7 +494,7 @@ RtMaterialSample sample_material(Instance inst, float2 uv)
     m.ao = inst.params.z;
     m.emissive = m.base_color * inst.base_color.a;
     if (inst.tex_emissive != NO_TEXTURE)
-        m.emissive += sample_texture_bilinear(inst.tex_emissive, uv).rgb * inst.base_color.a;
+        m.emissive += sample_texture_lod(inst.tex_emissive, uv, lod_base).rgb * inst.base_color.a;
 
     m.metallic = saturate(m.metallic);
     m.roughness = clamp(m.roughness, 0.02, 1.0);

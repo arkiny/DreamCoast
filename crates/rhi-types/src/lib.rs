@@ -49,6 +49,72 @@ pub enum Format {
     Depth32Float,
 }
 
+impl Format {
+    /// True for sRGB-encoded color formats (their RGB channels must be downsampled
+    /// in linear space).
+    pub fn is_srgb(self) -> bool {
+        matches!(self, Format::Bgra8Srgb | Format::Rgba8Srgb)
+    }
+}
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Box-downsample a tightly-packed 8-bit/4-channel `mip0` image into a full mip
+/// chain (levels `0..floor(log2(max(w,h)))+1`; level 0 is a copy of the input).
+///
+/// Shared by every backend's `create_texture` so the generated mips are *identical*
+/// across Vulkan / D3D12 / Metal (the engine's hard cross-backend-parity rule — a
+/// GPU `generateMipmaps` would differ per driver). For sRGB formats the RGB channels
+/// are averaged in linear space (alpha stays linear) so mips don't darken.
+pub fn generate_mip_chain(mip0: &[u8], width: u32, height: u32, format: Format) -> Vec<Vec<u8>> {
+    let srgb = format.is_srgb();
+    let mut levels = vec![mip0.to_vec()];
+    let (mut w, mut h) = (width.max(1), height.max(1));
+    let mut src = mip0.to_vec();
+    while w > 1 || h > 1 {
+        let nw = (w / 2).max(1);
+        let nh = (h / 2).max(1);
+        let mut dst = vec![0u8; (nw * nh * 4) as usize];
+        for y in 0..nh {
+            for x in 0..nw {
+                let x0 = (x * 2).min(w - 1);
+                let x1 = (x * 2 + 1).min(w - 1);
+                let y0 = (y * 2).min(h - 1);
+                let y1 = (y * 2 + 1).min(h - 1);
+                for c in 0..4u32 {
+                    let fetch = |px: u32, py: u32| -> f32 {
+                        let v = src[((py * w + px) * 4 + c) as usize] as f32 / 255.0;
+                        if srgb && c < 3 { srgb_to_linear(v) } else { v }
+                    };
+                    let avg =
+                        (fetch(x0, y0) + fetch(x1, y0) + fetch(x0, y1) + fetch(x1, y1)) * 0.25;
+                    let out = if srgb && c < 3 { linear_to_srgb(avg) } else { avg };
+                    dst[((y * nw + x) * 4 + c) as usize] = (out * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        levels.push(dst.clone());
+        src = dst;
+        w = nw;
+        h = nh;
+    }
+    levels
+}
+
 /// Swapchain present/pacing mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresentMode {
@@ -368,4 +434,50 @@ pub struct Rect2D {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mip_chain_count_and_sizes() {
+        // 4x4 RGBA8 -> levels 4x4, 2x2, 1x1 (floor(log2(4))+1 = 3).
+        let mip0 = vec![0u8; 4 * 4 * 4];
+        let levels = generate_mip_chain(&mip0, 4, 4, Format::Rgba8Unorm);
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0].len(), 4 * 4 * 4);
+        assert_eq!(levels[1].len(), 2 * 2 * 4);
+        assert_eq!(levels[2].len(), 4);
+    }
+
+    #[test]
+    fn mip_chain_box_average_unorm() {
+        // 2x2 with values 0,100,200,255 in R -> mip1 R = round(mean) = 139.
+        let mut mip0 = vec![0u8; 2 * 2 * 4];
+        mip0[0] = 0; // (0,0) R
+        mip0[4] = 100; // (1,0) R
+        mip0[8] = 200; // (0,1) R
+        mip0[12] = 255; // (1,1) R
+        let levels = generate_mip_chain(&mip0, 2, 2, Format::Rgba8Unorm);
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[1][0], 139); // (0+100+200+255)/4 = 138.75 -> 139
+    }
+
+    #[test]
+    fn mip_chain_srgb_averages_in_linear() {
+        // Averaging 0 and 255 in sRGB space differs from naive byte mean (127/128).
+        // Linear average of black+white sRGB is ~188 after re-encoding.
+        let mut mip0 = vec![0u8; 2 * 2 * 4];
+        for px in 0..4 {
+            let v = if px % 2 == 0 { 0 } else { 255 };
+            for c in 0..3 {
+                mip0[px * 4 + c] = v;
+            }
+            mip0[px * 4 + 3] = 255;
+        }
+        let levels = generate_mip_chain(&mip0, 2, 2, Format::Rgba8Srgb);
+        // Two black + two white pixels: linear mean 0.5 -> sRGB ~0.7353 -> ~188.
+        assert!(levels[1][0] >= 185 && levels[1][0] <= 192, "got {}", levels[1][0]);
+    }
 }
