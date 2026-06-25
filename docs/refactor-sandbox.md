@@ -74,7 +74,15 @@ Feature groups (setup line / loop line):
   each returning the output image; shared `build_gdf` (bake + merge) and `view_volume`
   helpers cut the duplication. The frame loop keeps the mutual-exclusion gating and the
   build-once flags, passing `build: bool` in (the flag set in `run()` after the call).
-- **R4 — `rt.rs` / `RtSystem`** (HW RT + path tracer + Cornell).
+- **R4 — `rt.rs` / `RtSystem`. DONE.** Owns the three RT pipelines (M3 inline trace,
+  M4 inline path tracer, M5 RT pipeline + SBT), the sample scene's BLAS/TLAS + per-
+  instance geometry table, and the Cornell-box scene. `new` takes the rasterizer's
+  scene + ground (its instance table mirrors the TLAS order) and binds the open
+  scene's TLAS as the startup default. Per-frame mutable state (accum buffer realloc,
+  TLAS rebind on scene switch, accum-frame / key resets) is in `prepare(&mut self,…)`,
+  run before the graph build; `record_path` / `record_trace` add the passes (`&'a self`),
+  and the loop bumps the accumulation counter at end-of-frame via `advance_accum` (the
+  R1 deferral pattern). `cornell_camera` is the fixed front-camera helper.
 - **R5 — `ibl.rs` / `IblSystem`** (fold the IBL resources in beside the existing fns).
 - **R6 — `deferred.rs` / `DeferredRenderer`** (the PBR backbone).
 - **R7 — `App::new()` / `App::frame()`.** With features bundled, the residual setup

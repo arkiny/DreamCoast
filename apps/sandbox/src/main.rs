@@ -11,17 +11,15 @@
 
 use std::time::Instant;
 
-use dreamcoast_asset::MeshData;
 use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_core::init_logging;
 use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
 use dreamcoast_render::{ComputePassInfo, GraphProfiler, PassInfo, RenderGraph, ResourcePool};
 use rhi::{
-    BackendKind, BlasGeometry, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor,
-    ComputePipelineDesc, CubemapDesc, Extent2D, Format, GraphicsPipelineDesc, Instance,
-    InstanceDesc, PresentMode, PrimitiveTopology, RaytracingPipelineDesc, RtGeometry,
-    StorageBufferDesc, SwapchainDesc, Texture, TlasInstance, VertexLayout,
+    BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, ComputePipelineDesc,
+    CubemapDesc, Extent2D, Format, GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode,
+    PrimitiveTopology, SwapchainDesc, Texture, VertexLayout,
 };
 use tracing::info;
 
@@ -32,6 +30,7 @@ mod ibl;
 mod mesh;
 mod particle;
 mod push;
+mod rt;
 mod smoketest;
 use app::*;
 use cull::*;
@@ -40,6 +39,7 @@ use ibl::*;
 use mesh::*;
 use particle::*;
 use push::*;
+use rt::*;
 use smoketest::*;
 
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -384,122 +384,6 @@ fn run() -> anyhow::Result<()> {
     // Stage B volumes / SDF bake / GDF merge / GDF trace). See `gdf.rs`.
     let gdf = GdfSystem::new(&device, backend, compute_supported)?;
 
-    // Phase 8 M3: inline ray-query trace pipeline (compute + `RayQuery`). Only on
-    // RT-capable devices; the bindless block then carries the scene TLAS (binding
-    // 5 / `t1088,space1`).
-    let rt_trace_pipeline = if device.has_raytracing() {
-        let rt_trace_cs = load_compute_shader(
-            backend,
-            dreamcoast_shader::rt_trace_cs_spirv,
-            dreamcoast_shader::rt_trace_cs_dxil,
-            dreamcoast_shader::rt_trace_cs_metallib,
-            "rt_trace",
-        )?;
-        Some(device.create_compute_pipeline(&ComputePipelineDesc {
-            compute_bytes: rt_trace_cs,
-            compute_entry: "csMain",
-            push_constant_size: 112, // inv_view_proj + cam_pos + sun_dir + out/w/h/pad
-            bindless: true,
-            threads_per_group: [8, 8, 1],
-        })?)
-    } else {
-        None
-    };
-
-    // Phase 8 M4: inline path tracer (diffuse GI bounce loop + progressive
-    // accumulation). Shares the bindless TLAS + geometry storage buffers.
-    let rt_path_pipeline = if device.has_raytracing() {
-        let rt_path_cs = load_compute_shader(
-            backend,
-            dreamcoast_shader::rt_path_cs_spirv,
-            dreamcoast_shader::rt_path_cs_dxil,
-            dreamcoast_shader::rt_path_cs_metallib,
-            "rt_path",
-        )?;
-        Some(device.create_compute_pipeline(&ComputePipelineDesc {
-            compute_bytes: rt_path_cs,
-            compute_entry: "csMain",
-            push_constant_size: 128, // inv_view_proj + cam_pos + sun + 2x uint4
-            bindless: true,
-            threads_per_group: [8, 8, 1],
-        })?)
-    } else {
-        None
-    };
-
-    let rt_pipeline_shaders_available = match backend {
-        BackendKind::Metal => {
-            dreamcoast_shader::rt_pipeline_rgen_metallib().is_some()
-                && dreamcoast_shader::rt_pipeline_miss_metallib().is_some()
-                && dreamcoast_shader::rt_pipeline_chit_metallib().is_some()
-                && dreamcoast_shader::rt_pipeline_dispatch_metallib().is_some()
-                && dreamcoast_shader::rt_pipeline_isect_metallib().is_some()
-        }
-        _ => true,
-    };
-
-    let rt_pipeline_requested = std::env::var_os("P8_PATHTRACE_PIPELINE").is_some();
-
-    // Phase 8 M5: the same path tracer via the hardware ray-tracing *pipeline*
-    // (raygen / miss / closest-hit + shader binding table). Reproduces the inline
-    // tracer's image so the two RT abstractions can be cross-checked. Gated on
-    // `supports_rt_pipeline()`; on Metal the shader bytes are optional because the
-    // converter/DXC toolchain may not be installed on every development machine.
-    let rt_pt_pipeline = if rt_pipeline_requested
-        && device.supports_rt_pipeline()
-        && rt_pipeline_shaders_available
-    {
-        let rgen = load_compute_shader(
-            backend,
-            dreamcoast_shader::rt_pipeline_rgen_spirv,
-            dreamcoast_shader::rt_pipeline_rgen_dxil,
-            dreamcoast_shader::rt_pipeline_rgen_metallib,
-            "rt_pipeline_rgen",
-        )?;
-        let miss = load_compute_shader(
-            backend,
-            dreamcoast_shader::rt_pipeline_miss_spirv,
-            dreamcoast_shader::rt_pipeline_miss_dxil,
-            dreamcoast_shader::rt_pipeline_miss_metallib,
-            "rt_pipeline_miss",
-        )?;
-        let chit = load_compute_shader(
-            backend,
-            dreamcoast_shader::rt_pipeline_chit_spirv,
-            dreamcoast_shader::rt_pipeline_chit_dxil,
-            dreamcoast_shader::rt_pipeline_chit_metallib,
-            "rt_pipeline_chit",
-        )?;
-        Some(device.create_raytracing_pipeline(&RaytracingPipelineDesc {
-            raygen_bytes: rgen,
-            raygen_entry: "rgMain",
-            miss_bytes: miss,
-            miss_entry: "msMain",
-            closesthit_bytes: chit,
-            closesthit_entry: "chMain",
-            metal_ray_dispatch_bytes: if backend == BackendKind::Metal {
-                dreamcoast_shader::rt_pipeline_dispatch_metallib()
-            } else {
-                None
-            },
-            metal_ray_dispatch_entry: Some("RaygenIndirection"),
-            metal_intersection_bytes: if backend == BackendKind::Metal {
-                dreamcoast_shader::rt_pipeline_isect_metallib()
-            } else {
-                None
-            },
-            metal_intersection_entry: Some("irconverter.wrapper.intersection.function.triangle"),
-            push_constant_size: 128, // matches rt_path / rt_pipeline PushConstants
-            // Payload = float3 x4 (48) + uint x3 (12) + float x2 cone state (8) = 68,
-            // rounded up to a multiple of 8. Must be >= the shader payload or D3D12
-            // CreateStateObject rejects the SHADER_CONFIG with E_INVALIDARG.
-            max_payload_size: 72,
-            max_attribute_size: 8, // barycentrics (float2)
-        })?)
-    } else {
-        None
-    };
-
     // GPU particle system (Phase 7): a persistent ping-pong buffer pair advanced by
     // a compute pass and drawn as instanced billboards (see `particle.rs`). Seeds
     // both buffers on construction.
@@ -753,138 +637,21 @@ fn run() -> anyhow::Result<()> {
     let ground = ground_mesh(scene_radius * 1.3, 0.0);
     let (ground_vbuf, ground_ibuf, ground_count) = upload_mesh(&device, &ground)?;
 
-    // Hardware ray tracing (Phase 8): build one BLAS per scene mesh + ground and a
-    // TLAS over their instances, then register the TLAS in the bindless table so
-    // the inline-trace compute pass (M3) can trace it. `rt_scene` outlives the
-    // frame loop (the TLAS must stay alive while it is bound).
-    let rt_scene = if device.has_raytracing() {
-        let mut geoms: Vec<RtGeometry> = scene
-            .iter()
-            .map(|o| RtGeometry {
-                vertex_buffer: &o.vbuf,
-                index_buffer: &o.ibuf,
-                geometry: BlasGeometry {
-                    vertex_count: o.vertex_count,
-                    vertex_stride: 32,
-                    index_count: o.index_count,
-                },
-            })
-            .collect();
-        geoms.push(RtGeometry {
-            vertex_buffer: &ground_vbuf,
-            index_buffer: &ground_ibuf,
-            geometry: BlasGeometry {
-                vertex_count: ground.vertices.len() as u32,
-                vertex_stride: 32,
-                index_count: ground_count,
-            },
-        });
-        let instances: Vec<TlasInstance> = (0..geoms.len())
-            .map(|i| TlasInstance {
-                blas_index: i as u32,
-                transform: mat4_to_3x4(if i < scene.len() {
-                    scene[i].transform
-                } else {
-                    Mat4::IDENTITY
-                }),
-                custom_index: i as u32,
-                mask: 0xFF,
-            })
-            .collect();
-        match device.build_raytracing_scene(&geoms, &instances) {
-            Ok(s) => {
-                device.bind_tlas(&s);
-                info!("ray-tracing scene built: {} BLAS + 1 TLAS", geoms.len());
-                Some(s)
-            }
-            Err(e) => {
-                tracing::error!("ray-tracing scene build failed: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Phase 8 M4: per-instance geometry storage buffers + instance table for the
-    // path tracer's hit shading. One vertex + one index storage buffer per
-    // instance (read as raw byte-address buffers in the shader), plus a table
-    // mapping InstanceID -> { vertex SB index, index SB index, albedo }. The order
-    // MUST match the TLAS instance custom_index order (scene objects, then ground).
-    // `_rt_geometry` keeps the geometry buffers alive for the program's lifetime.
-    let (rt_instance_table, _rt_geometry, rt_instance_count) = if rt_scene.is_some() {
-        // (mesh, material) per instance, in TLAS instance order (objects, then
-        // ground). Materials mirror the rasterizer's so the path tracer shades with
-        // the same metallic-roughness PBR model.
-        // base_color.a is the path tracer's emissive scale (the Cornell light uses
-        // it). The sample-scene objects are NOT emitters — their .a is just opacity —
-        // so zero it, else e.g. the chrome sphere emits its own base color and reads
-        // as a glowing white ball instead of a mirror.
-        let mat_of = |o: &SceneObject| PtMaterial {
-            base_color: [o.base_color[0], o.base_color[1], o.base_color[2], 0.0],
-            metallic: o.metallic,
-            roughness: o.roughness,
-            ao: 1.0,
-            tex: o.tex,
-        };
-        let entries: [(&MeshData, PtMaterial); 5] = [
-            (&model, mat_of(&scene[0])),
-            (&sphere, mat_of(&scene[1])),
-            (&sphere, mat_of(&scene[2])),
-            (&cube, mat_of(&scene[3])),
-            (&ground, PtMaterial::diffuse([0.8, 0.8, 0.8, 0.0])),
-        ];
-        let (table, geometry) = build_pt_instance_table(&device, &entries)?;
-        info!("path-tracer instance table: {} instances", entries.len());
-        (Some(table), geometry, entries.len() as u32)
-    } else {
-        (None, Vec::new(), 0u32)
-    };
-
-    // Phase 8 M4: an alternate Cornell-box scene for the path tracer (strong color
-    // bleeding from the red/green walls, area-light GI). Built once: its own BLAS
-    // per quad/box + TLAS + instance table. The host-visible vertex/index buffers
-    // are only needed during the BLAS build, so they drop at the end of this block.
-    let (cornell_scene, cornell_table, _cornell_geometry, cornell_instance_count) =
-        if device.has_raytracing() {
-            let meshes = dreamcoast_asset::cornell_box();
-            let mut hostbufs: Vec<(Buffer, Buffer, u32, u32)> = Vec::with_capacity(meshes.len());
-            for (m, _) in &meshes {
-                let (vb, ib, ic) = upload_mesh(&device, m)?;
-                hostbufs.push((vb, ib, ic, m.vertices.len() as u32));
-            }
-            let geoms: Vec<RtGeometry> = hostbufs
-                .iter()
-                .map(|(vb, ib, ic, vc)| RtGeometry {
-                    vertex_buffer: vb,
-                    index_buffer: ib,
-                    geometry: BlasGeometry {
-                        vertex_count: *vc,
-                        vertex_stride: 32,
-                        index_count: *ic,
-                    },
-                })
-                .collect();
-            let instances: Vec<TlasInstance> = (0..geoms.len() as u32)
-                .map(|i| TlasInstance {
-                    blas_index: i,
-                    transform: mat4_to_3x4(Mat4::IDENTITY), // geometry already world-space
-                    custom_index: i,
-                    mask: 0xFF,
-                })
-                .collect();
-            let scene = device.build_raytracing_scene(&geoms, &instances)?;
-            // The Cornell box is all matte diffuse (emissive ceiling via base_color.a).
-            let entries: Vec<(&MeshData, PtMaterial)> = meshes
-                .iter()
-                .map(|(m, a)| (m, PtMaterial::diffuse(*a)))
-                .collect();
-            let (table, geometry) = build_pt_instance_table(&device, &entries)?;
-            info!("cornell-box scene built: {} instances", meshes.len());
-            (Some(scene), Some(table), geometry, meshes.len() as u32)
-        } else {
-            (None, None, Vec::new(), 0u32)
-        };
+    // Hardware ray tracing (Phase 8): BLAS/TLAS over the sample scene + ground, the
+    // path tracer's per-instance geometry table, and the alternate Cornell-box scene
+    // — plus the M3/M4/M5 RT pipelines. See `rt.rs`. The sample scene's TLAS is bound
+    // on construction (the startup default). The instance table's mesh order MUST
+    // match the TLAS custom_index order (scene objects, then ground).
+    let mut rt = RtSystem::new(
+        &device,
+        backend,
+        &scene,
+        &[&model, &sphere, &sphere, &cube],
+        &ground,
+        &ground_vbuf,
+        &ground_ibuf,
+        ground_count,
+    )?;
 
     // Per-frame globals uniform buffer (one 256-byte slice per frame-in-flight).
     let globals_buffer = device.create_buffer(&BufferDesc {
@@ -933,15 +700,14 @@ fn run() -> anyhow::Result<()> {
     // Phase 8 M3: replace the rasterized image with an inline ray-query trace
     // (primary hit instance color modulated by a hardware shadow ray). Requires a
     // built RT scene; headless toggle via `P8_PATHTRACE`.
-    let mut path_trace = rt_trace_pipeline.is_some()
-        && rt_scene.is_some()
-        && std::env::var_os("P8_PATHTRACE").is_some();
+    let mut path_trace =
+        rt.has_trace() && rt.has_scene() && std::env::var_os("P8_PATHTRACE").is_some();
     // Debug mode: show the M3 single-bounce trace viz (instance color + RT shadow)
     // instead of the M4 path tracer. Headless toggle via `P8_RT_DEBUG`.
     let mut rt_debug = device.has_raytracing() && std::env::var_os("P8_RT_DEBUG").is_some();
     // Cornell-box scene for the path tracer (strong color bleeding). Headless
     // toggle via `P8_CORNELL`; uses a fixed front-facing camera.
-    let mut cornell = cornell_scene.is_some() && std::env::var_os("P8_CORNELL").is_some();
+    let mut cornell = rt.has_cornell() && std::env::var_os("P8_CORNELL").is_some();
     // Phase 11 Stage A: replace the rasterized image with a compute software ray
     // trace of the analytic SDF scene (sphere tracing, no hardware RT). Headless
     // toggle via `P11_SDF`.
@@ -969,7 +735,9 @@ fn run() -> anyhow::Result<()> {
     // Phase 8 M5: drive the path tracer through the full RT pipeline + SBT instead
     // of the inline compute ray query (same image). Headless toggle via
     // `P8_PATHTRACE_PIPELINE`; ignored when no RT pipeline is available.
-    let mut path_trace_pipeline = rt_pt_pipeline.is_some() && rt_pipeline_requested;
+    // `pt_pipeline` is only built when the pipeline was requested, so its presence
+    // alone is the default-on condition.
+    let mut path_trace_pipeline = rt.has_pt_pipeline();
     // Samples per path-trace dispatch (accumulated progressively across frames).
     let path_spp: u32 = 8;
     // Real-time environment capture: re-capture the env chain every frame (so the
@@ -1133,16 +901,8 @@ fn run() -> anyhow::Result<()> {
     let mut elapsed = 0.0f32;
     // Fixed view in screenshot mode for reproducible output.
     let mut angle = if screenshot_mode { 0.7 } else { 0.0 };
-    // Path-tracer progressive accumulation (Phase 8 M4): a persistent float4-per-
-    // pixel sum buffer, reset when the view/lighting/resolution changes. Extra
-    // headless warmup frames let the static-camera screenshot converge.
-    let mut path_accum: Option<rhi::StorageBuffer> = None;
-    let mut accum_extent = (0u32, 0u32);
-    let mut accum_frame = 0u32;
-    let mut last_pt_key: Option<[u32; 8]> = None;
-    // Which scene's TLAS is currently bound to the bindless slot (None = open
-    // scene, the startup default). Switching rebinds (wait_idle) the TLAS.
-    let mut bound_cornell = false;
+    // Path-tracer progressive accumulation (Phase 8 M4) lives in `rt`; extra headless
+    // warmup frames let the static-camera screenshot converge.
     const PATHTRACE_WARMUP: u64 = 64;
 
     while !window.should_close() {
@@ -1315,16 +1075,16 @@ fn run() -> anyhow::Result<()> {
                         ui.checkbox("GPU culling (indirect)", &mut gpu_cull);
                     }
 
-                    if rt_path_pipeline.is_some() && rt_scene.is_some() {
+                    if rt.has_path() && rt.has_scene() {
                         if ui.collapsing_header("Ray tracing (Phase 8)", TreeNodeFlags::empty()) {
                             ui.checkbox("Path trace (inline ray query)", &mut path_trace);
                             if path_trace {
                                 ui.checkbox("  - debug: instance + shadow viz", &mut rt_debug);
                                 if !rt_debug {
-                                    if cornell_scene.is_some() {
+                                    if rt.has_cornell() {
                                         ui.checkbox("  - Cornell box", &mut cornell);
                                     }
-                                    if rt_pt_pipeline.is_some() {
+                                    if rt.has_pt_pipeline() {
                                         ui.checkbox(
                                             "  - pipeline + SBT (vs inline)",
                                             &mut path_trace_pipeline,
@@ -1332,7 +1092,7 @@ fn run() -> anyhow::Result<()> {
                                     }
                                     ui.text(format!(
                                         "  - {} spp accumulated ({})",
-                                        accum_frame.saturating_mul(path_spp),
+                                        rt.accum_frame().saturating_mul(path_spp),
                                         if path_trace_pipeline {
                                             "pipeline"
                                         } else {
@@ -1538,59 +1298,25 @@ fn run() -> anyhow::Result<()> {
         // (re)allocation must not sit on a `?` early-return path while the graph
         // holds borrows of transient resources.
         let pt_active =
-            path_trace && !rt_debug && rt_path_pipeline.is_some() && rt_instance_table.is_some();
+            path_trace && !rt_debug && rt.has_path() && rt.has_instance_table();
         // The path tracer uses the Cornell scene (fixed front camera) when toggled,
         // else the orbiting open scene. `pt_eye` / `pt_inv_vp` feed the trace rays.
-        let use_cornell = pt_active && cornell && cornell_scene.is_some();
+        let use_cornell = pt_active && cornell && rt.has_cornell();
         let (pt_eye, pt_inv_vp) = if use_cornell {
-            let c_eye = Vec3::new(0.0, 1.0, 3.2);
-            let c_view = Mat4::look_at_rh(c_eye, Vec3::new(0.0, 1.0, 0.0), Vec3::Y);
-            let mut c_proj =
-                Mat4::perspective_rh(40f32.to_radians(), cw as f32 / ch as f32, 0.05, 100.0);
-            if backend == BackendKind::Vulkan {
-                c_proj.y_axis.y *= -1.0;
-            }
-            (c_eye, (c_proj * c_view).inverse().to_cols_array())
+            RtSystem::cornell_camera(cw, ch, backend == BackendKind::Vulkan)
         } else {
             (eye, inv_view_proj)
         };
-        if pt_active {
-            // Switch the bound TLAS when toggling scenes (rare → wait_idle is fine).
-            if bound_cornell != use_cornell {
-                device.wait_idle()?;
-                if use_cornell {
-                    device.bind_tlas(cornell_scene.as_ref().unwrap());
-                } else if let Some(s) = rt_scene.as_ref() {
-                    device.bind_tlas(s);
-                }
-                bound_cornell = use_cornell;
-                accum_frame = 0;
-            }
-            if accum_extent != (cw, ch) {
-                device.wait_idle()?;
-                path_accum = Some(device.create_storage_buffer(&StorageBufferDesc {
-                    size: (cw as u64) * (ch as u64) * 16,
-                    stride: 16,
-                    indirect: false,
-                })?);
-                accum_extent = (cw, ch);
-                accum_frame = 0;
-            }
-            let key = [
-                pt_eye.x.to_bits(),
-                pt_eye.y.to_bits(),
-                pt_eye.z.to_bits(),
-                sun_dir[0].to_bits(),
-                sun_dir[1].to_bits(),
-                sun_dir[2].to_bits(),
-                sun_intensity.to_bits(),
-                (cw.wrapping_mul(0x9E37_79B1).wrapping_add(ch)) ^ (use_cornell as u32),
-            ];
-            if last_pt_key != Some(key) {
-                accum_frame = 0;
-                last_pt_key = Some(key);
-            }
-        }
+        rt.prepare(
+            &device,
+            pt_active,
+            use_cornell,
+            cw,
+            ch,
+            pt_eye,
+            sun_dir,
+            sun_intensity,
+        )?;
 
         let extent = Extent2D::new(cw, ch);
         let mut graph = RenderGraph::new();
@@ -1794,7 +1520,7 @@ fn run() -> anyhow::Result<()> {
         // (debug). The chosen compute pass writes a storage image the tonemap pass
         // displays in place of the rasterized HDR. (`pt_active` + the accumulation
         // buffer were prepared above, before the graph was built.)
-        let rt_on = path_trace && (rt_path_pipeline.is_some() || rt_trace_pipeline.is_some());
+        let rt_on = path_trace && (rt.has_path() || rt.has_trace());
         let rt_out = if rt_on {
             Some(graph.create_storage_image("rt_out", HDR_FORMAT, extent))
         } else {
@@ -1802,99 +1528,22 @@ fn run() -> anyhow::Result<()> {
         };
         if let Some(rt_out) = rt_out {
             if pt_active {
-                let rt_pipe = rt_path_pipeline.as_ref().unwrap();
-                // M5: when enabled, drive the same path tracer through the RT pipeline
-                // + SBT instead of the inline compute ray query (`None` = inline).
-                let rt_pt = if path_trace_pipeline {
-                    rt_pt_pipeline.as_ref()
-                } else {
-                    None
-                };
-                // Index only (no borrow held into the graph closure — that would
-                // over-extend the graph's lifetime vs. the transient resources).
-                let accum_index = path_accum.as_ref().unwrap().storage_index();
-                let inst_index = if use_cornell {
-                    cornell_table.as_ref().unwrap().storage_index()
-                } else {
-                    rt_instance_table.as_ref().unwrap().storage_index()
-                };
-                let inst_count = if use_cornell {
-                    cornell_instance_count
-                } else {
-                    rt_instance_count
-                };
-                // External resource so the graph orders the accumulation write (and
-                // inserts a barrier before the next frame's read).
-                let accum_ext = graph.import_external("rt_accum");
-                let inv_vp = pt_inv_vp;
-                let cam = pt_eye;
-                let sun = sun_dir;
-                let sun_i = sun_intensity;
-                // bit0 = Vulkan Y-flip, bit1 = Cornell env mode (no sun, black bg).
-                let flip = flip_y | if use_cornell { 2 } else { 0 };
-                let frame_idx = accum_frame;
-                let spp = path_spp;
-                graph.add_compute_pass(
-                    ComputePassInfo {
-                        name: "rt_path",
-                        storage_writes: vec![rt_out, accum_ext],
-                        reads: vec![],
-                    },
-                    move |ctx| {
-                        let out_index = ctx.storage_index(rt_out);
-                        let cmd = ctx.cmd();
-                        let push = rt_path_push(
-                            &inv_vp,
-                            cam,
-                            sun,
-                            sun_i,
-                            out_index,
-                            accum_index,
-                            inst_index,
-                            inst_count,
-                            frame_idx,
-                            cw,
-                            ch,
-                            flip,
-                            spp,
-                        );
-                        if let Some(rt_pt) = rt_pt {
-                            // Full RT pipeline path (raygen/miss/hit + SBT).
-                            cmd.bind_raytracing_pipeline(rt_pt);
-                            cmd.push_constants_rt(&push);
-                            cmd.trace_rays(rt_pt, cw, ch);
-                        } else {
-                            // Inline ray-query compute path.
-                            cmd.bind_compute_pipeline(rt_pipe);
-                            cmd.push_constants_compute(&push);
-                            cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                        }
-                        Ok(())
-                    },
+                rt.record_path(
+                    &mut graph,
+                    rt_out,
+                    use_cornell,
+                    path_trace_pipeline,
+                    pt_inv_vp,
+                    pt_eye,
+                    sun_dir,
+                    sun_intensity,
+                    cw,
+                    ch,
+                    flip_y,
+                    path_spp,
                 );
-                accum_frame += 1;
-            } else if let Some(rt_pipe) = rt_trace_pipeline.as_ref() {
-                let inv_vp = inv_view_proj;
-                let cam = eye;
-                let sun = sun_dir;
-                let flip = flip_y;
-                graph.add_compute_pass(
-                    ComputePassInfo {
-                        name: "rt_trace",
-                        storage_writes: vec![rt_out],
-                        reads: vec![],
-                    },
-                    move |ctx| {
-                        let out_index = ctx.storage_index(rt_out);
-                        let cmd = ctx.cmd();
-                        cmd.bind_compute_pipeline(rt_pipe);
-                        cmd.push_constants_compute(&rt_trace_push(
-                            &inv_vp, cam, sun, out_index, cw, ch, flip,
-                        ));
-                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                        Ok(())
-                    },
-                );
+            } else if rt.has_trace() {
+                rt.record_trace(&mut graph, rt_out, inv_view_proj, eye, sun_dir, cw, ch, flip_y);
             }
         }
 
@@ -2125,6 +1774,11 @@ fn run() -> anyhow::Result<()> {
         // here so the graph's `&self` borrows have ended — see `particle.rs`).
         if particles_on {
             particles.advance();
+        }
+        // Bump the path tracer's progressive-accumulation counter (deferred here for the
+        // same reason: the `record_path` pass borrowed `&rt` for the graph's lifetime).
+        if pt_active {
+            rt.advance_accum();
         }
 
         // Wait for the GPU (copy included), read the buffer back, and save a PNG.
