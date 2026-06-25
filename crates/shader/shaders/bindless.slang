@@ -62,6 +62,11 @@ struct Bindless
     // RT-capable devices; shaders that don't trace drop it (Slang omits the unused
     // binding), so non-RT pipelines/layouts are unaffected.
     RaytracingAccelerationStructure tlas;
+    // binding 6 — sampled 3D volume textures (Phase 11 Stage B: baked distance
+    // fields, trilinear-sampled by the SW ray marcher). SRVs, after the TLAS.
+    Texture3D<float> volumes[64];
+    // binding 7 — read-write 3D volume textures (UAV) the SDF bake compute writes.
+    RWTexture3D<float> storage_volumes[64];
 };
 
 [[vk::binding(0, 0)]]

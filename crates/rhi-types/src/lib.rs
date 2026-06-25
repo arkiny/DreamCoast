@@ -45,6 +45,8 @@ pub enum Format {
     Rgba16Float,
     /// 16-bit float RG (BRDF integration LUT).
     Rg16Float,
+    /// 32-bit float R (single-channel; signed distance fields, Phase 11).
+    R32Float,
     /// 32-bit float depth.
     Depth32Float,
 }
@@ -378,6 +380,18 @@ pub struct RenderTargetDesc {
     pub format: Format,
     /// Also create an unordered-access view (compute-writable storage image).
     pub storage: bool,
+}
+
+/// A 3D (volume) texture, created as both a UAV (compute-writable storage volume,
+/// bindless `storage_volumes[]`) and an SRV (trilinear-sampled `volumes[]`) so a
+/// compute pass can bake into it and a later pass can ray-march/sample it (Phase 11
+/// Stage B distance fields).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VolumeDesc {
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub format: Format,
 }
 
 /// GPU memory footprint of a resource, used by the render graph to plan transient

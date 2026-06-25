@@ -15,6 +15,7 @@ use crate::pipeline::{VulkanComputePipeline, VulkanGraphicsPipeline};
 use crate::query::VulkanQueryHeap;
 use crate::render_target::VulkanRenderTarget;
 use crate::swapchain::VulkanSwapchain;
+use crate::volume::VulkanVolume;
 use crate::{color_subresource_range, vk_err};
 
 /// A primary command buffer, reset and re-recorded each frame.
@@ -844,6 +845,53 @@ impl VulkanCommandBuffer {
             vk::PipelineStageFlags::FRAGMENT_SHADER,
         );
         target.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    /// Transition a 3D volume into `GENERAL` so a compute bake can write it
+    /// (Phase 11 Stage B). Mirrors `rt_to_storage` for the volume tables.
+    pub fn volume_to_storage(&self, volume: &VulkanVolume) {
+        let old = volume.layout();
+        if old == vk::ImageLayout::GENERAL {
+            return;
+        }
+        let (src_access, src_stage) = match old {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+                vk::AccessFlags::SHADER_READ,
+                self.storage_stages() | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            ),
+            _ => (
+                vk::AccessFlags::empty(),
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+            ),
+        };
+        self.image_barrier(
+            volume.image(),
+            old,
+            vk::ImageLayout::GENERAL,
+            src_access,
+            vk::AccessFlags::SHADER_WRITE,
+            src_stage,
+            self.storage_stages(),
+        );
+        volume.set_layout(vk::ImageLayout::GENERAL);
+    }
+
+    /// Transition a 3D volume from `GENERAL` (compute bake) into
+    /// `SHADER_READ_ONLY_OPTIMAL` for trilinear sampling by a later pass.
+    pub fn volume_to_sampled(&self, volume: &VulkanVolume) {
+        if volume.layout() == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+            return;
+        }
+        self.image_barrier(
+            volume.image(),
+            volume.layout(),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            self.storage_stages(),
+            self.storage_stages() | vk::PipelineStageFlags::FRAGMENT_SHADER,
+        );
+        volume.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
 
     /// UAV barrier on a storage buffer: order a compute write before any later

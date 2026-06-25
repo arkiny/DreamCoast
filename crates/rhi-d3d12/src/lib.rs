@@ -18,7 +18,7 @@ use rhi_types::Format;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
     DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-    DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT,
 };
 
 mod accel;
@@ -35,6 +35,7 @@ mod rt_pipeline;
 mod swapchain;
 mod sync;
 mod texture;
+mod volume;
 
 pub use accel::D3d12RaytracingScene;
 pub use buffer::{D3d12Buffer, D3d12StorageBuffer};
@@ -50,6 +51,7 @@ pub use rt_pipeline::D3d12RaytracingPipeline;
 pub use swapchain::D3d12Swapchain;
 pub use sync::{D3d12Fence, D3d12Semaphore};
 pub use texture::D3d12Texture;
+pub use volume::D3d12Volume;
 
 /// Render/RTV format (includes sRGB write conversion).
 fn to_dxgi_format(format: Format) -> DXGI_FORMAT {
@@ -60,6 +62,7 @@ fn to_dxgi_format(format: Format) -> DXGI_FORMAT {
         Format::Rgba8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         Format::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
         Format::Rg16Float => DXGI_FORMAT_R16G16_FLOAT,
+        Format::R32Float => DXGI_FORMAT_R32_FLOAT,
         Format::Depth32Float => DXGI_FORMAT_D32_FLOAT,
     }
 }
@@ -73,6 +76,7 @@ fn to_dxgi_swapchain_format(format: Format) -> DXGI_FORMAT {
         Format::Rgba8Unorm | Format::Rgba8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM,
         Format::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
         Format::Rg16Float => DXGI_FORMAT_R16G16_FLOAT,
+        Format::R32Float => DXGI_FORMAT_R32_FLOAT,
         Format::Depth32Float => DXGI_FORMAT_D32_FLOAT,
     }
 }

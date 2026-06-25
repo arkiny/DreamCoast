@@ -23,7 +23,7 @@ use rhi::{
     CommandBuffer, ComputePipelineDesc, Cubemap, CubemapDesc, Device, Extent2D, Fence, Format,
     GraphicsPipeline, GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology,
     Queue, RaytracingPipelineDesc, ReadbackLayout, RtGeometry, Semaphore, StorageBufferDesc,
-    Swapchain, SwapchainDesc, Texture, TextureDesc, TlasInstance, VertexLayout,
+    Swapchain, SwapchainDesc, Texture, TextureDesc, TlasInstance, VertexLayout, VolumeDesc,
 };
 use tracing::info;
 
@@ -364,6 +364,56 @@ fn run() -> anyhow::Result<()> {
         bindless: true,
         threads_per_group: [8, 8, 1],
     })?;
+
+    // Phase 11 Stage B (B1): 3D volume texture RHI smoke test — a compute fill into a
+    // storage volume + a trilinear-sampled slice view. Gated on compute support.
+    const VOLUME_DIM: u32 = 64;
+    let volume_res = if compute_supported {
+        Some(device.create_volume(&VolumeDesc {
+            width: VOLUME_DIM,
+            height: VOLUME_DIM,
+            depth: VOLUME_DIM,
+            format: Format::R32Float,
+        })?)
+    } else {
+        None
+    };
+    let volume_fill_pipeline = if compute_supported {
+        let cs = load_compute_shader(
+            backend,
+            dreamcoast_shader::volume_fill_cs_spirv,
+            dreamcoast_shader::volume_fill_cs_dxil,
+            dreamcoast_shader::volume_fill_cs_metallib,
+            "volume_fill",
+        )?;
+        Some(device.create_compute_pipeline(&ComputePipelineDesc {
+            compute_bytes: cs,
+            compute_entry: "fillMain",
+            push_constant_size: 32,
+            bindless: true,
+            threads_per_group: [4, 4, 4],
+        })?)
+    } else {
+        None
+    };
+    let volume_view_pipeline = if compute_supported {
+        let cs = load_compute_shader(
+            backend,
+            dreamcoast_shader::volume_view_cs_spirv,
+            dreamcoast_shader::volume_view_cs_dxil,
+            dreamcoast_shader::volume_view_cs_metallib,
+            "volume_view",
+        )?;
+        Some(device.create_compute_pipeline(&ComputePipelineDesc {
+            compute_bytes: cs,
+            compute_entry: "viewMain",
+            push_constant_size: 32,
+            bindless: true,
+            threads_per_group: [8, 8, 1],
+        })?)
+    } else {
+        None
+    };
 
     // Phase 11 Stage A (A1): compute software ray tracing — sphere-traces an analytic
     // SDF scene (no hardware RT / TLAS), so it is gated only on compute support.
@@ -1102,6 +1152,9 @@ fn run() -> anyhow::Result<()> {
     // trace of the analytic SDF scene (sphere tracing, no hardware RT). Headless
     // toggle via `P11_SDF`.
     let mut sdf_trace = sdf_trace_pipeline.is_some() && std::env::var_os("P11_SDF").is_some();
+    // Phase 11 Stage B (B1): 3D volume texture smoke test — fill a volume then view a
+    // trilinear-sampled Z slice. Headless toggle via `P11_VOLUME_TEST`.
+    let mut volume_test = volume_res.is_some() && std::env::var_os("P11_VOLUME_TEST").is_some();
     // Phase 8 M5: drive the path tracer through the full RT pipeline + SBT instead
     // of the inline compute ray query (same image). Headless toggle via
     // `P8_PATHTRACE_PIPELINE`; ignored when no RT pipeline is available.
@@ -1494,6 +1547,12 @@ fn run() -> anyhow::Result<()> {
                         ui.checkbox("SDF sphere trace (compute, no HW RT)", &mut sdf_trace);
                         if sdf_trace {
                             ui.text_disabled("  - analytic SDF scene (Stage A)");
+                        }
+                        if volume_res.is_some() {
+                            ui.checkbox("3D volume test (fill + slice view)", &mut volume_test);
+                            if volume_test {
+                                ui.text_disabled("  - Stage B RHI smoke test");
+                            }
                         }
                     }
 
@@ -2129,9 +2188,80 @@ fn run() -> anyhow::Result<()> {
             None
         };
 
+        // Phase 11 Stage B (B1): 3D volume smoke test — fill a storage volume, then
+        // view a trilinear-sampled Z slice. Only when the other replacements are off.
+        let vol_out = if volume_test && rt_out.is_none() && sdf_out.is_none() {
+            if let (Some(vol), Some(fillp), Some(viewp)) = (
+                volume_res.as_ref(),
+                volume_fill_pipeline.as_ref(),
+                volume_view_pipeline.as_ref(),
+            ) {
+                let out = graph.create_storage_image("vol_out", HDR_FORMAT, extent);
+                // External so the graph orders the fill (write) before the view (read).
+                let vol_ext = graph.import_external("volume");
+                let vol_storage = vol.storage_index();
+                let vol_sampled = vol.sampled_index();
+                let dim = VOLUME_DIM;
+                graph.add_compute_pass(
+                    ComputePassInfo {
+                        name: "volume_fill",
+                        storage_writes: vec![vol_ext],
+                        reads: vec![],
+                    },
+                    move |ctx| {
+                        let cmd = ctx.cmd();
+                        cmd.volume_to_storage(vol);
+                        cmd.bind_compute_pipeline(fillp);
+                        cmd.push_constants_compute(&volume_push(
+                            vol_storage,
+                            vol_sampled,
+                            dim,
+                            0,
+                            0,
+                            0,
+                            0.0,
+                        ));
+                        let g = dim.div_ceil(4);
+                        cmd.dispatch(g, g, g);
+                        Ok(())
+                    },
+                );
+                graph.add_compute_pass(
+                    ComputePassInfo {
+                        name: "volume_view",
+                        storage_writes: vec![out],
+                        reads: vec![vol_ext],
+                    },
+                    move |ctx| {
+                        let out_index = ctx.storage_index(out);
+                        let cmd = ctx.cmd();
+                        cmd.volume_to_sampled(vol);
+                        cmd.bind_compute_pipeline(viewp);
+                        cmd.push_constants_compute(&volume_push(
+                            vol_storage,
+                            vol_sampled,
+                            dim,
+                            out_index,
+                            cw,
+                            ch,
+                            0.5,
+                        ));
+                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                        Ok(())
+                    },
+                );
+                Some(out)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active,
-        // else the SW-RT SDF trace (Phase 11), else the compute-post output, else HDR.
-        let tonemap_src = rt_out.or(sdf_out).or(hdr_post).unwrap_or(hdr);
+        // else the SW-RT SDF trace, else the Stage-B volume slice, else compute-post,
+        // else HDR.
+        let tonemap_src = rt_out.or(sdf_out).or(vol_out).or(hdr_post).unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the
         // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
         // exposure here before the filmic curve (else the bright sky + sun blow out).
@@ -2904,6 +3034,29 @@ fn sdf_trace_push(
     pc[100..104].copy_from_slice(&width.to_le_bytes());
     pc[104..108].copy_from_slice(&height.to_le_bytes());
     pc[108..112].copy_from_slice(&flip_y.to_le_bytes());
+    pc
+}
+
+/// Pack the Phase 11 Stage B volume-test push block (32 bytes): vol_storage,
+/// vol_sampled, dim, out_index, width, height, slice (f32), pad.
+#[allow(clippy::too_many_arguments)]
+fn volume_push(
+    vol_storage: u32,
+    vol_sampled: u32,
+    dim: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    slice: f32,
+) -> [u8; 32] {
+    let mut pc = [0u8; 32];
+    pc[0..4].copy_from_slice(&vol_storage.to_le_bytes());
+    pc[4..8].copy_from_slice(&vol_sampled.to_le_bytes());
+    pc[8..12].copy_from_slice(&dim.to_le_bytes());
+    pc[12..16].copy_from_slice(&out_index.to_le_bytes());
+    pc[16..20].copy_from_slice(&width.to_le_bytes());
+    pc[20..24].copy_from_slice(&height.to_le_bytes());
+    pc[24..28].copy_from_slice(&slice.to_le_bytes());
     pc
 }
 

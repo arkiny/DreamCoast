@@ -72,6 +72,8 @@ backend_enum!(/// An offscreen color render target (attachment + bindless sample
     RenderTarget => rhi_vulkan::VulkanRenderTarget, rhi_d3d12::D3d12RenderTarget, rhi_metal::MetalRenderTarget);
 backend_enum!(/// A render-target cubemap (6 faces + bindless `TextureCube`), for IBL.
     Cubemap => rhi_vulkan::VulkanCubemap, rhi_d3d12::D3d12Cubemap, rhi_metal::MetalCubemap);
+backend_enum!(/// A 3D volume texture: compute-writable storage + trilinear sampled (Phase 11).
+    Volume => rhi_vulkan::VulkanVolume, rhi_d3d12::D3d12Volume, rhi_metal::MetalVolume);
 backend_enum!(/// A heap that transient render targets alias into at graph-computed offsets.
     TransientHeap => rhi_vulkan::VulkanTransientHeap, rhi_d3d12::D3d12TransientHeap, rhi_metal::MetalTransientHeap);
 backend_enum!(/// A built ray-tracing scene: BLAS per mesh + one TLAS (Phase 8).
@@ -192,6 +194,32 @@ impl RenderTarget {
             Self::D3d12(t) => t.set_name(name),
             #[cfg(target_os = "macos")]
             Self::Metal(t) => t.set_name(name),
+        }
+    }
+}
+
+impl Volume {
+    /// `volumes[]` (SRV) bindless index for trilinear sampling.
+    pub fn sampled_index(&self) -> u32 {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(v) => v.sampled_index(),
+            #[cfg(windows)]
+            Self::D3d12(v) => v.sampled_index(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(v) => v.sampled_index(),
+        }
+    }
+
+    /// `storage_volumes[]` (UAV) bindless index for compute bakes.
+    pub fn storage_index(&self) -> u32 {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(v) => v.storage_index(),
+            #[cfg(windows)]
+            Self::D3d12(v) => v.storage_index(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(v) => v.storage_index(),
         }
     }
 }
@@ -667,6 +695,19 @@ impl Device {
             Self::D3d12(d) => Ok(RenderTarget::D3d12(d.create_render_target(desc)?)),
             #[cfg(target_os = "macos")]
             Self::Metal(d) => Ok(RenderTarget::Metal(d.create_render_target(desc)?)),
+        }
+    }
+
+    /// Create a 3D (volume) texture: compute-writable storage volume + trilinear
+    /// sampled volume, registered in the bindless volume tables (Phase 11 Stage B).
+    pub fn create_volume(&self, desc: &VolumeDesc) -> Result<Volume> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => Ok(Volume::Vulkan(d.create_volume(desc)?)),
+            #[cfg(windows)]
+            Self::D3d12(d) => Ok(Volume::D3d12(d.create_volume(desc)?)),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => Ok(Volume::Metal(d.create_volume(desc)?)),
         }
     }
 
@@ -1480,6 +1521,34 @@ impl CommandBuffer {
             (Self::D3d12(c), RenderTarget::D3d12(t)) => c.rt_to_storage(t),
             #[cfg(target_os = "macos")]
             (Self::Metal(c), RenderTarget::Metal(t)) => c.rt_to_storage(t),
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Transition a 3D volume into compute-writable storage for a bake pass (Phase 11).
+    pub fn volume_to_storage(&self, volume: &Volume) {
+        match (self, volume) {
+            #[cfg(windows)]
+            (Self::Vulkan(c), Volume::Vulkan(v)) => c.volume_to_storage(v),
+            #[cfg(windows)]
+            (Self::D3d12(c), Volume::D3d12(v)) => c.volume_to_storage(v),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(c), Volume::Metal(v)) => c.volume_to_storage(v),
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Transition a 3D volume from compute-write into shader-read for sampling (Phase 11).
+    pub fn volume_to_sampled(&self, volume: &Volume) {
+        match (self, volume) {
+            #[cfg(windows)]
+            (Self::Vulkan(c), Volume::Vulkan(v)) => c.volume_to_sampled(v),
+            #[cfg(windows)]
+            (Self::D3d12(c), Volume::D3d12(v)) => c.volume_to_sampled(v),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(c), Volume::Metal(v)) => c.volume_to_sampled(v),
             #[cfg(windows)]
             _ => unreachable!("{MIXED}"),
         }

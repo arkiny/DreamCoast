@@ -33,6 +33,7 @@ mod rt_pipeline;
 mod swapchain;
 mod sync;
 mod texture;
+mod volume;
 
 pub use accel::VulkanRaytracingScene;
 pub use buffer::{VulkanBuffer, VulkanStorageBuffer};
@@ -48,6 +49,7 @@ pub use rt_pipeline::VulkanRaytracingPipeline;
 pub use swapchain::VulkanSwapchain;
 pub use sync::{VulkanFence, VulkanSemaphore};
 pub use texture::VulkanTexture;
+pub use volume::VulkanVolume;
 
 /// Map a Vulkan result code into the engine error type.
 fn vk_err(e: vk::Result) -> EngineError {
@@ -63,6 +65,7 @@ fn to_vk_format(format: rhi_types::Format) -> vk::Format {
         rhi_types::Format::Rgba8Srgb => vk::Format::R8G8B8A8_SRGB,
         rhi_types::Format::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         rhi_types::Format::Rg16Float => vk::Format::R16G16_SFLOAT,
+        rhi_types::Format::R32Float => vk::Format::R32_SFLOAT,
         rhi_types::Format::Depth32Float => vk::Format::D32_SFLOAT,
     }
 }

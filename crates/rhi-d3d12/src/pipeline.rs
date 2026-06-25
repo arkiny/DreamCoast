@@ -34,7 +34,8 @@ use windows::core::s;
 
 use crate::device::{
     BINDLESS_COUNT, CUBE_COUNT, DeviceShared, STORAGE_BUFFER_BASE, STORAGE_BUFFER_COUNT,
-    STORAGE_IMAGE_BASE, STORAGE_IMAGE_COUNT, TLAS_SLOT,
+    STORAGE_IMAGE_BASE, STORAGE_IMAGE_COUNT, STORAGE_VOLUME_BASE, STORAGE_VOLUME_COUNT, TLAS_SLOT,
+    VOLUME_BASE, VOLUME_COUNT,
 };
 use crate::instance::d3d_err;
 use crate::to_dxgi_format;
@@ -266,7 +267,7 @@ fn create_root_signature(
 /// space1` (Phase 8). It is always present so every bindless root signature stays
 /// uniform; non-RT pipelines simply never reference it (and the slot stays empty
 /// on devices without a built scene).
-pub(crate) fn bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 5] {
+pub(crate) fn bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 7] {
     [
         D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
@@ -305,6 +306,23 @@ pub(crate) fn bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 5] {
             BaseShaderRegister: BINDLESS_COUNT + CUBE_COUNT,
             RegisterSpace: 1,
             OffsetInDescriptorsFromTableStart: TLAS_SLOT,
+        },
+        // Sampled 3D volumes SRV at t{BINDLESS_COUNT+CUBE_COUNT+1}, space1 (Phase 11).
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: VOLUME_COUNT,
+            BaseShaderRegister: BINDLESS_COUNT + CUBE_COUNT + 1,
+            RegisterSpace: 1,
+            OffsetInDescriptorsFromTableStart: VOLUME_BASE,
+        },
+        // Storage 3D volumes UAV at u{STORAGE_IMAGE_COUNT+STORAGE_BUFFER_COUNT},
+        // space1 (Phase 11). Shares the UAV register space after the storage buffers.
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: STORAGE_VOLUME_COUNT,
+            BaseShaderRegister: STORAGE_IMAGE_COUNT + STORAGE_BUFFER_COUNT,
+            RegisterSpace: 1,
+            OffsetInDescriptorsFromTableStart: STORAGE_VOLUME_BASE,
         },
     ]
 }

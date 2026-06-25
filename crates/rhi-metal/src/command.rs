@@ -656,6 +656,9 @@ impl MetalCommandBuffer {
         self.shared.set_storage_resident(&target.texture, false);
         self.shared.set_resident(&target.texture, true);
     }
+    /// Phase 11 Stage B volume barriers — stub (no Metal volume tables yet).
+    pub fn volume_to_storage(&self, _volume: &crate::resources::MetalVolume) {}
+    pub fn volume_to_sampled(&self, _volume: &crate::resources::MetalVolume) {}
     pub fn storage_buffer_barrier(&self, _buffer: &MetalStorageBuffer) {}
     pub fn storage_buffer_to_indirect(&self, _buffer: &MetalStorageBuffer) {}
     pub fn storage_buffer_to_storage(&self, _buffer: &MetalStorageBuffer) {}

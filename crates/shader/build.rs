@@ -253,6 +253,19 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "sdf_trace_cs",
     },
+    // Phase 11 Stage B (B1): 3D volume texture RHI smoke test (fill + slice view).
+    Job {
+        src: "volume_test.slang",
+        entry: "fillMain",
+        stage: "compute",
+        key: "volume_fill_cs",
+    },
+    Job {
+        src: "volume_test.slang",
+        entry: "viewMain",
+        stage: "compute",
+        key: "volume_view_cs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.

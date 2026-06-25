@@ -21,10 +21,12 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     D3D12_RAYTRACING_TIER_1_1, D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
     D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE, D3D12_SRV_DIMENSION_TEXTURE2D,
-    D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEX2D_SRV, D3D12_TEX2D_UAV, D3D12_TEXCUBE_SRV,
-    D3D12_UAV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_UNORDERED_ACCESS_VIEW_DESC,
-    D3D12_UNORDERED_ACCESS_VIEW_DESC_0, D3D12CreateDevice, ID3D12CommandList, ID3D12CommandQueue,
-    ID3D12CommandSignature, ID3D12DescriptorHeap, ID3D12Device, ID3D12Fence, ID3D12Resource,
+    D3D12_SRV_DIMENSION_TEXTURE3D, D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEX2D_SRV,
+    D3D12_TEX2D_UAV, D3D12_TEX3D_SRV, D3D12_TEX3D_UAV, D3D12_TEXCUBE_SRV,
+    D3D12_UAV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE3D,
+    D3D12_UNORDERED_ACCESS_VIEW_DESC, D3D12_UNORDERED_ACCESS_VIEW_DESC_0, D3D12CreateDevice,
+    ID3D12CommandList, ID3D12CommandQueue, ID3D12CommandSignature, ID3D12DescriptorHeap,
+    ID3D12Device, ID3D12Fence, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_UNKNOWN,
@@ -64,8 +66,19 @@ pub(crate) const STORAGE_BUFFER_BASE: u32 = STORAGE_IMAGE_BASE + STORAGE_IMAGE_C
 /// storage-buffer region; the shader sees it at `t{BINDLESS_COUNT+CUBE_COUNT},
 /// space1` (a `RaytracingAccelerationStructure`).
 pub(crate) const TLAS_SLOT: u32 = STORAGE_BUFFER_BASE + STORAGE_BUFFER_COUNT;
+/// Size of the bindless sampled 3D-volume SRV table (Phase 11 Stage B), after the
+/// TLAS slot. Shader sees it at `t{BINDLESS_COUNT+CUBE_COUNT+1}, space1`.
+pub(crate) const VOLUME_COUNT: u32 = 64;
+/// Size of the bindless storage 3D-volume UAV table (Phase 11 Stage B), after the
+/// sampled volumes. Shader sees it at `u{STORAGE_IMAGE_COUNT+STORAGE_BUFFER_COUNT},
+/// space1`.
+pub(crate) const STORAGE_VOLUME_COUNT: u32 = 64;
+/// Heap offset where the sampled-volume SRV region begins.
+pub(crate) const VOLUME_BASE: u32 = TLAS_SLOT + 1;
+/// Heap offset where the storage-volume UAV region begins.
+pub(crate) const STORAGE_VOLUME_BASE: u32 = VOLUME_BASE + VOLUME_COUNT;
 /// Total descriptors in the shader-visible bindless heap.
-pub(crate) const HEAP_DESCRIPTORS: u32 = TLAS_SLOT + 1;
+pub(crate) const HEAP_DESCRIPTORS: u32 = STORAGE_VOLUME_BASE + STORAGE_VOLUME_COUNT;
 
 /// Device-level objects shared (via `Rc`) by every GPU resource.
 pub(crate) struct DeviceShared {
@@ -80,6 +93,8 @@ pub(crate) struct DeviceShared {
     cube_next: Cell<u32>,
     storage_image_next: Cell<u32>,
     storage_buffer_next: Cell<u32>,
+    volume_next: Cell<u32>,
+    storage_volume_next: Cell<u32>,
     // Command signature for indexed indirect draws (`ExecuteIndirect`, Phase 7).
     pub indirect_draw_signature: ID3D12CommandSignature,
     // Async compute (Phase 7): a COMPUTE-type queue overlapping the DIRECT queue,
@@ -197,6 +212,8 @@ impl DeviceShared {
                 cube_next: Cell::new(0),
                 storage_image_next: Cell::new(0),
                 storage_buffer_next: Cell::new(0),
+                volume_next: Cell::new(0),
+                storage_volume_next: Cell::new(0),
                 indirect_draw_signature,
                 compute_queue,
                 async_fence,
@@ -353,6 +370,61 @@ impl DeviceShared {
                 Texture2D: D3D12_TEX2D_UAV {
                     MipSlice: 0,
                     PlaneSlice: 0,
+                },
+            },
+        };
+        unsafe {
+            self.device
+                .CreateUnorderedAccessView(resource, None, Some(&uav), handle);
+        }
+        index
+    }
+
+    /// Create a `Texture3D` SRV for a volume in the reserved sampled-volume heap
+    /// region; returns the 0-based volume index (Phase 11 Stage B).
+    pub(crate) fn register_volume(&self, resource: &ID3D12Resource, format: Format) -> u32 {
+        let index = self.volume_next.get();
+        self.volume_next.set(index + 1);
+        let handle = self.cpu_handle(VOLUME_BASE + index);
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: to_dxgi_format(format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE3D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        unsafe {
+            self.device
+                .CreateShaderResourceView(resource, Some(&srv), handle)
+        };
+        index
+    }
+
+    /// Create a `Texture3D` UAV for a volume in the reserved storage-volume heap
+    /// region; returns the 0-based storage-volume index. `depth` = the volume's W
+    /// extent so the UAV covers every slice (Phase 11 Stage B).
+    pub(crate) fn register_storage_volume(
+        &self,
+        resource: &ID3D12Resource,
+        format: Format,
+        depth: u32,
+    ) -> u32 {
+        let index = self.storage_volume_next.get();
+        self.storage_volume_next.set(index + 1);
+        let handle = self.cpu_handle(STORAGE_VOLUME_BASE + index);
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: to_dxgi_format(format),
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_UAV {
+                    MipSlice: 0,
+                    FirstWSlice: 0,
+                    WSize: depth,
                 },
             },
         };
@@ -605,6 +677,15 @@ impl D3d12Device {
         desc: &RenderTargetDesc,
     ) -> Result<D3d12RenderTarget, EngineError> {
         D3d12RenderTarget::new(self.shared.clone(), desc)
+    }
+
+    /// Create a 3D (volume) texture, registered in the bindless sampled + storage
+    /// volume tables (Phase 11 Stage B).
+    pub fn create_volume(
+        &self,
+        desc: &rhi_types::VolumeDesc,
+    ) -> Result<crate::volume::D3d12Volume, EngineError> {
+        crate::volume::D3d12Volume::new(self.shared.clone(), desc)
     }
 
     pub fn render_target_memory(
