@@ -15,16 +15,16 @@ use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_core::init_logging;
 use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
-use dreamcoast_render::{ComputePassInfo, GraphProfiler, PassInfo, RenderGraph, ResourcePool};
+use dreamcoast_render::{GraphProfiler, PassInfo, RenderGraph, ResourcePool};
 use rhi::{
-    BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, ComputePipelineDesc,
-    Extent2D, Format, GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode,
-    PrimitiveTopology, SwapchainDesc, Texture, VertexLayout,
+    BackendKind, Buffer, BufferDesc, BufferUsage, Extent2D, Format, Instance, InstanceDesc,
+    PresentMode, SwapchainDesc, Texture,
 };
 use tracing::info;
 
 mod app;
 mod cull;
+mod deferred;
 mod gdf;
 mod ibl;
 mod mesh;
@@ -34,6 +34,7 @@ mod rt;
 mod smoketest;
 use app::*;
 use cull::*;
+use deferred::*;
 use gdf::*;
 use ibl::*;
 use mesh::*;
@@ -251,134 +252,10 @@ fn run() -> anyhow::Result<()> {
         );
     }
 
-    // G-buffer fill pipeline: mesh -> 4 MRT (+ depth).
-    let (gb_vs, gb_fs) = load_shader_pair(
-        backend,
-        dreamcoast_shader::gbuffer_vs_spirv,
-        dreamcoast_shader::gbuffer_fs_spirv,
-        dreamcoast_shader::gbuffer_vs_dxil,
-        dreamcoast_shader::gbuffer_fs_dxil,
-        dreamcoast_shader::gbuffer_vs_metallib,
-        dreamcoast_shader::gbuffer_fs_metallib,
-        "gbuffer",
-    )?;
-    let gbuffer_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: gb_vs,
-        fragment_bytes: gb_fs,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_formats: &[
-            GB_ALBEDO_FMT,
-            GB_NORMAL_FMT,
-            GB_MATERIAL_FMT,
-            GB_POSITION_FMT,
-        ],
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::Mesh,
-        blend: BlendMode::Opaque,
-        push_constant_size: 112, // mat4(64) + base_color(16) + mr(16) + tex u32x4(16)
-        bindless: true,
-        uniform_buffer: false,
-        depth_test: true,
-        depth_format: Some(DEPTH_FORMAT),
-    })?;
-
-    // Shadow pipeline: depth-only, rasterizes the mesh from the light's POV.
-    let (shadow_vs, shadow_fs) = load_shader_pair(
-        backend,
-        dreamcoast_shader::shadow_vs_spirv,
-        dreamcoast_shader::shadow_fs_spirv,
-        dreamcoast_shader::shadow_vs_dxil,
-        dreamcoast_shader::shadow_fs_dxil,
-        dreamcoast_shader::shadow_vs_metallib,
-        dreamcoast_shader::shadow_fs_metallib,
-        "shadow",
-    )?;
-    let shadow_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: shadow_vs,
-        fragment_bytes: shadow_fs,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_formats: &[], // depth-only
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::MeshPosition,
-        blend: BlendMode::Opaque,
-        push_constant_size: 64, // light_mvp mat4
-        bindless: true,         // for the root-constants param (push constants)
-        uniform_buffer: false,
-        depth_test: true,
-        depth_format: Some(DEPTH_FORMAT),
-    })?;
-
-    // Deferred lighting pipeline: full-screen, reads G-buffer + globals -> HDR.
-    let (pbr_vs, pbr_fs) = load_shader_pair(
-        backend,
-        dreamcoast_shader::pbr_vs_spirv,
-        dreamcoast_shader::pbr_fs_spirv,
-        dreamcoast_shader::pbr_vs_dxil,
-        dreamcoast_shader::pbr_fs_dxil,
-        dreamcoast_shader::pbr_vs_metallib,
-        dreamcoast_shader::pbr_fs_metallib,
-        "pbr",
-    )?;
-    let pbr_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: pbr_vs,
-        fragment_bytes: pbr_fs,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_formats: &[HDR_FORMAT],
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::None,
-        blend: BlendMode::Opaque,
-        push_constant_size: 24, // 4 G-buffer indices + flip_y + shadow_index
-        bindless: true,
-        uniform_buffer: true,
-        depth_test: false,
-        depth_format: None,
-    })?;
-
-    // Tonemap pipeline: HDR -> backbuffer (encodes sRGB in-shader; UNORM target).
-    let (post_vs, post_fs) = load_shader_pair(
-        backend,
-        dreamcoast_shader::post_vs_spirv,
-        dreamcoast_shader::post_fs_spirv,
-        dreamcoast_shader::post_vs_dxil,
-        dreamcoast_shader::post_fs_dxil,
-        dreamcoast_shader::post_vs_metallib,
-        dreamcoast_shader::post_fs_metallib,
-        "post",
-    )?;
-    let post_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
-        vertex_bytes: post_vs,
-        fragment_bytes: post_fs,
-        vertex_entry: "vsMain",
-        fragment_entry: "fsMain",
-        color_formats: &[swapchain.format()],
-        topology: PrimitiveTopology::TriangleList,
-        vertex_layout: VertexLayout::None,
-        blend: BlendMode::Opaque,
-        push_constant_size: 16, // hdr_index + mode + flip_y + pad
-        bindless: true,
-        uniform_buffer: false,
-        depth_test: false,
-        depth_format: None,
-    })?;
-    // Compute post-process pipeline (Phase 7): blurs the HDR target into a
-    // storage image between the lighting and tonemap passes.
-    let post_compute_cs = load_compute_shader(
-        backend,
-        dreamcoast_shader::post_compute_cs_spirv,
-        dreamcoast_shader::post_compute_cs_dxil,
-        dreamcoast_shader::post_compute_cs_metallib,
-        "post_compute",
-    )?;
-    let post_compute_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
-        compute_bytes: post_compute_cs,
-        compute_entry: "csMain",
-        push_constant_size: 16, // hdr_index + out_index + width + height
-        bindless: true,
-        threads_per_group: [8, 8, 1],
-    })?;
+    // Deferred-PBR backbone (see `deferred.rs`): the shadow / G-buffer / lighting /
+    // tonemap graphics pipelines, the compute post-process pipeline, and the per-frame
+    // globals uniform buffer.
+    let deferred = DeferredRenderer::new(&device, backend, swapchain.format())?;
 
     // Phase 11 software ray tracing + global distance field (Stage A analytic trace,
     // Stage B volumes / SDF bake / GDF merge / GDF trace). See `gdf.rs`.
@@ -516,13 +393,6 @@ fn run() -> anyhow::Result<()> {
         &ground_ibuf,
         ground_count,
     )?;
-
-    // Per-frame globals uniform buffer (one 256-byte slice per frame-in-flight).
-    let globals_buffer = device.create_buffer(&BufferDesc {
-        size: GLOBALS_SLICE * FRAMES_IN_FLIGHT as u64,
-        usage: BufferUsage::Uniform,
-    })?;
-    device.set_globals_buffer(&globals_buffer, GLOBALS_SLICE);
 
     let mut gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
 
@@ -1038,7 +908,7 @@ fn run() -> anyhow::Result<()> {
             ],
         };
         let globals_offset = frame as u64 * GLOBALS_SLICE;
-        globals_buffer.write_at(globals_offset, globals_bytes(&globals))?;
+        deferred.write_globals(globals_offset, globals_bytes(&globals))?;
 
         // Build the deferred render graph:
         //   gbuffer (4 MRT + depth) -> lighting (HDR) -> tonemap (backbuffer) -> ui
@@ -1084,138 +954,33 @@ fn run() -> anyhow::Result<()> {
         } else {
             None
         };
+        let gbuf = GBufferTargets {
+            albedo: g_albedo,
+            normal: g_normal,
+            material: g_material,
+            position: g_position,
+            depth: g_depth,
+        };
 
-        let sky = ClearColor {
-            r: ambient,
-            g: ambient,
-            b: ambient,
-            a: 1.0,
-        };
-        let zero = ClearColor {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.0,
-        };
-        // Shadow pass: rasterize the mesh from the light's POV into the depth-only
-        // shadow map (the lighting pass samples it).
-        graph.add_pass(
-            PassInfo {
-                name: "shadow",
-                colors: vec![],
-                depth: Some(shadow_map),
-                reads: vec![],
-            },
-            |ctx| {
-                // Scene objects are the shadow casters (the ground is a flat
-                // receiver). Each draws with its own light-space MVP.
-                let cmd = ctx.cmd();
-                cmd.bind_graphics_pipeline(&shadow_pipeline);
-                for obj in &scene {
-                    if !obj.casts_shadow {
-                        continue;
-                    }
-                    let lmvp = (light_vp * obj.transform).to_cols_array();
-                    cmd.push_constants(&mat4_bytes(&lmvp));
-                    cmd.bind_vertex_buffer(&obj.vbuf, 32);
-                    cmd.bind_index_buffer(&obj.ibuf, true);
-                    cmd.draw_indexed(obj.index_count, 0, 0);
-                }
-                Ok(())
-            },
+        // Deferred backbone (see `deferred.rs`): shadow -> gbuffer -> lighting (HDR),
+        // then the optional compute-post blur.
+        deferred.record_shadow(&mut graph, shadow_map, &scene, light_vp);
+        deferred.record_gbuffer(
+            &mut graph,
+            gbuf,
+            &scene,
+            &ground_vbuf,
+            &ground_ibuf,
+            ground_count,
+            view_proj,
+            ambient,
+            override_material,
+            metallic_override,
+            roughness_override,
         );
-        graph.add_pass(
-            PassInfo {
-                name: "gbuffer",
-                colors: vec![
-                    (g_albedo, Some(sky)),
-                    (g_normal, Some(ClearColor::BLACK)),
-                    (g_material, Some(ClearColor::BLACK)),
-                    (g_position, Some(zero)), // alpha 0 marks "no geometry"
-                ],
-                depth: Some(g_depth),
-                reads: vec![],
-            },
-            |ctx| {
-                let cmd = ctx.cmd();
-                cmd.bind_graphics_pipeline(&gbuffer_pipeline);
-                // Each scene object with its own transform + PBR material. The UI
-                // material override (for IBL inspection) replaces metallic/roughness
-                // and drops the m/r texture so the factors apply directly.
-                for obj in &scene {
-                    let obj_mvp = (view_proj * obj.transform).to_cols_array();
-                    let (m, rgh, mr_tex) = if override_material {
-                        (metallic_override, roughness_override, NO_TEXTURE)
-                    } else {
-                        (obj.metallic, obj.roughness, obj.tex[1])
-                    };
-                    cmd.push_constants(&gbuffer_push(
-                        obj_mvp,
-                        obj.base_color,
-                        m,
-                        rgh,
-                        [obj.tex[0], mr_tex, obj.tex[2], obj.tex[3]],
-                    ));
-                    cmd.bind_vertex_buffer(&obj.vbuf, 32);
-                    cmd.bind_index_buffer(&obj.ibuf, true);
-                    cmd.draw_indexed(obj.index_count, 0, 0);
-                }
-                // Ground plane (plain matte material, no textures).
-                cmd.push_constants(&gbuffer_push(
-                    view_proj.to_cols_array(),
-                    [0.8, 0.8, 0.8, 1.0],
-                    0.0,
-                    0.9,
-                    [NO_TEXTURE; 4],
-                ));
-                cmd.bind_vertex_buffer(&ground_vbuf, 32);
-                cmd.bind_index_buffer(&ground_ibuf, true);
-                cmd.draw_indexed(ground_count, 0, 0);
-                Ok(())
-            },
-        );
-        graph.add_pass(
-            PassInfo {
-                name: "lighting",
-                colors: vec![(hdr, Some(ClearColor::BLACK))],
-                depth: None,
-                reads: vec![g_albedo, g_normal, g_material, g_position, shadow_map],
-            },
-            |ctx| {
-                let indices = [
-                    ctx.sampled_index(g_albedo),
-                    ctx.sampled_index(g_normal),
-                    ctx.sampled_index(g_material),
-                    ctx.sampled_index(g_position),
-                ];
-                let shadow_index = ctx.sampled_index(shadow_map);
-                let cmd = ctx.cmd();
-                cmd.set_globals(&globals_buffer, globals_offset);
-                cmd.bind_graphics_pipeline(&pbr_pipeline);
-                cmd.push_constants(&pbr_push(indices, flip_y, shadow_index));
-                cmd.draw(3, 1);
-                Ok(())
-            },
-        );
-        // Phase 7 compute post: blur `hdr` into the `hdr_post` storage image.
+        deferred.record_lighting(&mut graph, hdr, gbuf, shadow_map, globals_offset, flip_y);
         if let Some(hdr_post) = hdr_post {
-            let post_cp = &post_compute_pipeline;
-            graph.add_compute_pass(
-                ComputePassInfo {
-                    name: "post_compute",
-                    storage_writes: vec![hdr_post],
-                    reads: vec![hdr],
-                },
-                move |ctx| {
-                    let in_index = ctx.sampled_index(hdr);
-                    let out_index = ctx.storage_index(hdr_post);
-                    let cmd = ctx.cmd();
-                    cmd.bind_compute_pipeline(post_cp);
-                    cmd.push_constants_compute(&post_compute_push(in_index, out_index, cw, ch));
-                    cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                    Ok(())
-                },
-            );
+            deferred.record_compute_post(&mut graph, hdr, hdr_post, cw, ch);
         }
         // Phase 7 GPU particles: a compute pass advances the persistent particle
         // buffer; an external graph resource sequences it before the draw pass.
@@ -1400,21 +1165,13 @@ fn run() -> anyhow::Result<()> {
         } else {
             1.0
         };
-        graph.add_pass(
-            PassInfo {
-                name: "tonemap",
-                colors: vec![(backbuffer, Some(ClearColor::BLACK))],
-                depth: None,
-                reads: vec![tonemap_src],
-            },
-            |ctx| {
-                let hdr_index = ctx.sampled_index(tonemap_src);
-                let cmd = ctx.cmd();
-                cmd.bind_graphics_pipeline(&post_pipeline);
-                cmd.push_constants(&post_push(hdr_index, post_mode as u32, flip_y, tm_exposure));
-                cmd.draw(3, 1);
-                Ok(())
-            },
+        deferred.record_tonemap(
+            &mut graph,
+            backbuffer,
+            tonemap_src,
+            post_mode as u32,
+            flip_y,
+            tm_exposure,
         );
         // Phase 7 GPU-culling draw: indirect, instanced render of the visible cube
         // grid over the tonemapped image, with its own depth buffer.
@@ -1572,53 +1329,6 @@ fn globals_bytes(g: &Globals) -> &[u8] {
 fn normalize3(v: [f32; 3]) -> [f32; 4] {
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-5);
     [v[0] / len, v[1] / len, v[2] / len, 0.0]
-}
-
-/// Pack the G-buffer push block: mvp(64) + base_color(16) + metallic/roughness(16)
-/// + texture indices u32x4 (16) = 112 bytes.
-fn gbuffer_push(
-    mvp: [f32; 16],
-    base_color: [f32; 4],
-    metallic: f32,
-    roughness: f32,
-    tex: [u32; 4],
-) -> [u8; 112] {
-    let mut pc = [0u8; 112];
-    for (i, f) in mvp.iter().enumerate() {
-        pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
-    }
-    for (i, f) in base_color.iter().enumerate() {
-        let o = 64 + i * 4;
-        pc[o..o + 4].copy_from_slice(&f.to_le_bytes());
-    }
-    pc[80..84].copy_from_slice(&metallic.to_le_bytes());
-    pc[84..88].copy_from_slice(&roughness.to_le_bytes());
-    for (i, t) in tex.iter().enumerate() {
-        let o = 96 + i * 4;
-        pc[o..o + 4].copy_from_slice(&t.to_le_bytes());
-    }
-    pc
-}
-
-/// Pack the lighting push block: 4 G-buffer indices + flip_y + shadow_index
-/// (24 bytes).
-fn pbr_push(indices: [u32; 4], flip_y: u32, shadow_index: u32) -> [u8; 24] {
-    let mut pc = [0u8; 24];
-    for (i, v) in indices.iter().enumerate() {
-        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-    }
-    pc[16..20].copy_from_slice(&flip_y.to_le_bytes());
-    pc[20..24].copy_from_slice(&shadow_index.to_le_bytes());
-    pc
-}
-
-/// View a column-major 4x4 matrix as push-constant bytes.
-fn mat4_bytes(m: &[f32; 16]) -> [u8; 64] {
-    let mut pc = [0u8; 64];
-    for (i, f) in m.iter().enumerate() {
-        pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
-    }
-    pc
 }
 
 /// Directional-light view-projection: an orthographic box centered on `center`,
