@@ -64,7 +64,10 @@ Feature groups (setup line / loop line):
   (after the graph's `&self` borrows end — NLL releases them at `graph.execute`).
   Confirmed the pattern: graph closures capturing `&self.field` compile with the
   `&'a self` + `RenderGraph<'a>` signature, no extra lifetime gymnastics.
-- **R2 — `cull.rs` / `CullSystem`.**
+- **R2 — `cull.rs` / `CullSystem`. DONE.** Owns the args/visible buffers, reset/cull/
+  draw pipelines, and the grid's cube mesh. `import` declares the external graph
+  resources, `record_cull` adds the reset + cull compute passes, `record_draw` the
+  indirect draw (its own depth). Per-frame grid placement passed as a `CullGrid`.
 - **R3 — `swrt.rs` / `GdfSystem`** (Phase-11 volumes/bake/merge/trace/view).
 - **R4 — `rt.rs` / `RtSystem`** (HW RT + path tracer + Cornell).
 - **R5 — `ibl.rs` / `IblSystem`** (fold the IBL resources in beside the existing fns).
