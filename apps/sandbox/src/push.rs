@@ -367,7 +367,12 @@ pub(crate) fn sdf_bake_push(
 /// inst_table, inst_count, then float4 aabb_min / aabb_max (the GDF world extent;
 /// the unit cube here, matching the per-mesh bake box so a whole-cube single
 /// instance reproduces the B2 bake exactly).
-pub(crate) fn gdf_merge_push(gdf_storage: u32, dim: u32, inst_table: u32, inst_count: u32) -> [u8; 48] {
+pub(crate) fn gdf_merge_push(
+    gdf_storage: u32,
+    dim: u32,
+    inst_table: u32,
+    inst_count: u32,
+) -> [u8; 48] {
     let mut pc = [0u8; 48];
     pc[0..4].copy_from_slice(&gdf_storage.to_le_bytes());
     pc[4..8].copy_from_slice(&dim.to_le_bytes());
@@ -464,7 +469,12 @@ pub(crate) fn rt_path_push(
 }
 
 /// Pack the compute-post push block: hdr_index + out_index + width + height.
-pub(crate) fn post_compute_push(hdr_index: u32, out_index: u32, width: u32, height: u32) -> [u8; 16] {
+pub(crate) fn post_compute_push(
+    hdr_index: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+) -> [u8; 16] {
     let mut pc = [0u8; 16];
     pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
     pc[4..8].copy_from_slice(&out_index.to_le_bytes());
