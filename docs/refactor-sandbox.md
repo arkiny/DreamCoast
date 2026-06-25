@@ -46,13 +46,16 @@ Each of these is a separate, reviewed step — do them one at a time, screenshot
 1. `push.rs` — **DONE** (≈475 lines out; VK/DX default scene unchanged).
 2. `mesh.rs` — **DONE** (geometry/asset helpers; `PtMaterial` / `ModelBounds` made `pub(crate)`).
 3. `app.rs` — **DONE** (shader loaders, screenshot/PNG, CLI flag parsing).
-4. `ibl.rs` — next: RHI-touching but self-contained (`CubeSet`, `IblResources`,
-   `record_environment_capture`, `generate_brdf_lut`).
-5. `consts.rs` — preamble + shared leaves (`Globals` / `SceneObject`, `globals_bytes`,
-   `normalize3`, and the small `gbuffer_push` / `pbr_push` / `mat4_bytes` /
-   `light_view_proj` that stayed behind).
+4. `ibl.rs` — **DONE** (`CubeSet`, `IblResources`, `record_environment_capture`,
+   `generate_brdf_lut`; struct fields + `SceneObject` made `pub(crate)`). Note: child
+   modules can already name ancestor-private consts/types via `use crate::…`, so only
+   items reached *upward* from `run()` (the `ibl` structs) needed `pub(crate)`.
+5. `consts.rs` — preamble + shared leaves (`Globals`, `globals_bytes`, `normalize3`,
+   and the small `gbuffer_push` / `pbr_push` / `mat4_bytes` / `light_view_proj` that
+   stayed behind). Lower value now — defer or fold into a later pass.
 6. The `--clear-test` / `--triangle-test` / `--mesh-test` harnesses are a separate
    concern (`smoketest.rs`) — extract whenever convenient.
 7. `run()` decomposition — separate plan, after the leaves are out.
 
-main.rs: ~4.6k → ~3.7k lines after steps 1–3.
+main.rs: ~4.6k → ~3.5k lines after steps 1–4 (push/mesh/app/ibl = ~1.1k lines moved
+into focused, state-free modules).
