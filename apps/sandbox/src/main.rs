@@ -21,12 +21,13 @@ use rhi::{
     BackendKind, BlasGeometry, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor,
     ComputePipelineDesc, CubemapDesc, Extent2D, Format, GraphicsPipelineDesc, Instance,
     InstanceDesc, PresentMode, PrimitiveTopology, RaytracingPipelineDesc, RtGeometry,
-    StorageBufferDesc, SwapchainDesc, Texture, TlasInstance, VertexLayout, VolumeDesc,
+    StorageBufferDesc, SwapchainDesc, Texture, TlasInstance, VertexLayout,
 };
 use tracing::info;
 
 mod app;
 mod cull;
+mod gdf;
 mod ibl;
 mod mesh;
 mod particle;
@@ -34,6 +35,7 @@ mod push;
 mod smoketest;
 use app::*;
 use cull::*;
+use gdf::*;
 use ibl::*;
 use mesh::*;
 use particle::*;
@@ -378,230 +380,9 @@ fn run() -> anyhow::Result<()> {
         threads_per_group: [8, 8, 1],
     })?;
 
-    // Phase 11 Stage B (B1): 3D volume texture RHI smoke test — a compute fill into a
-    // storage volume + a trilinear-sampled slice view. Gated on compute support.
-    const VOLUME_DIM: u32 = 64;
-    let volume_res = if compute_supported {
-        Some(device.create_volume(&VolumeDesc {
-            width: VOLUME_DIM,
-            height: VOLUME_DIM,
-            depth: VOLUME_DIM,
-            format: Format::R32Float,
-        })?)
-    } else {
-        None
-    };
-    // Phase 11 Stage B (B3): a second volume for the merged global distance field. The
-    // B2 bake fills `volume_res` (the per-mesh SDF); the merge composites instances of
-    // it into this `gdf_res` (world-space GDF), which the slice view then displays.
-    let gdf_res = if compute_supported {
-        Some(device.create_volume(&VolumeDesc {
-            width: VOLUME_DIM,
-            height: VOLUME_DIM,
-            depth: VOLUME_DIM,
-            format: Format::R32Float,
-        })?)
-    } else {
-        None
-    };
-    let volume_fill_pipeline = if compute_supported {
-        let cs = load_compute_shader(
-            backend,
-            dreamcoast_shader::volume_fill_cs_spirv,
-            dreamcoast_shader::volume_fill_cs_dxil,
-            dreamcoast_shader::volume_fill_cs_metallib,
-            "volume_fill",
-        )?;
-        Some(device.create_compute_pipeline(&ComputePipelineDesc {
-            compute_bytes: cs,
-            compute_entry: "fillMain",
-            push_constant_size: 32,
-            bindless: true,
-            threads_per_group: [4, 4, 4],
-        })?)
-    } else {
-        None
-    };
-    let volume_view_pipeline = if compute_supported {
-        let cs = load_compute_shader(
-            backend,
-            dreamcoast_shader::volume_view_cs_spirv,
-            dreamcoast_shader::volume_view_cs_dxil,
-            dreamcoast_shader::volume_view_cs_metallib,
-            "volume_view",
-        )?;
-        Some(device.create_compute_pipeline(&ComputePipelineDesc {
-            compute_bytes: cs,
-            compute_entry: "viewMain",
-            push_constant_size: 32,
-            bindless: true,
-            threads_per_group: [8, 8, 1],
-        })?)
-    } else {
-        None
-    };
-
-    // Phase 11 Stage B (B2): bake a mesh's SDF into the volume. The bake mesh is a
-    // unit uv-sphere scaled to radius 0.3 and centred at (0.5, 0.5, 0.5), so its
-    // baked field matches the analytic centred sphere of the B1 smoke test (the
-    // volume's AABB is the unit cube) — a direct correctness check. Geometry is
-    // uploaded as bindless storage buffers (same 32B vertex stride as the RT path).
-    let (bake_vtx, bake_idx, bake_tri_count) = if compute_supported {
-        let mut sphere = dreamcoast_asset::uv_sphere(48, 32);
-        for v in &mut sphere.vertices {
-            v.pos = [
-                v.pos[0] * 0.3 + 0.5,
-                v.pos[1] * 0.3 + 0.5,
-                v.pos[2] * 0.3 + 0.5,
-            ];
-        }
-        let vb = vertex_bytes(&sphere);
-        let ib = index_bytes(&sphere);
-        let vsb = device.create_storage_buffer_init(
-            &StorageBufferDesc {
-                size: vb.len() as u64,
-                stride: 32,
-                indirect: false,
-            },
-            vb,
-        )?;
-        let isb = device.create_storage_buffer_init(
-            &StorageBufferDesc {
-                size: ib.len() as u64,
-                stride: 4,
-                indirect: false,
-            },
-            ib,
-        )?;
-        let tris = (sphere.indices.len() / 3) as u32;
-        (Some(vsb), Some(isb), tris)
-    } else {
-        (None, None, 0u32)
-    };
-    let sdf_bake_pipeline = if compute_supported {
-        let cs = load_compute_shader(
-            backend,
-            dreamcoast_shader::sdf_bake_cs_spirv,
-            dreamcoast_shader::sdf_bake_cs_dxil,
-            dreamcoast_shader::sdf_bake_cs_metallib,
-            "sdf_bake",
-        )?;
-        Some(device.create_compute_pipeline(&ComputePipelineDesc {
-            compute_bytes: cs,
-            compute_entry: "bakeMain",
-            push_constant_size: 64,
-            bindless: true,
-            threads_per_group: [4, 4, 4],
-        })?)
-    } else {
-        None
-    };
-
-    // Phase 11 Stage B (B3): instance table + merge pipeline for the global distance
-    // field. Each record places one instance of the baked per-mesh SDF (`volume_res`)
-    // into the world-space GDF AABB (the unit cube here). `P11_GDF_INSTANCES=1` lays
-    // down a single whole-cube instance (which must reproduce the B2 bake exactly — the
-    // regression anchor); otherwise three smaller spheres demonstrate the min-merge.
-    let gdf_instances = if let Some(vol) = volume_res.as_ref() {
-        let sampled = vol.sampled_index();
-        let single = std::env::var_os("P11_GDF_INSTANCES")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        // (origin, extent): the world box this instance's [0,1] bake volume maps onto.
-        // The bake box is the unit cube, so dist_scale == extent (uniform). One sphere
-        // filling the cube is the B2-identical case; the trio are half-size boxes.
-        let placements: &[([f32; 3], f32)] = if single {
-            &[([0.0, 0.0, 0.0], 1.0)]
-        } else {
-            &[
-                ([0.05, 0.30, 0.25], 0.5),
-                ([0.45, 0.20, 0.25], 0.5),
-                ([0.25, 0.50, 0.25], 0.5),
-            ]
-        };
-        let mut records = Vec::with_capacity(placements.len() * 32);
-        for (origin, extent) in placements {
-            let inv = 1.0 / extent;
-            records.extend_from_slice(&origin[0].to_le_bytes());
-            records.extend_from_slice(&origin[1].to_le_bytes());
-            records.extend_from_slice(&origin[2].to_le_bytes());
-            records.extend_from_slice(&extent.to_le_bytes()); // dist_scale
-            records.extend_from_slice(&inv.to_le_bytes());
-            records.extend_from_slice(&inv.to_le_bytes());
-            records.extend_from_slice(&inv.to_le_bytes());
-            records.extend_from_slice(&sampled.to_le_bytes());
-        }
-        let buf = device.create_storage_buffer_init(
-            &StorageBufferDesc {
-                size: records.len() as u64,
-                stride: 32,
-                indirect: false,
-            },
-            &records,
-        )?;
-        Some((buf, placements.len() as u32))
-    } else {
-        None
-    };
-    let gdf_merge_pipeline = if compute_supported {
-        let cs = load_compute_shader(
-            backend,
-            dreamcoast_shader::gdf_merge_cs_spirv,
-            dreamcoast_shader::gdf_merge_cs_dxil,
-            dreamcoast_shader::gdf_merge_cs_metallib,
-            "gdf_merge",
-        )?;
-        Some(device.create_compute_pipeline(&ComputePipelineDesc {
-            compute_bytes: cs,
-            compute_entry: "mergeMain",
-            push_constant_size: 48,
-            bindless: true,
-            threads_per_group: [4, 4, 4],
-        })?)
-    } else {
-        None
-    };
-    // Phase 11 Stage B (B4): software ray trace against the merged GDF — reuses the
-    // Stage-A march/shadow/AO but samples the baked volume instead of analytic SDFs.
-    let gdf_trace_pipeline = if compute_supported {
-        let cs = load_compute_shader(
-            backend,
-            dreamcoast_shader::gdf_trace_cs_spirv,
-            dreamcoast_shader::gdf_trace_cs_dxil,
-            dreamcoast_shader::gdf_trace_cs_metallib,
-            "gdf_trace",
-        )?;
-        Some(device.create_compute_pipeline(&ComputePipelineDesc {
-            compute_bytes: cs,
-            compute_entry: "csMain",
-            push_constant_size: 128, // inv_view_proj + cam + sun + out/w/h/flip + gdf/mode
-            bindless: true,
-            threads_per_group: [8, 8, 1],
-        })?)
-    } else {
-        None
-    };
-
-    // Phase 11 Stage A (A1): compute software ray tracing — sphere-traces an analytic
-    // SDF scene (no hardware RT / TLAS), so it is gated only on compute support.
-    let sdf_trace_pipeline = if compute_supported {
-        let sdf_trace_cs = load_compute_shader(
-            backend,
-            dreamcoast_shader::sdf_trace_cs_spirv,
-            dreamcoast_shader::sdf_trace_cs_dxil,
-            dreamcoast_shader::sdf_trace_cs_metallib,
-            "sdf_trace",
-        )?;
-        Some(device.create_compute_pipeline(&ComputePipelineDesc {
-            compute_bytes: sdf_trace_cs,
-            compute_entry: "csMain",
-            push_constant_size: 112, // inv_view_proj + cam_pos + sun + out/w/h/flip
-            bindless: true,
-            threads_per_group: [8, 8, 1],
-        })?)
-    } else {
-        None
-    };
+    // Phase 11 software ray tracing + global distance field (Stage A analytic trace,
+    // Stage B volumes / SDF bake / GDF merge / GDF trace). See `gdf.rs`.
+    let gdf = GdfSystem::new(&device, backend, compute_supported)?;
 
     // Phase 8 M3: inline ray-query trace pipeline (compute + `RayQuery`). Only on
     // RT-capable devices; the bindless block then carries the scene TLAS (binding
@@ -1164,31 +945,26 @@ fn run() -> anyhow::Result<()> {
     // Phase 11 Stage A: replace the rasterized image with a compute software ray
     // trace of the analytic SDF scene (sphere tracing, no hardware RT). Headless
     // toggle via `P11_SDF`.
-    let mut sdf_trace = sdf_trace_pipeline.is_some() && std::env::var_os("P11_SDF").is_some();
+    let mut sdf_trace = gdf.has_sdf_trace() && std::env::var_os("P11_SDF").is_some();
     // Phase 11 Stage B (B1): 3D volume texture smoke test — fill a volume then view a
     // trilinear-sampled Z slice. Headless toggle via `P11_VOLUME_TEST`.
-    let mut volume_test = volume_res.is_some() && std::env::var_os("P11_VOLUME_TEST").is_some();
+    let mut volume_test = gdf.has_volume() && std::env::var_os("P11_VOLUME_TEST").is_some();
     // Phase 11 Stage B (B2): bake a mesh's SDF into the volume, then view a slice.
     // Headless toggle via `P11_SDF_BAKE`. The bake is expensive (O(voxels*tris)) so
     // it runs once (`sdf_bake_done`), and later frames just view the baked volume.
-    let mut sdf_bake = sdf_bake_pipeline.is_some() && std::env::var_os("P11_SDF_BAKE").is_some();
+    let mut sdf_bake = gdf.has_bake() && std::env::var_os("P11_SDF_BAKE").is_some();
     let mut sdf_bake_done = false;
     // Phase 11 Stage B (B3): merge per-mesh SDF instances into the global distance
     // field, then view a slice. Headless toggle via `P11_GDF_MERGE`. Like the bake it
     // builds the field once (`gdf_merge_done`); the merge depends on the B2 bake, so it
     // also drives the bake when enabled.
-    let mut gdf_merge = gdf_merge_pipeline.is_some()
-        && gdf_instances.is_some()
-        && std::env::var_os("P11_GDF_MERGE").is_some();
+    let mut gdf_merge = gdf.has_merge() && std::env::var_os("P11_GDF_MERGE").is_some();
     let mut gdf_merge_done = false;
     // Phase 11 Stage B (B4): SW ray trace the merged GDF. Builds the GDF (bake + merge,
     // once) then sphere-traces it from a fixed camera framing the unit-cube scene.
     // Headless toggle via `P11_GDF_TRACE`; `P11_GDF_ANALYTIC` swaps the GDF sample for
     // the analytic field it was baked from (the B4 correctness reference).
-    let mut gdf_trace = gdf_trace_pipeline.is_some()
-        && gdf_merge_pipeline.is_some()
-        && gdf_instances.is_some()
-        && std::env::var_os("P11_GDF_TRACE").is_some();
+    let mut gdf_trace = gdf.has_gdf_trace() && std::env::var_os("P11_GDF_TRACE").is_some();
     let gdf_trace_analytic = std::env::var_os("P11_GDF_ANALYTIC").is_some();
     // Phase 8 M5: drive the path tracer through the full RT pipeline + SBT instead
     // of the inline compute ray query (same image). Headless toggle via
@@ -1570,7 +1346,7 @@ fn run() -> anyhow::Result<()> {
                         ui.text_disabled("Ray tracing (unsupported)");
                     }
 
-                    if sdf_trace_pipeline.is_some()
+                    if gdf.has_sdf_trace()
                         && ui.collapsing_header(
                             "Software ray tracing (Phase 11)",
                             TreeNodeFlags::empty(),
@@ -1580,13 +1356,13 @@ fn run() -> anyhow::Result<()> {
                         if sdf_trace {
                             ui.text_disabled("  - analytic SDF scene (Stage A)");
                         }
-                        if volume_res.is_some() {
+                        if gdf.has_volume() {
                             ui.checkbox("3D volume test (fill + slice view)", &mut volume_test);
                             if volume_test {
                                 ui.text_disabled("  - Stage B RHI smoke test");
                             }
                         }
-                        if sdf_bake_pipeline.is_some() {
+                        if gdf.has_bake() {
                             if ui.checkbox("SDF bake (per-mesh, slice view)", &mut sdf_bake) {
                                 sdf_bake_done = false; // re-bake when re-enabled
                             }
@@ -1594,7 +1370,7 @@ fn run() -> anyhow::Result<()> {
                                 ui.text_disabled("  - Stage B2: baked sphere ≈ analytic");
                             }
                         }
-                        if gdf_merge_pipeline.is_some() && gdf_instances.is_some() {
+                        if gdf.has_merge() {
                             if ui.checkbox("GDF merge (instances, slice view)", &mut gdf_merge) {
                                 gdf_merge_done = false; // re-merge when re-enabled
                             }
@@ -1602,7 +1378,7 @@ fn run() -> anyhow::Result<()> {
                                 ui.text_disabled("  - Stage B3: min-merged instances");
                             }
                         }
-                        if gdf_trace_pipeline.is_some() && gdf_instances.is_some() {
+                        if gdf.has_gdf_trace() {
                             ui.checkbox("GDF SW ray trace (compute)", &mut gdf_trace);
                             if gdf_trace {
                                 ui.text_disabled("  - Stage B4: sphere-march baked GDF");
@@ -2126,34 +1902,17 @@ fn run() -> anyhow::Result<()> {
         // written to a storage image the tonemap pass displays in place of the HDR
         // (mirrors the M3 `rt_trace` viz path). Only when the HW-RT path is off.
         let sdf_out = if sdf_trace && rt_out.is_none() {
-            if let Some(pipe) = sdf_trace_pipeline.as_ref() {
-                let out = graph.create_storage_image("sdf_out", HDR_FORMAT, extent);
-                let inv_vp = inv_view_proj;
-                let cam = eye;
-                let sun = sun_dir;
-                let sun_i = sun_intensity;
-                let flip = flip_y;
-                graph.add_compute_pass(
-                    ComputePassInfo {
-                        name: "sdf_trace",
-                        storage_writes: vec![out],
-                        reads: vec![],
-                    },
-                    move |ctx| {
-                        let out_index = ctx.storage_index(out);
-                        let cmd = ctx.cmd();
-                        cmd.bind_compute_pipeline(pipe);
-                        cmd.push_constants_compute(&sdf_trace_push(
-                            &inv_vp, cam, sun, sun_i, out_index, cw, ch, flip,
-                        ));
-                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                        Ok(())
-                    },
-                );
-                Some(out)
-            } else {
-                None
-            }
+            Some(gdf.record_sdf_trace(
+                &mut graph,
+                extent,
+                inv_view_proj,
+                eye,
+                sun_dir,
+                sun_intensity,
+                cw,
+                ch,
+                flip_y,
+            ))
         } else {
             None
         };
@@ -2161,69 +1920,7 @@ fn run() -> anyhow::Result<()> {
         // Phase 11 Stage B (B1): 3D volume smoke test — fill a storage volume, then
         // view a trilinear-sampled Z slice. Only when the other replacements are off.
         let vol_out = if volume_test && rt_out.is_none() && sdf_out.is_none() {
-            if let (Some(vol), Some(fillp), Some(viewp)) = (
-                volume_res.as_ref(),
-                volume_fill_pipeline.as_ref(),
-                volume_view_pipeline.as_ref(),
-            ) {
-                let out = graph.create_storage_image("vol_out", HDR_FORMAT, extent);
-                // External so the graph orders the fill (write) before the view (read).
-                let vol_ext = graph.import_external("volume");
-                let vol_storage = vol.storage_index();
-                let vol_sampled = vol.sampled_index();
-                let dim = VOLUME_DIM;
-                graph.add_compute_pass(
-                    ComputePassInfo {
-                        name: "volume_fill",
-                        storage_writes: vec![vol_ext],
-                        reads: vec![],
-                    },
-                    move |ctx| {
-                        let cmd = ctx.cmd();
-                        cmd.volume_to_storage(vol);
-                        cmd.bind_compute_pipeline(fillp);
-                        cmd.push_constants_compute(&volume_push(
-                            vol_storage,
-                            vol_sampled,
-                            dim,
-                            0,
-                            0,
-                            0,
-                            0.0,
-                        ));
-                        let g = dim.div_ceil(4);
-                        cmd.dispatch(g, g, g);
-                        Ok(())
-                    },
-                );
-                graph.add_compute_pass(
-                    ComputePassInfo {
-                        name: "volume_view",
-                        storage_writes: vec![out],
-                        reads: vec![vol_ext],
-                    },
-                    move |ctx| {
-                        let out_index = ctx.storage_index(out);
-                        let cmd = ctx.cmd();
-                        cmd.volume_to_sampled(vol);
-                        cmd.bind_compute_pipeline(viewp);
-                        cmd.push_constants_compute(&volume_push(
-                            vol_storage,
-                            vol_sampled,
-                            dim,
-                            out_index,
-                            cw,
-                            ch,
-                            0.5,
-                        ));
-                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                        Ok(())
-                    },
-                );
-                Some(out)
-            } else {
-                None
-            }
+            Some(gdf.record_volume_test(&mut graph, extent, cw, ch))
         } else {
             None
         };
@@ -2233,74 +1930,9 @@ fn run() -> anyhow::Result<()> {
         // sphere is pixel-comparable against B1's analytic fill (and VK ≡ DX). The bake
         // is O(voxels*tris): run it once (`sdf_bake_done`) and only re-view afterwards.
         let bake_out = if sdf_bake && rt_out.is_none() && sdf_out.is_none() && vol_out.is_none() {
-            if let (Some(vol), Some(bakep), Some(viewp), Some(vtx), Some(idx)) = (
-                volume_res.as_ref(),
-                sdf_bake_pipeline.as_ref(),
-                volume_view_pipeline.as_ref(),
-                bake_vtx.as_ref(),
-                bake_idx.as_ref(),
-            ) {
-                let out = graph.create_storage_image("bake_out", HDR_FORMAT, extent);
-                let vol_ext = graph.import_external("volume");
-                let vol_storage = vol.storage_index();
-                let vol_sampled = vol.sampled_index();
-                let dim = VOLUME_DIM;
-                if !sdf_bake_done {
-                    let vtx_index = vtx.storage_index();
-                    let idx_index = idx.storage_index();
-                    let tri_count = bake_tri_count;
-                    graph.add_compute_pass(
-                        ComputePassInfo {
-                            name: "sdf_bake",
-                            storage_writes: vec![vol_ext],
-                            reads: vec![],
-                        },
-                        move |ctx| {
-                            let cmd = ctx.cmd();
-                            cmd.volume_to_storage(vol);
-                            cmd.bind_compute_pipeline(bakep);
-                            cmd.push_constants_compute(&sdf_bake_push(
-                                vol_storage,
-                                dim,
-                                tri_count,
-                                vtx_index,
-                                idx_index,
-                            ));
-                            let g = dim.div_ceil(4);
-                            cmd.dispatch(g, g, g);
-                            Ok(())
-                        },
-                    );
-                    sdf_bake_done = true;
-                }
-                graph.add_compute_pass(
-                    ComputePassInfo {
-                        name: "sdf_bake_view",
-                        storage_writes: vec![out],
-                        reads: vec![vol_ext],
-                    },
-                    move |ctx| {
-                        let out_index = ctx.storage_index(out);
-                        let cmd = ctx.cmd();
-                        cmd.volume_to_sampled(vol);
-                        cmd.bind_compute_pipeline(viewp);
-                        cmd.push_constants_compute(&volume_push(
-                            vol_storage,
-                            vol_sampled,
-                            dim,
-                            out_index,
-                            cw,
-                            ch,
-                            0.5,
-                        ));
-                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                        Ok(())
-                    },
-                );
-                Some(out)
-            } else {
-                None
-            }
+            let out = gdf.record_bake_view(&mut graph, extent, cw, ch, !sdf_bake_done);
+            sdf_bake_done = true;
+            Some(out)
         } else {
             None
         };
@@ -2315,114 +1947,9 @@ fn run() -> anyhow::Result<()> {
             && vol_out.is_none()
             && bake_out.is_none()
         {
-            if let (
-                Some(vol),
-                Some(gdf),
-                Some(bakep),
-                Some(mergep),
-                Some(viewp),
-                Some(vtx),
-                Some(idx),
-                Some((insts, inst_count)),
-            ) = (
-                volume_res.as_ref(),
-                gdf_res.as_ref(),
-                sdf_bake_pipeline.as_ref(),
-                gdf_merge_pipeline.as_ref(),
-                volume_view_pipeline.as_ref(),
-                bake_vtx.as_ref(),
-                bake_idx.as_ref(),
-                gdf_instances.as_ref(),
-            ) {
-                let out = graph.create_storage_image("gdf_out", HDR_FORMAT, extent);
-                let vol_ext = graph.import_external("volume");
-                let gdf_ext = graph.import_external("gdf");
-                let vol_storage = vol.storage_index();
-                let gdf_storage = gdf.storage_index();
-                let gdf_sampled = gdf.sampled_index();
-                let dim = VOLUME_DIM;
-                if !gdf_merge_done {
-                    let vtx_index = vtx.storage_index();
-                    let idx_index = idx.storage_index();
-                    let tri_count = bake_tri_count;
-                    let inst_table = insts.storage_index();
-                    let inst_n = *inst_count;
-                    // B2 bake → per-mesh SDF in `volume_res`.
-                    graph.add_compute_pass(
-                        ComputePassInfo {
-                            name: "gdf_bake",
-                            storage_writes: vec![vol_ext],
-                            reads: vec![],
-                        },
-                        move |ctx| {
-                            let cmd = ctx.cmd();
-                            cmd.volume_to_storage(vol);
-                            cmd.bind_compute_pipeline(bakep);
-                            cmd.push_constants_compute(&sdf_bake_push(
-                                vol_storage,
-                                dim,
-                                tri_count,
-                                vtx_index,
-                                idx_index,
-                            ));
-                            let g = dim.div_ceil(4);
-                            cmd.dispatch(g, g, g);
-                            Ok(())
-                        },
-                    );
-                    // B3 merge: sample the per-mesh SDF per instance → min into the GDF.
-                    graph.add_compute_pass(
-                        ComputePassInfo {
-                            name: "gdf_merge",
-                            storage_writes: vec![gdf_ext],
-                            reads: vec![vol_ext],
-                        },
-                        move |ctx| {
-                            let cmd = ctx.cmd();
-                            cmd.volume_to_sampled(vol); // read the baked per-mesh SDF
-                            cmd.volume_to_storage(gdf); // write the GDF
-                            cmd.bind_compute_pipeline(mergep);
-                            cmd.push_constants_compute(&gdf_merge_push(
-                                gdf_storage,
-                                dim,
-                                inst_table,
-                                inst_n,
-                            ));
-                            let g = dim.div_ceil(4);
-                            cmd.dispatch(g, g, g);
-                            Ok(())
-                        },
-                    );
-                    gdf_merge_done = true;
-                }
-                graph.add_compute_pass(
-                    ComputePassInfo {
-                        name: "gdf_view",
-                        storage_writes: vec![out],
-                        reads: vec![gdf_ext],
-                    },
-                    move |ctx| {
-                        let out_index = ctx.storage_index(out);
-                        let cmd = ctx.cmd();
-                        cmd.volume_to_sampled(gdf);
-                        cmd.bind_compute_pipeline(viewp);
-                        cmd.push_constants_compute(&volume_push(
-                            gdf_storage,
-                            gdf_sampled,
-                            dim,
-                            out_index,
-                            cw,
-                            ch,
-                            0.5,
-                        ));
-                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                        Ok(())
-                    },
-                );
-                Some(out)
-            } else {
-                None
-            }
+            let out = gdf.record_gdf_view(&mut graph, extent, cw, ch, !gdf_merge_done);
+            gdf_merge_done = true;
+            Some(out)
         } else {
             None
         };
@@ -2438,129 +1965,20 @@ fn run() -> anyhow::Result<()> {
             && bake_out.is_none()
             && gdf_out.is_none()
         {
-            if let (
-                Some(vol),
-                Some(gdf),
-                Some(bakep),
-                Some(mergep),
-                Some(tracep),
-                Some(vtx),
-                Some(idx),
-                Some((insts, inst_count)),
-            ) = (
-                volume_res.as_ref(),
-                gdf_res.as_ref(),
-                sdf_bake_pipeline.as_ref(),
-                gdf_merge_pipeline.as_ref(),
-                gdf_trace_pipeline.as_ref(),
-                bake_vtx.as_ref(),
-                bake_idx.as_ref(),
-                gdf_instances.as_ref(),
-            ) {
-                let out = graph.create_storage_image("gdf_trace_out", HDR_FORMAT, extent);
-                let vol_ext = graph.import_external("volume");
-                let gdf_ext = graph.import_external("gdf");
-                let vol_storage = vol.storage_index();
-                let gdf_storage = gdf.storage_index();
-                let gdf_sampled = gdf.sampled_index();
-                let dim = VOLUME_DIM;
-                if !gdf_merge_done {
-                    let vtx_index = vtx.storage_index();
-                    let idx_index = idx.storage_index();
-                    let tri_count = bake_tri_count;
-                    let inst_table = insts.storage_index();
-                    let inst_n = *inst_count;
-                    graph.add_compute_pass(
-                        ComputePassInfo {
-                            name: "gdf_bake",
-                            storage_writes: vec![vol_ext],
-                            reads: vec![],
-                        },
-                        move |ctx| {
-                            let cmd = ctx.cmd();
-                            cmd.volume_to_storage(vol);
-                            cmd.bind_compute_pipeline(bakep);
-                            cmd.push_constants_compute(&sdf_bake_push(
-                                vol_storage,
-                                dim,
-                                tri_count,
-                                vtx_index,
-                                idx_index,
-                            ));
-                            let g = dim.div_ceil(4);
-                            cmd.dispatch(g, g, g);
-                            Ok(())
-                        },
-                    );
-                    graph.add_compute_pass(
-                        ComputePassInfo {
-                            name: "gdf_merge",
-                            storage_writes: vec![gdf_ext],
-                            reads: vec![vol_ext],
-                        },
-                        move |ctx| {
-                            let cmd = ctx.cmd();
-                            cmd.volume_to_sampled(vol);
-                            cmd.volume_to_storage(gdf);
-                            cmd.bind_compute_pipeline(mergep);
-                            cmd.push_constants_compute(&gdf_merge_push(
-                                gdf_storage,
-                                dim,
-                                inst_table,
-                                inst_n,
-                            ));
-                            let g = dim.div_ceil(4);
-                            cmd.dispatch(g, g, g);
-                            Ok(())
-                        },
-                    );
-                    gdf_merge_done = true;
-                }
-                // Fixed camera framing the unit-cube GDF scene (same Y-flip convention
-                // as the orbit camera so VK/DX reconstruct identical world rays).
-                let g_eye = Vec3::new(0.5, 0.65, 2.1);
-                let g_view = Mat4::look_at_rh(g_eye, Vec3::new(0.5, 0.42, 0.5), Vec3::Y);
-                let mut g_proj =
-                    Mat4::perspective_rh(35f32.to_radians(), cw as f32 / ch as f32, 0.02, 100.0);
-                if backend == BackendKind::Vulkan {
-                    g_proj.y_axis.y *= -1.0;
-                }
-                let g_inv_vp = (g_proj * g_view).inverse().to_cols_array();
-                let sun = sun_dir;
-                let sun_i = sun_intensity;
-                let flip = flip_y;
-                let mode = u32::from(gdf_trace_analytic);
-                graph.add_compute_pass(
-                    ComputePassInfo {
-                        name: "gdf_trace",
-                        storage_writes: vec![out],
-                        reads: vec![gdf_ext],
-                    },
-                    move |ctx| {
-                        let out_index = ctx.storage_index(out);
-                        let cmd = ctx.cmd();
-                        cmd.volume_to_sampled(gdf);
-                        cmd.bind_compute_pipeline(tracep);
-                        cmd.push_constants_compute(&gdf_trace_push(
-                            &g_inv_vp,
-                            g_eye,
-                            sun,
-                            sun_i,
-                            out_index,
-                            cw,
-                            ch,
-                            flip,
-                            gdf_sampled,
-                            mode,
-                        ));
-                        cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                        Ok(())
-                    },
-                );
-                Some(out)
-            } else {
-                None
-            }
+            let out = gdf.record_gdf_trace(
+                &mut graph,
+                extent,
+                cw,
+                ch,
+                sun_dir,
+                sun_intensity,
+                flip_y,
+                backend == BackendKind::Vulkan,
+                gdf_trace_analytic,
+                !gdf_merge_done,
+            );
+            gdf_merge_done = true;
+            Some(out)
         } else {
             None
         };
