@@ -656,9 +656,19 @@ impl MetalCommandBuffer {
         self.shared.set_storage_resident(&target.texture, false);
         self.shared.set_resident(&target.texture, true);
     }
-    /// Phase 11 Stage B volume barriers — stub (no Metal volume tables yet).
-    pub fn volume_to_storage(&self, _volume: &crate::resources::MetalVolume) {}
-    pub fn volume_to_sampled(&self, _volume: &crate::resources::MetalVolume) {}
+    /// Phase 11 Stage B volume transitions. Like the 2D storage hooks above, a 3D
+    /// volume is both compute-written (the SDF bake / GDF merge) and sampled (the SW
+    /// ray marcher), so residency toggles between the UAV `Read | Write` set and the
+    /// sampled `Read` set; Metal's encoder-boundary hazard tracking orders the
+    /// write → sample on the single queue, so there is no explicit barrier.
+    pub fn volume_to_storage(&self, volume: &crate::resources::MetalVolume) {
+        self.shared.set_resident(&volume.texture, false);
+        self.shared.set_storage_resident(&volume.texture, true);
+    }
+    pub fn volume_to_sampled(&self, volume: &crate::resources::MetalVolume) {
+        self.shared.set_storage_resident(&volume.texture, false);
+        self.shared.set_resident(&volume.texture, true);
+    }
     pub fn storage_buffer_barrier(&self, _buffer: &MetalStorageBuffer) {}
     pub fn storage_buffer_to_indirect(&self, _buffer: &MetalStorageBuffer) {}
     pub fn storage_buffer_to_storage(&self, _buffer: &MetalStorageBuffer) {}
