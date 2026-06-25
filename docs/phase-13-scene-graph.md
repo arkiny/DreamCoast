@@ -58,6 +58,12 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
 - **씬 그래프 = ECS 위의 변환 계층.** 별도 트리가 아니라 `Parent`/`Children` + `LocalTransform`/
   `WorldTransform` 컴포넌트로 표현하고, `propagate_transforms` 시스템이 top-down(dirty-aware)으로 월드
   트랜스폼을 계산. 루트(부모 없음)는 world = local. 작은 씬에선 전체 재계산이 trivial fallback.
+- **단일 source of truth = ECS, 얼굴은 둘.** 씬 상태 저장소는 ECS `World` **하나**뿐. "트리처럼 다루는
+  편의"는 두 번째 저장소가 아니라 얇은 **노드 핸들/빌더 API**로 제공: `NodeRef<'w> { world, entity }`에
+  `.child(...)`, `.set_local(...)`, `.with(Component)` 등 — 트리처럼 보이지만 실제로는 ECS에 바로
+  spawn/insert하는 설탕(중복 상태 0). *영구 이중 표현(레거시 리테인드 트리 + ECS) 기각*: 두 저장소는
+  source-of-truth 2개 → 동기화 함정 + 모든 소비처가 표현 분기. 레거시 `Vec<SceneObject>` 경로는 **Stage A
+  마이그레이션 중 플래그 뒤 임시 안전망**으로만 두고, 픽셀 회귀 확인 후 제거(전환기 공존, 영구 X).
 - **메시/머티리얼은 핸들 참조.** `MeshInstance { mesh: MeshHandle, material: MaterialHandle }` —
   샌드박스 소유 레지스트리의 인덱스. 이 핸들이 `crates/scene`를 RHI 타입에서 분리하는 이음매.
 - **드로우 리스트 추출**: `world.draw_list() -> Vec<Drawable { world, mesh, material, flags }>`(=
@@ -117,6 +123,10 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
 - 트랜스폼 계층을 **컴포넌트**로: `LocalTransform`, `WorldTransform`, `Parent`, `Children` +
   `propagate_transforms` 시스템(dirty-aware). 컴포넌트 `MeshInstance`/`Light`/`Camera`;
   `draw_list()` = `(WorldTransform, MeshInstance)` 쿼리.
+- **트리형 빌더/핸들 API**(`NodeRef`: `.child`/`.set_local`/`.with`) — ECS `World`에 직접 쓰는 설탕
+  (별도 저장소 아님). 씬 저작 편의를 단일 소스 유지하며 제공.
+- **임시 폴백:** 기존 `Vec<SceneObject>` 경로를 플래그 뒤에 잠시 유지(회귀 비교용 안전망), 픽셀 동일성
+  확인 후 이 Stage 내에서 제거.
 - 샌드박스가 `MeshRegistry` / `MaterialRegistry`(기존 `Buffer`/index-count/`tex` 데이터의 `Vec` 인덱스
   스토어) 소유. `MeshInstance`는 이들 핸들을 보유.
 - 오늘의 5-오브젝트 씬(로드 모델 + 크롬 구 + 코퍼 구 + 빨강 큐브 + 지면)을 **엔티티로 스폰**; 프레임 루프는
