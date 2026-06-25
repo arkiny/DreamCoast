@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 const RT_PIPELINE_ISECT_KEY: &str = "rt_pipeline_isect";
 const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
@@ -354,6 +355,7 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders/rt_pipeline_metal_rootsig.json");
     println!("cargo:rerun-if-env-changed=DXC");
     println!("cargo:rerun-if-env-changed=METAL_SHADERCONVERTER");
+    println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -578,7 +580,78 @@ fn slang_command(slangc: &Path, tool_home: &Path) -> Command {
     // builds can compile `metal_types` instead of trying `~/.cache/clang`.
     command.env("HOME", tool_home);
     command.env("XDG_CACHE_HOME", tool_home.join(".cache"));
+    // On macOS, point slangc's `-target metallib` at a developer dir that actually
+    // provides Apple's `metal` compiler, so the build works even when `xcode-select`
+    // is left on the Command Line Tools (which lack the Metal Toolchain). No-op on
+    // other platforms and when `metal` is already reachable / explicitly configured.
+    if let Some(dir) = metal_developer_dir() {
+        command.env("DEVELOPER_DIR", dir);
+    }
     command
+}
+
+/// A `DEVELOPER_DIR` to feed slangc so Apple's `metal` compiler resolves, or `None`
+/// when no override is needed (already reachable / `DEVELOPER_DIR` already set) or
+/// possible (not macOS / no toolchain found). Computed once and cached.
+///
+/// The Metal Toolchain (which provides the `metal` CLI that `-target metallib`
+/// shells out to) ships under **Xcode.app**, not the standalone Command Line Tools.
+/// If `xcode-select` points at the CLT — the default after a CLT-only install — every
+/// metallib silently degrades to a `None` accessor and the Metal backend ends up with
+/// no shaders. Discovering a working developer dir here makes a checkout build on any
+/// macOS box that has Xcode + the Metal Toolchain installed, regardless of the active
+/// `xcode-select`.
+fn metal_developer_dir() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        // Only relevant when building the metallib target (macOS).
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+            return None;
+        }
+        // Respect an explicit override and skip if the active toolchain already works.
+        if std::env::var_os("DEVELOPER_DIR").is_some() || metal_reachable(None) {
+            return None;
+        }
+        // Probe the current xcode-select target (in case it is a full Xcode whose
+        // `metal` just didn't resolve above) and the common Xcode install paths.
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        let selected = Command::new("xcode-select")
+            .arg("-p")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|p| !p.is_empty());
+        if let Some(p) = selected {
+            candidates.push(PathBuf::from(p));
+        }
+        candidates.push("/Applications/Xcode.app/Contents/Developer".into());
+        candidates.push("/Applications/Xcode-beta.app/Contents/Developer".into());
+
+        for cand in candidates {
+            if cand.is_dir() && metal_reachable(Some(&cand)) {
+                println!(
+                    "cargo:warning=metallib: using DEVELOPER_DIR={} for Apple `metal` \
+                     (active xcode-select lacks the Metal Toolchain)",
+                    cand.display()
+                );
+                return Some(cand);
+            }
+        }
+        None
+    })
+    .as_deref()
+}
+
+/// Whether Apple's `metal` compiler resolves via `xcrun`, optionally under a specific
+/// `DEVELOPER_DIR`. Used to pick a developer dir that can build metallibs.
+fn metal_reachable(developer_dir: Option<&Path>) -> bool {
+    let mut cmd = Command::new("xcrun");
+    cmd.args(["--find", "metal"]);
+    if let Some(dir) = developer_dir {
+        cmd.env("DEVELOPER_DIR", dir);
+    }
+    matches!(cmd.output(), Ok(o) if o.status.success())
 }
 
 /// Compile the DXR-style RT pipeline shaders to Metal via Apple's Metal Shader
