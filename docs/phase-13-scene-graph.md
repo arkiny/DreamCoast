@@ -13,12 +13,20 @@ DreamCoast에는 성숙한 **렌더 그래프**(`crates/render`) — GPU 패스 
 "Lantern" → 자식 Body·Chain·Lantern)인데 지금은 Body 하나만 렌더된다.
 
 이 Phase는 (1) 래스터라이저·HW 레이트레이싱·GPU 컬링에 **per-instance 월드 트랜스폼을 공급하는 단일
-소스**가 되는 변환 계층 **씬 그래프**와, (2) 선언적 **레벨** 포맷 + **스트리밍 레벨 그래프**(실제 게임에서
-쓰일 법한 콘텐츠 호스팅)를 추가한다. 테스트는 보유 애셋(Avocado / BoomBox / Lantern)으로 구동한다.
+소스**가 되는, **자체 제작 ECS 위에 얹힌** 변환 계층 **씬 그래프**와, (2) 선언적 **레벨** 포맷 +
+**스트리밍 레벨 그래프**(실제 게임에서 쓰일 법한 콘텐츠 호스팅)를 추가한다. 테스트는 보유 애셋
+(Avocado / BoomBox / Lantern)으로 구동한다.
+
+> **이 엔진의 위상:** DreamCoast는 단순 학습용이 아니라 **사용자가 장기적으로 직접 게임 개발에 쓸**
+> 엔진이다. 따라서 씬 표현은 게임 런타임에 맞는 **ECS(Entity-Component-System)**를 1급 코어로 둔다.
+> RHI·렌더그래프를 from-scratch로 만들어 온 엔진 철학과 일관되게 **ECS도 외부 의존 없이 자체 구현**한다.
 
 ### 사용자 결정 (이번 세션)
+- **씬 표현** = **자체 제작 from-scratch ECS**를 코어로(아키텍처/소유권 완전 제어, 의존성 0). 씬 그래프
+  (변환 계층)는 별도 트리가 아니라 ECS 위의 컴포넌트 + 전파 시스템으로 표현(현대 엔진 정석).
+- **ECS 도입 깊이** = **Stage A부터 ECS 코어**(arena 트리를 만들었다 ECS로 갈아엎는 재작업 회피).
 - **레벨 범위** = 레벨 파일 **+ 스트리밍 그래프**(완전한 게임형 야심, Stage D).
-- **기존 하드코딩 씬** = 파일로 통째 대체가 아니라 **씬 그래프로 마이그레이션**(그래프로 재구성하고 픽셀
+- **기존 하드코딩 씬** = 파일로 통째 대체가 아니라 **ECS 씬으로 마이그레이션**(엔티티로 재구성하고 픽셀
   동일성 회귀 검증).
 
 ## 아키텍처
@@ -26,22 +34,35 @@ DreamCoast에는 성숙한 **렌더 그래프**(`crates/render`) — GPU 패스 
 ### 신규 크레이트 `crates/scene` (`dreamcoast-scene`)
 RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`crates/render`가 `rhi` 파사드에만
 의존하는 구조를 그대로 미러링). 씬/레벨 *로직*을 소유하고 평면 드로우 리스트를 산출한다. GPU 리소스는
-전부 샌드박스가 소유하고 핸들 → 버퍼를 해석한다. 모듈 구성: `transform.rs`, `graph.rs`(arena),
-`node.rs`, `gltf_instance.rs`(Stage B), `level.rs`(Stage C), `world.rs`(Stage D).
+전부 샌드박스가 소유하고 핸들 → 버퍼를 해석한다. 모듈 구성:
+- `ecs/` — 자체 제작 최소 ECS: `Entity`(generational id), `World`(엔티티 할당 + 컴포넌트 스토리지),
+  컴포넌트 등록, 쿼리/순회, 시스템(월드에 대한 함수).
+- `transform.rs` — 트랜스폼 계층 **컴포넌트**: `LocalTransform { translation, rotation: Quat, scale }`,
+  `WorldTransform(Mat4)`, `Parent(Entity)`, `Children(Vec<Entity>)`; + `propagate_transforms(&mut World)`
+  시스템.
+- `components.rs` — `MeshInstance { mesh, material }`, `Light`, `Camera`, `Name`, 렌더 플래그(casts_shadow).
+- `draw_list.rs` — `(WorldTransform, MeshInstance)` 쿼리 → `Vec<Drawable>`.
+- `gltf_instance.rs`(Stage B), `level.rs`(Stage C), `level_graph.rs`(Stage D).
+
+> **이름 충돌 주의:** ECS 컨테이너 타입은 표준대로 `World`. Stage D의 "레벨들의 그래프"는 ECS `World`와
+> 겹치지 않도록 **`LevelGraph`**(온디스크 `.world` 파일이 역직렬화되는 타입)로 명명. 런타임 ECS = `World`,
+> 스트리밍 데이터 = `LevelGraph`.
 
 ### 핵심 설계 선택 (기각 대안 포함)
-- **Arena/SoA 트리, ECS 아님.** `SceneGraph { nodes: Vec<Node> }`를 generational `NodeId(u32)`로 키잉.
-  인덱스 기반 부모/자식(`Rc` 순환 없음) → 캐시 친화적, 직렬화 가능, 단일 스레드 `!Send` 모델에 부합.
-  *ECS 기각*: 학습용 렌더러엔 과하고, 사용자가 명시적으로 씬 그래프를 요청.
-- **로컬 `Transform { translation, rotation: Quat, scale }` → 캐시된 `world: Mat4`, dirty-flag 전파.**
-  `update_world_transforms()`는 dirty 서브트리만 재계산하는 top-down 단일 패스. 작은 씬에선 전체
-  재계산이 trivial fallback.
-- **노드 페이로드는 `NodeKind` enum**: `Empty | MeshInstance { mesh, material } | Light { .. } |
-  Camera { .. }`. 메시/머티리얼은 **핸들**(`MeshHandle(u32)`, `MaterialHandle(u32)`)로 참조 —
+- **자체 제작 ECS가 씬 코어.** `Entity`(generational id: index + generation), `World`가 엔티티 할당 +
+  컴포넌트 스토리지 소유. 스토리지 모델(아키타입 vs 스파스셋)은 Stage A 세부에서 확정 — 렌더 쿼리가
+  순회 중심이라 아키타입 쪽이 유력하나, from-scratch 1차 구현은 단순·정확 우선. 단일 스레드 `!Send`
+  모델에 부합. *Arena 트리 기각*: 게임 런타임엔 ECS가 정석(동적 스폰/디스폰, 컴포넌트 조합, 시스템
+  순회). *외부 ECS 크레이트(hecs/bevy_ecs) 기각*: 엔진을 raw 백엔드부터 자체 RHI/렌더그래프까지
+  from-scratch로 만들어 온 철학·소유권과 일관되게 직접 구현(의존성 0).
+- **씬 그래프 = ECS 위의 변환 계층.** 별도 트리가 아니라 `Parent`/`Children` + `LocalTransform`/
+  `WorldTransform` 컴포넌트로 표현하고, `propagate_transforms` 시스템이 top-down(dirty-aware)으로 월드
+  트랜스폼을 계산. 루트(부모 없음)는 world = local. 작은 씬에선 전체 재계산이 trivial fallback.
+- **메시/머티리얼은 핸들 참조.** `MeshInstance { mesh: MeshHandle, material: MaterialHandle }` —
   샌드박스 소유 레지스트리의 인덱스. 이 핸들이 `crates/scene`를 RHI 타입에서 분리하는 이음매.
-- **드로우 리스트 추출**: `scene.draw_list() -> Vec<Drawable { world, mesh, material, flags }>`가
-  오늘의 `Vec<SceneObject>`를 대체. `RtSystem`(TLAS 인스턴스)와 `CullSystem`이 같은 리스트를 소비 →
-  그래프가 per-instance 트랜스폼의 단일 소스.
+- **드로우 리스트 추출**: `world.draw_list() -> Vec<Drawable { world, mesh, material, flags }>`(=
+  `(WorldTransform, MeshInstance)` 쿼리)가 오늘의 `Vec<SceneObject>`를 대체. `RtSystem`(TLAS 인스턴스)와
+  `CullSystem`이 같은 리스트를 소비 → ECS 씬이 per-instance 트랜스폼의 단일 소스.
 
 ## 선행조건 (의존 Stage 전/내부에서 처리)
 
@@ -90,26 +111,29 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
   동일.
 - **검증:** 카메라 비행; 궤도 모드 스크린샷이 현재 베이스라인과 불변, VK ≡ DX.
 
-### Stage A — 씬 그래프 코어 + 샌드박스 씬 마이그레이션
-- `crates/scene` 생성: `Transform`, `Node`, `NodeId`, `SceneGraph` arena, `update_world_transforms`
-  (dirty 전파), `NodeKind`, `Drawable`, `draw_list()`.
+### Stage A — 자체 ECS 코어 + 컴포넌트 트랜스폼 계층 + 샌드박스 씬 마이그레이션
+- `crates/scene` 생성, **자체 제작 최소 ECS**(`ecs/`): `Entity`(generational), `World`(엔티티 할당 +
+  컴포넌트 스토리지), 컴포넌트 등록, 쿼리/순회, 시스템. 스토리지 모델은 이 Stage 세부에서 확정.
+- 트랜스폼 계층을 **컴포넌트**로: `LocalTransform`, `WorldTransform`, `Parent`, `Children` +
+  `propagate_transforms` 시스템(dirty-aware). 컴포넌트 `MeshInstance`/`Light`/`Camera`;
+  `draw_list()` = `(WorldTransform, MeshInstance)` 쿼리.
 - 샌드박스가 `MeshRegistry` / `MaterialRegistry`(기존 `Buffer`/index-count/`tex` 데이터의 `Vec` 인덱스
-  스토어) 소유. 씬 노드는 이들 핸들을 보유.
-- 오늘의 5-오브젝트 씬(로드 모델 + 크롬 구 + 코퍼 구 + 빨강 큐브 + 지면)을 **씬 그래프로 프로그래밍
-  구성**; 프레임 루프는 `scene.draw_list()`를 순회. `RtSystem` / `CullSystem`도 같은 리스트로 공급(당장
-  RT는 정적 유지).
+  스토어) 소유. `MeshInstance`는 이들 핸들을 보유.
+- 오늘의 5-오브젝트 씬(로드 모델 + 크롬 구 + 코퍼 구 + 빨강 큐브 + 지면)을 **엔티티로 스폰**; 프레임 루프는
+  `propagate_transforms` 후 `world.draw_list()`를 순회. `RtSystem` / `CullSystem`도 같은 리스트로 공급
+  (당장 RT는 정적 유지).
 - **검증(회귀 게이트):** 기본 씬이 마이그레이션 전과 **바이트 동일** 렌더(양 백엔드) — 이 Stage는 순수
-  데이터 경로 리팩터. RT 패스트레이서도 일치 유지.
+  데이터 경로 리팩터(ECS는 새 인프라지만 산출 드로우 리스트는 동일). RT 패스트레이서도 일치 유지.
 
 ### Stage B — 전체 glTF 계층 임포트 → 씬 서브트리
 - `crates/asset` 확장: `load_gltf_scene(path) -> GltfScene` — **모든** 노드(TRS 포함), 메시/프리미티브,
   머티리얼, 텍스처 반환. 기존 단일 메시 `load_gltf`는 폴백/큐브 경로용으로 유지.
-- `crates/scene`: `instantiate_gltf(&mut SceneGraph, &GltfScene, registries) -> NodeId` — 한 루트
-  아래 서브트리 구성, 부모/자식 TRS 보존, 구별되는 메시/머티리얼 등록.
+- `crates/scene`: `instantiate_gltf(&mut World, &GltfScene, registries) -> Entity` — glTF 노드마다
+  엔티티 스폰, `Parent`/`Children` + `LocalTransform`로 계층 보존, 구별되는 메시/머티리얼 등록.
 - 샌드박스가 **Lantern.glb** 로드 → 4노드 계층이 3개의 정확히 배치된 드로어블이 됨(오늘 로더는 Chain +
   Lantern을 누락). Avocado/BoomBox는 단일 노드 서브트리.
-- **검증(애셋 구동):** Lantern이 **3개 서브메시 전부**를 올바른 상대 배치로 렌더; 부모 "Lantern" 노드
-  회전 시 자식 3개가 함께 이동(계층 증명). VK ≡ DX.
+- **검증(애셋 구동):** Lantern이 **3개 서브메시 전부**를 올바른 상대 배치로 렌더; 부모 "Lantern" 엔티티의
+  `LocalTransform` 회전 시 `propagate_transforms`로 자식 3개가 함께 이동(계층 증명). VK ≡ DX.
 
 ### Stage C — 선언적 레벨 포맷 + 로더
 - 레벨 파일을 **RON**으로(`ron` 크레이트 — 작고 순수 Rust; minimal-install 방침에 따라 사용자 승인
@@ -124,16 +148,17 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
 - **검증:** 각 레벨이 올바른 씬으로 로드; UI에서 핫스왑; VK ≡ DX.
 
 ### Stage D — 레벨 그래프 + 스트리밍
-- `World` = 레벨 청크의 그래프: 노드 = 레벨(각자 월드 공간 원점 오프셋), 엣지 = 인접/포털 연결.
-  `.world` 파일이 청크 + 배치 + 연결성 나열.
-- 스트리밍: 매 프레임, 카메라 위치 기준으로 반경/그래프 거리 안의 청크 **로드**, 밖의 청크 **언로드**.
-  단일 스레드 엔진 → 동기 로드를 프레임당 한 청크로 예산화해 히치 방지(비동기 로드는 범위 외로 문서화).
-  GPU 리소스는 언로드 시 per-chunk 리소스 arena로 해제(공유 메시는 refcount).
+- `LevelGraph`(온디스크 `.world`) = 레벨 청크의 그래프: 노드 = 레벨(각자 월드 공간 원점 오프셋), 엣지 =
+  인접/포털 연결. `.world` 파일이 청크 + 배치 + 연결성 나열. (ECS `World`와 구분되는 이름.)
+- 스트리밍: 매 프레임, 카메라 위치 기준으로 반경/그래프 거리 안의 청크 **로드**(엔티티 스폰), 밖의 청크
+  **언로드**(엔티티 디스폰). 단일 스레드 엔진 → 동기 로드를 프레임당 한 청크로 예산화해 히치 방지(비동기
+  로드는 범위 외로 문서화). 청크별 스폰 엔티티 집합을 추적해 언로드 시 일괄 디스폰; GPU 리소스는 per-chunk
+  리소스 arena로 해제(공유 메시는 refcount). 동적 스폰/디스폰은 ECS 코어가 자연히 받쳐줌.
 - 샌드박스: Lantern으로 채운 청크 3개를 한 줄로 둔 `.world`; 카메라를 날리면 청크가 스트림 인/아웃; UI가
   로드된 청크 집합 + 작은 ImGui 그래프 시각화 표시.
-- `World` 데이터 모델 serde-ready(청크 리스트 + 배치 + 그래프 인접 + 스트리밍 반경); 샌드박스가 `.world`를
-  **로드·저장 양쪽**.
-- **검증:** 카메라 주행이 청크를 올바르게 로드/언로드(GPU 누수 없음); VK ≡ DX; 검증 클린.
+- `LevelGraph` 데이터 모델 serde-ready(청크 리스트 + 배치 + 그래프 인접 + 스트리밍 반경); 샌드박스가
+  `.world`를 **로드·저장 양쪽**.
+- **검증:** 카메라 주행이 청크를 올바르게 로드/언로드(엔티티 디스폰 + GPU 누수 없음); VK ≡ DX; 검증 클린.
 
 ### Stage E — 쿡된 바이너리 레벨/월드 (Phase 12 M1 이후; Phase 12 결속)
 - Phase 12 `.dcasset` 컨테이너에 씬/레벨 **청크 타입** 추가; `.level`/`.world` → 바이너리 쿡,
@@ -142,8 +167,9 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
 - **검증:** 쿡된 로드가 RON 경로와 동일 렌더(양 백엔드); 바이트 동일 캐시.
 
 ## 파일 (생성 / 수정)
-- **신규** `crates/scene/{Cargo.toml, src/lib.rs, transform.rs, graph.rs, node.rs, gltf_instance.rs,
-  level.rs, world.rs}`; 워크스페이스 `Cargo.toml` members에 추가.
+- **신규** `crates/scene/{Cargo.toml, src/lib.rs, ecs/(entity/world/storage/query), transform.rs,
+  components.rs, draw_list.rs, gltf_instance.rs, level.rs, level_graph.rs}`; 워크스페이스 `Cargo.toml`
+  members에 추가.
 - **신규** `apps/sandbox/levels/{gallery.level, lanterns.level}` + `worlds/demo.world`.
 - **수정** `crates/asset/src/lib.rs` — `load_gltf_scene` / `GltfScene` 추가(Stage B).
 - **수정** `apps/sandbox/src/main.rs` — 자유 비행 카메라(Stage 0); `Vec<SceneObject>` 구성 →
@@ -155,6 +181,9 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
 - **수정** `docs/phase-12-asset-pipeline.md` — 차후 씬/레벨 청크(Stage E / M3) 명기.
 
 ## 리스크 / 미결
+- **ECS 스토리지 모델 (Stage A 세부 결정):** 아키타입(순회 빠름, 구현 복잡) vs 스파스셋(추가/삭제 빠름,
+  구현 단순). 렌더 쿼리는 순회 중심이라 아키타입이 유력하나, from-scratch 1차는 단순·정확 우선 후 필요 시
+  최적화. 멀티스레드 시스템 스케줄링·변경 감지 등 고급 ECS 기능은 본 Phase 범위 외(후속).
 - **RT/cull 결합:** `RtSystem`은 씬 순서를 미러링해 TLAS 인스턴스 테이블을 빌드 → 동적 드로우 리스트는
   씬/레벨 변경 시 TLAS 재빌드를 의미. Stage A는 씬을 정적으로 유지해 RT 유지; 동적 재빌드는 C/D에서
   안착하고 각 Stage마다 PT 레퍼런스 대비 재검증.
@@ -169,5 +198,5 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
 헤드리스 실행 후 PNG Read:
 `VK_LOADER_LAYERS_DISABLE="~implicit~" cargo run -q -p sandbox -- --backend vulkan|d3d12
 --screenshot-clean tmp/x.png`, VK vs DX(및 Stage A에선 마이그레이션 전 베이스라인) 차분을
-`tools/rt-compare.py`로. Stage B는 부모 노드 회전 토글로 계층 확인; Stage D는 청크 경계를 가로지르는
+`tools/rt-compare.py`로. Stage B는 부모 엔티티 `LocalTransform` 회전 토글로 계층 확인; Stage D는 청크 경계를 가로지르는
 카메라 주행으로 로드/언로드를 검증 오류 없이 확인.
