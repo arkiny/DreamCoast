@@ -771,6 +771,15 @@ impl MetalDevice {
         td
     }
 
+    /// Create a 3D (volume) texture (Phase 11 Stage B). **Stub** — implemented on
+    /// the Windows backends first; the Metal argument buffer needs the volume tables.
+    pub fn create_volume(
+        &self,
+        _desc: &rhi_types::VolumeDesc,
+    ) -> Result<crate::resources::MetalVolume> {
+        unimplemented!("Phase 11 Stage B: 3D volume textures not yet on the Metal backend")
+    }
+
     /// Create an offscreen color render target (color attachment + bindless
     /// sampled) with its own dedicated allocation.
     pub fn create_render_target(&self, desc: &RenderTargetDesc) -> Result<MetalRenderTarget> {

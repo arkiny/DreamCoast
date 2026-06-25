@@ -33,6 +33,12 @@ pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
 /// Size of the bindless storage-buffer (UAV) table (binding 4). Compute/vertex
 /// read-write these; separate 0-based index space (Phase 7).
 pub(crate) const STORAGE_BUFFER_COUNT: u32 = 64;
+/// Size of the bindless sampled 3D-volume table (binding 6). Trilinear-sampled
+/// distance fields; separate 0-based index space (Phase 11 Stage B).
+pub(crate) const VOLUME_COUNT: u32 = 64;
+/// Size of the bindless storage 3D-volume (UAV) table (binding 7). Compute bakes
+/// write these; separate 0-based index space (Phase 11 Stage B).
+pub(crate) const STORAGE_VOLUME_COUNT: u32 = 64;
 
 /// Device-level objects shared (via `Arc`) by every GPU resource so each can
 /// destroy itself before the device is torn down.
@@ -54,6 +60,8 @@ pub(crate) struct DeviceShared {
     cube_next: AtomicU32,
     storage_image_next: AtomicU32,
     storage_buffer_next: AtomicU32,
+    volume_next: AtomicU32,
+    storage_volume_next: AtomicU32,
     // Per-frame globals (set 1): one UNIFORM_BUFFER_DYNAMIC binding, written once
     // to point at the app's globals buffer; the per-frame slice is selected by a
     // dynamic offset at bind time. Only PBR pipelines bind this set.
@@ -278,6 +286,8 @@ impl DeviceShared {
                 cube_next: AtomicU32::new(0),
                 storage_image_next: AtomicU32::new(0),
                 storage_buffer_next: AtomicU32::new(0),
+                volume_next: AtomicU32::new(0),
+                storage_volume_next: AtomicU32::new(0),
                 globals_pool,
                 globals_layout,
                 globals_set,
@@ -400,6 +410,43 @@ impl DeviceShared {
             .dst_array_element(index)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(&info);
+        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+        index
+    }
+
+    /// Register a sampled 3D volume view in the bindless table (binding 6),
+    /// returning its index in the separate 0-based volume space (Phase 11).
+    pub(crate) fn register_volume(&self, view: vk::ImageView) -> u32 {
+        let index = self.volume_next.fetch_add(1, Ordering::Relaxed);
+        let image_info = vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let infos = [image_info];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.bindless_set)
+            .dst_binding(6)
+            .dst_array_element(index)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(&infos);
+        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+        index
+    }
+
+    /// Register a storage 3D volume view (UAV) in the bindless table (binding 7),
+    /// returning its index in the separate 0-based storage-volume space. Compute
+    /// bakes write it (image layout GENERAL).
+    pub(crate) fn register_storage_volume(&self, view: vk::ImageView) -> u32 {
+        let index = self.storage_volume_next.fetch_add(1, Ordering::Relaxed);
+        let image_info = vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let infos = [image_info];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.bindless_set)
+            .dst_binding(7)
+            .dst_array_element(index)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(&infos);
         unsafe { self.device.update_descriptor_sets(&[write], &[]) };
         index
     }
@@ -584,6 +631,24 @@ fn create_bindless(
             // (Cornell toggle) without invalidating in-flight command buffers.
             flags.push(dynamic);
         }
+        // Bindings 6/7: sampled + storage 3D volume arrays (Phase 11 Stage B).
+        // Always present (no device feature gate), separate 0-based index spaces.
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(VOLUME_COUNT)
+                .stage_flags(sampled_stages),
+        );
+        flags.push(dynamic);
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(7)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(STORAGE_VOLUME_COUNT)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE | rt_stages),
+        );
+        flags.push(dynamic);
         let mut flags_ci =
             vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
         let layout_ci = vk::DescriptorSetLayoutCreateInfo::default()
@@ -597,13 +662,13 @@ fn create_bindless(
         let mut pool_sizes = vec![
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                .descriptor_count(BINDLESS_COUNT + CUBE_COUNT), // bindings 0 + 2
+                .descriptor_count(BINDLESS_COUNT + CUBE_COUNT + VOLUME_COUNT), // 0 + 2 + 6
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(STORAGE_IMAGE_COUNT), // binding 3
+                .descriptor_count(STORAGE_IMAGE_COUNT + STORAGE_VOLUME_COUNT), // 3 + 7
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(STORAGE_BUFFER_COUNT), // binding 4
@@ -830,6 +895,15 @@ impl VulkanDevice {
         desc: &RenderTargetDesc,
     ) -> Result<VulkanRenderTarget, EngineError> {
         VulkanRenderTarget::new(self.shared.clone(), desc)
+    }
+
+    /// Create a 3D (volume) texture, registered in the bindless sampled + storage
+    /// volume tables (Phase 11 Stage B).
+    pub fn create_volume(
+        &self,
+        desc: &rhi_types::VolumeDesc,
+    ) -> Result<crate::volume::VulkanVolume, EngineError> {
+        crate::volume::VulkanVolume::new(self.shared.clone(), desc)
     }
 
     /// Memory footprint of an aliasable render target (for graph alias planning).

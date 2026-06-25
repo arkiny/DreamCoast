@@ -58,11 +58,26 @@ HW RT 파이프라인(Phase 8) 없이 컴퓨트 셰이더로 레이를 추적하
 
 마일스톤(각 양 백엔드 + 검증 클린 게이트, phase-by-phase 승인):
 
-### B1 — 3D 볼륨 텍스처 RHI
-- 신규 `Texture3D`(샘플) + `RWTexture3D`(스토리지/UAV)를 `bindless.slang` 블록 + 양 백엔드에 추가:
-  Vulkan `VK_IMAGE_TYPE_3D` + 3D 뷰, D3D12 `Texture3D` SRV/UAV(`D3D12_UAV_DIMENSION_TEXTURE3D`,
-  WSize=depth). 3D 디스패치는 기존 `dispatch(x,y,z)`가 이미 지원. 포맷은 `R16Float`(거리, half) 우선.
-- 검증: 작은 볼륨을 컴퓨트로 채우고 트라이리니어 샘플 → 양 백엔드 일치.
+### B1 — 3D 볼륨 텍스처 RHI ✅ (양 백엔드 검증)
+- `bindless.slang` 블록에 `Texture3D<float> volumes[64]`(binding 6) + `RWTexture3D<float>
+  storage_volumes[64]`(binding 7) 추가. **slangc 리플렉션으로 register 매핑 검증**: SPIR-V binding 6/7,
+  DXIL `volumes`=`t1089,space1`(TLAS t1088 다음), `storage_volumes`=`u128,space1`(storage_buffers u64–127
+  다음). 신규 포맷 `Format::R32Float`(단일채널 거리; half R16F는 후속 최적화).
+- 양 백엔드 리소스: Vulkan `VK_IMAGE_TYPE_3D` 이미지+3D 뷰(`volume.rs`), bindings 6/7 디스크립터
+  레이아웃+풀+`register_volume`/`register_storage_volume`. D3D12 `Texture3D` 리소스+SRV(`TEX3D_SRV`)
+  +UAV(`TEX3D_UAV`, WSize=depth), 힙 영역 `VOLUME_BASE`/`STORAGE_VOLUME_BASE`, **루트시그니처
+  bindless_ranges 5→7**(volumes SRV t1089 + storage_volumes UAV u128). 파사드 `Volume` enum +
+  `create_volume` + `volume_to_storage`/`volume_to_sampled` 배리어(상태 추적 Cell, 2D storage RT 미러링).
+  Metal은 스텁(`unimplemented!` — argument buffer 볼륨 슬롯은 메탈 세션이 구현). 3D 디스패치는 기존
+  `dispatch(x,y,z)` 재사용.
+- 스모크 테스트 `volume_test.slang`(`fillMain`/`viewMain`): 컴퓨트가 storage_volume에 중심 구 부호거리
+  기록 → `volume_to_sampled` 배리어 → `volumes[]` SRV를 Z=0.5 슬라이스 트라이리니어 샘플 → 화면.
+  그래프 통합은 `import_external`로 fill→view 순서 보장, tonemap `rt_out.or(sdf_out).or(vol_out)`. 토글
+  env `P11_VOLUME_TEST` + UI.
+- **검증(RTX 2070 SUPER):** build+fmt+clippy(-D warnings) 클린. VK·DX 슬라이스 정상(중심 구 부호거리
+  그라데이션 + zero 등위면 녹색 링). **VK≡DX 픽셀 동일(mean 0.0000, max 0)** — 결정적 fill+트라이리니어
+  샘플. Vulkan VUID 0. **bindless 블록에 멤버 추가했지만 기존 래스터 씬 byte-identical(회귀 없음)** —
+  Slang이 미사용 binding을 drop. tmp/vol-{vk,dx}.png.
 
 ### B2 — per-mesh SDF 베이크
 - 컴퓨트로 각 메시의 로컬 AABB를 N³ 그리드(예 32³~64³)로 보로 voxel당 **부호 있는 거리** 계산.

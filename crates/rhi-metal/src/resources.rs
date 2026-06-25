@@ -178,6 +178,28 @@ impl MetalRenderTarget {
     pub fn set_name(&self, _name: &str) {}
 }
 
+/// A 3D (volume) texture for Phase 11 Stage B distance fields. **Stub** — the Metal
+/// argument buffer does not yet carry the `volumes[]` / `storage_volumes[]` tables
+/// (Stage B is implemented on the Windows backends first; the Metal session wires
+/// the argument-buffer slots + 3D `MTLTexture` here). The facade arms exist so the
+/// cross-platform build stays uniform.
+pub struct MetalVolume {
+    sampled_index: u32,
+    storage_index: u32,
+}
+
+impl MetalVolume {
+    /// `volumes[]` (sampled) bindless index.
+    pub fn sampled_index(&self) -> u32 {
+        self.sampled_index
+    }
+
+    /// `storage_volumes[]` (UAV) bindless index.
+    pub fn storage_index(&self) -> u32 {
+        self.storage_index
+    }
+}
+
 /// A render-target cubemap for IBL: a 6-face, optionally mipped `MTLTextureType::Cube`
 /// usable both as a per-(face, mip) color attachment (the IBL generation passes
 /// write it) and a bindless `TextureCube` (`g.cubes[index]`). Registered in the

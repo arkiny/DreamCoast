@@ -17,13 +17,14 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
     D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_TYPE_UAV,
     D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE,
-    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET,
-    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATES,
-    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER, D3D12_TEXTURE_COPY_LOCATION,
-    D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT,
-    ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList4, ID3D12Resource,
+    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT,
+    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER,
+    D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+    D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT, ID3D12CommandAllocator, ID3D12GraphicsCommandList,
+    ID3D12GraphicsCommandList4, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
 use windows::core::Interface;
@@ -579,6 +580,36 @@ impl D3d12CommandBuffer {
     /// UAV barrier on a storage buffer: order a compute write before later reads.
     pub fn storage_buffer_barrier(&self, buffer: &D3d12StorageBuffer) {
         self.uav_barrier(buffer.resource());
+    }
+
+    /// Transition a 3D volume into `UNORDERED_ACCESS` so a compute bake can write it
+    /// (Phase 11 Stage B). Mirrors `rt_to_storage` for the volume tables.
+    pub fn volume_to_storage(&self, volume: &crate::volume::D3d12Volume) {
+        let before = volume.state();
+        if before == D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            return;
+        }
+        self.barrier(
+            volume.resource(),
+            before,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        volume.set_state(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    /// Transition a 3D volume from `UNORDERED_ACCESS` (compute bake) into
+    /// `NON_PIXEL_SHADER_RESOURCE` for trilinear sampling by a later compute pass.
+    pub fn volume_to_sampled(&self, volume: &crate::volume::D3d12Volume) {
+        let before = volume.state();
+        if before == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE {
+            return;
+        }
+        self.barrier(
+            volume.resource(),
+            before,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        );
+        volume.set_state(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
     /// Transition a storage buffer from `UNORDERED_ACCESS` (compute write) into
