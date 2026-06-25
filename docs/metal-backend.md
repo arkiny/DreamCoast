@@ -25,12 +25,16 @@ fallback.
 
 Two tools are needed to compile shaders to Metal:
 
-1. **Xcode + Metal Toolchain.** Full Xcode (not just Command Line Tools) plus the
-   Metal toolchain component:
+1. **Xcode + Metal Toolchain.** Slang's `-target metallib` shells out to Apple's
+   `metal` compiler, which ships in the **Metal Toolchain** under `Xcode.app` — *not*
+   the standalone Command Line Tools. Install full Xcode plus the toolchain component:
    ```sh
    xcodebuild -downloadComponent MetalToolchain
    xcrun metal --version   # verify
    ```
+   You do **not** need to `xcode-select` onto Xcode: `build.rs` auto-discovers a
+   developer dir that provides `metal` (see below), so a checkout builds even when
+   `xcode-select` is left pointing at the Command Line Tools.
 2. **Slang (`slangc`).** Download the macOS build and place it under
    `tools/slang/` (gitignored), or point `SLANGC` at it, or add it to `PATH`:
    ```sh
@@ -42,8 +46,20 @@ Two tools are needed to compile shaders to Metal:
 
 `crates/shader/build.rs` resolves `slangc` (SLANGC → `tools/slang/bin/slangc` →
 PATH → `VULKAN_SDK`) and, on macOS, compiles each shader to a `.metallib` via
-Slang's Metal target (which shells out to `xcrun metal`). If `slangc` or the Metal
+Slang's Metal target (which shells out to `metal`). If `slangc` or the Metal
 toolchain is absent the build still succeeds — shader accessors just return `None`.
+
+**`metal` discovery (macOS).** Because the `metal` compiler lives under `Xcode.app`
+rather than the Command Line Tools, `build.rs` locates it without requiring an
+`xcode-select` switch: if `metal` is not already reachable (`xcrun --find metal`) and
+`DEVELOPER_DIR` is not preset, it probes `xcode-select -p`, then
+`/Applications/Xcode.app` and `/Applications/Xcode-beta.app`, and sets `DEVELOPER_DIR`
+on the slangc invocation to the first dir whose `metal` resolves (printing one
+`cargo:warning` naming the dir it picked). Overrides: set `DEVELOPER_DIR` explicitly,
+or make it durable system-wide with
+`sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`. When no dir
+provides `metal` (toolchain not installed), the metallib targets degrade to `None`
+accessors as above and the Metal backend can't run those shaders at runtime.
 
 ## Assets
 
