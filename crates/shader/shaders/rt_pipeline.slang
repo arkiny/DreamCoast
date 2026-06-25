@@ -49,8 +49,17 @@ void chMain(inout Payload p, BuiltInTriangleIntersectionAttributes attr)
     bool cornell = (pc.flip_y & 2u) != 0u;
     float3 sun_dir = normalize(pc.sun.xyz);
 
-    Instance inst = load_instance(InstanceID());
     uint prim = PrimitiveIndex();
+    Instance inst;
+    if (!load_valid_instance(InstanceID(), prim, inst))
+    {
+        // Out-of-range hit (never a valid surface) — terminate the path with no
+        // contribution, matching the inline path's `break`.
+        p.radiance = float3(0, 0, 0);
+        p.atten = float3(0, 0, 0);
+        p.done = 1u;
+        return;
+    }
     float2 material_uv = hit_uv(inst, prim, attr.barycentrics);
     RtMaterialSample mat = sample_material(inst, material_uv);
     float3 n = hit_normal(inst, prim, attr.barycentrics);

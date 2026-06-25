@@ -44,8 +44,10 @@ float3 trace(float3 origin, float3 dir, float3 sun_dir, bool cornell, inout uint
             break;
         }
 
-        Instance inst = load_instance(q.CommittedInstanceID());
         uint prim = q.CommittedPrimitiveIndex();
+        Instance inst;
+        if (!load_valid_instance(q.CommittedInstanceID(), prim, inst))
+            break; // out-of-range hit (never a valid surface) — terminate the path
         float2 bary = q.CommittedTriangleBarycentrics();
         float2 material_uv = hit_uv(inst, prim, bary);
         RtMaterialSample mat = sample_material(inst, material_uv);

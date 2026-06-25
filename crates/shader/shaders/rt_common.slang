@@ -23,7 +23,7 @@ static const float SUN_COS_MAX = 0.9998;
 struct PushConstants
 {
     float4x4 inv_view_proj; // clip -> world
-    float4 cam_pos;         // xyz camera world position
+    float4 cam_pos;         // xyz camera world position; w = instance count (bounds)
     float4 sun;             // xyz direction toward the sun, w = intensity
     uint out_index;         // bindless storage-image index (averaged output)
     uint accum_index;       // bindless storage-buffer index (float4 sum per pixel)
@@ -51,7 +51,7 @@ struct Instance
     float4 params;     // x metallic, y roughness, z ao, w unused
     uint tex_normal;   // tangent-space normal map
     uint tex_emissive; // emissive texture
-    uint pad0;
+    uint prim_count;   // triangle count (for closest-hit PrimitiveIndex bounds check)
     uint pad1;
 };
 
@@ -286,9 +286,25 @@ Instance load_instance(uint id)
     inst.params = asfloat(g.storage_buffers[pc.inst_index].Load4(base + 32u));
     inst.tex_normal = g.storage_buffers[pc.inst_index].Load(base + 48u);
     inst.tex_emissive = g.storage_buffers[pc.inst_index].Load(base + 52u);
-    inst.pad0 = 0u;
+    inst.prim_count = g.storage_buffers[pc.inst_index].Load(base + 56u);
     inst.pad1 = 0u;
     return inst;
+}
+
+// Bounds-checked hit fetch. The M7 RT-pipeline path (Metal Shader Converter) can
+// hand the closest-hit shader an out-of-range InstanceID/PrimitiveIndex for a few
+// rays (floor-biased, non-deterministic). Validating BEFORE any
+// storage_buffers[].Load avoids the out-of-bounds access entirely — both the
+// instance-table read and the index/vertex reads keyed off it — which is the root
+// fix (the hit_normal isfinite guard only masked the resulting NaN). Returns false
+// for an out-of-range hit; callers treat it as "no valid surface" (terminate path).
+bool load_valid_instance(uint id, uint prim, out Instance inst)
+{
+    inst = (Instance)0;
+    if (id >= (uint)pc.cam_pos.w)
+        return false;
+    inst = load_instance(id);
+    return prim < inst.prim_count;
 }
 
 // Barycentric-interpolated, normalized surface normal for a hit triangle.
@@ -303,12 +319,12 @@ float3 hit_normal(Instance inst, uint prim, float2 bary)
     float3 n2 = asfloat(g.storage_buffers[inst.vtx].Load3(i2 * 32u + 12u));
     float b0 = 1.0 - bary.x - bary.y;
     float3 n = n0 * b0 + n1 * bary.x + n2 * bary.y;
-    // The Metal Shader Converter RT-pipeline path occasionally hands the closest-hit
-    // shader an out-of-range PrimitiveIndex/InstanceID for a few rays (floor-biased,
-    // non-deterministic). That fetches degenerate vertex data and makes this
-    // normalize() non-finite; a NaN normal yields NaN BSDF radiance which the
-    // persistent accumulator then bakes into a permanent black speckle. Reject the
-    // non-finite/degenerate case (never a valid hit) so it can't poison shading.
+    // Defense-in-depth for degenerate geometry: a zero-area triangle (coincident
+    // vertices) gives a zero/non-finite interpolated normal, whose normalize() is
+    // NaN — and a NaN normal yields NaN BSDF radiance that the persistent
+    // accumulator bakes into a permanent black speckle. (The out-of-range
+    // InstanceID/PrimitiveIndex from the M7 converter path is now rejected upstream
+    // by load_valid_instance before any fetch, so this only guards real geometry.)
     // Valid hits keep the exact normalize() result, so inline == pipeline is intact.
     float len2 = dot(n, n);
     return (len2 > 1e-12 && len2 < 1e12) ? normalize(n) : float3(0, 1, 0);
