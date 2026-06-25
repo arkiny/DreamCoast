@@ -94,7 +94,17 @@ Feature groups (setup line / loop line):
   `generate_brdf_lut` / `CubeSet` / `IblResources` became module-private (only the
   bundle calls them); the BRDF LUT is held as `_brdf_lut` (kept alive for its bindless
   slot, not read again).
-- **R6 — `deferred.rs` / `DeferredRenderer`** (the PBR backbone).
+- **R6 — `deferred.rs` / `DeferredRenderer`. DONE.** The PBR backbone: owns the
+  shadow / G-buffer / lighting / tonemap graphics pipelines, the compute post-process
+  pipeline, and the per-frame globals uniform buffer. The graph's transient targets
+  (G-buffer MRTs, shadow map, HDR) are created in `run()` and shared with the other
+  bundles (the path tracer / GDF replace the tonemap source; cull + particles draw
+  over the backbuffer), so each `record_*` takes the resource ids as params and adds
+  one pass (`&'a self`): `record_shadow` / `record_gbuffer` (a `GBufferTargets` id
+  bundle) / `record_lighting` / `record_compute_post` / `record_tonemap`. `run()`
+  keeps the per-frame `Globals` assembly + tonemap-source selection; `write_globals`
+  packs the slice. The `gbuffer_push` / `pbr_push` / `mat4_bytes` packers moved in as
+  module-private helpers.
 - **R7 — `App::new()` / `App::frame()`.** With features bundled, the residual setup
   + loop is small enough to wrap into an `App` struct; `run()` shrinks to window +
   `App::new` + `while { app.frame() }`.
