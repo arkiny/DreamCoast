@@ -20,17 +20,18 @@ use dreamcoast_platform::Window;
 use dreamcoast_render::{ComputePassInfo, GraphProfiler, PassInfo, RenderGraph, ResourcePool};
 use rhi::{
     BackendKind, BlasGeometry, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor,
-    CommandBuffer, ComputePipelineDesc, Cubemap, CubemapDesc, Device, Extent2D, Fence, Format,
-    GraphicsPipeline, GraphicsPipelineDesc, Instance, InstanceDesc, PresentMode, PrimitiveTopology,
-    Queue, RaytracingPipelineDesc, RtGeometry, StorageBufferDesc, Swapchain, SwapchainDesc,
-    Texture, TlasInstance, VertexLayout, VolumeDesc,
+    ComputePipelineDesc, CubemapDesc, Device, Extent2D, Format, GraphicsPipelineDesc, Instance,
+    InstanceDesc, PresentMode, PrimitiveTopology, RaytracingPipelineDesc, RtGeometry,
+    StorageBufferDesc, Swapchain, SwapchainDesc, Texture, TlasInstance, VertexLayout, VolumeDesc,
 };
 use tracing::info;
 
 mod app;
+mod ibl;
 mod mesh;
 mod push;
 use app::*;
+use ibl::*;
 use mesh::*;
 use push::*;
 
@@ -90,20 +91,20 @@ const DEBUG_VIEWS: [&str; 9] = [
 const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 
 /// One drawable in the sample scene: a mesh + world transform + PBR material.
-struct SceneObject {
-    vbuf: Buffer,
-    ibuf: Buffer,
-    index_count: u32,
+pub(crate) struct SceneObject {
+    pub(crate) vbuf: Buffer,
+    pub(crate) ibuf: Buffer,
+    pub(crate) index_count: u32,
     /// Vertex count (for the BLAS build's `max_vertex`, Phase 8).
-    vertex_count: u32,
-    transform: Mat4,
-    base_color: [f32; 4],
-    metallic: f32,
-    roughness: f32,
+    pub(crate) vertex_count: u32,
+    pub(crate) transform: Mat4,
+    pub(crate) base_color: [f32; 4],
+    pub(crate) metallic: f32,
+    pub(crate) roughness: f32,
     /// base color, metallic-roughness, normal, emissive bindless indices
     /// (`NO_TEXTURE` if absent).
-    tex: [u32; 4],
-    casts_shadow: bool,
+    pub(crate) tex: [u32; 4],
+    pub(crate) casts_shadow: bool,
 }
 
 /// Per-frame globals, mirrored by `Globals` in pbr.slang. All members are 16-byte
@@ -3092,194 +3093,6 @@ fn light_view_proj(sun_dir: [f32; 3], center: Vec3, radius: f32) -> Mat4 {
     let half = radius * 1.6;
     let proj = Mat4::orthographic_rh(-half, half, -half, half, 0.1, dist + radius * 2.0);
     proj * view
-}
-
-/// The pipelines + cubemaps used to (re)generate the IBL environment chain, plus
-/// the scene geometry captured into the env cube (camera-based reflections).
-/// One double-buffered environment: the captured cube plus its diffuse and
-/// specular convolutions. Two of these ping-pong each frame for multi-bounce.
-struct CubeSet {
-    env: Cubemap,
-    irradiance: Cubemap,
-    prefilter: Cubemap,
-}
-
-struct IblResources<'a> {
-    sky_pipeline: &'a GraphicsPipeline,
-    capture_pipeline: &'a GraphicsPipeline,
-    irradiance_pipeline: &'a GraphicsPipeline,
-    prefilter_pipeline: &'a GraphicsPipeline,
-    /// Ground plane (a shadow/reflection receiver) captured into env mip 0.
-    ground_vbuf: &'a Buffer,
-    ground_ibuf: &'a Buffer,
-    ground_count: u32,
-}
-
-/// Record the environment chain into an already-open command buffer (no submit):
-/// procedural sky → env cube (full mip chain), then convolve into the
-/// diffuse-irradiance cube and the per-roughness specular prefilter cube (each
-/// left shader-readable). Recorded each frame before the main graph, so the
-/// lighting pass samples a fresh environment (real-time capture). The BRDF LUT is
-/// sky-independent and generated once (see [`generate_brdf_lut`]).
-#[allow(clippy::too_many_arguments)]
-fn record_environment_capture(
-    cmd: &CommandBuffer,
-    ibl: &IblResources,
-    write: &CubeSet,
-    prev: Option<&CubeSet>,
-    brdf_index: i32,
-    scene: &[SceneObject],
-    capture_depth: &rhi::DepthBuffer,
-    camera_pos: Vec3,
-    sun_dir: [f32; 3],
-    sun_intensity: f32,
-    ambient: f32,
-    flip_y: u32,
-    vulkan: bool,
-) {
-    let env_index = write.env.bindless_index();
-    let env_mips = write.env.mip_levels();
-    let prefilter_max_lod = (PREFILTER_MIPS - 1) as f32;
-    // Previous frame's convolved cubes (multi-bounce IBL source); -1 = single
-    // bounce (capture surfaces with flat ambient only).
-    let prev_ibl = match prev {
-        Some(p) => [
-            p.irradiance.bindless_index() as i32,
-            p.prefilter.bindless_index() as i32,
-            brdf_index,
-        ],
-        None => [-1, -1, -1],
-    };
-
-    // 1. Procedural sky -> environment cube, every mip (the sky is procedural and
-    // position-independent, so each mip is just a lower-res render — no
-    // downsample/self-sample hazard; the prefilter samples this mip chain).
-    cmd.cube_to_color(&write.env);
-    for mip in 0..env_mips {
-        let size = (ENV_SIZE >> mip).max(1);
-        for face in 0..6u32 {
-            cmd.begin_rendering_cube_face(&write.env, face, mip, Some(ClearColor::BLACK));
-            cmd.set_viewport_scissor_extent(Extent2D::new(size, size));
-            cmd.bind_graphics_pipeline(ibl.sky_pipeline);
-            cmd.push_constants(&sky_push(sun_dir, sun_intensity, face, flip_y));
-            cmd.draw(3, 1);
-            cmd.end_rendering();
-        }
-    }
-
-    // 1b. Scene (ground + objects) into env mip 0 from the camera position, with
-    // a depth buffer for correct occlusion, so reflective surfaces reflect the
-    // live scene. Captured surfaces are shaded with direct sun + IBL from the
-    // previous frame's cubes (multi-bounce) — never the cube being written, so
-    // there is no recursion.
-    let face_vp = cube_face_view_proj(camera_pos, vulkan);
-    cmd.depth_to_render_target(capture_depth);
-    for face in 0..6u32 {
-        cmd.begin_rendering_cube_face_depth(&write.env, face, 0, None, capture_depth);
-        cmd.set_viewport_scissor_extent(Extent2D::new(ENV_SIZE, ENV_SIZE));
-        cmd.bind_graphics_pipeline(ibl.capture_pipeline);
-        // Ground (matte receiver; identity model).
-        cmd.push_constants(&capture_push(
-            face_vp[face as usize].to_cols_array(),
-            Mat4::IDENTITY.to_cols_array(),
-            [0.8, 0.8, 0.8, 1.0],
-            0.0,
-            0.9,
-            sun_dir,
-            sun_intensity,
-            ambient,
-            camera_pos,
-            prefilter_max_lod,
-            prev_ibl,
-        ));
-        cmd.bind_vertex_buffer(ibl.ground_vbuf, 32);
-        cmd.bind_index_buffer(ibl.ground_ibuf, true);
-        cmd.draw_indexed(ibl.ground_count, 0, 0);
-        // Scene objects (their real metallic/roughness so reflective surfaces
-        // appear reflective inside the reflection).
-        for obj in scene {
-            let mvp = (face_vp[face as usize] * obj.transform).to_cols_array();
-            cmd.push_constants(&capture_push(
-                mvp,
-                obj.transform.to_cols_array(),
-                obj.base_color,
-                obj.metallic,
-                obj.roughness,
-                sun_dir,
-                sun_intensity,
-                ambient,
-                camera_pos,
-                prefilter_max_lod,
-                prev_ibl,
-            ));
-            cmd.bind_vertex_buffer(&obj.vbuf, 32);
-            cmd.bind_index_buffer(&obj.ibuf, true);
-            cmd.draw_indexed(obj.index_count, 0, 0);
-        }
-        cmd.end_rendering();
-    }
-    cmd.cube_to_sampled(&write.env);
-
-    // 2. Env -> diffuse irradiance cube.
-    cmd.cube_to_color(&write.irradiance);
-    for face in 0..6u32 {
-        cmd.begin_rendering_cube_face(&write.irradiance, face, 0, Some(ClearColor::BLACK));
-        cmd.set_viewport_scissor_extent(Extent2D::new(IRRADIANCE_SIZE, IRRADIANCE_SIZE));
-        cmd.bind_graphics_pipeline(ibl.irradiance_pipeline);
-        cmd.push_constants(&cube_gen_push(face, flip_y, env_index, 0.0));
-        cmd.draw(3, 1);
-        cmd.end_rendering();
-    }
-    cmd.cube_to_sampled(&write.irradiance);
-
-    // 3. Env -> specular prefilter cube (one roughness per mip).
-    cmd.cube_to_color(&write.prefilter);
-    for mip in 0..PREFILTER_MIPS {
-        let roughness = if PREFILTER_MIPS > 1 {
-            mip as f32 / (PREFILTER_MIPS - 1) as f32
-        } else {
-            0.0
-        };
-        let size = (PREFILTER_SIZE >> mip).max(1);
-        for face in 0..6u32 {
-            cmd.begin_rendering_cube_face(&write.prefilter, face, mip, Some(ClearColor::BLACK));
-            cmd.set_viewport_scissor_extent(Extent2D::new(size, size));
-            cmd.bind_graphics_pipeline(ibl.prefilter_pipeline);
-            cmd.push_constants(&prefilter_push(
-                face, flip_y, env_index, roughness, env_mips,
-            ));
-            cmd.draw(3, 1);
-            cmd.end_rendering();
-        }
-    }
-    cmd.cube_to_sampled(&write.prefilter);
-}
-
-/// Integrate the environment-BRDF LUT (sky-independent; generate once).
-fn generate_brdf_lut(
-    queue: &Queue,
-    cmd: &CommandBuffer,
-    fence: &Fence,
-    brdf_pipeline: &GraphicsPipeline,
-    brdf_lut: &rhi::RenderTarget,
-    flip_y: u32,
-) -> anyhow::Result<()> {
-    cmd.begin()?;
-    cmd.rt_to_render_target(brdf_lut);
-    cmd.begin_rendering_target(brdf_lut, Some(ClearColor::BLACK), None);
-    cmd.set_viewport_scissor_extent(Extent2D::new(BRDF_SIZE, BRDF_SIZE));
-    cmd.bind_graphics_pipeline(brdf_pipeline);
-    let mut push = [0u8; 16];
-    push[0..4].copy_from_slice(&flip_y.to_le_bytes());
-    cmd.push_constants(&push);
-    cmd.draw(3, 1);
-    cmd.end_rendering();
-    cmd.rt_to_sampled(brdf_lut);
-    cmd.end()?;
-    queue.submit_oneshot(cmd, fence)?;
-    fence.wait()?;
-    fence.reset()?;
-    Ok(())
 }
 
 /// Whether `--clear-test` was passed: run the minimal clear-screen loop (M0 of
