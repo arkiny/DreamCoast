@@ -280,6 +280,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gdf_merge_cs",
     },
+    // Phase 11 Stage B (B4): software ray trace against the merged global distance field.
+    Job {
+        src: "gdf_trace.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_trace_cs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.
