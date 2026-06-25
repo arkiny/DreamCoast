@@ -105,9 +105,17 @@ Feature groups (setup line / loop line):
   keeps the per-frame `Globals` assembly + tonemap-source selection; `write_globals`
   packs the slice. The `gbuffer_push` / `pbr_push` / `mat4_bytes` packers moved in as
   module-private helpers.
-- **R7 — `App::new()` / `App::frame()`.** With features bundled, the residual setup
-  + loop is small enough to wrap into an `App` struct; `run()` shrinks to window +
-  `App::new` + `while { app.frame() }`.
+- **R7 — `App::new()` / `App::frame()`. DONE.** The residual setup + loop wrapped into
+  an `App` struct that owns the device / queue / swapchain / per-frame sync, every
+  feature bundle, the scene, and the UI + loop state (it also holds `_instance` +
+  `window` alive, a driver-level dependency). `App::new` does all setup; `App::frame`
+  runs one iteration and returns whether to continue; `App::run` is the `while`. `run()`
+  shrinks to backend/model/window/device bring-up + the `*_test` early-returns +
+  `App::new` + `app.run()`. `frame` stays a single `&mut self` method so the render
+  graph's `&self.field` borrows split disjointly from `&mut self.pools` at `execute`;
+  the ImGui block destructures `self` (with `..`) into per-field `&mut` bindings so the
+  closure's disjoint captures coexist with `ui`'s `&mut self.gui` borrow. The FIF index
+  field is `fif` (not `frame`) to avoid colliding with the method.
 
 ### Why this order / thread-split payoff
 
@@ -138,7 +146,10 @@ not structural. Each R-step is independently revertible.
 6. `smoketest.rs` — **DONE** (`--clear-test` / `--triangle-test` / `--mesh-test`
    standalone loops + flag predicates). Self-contained alt entry points; `run()`
    early-returns into them.
-7. `run()` decomposition — in progress (see plan below); R1 done.
+7. `run()` decomposition — **DONE** (R1–R7; see plan above). Every feature is a bundle
+   (`particle` / `cull` / `gdf` / `rt` / `ibl` / `deferred`) and `App` owns them all
+   (R7), so `run()` is just window + device bring-up + `App::new` + `app.run()`.
 
-main.rs: ~4.6k → ~3.0k lines after the leaf splits + smoketest + R1 (push/mesh/app/
-ibl/particle/smoketest ≈ 1.8k lines moved into focused modules).
+main.rs: ~4.6k → ~1.6k lines. The leaf splits + smoketest + the six render bundles +
+`App` moved ~3k lines into focused modules. Every step was behavior-preserving
+(pixel-identical VK & DX screenshots vs. the prior build) and VK≡DX held throughout.
