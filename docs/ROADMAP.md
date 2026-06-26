@@ -159,9 +159,10 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
   캡처 기반 IBL을 SW-RT로 대체** — 디퓨즈 IBL→GDF GI, 스페큘러 IBL→**SSR(온스크린)+GDF 반사(오프스크린)+
   스카이(miss) 하이브리드**(C5 SSR·C6 GDF 반사·C7 합성+IBL 대체). 캡처 env 큐브는 스카이 전용으로 격하.
   스크린-스페이스 프로브/래디언스 캐시 구조는 Stage C 세부에서 확정.
-  - **진행:** C1–C7 ✅ 양 백엔드 검증·푸시 (C1 씬 GDF, C2 AO, C3 GI, C4 디노이즈, C5 SSR, C6 GDF 반사,
-    C7 하이브리드 합성→라이팅 specular 대체). **반사 트랙 성공 지표 달성: 하이브리드-vs-PT 잔차
-    4.18→2.58/ch(−38%)**(`P11_SWRT_REFLECT`). NEXT: C8 GDF 컬러/서피스 캐시(상수 알베도→실제 표면색).
+  - **진행:** C1–C7 + C8a ✅ 양 백엔드 검증·푸시 (C1 씬 GDF, C2 AO, C3 GI, C4 디노이즈, C5 SSR, C6 GDF
+    반사, C7 하이브리드 합성→라이팅 specular 대체, C8a per-voxel 알베도→컬러 GI·반사). **반사 트랙 성공
+    지표 달성: 하이브리드-vs-PT 잔차 4.18→2.58/ch(−38%)**(`P11_SWRT_REFLECT`); C8a로 GDF 히트가 실제 표면색
+    재조명(`P11_GDF_COLOR`). NEXT: C8b 서피스 캐시 라디언스(멀티바운스·잔차 추가 감소).
 - **완료 기준**: 동적 씬에서 HW RT 없이 GDF 기반 GI/AO가 두 백엔드에서 동작, 패스트레이서(Phase 8)
   레퍼런스 대비 그럴듯하게 수렴, 검증 클린.
 
