@@ -1127,9 +1127,10 @@ impl App {
             || self.cache_viz
             || self.surface_cache
             || self.reflect_cache
+            || (self.swrt_reflect && self.reflect.has_reflect_temporal())
         {
-            // The surface cache accrues a bounce per frame + temporally accumulates, like the
-            // GI denoiser — warm it up before the static screenshot.
+            // The surface cache / stochastic GGX reflection accrue a sample per frame + temporally
+            // accumulate, like the GI denoiser — warm them up before the static screenshot.
             GI_DENOISE_WARMUP
         } else {
             SCREENSHOT_WARMUP
@@ -1664,6 +1665,10 @@ impl App {
         if self.swrt_reflect && self.ssr_stochastic && self.reflect.has_ssr_resolve() {
             self.reflect.prepare_ssr_accum(&self.device, hcw, hch)?;
         }
+        // C8j: (re)allocate the stochastic GDF-reflection temporal accumulation buffers (full-res).
+        if self.swrt_reflect && self.reflect.has_reflect_temporal() {
+            self.reflect.prepare_reflect_accum(&self.device, cw, ch)?;
+        }
 
         let extent = Extent2D::new(cw, ch);
         let mut graph = RenderGraph::new();
@@ -1976,6 +1981,7 @@ impl App {
                     scene_aabb_max,
                     g_depth,
                     g_normal,
+                    g_material,
                     extent,
                     inv_view_proj,
                     eye,
@@ -1984,18 +1990,34 @@ impl App {
                     cw,
                     ch,
                     self.flip_y,
+                    self.frame_no as u32,
                     scene_albedo,
                     reflect_cache_arg,
                 );
-                // C8g: roughness mip pyramid of the GDF reflection (energy-conserving prefilter).
-                let refl_mips = self
-                    .reflect
-                    .record_reflect_mips(&mut graph, gdf_refl, cw, ch);
+                // C8j: temporally resolve the stochastic GGX GDF reflection (UE-style; the rough
+                // lobe is sampled by real rays + denoised, so it's correctly blurred without an
+                // image-space prefilter that over-brightens rough metals).
+                let gdf_resolved = self.reflect.record_reflect_temporal(
+                    &mut graph,
+                    gdf_refl,
+                    g_depth,
+                    g_material,
+                    extent,
+                    cw,
+                    ch,
+                    inv_view_proj,
+                    self.prev_view_proj,
+                    eye,
+                    self.flip_y,
+                    self.scene_radius * 0.02,
+                    64.0,
+                    firefly_max,
+                    0.25, // tonemap-space range for stable HDR accumulation
+                );
                 Some(self.reflect.record_composite(
                     &mut graph,
                     ssr,
-                    gdf_refl,
-                    refl_mips,
+                    gdf_resolved,
                     g_material,
                     extent,
                     cw,
@@ -2309,6 +2331,7 @@ impl App {
                 scene_aabb_max,
                 g_depth,
                 g_normal,
+                g_material,
                 extent,
                 inv_view_proj,
                 eye,
@@ -2317,6 +2340,7 @@ impl App {
                 cw,
                 ch,
                 self.flip_y,
+                self.frame_no as u32,
                 scene_albedo,
                 reflect_cache_arg,
             )),
@@ -2381,6 +2405,7 @@ impl App {
                     scene_aabb_max,
                     g_depth,
                     g_normal,
+                    g_material,
                     extent,
                     inv_view_proj,
                     eye,
@@ -2389,17 +2414,16 @@ impl App {
                     cw,
                     ch,
                     self.flip_y,
+                    self.frame_no as u32,
                     scene_albedo,
                     reflect_cache_arg,
                 );
-                let refl_mips = self
-                    .reflect
-                    .record_reflect_mips(&mut graph, gdf_refl, cw, ch);
+                // Standalone viz: no temporal resolve buffers here, so feed the GDF reflection
+                // straight into the composite (the resolve runs only in the lighting-fed path).
                 let composite = self.reflect.record_composite(
                     &mut graph,
                     ssr,
                     gdf_refl,
-                    refl_mips,
                     g_material,
                     extent,
                     cw,
@@ -2619,6 +2643,10 @@ impl App {
         // Advance the stochastic-SSR temporal accumulation ping-pong (stochastic mode only).
         if self.swrt_reflect && self.ssr_stochastic && self.reflect.has_ssr_resolve() {
             self.reflect.advance_ssr_accum();
+        }
+        // C8j: advance the stochastic GDF-reflection temporal accumulation ping-pong.
+        if self.swrt_reflect && self.reflect.has_reflect_temporal() {
+            self.reflect.advance_reflect_accum();
         }
         // C8b2: advance the surface-cache radiance ping-pong (next frame reads this frame's).
         if scene_cache_lit_ext.is_some() {
