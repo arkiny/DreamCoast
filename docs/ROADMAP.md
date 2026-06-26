@@ -164,8 +164,12 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
     −38%), C8a per-voxel 알베도→컬러, **C8b Lumen 메시-카드 서피스 캐시(캡처→라이팅→멀티바운스→컨슈머
     룩업, `P11_SURFACE_CACHE` opt-in)**. **레거시 캡처-큐브 IBL → 기본값을 SW-RT 반사+GDF GI로 전환,
     `P11_LEGACY_IBL` 플래그로 격하**(씬 캡처 sky-only). 정직한 한계: 서피스 캐시는 이 씬 PT 잔차 미개선
-    (지배 잔차=금속 sharp specular → 러프니스-aware 반사 GGX가 다음 트랙). NEXT: C8c(러프니스 반사 모델)
-    또는 동적 오브젝트 GDF 갱신.
+    (지배 잔차=금속 sharp specular → 러프니스-aware 반사 GGX가 다음 트랙). **반사 폴리시 ✅ (`21197f1`):
+    SSR을 stochastic half-res(Frostbite ratio estimator, Stachowiak 2015)로 — 스크린-DDA 마치 + half-res
+    GGX 지터 트레이스 + 이웃 레이 `pdf_p/pdf_q` 재가중 resolve(러프니스 적응 글로시) → ~4배 빠름(0.092ms),
+    스페클 0.** VK≡DX 정책: stochastic 경로는 비트 동일 불가(~3.85/ch, DDA 마치 fp + lit-history 피드백)
+    → 상용(Frostbite/Lumen)처럼 "지각/통계 동등"으로 검증(결정성 래스터·해석적 GI는 픽셀 정확). NEXT: 컴포짓
+    러프니스 블렌드 정교화 · PT 잔차 재측정 · 동적 오브젝트 GDF.
 - **완료 기준**: 동적 씬에서 HW RT 없이 GDF 기반 GI/AO가 두 백엔드에서 동작, 패스트레이서(Phase 8)
   레퍼런스 대비 그럴듯하게 수렴, 검증 클린.
 
