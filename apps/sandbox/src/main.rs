@@ -37,6 +37,7 @@ mod ibl;
 mod mesh;
 mod particle;
 mod push;
+mod reflect;
 mod rt;
 mod smoketest;
 use app::*;
@@ -47,6 +48,7 @@ use ibl::*;
 use mesh::*;
 use particle::*;
 use push::*;
+use reflect::*;
 use rt::*;
 use smoketest::*;
 
@@ -288,6 +290,7 @@ struct App {
     // Feature bundles (see the per-module docs).
     deferred: DeferredRenderer,
     gdf: GdfSystem,
+    reflect: ReflectSystem,
     particles: ParticleSystem,
     cull: CullSystem,
     rt: RtSystem,
@@ -421,6 +424,8 @@ impl App {
         // trace, Stage B volumes / SDF bake / GDF merge / GDF trace, Stage C1 world
         // scene GDF). See `gdf.rs`. The scene GDF is registered after the scene is built.
         let mut gdf = GdfSystem::new(&device, backend, compute_supported)?;
+        // Stage C reflection track (C5 SSR; C6/C7 later). See `reflect.rs`.
+        let reflect = ReflectSystem::new(&device, backend, compute_supported)?;
 
         // GPU particle system (Phase 7): a persistent ping-pong buffer pair advanced
         // by a compute pass and drawn as instanced billboards (see `particle.rs`).
@@ -658,7 +663,7 @@ impl App {
                 .map(|v| v != "0")
                 .unwrap_or(true);
         // C5 screen-space reflections (viz toggle).
-        let gdf_ssr = gdf.has_ssr() && std::env::var_os("P11_SSR").is_some();
+        let gdf_ssr = reflect.has_ssr() && std::env::var_os("P11_SSR").is_some();
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -727,6 +732,7 @@ impl App {
             gui,
             deferred,
             gdf,
+            reflect,
             particles,
             cull,
             rt,
@@ -951,6 +957,7 @@ impl App {
             let App {
                 scene,
                 gdf,
+                reflect,
                 rt,
                 debug_view,
                 sun_dir,
@@ -1140,7 +1147,7 @@ impl App {
                                 }
                             }
                         }
-                        if gdf.has_ssr() {
+                        if reflect.has_ssr() {
                             ui.checkbox("Screen-space reflections (viz)", gdf_ssr);
                             if *gdf_ssr {
                                 ui.text_disabled("  - Stage C5: SSR buffer (C7 composites)");
@@ -1644,7 +1651,7 @@ impl App {
             && gdf_trace_out.is_none()
             && scene_gdf_out.is_none()
         {
-            Some(self.gdf.record_ssr(
+            Some(self.reflect.record_ssr(
                 &mut graph,
                 hdr,
                 g_depth,
