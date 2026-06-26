@@ -699,6 +699,7 @@ pub(crate) fn gdf_gi_push(
     sky_term: f32,
     hit_albedo: f32,
     cache: [u32; 5],
+    clamp_max: f32,
 ) -> [u8; 208] {
     let mut pc = [0u8; 208];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -738,6 +739,8 @@ pub(crate) fn gdf_gi_push(
     for (i, v) in cache.iter().enumerate() {
         pc[176 + i * 4..180 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
+    // Firefly clamp (pad_c0 slot after cache_tile): 1e30 = off.
+    pc[196..200].copy_from_slice(&clamp_max.to_le_bytes());
     pc
 }
 
@@ -967,6 +970,7 @@ pub(crate) fn reflect_composite_push(
     width: u32,
     height: u32,
     gdf_scale: f32,
+    clamp_max: f32,
 ) -> [u8; 32] {
     let mut pc = [0u8; 32];
     pc[0..4].copy_from_slice(&ssr_index.to_le_bytes());
@@ -975,6 +979,7 @@ pub(crate) fn reflect_composite_push(
     pc[12..16].copy_from_slice(&width.to_le_bytes());
     pc[16..20].copy_from_slice(&height.to_le_bytes());
     pc[20..24].copy_from_slice(&gdf_scale.to_le_bytes());
+    pc[24..28].copy_from_slice(&clamp_max.to_le_bytes());
     pc
 }
 
@@ -987,6 +992,7 @@ pub(crate) fn lit_history_push(
     width: u32,
     height: u32,
     inv_exposure: f32,
+    clamp_max: f32,
 ) -> [u8; 32] {
     let mut pc = [0u8; 32];
     pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
@@ -994,6 +1000,7 @@ pub(crate) fn lit_history_push(
     pc[8..12].copy_from_slice(&width.to_le_bytes());
     pc[12..16].copy_from_slice(&height.to_le_bytes());
     pc[16..20].copy_from_slice(&inv_exposure.to_le_bytes());
+    pc[20..24].copy_from_slice(&clamp_max.to_le_bytes());
     pc
 }
 

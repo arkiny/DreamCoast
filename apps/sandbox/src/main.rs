@@ -385,6 +385,9 @@ struct App {
     /// C8b3: GDF GI / reflection consumers sample the lit surface cache (multibounce radiance)
     /// instead of per-ray re-lighting. Drives the per-frame cache lighting too.
     surface_cache: bool,
+    /// Firefly clamp: bound the per-sample radiance in the reflection source / composite / GI
+    /// gather so a bright specular pixel can't become a speckle. Off => unbounded (pre-clamp).
+    firefly_clamp: bool,
     /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
     scene_gdf_baked: bool,
     /// C8a bake-once latch for the per-voxel albedo volumes (GI + reflection consumers share).
@@ -846,6 +849,10 @@ impl App {
         let surface_cache = gdf.has_surface_cache()
             && gdf.has_cache_lighting()
             && std::env::var_os("P11_SURFACE_CACHE").is_some();
+        // Firefly clamp on by default (P11_FIREFLY_CLAMP=0 to disable / compare).
+        let firefly_clamp = std::env::var("P11_FIREFLY_CLAMP")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -982,6 +989,7 @@ impl App {
             gdf_color,
             cache_viz,
             surface_cache,
+            firefly_clamp,
             scene_gdf_baked: false,
             scene_albedo_baked: false,
             scene_cache_captured: false,
@@ -1200,6 +1208,7 @@ impl App {
                 gdf_color,
                 cache_viz,
                 surface_cache,
+                firefly_clamp,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1404,6 +1413,7 @@ impl App {
                                 }
                             }
                         }
+                        ui.checkbox("Firefly clamp (reflections/GI)", firefly_clamp);
                     }
 
                     if ui.collapsing_header("Profiling & debug (Phase 9)", open) {
@@ -1534,6 +1544,9 @@ impl App {
             prev_view_proj: self.prev_view_proj,
         };
         let globals_offset = fif as u64 * GLOBALS_SLICE;
+        // Firefly clamp ceiling (raw radiance, max component). ~8 keeps diffuse + moderate
+        // gloss but caps blown-out specular spikes; 1e30 = effectively off (byte-identical).
+        let firefly_max = if self.firefly_clamp { 8.0f32 } else { 1e30 };
         self.deferred
             .write_globals(globals_offset, globals_bytes(&globals))?;
 
@@ -1766,6 +1779,7 @@ impl App {
                     self.frame_no as u32,
                     scene_albedo,
                     cache_arg,
+                    firefly_max,
                 );
                 let out = if gi_denoise_active {
                     self.gi.record_denoise(
@@ -1838,10 +1852,16 @@ impl App {
                     scene_albedo,
                     cache_arg,
                 );
-                Some(
-                    self.reflect
-                        .record_composite(&mut graph, ssr, gdf_refl, extent, cw, ch, 1.0),
-                )
+                Some(self.reflect.record_composite(
+                    &mut graph,
+                    ssr,
+                    gdf_refl,
+                    extent,
+                    cw,
+                    ch,
+                    1.0,
+                    firefly_max,
+                ))
             }
             _ => None,
         };
@@ -1859,8 +1879,14 @@ impl App {
         // C7c: capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
         // Reads the lit `hdr` (not the post-blur), so it sequences after the lighting pass.
         if swrt_reflect_out.is_some() {
-            self.reflect
-                .record_lit_history(&mut graph, hdr, cw, ch, 1.0 / self.exposure.max(1e-4));
+            self.reflect.record_lit_history(
+                &mut graph,
+                hdr,
+                cw,
+                ch,
+                1.0 / self.exposure.max(1e-4),
+                firefly_max,
+            );
         }
         if let Some(hdr_post) = hdr_post {
             self.deferred
@@ -2205,9 +2231,16 @@ impl App {
                     scene_albedo,
                     cache_arg,
                 );
-                let composite = self
-                    .reflect
-                    .record_composite(&mut graph, ssr, gdf_refl, extent, cw, ch, 1.0);
+                let composite = self.reflect.record_composite(
+                    &mut graph,
+                    ssr,
+                    gdf_refl,
+                    extent,
+                    cw,
+                    ch,
+                    1.0,
+                    firefly_max,
+                );
                 // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
                 self.reflect.record_lit_history(
                     &mut graph,
@@ -2215,6 +2248,7 @@ impl App {
                     cw,
                     ch,
                     1.0 / self.exposure.max(1e-4),
+                    firefly_max,
                 );
                 Some(composite)
             }
