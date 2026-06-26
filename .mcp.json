@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "renderdoc": {
+      "command": "pwsh",
+      "args": [
+        "-NoProfile",
+        "-File",
+        "tools/renderdoc-mcp-launch.ps1"
+      ]
+    }
+  }
+}
