@@ -181,6 +181,7 @@ impl ReflectSystem {
         max_dist: f32,
         thickness: f32,
         use_history: bool,
+        neighborhood_clamp: bool,
     ) -> ResourceId {
         let pipe = self.ssr_pipeline.as_ref().expect("ssr pipeline");
         let out = graph.create_storage_image("ssr_out", HDR_FORMAT, extent);
@@ -196,7 +197,11 @@ impl ReflectSystem {
         } else {
             u32::MAX
         };
-        let flags = if use_history { flip_y | 2 } else { flip_y };
+        // bit1 = history mode; bit2 = neighborhood-clamp the reprojected history (firefly).
+        let mut flags = if use_history { flip_y | 2 } else { flip_y };
+        if use_history && neighborhood_clamp {
+            flags |= 4;
+        }
         // History mode reads the buffer (not the HDR), so the HDR is only a graph read in
         // the current-frame viz path.
         let reads = if use_history {

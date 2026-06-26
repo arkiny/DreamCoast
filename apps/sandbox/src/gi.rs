@@ -356,6 +356,7 @@ impl GiSystem {
         cw: u32,
         ch: u32,
         flip_y: u32,
+        neighborhood_clamp: bool,
     ) -> ResourceId {
         let tempp = self.temporal_pipeline.as_ref().expect("temporal pipeline");
         let atrousp = self.atrous_pipeline.as_ref().expect("atrous pipeline");
@@ -409,6 +410,7 @@ impl GiSystem {
                     reject_dist,
                     max_hist,
                     1.0 / max_hist,
+                    if neighborhood_clamp { 1.0 } else { 0.0 },
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
