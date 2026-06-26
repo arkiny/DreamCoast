@@ -21,7 +21,7 @@ use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_core::init_logging;
 use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
-use dreamcoast_render::{GraphProfiler, PassInfo, RenderGraph, ResourcePool};
+use dreamcoast_render::{GraphProfiler, PassInfo, RenderGraph, ResourceId, ResourcePool};
 use rhi::{
     BackendKind, Buffer, BufferDesc, BufferUsage, CommandBuffer, ComputeQueue, Device, Extent2D,
     Fence, Format, Instance, InstanceDesc, PresentMode, QueryHeap, Queue, Semaphore, Swapchain,
@@ -1686,6 +1686,15 @@ impl App {
             }
             _ => None,
         };
+        // C8b3: the (indices, lit-handle) the GI / reflection consumers use to read the cached
+        // multibounce radiance at a hit (instead of a per-ray re-light). `None` => per-ray.
+        let cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
+            Some(ext) if self.surface_cache => self
+                .gdf
+                .surface_cache_read()
+                .map(|(c, p, r, n, t)| ([c, p, r, n, t], ext)),
+            _ => None,
+        };
         // Stage C2: GDF ambient occlusion, multiplied into the lighting ambient term.
         let gdf_ao_out = match (self.gdf_ao, scene_gdf_vol, scene_gdf_ext) {
             (true, Some(vol), Some(ext)) => Some(self.gi.record_ao(
@@ -1725,6 +1734,7 @@ impl App {
                     self.gi_spp,
                     self.frame_no as u32,
                     scene_albedo,
+                    cache_arg,
                 );
                 let out = if gi_denoise_active {
                     self.gi.record_denoise(
@@ -1795,6 +1805,7 @@ impl App {
                     ch,
                     self.flip_y,
                     scene_albedo,
+                    cache_arg,
                 );
                 Some(
                     self.reflect
@@ -2098,6 +2109,7 @@ impl App {
                 ch,
                 self.flip_y,
                 scene_albedo,
+                cache_arg,
             )),
             _ => None,
         };
@@ -2160,6 +2172,7 @@ impl App {
                     ch,
                     self.flip_y,
                     scene_albedo,
+                    cache_arg,
                 );
                 let composite = self
                     .reflect

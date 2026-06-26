@@ -20,6 +20,7 @@
 // the lighting pass applies the camera exposure to the whole ambient + direct sum.
 
 #include "bindless.slang"
+#include "surface_cache.slang"
 
 static const float PI = 3.14159265359;
 
@@ -42,6 +43,11 @@ struct GiPush
     float4 aabb_min;        // xyz GDF world min, w = ground plane Y
     float4 aabb_max;        // xyz GDF world max, w = sample distance clamp
     float4 params;          // x = ray max distance, y = surface bias, z = sky term, w = constant hit albedo (fallback)
+    uint4 cache;            // C8b3: cards, cache_pos, cache_rad, num_cards (cards=0xFFFFFFFF = off)
+    uint cache_tile;        // surface-cache atlas tile edge
+    uint pad_c0;
+    uint pad_c1;
+    uint pad_c2;
 };
 
 [[vk::push_constant]]
@@ -166,6 +172,12 @@ float3 trace_bounce(float3 origin, float3 dir)
         if (d < HIT_EPS)
         {
             float3 hn = scene_normal(p);
+            // C8b3: when the surface cache is bound, the incoming radiance along this ray is
+            // the hit surface's cached (multibounce) radiance — a direct lookup, no per-ray
+            // re-light / shadow ray. Else (cache off) the C8a per-ray colored re-light.
+            if (pc.cache.x != 0xFFFFFFFFu)
+                return sample_surface_cache(p, hn, pc.cache.x, pc.cache.y, pc.cache.z,
+                                            pc.cache.w, pc.cache_tile);
             float3 sun_dir = normalize(pc.sun.xyz);
             float ndl = max(dot(hn, sun_dir), 0.0);
             float sh = ndl > 0.0 ? gi_shadow(p + hn * 0.004, sun_dir) : 1.0;

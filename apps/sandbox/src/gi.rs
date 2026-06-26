@@ -219,6 +219,7 @@ impl GiSystem {
         spp: u32,
         frame: u32,
         albedo: Option<(&'a [Volume; 3], ResourceId)>,
+        cache: Option<([u32; 5], ResourceId)>,
     ) -> ResourceId {
         let gip = self.gi_pipeline.as_ref().expect("gdf gi pipeline");
         let out = graph.create_storage_image("gdf_gi_out", HDR_FORMAT, extent);
@@ -226,11 +227,16 @@ impl GiSystem {
         let diag = Self::diag(aabb_min, aabb_max);
         let bias = diag * 0.004;
         // C8a: read the per-voxel albedo volumes (colored bounce) when present; else fall
-        // back to the constant `hit_albedo` in the shader (sentinel indices).
+        // back to the constant `hit_albedo` in the shader (sentinel indices). C8b3: when the
+        // surface cache is bound, a hit reads its cached multibounce radiance instead.
         let mut reads = vec![depth, normal, scene_gdf_ext];
         if let Some((_, ext)) = albedo {
             reads.push(ext);
         }
+        if let Some((_, ext)) = cache {
+            reads.push(ext);
+        }
+        let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "gdf_gi",
@@ -278,6 +284,7 @@ impl GiSystem {
                     bias,
                     0.25, // sky fill radiance at the bounce hit
                     0.7,  // constant hit-albedo fallback (sentinel albedo => achromatic, pre-C8a)
+                    cache_idx,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

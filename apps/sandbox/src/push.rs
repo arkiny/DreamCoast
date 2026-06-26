@@ -671,7 +671,7 @@ pub(crate) fn gdf_ao_push(
     pc
 }
 
-/// Pack the Phase 11 Stage C3 GDF-GI push block (176 bytes): inv_view_proj (64) +
+/// Pack the Phase 11 Stage C3 GDF-GI push block (208 bytes): inv_view_proj (64) +
 /// sun dir+intensity (16) + (depth, normal, gdf_sampled, out) (16) + (width, height,
 /// flip_y, spp) (16) + (frame, pad×3) (16) + aabb_min.xyz/ground_y (16) +
 /// aabb_max.xyz/dist_clamp (16) + (ray_max_dist, bias, sky_term, hit_albedo) (16).
@@ -698,8 +698,9 @@ pub(crate) fn gdf_gi_push(
     bias: f32,
     sky_term: f32,
     hit_albedo: f32,
-) -> [u8; 176] {
-    let mut pc = [0u8; 176];
+    cache: [u32; 5],
+) -> [u8; 208] {
+    let mut pc = [0u8; 208];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -733,6 +734,10 @@ pub(crate) fn gdf_gi_push(
     pc[164..168].copy_from_slice(&bias.to_le_bytes());
     pc[168..172].copy_from_slice(&sky_term.to_le_bytes());
     pc[172..176].copy_from_slice(&hit_albedo.to_le_bytes());
+    // C8b3 surface-cache lookup indices (uint4 cache + tile): cards = 0xFFFFFFFF -> off.
+    for (i, v) in cache.iter().enumerate() {
+        pc[176 + i * 4..180 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
     pc
 }
 
@@ -882,7 +887,7 @@ pub(crate) fn ssr_push(
     pc
 }
 
-/// Pack the Phase 11 Stage C6 GDF-reflection push block (192 bytes). Layout: inv_view_proj
+/// Pack the Phase 11 Stage C6 GDF-reflection push block (224 bytes). Layout: inv_view_proj
 /// 64, cam_pos 16, sun dir+intensity 16, then four uints depth/normal/gdf_sampled/out 16,
 /// then width/height/flip_y/pad 16, then aabb_min.xyz+ground_y 16, aabb_max.xyz+clamp 16,
 /// ray_max_dist/hit_albedo/sky_fill/bias 16, and the C8a albedo R/G/B volume indices +pad 16.
@@ -908,8 +913,9 @@ pub(crate) fn gdf_reflect_push(
     sky_fill: f32,
     bias: f32,
     albedo_rgb: [u32; 3],
-) -> [u8; 192] {
-    let mut pc = [0u8; 192];
+    cache: [u32; 5],
+) -> [u8; 224] {
+    let mut pc = [0u8; 224];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -944,6 +950,10 @@ pub(crate) fn gdf_reflect_push(
     pc[176..180].copy_from_slice(&albedo_rgb[0].to_le_bytes());
     pc[180..184].copy_from_slice(&albedo_rgb[1].to_le_bytes());
     pc[184..188].copy_from_slice(&albedo_rgb[2].to_le_bytes());
+    // C8b3 surface-cache lookup indices (uint4 cache + tile): cards = 0xFFFFFFFF -> off.
+    for (i, v) in cache.iter().enumerate() {
+        pc[192 + i * 4..196 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
     pc
 }
 

@@ -72,7 +72,7 @@ impl ReflectSystem {
             dreamcoast_shader::gdf_reflect_cs_dxil,
             dreamcoast_shader::gdf_reflect_cs_metallib,
             "gdf_reflect",
-            192,
+            224,
             false,
         )?;
         let composite_pipeline = compute(
@@ -316,6 +316,7 @@ impl ReflectSystem {
         ch: u32,
         flip_y: u32,
         albedo: Option<(&'a [Volume; 3], ResourceId)>,
+        cache: Option<([u32; 5], ResourceId)>,
     ) -> ResourceId {
         let pipe = self
             .reflect_pipeline
@@ -338,6 +339,10 @@ impl ReflectSystem {
         if let Some((_, ext)) = albedo {
             reads.push(ext);
         }
+        if let Some((_, ext)) = cache {
+            reads.push(ext);
+        }
+        let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "gdf_reflect",
@@ -384,6 +389,7 @@ impl ReflectSystem {
                     0.25, // sky fill at the reflected hit
                     bias,
                     albedo_rgb,
+                    cache_idx,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
