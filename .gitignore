@@ -45,3 +45,11 @@ Temporary Items
 # DirectX Shader Compiler build (Track 2 RT pipeline toolchain; not committed)
 /tools/dxc-src/
 /tools/dxc/
+
+# RenderDoc MCP graphics-debugging server (set up by tools/setup-renderdoc-mcp.ps1):
+# cloned upstream repo, the Python 3.12 venv, and the rebuilt renderdoc.pyd module.
+# All local-only — runs as a SEPARATE process, never linked into the engine.
+/tools/renderdoc-mcp/
+# RenderDoc source checkout used by tools/build-renderdoc-py312.ps1 to produce a
+# Python-3.12-compatible renderdoc.pyd (the official Windows module is 3.6-only).
+/tools/renderdoc-src/
