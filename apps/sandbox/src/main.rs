@@ -92,7 +92,7 @@ const BRDF_SIZE: u32 = 256;
 const NO_TEXTURE: u32 = u32::MAX;
 const MODEL_PATH: &str = "assets/model.glb";
 
-const DEBUG_VIEWS: [&str; 10] = [
+const DEBUG_VIEWS: [&str; 11] = [
     "Lit",
     "Albedo",
     "Normal",
@@ -103,6 +103,7 @@ const DEBUG_VIEWS: [&str; 10] = [
     "Direct",
     "IBL",
     "GDF AO",
+    "GDF GI",
 ];
 const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 
@@ -352,7 +353,11 @@ struct App {
     /// C2: GDF AO multiplied into the deferred ambient term (the first GDF feature in
     /// the real render path; C1's `scene_gdf` is a standalone trace viz).
     gdf_ao: bool,
-    /// Shared bake-once latch for the world scene GDF (both C1 trace + C2 AO read it).
+    /// C3: GDF 1-bounce diffuse GI added to the deferred ambient term.
+    gdf_gi: bool,
+    /// C3 hemisphere rays per pixel (no temporal accumulation yet — that's C4).
+    gi_spp: u32,
+    /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
     scene_gdf_baked: bool,
     path_trace_pipeline: bool,
     realtime_env: bool,
@@ -631,6 +636,13 @@ impl App {
         let scene_gdf = gdf.has_scene_sdf() && std::env::var_os("P11_SCENE_GDF").is_some();
         // Stage C2: GDF AO multiplied into the deferred ambient term.
         let gdf_ao = gdf.has_gdf_ao() && std::env::var_os("P11_GDF_AO").is_some();
+        // Stage C3: GDF 1-bounce diffuse GI added to the deferred ambient term.
+        let gdf_gi = gdf.has_gdf_gi() && std::env::var_os("P11_GDF_GI").is_some();
+        let gi_spp = std::env::var("P11_GI_SPP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(8)
+            .clamp(1, 256);
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -754,6 +766,8 @@ impl App {
             gdf_trace,
             scene_gdf,
             gdf_ao,
+            gdf_gi,
+            gi_spp,
             scene_gdf_baked: false,
             path_trace_pipeline,
             realtime_env: true,
@@ -949,6 +963,7 @@ impl App {
                 gdf_trace,
                 scene_gdf,
                 gdf_ao,
+                gdf_gi,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1091,6 +1106,12 @@ impl App {
                             ui.checkbox("GDF ambient occlusion (deferred)", gdf_ao);
                             if *gdf_ao {
                                 ui.text_disabled("  - Stage C2: GDF AO into ambient");
+                            }
+                        }
+                        if gdf.has_gdf_gi() {
+                            ui.checkbox("GDF diffuse GI (deferred)", gdf_gi);
+                            if *gdf_gi {
+                                ui.text_disabled("  - Stage C3: 1-bounce, noisy (C4 denoise)");
                             }
                         }
                     }
@@ -1300,12 +1321,38 @@ impl App {
         } else {
             None
         };
+        // Stage C3: 1-bounce diffuse GI. A compute pass casts cosine-hemisphere rays
+        // from each surface into the scene GDF, shades the hits, and writes the indirect
+        // irradiance the lighting pass adds to the ambient term. Recorded before lighting
+        // (gbuffer -> GI -> lighting); shares the bake-once latch with C1/C2.
+        let gdf_gi_out = if self.gdf_gi && self.gdf.has_gdf_gi() {
+            let out = self.gdf.record_gdf_gi(
+                &mut graph,
+                g_depth,
+                g_normal,
+                extent,
+                inv_view_proj,
+                self.sun_dir,
+                self.sun_intensity,
+                cw,
+                ch,
+                self.flip_y,
+                self.gi_spp,
+                self.frame_no as u32,
+                !self.scene_gdf_baked,
+            );
+            self.scene_gdf_baked = true;
+            Some(out)
+        } else {
+            None
+        };
         self.deferred.record_lighting(
             &mut graph,
             hdr,
             gbuf,
             shadow_map,
             gdf_ao_out,
+            gdf_gi_out,
             globals_offset,
             self.flip_y,
         );

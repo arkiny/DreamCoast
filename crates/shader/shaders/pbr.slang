@@ -36,6 +36,7 @@ struct PushConstants
     uint flip_y; // 0 = D3D12 (Y up), 1 = Vulkan (Y down)
     uint shadow_index; // bindless index of the directional shadow map
     uint gdf_ao_index; // Stage-C2 GDF AO image (0xFFFFFFFF = absent)
+    uint gdf_gi_index; // Stage-C3 GDF indirect-irradiance image (0xFFFFFFFF = absent)
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -282,10 +283,23 @@ float4 fsMain(VSOutput input) : SV_Target
         gdf_ao = g.textures[pc.gdf_ao_index].Sample(g.samp, input.uv).r;
 
     float3 ambient = ambient_ibl(n, v, world_pos, albedo, metallic, roughness, ao, f0) * gdf_ao;
+
+    // Stage C3: 1-bounce diffuse GI marched against the scene GDF in a prior compute
+    // pass. The GI image holds the mean incoming radiance (indirect irradiance) from
+    // scene geometry; weight it by the diffuse albedo (× 1-metallic) and add it to the
+    // ambient — the scene-bounce term IBL·AO can't capture. Absent -> 0.
+    float3 gi = float3(0.0);
+    if (pc.gdf_gi_index != NO_TEXTURE)
+    {
+        float3 e = g.textures[pc.gdf_gi_index].Sample(g.samp, input.uv).rgb;
+        gi = (1.0 - metallic) * albedo * e;
+    }
+    ambient += gi;
+
     float3 color = (ambient + lo) * globals.ambient.a; // a = exposure
 
     // Debug views (counts.y): 1 albedo, 2 normal, 3 metallic, 4 roughness,
-    // 5 world pos, 6 AO, 7 direct light, 8 IBL ambient, 9 GDF AO. 0 = lit.
+    // 5 world pos, 6 AO, 7 direct light, 8 IBL ambient, 9 GDF AO, 10 GDF GI. 0 = lit.
     int dbg = globals.counts.y;
     if (dbg == 1) color = albedo;
     else if (dbg == 2) color = n * 0.5 + 0.5;
@@ -296,6 +310,7 @@ float4 fsMain(VSOutput input) : SV_Target
     else if (dbg == 7) color = lo * globals.ambient.a;      // direct lighting only
     else if (dbg == 8) color = ambient * globals.ambient.a; // IBL ambient only
     else if (dbg == 9) color = float3(gdf_ao);              // GDF AO factor
+    else if (dbg == 10) color = gi * globals.ambient.a;     // GDF indirect diffuse
 
     return float4(color, 1.0);
 }

@@ -131,7 +131,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 28, // 4 G-buffer indices + flip_y + shadow + gdf_ao
+            push_constant_size: 32, // 4 G-buffer indices + flip_y + shadow + gdf_ao + gdf_gi
             bindless: true,
             uniform_buffer: true,
             depth_test: false,
@@ -322,8 +322,9 @@ impl DeferredRenderer {
 
     /// Deferred lighting: full-screen pass reading the G-buffer + shadow map + globals
     /// (Cook-Torrance BRDF + IBL) into the HDR target. `gdf_ao` is the Stage-C2 GDF
-    /// ambient-occlusion image (multiplied into the ambient term); pass `None` to leave
-    /// the ambient unoccluded (= pre-C2 behavior).
+    /// ambient-occlusion image (multiplied into the ambient term) and `gdf_gi` the
+    /// Stage-C3 indirect-irradiance image (added to the ambient); pass `None` for either
+    /// to leave that term off (= the pre-C2/C3 behavior).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_lighting<'a>(
         &'a self,
@@ -332,6 +333,7 @@ impl DeferredRenderer {
         gbuf: GBufferTargets,
         shadow_map: ResourceId,
         gdf_ao: Option<ResourceId>,
+        gdf_gi: Option<ResourceId>,
         globals_offset: u64,
         flip_y: u32,
     ) {
@@ -344,6 +346,9 @@ impl DeferredRenderer {
         ];
         if let Some(ao) = gdf_ao {
             reads.push(ao);
+        }
+        if let Some(gi) = gdf_gi {
+            reads.push(gi);
         }
         graph.add_pass(
             PassInfo {
@@ -361,10 +366,11 @@ impl DeferredRenderer {
                 ];
                 let shadow_index = ctx.sampled_index(shadow_map);
                 let ao_index = gdf_ao.map(|ao| ctx.sampled_index(ao)).unwrap_or(u32::MAX);
+                let gi_index = gdf_gi.map(|gi| ctx.sampled_index(gi)).unwrap_or(u32::MAX);
                 let cmd = ctx.cmd();
                 cmd.set_globals(&self.globals_buffer, globals_offset);
                 cmd.bind_graphics_pipeline(&self.pbr_pipeline);
-                cmd.push_constants(&pbr_push(indices, flip_y, shadow_index, ao_index));
+                cmd.push_constants(&pbr_push(indices, flip_y, shadow_index, ao_index, gi_index));
                 cmd.draw(3, 1);
                 Ok(())
             },
@@ -458,15 +464,23 @@ fn gbuffer_push(
 }
 
 /// Pack the lighting push block: 4 G-buffer indices + flip_y + shadow_index +
-/// gdf_ao_index (28 bytes). `gdf_ao_index` is `u32::MAX` when the C2 AO image is absent.
-fn pbr_push(indices: [u32; 4], flip_y: u32, shadow_index: u32, gdf_ao_index: u32) -> [u8; 28] {
-    let mut pc = [0u8; 28];
+/// gdf_ao_index + gdf_gi_index (32 bytes). The two GDF indices are `u32::MAX` when the
+/// C2 AO / C3 GI images are absent.
+fn pbr_push(
+    indices: [u32; 4],
+    flip_y: u32,
+    shadow_index: u32,
+    gdf_ao_index: u32,
+    gdf_gi_index: u32,
+) -> [u8; 32] {
+    let mut pc = [0u8; 32];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
     pc[16..20].copy_from_slice(&flip_y.to_le_bytes());
     pc[20..24].copy_from_slice(&shadow_index.to_le_bytes());
     pc[24..28].copy_from_slice(&gdf_ao_index.to_le_bytes());
+    pc[28..32].copy_from_slice(&gdf_gi_index.to_le_bytes());
     pc
 }
 
