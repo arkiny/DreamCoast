@@ -20,10 +20,7 @@ use rhi::{
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::mesh::{index_bytes, vertex_bytes};
-use crate::push::{
-    gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_merge_push, gdf_temporal_push, gdf_trace_push,
-    sdf_bake_push, sdf_trace_push, volume_push,
-};
+use crate::push::{gdf_merge_push, gdf_trace_push, sdf_bake_push, sdf_trace_push, volume_push};
 
 /// Volume edge length in voxels (cube). The bake/merge/view all share it.
 const VOLUME_DIM: u32 = 64;
@@ -38,10 +35,6 @@ pub(crate) struct GdfSystem {
     bake_pipeline: Option<ComputePipeline>,  // B2 per-mesh SDF bake
     merge_pipeline: Option<ComputePipeline>, // B3 instance merge
     trace_pipeline: Option<ComputePipeline>, // B4 GDF sphere-march
-    ao_pipeline: Option<ComputePipeline>,    // C2 GDF ambient occlusion
-    gi_pipeline: Option<ComputePipeline>,    // C3 GDF 1-bounce diffuse GI
-    temporal_pipeline: Option<ComputePipeline>, // C4 temporal reprojection
-    atrous_pipeline: Option<ComputePipeline>, // C4 spatial à-trous
     sdf_pipeline: Option<ComputePipeline>,   // Stage-A analytic sphere-march
     bake_vtx: Option<StorageBuffer>,
     bake_idx: Option<StorageBuffer>,
@@ -59,16 +52,6 @@ pub(crate) struct GdfSystem {
     /// World-space AABB the `scene_gdf` voxel grid maps to.
     scene_aabb_min: [f32; 3],
     scene_aabb_max: [f32; 3],
-    /// C4 GI denoiser history: ping-pong float4/pixel storage buffers — `gi_hist`
-    /// (rgb = accumulated irradiance, a = history length) + `gi_pos` (xyz = the world
-    /// point the sample belongs to, w = valid), (re)allocated to the render extent.
-    gi_hist: [Option<StorageBuffer>; 2],
-    gi_pos: [Option<StorageBuffer>; 2],
-    gi_denoise_extent: (u32, u32),
-    /// Frames since the last denoiser reset (0 = reset this frame, ignore history).
-    gi_denoise_frame: u32,
-    /// Lighting/quality key; a change (sun, spp, …) resets the accumulation.
-    gi_denoise_key: Option<u64>,
 }
 
 /// Scene-GDF volume edge length (cube). Coarser than `VOLUME_DIM`: the fused
@@ -162,42 +145,6 @@ impl GdfSystem {
             dreamcoast_shader::gdf_trace_cs_metallib,
             "gdf_trace",
             160,
-            [8, 8, 1],
-        )?;
-        let ao_pipeline = compute(
-            "csMain",
-            dreamcoast_shader::gdf_ao_cs_spirv,
-            dreamcoast_shader::gdf_ao_cs_dxil,
-            dreamcoast_shader::gdf_ao_cs_metallib,
-            "gdf_ao",
-            144,
-            [8, 8, 1],
-        )?;
-        let gi_pipeline = compute(
-            "csMain",
-            dreamcoast_shader::gdf_gi_cs_spirv,
-            dreamcoast_shader::gdf_gi_cs_dxil,
-            dreamcoast_shader::gdf_gi_cs_metallib,
-            "gdf_gi",
-            176,
-            [8, 8, 1],
-        )?;
-        let temporal_pipeline = compute(
-            "csMain",
-            dreamcoast_shader::gdf_temporal_cs_spirv,
-            dreamcoast_shader::gdf_temporal_cs_dxil,
-            dreamcoast_shader::gdf_temporal_cs_metallib,
-            "gdf_temporal",
-            192,
-            [8, 8, 1],
-        )?;
-        let atrous_pipeline = compute(
-            "csMain",
-            dreamcoast_shader::gdf_atrous_cs_spirv,
-            dreamcoast_shader::gdf_atrous_cs_dxil,
-            dreamcoast_shader::gdf_atrous_cs_metallib,
-            "gdf_atrous",
-            112,
             [8, 8, 1],
         )?;
         let sdf_pipeline = compute(
@@ -294,10 +241,6 @@ impl GdfSystem {
             bake_pipeline,
             merge_pipeline,
             trace_pipeline,
-            ao_pipeline,
-            gi_pipeline,
-            temporal_pipeline,
-            atrous_pipeline,
             sdf_pipeline,
             bake_vtx,
             bake_idx,
@@ -309,11 +252,6 @@ impl GdfSystem {
             scene_tri_count: 0,
             scene_aabb_min: [0.0; 3],
             scene_aabb_max: [0.0; 3],
-            gi_hist: [None, None],
-            gi_pos: [None, None],
-            gi_denoise_extent: (0, 0),
-            gi_denoise_frame: 0,
-            gi_denoise_key: None,
         })
     }
 
@@ -440,7 +378,26 @@ impl GdfSystem {
 
     /// The fused scene bake pass: brute-force the world-space triangle soup into the
     /// scene GDF over the scene AABB (Stage C1).
-    fn record_scene_bake<'a>(&'a self, graph: &mut RenderGraph<'a>, gdf_ext: ResourceId) {
+    /// Borrow the world scene GDF volume (consumers — `GiSystem`, the reflection track —
+    /// sample it; the volume itself stays owned here). `None` without compute support.
+    pub(crate) fn scene_gdf_volume(&self) -> Option<&Volume> {
+        self.scene_gdf.as_ref()
+    }
+
+    /// The world-space AABB the scene GDF voxel grid maps to (consumers scale their
+    /// world-unit constants by its diagonal).
+    pub(crate) fn scene_aabb(&self) -> ([f32; 3], [f32; 3]) {
+        (self.scene_aabb_min, self.scene_aabb_max)
+    }
+
+    /// Record the one-time fused-scene bake into the scene GDF, writing the imported
+    /// `gdf_ext` handle. The caller imports `scene_gdf` once and shares the handle with
+    /// every consumer (AO / GI / reflection) so the graph orders bake → reads.
+    pub(crate) fn record_scene_bake<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        gdf_ext: ResourceId,
+    ) {
         let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
         let bakep = self.bake_pipeline.as_ref().expect("bake pipeline");
         let vtx = self.scene_vtx.as_ref().expect("scene vtx").storage_index();
@@ -469,353 +426,7 @@ impl GdfSystem {
         );
     }
 
-    /// Stage C2: compute GDF ambient occlusion for the deferred render. Builds the
-    /// fused scene GDF once (shared with the C1 trace via the caller's `build` flag),
-    /// then a full-screen compute pass reconstructs each pixel's world surface point
-    /// from the depth G-buffer, marches the scene GDF along the world normal, and
-    /// writes an AO factor [0,1] into a storage image the lighting pass multiplies into
-    /// its ambient term. World position comes from depth (not the object-space position
-    /// MRT) so transformed objects line up with the world-space GDF. Returns the AO
-    /// storage image.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_gdf_ao<'a>(
-        &'a self,
-        graph: &mut RenderGraph<'a>,
-        depth: ResourceId,
-        normal: ResourceId,
-        extent: Extent2D,
-        inv_view_proj: [f32; 16],
-        cw: u32,
-        ch: u32,
-        flip_y: u32,
-        build: bool,
-    ) -> ResourceId {
-        let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
-        let aop = self.ao_pipeline.as_ref().expect("gdf ao pipeline");
-        let out = graph.create_storage_image("gdf_ao_out", HDR_FORMAT, extent);
-        let gdf_ext = graph.import_external("scene_gdf");
-        let aabb_min = self.scene_aabb_min;
-        let aabb_max = self.scene_aabb_max;
-        if build {
-            self.record_scene_bake(graph, gdf_ext);
-        }
-        let sampled = vol.sampled_index();
-        // The scene extent sets the world-unit AO scale: a fraction of the AABB diagonal
-        // for the sampling reach + a small surface bias, with the clamp = full diagonal
-        // (exceeds the field's true max, so a query never wrongly clamps).
-        let diag = {
-            let d = [
-                aabb_max[0] - aabb_min[0],
-                aabb_max[1] - aabb_min[1],
-                aabb_max[2] - aabb_min[2],
-            ];
-            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-        };
-        let reach = diag * 0.07;
-        let bias = diag * 0.004;
-        let strength = 1.6;
-        graph.add_compute_pass(
-            ComputePassInfo {
-                name: "gdf_ao",
-                storage_writes: vec![out],
-                reads: vec![depth, normal, gdf_ext],
-            },
-            move |ctx| {
-                let depth_index = ctx.sampled_index(depth);
-                let normal_index = ctx.sampled_index(normal);
-                let out_index = ctx.storage_index(out);
-                let cmd = ctx.cmd();
-                cmd.volume_to_sampled(vol);
-                cmd.bind_compute_pipeline(aop);
-                cmd.push_constants_compute(&gdf_ao_push(
-                    &inv_view_proj,
-                    depth_index,
-                    normal_index,
-                    sampled,
-                    out_index,
-                    cw,
-                    ch,
-                    flip_y,
-                    aabb_min,
-                    aabb_max,
-                    0.0, // world ground plane at y = 0
-                    diag,
-                    reach,
-                    strength,
-                    bias,
-                ));
-                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                Ok(())
-            },
-        );
-        out
-    }
-
-    /// Stage C3: stochastic 1-bounce diffuse GI for the deferred render. Builds the
-    /// fused scene GDF once (shared latch with C1/C2), then a full-screen compute pass
-    /// reconstructs each pixel's world surface from depth, casts `spp` cosine-hemisphere
-    /// rays into the scene GDF, shades the hits (constant albedo + sun + sky), and writes
-    /// the mean incoming radiance (indirect irradiance) the lighting pass adds to the
-    /// ambient term (× surface albedo × 1-metallic). Returns the GI storage image.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_gdf_gi<'a>(
-        &'a self,
-        graph: &mut RenderGraph<'a>,
-        depth: ResourceId,
-        normal: ResourceId,
-        extent: Extent2D,
-        inv_view_proj: [f32; 16],
-        sun_dir: [f32; 3],
-        sun_intensity: f32,
-        cw: u32,
-        ch: u32,
-        flip_y: u32,
-        spp: u32,
-        frame: u32,
-        build: bool,
-    ) -> ResourceId {
-        let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
-        let gip = self.gi_pipeline.as_ref().expect("gdf gi pipeline");
-        let out = graph.create_storage_image("gdf_gi_out", HDR_FORMAT, extent);
-        let gdf_ext = graph.import_external("scene_gdf");
-        let aabb_min = self.scene_aabb_min;
-        let aabb_max = self.scene_aabb_max;
-        if build {
-            self.record_scene_bake(graph, gdf_ext);
-        }
-        let sampled = vol.sampled_index();
-        let diag = {
-            let d = [
-                aabb_max[0] - aabb_min[0],
-                aabb_max[1] - aabb_min[1],
-                aabb_max[2] - aabb_min[2],
-            ];
-            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-        };
-        let bias = diag * 0.004;
-        graph.add_compute_pass(
-            ComputePassInfo {
-                name: "gdf_gi",
-                storage_writes: vec![out],
-                reads: vec![depth, normal, gdf_ext],
-            },
-            move |ctx| {
-                let depth_index = ctx.sampled_index(depth);
-                let normal_index = ctx.sampled_index(normal);
-                let out_index = ctx.storage_index(out);
-                let cmd = ctx.cmd();
-                cmd.volume_to_sampled(vol);
-                cmd.bind_compute_pipeline(gip);
-                cmd.push_constants_compute(&gdf_gi_push(
-                    &inv_view_proj,
-                    sun_dir,
-                    sun_intensity,
-                    depth_index,
-                    normal_index,
-                    sampled,
-                    out_index,
-                    cw,
-                    ch,
-                    flip_y,
-                    spp,
-                    frame,
-                    aabb_min,
-                    aabb_max,
-                    0.0,  // world ground plane at y = 0
-                    diag, // sample distance clamp
-                    diag, // ray max distance (bounce reach = scene diagonal)
-                    bias,
-                    0.25, // sky fill radiance at the bounce hit
-                    0.7, // constant hit albedo (no material in the GDF; bleed = surface cache later)
-                ));
-                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                Ok(())
-            },
-        );
-        out
-    }
-
-    /// C4: (re)allocate the GI denoiser history buffers on a resize and reset the
-    /// accumulation counter on a resize or lighting/quality change. Runs before the
-    /// graph is built (its `wait_idle` + fallible alloc stay off the graph borrow path),
-    /// mirroring `RtSystem::prepare`. No-op without the GI/denoise pipelines.
-    pub(crate) fn prepare_denoise(
-        &mut self,
-        device: &Device,
-        cw: u32,
-        ch: u32,
-        reset_key: u64,
-    ) -> anyhow::Result<()> {
-        if self.temporal_pipeline.is_none() {
-            return Ok(());
-        }
-        if self.gi_denoise_extent != (cw, ch) {
-            device.wait_idle()?;
-            let make = || -> anyhow::Result<Option<StorageBuffer>> {
-                Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
-                    size: (cw as u64) * (ch as u64) * 16,
-                    stride: 16,
-                    indirect: false,
-                })?))
-            };
-            self.gi_hist = [make()?, make()?];
-            self.gi_pos = [make()?, make()?];
-            self.gi_denoise_extent = (cw, ch);
-            self.gi_denoise_frame = 0;
-        }
-        if self.gi_denoise_key != Some(reset_key) {
-            self.gi_denoise_frame = 0;
-            self.gi_denoise_key = Some(reset_key);
-        }
-        Ok(())
-    }
-
-    /// Bump the denoiser accumulation counter (end-of-frame, after submit) so the next
-    /// frame reprojects history and swaps the ping-pong buffers.
-    pub(crate) fn advance_denoise(&mut self) {
-        self.gi_denoise_frame = self.gi_denoise_frame.saturating_add(1);
-    }
-
-    /// C4: spatio-temporal denoise of the noisy C3 GI image. A temporal pass reprojects
-    /// and accumulates `gi_raw` into the ping-pong history (validated by world position),
-    /// then two edge-aware à-trous passes clean the residual. Returns the denoised image
-    /// the lighting pass consumes in place of the raw GI. `prepare_denoise` must have run
-    /// this frame.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_gdf_denoise<'a>(
-        &'a self,
-        graph: &mut RenderGraph<'a>,
-        gi_raw: ResourceId,
-        depth: ResourceId,
-        normal: ResourceId,
-        extent: Extent2D,
-        inv_view_proj: [f32; 16],
-        prev_view_proj: [f32; 16],
-        cw: u32,
-        ch: u32,
-        flip_y: u32,
-    ) -> ResourceId {
-        let tempp = self.temporal_pipeline.as_ref().expect("temporal pipeline");
-        let atrousp = self.atrous_pipeline.as_ref().expect("atrous pipeline");
-        let frame = self.gi_denoise_frame;
-        let reset = u32::from(frame == 0);
-        let read = ((frame + 1) % 2) as usize;
-        let write = (frame % 2) as usize;
-        let hist_r = self.gi_hist[read].as_ref().expect("hist r").storage_index();
-        let hist_w = self.gi_hist[write]
-            .as_ref()
-            .expect("hist w")
-            .storage_index();
-        let pos_r = self.gi_pos[read].as_ref().expect("pos r").storage_index();
-        let pos_w = self.gi_pos[write].as_ref().expect("pos w").storage_index();
-        let hist_w_ext = graph.import_external("gi_hist_w");
-        let pos_w_ext = graph.import_external("gi_pos_w");
-
-        let diag = {
-            let d = [
-                self.scene_aabb_max[0] - self.scene_aabb_min[0],
-                self.scene_aabb_max[1] - self.scene_aabb_min[1],
-                self.scene_aabb_max[2] - self.scene_aabb_min[2],
-            ];
-            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-        };
-        let reject_dist = diag * 0.01;
-        let max_hist = 64.0_f32;
-
-        let temporal_out = graph.create_storage_image("gi_temporal", HDR_FORMAT, extent);
-        graph.add_compute_pass(
-            ComputePassInfo {
-                name: "gdf_temporal",
-                storage_writes: vec![temporal_out, hist_w_ext, pos_w_ext],
-                reads: vec![gi_raw, depth, normal],
-            },
-            move |ctx| {
-                let gi_raw_index = ctx.sampled_index(gi_raw);
-                let depth_index = ctx.sampled_index(depth);
-                let normal_index = ctx.sampled_index(normal);
-                let out_index = ctx.storage_index(temporal_out);
-                let cmd = ctx.cmd();
-                cmd.bind_compute_pipeline(tempp);
-                cmd.push_constants_compute(&gdf_temporal_push(
-                    &inv_view_proj,
-                    &prev_view_proj,
-                    gi_raw_index,
-                    depth_index,
-                    normal_index,
-                    out_index,
-                    hist_r,
-                    hist_w,
-                    pos_r,
-                    pos_w,
-                    cw,
-                    ch,
-                    flip_y,
-                    reset,
-                    reject_dist,
-                    max_hist,
-                    1.0 / max_hist,
-                ));
-                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                Ok(())
-            },
-        );
-
-        // Two à-trous iterations (step 1 then 2): a wide edge-aware blur at low cost.
-        let pos_sigma = diag * 0.03;
-        let normal_power = 32.0_f32;
-        let mut cur = temporal_out;
-        for (i, step) in [1u32, 2u32].into_iter().enumerate() {
-            let out = graph.create_storage_image(
-                if i == 0 { "gi_atrous0" } else { "gi_atrous1" },
-                HDR_FORMAT,
-                extent,
-            );
-            let src = cur;
-            graph.add_compute_pass(
-                ComputePassInfo {
-                    name: "gdf_atrous",
-                    storage_writes: vec![out],
-                    reads: vec![src, depth, normal],
-                },
-                move |ctx| {
-                    let in_index = ctx.sampled_index(src);
-                    let depth_index = ctx.sampled_index(depth);
-                    let normal_index = ctx.sampled_index(normal);
-                    let out_index = ctx.storage_index(out);
-                    let cmd = ctx.cmd();
-                    cmd.bind_compute_pipeline(atrousp);
-                    cmd.push_constants_compute(&gdf_atrous_push(
-                        &inv_view_proj,
-                        in_index,
-                        depth_index,
-                        normal_index,
-                        out_index,
-                        cw,
-                        ch,
-                        step,
-                        flip_y,
-                        pos_sigma,
-                        normal_power,
-                    ));
-                    cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                    Ok(())
-                },
-            );
-            cur = out;
-        }
-        cur
-    }
-
     // Feature-availability predicates (drive the UI checkboxes + toggle defaults).
-    pub(crate) fn has_gdf_denoise(&self) -> bool {
-        self.temporal_pipeline.is_some() && self.atrous_pipeline.is_some()
-    }
-    pub(crate) fn has_gdf_gi(&self) -> bool {
-        self.gi_pipeline.is_some() && self.scene_gdf.is_some()
-    }
-    pub(crate) fn has_gdf_ao(&self) -> bool {
-        self.ao_pipeline.is_some() && self.scene_gdf.is_some()
-    }
     pub(crate) fn has_sdf_trace(&self) -> bool {
         self.sdf_pipeline.is_some()
     }
