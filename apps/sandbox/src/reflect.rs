@@ -576,11 +576,13 @@ impl ReflectSystem {
     /// raw GDF radiance into the SSR's post-exposure space for the standalone viz; it is
     /// 1.0 once both sources are raw radiance (C7b). Returns the composite image.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_composite<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
         ssr: ResourceId,
         gdf_reflect: ResourceId,
+        material: ResourceId,
         extent: Extent2D,
         cw: u32,
         ch: u32,
@@ -596,16 +598,24 @@ impl ReflectSystem {
             ComputePassInfo {
                 name: "reflect_composite",
                 storage_writes: vec![out],
-                reads: vec![ssr, gdf_reflect],
+                reads: vec![ssr, gdf_reflect, material],
             },
             move |ctx| {
                 let ssr_index = ctx.sampled_index(ssr);
                 let gdf_index = ctx.sampled_index(gdf_reflect);
+                let material_index = ctx.sampled_index(material);
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&reflect_composite_push(
-                    ssr_index, gdf_index, out_index, cw, ch, gdf_scale, clamp_max,
+                    ssr_index,
+                    gdf_index,
+                    out_index,
+                    cw,
+                    ch,
+                    gdf_scale,
+                    clamp_max,
+                    material_index,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

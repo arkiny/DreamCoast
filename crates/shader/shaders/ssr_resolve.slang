@@ -91,10 +91,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
 
     // --- Spatial ratio estimator: borrow neighbour rays, reweight by pdf_p(dir)/pdf_q. ---
+    // Roughness-adaptive kernel: a sharp lobe (near-mirror) wants only its own / immediate
+    // neighbours (a wide kernel mixes in off-lobe neighbours whose pdf_p is ~0, adding noise
+    // and dark misses); a wide lobe pulls the whole neighbourhood to denoise. params.w = max r.
+    int rmax = int(pc.params.w);
+    int r = clamp(int(ceil(roughness * float(rmax) * 3.0)), 1, rmax);
     float3 num = float3(0, 0, 0);
     float conf_num = 0.0;
     float den = 0.0;
-    int r = int(pc.params.w);
     for (int dy = -r; dy <= r; dy++)
     {
         for (int dx = -r; dx <= r; dx++)
@@ -114,8 +118,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             den += w;
         }
     }
-    float3 spatial = den > 1e-6 ? num / den : float3(0, 0, 0);
-    float conf = den > 1e-6 ? saturate(conf_num / den) : 0.0;
+    bool have_sample = den > 1e-6;
+    float3 spatial = have_sample ? num / den : float3(0, 0, 0);
+    float conf = have_sample ? saturate(conf_num / den) : 0.0;
 
     // --- Light temporal: reproject the surface, EMA-blend (disocclusion reject). ---
     float3 accum_rgb = spatial;
@@ -137,8 +142,21 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 float4 pp = asfloat(g.storage_buffers[pc.pos_read].Load4(pidx * 16u));
                 if (pp.w > 0.5 && distance(world_pos, pp.xyz) < pc.params.x)
                 {
-                    accum_rgb = lerp(ph.rgb, spatial, pc.params.y);
-                    accum_conf = lerp(ph.a, conf, pc.params.y);
+                    if (have_sample)
+                    {
+                        accum_rgb = lerp(ph.rgb, spatial, pc.params.y);
+                        accum_conf = lerp(ph.a, conf, pc.params.y);
+                    }
+                    else
+                    {
+                        // No valid ray this frame (every kernel ray missed / off-lobe): a sharp
+                        // mirror reflecting off-screen sky hits this every frame. EMA-ing the 0 in
+                        // decays the accumulation to black (the dark-metal blotches); instead keep
+                        // the history radiance and only bleed confidence down so a persistently
+                        // empty surface yields smoothly to the GDF / sky fallback in the composite.
+                        accum_rgb = ph.rgb;
+                        accum_conf = ph.a * 0.9;
+                    }
                 }
             }
         }
