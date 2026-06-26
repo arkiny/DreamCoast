@@ -177,10 +177,38 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
     return (kd * diffuse + specular) * ao;
 }
 
+// --- Soft-shadow quality tier (the scalability seam): one place to swap counts.
+// A future RenderQuality{low,med,high} just picks these; `light_size` (globals.shadow.z,
+// 0 = hard) is the per-frame tunable / off switch.
+static const int SHADOW_BLOCKER_SAMPLES = 16;
+static const int SHADOW_PCF_SAMPLES = 16;
+static const float SHADOW_SEARCH_UV = 0.012; // blocker-search disk radius (shadow-map UV)
+static const float SHADOW_MAX_PENUMBRA = 0.015; // clamp so a far caster can't over-blur
+
+static const float2 POISSON16[16] = {
+    float2(-0.94201624, -0.39906216), float2(0.94558609, -0.76890725),
+    float2(-0.09418410, -0.92938870), float2(0.34495938, 0.29387760),
+    float2(-0.91588581, 0.45771432), float2(-0.81544232, -0.87912464),
+    float2(-0.38277543, 0.27676845), float2(0.97484398, 0.75648379),
+    float2(0.44323325, -0.97511554), float2(0.53742981, -0.47373420),
+    float2(-0.26496911, -0.41893023), float2(0.79197514, 0.19090188),
+    float2(-0.24188840, 0.99706507), float2(-0.81409955, 0.91437590),
+    float2(0.19984126, 0.78641367), float2(0.14383161, -0.14100790),
+};
+
+// One PCF tap: 1 if `current` (biased receiver depth) is in front of the stored blocker.
+float shadow_tap(float2 uv, float current)
+{
+    float closest = g.textures[pc.shadow_index].Sample(g.samp, uv).r;
+    return current <= closest ? 1.0 : 0.0;
+}
+
 // Fraction of the directional sun reaching `world_pos` (1 = fully lit, 0 = fully
-// shadowed), via 3x3 PCF over the directional shadow map. Returns 1 when shadows
-// are disabled or the point falls outside the light frustum.
-float sun_shadow(float3 world_pos)
+// shadowed). PCSS-lite: a blocker search sizes a distance-proportional penumbra,
+// then a rotated Poisson PCF filters it (soft contact-hard, wide far from the caster).
+// `light_size` (globals.shadow.z) <= 0 falls back to the cheap 3x3 PCF (hard shadows).
+// `pix` = screen pixel coord, for the per-pixel rotation that hides banding.
+float sun_shadow(float3 world_pos, float2 pix)
 {
     if (globals.counts.w == 0)
         return 1.0;
@@ -200,18 +228,55 @@ float sun_shadow(float3 world_pos)
     float bias = globals.shadow.x;
     float texel = globals.shadow.y;
     float current = proj.z - bias;
+    // Penumbra factor: shadow-map UV of penumbra per unit normalized depth gap. Folds
+    // the sun's angular size + the ortho depth-range/width on the CPU so it matches the
+    // path tracer's sun disk. 0 = hard 3x3 PCF.
+    float penumbra_factor = globals.shadow.z;
 
-    float sum = 0.0;
-    for (int x = -1; x <= 1; ++x)
+    // Per-pixel rotation of the Poisson disk (interleaved gradient noise).
+    float ign = frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))));
+    float ca = cos(ign * 6.2831853);
+    float sa = sin(ign * 6.2831853);
+    float2x2 rot = float2x2(ca, -sa, sa, ca);
+
+    // Hard fallback (soft shadows disabled): cheap 3x3 PCF.
+    if (penumbra_factor <= 0.0)
     {
-        for (int y = -1; y <= 1; ++y)
+        float sum = 0.0;
+        for (int x = -1; x <= 1; ++x)
+            for (int y = -1; y <= 1; ++y)
+                sum += shadow_tap(uv + float2(x, y) * texel, current);
+        return sum / 9.0;
+    }
+
+    // 1) Blocker search over a fixed disk; average the occluders' depth.
+    float blocker_sum = 0.0;
+    int blocker_n = 0;
+    for (int i = 0; i < SHADOW_BLOCKER_SAMPLES; ++i)
+    {
+        float2 o = mul(rot, POISSON16[i]) * SHADOW_SEARCH_UV;
+        float d = g.textures[pc.shadow_index].Sample(g.samp, uv + o).r;
+        if (d < current)
         {
-            float2 o = float2(x, y) * texel;
-            float closest = g.textures[pc.shadow_index].Sample(g.samp, uv + o).r;
-            sum += current <= closest ? 1.0 : 0.0;
+            blocker_sum += d;
+            blocker_n += 1;
         }
     }
-    return sum / 9.0;
+    if (blocker_n == 0)
+        return 1.0; // no occluder -> fully lit (the common, cheap case)
+    float avg_blocker = blocker_sum / float(blocker_n);
+
+    // 2) Penumbra radius = depth gap x calibrated factor (directional light, linear gap).
+    float radius = clamp((current - avg_blocker) * penumbra_factor, texel, SHADOW_MAX_PENUMBRA);
+
+    // 3) PCF over the penumbra radius.
+    float sum = 0.0;
+    for (int i = 0; i < SHADOW_PCF_SAMPLES; ++i)
+    {
+        float2 o = mul(rot, POISSON16[i]) * radius;
+        sum += shadow_tap(uv + o, current);
+    }
+    return sum / float(SHADOW_PCF_SAMPLES);
 }
 
 // One light's contribution. `radiance` already folds color * intensity * atten.
@@ -276,7 +341,7 @@ float4 fsMain(VSOutput input) : SV_Target
         float3 l = normalize(globals.sun_direction.xyz);
         float3 radiance = globals.sun_color.rgb * globals.sun_color.a;
         lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0)
-            * sun_shadow(world_pos);
+            * sun_shadow(world_pos, input.pos.xy);
     }
 
     // Point lights.
