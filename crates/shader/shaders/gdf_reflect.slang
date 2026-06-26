@@ -107,8 +107,12 @@ float3 scene_normal(float3 p)
                      + k.yxy * scene_occ(p + k.yxy * e) + k.xxx * scene_occ(p + k.xxx * e));
 }
 
-// Gradient sky + HDR sun disk (same model as the Stage-A SW-RT / path-tracer sky).
-float3 sky(float3 dir, float3 sun_dir, float sun_i)
+// Gradient sky (+ optional HDR sun disk). `with_sun` adds the bright sun disk — enabled only
+// for the background viz. The REFLECTION escape passes `with_sun = false`: like a path tracer's
+// indirect rays, the reflected sky carries no sun (which would double the directional light's
+// analytic specular highlight — two sun glints on a metal — and the sharp reflected disk also
+// blows out when the roughness prefilter spreads it). The sun appears once, via direct lighting.
+float3 sky(float3 dir, float3 sun_dir, float sun_i, bool with_sun)
 {
     float up = dir.y;
     float3 zenith = float3(0.04, 0.16, 0.55);
@@ -116,8 +120,11 @@ float3 sky(float3 dir, float3 sun_dir, float sun_i)
     float3 ground = float3(0.16, 0.15, 0.14);
     float3 col = up >= 0.0 ? lerp(horizon, zenith, pow(saturate(up), 0.45))
                            : lerp(horizon, ground, saturate(-up * 6.0));
-    float c = saturate(dot(dir, sun_dir));
-    col += sun_i * (pow(c, 4000.0) * 6.0 + pow(c, 32.0) * 0.4);
+    if (with_sun)
+    {
+        float c = saturate(dot(dir, sun_dir));
+        col += sun_i * (pow(c, 4000.0) * 6.0 + pow(c, 32.0) * 0.4);
+    }
     return col;
 }
 
@@ -160,7 +167,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     {
         float4 far = mul(pc.inv_view_proj, float4(ndc, 1.0, 1.0));
         float3 vdir = normalize(far.xyz / far.w - pc.cam_pos.xyz);
-        g.storage_images[pc.out_index][tid.xy] = float4(sky(vdir, sun_dir, sun_i), 1.0);
+        g.storage_images[pc.out_index][tid.xy] = float4(sky(vdir, sun_dir, sun_i, true), 1.0);
         return;
     }
 
@@ -216,7 +223,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     }
     else
     {
-        color = sky(dir, sun_dir, sun_i); // specular miss -> the sky (NOT 0)
+        color = sky(dir, sun_dir, sun_i, false); // specular miss -> sky w/o sun (direct light owns the glint)
     }
 
     g.storage_images[pc.out_index][tid.xy] = float4(color, 1.0);
