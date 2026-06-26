@@ -94,6 +94,10 @@
   카메라/배경/위치 완전 정렬(PT 카메라 = 래스터 `view_proj` 역행렬). 남은 차이는 **금속 구 반사**가 대부분:
   래스터 split-sum IBL 큐브(이웃 객체 미반영, 매끈) vs PT 실제 광선추적 반사(아보카도·큐브가 정확히 비침) →
   **PT가 정답**, 차이 = 래스터 IBL의 근본 한계(닫으려면 하이브리드 RT 반사 필요). 디퓨즈 표면은 거의 일치.
+  > **후속 채택 (2026-06-26):** 이 "하이브리드 RT 반사" 길을 공식 채택 — **Phase 11 Stage C(C5 SSR +
+  > C6 GDF SW-RT 반사 + C7 하이브리드 합성)가 래스터의 IBL 스페큘러를 대체**한다. 이 잔차(평균 ~4.0/ch,
+  > 대부분 금속 반사)가 줄어드는지를 `tools/rt-compare.py`로 정량 측정하는 것이 그 트랙의 성공 지표.
+  > 세부: [phase-11-distance-field-gi.md](phase-11-distance-field-gi.md) Stage C.
 - **양 백엔드 패리티(전 게이트 누적)**: 인라인≡파이프라인 avg≤0.0010, VK≡DX avg≤0.0010, Cornell VK≡DX 0.0000,
   Vulkan VUID 0 / D3D12 디버그 클린, build+fmt+clippy(`-D warnings`) 클린.
 
