@@ -17,6 +17,7 @@
 // applies exposure), like the C1 scene-GDF trace.
 
 #include "bindless.slang"
+#include "surface_cache.slang"
 
 struct ReflectPush
 {
@@ -38,6 +39,11 @@ struct ReflectPush
     uint albedo_g;          // green
     uint albedo_b;          // blue
     uint pad1;
+    uint4 cache;            // C8b3: cards, cache_pos, cache_rad, num_cards (cards=0xFFFFFFFF = off)
+    uint cache_tile;        // surface-cache atlas tile edge
+    uint pad_c0;
+    uint pad_c1;
+    uint pad_c2;
 };
 
 [[vk::push_constant]]
@@ -193,10 +199,20 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     if (hit)
     {
         float3 hn = scene_normal(hp);
-        float ndl = max(dot(hn, sun_dir), 0.0);
-        float sh = ndl > 0.0 ? refl_shadow(hp + hn * 0.004, sun_dir, max_dist) : 1.0;
-        float fill = sky_fill * (0.5 + 0.5 * hn.y);
-        color = albedo_at(hp) * (sun_i * ndl * sh + fill);
+        // C8b3: the reflected surface's cached (multibounce) radiance — a direct lookup
+        // when the cache is bound, else the C8a per-ray colored re-light.
+        if (pc.cache.x != 0xFFFFFFFFu)
+        {
+            color = sample_surface_cache(hp, hn, pc.cache.x, pc.cache.y, pc.cache.z,
+                                         pc.cache.w, pc.cache_tile);
+        }
+        else
+        {
+            float ndl = max(dot(hn, sun_dir), 0.0);
+            float sh = ndl > 0.0 ? refl_shadow(hp + hn * 0.004, sun_dir, max_dist) : 1.0;
+            float fill = sky_fill * (0.5 + 0.5 * hn.y);
+            color = albedo_at(hp) * (sun_i * ndl * sh + fill);
+        }
     }
     else
     {
