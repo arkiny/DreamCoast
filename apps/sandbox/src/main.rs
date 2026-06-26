@@ -38,6 +38,7 @@ mod ibl;
 mod mesh;
 mod particle;
 mod push;
+mod quality;
 mod reflect;
 mod rt;
 mod smoketest;
@@ -344,6 +345,12 @@ struct App {
     shadow_bias: f32,
     // PCSS-lite penumbra scale (max soft-shadow radius in shadow-map UV); 0 = hard 3x3 PCF.
     shadow_softness: f32,
+    /// Soft-shadow blocker/PCF tap count, written to `globals.shadow.w` (RenderQuality knob).
+    /// Only the soft path (softness > 0) reads it; the shader clamps to [1, 16].
+    shadow_taps: u32,
+    /// Active RenderQuality tier (Stage D). The single selector that seeded the knob defaults
+    /// below; shown in the UI. Individual env vars still override per knob.
+    quality: quality::RenderQuality,
     override_material: bool,
     metallic_override: f32,
     roughness_override: f32,
@@ -793,6 +800,11 @@ impl App {
         // On by default; `NO_POINT_LIGHTS=1` disables them (the path tracer has no
         // point lights, so a fair raster-vs-ground-truth comparison turns these off).
         let point_lights_on = std::env::var_os("NO_POINT_LIGHTS").is_none();
+        // RenderQuality tier (Stage D): `RENDER_QUALITY=low|med|high` (unset => Med = the legacy
+        // defaults, no-reg). `qp` is the single tier→knob table; each knob below reads its own env
+        // first and falls back to `qp.*`, so an explicit `P11_*`/`SHADOW_*` override always wins.
+        let quality = quality::RenderQuality::from_env();
+        let qp = quality::preset(quality);
         // Phase 7: route the HDR result through a compute post-process (3x3 blur into
         // a storage image) before tonemapping. Initial state seedable via env var so
         // headless screenshots can exercise each demo (`P7_COMPUTE_POST=1`, etc.).
@@ -819,7 +831,8 @@ impl App {
         // Stage C1: trace the world-space scene GDF from the live camera.
         let scene_gdf = gdf.has_scene_sdf() && std::env::var_os("P11_SCENE_GDF").is_some();
         // Stage C2: GDF AO multiplied into the deferred ambient term.
-        let gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && std::env::var_os("P11_GDF_AO").is_some();
+        let gdf_ao =
+            gi.has_ao() && gdf.has_scene_sdf() && quality::env_bool("P11_GDF_AO", qp.gdf_ao);
         // Deprecate the legacy captured-cube IBL: by default the deferred ambient is the
         // SW-RT hybrid reflection (specular) + GDF GI (diffuse scene bounce) + sky irradiance.
         // `P11_LEGACY_IBL` restores the captured-cube path (prefilter-cube specular + scene
@@ -838,13 +851,10 @@ impl App {
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(8)
+            .unwrap_or(qp.gi_spp)
             .clamp(1, 256);
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
-        let gi_denoise = gi.has_denoise()
-            && std::env::var("P11_GI_DENOISE")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+        let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", qp.gi_denoise);
         // C5 screen-space reflections (viz toggle).
         let gdf_ssr = reflect.has_ssr() && std::env::var_os("P11_SSR").is_some();
         // C6 GDF reflections (off-screen fallback viz toggle).
@@ -871,7 +881,7 @@ impl App {
         // C8b3 surface-cache consumers (multibounce radiance lookup in GI / reflections).
         let surface_cache = gdf.has_surface_cache()
             && gdf.has_cache_lighting()
-            && std::env::var_os("P11_SURFACE_CACHE").is_some();
+            && quality::env_bool("P11_SURFACE_CACHE", qp.surface_cache);
         // C8g: use the surface cache as the GDF REFLECTION hit radiance by default (accurate lit
         // colour for reflected objects — fixes the grazing avocado smear; ground hits have no
         // cards and fall back to the per-ray re-light). Cheap (only the per-frame cache-light pass
@@ -880,20 +890,16 @@ impl App {
         let reflect_cache = swrt_reflect
             && gdf.has_surface_cache()
             && gdf.has_cache_lighting()
-            && std::env::var("P11_REFLECT_CACHE")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            && quality::env_bool("P11_REFLECT_CACHE", qp.reflect_cache);
         // Firefly clamp on by default (P11_FIREFLY_CLAMP=0 to disable / compare).
-        let firefly_clamp = std::env::var("P11_FIREFLY_CLAMP")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let firefly_clamp = quality::env_bool("P11_FIREFLY_CLAMP", qp.firefly_clamp);
         // C8d: roughness above which screen-mirror SSR stops contributing (GDF takes over).
         let reflect_max_roughness = std::env::var("P11_REFLECT_MAX_ROUGHNESS")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.5);
+            .unwrap_or(qp.reflect_max_roughness);
         // C8d: default to the full-res mirror SSR; opt into the stochastic glossy path to compare.
-        let ssr_stochastic = std::env::var_os("P11_SSR_STOCHASTIC").is_some();
+        let ssr_stochastic = quality::env_bool("P11_SSR_STOCHASTIC", qp.ssr_stochastic);
         // Diagnostic single-object orbit: frame one scene object tightly so it can be
         // inspected from every side. `DIAG_OBJ=<index>` selects it (2 = copper sphere,
         // 3 = red cube); `DIAG_COPPER=1` / `DIAG_CUBE=1` are shortcuts. `DIAG_ANGLE=<deg>`
@@ -1022,7 +1028,15 @@ impl App {
             shadow_softness: std::env::var("SHADOW_SOFTNESS")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(0.0),
+                .unwrap_or(qp.shadow_softness),
+            // Soft-shadow tap count (RenderQuality knob, written to globals.shadow.w). Only the
+            // soft path reads it; the shader clamps to [1, 16] (POISSON16). `SHADOW_TAPS` overrides.
+            shadow_taps: std::env::var("SHADOW_TAPS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(qp.shadow_taps)
+                .clamp(1, 16),
+            quality,
             override_material: false,
             metallic_override: 1.0,
             roughness_override: 0.15,
@@ -1266,6 +1280,7 @@ impl App {
                 shadows_on,
                 shadow_bias,
                 shadow_softness,
+                quality,
                 override_material,
                 metallic_override,
                 roughness_override,
@@ -1319,6 +1334,10 @@ impl App {
                         dt * 1000.0
                     ));
                     ui.text(format!("scene: {} objects + ground", scene.len()));
+                    ui.text(format!(
+                        "RenderQuality: {} (RENDER_QUALITY)",
+                        quality.label()
+                    ));
                     ui.text(format!(
                         "validation: {}",
                         if validation_on { "on" } else { "off" }
@@ -1647,7 +1666,7 @@ impl App {
                 self.shadow_bias,
                 1.0 / SHADOW_SIZE as f32,
                 self.shadow_softness, // z: PCSS-lite penumbra scale (0 = hard PCF)
-                0.0,
+                self.shadow_taps as f32, // w: soft-shadow tap count (RenderQuality; soft path only)
             ],
             inv_view_proj,
             ibl: ibl_indices,
