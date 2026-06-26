@@ -461,9 +461,9 @@ impl DeferredRenderer {
     }
 }
 
-/// Pack the G-buffer push block: mvp(64) + base_color(16) + metallic/roughness(16)
-/// + texture indices u32x4 (16) + model mat4 (64) = 176 bytes. `model` is the
-/// object->world transform the vertex shader uses for the world-space position +
+/// Pack the G-buffer push block (176 bytes): mvp(64), base_color(16),
+/// metallic/roughness(16), texture indices u32x4 (16), model mat4 (64). `model` is the
+/// object->world transform the vertex shader uses for the world-space position and
 /// normal G-buffer outputs (the `mvp` already folds it in for clip space).
 fn gbuffer_push(
     mvp: [f32; 16],
