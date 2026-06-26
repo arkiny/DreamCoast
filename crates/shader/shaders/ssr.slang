@@ -204,6 +204,31 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                           int2(int(pc.width) - 1, int(pc.height) - 1));
         uint pidx = uint(ppix.y) * pc.width + uint(ppix.x);
         color = asfloat(g.storage_buffers[pc.hist_index].Load4(pidx * 16u)).rgb;
+
+        // Neighborhood clamp (flip_y bit2): bound the reprojected history sample to the
+        // min/max of its 8 neighbours, pulling an isolated reprojected firefly back into the
+        // local reflection range. Canonical for temporal reprojection.
+        if ((pc.flip_y & 4u) != 0u)
+        {
+            float3 mn = float3(1e30, 1e30, 1e30);
+            float3 mx = float3(-1e30, -1e30, -1e30);
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    if (dx == 0 && dy == 0)
+                        continue;
+                    int2 q = clamp(ppix + int2(dx, dy), int2(0, 0),
+                                   int2(int(pc.width) - 1, int(pc.height) - 1));
+                    float3 c = asfloat(g.storage_buffers[pc.hist_index].Load4(
+                                           (uint(q.y) * pc.width + uint(q.x)) * 16u))
+                                   .rgb;
+                    mn = min(mn, c);
+                    mx = max(mx, c);
+                }
+            }
+            color = clamp(color, mn, mx);
+        }
     }
     else
     {

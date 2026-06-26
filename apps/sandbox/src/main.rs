@@ -1795,6 +1795,7 @@ impl App {
                         cw,
                         ch,
                         self.flip_y,
+                        self.firefly_clamp,
                     )
                 } else {
                     raw
@@ -1832,6 +1833,7 @@ impl App {
                     self.scene_radius * 1.5,
                     self.scene_radius * 0.06,
                     true, // history mode: reprojected raw-radiance previous frame
+                    self.firefly_clamp,
                 );
                 let gdf_refl = self.reflect.record_gdf_reflect(
                     &mut graph,
@@ -2126,6 +2128,7 @@ impl App {
                 self.scene_radius * 1.5,
                 self.scene_radius * 0.06,
                 false, // standalone C5 viz: sample the current lit HDR
+                false, // (viz uses the current HDR, no reprojected history to clamp)
             ))
         } else {
             None
@@ -2211,6 +2214,7 @@ impl App {
                     self.scene_radius * 1.5,
                     self.scene_radius * 0.06,
                     true, // history mode: reprojected raw-radiance previous frame
+                    self.firefly_clamp,
                 );
                 let gdf_refl = self.reflect.record_gdf_reflect(
                     &mut graph,

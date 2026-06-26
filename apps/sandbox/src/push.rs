@@ -767,6 +767,7 @@ pub(crate) fn gdf_temporal_push(
     reject_dist: f32,
     max_hist: f32,
     min_alpha: f32,
+    neighborhood: f32,
 ) -> [u8; 192] {
     let mut pc = [0u8; 192];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -795,6 +796,7 @@ pub(crate) fn gdf_temporal_push(
     pc[176..180].copy_from_slice(&reject_dist.to_le_bytes());
     pc[180..184].copy_from_slice(&max_hist.to_le_bytes());
     pc[184..188].copy_from_slice(&min_alpha.to_le_bytes());
+    pc[188..192].copy_from_slice(&neighborhood.to_le_bytes());
     pc
 }
 

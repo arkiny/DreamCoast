@@ -98,6 +98,25 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float len;
     if (hist_len > 0.5)
     {
+        // Neighborhood clamp (params.w > 0.5): clip the reprojected history to the current
+        // GI's 3x3 min/max box before accumulating — removes history fireflies / ghosting.
+        if (pc.params.w > 0.5)
+        {
+            float2 ts = 1.0 / float2(pc.width, pc.height);
+            float3 mn = gi_cur, mx = gi_cur;
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    float3 c = g.textures[pc.gi_raw_index]
+                                   .SampleLevel(g.samp, uv + float2(dx, dy) * ts, 0.0)
+                                   .rgb;
+                    mn = min(mn, c);
+                    mx = max(mx, c);
+                }
+            }
+            hist_rgb = clamp(hist_rgb, mn, mx);
+        }
         len = min(hist_len + 1.0, pc.params.y);
         float alpha = max(1.0 / len, pc.params.z); // EMA weight on the new sample
         accum = lerp(hist_rgb, gi_cur, alpha);
