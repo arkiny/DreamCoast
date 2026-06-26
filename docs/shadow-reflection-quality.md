@@ -52,10 +52,11 @@ factor(0=하드 3×3 폴백, scalability seam), 품질 상수(샘플수/search/m
 - 주의: push의 float3는 **반드시 16바이트 정렬**(SPIR-V vec3 align 16 vs DXIL 4바이트 팩) — 미정렬 시 DX≡VK 3.19/ch 발산했음 → 정렬로 0.0003 복구.
 - 결과: 반사/GI 지면이 깨끗한 grey, 객체 색 침범 제거. 기본 씬 6.26→**6.04/ch**(off>32 1.68→1.22%), DX≡VK 0.0003.
 
-## 남음 (큰 작업, 보류) — Glossy/chrome 반사 지오메트리
+## 남음 (큰 작업) — Glossy/chrome 반사 지오메트리 → 계획 수립됨
 크롬(rough 0.08)·글로시가 저해상 48³ SDF blob이라 PT의 정확한 반사 형상과 차이(copper 뷰 잔차 지배).
-근본은 B3 고해상/클립맵 SDF(비용 큼) — 게임 최적화 우선이라 **보류**. à-trous/cone-mip은 노이즈용인데
-현 GGX+temporal이 이미 글로시 노이즈를 해소해 효과 작음 → 현재로선 비용 대비 이득 낮음.
+근본은 고해상/클립맵 SDF. **계획: [reflection-sdf-resolution.md](reflection-sdf-resolution.md)**
+(Step1 단일볼륨 해상도 상향 프로브 → Step2 클립맵 → Step3 Hi-Z SSR 오프로드, 최적화 우선·RenderQuality
+티어 연동). à-trous/cone-mip은 노이즈용인데 현 GGX+temporal이 이미 노이즈를 해소해 효과 작음(보류).
 
 ## 진행
 Phase 1 → 측정/승인 → Phase 2 → 측정. 각 Phase는 기본 on·env 폴백으로 commit.

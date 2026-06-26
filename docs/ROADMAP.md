@@ -170,6 +170,12 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
     스페클 0.** VK≡DX 정책: stochastic 경로는 비트 동일 불가(~3.85/ch, DDA 마치 fp + lit-history 피드백)
     → 상용(Frostbite/Lumen)처럼 "지각/통계 동등"으로 검증(결정성 래스터·해석적 GI는 픽셀 정확). NEXT: 컴포짓
     러프니스 블렌드 정교화 · PT 잔차 재측정 · 동적 오브젝트 GDF.
+- **Stage D — RenderQuality 티어 (확장성, 계획, 가로지르는 항목):** 이 씬/엔진은 차후 범용 게임용이라,
+  트랙 전반에 흩어진 품질 노브(GI spp, 반사 GGX 샘플/디노이즈 반경, 소프트 그림자 PCSS 샘플 수,
+  서피스-캐시 해상도)를 **단일 `RenderQuality{low,med,high}` enum 한 곳으로** 묶어 런타임/플랫폼별로
+  분리한다(저사양 = 저티어 폴백). 각 기능은 이미 "기본 off/저비용 + env·플래그 seam"으로 설계돼 있어
+  (`SHADOW_SOFTNESS`/`SOFT_SHADOWS`, `P11_*`, 셰이더 상수 블록) **티어가 그 seam을 선택만** 하면 된다.
+  Phase 6 그림자도 포함. 게임용 스케일러빌리티의 토대. 세부: [shadow-reflection-quality.md](shadow-reflection-quality.md).
 - **완료 기준**: 동적 씬에서 HW RT 없이 GDF 기반 GI/AO가 두 백엔드에서 동작, 패스트레이서(Phase 8)
   레퍼런스 대비 그럴듯하게 수렴, 검증 클린.
 
