@@ -336,6 +336,8 @@ struct App {
     point_lights_on: bool,
     shadows_on: bool,
     shadow_bias: f32,
+    // PCSS-lite penumbra scale (max soft-shadow radius in shadow-map UV); 0 = hard 3x3 PCF.
+    shadow_softness: f32,
     override_material: bool,
     metallic_override: f32,
     roughness_override: f32,
@@ -1006,6 +1008,15 @@ impl App {
             point_lights_on,
             shadows_on: true,
             shadow_bias: 0.0015,
+            // PCSS-lite soft shadows: an opt-in quality tier (the scalability seam).
+            // Default 0 = hard 3x3 PCF — cheapest AND the closest match to the path
+            // tracer, whose sun disk (SUN_COS_MAX ~1.15deg) is near-sharp, so a wide
+            // penumbra actually diverges from PT. `SHADOW_SOFTNESS=<f>` (or the UI slider)
+            // turns it on; the PT-calibrated factor is ~0.0375, larger = softer/aesthetic.
+            shadow_softness: std::env::var("SHADOW_SOFTNESS")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.0),
             override_material: false,
             metallic_override: 1.0,
             roughness_override: 0.15,
@@ -1249,6 +1260,7 @@ impl App {
                 point_lights_on,
                 shadows_on,
                 shadow_bias,
+                shadow_softness,
                 override_material,
                 metallic_override,
                 roughness_override,
@@ -1323,6 +1335,7 @@ impl App {
                         ui.checkbox("Point lights", point_lights_on);
                         ui.checkbox("Shadows", shadows_on);
                         ui.slider("Shadow bias", 0.0, 0.01, shadow_bias);
+                        ui.slider("Shadow softness (0=hard)", 0.0, 0.1, shadow_softness);
                     }
 
                     if ui.collapsing_header("Material override", TreeNodeFlags::empty()) {
@@ -1625,7 +1638,12 @@ impl App {
                 [0.0, 0.0, 0.0, 0.0],
             ],
             light_view_proj: light_vp.to_cols_array(),
-            shadow: [self.shadow_bias, 1.0 / SHADOW_SIZE as f32, 0.0, 0.0],
+            shadow: [
+                self.shadow_bias,
+                1.0 / SHADOW_SIZE as f32,
+                self.shadow_softness, // z: PCSS-lite penumbra scale (0 = hard PCF)
+                0.0,
+            ],
             inv_view_proj,
             ibl: ibl_indices,
             // Reflection-probe centre (matches the env-capture eye) + a box proxy for
