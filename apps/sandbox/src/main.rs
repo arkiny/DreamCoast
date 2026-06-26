@@ -380,10 +380,14 @@ struct App {
     /// C8a: use the per-voxel albedo volumes (real surface color) in the GDF GI / reflection
     /// re-light instead of a constant albedo. Off => achromatic (pre-C8a), for no-reg compare.
     gdf_color: bool,
+    /// C8b1: viz the captured mesh-card surface-cache atlas (validation of card capture).
+    cache_viz: bool,
     /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
     scene_gdf_baked: bool,
     /// C8a bake-once latch for the per-voxel albedo volumes (GI + reflection consumers share).
     scene_albedo_baked: bool,
+    /// C8b1 capture-once latch for the surface cache (static geometry capture).
+    scene_cache_captured: bool,
     path_trace_pipeline: bool,
     realtime_env: bool,
     multibounce: bool,
@@ -645,6 +649,8 @@ impl App {
             let mut base: u32 = 0;
             let mut amin = [f32::MAX; 3];
             let mut amax = [f32::MIN; 3];
+            // C8b1: per-object world AABB (for the surface-cache mesh cards).
+            let mut obj_aabb: [([f32; 3], [f32; 3]); 4] = [([f32::MAX; 3], [f32::MIN; 3]); 4];
             for (oi, (m, xf)) in objs.into_iter().enumerate() {
                 for v in &m.vertices {
                     let p = xf.transform_point3(Vec3::from(v.pos));
@@ -653,6 +659,9 @@ impl App {
                         .normalize_or_zero();
                     amin = [amin[0].min(p.x), amin[1].min(p.y), amin[2].min(p.z)];
                     amax = [amax[0].max(p.x), amax[1].max(p.y), amax[2].max(p.z)];
+                    let (omin, omax) = &mut obj_aabb[oi];
+                    *omin = [omin[0].min(p.x), omin[1].min(p.y), omin[2].min(p.z)];
+                    *omax = [omax[0].max(p.x), omax[1].max(p.y), omax[2].max(p.z)];
                     fused_v.extend_from_slice(&p.x.to_le_bytes());
                     fused_v.extend_from_slice(&p.y.to_le_bytes());
                     fused_v.extend_from_slice(&p.z.to_le_bytes());
@@ -691,6 +700,50 @@ impl App {
                 amin,
                 amax,
             )?;
+            // C8b1: 6 axis-aligned mesh cards per object (Lumen-style box-projection cards).
+            // Each 64-B record = center.xyz/trace_depth, normal.xyz, u_axis.xyz (half-extent),
+            // v_axis.xyz (half-extent). The capture pass sphere-traces the GDF inward from each
+            // card-plane texel to the object surface.
+            let mut cards: Vec<u8> = Vec::new();
+            let push4 = |v: [f32; 3], w: f32, buf: &mut Vec<u8>| {
+                for c in v {
+                    buf.extend_from_slice(&c.to_le_bytes());
+                }
+                buf.extend_from_slice(&w.to_le_bytes());
+            };
+            for (omin, omax) in obj_aabb {
+                let center = [
+                    (omin[0] + omax[0]) * 0.5,
+                    (omin[1] + omax[1]) * 0.5,
+                    (omin[2] + omax[2]) * 0.5,
+                ];
+                let half = [
+                    (omax[0] - omin[0]) * 0.5,
+                    (omax[1] - omin[1]) * 0.5,
+                    (omax[2] - omin[2]) * 0.5,
+                ];
+                for axis in 0..3 {
+                    for &sign in &[1.0f32, -1.0] {
+                        let mut normal = [0.0f32; 3];
+                        normal[axis] = sign;
+                        let mut fc = center;
+                        fc[axis] = if sign > 0.0 { omax[axis] } else { omin[axis] };
+                        let t1 = (axis + 1) % 3;
+                        let t2 = (axis + 2) % 3;
+                        let mut u_axis = [0.0f32; 3];
+                        u_axis[t1] = half[t1];
+                        let mut v_axis = [0.0f32; 3];
+                        v_axis[t2] = half[t2];
+                        let depth = (omax[axis] - omin[axis]).max(1e-4);
+                        push4(fc, depth, &mut cards);
+                        push4(normal, 0.0, &mut cards);
+                        push4(u_axis, 0.0, &mut cards);
+                        push4(v_axis, 0.0, &mut cards);
+                    }
+                }
+            }
+            let num_cards = (cards.len() / 64) as u32;
+            gdf.build_surface_cache(&device, &cards, num_cards)?;
         }
 
         let gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
@@ -771,6 +824,8 @@ impl App {
             && std::env::var("P11_GDF_COLOR")
                 .map(|v| v != "0")
                 .unwrap_or(true);
+        // C8b1 surface-cache atlas viz (validation toggle).
+        let cache_viz = gdf.has_surface_cache() && std::env::var_os("P11_CACHE_VIZ").is_some();
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -905,8 +960,10 @@ impl App {
             gdf_hybrid,
             swrt_reflect,
             gdf_color,
+            cache_viz,
             scene_gdf_baked: false,
             scene_albedo_baked: false,
+            scene_cache_captured: false,
             path_trace_pipeline,
             realtime_env: true,
             multibounce: true,
@@ -1112,6 +1169,7 @@ impl App {
                 gdf_hybrid,
                 swrt_reflect,
                 gdf_color,
+                cache_viz,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1293,6 +1351,12 @@ impl App {
                             ui.checkbox("Colored GDF re-light (C8a)", gdf_color);
                             if *gdf_color {
                                 ui.text_disabled("  - per-voxel albedo: colored GI + reflections");
+                            }
+                        }
+                        if gdf.has_surface_cache() {
+                            ui.checkbox("Surface-cache atlas (C8b1 viz)", cache_viz);
+                            if *cache_viz {
+                                ui.text_disabled("  - mesh cards: captured geometry + albedo");
                             }
                         }
                     }
@@ -1519,7 +1583,8 @@ impl App {
             || self.gdf_gi
             || self.gdf_reflect
             || self.gdf_hybrid
-            || self.swrt_reflect)
+            || self.swrt_reflect
+            || self.cache_viz)
             && scene_gdf_vol.is_some()
         {
             let ext = graph.import_external("scene_gdf");
@@ -1536,7 +1601,11 @@ impl App {
         // bit-identical); the re-light consumers (C3 GI, C6/C7 reflection) read it. Gated on
         // `gdf_color` so `P11_GDF_COLOR=0` is the achromatic pre-C8a path.
         let scene_albedo_ext = if self.gdf_color
-            && (self.gdf_gi || self.gdf_reflect || self.gdf_hybrid || self.swrt_reflect)
+            && (self.gdf_gi
+                || self.gdf_reflect
+                || self.gdf_hybrid
+                || self.swrt_reflect
+                || self.cache_viz)
             && self.gdf.has_scene_albedo()
         {
             let ext = graph.import_external("scene_albedo");
@@ -1551,6 +1620,24 @@ impl App {
         // The (volumes, handle) pair the re-light consumers take; `None` => constant albedo.
         let scene_albedo = match (self.gdf.scene_albedo(), scene_albedo_ext) {
             (Some(vols), Some(ext)) => Some((vols, ext)),
+            _ => None,
+        };
+        // C8b1: capture the mesh-card surface cache once (static geometry + albedo), reading
+        // the scene GDF (+ the C8a albedo volumes for the captured color). The handle is
+        // shared with the atlas viz below (and, later, the C8b2 cache lighting).
+        let scene_cache_ext = match (
+            self.cache_viz && self.gdf.has_surface_cache(),
+            scene_gdf_ext,
+        ) {
+            (true, Some(gdf_ext)) => {
+                let ext = graph.import_external("scene_cache");
+                if !self.scene_cache_captured {
+                    self.gdf
+                        .record_cache_capture(&mut graph, gdf_ext, scene_albedo_ext, ext);
+                    self.scene_cache_captured = true;
+                }
+                Some(ext)
+            }
             _ => None,
         };
         // Stage C2: GDF ambient occlusion, multiplied into the lighting ambient term.
@@ -2044,9 +2131,16 @@ impl App {
             _ => None,
         };
 
+        // Stage C8b1: surface-cache atlas viz — tiles the captured cards across the screen.
+        let cache_out = match (self.cache_viz, scene_cache_ext) {
+            (true, Some(ext)) => Some(self.gdf.record_cache_view(&mut graph, ext, extent, cw, ch)),
+            _ => None,
+        };
+
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active, else
         // the SW-RT SDF trace, else the Stage-B volume slice, else the Stage-C1 scene
-        // GDF, else the Stage-C5 SSR / C6 GDF-reflection viz, else compute-post, else HDR.
+        // GDF, else the Stage-C5 SSR / C6 GDF-reflection viz, else the C8b1 cache atlas,
+        // else compute-post, else HDR.
         let tonemap_src = rt_out
             .or(sdf_out)
             .or(vol_out)
@@ -2057,6 +2151,7 @@ impl App {
             .or(ssr_out)
             .or(reflect_out)
             .or(hybrid_out)
+            .or(cache_out)
             .or(hdr_post)
             .unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the

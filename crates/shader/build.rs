@@ -281,6 +281,20 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "sdf_albedo_bake_cs",
     },
+    // Phase 11 Stage C (C8b1): mesh-card surface-cache capture (GDF-traced geometry+albedo).
+    Job {
+        src: "sdf_cache_capture.slang",
+        entry: "cacheMain",
+        stage: "compute",
+        key: "sdf_cache_capture_cs",
+    },
+    // Phase 11 Stage C (C8b1): surface-cache atlas viz.
+    Job {
+        src: "sdf_cache_view.slang",
+        entry: "viewMain",
+        stage: "compute",
+        key: "sdf_cache_view_cs",
+    },
     // Phase 11 Stage B (B3): merge per-mesh SDF instances into a global distance field.
     Job {
         src: "gdf_merge.slang",
