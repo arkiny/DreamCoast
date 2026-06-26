@@ -22,13 +22,19 @@ factor(0=하드 3×3 폴백, scalability seam), 품질 상수(샘플수/search/m
   옵트인이라 허용; 기본 하드 경로는 0.0013 유지).
 - **결론**: 그림자는 PT-패리티 레버가 아님(태양이 샤프). 패리티 개선은 Phase 2(반사)가 본진.
 
-## Phase 2 — Glossy/chrome reflection 정확도
-현재: C8j 확률적 GGX GDF 레이 + temporal resolve. 크롬(rough 0.08)·글로시 잔차 큼(저해상 SDF blob + SSR 미스).
-후보(저비용 우선):
-- **à-trous 공간 디노이즈 강화**: roughness 스케일 반경·깊이/법선 가중 edge-stop 강화 → 노이즈↓(레이 수 유지).
-- 또는 **cone→GDF-mip**: 거친 로브를 GDF 반사 mip 피라미드의 cone LOD로 싸게 근사(레이 1개 + 와이드 콘).
-- 파라미터/토글을 seam 규칙대로. 본질적 한계(48³ SDF blob)는 Phase 3(B3 클립맵/고해상)로 분리.
-- 검증: rt-compare 잔차(금속 영역) ↓, 코스트 측정(P11 타이밍), DX≡VK 유지.
+## Phase 2 — GDF GI 과밝음 수정 ✅ (데이터가 재정의)
+조사 중 발견: 크롬 뷰 PT 잔차의 최대 원인은 반사가 아니라 **디퓨즈 GDF GI 과밝음**(아보카도 +60/ch).
+원인: `gdf_gi.slang` `trace_bounce`의 바운스 표면 재조명이 Lambertian **`/π` 누락** — pbr 직접광은
+`albedo/PI*radiance*ndl`인데 바운스는 `albedo*(...)`로 ~π(3.14×) 과밝음. (1차 표면은 코사인 샘플링으로
+π가 상쇄되어 정상.) 수정: 재조명에 `* (1/PI)`.
+- 결과: 아보카도 diff (60,22,0)→(7,-10,-16). 크롬 뷰 9.14→**6.77/ch**(off>32 9.24%→5.13%),
+  기본 씬 6.90→**6.56/ch**, DX≡VK **0.0010**(게이트 통과). 시각: diff에서 아보카도 글로우 소거.
+- 남은 잔차 지배 = 크롬/글로시 **반사 지오메트리**(저해상 48³ SDF blob) → Phase 3.
+
+## Phase 3 — Glossy/chrome reflection 정확도 (남음)
+크롬(rough 0.08)·글로시 반사가 GDF blob 형상이라 PT의 정확한 반사와 차이. 후보(저비용 우선):
+à-trous 강화 / cone→GDF-mip / 본질적으론 B3 고해상·클립맵 SDF. seam 규칙 유지, rt-compare로 검증.
+주의: gdf_reflect/surface-cache 재조명도 같은 `/π` 결을 점검할 것(반사는 스페큘러라 별도 정규화).
 
 ## 진행
 Phase 1 → 측정/승인 → Phase 2 → 측정. 각 Phase는 기본 on·env 폴백으로 commit.
