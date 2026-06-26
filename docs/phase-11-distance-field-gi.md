@@ -238,8 +238,9 @@ Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실
   denoise 토글 재활성 시 1–2프레임 stale(self-heal). NEXT C5(선택) 러프 반사.
 
 ---
-**C5–C7 = 반사 트랙(캡처 기반 IBL 스페큘러 대체).** SSR(온스크린) → GDF SW-RT(오프스크린) → 스카이(miss)
-3단 폴백을 차례로 세운 뒤(C7) 하나로 합성해 `pbr.slang`의 prefilter-큐브 스페큘러 lookup을 교체한다.
+**C5–C7 = 반사 트랙(캡처 기반 IBL 스페큘러 대체) ✅ (C5/C6/C7 모두 양 백엔드 검증, 푸시됨).** SSR(온스크린)
+→ GDF SW-RT(오프스크린) → 스카이(miss) 3단 폴백을 세운 뒤(C7c) 하나로 합성해 `pbr.slang`의 prefilter-큐브
+스페큘러 lookup을 교체 — **하이브리드-vs-PT 잔차 4.18→2.58/ch(−38%)로 트랙 성공 지표 달성(C7d)**.
 **C8 = GDF 컬러(서피스 캐시).** C3 GI·C6/C7 반사의 무채색 상수 알베도(0.7)를 실제 표면 컬러/라디언스로
 교체 — C3 컬러 bleed + 컬러 반사. C7과 독립이나 C7 전에 C8a를 하면 반사가 곧바로 컬러가 된다.
 
@@ -279,7 +280,7 @@ Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실
   VUID 0, DX 클린, TDR 없음. PT 정량 대조는 C7 합성 후(rt-compare.py). 한계: 무채색 상수 알베도 + 월드
   march 스트라이프(B4와 동일).
 
-### C7 — 하이브리드 반사 합성 + IBL 스페큘러/디퓨즈 대체
+### C7 — 하이브리드 반사 합성 + IBL 스페큘러/디퓨즈 대체 ✅ (C7a–C7d 양 백엔드 검증, 푸시됨)
 - **합성:** 픽셀별로 **SSR(C5, 신뢰도 높음) → GDF SW-RT(C6, 오프스크린) → 절차적 스카이(miss)** 순으로
   폴백 선택/블렌드(SSR confidence + 화면 가장자리 페이드). Fresnel·러프니스로 가중해 `pbr.slang`의
   **prefilter-큐브 스페큘러 lookup을 이 하이브리드 결과로 교체**.
@@ -290,6 +291,38 @@ Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실
   소스로 축소(시차·단일프로브·이웃반사·프록시 한계 모두 은퇴). 토글로 레거시 IBL ↔ 신 SW-RT 경로 비교 유지.
 - **검증:** `tools/rt-compare.py`로 **신 하이브리드 반사 vs PT** 평균차가 캡처 IBL(잔차 ~4.0/ch) 대비
   유의미하게 감소함을 정량 확인(= 이 트랙의 성공 지표). 양 백엔드 픽셀 일치, 검증 클린.
+
+**C7a/C7b ✅ (`fb0dd0a`/`9e91370`):** 합성 viz(`reflect_composite.slang`) + 컴퓨트-UBO 인프라 +
+재투영 raw-radiance SSR history(`lit_history.slang`, `ssr.slang` history 모드). 자세한 내역은
+engine-backlog 메모리.
+
+**C7c ✅ (`0f61395`) — 하이브리드 반사를 라이팅에 연결:** 합성 이미지를 **`pbr.slang` `ambient_ibl`의
+prefilter-큐브 스페큘러(`prefiltered`) 대신** 사용. env-BRDF(`specular = refl*(f*brdf.x+brdf.y)`)·
+디퓨즈 irradiance는 유지; 합성은 raw radiance라 큐브 샘플의 drop-in(pbr가 마지막 `*ambient.a`로 노출
+1회 적용). `PushConstants += reflect_index`(32→36B); `has_swrt`면 box-프록시 시차 보정 생략(합성이 이미
+실제 지오메트리를 봄), 없으면(0xFFFFFFFF) 레거시 box-시차 prefilter 큐브 경로 = **반사-off 무회귀**.
+**그래프 순서 이동:** 합성이 라이팅 스페큘러에 피드백되므로 **라이팅 이전**에 실행 —
+gbuffer→AO/GI→**SSR(history)+GDF reflect+composite**→lighting→lit_history(다음 프레임 history 캡처).
+SSR은 history 모드(직전 프레임 raw-radiance 재투영)라 이번 프레임 미작성 HDR을 읽지 않음(read-before-write
+회피). **토글 `P11_SWRT_REFLECT`**(+UI)로 레거시 IBL ↔ SW-RT 병존 비교. 활성 시 standalone SSR/GDF/
+hybrid viz는 억제(history 인프라 공유). **검증 RTX2070S:** fmt+clippy(-D) 클린; 크롬 구가 실제 녹색
+아보카도 이웃을 반사(레거시는 블러 큐브뿐). **VK≡DX** — 기본 래스터 max1, SW-RT max26/4px(C5/C6 march
+fp-contraction 상속). **레거시-IBL(반사-off) pre-C7c HEAD와 바이트 동일(max0)=무회귀**. VUID 0, DX 클린.
+
+**C7d ✅ — 정량 성공 지표 달성:** `tools/rt-compare.py`로 `NO_POINT_LIGHTS=1` 공정 비교(기존 ~4.0/ch
+방법론), Vulkan 고정 카메라:
+- **레거시 캡처-IBL vs PT: 4.178/ch** (>8: 6.55%, >32: 3.02%) — 문서화된 ~4.0/ch 잔차 재현.
+- **SW-RT 하이브리드 vs PT: 2.580/ch** (>8: 4.00%, >32: 1.27%) — **잔차 −38%**, 큰 오차(>32) 절반 이하.
+- 몽타주 `docs/images/hybrid-vs-pt.png`(SW-RT 래스터 | PT | diff×4): 잔차가 금속 구의 스페큘러
+  하이라이트/에지에 집중 — **남은 차이 = SSR 미러-only(러프니스 GGX 블러 미구현) + GDF 히트 상수
+  알베도(0.7)**. → **C8(GDF 컬러/서피스 캐시) + 러프 반사가 다음 잔차 감소 트랙**.
+- **= 반사 트랙 성공 지표 충족: 캡처-IBL이 원리적으로 못 닫던 이웃 반사 잔차를 SW-RT가 유의미하게 축소.**
+
+**씬 캡처 스카이-only 격하 — 후속(미착수):** C7c 경로(`P11_SWRT_REFLECT`)에서는 specular가 SW-RT라 캡처
+큐브 specular가 불필요하나, env 큐브의 **디퓨즈 irradiance(mip2 = 이미 스카이-only)** 와 **레거시 비교
+경로**가 여전히 큐브에 의존. 캡처 파이프라인(RT3/RT5 멀티바운스) 실제 제거/스카이-only 재구성은
+`P11_SWRT_REFLECT`가 기본값이 된 뒤의 정리 작업 → [realtime-env-capture.md](realtime-env-capture.md)
+RT3/RT5 격하와 함께 후속 단계로 문서화(현재는 토글 병존 유지).
 
 ### C8 — GDF 컬러 / 서피스 캐시 (무채색 상수 알베도 → 실제 표면 컬러·라디언스)
 현재 C3 GI·C6/C7 반사는 GDF 히트를 **상수 알베도 0.7로 재조명** → 무채색(녹색 아보카도·빨간 큐브의 색이
