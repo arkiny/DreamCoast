@@ -54,6 +54,13 @@ pub(crate) struct GdfSystem {
     scene_vtx: Option<StorageBuffer>,
     scene_idx: Option<StorageBuffer>,
     scene_tri_count: u32,
+    /// Scene-GDF voxel-grid edge length (cube). Defaults to `SCENE_DIM`; `P11_GDF_DIM=<n>`
+    /// (32..=256) overrides it. NOTE: raising it does NOT meaningfully improve reflection/GI
+    /// parity on the sample scene (measured 48→128 ≈ 0.02–0.03/ch; the residual isn't voxel-
+    /// resolution-bound — see docs/reflection-sdf-resolution.md). Kept as a coverage /
+    /// RenderQuality knob for larger future scenes, not a parity lever. The bake is
+    /// O(voxels·tris) one-time, so high values only lengthen the one-shot bake + volume memory.
+    scene_dim: u32,
     /// World-space AABB the `scene_gdf` voxel grid maps to.
     scene_aabb_min: [f32; 3],
     scene_aabb_max: [f32; 3],
@@ -319,6 +326,14 @@ impl GdfSystem {
             scene_vtx: None,
             scene_idx: None,
             scene_tri_count: 0,
+            // `P11_GDF_DIM=<n>` overrides the scene-GDF resolution (clamped 32..=256); the
+            // brute-force bake is O(voxels·tris) one-time, so very high values lengthen the
+            // one-shot bake. Default keeps the watchdog-safe SCENE_DIM.
+            scene_dim: std::env::var("P11_GDF_DIM")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|d| d.clamp(32, 256))
+                .unwrap_or(SCENE_DIM),
             scene_aabb_min: [0.0; 3],
             scene_aabb_max: [0.0; 3],
             scene_albedo: None,
@@ -354,10 +369,11 @@ impl GdfSystem {
         if self.gdf.is_none() {
             return Ok(()); // compute unsupported (no volumes created)
         }
+        let dim = self.scene_dim;
         self.scene_gdf = Some(device.create_volume(&VolumeDesc {
-            width: SCENE_DIM,
-            height: SCENE_DIM,
-            depth: SCENE_DIM,
+            width: dim,
+            height: dim,
+            depth: dim,
             format: Format::R32Float,
         })?);
         self.scene_vtx = Some(device.create_storage_buffer_init(
@@ -384,9 +400,9 @@ impl GdfSystem {
         if self.albedo_bake_pipeline.is_some() {
             let make = || -> anyhow::Result<Volume> {
                 Ok(device.create_volume(&VolumeDesc {
-                    width: SCENE_DIM,
-                    height: SCENE_DIM,
-                    depth: SCENE_DIM,
+                    width: dim,
+                    height: dim,
+                    depth: dim,
                     format: Format::R32Float,
                 })?)
             };
@@ -440,6 +456,7 @@ impl GdfSystem {
         let tri_count = self.scene_tri_count;
         let aabb_min = self.scene_aabb_min;
         let aabb_max = self.scene_aabb_max;
+        let dim = self.scene_dim;
         let storage = [
             vols[0].storage_index(),
             vols[1].storage_index(),
@@ -458,10 +475,10 @@ impl GdfSystem {
                 }
                 cmd.bind_compute_pipeline(bakep);
                 cmd.push_constants_compute(&sdf_albedo_bake_push(
-                    storage[0], storage[1], storage[2], SCENE_DIM, tri_count, vtx, idx, tri_albedo,
+                    storage[0], storage[1], storage[2], dim, tri_count, vtx, idx, tri_albedo,
                     aabb_min, aabb_max,
                 ));
-                let g = SCENE_DIM.div_ceil(4);
+                let g = dim.div_ceil(4);
                 cmd.dispatch(g, g, g);
                 Ok(())
             },
@@ -845,6 +862,7 @@ impl GdfSystem {
         let tri_count = self.scene_tri_count;
         let aabb_min = self.scene_aabb_min;
         let aabb_max = self.scene_aabb_max;
+        let dim = self.scene_dim;
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "scene_sdf_bake",
@@ -856,9 +874,9 @@ impl GdfSystem {
                 cmd.volume_to_storage(vol);
                 cmd.bind_compute_pipeline(bakep);
                 cmd.push_constants_compute(&sdf_bake_push(
-                    storage, SCENE_DIM, tri_count, vtx, idx, aabb_min, aabb_max,
+                    storage, dim, tri_count, vtx, idx, aabb_min, aabb_max,
                 ));
-                let g = SCENE_DIM.div_ceil(4);
+                let g = dim.div_ceil(4);
                 cmd.dispatch(g, g, g);
                 Ok(())
             },
