@@ -22,7 +22,10 @@ use rhi::{
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::mesh::{index_bytes, vertex_bytes};
-use crate::push::{gdf_merge_push, gdf_trace_push, sdf_bake_push, sdf_trace_push, volume_push};
+use crate::push::{
+    gdf_merge_push, gdf_trace_push, sdf_albedo_bake_push, sdf_bake_push, sdf_trace_push,
+    volume_push,
+};
 
 /// Volume edge length in voxels (cube). The bake/merge/view all share it.
 const VOLUME_DIM: u32 = 64;
@@ -54,6 +57,12 @@ pub(crate) struct GdfSystem {
     /// World-space AABB the `scene_gdf` voxel grid maps to.
     scene_aabb_min: [f32; 3],
     scene_aabb_max: [f32; 3],
+    /// Stage C8a: per-voxel surface albedo (R/G/B as three R32Float volumes sharing the
+    /// scene GDF's grid) + the parallel per-triangle albedo buffer the bake reads. Lets the
+    /// C3 GI / C6 reflection re-light a hit with the real surface color instead of a constant.
+    scene_albedo: Option<[Volume; 3]>,
+    scene_tri_albedo: Option<StorageBuffer>,
+    albedo_bake_pipeline: Option<ComputePipeline>,
 }
 
 /// Scene-GDF volume edge length (cube). Coarser than `VOLUME_DIM`: the fused
@@ -139,6 +148,16 @@ impl GdfSystem {
             dreamcoast_shader::gdf_merge_cs_metallib,
             "gdf_merge",
             48,
+            [4, 4, 4],
+        )?;
+        // C8a per-voxel albedo bake (nearest-triangle color into 3 R32F volumes).
+        let albedo_bake_pipeline = compute(
+            "albedoBakeMain",
+            dreamcoast_shader::sdf_albedo_bake_cs_spirv,
+            dreamcoast_shader::sdf_albedo_bake_cs_dxil,
+            dreamcoast_shader::sdf_albedo_bake_cs_metallib,
+            "sdf_albedo_bake",
+            64,
             [4, 4, 4],
         )?;
         let trace_pipeline = compute(
@@ -255,6 +274,9 @@ impl GdfSystem {
             scene_tri_count: 0,
             scene_aabb_min: [0.0; 3],
             scene_aabb_max: [0.0; 3],
+            scene_albedo: None,
+            scene_tri_albedo: None,
+            albedo_bake_pipeline,
         })
     }
 
@@ -262,11 +284,13 @@ impl GdfSystem {
     /// of all opaque scene objects, already transformed to world space) + its world
     /// AABB, and allocate the scene GDF volume. The bake itself runs once on the graph
     /// (`record_scene_build`). No-op when compute is unsupported.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_scene_sdf(
         &mut self,
         device: &Device,
         fused_vtx: &[u8],
         fused_idx: &[u8],
+        tri_albedo: &[u8],
         tri_count: u32,
         aabb_min: [f32; 3],
         aabb_max: [f32; 3],
@@ -299,11 +323,93 @@ impl GdfSystem {
         self.scene_tri_count = tri_count;
         self.scene_aabb_min = aabb_min;
         self.scene_aabb_max = aabb_max;
+        // C8a: three R32F color volumes (R/G/B) over the same grid + the per-triangle linear
+        // albedo buffer (12 B/triangle) the bake reads. Only when the albedo bake exists.
+        if self.albedo_bake_pipeline.is_some() {
+            let make = || -> anyhow::Result<Volume> {
+                Ok(device.create_volume(&VolumeDesc {
+                    width: SCENE_DIM,
+                    height: SCENE_DIM,
+                    depth: SCENE_DIM,
+                    format: Format::R32Float,
+                })?)
+            };
+            self.scene_albedo = Some([make()?, make()?, make()?]);
+            self.scene_tri_albedo = Some(device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: tri_albedo.len() as u64,
+                    stride: 12,
+                    indirect: false,
+                },
+                tri_albedo,
+            )?);
+        }
         Ok(())
     }
 
     pub(crate) fn has_scene_sdf(&self) -> bool {
         self.scene_gdf.is_some()
+    }
+
+    pub(crate) fn has_scene_albedo(&self) -> bool {
+        self.scene_albedo.is_some()
+    }
+
+    /// C8a: the three per-voxel albedo channel volumes (R/G/B), `None` until built / when
+    /// compute is unsupported. Consumers (`GiSystem`, `ReflectSystem`) sample them at a hit.
+    pub(crate) fn scene_albedo(&self) -> Option<&[Volume; 3]> {
+        self.scene_albedo.as_ref()
+    }
+
+    /// Record the one-time per-voxel albedo bake into the 3 color volumes, writing the
+    /// imported `albedo_ext` handle (the caller imports it once + shares it with every
+    /// re-lighting consumer so the graph orders bake -> reads, like the distance field).
+    pub(crate) fn record_scene_albedo_bake<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        albedo_ext: ResourceId,
+    ) {
+        let vols = self.scene_albedo.as_ref().expect("scene albedo volumes");
+        let bakep = self
+            .albedo_bake_pipeline
+            .as_ref()
+            .expect("albedo bake pipeline");
+        let vtx = self.scene_vtx.as_ref().expect("scene vtx").storage_index();
+        let idx = self.scene_idx.as_ref().expect("scene idx").storage_index();
+        let tri_albedo = self
+            .scene_tri_albedo
+            .as_ref()
+            .expect("scene tri albedo")
+            .storage_index();
+        let tri_count = self.scene_tri_count;
+        let aabb_min = self.scene_aabb_min;
+        let aabb_max = self.scene_aabb_max;
+        let storage = [
+            vols[0].storage_index(),
+            vols[1].storage_index(),
+            vols[2].storage_index(),
+        ];
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "scene_albedo_bake",
+                storage_writes: vec![albedo_ext],
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                for v in vols.iter() {
+                    cmd.volume_to_storage(v);
+                }
+                cmd.bind_compute_pipeline(bakep);
+                cmd.push_constants_compute(&sdf_albedo_bake_push(
+                    storage[0], storage[1], storage[2], SCENE_DIM, tri_count, vtx, idx, tri_albedo,
+                    aabb_min, aabb_max,
+                ));
+                let g = SCENE_DIM.div_ceil(4);
+                cmd.dispatch(g, g, g);
+                Ok(())
+            },
+        );
     }
 
     /// Stage C1: build the world-space scene GDF (fused brute-force bake, once) then SW

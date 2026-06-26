@@ -274,6 +274,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "sdf_bake_cs",
     },
+    // Phase 11 Stage C (C8a): per-voxel albedo bake (nearest-triangle color → 3 volumes).
+    Job {
+        src: "sdf_albedo_bake.slang",
+        entry: "albedoBakeMain",
+        stage: "compute",
+        key: "sdf_albedo_bake_cs",
+    },
     // Phase 11 Stage B (B3): merge per-mesh SDF instances into a global distance field.
     Job {
         src: "gdf_merge.slang",

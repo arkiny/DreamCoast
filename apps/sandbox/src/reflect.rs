@@ -72,7 +72,7 @@ impl ReflectSystem {
             dreamcoast_shader::gdf_reflect_cs_dxil,
             dreamcoast_shader::gdf_reflect_cs_metallib,
             "gdf_reflect",
-            176,
+            192,
             false,
         )?;
         let composite_pipeline = compute(
@@ -315,6 +315,7 @@ impl ReflectSystem {
         cw: u32,
         ch: u32,
         flip_y: u32,
+        albedo: Option<(&'a [Volume; 3], ResourceId)>,
     ) -> ResourceId {
         let pipe = self
             .reflect_pipeline
@@ -331,11 +332,17 @@ impl ReflectSystem {
             (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
         };
         let bias = diag * 0.01;
+        // C8a: read the per-voxel albedo volumes (colored reflections) when present; else
+        // the shader's constant `hit_albedo` fallback (sentinel indices).
+        let mut reads = vec![depth, normal, scene_gdf_ext];
+        if let Some((_, ext)) = albedo {
+            reads.push(ext);
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "gdf_reflect",
                 storage_writes: vec![out],
-                reads: vec![depth, normal, scene_gdf_ext],
+                reads,
             },
             move |ctx| {
                 let depth_index = ctx.sampled_index(depth);
@@ -343,6 +350,18 @@ impl ReflectSystem {
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.volume_to_sampled(scene_gdf);
+                let albedo_rgb = if let Some((vols, _)) = albedo {
+                    for v in vols.iter() {
+                        cmd.volume_to_sampled(v);
+                    }
+                    [
+                        vols[0].sampled_index(),
+                        vols[1].sampled_index(),
+                        vols[2].sampled_index(),
+                    ]
+                } else {
+                    [u32::MAX; 3]
+                };
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&gdf_reflect_push(
                     &inv_view_proj,
@@ -361,9 +380,10 @@ impl ReflectSystem {
                     0.0,  // world ground plane at y = 0
                     diag, // sample distance clamp
                     diag, // reflection ray max distance
-                    0.7,  // constant hit albedo (no material in the GDF)
+                    0.7,  // constant hit-albedo fallback (sentinel albedo => achromatic, pre-C8a)
                     0.25, // sky fill at the reflected hit
                     bias,
+                    albedo_rgb,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

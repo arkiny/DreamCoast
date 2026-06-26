@@ -218,17 +218,24 @@ impl GiSystem {
         flip_y: u32,
         spp: u32,
         frame: u32,
+        albedo: Option<(&'a [Volume; 3], ResourceId)>,
     ) -> ResourceId {
         let gip = self.gi_pipeline.as_ref().expect("gdf gi pipeline");
         let out = graph.create_storage_image("gdf_gi_out", HDR_FORMAT, extent);
         let sampled = scene_gdf.sampled_index();
         let diag = Self::diag(aabb_min, aabb_max);
         let bias = diag * 0.004;
+        // C8a: read the per-voxel albedo volumes (colored bounce) when present; else fall
+        // back to the constant `hit_albedo` in the shader (sentinel indices).
+        let mut reads = vec![depth, normal, scene_gdf_ext];
+        if let Some((_, ext)) = albedo {
+            reads.push(ext);
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "gdf_gi",
                 storage_writes: vec![out],
-                reads: vec![depth, normal, scene_gdf_ext],
+                reads,
             },
             move |ctx| {
                 let depth_index = ctx.sampled_index(depth);
@@ -236,6 +243,18 @@ impl GiSystem {
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.volume_to_sampled(scene_gdf);
+                let albedo_rgb = if let Some((vols, _)) = albedo {
+                    for v in vols.iter() {
+                        cmd.volume_to_sampled(v);
+                    }
+                    [
+                        vols[0].sampled_index(),
+                        vols[1].sampled_index(),
+                        vols[2].sampled_index(),
+                    ]
+                } else {
+                    [u32::MAX; 3]
+                };
                 cmd.bind_compute_pipeline(gip);
                 cmd.push_constants_compute(&gdf_gi_push(
                     &inv_view_proj,
@@ -250,6 +269,7 @@ impl GiSystem {
                     flip_y,
                     spp,
                     frame,
+                    albedo_rgb,
                     aabb_min,
                     aabb_max,
                     0.0,  // world ground plane at y = 0
@@ -257,7 +277,7 @@ impl GiSystem {
                     diag, // ray max distance (bounce reach = scene diagonal)
                     bias,
                     0.25, // sky fill radiance at the bounce hit
-                    0.7, // constant hit albedo (no material in the GDF; bleed = surface cache later)
+                    0.7,  // constant hit-albedo fallback (sentinel albedo => achromatic, pre-C8a)
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
