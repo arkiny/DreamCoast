@@ -190,8 +190,11 @@ float3 trace_bounce(float3 origin, float3 dir)
             // C8a colored re-light: the hit's real surface albedo (per-voxel color volume)
             // × sun (soft-shadowed) + a small hemispheric sky fill so surfaces in full
             // shadow still bounce a little. Colored albedo => colored indirect bleed.
+            // Lambertian: the bounce surface re-emits albedo/PI * irradiance — the same
+            // 1/PI the deferred direct term uses. Omitting it over-brightened indirect
+            // diffuse by ~PI (the GDF-GI over-lighting vs the path tracer).
             float sky_fill = pc.params.z * (0.5 + 0.5 * hn.y);
-            return albedo_at(p) * (pc.sun.w * ndl * sh + sky_fill);
+            return albedo_at(p) * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / PI);
         }
         t += max(d, 0.01);
         if (t > maxt)
