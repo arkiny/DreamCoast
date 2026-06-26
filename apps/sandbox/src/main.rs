@@ -1987,19 +1987,21 @@ impl App {
                     scene_albedo,
                     reflect_cache_arg,
                 );
+                // C8g: roughness mip pyramid of the GDF reflection (energy-conserving prefilter).
+                let refl_mips = self
+                    .reflect
+                    .record_reflect_mips(&mut graph, gdf_refl, cw, ch);
                 Some(self.reflect.record_composite(
                     &mut graph,
                     ssr,
                     gdf_refl,
+                    refl_mips,
                     g_material,
-                    g_depth,
                     extent,
                     cw,
                     ch,
                     1.0,
                     firefly_max,
-                    70.0,  // GDF prefilter radius (px) per unit roughness (glossy reflections)
-                    0.006, // same-surface NDC-depth threshold for a prefilter tap
                     self.reflect_max_roughness,
                 ))
             }
@@ -2390,19 +2392,20 @@ impl App {
                     scene_albedo,
                     reflect_cache_arg,
                 );
+                let refl_mips = self
+                    .reflect
+                    .record_reflect_mips(&mut graph, gdf_refl, cw, ch);
                 let composite = self.reflect.record_composite(
                     &mut graph,
                     ssr,
                     gdf_refl,
+                    refl_mips,
                     g_material,
-                    g_depth,
                     extent,
                     cw,
                     ch,
                     1.0,
                     firefly_max,
-                    70.0,  // GDF prefilter radius (px) per unit roughness (glossy reflections)
-                    0.006, // same-surface NDC-depth threshold for a prefilter tap
                     self.reflect_max_roughness,
                 );
                 // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.

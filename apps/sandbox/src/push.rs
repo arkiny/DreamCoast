@@ -1042,31 +1042,47 @@ pub(crate) fn gdf_reflect_push(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reflect_composite_push(
     ssr_index: u32,
-    gdf_index: u32,
+    gdf_index: u32,  // GDF reflection, full-res (mip level 0)
+    mip1_index: u32, // 1/4-res prefilter level
+    mip2_index: u32, // 1/16-res
+    mip3_index: u32, // 1/64-res
     out_index: u32,
     width: u32,
     height: u32,
     gdf_scale: f32,
     clamp_max: f32,
     material_index: u32,
-    depth_index: u32,
-    blur_scale: f32,
-    depth_reject: f32,
     max_roughness: f32,
 ) -> [u8; 48] {
     let mut pc = [0u8; 48];
     pc[0..4].copy_from_slice(&ssr_index.to_le_bytes());
     pc[4..8].copy_from_slice(&gdf_index.to_le_bytes());
-    pc[8..12].copy_from_slice(&out_index.to_le_bytes());
-    pc[12..16].copy_from_slice(&width.to_le_bytes());
-    pc[16..20].copy_from_slice(&height.to_le_bytes());
-    pc[20..24].copy_from_slice(&gdf_scale.to_le_bytes());
-    pc[24..28].copy_from_slice(&clamp_max.to_le_bytes());
-    pc[28..32].copy_from_slice(&material_index.to_le_bytes());
-    pc[32..36].copy_from_slice(&depth_index.to_le_bytes());
-    pc[36..40].copy_from_slice(&blur_scale.to_le_bytes());
-    pc[40..44].copy_from_slice(&depth_reject.to_le_bytes());
+    pc[8..12].copy_from_slice(&mip1_index.to_le_bytes());
+    pc[12..16].copy_from_slice(&mip2_index.to_le_bytes());
+    pc[16..20].copy_from_slice(&mip3_index.to_le_bytes());
+    pc[20..24].copy_from_slice(&out_index.to_le_bytes());
+    pc[24..28].copy_from_slice(&width.to_le_bytes());
+    pc[28..32].copy_from_slice(&height.to_le_bytes());
+    pc[32..36].copy_from_slice(&gdf_scale.to_le_bytes());
+    pc[36..40].copy_from_slice(&clamp_max.to_le_bytes());
+    pc[40..44].copy_from_slice(&material_index.to_le_bytes());
     pc[44..48].copy_from_slice(&max_roughness.to_le_bytes());
+    pc
+}
+
+/// Pack the C8g reflection-mip downsample push (16 bytes): src index, dst storage index,
+/// and this level's width/height.
+pub(crate) fn reflect_downsample_push(
+    src_index: u32,
+    out_index: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> [u8; 16] {
+    let mut pc = [0u8; 16];
+    pc[0..4].copy_from_slice(&src_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&out_index.to_le_bytes());
+    pc[8..12].copy_from_slice(&dst_width.to_le_bytes());
+    pc[12..16].copy_from_slice(&dst_height.to_le_bytes());
     pc
 }
 
