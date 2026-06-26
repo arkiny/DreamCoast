@@ -396,6 +396,9 @@ struct App {
     path_trace_pipeline: bool,
     realtime_env: bool,
     multibounce: bool,
+    /// Deprecated legacy captured-cube IBL path (prefilter-cube specular + scene capture).
+    /// Off by default — the SW-RT hybrid reflection + GDF GI are the default ambient.
+    legacy_ibl: bool,
 
     // Profiler UI state.
     profiler_on: bool,
@@ -791,8 +794,21 @@ impl App {
         let scene_gdf = gdf.has_scene_sdf() && std::env::var_os("P11_SCENE_GDF").is_some();
         // Stage C2: GDF AO multiplied into the deferred ambient term.
         let gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && std::env::var_os("P11_GDF_AO").is_some();
-        // Stage C3: GDF 1-bounce diffuse GI added to the deferred ambient term.
-        let gdf_gi = gi.has_gi() && gdf.has_scene_sdf() && std::env::var_os("P11_GDF_GI").is_some();
+        // Deprecate the legacy captured-cube IBL: by default the deferred ambient is the
+        // SW-RT hybrid reflection (specular) + GDF GI (diffuse scene bounce) + sky irradiance.
+        // `P11_LEGACY_IBL` restores the captured-cube path (prefilter-cube specular + scene
+        // capture) for comparison.
+        let legacy_ibl = std::env::var_os("P11_LEGACY_IBL").is_some();
+        let swrt_ok = reflect.has_ssr()
+            && reflect.has_gdf_reflect()
+            && reflect.has_composite()
+            && reflect.has_lit_history()
+            && gdf.has_scene_sdf();
+        // Stage C3: GDF 1-bounce diffuse GI — part of the default ambient now (on unless
+        // legacy IBL); `P11_GDF_GI` still force-enables it under legacy.
+        let gdf_gi = gi.has_gi()
+            && gdf.has_scene_sdf()
+            && (!legacy_ibl || std::env::var_os("P11_GDF_GI").is_some());
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -815,14 +831,9 @@ impl App {
             && reflect.has_composite()
             && gdf.has_scene_sdf()
             && std::env::var_os("P11_HYBRID").is_some();
-        // C7c: feed the hybrid composite into the lighting specular (vs legacy IBL). Same
-        // prerequisites as the viz, plus the lit-color history pass for the SSR feedback.
-        let swrt_reflect = reflect.has_ssr()
-            && reflect.has_gdf_reflect()
-            && reflect.has_composite()
-            && reflect.has_lit_history()
-            && gdf.has_scene_sdf()
-            && std::env::var_os("P11_SWRT_REFLECT").is_some();
+        // C7c: feed the hybrid composite into the lighting specular — the DEFAULT specular
+        // now (replaces the prefilter-cube IBL); `P11_LEGACY_IBL` falls back to the cube.
+        let swrt_reflect = swrt_ok && !legacy_ibl;
         // C8a colored GDF re-light (per-voxel albedo). On by default when the albedo volumes
         // exist; `P11_GDF_COLOR=0` forces the achromatic constant-albedo path (no-reg compare).
         let gdf_color = gdf.has_scene_albedo()
@@ -978,6 +989,7 @@ impl App {
             path_trace_pipeline,
             realtime_env: true,
             multibounce: true,
+            legacy_ibl,
             profiler_on,
             slot_pass_names,
             gpu_timings: Vec::new(),
@@ -1159,6 +1171,7 @@ impl App {
                 roughness_override,
                 realtime_env,
                 multibounce,
+                legacy_ibl,
                 post_mode,
                 aliasing,
                 compute_post,
@@ -1233,8 +1246,14 @@ impl App {
                     }
 
                     if ui.collapsing_header("IBL / Environment", TreeNodeFlags::empty()) {
-                        ui.checkbox("Real-time env capture", realtime_env);
-                        ui.checkbox("Multi-bounce reflections", multibounce);
+                        ui.checkbox("Legacy captured-cube IBL (deprecated)", legacy_ibl);
+                        if *legacy_ibl {
+                            ui.text_disabled("  - prefilter-cube specular + scene capture");
+                            ui.checkbox("Real-time env capture", realtime_env);
+                            ui.checkbox("Multi-bounce reflections", multibounce);
+                        } else {
+                            ui.text_disabled("  - default: SW-RT specular + GDF GI diffuse");
+                        }
                         ui.combo_simple_string("Post effect", post_mode, &POST_EFFECTS);
                         ui.checkbox("Transient aliasing", aliasing);
                     }
@@ -1430,11 +1449,23 @@ impl App {
         // (Re)capture the environment into the "write" cube set before the main graph
         // samples it (see `ibl.rs`). The reflection probe is fixed at the scene centre
         // (`focus`), NOT the camera, to avoid per-surface parallax error.
+        // Deprecation: with the SW-RT specular default, the prefilter cube (its only consumer
+        // of the scene-in-cube capture) is unused — so demote the capture to sky-only (empty
+        // scene + single bounce). The diffuse irradiance (mip 2) and skybox (mip 1) are sky
+        // anyway, so this is behavior-preserving for the default path, just cheaper. Legacy
+        // IBL keeps the full scene capture for the prefilter-cube specular.
+        // Demote only when SW-RT actually feeds the specular (so the no-compute / legacy
+        // fallback, where pbr still samples the prefilter cube, keeps its scene capture).
+        let (cap_scene, cap_multibounce): (&[SceneObject], bool) = if self.swrt_reflect {
+            (&[], false)
+        } else {
+            (&self.scene, self.multibounce)
+        };
         self.ibl.maybe_capture(
             cmd,
             self.realtime_env,
-            self.multibounce,
-            &self.scene,
+            cap_multibounce,
+            cap_scene,
             &self.ground_vbuf,
             &self.ground_ibuf,
             self.ground_count,
