@@ -41,8 +41,15 @@ float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos
         float4 capt = asfloat(g.storage_buffers[cache_pos_index].Load4(texel * 16u));
         if (capt.w < 0.5)
             continue; // that texel captured no geometry
+        // The query must lie ON the captured surface, within a few texels. Using the card's
+        // trace_depth (c0.w) as the tolerance was far too loose: a card on an object's AABB
+        // face reaches a full object-depth inward, so a ground point under the cube matched
+        // the cube's up-facing top card (dist ~= trace_depth) and the floor reflected the
+        // cube's cached colour. A texel-sized tolerance keeps legitimate on-surface hits
+        // (even on deep concavities, since this measures distance to the captured point).
         float dist = length(capt.xyz - p);
-        if (dist > c0.w)
+        float tol = max((length(ua) + length(va)) / float(tile) * 4.0, 0.02);
+        if (dist > tol)
             continue; // captured a different (farther) surface than the query point
 
         float score = align / (1.0 + dist * 4.0);

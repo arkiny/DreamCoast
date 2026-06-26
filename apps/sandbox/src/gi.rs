@@ -74,7 +74,7 @@ impl GiSystem {
             dreamcoast_shader::gdf_gi_cs_dxil,
             dreamcoast_shader::gdf_gi_cs_metallib,
             "gdf_gi",
-            208,
+            224,
         )?;
         let temporal_pipeline = compute(
             dreamcoast_shader::gdf_temporal_cs_spirv,
@@ -287,6 +287,7 @@ impl GiSystem {
                     0.7,  // constant hit-albedo fallback (sentinel albedo => achromatic, pre-C8a)
                     cache_idx,
                     clamp_max,
+                    crate::GROUND_ALBEDO, // analytic ground material (floor bounce hits)
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

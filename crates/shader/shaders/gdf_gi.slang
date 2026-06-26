@@ -48,6 +48,7 @@ struct GiPush
     float clamp_max;        // firefly clamp: max bounce-sample radiance component (1e30 = off)
     uint pad_c1;
     uint pad_c2;
+    float3 ground_albedo;   // analytic ground material (not in the albedo volume)
 };
 
 [[vk::push_constant]]
@@ -190,11 +191,16 @@ float3 trace_bounce(float3 origin, float3 dir)
             // C8a colored re-light: the hit's real surface albedo (per-voxel color volume)
             // × sun (soft-shadowed) + a small hemispheric sky fill so surfaces in full
             // shadow still bounce a little. Colored albedo => colored indirect bleed.
+            // The analytic ground is not in the albedo volume, so albedo_at() returns the
+            // nearest object's colour for a ground hit — use the ground's own albedo
+            // ([0.8], matching deferred.rs) so floor bounce isn't tinted by nearby objects.
+            bool is_ground = (p.y - GROUND_Y) < geo_inside(p);
+            float3 hit_albedo = is_ground ? pc.ground_albedo : albedo_at(p);
             // Lambertian: the bounce surface re-emits albedo/PI * irradiance — the same
             // 1/PI the deferred direct term uses. Omitting it over-brightened indirect
             // diffuse by ~PI (the GDF-GI over-lighting vs the path tracer).
             float sky_fill = pc.params.z * (0.5 + 0.5 * hn.y);
-            return albedo_at(p) * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / PI);
+            return hit_albedo * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / PI);
         }
         t += max(d, 0.01);
         if (t > maxt)

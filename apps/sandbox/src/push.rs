@@ -671,10 +671,11 @@ pub(crate) fn gdf_ao_push(
     pc
 }
 
-/// Pack the Phase 11 Stage C3 GDF-GI push block (208 bytes): inv_view_proj (64) +
+/// Pack the Phase 11 Stage C3 GDF-GI push block (224 bytes): inv_view_proj (64) +
 /// sun dir+intensity (16) + (depth, normal, gdf_sampled, out) (16) + (width, height,
 /// flip_y, spp) (16) + (frame, pad×3) (16) + aabb_min.xyz/ground_y (16) +
-/// aabb_max.xyz/dist_clamp (16) + (ray_max_dist, bias, sky_term, hit_albedo) (16).
+/// aabb_max.xyz/dist_clamp (16) + (ray_max_dist, bias, sky_term, hit_albedo) (16) +
+/// (cache uint4 + tile, clamp_max, pad×2) (16) + ground_albedo.xyz/pad (16).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gdf_gi_push(
     inv_view_proj: &[f32; 16],
@@ -700,8 +701,9 @@ pub(crate) fn gdf_gi_push(
     hit_albedo: f32,
     cache: [u32; 5],
     clamp_max: f32,
-) -> [u8; 208] {
-    let mut pc = [0u8; 208];
+    ground_albedo: [f32; 3],
+) -> [u8; 224] {
+    let mut pc = [0u8; 224];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -741,6 +743,11 @@ pub(crate) fn gdf_gi_push(
     }
     // Firefly clamp (pad_c0 slot after cache_tile): 1e30 = off.
     pc[196..200].copy_from_slice(&clamp_max.to_le_bytes());
+    // Analytic-ground albedo (float3 at offset 208): floor bounce hits re-light with this
+    // instead of albedo_at() (no ground data in the volume -> nearest object's colour).
+    for (i, v) in ground_albedo.iter().enumerate() {
+        pc[208 + i * 4..212 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
     pc
 }
 
@@ -966,10 +973,11 @@ pub(crate) fn ssr_resolve_push(
     pc
 }
 
-/// Pack the Phase 11 Stage C6 GDF-reflection push block (224 bytes). Layout: inv_view_proj
+/// Pack the Phase 11 Stage C6 GDF-reflection push block (240 bytes). Layout: inv_view_proj
 /// 64, cam_pos 16, sun dir+intensity 16, then four uints depth/normal/gdf_sampled/out 16,
 /// then width/height/flip_y/pad 16, then aabb_min.xyz+ground_y 16, aabb_max.xyz+clamp 16,
-/// ray_max_dist/hit_albedo/sky_fill/bias 16, and the C8a albedo R/G/B volume indices +pad 16.
+/// ray_max_dist/hit_albedo/sky_fill/bias 16, the C8a albedo R/G/B volume indices + frame 16,
+/// cache uint4+tile +pad×3 16, then ground_albedo.xyz on its own 16-aligned row 16.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gdf_reflect_push(
     inv_view_proj: &[f32; 16],
@@ -995,8 +1003,9 @@ pub(crate) fn gdf_reflect_push(
     albedo_rgb: [u32; 3],
     frame: u32,
     cache: [u32; 5],
-) -> [u8; 224] {
-    let mut pc = [0u8; 224];
+    ground_albedo: [f32; 3],
+) -> [u8; 240] {
+    let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1036,6 +1045,12 @@ pub(crate) fn gdf_reflect_push(
     // C8b3 surface-cache lookup indices (uint4 cache + tile): cards = 0xFFFFFFFF -> off.
     for (i, v) in cache.iter().enumerate() {
         pc[192 + i * 4..196 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // Analytic-ground albedo (float3 on its own 16-byte-aligned row, offset 224): floor hits
+    // re-light with this instead of albedo_at() (no ground data -> nearest object's colour).
+    // 16-aligned so SPIR-V (vec3 align 16) and DXIL agree on the offset.
+    for (i, v) in ground_albedo.iter().enumerate() {
+        pc[224 + i * 4..228 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
     pc
 }
