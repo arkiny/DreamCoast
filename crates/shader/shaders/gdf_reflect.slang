@@ -206,14 +206,17 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     if (hit)
     {
         float3 hn = scene_normal(hp);
-        // C8b3: the reflected surface's cached (multibounce) radiance — a direct lookup
-        // when the cache is bound, else the C8a per-ray colored re-light.
+        // C8b3/C8g: the reflected surface's cached (multibounce, accurately-lit) radiance — a
+        // direct lookup when the cache is bound. The cache only covers the meshed objects (no
+        // cards for the analytic ground), so on a cache MISS fall back to the C8a per-ray
+        // re-light instead of black (which previously left the ground reflection dark).
+        bool cached = false;
         if (pc.cache.x != 0xFFFFFFFFu)
         {
             color = sample_surface_cache(hp, hn, pc.cache.x, pc.cache.y, pc.cache.z,
-                                         pc.cache.w, pc.cache_tile);
+                                         pc.cache.w, pc.cache_tile, cached);
         }
-        else
+        if (!cached)
         {
             float ndl = max(dot(hn, sun_dir), 0.0);
             float sh = ndl > 0.0 ? refl_shadow(hp + hn * 0.004, sun_dir, max_dist) : 1.0;

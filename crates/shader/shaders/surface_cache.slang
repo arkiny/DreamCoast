@@ -6,9 +6,13 @@
 // caller keeps its own push layout. Card record (64 B): center.xyz/trace_depth, normal.xyz,
 // u_axis.xyz (half-extent), v_axis.xyz (half-extent).
 
+// `found` reports whether a card covered the query point; on a miss it is false and the
+// caller can fall back (e.g. the analytic ground, which has no cards, would otherwise read
+// black). Returns 0 on a miss.
 float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos_index,
-                            uint cache_rad_index, uint num_cards, uint tile)
+                            uint cache_rad_index, uint num_cards, uint tile, out bool found)
 {
+    found = false;
     int best = -1;
     uint best_texel = 0u;
     float best_score = 0.0;
@@ -51,5 +55,6 @@ float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos
     }
     if (best < 0)
         return float3(0.0, 0.0, 0.0);
+    found = true;
     return asfloat(g.storage_buffers[cache_rad_index].Load3(best_texel * 16u));
 }
