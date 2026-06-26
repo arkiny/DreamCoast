@@ -1449,6 +1449,18 @@ impl App {
                     (name.clone(), dt as f32 * period_ns * 1e-6)
                 })
                 .collect();
+            // Headless dump (screenshot mode has no UI): log per-pass GPU ms so PROFILE_GPU
+            // is useful for measuring without the interactive table.
+            if self.screenshot_mode {
+                let total: f32 = self.gpu_timings.iter().map(|(_, ms)| ms).sum();
+                let rows: String = self
+                    .gpu_timings
+                    .iter()
+                    .map(|(n, ms)| format!("  {n:<20} {ms:.4} ms"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                tracing::info!("GPU profile (total {total:.4} ms):\n{rows}");
+            }
         }
 
         self.in_flight[fif].reset()?;
@@ -1598,6 +1610,11 @@ impl App {
         // (the standalone viz or the C7c lighting feedback).
         if self.gdf_hybrid || self.swrt_reflect {
             self.reflect.prepare_history(&self.device, cw, ch)?;
+        }
+        // Stochastic SSR runs at half-res; (re)allocate its temporal accumulation buffers.
+        let (hcw, hch) = (cw.div_ceil(2), ch.div_ceil(2));
+        if self.swrt_reflect && self.reflect.has_ssr_resolve() {
+            self.reflect.prepare_ssr_accum(&self.device, hcw, hch)?;
         }
 
         let extent = Extent2D::new(cw, ch);
@@ -1816,24 +1833,51 @@ impl App {
             scene_gdf_ext,
         ) {
             (true, Some(vol), Some(ext)) => {
-                let ssr = self.reflect.record_ssr(
+                // Stochastic SSR at half-res: 1 GGX-jittered ray/pixel (cheap), then a temporal
+                // resolve accumulates them into a glossy reflection. The resolved half-res image
+                // feeds the composite (bilinearly upsampled).
+                let half = Extent2D::new(hcw, hch);
+                let (ssr_a, ssr_b) = self.reflect.record_ssr(
                     &mut graph,
                     self.deferred.globals_buffer(),
                     globals_offset,
                     hdr,
                     g_depth,
                     g_normal,
-                    extent,
+                    g_material,
+                    half,
                     view_proj.to_cols_array(),
                     inv_view_proj,
                     eye,
+                    hcw,
+                    hch,
                     cw,
                     ch,
                     self.flip_y,
+                    self.frame_no as u32,
                     self.scene_radius * 1.5,
                     self.scene_radius * 0.06,
                     true, // history mode: reprojected raw-radiance previous frame
                     self.firefly_clamp,
+                    true, // stochastic GGX jitter
+                );
+                let ssr = self.reflect.record_ssr_resolve(
+                    &mut graph,
+                    ssr_a,
+                    ssr_b,
+                    g_depth,
+                    g_normal,
+                    g_material,
+                    half,
+                    inv_view_proj,
+                    self.prev_view_proj,
+                    eye,
+                    hcw,
+                    hch,
+                    self.flip_y,
+                    self.scene_radius * 0.02,
+                    firefly_max,
+                    2.0, // ratio-estimator kernel radius (5x5 half-res neighbourhood)
                 );
                 let gdf_refl = self.reflect.record_gdf_reflect(
                     &mut graph,
@@ -2111,25 +2155,34 @@ impl App {
             && gdf_trace_out.is_none()
             && scene_gdf_out.is_none()
         {
-            Some(self.reflect.record_ssr(
-                &mut graph,
-                self.deferred.globals_buffer(),
-                globals_offset,
-                hdr,
-                g_depth,
-                g_normal,
-                extent,
-                view_proj.to_cols_array(),
-                inv_view_proj,
-                eye,
-                cw,
-                ch,
-                self.flip_y,
-                self.scene_radius * 1.5,
-                self.scene_radius * 0.06,
-                false, // standalone C5 viz: sample the current lit HDR
-                false, // (viz uses the current HDR, no reprojected history to clamp)
-            ))
+            Some(
+                self.reflect
+                    .record_ssr(
+                        &mut graph,
+                        self.deferred.globals_buffer(),
+                        globals_offset,
+                        hdr,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        extent,
+                        view_proj.to_cols_array(),
+                        inv_view_proj,
+                        eye,
+                        cw,
+                        ch,
+                        cw,
+                        ch,
+                        self.flip_y,
+                        self.frame_no as u32,
+                        self.scene_radius * 1.5,
+                        self.scene_radius * 0.06,
+                        false, // standalone C5 viz: sample the current lit HDR
+                        false, // (viz uses the current HDR, no reprojected history to clamp)
+                        false, // mirror (no stochastic jitter) for the raw-SSR viz
+                    )
+                    .0,
+            )
         } else {
             None
         };
@@ -2197,25 +2250,33 @@ impl App {
             scene_gdf_ext,
         ) {
             (true, Some(vol), Some(ext)) => {
-                let ssr = self.reflect.record_ssr(
-                    &mut graph,
-                    self.deferred.globals_buffer(),
-                    globals_offset,
-                    hdr,
-                    g_depth,
-                    g_normal,
-                    extent,
-                    view_proj.to_cols_array(),
-                    inv_view_proj,
-                    eye,
-                    cw,
-                    ch,
-                    self.flip_y,
-                    self.scene_radius * 1.5,
-                    self.scene_radius * 0.06,
-                    true, // history mode: reprojected raw-radiance previous frame
-                    self.firefly_clamp,
-                );
+                let ssr = self
+                    .reflect
+                    .record_ssr(
+                        &mut graph,
+                        self.deferred.globals_buffer(),
+                        globals_offset,
+                        hdr,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        extent,
+                        view_proj.to_cols_array(),
+                        inv_view_proj,
+                        eye,
+                        cw,
+                        ch,
+                        cw,
+                        ch,
+                        self.flip_y,
+                        self.frame_no as u32,
+                        self.scene_radius * 1.5,
+                        self.scene_radius * 0.06,
+                        true, // history mode: reprojected raw-radiance previous frame
+                        self.firefly_clamp,
+                        false, // mirror for the hybrid viz (no temporal resolve here)
+                    )
+                    .0;
                 let gdf_refl = self.reflect.record_gdf_reflect(
                     &mut graph,
                     vol,
@@ -2452,6 +2513,10 @@ impl App {
         // C7b: advance the lit-color history ping-pong so next frame reads this frame's write.
         if self.gdf_hybrid || self.swrt_reflect {
             self.reflect.advance_history();
+        }
+        // Advance the stochastic-SSR temporal accumulation ping-pong.
+        if self.swrt_reflect && self.reflect.has_ssr_resolve() {
+            self.reflect.advance_ssr_accum();
         }
         // C8b2: advance the surface-cache radiance ping-pong (next frame reads this frame's).
         if scene_cache_lit_ext.is_some() {
