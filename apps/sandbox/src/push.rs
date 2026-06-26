@@ -1052,6 +1052,7 @@ pub(crate) fn reflect_composite_push(
     depth_index: u32,
     blur_scale: f32,
     depth_reject: f32,
+    max_roughness: f32,
 ) -> [u8; 48] {
     let mut pc = [0u8; 48];
     pc[0..4].copy_from_slice(&ssr_index.to_le_bytes());
@@ -1065,6 +1066,7 @@ pub(crate) fn reflect_composite_push(
     pc[32..36].copy_from_slice(&depth_index.to_le_bytes());
     pc[36..40].copy_from_slice(&blur_scale.to_le_bytes());
     pc[40..44].copy_from_slice(&depth_reject.to_le_bytes());
+    pc[44..48].copy_from_slice(&max_roughness.to_le_bytes());
     pc
 }
 

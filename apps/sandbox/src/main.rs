@@ -388,6 +388,14 @@ struct App {
     /// Firefly clamp: bound the per-sample radiance in the reflection source / composite / GI
     /// gather so a bright specular pixel can't become a speckle. Off => unbounded (pre-clamp).
     firefly_clamp: bool,
+    /// C8d reflection max-roughness threshold: the screen-space mirror SSR (accurate on-screen
+    /// reflection) is used below this roughness and fades to the GDF prefilter above it (the
+    /// mirror can't blur; a stochastic trace goes dark on sharp metals). `P11_REFLECT_MAX_ROUGHNESS`.
+    reflect_max_roughness: f32,
+    /// C8d: SSR trace mode. Default = full-res screen mirror (accurate on-screen reflection).
+    /// `P11_SSR_STOCHASTIC=1` selects the half-res GGX-jittered trace + ratio-estimator resolve
+    /// (the glossy path — cheaper, but it goes dark on sharp metals, so it is not the default).
+    ssr_stochastic: bool,
     /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
     scene_gdf_baked: bool,
     /// C8a bake-once latch for the per-voxel albedo volumes (GI + reflection consumers share).
@@ -853,6 +861,13 @@ impl App {
         let firefly_clamp = std::env::var("P11_FIREFLY_CLAMP")
             .map(|v| v != "0")
             .unwrap_or(true);
+        // C8d: roughness above which screen-mirror SSR stops contributing (GDF takes over).
+        let reflect_max_roughness = std::env::var("P11_REFLECT_MAX_ROUGHNESS")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.5);
+        // C8d: default to the full-res mirror SSR; opt into the stochastic glossy path to compare.
+        let ssr_stochastic = std::env::var_os("P11_SSR_STOCHASTIC").is_some();
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -990,6 +1005,8 @@ impl App {
             cache_viz,
             surface_cache,
             firefly_clamp,
+            reflect_max_roughness,
+            ssr_stochastic,
             scene_gdf_baked: false,
             scene_albedo_baked: false,
             scene_cache_captured: false,
@@ -1209,6 +1226,8 @@ impl App {
                 cache_viz,
                 surface_cache,
                 firefly_clamp,
+                reflect_max_roughness,
+                ssr_stochastic,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1414,6 +1433,19 @@ impl App {
                             }
                         }
                         ui.checkbox("Firefly clamp (reflections/GI)", firefly_clamp);
+                        if *swrt_reflect {
+                            ui.slider(
+                                "Reflection max roughness (C8d)",
+                                0.0,
+                                1.0,
+                                reflect_max_roughness,
+                            );
+                            ui.text_disabled("  - screen mirror below, GDF prefilter above");
+                            ui.checkbox(
+                                "Stochastic glossy SSR (else full-res mirror)",
+                                ssr_stochastic,
+                            );
+                        }
                     }
 
                     if ui.collapsing_header("Profiling & debug (Phase 9)", open) {
@@ -1613,7 +1645,7 @@ impl App {
         }
         // Stochastic SSR runs at half-res; (re)allocate its temporal accumulation buffers.
         let (hcw, hch) = (cw.div_ceil(2), ch.div_ceil(2));
-        if self.swrt_reflect && self.reflect.has_ssr_resolve() {
+        if self.swrt_reflect && self.ssr_stochastic && self.reflect.has_ssr_resolve() {
             self.reflect.prepare_ssr_accum(&self.device, hcw, hch)?;
         }
 
@@ -1833,52 +1865,85 @@ impl App {
             scene_gdf_ext,
         ) {
             (true, Some(vol), Some(ext)) => {
-                // Stochastic SSR at half-res: 1 GGX-jittered ray/pixel (cheap), then a temporal
-                // resolve accumulates them into a glossy reflection. The resolved half-res image
-                // feeds the composite (bilinearly upsampled).
-                let half = Extent2D::new(hcw, hch);
-                let (ssr_a, ssr_b) = self.reflect.record_ssr(
-                    &mut graph,
-                    self.deferred.globals_buffer(),
-                    globals_offset,
-                    hdr,
-                    g_depth,
-                    g_normal,
-                    g_material,
-                    half,
-                    view_proj.to_cols_array(),
-                    inv_view_proj,
-                    eye,
-                    hcw,
-                    hch,
-                    cw,
-                    ch,
-                    self.flip_y,
-                    self.frame_no as u32,
-                    self.scene_radius * 1.5,
-                    self.scene_radius * 0.06,
-                    true, // history mode: reprojected raw-radiance previous frame
-                    self.firefly_clamp,
-                    true, // stochastic GGX jitter
-                );
-                let ssr = self.reflect.record_ssr_resolve(
-                    &mut graph,
-                    ssr_a,
-                    ssr_b,
-                    g_depth,
-                    g_normal,
-                    g_material,
-                    half,
-                    inv_view_proj,
-                    self.prev_view_proj,
-                    eye,
-                    hcw,
-                    hch,
-                    self.flip_y,
-                    self.scene_radius * 0.02,
-                    firefly_max,
-                    2.0, // ratio-estimator kernel radius (5x5 half-res neighbourhood)
-                );
+                // C8d: the SSR that feeds the composite. Default = full-res screen MIRROR — the
+                // accurate on-screen source (real neighbour pixels via the reprojected lit-history;
+                // correct colour + geometry the GDF sphere-trace can't match). The composite uses
+                // it below `reflect_max_roughness` and the GDF prefilter above, with a luminance
+                // gate that routes off-screen / grazing bad hits to the GDF (also keeping the march
+                // VK≡DX-stable). `P11_SSR_STOCHASTIC` selects the half-res GGX trace + ratio-
+                // estimator resolve instead (the glossy path; it goes dark on sharp metals).
+                let ssr = if self.ssr_stochastic {
+                    let half = Extent2D::new(hcw, hch);
+                    let (ssr_a, ssr_b) = self.reflect.record_ssr(
+                        &mut graph,
+                        self.deferred.globals_buffer(),
+                        globals_offset,
+                        hdr,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        half,
+                        view_proj.to_cols_array(),
+                        inv_view_proj,
+                        eye,
+                        hcw,
+                        hch,
+                        cw,
+                        ch,
+                        self.flip_y,
+                        self.frame_no as u32,
+                        self.scene_radius * 1.5,
+                        self.scene_radius * 0.06,
+                        true,
+                        self.firefly_clamp,
+                        true, // stochastic GGX jitter
+                    );
+                    self.reflect.record_ssr_resolve(
+                        &mut graph,
+                        ssr_a,
+                        ssr_b,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        half,
+                        inv_view_proj,
+                        self.prev_view_proj,
+                        eye,
+                        hcw,
+                        hch,
+                        self.flip_y,
+                        self.scene_radius * 0.02,
+                        firefly_max,
+                        2.0,
+                    )
+                } else {
+                    self.reflect
+                        .record_ssr(
+                            &mut graph,
+                            self.deferred.globals_buffer(),
+                            globals_offset,
+                            hdr,
+                            g_depth,
+                            g_normal,
+                            g_material,
+                            extent,
+                            view_proj.to_cols_array(),
+                            inv_view_proj,
+                            eye,
+                            cw,
+                            ch,
+                            cw,
+                            ch,
+                            self.flip_y,
+                            self.frame_no as u32,
+                            self.scene_radius * 1.5,
+                            self.scene_radius * 0.06,
+                            true, // history mode: reprojected raw-radiance previous frame
+                            self.firefly_clamp,
+                            false, // mirror ray (composite handles roughness via the GDF prefilter)
+                        )
+                        .0
+                };
                 let gdf_refl = self.reflect.record_gdf_reflect(
                     &mut graph,
                     vol,
@@ -1911,6 +1976,7 @@ impl App {
                     firefly_max,
                     70.0,  // GDF prefilter radius (px) per unit roughness (glossy reflections)
                     0.006, // same-surface NDC-depth threshold for a prefilter tap
+                    self.reflect_max_roughness,
                 ))
             }
             _ => None,
@@ -2313,6 +2379,7 @@ impl App {
                     firefly_max,
                     70.0,  // GDF prefilter radius (px) per unit roughness (glossy reflections)
                     0.006, // same-surface NDC-depth threshold for a prefilter tap
+                    self.reflect_max_roughness,
                 );
                 // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
                 self.reflect.record_lit_history(
@@ -2522,8 +2589,8 @@ impl App {
         if self.gdf_hybrid || self.swrt_reflect {
             self.reflect.advance_history();
         }
-        // Advance the stochastic-SSR temporal accumulation ping-pong.
-        if self.swrt_reflect && self.reflect.has_ssr_resolve() {
+        // Advance the stochastic-SSR temporal accumulation ping-pong (stochastic mode only).
+        if self.swrt_reflect && self.ssr_stochastic && self.reflect.has_ssr_resolve() {
             self.reflect.advance_ssr_accum();
         }
         // C8b2: advance the surface-cache radiance ping-pong (next frame reads this frame's).

@@ -466,9 +466,35 @@ copper-roughness-prefilter.png`(샤프미러|프리필터|PT). hybrid-vs-PT **3.
 작음(프레임은 gdf_gi 4.2ms 지배). **시도했다 폐기:** per-pixel 회전 디더(24탭으로 밴딩 제거)는 텍스처
 캐시 스캐터로 0.15→0.51ms(~2.5배) → 고정 3링이 더 빠름. **근사 한계:** 반경이 러프니스만 따름(반사
 히트 거리 미반영) — 1차 근사. 더 큰 블러/저비용은 GDF 반사 밉-피라미드 프리필터가 정공법(미구현).
-- **NEXT 후보:** SSR을 더 살리려면 lit-history 에너지 손실/밝기 공간 정합(풀-res 미러 2.58 회복) 또는
-  GDF 재조명에 포인트라이트 추가. GDF 반사 밉-피라미드(매우 러프한 표면의 큰 블러 저비용). stochastic
-  기본 유지(VK≡DX·perf·글로시 이점); 풀-res 미러 롤백은 보류.
+#### C8d — 풀-res 미러 SSR 복원 = 정확한 반사 컬러 (상용엔진 정렬, 2026-06-26)
+사용자 지적 = 반사 컬러가 PT와 다름(크롬에 반사된 아보카도 밑 초록 줄, 바닥이 길게 늘어짐) + 반사
+maxroughness 별도 스레시홀드 요청 + (밉-피라미드/SSR-에너지 리커버리가 해결하면 구현).
+**상용 참조(Lumen/Frostbite):** 스토캐스틱 GGX 레이 → **스크린 트레이스 먼저(정확한 온스크린 컬러)** →
+실패 시 월드/SDF + **서피스 캐시 라디언스**(per-ray 재조명 아님) 폴백 → 디노이즈. **`MaxRoughnessToTrace`**
+임계 위는 반사 트레이스 생략·GI/라디언스캐시로 대체. **핵심: 스크린 트레이스가 *주(정확)*, 월드/SDF는
+*폴백*.** 우리 C8c는 거꾸로(샤프=GDF sphere-trace=저해상 48³ SDF+해석적 바닥+per-ray 재조명)였고 = 초록
+줄/늘어진 바닥 = GDF 아티팩트.
+**진단:** 컴포짓 SSR-only 강제 = 금속 거의 **black** → 스토캐스틱 half-res+ratio-estimator가 샤프 미러서
+붕괴(den→0, lit-history 정확샘플 못함). 풀-res 미러 트레이스(C7d 방식)는 **정확한 온스크린 컬러**(아보카도
+녹색·바닥 실제 픽셀)지만 상단 반구가 black(오프스크린/그레이징 bad-hit).
+**수정 = 풀-res 미러 SSR 기본 + 컴포짓 게이트(`reflect_composite.slang`):**
+- **SSR이 주(정확) 소스, 샤프 owns.** `ssr_trust = 1 - smoothstep(0.1, max_roughness, roughness)` →
+  샤프=SSR, `max_roughness`(기본 0.5) 위는 GDF 프리필터로 페이드(미러는 블러 못함). **= 사용자 요청
+  reflection maxroughness 별도 스레시홀드** (`P11_REFLECT_MAX_ROUGHNESS` env + UI 슬라이더).
+- **휘도 validity 게이트:** 오프스크린/그레이징 bad-hit이 near-black이면(`ssr_lum < 0.25·gdf_lum`) 밝은
+  GDF로 폴백 → black 상단 해소. **보너스: 백엔드 발산 마치 픽셀도 결정적 GDF로 라우팅 → VK≡DX 안정.**
+- main.rs: 기본 풀-res 미러(stochastic=false, 풀 extent), `P11_SSR_STOCHASTIC`로 구 half-res+resolve
+  글로시 경로 토글(데드코드 회피, 비교용). resolve 인프라 유지(미래 글로시 SSR).
+**검증 RTX2070S:** fmt+clippy(-D) 클린; 크롬이 PT처럼 실제 아보카도·바닥·하늘 반사(`docs/images/
+chrome-ssr-vs-gdf.png` GDF아티팩트|C8d-미러|PT), 코퍼 글로시 유지. hybrid-vs-PT **3.35→3.40/ch**
+(평탄; 컬러 정확도·VK≡DX 우선). **VK VUID 0 / DX clean, VK≡DX 0.001/ch(max6)** — 게이트가 발산 마치를
+GDF로 보내 이전 0.394서 대폭↓(구 풀-res 미러 max98·스토캐스틱 ~3.85 대비 최고). **레거시 무회귀.**
+비용: ssr 0.080ms(풀-res, resolve 패스 제거로 상쇄) + composite 0.21 + gdf_reflect 0.12 ≈ 0.41ms(무회귀).
+**남은 한계(정직):** 그레이징 각 초록 줄(아보카도 반사 스미어)은 잔존 — 스크린스페이스/SDF 공통 그레이징
+한계. **완전 해결 = Hi-Z 마치 + thickness 정교화, 또는 Lumen식 서피스 캐시를 히트 라디언스로(오프스크린/
+그레이징 정확 컬러).** 밉-피라미드는 블러만(컬러 미해결) → SSR-에너지 리커버리가 정답이었음.
+- **NEXT 후보:** 그레이징 초록줄 → Hi-Z SSR 마치/thickness, 또는 서피스 캐시(C8b) 히트 라디언스 결합
+  (Lumen 정렬, 오프스크린 컬러 정확). 풀-res 미러 2.58 잔차 회복. GDF 재조명 포인트라이트.
 
 **권장 순서:** C8a(저위험 컬러) 먼저 → 필요 시 C8b. C7과 독립이지만 **C8a를 C7 앞에 두면 C7 반사가 바로
 컬러**가 된다(사용자 선택: C7 → C8a, 또는 C8a → C7). C8b는 동적 오브젝트/시간변화 조명까지 정확히 가는

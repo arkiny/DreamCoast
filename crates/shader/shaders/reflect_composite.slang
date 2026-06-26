@@ -35,7 +35,7 @@ struct CompositePush
     uint depth_index;    // sampled full-res G-buffer depth (silhouette guard for the prefilter)
     float blur_scale;    // GDF prefilter radius (px) per unit roughness; 0 = prefilter off
     float depth_reject;  // max |Δ NDC depth| for a prefilter tap to count as the same surface
-    uint pad0;
+    float max_roughness; // SSR (screen mirror) fades out by this roughness; above it = GDF only
 };
 
 [[vk::push_constant]]
@@ -100,10 +100,21 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         gdf = acc / wsum;
     }
 
-    // --- Blend: GDF owns the sharp end, SSR (already roughness-resolved) adds on-screen glossy
-    // detail as the lobe widens; `ssr.a` keeps off-screen misses on the GDF / sky fallback. ---
-    float ssr_trust = smoothstep(0.2, 0.6, roughness);
-    float3 refl = lerp(gdf, ssr.rgb, saturate(ssr.a) * ssr_trust);
+    // --- Blend (C8d): SSR is the accurate source (a full-res screen mirror = the real
+    // neighbour pixels: correct colour + geometry the GDF sphere-trace can't match), so it owns
+    // the SHARP end; the GDF prefilter takes over as the lobe widens past `max_roughness` (the
+    // screen mirror can't blur, and a stochastic trace goes dark on sharp metals). Two gates keep
+    // SSR honest:
+    //   * `ssr.a` (edge-fade / hit confidence) routes off-screen misses to the GDF / sky fallback.
+    //   * luminance validity — an off-screen or grazing SSR ray that found a bad/no-history hit
+    //     reads near-black; rather than darkening the metal, fall back to the bright GDF there.
+    //     (This also routes the few backend-divergent march pixels to the deterministic GDF, so
+    //     the full-res mirror stays VK≡DX-stable.)
+    float ssr_trust = 1.0 - smoothstep(0.1, max(pc.max_roughness, 0.12), roughness);
+    float ssr_lum = dot(ssr.rgb, float3(0.299, 0.587, 0.114));
+    float gdf_lum = dot(gdf, float3(0.299, 0.587, 0.114));
+    float valid = ssr_lum > 0.25 * gdf_lum ? 1.0 : 0.0;
+    float3 refl = lerp(gdf, ssr.rgb, saturate(ssr.a) * ssr_trust * valid);
     // Firefly clamp at the reflection chokepoint feeding the lighting specular (C7c): cap an
     // isolated bright reflected pixel. Hue-preserving; `clamp_max = 1e30` disables it.
     float m = max(refl.r, max(refl.g, refl.b));
