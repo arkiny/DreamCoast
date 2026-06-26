@@ -50,6 +50,13 @@ static const float2 POISSON12[12] = {
     float2(0.896, 0.412),   float2(-0.322, -0.933), float2(-0.792, -0.598)
 };
 
+// Hue-preserving radiance clamp (scale by the max component).
+float3 clamp_hue(float3 c, float m)
+{
+    float mx = max(c.r, max(c.g, c.b));
+    return mx > m ? c * (m / mx) : c;
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void csMain(uint3 tid: SV_DispatchThreadID)
@@ -75,7 +82,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     if (roughness > 0.12 && center_z < 1.0)
     {
         float2 texel = 1.0 / float2(pc.width, pc.height);
-        float3 acc = gdf; // centre tap
+        // Firefly suppression in the prefilter: clamp each tap before averaging so a single very
+        // bright pixel (the sharp reflected sun disk) can't dominate the gather. A fixed-pattern
+        // gather of an unclamped point source replicates it as the Poisson speckles seen on the
+        // copper highlight, and the spread blows out to flat white; per-tap clamping integrates
+        // it into a soft glossy highlight instead (what an energy-conserving mip prefilter does).
+        float prefilter_cap = min(pc.clamp_max, 2.5);
+        float3 acc = clamp_hue(gdf, prefilter_cap); // centre tap
         float wsum = 1.0;
         // Three concentric rings (36 taps) so a wide glossy radius stays smooth instead of
         // banding; the inner rings fill the disk the outer ring would leave sparse. (A per-pixel
@@ -93,7 +106,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 float dz = g.textures[pc.depth_index].SampleLevel(g.samp, nuv, 0.0).r;
                 if (dz >= 1.0 || abs(dz - center_z) > pc.depth_reject)
                     continue; // background / different surface — would bleed across the silhouette
-                acc += g.textures[pc.gdf_index].SampleLevel(g.samp, nuv, 0.0).rgb * pc.gdf_scale;
+                float3 tap = g.textures[pc.gdf_index].SampleLevel(g.samp, nuv, 0.0).rgb * pc.gdf_scale;
+                acc += clamp_hue(tap, prefilter_cap);
                 wsum += 1.0;
             }
         }
