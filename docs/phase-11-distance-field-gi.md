@@ -241,17 +241,24 @@ Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실
 **C5–C7 = 반사 트랙(캡처 기반 IBL 스페큘러 대체).** SSR(온스크린) → GDF SW-RT(오프스크린) → 스카이(miss)
 3단 폴백을 차례로 세운 뒤(C7) 하나로 합성해 `pbr.slang`의 prefilter-큐브 스페큘러 lookup을 교체한다.
 
-### C5 — 스크린-스페이스 반사 (SSR)
-- 풀스크린 컴퓨트 패스: G-buffer(depth/normal/roughness)에서 픽셀별 반사 레이 `R = reflect(V, N)`를
-  **스크린 공간에서 깊이 버퍼로 ray-march**(Hi-Z/계층적 깊이로 가속). 히트하면 **직전 프레임의 셰이딩된
-  컬러 버퍼**(라이팅 결과 history)를 그 위치에서 샘플 → **이웃 오브젝트가 정확히 비치는 반사**(캡처 큐브의
-  시차·이웃 미반영 오류를 직접 해소 = 사용자 요청의 핵심).
-- 러프니스: 반사 컬러를 러프니스로 블러(컬러 피라미드 mip 샘플)하거나 GGX-VNDF로 레이 jitter + C4
-  디노이저 재사용. 1차 구현은 미러 레이 + 러프니스 기반 mip.
-- **한계(설계상 내재):** 화면 밖으로 나가는 레이, 카메라가 못 보는 면(디스오클루전), 화면 가장자리 →
-  히트 실패. 이 미스를 C6 GDF 폴백이 메운다. 마스크/신뢰도(confidence)를 출력해 C7 합성에서 가중.
-- 토글 env `P11_SSR` + UI + 디버그뷰. 검증: 양 백엔드 픽셀 일치, 크롬/금속 구가 이웃 아보카도·큐브를
-  반사(캡처 큐브 대비 시차/이웃반사 개선을 PT 레퍼런스와 대조).
+### C5 — 스크린-스페이스 반사 (SSR) ✅ (양 백엔드 검증)
+- 풀스크린 컴퓨트 `ssr.slang`(`ssr_cs`, push **192B**): 픽셀별로 depth에서 월드점 P 재구성 → 반사 레이
+  `R = reflect(-V, N)`를 **월드 공간 선형 march**(96스텝), 각 샘플을 view-proj로 화면 투영해 깊이 버퍼와
+  비교(ray ndc.z > scene depth + thickness 내면 히트) → 6회 binary-refine → **셰이딩된 HDR을 히트 픽셀에서
+  샘플** → 이웃 오브젝트가 실제로 비침(크롬/구리 구가 녹색 아보카도·이웃을 반사 = 캡처 큐브의 시차/이웃
+  미반영 한계 해소). 출력 = `float4(반사색, confidence)`, confidence = 화면 가장자리 페이드(C7 폴백 블렌드용).
+- **컬러 소스 결정:** C5는 **라이팅 직후 실행 → 현재 프레임 HDR 샘플**(노출 베이크된 래스터 경로와 동일,
+  tonemap 노출 1.0). C7에서 SSR이 라이팅 스페큘러로 **피드백**할 때는 read-before-write라 직전 프레임 컬러
+  history(재투영)로 전환 필요 — C7 범위.
+- **미스 = 0**(화면 밖/디스오클루전/가장자리) → C6 GDF 폴백이 메우고 C7이 confidence로 가중 합성.
+  러프니스 블러·GGX 지터는 미구현(1차는 미러 레이) — C7/후속.
+- 토글 env `P11_SSR` + UI "Screen-space reflections (viz)"(다른 전체화면 viz와 배타, tonemap 소스 교체).
+- **검증(RTX 2070 SUPER):** build+fmt+clippy(-D warnings) 클린. SSR 버퍼가 각 표면의 반사를 보여줌(구의
+  하반부=지면/하늘, 상부=녹색 아보카도; 큐브·구리 구도 이웃 반사; 하늘=검정 miss). **VK≡DX 33px만 차이**
+  (mean 0.0026/ch — iterative march의 SPIR-V/DXIL fp-contraction로 hit이 뒤집히는 knife-edge 픽셀, B4/C1급).
+  **SSR-off 래스터는 베이스라인과 byte-identical(max 0)=무회귀.** VUID 0, DX 클린, TDR 없음.
+  한계: 월드공간 선형 march라 grazing 각에서 동심 스트라이프(스텝의 화면투영 불균일) — Hi-Z/스크린공간 DDA는
+  후속; C7의 confidence+러프니스+GDF 폴백이 가린다.
 
 ### C6 — GDF 반사 (오프스크린 폴백, SW-RT)
 - C5 SSR이 미스한 픽셀에 대해 반사 레이 `R`을 **씬 GDF에 sphere-trace**(C3 GI 머신 재사용) → 히트
