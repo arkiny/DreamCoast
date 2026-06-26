@@ -131,7 +131,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 32, // 4 G-buffer indices + flip_y + shadow + gdf_ao + gdf_gi
+            push_constant_size: 36, // 4 G-buffer indices + flip_y + shadow + gdf_ao + gdf_gi + reflect
             bindless: true,
             uniform_buffer: true,
             depth_test: false,
@@ -331,7 +331,9 @@ impl DeferredRenderer {
     /// (Cook-Torrance BRDF + IBL) into the HDR target. `gdf_ao` is the Stage-C2 GDF
     /// ambient-occlusion image (multiplied into the ambient term) and `gdf_gi` the
     /// Stage-C3 indirect-irradiance image (added to the ambient); pass `None` for either
-    /// to leave that term off (= the pre-C2/C3 behavior).
+    /// to leave that term off (= the pre-C2/C3 behavior). `reflect` is the Stage-C7c hybrid
+    /// SW-RT reflection image — when present it replaces the IBL prefilter-cube specular
+    /// in `pbr.slang`; `None` keeps the legacy captured-cube IBL specular.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_lighting<'a>(
         &'a self,
@@ -341,6 +343,7 @@ impl DeferredRenderer {
         shadow_map: ResourceId,
         gdf_ao: Option<ResourceId>,
         gdf_gi: Option<ResourceId>,
+        reflect: Option<ResourceId>,
         globals_offset: u64,
         flip_y: u32,
     ) {
@@ -356,6 +359,9 @@ impl DeferredRenderer {
         }
         if let Some(gi) = gdf_gi {
             reads.push(gi);
+        }
+        if let Some(r) = reflect {
+            reads.push(r);
         }
         graph.add_pass(
             PassInfo {
@@ -374,10 +380,18 @@ impl DeferredRenderer {
                 let shadow_index = ctx.sampled_index(shadow_map);
                 let ao_index = gdf_ao.map(|ao| ctx.sampled_index(ao)).unwrap_or(u32::MAX);
                 let gi_index = gdf_gi.map(|gi| ctx.sampled_index(gi)).unwrap_or(u32::MAX);
+                let reflect_index = reflect.map(|r| ctx.sampled_index(r)).unwrap_or(u32::MAX);
                 let cmd = ctx.cmd();
                 cmd.set_globals(&self.globals_buffer, globals_offset);
                 cmd.bind_graphics_pipeline(&self.pbr_pipeline);
-                cmd.push_constants(&pbr_push(indices, flip_y, shadow_index, ao_index, gi_index));
+                cmd.push_constants(&pbr_push(
+                    indices,
+                    flip_y,
+                    shadow_index,
+                    ao_index,
+                    gi_index,
+                    reflect_index,
+                ));
                 cmd.draw(3, 1);
                 Ok(())
             },
@@ -471,16 +485,17 @@ fn gbuffer_push(
 }
 
 /// Pack the lighting push block: 4 G-buffer indices + flip_y + shadow_index +
-/// gdf_ao_index + gdf_gi_index (32 bytes). The two GDF indices are `u32::MAX` when the
-/// C2 AO / C3 GI images are absent.
+/// gdf_ao_index + gdf_gi_index + reflect_index (36 bytes). The GDF / reflect indices are
+/// `u32::MAX` when the C2 AO / C3 GI / C7c hybrid-reflection images are absent.
 fn pbr_push(
     indices: [u32; 4],
     flip_y: u32,
     shadow_index: u32,
     gdf_ao_index: u32,
     gdf_gi_index: u32,
-) -> [u8; 32] {
-    let mut pc = [0u8; 32];
+    reflect_index: u32,
+) -> [u8; 36] {
+    let mut pc = [0u8; 36];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -488,6 +503,7 @@ fn pbr_push(
     pc[20..24].copy_from_slice(&shadow_index.to_le_bytes());
     pc[24..28].copy_from_slice(&gdf_ao_index.to_le_bytes());
     pc[28..32].copy_from_slice(&gdf_gi_index.to_le_bytes());
+    pc[32..36].copy_from_slice(&reflect_index.to_le_bytes());
     pc
 }
 
