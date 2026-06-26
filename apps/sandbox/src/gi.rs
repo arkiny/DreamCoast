@@ -74,7 +74,7 @@ impl GiSystem {
             dreamcoast_shader::gdf_gi_cs_dxil,
             dreamcoast_shader::gdf_gi_cs_metallib,
             "gdf_gi",
-            176,
+            208,
         )?;
         let temporal_pipeline = compute(
             dreamcoast_shader::gdf_temporal_cs_spirv,
