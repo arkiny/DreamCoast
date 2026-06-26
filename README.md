@@ -122,6 +122,10 @@ builds) — see [`docs/vulkan-validation-setup.md`](docs/vulkan-validation-setup
 Sample glTF assets (CC0) are fetched at runtime, not committed:
 `tools/fetch-assets.sh` (macOS/Linux) or `pwsh tools/fetch-assets.ps1` (Windows).
 
+Setup and usage for all developer tooling — asset/layer fetchers, the Slang and
+DXC shader compilers, the rasterizer-vs-path-tracer diff, and the RenderDoc
+graphics-debug MCP server — is in [`tools/README.md`](tools/README.md).
+
 ## Workspace layout
 
 ```
