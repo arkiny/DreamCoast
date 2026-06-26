@@ -155,7 +155,9 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
 - **Stage B — Global Distance Field:** per-mesh SDF(메시 거리장) 베이크 → 카메라 주변을 덮는 **전역
   거리장 볼륨**(클립맵/스파스 볼륨 텍스처)으로 머지. 동적 오브젝트는 매 프레임/저빈도 갱신.
 - **Stage C — Stochastic Lighting:** GDF에 대해 stochastic(몬테카를로) 샘플링으로 GI(디퓨즈
-  바운스)·AO·러프 반사를 ray-march + **시공간 디노이즈**(temporal accumulation + 공간 필터).
+  바운스)·AO·반사를 ray-march + **시공간 디노이즈**(temporal accumulation + 공간 필터). **최종 목표:
+  캡처 기반 IBL을 SW-RT로 대체** — 디퓨즈 IBL→GDF GI, 스페큘러 IBL→**SSR(온스크린)+GDF 반사(오프스크린)+
+  스카이(miss) 하이브리드**(C5 SSR·C6 GDF 반사·C7 합성+IBL 대체). 캡처 env 큐브는 스카이 전용으로 격하.
   스크린-스페이스 프로브/래디언스 캐시 구조는 Stage C 세부에서 확정.
 - **완료 기준**: 동적 씬에서 HW RT 없이 GDF 기반 GI/AO가 두 백엔드에서 동작, 패스트레이서(Phase 8)
   레퍼런스 대비 그럴듯하게 수렴, 검증 클린.
