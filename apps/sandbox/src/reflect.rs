@@ -590,6 +590,7 @@ impl ReflectSystem {
         clamp_max: f32,
         blur_scale: f32,
         depth_reject: f32,
+        max_roughness: f32,
     ) -> ResourceId {
         let pipe = self
             .composite_pipeline
@@ -622,6 +623,7 @@ impl ReflectSystem {
                     depth_index,
                     blur_scale,
                     depth_reject,
+                    max_roughness,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
