@@ -37,6 +37,7 @@ struct PushConstants
     uint shadow_index; // bindless index of the directional shadow map
     uint gdf_ao_index; // Stage-C2 GDF AO image (0xFFFFFFFF = absent)
     uint gdf_gi_index; // Stage-C3 GDF indirect-irradiance image (0xFFFFFFFF = absent)
+    uint reflect_index; // Stage-C7c hybrid SW-RT reflection image (0xFFFFFFFF = legacy IBL prefilter cube)
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -115,8 +116,13 @@ float3 fresnel_schlick_roughness(float cos_theta, float3 f0, float roughness)
 // Image-based ambient: diffuse from the irradiance cube + specular from the
 // prefilter cube and BRDF LUT (split-sum). Falls back to flat ambient when no
 // IBL is bound.
+// `has_swrt` / `swrt_refl`: Stage-C7c hybrid SW-RT reflection radiance, composited in a
+// prior compute pass (SSR -> GDF -> sky). When present it replaces the prefilter-cube
+// specular lookup; the env-BRDF term (`f * brdf.x + brdf.y`) and the diffuse irradiance
+// are unchanged. The composite already sees the real neighbouring geometry, so the
+// box-proxy parallax correction is skipped on that path.
 float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float metallic,
-                   float roughness, float ao, float3 f0)
+                   float roughness, float ao, float3 f0, float3 swrt_refl, bool has_swrt)
 {
     if (globals.ibl.y < 0)
         return globals.ambient.rgb * albedo * ao;
@@ -124,39 +130,49 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
     float n_dot_v = max(dot(n, v), 1e-4);
     float3 r = reflect(-v, n);
 
-    // Box-proxy parallax correction: the reflection probe is a single cubemap
-    // captured at `probe.xyz`, but this surface is elsewhere, so the raw reflection
-    // vector samples the wrong part of the cube (the reflected ground/horizon slides
-    // around as the surface moves). Model the captured scene as an axis-aligned box
-    // (floor at the ground plane, walls/ceiling at the captured extent), intersect
-    // the reflection ray with that box, and re-anchor the lookup to the exit point
-    // relative to the capture centre. A box fits the flat ground far better than a
-    // sphere proxy, which mapped floor reflections up toward the horizon and
-    // darkened them.
-    if (globals.probe.w > 0.0)
-    {
-        float3 inv_r = 1.0 / r;
-        float3 t1 = (globals.probe_box_min.xyz - world_pos) * inv_r;
-        float3 t2 = (globals.probe_box_max.xyz - world_pos) * inv_r;
-        float3 t_far = max(t1, t2);
-        float t = min(min(t_far.x, t_far.y), t_far.z); // box exit distance
-        if (t > 0.0)
-        {
-            float3 hit = world_pos + r * t;
-            r = normalize(hit - globals.probe.xyz);
-        }
-    }
-
     float3 f = fresnel_schlick_roughness(n_dot_v, f0, roughness);
     float3 kd = (1.0 - f) * (1.0 - metallic);
 
     float3 irradiance = g.cubes[globals.ibl.y].SampleLevel(g.samp, n, 0.0).rgb;
     float3 diffuse = irradiance * albedo;
 
-    float max_lod = float(globals.counts.z);
-    float3 prefiltered = g.cubes[globals.ibl.z].SampleLevel(g.samp, r, roughness * max_lod).rgb;
+    float3 refl;
+    if (has_swrt)
+    {
+        // Stage C7c: raw-radiance hybrid reflection (drop-in for the prefiltered cube;
+        // the final `* ambient.a` below applies exposure once, like the cube path).
+        refl = swrt_refl;
+    }
+    else
+    {
+        // Box-proxy parallax correction (legacy IBL): the reflection probe is a single
+        // cubemap captured at `probe.xyz`, but this surface is elsewhere, so the raw
+        // reflection vector samples the wrong part of the cube (the reflected
+        // ground/horizon slides around as the surface moves). Model the captured scene as
+        // an axis-aligned box (floor at the ground plane, walls/ceiling at the captured
+        // extent), intersect the reflection ray with that box, and re-anchor the lookup to
+        // the exit point relative to the capture centre. A box fits the flat ground far
+        // better than a sphere proxy, which mapped floor reflections up toward the horizon
+        // and darkened them.
+        if (globals.probe.w > 0.0)
+        {
+            float3 inv_r = 1.0 / r;
+            float3 t1 = (globals.probe_box_min.xyz - world_pos) * inv_r;
+            float3 t2 = (globals.probe_box_max.xyz - world_pos) * inv_r;
+            float3 t_far = max(t1, t2);
+            float t = min(min(t_far.x, t_far.y), t_far.z); // box exit distance
+            if (t > 0.0)
+            {
+                float3 hit = world_pos + r * t;
+                r = normalize(hit - globals.probe.xyz);
+            }
+        }
+        float max_lod = float(globals.counts.z);
+        refl = g.cubes[globals.ibl.z].SampleLevel(g.samp, r, roughness * max_lod).rgb;
+    }
+
     float2 brdf = g.textures[globals.ibl.w].SampleLevel(g.samp, float2(n_dot_v, roughness), 0.0).rg;
-    float3 specular = prefiltered * (f * brdf.x + brdf.y);
+    float3 specular = refl * (f * brdf.x + brdf.y);
 
     return (kd * diffuse + specular) * ao;
 }
@@ -282,7 +298,15 @@ float4 fsMain(VSOutput input) : SV_Target
     if (pc.gdf_ao_index != NO_TEXTURE)
         gdf_ao = g.textures[pc.gdf_ao_index].Sample(g.samp, input.uv).r;
 
-    float3 ambient = ambient_ibl(n, v, world_pos, albedo, metallic, roughness, ao, f0) * gdf_ao;
+    // Stage C7c: the hybrid SW-RT reflection (composited in a prior compute pass) replaces
+    // the IBL prefilter-cube specular when bound; absent (0xFFFFFFFF) -> legacy IBL path.
+    bool has_swrt = pc.reflect_index != NO_TEXTURE;
+    float3 swrt_refl = float3(0.0);
+    if (has_swrt)
+        swrt_refl = g.textures[pc.reflect_index].Sample(g.samp, input.uv).rgb;
+
+    float3 ambient = ambient_ibl(n, v, world_pos, albedo, metallic, roughness, ao, f0,
+                                 swrt_refl, has_swrt) * gdf_ao;
 
     // Stage C3: 1-bounce diffuse GI marched against the scene GDF in a prior compute
     // pass. The GI image holds the mean incoming radiance (indirect irradiance) from

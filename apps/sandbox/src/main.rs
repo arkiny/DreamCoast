@@ -374,6 +374,9 @@ struct App {
     gdf_reflect: bool,
     /// C7: hybrid reflection composite (SSR over GDF / sky), viz toward IBL-specular replacement.
     gdf_hybrid: bool,
+    /// C7c: feed the hybrid composite into the lighting specular (replaces the prefilter-cube
+    /// IBL specular). The toggle that compares legacy captured-cube IBL vs the new SW-RT path.
+    swrt_reflect: bool,
     /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
     scene_gdf_baked: bool,
     path_trace_pipeline: bool,
@@ -684,6 +687,14 @@ impl App {
             && reflect.has_composite()
             && gdf.has_scene_sdf()
             && std::env::var_os("P11_HYBRID").is_some();
+        // C7c: feed the hybrid composite into the lighting specular (vs legacy IBL). Same
+        // prerequisites as the viz, plus the lit-color history pass for the SSR feedback.
+        let swrt_reflect = reflect.has_ssr()
+            && reflect.has_gdf_reflect()
+            && reflect.has_composite()
+            && reflect.has_lit_history()
+            && gdf.has_scene_sdf()
+            && std::env::var_os("P11_SWRT_REFLECT").is_some();
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -816,6 +827,7 @@ impl App {
             gdf_ssr,
             gdf_reflect,
             gdf_hybrid,
+            swrt_reflect,
             scene_gdf_baked: false,
             path_trace_pipeline,
             realtime_env: true,
@@ -1020,6 +1032,7 @@ impl App {
                 gdf_ssr,
                 gdf_reflect,
                 gdf_hybrid,
+                swrt_reflect,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1191,6 +1204,12 @@ impl App {
                                 ui.text_disabled("  - Stage C7: SSR over GDF / sky composite");
                             }
                         }
+                        if reflect.has_lit_history() && gdf.has_scene_sdf() {
+                            ui.checkbox("SW-RT reflections in lighting", swrt_reflect);
+                            if *swrt_reflect {
+                                ui.text_disabled("  - Stage C7c: replaces IBL prefilter specular");
+                            }
+                        }
                     }
 
                     if ui.collapsing_header("Profiling & debug (Phase 9)", open) {
@@ -1356,8 +1375,9 @@ impl App {
                 .wrapping_add(self.gi_spp as u64);
             self.gi.prepare_denoise(&self.device, cw, ch, key)?;
         }
-        // C7b: (re)allocate the lit-color history buffers for the hybrid reflection path.
-        if self.gdf_hybrid {
+        // C7b: (re)allocate the lit-color history buffers for the hybrid reflection path
+        // (the standalone viz or the C7c lighting feedback).
+        if self.gdf_hybrid || self.swrt_reflect {
             self.reflect.prepare_history(&self.device, cw, ch)?;
         }
 
@@ -1410,7 +1430,11 @@ impl App {
         // trace (whichever runs first bakes).
         let scene_gdf_vol = self.gdf.scene_gdf_volume();
         let (scene_aabb_min, scene_aabb_max) = self.gdf.scene_aabb();
-        let scene_gdf_ext = if (self.gdf_ao || self.gdf_gi || self.gdf_reflect || self.gdf_hybrid)
+        let scene_gdf_ext = if (self.gdf_ao
+            || self.gdf_gi
+            || self.gdf_reflect
+            || self.gdf_hybrid
+            || self.swrt_reflect)
             && scene_gdf_vol.is_some()
         {
             let ext = graph.import_external("scene_gdf");
@@ -1483,6 +1507,60 @@ impl App {
             }
             _ => None,
         };
+        // Stage C7c: hybrid SW-RT reflection feeding the lighting specular. Built BEFORE
+        // lighting (it replaces the prefilter-cube IBL specular). SSR runs in history mode
+        // (reprojected previous-frame raw radiance) so it never reads this frame's
+        // not-yet-written HDR; the GDF reflect + composite are already raw radiance, so the
+        // composite is a drop-in for the cube `prefiltered` (pbr applies exposure once). The
+        // lit-color history for the NEXT frame's SSR is captured after lighting, below.
+        let swrt_reflect_out = match (
+            self.swrt_reflect && self.reflect.has_lit_history(),
+            scene_gdf_vol,
+            scene_gdf_ext,
+        ) {
+            (true, Some(vol), Some(ext)) => {
+                let ssr = self.reflect.record_ssr(
+                    &mut graph,
+                    self.deferred.globals_buffer(),
+                    globals_offset,
+                    hdr,
+                    g_depth,
+                    g_normal,
+                    extent,
+                    view_proj.to_cols_array(),
+                    inv_view_proj,
+                    eye,
+                    cw,
+                    ch,
+                    self.flip_y,
+                    self.scene_radius * 1.5,
+                    self.scene_radius * 0.06,
+                    true, // history mode: reprojected raw-radiance previous frame
+                );
+                let gdf_refl = self.reflect.record_gdf_reflect(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    extent,
+                    inv_view_proj,
+                    eye,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    cw,
+                    ch,
+                    self.flip_y,
+                );
+                Some(
+                    self.reflect
+                        .record_composite(&mut graph, ssr, gdf_refl, extent, cw, ch, 1.0),
+                )
+            }
+            _ => None,
+        };
         self.deferred.record_lighting(
             &mut graph,
             hdr,
@@ -1490,9 +1568,16 @@ impl App {
             shadow_map,
             gdf_ao_out,
             gdf_gi_out,
+            swrt_reflect_out,
             globals_offset,
             self.flip_y,
         );
+        // C7c: capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
+        // Reads the lit `hdr` (not the post-blur), so it sequences after the lighting pass.
+        if swrt_reflect_out.is_some() {
+            self.reflect
+                .record_lit_history(&mut graph, hdr, cw, ch, 1.0 / self.exposure.max(1e-4));
+        }
         if let Some(hdr_post) = hdr_post {
             self.deferred
                 .record_compute_post(&mut graph, hdr, hdr_post, cw, ch);
@@ -1705,6 +1790,7 @@ impl App {
         // when the other full-screen replacements are off.
         let ssr_out = if self.gdf_ssr
             && !self.gdf_hybrid
+            && !self.swrt_reflect
             && rt_out.is_none()
             && sdf_out.is_none()
             && vol_out.is_none()
@@ -1741,6 +1827,7 @@ impl App {
         let reflect_out = match (
             self.gdf_reflect
                 && !self.gdf_hybrid
+                && !self.swrt_reflect
                 && rt_out.is_none()
                 && sdf_out.is_none()
                 && vol_out.is_none()
@@ -1782,6 +1869,7 @@ impl App {
         // history for the next frame. Only when the other full-screen replacements are off.
         let hybrid_out = match (
             self.gdf_hybrid
+                && !self.swrt_reflect
                 && self.reflect.has_lit_history()
                 && rt_out.is_none()
                 && sdf_out.is_none()
@@ -2009,7 +2097,7 @@ impl App {
             self.gi.advance_denoise();
         }
         // C7b: advance the lit-color history ping-pong so next frame reads this frame's write.
-        if self.gdf_hybrid {
+        if self.gdf_hybrid || self.swrt_reflect {
             self.reflect.advance_history();
         }
         self.prev_view_proj = view_proj.to_cols_array();
