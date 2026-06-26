@@ -260,14 +260,22 @@ Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실
   한계: 월드공간 선형 march라 grazing 각에서 동심 스트라이프(스텝의 화면투영 불균일) — Hi-Z/스크린공간 DDA는
   후속; C7의 confidence+러프니스+GDF 폴백이 가린다.
 
-### C6 — GDF 반사 (오프스크린 폴백, SW-RT)
-- C5 SSR이 미스한 픽셀에 대해 반사 레이 `R`을 **씬 GDF에 sphere-trace**(C3 GI 머신 재사용) → 히트
-  재조명(C3와 동일: 상수 알베도 + 태양/스카이, 차후 surface cache로 컬러). 화면 밖 지오메트리·디스오클루전
-  영역도 그럴듯한 반사를 제공.
-- 러프 반사는 GGX-VNDF 샘플 GDF 레이 + C4 디노이저(러프할수록 콘 확대 = sphere-trace 자연 정합).
-- **이중계산 없음:** GDF 레이가 스카이로 탈출하면 0이 아니라 **절차적 스카이** 반환(스페큘러 miss 폴백) —
-  C3 디퓨즈 GI의 "스카이 탈출=0"과 역할이 다름(거긴 IBL 디퓨즈가 스카이를 공급하므로 0).
-- 토글 env `P11_GDF_REFLECT` + UI. 검증: SSR-off로 GDF-only 반사 단독 확인 → 양 백엔드 일치 + PT 대조.
+### C6 — GDF 반사 (오프스크린 폴백, SW-RT) ✅ (양 백엔드 검증)
+- 풀스크린 컴퓨트 `gdf_reflect.slang`(`gdf_reflect_cs`, push **176B**): 픽셀별로 depth→월드점 P 재구성 →
+  반사 레이 `R=reflect(-V,N)`를 **씬 GDF에 sphere-trace**(96스텝; B4/C3와 동일한 geo_inside/geo_march/
+  scene_normal 헬퍼) → 히트 재조명(gradient 노멀 + 짧은 penumbra 소프트섀도우 태양 + 소형 스카이 fill,
+  상수 알베도 0.7 — C3와 동일, 차후 surface cache로 컬러). 화면 밖 지오메트리·디스오클루전도 그럴듯한 반사 제공.
+- **이중계산 없음 / KEY vs C3:** GDF 레이가 스카이로 탈출하면 0이 아니라 **절차적 스카이(`sky(R)`) 반환**
+  (스페큘러 miss = 거울이 하늘을 비춤) — C3 디퓨즈 GI의 "스카이 탈출=0"과 역할 반대(거긴 IBL 디퓨즈가
+  스카이 공급). 출력=raw radiance(C1 트레이스처럼 tonemap이 노출 적용). 러프 반사(GGX-VNDF+디노이저)는 후속.
+- `ReflectSystem::record_gdf_reflect`(reflect.rs): 씬 GDF 볼륨+ext+AABB를 인자로 받음(AO/GI와 동일 패턴,
+  bake는 App가 1회). 토글 env `P11_GDF_REFLECT` + UI "GDF reflections (viz)"(다른 전체화면 viz와 배타,
+  tonemap 소스 교체 + 노출 적용). bake 게이트 `(gdf_ao||gdf_gi||gdf_reflect)`에 포함.
+- **검증(RTX 2070 SUPER):** build+fmt+clippy(-D warnings) 클린. GDF 반사 viz가 정상(지면이 오브젝트를 반사,
+  구가 하늘+지면 반사, 스카이 탈출=파란 하늘). **VK≡DX 4px만 차이**(mean 0.0003/ch — sphere-trace
+  fp-contraction knife-edge, B4/C1급). **reflect-off 래스터는 베이스라인과 byte-identical(max 0)=무회귀.**
+  VUID 0, DX 클린, TDR 없음. PT 정량 대조는 C7 합성 후(rt-compare.py). 한계: 무채색 상수 알베도 + 월드
+  march 스트라이프(B4와 동일).
 
 ### C7 — 하이브리드 반사 합성 + IBL 스페큘러/디퓨즈 대체
 - **합성:** 픽셀별로 **SSR(C5, 신뢰도 높음) → GDF SW-RT(C6, 오프스크린) → 절차적 스카이(miss)** 순으로

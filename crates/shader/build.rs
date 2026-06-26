@@ -322,6 +322,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "ssr_cs",
     },
+    // Phase 11 Stage C (C6): GDF reflections (off-screen fallback for SSR misses).
+    Job {
+        src: "gdf_reflect.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_reflect_cs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.
