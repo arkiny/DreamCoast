@@ -74,6 +74,12 @@ const GB_POSITION_FMT: Format = Format::Rgba16Float;
 const GLOBALS_SLICE: u64 = 512;
 /// Directional shadow map resolution (square).
 const SHADOW_SIZE: u32 = 2048;
+/// The ground plane's linear albedo — the single source of truth shared by the
+/// G-buffer ground draw (direct view) and the SW-RT GI / reflection re-light passes.
+/// The ground is analytic (not in the per-voxel albedo volume), so those passes must
+/// be told its material explicitly; sourcing it here keeps them from drifting (and
+/// stops `albedo_at()` returning the nearest *object's* colour for a floor hit).
+pub(crate) const GROUND_ALBEDO: [f32; 3] = [0.8, 0.8, 0.8];
 /// GPU particle count (Phase 7 fountain demo); 32 bytes each.
 const PARTICLE_COUNT: usize = 4096;
 /// GPU-culling instance grid: `GRID_DIM x GRID_DIM` cube instances (Phase 7).

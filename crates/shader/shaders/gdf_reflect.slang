@@ -44,6 +44,9 @@ struct ReflectPush
     uint pad_c0;
     uint pad_c1;
     uint pad_c2;
+    // float3 must sit on a 16-byte boundary or SPIR-V (vec3 align 16) and DXIL (4-byte pack)
+    // disagree on its offset — keep it as its own aligned row.
+    float3 ground_albedo;   // analytic ground material (not in the albedo volume)
 };
 
 [[vk::push_constant]]
@@ -266,10 +269,16 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float ndl = max(dot(hn, sun_dir), 0.0);
             float sh = ndl > 0.0 ? refl_shadow(hp + hn * 0.004, sun_dir, max_dist) : 1.0;
             float fill = sky_fill * (0.5 + 0.5 * hn.y);
+            // The ground plane is analytic — it's NOT in the per-voxel albedo volume, so
+            // albedo_at() would return the nearest *object's* colour for a ground hit (the
+            // red cube / green avocado bleeding onto the reflected floor). Use the ground's
+            // own albedo (matches deferred.rs's [0.8] ground material) for ground hits.
+            bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp);
+            float3 hit_albedo = is_ground ? pc.ground_albedo : albedo_at(hp);
             // Lambertian reflected surface: albedo/PI * irradiance, so the reflection of a
-            // diffuse surface (the ground here) matches its directly-shaded appearance. The
-            // cache path (meshed hits) gets the same 1/PI in sdf_cache_light.slang.
-            color = albedo_at(hp) * (sun_i * ndl * sh + fill) * (1.0 / GGX_PI);
+            // diffuse surface matches its directly-shaded appearance. The cache path (meshed
+            // hits) gets the same 1/PI in sdf_cache_light.slang.
+            color = hit_albedo * (sun_i * ndl * sh + fill) * (1.0 / GGX_PI);
         }
     }
     else

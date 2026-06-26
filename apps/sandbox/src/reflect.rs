@@ -99,7 +99,7 @@ impl ReflectSystem {
             dreamcoast_shader::gdf_reflect_cs_dxil,
             dreamcoast_shader::gdf_reflect_cs_metallib,
             "gdf_reflect",
-            224,
+            240,
             false,
         )?;
         let composite_pipeline = compute(
@@ -710,6 +710,7 @@ impl ReflectSystem {
                     albedo_rgb,
                     frame,
                     cache_idx,
+                    crate::GROUND_ALBEDO, // analytic ground material (floor reflection hits)
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

@@ -22,7 +22,7 @@ use crate::app::{load_compute_shader, load_shader_pair};
 use crate::push::{post_compute_push, post_push};
 use crate::{
     DEPTH_FORMAT, FRAMES_IN_FLIGHT, GB_ALBEDO_FMT, GB_MATERIAL_FMT, GB_NORMAL_FMT, GB_POSITION_FMT,
-    GLOBALS_SLICE, HDR_FORMAT, NO_TEXTURE, SceneObject,
+    GLOBALS_SLICE, GROUND_ALBEDO, HDR_FORMAT, NO_TEXTURE, SceneObject,
 };
 
 /// The render graph's G-buffer targets: four MRTs (+ depth) written by the fill pass
@@ -312,10 +312,11 @@ impl DeferredRenderer {
                     cmd.bind_index_buffer(&obj.ibuf, true);
                     cmd.draw_indexed(obj.index_count, 0, 0);
                 }
-                // Ground plane (plain matte material, no textures).
+                // Ground plane (plain matte material, no textures). Albedo from the shared
+                // GROUND_ALBEDO single source (also fed to the GI / reflection re-light passes).
                 cmd.push_constants(&gbuffer_push(
                     view_proj.to_cols_array(),
-                    [0.8, 0.8, 0.8, 1.0],
+                    [GROUND_ALBEDO[0], GROUND_ALBEDO[1], GROUND_ALBEDO[2], 1.0],
                     0.0,
                     0.9,
                     [NO_TEXTURE; 4],
