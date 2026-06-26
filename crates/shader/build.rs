@@ -336,6 +336,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "reflect_composite_cs",
     },
+    // Phase 11 Stage C (C7b): lit-color history capture (raw radiance) for SSR reprojection.
+    Job {
+        src: "lit_history.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "lit_history_cs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.

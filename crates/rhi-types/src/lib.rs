@@ -262,6 +262,11 @@ pub struct ComputePipelineDesc<'a> {
     pub push_constant_size: u32,
     /// Whether the pipeline binds the device's bindless tables.
     pub bindless: bool,
+    /// Whether the pipeline binds the per-frame globals uniform buffer (set 1 / b1),
+    /// the same one the deferred PBR passes use. Lets a compute pass read structured
+    /// per-frame camera data (e.g. the reflection reprojection matrices) instead of
+    /// overflowing the push-constant budget. Bound via [`CommandBuffer::set_globals`].
+    pub uniform_buffer: bool,
     /// Threads per threadgroup (the shader's `[numthreads(x, y, z)]`). Vulkan and
     /// D3D12 bake this into the shader, so they ignore it; Metal's MSL kernels do
     /// not, so the backend needs it to turn a `dispatch(x, y, z)` (threadgroup

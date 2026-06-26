@@ -147,6 +147,7 @@ struct Globals {
     probe: [f32; 4],            // xyz reflection-probe capture centre, w parallax on (1) / off (0)
     probe_box_min: [f32; 4],    // xyz reflection proxy AABB min corner
     probe_box_max: [f32; 4],    // xyz reflection proxy AABB max corner
+    prev_view_proj: [f32; 16],  // world -> previous clip (Stage C7 SSR history reprojection)
 }
 
 fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
@@ -1303,6 +1304,9 @@ impl App {
                 self.scene_radius * 1.3,
                 0.0,
             ],
+            // Last frame's view-projection (updated end-of-frame) so the SSR history
+            // sample reprojects the world hit point into the previous frame (Stage C7b).
+            prev_view_proj: self.prev_view_proj,
         };
         let globals_offset = fif as u64 * GLOBALS_SLICE;
         self.deferred
@@ -1351,6 +1355,10 @@ impl App {
                 .wrapping_mul(0x100_0000_01b3)
                 .wrapping_add(self.gi_spp as u64);
             self.gi.prepare_denoise(&self.device, cw, ch, key)?;
+        }
+        // C7b: (re)allocate the lit-color history buffers for the hybrid reflection path.
+        if self.gdf_hybrid {
+            self.reflect.prepare_history(&self.device, cw, ch)?;
         }
 
         let extent = Extent2D::new(cw, ch);
@@ -1707,10 +1715,11 @@ impl App {
         {
             Some(self.reflect.record_ssr(
                 &mut graph,
+                self.deferred.globals_buffer(),
+                globals_offset,
                 hdr,
                 g_depth,
                 g_normal,
-                g_material,
                 extent,
                 view_proj.to_cols_array(),
                 inv_view_proj,
@@ -1720,6 +1729,7 @@ impl App {
                 self.flip_y,
                 self.scene_radius * 1.5,
                 self.scene_radius * 0.06,
+                false, // standalone C5 viz: sample the current lit HDR
             ))
         } else {
             None
@@ -1762,14 +1772,17 @@ impl App {
             _ => None,
         };
 
-        // Phase 11 Stage C7: hybrid reflection composite. Runs both reflection sources
-        // (C5 SSR over the lit HDR + C6 GDF reflect) and blends them by SSR confidence into
-        // one image — a viz of the reflection radiance that will replace the IBL specular
-        // (C7c). The GDF source is raw radiance, so the composite lifts it by `exposure`
-        // into the SSR's post-exposure space, and the tonemap then applies exposure 1.0
-        // (like the SSR viz). Only when the other full-screen replacements are off.
+        // Phase 11 Stage C7: hybrid reflection composite. Runs both reflection sources and
+        // blends them by SSR confidence into one raw-radiance image — the reflection that
+        // will replace the IBL prefilter-cube specular (C7c). SSR samples the previous
+        // frame's raw-radiance lit-color history (reprojected) so it can feed back into
+        // lighting without a read-before-write cycle; the GDF reflect is already raw, so the
+        // composite stays in raw radiance (gdf_scale = 1.0) and the tonemap applies exposure
+        // (like the other SW-RT viz). A copy pass then captures this frame's lit HDR into the
+        // history for the next frame. Only when the other full-screen replacements are off.
         let hybrid_out = match (
             self.gdf_hybrid
+                && self.reflect.has_lit_history()
                 && rt_out.is_none()
                 && sdf_out.is_none()
                 && vol_out.is_none()
@@ -1783,10 +1796,11 @@ impl App {
             (true, Some(vol), Some(ext)) => {
                 let ssr = self.reflect.record_ssr(
                     &mut graph,
+                    self.deferred.globals_buffer(),
+                    globals_offset,
                     hdr,
                     g_depth,
                     g_normal,
-                    g_material,
                     extent,
                     view_proj.to_cols_array(),
                     inv_view_proj,
@@ -1796,6 +1810,7 @@ impl App {
                     self.flip_y,
                     self.scene_radius * 1.5,
                     self.scene_radius * 0.06,
+                    true, // history mode: reprojected raw-radiance previous frame
                 );
                 let gdf_refl = self.reflect.record_gdf_reflect(
                     &mut graph,
@@ -1814,15 +1829,18 @@ impl App {
                     ch,
                     self.flip_y,
                 );
-                Some(self.reflect.record_composite(
+                let composite = self
+                    .reflect
+                    .record_composite(&mut graph, ssr, gdf_refl, extent, cw, ch, 1.0);
+                // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
+                self.reflect.record_lit_history(
                     &mut graph,
-                    ssr,
-                    gdf_refl,
-                    extent,
+                    hdr,
                     cw,
                     ch,
-                    self.exposure,
-                ))
+                    1.0 / self.exposure.max(1e-4),
+                );
+                Some(composite)
             }
             _ => None,
         };
@@ -1850,6 +1868,7 @@ impl App {
             || gdf_trace_out.is_some()
             || scene_gdf_out.is_some()
             || reflect_out.is_some()
+            || hybrid_out.is_some()
         {
             self.exposure
         } else {
@@ -1988,6 +2007,10 @@ impl App {
         // frame's view-projection for the next frame's temporal reprojection.
         if gi_denoise_active {
             self.gi.advance_denoise();
+        }
+        // C7b: advance the lit-color history ping-pong so next frame reads this frame's write.
+        if self.gdf_hybrid {
+            self.reflect.advance_history();
         }
         self.prev_view_proj = view_proj.to_cols_array();
 

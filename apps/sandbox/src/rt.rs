@@ -85,6 +85,7 @@ impl RtSystem {
                 compute_entry: "csMain",
                 push_constant_size: 112, // inv_view_proj + cam_pos + sun_dir + out/w/h/pad
                 bindless: true,
+                uniform_buffer: false,
                 threads_per_group: [8, 8, 1],
             })?)
         } else {
@@ -106,6 +107,7 @@ impl RtSystem {
                 compute_entry: "csMain",
                 push_constant_size: 128, // inv_view_proj + cam_pos + sun + 2x uint4
                 bindless: true,
+                uniform_buffer: false,
                 threads_per_group: [8, 8, 1],
             })?)
         } else {

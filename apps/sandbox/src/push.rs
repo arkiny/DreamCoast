@@ -658,7 +658,7 @@ pub(crate) fn ssr_push(
     cam_pos: Vec3,
     depth_index: u32,
     normal_index: u32,
-    material_index: u32,
+    hist_index: u32,
     color_index: u32,
     out_index: u32,
     width: u32,
@@ -682,7 +682,7 @@ pub(crate) fn ssr_push(
     let u = [
         depth_index,
         normal_index,
-        material_index,
+        hist_index,
         color_index,
         out_index,
         width,
@@ -777,6 +777,25 @@ pub(crate) fn reflect_composite_push(
     pc[12..16].copy_from_slice(&width.to_le_bytes());
     pc[16..20].copy_from_slice(&height.to_le_bytes());
     pc[20..24].copy_from_slice(&gdf_scale.to_le_bytes());
+    pc
+}
+
+/// Pack the Phase 11 Stage C7b lit-history push block (32 bytes): the lit-HDR sampled
+/// index, the history storage-buffer index, width/height, and `inv_exposure` (recovers
+/// raw radiance from the exposure-baked HDR).
+pub(crate) fn lit_history_push(
+    hdr_index: u32,
+    out_buffer: u32,
+    width: u32,
+    height: u32,
+    inv_exposure: f32,
+) -> [u8; 32] {
+    let mut pc = [0u8; 32];
+    pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&out_buffer.to_le_bytes());
+    pc[8..12].copy_from_slice(&width.to_le_bytes());
+    pc[12..16].copy_from_slice(&height.to_le_bytes());
+    pc[16..20].copy_from_slice(&inv_exposure.to_le_bytes());
     pc
 }
 

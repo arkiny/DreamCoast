@@ -179,6 +179,7 @@ impl DeferredRenderer {
             compute_entry: "csMain",
             push_constant_size: 16, // hdr_index + out_index + width + height
             bindless: true,
+            uniform_buffer: false,
             threads_per_group: [8, 8, 1],
         })?;
 
@@ -204,6 +205,12 @@ impl DeferredRenderer {
     pub(crate) fn write_globals(&self, offset: u64, bytes: &[u8]) -> anyhow::Result<()> {
         self.globals_buffer.write_at(offset, bytes)?;
         Ok(())
+    }
+
+    /// The per-frame globals uniform buffer, so a compute pass (Stage C7 SSR) can bind it
+    /// via `cmd.set_globals` to read structured camera data (the reprojection matrices).
+    pub(crate) fn globals_buffer(&self) -> &Buffer {
+        &self.globals_buffer
     }
 
     /// Shadow pass: rasterize the shadow-casting scene objects from the light's POV

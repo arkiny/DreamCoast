@@ -9,15 +9,16 @@
 // error). Rays that leave the screen or find no surface miss (confidence 0); Stage C6
 // (GDF reflection) fills those, and C7 composites the two over the IBL specular.
 //
-// Color source: this pass runs AFTER the lighting pass, so it samples the CURRENT
-// frame's HDR result (exposure already baked, like the raster path). When SSR later
-// feeds back INTO lighting (C7) it must switch to a reprojected previous-frame history
-// to avoid the read-before-write cycle; for the standalone C5 viz the current frame is
-// simplest and exact.
+// Color source — two modes (flip_y bit1):
+//   * Current-HDR (bit1=0, the standalone C5 viz): runs after lighting and samples this
+//     frame's HDR at the hit (exposure already baked, like the raster path); the tonemap
+//     applies exposure 1.0.
+//   * Reprojected history (bit1=1, C7b, feeds lighting): samples the PREVIOUS frame's
+//     raw-radiance lit-color history buffer at the reprojected world hit point, so SSR can
+//     feed back into the lighting specular (C7c) without a read-before-write cycle. The
+//     reprojection uses `globals.prev_view_proj`; the result is raw radiance.
 //
-// Output: float4(reflected color, confidence) into a storage image. The deferred
-// raster's exposure is already in the sampled HDR, so the tonemap pass applies exposure
-// 1.0 to the SSR viz (same as the raster HDR path).
+// Output: float4(reflected color, confidence) into a storage image.
 
 #include "bindless.slang"
 
@@ -28,17 +29,42 @@ struct SsrPush
     float4 cam_pos;         // xyz camera world position
     uint depth_index;       // sampled G-buffer depth
     uint normal_index;      // sampled G-buffer world normal
-    uint material_index;    // sampled G-buffer material (g = roughness)
-    uint color_index;       // sampled shaded HDR color (this frame's lighting result)
+    uint hist_index;        // history mode: storage buffer (raw-radiance prev-frame color)
+    uint color_index;       // current-HDR mode: sampled shaded HDR color (this frame)
     uint out_index;         // storage image (reflected color + confidence)
     uint width;
     uint height;
-    uint flip_y;            // bit0: 1 = Vulkan (clip-space Y down)
+    uint flip_y;            // bit0: 1 = Vulkan (Y down); bit1: 1 = reprojected history mode
     float4 params;          // x = max ray distance, y = thickness, z = step count, w = edge fade
 };
 
 [[vk::push_constant]]
 ConstantBuffer<SsrPush> pc : register(b0, space0);
+
+// Per-frame globals (set 1 / b1) — the same UBO the deferred PBR pass binds, opted into
+// via the compute pipeline's `uniform_buffer`. Only `prev_view_proj` (appended at the end)
+// is read here, for the history reprojection; the layout must match the host `Globals`.
+struct Globals
+{
+    float4 camera_pos;
+    float4 sun_direction;
+    float4 sun_color;
+    float4 ambient;
+    int4 counts;
+    float4 point_pos[4];
+    float4 point_color[4];
+    float4x4 light_view_proj;
+    float4 shadow;
+    float4x4 inv_view_proj;
+    int4 ibl;
+    float4 probe;
+    float4 probe_box_min;
+    float4 probe_box_max;
+    float4x4 prev_view_proj; // world -> previous clip
+};
+
+[[vk::binding(0, 1)]]
+ConstantBuffer<Globals> globals : register(b1, space0);
 
 float3 reconstruct(float2 uv, float depth)
 {
@@ -153,7 +179,36 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         }
     }
 
-    float3 color = g.textures[pc.color_index].SampleLevel(g.samp, hit_uv, 0.0).rgb;
+    float3 color;
+    if ((pc.flip_y & 2u) != 0u)
+    {
+        // History mode: reproject the world hit point into the previous frame and read the
+        // raw-radiance lit-color history (nearest). `hi` is the binary-refined hit distance.
+        float sy = (pc.flip_y & 1u) != 0u ? 1.0 : -1.0;
+        float3 hp = p + dir * hi;
+        float4 pclip = mul(globals.prev_view_proj, float4(hp, 1.0));
+        if (pclip.w <= 0.0)
+        {
+            g.storage_images[pc.out_index][tid.xy] = float4(0.0, 0.0, 0.0, 0.0);
+            return;
+        }
+        float3 pndc = pclip.xyz / pclip.w;
+        float2 puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
+        if (any(puv < 0.0) || any(puv > 1.0))
+        {
+            // Off-screen last frame: no history there -> miss, let the GDF fallback fill it.
+            g.storage_images[pc.out_index][tid.xy] = float4(0.0, 0.0, 0.0, 0.0);
+            return;
+        }
+        int2 ppix = clamp(int2(floor(puv * float2(pc.width, pc.height))), int2(0, 0),
+                          int2(int(pc.width) - 1, int(pc.height) - 1));
+        uint pidx = uint(ppix.y) * pc.width + uint(ppix.x);
+        color = asfloat(g.storage_buffers[pc.hist_index].Load4(pidx * 16u)).rgb;
+    }
+    else
+    {
+        color = g.textures[pc.color_index].SampleLevel(g.samp, hit_uv, 0.0).rgb;
+    }
     // Confidence: fade toward the screen edges (the march cuts off there) so C7 can
     // blend in the GDF / sky fallback without a hard seam.
     float2 e = abs(hit_uv * 2.0 - 1.0);

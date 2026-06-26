@@ -667,6 +667,12 @@ impl D3d12CommandBuffer {
                 self.list
                     .SetComputeRootDescriptorTable(0, self.device.srv_gpu_start());
             }
+            // Bind the per-frame globals CBV (param 2) at the VA selected by `set_globals`,
+            // mirroring the graphics path (Stage C7 reflection passes).
+            if pipeline.uses_uniform() {
+                self.list
+                    .SetComputeRootConstantBufferView(2, self.globals_va.get());
+            }
             self.list.SetPipelineState(pipeline.pso());
         }
     }

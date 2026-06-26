@@ -359,7 +359,9 @@ impl<'a> RenderGraph<'a> {
         let mut required = vec![false; n];
         let mut stack: Vec<usize> = Vec::new();
         for (i, pass) in self.passes.iter().enumerate() {
-            if pass.writes_backbuffer(&self.resources) {
+            // Root at backbuffer-writers and at external-writers (cross-frame side effects,
+            // e.g. the Stage C7b lit-color history written this frame, read the next).
+            if pass.writes_backbuffer(&self.resources) || pass.writes_external(&self.resources) {
                 required[i] = true;
                 stack.push(i);
             }
@@ -812,6 +814,16 @@ impl PassNode<'_> {
 
     fn writes_backbuffer(&self, resources: &[Resource]) -> bool {
         self.colors.iter().any(|(id, _)| resources[id.0].backbuffer)
+    }
+
+    /// Whether this pass writes an imported external resource. Such a write is an
+    /// observable side effect that may be consumed outside this graph or in a later
+    /// frame (e.g. a ping-pong history buffer written this frame, read the next), so the
+    /// pass must be kept even when nothing in *this* frame's graph reads its output.
+    fn writes_external(&self, resources: &[Resource]) -> bool {
+        self.storage_writes
+            .iter()
+            .any(|id| matches!(resources[id.0].kind, ResourceKind::External))
     }
 }
 

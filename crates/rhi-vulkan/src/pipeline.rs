@@ -318,6 +318,7 @@ pub struct VulkanComputePipeline {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     bindless: bool,
+    uniform_buffer: bool,
 }
 
 impl VulkanComputePipeline {
@@ -335,6 +336,7 @@ impl VulkanComputePipeline {
                 pipeline,
                 layout,
                 bindless: desc.bindless,
+                uniform_buffer: desc.uniform_buffer,
             })
         }
     }
@@ -349,6 +351,10 @@ impl VulkanComputePipeline {
 
     pub(crate) fn is_bindless(&self) -> bool {
         self.bindless
+    }
+
+    pub(crate) fn uses_uniform(&self) -> bool {
+        self.uniform_buffer
     }
 }
 
@@ -376,7 +382,14 @@ unsafe fn build_compute(
             .module(cs)
             .name(&entry);
 
-        let set_layouts = [device.bindless_layout];
+        // Bindless set (0) + the optional per-frame globals set (1), the same layout the
+        // graphics PBR pipelines use — a compute pass opts in via `uniform_buffer` to read
+        // structured per-frame camera data (Stage C7 reflection reprojection).
+        let set_layouts: Vec<vk::DescriptorSetLayout> = if desc.uniform_buffer {
+            vec![device.bindless_layout, device.globals_layout]
+        } else {
+            vec![device.bindless_layout]
+        };
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)

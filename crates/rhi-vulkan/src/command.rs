@@ -982,6 +982,18 @@ impl VulkanCommandBuffer {
                     &[],
                 );
             }
+            // Bind the per-frame globals UBO (set 1) at the dynamic offset selected by
+            // `set_globals`, mirroring the graphics path (Stage C7 reflection passes).
+            if pipeline.uses_uniform() {
+                self.device.device.cmd_bind_descriptor_sets(
+                    self.cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipeline.layout(),
+                    1,
+                    &[self.device.globals_set],
+                    &[self.globals_offset.get()],
+                );
+            }
         }
     }
 
