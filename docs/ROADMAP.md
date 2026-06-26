@@ -159,10 +159,13 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
   캡처 기반 IBL을 SW-RT로 대체** — 디퓨즈 IBL→GDF GI, 스페큘러 IBL→**SSR(온스크린)+GDF 반사(오프스크린)+
   스카이(miss) 하이브리드**(C5 SSR·C6 GDF 반사·C7 합성+IBL 대체). 캡처 env 큐브는 스카이 전용으로 격하.
   스크린-스페이스 프로브/래디언스 캐시 구조는 Stage C 세부에서 확정.
-  - **진행:** C1–C7 + C8a ✅ 양 백엔드 검증·푸시 (C1 씬 GDF, C2 AO, C3 GI, C4 디노이즈, C5 SSR, C6 GDF
-    반사, C7 하이브리드 합성→라이팅 specular 대체, C8a per-voxel 알베도→컬러 GI·반사). **반사 트랙 성공
-    지표 달성: 하이브리드-vs-PT 잔차 4.18→2.58/ch(−38%)**(`P11_SWRT_REFLECT`); C8a로 GDF 히트가 실제 표면색
-    재조명(`P11_GDF_COLOR`). NEXT: C8b 서피스 캐시 라디언스(멀티바운스·잔차 추가 감소).
+  - **진행:** C1–C7 + C8a + C8b ✅ + 레거시 IBL deprecated ✅ 양 백엔드 검증·푸시. C1 씬 GDF, C2 AO,
+    C3 GI, C4 디노이즈, C5 SSR, C6 GDF 반사, C7 하이브리드 합성→라이팅 specular 대체(잔차 4.18→2.58/ch
+    −38%), C8a per-voxel 알베도→컬러, **C8b Lumen 메시-카드 서피스 캐시(캡처→라이팅→멀티바운스→컨슈머
+    룩업, `P11_SURFACE_CACHE` opt-in)**. **레거시 캡처-큐브 IBL → 기본값을 SW-RT 반사+GDF GI로 전환,
+    `P11_LEGACY_IBL` 플래그로 격하**(씬 캡처 sky-only). 정직한 한계: 서피스 캐시는 이 씬 PT 잔차 미개선
+    (지배 잔차=금속 sharp specular → 러프니스-aware 반사 GGX가 다음 트랙). NEXT: C8c(러프니스 반사 모델)
+    또는 동적 오브젝트 GDF 갱신.
 - **완료 기준**: 동적 씬에서 HW RT 없이 GDF 기반 GI/AO가 두 백엔드에서 동작, 패스트레이서(Phase 8)
   레퍼런스 대비 그럴듯하게 수렴, 검증 클린.
 
