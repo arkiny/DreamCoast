@@ -1039,6 +1039,7 @@ pub(crate) fn gdf_reflect_push(
 /// Pack the Phase 11 Stage C7 hybrid-composite push block (32 bytes): SSR + GDF image
 /// indices, the output storage index, width/height, and `gdf_scale` (the exposure applied
 /// to the raw GDF radiance so it shares the SSR's post-exposure viz space).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reflect_composite_push(
     ssr_index: u32,
     gdf_index: u32,
@@ -1047,6 +1048,7 @@ pub(crate) fn reflect_composite_push(
     height: u32,
     gdf_scale: f32,
     clamp_max: f32,
+    material_index: u32,
 ) -> [u8; 32] {
     let mut pc = [0u8; 32];
     pc[0..4].copy_from_slice(&ssr_index.to_le_bytes());
@@ -1056,6 +1058,7 @@ pub(crate) fn reflect_composite_push(
     pc[16..20].copy_from_slice(&height.to_le_bytes());
     pc[20..24].copy_from_slice(&gdf_scale.to_le_bytes());
     pc[24..28].copy_from_slice(&clamp_max.to_le_bytes());
+    pc[28..32].copy_from_slice(&material_index.to_le_bytes());
     pc
 }
 
