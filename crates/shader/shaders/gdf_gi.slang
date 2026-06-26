@@ -172,12 +172,18 @@ float3 trace_bounce(float3 origin, float3 dir)
         if (d < HIT_EPS)
         {
             float3 hn = scene_normal(p);
-            // C8b3: when the surface cache is bound, the incoming radiance along this ray is
+            // C8b3/C8g: when the surface cache is bound, the incoming radiance along this ray is
             // the hit surface's cached (multibounce) radiance — a direct lookup, no per-ray
-            // re-light / shadow ray. Else (cache off) the C8a per-ray colored re-light.
+            // re-light / shadow ray. On a cache MISS (e.g. the analytic ground, which has no
+            // cards) fall back to the C8a per-ray colored re-light instead of black.
             if (pc.cache.x != 0xFFFFFFFFu)
-                return sample_surface_cache(p, hn, pc.cache.x, pc.cache.y, pc.cache.z,
-                                            pc.cache.w, pc.cache_tile);
+            {
+                bool cached = false;
+                float3 r = sample_surface_cache(p, hn, pc.cache.x, pc.cache.y, pc.cache.z,
+                                                pc.cache.w, pc.cache_tile, cached);
+                if (cached)
+                    return r;
+            }
             float3 sun_dir = normalize(pc.sun.xyz);
             float ndl = max(dot(hn, sun_dir), 0.0);
             float sh = ndl > 0.0 ? gi_shadow(p + hn * 0.004, sun_dir) : 1.0;

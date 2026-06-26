@@ -385,6 +385,9 @@ struct App {
     /// C8b3: GDF GI / reflection consumers sample the lit surface cache (multibounce radiance)
     /// instead of per-ray re-lighting. Drives the per-frame cache lighting too.
     surface_cache: bool,
+    /// C8g: use the surface cache as the GDF reflection hit radiance (default on); ground hits
+    /// (no cards) fall back to the per-ray re-light. Cheaper than the full GI cache above.
+    reflect_cache: bool,
     /// Firefly clamp: bound the per-sample radiance in the reflection source / composite / GI
     /// gather so a bright specular pixel can't become a speckle. Off => unbounded (pre-clamp).
     firefly_clamp: bool,
@@ -857,6 +860,17 @@ impl App {
         let surface_cache = gdf.has_surface_cache()
             && gdf.has_cache_lighting()
             && std::env::var_os("P11_SURFACE_CACHE").is_some();
+        // C8g: use the surface cache as the GDF REFLECTION hit radiance by default (accurate lit
+        // colour for reflected objects — fixes the grazing avocado smear; ground hits have no
+        // cards and fall back to the per-ray re-light). Cheap (only the per-frame cache-light pass
+        // + a reflect-side lookup); the expensive per-ray GI cache lookup stays opt-in above.
+        // `P11_REFLECT_CACHE=0` disables (reflections then use the C8a per-ray re-light).
+        let reflect_cache = swrt_reflect
+            && gdf.has_surface_cache()
+            && gdf.has_cache_lighting()
+            && std::env::var("P11_REFLECT_CACHE")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         // Firefly clamp on by default (P11_FIREFLY_CLAMP=0 to disable / compare).
         let firefly_clamp = std::env::var("P11_FIREFLY_CLAMP")
             .map(|v| v != "0")
@@ -1004,6 +1018,7 @@ impl App {
             gdf_color,
             cache_viz,
             surface_cache,
+            reflect_cache,
             firefly_clamp,
             reflect_max_roughness,
             ssr_stochastic,
@@ -1111,6 +1126,7 @@ impl App {
         } else if (self.gdf_gi && self.gi_denoise && self.gi.has_denoise())
             || self.cache_viz
             || self.surface_cache
+            || self.reflect_cache
         {
             // The surface cache accrues a bounce per frame + temporally accumulates, like the
             // GI denoiser — warm it up before the static screenshot.
@@ -1746,7 +1762,8 @@ impl App {
         // C8b1: capture the mesh-card surface cache once (static geometry + albedo), reading
         // the scene GDF (+ the C8a albedo volumes for the captured color). C8b2 then re-lights
         // it every frame into a radiance atlas (multibounce gather from the previous frame).
-        let cache_active = (self.cache_viz || self.surface_cache) && self.gdf.has_surface_cache();
+        let cache_active = (self.cache_viz || self.surface_cache || self.reflect_cache)
+            && self.gdf.has_surface_cache();
         let scene_cache_ext = match (cache_active, scene_gdf_ext) {
             (true, Some(gdf_ext)) => {
                 let ext = graph.import_external("scene_cache");
@@ -1779,13 +1796,20 @@ impl App {
             }
             _ => None,
         };
-        // C8b3: the (indices, lit-handle) the GI / reflection consumers use to read the cached
-        // multibounce radiance at a hit (instead of a per-ray re-light). `None` => per-ray.
-        let cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
-            Some(ext) if self.surface_cache => self
-                .gdf
-                .surface_cache_read()
-                .map(|(c, p, r, n, t)| ([c, p, r, n, t], ext)),
+        // C8b3/C8g: the (indices, lit-handle) the consumers use to read the cached multibounce
+        // radiance at a hit (instead of a per-ray re-light). `None` => per-ray. Split so the
+        // reflection cache (C8g, default) is independent of the heavier per-ray GI cache (opt-in).
+        let cache_read = self.gdf.surface_cache_read();
+        let gi_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
+            Some(ext) if self.surface_cache => {
+                cache_read.map(|(c, p, r, n, t)| ([c, p, r, n, t], ext))
+            }
+            _ => None,
+        };
+        let reflect_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
+            Some(ext) if self.reflect_cache => {
+                cache_read.map(|(c, p, r, n, t)| ([c, p, r, n, t], ext))
+            }
             _ => None,
         };
         // Stage C2: GDF ambient occlusion, multiplied into the lighting ambient term.
@@ -1827,7 +1851,7 @@ impl App {
                     self.gi_spp,
                     self.frame_no as u32,
                     scene_albedo,
-                    cache_arg,
+                    gi_cache_arg,
                     firefly_max,
                 );
                 let out = if gi_denoise_active {
@@ -1961,7 +1985,7 @@ impl App {
                     ch,
                     self.flip_y,
                     scene_albedo,
-                    cache_arg,
+                    reflect_cache_arg,
                 );
                 Some(self.reflect.record_composite(
                     &mut graph,
@@ -2292,7 +2316,7 @@ impl App {
                 ch,
                 self.flip_y,
                 scene_albedo,
-                cache_arg,
+                reflect_cache_arg,
             )),
             _ => None,
         };
@@ -2364,7 +2388,7 @@ impl App {
                     ch,
                     self.flip_y,
                     scene_albedo,
-                    cache_arg,
+                    reflect_cache_arg,
                 );
                 let composite = self.reflect.record_composite(
                     &mut graph,

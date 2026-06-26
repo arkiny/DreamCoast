@@ -147,9 +147,10 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
             float d = geo_march(q);
             if (d < 0.0015)
             {
+                bool cache_hit;
                 indirect += sample_surface_cache(q, geo_normal(q), pc.cards_index,
                                                  pc.cache_pos_index, pc.cache_rad_read,
-                                                 pc.num_cards, pc.tile);
+                                                 pc.num_cards, pc.tile, cache_hit);
                 break;
             }
             tt += max(d, 0.01);

@@ -544,6 +544,26 @@ falloff. hybrid-vs-PT 3.40→**3.39/ch**(>32 2.01→1.98%). **VK VUID0/DX clean,
   = 게더 대체, 큰블러 저비용 + blow-out 근본해결. ② 그레이징 초록줄 → Hi-Z SSR/thickness. ③ 서피스
   캐시(C8b) 히트 라디언스(Lumen, 오프스크린 컬러). ④ 알파-under 멀티레이어 합성(스카이라이트 분리).
 
+#### C8g — 서피스 캐시를 GDF 반사 히트 라디언스로 (Lumen식, 그레이징 초록줄 완화, 2026-06-26)
+**먼저 Option2(Hi-Z) 진단이 전제를 뒤집음:** 컴포짓 SSR-only/GDF-only 강제 + 스탠드얼론 P11_SSR viz →
+**SSR은 이 씬서 거의 전부 miss**(작은 오브젝트+넓은 바닥+큰 하늘=반사 대부분 하늘/오프스크린), **반사는
+GDF 지배.** 따라서 **그레이징 초록줄 = GDF가 저해상 48³ SDF로 아보카도를 그레이징서 블롭 반사** = SSR
+march(Hi-Z/thickness)로 못 고침(self-intersection bias·front-face 둘 다 무효 확인). **C8d "SSR 리커버리"는
+실제 GDF 지배였음**(휘도 게이트가 black SSR을 GDF로). → 사용자 Option1(서피스 캐시 히트 라디언스) 채택.
+**구현:** C8b3에 이미 `sample_surface_cache` 경로 있으나 (1) **opt-in**(`P11_SURFACE_CACHE`), (2) **캐시
+miss(바닥=카드 없음)서 black 반환** = 바닥 반사 검정 → PT 잔차 악화(3.39→4.82). **수정:** `sample_surface_cache`
+에 **`out bool found`** 추가, gdf_reflect/gdf_gi가 **miss면 C8a per-ray 재조명 폴백**(바닥=흰 바닥 복원,
+오브젝트=캐시 라디언스). + **반사용 캐시를 GI 캐시와 분리**: `reflect_cache`(기본 ON, swrt_reflect 게이트,
+`P11_REFLECT_CACHE=0` off) = gdf_reflect만 캐시 룩업(정확 컬러), GI는 C8a 유지(per-ray 캐시 룩업이 gdf_gi
+4.2→7.8ms로 비싸서 opt-in 유지). cache_active/cache_arg를 gi/reflect로 split, advance_cache는
+scene_cache_lit 구동, 워밍업에 reflect_cache 추가. **결과(`docs/images/reflection-surface-cache.png`
+GDF재조명|캐시|PT):** 반사된 아보카도가 캐시 라디언스(정확 lit 컬러)로 → 그레이징 초록 스미어 완화·억제.
+hybrid-vs-PT **3.39→3.44/ch**(>32 1.98→2.06%; 평탄~약간↑ — 저해상 카드 라디언스가 평균선 GDF 재조명보다
+약간 다름, 단 스트릭은 개선). **VK VUID0/DX clean, VK≡DX 0.001, 레거시 무회귀**(reflect_cache가 swrt 게이트
+→ legacy서 캐시 패스 미실행). **비용 +0.8ms**(sdf_cache_light 매 프레임; gdf_gi 4.2ms 무변=GI 캐시 분리
+덕). **남은:** 캐시 저해상(CARD_TILE=32)이라 샤프 미러 반사서 블로키 가능, 그레이징 SDF 블롭 형상 자체는
+잔존(컬러만 정확해짐). **NEXT: 밉-피라미드 프리필터(UE), 또는 캐시 해상도↑/카드 시임 개선.**
+
 **권장 순서:** C8a(저위험 컬러) 먼저 → 필요 시 C8b. C7과 독립이지만 **C8a를 C7 앞에 두면 C7 반사가 바로
 컬러**가 된다(사용자 선택: C7 → C8a, 또는 C8a → C7). C8b는 동적 오브젝트/시간변화 조명까지 정확히 가는
 장기 트랙이라 C7/C8a 검증 후 별도 착수.
