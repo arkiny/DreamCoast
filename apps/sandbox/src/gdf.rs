@@ -1,14 +1,16 @@
-//! Phase 11 software ray tracing + global distance field, extracted from `run()` —
-//! R3 of the render-loop decomposition (see docs/refactor-sandbox.md). The largest
-//! bundle: it owns both volumes (per-mesh SDF + merged GDF), the bake mesh, the
-//! instance table, and every Stage-A/B compute pipeline (analytic sdf trace, volume
-//! fill/view, SDF bake, GDF merge, GDF trace).
+//! Phase 11 software ray tracing + global distance field — the distance field itself
+//! and its construction / debug viz. Owns the volumes (per-mesh SDF + merged GDF + the
+//! world scene GDF), the bake mesh + instance table, and the Stage-A/B pipelines
+//! (analytic sdf trace, volume fill/view, SDF bake, GDF merge, GDF trace) + the Stage-C1
+//! world-scene trace. The real-render *consumers* of the scene GDF moved out: AO / GI /
+//! denoise live in `gi.rs` (`GiSystem`), reflections in `reflect.rs` (`ReflectSystem`);
+//! both read the scene GDF via `scene_gdf_volume()` / `scene_aabb()` and rely on this
+//! bundle's `record_scene_bake()` for the one-time fused-scene bake.
 //!
 //! Each `record_*` adds one feature's passes and returns the output storage image;
 //! the frame loop keeps the mutual-exclusion gating (only one replaces the HDR) and
-//! the build-once flags, passing `build` in (the bake/merge run once, then the
-//! persistent volumes are re-viewed). All record methods borrow `&'a self` for the
-//! graph's lifetime, like the other bundles.
+//! the build-once flags. All record methods borrow `&'a self` for the graph's lifetime,
+//! like the other bundles.
 
 use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_render::{ComputePassInfo, RenderGraph, ResourceId};
