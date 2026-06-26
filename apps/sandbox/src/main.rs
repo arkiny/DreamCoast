@@ -33,6 +33,7 @@ mod app;
 mod cull;
 mod deferred;
 mod gdf;
+mod gi;
 mod ibl;
 mod mesh;
 mod particle;
@@ -44,6 +45,7 @@ use app::*;
 use cull::*;
 use deferred::*;
 use gdf::*;
+use gi::*;
 use ibl::*;
 use mesh::*;
 use particle::*;
@@ -290,6 +292,7 @@ struct App {
     // Feature bundles (see the per-module docs).
     deferred: DeferredRenderer,
     gdf: GdfSystem,
+    gi: GiSystem,
     reflect: ReflectSystem,
     particles: ParticleSystem,
     cull: CullSystem,
@@ -424,6 +427,8 @@ impl App {
         // trace, Stage B volumes / SDF bake / GDF merge / GDF trace, Stage C1 world
         // scene GDF). See `gdf.rs`. The scene GDF is registered after the scene is built.
         let mut gdf = GdfSystem::new(&device, backend, compute_supported)?;
+        // Stage C GDF-lighting consumers (C2 AO, C3 GI, C4 denoise). See `gi.rs`.
+        let gi = GiSystem::new(&device, backend, compute_supported)?;
         // Stage C reflection track (C5 SSR; C6/C7 later). See `reflect.rs`.
         let reflect = ReflectSystem::new(&device, backend, compute_supported)?;
 
@@ -649,16 +654,16 @@ impl App {
         // Stage C1: trace the world-space scene GDF from the live camera.
         let scene_gdf = gdf.has_scene_sdf() && std::env::var_os("P11_SCENE_GDF").is_some();
         // Stage C2: GDF AO multiplied into the deferred ambient term.
-        let gdf_ao = gdf.has_gdf_ao() && std::env::var_os("P11_GDF_AO").is_some();
+        let gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && std::env::var_os("P11_GDF_AO").is_some();
         // Stage C3: GDF 1-bounce diffuse GI added to the deferred ambient term.
-        let gdf_gi = gdf.has_gdf_gi() && std::env::var_os("P11_GDF_GI").is_some();
+        let gdf_gi = gi.has_gi() && gdf.has_scene_sdf() && std::env::var_os("P11_GDF_GI").is_some();
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(8)
             .clamp(1, 256);
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
-        let gi_denoise = gdf.has_gdf_denoise()
+        let gi_denoise = gi.has_denoise()
             && std::env::var("P11_GI_DENOISE")
                 .map(|v| v != "0")
                 .unwrap_or(true);
@@ -732,6 +737,7 @@ impl App {
             gui,
             deferred,
             gdf,
+            gi,
             reflect,
             particles,
             cull,
@@ -890,7 +896,7 @@ impl App {
         // accumulation converges before the frame is captured.
         let warmup = if self.path_trace && !self.rt_debug {
             PATHTRACE_WARMUP
-        } else if self.gdf_gi && self.gi_denoise && self.gdf.has_gdf_denoise() {
+        } else if self.gdf_gi && self.gi_denoise && self.gi.has_denoise() {
             GI_DENOISE_WARMUP
         } else {
             SCREENSHOT_WARMUP
@@ -957,6 +963,7 @@ impl App {
             let App {
                 scene,
                 gdf,
+                gi,
                 reflect,
                 rt,
                 debug_view,
@@ -1132,17 +1139,17 @@ impl App {
                                 ui.text_disabled("  - Stage C1: fused world scene SDF");
                             }
                         }
-                        if gdf.has_gdf_ao() {
+                        if gi.has_ao() && gdf.has_scene_sdf() {
                             ui.checkbox("GDF ambient occlusion (deferred)", gdf_ao);
                             if *gdf_ao {
                                 ui.text_disabled("  - Stage C2: GDF AO into ambient");
                             }
                         }
-                        if gdf.has_gdf_gi() {
+                        if gi.has_gi() && gdf.has_scene_sdf() {
                             ui.checkbox("GDF diffuse GI (deferred)", gdf_gi);
                             if *gdf_gi {
                                 ui.text_disabled("  - Stage C3: 1-bounce stochastic");
-                                if gdf.has_gdf_denoise() {
+                                if gi.has_denoise() {
                                     ui.checkbox("  - C4 spatio-temporal denoise", gi_denoise);
                                 }
                             }
@@ -1299,7 +1306,7 @@ impl App {
         // C4: (re)allocate the GI denoiser history + reset accumulation on a lighting/
         // quality change (NOT camera — the temporal pass reprojects). Runs before the
         // graph, like the path-tracer's accumulation prepare.
-        let gi_denoise_active = self.gdf_gi && self.gi_denoise && self.gdf.has_gdf_denoise();
+        let gi_denoise_active = self.gdf_gi && self.gi_denoise && self.gi.has_denoise();
         if gi_denoise_active {
             let mut key = 0u64;
             for b in self.sun_dir.iter() {
@@ -1313,7 +1320,7 @@ impl App {
             key = key
                 .wrapping_mul(0x100_0000_01b3)
                 .wrapping_add(self.gi_spp as u64);
-            self.gdf.prepare_denoise(&self.device, cw, ch, key)?;
+            self.gi.prepare_denoise(&self.device, cw, ch, key)?;
         }
 
         let extent = Extent2D::new(cw, ch);
@@ -1358,69 +1365,83 @@ impl App {
             self.metallic_override,
             self.roughness_override,
         );
-        // Stage C2: GDF ambient occlusion. A compute pass reconstructs each pixel's
-        // world surface from the depth G-buffer, marches the world-space scene GDF, and
-        // writes an AO image the lighting pass multiplies into its ambient term. Builds
-        // the fused scene GDF once (shared latch with the C1 trace). Recorded before
-        // lighting so the graph orders gbuffer -> AO -> lighting.
-        let gdf_ao_out = if self.gdf_ao && self.gdf.has_gdf_ao() {
-            let out = self.gdf.record_gdf_ao(
-                &mut graph,
-                g_depth,
-                g_normal,
-                extent,
-                inv_view_proj,
-                cw,
-                ch,
-                self.flip_y,
-                !self.scene_gdf_baked,
-            );
-            self.scene_gdf_baked = true;
-            Some(out)
+        // Stage C2/C3 (GDF-lighting consumers, see `gi.rs`) share the world scene GDF:
+        // import its handle once + record the one-time fused-scene bake (the volume is
+        // owned by `GdfSystem`), then AO + GI read it. Recorded before lighting so the
+        // graph orders gbuffer -> AO/GI -> lighting. The bake latch is shared with the C1
+        // trace (whichever runs first bakes).
+        let scene_gdf_vol = self.gdf.scene_gdf_volume();
+        let (scene_aabb_min, scene_aabb_max) = self.gdf.scene_aabb();
+        let scene_gdf_ext = if (self.gdf_ao || self.gdf_gi) && scene_gdf_vol.is_some() {
+            let ext = graph.import_external("scene_gdf");
+            if !self.scene_gdf_baked {
+                self.gdf.record_scene_bake(&mut graph, ext);
+                self.scene_gdf_baked = true;
+            }
+            Some(ext)
         } else {
             None
         };
-        // Stage C3: 1-bounce diffuse GI. A compute pass casts cosine-hemisphere rays
-        // from each surface into the scene GDF, shades the hits, and writes the indirect
-        // irradiance the lighting pass adds to the ambient term. Recorded before lighting
-        // (gbuffer -> GI -> lighting); shares the bake-once latch with C1/C2.
-        let gdf_gi_out = if self.gdf_gi && self.gdf.has_gdf_gi() {
-            let raw = self.gdf.record_gdf_gi(
+        // Stage C2: GDF ambient occlusion, multiplied into the lighting ambient term.
+        let gdf_ao_out = match (self.gdf_ao, scene_gdf_vol, scene_gdf_ext) {
+            (true, Some(vol), Some(ext)) => Some(self.gi.record_ao(
                 &mut graph,
+                vol,
+                ext,
+                scene_aabb_min,
+                scene_aabb_max,
                 g_depth,
                 g_normal,
                 extent,
                 inv_view_proj,
-                self.sun_dir,
-                self.sun_intensity,
                 cw,
                 ch,
                 self.flip_y,
-                self.gi_spp,
-                self.frame_no as u32,
-                !self.scene_gdf_baked,
-            );
-            self.scene_gdf_baked = true;
-            // C4: spatio-temporal denoise on top of the noisy raw GI (else use it raw).
-            let out = if gi_denoise_active {
-                self.gdf.record_gdf_denoise(
+            )),
+            _ => None,
+        };
+        // Stage C3: 1-bounce diffuse GI added to the ambient term, optionally denoised (C4).
+        let gdf_gi_out = match (self.gdf_gi, scene_gdf_vol, scene_gdf_ext) {
+            (true, Some(vol), Some(ext)) => {
+                let raw = self.gi.record_gi(
                     &mut graph,
-                    raw,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
                     g_depth,
                     g_normal,
                     extent,
                     inv_view_proj,
-                    self.prev_view_proj,
+                    self.sun_dir,
+                    self.sun_intensity,
                     cw,
                     ch,
                     self.flip_y,
-                )
-            } else {
-                raw
-            };
-            Some(out)
-        } else {
-            None
+                    self.gi_spp,
+                    self.frame_no as u32,
+                );
+                let out = if gi_denoise_active {
+                    self.gi.record_denoise(
+                        &mut graph,
+                        raw,
+                        g_depth,
+                        g_normal,
+                        extent,
+                        inv_view_proj,
+                        self.prev_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        self.flip_y,
+                    )
+                } else {
+                    raw
+                };
+                Some(out)
+            }
+            _ => None,
         };
         self.deferred.record_lighting(
             &mut graph,
@@ -1826,7 +1847,7 @@ impl App {
         // C4: advance the GI denoiser accumulation (ping-pong swap) and stash this
         // frame's view-projection for the next frame's temporal reprojection.
         if gi_denoise_active {
-            self.gdf.advance_denoise();
+            self.gi.advance_denoise();
         }
         self.prev_view_proj = view_proj.to_cols_array();
 
