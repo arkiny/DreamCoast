@@ -98,7 +98,7 @@ impl ReflectSystem {
             dreamcoast_shader::reflect_composite_cs_dxil,
             dreamcoast_shader::reflect_composite_cs_metallib,
             "reflect_composite",
-            32,
+            48,
             false,
         )?;
         let lit_history_pipeline = compute(
@@ -576,18 +576,20 @@ impl ReflectSystem {
     /// raw GDF radiance into the SSR's post-exposure space for the standalone viz; it is
     /// 1.0 once both sources are raw radiance (C7b). Returns the composite image.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_composite<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
         ssr: ResourceId,
         gdf_reflect: ResourceId,
         material: ResourceId,
+        depth: ResourceId,
         extent: Extent2D,
         cw: u32,
         ch: u32,
         gdf_scale: f32,
         clamp_max: f32,
+        blur_scale: f32,
+        depth_reject: f32,
     ) -> ResourceId {
         let pipe = self
             .composite_pipeline
@@ -598,12 +600,13 @@ impl ReflectSystem {
             ComputePassInfo {
                 name: "reflect_composite",
                 storage_writes: vec![out],
-                reads: vec![ssr, gdf_reflect, material],
+                reads: vec![ssr, gdf_reflect, material, depth],
             },
             move |ctx| {
                 let ssr_index = ctx.sampled_index(ssr);
                 let gdf_index = ctx.sampled_index(gdf_reflect);
                 let material_index = ctx.sampled_index(material);
+                let depth_index = ctx.sampled_index(depth);
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(pipe);
@@ -616,6 +619,9 @@ impl ReflectSystem {
                     gdf_scale,
                     clamp_max,
                     material_index,
+                    depth_index,
+                    blur_scale,
+                    depth_reject,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

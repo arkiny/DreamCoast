@@ -1,23 +1,24 @@
-// Phase 11 Stage C7 — hybrid reflection composite.
+// Phase 11 Stage C7 — hybrid reflection composite (+ C8c roughness prefilter).
 //
 // A full-screen compute pass that fuses the two reflection sources into the single
-// reflection radiance the lighting pass will use in place of the prefilter-cube IBL
-// specular lookup:
-//   * C5 screen-space reflections (`ssr.slang`) — accurate where the reflected surface
-//     is on screen; rgb = reflected color, a = confidence (0 on a miss / screen edge).
-//   * C6 GDF reflections (`gdf_reflect.slang`) — the off-screen fallback; rgb = the
-//     GDF-traced reflection with the procedural sky already baked in on a ray escape.
+// reflection radiance the lighting pass uses in place of the prefilter-cube IBL specular:
+//   * C5 screen-space reflections (`ssr.slang` + `ssr_resolve.slang`) — accurate where the
+//     reflected surface is on screen; rgb = reflected color, a = confidence. The stochastic
+//     resolve already prefilters it to the surface roughness (the ratio estimator).
+//   * C6 GDF reflections (`gdf_reflect.slang`) — the reliable fallback: a single sphere-trace
+//     = a CRISP mirror (sky on escape, neighbour colour via C8a) but with NO roughness blur.
 //
-// Composite = lerp(gdf, ssr, ssr.confidence): SSR where it is confident, the GDF / sky
-// fallback elsewhere, blended smoothly by the SSR edge-fade so there is no hard seam.
-// Roughness / Fresnel weighting is NOT applied here — that stays in `pbr.slang`'s env
-// BRDF term (the composite is a drop-in replacement for the prefiltered cube sample).
+// Two roughness behaviours, kept separate ("which source" vs "how blurry"):
+//   * Blend (C8c): `ssr_trust = smoothstep(roughness)` selects the source — GDF owns sharp
+//     metals (where the stochastic SSR ray misses off-screen and goes dark), SSR fades in for
+//     glossy lobes. `ssr.a` still routes off-screen misses to the GDF / sky fallback.
+//   * Prefilter (C8c): the GDF mirror is roughness-prefiltered here by a roughness-adaptive
+//     bilateral gather (a screen-space GGX-lobe approximation), so a glossy metal (copper) gets
+//     a blurred reflection like the path tracer instead of a sharp mirror. Sharp metals keep a
+//     ~0 radius => crisp. The gather is depth-weighted to avoid bleeding across silhouettes.
 //
-// Exposure (C7a viz only): the SSR image samples the post-exposure lit HDR while the GDF
-// image is raw scene radiance, so `gdf_scale` multiplies the GDF source up into the same
-// post-exposure space for a consistent standalone viz (tonemapped at exposure 1.0). C7b
-// switches SSR to a raw-radiance history, after which both sources are raw and the
-// composite feeds the lighting pass directly.
+// Exposure: `gdf_scale` lifts the raw GDF radiance into the SSR's space (1.0 once both are raw
+// radiance, C7b); the composite then feeds the lighting pass directly.
 
 #include "bindless.slang"
 
@@ -30,11 +31,24 @@ struct CompositePush
     uint height;
     float gdf_scale;     // exposure applied to the raw GDF radiance (post-exposure viz space)
     float clamp_max;     // firefly clamp: max composited reflection-radiance component (1e30 = off)
-    uint material_index; // sampled full-res G-buffer material (g = roughness) for the blend
+    uint material_index; // sampled full-res G-buffer material (g = roughness)
+    uint depth_index;    // sampled full-res G-buffer depth (silhouette guard for the prefilter)
+    float blur_scale;    // GDF prefilter radius (px) per unit roughness; 0 = prefilter off
+    float depth_reject;  // max |Δ NDC depth| for a prefilter tap to count as the same surface
+    uint pad0;
 };
 
 [[vk::push_constant]]
 ConstantBuffer<CompositePush> pc : register(b0, space0);
+
+// Poisson disk (unit radius) for the roughness prefilter gather — a fixed set keeps the pass
+// deterministic (VK≡DX) while spreading taps more evenly than a box kernel.
+static const float2 POISSON12[12] = {
+    float2(-0.326, -0.406), float2(-0.840, -0.074), float2(-0.696, 0.457),
+    float2(-0.203, 0.621),  float2(0.962, -0.195),  float2(0.473, -0.480),
+    float2(0.519, 0.767),   float2(0.185, -0.893),  float2(0.507, 0.064),
+    float2(0.896, 0.412),   float2(-0.322, -0.933), float2(-0.792, -0.598)
+};
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -48,16 +62,46 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 gdf = g.textures[pc.gdf_index].SampleLevel(g.samp, uv, 0.0).rgb * pc.gdf_scale;
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
 
-    // Roughness-aware blend (C8c). The two sources have opposite reliability profiles here:
-    //   * GDF reflect = a single sphere-trace = a CRISP, correct mirror (sky / neighbours /
-    //     colour via C8a) — excellent for SHARP metals, but a single ray so it can't blur.
-    //   * Stochastic half-res SSR = a GGX-jittered ray + ratio-estimator resolve = reliable for
-    //     GLOSSY lobes (the kernel denoises a wide cone), but for a near-mirror its jittered ray
-    //     misses off-screen → the resolve goes dark, dragging the metal below the GDF truth
-    //     (measured: SSR composite 5.90/ch vs GDF-only 3.42/ch vs PT).
-    // So fade SSR in with roughness: GDF owns the sharp end, SSR adds on-screen glossy detail as
-    // the lobe widens. `ssr.a` (confidence / edge-fade) still gates SSR where its trace left the
-    // screen, so off-screen reflections fall through to the GDF / sky fallback.
+    // --- Roughness prefilter of the GDF mirror: a depth-weighted Poisson gather whose radius
+    // grows with roughness. This approximates integrating the GGX lobe over screen directions
+    // (neighbouring surface points reflect slightly different directions on a curved surface),
+    // turning the single sphere-trace mirror into a glossy reflection. (Radius scales with
+    // roughness only — not reflected-hit distance — a documented first-order approximation.) ---
+    float center_z = g.textures[pc.depth_index].SampleLevel(g.samp, uv, 0.0).r;
+    // Near-mirror surfaces (chrome) stay crisp — and skip the gather entirely, so the cost is
+    // paid only on genuinely glossy pixels. Cap the radius so a very rough surface (or the large
+    // ground area) doesn't gather an enormous, expensive disk (a 30 px blur already reads soft).
+    float radius = min(roughness * pc.blur_scale, 30.0); // px
+    if (roughness > 0.12 && center_z < 1.0)
+    {
+        float2 texel = 1.0 / float2(pc.width, pc.height);
+        float3 acc = gdf; // centre tap
+        float wsum = 1.0;
+        // Three concentric rings (36 taps) so a wide glossy radius stays smooth instead of
+        // banding; the inner rings fill the disk the outer ring would leave sparse. (A per-pixel
+        // tap rotation would dither banding with fewer taps but scatters the gather across the
+        // texture cache — measured ~2.5x slower — so fixed rings win here.)
+        static const float RING_SCALE[3] = { 1.0, 0.66, 0.33 };
+        [unroll]
+        for (int ring = 0; ring < 3; ring++)
+        {
+            float rr = radius * RING_SCALE[ring];
+            [unroll]
+            for (int i = 0; i < 12; i++)
+            {
+                float2 nuv = uv + POISSON12[i] * rr * texel;
+                float dz = g.textures[pc.depth_index].SampleLevel(g.samp, nuv, 0.0).r;
+                if (dz >= 1.0 || abs(dz - center_z) > pc.depth_reject)
+                    continue; // background / different surface — would bleed across the silhouette
+                acc += g.textures[pc.gdf_index].SampleLevel(g.samp, nuv, 0.0).rgb * pc.gdf_scale;
+                wsum += 1.0;
+            }
+        }
+        gdf = acc / wsum;
+    }
+
+    // --- Blend: GDF owns the sharp end, SSR (already roughness-resolved) adds on-screen glossy
+    // detail as the lobe widens; `ssr.a` keeps off-screen misses on the GDF / sky fallback. ---
     float ssr_trust = smoothstep(0.2, 0.6, roughness);
     float3 refl = lerp(gdf, ssr.rgb, saturate(ssr.a) * ssr_trust);
     // Firefly clamp at the reflection chokepoint feeding the lighting specular (C7c): cap an
