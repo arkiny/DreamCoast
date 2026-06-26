@@ -355,8 +355,12 @@ struct App {
     gdf_ao: bool,
     /// C3: GDF 1-bounce diffuse GI added to the deferred ambient term.
     gdf_gi: bool,
-    /// C3 hemisphere rays per pixel (no temporal accumulation yet — that's C4).
+    /// C3 hemisphere rays per pixel.
     gi_spp: u32,
+    /// C4: spatio-temporal denoise of the noisy C3 GI.
+    gi_denoise: bool,
+    /// Previous frame's view-projection (world -> clip) for C4 temporal reprojection.
+    prev_view_proj: [f32; 16],
     /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
     scene_gdf_baked: bool,
     path_trace_pipeline: bool,
@@ -383,6 +387,9 @@ const SCREENSHOT_WARMUP: u64 = 3;
 // Path-trace screenshots need a long warmup so the static-camera accumulation
 // converges before the frame is captured.
 const PATHTRACE_WARMUP: u64 = 64;
+// GI temporal accumulation likewise needs several frames to converge for a clean
+// screenshot (the camera is held fixed while capturing).
+const GI_DENOISE_WARMUP: u64 = 64;
 
 impl App {
     #[allow(clippy::too_many_arguments)]
@@ -643,6 +650,11 @@ impl App {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(8)
             .clamp(1, 256);
+        // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
+        let gi_denoise = gdf.has_gdf_denoise()
+            && std::env::var("P11_GI_DENOISE")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -768,6 +780,8 @@ impl App {
             gdf_ao,
             gdf_gi,
             gi_spp,
+            gi_denoise,
+            prev_view_proj: Mat4::IDENTITY.to_cols_array(),
             scene_gdf_baked: false,
             path_trace_pipeline,
             realtime_env: true,
@@ -861,10 +875,12 @@ impl App {
             self.angle += dt * 0.6; // hold a fixed view when capturing
         }
 
-        // Path-trace screenshots need a long warmup so the static-camera accumulation
-        // converges before the frame is captured.
+        // Path-trace + GI-denoise screenshots need a long warmup so the static-camera
+        // accumulation converges before the frame is captured.
         let warmup = if self.path_trace && !self.rt_debug {
             PATHTRACE_WARMUP
+        } else if self.gdf_gi && self.gi_denoise && self.gdf.has_gdf_denoise() {
+            GI_DENOISE_WARMUP
         } else {
             SCREENSHOT_WARMUP
         };
@@ -964,6 +980,7 @@ impl App {
                 scene_gdf,
                 gdf_ao,
                 gdf_gi,
+                gi_denoise,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1111,7 +1128,10 @@ impl App {
                         if gdf.has_gdf_gi() {
                             ui.checkbox("GDF diffuse GI (deferred)", gdf_gi);
                             if *gdf_gi {
-                                ui.text_disabled("  - Stage C3: 1-bounce, noisy (C4 denoise)");
+                                ui.text_disabled("  - Stage C3: 1-bounce stochastic");
+                                if gdf.has_gdf_denoise() {
+                                    ui.checkbox("  - C4 spatio-temporal denoise", gi_denoise);
+                                }
                             }
                         }
                     }
@@ -1257,6 +1277,26 @@ impl App {
             self.sun_intensity,
         )?;
 
+        // C4: (re)allocate the GI denoiser history + reset accumulation on a lighting/
+        // quality change (NOT camera — the temporal pass reprojects). Runs before the
+        // graph, like the path-tracer's accumulation prepare.
+        let gi_denoise_active = self.gdf_gi && self.gi_denoise && self.gdf.has_gdf_denoise();
+        if gi_denoise_active {
+            let mut key = 0u64;
+            for b in self.sun_dir.iter() {
+                key = key
+                    .wrapping_mul(0x100_0000_01b3)
+                    .wrapping_add(b.to_bits() as u64);
+            }
+            key = key
+                .wrapping_mul(0x100_0000_01b3)
+                .wrapping_add(self.sun_intensity.to_bits() as u64);
+            key = key
+                .wrapping_mul(0x100_0000_01b3)
+                .wrapping_add(self.gi_spp as u64);
+            self.gdf.prepare_denoise(&self.device, cw, ch, key)?;
+        }
+
         let extent = Extent2D::new(cw, ch);
         let mut graph = RenderGraph::new();
         let backbuffer = graph.import_backbuffer(self.swapchain.format(), extent);
@@ -1326,7 +1366,7 @@ impl App {
         // irradiance the lighting pass adds to the ambient term. Recorded before lighting
         // (gbuffer -> GI -> lighting); shares the bake-once latch with C1/C2.
         let gdf_gi_out = if self.gdf_gi && self.gdf.has_gdf_gi() {
-            let out = self.gdf.record_gdf_gi(
+            let raw = self.gdf.record_gdf_gi(
                 &mut graph,
                 g_depth,
                 g_normal,
@@ -1342,6 +1382,23 @@ impl App {
                 !self.scene_gdf_baked,
             );
             self.scene_gdf_baked = true;
+            // C4: spatio-temporal denoise on top of the noisy raw GI (else use it raw).
+            let out = if gi_denoise_active {
+                self.gdf.record_gdf_denoise(
+                    &mut graph,
+                    raw,
+                    g_depth,
+                    g_normal,
+                    extent,
+                    inv_view_proj,
+                    self.prev_view_proj,
+                    cw,
+                    ch,
+                    self.flip_y,
+                )
+            } else {
+                raw
+            };
             Some(out)
         } else {
             None
@@ -1713,6 +1770,12 @@ impl App {
         if pt_active {
             self.rt.advance_accum();
         }
+        // C4: advance the GI denoiser accumulation (ping-pong swap) and stash this
+        // frame's view-projection for the next frame's temporal reprojection.
+        if gi_denoise_active {
+            self.gdf.advance_denoise();
+        }
+        self.prev_view_proj = view_proj.to_cols_array();
 
         // Wait for the GPU (copy included), read the buffer back, and save a PNG.
         if let (Some(cap), Some((buf, layout))) = (capture_this_frame.as_ref(), readback.as_ref()) {

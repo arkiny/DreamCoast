@@ -146,9 +146,23 @@ HW RT 파이프라인(Phase 8) 없이 컴퓨트 셰이더로 레이를 추적하
 > 결과가 Phase 12 M2의 SDF 청크로 영속화된다. (메시 직렬화 M1은 Phase 11과 독립적으로 먼저 가능.)
 
 ## Stage C — Stochastic Lighting
-GDF를 ray-march해 **디퓨즈 GI(1+ 바운스)·AO·러프 반사**를 stochastic 샘플하고, 결과를 디퍼드
+GDF를 ray-march해 **디퓨즈 GI(1+ 바운스)·AO·반사**를 stochastic 샘플하고, 결과를 디퍼드
 라이팅(Phase 6)의 ambient/GI 항으로 합성한다. Stage B의 GDF는 *단위 큐브 데모*(고정 카메라)였으므로
 Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실제 디퍼드 G-buffer**에서 march한다.
+
+### Stage C의 최종 목표 — 캡처 기반 IBL을 SW-RT로 대체 (사용자 확정 2026-06-26)
+지금까지 [rt-pbr-parity.md](rt-pbr-parity.md)(PT가 정답)와 [realtime-env-capture.md](realtime-env-capture.md)
+(캡처 기반 IBL)가 거듭 확인한 결론: **split-sum 큐브 IBL은 PT 반사를 근본적으로 못 따라간다** — 단일 프로브
+시차 오차, 이웃 오브젝트 미반영, 프리필터 블러, 구/박스 프록시 부정합. 컴퓨트 SW RT(Stage A)가 잘
+동작하므로(A1/A2 ✅), Stage C는 **캡처 기반 IBL의 디퓨즈·스페큘러 항을 SW-RT 결과로 교체**하는 것을 최종
+목표로 한다:
+- **디퓨즈 간접광(IBL irradiance) → GDF 디퓨즈 GI**(C3/C4). 캡처 큐브의 씬 캡처가 불필요해진다.
+- **스페큘러 반사(IBL prefilter) → 하이브리드 반사**: **(1) SSR**(스크린-스페이스, 온스크린 정확
+  반사 — 캡처 시차/이웃 오브젝트 오류를 직접 해소) **+ (2) GDF 반사**(오프스크린/디스오클루전 폴백, SW-RT)
+  **+ (3) 절차적 스카이**(레이 miss 폴백). 캡처 env 큐브는 **스카이 전용 폴백/디퓨즈 스카이 irradiance**로
+  격하(시차·프록시·이웃반사 한계 모두 은퇴).
+- 절차적 스카이는 레이 miss 라디언스로 그대로 유지 — "IBL을 없앤다"가 아니라 **씬 캡처를 SW-RT로
+  대체하고, 큐브는 하늘만 담당**하게 한다.
 
 마일스톤(각 양 백엔드 + 검증 클린 게이트, phase-by-phase 승인):
 
@@ -204,14 +218,68 @@ Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실
   레퍼런스 mean0.70/ch(=노이즈, C4 디노이즈 대상; GDF 저주파라 과하지 않음). VUID 0, DX 클린, TDR 없음.
   한계: 무채색(상수 알베도) + spp8 노이즈 + 48³ 저주파. NEXT C4가 temporal+공간 필터로 정리.
 
-### C4 — 시공간 디노이즈
-- temporal 재투영(히스토리 누적) + 공간 필터(à-trous/bilateral)로 noisy GI 정리.
+### C4 — 시공간 디노이즈 ✅ (양 백엔드 검증)
+- **temporal 재투영 + 누적**(`gdf_temporal.slang`, push **192B**): 픽셀별로 depth에서 월드점 P 재구성 →
+  **이전 프레임 view-proj로 reproject** → 저장된 월드점으로 히스토리 검증(disocclusion: reproject 텍셀의 이전
+  전면 표면이 다른 점이면 리젝트) → EMA 누적(alpha=1/len, len≤64). 히스토리는 **ping-pong byte-address
+  storage buffer 2쌍**(`gi_hist` rgb+len, `gi_pos` xyz+valid), 렌더 extent로 (재)할당. 씬 지오메트리가 정적이라
+  월드점이 프레임 불변 → 이동 카메라에서도 reproject 정확. `reset`(첫 프레임/조명·해상도 변경)은 히스토리 무시.
+- **공간 à-trous**(`gdf_atrous.slang`, push **112B** — `float4 params`가 offset 96 정렬이라 96이 아닌 112!):
+  5×5 B3-스플라인 커널 2패스(step 1,2), edge-stopping = world-pos(depth 재구성) + normal 가중 → 저주파 간접
+  irradiance를 표면 경계 안 넘게 평활. disoccluded/짧은 히스토리 픽셀의 잔여 노이즈 정리.
+- 영속 상태 + 리셋은 `GdfSystem::prepare_denoise`(그래프 전, rt accum 미러) + end-of-frame `advance_denoise`
+  (ping-pong swap) + `App::prev_view_proj` 저장. 스크린샷은 카메라 고정이라 reproject=identity로 환원,
+  64프레임 warmup(`GI_DENOISE_WARMUP`)으로 progressive 수렴. 토글 `P11_GI_DENOISE`(기본 on) + UI.
+- **검증(RTX 2070 SUPER):** build+fmt+clippy(-D warnings) 클린. 디노이즈된 GI가 깔끔(노이즈 제거된 간접 fill).
+  **VK≡DX 픽셀 동일**(spp8 디노이즈 mean 0.0026/ch, max 1, >2px 0/921600 — 정수 RNG+결정적 reproject).
+  **디노이즈가 ground truth(spp64) 대비 오차 절반↓**: raw spp8 0.70/ch → 디노이즈 0.32/ch, >8px 13,591→1,639(≈8×↓).
+  GI-off는 C3 베이스라인과 **byte-identical(max 0)** = 무회귀. VUID 0(à-trous push 112B 수정 후), DX 클린, TDR 없음.
+  한계: storage-buffer 히스토리라 reproject는 nearest(정적 스크린샷엔 정확, 이동 시 bilinear는 후속);
+  denoise 토글 재활성 시 1–2프레임 stale(self-heal). NEXT C5(선택) 러프 반사.
 
-### C5 (선택) — 러프 반사
-- GGX 샘플 GDF 레이로 광택 반사.
+---
+**C5–C7 = 반사 트랙(캡처 기반 IBL 스페큘러 대체).** SSR(온스크린) → GDF SW-RT(오프스크린) → 스카이(miss)
+3단 폴백을 차례로 세운 뒤(C7) 하나로 합성해 `pbr.slang`의 prefilter-큐브 스페큘러 lookup을 교체한다.
+
+### C5 — 스크린-스페이스 반사 (SSR)
+- 풀스크린 컴퓨트 패스: G-buffer(depth/normal/roughness)에서 픽셀별 반사 레이 `R = reflect(V, N)`를
+  **스크린 공간에서 깊이 버퍼로 ray-march**(Hi-Z/계층적 깊이로 가속). 히트하면 **직전 프레임의 셰이딩된
+  컬러 버퍼**(라이팅 결과 history)를 그 위치에서 샘플 → **이웃 오브젝트가 정확히 비치는 반사**(캡처 큐브의
+  시차·이웃 미반영 오류를 직접 해소 = 사용자 요청의 핵심).
+- 러프니스: 반사 컬러를 러프니스로 블러(컬러 피라미드 mip 샘플)하거나 GGX-VNDF로 레이 jitter + C4
+  디노이저 재사용. 1차 구현은 미러 레이 + 러프니스 기반 mip.
+- **한계(설계상 내재):** 화면 밖으로 나가는 레이, 카메라가 못 보는 면(디스오클루전), 화면 가장자리 →
+  히트 실패. 이 미스를 C6 GDF 폴백이 메운다. 마스크/신뢰도(confidence)를 출력해 C7 합성에서 가중.
+- 토글 env `P11_SSR` + UI + 디버그뷰. 검증: 양 백엔드 픽셀 일치, 크롬/금속 구가 이웃 아보카도·큐브를
+  반사(캡처 큐브 대비 시차/이웃반사 개선을 PT 레퍼런스와 대조).
+
+### C6 — GDF 반사 (오프스크린 폴백, SW-RT)
+- C5 SSR이 미스한 픽셀에 대해 반사 레이 `R`을 **씬 GDF에 sphere-trace**(C3 GI 머신 재사용) → 히트
+  재조명(C3와 동일: 상수 알베도 + 태양/스카이, 차후 surface cache로 컬러). 화면 밖 지오메트리·디스오클루전
+  영역도 그럴듯한 반사를 제공.
+- 러프 반사는 GGX-VNDF 샘플 GDF 레이 + C4 디노이저(러프할수록 콘 확대 = sphere-trace 자연 정합).
+- **이중계산 없음:** GDF 레이가 스카이로 탈출하면 0이 아니라 **절차적 스카이** 반환(스페큘러 miss 폴백) —
+  C3 디퓨즈 GI의 "스카이 탈출=0"과 역할이 다름(거긴 IBL 디퓨즈가 스카이를 공급하므로 0).
+- 토글 env `P11_GDF_REFLECT` + UI. 검증: SSR-off로 GDF-only 반사 단독 확인 → 양 백엔드 일치 + PT 대조.
+
+### C7 — 하이브리드 반사 합성 + IBL 스페큘러/디퓨즈 대체
+- **합성:** 픽셀별로 **SSR(C5, 신뢰도 높음) → GDF SW-RT(C6, 오프스크린) → 절차적 스카이(miss)** 순으로
+  폴백 선택/블렌드(SSR confidence + 화면 가장자리 페이드). Fresnel·러프니스로 가중해 `pbr.slang`의
+  **prefilter-큐브 스페큘러 lookup을 이 하이브리드 결과로 교체**.
+- **디퓨즈 대체:** ambient irradiance 항을 **C3/C4 GDF 디퓨즈 GI**(씬 바운스) + **스카이 irradiance**
+  (절차적 스카이 적분; 캡처 큐브 대신 SH 또는 저해상 스카이-only 큐브 — 씬 캡처 불필요)로 구성.
+- **캡처 파이프라인 격하:** [realtime-env-capture.md](realtime-env-capture.md)의 **씬 캡처(RT3/RT5
+  멀티바운스)는 불필요**해짐 — 반사는 SSR+GDF가 실제 이웃 오브젝트를 보고 공급. env 큐브는 **스카이 전용**
+  소스로 축소(시차·단일프로브·이웃반사·프록시 한계 모두 은퇴). 토글로 레거시 IBL ↔ 신 SW-RT 경로 비교 유지.
+- **검증:** `tools/rt-compare.py`로 **신 하이브리드 반사 vs PT** 평균차가 캡처 IBL(잔차 ~4.0/ch) 대비
+  유의미하게 감소함을 정량 확인(= 이 트랙의 성공 지표). 양 백엔드 픽셀 일치, 검증 클린.
 
 ## 미결 / 설계 항목
 - GDF 표현(클립맵 레벨 수/해상도), 메모리 예산.
 - SW RT 정확도 vs 비용(마칭 스텝/원뿔 추적).
-- 디노이저 구조, 동적 오브젝트 GDF 갱신 빈도.
-- HW RT(Phase 8)와의 선택/하이브리드 관계.
+- 디노이저 구조(GI + 러프 반사 공유), 동적 오브젝트 GDF 갱신 빈도.
+- **SSR 컬러 소스:** 직전 프레임 라이팅 history(재투영) vs 현재 프레임 부분 결과 — 재투영 필요(C4 인프라 공유).
+- **반사 러프니스 모델:** 미러+mip 블러(저비용) vs GGX-VNDF 레이(정확, 디노이즈 필요). 1차는 전자.
+- **IBL 디퓨즈 스카이 irradiance:** SH 9계수(컴퓨트) vs 저해상 스카이-only 큐브 유지. 씬 캡처는 제거.
+- **레거시 IBL 경로 유지 기간:** SW-RT 반사가 PT 대비 확실히 우월함을 정량 확인할 때까지 토글로 병존.
+- HW RT(Phase 8)와의 선택/하이브리드 관계(GDF 폴백 대신 TLAS 반사 레이 옵션).
