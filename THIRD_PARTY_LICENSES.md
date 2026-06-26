@@ -58,6 +58,16 @@ separately.
   (`tools/fetch-vulkan-layers.py`) and loaded only in development builds;
   validation is compiled out of release builds (`cfg!(debug_assertions)`), so the
   layer is never part of a shipped artifact.
+- **[renderdoc-mcp](https://github.com/Linkingooo/renderdoc-mcp)** — MIT (declared
+  in its README). Cloned into the gitignored `tools/renderdoc-mcp/` and run as a
+  separate MCP process for graphics debugging; never linked into the engine.
+- **[RenderDoc](https://github.com/baldurk/renderdoc)** (Baldur Karlsson) — MIT.
+  Built from source (gitignored `tools/renderdoc-src/`) only to produce a
+  Python-3.12 `renderdoc.pyd` for the MCP above. RenderDoc-bundled **SWIG** (GPL)
+  is invoked solely as a local build tool — its generated output is unrestricted by
+  SWIG's GPL exception. No RenderDoc/SWIG sources or binaries are committed.
+
+The RenderDoc MCP setup is documented in [`docs/renderdoc-mcp.md`](docs/renderdoc-mcp.md).
 
 ## Sample assets
 
