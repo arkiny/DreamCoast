@@ -266,7 +266,10 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float ndl = max(dot(hn, sun_dir), 0.0);
             float sh = ndl > 0.0 ? refl_shadow(hp + hn * 0.004, sun_dir, max_dist) : 1.0;
             float fill = sky_fill * (0.5 + 0.5 * hn.y);
-            color = albedo_at(hp) * (sun_i * ndl * sh + fill);
+            // Lambertian reflected surface: albedo/PI * irradiance, so the reflection of a
+            // diffuse surface (the ground here) matches its directly-shaded appearance. The
+            // cache path (meshed hits) gets the same 1/PI in sdf_cache_light.slang.
+            color = albedo_at(hp) * (sun_i * ndl * sh + fill) * (1.0 / GGX_PI);
         }
     }
     else

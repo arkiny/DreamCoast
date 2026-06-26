@@ -160,7 +160,11 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     }
     indirect /= float(spp);
 
-    float3 radiance = albedo * (direct_irr + indirect);
+    // Lambertian: outgoing radiance = albedo/PI * irradiance. The direct term is an
+    // irradiance, so it needs the 1/PI (matching the deferred direct + the GI fix); the
+    // indirect gather is already cosine-weighted mean radiance (its PI cancels), so it
+    // stays as-is. Omitting the direct 1/PI made cached (reflected) surfaces ~PI too bright.
+    float3 radiance = albedo * (direct_irr * (1.0 / PI) + indirect);
 
     // Temporal EMA (skip on reset) — static cache converges; damps gather noise.
     if (pc.reset == 0u)

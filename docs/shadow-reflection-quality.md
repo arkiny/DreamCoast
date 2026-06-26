@@ -31,10 +31,18 @@ factor(0=하드 3×3 폴백, scalability seam), 품질 상수(샘플수/search/m
   기본 씬 6.90→**6.56/ch**, DX≡VK **0.0010**(게이트 통과). 시각: diff에서 아보카도 글로우 소거.
 - 남은 잔차 지배 = 크롬/글로시 **반사 지오메트리**(저해상 48³ SDF blob) → Phase 3.
 
-## Phase 3 — Glossy/chrome reflection 정확도 (남음)
-크롬(rough 0.08)·글로시 반사가 GDF blob 형상이라 PT의 정확한 반사와 차이. 후보(저비용 우선):
-à-trous 강화 / cone→GDF-mip / 본질적으론 B3 고해상·클립맵 SDF. seam 규칙 유지, rt-compare로 검증.
-주의: gdf_reflect/surface-cache 재조명도 같은 `/π` 결을 점검할 것(반사는 스페큘러라 별도 정규화).
+## Phase 3 — 반사 재조명 1/π (저비용 완화) ✅
+사용자: "저비용 완화 정도로". GI와 같은 `/π` 누락이 반사 경로에도 있었음:
+- `sdf_cache_light.slang`: `albedo*(direct_irr + indirect)` → direct 항만 `/π`(indirect는 코사인샘플 π 상쇄).
+  reflect_cache(기본 on)가 이 캐시를 반사에 먹이므로 메시 객체 반사가 π× 과밝았음.
+- `gdf_reflect.slang` 미스 폴백(지면 반사): `albedo*(sun*ndl*sh+fill)` → `*1/GGX_PI`.
+- 결과: 반사된 디퓨즈 표면이 직접 본 모습과 일치. **기본 씬 6.56→6.26/ch**(off>32 2.31→1.68%),
+  DX≡VK 0.0003. 크롬 뷰는 하늘 반사 지배라 변화 작음(혼합). 시각 회귀 없음.
+
+## 남음 (큰 작업, 보류) — Glossy/chrome 반사 지오메트리
+크롬(rough 0.08)·글로시가 저해상 48³ SDF blob이라 PT의 정확한 반사 형상과 차이(copper 뷰 잔차 지배).
+근본은 B3 고해상/클립맵 SDF(비용 큼) — 게임 최적화 우선이라 **보류**. à-trous/cone-mip은 노이즈용인데
+현 GGX+temporal이 이미 글로시 노이즈를 해소해 효과 작음 → 현재로선 비용 대비 이득 낮음.
 
 ## 진행
 Phase 1 → 측정/승인 → Phase 2 → 측정. 각 Phase는 기본 on·env 폴백으로 commit.
