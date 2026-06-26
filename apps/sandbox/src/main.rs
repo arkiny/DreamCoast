@@ -371,6 +371,8 @@ struct App {
     gdf_ssr: bool,
     /// C6: GDF reflections (off-screen fallback viz; C7 composites SSR→GDF→sky).
     gdf_reflect: bool,
+    /// C7: hybrid reflection composite (SSR over GDF / sky), viz toward IBL-specular replacement.
+    gdf_hybrid: bool,
     /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
     scene_gdf_baked: bool,
     path_trace_pipeline: bool,
@@ -675,6 +677,12 @@ impl App {
         let gdf_reflect = reflect.has_gdf_reflect()
             && gdf.has_scene_sdf()
             && std::env::var_os("P11_GDF_REFLECT").is_some();
+        // C7 hybrid reflection composite (viz toggle): needs SSR + GDF reflect + composite.
+        let gdf_hybrid = reflect.has_ssr()
+            && reflect.has_gdf_reflect()
+            && reflect.has_composite()
+            && gdf.has_scene_sdf()
+            && std::env::var_os("P11_HYBRID").is_some();
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -806,6 +814,7 @@ impl App {
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
             gdf_ssr,
             gdf_reflect,
+            gdf_hybrid,
             scene_gdf_baked: false,
             path_trace_pipeline,
             realtime_env: true,
@@ -1009,6 +1018,7 @@ impl App {
                 gi_denoise,
                 gdf_ssr,
                 gdf_reflect,
+                gdf_hybrid,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1172,6 +1182,12 @@ impl App {
                             ui.checkbox("GDF reflections (viz)", gdf_reflect);
                             if *gdf_reflect {
                                 ui.text_disabled("  - Stage C6: SSR-miss fallback (sky on escape)");
+                            }
+                        }
+                        if reflect.has_composite() && gdf.has_scene_sdf() {
+                            ui.checkbox("Hybrid reflections (viz)", gdf_hybrid);
+                            if *gdf_hybrid {
+                                ui.text_disabled("  - Stage C7: SSR over GDF / sky composite");
                             }
                         }
                     }
@@ -1386,17 +1402,18 @@ impl App {
         // trace (whichever runs first bakes).
         let scene_gdf_vol = self.gdf.scene_gdf_volume();
         let (scene_aabb_min, scene_aabb_max) = self.gdf.scene_aabb();
-        let scene_gdf_ext =
-            if (self.gdf_ao || self.gdf_gi || self.gdf_reflect) && scene_gdf_vol.is_some() {
-                let ext = graph.import_external("scene_gdf");
-                if !self.scene_gdf_baked {
-                    self.gdf.record_scene_bake(&mut graph, ext);
-                    self.scene_gdf_baked = true;
-                }
-                Some(ext)
-            } else {
-                None
-            };
+        let scene_gdf_ext = if (self.gdf_ao || self.gdf_gi || self.gdf_reflect || self.gdf_hybrid)
+            && scene_gdf_vol.is_some()
+        {
+            let ext = graph.import_external("scene_gdf");
+            if !self.scene_gdf_baked {
+                self.gdf.record_scene_bake(&mut graph, ext);
+                self.scene_gdf_baked = true;
+            }
+            Some(ext)
+        } else {
+            None
+        };
         // Stage C2: GDF ambient occlusion, multiplied into the lighting ambient term.
         let gdf_ao_out = match (self.gdf_ao, scene_gdf_vol, scene_gdf_ext) {
             (true, Some(vol), Some(ext)) => Some(self.gi.record_ao(
@@ -1679,6 +1696,7 @@ impl App {
         // buffer; C7 will instead composite it into the lighting's specular term. Only
         // when the other full-screen replacements are off.
         let ssr_out = if self.gdf_ssr
+            && !self.gdf_hybrid
             && rt_out.is_none()
             && sdf_out.is_none()
             && vol_out.is_none()
@@ -1712,6 +1730,7 @@ impl App {
         // trace; C7 will composite it under SSR. Only when the other replacements are off.
         let reflect_out = match (
             self.gdf_reflect
+                && !self.gdf_hybrid
                 && rt_out.is_none()
                 && sdf_out.is_none()
                 && vol_out.is_none()
@@ -1743,6 +1762,71 @@ impl App {
             _ => None,
         };
 
+        // Phase 11 Stage C7: hybrid reflection composite. Runs both reflection sources
+        // (C5 SSR over the lit HDR + C6 GDF reflect) and blends them by SSR confidence into
+        // one image — a viz of the reflection radiance that will replace the IBL specular
+        // (C7c). The GDF source is raw radiance, so the composite lifts it by `exposure`
+        // into the SSR's post-exposure space, and the tonemap then applies exposure 1.0
+        // (like the SSR viz). Only when the other full-screen replacements are off.
+        let hybrid_out = match (
+            self.gdf_hybrid
+                && rt_out.is_none()
+                && sdf_out.is_none()
+                && vol_out.is_none()
+                && bake_out.is_none()
+                && gdf_out.is_none()
+                && gdf_trace_out.is_none()
+                && scene_gdf_out.is_none(),
+            scene_gdf_vol,
+            scene_gdf_ext,
+        ) {
+            (true, Some(vol), Some(ext)) => {
+                let ssr = self.reflect.record_ssr(
+                    &mut graph,
+                    hdr,
+                    g_depth,
+                    g_normal,
+                    g_material,
+                    extent,
+                    view_proj.to_cols_array(),
+                    inv_view_proj,
+                    eye,
+                    cw,
+                    ch,
+                    self.flip_y,
+                    self.scene_radius * 1.5,
+                    self.scene_radius * 0.06,
+                );
+                let gdf_refl = self.reflect.record_gdf_reflect(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    extent,
+                    inv_view_proj,
+                    eye,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    cw,
+                    ch,
+                    self.flip_y,
+                );
+                Some(self.reflect.record_composite(
+                    &mut graph,
+                    ssr,
+                    gdf_refl,
+                    extent,
+                    cw,
+                    ch,
+                    self.exposure,
+                ))
+            }
+            _ => None,
+        };
+
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active, else
         // the SW-RT SDF trace, else the Stage-B volume slice, else the Stage-C1 scene
         // GDF, else the Stage-C5 SSR / C6 GDF-reflection viz, else compute-post, else HDR.
@@ -1755,6 +1839,7 @@ impl App {
             .or(scene_gdf_out)
             .or(ssr_out)
             .or(reflect_out)
+            .or(hybrid_out)
             .or(hdr_post)
             .unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the

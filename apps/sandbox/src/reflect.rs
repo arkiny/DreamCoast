@@ -10,11 +10,12 @@ use rhi::{BackendKind, ComputePipeline, ComputePipelineDesc, Device, Extent2D, V
 
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
-use crate::push::{gdf_reflect_push, ssr_push};
+use crate::push::{gdf_reflect_push, reflect_composite_push, ssr_push};
 
 pub(crate) struct ReflectSystem {
     ssr_pipeline: Option<ComputePipeline>, // C5 screen-space reflections
     reflect_pipeline: Option<ComputePipeline>, // C6 GDF reflection fallback
+    composite_pipeline: Option<ComputePipeline>, // C7 hybrid composite
 }
 
 impl ReflectSystem {
@@ -57,9 +58,17 @@ impl ReflectSystem {
             "gdf_reflect",
             176,
         )?;
+        let composite_pipeline = compute(
+            dreamcoast_shader::reflect_composite_cs_spirv,
+            dreamcoast_shader::reflect_composite_cs_dxil,
+            dreamcoast_shader::reflect_composite_cs_metallib,
+            "reflect_composite",
+            32,
+        )?;
         Ok(Self {
             ssr_pipeline,
             reflect_pipeline,
+            composite_pipeline,
         })
     }
 
@@ -68,6 +77,9 @@ impl ReflectSystem {
     }
     pub(crate) fn has_gdf_reflect(&self) -> bool {
         self.reflect_pipeline.is_some()
+    }
+    pub(crate) fn has_composite(&self) -> bool {
+        self.composite_pipeline.is_some()
     }
 
     /// C5: screen-space reflections. A full-screen compute pass reflects the view ray
@@ -207,6 +219,51 @@ impl ReflectSystem {
                     0.7,  // constant hit albedo (no material in the GDF)
                     0.25, // sky fill at the reflected hit
                     bias,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
+    /// C7: hybrid reflection composite. A full-screen compute pass blends the C5 SSR image
+    /// (`ssr`, rgb = reflected color, a = confidence) over the C6 GDF reflection image
+    /// (`gdf_reflect`, sky baked in on a ray escape) by the SSR confidence — SSR where it
+    /// is confident, the GDF / sky fallback elsewhere. The result is the single reflection
+    /// radiance that replaces the prefilter-cube IBL specular (C7c). `gdf_scale` lifts the
+    /// raw GDF radiance into the SSR's post-exposure space for the standalone viz; it is
+    /// 1.0 once both sources are raw radiance (C7b). Returns the composite image.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_composite<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        ssr: ResourceId,
+        gdf_reflect: ResourceId,
+        extent: Extent2D,
+        cw: u32,
+        ch: u32,
+        gdf_scale: f32,
+    ) -> ResourceId {
+        let pipe = self
+            .composite_pipeline
+            .as_ref()
+            .expect("composite pipeline");
+        let out = graph.create_storage_image("reflect_composite_out", HDR_FORMAT, extent);
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "reflect_composite",
+                storage_writes: vec![out],
+                reads: vec![ssr, gdf_reflect],
+            },
+            move |ctx| {
+                let ssr_index = ctx.sampled_index(ssr);
+                let gdf_index = ctx.sampled_index(gdf_reflect);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&reflect_composite_push(
+                    ssr_index, gdf_index, out_index, cw, ch, gdf_scale,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
