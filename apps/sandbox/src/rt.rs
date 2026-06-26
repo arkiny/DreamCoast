@@ -173,7 +173,9 @@ impl RtSystem {
                 } else {
                     None
                 },
-                metal_intersection_entry: Some("irconverter.wrapper.intersection.function.triangle"),
+                metal_intersection_entry: Some(
+                    "irconverter.wrapper.intersection.function.triangle",
+                ),
                 push_constant_size: 128, // matches rt_path / rt_pipeline PushConstants
                 // Payload = float3 x4 (48) + uint x3 (12) + float x2 cone state (8) = 68,
                 // rounded up to a multiple of 8. Must be >= the shader payload or D3D12
@@ -276,47 +278,47 @@ impl RtSystem {
         // bleeding from the red/green walls, area-light GI). Built once: its own BLAS
         // per quad/box + TLAS + instance table. The host-visible vertex/index buffers
         // are only needed during the BLAS build, so they drop at the end of this block.
-        let (cornell_scene, cornell_table, cornell_geometry, cornell_instance_count) =
-            if device.has_raytracing() {
-                let meshes = dreamcoast_asset::cornell_box();
-                let mut hostbufs: Vec<(Buffer, Buffer, u32, u32)> =
-                    Vec::with_capacity(meshes.len());
-                for (m, _) in &meshes {
-                    let (vb, ib, ic) = crate::mesh::upload_mesh(device, m)?;
-                    hostbufs.push((vb, ib, ic, m.vertices.len() as u32));
-                }
-                let geoms: Vec<RtGeometry> = hostbufs
-                    .iter()
-                    .map(|(vb, ib, ic, vc)| RtGeometry {
-                        vertex_buffer: vb,
-                        index_buffer: ib,
-                        geometry: BlasGeometry {
-                            vertex_count: *vc,
-                            vertex_stride: 32,
-                            index_count: *ic,
-                        },
-                    })
-                    .collect();
-                let instances: Vec<TlasInstance> = (0..geoms.len() as u32)
-                    .map(|i| TlasInstance {
-                        blas_index: i,
-                        transform: mat4_to_3x4(Mat4::IDENTITY), // geometry already world-space
-                        custom_index: i,
-                        mask: 0xFF,
-                    })
-                    .collect();
-                let scene = device.build_raytracing_scene(&geoms, &instances)?;
-                // The Cornell box is all matte diffuse (emissive ceiling via base_color.a).
-                let entries: Vec<(&MeshData, PtMaterial)> = meshes
-                    .iter()
-                    .map(|(m, a)| (m, PtMaterial::diffuse(*a)))
-                    .collect();
-                let (table, geometry) = build_pt_instance_table(device, &entries)?;
-                info!("cornell-box scene built: {} instances", meshes.len());
-                (Some(scene), Some(table), geometry, meshes.len() as u32)
-            } else {
-                (None, None, Vec::new(), 0u32)
-            };
+        let (cornell_scene, cornell_table, cornell_geometry, cornell_instance_count) = if device
+            .has_raytracing()
+        {
+            let meshes = dreamcoast_asset::cornell_box();
+            let mut hostbufs: Vec<(Buffer, Buffer, u32, u32)> = Vec::with_capacity(meshes.len());
+            for (m, _) in &meshes {
+                let (vb, ib, ic) = crate::mesh::upload_mesh(device, m)?;
+                hostbufs.push((vb, ib, ic, m.vertices.len() as u32));
+            }
+            let geoms: Vec<RtGeometry> = hostbufs
+                .iter()
+                .map(|(vb, ib, ic, vc)| RtGeometry {
+                    vertex_buffer: vb,
+                    index_buffer: ib,
+                    geometry: BlasGeometry {
+                        vertex_count: *vc,
+                        vertex_stride: 32,
+                        index_count: *ic,
+                    },
+                })
+                .collect();
+            let instances: Vec<TlasInstance> = (0..geoms.len() as u32)
+                .map(|i| TlasInstance {
+                    blas_index: i,
+                    transform: mat4_to_3x4(Mat4::IDENTITY), // geometry already world-space
+                    custom_index: i,
+                    mask: 0xFF,
+                })
+                .collect();
+            let scene = device.build_raytracing_scene(&geoms, &instances)?;
+            // The Cornell box is all matte diffuse (emissive ceiling via base_color.a).
+            let entries: Vec<(&MeshData, PtMaterial)> = meshes
+                .iter()
+                .map(|(m, a)| (m, PtMaterial::diffuse(*a)))
+                .collect();
+            let (table, geometry) = build_pt_instance_table(device, &entries)?;
+            info!("cornell-box scene built: {} instances", meshes.len());
+            (Some(scene), Some(table), geometry, meshes.len() as u32)
+        } else {
+            (None, None, Vec::new(), 0u32)
+        };
 
         Ok(Self {
             trace_pipeline,

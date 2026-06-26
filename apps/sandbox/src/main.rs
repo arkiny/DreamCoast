@@ -92,7 +92,7 @@ const BRDF_SIZE: u32 = 256;
 const NO_TEXTURE: u32 = u32::MAX;
 const MODEL_PATH: &str = "assets/model.glb";
 
-const DEBUG_VIEWS: [&str; 9] = [
+const DEBUG_VIEWS: [&str; 10] = [
     "Lit",
     "Albedo",
     "Normal",
@@ -102,6 +102,7 @@ const DEBUG_VIEWS: [&str; 9] = [
     "AO",
     "Direct",
     "IBL",
+    "GDF AO",
 ];
 const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 
@@ -348,7 +349,11 @@ struct App {
     gdf_merge_done: bool,
     gdf_trace: bool,
     scene_gdf: bool,
-    scene_gdf_done: bool,
+    /// C2: GDF AO multiplied into the deferred ambient term (the first GDF feature in
+    /// the real render path; C1's `scene_gdf` is a standalone trace viz).
+    gdf_ao: bool,
+    /// Shared bake-once latch for the world scene GDF (both C1 trace + C2 AO read it).
+    scene_gdf_baked: bool,
     path_trace_pipeline: bool,
     realtime_env: bool,
     multibounce: bool,
@@ -556,7 +561,9 @@ impl App {
             for (m, xf) in objs {
                 for v in &m.vertices {
                     let p = xf.transform_point3(Vec3::from(v.pos));
-                    let n = xf.transform_vector3(Vec3::from(v.normal)).normalize_or_zero();
+                    let n = xf
+                        .transform_vector3(Vec3::from(v.normal))
+                        .normalize_or_zero();
                     amin = [amin[0].min(p.x), amin[1].min(p.y), amin[2].min(p.z)];
                     amax = [amax[0].max(p.x), amax[1].max(p.y), amax[2].max(p.z)];
                     fused_v.extend_from_slice(&p.x.to_le_bytes());
@@ -588,8 +595,7 @@ impl App {
 
         // One render-graph transient pool per frame-in-flight (reused only after the
         // frame slot's fence has signaled — no cross-frame hazards).
-        let pools: Vec<ResourcePool> =
-            (0..FRAMES_IN_FLIGHT).map(|_| ResourcePool::new()).collect();
+        let pools: Vec<ResourcePool> = (0..FRAMES_IN_FLIGHT).map(|_| ResourcePool::new()).collect();
 
         // UI-controlled lighting state defaults.
         let sun_dir = [0.4f32, 0.8, 0.4];
@@ -623,6 +629,8 @@ impl App {
         let gdf_trace_analytic = std::env::var_os("P11_GDF_ANALYTIC").is_some();
         // Stage C1: trace the world-space scene GDF from the live camera.
         let scene_gdf = gdf.has_scene_sdf() && std::env::var_os("P11_SCENE_GDF").is_some();
+        // Stage C2: GDF AO multiplied into the deferred ambient term.
+        let gdf_ao = gdf.has_gdf_ao() && std::env::var_os("P11_GDF_AO").is_some();
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -745,7 +753,8 @@ impl App {
             gdf_merge_done: false,
             gdf_trace,
             scene_gdf,
-            scene_gdf_done: false,
+            gdf_ao,
+            scene_gdf_baked: false,
             path_trace_pipeline,
             realtime_env: true,
             multibounce: true,
@@ -813,7 +822,10 @@ impl App {
         // of truth for this whole frame (ImGui display size, camera aspect, render
         // extent, viewport). A failed acquire skips here, BEFORE the ImGui frame is
         // started, so NewFrame/Render stay balanced.
-        let image_index = match self.swapchain.acquire_next_image(&self.image_available[fif])? {
+        let image_index = match self
+            .swapchain
+            .acquire_next_image(&self.image_available[fif])?
+        {
             Some(i) => i,
             None => {
                 self.needs_recreate = true;
@@ -936,6 +948,7 @@ impl App {
                 gdf_merge_done,
                 gdf_trace,
                 scene_gdf,
+                gdf_ao,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1074,6 +1087,12 @@ impl App {
                                 ui.text_disabled("  - Stage C1: fused world scene SDF");
                             }
                         }
+                        if gdf.has_gdf_ao() {
+                            ui.checkbox("GDF ambient occlusion (deferred)", gdf_ao);
+                            if *gdf_ao {
+                                ui.text_disabled("  - Stage C2: GDF AO into ambient");
+                            }
+                        }
                     }
 
                     if ui.collapsing_header("Profiling & debug (Phase 9)", open) {
@@ -1196,10 +1215,8 @@ impl App {
         // reset key BEFORE building the render graph — the fallible buffer
         // (re)allocation must not sit on a `?` early-return path while the graph holds
         // borrows of transient resources.
-        let pt_active = self.path_trace
-            && !self.rt_debug
-            && self.rt.has_path()
-            && self.rt.has_instance_table();
+        let pt_active =
+            self.path_trace && !self.rt_debug && self.rt.has_path() && self.rt.has_instance_table();
         // The path tracer uses the Cornell scene (fixed front camera) when toggled,
         // else the orbiting open scene. `pt_eye` / `pt_inv_vp` feed the trace rays.
         let use_cornell = pt_active && self.cornell && self.rt.has_cornell();
@@ -1261,8 +1278,37 @@ impl App {
             self.metallic_override,
             self.roughness_override,
         );
-        self.deferred
-            .record_lighting(&mut graph, hdr, gbuf, shadow_map, globals_offset, self.flip_y);
+        // Stage C2: GDF ambient occlusion. A compute pass reconstructs each pixel's
+        // world surface from the depth G-buffer, marches the world-space scene GDF, and
+        // writes an AO image the lighting pass multiplies into its ambient term. Builds
+        // the fused scene GDF once (shared latch with the C1 trace). Recorded before
+        // lighting so the graph orders gbuffer -> AO -> lighting.
+        let gdf_ao_out = if self.gdf_ao && self.gdf.has_gdf_ao() {
+            let out = self.gdf.record_gdf_ao(
+                &mut graph,
+                g_depth,
+                g_normal,
+                extent,
+                inv_view_proj,
+                cw,
+                ch,
+                self.flip_y,
+                !self.scene_gdf_baked,
+            );
+            self.scene_gdf_baked = true;
+            Some(out)
+        } else {
+            None
+        };
+        self.deferred.record_lighting(
+            &mut graph,
+            hdr,
+            gbuf,
+            shadow_map,
+            gdf_ao_out,
+            globals_offset,
+            self.flip_y,
+        );
         if let Some(hdr_post) = hdr_post {
             self.deferred
                 .record_compute_post(&mut graph, hdr, hdr_post, cw, ch);
@@ -1384,9 +1430,9 @@ impl App {
         // O(voxels*tris): run it once (`sdf_bake_done`) and only re-view afterwards.
         let bake_out =
             if self.sdf_bake && rt_out.is_none() && sdf_out.is_none() && vol_out.is_none() {
-                let out = self
-                    .gdf
-                    .record_bake_view(&mut graph, extent, cw, ch, !self.sdf_bake_done);
+                let out =
+                    self.gdf
+                        .record_bake_view(&mut graph, extent, cw, ch, !self.sdf_bake_done);
                 self.sdf_bake_done = true;
                 Some(out)
             } else {
@@ -1461,9 +1507,9 @@ impl App {
                 cw,
                 ch,
                 self.flip_y,
-                !self.scene_gdf_done,
+                !self.scene_gdf_baked,
             );
-            self.scene_gdf_done = true;
+            self.scene_gdf_baked = true;
             Some(out)
         } else {
             None
@@ -1485,7 +1531,8 @@ impl App {
         // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
         // exposure here before the filmic curve (else the bright sky + sun blow out).
         let tm_exposure =
-            if pt_active || sdf_out.is_some() || gdf_trace_out.is_some() || scene_gdf_out.is_some() {
+            if pt_active || sdf_out.is_some() || gdf_trace_out.is_some() || scene_gdf_out.is_some()
+            {
                 self.exposure
             } else {
                 1.0
@@ -1602,8 +1649,12 @@ impl App {
                 &self.in_flight[fif],
             )?;
         } else {
-            self.queue
-                .submit(cmd, &self.image_available[fif], signal, &self.in_flight[fif])?;
+            self.queue.submit(
+                cmd,
+                &self.image_available[fif],
+                signal,
+                &self.in_flight[fif],
+            )?;
         }
         // Swap the particle ping-pong parity for the next simulated frame (deferred to
         // here so the graph's `&self` borrows have ended — see `particle.rs`).

@@ -443,6 +443,55 @@ pub(crate) fn gdf_trace_push(
     pc
 }
 
+/// Pack the Phase 11 Stage C2 GDF-AO push block (144 bytes): inv_view_proj (64) +
+/// (depth_index, normal_index, gdf_sampled, out_index) (16) + (width, height, flip_y,
+/// pad) (16) + aabb_min.xyz/ground_y (16) + aabb_max.xyz/dist_clamp (16) +
+/// (reach, strength, bias, pad) (16). World position is reconstructed from the depth
+/// G-buffer (the position MRT is object-space), so only `inv_view_proj` is needed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gdf_ao_push(
+    inv_view_proj: &[f32; 16],
+    depth_index: u32,
+    normal_index: u32,
+    gdf_sampled: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+    ground_y: f32,
+    dist_clamp: f32,
+    reach: f32,
+    strength: f32,
+    bias: f32,
+) -> [u8; 144] {
+    let mut pc = [0u8; 144];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&depth_index.to_le_bytes());
+    pc[68..72].copy_from_slice(&normal_index.to_le_bytes());
+    pc[72..76].copy_from_slice(&gdf_sampled.to_le_bytes());
+    pc[76..80].copy_from_slice(&out_index.to_le_bytes());
+    pc[80..84].copy_from_slice(&width.to_le_bytes());
+    pc[84..88].copy_from_slice(&height.to_le_bytes());
+    pc[88..92].copy_from_slice(&flip_y.to_le_bytes());
+    // pc[92..96]: pad to the float4 boundary.
+    for (i, v) in aabb_min.iter().enumerate() {
+        pc[96 + i * 4..100 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[108..112].copy_from_slice(&ground_y.to_le_bytes());
+    for (i, v) in aabb_max.iter().enumerate() {
+        pc[112 + i * 4..116 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[124..128].copy_from_slice(&dist_clamp.to_le_bytes());
+    pc[128..132].copy_from_slice(&reach.to_le_bytes());
+    pc[132..136].copy_from_slice(&strength.to_le_bytes());
+    pc[136..140].copy_from_slice(&bias.to_le_bytes());
+    pc
+}
+
 /// Pack the path-tracer push block (Phase 8 M4, 128 bytes): inv_view_proj (64) +
 /// cam_pos (16) + sun dir+intensity (16) + (out, accum, inst, frame) (16) +
 /// (width, height, flip_y, spp) (16).
