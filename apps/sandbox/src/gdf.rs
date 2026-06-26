@@ -21,7 +21,8 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::mesh::{index_bytes, vertex_bytes};
 use crate::push::{
-    gdf_ao_push, gdf_merge_push, gdf_trace_push, sdf_bake_push, sdf_trace_push, volume_push,
+    gdf_ao_push, gdf_gi_push, gdf_merge_push, gdf_trace_push, sdf_bake_push, sdf_trace_push,
+    volume_push,
 };
 
 /// Volume edge length in voxels (cube). The bake/merge/view all share it.
@@ -38,6 +39,7 @@ pub(crate) struct GdfSystem {
     merge_pipeline: Option<ComputePipeline>, // B3 instance merge
     trace_pipeline: Option<ComputePipeline>, // B4 GDF sphere-march
     ao_pipeline: Option<ComputePipeline>,    // C2 GDF ambient occlusion
+    gi_pipeline: Option<ComputePipeline>,    // C3 GDF 1-bounce diffuse GI
     sdf_pipeline: Option<ComputePipeline>,   // Stage-A analytic sphere-march
     bake_vtx: Option<StorageBuffer>,
     bake_idx: Option<StorageBuffer>,
@@ -159,6 +161,15 @@ impl GdfSystem {
             144,
             [8, 8, 1],
         )?;
+        let gi_pipeline = compute(
+            "csMain",
+            dreamcoast_shader::gdf_gi_cs_spirv,
+            dreamcoast_shader::gdf_gi_cs_dxil,
+            dreamcoast_shader::gdf_gi_cs_metallib,
+            "gdf_gi",
+            176,
+            [8, 8, 1],
+        )?;
         let sdf_pipeline = compute(
             "csMain",
             dreamcoast_shader::sdf_trace_cs_spirv,
@@ -254,6 +265,7 @@ impl GdfSystem {
             merge_pipeline,
             trace_pipeline,
             ao_pipeline,
+            gi_pipeline,
             sdf_pipeline,
             bake_vtx,
             bake_idx,
@@ -502,7 +514,94 @@ impl GdfSystem {
         out
     }
 
+    /// Stage C3: stochastic 1-bounce diffuse GI for the deferred render. Builds the
+    /// fused scene GDF once (shared latch with C1/C2), then a full-screen compute pass
+    /// reconstructs each pixel's world surface from depth, casts `spp` cosine-hemisphere
+    /// rays into the scene GDF, shades the hits (constant albedo + sun + sky), and writes
+    /// the mean incoming radiance (indirect irradiance) the lighting pass adds to the
+    /// ambient term (× surface albedo × 1-metallic). Returns the GI storage image.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_gdf_gi<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        depth: ResourceId,
+        normal: ResourceId,
+        extent: Extent2D,
+        inv_view_proj: [f32; 16],
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        cw: u32,
+        ch: u32,
+        flip_y: u32,
+        spp: u32,
+        frame: u32,
+        build: bool,
+    ) -> ResourceId {
+        let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
+        let gip = self.gi_pipeline.as_ref().expect("gdf gi pipeline");
+        let out = graph.create_storage_image("gdf_gi_out", HDR_FORMAT, extent);
+        let gdf_ext = graph.import_external("scene_gdf");
+        let aabb_min = self.scene_aabb_min;
+        let aabb_max = self.scene_aabb_max;
+        if build {
+            self.record_scene_bake(graph, gdf_ext);
+        }
+        let sampled = vol.sampled_index();
+        let diag = {
+            let d = [
+                aabb_max[0] - aabb_min[0],
+                aabb_max[1] - aabb_min[1],
+                aabb_max[2] - aabb_min[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        let bias = diag * 0.004;
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "gdf_gi",
+                storage_writes: vec![out],
+                reads: vec![depth, normal, gdf_ext],
+            },
+            move |ctx| {
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(vol);
+                cmd.bind_compute_pipeline(gip);
+                cmd.push_constants_compute(&gdf_gi_push(
+                    &inv_view_proj,
+                    sun_dir,
+                    sun_intensity,
+                    depth_index,
+                    normal_index,
+                    sampled,
+                    out_index,
+                    cw,
+                    ch,
+                    flip_y,
+                    spp,
+                    frame,
+                    aabb_min,
+                    aabb_max,
+                    0.0,  // world ground plane at y = 0
+                    diag, // sample distance clamp
+                    diag, // ray max distance (bounce reach = scene diagonal)
+                    bias,
+                    0.25, // sky fill radiance at the bounce hit
+                    0.7, // constant hit albedo (no material in the GDF; bleed = surface cache later)
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
     // Feature-availability predicates (drive the UI checkboxes + toggle defaults).
+    pub(crate) fn has_gdf_gi(&self) -> bool {
+        self.gi_pipeline.is_some() && self.scene_gdf.is_some()
+    }
     pub(crate) fn has_gdf_ao(&self) -> bool {
         self.ao_pipeline.is_some() && self.scene_gdf.is_some()
     }

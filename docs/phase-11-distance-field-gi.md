@@ -186,11 +186,23 @@ Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실
   한계: 48³ 복셀화로 AO 저주파(soft); per-pixel cone-trace나 클립맵 고해상은 후속. 패스트레이서 AO 정량
   대조는 미수행(시각적 타당성으로 확인).
 
-### C3 — 디퓨즈 GI 1바운스 (stochastic)
-- G-buffer 표면에서 코사인-반구 레이를 GDF에 sphere-trace → 히트 셰이딩 → 간접 디퓨즈 누적(노이지).
-- **설계 포크 — GDF 히트 셰이딩:** GDF는 거리만 보유. (A) 히트에서 gradient 노멀+태양(소프트섀도우)+스카이로
-  재조명, 상수 알베도(최소 인프라, B4 히트 셰이딩 재사용) / (B) surface cache(라디언스 아틀라스/카드, 정확) /
-  (C) 스크린스페이스 샘플+폴백. C3 도달 시 확정(권장 시작점 A).
+### C3 — 디퓨즈 GI 1바운스 (stochastic) ✅ (양 백엔드 검증)
+- 풀스크린 컴퓨트 `gdf_gi.slang`(`gdf_gi_cs`, push **176B**): 픽셀별로 depth에서 월드 표면 재구성(C2와 동일)
+  → `spp`개 **코사인-반구 레이**를 씬 GDF에 sphere-trace → 히트 셰이딩 → 평균 incoming radiance(간접
+  irradiance E)를 storage image에 출력. `pbr.slang`이 `(1-metallic)·albedo·E`를 ambient에 가산.
+- **설계 포크 확정 = (A) 상수 알베도 재조명.** 히트에서 gradient 노멀 + 태양(짧은 penumbra 소프트섀도우,
+  48-step) + 소형 스카이 fill로 재조명, 단일 상수 알베도(0.7). GDF에 머티리얼이 없어 **색 bleeding 없음(무채색
+  fill)** — 컬러 바운스는 (B) surface cache 후속. RNG/코사인 샘플은 `rt_common.slang`과 동일(pcg/`cosine_hemisphere`)
+  → 패스트레이서와 일관 + 백엔드 결정적.
+- **합성 분해(이중계산 없음):** 스카이로 탈출한 레이는 0 반환(IBL 디퓨즈가 이미 미차폐 스카이 공급, C2 AO가
+  차폐분 제거, C3가 차폐물의 바운스광 가산) → ambient = IBL·AO(스카이) + albedo·E_gi(씬 바운스). AO·GI 동시 가능.
+- 토글 env `P11_GDF_GI` + UI "GDF diffuse GI (deferred)" + `P11_GI_SPP`(기본 8, 1–256) + 디버그뷰 10 "GDF GI".
+  RNG 시드에 frame 포함(C4 temporal 대비). 라이팅 push **28→32B**(+`gdf_gi_index`, 부재 시 0xFFFFFFFF→가산 0=무회귀).
+- **검증(RTX 2070 SUPER):** build+fmt+clippy(-D warnings) 클린. 태양이 밝은 지면에서 바운스되어 그림자부·오브젝트
+  밑면을 채우는 간접 fill 확인. **VK≡DX 픽셀 동일**(GI on spp8 mean 0.0001/ch max3 >2px 1/921600 — RNG 정수
+  결정적이라 노이즈 패턴까지 일치; GI off는 max1=무회귀). GI on-vs-off 100,147px(mean1.20/ch). spp8 vs spp64
+  레퍼런스 mean0.70/ch(=노이즈, C4 디노이즈 대상; GDF 저주파라 과하지 않음). VUID 0, DX 클린, TDR 없음.
+  한계: 무채색(상수 알베도) + spp8 노이즈 + 48³ 저주파. NEXT C4가 temporal+공간 필터로 정리.
 
 ### C4 — 시공간 디노이즈
 - temporal 재투영(히스토리 누적) + 공간 필터(à-trous/bilateral)로 noisy GI 정리.
