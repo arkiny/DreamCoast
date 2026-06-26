@@ -77,7 +77,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::Mesh,
             blend: BlendMode::Opaque,
-            push_constant_size: 112, // mat4(64) + base_color(16) + mr(16) + tex u32x4(16)
+            push_constant_size: 176, // mvp(64) + base_color(16) + mr(16) + tex u32x4(16) + model mat4(64)
             bindless: true,
             uniform_buffer: false,
             depth_test: true,
@@ -306,6 +306,7 @@ impl DeferredRenderer {
                         m,
                         rgh,
                         [obj.tex[0], mr_tex, obj.tex[2], obj.tex[3]],
+                        obj.transform.to_cols_array(),
                     ));
                     cmd.bind_vertex_buffer(&obj.vbuf, 32);
                     cmd.bind_index_buffer(&obj.ibuf, true);
@@ -318,6 +319,7 @@ impl DeferredRenderer {
                     0.0,
                     0.9,
                     [NO_TEXTURE; 4],
+                    Mat4::IDENTITY.to_cols_array(),
                 ));
                 cmd.bind_vertex_buffer(ground_vbuf, 32);
                 cmd.bind_index_buffer(ground_ibuf, true);
@@ -459,15 +461,18 @@ impl DeferredRenderer {
 }
 
 /// Pack the G-buffer push block: mvp(64) + base_color(16) + metallic/roughness(16)
-/// + texture indices u32x4 (16) = 112 bytes.
+/// + texture indices u32x4 (16) + model mat4 (64) = 176 bytes. `model` is the
+/// object->world transform the vertex shader uses for the world-space position +
+/// normal G-buffer outputs (the `mvp` already folds it in for clip space).
 fn gbuffer_push(
     mvp: [f32; 16],
     base_color: [f32; 4],
     metallic: f32,
     roughness: f32,
     tex: [u32; 4],
-) -> [u8; 112] {
-    let mut pc = [0u8; 112];
+    model: [f32; 16],
+) -> [u8; 176] {
+    let mut pc = [0u8; 176];
     for (i, f) in mvp.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
@@ -480,6 +485,10 @@ fn gbuffer_push(
     for (i, t) in tex.iter().enumerate() {
         let o = 96 + i * 4;
         pc[o..o + 4].copy_from_slice(&t.to_le_bytes());
+    }
+    for (i, f) in model.iter().enumerate() {
+        let o = 112 + i * 4;
+        pc[o..o + 4].copy_from_slice(&f.to_le_bytes());
     }
     pc
 }

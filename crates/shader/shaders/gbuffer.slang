@@ -43,6 +43,7 @@ struct PushConstants
     float4 base_color_factor;
     float4 mr_factor;     // x metallic, y roughness
     uint4 tex;            // x base_color, y metallic_roughness, z normal, w emissive
+    float4x4 model;       // object -> world (for world-space position + normal outputs)
 };
 
 [[vk::push_constant]]
@@ -53,8 +54,10 @@ VSOutput vsMain(VSInput input)
 {
     VSOutput o;
     o.clip = mul(pc.mvp, float4(input.pos, 1.0));
-    o.world_pos = input.pos;
-    o.world_normal = input.normal;
+    // World-space position + normal (the model matrix is translation + uniform scale,
+    // so the 3x3 transforms the normal direction correctly once re-normalized in fsMain).
+    o.world_pos = mul(pc.model, float4(input.pos, 1.0)).xyz;
+    o.world_normal = mul((float3x3)pc.model, input.normal);
     o.uv = input.uv;
     return o;
 }

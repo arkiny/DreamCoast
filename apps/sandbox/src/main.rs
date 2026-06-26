@@ -427,6 +427,9 @@ struct App {
     last: Instant,
     elapsed: f32,
     angle: f32,
+    // Diagnostic: tight orbit centred on the brushed-copper sphere (scene[2]) for
+    // inspecting its reflection/highlight from all sides. `DIAG_COPPER=1`.
+    diag_copper: bool,
 }
 
 const VK_F2: u16 = 0x71;
@@ -882,6 +885,13 @@ impl App {
             .unwrap_or(0.5);
         // C8d: default to the full-res mirror SSR; opt into the stochastic glossy path to compare.
         let ssr_stochastic = std::env::var_os("P11_SSR_STOCHASTIC").is_some();
+        // Diagnostic copper-sphere orbit (`DIAG_COPPER=1`): frame scene[2] tightly.
+        // `DIAG_ANGLE=<deg>` pins the orbit azimuth (else 0.7 rad in screenshot mode).
+        let diag_copper = std::env::var_os("DIAG_COPPER").is_some();
+        let diag_angle = std::env::var("DIAG_ANGLE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .map(f32::to_radians);
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -988,7 +998,10 @@ impl App {
             override_material: false,
             metallic_override: 1.0,
             roughness_override: 0.15,
-            debug_view: 0,
+            debug_view: std::env::var("DEBUG_VIEW")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
             post_mode: 0,
             aliasing: true,
             compute_post,
@@ -1039,8 +1052,10 @@ impl App {
             needs_recreate: false,
             last: Instant::now(),
             elapsed: 0.0,
-            // Fixed view in screenshot mode for reproducible output.
-            angle: if screenshot_mode { 0.7 } else { 0.0 },
+            // Fixed view in screenshot mode for reproducible output; `DIAG_ANGLE`
+            // overrides it (degrees) for capturing the copper sphere from a chosen side.
+            angle: diag_angle.unwrap_or(if screenshot_mode { 0.7 } else { 0.0 }),
+            diag_copper,
         })
     }
 
@@ -1158,13 +1173,24 @@ impl App {
             .map(|c| c.include_ui)
             .unwrap_or(true);
 
-        // Orbiting camera framing the whole sample scene.
-        let focus = Vec3::new(0.0, self.model_radius * 0.6, 0.0);
-        let dist = self.scene_radius * 1.6;
+        // Orbiting camera framing the whole sample scene — or, in copper-diagnostic
+        // mode, a tight orbit centred on the brushed-copper sphere (scene[2]) so its
+        // reflection/highlight can be inspected from every side.
+        let (focus, dist, elev) = if self.diag_copper {
+            let center = self.scene[2].transform.w_axis.truncate();
+            let radius = self.model_radius * 0.5; // copper sphere scale
+            (center, radius * 3.2, radius * 0.45)
+        } else {
+            (
+                Vec3::new(0.0, self.model_radius * 0.6, 0.0),
+                self.scene_radius * 1.6,
+                self.scene_radius * 0.55,
+            )
+        };
         let eye = focus
             + Vec3::new(
                 self.angle.cos() * dist,
-                self.scene_radius * 0.55,
+                elev,
                 self.angle.sin() * dist,
             );
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
