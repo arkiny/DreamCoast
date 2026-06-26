@@ -553,6 +553,100 @@ pub(crate) fn gdf_gi_push(
     pc
 }
 
+/// Pack the Phase 11 Stage C4 GI-temporal push block (192 bytes): inv_view_proj (64) +
+/// prev_view_proj (64) + (gi_raw, depth, normal, out) (16) + (hist_r, hist_w, pos_r,
+/// pos_w) (16) + (width, height, flip_y, reset) (16) + (reject_dist, max_hist, min_alpha,
+/// pad) (16).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gdf_temporal_push(
+    inv_view_proj: &[f32; 16],
+    prev_view_proj: &[f32; 16],
+    gi_raw_index: u32,
+    depth_index: u32,
+    normal_index: u32,
+    out_index: u32,
+    hist_read: u32,
+    hist_write: u32,
+    pos_read: u32,
+    pos_write: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    reset: u32,
+    reject_dist: f32,
+    max_hist: f32,
+    min_alpha: f32,
+) -> [u8; 192] {
+    let mut pc = [0u8; 192];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in prev_view_proj.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let u = [
+        gi_raw_index,
+        depth_index,
+        normal_index,
+        out_index,
+        hist_read,
+        hist_write,
+        pos_read,
+        pos_write,
+        width,
+        height,
+        flip_y,
+        reset,
+    ];
+    for (i, v) in u.iter().enumerate() {
+        pc[128 + i * 4..132 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[176..180].copy_from_slice(&reject_dist.to_le_bytes());
+    pc[180..184].copy_from_slice(&max_hist.to_le_bytes());
+    pc[184..188].copy_from_slice(&min_alpha.to_le_bytes());
+    pc
+}
+
+/// Pack the Phase 11 Stage C4 GI-à-trous push block (112 bytes): inv_view_proj (64) +
+/// (in, depth, normal, out) (16) + (width, height, step, flip_y) (16) + (pos_sigma,
+/// normal_power, pad, pad) (16). The `float4 params` aligns to offset 96, so the block
+/// is 112 bytes, not 96.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gdf_atrous_push(
+    inv_view_proj: &[f32; 16],
+    in_index: u32,
+    depth_index: u32,
+    normal_index: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    step: u32,
+    flip_y: u32,
+    pos_sigma: f32,
+    normal_power: f32,
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let u = [
+        in_index,
+        depth_index,
+        normal_index,
+        out_index,
+        width,
+        height,
+        step,
+        flip_y,
+    ];
+    for (i, v) in u.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[96..100].copy_from_slice(&pos_sigma.to_le_bytes());
+    pc[100..104].copy_from_slice(&normal_power.to_le_bytes());
+    pc
+}
+
 /// Pack the path-tracer push block (Phase 8 M4, 128 bytes): inv_view_proj (64) +
 /// cam_pos (16) + sun dir+intensity (16) + (out, accum, inst, frame) (16) +
 /// (width, height, flip_y, spp) (16).

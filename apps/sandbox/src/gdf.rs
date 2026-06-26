@@ -21,8 +21,8 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::mesh::{index_bytes, vertex_bytes};
 use crate::push::{
-    gdf_ao_push, gdf_gi_push, gdf_merge_push, gdf_trace_push, sdf_bake_push, sdf_trace_push,
-    volume_push,
+    gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_merge_push, gdf_temporal_push, gdf_trace_push,
+    sdf_bake_push, sdf_trace_push, volume_push,
 };
 
 /// Volume edge length in voxels (cube). The bake/merge/view all share it.
@@ -40,6 +40,8 @@ pub(crate) struct GdfSystem {
     trace_pipeline: Option<ComputePipeline>, // B4 GDF sphere-march
     ao_pipeline: Option<ComputePipeline>,    // C2 GDF ambient occlusion
     gi_pipeline: Option<ComputePipeline>,    // C3 GDF 1-bounce diffuse GI
+    temporal_pipeline: Option<ComputePipeline>, // C4 temporal reprojection
+    atrous_pipeline: Option<ComputePipeline>, // C4 spatial à-trous
     sdf_pipeline: Option<ComputePipeline>,   // Stage-A analytic sphere-march
     bake_vtx: Option<StorageBuffer>,
     bake_idx: Option<StorageBuffer>,
@@ -57,6 +59,16 @@ pub(crate) struct GdfSystem {
     /// World-space AABB the `scene_gdf` voxel grid maps to.
     scene_aabb_min: [f32; 3],
     scene_aabb_max: [f32; 3],
+    /// C4 GI denoiser history: ping-pong float4/pixel storage buffers — `gi_hist`
+    /// (rgb = accumulated irradiance, a = history length) + `gi_pos` (xyz = the world
+    /// point the sample belongs to, w = valid), (re)allocated to the render extent.
+    gi_hist: [Option<StorageBuffer>; 2],
+    gi_pos: [Option<StorageBuffer>; 2],
+    gi_denoise_extent: (u32, u32),
+    /// Frames since the last denoiser reset (0 = reset this frame, ignore history).
+    gi_denoise_frame: u32,
+    /// Lighting/quality key; a change (sun, spp, …) resets the accumulation.
+    gi_denoise_key: Option<u64>,
 }
 
 /// Scene-GDF volume edge length (cube). Coarser than `VOLUME_DIM`: the fused
@@ -170,6 +182,24 @@ impl GdfSystem {
             176,
             [8, 8, 1],
         )?;
+        let temporal_pipeline = compute(
+            "csMain",
+            dreamcoast_shader::gdf_temporal_cs_spirv,
+            dreamcoast_shader::gdf_temporal_cs_dxil,
+            dreamcoast_shader::gdf_temporal_cs_metallib,
+            "gdf_temporal",
+            192,
+            [8, 8, 1],
+        )?;
+        let atrous_pipeline = compute(
+            "csMain",
+            dreamcoast_shader::gdf_atrous_cs_spirv,
+            dreamcoast_shader::gdf_atrous_cs_dxil,
+            dreamcoast_shader::gdf_atrous_cs_metallib,
+            "gdf_atrous",
+            112,
+            [8, 8, 1],
+        )?;
         let sdf_pipeline = compute(
             "csMain",
             dreamcoast_shader::sdf_trace_cs_spirv,
@@ -266,6 +296,8 @@ impl GdfSystem {
             trace_pipeline,
             ao_pipeline,
             gi_pipeline,
+            temporal_pipeline,
+            atrous_pipeline,
             sdf_pipeline,
             bake_vtx,
             bake_idx,
@@ -277,6 +309,11 @@ impl GdfSystem {
             scene_tri_count: 0,
             scene_aabb_min: [0.0; 3],
             scene_aabb_max: [0.0; 3],
+            gi_hist: [None, None],
+            gi_pos: [None, None],
+            gi_denoise_extent: (0, 0),
+            gi_denoise_frame: 0,
+            gi_denoise_key: None,
         })
     }
 
@@ -598,7 +635,181 @@ impl GdfSystem {
         out
     }
 
+    /// C4: (re)allocate the GI denoiser history buffers on a resize and reset the
+    /// accumulation counter on a resize or lighting/quality change. Runs before the
+    /// graph is built (its `wait_idle` + fallible alloc stay off the graph borrow path),
+    /// mirroring `RtSystem::prepare`. No-op without the GI/denoise pipelines.
+    pub(crate) fn prepare_denoise(
+        &mut self,
+        device: &Device,
+        cw: u32,
+        ch: u32,
+        reset_key: u64,
+    ) -> anyhow::Result<()> {
+        if self.temporal_pipeline.is_none() {
+            return Ok(());
+        }
+        if self.gi_denoise_extent != (cw, ch) {
+            device.wait_idle()?;
+            let make = || -> anyhow::Result<Option<StorageBuffer>> {
+                Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
+                    size: (cw as u64) * (ch as u64) * 16,
+                    stride: 16,
+                    indirect: false,
+                })?))
+            };
+            self.gi_hist = [make()?, make()?];
+            self.gi_pos = [make()?, make()?];
+            self.gi_denoise_extent = (cw, ch);
+            self.gi_denoise_frame = 0;
+        }
+        if self.gi_denoise_key != Some(reset_key) {
+            self.gi_denoise_frame = 0;
+            self.gi_denoise_key = Some(reset_key);
+        }
+        Ok(())
+    }
+
+    /// Bump the denoiser accumulation counter (end-of-frame, after submit) so the next
+    /// frame reprojects history and swaps the ping-pong buffers.
+    pub(crate) fn advance_denoise(&mut self) {
+        self.gi_denoise_frame = self.gi_denoise_frame.saturating_add(1);
+    }
+
+    /// C4: spatio-temporal denoise of the noisy C3 GI image. A temporal pass reprojects
+    /// and accumulates `gi_raw` into the ping-pong history (validated by world position),
+    /// then two edge-aware à-trous passes clean the residual. Returns the denoised image
+    /// the lighting pass consumes in place of the raw GI. `prepare_denoise` must have run
+    /// this frame.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_gdf_denoise<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        gi_raw: ResourceId,
+        depth: ResourceId,
+        normal: ResourceId,
+        extent: Extent2D,
+        inv_view_proj: [f32; 16],
+        prev_view_proj: [f32; 16],
+        cw: u32,
+        ch: u32,
+        flip_y: u32,
+    ) -> ResourceId {
+        let tempp = self.temporal_pipeline.as_ref().expect("temporal pipeline");
+        let atrousp = self.atrous_pipeline.as_ref().expect("atrous pipeline");
+        let frame = self.gi_denoise_frame;
+        let reset = u32::from(frame == 0);
+        let read = ((frame + 1) % 2) as usize;
+        let write = (frame % 2) as usize;
+        let hist_r = self.gi_hist[read].as_ref().expect("hist r").storage_index();
+        let hist_w = self.gi_hist[write]
+            .as_ref()
+            .expect("hist w")
+            .storage_index();
+        let pos_r = self.gi_pos[read].as_ref().expect("pos r").storage_index();
+        let pos_w = self.gi_pos[write].as_ref().expect("pos w").storage_index();
+        let hist_w_ext = graph.import_external("gi_hist_w");
+        let pos_w_ext = graph.import_external("gi_pos_w");
+
+        let diag = {
+            let d = [
+                self.scene_aabb_max[0] - self.scene_aabb_min[0],
+                self.scene_aabb_max[1] - self.scene_aabb_min[1],
+                self.scene_aabb_max[2] - self.scene_aabb_min[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        let reject_dist = diag * 0.01;
+        let max_hist = 64.0_f32;
+
+        let temporal_out = graph.create_storage_image("gi_temporal", HDR_FORMAT, extent);
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "gdf_temporal",
+                storage_writes: vec![temporal_out, hist_w_ext, pos_w_ext],
+                reads: vec![gi_raw, depth, normal],
+            },
+            move |ctx| {
+                let gi_raw_index = ctx.sampled_index(gi_raw);
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let out_index = ctx.storage_index(temporal_out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(tempp);
+                cmd.push_constants_compute(&gdf_temporal_push(
+                    &inv_view_proj,
+                    &prev_view_proj,
+                    gi_raw_index,
+                    depth_index,
+                    normal_index,
+                    out_index,
+                    hist_r,
+                    hist_w,
+                    pos_r,
+                    pos_w,
+                    cw,
+                    ch,
+                    flip_y,
+                    reset,
+                    reject_dist,
+                    max_hist,
+                    1.0 / max_hist,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+
+        // Two à-trous iterations (step 1 then 2): a wide edge-aware blur at low cost.
+        let pos_sigma = diag * 0.03;
+        let normal_power = 32.0_f32;
+        let mut cur = temporal_out;
+        for (i, step) in [1u32, 2u32].into_iter().enumerate() {
+            let out = graph.create_storage_image(
+                if i == 0 { "gi_atrous0" } else { "gi_atrous1" },
+                HDR_FORMAT,
+                extent,
+            );
+            let src = cur;
+            graph.add_compute_pass(
+                ComputePassInfo {
+                    name: "gdf_atrous",
+                    storage_writes: vec![out],
+                    reads: vec![src, depth, normal],
+                },
+                move |ctx| {
+                    let in_index = ctx.sampled_index(src);
+                    let depth_index = ctx.sampled_index(depth);
+                    let normal_index = ctx.sampled_index(normal);
+                    let out_index = ctx.storage_index(out);
+                    let cmd = ctx.cmd();
+                    cmd.bind_compute_pipeline(atrousp);
+                    cmd.push_constants_compute(&gdf_atrous_push(
+                        &inv_view_proj,
+                        in_index,
+                        depth_index,
+                        normal_index,
+                        out_index,
+                        cw,
+                        ch,
+                        step,
+                        flip_y,
+                        pos_sigma,
+                        normal_power,
+                    ));
+                    cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                    Ok(())
+                },
+            );
+            cur = out;
+        }
+        cur
+    }
+
     // Feature-availability predicates (drive the UI checkboxes + toggle defaults).
+    pub(crate) fn has_gdf_denoise(&self) -> bool {
+        self.temporal_pipeline.is_some() && self.atrous_pipeline.is_some()
+    }
     pub(crate) fn has_gdf_gi(&self) -> bool {
         self.gi_pipeline.is_some() && self.scene_gdf.is_some()
     }
