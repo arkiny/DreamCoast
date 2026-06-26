@@ -983,6 +983,7 @@ pub(crate) fn gdf_reflect_push(
     width: u32,
     height: u32,
     flip_y: u32,
+    material_index: u32,
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     ground_y: f32,
@@ -992,6 +993,7 @@ pub(crate) fn gdf_reflect_push(
     sky_fill: f32,
     bias: f32,
     albedo_rgb: [u32; 3],
+    frame: u32,
     cache: [u32; 5],
 ) -> [u8; 224] {
     let mut pc = [0u8; 224];
@@ -1013,6 +1015,7 @@ pub(crate) fn gdf_reflect_push(
     pc[112..116].copy_from_slice(&width.to_le_bytes());
     pc[116..120].copy_from_slice(&height.to_le_bytes());
     pc[120..124].copy_from_slice(&flip_y.to_le_bytes());
+    pc[124..128].copy_from_slice(&material_index.to_le_bytes());
     for (i, v) in aabb_min.iter().enumerate() {
         pc[128 + i * 4..132 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1029,6 +1032,7 @@ pub(crate) fn gdf_reflect_push(
     pc[176..180].copy_from_slice(&albedo_rgb[0].to_le_bytes());
     pc[180..184].copy_from_slice(&albedo_rgb[1].to_le_bytes());
     pc[184..188].copy_from_slice(&albedo_rgb[2].to_le_bytes());
+    pc[188..192].copy_from_slice(&frame.to_le_bytes()); // C8j GGX-jitter RNG decorrelation
     // C8b3 surface-cache lookup indices (uint4 cache + tile): cards = 0xFFFFFFFF -> off.
     for (i, v) in cache.iter().enumerate() {
         pc[192 + i * 4..196 + i * 4].copy_from_slice(&v.to_le_bytes());
@@ -1042,10 +1046,7 @@ pub(crate) fn gdf_reflect_push(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reflect_composite_push(
     ssr_index: u32,
-    gdf_index: u32,  // GDF reflection, full-res (mip level 0)
-    mip1_index: u32, // 1/4-res prefilter level
-    mip2_index: u32, // 1/16-res
-    mip3_index: u32, // 1/64-res
+    gdf_index: u32, // GDF reflection (GGX-resolved, already roughness-blurred)
     out_index: u32,
     width: u32,
     height: u32,
@@ -1057,32 +1058,68 @@ pub(crate) fn reflect_composite_push(
     let mut pc = [0u8; 48];
     pc[0..4].copy_from_slice(&ssr_index.to_le_bytes());
     pc[4..8].copy_from_slice(&gdf_index.to_le_bytes());
-    pc[8..12].copy_from_slice(&mip1_index.to_le_bytes());
-    pc[12..16].copy_from_slice(&mip2_index.to_le_bytes());
-    pc[16..20].copy_from_slice(&mip3_index.to_le_bytes());
-    pc[20..24].copy_from_slice(&out_index.to_le_bytes());
-    pc[24..28].copy_from_slice(&width.to_le_bytes());
-    pc[28..32].copy_from_slice(&height.to_le_bytes());
-    pc[32..36].copy_from_slice(&gdf_scale.to_le_bytes());
-    pc[36..40].copy_from_slice(&clamp_max.to_le_bytes());
-    pc[40..44].copy_from_slice(&material_index.to_le_bytes());
-    pc[44..48].copy_from_slice(&max_roughness.to_le_bytes());
+    pc[8..12].copy_from_slice(&out_index.to_le_bytes());
+    pc[12..16].copy_from_slice(&width.to_le_bytes());
+    pc[16..20].copy_from_slice(&height.to_le_bytes());
+    pc[20..24].copy_from_slice(&gdf_scale.to_le_bytes());
+    pc[24..28].copy_from_slice(&clamp_max.to_le_bytes());
+    pc[28..32].copy_from_slice(&material_index.to_le_bytes());
+    pc[32..36].copy_from_slice(&max_roughness.to_le_bytes());
     pc
 }
 
-/// Pack the C8g reflection-mip downsample push (16 bytes): src index, dst storage index,
-/// and this level's width/height.
-pub(crate) fn reflect_downsample_push(
-    src_index: u32,
+/// Pack the C8j stochastic-GDF-reflection temporal-resolve push block (208 bytes):
+/// inv_view_proj (64) + prev_view_proj (64) + cam_pos (16) + image/buffer indices (32) +
+/// (width, height, flip_y, reset) (16) + `float4 params` (reject dist, max history len,
+/// firefly clamp, tonemap range) aligned at offset 192.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reflect_temporal_push(
+    inv_view_proj: &[f32; 16],
+    prev_view_proj: &[f32; 16],
+    cam_pos: Vec3,
+    refl_index: u32,
+    depth_index: u32,
     out_index: u32,
-    dst_width: u32,
-    dst_height: u32,
-) -> [u8; 16] {
-    let mut pc = [0u8; 16];
-    pc[0..4].copy_from_slice(&src_index.to_le_bytes());
-    pc[4..8].copy_from_slice(&out_index.to_le_bytes());
-    pc[8..12].copy_from_slice(&dst_width.to_le_bytes());
-    pc[12..16].copy_from_slice(&dst_height.to_le_bytes());
+    accum_read: u32,
+    accum_write: u32,
+    pos_read: u32,
+    pos_write: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    reset: u32,
+    material_index: u32,
+    reject_dist: f32,
+    max_len: f32,
+    firefly_clamp: f32,
+    tonemap_range: f32,
+) -> [u8; 208] {
+    let mut pc = [0u8; 208];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in prev_view_proj.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[128..132].copy_from_slice(&cam_pos.x.to_le_bytes());
+    pc[132..136].copy_from_slice(&cam_pos.y.to_le_bytes());
+    pc[136..140].copy_from_slice(&cam_pos.z.to_le_bytes());
+    pc[144..148].copy_from_slice(&refl_index.to_le_bytes());
+    pc[148..152].copy_from_slice(&depth_index.to_le_bytes());
+    pc[152..156].copy_from_slice(&out_index.to_le_bytes());
+    pc[156..160].copy_from_slice(&accum_read.to_le_bytes());
+    pc[160..164].copy_from_slice(&accum_write.to_le_bytes());
+    pc[164..168].copy_from_slice(&pos_read.to_le_bytes());
+    pc[168..172].copy_from_slice(&pos_write.to_le_bytes());
+    pc[172..176].copy_from_slice(&width.to_le_bytes());
+    pc[176..180].copy_from_slice(&height.to_le_bytes());
+    pc[180..184].copy_from_slice(&flip_y.to_le_bytes());
+    pc[184..188].copy_from_slice(&reset.to_le_bytes());
+    pc[188..192].copy_from_slice(&material_index.to_le_bytes());
+    pc[192..196].copy_from_slice(&reject_dist.to_le_bytes());
+    pc[196..200].copy_from_slice(&max_len.to_le_bytes());
+    pc[200..204].copy_from_slice(&firefly_clamp.to_le_bytes());
+    pc[204..208].copy_from_slice(&tonemap_range.to_le_bytes());
     pc
 }
 

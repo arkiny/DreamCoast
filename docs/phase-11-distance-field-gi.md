@@ -582,6 +582,27 @@ VK≡DX 0.001, 레거시 무회귀.** **비용 대폭↓: reflect_composite 0.20
 이중스펙·blow-out 다 처리; 남은 본질 한계 = GDF 저해상 48³ SDF 블롭 형상(클립맵/고해상 SDF가 다음 레버,
 B3 클립맵 계획 참조) + SSR 씬한계(온스크린 반사 적음).
 
+#### C8j — 스토캐스틱 GGX GDF 반사 + 시공간 디노이즈 (UE Lumen식, 구리구 과밝음 근본수정, 2026-06-26)
+사용자 = 구리구 왼쪽 하얀색(러프 금속 과밝음) UE 참조해 수정. **UE5.7 소스 확인(`Lumen/LumenReflections.usf`
+`ReflectionGenerateRaysCS`):** 러프 반사를 **이미지-스페이스 프리필터가 아니라 실제 GGX 로브 레이로 트레이스**
+— `ImportanceSampleVisibleGGX`로 픽셀당 1 지터 레이(`ConeAngle=1/PDF`), 미러는 `reflect(V,N)`; 이후
+`LumenReflectionResolve`(스페이셜)+`LumenReflectionDenoiser`(템포럴)로 디노이즈, **`RGBToDenoiserSpace`**
+=`V/(1+luma·k)` 톤맵가중 평균(밝은 샘플 비지배). **진단 일치:** 밉/게더(이미지 프리필터)는 구리 상반구가
+반사이미지상 바닥만 담아 평균해도 밝음 — 실제 로브는 오프스크린 하늘(어두움)을 섞어 muted. 이미지 블러로 불가.
+**구현(C8j, 밉-피라미드 C8h 대체):** (1) **`gdf_reflect.slang` GGX 지터** — roughness>0.04면 `sample_ggx`로
+반사 방향 importance-sample(프레임별 jitter), 미러는 그대로. material_index/frame 푸시 추가. (2) **신규
+`reflect_temporal.slang`** — 리프로젝트+EMA 시간누적(len≤64) + **러프니스 스케일 깊이가중 스페이셜 게더**
+(이웃 픽셀의 서로 다른 GGX 레이 평균=분산↓) + 톤맵-스페이스 누적(UE RGBToDenoiserSpace). ping-pong
+`refl_accum`/`refl_pos`(풀-res) + prepare/advance. (3) composite는 resolved 반사 직접 사용(밉 lod 제거),
+push 48B 단순화. 밉 인프라(reflect_downsample/record_reflect_mips) 제거. **결과(`docs/images/
+copper-ggx-reflection.png` 밉|GGX|PT):** 구리 상반구가 PT처럼 muted(밉의 밝은 청백 제거), 번-아웃 하양 해소.
+hybrid-vs-PT 3.41→3.45/ch(평탄; 시각 개선이 목표). **VK VUID0/DX clean, VK≡DX 0.002/ch**(GGX는 정수 RNG=
+비트동일, 마치 fp만 미세). **레거시 무회귀.** 워밍업 64프레임 수렴(GI 디노이저급). **비용 0.21→0.89ms**
+(gdf_reflect 0.15→0.50=GGX 레이 발산으로 마치 비코히어런트, temporal 0.35, composite 0.04) — UE식 정공법
+비용(프레임은 gdf_gi 4.2ms 지배). **남은: 그레이징 좌측 엣지가 PT보다 약간 밝음(스플릿섬 grazing 잔차);
+체감 번-아웃은 해소.** chrome(0.08)도 GGX(좁은 로브) — 미러 임계 0.04. **NEXT: 더 적은 노이즈(스페이셜
+à-trous 강화) 또는 cone→GDF mip(UE식 저비용 와이드 콘); GDF 저해상 블롭은 여전히 B3 클립맵 트랙.**
+
 **권장 순서:** C8a(저위험 컬러) 먼저 → 필요 시 C8b. C7과 독립이지만 **C8a를 C7 앞에 두면 C7 반사가 바로
 컬러**가 된다(사용자 선택: C7 → C8a, 또는 C8a → C7). C8b는 동적 오브젝트/시간변화 조명까지 정확히 가는
 장기 트랙이라 C7/C8a 검증 후 별도 착수.

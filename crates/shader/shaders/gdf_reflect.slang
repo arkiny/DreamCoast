@@ -31,14 +31,14 @@ struct ReflectPush
     uint width;
     uint height;
     uint flip_y;            // bit0: 1 = Vulkan (clip-space Y down)
-    uint pad0;
+    uint material_index;    // C8j: G-buffer material (g = roughness) for the GGX-sampled ray
     float4 aabb_min;        // xyz GDF world min, w = ground plane Y
     float4 aabb_max;        // xyz GDF world max, w = sample distance clamp
     float4 params;          // x = ray max distance, y = constant hit albedo (fallback), z = sky fill, w = surface bias
     uint albedo_r;          // C8a: volumes[] index of the red albedo channel (0xFFFFFFFF = constant)
     uint albedo_g;          // green
     uint albedo_b;          // blue
-    uint pad1;
+    uint frame;             // C8j: RNG decorrelation for the per-frame GGX jitter
     uint4 cache;            // C8b3: cards, cache_pos, cache_rad, num_cards (cards=0xFFFFFFFF = off)
     uint cache_tile;        // surface-cache atlas tile edge
     uint pad_c0;
@@ -52,6 +52,36 @@ ConstantBuffer<ReflectPush> pc : register(b0, space0);
 #define GDF_MIN (pc.aabb_min.xyz)
 #define GDF_MAX (pc.aabb_max.xyz)
 #define GROUND_Y (pc.aabb_min.w)
+
+// C8j — GGX importance sampling for a stochastic reflection ray (UE Lumen casts ONE GGX ray /
+// pixel into the real lobe directions, then denoises; an image-space prefilter of a single mirror
+// ray can't average in the off-screen sky a rough lobe sees, so a rough metal's reflection of the
+// bright ground reads too bright). One jittered ray/frame; the temporal resolve accumulates them.
+static const float GGX_PI = 3.14159265359;
+uint pcg_hash(inout uint state)
+{
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28) + 4u)) ^ state) * 277803737u;
+    return (word >> 22) ^ word;
+}
+float rnd01(inout uint s) { return float(pcg_hash(s) & 0xFFFFFFu) / float(0x1000000); }
+void onb(float3 n, out float3 t, out float3 b)
+{
+    t = normalize(abs(n.x) > 0.9 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
+    b = cross(n, t);
+}
+// GGX NDF importance sample: a microfacet half-vector around the surface normal.
+float3 sample_ggx(float3 n, float roughness, inout uint rng)
+{
+    float a = max(roughness * roughness, 1e-3);
+    float u1 = rnd01(rng), u2 = rnd01(rng);
+    float phi = 2.0 * GGX_PI * u1;
+    float ct = sqrt((1.0 - u2) / (1.0 + (a * a - 1.0) * u2));
+    float st = sqrt(saturate(1.0 - ct * ct));
+    float3 t, bvec;
+    onb(n, t, bvec);
+    return normalize(t * (st * cos(phi)) + bvec * (st * sin(phi)) + n * ct);
+}
 
 // Distance to the baked geometry inside the GDF box (trilinear sample, clamped). Outside
 // the box: no geometry. (Same as the C3 GI / B4 trace `geo_inside`.)
@@ -175,7 +205,22 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 p = hpos.xyz / hpos.w;
     float3 n = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, uv, 0.0).xyz);
     float3 v = normalize(pc.cam_pos.xyz - p);
-    float3 dir = reflect(-v, n);
+    // C8j: GGX-importance-sample the reflection direction by roughness (one jittered ray/frame;
+    // the temporal resolve accumulates them into the glossy lobe). Near-mirror stays sharp.
+    float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
+    float3 dir;
+    if (roughness > 0.04)
+    {
+        uint rng = (tid.x * 1973u + tid.y * 9277u + pc.frame * 26699u) | 1u;
+        float3 h = sample_ggx(n, roughness, rng);
+        dir = reflect(-v, h);
+        if (dot(dir, n) <= 0.0)
+            dir = reflect(-v, n); // keep the ray in the upper hemisphere
+    }
+    else
+    {
+        dir = reflect(-v, n);
+    }
 
     float max_dist = pc.params.x;
     float sky_fill = pc.params.z;

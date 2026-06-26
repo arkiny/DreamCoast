@@ -14,7 +14,7 @@ use rhi::{
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
-    gdf_reflect_push, lit_history_push, reflect_composite_push, reflect_downsample_push, ssr_push,
+    gdf_reflect_push, lit_history_push, reflect_composite_push, reflect_temporal_push, ssr_push,
     ssr_resolve_push,
 };
 
@@ -24,7 +24,14 @@ pub(crate) struct ReflectSystem {
     reflect_pipeline: Option<ComputePipeline>, // C6 GDF reflection fallback
     composite_pipeline: Option<ComputePipeline>, // C7 hybrid composite
     lit_history_pipeline: Option<ComputePipeline>, // C7b lit-color history capture
-    downsample_pipeline: Option<ComputePipeline>, // C8g GDF-reflection mip downsample
+    temporal_pipeline: Option<ComputePipeline>, // C8j stochastic-GDF-reflection temporal resolve
+    /// C8j stochastic GDF reflection temporal accumulation: ping-pong byte-address buffers —
+    /// `accum` (tonemap-space rgb + history len) and `pos` (surface world point + valid), at the
+    /// full render extent. The resolve reprojects the surface into the previous frame.
+    refl_accum: [Option<StorageBuffer>; 2],
+    refl_pos: [Option<StorageBuffer>; 2],
+    refl_accum_extent: (u32, u32),
+    refl_accum_frame: u32,
     /// C7b lit-color history: ping-pong byte-address storage buffers (float4/pixel, rgb =
     /// raw radiance, a = 1), (re)allocated to the render extent. The SSR reads the previous
     /// frame's buffer (reprojected); the copy pass writes this frame's.
@@ -111,13 +118,13 @@ impl ReflectSystem {
             32,
             false,
         )?;
-        // C8g: 4x box downsample for the GDF-reflection roughness mip pyramid.
-        let downsample_pipeline = compute(
-            dreamcoast_shader::reflect_downsample_cs_spirv,
-            dreamcoast_shader::reflect_downsample_cs_dxil,
-            dreamcoast_shader::reflect_downsample_cs_metallib,
-            "reflect_downsample",
-            16,
+        // C8j: temporal resolve of the stochastic GGX GDF reflection.
+        let temporal_pipeline = compute(
+            dreamcoast_shader::reflect_temporal_cs_spirv,
+            dreamcoast_shader::reflect_temporal_cs_dxil,
+            dreamcoast_shader::reflect_temporal_cs_metallib,
+            "reflect_temporal",
+            208,
             false,
         )?;
         Ok(Self {
@@ -126,7 +133,11 @@ impl ReflectSystem {
             reflect_pipeline,
             composite_pipeline,
             lit_history_pipeline,
-            downsample_pipeline,
+            temporal_pipeline,
+            refl_accum: [None, None],
+            refl_pos: [None, None],
+            refl_accum_extent: (0, 0),
+            refl_accum_frame: 0,
             lit_hist: [None, None],
             lit_hist_extent: (0, 0),
             lit_hist_frame: 0,
@@ -172,6 +183,42 @@ impl ReflectSystem {
 
     pub(crate) fn advance_ssr_accum(&mut self) {
         self.ssr_accum_frame = self.ssr_accum_frame.saturating_add(1);
+    }
+
+    pub(crate) fn has_reflect_temporal(&self) -> bool {
+        self.temporal_pipeline.is_some()
+    }
+
+    /// C8j: (re)allocate the stochastic-GDF-reflection temporal accumulation buffers on a resize.
+    /// Runs before the graph, like `prepare_history`. No-op without the temporal pipeline.
+    pub(crate) fn prepare_reflect_accum(
+        &mut self,
+        device: &Device,
+        cw: u32,
+        ch: u32,
+    ) -> anyhow::Result<()> {
+        if self.temporal_pipeline.is_none() {
+            return Ok(());
+        }
+        if self.refl_accum_extent != (cw, ch) {
+            device.wait_idle()?;
+            let make = || -> anyhow::Result<Option<StorageBuffer>> {
+                Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
+                    size: (cw as u64) * (ch as u64) * 16,
+                    stride: 16,
+                    indirect: false,
+                })?))
+            };
+            self.refl_accum = [make()?, make()?];
+            self.refl_pos = [make()?, make()?];
+            self.refl_accum_extent = (cw, ch);
+            self.refl_accum_frame = 0;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn advance_reflect_accum(&mut self) {
+        self.refl_accum_frame = self.refl_accum_frame.saturating_add(1);
     }
 
     pub(crate) fn has_ssr(&self) -> bool {
@@ -426,6 +473,92 @@ impl ReflectSystem {
         out
     }
 
+    /// C8j: temporally resolve the stochastic GGX GDF reflection. Reprojects each surface into
+    /// the previous frame, EMA-accumulates the noisy single-ray sample (in tonemap space), and
+    /// disocclusion-rejects. `prepare_reflect_accum` must have run this frame.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_reflect_temporal<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        refl: ResourceId,
+        depth: ResourceId,
+        material: ResourceId,
+        extent: Extent2D,
+        cw: u32,
+        ch: u32,
+        inv_view_proj: [f32; 16],
+        prev_view_proj: [f32; 16],
+        eye: Vec3,
+        flip_y: u32,
+        reject_dist: f32,
+        max_len: f32,
+        firefly_clamp: f32,
+        tonemap_range: f32,
+    ) -> ResourceId {
+        let pipe = self
+            .temporal_pipeline
+            .as_ref()
+            .expect("reflect temporal pipeline");
+        let out = graph.create_storage_image("reflect_resolved", HDR_FORMAT, extent);
+        let reset = self.refl_accum_frame == 0;
+        let read = ((self.refl_accum_frame + 1) % 2) as usize;
+        let write = (self.refl_accum_frame % 2) as usize;
+        let accum_r = self.refl_accum[read]
+            .as_ref()
+            .expect("accum r")
+            .storage_index();
+        let accum_w = self.refl_accum[write]
+            .as_ref()
+            .expect("accum w")
+            .storage_index();
+        let pos_r = self.refl_pos[read].as_ref().expect("pos r").storage_index();
+        let pos_w = self.refl_pos[write]
+            .as_ref()
+            .expect("pos w")
+            .storage_index();
+        let accum_w_ext = graph.import_external("refl_accum_w");
+        let pos_w_ext = graph.import_external("refl_pos_w");
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "reflect_temporal",
+                storage_writes: vec![out, accum_w_ext, pos_w_ext],
+                reads: vec![refl, depth, material],
+            },
+            move |ctx| {
+                let refl_index = ctx.sampled_index(refl);
+                let depth_index = ctx.sampled_index(depth);
+                let material_index = ctx.sampled_index(material);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&reflect_temporal_push(
+                    &inv_view_proj,
+                    &prev_view_proj,
+                    eye,
+                    refl_index,
+                    depth_index,
+                    out_index,
+                    accum_r,
+                    accum_w,
+                    pos_r,
+                    pos_w,
+                    cw,
+                    ch,
+                    flip_y,
+                    u32::from(reset),
+                    material_index,
+                    reject_dist,
+                    max_len,
+                    firefly_clamp,
+                    tonemap_range,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
     /// C7b: capture this frame's lit HDR into the ping-pong history buffer (raw radiance =
     /// `hdr * inv_exposure`) so the next frame's history-mode SSR can sample it. Runs after
     /// the lighting pass. `prepare_history` must have run this frame.
@@ -489,6 +622,7 @@ impl ReflectSystem {
         aabb_max: [f32; 3],
         depth: ResourceId,
         normal: ResourceId,
+        material: ResourceId,
         extent: Extent2D,
         inv_view_proj: [f32; 16],
         eye: Vec3,
@@ -497,6 +631,7 @@ impl ReflectSystem {
         cw: u32,
         ch: u32,
         flip_y: u32,
+        frame: u32,
         albedo: Option<(&'a [Volume; 3], ResourceId)>,
         cache: Option<([u32; 5], ResourceId)>,
     ) -> ResourceId {
@@ -517,7 +652,7 @@ impl ReflectSystem {
         let bias = diag * 0.01;
         // C8a: read the per-voxel albedo volumes (colored reflections) when present; else
         // the shader's constant `hit_albedo` fallback (sentinel indices).
-        let mut reads = vec![depth, normal, scene_gdf_ext];
+        let mut reads = vec![depth, normal, material, scene_gdf_ext];
         if let Some((_, ext)) = albedo {
             reads.push(ext);
         }
@@ -534,6 +669,7 @@ impl ReflectSystem {
             move |ctx| {
                 let depth_index = ctx.sampled_index(depth);
                 let normal_index = ctx.sampled_index(normal);
+                let material_index = ctx.sampled_index(material);
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.volume_to_sampled(scene_gdf);
@@ -562,6 +698,7 @@ impl ReflectSystem {
                     cw,
                     ch,
                     flip_y,
+                    material_index,
                     aabb_min,
                     aabb_max,
                     0.0,  // world ground plane at y = 0
@@ -571,6 +708,7 @@ impl ReflectSystem {
                     0.25, // sky fill at the reflected hit
                     bias,
                     albedo_rgb,
+                    frame,
                     cache_idx,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
@@ -587,64 +725,12 @@ impl ReflectSystem {
     /// radiance that replaces the prefilter-cube IBL specular (C7c). `gdf_scale` lifts the
     /// raw GDF radiance into the SSR's post-exposure space for the standalone viz; it is
     /// 1.0 once both sources are raw radiance (C7b). Returns the composite image.
-    /// C8g: build a 3-level mip pyramid of the GDF reflection (1/4, 1/16, 1/64 res) by chaining
-    /// 4x box downsamples. The composite samples these at a roughness LOD for an energy-conserving
-    /// glossy prefilter (vs the old screen-space gather). Returns `[mip1, mip2, mip3]`. No-op
-    /// fallback to the source handle if the downsample pipeline is absent.
-    pub(crate) fn record_reflect_mips<'a>(
-        &'a self,
-        graph: &mut RenderGraph<'a>,
-        src: ResourceId,
-        cw: u32,
-        ch: u32,
-    ) -> [ResourceId; 3] {
-        let Some(pipe) = self.downsample_pipeline.as_ref() else {
-            return [src, src, src];
-        };
-        let mut prev = src;
-        let mut prev_dims = (cw, ch);
-        let mut out = [src; 3];
-        for (i, slot) in out.iter_mut().enumerate() {
-            let dw = (prev_dims.0 / 4).max(1);
-            let dh = (prev_dims.1 / 4).max(1);
-            let dst = graph.create_storage_image(
-                &format!("reflect_mip{}", i + 1),
-                HDR_FORMAT,
-                Extent2D::new(dw, dh),
-            );
-            let read = prev;
-            graph.add_compute_pass(
-                ComputePassInfo {
-                    name: "reflect_downsample",
-                    storage_writes: vec![dst],
-                    reads: vec![read],
-                },
-                move |ctx| {
-                    let src_index = ctx.sampled_index(read);
-                    let out_index = ctx.storage_index(dst);
-                    let cmd = ctx.cmd();
-                    cmd.bind_compute_pipeline(pipe);
-                    cmd.push_constants_compute(&reflect_downsample_push(
-                        src_index, out_index, dw, dh,
-                    ));
-                    cmd.dispatch(dw.div_ceil(8), dh.div_ceil(8), 1);
-                    Ok(())
-                },
-            );
-            *slot = dst;
-            prev = dst;
-            prev_dims = (dw, dh);
-        }
-        out
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_composite<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
         ssr: ResourceId,
         gdf_reflect: ResourceId,
-        mips: [ResourceId; 3],
         material: ResourceId,
         extent: Extent2D,
         cw: u32,
@@ -662,14 +748,11 @@ impl ReflectSystem {
             ComputePassInfo {
                 name: "reflect_composite",
                 storage_writes: vec![out],
-                reads: vec![ssr, gdf_reflect, mips[0], mips[1], mips[2], material],
+                reads: vec![ssr, gdf_reflect, material],
             },
             move |ctx| {
                 let ssr_index = ctx.sampled_index(ssr);
                 let gdf_index = ctx.sampled_index(gdf_reflect);
-                let mip1_index = ctx.sampled_index(mips[0]);
-                let mip2_index = ctx.sampled_index(mips[1]);
-                let mip3_index = ctx.sampled_index(mips[2]);
                 let material_index = ctx.sampled_index(material);
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
@@ -677,9 +760,6 @@ impl ReflectSystem {
                 cmd.push_constants_compute(&reflect_composite_push(
                     ssr_index,
                     gdf_index,
-                    mip1_index,
-                    mip2_index,
-                    mip3_index,
                     out_index,
                     cw,
                     ch,

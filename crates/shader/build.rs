@@ -371,12 +371,12 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "reflect_composite_cs",
     },
-    // Phase 11 Stage C (C8g): 4x box downsample for the GDF-reflection roughness mip pyramid.
+    // Phase 11 Stage C (C8j): temporal resolve of the stochastic GGX GDF reflection.
     Job {
-        src: "reflect_downsample.slang",
+        src: "reflect_temporal.slang",
         entry: "csMain",
         stage: "compute",
-        key: "reflect_downsample_cs",
+        key: "reflect_temporal_cs",
     },
     // Phase 11 Stage C (C7b): lit-color history capture (raw radiance) for SSR reprojection.
     Job {
