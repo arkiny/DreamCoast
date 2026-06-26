@@ -361,6 +361,8 @@ struct App {
     gi_denoise: bool,
     /// Previous frame's view-projection (world -> clip) for C4 temporal reprojection.
     prev_view_proj: [f32; 16],
+    /// C5: screen-space reflections (viz; C7 will composite into lighting).
+    gdf_ssr: bool,
     /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
     scene_gdf_baked: bool,
     path_trace_pipeline: bool,
@@ -655,6 +657,8 @@ impl App {
             && std::env::var("P11_GI_DENOISE")
                 .map(|v| v != "0")
                 .unwrap_or(true);
+        // C5 screen-space reflections (viz toggle).
+        let gdf_ssr = gdf.has_ssr() && std::env::var_os("P11_SSR").is_some();
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -782,6 +786,7 @@ impl App {
             gi_spp,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
+            gdf_ssr,
             scene_gdf_baked: false,
             path_trace_pipeline,
             realtime_env: true,
@@ -981,6 +986,7 @@ impl App {
                 gdf_ao,
                 gdf_gi,
                 gi_denoise,
+                gdf_ssr,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1132,6 +1138,12 @@ impl App {
                                 if gdf.has_gdf_denoise() {
                                     ui.checkbox("  - C4 spatio-temporal denoise", gi_denoise);
                                 }
+                            }
+                        }
+                        if gdf.has_ssr() {
+                            ui.checkbox("Screen-space reflections (viz)", gdf_ssr);
+                            if *gdf_ssr {
+                                ui.text_disabled("  - Stage C5: SSR buffer (C7 composites)");
                             }
                         }
                     }
@@ -1619,9 +1631,42 @@ impl App {
             None
         };
 
+        // Phase 11 Stage C5: screen-space reflections. Runs after lighting (samples the
+        // lit HDR) and replaces the tonemap source as a standalone viz of the reflection
+        // buffer; C7 will instead composite it into the lighting's specular term. Only
+        // when the other full-screen replacements are off.
+        let ssr_out = if self.gdf_ssr
+            && rt_out.is_none()
+            && sdf_out.is_none()
+            && vol_out.is_none()
+            && bake_out.is_none()
+            && gdf_out.is_none()
+            && gdf_trace_out.is_none()
+            && scene_gdf_out.is_none()
+        {
+            Some(self.gdf.record_ssr(
+                &mut graph,
+                hdr,
+                g_depth,
+                g_normal,
+                g_material,
+                extent,
+                view_proj.to_cols_array(),
+                inv_view_proj,
+                eye,
+                cw,
+                ch,
+                self.flip_y,
+                self.scene_radius * 1.5,
+                self.scene_radius * 0.06,
+            ))
+        } else {
+            None
+        };
+
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active, else
         // the SW-RT SDF trace, else the Stage-B volume slice, else the Stage-C1 scene
-        // GDF, else compute-post, else HDR.
+        // GDF, else the Stage-C5 SSR viz, else compute-post, else HDR.
         let tonemap_src = rt_out
             .or(sdf_out)
             .or(vol_out)
@@ -1629,6 +1674,7 @@ impl App {
             .or(gdf_out)
             .or(gdf_trace_out)
             .or(scene_gdf_out)
+            .or(ssr_out)
             .or(hdr_post)
             .unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the

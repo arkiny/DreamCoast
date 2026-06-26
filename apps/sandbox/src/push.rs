@@ -647,6 +647,58 @@ pub(crate) fn gdf_atrous_push(
     pc
 }
 
+/// Pack the Phase 11 Stage C5 SSR push block (192 bytes): view_proj (64) +
+/// inv_view_proj (64) + cam_pos (16) + (depth, normal, material, color, out) +
+/// (width, height, flip_y) (32 across two rows) + (max_dist, thickness, steps,
+/// edge_fade) (16).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ssr_push(
+    view_proj: &[f32; 16],
+    inv_view_proj: &[f32; 16],
+    cam_pos: Vec3,
+    depth_index: u32,
+    normal_index: u32,
+    material_index: u32,
+    color_index: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    max_dist: f32,
+    thickness: f32,
+    steps: f32,
+    edge_fade: f32,
+) -> [u8; 192] {
+    let mut pc = [0u8; 192];
+    for (i, v) in view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[128..132].copy_from_slice(&cam_pos.x.to_le_bytes());
+    pc[132..136].copy_from_slice(&cam_pos.y.to_le_bytes());
+    pc[136..140].copy_from_slice(&cam_pos.z.to_le_bytes());
+    let u = [
+        depth_index,
+        normal_index,
+        material_index,
+        color_index,
+        out_index,
+        width,
+        height,
+        flip_y,
+    ];
+    for (i, v) in u.iter().enumerate() {
+        pc[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[176..180].copy_from_slice(&max_dist.to_le_bytes());
+    pc[180..184].copy_from_slice(&thickness.to_le_bytes());
+    pc[184..188].copy_from_slice(&steps.to_le_bytes());
+    pc[188..192].copy_from_slice(&edge_fade.to_le_bytes());
+    pc
+}
+
 /// Pack the path-tracer push block (Phase 8 M4, 128 bytes): inv_view_proj (64) +
 /// cam_pos (16) + sun dir+intensity (16) + (out, accum, inst, frame) (16) +
 /// (width, height, flip_y, spp) (16).
