@@ -366,6 +366,46 @@ pub(crate) fn sdf_bake_push(
     pc
 }
 
+/// Pack the Phase 11 Stage C8a albedo-bake push block (64 bytes): three storage-volume
+/// indices (R/G/B), dim, tri_count, vtx_index, idx_index, per-triangle albedo buffer index,
+/// then float4 aabb_min / aabb_max (16-byte aligned). Same scene AABB + voxel grid as the
+/// distance bake so the color volumes register identically to the scene GDF.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdf_albedo_bake_push(
+    vol_storage_r: u32,
+    vol_storage_g: u32,
+    vol_storage_b: u32,
+    dim: u32,
+    tri_count: u32,
+    vtx_index: u32,
+    idx_index: u32,
+    albedo_index: u32,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+) -> [u8; 64] {
+    let mut pc = [0u8; 64];
+    let u = [
+        vol_storage_r,
+        vol_storage_g,
+        vol_storage_b,
+        dim,
+        tri_count,
+        vtx_index,
+        idx_index,
+        albedo_index,
+    ];
+    for (i, v) in u.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in aabb_min.iter().enumerate() {
+        pc[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in aabb_max.iter().enumerate() {
+        pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc
+}
+
 /// Pack the Phase 11 Stage B3 GDF-merge push block (48 bytes): gdf_storage, dim,
 /// inst_table, inst_count, then float4 aabb_min / aabb_max (the GDF world extent;
 /// the unit cube here, matching the per-mesh bake box so a whole-cube single
@@ -510,6 +550,7 @@ pub(crate) fn gdf_gi_push(
     flip_y: u32,
     spp: u32,
     frame: u32,
+    albedo_rgb: [u32; 3],
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     ground_y: f32,
@@ -537,7 +578,10 @@ pub(crate) fn gdf_gi_push(
     pc[104..108].copy_from_slice(&flip_y.to_le_bytes());
     pc[108..112].copy_from_slice(&spp.to_le_bytes());
     pc[112..116].copy_from_slice(&frame.to_le_bytes());
-    // pc[116..128]: pad to the float4 boundary.
+    // C8a albedo channel indices (former pad slots): 0xFFFFFFFF = constant fallback.
+    pc[116..120].copy_from_slice(&albedo_rgb[0].to_le_bytes());
+    pc[120..124].copy_from_slice(&albedo_rgb[1].to_le_bytes());
+    pc[124..128].copy_from_slice(&albedo_rgb[2].to_le_bytes());
     for (i, v) in aabb_min.iter().enumerate() {
         pc[128 + i * 4..132 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -699,10 +743,10 @@ pub(crate) fn ssr_push(
     pc
 }
 
-/// Pack the Phase 11 Stage C6 GDF-reflection push block (176 bytes). Layout: inv_view_proj
+/// Pack the Phase 11 Stage C6 GDF-reflection push block (192 bytes). Layout: inv_view_proj
 /// 64, cam_pos 16, sun dir+intensity 16, then four uints depth/normal/gdf_sampled/out 16,
 /// then width/height/flip_y/pad 16, then aabb_min.xyz+ground_y 16, aabb_max.xyz+clamp 16,
-/// and ray_max_dist/hit_albedo/sky_fill/bias 16.
+/// ray_max_dist/hit_albedo/sky_fill/bias 16, and the C8a albedo R/G/B volume indices +pad 16.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gdf_reflect_push(
     inv_view_proj: &[f32; 16],
@@ -724,8 +768,9 @@ pub(crate) fn gdf_reflect_push(
     hit_albedo: f32,
     sky_fill: f32,
     bias: f32,
-) -> [u8; 176] {
-    let mut pc = [0u8; 176];
+    albedo_rgb: [u32; 3],
+) -> [u8; 192] {
+    let mut pc = [0u8; 192];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -756,6 +801,10 @@ pub(crate) fn gdf_reflect_push(
     pc[164..168].copy_from_slice(&hit_albedo.to_le_bytes());
     pc[168..172].copy_from_slice(&sky_fill.to_le_bytes());
     pc[172..176].copy_from_slice(&bias.to_le_bytes());
+    // C8a albedo channel indices (uint4 row): 0xFFFFFFFF = constant fallback.
+    pc[176..180].copy_from_slice(&albedo_rgb[0].to_le_bytes());
+    pc[180..184].copy_from_slice(&albedo_rgb[1].to_le_bytes());
+    pc[184..188].copy_from_slice(&albedo_rgb[2].to_le_bytes());
     pc
 }
 

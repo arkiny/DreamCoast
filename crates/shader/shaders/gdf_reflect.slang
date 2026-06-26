@@ -33,7 +33,11 @@ struct ReflectPush
     uint pad0;
     float4 aabb_min;        // xyz GDF world min, w = ground plane Y
     float4 aabb_max;        // xyz GDF world max, w = sample distance clamp
-    float4 params;          // x = ray max distance, y = hit albedo, z = sky fill, w = surface bias
+    float4 params;          // x = ray max distance, y = constant hit albedo (fallback), z = sky fill, w = surface bias
+    uint albedo_r;          // C8a: volumes[] index of the red albedo channel (0xFFFFFFFF = constant)
+    uint albedo_g;          // green
+    uint albedo_b;          // blue
+    uint pad1;
 };
 
 [[vk::push_constant]]
@@ -74,6 +78,19 @@ float scene_march(float3 p)
 float scene_occ(float3 p)
 {
     return min(geo_inside(p), p.y - GROUND_Y);
+}
+
+// C8a: the nearest-triangle albedo at a GDF reflection hit (trilinear from the 3 R32F
+// color volumes), or the constant fallback when no albedo volume is bound. Shares the
+// distance field's voxel grid; gives colored reflections instead of grey.
+float3 albedo_at(float3 p)
+{
+    if (pc.albedo_r == 0xFFFFFFFFu)
+        return float3(pc.params.y, pc.params.y, pc.params.y);
+    float3 uvw = saturate((p - GDF_MIN) / (GDF_MAX - GDF_MIN));
+    return float3(g.volumes[pc.albedo_r].SampleLevel(g.samp, uvw, 0.0).x,
+                  g.volumes[pc.albedo_g].SampleLevel(g.samp, uvw, 0.0).x,
+                  g.volumes[pc.albedo_b].SampleLevel(g.samp, uvw, 0.0).x);
 }
 
 float3 scene_normal(float3 p)
@@ -148,7 +165,6 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 dir = reflect(-v, n);
 
     float max_dist = pc.params.x;
-    float albedo = pc.params.y;
     float sky_fill = pc.params.z;
     float bias = pc.params.w;
 
@@ -180,7 +196,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         float ndl = max(dot(hn, sun_dir), 0.0);
         float sh = ndl > 0.0 ? refl_shadow(hp + hn * 0.004, sun_dir, max_dist) : 1.0;
         float fill = sky_fill * (0.5 + 0.5 * hn.y);
-        color = albedo * (sun_i * ndl * sh + fill);
+        color = albedo_at(hp) * (sun_i * ndl * sh + fill);
     }
     else
     {

@@ -377,8 +377,13 @@ struct App {
     /// C7c: feed the hybrid composite into the lighting specular (replaces the prefilter-cube
     /// IBL specular). The toggle that compares legacy captured-cube IBL vs the new SW-RT path.
     swrt_reflect: bool,
+    /// C8a: use the per-voxel albedo volumes (real surface color) in the GDF GI / reflection
+    /// re-light instead of a constant albedo. Off => achromatic (pre-C8a), for no-reg compare.
+    gdf_color: bool,
     /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
     scene_gdf_baked: bool,
+    /// C8a bake-once latch for the per-voxel albedo volumes (GI + reflection consumers share).
+    scene_albedo_baked: bool,
     path_trace_pipeline: bool,
     realtime_env: bool,
     multibounce: bool,
@@ -585,12 +590,62 @@ impl App {
                 (&sphere, scene[2].transform),
                 (&cube, scene[3].transform),
             ];
+            // C8a per-object representative linear albedo (tagged onto each triangle so the
+            // albedo bake can color a voxel by its nearest triangle). The loaded model is
+            // textured, so its color lives in the base-color image, not the factor — average
+            // the texture (sRGB -> linear) × factor for a representative albedo; the
+            // procedural objects use their (linear) base color directly.
+            let avocado_albedo: [f32; 3] = match &model.material.base_color {
+                Some(img) => {
+                    let mut acc = [0f64; 3];
+                    let n = (img.rgba8.len() / 4).max(1) as f64;
+                    for px in img.rgba8.chunks_exact(4) {
+                        for (c, a) in acc.iter_mut().enumerate() {
+                            let s = px[c] as f64 / 255.0;
+                            *a += if s <= 0.04045 {
+                                s / 12.92
+                            } else {
+                                ((s + 0.055) / 1.055).powf(2.4)
+                            };
+                        }
+                    }
+                    let f = model.material.base_color_factor;
+                    [
+                        (acc[0] / n) as f32 * f[0],
+                        (acc[1] / n) as f32 * f[1],
+                        (acc[2] / n) as f32 * f[2],
+                    ]
+                }
+                None => {
+                    let f = model.material.base_color_factor;
+                    [f[0], f[1], f[2]]
+                }
+            };
+            let obj_albedo: [[f32; 3]; 4] = [
+                avocado_albedo,
+                [
+                    scene[1].base_color[0],
+                    scene[1].base_color[1],
+                    scene[1].base_color[2],
+                ],
+                [
+                    scene[2].base_color[0],
+                    scene[2].base_color[1],
+                    scene[2].base_color[2],
+                ],
+                [
+                    scene[3].base_color[0],
+                    scene[3].base_color[1],
+                    scene[3].base_color[2],
+                ],
+            ];
             let mut fused_v: Vec<u8> = Vec::new();
             let mut fused_i: Vec<u8> = Vec::new();
+            let mut tri_albedo: Vec<u8> = Vec::new();
             let mut base: u32 = 0;
             let mut amin = [f32::MAX; 3];
             let mut amax = [f32::MIN; 3];
-            for (m, xf) in objs {
+            for (oi, (m, xf)) in objs.into_iter().enumerate() {
                 for v in &m.vertices {
                     let p = xf.transform_point3(Vec3::from(v.pos));
                     let n = xf
@@ -610,6 +665,13 @@ impl App {
                 for &ix in &m.indices {
                     fused_i.extend_from_slice(&(ix + base).to_le_bytes());
                 }
+                // One albedo record (float3, 12 B) per triangle of this object, in the same
+                // fused-triangle order the bake indexes.
+                for _ in 0..(m.indices.len() / 3) {
+                    for c in obj_albedo[oi] {
+                        tri_albedo.extend_from_slice(&c.to_le_bytes());
+                    }
+                }
                 base += m.vertices.len() as u32;
             }
             // Pad the AABB by 10% per axis so the zero-isosurface isn't clipped at the
@@ -620,7 +682,15 @@ impl App {
                 amax[i] += pad;
             }
             let tri_count = (fused_i.len() / 4 / 3) as u32;
-            gdf.build_scene_sdf(&device, &fused_v, &fused_i, tri_count, amin, amax)?;
+            gdf.build_scene_sdf(
+                &device,
+                &fused_v,
+                &fused_i,
+                &tri_albedo,
+                tri_count,
+                amin,
+                amax,
+            )?;
         }
 
         let gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
@@ -695,6 +765,12 @@ impl App {
             && reflect.has_lit_history()
             && gdf.has_scene_sdf()
             && std::env::var_os("P11_SWRT_REFLECT").is_some();
+        // C8a colored GDF re-light (per-voxel albedo). On by default when the albedo volumes
+        // exist; `P11_GDF_COLOR=0` forces the achromatic constant-albedo path (no-reg compare).
+        let gdf_color = gdf.has_scene_albedo()
+            && std::env::var("P11_GDF_COLOR")
+                .map(|v| v != "0")
+                .unwrap_or(true);
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -828,7 +904,9 @@ impl App {
             gdf_reflect,
             gdf_hybrid,
             swrt_reflect,
+            gdf_color,
             scene_gdf_baked: false,
+            scene_albedo_baked: false,
             path_trace_pipeline,
             realtime_env: true,
             multibounce: true,
@@ -1033,6 +1111,7 @@ impl App {
                 gdf_reflect,
                 gdf_hybrid,
                 swrt_reflect,
+                gdf_color,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1208,6 +1287,12 @@ impl App {
                             ui.checkbox("SW-RT reflections in lighting", swrt_reflect);
                             if *swrt_reflect {
                                 ui.text_disabled("  - Stage C7c: replaces IBL prefilter specular");
+                            }
+                        }
+                        if gdf.has_scene_albedo() {
+                            ui.checkbox("Colored GDF re-light (C8a)", gdf_color);
+                            if *gdf_color {
+                                ui.text_disabled("  - per-voxel albedo: colored GI + reflections");
                             }
                         }
                     }
@@ -1446,6 +1531,28 @@ impl App {
         } else {
             None
         };
+        // Stage C8a: the per-voxel albedo volumes (colored GI + reflection re-light). Import
+        // the shared handle once + bake once (separate from the distance bake so that stays
+        // bit-identical); the re-light consumers (C3 GI, C6/C7 reflection) read it. Gated on
+        // `gdf_color` so `P11_GDF_COLOR=0` is the achromatic pre-C8a path.
+        let scene_albedo_ext = if self.gdf_color
+            && (self.gdf_gi || self.gdf_reflect || self.gdf_hybrid || self.swrt_reflect)
+            && self.gdf.has_scene_albedo()
+        {
+            let ext = graph.import_external("scene_albedo");
+            if !self.scene_albedo_baked {
+                self.gdf.record_scene_albedo_bake(&mut graph, ext);
+                self.scene_albedo_baked = true;
+            }
+            Some(ext)
+        } else {
+            None
+        };
+        // The (volumes, handle) pair the re-light consumers take; `None` => constant albedo.
+        let scene_albedo = match (self.gdf.scene_albedo(), scene_albedo_ext) {
+            (Some(vols), Some(ext)) => Some((vols, ext)),
+            _ => None,
+        };
         // Stage C2: GDF ambient occlusion, multiplied into the lighting ambient term.
         let gdf_ao_out = match (self.gdf_ao, scene_gdf_vol, scene_gdf_ext) {
             (true, Some(vol), Some(ext)) => Some(self.gi.record_ao(
@@ -1484,6 +1591,7 @@ impl App {
                     self.flip_y,
                     self.gi_spp,
                     self.frame_no as u32,
+                    scene_albedo,
                 );
                 let out = if gi_denoise_active {
                     self.gi.record_denoise(
@@ -1553,6 +1661,7 @@ impl App {
                     cw,
                     ch,
                     self.flip_y,
+                    scene_albedo,
                 );
                 Some(
                     self.reflect
@@ -1855,6 +1964,7 @@ impl App {
                 cw,
                 ch,
                 self.flip_y,
+                scene_albedo,
             )),
             _ => None,
         };
@@ -1916,6 +2026,7 @@ impl App {
                     cw,
                     ch,
                     self.flip_y,
+                    scene_albedo,
                 );
                 let composite = self
                     .reflect

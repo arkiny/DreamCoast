@@ -36,12 +36,12 @@ struct GiPush
     uint flip_y;            // bit0: 1 = Vulkan (clip-space Y down)
     uint spp;               // hemisphere rays per pixel
     uint frame;             // frame counter (RNG decorrelation, for C4 temporal)
-    uint pad0;
-    uint pad1;
-    uint pad2;
+    uint albedo_r;          // C8a: volumes[] index of the red albedo channel (0xFFFFFFFF = constant)
+    uint albedo_g;          // green
+    uint albedo_b;          // blue
     float4 aabb_min;        // xyz GDF world min, w = ground plane Y
     float4 aabb_max;        // xyz GDF world max, w = sample distance clamp
-    float4 params;          // x = ray max distance, y = surface bias, z = sky term, w = hit albedo
+    float4 params;          // x = ray max distance, y = surface bias, z = sky term, w = constant hit albedo (fallback)
 };
 
 [[vk::push_constant]]
@@ -111,6 +111,19 @@ float scene_occ(float3 p)
     return min(geo_inside(p), p.y - GROUND_Y);
 }
 
+// C8a: the nearest-triangle albedo at a GDF hit (trilinear from the 3 R32F color volumes
+// baked in `sdf_albedo_bake.slang`), or the constant fallback when no albedo volume is
+// bound (albedo_r == 0xFFFFFFFF). The albedo grid shares the distance field's voxel grid.
+float3 albedo_at(float3 p)
+{
+    if (pc.albedo_r == 0xFFFFFFFFu)
+        return float3(pc.params.w, pc.params.w, pc.params.w);
+    float3 uvw = saturate((p - GDF_MIN) / (GDF_MAX - GDF_MIN));
+    return float3(g.volumes[pc.albedo_r].SampleLevel(g.samp, uvw, 0.0).x,
+                  g.volumes[pc.albedo_g].SampleLevel(g.samp, uvw, 0.0).x,
+                  g.volumes[pc.albedo_b].SampleLevel(g.samp, uvw, 0.0).x);
+}
+
 float3 scene_normal(float3 p)
 {
     const float e = 0.012;
@@ -156,10 +169,11 @@ float3 trace_bounce(float3 origin, float3 dir)
             float3 sun_dir = normalize(pc.sun.xyz);
             float ndl = max(dot(hn, sun_dir), 0.0);
             float sh = ndl > 0.0 ? gi_shadow(p + hn * 0.004, sun_dir) : 1.0;
-            // Constant-albedo re-light: sun (soft-shadowed) + a small hemispheric sky
-            // fill so surfaces in full shadow still bounce a little.
+            // C8a colored re-light: the hit's real surface albedo (per-voxel color volume)
+            // × sun (soft-shadowed) + a small hemispheric sky fill so surfaces in full
+            // shadow still bounce a little. Colored albedo => colored indirect bleed.
             float sky_fill = pc.params.z * (0.5 + 0.5 * hn.y);
-            return pc.params.w * (pc.sun.w * ndl * sh + sky_fill);
+            return albedo_at(p) * (pc.sun.w * ndl * sh + sky_fill);
         }
         t += max(d, 0.01);
         if (t > maxt)
