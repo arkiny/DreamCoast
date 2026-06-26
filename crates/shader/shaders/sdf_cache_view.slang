@@ -11,7 +11,7 @@
 struct CacheViewPush
 {
     uint cache_pos_index; // storage buffer: float4(hit pos, valid)
-    uint cache_alb_index; // storage buffer: float4(albedo rgb, 0)
+    uint cache_src_index; // storage buffer shown: albedo (C8b1) or radiance (C8b2)
     uint out_index;       // storage image
     uint num_cards;
     uint tile;            // card atlas tile edge
@@ -39,8 +39,8 @@ void viewMain(uint3 tid: SV_DispatchThreadID)
     uint t = card * (pc.tile * pc.tile) + ty * pc.tile + tx;
 
     float4 pos = asfloat(g.storage_buffers[pc.cache_pos_index].Load4(t * 16u));
-    float3 alb = asfloat(g.storage_buffers[pc.cache_alb_index].Load3(t * 16u));
-    float3 color = pos.w > 0.5 ? alb : float3(0.06, 0.0, 0.06);
+    float3 src = asfloat(g.storage_buffers[pc.cache_src_index].Load3(t * 16u));
+    float3 color = pos.w > 0.5 ? src : float3(0.06, 0.0, 0.06);
 
     // Thin black gridline between cards for readability.
     if (fx < 0.01)

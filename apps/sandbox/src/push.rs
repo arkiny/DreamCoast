@@ -451,10 +451,11 @@ pub(crate) fn cache_capture_push(
     pc
 }
 
-/// Pack the Phase 11 Stage C8b1 surface-cache atlas-viz push block (32 bytes).
+/// Pack the Phase 11 Stage C8b1 surface-cache atlas-viz push block (32 bytes). `cache_src`
+/// is the buffer shown — the captured albedo (C8b1) or the lit radiance (C8b2).
 pub(crate) fn cache_view_push(
     cache_pos_index: u32,
-    cache_alb_index: u32,
+    cache_src_index: u32,
     out_index: u32,
     num_cards: u32,
     tile: u32,
@@ -464,7 +465,7 @@ pub(crate) fn cache_view_push(
     let mut pc = [0u8; 32];
     let u = [
         cache_pos_index,
-        cache_alb_index,
+        cache_src_index,
         out_index,
         num_cards,
         tile,
@@ -475,6 +476,72 @@ pub(crate) fn cache_view_push(
     for (i, v) in u.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
+    pc
+}
+
+/// Pack the Phase 11 Stage C8b2 surface-cache lighting push block (112 bytes): card +
+/// cache buffer indices, GDF sampled, atlas dims, spp/frame/reset, then float4 sun /
+/// aabb_min(+ground) / aabb_max(+clamp) / params(sky_fill, temporal alpha, bias, ray max).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cache_light_push(
+    cards_index: u32,
+    cache_pos_index: u32,
+    cache_alb_index: u32,
+    cache_rad_read: u32,
+    cache_rad_write: u32,
+    gdf_sampled: u32,
+    num_cards: u32,
+    tile: u32,
+    num_texels: u32,
+    spp: u32,
+    frame: u32,
+    reset: u32,
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    aabb_min: [f32; 3],
+    ground_y: f32,
+    aabb_max: [f32; 3],
+    dist_clamp: f32,
+    sky_fill: f32,
+    alpha: f32,
+    bias: f32,
+    ray_max: f32,
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
+    let u = [
+        cards_index,
+        cache_pos_index,
+        cache_alb_index,
+        cache_rad_read,
+        cache_rad_write,
+        gdf_sampled,
+        num_cards,
+        tile,
+        num_texels,
+        spp,
+        frame,
+        reset,
+    ];
+    for (i, v) in u.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let sun = normalize3(sun_dir);
+    pc[48..52].copy_from_slice(&sun[0].to_le_bytes());
+    pc[52..56].copy_from_slice(&sun[1].to_le_bytes());
+    pc[56..60].copy_from_slice(&sun[2].to_le_bytes());
+    pc[60..64].copy_from_slice(&sun_intensity.to_le_bytes());
+    for (i, v) in aabb_min.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[76..80].copy_from_slice(&ground_y.to_le_bytes());
+    for (i, v) in aabb_max.iter().enumerate() {
+        pc[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[92..96].copy_from_slice(&dist_clamp.to_le_bytes());
+    pc[96..100].copy_from_slice(&sky_fill.to_le_bytes());
+    pc[100..104].copy_from_slice(&alpha.to_le_bytes());
+    pc[104..108].copy_from_slice(&bias.to_le_bytes());
+    pc[108..112].copy_from_slice(&ray_max.to_le_bytes());
     pc
 }
 
