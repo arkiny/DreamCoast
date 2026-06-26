@@ -343,12 +343,19 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gdf_atrous_cs",
     },
-    // Phase 11 Stage C (C5): screen-space reflections.
+    // Phase 11 Stage C (C5): screen-space reflections (stochastic half-res trace).
     Job {
         src: "ssr.slang",
         entry: "csMain",
         stage: "compute",
         key: "ssr_cs",
+    },
+    // Phase 11 Stage C: stochastic SSR temporal resolve (reproject + EMA + clamp).
+    Job {
+        src: "ssr_resolve.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "ssr_resolve_cs",
     },
     // Phase 11 Stage C (C6): GDF reflections (off-screen fallback for SSR misses).
     Job {

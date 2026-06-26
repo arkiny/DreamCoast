@@ -851,18 +851,23 @@ pub(crate) fn ssr_push(
     cam_pos: Vec3,
     depth_index: u32,
     normal_index: u32,
+    material_index: u32,
     hist_index: u32,
     color_index: u32,
     out_index: u32,
     width: u32,
     height: u32,
     flip_y: u32,
+    frame: u32,
+    full_width: u32,
+    full_height: u32,
     max_dist: f32,
     thickness: f32,
     steps: f32,
     edge_fade: f32,
-) -> [u8; 192] {
-    let mut pc = [0u8; 192];
+    out_b_index: u32,
+) -> [u8; 224] {
+    let mut pc = [0u8; 224];
     for (i, v) in view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -875,20 +880,89 @@ pub(crate) fn ssr_push(
     let u = [
         depth_index,
         normal_index,
+        material_index,
         hist_index,
         color_index,
         out_index,
         width,
         height,
         flip_y,
+        frame,
+        full_width,
+        full_height,
     ];
     for (i, v) in u.iter().enumerate() {
         pc[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
-    pc[176..180].copy_from_slice(&max_dist.to_le_bytes());
-    pc[180..184].copy_from_slice(&thickness.to_le_bytes());
-    pc[184..188].copy_from_slice(&steps.to_le_bytes());
-    pc[188..192].copy_from_slice(&edge_fade.to_le_bytes());
+    pc[192..196].copy_from_slice(&max_dist.to_le_bytes());
+    pc[196..200].copy_from_slice(&thickness.to_le_bytes());
+    pc[200..204].copy_from_slice(&steps.to_le_bytes());
+    pc[204..208].copy_from_slice(&edge_fade.to_le_bytes());
+    pc[208..212].copy_from_slice(&out_b_index.to_le_bytes());
+    pc
+}
+
+/// Pack the stochastic-SSR ratio-estimator resolve push block (224 bytes): inv_view_proj
+/// (64) + prev_view_proj (64) + cam_pos (16) + 14 uints (ssr_a, ssr_b, depth, normal,
+/// material, out, accum_r/w, pos_r/w, width, height, flip_y, reset) + params (reject_dist,
+/// alpha, clamp_max, kernel_radius).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ssr_resolve_push(
+    inv_view_proj: &[f32; 16],
+    prev_view_proj: &[f32; 16],
+    cam_pos: Vec3,
+    ssr_a_index: u32,
+    ssr_b_index: u32,
+    depth_index: u32,
+    normal_index: u32,
+    material_index: u32,
+    out_index: u32,
+    accum_read: u32,
+    accum_write: u32,
+    pos_read: u32,
+    pos_write: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    reset: u32,
+    reject_dist: f32,
+    alpha: f32,
+    clamp_max: f32,
+    kernel_radius: f32,
+) -> [u8; 224] {
+    let mut pc = [0u8; 224];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in prev_view_proj.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[128..132].copy_from_slice(&cam_pos.x.to_le_bytes());
+    pc[132..136].copy_from_slice(&cam_pos.y.to_le_bytes());
+    pc[136..140].copy_from_slice(&cam_pos.z.to_le_bytes());
+    let u = [
+        ssr_a_index,
+        ssr_b_index,
+        depth_index,
+        normal_index,
+        material_index,
+        out_index,
+        accum_read,
+        accum_write,
+        pos_read,
+        pos_write,
+        width,
+        height,
+        flip_y,
+        reset,
+    ];
+    for (i, v) in u.iter().enumerate() {
+        pc[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[208..212].copy_from_slice(&reject_dist.to_le_bytes());
+    pc[212..216].copy_from_slice(&alpha.to_le_bytes());
+    pc[216..220].copy_from_slice(&clamp_max.to_le_bytes());
+    pc[220..224].copy_from_slice(&kernel_radius.to_le_bytes());
     pc
 }
 

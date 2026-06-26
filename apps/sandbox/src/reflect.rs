@@ -13,10 +13,13 @@ use rhi::{
 
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
-use crate::push::{gdf_reflect_push, lit_history_push, reflect_composite_push, ssr_push};
+use crate::push::{
+    gdf_reflect_push, lit_history_push, reflect_composite_push, ssr_push, ssr_resolve_push,
+};
 
 pub(crate) struct ReflectSystem {
-    ssr_pipeline: Option<ComputePipeline>, // C5 screen-space reflections
+    ssr_pipeline: Option<ComputePipeline>, // C5 screen-space reflections (stochastic half-res)
+    ssr_resolve_pipeline: Option<ComputePipeline>, // stochastic SSR temporal resolve
     reflect_pipeline: Option<ComputePipeline>, // C6 GDF reflection fallback
     composite_pipeline: Option<ComputePipeline>, // C7 hybrid composite
     lit_history_pipeline: Option<ComputePipeline>, // C7b lit-color history capture
@@ -27,6 +30,13 @@ pub(crate) struct ReflectSystem {
     lit_hist_extent: (u32, u32),
     /// Frames since the last history (re)allocation; selects the ping-pong read/write pair.
     lit_hist_frame: u32,
+    /// Stochastic SSR temporal accumulation (half-res): ping-pong byte-address buffers —
+    /// `accum` (rgb + confidence) and `pos` (surface world point + valid), (re)allocated to
+    /// the half-res extent. The resolve reprojects the surface into the previous frame.
+    ssr_accum: [Option<StorageBuffer>; 2],
+    ssr_pos: [Option<StorageBuffer>; 2],
+    ssr_accum_extent: (u32, u32),
+    ssr_accum_frame: u32,
 }
 
 impl ReflectSystem {
@@ -64,8 +74,16 @@ impl ReflectSystem {
             dreamcoast_shader::ssr_cs_dxil,
             dreamcoast_shader::ssr_cs_metallib,
             "ssr",
-            192,
+            224,
             true,
+        )?;
+        let ssr_resolve_pipeline = compute(
+            dreamcoast_shader::ssr_resolve_cs_spirv,
+            dreamcoast_shader::ssr_resolve_cs_dxil,
+            dreamcoast_shader::ssr_resolve_cs_metallib,
+            "ssr_resolve",
+            224,
+            false,
         )?;
         let reflect_pipeline = compute(
             dreamcoast_shader::gdf_reflect_cs_spirv,
@@ -93,13 +111,55 @@ impl ReflectSystem {
         )?;
         Ok(Self {
             ssr_pipeline,
+            ssr_resolve_pipeline,
             reflect_pipeline,
             composite_pipeline,
             lit_history_pipeline,
             lit_hist: [None, None],
             lit_hist_extent: (0, 0),
             lit_hist_frame: 0,
+            ssr_accum: [None, None],
+            ssr_pos: [None, None],
+            ssr_accum_extent: (0, 0),
+            ssr_accum_frame: 0,
         })
+    }
+
+    pub(crate) fn has_ssr_resolve(&self) -> bool {
+        self.ssr_resolve_pipeline.is_some()
+    }
+
+    /// (Re)allocate the half-res stochastic-SSR accumulation buffers on a resize (resetting
+    /// the ping-pong counter). Runs before the graph, like `prepare_history`. No-op without
+    /// the resolve pipeline.
+    pub(crate) fn prepare_ssr_accum(
+        &mut self,
+        device: &Device,
+        hw: u32,
+        hh: u32,
+    ) -> anyhow::Result<()> {
+        if self.ssr_resolve_pipeline.is_none() {
+            return Ok(());
+        }
+        if self.ssr_accum_extent != (hw, hh) {
+            device.wait_idle()?;
+            let make = || -> anyhow::Result<Option<StorageBuffer>> {
+                Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
+                    size: (hw as u64) * (hh as u64) * 16,
+                    stride: 16,
+                    indirect: false,
+                })?))
+            };
+            self.ssr_accum = [make()?, make()?];
+            self.ssr_pos = [make()?, make()?];
+            self.ssr_accum_extent = (hw, hh);
+            self.ssr_accum_frame = 0;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn advance_ssr_accum(&mut self) {
+        self.ssr_accum_frame = self.ssr_accum_frame.saturating_add(1);
     }
 
     pub(crate) fn has_ssr(&self) -> bool {
@@ -171,23 +231,27 @@ impl ReflectSystem {
         hdr: ResourceId,
         depth: ResourceId,
         normal: ResourceId,
+        material: ResourceId,
         extent: Extent2D,
         view_proj: [f32; 16],
         inv_view_proj: [f32; 16],
         eye: Vec3,
         cw: u32,
         ch: u32,
+        full_cw: u32,
+        full_ch: u32,
         flip_y: u32,
+        frame: u32,
         max_dist: f32,
         thickness: f32,
         use_history: bool,
         neighborhood_clamp: bool,
-    ) -> ResourceId {
+        stochastic: bool,
+    ) -> (ResourceId, ResourceId) {
         let pipe = self.ssr_pipeline.as_ref().expect("ssr pipeline");
         let out = graph.create_storage_image("ssr_out", HDR_FORMAT, extent);
-        // History mode: read the previous frame's buffer (ping-pong), set the history flag
-        // bit. The buffer was written last frame (cross-frame sync via the frame fence), so
-        // it is bound by index like the C4 denoiser history — not a graph resource.
+        // 2nd output (stochastic ratio estimator): the ray direction + GGX pdf per pixel.
+        let out_b = graph.create_storage_image("ssr_dir", HDR_FORMAT, extent);
         let hist_index = if use_history {
             let read = ((self.lit_hist_frame + 1) % 2) as usize;
             self.lit_hist[read]
@@ -197,33 +261,37 @@ impl ReflectSystem {
         } else {
             u32::MAX
         };
-        // bit1 = history mode; bit2 = neighborhood-clamp the reprojected history (firefly).
+        // bit1 = history mode; bit2 = neighborhood-clamp the reprojected history; bit3 = GGX
+        // stochastic jitter (the temporal resolve accumulates the per-frame rays).
         let mut flags = if use_history { flip_y | 2 } else { flip_y };
         if use_history && neighborhood_clamp {
             flags |= 4;
         }
-        // History mode reads the buffer (not the HDR), so the HDR is only a graph read in
-        // the current-frame viz path.
+        if stochastic {
+            flags |= 8;
+        }
         let reads = if use_history {
-            vec![depth, normal]
+            vec![depth, normal, material]
         } else {
-            vec![hdr, depth, normal]
+            vec![hdr, depth, normal, material]
         };
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "ssr",
-                storage_writes: vec![out],
+                storage_writes: vec![out, out_b],
                 reads,
             },
             move |ctx| {
                 let depth_index = ctx.sampled_index(depth);
                 let normal_index = ctx.sampled_index(normal);
+                let material_index = ctx.sampled_index(material);
                 let color_index = if use_history {
                     u32::MAX
                 } else {
                     ctx.sampled_index(hdr)
                 };
                 let out_index = ctx.storage_index(out);
+                let out_b_index = ctx.storage_index(out_b);
                 let cmd = ctx.cmd();
                 cmd.set_globals(globals, globals_offset);
                 cmd.bind_compute_pipeline(pipe);
@@ -233,18 +301,113 @@ impl ReflectSystem {
                     eye,
                     depth_index,
                     normal_index,
+                    material_index,
                     hist_index,
                     color_index,
                     out_index,
                     cw,
                     ch,
+                    full_cw,
+                    full_ch,
                     flags,
+                    frame,
                     max_dist,
                     thickness,
-                    96.0, // march steps (finer = less stair-step speckle)
-                    0.1,  // edge-fade width (fraction of half-screen)
+                    256.0, // screen-space DDA step cap (actual steps = min(ray screen length, cap))
+                    0.1,   // edge-fade width (fraction of half-screen)
+                    out_b_index,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        (out, out_b)
+    }
+
+    /// Stochastic SSR resolve (Frostbite ratio estimator): gather the half-res neighbour rays
+    /// (`ssr_a` colour+conf, `ssr_b` dir+pdf), reweight each by `pdf_p(dir)/pdf_q` so the
+    /// centre pixel borrows them under its own GGX lobe (roughness-adaptive, low variance per
+    /// frame), then a light temporal EMA + firefly clamp. Returns the resolved half-res
+    /// reflection (the composite samples it bilinearly). `prepare_ssr_accum` must have run.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_ssr_resolve<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        ssr_a: ResourceId,
+        ssr_b: ResourceId,
+        depth: ResourceId,
+        normal: ResourceId,
+        material: ResourceId,
+        extent: Extent2D,
+        inv_view_proj: [f32; 16],
+        prev_view_proj: [f32; 16],
+        eye: Vec3,
+        hw: u32,
+        hh: u32,
+        flip_y: u32,
+        reject_dist: f32,
+        clamp_max: f32,
+        kernel_radius: f32,
+    ) -> ResourceId {
+        let pipe = self
+            .ssr_resolve_pipeline
+            .as_ref()
+            .expect("ssr resolve pipeline");
+        let out = graph.create_storage_image("ssr_resolved", HDR_FORMAT, extent);
+        let reset = self.ssr_accum_frame == 0;
+        let read = ((self.ssr_accum_frame + 1) % 2) as usize;
+        let write = (self.ssr_accum_frame % 2) as usize;
+        let accum_r = self.ssr_accum[read]
+            .as_ref()
+            .expect("accum r")
+            .storage_index();
+        let accum_w = self.ssr_accum[write]
+            .as_ref()
+            .expect("accum w")
+            .storage_index();
+        let pos_r = self.ssr_pos[read].as_ref().expect("pos r").storage_index();
+        let pos_w = self.ssr_pos[write].as_ref().expect("pos w").storage_index();
+        let accum_w_ext = graph.import_external("ssr_accum_w");
+        let pos_w_ext = graph.import_external("ssr_pos_w");
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "ssr_resolve",
+                storage_writes: vec![out, accum_w_ext, pos_w_ext],
+                reads: vec![ssr_a, ssr_b, depth, normal, material],
+            },
+            move |ctx| {
+                let ssr_a_index = ctx.sampled_index(ssr_a);
+                let ssr_b_index = ctx.sampled_index(ssr_b);
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let material_index = ctx.sampled_index(material);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&ssr_resolve_push(
+                    &inv_view_proj,
+                    &prev_view_proj,
+                    eye,
+                    ssr_a_index,
+                    ssr_b_index,
+                    depth_index,
+                    normal_index,
+                    material_index,
+                    out_index,
+                    accum_r,
+                    accum_w,
+                    pos_r,
+                    pos_w,
+                    hw,
+                    hh,
+                    flip_y,
+                    u32::from(reset),
+                    reject_dist,
+                    0.15, // temporal EMA alpha (spatial resolve already cut the variance)
+                    clamp_max,
+                    kernel_radius,
+                ));
+                cmd.dispatch(hw.div_ceil(8), hh.div_ceil(8), 1);
                 Ok(())
             },
         );
