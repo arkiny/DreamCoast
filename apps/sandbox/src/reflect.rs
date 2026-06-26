@@ -14,7 +14,8 @@ use rhi::{
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
-    gdf_reflect_push, lit_history_push, reflect_composite_push, ssr_push, ssr_resolve_push,
+    gdf_reflect_push, lit_history_push, reflect_composite_push, reflect_downsample_push, ssr_push,
+    ssr_resolve_push,
 };
 
 pub(crate) struct ReflectSystem {
@@ -23,6 +24,7 @@ pub(crate) struct ReflectSystem {
     reflect_pipeline: Option<ComputePipeline>, // C6 GDF reflection fallback
     composite_pipeline: Option<ComputePipeline>, // C7 hybrid composite
     lit_history_pipeline: Option<ComputePipeline>, // C7b lit-color history capture
+    downsample_pipeline: Option<ComputePipeline>, // C8g GDF-reflection mip downsample
     /// C7b lit-color history: ping-pong byte-address storage buffers (float4/pixel, rgb =
     /// raw radiance, a = 1), (re)allocated to the render extent. The SSR reads the previous
     /// frame's buffer (reprojected); the copy pass writes this frame's.
@@ -109,12 +111,22 @@ impl ReflectSystem {
             32,
             false,
         )?;
+        // C8g: 4x box downsample for the GDF-reflection roughness mip pyramid.
+        let downsample_pipeline = compute(
+            dreamcoast_shader::reflect_downsample_cs_spirv,
+            dreamcoast_shader::reflect_downsample_cs_dxil,
+            dreamcoast_shader::reflect_downsample_cs_metallib,
+            "reflect_downsample",
+            16,
+            false,
+        )?;
         Ok(Self {
             ssr_pipeline,
             ssr_resolve_pipeline,
             reflect_pipeline,
             composite_pipeline,
             lit_history_pipeline,
+            downsample_pipeline,
             lit_hist: [None, None],
             lit_hist_extent: (0, 0),
             lit_hist_frame: 0,
@@ -575,21 +587,70 @@ impl ReflectSystem {
     /// radiance that replaces the prefilter-cube IBL specular (C7c). `gdf_scale` lifts the
     /// raw GDF radiance into the SSR's post-exposure space for the standalone viz; it is
     /// 1.0 once both sources are raw radiance (C7b). Returns the composite image.
+    /// C8g: build a 3-level mip pyramid of the GDF reflection (1/4, 1/16, 1/64 res) by chaining
+    /// 4x box downsamples. The composite samples these at a roughness LOD for an energy-conserving
+    /// glossy prefilter (vs the old screen-space gather). Returns `[mip1, mip2, mip3]`. No-op
+    /// fallback to the source handle if the downsample pipeline is absent.
+    pub(crate) fn record_reflect_mips<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        src: ResourceId,
+        cw: u32,
+        ch: u32,
+    ) -> [ResourceId; 3] {
+        let Some(pipe) = self.downsample_pipeline.as_ref() else {
+            return [src, src, src];
+        };
+        let mut prev = src;
+        let mut prev_dims = (cw, ch);
+        let mut out = [src; 3];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let dw = (prev_dims.0 / 4).max(1);
+            let dh = (prev_dims.1 / 4).max(1);
+            let dst = graph.create_storage_image(
+                &format!("reflect_mip{}", i + 1),
+                HDR_FORMAT,
+                Extent2D::new(dw, dh),
+            );
+            let read = prev;
+            graph.add_compute_pass(
+                ComputePassInfo {
+                    name: "reflect_downsample",
+                    storage_writes: vec![dst],
+                    reads: vec![read],
+                },
+                move |ctx| {
+                    let src_index = ctx.sampled_index(read);
+                    let out_index = ctx.storage_index(dst);
+                    let cmd = ctx.cmd();
+                    cmd.bind_compute_pipeline(pipe);
+                    cmd.push_constants_compute(&reflect_downsample_push(
+                        src_index, out_index, dw, dh,
+                    ));
+                    cmd.dispatch(dw.div_ceil(8), dh.div_ceil(8), 1);
+                    Ok(())
+                },
+            );
+            *slot = dst;
+            prev = dst;
+            prev_dims = (dw, dh);
+        }
+        out
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_composite<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
         ssr: ResourceId,
         gdf_reflect: ResourceId,
+        mips: [ResourceId; 3],
         material: ResourceId,
-        depth: ResourceId,
         extent: Extent2D,
         cw: u32,
         ch: u32,
         gdf_scale: f32,
         clamp_max: f32,
-        blur_scale: f32,
-        depth_reject: f32,
         max_roughness: f32,
     ) -> ResourceId {
         let pipe = self
@@ -601,28 +662,30 @@ impl ReflectSystem {
             ComputePassInfo {
                 name: "reflect_composite",
                 storage_writes: vec![out],
-                reads: vec![ssr, gdf_reflect, material, depth],
+                reads: vec![ssr, gdf_reflect, mips[0], mips[1], mips[2], material],
             },
             move |ctx| {
                 let ssr_index = ctx.sampled_index(ssr);
                 let gdf_index = ctx.sampled_index(gdf_reflect);
+                let mip1_index = ctx.sampled_index(mips[0]);
+                let mip2_index = ctx.sampled_index(mips[1]);
+                let mip3_index = ctx.sampled_index(mips[2]);
                 let material_index = ctx.sampled_index(material);
-                let depth_index = ctx.sampled_index(depth);
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&reflect_composite_push(
                     ssr_index,
                     gdf_index,
+                    mip1_index,
+                    mip2_index,
+                    mip3_index,
                     out_index,
                     cw,
                     ch,
                     gdf_scale,
                     clamp_max,
                     material_index,
-                    depth_index,
-                    blur_scale,
-                    depth_reject,
                     max_roughness,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
