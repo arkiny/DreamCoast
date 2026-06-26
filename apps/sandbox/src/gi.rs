@@ -57,6 +57,7 @@ impl GiSystem {
                     compute_entry: "csMain",
                     push_constant_size: pcsize,
                     bindless: true,
+                    uniform_buffer: false,
                     threads_per_group: [8, 8, 1],
                 },
             )?))

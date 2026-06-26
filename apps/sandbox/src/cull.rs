@@ -73,6 +73,7 @@ impl CullSystem {
             compute_entry: "csReset",
             push_constant_size: 128,
             bindless: true,
+            uniform_buffer: false,
             threads_per_group: [1, 1, 1],
         })?;
         let cull_cs = load_compute_shader(
@@ -87,6 +88,7 @@ impl CullSystem {
             compute_entry: "csCull",
             push_constant_size: 128,
             bindless: true,
+            uniform_buffer: false,
             threads_per_group: [64, 1, 1],
         })?;
         // The cull-draw pipeline draws the GPU-culled list indirectly, so it is

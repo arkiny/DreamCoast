@@ -715,7 +715,12 @@ fn create_globals(
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
+            // COMPUTE: a compute pass may bind the globals UBO (Stage C7 reflections).
+            .stage_flags(
+                vk::ShaderStageFlags::VERTEX
+                    | vk::ShaderStageFlags::FRAGMENT
+                    | vk::ShaderStageFlags::COMPUTE,
+            )];
         let layout_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         let layout = device
             .create_descriptor_set_layout(&layout_ci, None)

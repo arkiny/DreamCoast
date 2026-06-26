@@ -47,6 +47,7 @@ impl ParticleSystem {
             compute_entry: "csMain",
             push_constant_size: 24, // read_index + write_index + count + dt + time + init
             bindless: true,
+            uniform_buffer: false,
             threads_per_group: [64, 1, 1],
         })?;
         // The draw pipeline vertex-pulls from the compute-written buffer, so it only

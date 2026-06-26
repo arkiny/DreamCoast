@@ -334,6 +334,7 @@ pub struct D3d12ComputePipeline {
     root_signature: ID3D12RootSignature,
     pso: ID3D12PipelineState,
     bindless: bool,
+    uniform_buffer: bool,
 }
 
 impl D3d12ComputePipeline {
@@ -357,6 +358,7 @@ impl D3d12ComputePipeline {
                 root_signature,
                 pso,
                 bindless: desc.bindless,
+                uniform_buffer: desc.uniform_buffer,
             })
         }
     }
@@ -371,6 +373,10 @@ impl D3d12ComputePipeline {
 
     pub(crate) fn is_bindless(&self) -> bool {
         self.bindless
+    }
+
+    pub(crate) fn uses_uniform(&self) -> bool {
+        self.uniform_buffer
     }
 }
 
@@ -392,7 +398,11 @@ fn create_compute_root_signature(
             );
         }
         let ranges = bindless_ranges();
-        let params = [
+        // params[0] = bindless table, params[1] = 32-bit root constants (b0), and the
+        // optional params[2] = root CBV (b1) for the per-frame globals — the same layout
+        // as the graphics root signature, so a compute pass can opt into the globals UBO
+        // (Stage C7 reflection reprojection) via `uniform_buffer`.
+        let mut params = vec![
             D3D12_ROOT_PARAMETER {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                 Anonymous: D3D12_ROOT_PARAMETER_0 {
@@ -415,6 +425,18 @@ fn create_compute_root_signature(
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
         ];
+        if desc.uniform_buffer {
+            params.push(D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR {
+                        ShaderRegister: 1,
+                        RegisterSpace: 0,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         let sampler = D3D12_STATIC_SAMPLER_DESC {
             Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
             AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,

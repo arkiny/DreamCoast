@@ -100,6 +100,7 @@ impl GdfSystem {
                     compute_entry: entry,
                     push_constant_size: pcsize,
                     bindless: true,
+                    uniform_buffer: false,
                     threads_per_group: tg,
                 },
             )?))
