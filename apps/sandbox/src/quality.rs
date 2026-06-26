@@ -1,0 +1,138 @@
+//! RenderQuality tiers (Phase 11 Stage D) — the single source of truth that maps a
+//! quality tier to the quality knobs that were previously scattered across `main.rs`
+//! as ad-hoc `env.unwrap_or(<hardcoded>)` defaults.
+//!
+//! Selection: `RENDER_QUALITY=low|med|high` (unset / unknown => `Med`). `Med` reproduces
+//! the historical defaults byte-for-byte (the no-regression target), so an unset env is
+//! identical to before this module existed.
+//!
+//! Seam preserved: this module only supplies *defaults*. Every consumer still reads its
+//! individual env var first and falls back to the preset (`env.unwrap_or(preset.x)`), so an
+//! explicit `P11_*` / `SHADOW_*` override always wins over the tier. The tier is a thin
+//! selection layer — no rendering logic lives here, and capability gates stay at the call site.
+//!
+//! Design rules (CLAUDE.md): default tier = cheapest *accurate* path; heavy features opt in at
+//! higher tiers; one place owns the tier→knob table; measurement-rejected knobs are excluded
+//! (`P11_GDF_DIM` resolution, `CARD_TILE` — see `docs/reflection-sdf-resolution.md`).
+
+/// Render quality tier. `Med` is the default (unset env) and matches the legacy behavior.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RenderQuality {
+    /// Low-end fallback: heavy reflection/GI features off, fewer samples, cheaper SSR.
+    Low,
+    /// Default — byte-identical to the pre-tier behavior (no-regression baseline).
+    Med,
+    /// Quality: opt-in surface cache / GDF AO, doubled GI samples, aesthetic soft shadows.
+    High,
+}
+
+impl RenderQuality {
+    /// Resolve the active tier from `RENDER_QUALITY` (unset / unrecognized => `Med`).
+    pub fn from_env() -> Self {
+        match std::env::var("RENDER_QUALITY")
+            .ok()
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("low") => RenderQuality::Low,
+            Some("high") => RenderQuality::High,
+            _ => RenderQuality::Med,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RenderQuality::Low => "low",
+            RenderQuality::Med => "med",
+            RenderQuality::High => "high",
+        }
+    }
+}
+
+/// Per-tier default values for the quality knobs. The ONE place the tier→knob mapping lives;
+/// every field is overridable by its individual env var at the consumer site.
+pub struct QualityPreset {
+    /// C3 hemisphere rays per pixel (`P11_GI_SPP`).
+    pub gi_spp: u32,
+    /// C4 spatio-temporal GI denoise (`P11_GI_DENOISE`).
+    pub gi_denoise: bool,
+    /// C8g reflection hit cache (`P11_REFLECT_CACHE`).
+    pub reflect_cache: bool,
+    /// C8b3 GI surface-cache multibounce lookup (`P11_SURFACE_CACHE`) — heavy, High only.
+    pub surface_cache: bool,
+    /// SSR mode: stochastic half-res glossy path vs full-res mirror (`P11_SSR_STOCHASTIC`).
+    pub ssr_stochastic: bool,
+    /// C8d roughness above which screen-mirror SSR fades to the GDF fallback (`P11_REFLECT_MAX_ROUGHNESS`).
+    pub reflect_max_roughness: f32,
+    /// C2 GDF ambient occlusion (`P11_GDF_AO`).
+    pub gdf_ao: bool,
+    /// Firefly clamp on the reflection/GI radiance (`P11_FIREFLY_CLAMP`).
+    pub firefly_clamp: bool,
+    /// PCSS-lite penumbra scale; 0 = hard 3x3 PCF (`SHADOW_SOFTNESS`).
+    pub shadow_softness: f32,
+    /// Soft-shadow blocker/PCF tap count, written to `globals.shadow.w` (`SHADOW_TAPS`).
+    /// Only consumed by the soft path (softness > 0); clamped to [1, 16] (POISSON16) in the shader.
+    pub shadow_taps: u32,
+}
+
+/// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
+pub fn preset(q: RenderQuality) -> QualityPreset {
+    match q {
+        // Low-end fallback: reflection hit cache off, cheap stochastic half-res SSR, half the
+        // GI samples, lower reflection roughness cutoff (GDF takes over sooner). Hard shadows.
+        RenderQuality::Low => QualityPreset {
+            gi_spp: 4,
+            gi_denoise: true,
+            reflect_cache: false,
+            surface_cache: false,
+            ssr_stochastic: true,
+            reflect_max_roughness: 0.3,
+            gdf_ao: false,
+            firefly_clamp: true,
+            shadow_softness: 0.0,
+            shadow_taps: 8,
+        },
+        // Default — identical to the pre-tier behavior. Do not change without re-baselining no-reg.
+        RenderQuality::Med => QualityPreset {
+            gi_spp: 8,
+            gi_denoise: true,
+            reflect_cache: true,
+            surface_cache: false,
+            ssr_stochastic: false,
+            reflect_max_roughness: 0.5,
+            gdf_ao: false,
+            firefly_clamp: true,
+            shadow_softness: 0.0,
+            shadow_taps: 16,
+        },
+        // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
+        // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
+        RenderQuality::High => QualityPreset {
+            gi_spp: 16,
+            gi_denoise: true,
+            reflect_cache: true,
+            surface_cache: true,
+            ssr_stochastic: false,
+            reflect_max_roughness: 0.6,
+            gdf_ao: true,
+            firefly_clamp: true,
+            shadow_softness: 0.03,
+            shadow_taps: 16,
+        },
+    }
+}
+
+/// Resolve a boolean knob: explicit env (`0`/`false`/`off` => false, any other value => true)
+/// overrides the tier default; unset => `tier_default`. Replaces the old presence-only
+/// (`var_os(..).is_some()`) toggles so a higher tier's on-by-default can still be turned off
+/// via env (e.g. `P11_GDF_AO=0` on High), keeping the override seam symmetric.
+pub fn env_bool(name: &str, tier_default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "off")
+        }
+        Err(_) => tier_default,
+    }
+}

@@ -178,10 +178,11 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
 }
 
 // --- Soft-shadow quality tier (the scalability seam): one place to swap counts.
-// A future RenderQuality{low,med,high} just picks these; `light_size` (globals.shadow.z,
-// 0 = hard) is the per-frame tunable / off switch.
-static const int SHADOW_BLOCKER_SAMPLES = 16;
-static const int SHADOW_PCF_SAMPLES = 16;
+// RenderQuality{low,med,high} drives the per-frame tap count via `globals.shadow.w`
+// (0/out-of-range => SHADOW_MAX_SAMPLES, the legacy default). `light_size`
+// (globals.shadow.z, 0 = hard) is the penumbra scale / off switch. POISSON16 caps the
+// tap count at 16, so SHADOW_MAX_SAMPLES is the array bound, not a tier knob.
+static const int SHADOW_MAX_SAMPLES = 16;
 static const float SHADOW_SEARCH_UV = 0.012; // blocker-search disk radius (shadow-map UV)
 static const float SHADOW_MAX_PENUMBRA = 0.015; // clamp so a far caster can't over-blur
 
@@ -249,10 +250,16 @@ float sun_shadow(float3 world_pos, float2 pix)
         return sum / 9.0;
     }
 
+    // Soft-shadow tap count from the RenderQuality tier (globals.shadow.w). 0 / out-of-range
+    // falls back to the array bound, so an unset slot reproduces the legacy 16-tap behavior.
+    int taps = int(globals.shadow.w);
+    if (taps < 1 || taps > SHADOW_MAX_SAMPLES)
+        taps = SHADOW_MAX_SAMPLES;
+
     // 1) Blocker search over a fixed disk; average the occluders' depth.
     float blocker_sum = 0.0;
     int blocker_n = 0;
-    for (int i = 0; i < SHADOW_BLOCKER_SAMPLES; ++i)
+    for (int i = 0; i < taps; ++i)
     {
         float2 o = mul(rot, POISSON16[i]) * SHADOW_SEARCH_UV;
         float d = g.textures[pc.shadow_index].Sample(g.samp, uv + o).r;
@@ -271,12 +278,12 @@ float sun_shadow(float3 world_pos, float2 pix)
 
     // 3) PCF over the penumbra radius.
     float sum = 0.0;
-    for (int i = 0; i < SHADOW_PCF_SAMPLES; ++i)
+    for (int i = 0; i < taps; ++i)
     {
         float2 o = mul(rot, POISSON16[i]) * radius;
         sum += shadow_tap(uv + o, current);
     }
-    return sum / float(SHADOW_PCF_SAMPLES);
+    return sum / float(taps);
 }
 
 // One light's contribution. `radiance` already folds color * intensity * atten.
