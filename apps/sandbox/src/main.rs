@@ -1211,8 +1211,7 @@ impl App {
             let dist = radius * 4.5;
             let pitch = self.diag_pitch.unwrap_or(0.18); // slight elevation by default
             let (sp, cp) = (pitch.sin(), pitch.cos());
-            let eye = center
-                + dist * Vec3::new(cp * self.angle.cos(), sp, cp * self.angle.sin());
+            let eye = center + dist * Vec3::new(cp * self.angle.cos(), sp, cp * self.angle.sin());
             (center, eye)
         } else {
             let focus = Vec3::new(0.0, self.model_radius * 0.6, 0.0);
