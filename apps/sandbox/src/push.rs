@@ -699,6 +699,66 @@ pub(crate) fn ssr_push(
     pc
 }
 
+/// Pack the Phase 11 Stage C6 GDF-reflection push block (176 bytes). Layout: inv_view_proj
+/// 64, cam_pos 16, sun dir+intensity 16, then four uints depth/normal/gdf_sampled/out 16,
+/// then width/height/flip_y/pad 16, then aabb_min.xyz+ground_y 16, aabb_max.xyz+clamp 16,
+/// and ray_max_dist/hit_albedo/sky_fill/bias 16.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gdf_reflect_push(
+    inv_view_proj: &[f32; 16],
+    cam_pos: Vec3,
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    depth_index: u32,
+    normal_index: u32,
+    gdf_sampled: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+    ground_y: f32,
+    dist_clamp: f32,
+    ray_max_dist: f32,
+    hit_albedo: f32,
+    sky_fill: f32,
+    bias: f32,
+) -> [u8; 176] {
+    let mut pc = [0u8; 176];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&cam_pos.x.to_le_bytes());
+    pc[68..72].copy_from_slice(&cam_pos.y.to_le_bytes());
+    pc[72..76].copy_from_slice(&cam_pos.z.to_le_bytes());
+    let sun = normalize3(sun_dir);
+    pc[80..84].copy_from_slice(&sun[0].to_le_bytes());
+    pc[84..88].copy_from_slice(&sun[1].to_le_bytes());
+    pc[88..92].copy_from_slice(&sun[2].to_le_bytes());
+    pc[92..96].copy_from_slice(&sun_intensity.to_le_bytes());
+    pc[96..100].copy_from_slice(&depth_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&normal_index.to_le_bytes());
+    pc[104..108].copy_from_slice(&gdf_sampled.to_le_bytes());
+    pc[108..112].copy_from_slice(&out_index.to_le_bytes());
+    pc[112..116].copy_from_slice(&width.to_le_bytes());
+    pc[116..120].copy_from_slice(&height.to_le_bytes());
+    pc[120..124].copy_from_slice(&flip_y.to_le_bytes());
+    for (i, v) in aabb_min.iter().enumerate() {
+        pc[128 + i * 4..132 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[140..144].copy_from_slice(&ground_y.to_le_bytes());
+    for (i, v) in aabb_max.iter().enumerate() {
+        pc[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[156..160].copy_from_slice(&dist_clamp.to_le_bytes());
+    pc[160..164].copy_from_slice(&ray_max_dist.to_le_bytes());
+    pc[164..168].copy_from_slice(&hit_albedo.to_le_bytes());
+    pc[168..172].copy_from_slice(&sky_fill.to_le_bytes());
+    pc[172..176].copy_from_slice(&bias.to_le_bytes());
+    pc
+}
+
 /// Pack the path-tracer push block (Phase 8 M4, 128 bytes): inv_view_proj (64) +
 /// cam_pos (16) + sun dir+intensity (16) + (out, accum, inst, frame) (16) +
 /// (width, height, flip_y, spp) (16).

@@ -369,6 +369,8 @@ struct App {
     prev_view_proj: [f32; 16],
     /// C5: screen-space reflections (viz; C7 will composite into lighting).
     gdf_ssr: bool,
+    /// C6: GDF reflections (off-screen fallback viz; C7 composites SSR→GDF→sky).
+    gdf_reflect: bool,
     /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
     scene_gdf_baked: bool,
     path_trace_pipeline: bool,
@@ -669,6 +671,10 @@ impl App {
                 .unwrap_or(true);
         // C5 screen-space reflections (viz toggle).
         let gdf_ssr = reflect.has_ssr() && std::env::var_os("P11_SSR").is_some();
+        // C6 GDF reflections (off-screen fallback viz toggle).
+        let gdf_reflect = reflect.has_gdf_reflect()
+            && gdf.has_scene_sdf()
+            && std::env::var_os("P11_GDF_REFLECT").is_some();
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -799,6 +805,7 @@ impl App {
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
             gdf_ssr,
+            gdf_reflect,
             scene_gdf_baked: false,
             path_trace_pipeline,
             realtime_env: true,
@@ -1001,6 +1008,7 @@ impl App {
                 gdf_gi,
                 gi_denoise,
                 gdf_ssr,
+                gdf_reflect,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1158,6 +1166,12 @@ impl App {
                             ui.checkbox("Screen-space reflections (viz)", gdf_ssr);
                             if *gdf_ssr {
                                 ui.text_disabled("  - Stage C5: SSR buffer (C7 composites)");
+                            }
+                        }
+                        if reflect.has_gdf_reflect() && gdf.has_scene_sdf() {
+                            ui.checkbox("GDF reflections (viz)", gdf_reflect);
+                            if *gdf_reflect {
+                                ui.text_disabled("  - Stage C6: SSR-miss fallback (sky on escape)");
                             }
                         }
                     }
@@ -1372,16 +1386,17 @@ impl App {
         // trace (whichever runs first bakes).
         let scene_gdf_vol = self.gdf.scene_gdf_volume();
         let (scene_aabb_min, scene_aabb_max) = self.gdf.scene_aabb();
-        let scene_gdf_ext = if (self.gdf_ao || self.gdf_gi) && scene_gdf_vol.is_some() {
-            let ext = graph.import_external("scene_gdf");
-            if !self.scene_gdf_baked {
-                self.gdf.record_scene_bake(&mut graph, ext);
-                self.scene_gdf_baked = true;
-            }
-            Some(ext)
-        } else {
-            None
-        };
+        let scene_gdf_ext =
+            if (self.gdf_ao || self.gdf_gi || self.gdf_reflect) && scene_gdf_vol.is_some() {
+                let ext = graph.import_external("scene_gdf");
+                if !self.scene_gdf_baked {
+                    self.gdf.record_scene_bake(&mut graph, ext);
+                    self.scene_gdf_baked = true;
+                }
+                Some(ext)
+            } else {
+                None
+            };
         // Stage C2: GDF ambient occlusion, multiplied into the lighting ambient term.
         let gdf_ao_out = match (self.gdf_ao, scene_gdf_vol, scene_gdf_ext) {
             (true, Some(vol), Some(ext)) => Some(self.gi.record_ao(
@@ -1692,9 +1707,45 @@ impl App {
             None
         };
 
+        // Phase 11 Stage C6: GDF reflections (off-screen fallback). A standalone viz of
+        // the GDF-traced reflection buffer (sky on escape), raw radiance like the C1
+        // trace; C7 will composite it under SSR. Only when the other replacements are off.
+        let reflect_out = match (
+            self.gdf_reflect
+                && rt_out.is_none()
+                && sdf_out.is_none()
+                && vol_out.is_none()
+                && bake_out.is_none()
+                && gdf_out.is_none()
+                && gdf_trace_out.is_none()
+                && scene_gdf_out.is_none()
+                && ssr_out.is_none(),
+            scene_gdf_vol,
+            scene_gdf_ext,
+        ) {
+            (true, Some(vol), Some(ext)) => Some(self.reflect.record_gdf_reflect(
+                &mut graph,
+                vol,
+                ext,
+                scene_aabb_min,
+                scene_aabb_max,
+                g_depth,
+                g_normal,
+                extent,
+                inv_view_proj,
+                eye,
+                self.sun_dir,
+                self.sun_intensity,
+                cw,
+                ch,
+                self.flip_y,
+            )),
+            _ => None,
+        };
+
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active, else
         // the SW-RT SDF trace, else the Stage-B volume slice, else the Stage-C1 scene
-        // GDF, else the Stage-C5 SSR viz, else compute-post, else HDR.
+        // GDF, else the Stage-C5 SSR / C6 GDF-reflection viz, else compute-post, else HDR.
         let tonemap_src = rt_out
             .or(sdf_out)
             .or(vol_out)
@@ -1703,18 +1754,22 @@ impl App {
             .or(gdf_trace_out)
             .or(scene_gdf_out)
             .or(ssr_out)
+            .or(reflect_out)
             .or(hdr_post)
             .unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the
         // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
         // exposure here before the filmic curve (else the bright sky + sun blow out).
-        let tm_exposure =
-            if pt_active || sdf_out.is_some() || gdf_trace_out.is_some() || scene_gdf_out.is_some()
-            {
-                self.exposure
-            } else {
-                1.0
-            };
+        let tm_exposure = if pt_active
+            || sdf_out.is_some()
+            || gdf_trace_out.is_some()
+            || scene_gdf_out.is_some()
+            || reflect_out.is_some()
+        {
+            self.exposure
+        } else {
+            1.0
+        };
         self.deferred.record_tonemap(
             &mut graph,
             backbuffer,
