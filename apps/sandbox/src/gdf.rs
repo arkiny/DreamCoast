@@ -20,7 +20,9 @@ use rhi::{
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::mesh::{index_bytes, vertex_bytes};
-use crate::push::{gdf_merge_push, gdf_trace_push, sdf_bake_push, sdf_trace_push, volume_push};
+use crate::push::{
+    gdf_ao_push, gdf_merge_push, gdf_trace_push, sdf_bake_push, sdf_trace_push, volume_push,
+};
 
 /// Volume edge length in voxels (cube). The bake/merge/view all share it.
 const VOLUME_DIM: u32 = 64;
@@ -35,6 +37,7 @@ pub(crate) struct GdfSystem {
     bake_pipeline: Option<ComputePipeline>,  // B2 per-mesh SDF bake
     merge_pipeline: Option<ComputePipeline>, // B3 instance merge
     trace_pipeline: Option<ComputePipeline>, // B4 GDF sphere-march
+    ao_pipeline: Option<ComputePipeline>,    // C2 GDF ambient occlusion
     sdf_pipeline: Option<ComputePipeline>,   // Stage-A analytic sphere-march
     bake_vtx: Option<StorageBuffer>,
     bake_idx: Option<StorageBuffer>,
@@ -147,6 +150,15 @@ impl GdfSystem {
             160,
             [8, 8, 1],
         )?;
+        let ao_pipeline = compute(
+            "csMain",
+            dreamcoast_shader::gdf_ao_cs_spirv,
+            dreamcoast_shader::gdf_ao_cs_dxil,
+            dreamcoast_shader::gdf_ao_cs_metallib,
+            "gdf_ao",
+            144,
+            [8, 8, 1],
+        )?;
         let sdf_pipeline = compute(
             "csMain",
             dreamcoast_shader::sdf_trace_cs_spirv,
@@ -241,6 +253,7 @@ impl GdfSystem {
             bake_pipeline,
             merge_pipeline,
             trace_pipeline,
+            ao_pipeline,
             sdf_pipeline,
             bake_vtx,
             bake_idx,
@@ -407,7 +420,92 @@ impl GdfSystem {
         );
     }
 
+    /// Stage C2: compute GDF ambient occlusion for the deferred render. Builds the
+    /// fused scene GDF once (shared with the C1 trace via the caller's `build` flag),
+    /// then a full-screen compute pass reconstructs each pixel's world surface point
+    /// from the depth G-buffer, marches the scene GDF along the world normal, and
+    /// writes an AO factor [0,1] into a storage image the lighting pass multiplies into
+    /// its ambient term. World position comes from depth (not the object-space position
+    /// MRT) so transformed objects line up with the world-space GDF. Returns the AO
+    /// storage image.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_gdf_ao<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        depth: ResourceId,
+        normal: ResourceId,
+        extent: Extent2D,
+        inv_view_proj: [f32; 16],
+        cw: u32,
+        ch: u32,
+        flip_y: u32,
+        build: bool,
+    ) -> ResourceId {
+        let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
+        let aop = self.ao_pipeline.as_ref().expect("gdf ao pipeline");
+        let out = graph.create_storage_image("gdf_ao_out", HDR_FORMAT, extent);
+        let gdf_ext = graph.import_external("scene_gdf");
+        let aabb_min = self.scene_aabb_min;
+        let aabb_max = self.scene_aabb_max;
+        if build {
+            self.record_scene_bake(graph, gdf_ext);
+        }
+        let sampled = vol.sampled_index();
+        // The scene extent sets the world-unit AO scale: a fraction of the AABB diagonal
+        // for the sampling reach + a small surface bias, with the clamp = full diagonal
+        // (exceeds the field's true max, so a query never wrongly clamps).
+        let diag = {
+            let d = [
+                aabb_max[0] - aabb_min[0],
+                aabb_max[1] - aabb_min[1],
+                aabb_max[2] - aabb_min[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        let reach = diag * 0.07;
+        let bias = diag * 0.004;
+        let strength = 1.6;
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "gdf_ao",
+                storage_writes: vec![out],
+                reads: vec![depth, normal, gdf_ext],
+            },
+            move |ctx| {
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(vol);
+                cmd.bind_compute_pipeline(aop);
+                cmd.push_constants_compute(&gdf_ao_push(
+                    &inv_view_proj,
+                    depth_index,
+                    normal_index,
+                    sampled,
+                    out_index,
+                    cw,
+                    ch,
+                    flip_y,
+                    aabb_min,
+                    aabb_max,
+                    0.0, // world ground plane at y = 0
+                    diag,
+                    reach,
+                    strength,
+                    bias,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
     // Feature-availability predicates (drive the UI checkboxes + toggle defaults).
+    pub(crate) fn has_gdf_ao(&self) -> bool {
+        self.ao_pipeline.is_some() && self.scene_gdf.is_some()
+    }
     pub(crate) fn has_sdf_trace(&self) -> bool {
         self.sdf_pipeline.is_some()
     }
@@ -606,8 +704,8 @@ impl GdfSystem {
                     mode,
                     [0.0, 0.0, 0.0], // unit-cube GDF extent (B4)
                     [1.0, 1.0, 1.0],
-                    0.2,             // ground plane height
-                    0.6,             // sample clamp (> unit-cube field max)
+                    0.2, // ground plane height
+                    0.6, // sample clamp (> unit-cube field max)
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

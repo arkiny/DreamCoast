@@ -288,6 +288,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gdf_trace_cs",
     },
+    // Phase 11 Stage C (C2): GDF ambient occlusion into the deferred render.
+    Job {
+        src: "gdf_ao.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_ao_cs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.

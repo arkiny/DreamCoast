@@ -35,7 +35,10 @@ struct PushConstants
     uint position_index;
     uint flip_y; // 0 = D3D12 (Y up), 1 = Vulkan (Y down)
     uint shadow_index; // bindless index of the directional shadow map
+    uint gdf_ao_index; // Stage-C2 GDF AO image (0xFFFFFFFF = absent)
 };
+
+static const uint NO_TEXTURE = 0xFFFFFFFF;
 
 // Must match the Rust `Globals` layout (all float4 / int4 for std140/cbuffer
 // agreement between Vulkan and D3D12).
@@ -271,11 +274,18 @@ float4 fsMain(VSOutput input) : SV_Target
         lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
     }
 
-    float3 ambient = ambient_ibl(n, v, world_pos, albedo, metallic, roughness, ao, f0);
+    // Stage C2: GDF ambient occlusion, marched against the world-space scene GDF in a
+    // prior compute pass. Multiplies into the ambient/IBL term only (direct light keeps
+    // its own shadow-mapped visibility). Absent (index 0xFFFFFFFF) -> unoccluded.
+    float gdf_ao = 1.0;
+    if (pc.gdf_ao_index != NO_TEXTURE)
+        gdf_ao = g.textures[pc.gdf_ao_index].Sample(g.samp, input.uv).r;
+
+    float3 ambient = ambient_ibl(n, v, world_pos, albedo, metallic, roughness, ao, f0) * gdf_ao;
     float3 color = (ambient + lo) * globals.ambient.a; // a = exposure
 
     // Debug views (counts.y): 1 albedo, 2 normal, 3 metallic, 4 roughness,
-    // 5 world pos, 6 AO, 7 direct light, 8 IBL ambient. 0 = lit.
+    // 5 world pos, 6 AO, 7 direct light, 8 IBL ambient, 9 GDF AO. 0 = lit.
     int dbg = globals.counts.y;
     if (dbg == 1) color = albedo;
     else if (dbg == 2) color = n * 0.5 + 0.5;
@@ -285,6 +295,7 @@ float4 fsMain(VSOutput input) : SV_Target
     else if (dbg == 6) color = float3(ao);
     else if (dbg == 7) color = lo * globals.ambient.a;      // direct lighting only
     else if (dbg == 8) color = ambient * globals.ambient.a; // IBL ambient only
+    else if (dbg == 9) color = float3(gdf_ao);              // GDF AO factor
 
     return float4(color, 1.0);
 }

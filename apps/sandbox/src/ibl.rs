@@ -271,7 +271,14 @@ impl IblSystem {
         {
             let gen_cmd = device.create_command_buffer()?;
             let gen_fence = device.create_fence(false)?;
-            generate_brdf_lut(queue, &gen_cmd, &gen_fence, &brdf_pipeline, &brdf_lut, flip_y)?;
+            generate_brdf_lut(
+                queue,
+                &gen_cmd,
+                &gen_fence,
+                &brdf_pipeline,
+                &brdf_lut,
+                flip_y,
+            )?;
         }
 
         Ok(Self {

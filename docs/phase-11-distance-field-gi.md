@@ -166,9 +166,25 @@ Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실
   march의 SPIR-V/DXIL sub-ULP step 차이, 거리장 자체는 동일). 기본 래스터/B4 무회귀(default 1px, B4 17px).
   한계: 48³ 복셀화 패싯 + 단위큐브 튜닝된 march/AO 상수(C2에서 G-buffer march로 정밀화).
 
-### C2 — GDF AO → 디퍼드 ambient (다음)
-- G-buffer(월드 pos+노멀)에서 씬 GDF를 ray-march해 AO 산출 → 라이팅 패스의 ambient/IBL 항에 곱셈 합성.
-  GDF가 실제 렌더에 처음 영향. 패스트레이서 AO 레퍼런스 대조.
+### C2 — GDF AO → 디퍼드 ambient ✅ (양 백엔드 검증)
+- 풀스크린 컴퓨트 패스(`gdf_ao.slang`, `gdf_ao_cs`)가 픽셀별로 씬 GDF를 march해 AO[0,1]를 storage
+  image에 출력 → 디퍼드 라이팅(`pbr.slang`)이 ambient/IBL 항에만 곱셈 합성(직접광은 기존 섀도우맵 가시성
+  유지). **GDF가 실제 렌더에 처음 영향.** 토글 env `P11_GDF_AO` + UI "GDF ambient occlusion (deferred)",
+  디버그뷰 9 "GDF AO".
+- **월드 좌표는 depth G-buffer에서 재구성**(`inv_view_proj·(ndc, depth)`), G-buffer position MRT가
+  **아니라**. 래스터라이저가 모델 행렬을 클립 위치에만 접어 넣어 position MRT는 오브젝트 공간 →
+  변환된 오브젝트(구·큐브)가 월드 GDF와 어긋남. depth 재구성은 모든 오브젝트에 균일하게 참 월드점을 주며
+  C1 primary-ray 경로와 동일. 월드 노멀은 G-buffer 그대로(샘플 씬 변환=이동+균등스케일이라 방향 보존).
+  AO march: IQ 5-tap, reach=AABB대각×0.07, bias=대각×0.004, strength=1.6(월드 스케일 튜닝, 호스트 상수).
+  bake-once 래치는 C1 트레이스와 공유(`scene_gdf_baked`).
+- 라이팅 push 24→28B(+`gdf_ao_index`, 부재 시 `0xFFFFFFFF`→곱 1.0=무회귀). AO 패스는 graph에서
+  gbuffer→AO→lighting 순서(depth+normal sampled read, AO storage write, scene GDF 1회 bake).
+- **검증(RTX 2070 SUPER):** build+fmt+clippy(-D warnings) 클린. 오브젝트 접촉부에 소프트 컨택트 AO가
+  ground ambient를 어둡게(아보카도·구·큐브 밑면). **VK≡DX 픽셀 동일**(AO on/off 둘 다 mean 0.0001/ch,
+  max 1, >2px 0/921600 — 결정적 컴퓨트). AO on vs off는 59,271px 국소 변경(접촉부, mean 1.50/ch max240).
+  AO-off는 pre-C2와 동일(곱 1.0). Vulkan VUID 0, D3D12 클린.
+  한계: 48³ 복셀화로 AO 저주파(soft); per-pixel cone-trace나 클립맵 고해상은 후속. 패스트레이서 AO 정량
+  대조는 미수행(시각적 타당성으로 확인).
 
 ### C3 — 디퓨즈 GI 1바운스 (stochastic)
 - G-buffer 표면에서 코사인-반구 레이를 GDF에 sphere-trace → 히트 셰이딩 → 간접 디퓨즈 누적(노이지).
