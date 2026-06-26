@@ -1903,11 +1903,14 @@ impl App {
                     ssr,
                     gdf_refl,
                     g_material,
+                    g_depth,
                     extent,
                     cw,
                     ch,
                     1.0,
                     firefly_max,
+                    70.0,  // GDF prefilter radius (px) per unit roughness (glossy reflections)
+                    0.006, // same-surface NDC-depth threshold for a prefilter tap
                 ))
             }
             _ => None,
@@ -2302,11 +2305,14 @@ impl App {
                     ssr,
                     gdf_refl,
                     g_material,
+                    g_depth,
                     extent,
                     cw,
                     ch,
                     1.0,
                     firefly_max,
+                    70.0,  // GDF prefilter radius (px) per unit roughness (glossy reflections)
+                    0.006, // same-surface NDC-depth threshold for a prefilter tap
                 );
                 // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
                 self.reflect.record_lit_history(

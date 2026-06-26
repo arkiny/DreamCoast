@@ -450,8 +450,25 @@ Vulkan에서 firefly clamp/캐시 인덱스가 undefined로 전달되던 버그;
 - **디스오클루전(검토):** 컴포짓의 half-res→full-res bilinear 업샘플은 실루엣서 전경/배경 섞임 가능하나,
   러프니스 게이트가 샤프 금속(주요 실루엣)을 GDF로 보내고 `ssr.a` 엣지-페이드가 약화 → 현 측정선 잔차 미미.
   깊이-aware bilateral 업샘플은 측정 이득 불확실 → 보류.
+**C8c2 ✅ — GDF 러프니스 프리필터 (글로시 반사가 PT만큼 블러):** C8c가 샤프 금속을 GDF로 라우팅했는데
+**GDF reflect는 단일 sphere-trace = 항상 미러(러프니스 무반영)** → 코퍼(러프0.35)가 PT 대비 너무 선명
+(사용자 지적). 사용자 방향 = "라이팅 잘 정리". **수정 = 컴포짓에서 GDF를 러프니스로 프리필터**(블렌드와
+분리: "어느 소스" vs "얼마나 블러"). `reflect_composite.slang`에 **러프니스 적응 bilateral 게더** 추가 —
+반경 `min(roughness·blur_scale, 30px)`(`blur_scale=70`), **3링 36탭 Poisson**(와이드 반경서 밴딩 방지),
+**깊이 가중**(`|Δz|>depth_reject`나 배경(z≥1) 탭 제외 → 실루엣 누출 차단), **`roughness>0.12` 게이트**
+(near-미러는 게더 skip = 크리스프 유지 + 비용 0). SSR은 resolve가 이미 러프니스-프리필터하므로 그대로.
+push 32→48B(+depth_index/blur_scale/depth_reject), `record_composite`에 `g_depth`. **결과:** 코퍼가
+PT처럼 글로시(스카이/바닥 밴드가 매끈한 로브로 블렌드), 크롬은 크리스프 유지 — `docs/images/
+copper-roughness-prefilter.png`(샤프미러|프리필터|PT). hybrid-vs-PT **3.42→3.35/ch**(>32 2.03→1.88%;
+코퍼는 화면 소수 픽셀이라 총합 변화는 작지만 지각 개선은 큼). **VK VUID 0 / DX clean, VK≡DX 0.394/ch**
+(프리필터는 결정적 = 발산 무추가), **레거시 바이트 동일(max1)=무회귀.** **비용:** `reflect_composite`
+0.029→0.206ms(36탭 게더가 글로시 픽셀=대부분 바닥 위에서 실행; 반경캡+러프니스 게이트로 억제) — 절대값
+작음(프레임은 gdf_gi 4.2ms 지배). **시도했다 폐기:** per-pixel 회전 디더(24탭으로 밴딩 제거)는 텍스처
+캐시 스캐터로 0.15→0.51ms(~2.5배) → 고정 3링이 더 빠름. **근사 한계:** 반경이 러프니스만 따름(반사
+히트 거리 미반영) — 1차 근사. 더 큰 블러/저비용은 GDF 반사 밉-피라미드 프리필터가 정공법(미구현).
 - **NEXT 후보:** SSR을 더 살리려면 lit-history 에너지 손실/밝기 공간 정합(풀-res 미러 2.58 회복) 또는
-  GDF 재조명에 포인트라이트 추가. stochastic 기본 유지(VK≡DX·perf·글로시 이점); 풀-res 미러 롤백은 보류.
+  GDF 재조명에 포인트라이트 추가. GDF 반사 밉-피라미드(매우 러프한 표면의 큰 블러 저비용). stochastic
+  기본 유지(VK≡DX·perf·글로시 이점); 풀-res 미러 롤백은 보류.
 
 **권장 순서:** C8a(저위험 컬러) 먼저 → 필요 시 C8b. C7과 독립이지만 **C8a를 C7 앞에 두면 C7 반사가 바로
 컬러**가 된다(사용자 선택: C7 → C8a, 또는 C8a → C7). C8b는 동적 오브젝트/시간변화 조명까지 정확히 가는
