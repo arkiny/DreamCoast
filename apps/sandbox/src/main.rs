@@ -382,12 +382,17 @@ struct App {
     gdf_color: bool,
     /// C8b1: viz the captured mesh-card surface-cache atlas (validation of card capture).
     cache_viz: bool,
+    /// C8b3: GDF GI / reflection consumers sample the lit surface cache (multibounce radiance)
+    /// instead of per-ray re-lighting. Drives the per-frame cache lighting too.
+    surface_cache: bool,
     /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
     scene_gdf_baked: bool,
     /// C8a bake-once latch for the per-voxel albedo volumes (GI + reflection consumers share).
     scene_albedo_baked: bool,
     /// C8b1 capture-once latch for the surface cache (static geometry capture).
     scene_cache_captured: bool,
+    /// C8b2 temporal reset for the cache lighting (true until the first lit frame).
+    scene_cache_reset: bool,
     path_trace_pipeline: bool,
     realtime_env: bool,
     multibounce: bool,
@@ -826,6 +831,10 @@ impl App {
                 .unwrap_or(true);
         // C8b1 surface-cache atlas viz (validation toggle).
         let cache_viz = gdf.has_surface_cache() && std::env::var_os("P11_CACHE_VIZ").is_some();
+        // C8b3 surface-cache consumers (multibounce radiance lookup in GI / reflections).
+        let surface_cache = gdf.has_surface_cache()
+            && gdf.has_cache_lighting()
+            && std::env::var_os("P11_SURFACE_CACHE").is_some();
         // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
         // its presence alone is the default-on condition.
         let path_trace_pipeline = rt.has_pt_pipeline();
@@ -961,9 +970,11 @@ impl App {
             swrt_reflect,
             gdf_color,
             cache_viz,
+            surface_cache,
             scene_gdf_baked: false,
             scene_albedo_baked: false,
             scene_cache_captured: false,
+            scene_cache_reset: true,
             path_trace_pipeline,
             realtime_env: true,
             multibounce: true,
@@ -1060,7 +1071,12 @@ impl App {
         // accumulation converges before the frame is captured.
         let warmup = if self.path_trace && !self.rt_debug {
             PATHTRACE_WARMUP
-        } else if self.gdf_gi && self.gi_denoise && self.gi.has_denoise() {
+        } else if (self.gdf_gi && self.gi_denoise && self.gi.has_denoise())
+            || self.cache_viz
+            || self.surface_cache
+        {
+            // The surface cache accrues a bounce per frame + temporally accumulates, like the
+            // GI denoiser — warm it up before the static screenshot.
             GI_DENOISE_WARMUP
         } else {
             SCREENSHOT_WARMUP
@@ -1170,6 +1186,7 @@ impl App {
                 swrt_reflect,
                 gdf_color,
                 cache_viz,
+                surface_cache,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -1354,9 +1371,18 @@ impl App {
                             }
                         }
                         if gdf.has_surface_cache() {
-                            ui.checkbox("Surface-cache atlas (C8b1 viz)", cache_viz);
+                            ui.checkbox("Surface-cache atlas (C8b1/2 viz)", cache_viz);
                             if *cache_viz {
-                                ui.text_disabled("  - mesh cards: captured geometry + albedo");
+                                ui.text_disabled("  - mesh cards: lit radiance (multibounce)");
+                            }
+                            if gdf.has_cache_lighting() {
+                                ui.checkbox(
+                                    "Surface cache in GI/reflections (C8b3)",
+                                    surface_cache,
+                                );
+                                if *surface_cache {
+                                    ui.text_disabled("  - cached multibounce radiance lookup");
+                                }
                             }
                         }
                     }
@@ -1584,7 +1610,8 @@ impl App {
             || self.gdf_reflect
             || self.gdf_hybrid
             || self.swrt_reflect
-            || self.cache_viz)
+            || self.cache_viz
+            || self.surface_cache)
             && scene_gdf_vol.is_some()
         {
             let ext = graph.import_external("scene_gdf");
@@ -1605,7 +1632,8 @@ impl App {
                 || self.gdf_reflect
                 || self.gdf_hybrid
                 || self.swrt_reflect
-                || self.cache_viz)
+                || self.cache_viz
+                || self.surface_cache)
             && self.gdf.has_scene_albedo()
         {
             let ext = graph.import_external("scene_albedo");
@@ -1623,12 +1651,10 @@ impl App {
             _ => None,
         };
         // C8b1: capture the mesh-card surface cache once (static geometry + albedo), reading
-        // the scene GDF (+ the C8a albedo volumes for the captured color). The handle is
-        // shared with the atlas viz below (and, later, the C8b2 cache lighting).
-        let scene_cache_ext = match (
-            self.cache_viz && self.gdf.has_surface_cache(),
-            scene_gdf_ext,
-        ) {
+        // the scene GDF (+ the C8a albedo volumes for the captured color). C8b2 then re-lights
+        // it every frame into a radiance atlas (multibounce gather from the previous frame).
+        let cache_active = (self.cache_viz || self.surface_cache) && self.gdf.has_surface_cache();
+        let scene_cache_ext = match (cache_active, scene_gdf_ext) {
             (true, Some(gdf_ext)) => {
                 let ext = graph.import_external("scene_cache");
                 if !self.scene_cache_captured {
@@ -1636,6 +1662,26 @@ impl App {
                         .record_cache_capture(&mut graph, gdf_ext, scene_albedo_ext, ext);
                     self.scene_cache_captured = true;
                 }
+                Some(ext)
+            }
+            _ => None,
+        };
+        // C8b2: re-light the cache (direct sun + sky + multibounce gather from last frame).
+        let scene_cache_lit_ext = match (scene_gdf_ext, scene_cache_ext) {
+            (Some(gdf_ext), Some(cache_ext)) if self.gdf.has_cache_lighting() => {
+                let ext = graph.import_external("scene_cache_lit");
+                self.gdf.record_cache_light(
+                    &mut graph,
+                    gdf_ext,
+                    cache_ext,
+                    ext,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    8,
+                    self.frame_no as u32,
+                    self.scene_cache_reset,
+                );
+                self.scene_cache_reset = false;
                 Some(ext)
             }
             _ => None,
@@ -2131,9 +2177,27 @@ impl App {
             _ => None,
         };
 
-        // Stage C8b1: surface-cache atlas viz — tiles the captured cards across the screen.
-        let cache_out = match (self.cache_viz, scene_cache_ext) {
-            (true, Some(ext)) => Some(self.gdf.record_cache_view(&mut graph, ext, extent, cw, ch)),
+        // Stage C8b1/2: surface-cache atlas viz — tiles the cards across the screen, showing
+        // the lit radiance (C8b2) when lighting ran, else the captured albedo (C8b1).
+        let cache_out = match (self.cache_viz, scene_cache_lit_ext, scene_cache_ext) {
+            (true, Some(lit), _) => {
+                let rad = self
+                    .gdf
+                    .surface_cache_read()
+                    .map(|t| t.2)
+                    .unwrap_or(u32::MAX);
+                Some(
+                    self.gdf
+                        .record_cache_view(&mut graph, lit, rad, extent, cw, ch),
+                )
+            }
+            (true, None, Some(cap)) => {
+                let alb = self.gdf.cache_albedo_index();
+                Some(
+                    self.gdf
+                        .record_cache_view(&mut graph, cap, alb, extent, cw, ch),
+                )
+            }
             _ => None,
         };
 
@@ -2163,6 +2227,7 @@ impl App {
             || scene_gdf_out.is_some()
             || reflect_out.is_some()
             || hybrid_out.is_some()
+            || cache_out.is_some()
         {
             self.exposure
         } else {
@@ -2305,6 +2370,10 @@ impl App {
         // C7b: advance the lit-color history ping-pong so next frame reads this frame's write.
         if self.gdf_hybrid || self.swrt_reflect {
             self.reflect.advance_history();
+        }
+        // C8b2: advance the surface-cache radiance ping-pong (next frame reads this frame's).
+        if scene_cache_lit_ext.is_some() {
+            self.gdf.advance_cache();
         }
         self.prev_view_proj = view_proj.to_cols_array();
 

@@ -23,8 +23,8 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::mesh::{index_bytes, vertex_bytes};
 use crate::push::{
-    cache_capture_push, cache_view_push, gdf_merge_push, gdf_trace_push, sdf_albedo_bake_push,
-    sdf_bake_push, sdf_trace_push, volume_push,
+    cache_capture_push, cache_light_push, cache_view_push, gdf_merge_push, gdf_trace_push,
+    sdf_albedo_bake_push, sdf_bake_push, sdf_trace_push, volume_push,
 };
 
 /// Volume edge length in voxels (cube). The bake/merge/view all share it.
@@ -73,6 +73,11 @@ pub(crate) struct GdfSystem {
     num_cards: u32,
     cache_capture_pipeline: Option<ComputePipeline>,
     cache_view_pipeline: Option<ComputePipeline>,
+    /// C8b2: ping-pong cached radiance (re-lit each frame; the gather reads last frame's for
+    /// multibounce). `cache_frame` selects the read/write pair.
+    cache_radiance: [Option<StorageBuffer>; 2],
+    cache_frame: u32,
+    cache_light_pipeline: Option<ComputePipeline>,
 }
 
 /// Surface-cache card atlas tile edge (texels per card side). 6 cards / object.
@@ -191,6 +196,16 @@ impl GdfSystem {
             "sdf_cache_view",
             32,
             [8, 8, 1],
+        )?;
+        // C8b2 surface-cache lighting (re-light texels + multibounce gather).
+        let cache_light_pipeline = compute(
+            "lightMain",
+            dreamcoast_shader::sdf_cache_light_cs_spirv,
+            dreamcoast_shader::sdf_cache_light_cs_dxil,
+            dreamcoast_shader::sdf_cache_light_cs_metallib,
+            "sdf_cache_light",
+            112,
+            [64, 1, 1],
         )?;
         let trace_pipeline = compute(
             "csMain",
@@ -315,6 +330,9 @@ impl GdfSystem {
             num_cards: 0,
             cache_capture_pipeline,
             cache_view_pipeline,
+            cache_radiance: [None, None],
+            cache_frame: 0,
+            cache_light_pipeline,
         })
     }
 
@@ -481,12 +499,127 @@ impl GdfSystem {
         };
         self.cache_pos = make()?;
         self.cache_albedo = make()?;
+        self.cache_radiance = [make()?, make()?];
         self.num_cards = num_cards;
+        self.cache_frame = 0;
         Ok(())
     }
 
     pub(crate) fn has_surface_cache(&self) -> bool {
         self.cards.is_some()
+    }
+
+    pub(crate) fn has_cache_lighting(&self) -> bool {
+        self.cache_light_pipeline.is_some()
+    }
+
+    /// Bump the cache radiance ping-pong (end-of-frame), so next frame's gather + the
+    /// consumers read the buffer this frame lit.
+    pub(crate) fn advance_cache(&mut self) {
+        self.cache_frame = self.cache_frame.saturating_add(1);
+    }
+
+    /// C8b2/3: the bindless indices a cache *reader* needs — cards, captured positions, the
+    /// radiance buffer this frame lit (write slot), plus card count + tile. `None` until the
+    /// cache + radiance buffers exist.
+    pub(crate) fn surface_cache_read(&self) -> Option<(u32, u32, u32, u32, u32)> {
+        let cards = self.cards.as_ref()?.storage_index();
+        let pos = self.cache_pos.as_ref()?.storage_index();
+        let write = (self.cache_frame % 2) as usize;
+        let rad = self.cache_radiance[write].as_ref()?.storage_index();
+        Some((cards, pos, rad, self.num_cards, CARD_TILE))
+    }
+
+    /// C8b2: re-light the surface cache this frame — direct sun (GDF soft-shadow) + sky +
+    /// an indirect gather that reads last frame's radiance (multibounce). Reads the captured
+    /// geometry (`scene_cache_ext`) + the scene GDF; writes the `lit_ext` handle (the freshly
+    /// lit radiance) the consumers / viz read. `reset` ignores the temporal history.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_cache_light<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        scene_gdf_ext: ResourceId,
+        scene_cache_ext: ResourceId,
+        lit_ext: ResourceId,
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        spp: u32,
+        frame: u32,
+        reset: bool,
+    ) {
+        let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
+        let pipe = self
+            .cache_light_pipeline
+            .as_ref()
+            .expect("cache light pipeline");
+        let cards = self.cards.as_ref().expect("cards").storage_index();
+        let cpos = self.cache_pos.as_ref().expect("cache pos").storage_index();
+        let calb = self
+            .cache_albedo
+            .as_ref()
+            .expect("cache albedo")
+            .storage_index();
+        let read = ((self.cache_frame + 1) % 2) as usize;
+        let write = (self.cache_frame % 2) as usize;
+        let rad_read = self.cache_radiance[read]
+            .as_ref()
+            .expect("rad")
+            .storage_index();
+        let rad_write = self.cache_radiance[write]
+            .as_ref()
+            .expect("rad")
+            .storage_index();
+        let num_cards = self.num_cards;
+        let num_texels = num_cards * CARD_TILE * CARD_TILE;
+        let sampled = vol.sampled_index();
+        let aabb_min = self.scene_aabb_min;
+        let aabb_max = self.scene_aabb_max;
+        let diag = {
+            let d = [
+                aabb_max[0] - aabb_min[0],
+                aabb_max[1] - aabb_min[1],
+                aabb_max[2] - aabb_min[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "sdf_cache_light",
+                storage_writes: vec![lit_ext],
+                reads: vec![scene_gdf_ext, scene_cache_ext],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(vol);
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&cache_light_push(
+                    cards,
+                    cpos,
+                    calb,
+                    rad_read,
+                    rad_write,
+                    sampled,
+                    num_cards,
+                    CARD_TILE,
+                    num_texels,
+                    spp,
+                    frame,
+                    u32::from(reset),
+                    sun_dir,
+                    sun_intensity,
+                    aabb_min,
+                    0.0,
+                    aabb_max,
+                    diag,
+                    0.25,                           // sky fill irradiance
+                    if reset { 1.0 } else { 0.35 }, // temporal alpha
+                    diag * 0.01,                    // surface bias
+                    diag,                           // gather ray max distance
+                ));
+                cmd.dispatch(num_texels.div_ceil(64), 1, 1);
+                Ok(())
+            },
+        );
     }
 
     /// C8b1: capture the surface cache once — per card texel, sphere-trace the scene GDF
@@ -562,11 +695,14 @@ impl GdfSystem {
         );
     }
 
-    /// C8b1: tile the captured surface-cache atlas across the screen (validation viz).
+    /// C8b1/2: tile a surface-cache atlas buffer across the screen (validation viz). `src`
+    /// is the buffer shown — the captured albedo (C8b1) or the lit radiance (C8b2); `src_ext`
+    /// orders the viz after whichever pass produced it.
     pub(crate) fn record_cache_view<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
-        cache_ext: ResourceId,
+        src: ResourceId,
+        src_index: u32,
         extent: Extent2D,
         cw: u32,
         ch: u32,
@@ -577,30 +713,33 @@ impl GdfSystem {
             .expect("cache view pipeline");
         let out = graph.create_storage_image("cache_view_out", HDR_FORMAT, extent);
         let cpos = self.cache_pos.as_ref().expect("cache pos").storage_index();
-        let calb = self
-            .cache_albedo
-            .as_ref()
-            .expect("cache albedo")
-            .storage_index();
         let num_cards = self.num_cards;
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "sdf_cache_view",
                 storage_writes: vec![out],
-                reads: vec![cache_ext],
+                reads: vec![src],
             },
             move |ctx| {
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&cache_view_push(
-                    cpos, calb, out_index, num_cards, CARD_TILE, cw, ch,
+                    cpos, src_index, out_index, num_cards, CARD_TILE, cw, ch,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
             },
         );
         out
+    }
+
+    /// The captured-albedo buffer index (C8b1 viz source).
+    pub(crate) fn cache_albedo_index(&self) -> u32 {
+        self.cache_albedo
+            .as_ref()
+            .map(|b| b.storage_index())
+            .unwrap_or(u32::MAX)
     }
 
     /// Stage C1: build the world-space scene GDF (fused brute-force bake, once) then SW

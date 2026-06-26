@@ -295,6 +295,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "sdf_cache_view_cs",
     },
+    // Phase 11 Stage C (C8b2): surface-cache lighting (continuous, multibounce).
+    Job {
+        src: "sdf_cache_light.slang",
+        entry: "lightMain",
+        stage: "compute",
+        key: "sdf_cache_light_cs",
+    },
     // Phase 11 Stage B (B3): merge per-mesh SDF instances into a global distance field.
     Job {
         src: "gdf_merge.slang",
