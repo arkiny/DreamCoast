@@ -406,6 +406,78 @@ pub(crate) fn sdf_albedo_bake_push(
     pc
 }
 
+/// Pack the Phase 11 Stage C8b1 surface-cache capture push block (80 bytes): cards buffer,
+/// the two output cache buffers (pos / albedo), the GDF sampled index, num_cards / tile /
+/// num_texels, the 3 C8a albedo channel indices, then float4 aabb_min / aabb_max.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cache_capture_push(
+    cards_index: u32,
+    cache_pos_index: u32,
+    cache_alb_index: u32,
+    gdf_sampled: u32,
+    num_cards: u32,
+    tile: u32,
+    num_texels: u32,
+    albedo_rgb: [u32; 3],
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+    dist_clamp: f32,
+) -> [u8; 80] {
+    let mut pc = [0u8; 80];
+    let u = [
+        cards_index,
+        cache_pos_index,
+        cache_alb_index,
+        gdf_sampled,
+        num_cards,
+        tile,
+        num_texels,
+        0,
+        albedo_rgb[0],
+        albedo_rgb[1],
+        albedo_rgb[2],
+        0,
+    ];
+    for (i, v) in u.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in aabb_min.iter().enumerate() {
+        pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in aabb_max.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[76..80].copy_from_slice(&dist_clamp.to_le_bytes());
+    pc
+}
+
+/// Pack the Phase 11 Stage C8b1 surface-cache atlas-viz push block (32 bytes).
+pub(crate) fn cache_view_push(
+    cache_pos_index: u32,
+    cache_alb_index: u32,
+    out_index: u32,
+    num_cards: u32,
+    tile: u32,
+    width: u32,
+    height: u32,
+) -> [u8; 32] {
+    let mut pc = [0u8; 32];
+    let u = [
+        cache_pos_index,
+        cache_alb_index,
+        out_index,
+        num_cards,
+        tile,
+        width,
+        height,
+        0,
+    ];
+    for (i, v) in u.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc
+}
+
 /// Pack the Phase 11 Stage B3 GDF-merge push block (48 bytes): gdf_storage, dim,
 /// inst_table, inst_count, then float4 aabb_min / aabb_max (the GDF world extent;
 /// the unit cube here, matching the per-mesh bake box so a whole-cube single

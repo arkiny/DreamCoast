@@ -23,8 +23,8 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::mesh::{index_bytes, vertex_bytes};
 use crate::push::{
-    gdf_merge_push, gdf_trace_push, sdf_albedo_bake_push, sdf_bake_push, sdf_trace_push,
-    volume_push,
+    cache_capture_push, cache_view_push, gdf_merge_push, gdf_trace_push, sdf_albedo_bake_push,
+    sdf_bake_push, sdf_trace_push, volume_push,
 };
 
 /// Volume edge length in voxels (cube). The bake/merge/view all share it.
@@ -63,7 +63,20 @@ pub(crate) struct GdfSystem {
     scene_albedo: Option<[Volume; 3]>,
     scene_tri_albedo: Option<StorageBuffer>,
     albedo_bake_pipeline: Option<ComputePipeline>,
+    /// Stage C8b: Lumen-style mesh-card surface cache. `cards` holds the per-object AABB-face
+    /// card records; `cache_pos` (hit pos + valid) and `cache_albedo` are the captured-once
+    /// geometry atlases (flat storage buffers, one float4 / texel). C8b2 adds the re-lit
+    /// radiance ping-pong; C8b3 looks it up at GI / reflection hits.
+    cards: Option<StorageBuffer>,
+    cache_pos: Option<StorageBuffer>,
+    cache_albedo: Option<StorageBuffer>,
+    num_cards: u32,
+    cache_capture_pipeline: Option<ComputePipeline>,
+    cache_view_pipeline: Option<ComputePipeline>,
 }
+
+/// Surface-cache card atlas tile edge (texels per card side). 6 cards / object.
+const CARD_TILE: u32 = 32;
 
 /// Scene-GDF volume edge length (cube). Coarser than `VOLUME_DIM`: the fused
 /// brute-force bake is O(voxels·tris) over the whole scene, so a 48³ grid keeps the
@@ -159,6 +172,25 @@ impl GdfSystem {
             "sdf_albedo_bake",
             64,
             [4, 4, 4],
+        )?;
+        // C8b1 surface-cache capture (GDF-traced geometry+albedo into card atlases) + viz.
+        let cache_capture_pipeline = compute(
+            "cacheMain",
+            dreamcoast_shader::sdf_cache_capture_cs_spirv,
+            dreamcoast_shader::sdf_cache_capture_cs_dxil,
+            dreamcoast_shader::sdf_cache_capture_cs_metallib,
+            "sdf_cache_capture",
+            80,
+            [64, 1, 1],
+        )?;
+        let cache_view_pipeline = compute(
+            "viewMain",
+            dreamcoast_shader::sdf_cache_view_cs_spirv,
+            dreamcoast_shader::sdf_cache_view_cs_dxil,
+            dreamcoast_shader::sdf_cache_view_cs_metallib,
+            "sdf_cache_view",
+            32,
+            [8, 8, 1],
         )?;
         let trace_pipeline = compute(
             "csMain",
@@ -277,6 +309,12 @@ impl GdfSystem {
             scene_albedo: None,
             scene_tri_albedo: None,
             albedo_bake_pipeline,
+            cards: None,
+            cache_pos: None,
+            cache_albedo: None,
+            num_cards: 0,
+            cache_capture_pipeline,
+            cache_view_pipeline,
         })
     }
 
@@ -410,6 +448,159 @@ impl GdfSystem {
                 Ok(())
             },
         );
+    }
+
+    /// Stage C8b1: register the per-object mesh cards + allocate the surface-cache atlas
+    /// buffers (captured geometry: `cache_pos` = hit pos + valid, `cache_albedo`). `cards`
+    /// is the host-built card-record byte buffer (64 B / card). No-op without the capture
+    /// pipeline. The card tile edge is `CARD_TILE`; the atlas is `num_cards * tile²` texels.
+    pub(crate) fn build_surface_cache(
+        &mut self,
+        device: &Device,
+        cards: &[u8],
+        num_cards: u32,
+    ) -> anyhow::Result<()> {
+        if self.cache_capture_pipeline.is_none() || num_cards == 0 {
+            return Ok(());
+        }
+        self.cards = Some(device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: cards.len() as u64,
+                stride: 16,
+                indirect: false,
+            },
+            cards,
+        )?);
+        let texels = (num_cards * CARD_TILE * CARD_TILE) as u64;
+        let make = || -> anyhow::Result<Option<StorageBuffer>> {
+            Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
+                size: texels * 16,
+                stride: 16,
+                indirect: false,
+            })?))
+        };
+        self.cache_pos = make()?;
+        self.cache_albedo = make()?;
+        self.num_cards = num_cards;
+        Ok(())
+    }
+
+    pub(crate) fn has_surface_cache(&self) -> bool {
+        self.cards.is_some()
+    }
+
+    /// C8b1: capture the surface cache once — per card texel, sphere-trace the scene GDF
+    /// inward from the card plane and store the hit's world position + albedo. Reads the
+    /// scene GDF (and the C8a albedo volumes when `albedo_ext` is `Some`, for the captured
+    /// color); writes the `cache_ext` handle (the caller imports it once + shares it).
+    pub(crate) fn record_cache_capture<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        scene_gdf_ext: ResourceId,
+        albedo_ext: Option<ResourceId>,
+        cache_ext: ResourceId,
+    ) {
+        let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
+        let pipe = self
+            .cache_capture_pipeline
+            .as_ref()
+            .expect("cache capture pipeline");
+        let cards = self.cards.as_ref().expect("cards").storage_index();
+        let cpos = self.cache_pos.as_ref().expect("cache pos").storage_index();
+        let calb = self
+            .cache_albedo
+            .as_ref()
+            .expect("cache albedo")
+            .storage_index();
+        let albedo = albedo_ext.and(self.scene_albedo.as_ref());
+        let num_cards = self.num_cards;
+        let num_texels = num_cards * CARD_TILE * CARD_TILE;
+        let sampled = vol.sampled_index();
+        let aabb_min = self.scene_aabb_min;
+        let aabb_max = self.scene_aabb_max;
+        let diag = {
+            let d = [
+                aabb_max[0] - aabb_min[0],
+                aabb_max[1] - aabb_min[1],
+                aabb_max[2] - aabb_min[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        let mut reads = vec![scene_gdf_ext];
+        if let Some(ext) = albedo_ext {
+            reads.push(ext);
+        }
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "sdf_cache_capture",
+                storage_writes: vec![cache_ext],
+                reads,
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(vol);
+                let albedo_rgb = if let Some(vols) = albedo {
+                    for v in vols.iter() {
+                        cmd.volume_to_sampled(v);
+                    }
+                    [
+                        vols[0].sampled_index(),
+                        vols[1].sampled_index(),
+                        vols[2].sampled_index(),
+                    ]
+                } else {
+                    [u32::MAX; 3]
+                };
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&cache_capture_push(
+                    cards, cpos, calb, sampled, num_cards, CARD_TILE, num_texels, albedo_rgb,
+                    aabb_min, aabb_max, diag,
+                ));
+                cmd.dispatch(num_texels.div_ceil(64), 1, 1);
+                Ok(())
+            },
+        );
+    }
+
+    /// C8b1: tile the captured surface-cache atlas across the screen (validation viz).
+    pub(crate) fn record_cache_view<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        cache_ext: ResourceId,
+        extent: Extent2D,
+        cw: u32,
+        ch: u32,
+    ) -> ResourceId {
+        let pipe = self
+            .cache_view_pipeline
+            .as_ref()
+            .expect("cache view pipeline");
+        let out = graph.create_storage_image("cache_view_out", HDR_FORMAT, extent);
+        let cpos = self.cache_pos.as_ref().expect("cache pos").storage_index();
+        let calb = self
+            .cache_albedo
+            .as_ref()
+            .expect("cache albedo")
+            .storage_index();
+        let num_cards = self.num_cards;
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "sdf_cache_view",
+                storage_writes: vec![out],
+                reads: vec![cache_ext],
+            },
+            move |ctx| {
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&cache_view_push(
+                    cpos, calb, out_index, num_cards, CARD_TILE, cw, ch,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
     }
 
     /// Stage C1: build the world-space scene GDF (fused brute-force bake, once) then SW
