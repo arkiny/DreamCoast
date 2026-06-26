@@ -29,7 +29,7 @@ struct CompositePush
     uint width;
     uint height;
     float gdf_scale; // exposure applied to the raw GDF radiance (post-exposure viz space)
-    uint pad0;
+    float clamp_max; // firefly clamp: max composited reflection-radiance component (1e30 = off)
     uint pad1;
 };
 
@@ -48,5 +48,10 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 gdf = g.textures[pc.gdf_index].SampleLevel(g.samp, uv, 0.0).rgb * pc.gdf_scale;
 
     float3 refl = lerp(gdf, ssr.rgb, saturate(ssr.a));
+    // Firefly clamp at the reflection chokepoint feeding the lighting specular (C7c): cap an
+    // isolated bright reflected pixel. Hue-preserving; `clamp_max = 1e30` disables it.
+    float m = max(refl.r, max(refl.g, refl.b));
+    if (m > pc.clamp_max)
+        refl *= pc.clamp_max / m;
     g.storage_images[pc.out_index][tid.xy] = float4(refl, 1.0);
 }

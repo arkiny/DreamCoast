@@ -256,6 +256,7 @@ impl ReflectSystem {
         cw: u32,
         ch: u32,
         inv_exposure: f32,
+        clamp_max: f32,
     ) {
         let pipe = self
             .lit_history_pipeline
@@ -283,6 +284,7 @@ impl ReflectSystem {
                     cw,
                     ch,
                     inv_exposure,
+                    clamp_max,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
@@ -415,6 +417,7 @@ impl ReflectSystem {
         cw: u32,
         ch: u32,
         gdf_scale: f32,
+        clamp_max: f32,
     ) -> ResourceId {
         let pipe = self
             .composite_pipeline
@@ -434,7 +437,7 @@ impl ReflectSystem {
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&reflect_composite_push(
-                    ssr_index, gdf_index, out_index, cw, ch, gdf_scale,
+                    ssr_index, gdf_index, out_index, cw, ch, gdf_scale, clamp_max,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

@@ -45,7 +45,7 @@ struct GiPush
     float4 params;          // x = ray max distance, y = surface bias, z = sky term, w = constant hit albedo (fallback)
     uint4 cache;            // C8b3: cards, cache_pos, cache_rad, num_cards (cards=0xFFFFFFFF = off)
     uint cache_tile;        // surface-cache atlas tile edge
-    uint pad_c0;
+    float clamp_max;        // firefly clamp: max bounce-sample radiance component (1e30 = off)
     uint pad_c1;
     uint pad_c2;
 };
@@ -225,7 +225,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     for (uint s = 0; s < spp; s++)
     {
         float3 dir = cosine_hemisphere(n, seed);
-        sum += trace_bounce(origin, dir);
+        // Firefly clamp per sample (before averaging): one ray hitting a bright spot can't
+        // blow out the mean. Hue-preserving; `clamp_max = 1e30` disables it.
+        float3 b = trace_bounce(origin, dir);
+        float m = max(b.r, max(b.g, b.b));
+        if (m > pc.clamp_max)
+            b *= pc.clamp_max / m;
+        sum += b;
     }
     // Cosine-weighted estimator: mean incoming radiance = indirect irradiance E. The
     // lighting pass multiplies by the surface albedo (× 1-metallic) to get L_o.

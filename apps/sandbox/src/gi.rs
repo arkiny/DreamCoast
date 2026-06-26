@@ -220,6 +220,7 @@ impl GiSystem {
         frame: u32,
         albedo: Option<(&'a [Volume; 3], ResourceId)>,
         cache: Option<([u32; 5], ResourceId)>,
+        clamp_max: f32,
     ) -> ResourceId {
         let gip = self.gi_pipeline.as_ref().expect("gdf gi pipeline");
         let out = graph.create_storage_image("gdf_gi_out", HDR_FORMAT, extent);
@@ -285,6 +286,7 @@ impl GiSystem {
                     0.25, // sky fill radiance at the bounce hit
                     0.7,  // constant hit-albedo fallback (sentinel albedo => achromatic, pre-C8a)
                     cache_idx,
+                    clamp_max,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

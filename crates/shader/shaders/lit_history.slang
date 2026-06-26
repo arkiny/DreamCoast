@@ -22,7 +22,7 @@ struct LitHistoryPush
     uint width;
     uint height;
     float inv_exposure; // 1 / camera exposure (recovers raw radiance)
-    uint pad0;
+    float clamp_max;    // firefly clamp: max raw-radiance component stored (1e30 = off)
     uint pad1;
     uint pad2;
 };
@@ -40,5 +40,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     uint idx = tid.y * pc.width + tid.x;
     float2 uv = (float2(tid.xy) + 0.5) / float2(pc.width, pc.height);
     float3 rgb = g.textures[pc.hdr_index].SampleLevel(g.samp, uv, 0.0).rgb * pc.inv_exposure;
+    // Firefly clamp at the reflection source: bound the raw radiance the SSR history feeds
+    // back, so a blown-out specular highlight can't become a reflected speckle. Hue-preserving
+    // (scales by the max component). `clamp_max = 1e30` disables it (byte-identical).
+    float m = max(rgb.r, max(rgb.g, rgb.b));
+    if (m > pc.clamp_max)
+        rgb *= pc.clamp_max / m;
     g.storage_buffers[pc.out_buffer].Store4(idx * 16u, asuint(float4(rgb, 1.0)));
 }
