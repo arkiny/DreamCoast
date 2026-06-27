@@ -12,6 +12,7 @@ members = [
     "crates/gui",
     "crates/asset",
     "crates/render",
+    "crates/scene",
     "apps/sandbox",
 ]
 
@@ -34,6 +35,7 @@ rhi = { path = "crates/rhi" }
 dreamcoast-gui = { path = "crates/gui" }
 dreamcoast-asset = { path = "crates/asset" }
 dreamcoast-render = { path = "crates/render" }
+dreamcoast-scene = { path = "crates/scene" }
 
 # External
 windows = "0.62"

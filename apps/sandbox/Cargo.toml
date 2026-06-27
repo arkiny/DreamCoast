@@ -12,6 +12,7 @@ dreamcoast-shader.workspace = true
 dreamcoast-gui.workspace = true
 dreamcoast-asset.workspace = true
 dreamcoast-render.workspace = true
+dreamcoast-scene.workspace = true
 rhi.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

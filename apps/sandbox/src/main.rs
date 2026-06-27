@@ -41,11 +41,13 @@ mod particle;
 mod push;
 mod quality;
 mod reflect;
+mod registry;
 mod rt;
 mod smoketest;
 use app::*;
 use cull::*;
 use deferred::*;
+use dreamcoast_scene::{LocalTransform, MeshInstance, World};
 use gdf::*;
 use gi::*;
 use ibl::*;
@@ -53,6 +55,7 @@ use mesh::*;
 use particle::*;
 use push::*;
 use reflect::*;
+use registry::{GpuMesh, MaterialDesc, MaterialRegistry, MeshRegistry, build_scene};
 use rt::*;
 use smoketest::*;
 
@@ -119,13 +122,12 @@ const DEBUG_VIEWS: [&str; 11] = [
 ];
 const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 
-/// One drawable in the sample scene: a mesh + world transform + PBR material.
+/// One materialized drawable in the sample scene: a shared GPU mesh + world
+/// transform + resolved PBR material. Produced from the ECS draw list by
+/// [`registry::build_scene`]; consumed by the rasterizer, RT, and GDF passes.
 pub(crate) struct SceneObject {
-    pub(crate) vbuf: Buffer,
-    pub(crate) ibuf: Buffer,
-    pub(crate) index_count: u32,
-    /// Vertex count (for the BLAS build's `max_vertex`, Phase 8).
-    pub(crate) vertex_count: u32,
+    /// Shared uploaded geometry (vertex/index buffers + counts).
+    pub(crate) mesh: std::rc::Rc<GpuMesh>,
     pub(crate) transform: Mat4,
     pub(crate) base_color: [f32; 4],
     pub(crate) metallic: f32,
@@ -333,9 +335,13 @@ struct App {
     rt: RtSystem,
     ibl: IblSystem,
 
-    // Scene geometry. `_textures` keeps the model's bindless textures alive.
+    // Scene. The ECS `world` (+ registries) is the single source of truth; the flat
+    // `SceneObject` draw list is materialized from it each frame via `build_scene`.
+    // `_textures` keeps the model's bindless textures alive.
     _textures: Vec<Texture>,
-    scene: Vec<SceneObject>,
+    world: World,
+    mesh_registry: MeshRegistry,
+    material_registry: MaterialRegistry,
     ground_vbuf: Buffer,
     ground_ibuf: Buffer,
     ground_count: u32,
@@ -573,67 +579,77 @@ impl App {
         let r = model_radius;
         let sphere = dreamcoast_asset::uv_sphere(48, 32);
         let cube = dreamcoast_asset::unit_cube();
-        let trs = |pos: Vec3, scale: f32| {
-            Mat4::from_translation(pos) * Mat4::from_scale(Vec3::splat(scale))
-        };
-        let mut scene: Vec<SceneObject> = Vec::new();
-        // Loaded model (its glTF material).
-        let (vbuf, ibuf, index_count) = upload_mesh(&device, model)?;
-        scene.push(SceneObject {
-            vbuf,
-            ibuf,
-            index_count,
-            vertex_count: model.vertices.len() as u32,
-            transform: Mat4::IDENTITY,
+
+        // Registries own the GPU meshes + material descriptors the scene's handles
+        // point at (P2). Unique geometry uploads once — the two spheres share a handle.
+        let mut mesh_registry = MeshRegistry::new();
+        let mut material_registry = MaterialRegistry::new();
+        let mesh_model = mesh_registry.upload(&device, model)?;
+        let mesh_sphere = mesh_registry.upload(&device, &sphere)?;
+        let mesh_cube = mesh_registry.upload(&device, &cube)?;
+        let mat_model = material_registry.add(MaterialDesc {
             base_color: model.material.base_color_factor,
             metallic: model.material.metallic_factor,
             roughness: model.material.roughness_factor,
             tex: [base_index, mr_index, normal_index, emissive_index],
-            casts_shadow: true,
         });
-        // Polished chrome sphere.
-        let (sv, si, sc) = upload_mesh(&device, &sphere)?;
-        scene.push(SceneObject {
-            vbuf: sv,
-            ibuf: si,
-            index_count: sc,
-            vertex_count: sphere.vertices.len() as u32,
-            transform: trs(Vec3::new(-r * 1.7, r * 0.75, r * 0.5), r * 0.75),
+        let mat_chrome = material_registry.add(MaterialDesc {
             base_color: [0.95, 0.96, 0.97, 1.0],
             metallic: 1.0,
             roughness: 0.08,
             tex: [NO_TEXTURE; 4],
-            casts_shadow: true,
         });
-        // Brushed-copper sphere.
-        let (sv2, si2, sc2) = upload_mesh(&device, &sphere)?;
-        scene.push(SceneObject {
-            vbuf: sv2,
-            ibuf: si2,
-            index_count: sc2,
-            vertex_count: sphere.vertices.len() as u32,
-            transform: trs(Vec3::new(r * 1.9, r * 0.5, -r * 0.4), r * 0.5),
+        let mat_copper = material_registry.add(MaterialDesc {
             base_color: [0.95, 0.64, 0.54, 1.0],
             metallic: 1.0,
             roughness: 0.35,
             tex: [NO_TEXTURE; 4],
-            casts_shadow: true,
         });
-        // Red dielectric cube.
-        let (cv, ci, cc) = upload_mesh(&device, &cube)?;
-        scene.push(SceneObject {
-            vbuf: cv,
-            ibuf: ci,
-            index_count: cc,
-            vertex_count: cube.vertices.len() as u32,
-            transform: Mat4::from_translation(Vec3::new(0.0, r * 0.45, -r * 2.0))
-                * Mat4::from_scale(Vec3::splat(r * 0.45)),
+        let mat_red = material_registry.add(MaterialDesc {
             base_color: [0.85, 0.25, 0.2, 1.0],
             metallic: 0.0,
             roughness: 0.5,
             tex: [NO_TEXTURE; 4],
-            casts_shadow: true,
         });
+
+        // Spawn the scene as ECS entities. Spawn order defines the deterministic draw
+        // and TLAS-instance order (model, chrome, copper, cube) — the same order the
+        // legacy flat list used, so the materialized draw list is byte-identical.
+        let mut world = World::new();
+        world
+            .spawn_node()
+            .named("model")
+            .with(MeshInstance::new(mesh_model, mat_model))
+            .with(LocalTransform::IDENTITY);
+        world
+            .spawn_node()
+            .named("chrome-sphere")
+            .with(MeshInstance::new(mesh_sphere, mat_chrome))
+            .with(LocalTransform::trs(
+                Vec3::new(-r * 1.7, r * 0.75, r * 0.5),
+                r * 0.75,
+            ));
+        world
+            .spawn_node()
+            .named("copper-sphere")
+            .with(MeshInstance::new(mesh_sphere, mat_copper))
+            .with(LocalTransform::trs(
+                Vec3::new(r * 1.9, r * 0.5, -r * 0.4),
+                r * 0.5,
+            ));
+        world
+            .spawn_node()
+            .named("red-cube")
+            .with(MeshInstance::new(mesh_cube, mat_red))
+            .with(LocalTransform::trs(
+                Vec3::new(0.0, r * 0.45, -r * 2.0),
+                r * 0.45,
+            ));
+        dreamcoast_scene::propagate_transforms(&mut world);
+
+        // Materialize the ECS draw list into the flat `SceneObject` list the GPU passes
+        // consume. (Static scene → built once; later stages rebuild on scene change.)
+        let scene = build_scene(&world, &mesh_registry, &material_registry);
         let scene_radius = r * 3.0;
 
         // Ground plane (separate handle: also used by the environment capture).
@@ -1061,7 +1077,9 @@ impl App {
             rt,
             ibl,
             _textures: textures,
-            scene,
+            world,
+            mesh_registry,
+            material_registry,
             ground_vbuf,
             ground_ibuf,
             ground_count,
@@ -1307,12 +1325,18 @@ impl App {
             .map(|c| c.include_ui)
             .unwrap_or(true);
 
+        // Materialize this frame's draw list from the ECS world (the single source of
+        // truth). Static scene → identical every frame; the rebuild is cheap (no GPU
+        // re-upload, just handle resolution + Rc clones). Later stages rebuild this when
+        // entities spawn/despawn.
+        let scene = build_scene(&self.world, &self.mesh_registry, &self.material_registry);
+
         // Orbiting camera framing the whole sample scene — or, in single-object
         // diagnostic mode, a tight orbit centred on one scene object so it can be
         // inspected from every side (azimuth = self.angle, elevation = diag_pitch).
-        let (focus, eye) = if let Some(oi) = self.diag_obj.filter(|&i| i < self.scene.len()) {
-            let center = self.scene[oi].transform.w_axis.truncate();
-            let radius = self.scene[oi].transform.x_axis.truncate().length(); // uniform scale
+        let (focus, eye) = if let Some(oi) = self.diag_obj.filter(|&i| i < scene.len()) {
+            let center = scene[oi].transform.w_axis.truncate();
+            let radius = scene[oi].transform.x_axis.truncate().length(); // uniform scale
             let dist = radius * 4.5;
             let pitch = self.diag_pitch.unwrap_or(0.18); // slight elevation by default
             let (sp, cp) = (pitch.sin(), pitch.cos());
@@ -1370,7 +1394,6 @@ impl App {
                 .gui
                 .new_frame(dt, [cw as f32, ch as f32], self.window.input());
             let App {
-                scene,
                 gdf,
                 gi,
                 reflect,
@@ -1749,7 +1772,7 @@ impl App {
         let (cap_scene, cap_multibounce): (&[SceneObject], bool) = if self.swrt_reflect {
             (&[], false)
         } else {
-            (&self.scene, self.multibounce)
+            (&scene, self.multibounce)
         };
         self.ibl.maybe_capture(
             cmd,
@@ -1922,11 +1945,11 @@ impl App {
         // Deferred backbone (see `deferred.rs`): shadow -> gbuffer -> lighting (HDR),
         // then the optional compute-post blur.
         self.deferred
-            .record_shadow(&mut graph, shadow_map, &self.scene, light_vp);
+            .record_shadow(&mut graph, shadow_map, &scene, light_vp);
         self.deferred.record_gbuffer(
             &mut graph,
             gbuf,
-            &self.scene,
+            &scene,
             &self.ground_vbuf,
             &self.ground_ibuf,
             self.ground_count,

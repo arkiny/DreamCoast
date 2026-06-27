@@ -532,9 +532,9 @@ fn record_environment_capture(
                 prefilter_max_lod,
                 prev_ibl,
             ));
-            cmd.bind_vertex_buffer(&obj.vbuf, 32);
-            cmd.bind_index_buffer(&obj.ibuf, true);
-            cmd.draw_indexed(obj.index_count, 0, 0);
+            cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
+            cmd.bind_index_buffer(&obj.mesh.ibuf, true);
+            cmd.draw_indexed(obj.mesh.index_count, 0, 0);
         }
         cmd.end_rendering();
     }

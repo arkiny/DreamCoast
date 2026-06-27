@@ -338,6 +338,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dreamcoast-scene"
+version = "0.0.0"
+dependencies = [
+ "glam",
+]
+
+[[package]]
 name = "dreamcoast-shader"
 version = "0.0.0"
 
@@ -1306,6 +1313,7 @@ dependencies = [
  "dreamcoast-gui",
  "dreamcoast-platform",
  "dreamcoast-render",
+ "dreamcoast-scene",
  "dreamcoast-shader",
  "image",
  "rhi",

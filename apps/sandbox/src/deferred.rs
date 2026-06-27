@@ -239,9 +239,9 @@ impl DeferredRenderer {
                     }
                     let lmvp = (light_vp * obj.transform).to_cols_array();
                     cmd.push_constants(&mat4_bytes(&lmvp));
-                    cmd.bind_vertex_buffer(&obj.vbuf, 32);
-                    cmd.bind_index_buffer(&obj.ibuf, true);
-                    cmd.draw_indexed(obj.index_count, 0, 0);
+                    cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
+                    cmd.bind_index_buffer(&obj.mesh.ibuf, true);
+                    cmd.draw_indexed(obj.mesh.index_count, 0, 0);
                 }
                 Ok(())
             },
@@ -308,9 +308,9 @@ impl DeferredRenderer {
                         [obj.tex[0], mr_tex, obj.tex[2], obj.tex[3]],
                         obj.transform.to_cols_array(),
                     ));
-                    cmd.bind_vertex_buffer(&obj.vbuf, 32);
-                    cmd.bind_index_buffer(&obj.ibuf, true);
-                    cmd.draw_indexed(obj.index_count, 0, 0);
+                    cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
+                    cmd.bind_index_buffer(&obj.mesh.ibuf, true);
+                    cmd.draw_indexed(obj.mesh.index_count, 0, 0);
                 }
                 // Ground plane (plain matte material, no textures). Albedo from the shared
                 // GROUND_ALBEDO single source (also fed to the GI / reflection re-light passes).
