@@ -83,16 +83,19 @@ float3 apply_normal_map(float3 n, float3 world_pos, float2 uv, float3 tangent_no
 [shader("fragment")]
 GBufferOut fsMain(VSOutput input)
 {
+    // Material textures use the REPEAT/wrap sampler: floor tiles / brick courses tile via
+    // glTF UVs > 1 (CLAMP would smear one edge texel across the whole surface). Untextured
+    // or in-[0,1] UVs (the gallery avocado) are unaffected → byte-identical.
     float3 albedo = pc.base_color_factor.rgb;
     if (pc.tex.x != NO_TEXTURE)
-        albedo *= g.textures[pc.tex.x].Sample(g.samp, input.uv).rgb;
+        albedo *= g.textures[pc.tex.x].Sample(g.samp_wrap, input.uv).rgb;
 
     float metallic = pc.mr_factor.x;
     float roughness = pc.mr_factor.y;
     if (pc.tex.y != NO_TEXTURE)
     {
         // glTF metallic-roughness: G = roughness, B = metallic.
-        float3 mr = g.textures[pc.tex.y].Sample(g.samp, input.uv).rgb;
+        float3 mr = g.textures[pc.tex.y].Sample(g.samp_wrap, input.uv).rgb;
         roughness *= mr.g;
         metallic *= mr.b;
     }
@@ -100,7 +103,7 @@ GBufferOut fsMain(VSOutput input)
     float3 n = normalize(input.world_normal);
     if (pc.tex.z != NO_TEXTURE)
     {
-        float3 tn = g.textures[pc.tex.z].Sample(g.samp, input.uv).rgb * 2.0 - 1.0;
+        float3 tn = g.textures[pc.tex.z].Sample(g.samp_wrap, input.uv).rgb * 2.0 - 1.0;
         n = apply_normal_map(n, input.world_pos, input.uv, tn);
     }
 

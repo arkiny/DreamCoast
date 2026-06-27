@@ -23,8 +23,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_ROOT_SIGNATURE_DESC, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
     D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL,
     D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK, D3D12_STATIC_SAMPLER_DESC,
-    D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12SerializeRootSignature, ID3D12PipelineState,
-    ID3D12RootSignature,
+    D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12SerializeRootSignature,
+    ID3D12PipelineState, ID3D12RootSignature,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT,
@@ -218,34 +218,50 @@ fn create_root_signature(
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
-        let sampler = D3D12_STATIC_SAMPLER_DESC {
-            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
-            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-            MipLODBias: 0.0,
-            MaxAnisotropy: 0,
-            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
-            BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
-            MinLOD: 0.0,
-            MaxLOD: f32::MAX,
-            ShaderRegister: 0,
-            // space1: the sampler lives inside the shared `ParameterBlock` (see
-            // `bindless_ranges`), alongside the texture/cube SRVs.
-            RegisterSpace: 1,
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        };
+        let samplers = bindless_static_samplers();
         serialize_and_create(
             device,
             &D3D12_ROOT_SIGNATURE_DESC {
                 NumParameters: params.len() as u32,
                 pParameters: params.as_ptr(),
-                NumStaticSamplers: 1,
-                pStaticSamplers: &sampler,
+                NumStaticSamplers: samplers.len() as u32,
+                pStaticSamplers: samplers.as_ptr(),
                 Flags: flags,
             },
         )
     }
+}
+
+/// The shared static samplers inside the bindless `ParameterBlock` (space1): `s0` clamp
+/// (cubes/volumes/G-buffer) + `s1` wrap (tiling material textures — floor tiles, brick
+/// courses with glTF UVs > 1). Order matches the `samp` / `samp_wrap` declaration in
+/// `bindless.slang`.
+fn bindless_static_samplers() -> [D3D12_STATIC_SAMPLER_DESC; 2] {
+    let base = D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 0,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+        BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+        MinLOD: 0.0,
+        MaxLOD: f32::MAX,
+        ShaderRegister: 0,
+        RegisterSpace: 1, // inside the shared ParameterBlock
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    [
+        base,
+        D3D12_STATIC_SAMPLER_DESC {
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            ShaderRegister: 1,
+            ..base
+        },
+    ]
 }
 
 /// The four bindless descriptor-table ranges, shared verbatim by the graphics and
@@ -437,30 +453,14 @@ fn create_compute_root_signature(
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
-        let sampler = D3D12_STATIC_SAMPLER_DESC {
-            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
-            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-            MipLODBias: 0.0,
-            MaxAnisotropy: 0,
-            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
-            BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
-            MinLOD: 0.0,
-            MaxLOD: f32::MAX,
-            ShaderRegister: 0,
-            // space1: the sampler lives inside the shared `ParameterBlock` (see
-            // `bindless_ranges`), matching the compute shaders' migrated layout.
-            RegisterSpace: 1,
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        };
+        let samplers = bindless_static_samplers();
         serialize_and_create(
             device,
             &D3D12_ROOT_SIGNATURE_DESC {
                 NumParameters: params.len() as u32,
                 pParameters: params.as_ptr(),
-                NumStaticSamplers: 1,
-                pStaticSamplers: &sampler,
+                NumStaticSamplers: samplers.len() as u32,
+                pStaticSamplers: samplers.as_ptr(),
                 Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
             },
         )

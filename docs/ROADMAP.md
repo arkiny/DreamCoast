@@ -224,7 +224,9 @@ glTF 재파싱 + 텍스처 디코드 + SDF/albedo 재베이크를 없앤다. 수
 - **완료 기준 달성**: glTF 재파싱·재베이크 없이 `.dcasset` 로드로 동일 렌더(DX≡VK 0.000/ch, 기준선
   무회귀), run2=CacheHit startup 가속, 베이크 바이트 동일 캐시. clippy/fmt 클린.
 - **남은 후속(선택)**: BC7 멀티모드(품질), 추가 베이크 페이로드(BVH/라이트맵/프로브), 텍스처 압축 기본화
-  RenderQuality 결속. **씬/레벨 렌더 구동은 Phase 12 Stage E**가 `.dclevel` 포맷에 결속.
+  RenderQuality 결속. **씬/레벨 렌더 구동은 Phase 12 Stage E**가 `.dclevel` 포맷에 결속. **머티리얼
+  애셋화**(쿡 컨테이너 토대는 본 Phase에서 완료, 런타임/레벨 결속은 진행 중인 Phase 12로) →
+  [material-assets.md](material-assets.md).
 
 ### Phase 12 — 씬 그래프 + 레벨 스트리밍 — 🧪 실험적 / 계획
 세부: [phase-12-scene-graph.md](phase-12-scene-graph.md)
@@ -246,6 +248,9 @@ per-instance 트랜스폼을 공급하는 단일 소스가 된다. 테스트는 
   회귀) → **B** 전체 glTF 계층 임포트(Lantern 3메시, `Parent`/`Children`) → **C** 선언적 `.level` 포맷 +
   로더/세이브 + 런타임 전환 → **D** 레벨 그래프(`LevelGraph`) + 카메라 기반 청크 스트리밍(엔티티
   스폰/디스폰) → **E**(선택, Phase 11 이후) 쿡된 바이너리 레벨/월드.
+- **컴패니언 트랙 — 머티리얼 애셋화**(쿡 토대는 Phase 11 완료): 메시 종속 머티리얼을 공유 가능한 1급
+  애셋으로 분리(콘텐츠-주소 텍스처 dedup, UE식 Material Instance). 런타임 키 dedup은 Stage B(다중 머티리얼
+  업로드), 인스턴스 오버라이드는 Stage C/E(레벨 머티리얼)에 결속. 세부: [material-assets.md](material-assets.md).
 - **완료 기준**: ECS 씬이 단일 드로우 리스트로 세 소비처(래스터/RT/컬)를 공급, glTF 계층이 올바른 상대
   트랜스폼으로 렌더, 선언적 레벨 핫스왑, 카메라 주행 시 청크 스트림 인/아웃(엔티티 디스폰, 누수 없음), 두
   백엔드 픽셀 일치, 검증 클린.
