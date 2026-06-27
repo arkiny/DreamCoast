@@ -15,7 +15,10 @@ AO, 1-bounce diffuse GI, and hybrid SW-RT reflections (SSR + GDF + sky) are now
 the default ambient, with a mesh-card surface cache and a
 `RenderQuality{low,med,high}` tier (Stage D) layered on top. The residual vs the
 path tracer (≈3.45/ch) is an accepted limit set by the 48³ GDF resolution.
-Phases 10, 12, 13 (virtual geometry, cooked-asset pipeline, scene graph) remain
+**Phase 12 (cooked-asset pipeline) is complete** — meshes, the scene SDF/albedo
+bakes, and BCn-compressed textures cook to a single deterministic `.dcasset`
+binary (loaded directly, no glTF re-parse / re-bake), alongside the per-OS shader
+bytecode cook cache. Phases 10 and 13 (virtual geometry, scene graph) remain
 experimental / planned. The native **Metal backend for macOS**
 is at near-full parity — including Phase-8 ray tracing (inline `RayQuery` **and** the
 DXR-style RT pipeline via Metal Shader Converter); the main gap is the Phase-9
@@ -89,7 +92,11 @@ Backend parity is a hard rule: every milestone must produce identical results on
   reflections (now the default ambient, replacing captured-cube IBL), a mesh-card
   surface cache, and a `RenderQuality` tier. Stages A–C verified on Metal. The
   residual vs the path tracer (≈3.45/ch) is an accepted 48³-GDF-resolution limit.
-- [ ] **Phase 12** — Cooked-asset pipeline (`.dcasset`) + shader bytecode cook cache — planned
+- [x] **Phase 12** — Cooked-asset pipeline + shader bytecode cook cache: meshes +
+  textures + scene SDF/albedo bakes cook to one deterministic `.dcasset` (chunk
+  container; loaded directly, no glTF re-parse / re-bake). GPU-native BCn texture
+  compression (BC1/3/4/5/7, opt-in `Off/Fast/High` tier, zero runtime decompress),
+  a `.dclevel` scene chunk, and volume GPU↔CPU readback. DX≡VK byte-identical cooks.
 - [ ] **Phase 13** — Scene graph + level streaming (self-made ECS) — planned
 - [ ] **Phase 14** — Skeletal animation + GPU skinning / skin cache + FBX importer (ufbx / FBX SDK) — planned
 - [ ] **Phase 15+** — Commercial runtime & tooling layer: job system, physics, audio,
@@ -162,7 +169,7 @@ crates/
 ├── rhi-metal/   # rhi-metal            — objc2 Metal backend (macOS)
 ├── rhi/         # rhi                  — enum-dispatch RHI facade
 ├── gui/         # dreamcoast-gui       — Dear ImGui + custom RHI renderer
-├── asset/       # dreamcoast-asset     — glTF / image loading
+├── asset/       # dreamcoast-asset     — glTF/image loading + `.dcasset` cook/cache + BCn texture compression
 └── render/      # dreamcoast-render    — render graph + transient aliasing
 apps/
 └── sandbox/     # technique playground executable
