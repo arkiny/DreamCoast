@@ -24,6 +24,18 @@ pub struct SdfVolume {
     pub voxels: Vec<f32>,
 }
 
+impl SdfVolume {
+    /// The voxels as little-endian f32 bytes — the layout the GPU volume upload
+    /// (`Device::create_volume_init`) and the `.dcasset` SDF chunk both store.
+    pub fn to_le_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.voxels.len() * 4);
+        for v in &self.voxels {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+}
+
 /// Vertex stride of the fused buffer (pos[3] + normal[3] + uv[2], all f32).
 const VTX_STRIDE: usize = 32;
 

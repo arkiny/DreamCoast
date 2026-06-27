@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use dreamcoast_core::EngineError;
 
+use crate::sdf::{self, SdfVolume};
 use crate::{MeshData, dcasset, load_gltf};
 
 /// Which path [`load_cooked`] took, for the caller to log (startup speedup is
@@ -103,6 +104,58 @@ pub fn load_cooked(
         ));
     }
     Ok((mesh, LoadOutcome::Cooked))
+}
+
+/// Load the scene's signed-distance field as cooked data, baking + caching on a
+/// miss. Unlike [`load_cooked`] there is no source file: the "source" is the fused
+/// world-space geometry generated in-process, so the invalidation key is a content
+/// hash of `(fused_vtx, fused_idx, dim, aabb)` — any change re-bakes.
+///
+/// - **Hit:** a cached `.dcasset` whose header key matches → decode the SDF chunk
+///   (no CPU bake).
+/// - **Miss:** [`sdf::bake_sdf_from_fused`] then write the `.dcasset` (atomic; a
+///   write failure is non-fatal — the volume is still returned).
+///
+/// The cook is pure CPU, so the bytes are deterministic and backend-independent;
+/// uploading them to the GPU volume gives a Vulkan/D3D12 byte-identical field and
+/// makes "loaded without re-bake == direct bake" hold by construction.
+pub fn load_or_bake_scene_sdf(
+    fused_vtx: &[u8],
+    fused_idx: &[u8],
+    dim: u32,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+    cache_dir: &Path,
+) -> (SdfVolume, LoadOutcome) {
+    // Content key over geometry + grid params (the cook parameters that change the
+    // baked bytes). Folded incrementally so the large vertex buffer isn't copied.
+    let mut key = dcasset::hash_begin();
+    key = dcasset::hash_update(key, fused_vtx);
+    key = dcasset::hash_update(key, fused_idx);
+    key = dcasset::hash_update(key, &dim.to_le_bytes());
+    for c in aabb_min.iter().chain(aabb_max.iter()) {
+        key = dcasset::hash_update(key, &c.to_le_bytes());
+    }
+    let cache_file = cache_dir.join(format!("scene-sdf.{key:016x}.dcasset"));
+
+    if let Ok(bytes) = std::fs::read(&cache_file)
+        && let Ok(header) = dcasset::read_header(&bytes)
+        && header.version == dcasset::VERSION
+        && header.source_hash == key
+        && header.cook_params_hash == dcasset::cook_params_hash()
+        && let Ok((_, vol)) = dcasset::read_sdf(&bytes)
+    {
+        return (vol, LoadOutcome::CacheHit);
+    }
+
+    let vol = sdf::bake_sdf_from_fused(fused_vtx, fused_idx, dim, aabb_min, aabb_max);
+    if let Err(e) = write_atomic(&cache_file, &dcasset::write_sdf(&vol, key)) {
+        tracing_warn(&format!(
+            "failed to write cooked scene SDF {}: {e}",
+            cache_file.display()
+        ));
+    }
+    (vol, LoadOutcome::Cooked)
 }
 
 /// Write `bytes` to `path`, creating the parent dir. Writes to a temp sibling then

@@ -64,6 +64,9 @@ pub(crate) struct GdfSystem {
     /// World-space AABB the `scene_gdf` voxel grid maps to.
     scene_aabb_min: [f32; 3],
     scene_aabb_max: [f32; 3],
+    /// Phase 12 M2: the scene GDF was seeded from a cooked `.dcasset` (CPU bake
+    /// uploaded), so the one-time GPU `record_scene_bake` is skipped.
+    scene_sdf_cooked: bool,
     /// Stage C8a: per-voxel surface albedo (R/G/B as three R32Float volumes sharing the
     /// scene GDF's grid) + the parallel per-triangle albedo buffer the bake reads. Lets the
     /// C3 GI / C6 reflection re-light a hit with the real surface color instead of a constant.
@@ -336,6 +339,7 @@ impl GdfSystem {
                 .unwrap_or(SCENE_DIM),
             scene_aabb_min: [0.0; 3],
             scene_aabb_max: [0.0; 3],
+            scene_sdf_cooked: false,
             scene_albedo: None,
             scene_tri_albedo: None,
             albedo_bake_pipeline,
@@ -365,17 +369,26 @@ impl GdfSystem {
         tri_count: u32,
         aabb_min: [f32; 3],
         aabb_max: [f32; 3],
+        cooked_sdf: Option<&[u8]>,
     ) -> anyhow::Result<()> {
         if self.gdf.is_none() {
             return Ok(()); // compute unsupported (no volumes created)
         }
         let dim = self.scene_dim;
-        self.scene_gdf = Some(device.create_volume(&VolumeDesc {
+        let vol_desc = VolumeDesc {
             width: dim,
             height: dim,
             depth: dim,
             format: Format::R32Float,
-        })?);
+        };
+        // Phase 12 M2: when a cooked SDF is supplied, upload it straight into the
+        // volume (deterministic CPU bake) and skip the one-time GPU bake pass; else
+        // allocate an empty volume the GPU `record_scene_bake` fills.
+        self.scene_gdf = Some(match cooked_sdf {
+            Some(bytes) => device.create_volume_init(&vol_desc, bytes)?,
+            None => device.create_volume(&vol_desc)?,
+        });
+        self.scene_sdf_cooked = cooked_sdf.is_some();
         self.scene_vtx = Some(device.create_storage_buffer_init(
             &StorageBufferDesc {
                 size: fused_vtx.len() as u64,
@@ -421,6 +434,18 @@ impl GdfSystem {
 
     pub(crate) fn has_scene_sdf(&self) -> bool {
         self.scene_gdf.is_some()
+    }
+
+    /// Scene-GDF voxel-grid edge length — the dim a cooked SDF must be baked at to
+    /// match the volume `build_scene_sdf` allocates.
+    pub(crate) fn scene_dim(&self) -> u32 {
+        self.scene_dim
+    }
+
+    /// Whether the scene GDF was seeded from a cooked `.dcasset` (so the GPU bake is
+    /// already done and `record_scene_bake` should be skipped).
+    pub(crate) fn scene_sdf_is_cooked(&self) -> bool {
+        self.scene_sdf_cooked
     }
 
     pub(crate) fn has_scene_albedo(&self) -> bool {

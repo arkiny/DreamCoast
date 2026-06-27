@@ -22,6 +22,7 @@
 
 use dreamcoast_core::EngineError;
 
+use crate::sdf::SdfVolume;
 use crate::{ImageData, Material, MeshData, MeshVertex};
 
 /// Container magic. The trailing NUL keeps it a fixed 8 bytes and ASCII-greppable.
@@ -35,6 +36,8 @@ pub const VERSION: u32 = 1;
 // get new tags. Unknown tags are skipped by the reader (forward compatibility).
 const CHUNK_MESH: u32 = 1;
 const CHUNK_TEXTURE: u32 = 2;
+/// SDF volume chunk: `dim`, `aabb_min`/`aabb_max`, then `dim³` R32F voxels (M2).
+const CHUNK_SDF: u32 = 3;
 
 // Texture slot tags (texture chunk `slot` field) — which `Material` field a decoded
 // image fills. Kept distinct from chunk tags so the two namespaces never collide.
@@ -62,6 +65,18 @@ fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
 /// Content hash of the source asset bytes — half of the invalidation key.
 pub fn source_hash(bytes: &[u8]) -> u64 {
     fnv1a(bytes, FNV_OFFSET)
+}
+
+/// Seed for an incremental content hash; fold parts in with [`hash_update`]. Use
+/// for assets whose identity spans several buffers (e.g. the scene SDF keyed on its
+/// fused geometry + grid dims + AABB) so the key never has to concatenate them.
+pub fn hash_begin() -> u64 {
+    FNV_OFFSET
+}
+
+/// Fold `bytes` into the running hash `h`.
+pub fn hash_update(h: u64, bytes: &[u8]) -> u64 {
+    fnv1a(bytes, h)
 }
 
 /// Hash of the cook parameters that affect the produced bytes — the other half of
@@ -330,6 +345,90 @@ pub fn read(bytes: &[u8]) -> Result<(Header, MeshData), EngineError> {
     ))
 }
 
+/// Serialize an SDF volume into a `.dcasset` byte buffer (a container with a single
+/// SDF chunk — no mesh). `src_hash` is the invalidation key the loader compares
+/// against the live source (here, the fused-geometry + grid hash).
+pub fn write_sdf(vol: &SdfVolume, src_hash: u64) -> Vec<u8> {
+    let payload = encode_sdf(vol);
+    let payload_start = HEADER_SIZE + DIR_ENTRY_SIZE; // one chunk
+
+    let mut w = Writer::default();
+    w.bytes(&MAGIC);
+    w.u32(VERSION);
+    w.u32(0);
+    w.u64(src_hash);
+    w.u64(cook_params_hash());
+    w.u32(1); // chunk_count
+    w.u32(CHUNK_SDF);
+    w.u64(payload_start as u64);
+    w.u64(payload.len() as u64);
+    w.bytes(&payload);
+    w.buf
+}
+
+/// Decode a `.dcasset` buffer's SDF chunk into its [`Header`] and [`SdfVolume`].
+/// Errors on a bad magic, truncation, or a missing SDF chunk.
+pub fn read_sdf(bytes: &[u8]) -> Result<(Header, SdfVolume), EngineError> {
+    let header = read_header(bytes)?;
+    let mut r = Reader::at(bytes, HEADER_SIZE - 4);
+    let chunk_count = r.u32()?;
+    let mut dir = Vec::with_capacity(chunk_count as usize);
+    for _ in 0..chunk_count {
+        let ty = r.u32()?;
+        let offset = r.u64()? as usize;
+        let size = r.u64()? as usize;
+        dir.push((ty, offset, size));
+    }
+    for (ty, offset, size) in dir {
+        if ty != CHUNK_SDF {
+            continue;
+        }
+        let end = offset
+            .checked_add(size)
+            .filter(|&e| e <= bytes.len())
+            .ok_or_else(|| EngineError::Asset("dcasset: sdf chunk out of bounds".into()))?;
+        let mut cr = Reader::at(&bytes[..end], offset);
+        return Ok((header, decode_sdf(&mut cr)?));
+    }
+    Err(EngineError::Asset("dcasset: missing sdf chunk".into()))
+}
+
+/// Encode the SDF chunk payload: `dim`, `aabb_min`, `aabb_max`, then the voxels.
+fn encode_sdf(vol: &SdfVolume) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.u32(vol.dim);
+    for c in vol.aabb_min {
+        w.f32(c);
+    }
+    for c in vol.aabb_max {
+        w.f32(c);
+    }
+    for &v in &vol.voxels {
+        w.f32(v);
+    }
+    w.buf
+}
+
+/// Decode an SDF chunk payload, validating the voxel count against `dim³`.
+fn decode_sdf(r: &mut Reader) -> Result<SdfVolume, EngineError> {
+    let dim = r.u32()?;
+    let aabb_min = [r.f32()?, r.f32()?, r.f32()?];
+    let aabb_max = [r.f32()?, r.f32()?, r.f32()?];
+    let count = (dim as usize)
+        .checked_pow(3)
+        .ok_or_else(|| EngineError::Asset("dcasset: sdf dim overflow".into()))?;
+    let mut voxels = Vec::with_capacity(count);
+    for _ in 0..count {
+        voxels.push(r.f32()?);
+    }
+    Ok(SdfVolume {
+        dim,
+        aabb_min,
+        aabb_max,
+        voxels,
+    })
+}
+
 /// Decode a mesh chunk payload (factors + geometry). Textures are merged in by the
 /// caller from separate chunks.
 fn decode_mesh(r: &mut Reader) -> Result<(Vec<MeshVertex>, Vec<u32>, Material), EngineError> {
@@ -489,6 +588,23 @@ mod tests {
         let bytes = write(&sample_mesh(), 0);
         let count = u32::from_le_bytes(bytes[HEADER_SIZE - 4..HEADER_SIZE].try_into().unwrap());
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn sdf_chunk_roundtrip() {
+        let vol = SdfVolume {
+            dim: 2,
+            aabb_min: [-1.0, 0.0, 0.5],
+            aabb_max: [1.0, 2.0, 1.5],
+            voxels: vec![-0.3, 0.1, 0.0, 0.7, -0.5, 0.2, 0.9, -0.1],
+        };
+        let bytes = write_sdf(&vol, 0xabc);
+        let (header, decoded) = read_sdf(&bytes).expect("decode");
+        assert_eq!(header.source_hash, 0xabc);
+        assert_eq!(decoded.dim, 2);
+        assert_eq!(decoded.aabb_min, vol.aabb_min);
+        assert_eq!(decoded.aabb_max, vol.aabb_max);
+        assert_eq!(decoded.voxels, vol.voxels);
     }
 
     #[test]
