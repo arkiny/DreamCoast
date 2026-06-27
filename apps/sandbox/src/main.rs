@@ -643,12 +643,8 @@ impl App {
                         .is_some_and(|s| s.eq_ignore_ascii_case(select))
                 })
                 .unwrap_or(0);
-            let level = dreamcoast_asset::LevelData::load_ron(&level_paths[current_level])?;
-            info!(
-                "level '{}' ({} entities)",
-                level_paths[current_level],
-                level.entities.len()
-            );
+            // Stage E: load through the cook (RON → cooked .dcasset, cache-keyed).
+            let level = level::load(std::path::Path::new(&level_paths[current_level]))?;
             level::build_level(
                 &device,
                 &level,
@@ -1359,7 +1355,7 @@ impl App {
     fn load_level(&mut self, idx: usize) -> anyhow::Result<()> {
         self.device.wait_idle()?;
         let path = self.level_paths[idx].clone();
-        let level = dreamcoast_asset::LevelData::load_ron(&path)?;
+        let level = level::load(std::path::Path::new(&path))?;
         let mut world = World::new();
         let mut mesh_registry = MeshRegistry::new();
         let mut material_registry = MaterialRegistry::new();

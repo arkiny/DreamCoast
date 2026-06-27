@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use dreamcoast_asset::{LevelData, LevelGraph, WorldChunk};
+use dreamcoast_asset::{LevelGraph, WorldChunk};
 use dreamcoast_core::glam::Vec3;
 use dreamcoast_scene::{World, propagate_transforms};
 use rhi::{Device, Texture};
@@ -100,7 +100,7 @@ impl Streaming {
 
     fn load_chunk(&mut self, device: &Device, i: usize) -> anyhow::Result<()> {
         let WorldChunk { level, origin, .. } = &self.graph.chunks[i];
-        let level_data = LevelData::load_ron(self.dir.join(level))?;
+        let level_data = crate::level::load(&self.dir.join(level))?;
         let mut world = World::new();
         let mut meshes = MeshRegistry::new();
         let mut materials = MaterialRegistry::new();
