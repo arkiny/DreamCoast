@@ -11,8 +11,15 @@
 
 use dreamcoast_core::glam::Vec3;
 use dreamcoast_scene::World;
+use tracing::warn;
 
 use crate::registry::{MaterialRegistry, MeshRegistry};
+
+/// Surface-cache atlas budget: the maximum number of mesh cards (atlas = `cards · tile²`
+/// texels in flat buffers, re-lit every frame). Caps atlas memory and per-frame relight
+/// cost for large scenes; 6 cards / drawable ⇒ ~680 drawables. Above this the largest
+/// drawables are kept (most screen-relevant) and the rest logged — never silently dropped.
+pub(crate) const MAX_CARDS: u32 = 4096;
 
 /// The fused scene: one world-space triangle soup ready for the GDF bake, plus the
 /// per-drawable AABBs the surface-cache cards are built from.
@@ -108,4 +115,78 @@ pub(crate) fn fuse_scene(
         aabb_max: amax,
         drawable_aabb,
     }
+}
+
+/// Build the Lumen-style surface-cache mesh cards from the per-drawable world AABBs: 6
+/// axis-aligned cards per drawable (one per AABB face), 64 bytes each
+/// (`center.xyz/trace_depth, normal.xyz, u_axis.xyz, v_axis.xyz`). The capture pass
+/// sphere-traces the GDF inward from each card-plane texel to the surface.
+///
+/// Optimization / scalability: if 6·drawables would exceed [`MAX_CARDS`], only the largest
+/// drawables (by AABB volume — the most screen-relevant) keep cards, in their original
+/// draw-list order (so a within-budget scene like the gallery is byte-identical), and the
+/// dropped count is logged. This bounds the atlas size and the per-frame relight cost.
+pub(crate) fn build_surface_cards(drawable_aabb: &[([f32; 3], [f32; 3])]) -> Vec<u8> {
+    let max_drawables = (MAX_CARDS / 6) as usize;
+    // Pick which drawables get cards (all, unless over budget → largest-volume subset).
+    let mut keep: Vec<usize> = (0..drawable_aabb.len()).collect();
+    if keep.len() > max_drawables {
+        let volume = |i: usize| -> f32 {
+            let (mn, mx) = drawable_aabb[i];
+            (mx[0] - mn[0]).max(0.0) * (mx[1] - mn[1]).max(0.0) * (mx[2] - mn[2]).max(0.0)
+        };
+        keep.sort_by(|&a, &b| volume(b).total_cmp(&volume(a)));
+        let dropped = keep.len() - max_drawables;
+        keep.truncate(max_drawables);
+        keep.sort_unstable(); // restore draw-list order for determinism
+        warn!(
+            "surface cache: {} drawables exceed the {}-card budget — keeping the {} largest, \
+             dropping {} (smaller drawables get no cache cards)",
+            drawable_aabb.len(),
+            MAX_CARDS,
+            max_drawables,
+            dropped
+        );
+    }
+
+    let mut cards: Vec<u8> = Vec::with_capacity(keep.len() * 6 * 64);
+    let push4 = |v: [f32; 3], w: f32, buf: &mut Vec<u8>| {
+        for c in v {
+            buf.extend_from_slice(&c.to_le_bytes());
+        }
+        buf.extend_from_slice(&w.to_le_bytes());
+    };
+    for &i in &keep {
+        let (omin, omax) = drawable_aabb[i];
+        let center = [
+            (omin[0] + omax[0]) * 0.5,
+            (omin[1] + omax[1]) * 0.5,
+            (omin[2] + omax[2]) * 0.5,
+        ];
+        let half = [
+            (omax[0] - omin[0]) * 0.5,
+            (omax[1] - omin[1]) * 0.5,
+            (omax[2] - omin[2]) * 0.5,
+        ];
+        for axis in 0..3 {
+            for &sign in &[1.0f32, -1.0] {
+                let mut normal = [0.0f32; 3];
+                normal[axis] = sign;
+                let mut fc = center;
+                fc[axis] = if sign > 0.0 { omax[axis] } else { omin[axis] };
+                let t1 = (axis + 1) % 3;
+                let t2 = (axis + 2) % 3;
+                let mut u_axis = [0.0f32; 3];
+                u_axis[t1] = half[t1];
+                let mut v_axis = [0.0f32; 3];
+                v_axis[t2] = half[t2];
+                let depth = (omax[axis] - omin[axis]).max(1e-4);
+                push4(fc, depth, &mut cards);
+                push4(normal, 0.0, &mut cards);
+                push4(u_axis, 0.0, &mut cards);
+                push4(v_axis, 0.0, &mut cards);
+            }
+        }
+    }
+    cards
 }
