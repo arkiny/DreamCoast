@@ -47,6 +47,7 @@ mod reflect;
 mod registry;
 mod rt;
 mod smoketest;
+mod taau;
 mod world;
 use app::*;
 use cull::*;
@@ -517,6 +518,9 @@ struct App {
     gi_denoise: bool,
     /// Previous frame's view-projection (world -> clip) for C4 temporal reprojection.
     prev_view_proj: [f32; 16],
+    /// QHD/UHD TAAU: previous frame's UNJITTERED view-projection (the stable grid the TAAU history
+    /// lives on; the per-frame jitter must not enter the history reprojection).
+    prev_view_proj_taau: [f32; 16],
     /// C5: screen-space reflections (viz; C7 will composite into lighting).
     gdf_ssr: bool,
     /// C6: GDF reflections (off-screen fallback viz; C7 composites SSR→GDF→sky).
@@ -572,6 +576,15 @@ struct App {
     /// for dynamic resolution. `1.0` = native (byte-identical). Ignored when `render_res` (absolute)
     /// is set. `RENDER_SCALE` env / `quality.rs` tier.
     render_scale: f32,
+    /// QHD/UHD track: temporal upsampler (TAAU) — reconstructs full-res from jittered low-res
+    /// frames when the internal render extent is smaller than the output. `P_TAAU=0` disables.
+    taau: taau::TaauSystem,
+    taau_on: bool,
+    /// QHD/UHD: camera sub-pixel jitter for TAAU. Default OFF — on this engine's heavy GDF GI /
+    /// reflection temporal stack the jitter destabilizes those passes (per-frame G-buffer shimmer)
+    /// faster than TAAU can resolve it. FXAA supplies the spatial AA instead; `P_TAAU_JITTER=1`
+    /// re-enables jitter once the jitter is coordinated across all temporal accumulators.
+    taau_jitter: bool,
     // Profiler UI state.
     profiler_on: bool,
     slot_pass_names: Vec<Vec<String>>,
@@ -606,6 +619,22 @@ const PATHTRACE_WARMUP: u64 = 64;
 // GI temporal accumulation likewise needs several frames to converge for a clean
 // screenshot (the camera is held fixed while capturing).
 const GI_DENOISE_WARMUP: u64 = 64;
+/// TAAU sub-pixel jitter sequence length (Halton(2,3)); the history accumulates over this many
+/// jittered frames to reconstruct full-res detail.
+const TAAU_JITTER_LEN: u64 = 8;
+
+/// Halton low-discrepancy sample (1-indexed) for the TAAU jitter sequence — uniform sub-pixel
+/// coverage so the temporal accumulation resolves detail the low-res frame lacks.
+fn halton(mut i: u32, base: u32) -> f32 {
+    let mut f = 1.0_f32;
+    let mut r = 0.0_f32;
+    while i > 0 {
+        f /= base as f32;
+        r += f * (i % base) as f32;
+        i /= base;
+    }
+    r
+}
 
 impl App {
     #[allow(clippy::too_many_arguments)]
@@ -639,6 +668,8 @@ impl App {
         let gi = GiSystem::new(&device, backend, compute_supported)?;
         // Stage C reflection track (C5 SSR; C6/C7 later). See `reflect.rs`.
         let reflect = ReflectSystem::new(&device, backend, compute_supported)?;
+        // QHD/UHD track: temporal upsampler. See `taau.rs`.
+        let taau = taau::TaauSystem::new(&device, backend, compute_supported)?;
 
         // GPU particle system (Phase 7): a persistent ping-pong buffer pair advanced
         // by a compute pass and drawn as instanced billboards (see `particle.rs`).
@@ -1491,6 +1522,7 @@ impl App {
             gi_half_res,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
+            prev_view_proj_taau: Mat4::IDENTITY.to_cols_array(),
             gdf_ssr,
             gdf_reflect,
             gdf_hybrid,
@@ -1514,6 +1546,9 @@ impl App {
             legacy_ibl,
             render_res,
             render_scale,
+            taau,
+            taau_on: quality::env_bool("P_TAAU", true),
+            taau_jitter: quality::env_bool("P_TAAU_JITTER", false),
             profiler_on,
             slot_pass_names,
             gpu_timings: Vec::new(),
@@ -1663,6 +1698,10 @@ impl App {
                 ((sh as f32 * self.render_scale).round() as u32).max(64),
             ),
         };
+        // QHD/UHD track: TAAU is active when the scene renders below the output resolution (upscale)
+        // and isn't a path-trace/debug capture. It jitters the camera + reconstructs full-res from
+        // history. When render == output (default), it's inactive (byte-identical).
+        let taau_active = self.taau_on && self.taau.has_taau() && cw < sw && ch < sh;
 
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32();
@@ -1699,6 +1738,7 @@ impl App {
             || self.cache_viz
             || self.surface_cache
             || self.reflect_cache
+            || taau_active
             || (self.swrt_reflect && self.reflect.has_reflect_temporal())
         {
             // The surface cache / stochastic GGX reflection accrue a sample per frame + temporally
@@ -1811,6 +1851,30 @@ impl App {
         let mut proj = proj_noflip;
         if self.backend == BackendKind::Vulkan {
             proj.y_axis.y *= -1.0; // Vulkan clip-space Y points down
+        }
+        // The unjittered (but Y-flipped) view-proj — the stable grid the TAAU history lives on.
+        let view_proj_stable = proj * view;
+        // QHD/UHD TAAU: sub-pixel camera jitter (Halton(2,3)) so successive low-res frames sample
+        // different sub-pixel positions; the TAAU history reconstructs full-res detail from them.
+        // Applied to the scene projection only (cull_view_proj stays unjittered = stable culling);
+        // the GI/reflect denoisers reproject in world space, so the consistent jitter cancels.
+        let mut taau_jitter_uv = [0.0f32, 0.0f32];
+        if taau_active && self.taau_jitter {
+            let j = ((self.frame_no % TAAU_JITTER_LEN) + 1) as u32;
+            let jx = (halton(j, 2) - 0.5) * 2.0 / cw as f32; // NDC offset (±1 px in internal res)
+            let jy = (halton(j, 3) - 0.5) * 2.0 / ch as f32;
+            // clip.xy += offset * clip.w  ⇒  row0/row1 += offset * row3 (row3 = (0,0,-1,0) RH).
+            // Negate Y on Vulkan so the screen-space jitter direction matches D3D12 (DX≡VK).
+            let sy = if self.backend == BackendKind::Vulkan {
+                -1.0
+            } else {
+                1.0
+            };
+            proj.z_axis.x -= jx;
+            proj.z_axis.y -= jy * sy;
+            // The jitter shifts NDC by +jx/+jy*sy; in UV that is (jx*0.5, jy*0.5) (the sy cancels
+            // with the UV-Y flip). The TAAU samples the internal frame at `uv + jitter_uv`.
+            taau_jitter_uv = [jx * 0.5, jy * 0.5];
         }
         let view_proj = proj * view;
         // Frustum culling uses the Y-flip-free matrix so the visible set (and the
@@ -2426,6 +2490,10 @@ impl App {
         // C8j: (re)allocate the stochastic GDF-reflection temporal accumulation buffers (full-res).
         if self.swrt_reflect && self.reflect.has_reflect_temporal() {
             self.reflect.prepare_reflect_accum(&self.device, cw, ch)?;
+        }
+        // QHD/UHD TAAU: (re)allocate the full-res (output) history.
+        if taau_active {
+            self.taau.prepare(&self.device, sw, sh, 0)?;
         }
 
         let extent = Extent2D::new(cw, ch); // scene render extent (RENDER_RES or swapchain)
@@ -3337,6 +3405,36 @@ impl App {
         // the SW-RT SDF trace, else the Stage-B volume slice, else the Stage-C1 scene
         // GDF, else the Stage-C5 SSR / C6 GDF-reflection viz, else the C8b1 cache atlas,
         // else compute-post, else HDR.
+        // QHD/UHD TAAU: reconstruct the full-res (output) HDR from the jittered internal-res lit
+        // image + history, before tonemap. Only the main lit path (not the debug/RT viz outputs).
+        let taau_out = if taau_active {
+            let main_lit = hdr_post.unwrap_or(hdr);
+            // Decima FXAA→TAA: spatially anti-alias the jittered internal frame first so its edges
+            // don't flicker frame to frame, then temporally upsample. Stabilizes the jitter.
+            let taau_in = if self.taau.has_fxaa() {
+                self.taau.record_fxaa(&mut graph, main_lit, extent, cw, ch)
+            } else {
+                main_lit
+            };
+            Some(self.taau.record(
+                &mut graph,
+                taau_in,
+                g_depth,
+                swap_extent,
+                sw,
+                sh,
+                cw,
+                ch,
+                inv_view_proj,
+                self.prev_view_proj_taau,
+                self.flip_y,
+                self.scene_radius * 2.0,
+                taau_jitter_uv,
+                false,
+            ))
+        } else {
+            None
+        };
         let tonemap_src = rt_out
             .or(sdf_out)
             .or(vol_out)
@@ -3348,6 +3446,7 @@ impl App {
             .or(reflect_out)
             .or(hybrid_out)
             .or(cache_out)
+            .or(taau_out)
             .or(hdr_post)
             .unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the
@@ -3365,6 +3464,13 @@ impl App {
         } else {
             1.0
         };
+        // QHD/UHD: sharpen only when the TAAU upscale produced this frame (recover crispness lost
+        // in temporal upsampling); native/debug paths get 0 = byte-identical.
+        let (sharpen, inv_w, inv_h) = if taau_active && taau_out.is_some() {
+            (0.25, 1.0 / sw as f32, 1.0 / sh as f32)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
         self.deferred.record_tonemap(
             &mut graph,
             backbuffer,
@@ -3372,6 +3478,9 @@ impl App {
             self.post_mode as u32,
             self.flip_y,
             tm_exposure,
+            sharpen,
+            inv_w,
+            inv_h,
         );
 
         // Phase 7 GPU-culling draw: indirect, instanced render of the visible cube
@@ -3515,7 +3624,12 @@ impl App {
         if scene_cache_lit_ext.is_some() {
             self.gdf.advance_cache();
         }
+        // QHD/UHD TAAU: advance the history ping-pong (next frame reprojects this frame's).
+        if taau_active {
+            self.taau.advance();
+        }
         self.prev_view_proj = view_proj.to_cols_array();
+        self.prev_view_proj_taau = view_proj_stable.to_cols_array();
 
         // Wait for the GPU (copy included), read the buffer back, and save a PNG.
         if let (Some(cap), Some((buf, layout))) = (capture_this_frame.as_ref(), readback.as_ref()) {

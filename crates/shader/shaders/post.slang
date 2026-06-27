@@ -27,6 +27,10 @@ struct PushConstants
     uint mode;      // 0 = none, 1 = grayscale, 2 = vignette
     uint flip_y;    // 0 = D3D12 (Y up), 1 = Vulkan (Y down)
     float exposure; // camera exposure applied before the filmic curve (1 = none)
+    float sharpen;  // QHD/UHD: unsharp amount to recover crispness after upscale (0 = off)
+    float inv_w;    // 1 / output width  (sharpen tap spacing)
+    float inv_h;    // 1 / output height
+    float pad;
 };
 
 [[vk::push_constant]]
@@ -55,6 +59,17 @@ float3 aces(float3 x)
 float4 fsMain(VSOutput input) : SV_Target
 {
     float3 hdr = g.textures[pc.hdr_index].Sample(g.samp, input.uv).rgb;
+    // QHD/UHD: contrast-adaptive unsharp (FSR-RCAS-style) to recover crispness lost in the
+    // temporal upscale. A 4-tap cross at the output texel spacing; `sharpen == 0` is a no-op.
+    if (pc.sharpen > 0.0)
+    {
+        float3 n = g.textures[pc.hdr_index].Sample(g.samp, input.uv + float2(0.0, -pc.inv_h)).rgb;
+        float3 s = g.textures[pc.hdr_index].Sample(g.samp, input.uv + float2(0.0, pc.inv_h)).rgb;
+        float3 e = g.textures[pc.hdr_index].Sample(g.samp, input.uv + float2(pc.inv_w, 0.0)).rgb;
+        float3 w = g.textures[pc.hdr_index].Sample(g.samp, input.uv + float2(-pc.inv_w, 0.0)).rgb;
+        float3 blur = (n + s + e + w) * 0.25;
+        hdr = max(hdr + pc.sharpen * (hdr - blur), 0.0);
+    }
     // Camera exposure before the filmic curve. The rasterized HDR already bakes
     // exposure into the lighting pass (so it passes 1.0 here); the path-traced
     // output carries raw scene radiance and is exposed at this stage instead.
