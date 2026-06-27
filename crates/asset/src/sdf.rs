@@ -245,6 +245,164 @@ pub fn bake_sdf_from_fused(
     }
 }
 
+/// A baked per-voxel albedo field: three `dim³` R32F channels (R/G/B) over the same
+/// grid as the scene SDF (Phase 11 Stage C8a). Each voxel holds the linear albedo of
+/// the nearest triangle. Used by the GI / reflection re-lighting to recover surface
+/// colour at a ray hit.
+pub struct AlbedoVolumes {
+    pub dim: u32,
+    /// `[r, g, b]`, each `dim³` values in `idx = x + dim*(y + dim*z)` order.
+    pub channels: [Vec<f32>; 3],
+}
+
+impl AlbedoVolumes {
+    /// Channel `c` (0=R,1=G,2=B) as little-endian f32 bytes for `create_volume_init`.
+    pub fn channel_le_bytes(&self, c: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.channels[c].len() * 4);
+        for v in &self.channels[c] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// Bake one Z-slab of the albedo field: per voxel, the nearest triangle's albedo
+/// (RGB interleaved into `out`, 3 floats per voxel). The nearest-triangle search is
+/// identical to [`bake_slab`] so the winner matches the distance field's.
+fn bake_albedo_slab(out: &mut [f32], z0: u32, z1: u32, ctx: &BakeCtx, tri_albedo: &[[f32; 3]]) {
+    let BakeCtx {
+        dim,
+        aabb_min,
+        aabb_max,
+        positions,
+        indices,
+        ..
+    } = *ctx;
+    let tri_count = indices.len() / 3;
+    let inv_dim = 1.0 / dim as f32;
+    for z in z0..z1 {
+        for y in 0..dim {
+            for x in 0..dim {
+                let t = [
+                    (x as f32 + 0.5) * inv_dim,
+                    (y as f32 + 0.5) * inv_dim,
+                    (z as f32 + 0.5) * inv_dim,
+                ];
+                let p = [
+                    aabb_min[0] + (aabb_max[0] - aabb_min[0]) * t[0],
+                    aabb_min[1] + (aabb_max[1] - aabb_min[1]) * t[1],
+                    aabb_min[2] + (aabb_max[2] - aabb_min[2]) * t[2],
+                ];
+                let mut best = 1e30_f32;
+                let mut best_tri = 0usize;
+                for tri in 0..tri_count {
+                    let a = positions[indices[tri * 3] as usize];
+                    let b = positions[indices[tri * 3 + 1] as usize];
+                    let c = positions[indices[tri * 3 + 2] as usize];
+                    let q = closest_on_triangle(p, a, b, c);
+                    let dp = sub(p, q);
+                    let d = dot(dp, dp);
+                    if d < best {
+                        best = d;
+                        best_tri = tri;
+                    }
+                }
+                let albedo = if tri_count > 0 {
+                    tri_albedo[best_tri]
+                } else {
+                    [0.7, 0.7, 0.7]
+                };
+                let local = (((z - z0) * dim * dim + y * dim + x) * 3) as usize;
+                out[local] = albedo[0];
+                out[local + 1] = albedo[1];
+                out[local + 2] = albedo[2];
+            }
+        }
+    }
+}
+
+/// Bake the per-voxel albedo volumes from the fused geometry + a per-triangle linear
+/// albedo buffer (12 bytes / triangle, the same bytes the GPU albedo bake reads).
+/// Brute force O(voxels·triangles), parallelized over Z slabs — a deterministic CPU
+/// cook persisted as a `.dcasset` albedo chunk (Phase 12 M2 extension).
+pub fn bake_albedo_from_fused(
+    vtx_bytes: &[u8],
+    idx_bytes: &[u8],
+    tri_albedo_bytes: &[u8],
+    dim: u32,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+) -> AlbedoVolumes {
+    let vtx_count = vtx_bytes.len() / VTX_STRIDE;
+    let mut positions = Vec::with_capacity(vtx_count);
+    let mut normals = Vec::with_capacity(vtx_count);
+    for v in 0..vtx_count {
+        let base = v * VTX_STRIDE;
+        positions.push(read_vec3(vtx_bytes, base));
+        normals.push(read_vec3(vtx_bytes, base + 12));
+    }
+    let indices: Vec<u32> = idx_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let tri_albedo: Vec<[f32; 3]> = tri_albedo_bytes
+        .chunks_exact(12)
+        .map(|c| {
+            [
+                f32::from_le_bytes(c[0..4].try_into().unwrap()),
+                f32::from_le_bytes(c[4..8].try_into().unwrap()),
+                f32::from_le_bytes(c[8..12].try_into().unwrap()),
+            ]
+        })
+        .collect();
+
+    let slab = dim * dim;
+    // RGB interleaved (3 floats / voxel) so the parallel split stays one contiguous
+    // output; deinterleaved into channels afterwards.
+    let mut interleaved = vec![0.0_f32; (slab * dim * 3) as usize];
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(dim as usize)
+        .max(1);
+    let per = dim.div_ceil(threads as u32);
+    let ctx = BakeCtx {
+        dim,
+        aabb_min,
+        aabb_max,
+        positions: &positions,
+        normals: &normals,
+        indices: &indices,
+    };
+    std::thread::scope(|scope| {
+        let mut rest = interleaved.as_mut_slice();
+        let mut z0 = 0u32;
+        let ctx = &ctx;
+        let tri_albedo = &tri_albedo;
+        while z0 < dim {
+            let z1 = (z0 + per).min(dim);
+            let take = ((z1 - z0) * slab * 3) as usize;
+            let (head, tail) = rest.split_at_mut(take.min(rest.len()));
+            rest = tail;
+            scope.spawn(move || bake_albedo_slab(head, z0, z1, ctx, tri_albedo));
+            z0 = z1;
+        }
+    });
+
+    let n = (slab * dim) as usize;
+    let mut channels = [
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    ];
+    for voxel in interleaved.chunks_exact(3) {
+        channels[0].push(voxel[0]);
+        channels[1].push(voxel[1]);
+        channels[2].push(voxel[2]);
+    }
+    AlbedoVolumes { dim, channels }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +468,40 @@ mod tests {
         let a = bake_sdf_from_fused(&vtx, &idx, 16, [0.0; 3], [1.0; 3]);
         let b = bake_sdf_from_fused(&vtx, &idx, 16, [0.0; 3], [1.0; 3]);
         assert_eq!(a.voxels, b.voxels, "two CPU bakes must be byte-identical");
+    }
+
+    #[test]
+    fn albedo_bake_picks_nearest_triangle_colour() {
+        // One sphere whose every triangle carries the same albedo → every voxel
+        // (only one mesh to be nearest to) gets that colour.
+        let (vtx, idx) = sphere_fused();
+        let tri_count = idx.len() / 4 / 3;
+        let colour = [0.2_f32, 0.6, 0.9];
+        let mut tri_albedo = Vec::with_capacity(tri_count * 12);
+        for _ in 0..tri_count {
+            for c in colour {
+                tri_albedo.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let dim = 16;
+        let alb = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, dim, [0.0; 3], [1.0; 3]);
+        assert_eq!(alb.dim, dim);
+        for (ch, (channel, &expected)) in alb.channels.iter().zip(&colour).enumerate() {
+            assert_eq!(channel.len(), (dim * dim * dim) as usize);
+            assert!(
+                channel.iter().all(|&v| (v - expected).abs() < 1e-6),
+                "channel {ch} should be uniformly {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn albedo_bake_is_deterministic() {
+        let (vtx, idx) = sphere_fused();
+        let tri_count = idx.len() / 4 / 3;
+        let tri_albedo: Vec<u8> = (0..tri_count * 12).map(|i| (i % 251) as u8).collect();
+        let a = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, 12, [0.0; 3], [1.0; 3]);
+        let b = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, 12, [0.0; 3], [1.0; 3]);
+        assert_eq!(a.channels, b.channels);
     }
 }

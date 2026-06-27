@@ -67,6 +67,9 @@ pub(crate) struct GdfSystem {
     /// Phase 12 M2: the scene GDF was seeded from a cooked `.dcasset` (CPU bake
     /// uploaded), so the one-time GPU `record_scene_bake` is skipped.
     scene_sdf_cooked: bool,
+    /// Phase 12 M2-ext: the C8a albedo volumes were seeded from a cooked `.dcasset`,
+    /// so the one-time GPU `record_scene_albedo_bake` is skipped.
+    scene_albedo_cooked: bool,
     /// Stage C8a: per-voxel surface albedo (R/G/B as three R32Float volumes sharing the
     /// scene GDF's grid) + the parallel per-triangle albedo buffer the bake reads. Lets the
     /// C3 GI / C6 reflection re-light a hit with the real surface color instead of a constant.
@@ -340,6 +343,7 @@ impl GdfSystem {
             scene_aabb_min: [0.0; 3],
             scene_aabb_max: [0.0; 3],
             scene_sdf_cooked: false,
+            scene_albedo_cooked: false,
             scene_albedo: None,
             scene_tri_albedo: None,
             albedo_bake_pipeline,
@@ -370,6 +374,7 @@ impl GdfSystem {
         aabb_min: [f32; 3],
         aabb_max: [f32; 3],
         cooked_sdf: Option<&[u8]>,
+        cooked_albedo: Option<[&[u8]; 3]>,
     ) -> anyhow::Result<()> {
         if self.gdf.is_none() {
             return Ok(()); // compute unsupported (no volumes created)
@@ -408,26 +413,39 @@ impl GdfSystem {
         self.scene_tri_count = tri_count;
         self.scene_aabb_min = aabb_min;
         self.scene_aabb_max = aabb_max;
-        // C8a: three R32F color volumes (R/G/B) over the same grid + the per-triangle linear
-        // albedo buffer (12 B/triangle) the bake reads. Only when the albedo bake exists.
+        // C8a: three R32F color volumes (R/G/B) over the same grid. Only when the
+        // albedo bake exists. Phase 12 M2-ext: a cooked albedo (CPU bake) uploads
+        // straight into the volumes and skips the GPU bake + the per-triangle buffer;
+        // otherwise allocate empty volumes the GPU `record_scene_albedo_bake` fills.
         if self.albedo_bake_pipeline.is_some() {
-            let make = || -> anyhow::Result<Volume> {
-                Ok(device.create_volume(&VolumeDesc {
-                    width: dim,
-                    height: dim,
-                    depth: dim,
-                    format: Format::R32Float,
-                })?)
+            let vd = VolumeDesc {
+                width: dim,
+                height: dim,
+                depth: dim,
+                format: Format::R32Float,
             };
-            self.scene_albedo = Some([make()?, make()?, make()?]);
-            self.scene_tri_albedo = Some(device.create_storage_buffer_init(
-                &StorageBufferDesc {
-                    size: tri_albedo.len() as u64,
-                    stride: 12,
-                    indirect: false,
-                },
-                tri_albedo,
-            )?);
+            if let Some(channels) = cooked_albedo {
+                self.scene_albedo = Some([
+                    device.create_volume_init(&vd, channels[0])?,
+                    device.create_volume_init(&vd, channels[1])?,
+                    device.create_volume_init(&vd, channels[2])?,
+                ]);
+                self.scene_albedo_cooked = true;
+            } else {
+                self.scene_albedo = Some([
+                    device.create_volume(&vd)?,
+                    device.create_volume(&vd)?,
+                    device.create_volume(&vd)?,
+                ]);
+                self.scene_tri_albedo = Some(device.create_storage_buffer_init(
+                    &StorageBufferDesc {
+                        size: tri_albedo.len() as u64,
+                        stride: 12,
+                        indirect: false,
+                    },
+                    tri_albedo,
+                )?);
+            }
         }
         Ok(())
     }
@@ -446,6 +464,12 @@ impl GdfSystem {
     /// already done and `record_scene_bake` should be skipped).
     pub(crate) fn scene_sdf_is_cooked(&self) -> bool {
         self.scene_sdf_cooked
+    }
+
+    /// Whether the C8a albedo volumes were seeded from a cooked `.dcasset` (so the GPU
+    /// `record_scene_albedo_bake` should be skipped).
+    pub(crate) fn scene_albedo_is_cooked(&self) -> bool {
+        self.scene_albedo_cooked
     }
 
     pub(crate) fn has_scene_albedo(&self) -> bool {

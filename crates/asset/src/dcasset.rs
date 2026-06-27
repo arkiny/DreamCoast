@@ -23,7 +23,7 @@
 use dreamcoast_core::EngineError;
 
 use crate::bc::BcFormat;
-use crate::sdf::SdfVolume;
+use crate::sdf::{AlbedoVolumes, SdfVolume};
 use crate::{ImageData, Material, MeshData, MeshVertex, TexData};
 
 /// Container magic. The trailing NUL keeps it a fixed 8 bytes and ASCII-greppable.
@@ -39,6 +39,8 @@ const CHUNK_MESH: u32 = 1;
 const CHUNK_TEXTURE: u32 = 2;
 /// SDF volume chunk: `dim`, `aabb_min`/`aabb_max`, then `dim³` R32F voxels (M2).
 const CHUNK_SDF: u32 = 3;
+/// Albedo volumes chunk: `dim`, then three `dim³` R32F channels (R,G,B) (M2 ext).
+const CHUNK_ALBEDO: u32 = 4;
 
 // Texture slot tags (texture chunk `slot` field) — which `Material` field a decoded
 // image fills. Kept distinct from chunk tags so the two namespaces never collide.
@@ -428,6 +430,83 @@ pub fn read_sdf(bytes: &[u8]) -> Result<(Header, SdfVolume), EngineError> {
     Err(EngineError::Asset("dcasset: missing sdf chunk".into()))
 }
 
+/// Serialize the per-voxel albedo volumes into a `.dcasset` (single albedo chunk).
+/// `src_hash` is the invalidation key (the fused-geometry + per-triangle albedo +
+/// grid hash).
+pub fn write_albedo(vol: &AlbedoVolumes, src_hash: u64) -> Vec<u8> {
+    let payload = encode_albedo(vol);
+    let payload_start = HEADER_SIZE + DIR_ENTRY_SIZE;
+    let mut w = Writer::default();
+    w.bytes(&MAGIC);
+    w.u32(VERSION);
+    w.u32(0);
+    w.u64(src_hash);
+    w.u64(cook_params_hash());
+    w.u32(1);
+    w.u32(CHUNK_ALBEDO);
+    w.u64(payload_start as u64);
+    w.u64(payload.len() as u64);
+    w.bytes(&payload);
+    w.buf
+}
+
+/// Decode a `.dcasset` buffer's albedo chunk into its [`Header`] and [`AlbedoVolumes`].
+pub fn read_albedo(bytes: &[u8]) -> Result<(Header, AlbedoVolumes), EngineError> {
+    let header = read_header(bytes)?;
+    let mut r = Reader::at(bytes, HEADER_SIZE - 4);
+    let chunk_count = r.u32()?;
+    let mut dir = Vec::with_capacity(chunk_count as usize);
+    for _ in 0..chunk_count {
+        let ty = r.u32()?;
+        let offset = r.u64()? as usize;
+        let size = r.u64()? as usize;
+        dir.push((ty, offset, size));
+    }
+    for (ty, offset, size) in dir {
+        if ty != CHUNK_ALBEDO {
+            continue;
+        }
+        let end = offset
+            .checked_add(size)
+            .filter(|&e| e <= bytes.len())
+            .ok_or_else(|| EngineError::Asset("dcasset: albedo chunk out of bounds".into()))?;
+        let mut cr = Reader::at(&bytes[..end], offset);
+        return Ok((header, decode_albedo(&mut cr)?));
+    }
+    Err(EngineError::Asset("dcasset: missing albedo chunk".into()))
+}
+
+/// Encode the albedo chunk payload: `dim`, then the R, G, B channels in order.
+fn encode_albedo(vol: &AlbedoVolumes) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.u32(vol.dim);
+    for ch in &vol.channels {
+        for &v in ch {
+            w.f32(v);
+        }
+    }
+    w.buf
+}
+
+/// Decode an albedo chunk payload (`dim` + three `dim³` channels).
+fn decode_albedo(r: &mut Reader) -> Result<AlbedoVolumes, EngineError> {
+    let dim = r.u32()?;
+    let count = (dim as usize)
+        .checked_pow(3)
+        .ok_or_else(|| EngineError::Asset("dcasset: albedo dim overflow".into()))?;
+    let mut channels = [
+        Vec::with_capacity(count),
+        Vec::with_capacity(count),
+        Vec::with_capacity(count),
+    ];
+    for ch in &mut channels {
+        for _ in 0..count {
+            ch.push(r.f32()?);
+        }
+    }
+    Ok(AlbedoVolumes { dim, channels })
+}
+
 /// Encode the SDF chunk payload: `dim`, `aabb_min`, `aabb_max`, then the voxels.
 fn encode_sdf(vol: &SdfVolume) -> Vec<u8> {
     let mut w = Writer::default();
@@ -712,6 +791,23 @@ mod tests {
         assert_eq!(decoded.aabb_min, vol.aabb_min);
         assert_eq!(decoded.aabb_max, vol.aabb_max);
         assert_eq!(decoded.voxels, vol.voxels);
+    }
+
+    #[test]
+    fn albedo_chunk_roundtrip() {
+        let vol = AlbedoVolumes {
+            dim: 2,
+            channels: [
+                vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+                vec![1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3],
+                vec![0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35],
+            ],
+        };
+        let bytes = write_albedo(&vol, 0x5151);
+        let (header, decoded) = read_albedo(&bytes).expect("decode");
+        assert_eq!(header.source_hash, 0x5151);
+        assert_eq!(decoded.dim, 2);
+        assert_eq!(decoded.channels, vol.channels);
     }
 
     #[test]
