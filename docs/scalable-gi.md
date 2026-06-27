@@ -134,22 +134,27 @@ Phase 10에서 만든 GDF(global distance field) 기반 SW-RT GI/AO/반사는 **
 | B3 멀티레벨 | `8e3c6aa` | finer 레벨 볼륨 빌드 + 디스크립터 + 패스별 transition |
 | C 아틀라스 | `5995649` | `fuse::build_surface_cards` 일반화 + MAX_CARDS 예산 |
 | D-build | `9ce08b8` | 콘텐츠 씬 GDF/클립맵 빌드(Sponza 4레벨), analytic ground 비활성 |
-| D-lighting | `4171839` | 콘텐츠 GDF ambient 배선(`P11_GDF_CONTENT` opt-in), 캐시 예산 게이트 |
+| D-lighting | `4171839` | 콘텐츠 GDF ambient 배선 |
+| **NaN fix** | `46f396d` | UE `MakeFinite` + safe_normalize — temporal 누적 NaN 오염 차단 |
+| **GDF 디폴트** | `e5f54df` | **콘텐츠 씬 GDF ambient 디폴트**(P11_LEGACY_IBL=escape) |
 
 **검증 결과:**
 - 갤러리: 전 스테이지 **바이트 동일**(DX/VK 0.000/ch, DX≡VK 0.000, Vulkan 검증 클린).
-- Sponza 클립맵 **지오메트리 검증됨**: `P11_SCENE_GDF` 트레이스가 기둥·아치·벽을 해상(4레벨 vs 1레벨
-  = 31.9/ch — 48³ 블롭이 인식 가능한 건축물로). 트레이스 자체 DX≡VK는 복잡 SDF 256-step march의
-  본질적 FP 분기로 1레벨 0.026·4레벨 0.041/ch(갤러리=단순→0.000); **디버그 viz 한정**, 프로덕션
-  파리티는 라이팅 렌더 기준.
+- **Sponza GDF 라이팅 정상**(디폴트): 코트야드 기둥·아치·배너 제대로 조명, 프레임 안정. GDF vs IBL
+  =5.6/ch(실제 GI 바운스+앰비언트 모델 차이). **라이팅 렌더 DX≡VK 0.003/ch**(디노이즈됨 — raw 트레이스
+  0.041보다 훨씬 타이트; 잔차=복잡 SDF march의 본질적 FP, 갤러리 파리티 기준은 0.000 유지).
+- 클립맵 지오메트리: `P11_SCENE_GDF` 트레이스가 기둥·아치·벽 해상(4레벨 vs 1레벨=31.9/ch). 트레이스
+  자체 DX≡VK 0.026~0.041은 디버그 viz 한정(라이팅 렌더는 디노이즈로 0.003).
+
+**★ 핵심 교훈(NaN 오염)**: "Sponza GDF가 검다"는 GI 부족이 아니라 **temporal 누적 버퍼 NaN 오염**이었음
+(첫 프레임 정상→이후 검은색 번짐). 원인=빈 영역 SDF 그래디언트 `normalize(0)`→NaN→서피스캐시/GI
+디노이저/반사 누적의 EMA로 매 프레임 확산. UE5 Lumen `MakeFinite` 패턴(누적 경계 sanitize)+
+safe_normalize로 해결. 유한값엔 무영향=갤러리 바이트 동일.
 
 **미결(측정 주도 후속):**
-- **콘텐츠 GDF 라이팅 튜닝(Stage E 본체)**: Sponza에서 GDF 1-bounce GI가 **어둡다**(열린 코트야드는
-  IBL 큐브의 풀 스카이 조명이 필요한데 GI sky-fill 0.25 + 1바운스로는 미달). 콘텐츠 디폴트는 IBL 유지
-  (보기 좋음·무회귀), `P11_GDF_CONTENT`로 GDF 진입(튜닝 seam). 끌어올리려면: 스카이 강도, **서피스
-  캐시 멀티바운스**, 노출, content용 IBL 이라디언스 캡처 여부 확인.
 - **서피스 캐시 단일화(albedo 볼륨 제거)**: 계획의 GI=캐시-radiance-소스 단일화는 미적용(현 GI=
-  per-voxel albedo 볼륨 경로). 갤러리 재baseline을 동반하므로 라이팅 튜닝과 함께 측정 주도로.
+  per-voxel albedo 볼륨 경로, 콘텐츠는 클립맵 레벨당 albedo 볼륨). 갤러리 재baseline 동반→별도 측정 주도.
+- **콘텐츠 라이팅 추가 품질**(UE Lumen 정렬): 멀티바운스 강화·스카이 이라디언스·노출 미세조정.
 
 ## 향후 정합성 — 카메라 이동 GDF 스트리밍 (대형 월드)
 
