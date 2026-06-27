@@ -23,7 +23,8 @@
 | 셰이더 | Slang → DXIL(D3D12) + SPIR-V(Vulkan) + metallib(Metal) 동시 컴파일 |
 | UI | Dear ImGui (`imgui` crate + 커스텀 RHI 렌더 백엔드) |
 | 수학 | `glam` (SIMD, de-facto 표준) |
-| 목표 기법 | PBR/디퍼드 · 레이트레이싱(DXR/VK_KHR) · 컴퓨트/GPGPU · 렌더그래프 |
+| 에셋 임포트 | glTF (`gltf` crate) · **FBX**(ufbx 기본 / Autodesk FBX SDK 옵션 — `tools/` fetch 스크립트, Phase 14) |
+| 목표 기법 | PBR/디퍼드 · 레이트레이싱(DXR/VK_KHR) · 컴퓨트/GPGPU · 렌더그래프 · **스켈레탈 애니메이션/GPU 스키닝** |
 
 ## 워크스페이스 구조 (제안)
 
@@ -37,11 +38,22 @@ engine/                 # cargo workspace root
 │   ├── shader/         # Slang 컴파일 파이프라인 + 리플렉션 + 핫리로드
 │   ├── render/         # 렌더그래프 + PBR/디퍼드/RT/컴퓨트 패스
 │   ├── scene/          # 자체 ECS + 씬 그래프(변환 계층 컴포넌트) + 레벨/스트리밍 — RHI 비의존 (Phase 13)
-│   ├── asset/          # glTF 모델, 텍스처(KTX2/DDS) 로딩
+│   ├── anim/           # 스켈레톤·클립·포즈 샘플링/블렌딩 + 본 팔레트 — RHI 비의존 (Phase 14)
+│   ├── asset/          # glTF + FBX(ufbx/SDK) 모델, 스킨/애니메이션, 텍스처(KTX2/DDS) 로딩
 │   ├── gui/            # imgui-rs + 커스텀 RHI 렌더 백엔드
-│   └── core/           # 공통 유틸(로깅, 에러, 핸들/풀, 수학 재노출)
+│   ├── core/           # 공통 유틸(로깅, 에러, 핸들/풀, 수학 재노출)
+│   │                   # ── 상용 확장(Phase 15+): 비그래픽스 시스템은 facade+백엔드 분리 ──
+│   ├── jobs/           # work-stealing 잡 시스템 / 태스크 그래프 (P15, S)
+│   ├── physics/        # 피직스 facade(중립 타입) — physics-rapier/jolt 백엔드 (P16, S/B)
+│   ├── audio/          # 오디오 facade — audio-kira/miniaudio 백엔드 (P17, S/B)
+│   ├── script/         # 스크립트 facade — script-lua(mlua)/wasm 백엔드 (P25, S/B)
+│   ├── net/            # 네트워킹 facade — 리플리케이션/트랜스포트 백엔드 (P30, S/B)
+│   ├── ui/             # 게임 리테인드 UI + 텍스트 셰이핑 + i18n (P26, S)
+│   ├── vfx/            # Niagara式 파티클/VFX 그래프 (P28, S)
+│   └── ai/             # navmesh + 패스파인딩 + 비헤이비어 트리 (P29, S/B)
 └── apps/
-    └── sandbox/        # 기법 전환용 플레이그라운드 실행 파일
+    ├── sandbox/        # 기법 전환용 플레이그라운드 실행 파일
+    └── editor/         # 독립 standalone 에디터 앱 (에디터 트랙, S)
 ```
 
 ## 핵심 설계 원칙 (Phase 전반에 적용)
@@ -55,6 +67,13 @@ engine/                 # cargo workspace root
 4. **렌더그래프가 모든 렌더 기법의 척추** — 패스 선언, transient 리소스 할당/aliasing,
    자동 배리어/상태 전이. PBR·컴퓨트·RT 모두 이 위에 얹는다.
 5. **Slang 단일 소스** — 셰이더는 Slang로 한 번 작성, 빌드 시 DXIL과 SPIR-V로 동시 컴파일.
+6. **비그래픽스 대형 시스템은 "RHI 패턴"으로 통합** (Phase 15+) — 피직스/오디오/스크립트/네트워킹은
+   from-scratch facade 크레이트(중립 타입+trait) + 백엔드 크레이트(서드파티 어댑터)로 분리, 엔진은
+   facade에만 의존 → 차후 자체 구현으로 교체 가능. `rhi`/`rhi-vulkan` 구조 미러링.
+7. **잡 시스템이 멀티스레드의 척추** (Phase 15+) — work-stealing 스케줄러 위에 ECS 병렬·병렬 RHI 기록·
+   비동기 스트리밍·피직스 스텝을 얹는다(렌더그래프가 GPU 패스의 척추이듯).
+8. **결정성·재현성 우선** — 멀티스레드/피직스/네트워크는 고정 타임스텝 + 결정적 실행 전제(헤드리스
+   골든이미지·양 백엔드 회귀를 깨지 않게).
 
 ## 단계별 로드맵 (Milestones)
 
@@ -144,7 +163,7 @@ engine/                 # cargo workspace root
   BDA. 외부 의존 `meshopt`(+선택 `metis`) 사용자 승인 필요
 - **완료 기준**: 고밀도 메시가 화면 적응 LOD로 크랙/팝핑 없이 렌더, SW/HW 경로 seam 없음, 두 백엔드 일치
 
-### Phase 11 — 소프트웨어 레이트레이싱 + Distance-Field GI — 🧪 실험적 / 계획
+### Phase 11 — 소프트웨어 레이트레이싱 + Distance-Field GI — 🧪 실험적 (Stage A–D 구현, 양 백엔드)
 세부: [phase-11-distance-field-gi.md](phase-11-distance-field-gi.md)
 하드웨어 RT(Phase 8) 없이도 동작하는, **컴퓨트 기반 소프트웨어 레이트레이싱 → 전역 거리장(Global
 Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/AO를 구현한다. 전제: **Phase 7
@@ -159,17 +178,20 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
   캡처 기반 IBL을 SW-RT로 대체** — 디퓨즈 IBL→GDF GI, 스페큘러 IBL→**SSR(온스크린)+GDF 반사(오프스크린)+
   스카이(miss) 하이브리드**(C5 SSR·C6 GDF 반사·C7 합성+IBL 대체). 캡처 env 큐브는 스카이 전용으로 격하.
   스크린-스페이스 프로브/래디언스 캐시 구조는 Stage C 세부에서 확정.
-  - **진행:** C1–C7 + C8a + C8b ✅ + 레거시 IBL deprecated ✅ 양 백엔드 검증·푸시. C1 씬 GDF, C2 AO,
+  - **진행:** C1–C7 + C8a–C8j ✅ + 레거시 IBL deprecated ✅ 양 백엔드 검증·푸시. C1 씬 GDF, C2 AO,
     C3 GI, C4 디노이즈, C5 SSR, C6 GDF 반사, C7 하이브리드 합성→라이팅 specular 대체(잔차 4.18→2.58/ch
-    −38%), C8a per-voxel 알베도→컬러, **C8b Lumen 메시-카드 서피스 캐시(캡처→라이팅→멀티바운스→컨슈머
+    −38%), C8a per-voxel 알베도→컬러, **C8b 메시-카드 서피스 캐시(캡처→라이팅→멀티바운스→컨슈머
     룩업, `P11_SURFACE_CACHE` opt-in)**. **레거시 캡처-큐브 IBL → 기본값을 SW-RT 반사+GDF GI로 전환,
-    `P11_LEGACY_IBL` 플래그로 격하**(씬 캡처 sky-only). 정직한 한계: 서피스 캐시는 이 씬 PT 잔차 미개선
-    (지배 잔차=금속 sharp specular → 러프니스-aware 반사 GGX가 다음 트랙). **반사 폴리시 ✅ (`21197f1`):
-    SSR을 stochastic half-res(Frostbite ratio estimator, Stachowiak 2015)로 — 스크린-DDA 마치 + half-res
-    GGX 지터 트레이스 + 이웃 레이 `pdf_p/pdf_q` 재가중 resolve(러프니스 적응 글로시) → ~4배 빠름(0.092ms),
-    스페클 0.** VK≡DX 정책: stochastic 경로는 비트 동일 불가(~3.85/ch, DDA 마치 fp + lit-history 피드백)
-    → 상용(Frostbite/Lumen)처럼 "지각/통계 동등"으로 검증(결정성 래스터·해석적 GI는 픽셀 정확). NEXT: 컴포짓
-    러프니스 블렌드 정교화 · PT 잔차 재측정 · 동적 오브젝트 GDF.
+    `P11_LEGACY_IBL` 플래그로 격하**(씬 캡처 sky-only).
+  - **반사 트랙 마무리 C8c–C8j ✅** (세부 [phase-11-distance-field-gi.md](phase-11-distance-field-gi.md)):
+    러프니스-aware 컴포짓 + GDF 러프니스 프리필터(C8c/C8c2) → **풀-res 미러 SSR을 정확 소스로 복원 +
+    reflection max-roughness 임계**(`P11_REFLECT_MAX_ROUGHNESS`, C8d) → 구리 하이라이트 blow-out·이중
+    디렉셔널 스펙큘러 수정(반사된 태양 디스크 제거, C8e/C8f) → 서피스 캐시 히트 라디언스 반사(C8g) →
+    밉-피라미드 프리필터(C8h) → **스토캐스틱 GGX GDF 반사 + 시공간 디노이즈**(C8j). 현재
+    하이브리드-vs-PT **≈3.45/ch**(컬러·러프니스·이중스펙·blow-out 모두 처리; 풀-res 미러 2.58이 best-known).
+  - **남은 본질 한계 = GDF 저해상 48³ SDF 블롭 형상** — 해상도/클립맵 레버는 측정으로 기각·종료
+    (이 작은 테스트 씬 한정, [reflection-sdf-resolution.md](reflection-sdf-resolution.md)). 추가 반사 작업은
+    *실제 게임 씬*에서 측정-구동으로 재개. NEXT 후보: 동적 오브젝트 GDF 갱신.
 - **Stage D — RenderQuality 티어 (확장성, ✅ 구현, 가로지르는 항목):** 이 씬/엔진은 차후 범용 게임용이라,
   트랙 전반에 흩어진 품질 노브(GI spp, 반사 GGX 샘플/디노이즈 반경, 소프트 그림자 PCSS 샘플 수,
   서피스-캐시 해상도)를 **단일 `RenderQuality{low,med,high}` enum 한 곳으로** 묶어 런타임/플랫폼별로
@@ -225,8 +247,34 @@ per-instance 트랜스폼을 공급하는 단일 소스가 된다. 테스트는 
 - **완료 기준**: ECS 씬이 단일 드로우 리스트로 세 소비처(래스터/RT/컬)를 공급, glTF 계층이 올바른 상대
   트랜스폼으로 렌더, 선언적 레벨 핫스왑, 카메라 주행 시 청크 스트림 인/아웃(엔티티 디스폰, 누수 없음), 두
   백엔드 픽셀 일치, 검증 클린.
-- **범위 외**: glTF 애니메이션/스키닝, ECS 멀티스레드 스케줄링·변경 감지(계층/ECS가 잠금 해제하는 후속이나
-  본 Phase 제외).
+- **범위 외**: glTF 애니메이션/스키닝(→ **Phase 14**), ECS 멀티스레드 스케줄링·변경 감지(계층/ECS가
+  잠금 해제하는 후속이나 본 Phase 제외).
+
+### Phase 14 — 스켈레탈 애니메이션 + GPU 스키닝/스킨 캐시 — 🧪 실험적 / 계획
+세부: [phase-14-animation-skinning.md](phase-14-animation-skinning.md)
+범용 게임용 엔진(Phase 13)에 거의 모든 동적 콘텐츠의 기반인 **스켈레탈 애니메이션 + GPU 스키닝**을
+추가한다. 핵심은 **GPU 스킨 캐시** — 스킨된 정점을 정점 셰이더가 아니라 **프레임당 한 번 컴퓨트로
+계산해 버퍼에 캐시**하고, G-buffer·섀도우·HW 패스트레이서(BLAS)·SW-RT GDF 등 **모든 지오메트리
+소비처가 그 단일 버퍼를 공유**한다(*skin once, consume many*; 멀티 소비처/RT 엔진의 GPU 스킨 캐시 패턴과 동일 동기). 정점 셰이더
+스키닝은 패스마다 재계산하고 레이트레이싱에 줄 정점 버퍼가 없어, 멀티 소비처/RT 엔진엔 스킨 캐시가 정답.
+업계 표준 **FBX 임포터**도 포함(서드파티 백엔드 + 별도 설치 스크립트).
+- **신규 크레이트 `crates/anim`** (RHI 비의존): 스켈레톤·클립·포즈 샘플링/블렌딩 → **본 팔레트**(단일 소스).
+- **스킨 영향치는 별도 스트림**(`SkinInfluence`, 12B): `VertexLayout::Mesh`(32B) 무변경 → 기존 PSO 처닝 0,
+  스킨 캐시 출력도 32B Mesh 레이아웃 → 다운스트림 래스터 무구별.
+- **GPU 스키닝 컴퓨트**(`skinning.slang`) + **프레임 그래프 `skin_cache` 패스**(모든 소비처 앞 1회) +
+  더블 버퍼(모션 벡터) + dirty 스킵. 결정적 컴퓨트 → **VK ≡ DX 비트 동일**. 신규 RHI: 버퍼 다용도
+  `Vertex|Storage|AccelInput` + 상태 전이.
+- **RT 통합**(Phase 8 게이트): 스킨 캐시 출력으로 매 프레임 **스킨된 BLAS 리핏 + TLAS 갱신** → 패스트레이서/
+  GDF가 애니메이션 반영.
+- **FBX 임포터 (둘 다 seam)**: **ufbx**(MIT 단일 .c, 기본, `cc` 빌드) + **Autodesk FBX SDK**(옵션 feature
+  `fbx-sdk`). 서드파티 → `tools/fetch-ufbx.{ps1,sh}` / `tools/fetch-fbxsdk.ps1`로 확보(gitignored, 게이트
+  다운로드는 안내·배치). glTF와 **동일 중립 타입**(`SkinnedModel`)으로 매핑.
+- **확장성**: 스키닝 품질 노브(갱신 레이트/최대 영향치/본 LOD)를 `RenderQuality` 티어 seam에 접속(`P14_*`).
+- **전제**: Phase 8(RT, Stage D만) — 완료. Phase 13(씬 그래프)은 **시너지·하드 의존 아님**(단일 스킨
+  인스턴스로 독립 출하, 재생 상태/다중 인스턴스는 Phase 13 ECS `AnimationPlayer`/`SkinnedMesh`로 승격).
+- **완료 기준**: 스킨 메시가 GPU 스키닝/스킨 캐시로 애니메이션, CPU 스킨 ≡ GPU 스킨 픽셀 일치, 스킨된
+  BLAS로 패스트레이서 잔차가 정적 메시 수준 수렴, glTF/FBX가 같은 스켈레톤·클립으로 같은 렌더, 두 백엔드
+  픽셀 일치, 검증 클린.
 
 ### macOS / Metal 백엔드 — 🚧 진행 중
 세부: [metal-backend.md](metal-backend.md)
@@ -246,12 +294,46 @@ per-instance 트랜스폼을 공급하는 단일 소스가 된다. 테스트는 
   기반 bilinear 샘플링으로 base/mr/normal/emissive를 inline과 M7 양쪽에 적용했고, M7
   converter descriptor table도 sampled texture/cube/storage/TLAS 범위를 채우도록 갱신.
 
+## 상용 엔진 확장 — 런타임/툴링 계층 (Phase 15+) — 🧭 전략 계획
+
+세부 검토·갭 분석: [commercial-engine-gap-analysis.md](commercial-engine-gap-analysis.md).
+렌더링 코어(P0–P14)는 상용 R&D급이나, **게임 런타임 서비스 + 저작 툴 계층**이 비어 있다. 목표는
+**범용 엔진 breadth**. 비그래픽스 대형 시스템은 **하이브리드 + 인터페이스 분리**(RHI처럼 from-scratch
+facade trait 뒤에 성숙 라이브러리 백엔드를 격리 → 차후 자체 구현 교체 가능). 에디터는 **독립 standalone
+앱**. `S`=from-scratch, `S/B`=facade 자체+백엔드 통합.
+
+- **T0 토대 — Phase 15 잡 시스템/멀티스레드 코어 + 병렬 렌더 [S].** work-stealing 스케줄러, 태스크
+  그래프, 병렬 RHI 커맨드 기록, 고정 타임스텝 sim, 결정적 스케줄. *멀티스레드 전 시스템의 전제.*
+- **T1 런타임 코어** — **16 피직스 [S/B]**(facade + Rapier/Jolt) · **17 오디오 [S/B]**(facade + kira/
+  miniaudio) · **18 입력/플랫폼 서비스 [S]**(액션 매핑·게임패드·설정 영속화) · **19 ECS 성숙 + 프리팹/
+  세이브 [S]**(시스템 스케줄링·이벤트·직렬화).
+- **T1→T2 렌더 완성도** — **20 AA(TAA)+포스트 스택+투명/OIT [S]**(P14 모션벡터) · **21 다광원
+  클러스터드+CSM+데칼+프로브 [S]** · **22 대기/볼류메트릭 [S]** · **23 월드(지형/식생/물/버추얼 텍스처)
+  [S]** · **24 머티리얼 그래프+고급 셰이딩(SSS/헤어/클로스) [S]**.
+- **T2 게임플레이 breadth** — **25 스크립팅 [S/B]**(facade + mlua/WASM) · **26 게임 UI [S/B]**(리테인드+
+  텍스트 셰이핑+i18n) · **27 고급 애니메이션 [S]**(스테이트머신/블렌드트리·IK·리타깃, P14 확장) ·
+  **28 VFX 저작 [S]**(Niagara式, P7 위) · **29 AI/내비 [S/B]**(navmesh+BT) · **30 네트워킹/리플리케이션
+  [S/B]**.
+- **에디터 트랙 `apps/editor`(독립 앱, 연속)** — E1 셸/도킹/undo → E2 씬 편집(기즈모·인스펙터·`.level`) →
+  E3 콘텐츠 브라우저/임포트 → E4 서브에디터(머티리얼/애님/VFX/지형) → E5 PIE/라이브링크/패키지.
+- **인프라(가로지름, 연속)** — 핫리로드(셰이더→에셋→스크립트), CPU 프로파일러/메모리 추적, 크래시/
+  텔레메트리, 골든이미지 회귀 CI, 패키징/배포(P12 확장), 로컬라이제이션.
+- **권장 1차 수직 슬라이스**(플레이 가능 최소 루프): `15 잡 → 16 피직스 → 18 입력 → 19 ECS/세이브 →
+  20 AA/포스트 → 17 오디오 → 25 스크립팅 → 에디터 E1–E2`. 이후 21–24(렌더)·26–30(게임플레이)·E3–E5로 확장.
+- **정직한 점검**: UE/Unity式 breadth + 독립 에디터는 **수년 규모**다. 본 계획의 가치는 완성이 아니라
+  **올바른 의존 순서 · 백엔드 추상화 seam · 언제든 수직 슬라이스로 절단 가능한 구조**를 박아두는 것.
+
 ## 의존성 위험 / 미결 사항 (세부 계획에서 해소)
 
 - **백엔드 디스패치**: trait object vs enum-dispatch. Phase 1.
 - **디스크립터/바인드리스 모델 통일**: 두 API의 디스크립터 모델 차이 흡수 설계. Phase 1.
 - **windows-rs D3D12 ergonomics**: raw COM 인터페이스라 RAII 래퍼 설계 필요. Phase 2.
 - **RT 추상화**: SBT 레이아웃·AS 빌드 인터페이스의 두 API 공통화 난이도 높음. Phase 8.
+- **FBX 외부 의존 + 버퍼 다용도**: `cc`+ufbx 벤더링/FBX SDK 게이트 다운로드(승인 대상), 스킨 캐시 버퍼의
+  `Vertex|Storage|AccelInput` 상태 전이 두 API 통일, 비균등 스케일 노멀 매트릭스. Phase 14.
+- **상용 확장(Phase 15+)**: 서드파티 의존 승인(Rapier/Jolt·kira·mlua·Recast 등, facade 뒤 격리), 결정성
+  vs 멀티스레드/피직스(고정 타임스텝), 에디터↔런타임 결합(리플렉션/직렬화 선결), 범위 폭주(수직 슬라이스
+  절단 유지), 백엔드 추상화 누수. 세부: [commercial-engine-gap-analysis.md](commercial-engine-gap-analysis.md).
 
 ## 검증 전략 (전 단계 공통)
 
