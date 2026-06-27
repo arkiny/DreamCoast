@@ -539,13 +539,31 @@ impl MetalCommandBuffer {
                 .expect("failed to create compute command encoder")
         };
         enc.setComputePipelineState(&pipeline.state);
-        if pipeline.bindless {
+        // Per-frame globals UBO (Stage C7 SSR reprojection reads `globals.prev_view_proj`):
+        // bound at GLOBALS_BUFFER_INDEX with the `set_globals` offset, mirroring the
+        // graphics path. The bindless block then shifts past it to buffer(2).
+        if pipeline.uses_globals
+            && let Some(globals) = self.shared.globals_buffer()
+        {
             unsafe {
                 enc.setBuffer_offset_atIndex(
-                    Some(&self.shared.arg_buffer),
-                    0,
-                    BINDLESS_BUFFER_INDEX,
+                    Some(&globals),
+                    self.globals_offset.get() as usize,
+                    GLOBALS_BUFFER_INDEX,
                 );
+            }
+        }
+        if pipeline.bindless {
+            // The globals UBO (if any) sits at buffer(1), so the bindless argument
+            // buffer shifts to buffer(2) for `uses_globals` pipelines; otherwise it
+            // is at buffer(1) — identical to the graphics convention.
+            let bindless_index = if pipeline.uses_globals {
+                BINDLESS_BUFFER_INDEX_WITH_GLOBALS
+            } else {
+                BINDLESS_BUFFER_INDEX
+            };
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&self.shared.arg_buffer), 0, bindless_index);
             }
             // Make argument-buffer-referenced resources resident: sampled inputs
             // (Read), storage images being written (Read | Write), and the storage

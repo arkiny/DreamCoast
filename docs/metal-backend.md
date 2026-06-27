@@ -894,3 +894,46 @@ results:
 **Cross-backend:** the only shared change is `R32Float` (Stage B already added it to
 the shared `Format` / shaders, verified on Windows); the rest is `rhi-metal`-only
 Rust, so Vulkan / D3D12 are unaffected.
+
+## Phase 11 Stage C — GDF GI / reflections / SSR / surface cache on Metal (done, verified this M3 box)
+
+Phase 11 Stage C (GDF ambient occlusion, stochastic 1-bounce diffuse GI, screen-space
++ GDF reflections, the Lumen-style mesh-card surface cache, and a `RenderQuality` tier)
+shipped on Vulkan / D3D12 first and landed on `main` as one large drop (origin/main
+`041caae`). On macOS it brought up cleanly on the first fetch with **one** real RHI gap.
+
+- **Shaders.** All Stage-C `.slang` (`ssr`, `ssr_resolve`, `gdf_ao`, `gdf_gi`,
+  `gdf_temporal`, `gdf_atrous`, `gdf_reflect`, `reflect_composite`, `reflect_temporal`,
+  `lit_history`, `sdf_albedo_bake`, `sdf_cache_{capture,view,light}`) compiled to
+  `metallib` with **zero skip warnings**, so Slang's Metal target accepted every
+  Stage-C kernel as-is — no shader-source change was needed. The 4-MRT G-buffer
+  (now carrying **world position**) and the transformed-object world-space normal/pos
+  fix render correctly on Metal.
+
+- **The one RHI gap — compute `uniform_buffer` (globals-in-compute).** Stage C7 added
+  `ComputePipelineDesc::uniform_buffer` so a *compute* pass can bind the per-frame
+  globals UBO (only the SSR pipeline sets it `true`, for the C7b history reprojection
+  that reads `globals.prev_view_proj`). It was wired into `rhi-vulkan` (globals set 1
+  at the dynamic offset, `COMPUTE` stage flag on the globals layout) and `rhi-d3d12`
+  (root CBV param 2), but **`rhi-metal` silently ignored the field**: `build_compute`
+  dropped it, and `bind_compute_pipeline` never bound the globals buffer and left the
+  bindless argument buffer at `buffer(1)` — where the SSR metallib expects globals at
+  `buffer(1)` and bindless shifted to `buffer(2)`. The fix carries `uses_globals` on
+  `MetalComputePipeline` and, in `bind_compute_pipeline`, binds globals at
+  `GLOBALS_BUFFER_INDEX` (offset from `set_globals`) then shifts bindless to
+  `BINDLESS_BUFFER_INDEX_WITH_GLOBALS`, mirroring the existing graphics path exactly.
+  SSR uses the same `[[vk::binding(0, 1)]] register(b1, space0)` globals pin as
+  `pbr.slang`, so Slang's Metal target assigns the compute kernel the identical buffer
+  indices (globals=`buffer(1)`, bindless=`buffer(2)`). `ssr_resolve` reads
+  `prev_view_proj` from push constants, so it correctly stays `uniform_buffer: false`.
+
+**Verified this box** (build + `cargo clippy --all-targets -D warnings` + `cargo test`
+clean): `--backend metal --screenshot-clean` renders the default scene (SW-RT specular
++ GDF GI ambient, the chrome / metallic spheres reflecting their neighbours) and the
+`P8_PATHTRACE=1` ground-truth path tracer both render correctly and validation-clean.
+
+**Cross-backend — no regression.** The fix is `rhi-metal`-only Rust; it touches **no**
+shared shader, `rhi-types`, or render-graph code, and the Stage-C shaders themselves
+were unchanged for Metal. Vulkan / D3D12 are byte-for-byte unaffected (their
+`uniform_buffer` path already shipped and is verified on the Windows RTX 2070 SUPER box
+with the rest of Stage C).
