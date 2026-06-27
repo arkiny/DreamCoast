@@ -120,8 +120,9 @@ float3 scene_normal(float3 p)
 {
     const float e = 0.012;
     float2 k = float2(1.0, -1.0);
-    return normalize(k.xyy * scene_occ(p + k.xyy * e) + k.yyx * scene_occ(p + k.yyx * e)
-                     + k.yxy * scene_occ(p + k.yxy * e) + k.xxx * scene_occ(p + k.xxx * e));
+    float3 grad = k.xyy * scene_occ(p + k.xyy * e) + k.yyx * scene_occ(p + k.yyx * e)
+                  + k.yxy * scene_occ(p + k.yxy * e) + k.xxx * scene_occ(p + k.xxx * e);
+    return safe_normalize(grad, float3(0.0, 1.0, 0.0));
 }
 
 // Gradient sky + HDR sun disk (same model as the Stage-A SW-RT / path-tracer sky).

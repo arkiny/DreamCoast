@@ -87,3 +87,26 @@ float3 linear_to_srgb(float3 c)
     float3 hi = 1.055 * pow(max(c, float3(0.0)), 1.0 / 2.4) - 0.055;
     return lerp(lo, hi, step(float3(0.0031308), c));
 }
+
+// NaN/Inf guard (UE Lumen `MakeFinite`): an IEEE float is non-finite iff its exponent
+// field is all ones. Zero out non-finite components so one bad sample can't poison a
+// temporal-accumulation buffer — an EMA blend would otherwise spread the NaN every frame
+// (the "black creeps in from frame 2" failure). The asuint bit test survives the optimizer
+// (native isnan/isinf often get folded away). Finite values pass through unchanged, so a
+// scene that never produces a NaN (the gallery) is byte-identical.
+bool3 is_finite3(float3 v)
+{
+    return (asuint(v) & 0x7F800000u) != 0x7F800000u;
+}
+float3 make_finite(float3 v)
+{
+    return select(is_finite3(v), v, float3(0.0, 0.0, 0.0));
+}
+
+// Normalize that never returns NaN: a zero-length vector (e.g. a flat SDF gradient in an
+// empty region → `normalize(0)`) yields `fallback` instead of NaN. For a non-degenerate
+// vector this is bit-identical to `normalize(v)`.
+float3 safe_normalize(float3 v, float3 fallback)
+{
+    return dot(v, v) > 1e-20 ? normalize(v) : fallback;
+}
