@@ -487,6 +487,9 @@ struct App {
     /// Stage D2: surface-cache amortized-relight period (round-robin card budget; 1 = legacy
     /// every-frame, forced for the gallery anchor). Higher = cheaper `sdf_cache_light`.
     cache_relight_period: u32,
+    /// Stage D2b: drive the relight budget by per-card camera-frustum visibility (off-screen
+    /// cards relit far less). Off for the gallery anchor. Pure perf (on-screen image invariant).
+    cache_feedback: bool,
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
     /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
     gi_half_res: bool,
@@ -1147,6 +1150,12 @@ impl App {
                 qp.cache_relight_period
             })
             .max(1);
+        // Stage D2b: camera-visibility feedback drives the relight budget (off-screen cards relit
+        // far less). Pure perf optimization — invariant for the on-screen image — so default on for
+        // content; forced off for the gallery anchor (uniform period = byte-identical). Needs the
+        // visibility pipeline (capability-gated). `P11_CACHE_FEEDBACK` overrides.
+        let cache_feedback =
+            gdf.has_cache_visibility() && quality::env_bool("P11_CACHE_FEEDBACK", !gallery_scene);
         // Stage D1: half-res GI trace + bilateral upsample. Gallery stays full-res (the
         // byte-identical anchor); content scenes take the tier default. `P11_GI_HALF_RES`
         // overrides. Needs the upsample pipeline (capability-gated).
@@ -1383,6 +1392,7 @@ impl App {
             gdf_gi,
             gi_spp,
             cache_relight_period,
+            cache_feedback,
             gi_half_res,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
@@ -2432,6 +2442,14 @@ impl App {
         let scene_cache_lit_ext = match (scene_gdf_ext, scene_cache_ext) {
             (Some(gdf_ext), Some(cache_ext)) if self.gdf.has_cache_lighting() => {
                 let ext = graph.import_external("scene_cache_lit");
+                // Stage D2b: fill per-card camera visibility (Y-flip-free planes => DX≡VK), then
+                // relight on-screen cards at the budget period and off-screen cards far less often.
+                let card_vis_ext = if self.cache_feedback {
+                    self.gdf
+                        .record_cache_visibility(&mut graph, frustum_planes(cull_view_proj))
+                } else {
+                    None
+                };
                 self.gdf.record_cache_light(
                     &mut graph,
                     gdf_ext,
@@ -2443,6 +2461,7 @@ impl App {
                     self.frame_no as u32,
                     self.scene_cache_reset,
                     self.cache_relight_period,
+                    card_vis_ext,
                 );
                 self.scene_cache_reset = false;
                 Some(ext)

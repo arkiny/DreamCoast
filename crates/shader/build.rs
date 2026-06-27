@@ -542,6 +542,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gdf_gi_upsample_cs",
     },
+    // Stage D2b (Sponza 60fps): per-card camera-frustum visibility for the relight budget.
+    Job {
+        src: "sdf_cache_visibility.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "sdf_cache_visibility_cs",
+    },
     // Phase 11 Stage C (C4): spatio-temporal denoise of the noisy GI.
     Job {
         src: "gdf_temporal.slang",

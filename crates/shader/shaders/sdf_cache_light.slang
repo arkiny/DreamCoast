@@ -122,7 +122,18 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     // gallery regression anchor passes period 1). `reset` always relights all cards (first frame).
     uint relight_period = max(pc.clip.z, 1u);
     uint card = t / max(pc.tile * pc.tile, 1u);
-    bool selected = (pc.reset != 0u) || ((card % relight_period) == (pc.frame % relight_period));
+    // Stage D2b: camera-visibility priority. On-screen cards relight at the base budget period;
+    // off-screen cards relight HIDDEN_MULT× less often (most of a dense scene's cards are out of
+    // any one view, and they don't affect the current image — UE5 Lumen's visibility/staleness
+    // priority). `clip.w == 0xFFFFFFFF` ⇒ no feedback ⇒ uniform period (Stage D2 behavior).
+    const uint HIDDEN_MULT = 4u;
+    uint period = relight_period;
+    if (pc.clip.w != 0xFFFFFFFFu)
+    {
+        uint vis = g.storage_buffers[pc.clip.w].Load(card * 4u);
+        period = (vis != 0u) ? relight_period : relight_period * HIDDEN_MULT;
+    }
+    bool selected = (pc.reset != 0u) || ((card % period) == (pc.frame % period));
     if (!selected)
     {
         // Persist: carry last frame's radiance into the write (ping-pong) buffer so the GI /

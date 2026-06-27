@@ -218,6 +218,43 @@ D1 후 `sdf_cache_light`가 다시 Top-1(~143ms). UE5 Lumen 소스(`D:/Repositor
 **권장 순서**: T1(즉시 안전) → **T2(구조적, UE식 가시성 피드백 = 60fps 핵심)** → T3(미세 조정). T2가
 이 씬에서 가장 큰 컷이자 UE가 실제로 의존하는 메커니즘.
 
+### T1+T2 구현 완료 (2026-06-27)
+- **T1**: Med relight 주기 4→8 (quality.rs).
+- **T2**: 신규 `sdf_cache_visibility.slang` — 카드당 바운딩 스피어를 **카메라 프러스텀**(Y-flip-free planes
+  → DX≡VK) 테스트해 per-card visibility 버퍼 작성. `sdf_cache_light`가 이를 읽어 **온스크린=주기 P,
+  오프스크린=주기 P×4**로 relight(밀집 씬은 카드 대부분이 시야 밖 → 큰 컷). UE Lumen 가시성/staleness
+  우선순위의 **결정적 카메라-가시성 변형**(샘플 피드백은 정밀판, 추후 정제 여지). 가시성 패스 자체 비용
+  **0.006ms**. clip.w=0xFFFFFFFF=피드백 off=균일 주기(D2), 갤러리 강제 off.
+- 파일: `sdf_cache_visibility.slang`(신규)+`build.rs`, `gdf.rs`(`record_cache_visibility`+버퍼+파이프라인),
+  `push.rs`(`cache_vis_push`+clip.w), `sdf_cache_light.slang`(가시성 주기), `quality.rs`/`main.rs`(배선,
+  `cache_feedback` 콘텐츠 디폴트·갤러리 off, `P11_CACHE_FEEDBACK`).
+
+#### before/after (Med; before = D1)
+| 패스 | DX before→after | VK before→after |
+|---|---:|---:|
+| **sdf_cache_light** | ~143 → **46.9** | ~156 → **56.2** |
+| sdf_cache_visibility | — | **0.006** | — | **0.006** |
+| **프레임 총합** | 190.4 → **93.4** | 199.3 → **96.3** |
+
+#### 누적 (Stage 0 → T2)
+| | DX 프레임 | VK 프레임 |
+|---|---:|---:|
+| Stage 0 | 492.6 | 1039.3 |
+| D2 | 240.8 | 314.3 |
+| D1 | 190.4 | 199.3 |
+| **T1+T2** | **93.4 (5.3×)** | **96.3 (10.8×)** |
+
+#### 게이트 (정직 보고)
+- 무회귀(갤러리): base vs T2 = **0.000/ch** (피드백 off + 주기 1 강제). ✓
+- 품질(Sponza D1 vs T2): **0.005/ch, max 3 LSB** — 온스크린 카드는 동일 수렴, 지각 불가. ✓
+- DX≡VK: **0.004/ch** (가시성 결정적·Y-flip-free → 신규 발산 없음, 기존 갭과 동일). ✓
+- PT 잔차: 0.094/ch (≈D1 0.091, 하프해상 GI가 지배). ✓
+- fmt/clippy 클린, Vulkan 검증 클린. ✓
+
+**남은 것**: 아직 60fps 미달(93ms). 잔여 Top-3 = sdf_cache_light 47 + gdf_gi 32 + gdf_reflect 11 = ~90ms.
+다음 = **T3(march/LOD): relight gather spp 8→4 + step↓, gdf_gi/reflect march LOD**, 또는 주기·HIDDEN_MULT
+추가 상향. 각 RenderQuality 티어 결속·PT 잔차 검증.
+
 ## 설계 제약 (CLAUDE.md 5원칙)
 1. **근본 원인**: 마이크로 패치 금지. 비용의 근원(풀스크린 레이 수 / 카드 텍셀 수 / 미컬링 드로우)을 줄인다.
 2. **측정 주도**: `PROFILE_GPU`가 성공 지표. 모든 before/after를 ms로 보고.
