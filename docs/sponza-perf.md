@@ -185,6 +185,39 @@ surface-cache relight가 벽. 다음: D2 후속(주기↑/카드수↓) 또는 *
 - **PT 잔차**: 0.004 → 0.091/ch (둘 다 sub-0.1 grey-level, 지각 불가). ✓
 - **fmt/clippy 클린, Vulkan 검증 클린**(VUID 없음). ✓
 
+## Stage D2b/D3 — UE Lumen 연구 + surface-cache relight 제안 (측정 기반)
+
+D1 후 `sdf_cache_light`가 다시 Top-1(~143ms). UE5 Lumen 소스(`D:/Repositories/UnrealEngine-1`)를
+폭넓게 조사한 결과와 그에 기반한 제안.
+
+### UE Lumen의 surface-cache 조명 갱신 (확인된 사실)
+- **고정 텍셀 예산 + 상각**: `r.LumenScene.DirectLighting.UpdateFactor=32` / `Radiosity.UpdateFactor=64`
+  → 매 프레임 텍셀의 **1/32(직접)·1/64(간접)** 만 재조명(전체 갱신 32~64프레임). 우리 D2 period=4는 UE보다
+  **8~16× 보수적**. (`LumenSceneLighting.cpp:40,48`)
+- **우선순위 선택(라운드로빈 아님)**: 16-bin **우선순위 히스토그램** — 타일을
+  `bucket = f(log2(FramesSinceLastUpdated × UpdateSpeed))`로 분류, 예산(`MaxUpdateTiles`)을 **가장
+  오래된/가장 보이는 버킷부터** 채움. 굶주림 방지로 "최소 1페이지는 갱신". (`LumenSceneLighting.usf:176`)
+- **가시성 피드백**: `r.LumenScene.SurfaceCache.Feedback` — 화면에 샘플된 카드만 고우선순위 →
+  **오프스크린 카드는 거의 갱신 안 함**. (`LumenSurfaceCacheFeedback.cpp`)
+- **직접/간접 분리**: 비싼 간접(spp gather에 해당)을 가장 드물게(1/64). 라디오시티는 자체 시간 누적으로
+  드문 갱신에도 노이즈 적음.
+- persistent radiance 아틀라스(우리는 EMA carry-forward로 이미 보유).
+
+### 제안 (레버리지/리스크 순, 모두 reflect 품질 보존 지향)
+- **T1 — relight 주기 상향 (즉시, 품질 안전)**: Med period 4→8, Low→16. UE가 32/64를 쓰는 점에서 매우
+  보수적. 64프레임 워밍업 수렴 확인(period 8 EMA 잔차 ~0.03). 비용 ~½. *단독으론 ~75ms, 60fps 미달.*
+- **T2 — 가시성/우선순위 피드백 (구조적 핵심, UE의 진짜 레버)**: GI/reflect 소비자가 샘플한 카드를
+  feedback 버퍼에 마크 → relight를 **화면에 보이는 + 오래된 카드 우선**으로. Sponza 데모 앵글은 카드
+  다수가 오프스크린이라 **여기서 큰 컷**. per-card last-update-frame + 가시성 마크 + 예산 내 우선순위 선택
+  (UE 히스토그램의 경량판). 신규 작업(여러 셰이더 + 버퍼). **60fps 경로의 핵심.**
+- **T3 — march/LOD 비용 절감 (D3)**: relight gather spp 8→4 + march step↓ + 거리 기반 거친 clipmap LOD;
+  같은 절감을 `gdf_gi`/`gdf_reflect`에도. 각 RenderQuality 티어 결속, PT 잔차로 검증.
+- **대안 — Med에서 캐시 끄기**: `reflect_cache`를 High 전용으로 → Med Sponza가 143ms 통째 제거(가장
+  빠른 60fps 길), 단 반사는 per-ray GDF 폴백(grazing smear 등 저품질). 품질 우선 사용자에겐 비권장.
+
+**권장 순서**: T1(즉시 안전) → **T2(구조적, UE식 가시성 피드백 = 60fps 핵심)** → T3(미세 조정). T2가
+이 씬에서 가장 큰 컷이자 UE가 실제로 의존하는 메커니즘.
+
 ## 설계 제약 (CLAUDE.md 5원칙)
 1. **근본 원인**: 마이크로 패치 금지. 비용의 근원(풀스크린 레이 수 / 카드 텍셀 수 / 미컬링 드로우)을 줄인다.
 2. **측정 주도**: `PROFILE_GPU`가 성공 지표. 모든 before/after를 ms로 보고.
