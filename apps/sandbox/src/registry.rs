@@ -154,15 +154,14 @@ pub(crate) type PrimitiveHandles = Vec<Vec<(MeshHandle, MaterialHandle)>>;
 /// P2 multi-material generalization): every primitive's geometry → a `MeshHandle`,
 /// every material → a `MaterialHandle` (with shared images deduplicated by index and
 /// colour space). Returns, per glTF mesh index, the `(mesh, material)` handle of each
-/// primitive — plus a CPU-geometry list aligned with the mesh handles for the RT
-/// instance table.
+/// primitive.
 pub(crate) fn upload_gltf_scene(
     device: &Device,
     scene: &GltfScene,
     meshes: &mut MeshRegistry,
     materials: &mut MaterialRegistry,
     textures: &mut Vec<Texture>,
-) -> anyhow::Result<(PrimitiveHandles, Vec<MeshData>)> {
+) -> anyhow::Result<PrimitiveHandles> {
     // Dedup images by (glTF image index, sRGB) so a shared texture uploads once. The
     // same image is rarely used across colour spaces, so keying on both is safe.
     let mut image_cache: HashMap<(usize, bool), u32> = HashMap::new();
@@ -210,18 +209,10 @@ pub(crate) fn upload_gltf_scene(
 
     let mut per_mesh: Vec<Vec<(MeshHandle, MaterialHandle)>> =
         Vec::with_capacity(scene.meshes.len());
-    let mut cpu_meshes: Vec<MeshData> = Vec::new();
     for primitives in &scene.meshes {
         let mut row = Vec::with_capacity(primitives.len());
         for prim in primitives {
             let mesh = meshes.upload_geometry(device, &prim.vertices, &prim.indices)?;
-            // Keep CPU geometry aligned with the mesh handle for the RT instance table.
-            debug_assert_eq!(mesh.0 as usize, cpu_meshes.len());
-            cpu_meshes.push(MeshData {
-                vertices: prim.vertices.clone(),
-                indices: prim.indices.clone(),
-                material: Material::default(),
-            });
             let material = prim
                 .material
                 .map(|i| material_handles[i])
@@ -230,7 +221,7 @@ pub(crate) fn upload_gltf_scene(
         }
         per_mesh.push(row);
     }
-    Ok((per_mesh, cpu_meshes))
+    Ok(per_mesh)
 }
 
 /// The world-space AABB of an imported glTF scene at its **native** (authored) scale,

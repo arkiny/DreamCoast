@@ -139,8 +139,7 @@ pub(crate) fn build_level(
         if is_gltf(&ent.asset) {
             if !gltf_cache.contains_key(&ent.asset) {
                 let gscene = load_gltf_scene(&ent.asset)?;
-                let (handles, _cpu) =
-                    upload_gltf_scene(device, &gscene, meshes, materials, textures)?;
+                let handles = upload_gltf_scene(device, &gscene, meshes, materials, textures)?;
                 gltf_cache.insert(ent.asset.clone(), (gscene, handles));
             }
             let (gscene, handles) = &gltf_cache[&ent.asset];
@@ -156,6 +155,8 @@ pub(crate) fn build_level(
             let mesh = match ent.asset.as_str() {
                 "sphere" => uv_sphere(48, 32),
                 "cube" => unit_cube(),
+                // A unit (2×2 m) ground quad on y=0; the entity transform scales it.
+                "ground" => crate::mesh::ground_mesh(1.0, 0.0),
                 other => {
                     return Err(anyhow::anyhow!("level: unknown procedural asset '{other}'"));
                 }
@@ -205,12 +206,27 @@ fn trs(x: f32, y: f32, z: f32, s: f32) -> [f32; 16] {
     (Mat4::from_translation(Vec3::new(x, y, z)) * Mat4::from_scale(Vec3::splat(s))).to_cols_array()
 }
 
+/// A flat grey ground patch of `half` metres, centred on the origin (the floor a level
+/// brings itself now that the hardcoded ground is gallery-only).
+fn ground_entity(half: f32) -> LevelEntity {
+    LevelEntity {
+        asset: "ground".into(),
+        transform: trs(0.0, 0.0, 0.0, half),
+        material_override: Some(MaterialOverride {
+            base_color_factor: [0.8, 0.8, 0.8, 1.0],
+            metallic: 0.0,
+            roughness: 0.9,
+        }),
+    }
+}
+
 /// The migrated gallery, in declarative form: the avocado glTF + chrome/copper
 /// spheres + a red cube (mirrors the hardcoded gallery's layout/materials).
 pub(crate) fn gallery_level() -> LevelData {
     use dreamcoast_asset::level::{Camera, Environment};
     LevelData {
         entities: vec![
+            ground_entity(6.0),
             LevelEntity {
                 // The 6 cm avocado scaled up to ~1 m to sit with the procedural spheres.
                 asset: "assets/model.glb".into(),
@@ -262,7 +278,13 @@ pub(crate) fn lanterns_level() -> LevelData {
         material_override: None,
     };
     LevelData {
-        entities: vec![lantern(-4.0), lantern(0.0), lantern(4.0)],
+        entities: vec![
+            // A 16 m ground patch (tiles exactly with the demo world's 16 m chunk spacing).
+            ground_entity(8.0),
+            lantern(-4.0),
+            lantern(0.0),
+            lantern(4.0),
+        ],
         lights: vec![Light {
             kind: LightKind::Directional,
             vec: [-0.4, -1.0, -0.3],
@@ -278,14 +300,21 @@ pub(crate) fn lanterns_level() -> LevelData {
 /// cooked-level verification. (Sponza is fetched locally via tools/fetch-sponza;
 /// loading this level errors cleanly if it's absent.)
 pub(crate) fn sponza_level() -> LevelData {
-    use dreamcoast_asset::level::{Camera, Environment};
+    use dreamcoast_asset::level::{Camera, Environment, Light};
     LevelData {
         entities: vec![LevelEntity {
             asset: "assets/Sponza/Sponza.gltf".into(),
             transform: trs(0.0, 0.0, 0.0, 1.0),
             material_override: None,
         }],
-        lights: vec![],
+        // Lights live in the level asset, serialized by kind. Sponza is lit by a single
+        // directional sun angled down into the open courtyard (no code-default lights).
+        lights: vec![Light {
+            kind: LightKind::Directional,
+            vec: [0.3, -0.9, 0.25],
+            color: [1.0, 0.96, 0.9],
+            intensity: 4.0,
+        }],
         // The iconic Sponza atrium angle: standing in the open courtyard looking down
         // the length, the draped arcades receding on both sides.
         camera: Camera {
