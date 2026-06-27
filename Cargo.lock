@@ -341,6 +341,7 @@ dependencies = [
 name = "dreamcoast-scene"
 version = "0.0.0"
 dependencies = [
+ "dreamcoast-asset",
  "glam",
 ]
 

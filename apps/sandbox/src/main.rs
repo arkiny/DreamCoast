@@ -17,7 +17,7 @@
 use std::time::Instant;
 
 use dreamcoast_asset::MeshData;
-use dreamcoast_core::glam::{Mat4, Vec3};
+use dreamcoast_core::glam::{Mat4, Quat, Vec3};
 use dreamcoast_core::init_logging;
 use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
@@ -572,85 +572,134 @@ impl App {
             None => NO_TEXTURE,
         };
 
-        // Build the sample scene: the loaded model at the origin plus a few
-        // procedural objects with varied materials (showing PBR + image-based
-        // reflections). A ground plane (kept separate — it's also the
-        // environment-capture geometry) catches shadows and grounds the reflections.
+        // Build the scene as ECS entities: either the procedural gallery (default) or a
+        // full glTF scene imported via `SCENE_GLTF=<path>` (Stage B). A ground plane is
+        // kept separate (it's also the environment-capture geometry). `sphere`/`cube`
+        // are always built — the gallery uses them, and they're cheap.
         let r = model_radius;
         let sphere = dreamcoast_asset::uv_sphere(48, 32);
         let cube = dreamcoast_asset::unit_cube();
+        let scene_gltf_path = std::env::var("SCENE_GLTF").ok();
+        let gallery_scene = scene_gltf_path.is_none();
 
         // Registries own the GPU meshes + material descriptors the scene's handles
         // point at (P2). Unique geometry uploads once — the two spheres share a handle.
         let mut mesh_registry = MeshRegistry::new();
         let mut material_registry = MaterialRegistry::new();
-        let mesh_model = mesh_registry.upload(&device, model)?;
-        let mesh_sphere = mesh_registry.upload(&device, &sphere)?;
-        let mesh_cube = mesh_registry.upload(&device, &cube)?;
-        let mat_model = material_registry.add(MaterialDesc {
-            base_color: model.material.base_color_factor,
-            metallic: model.material.metallic_factor,
-            roughness: model.material.roughness_factor,
-            tex: [base_index, mr_index, normal_index, emissive_index],
-        });
-        let mat_chrome = material_registry.add(MaterialDesc {
-            base_color: [0.95, 0.96, 0.97, 1.0],
-            metallic: 1.0,
-            roughness: 0.08,
-            tex: [NO_TEXTURE; 4],
-        });
-        let mat_copper = material_registry.add(MaterialDesc {
-            base_color: [0.95, 0.64, 0.54, 1.0],
-            metallic: 1.0,
-            roughness: 0.35,
-            tex: [NO_TEXTURE; 4],
-        });
-        let mat_red = material_registry.add(MaterialDesc {
-            base_color: [0.85, 0.25, 0.2, 1.0],
-            metallic: 0.0,
-            roughness: 0.5,
-            tex: [NO_TEXTURE; 4],
-        });
-
-        // Spawn the scene as ECS entities. Spawn order defines the deterministic draw
-        // and TLAS-instance order (model, chrome, copper, cube) — the same order the
-        // legacy flat list used, so the materialized draw list is byte-identical.
         let mut world = World::new();
-        world
-            .spawn_node()
-            .named("model")
-            .with(MeshInstance::new(mesh_model, mat_model))
-            .with(LocalTransform::IDENTITY);
-        world
-            .spawn_node()
-            .named("chrome-sphere")
-            .with(MeshInstance::new(mesh_sphere, mat_chrome))
-            .with(LocalTransform::trs(
-                Vec3::new(-r * 1.7, r * 0.75, r * 0.5),
-                r * 0.75,
-            ));
-        world
-            .spawn_node()
-            .named("copper-sphere")
-            .with(MeshInstance::new(mesh_sphere, mat_copper))
-            .with(LocalTransform::trs(
-                Vec3::new(r * 1.9, r * 0.5, -r * 0.4),
-                r * 0.5,
-            ));
-        world
-            .spawn_node()
-            .named("red-cube")
-            .with(MeshInstance::new(mesh_cube, mat_red))
-            .with(LocalTransform::trs(
-                Vec3::new(0.0, r * 0.45, -r * 2.0),
-                r * 0.45,
-            ));
+        // glTF path only: CPU geometry per mesh handle, for the RT instance table.
+        let mut gltf_cpu_meshes: Vec<MeshData> = Vec::new();
+
+        if let Some(path) = &scene_gltf_path {
+            // Stage B: import the whole node hierarchy + every primitive/material/image.
+            let gscene = dreamcoast_asset::load_gltf_scene(path)?;
+            info!(
+                "glTF scene '{path}': {} nodes, {} primitives, {} materials, {} images",
+                gscene.nodes.len(),
+                gscene.primitive_count(),
+                gscene.materials.len(),
+                gscene.images.len()
+            );
+            let (prim_handles, cpu) = registry::upload_gltf_scene(
+                &device,
+                &gscene,
+                &mut mesh_registry,
+                &mut material_registry,
+                &mut textures,
+            )?;
+            gltf_cpu_meshes = cpu;
+            let imported = dreamcoast_scene::instantiate_gltf(&mut world, &gscene, &prim_handles);
+            // Normalize the import to the unit-radius, on-ground convention via a
+            // transformable wrapper root (so the glTF nodes keep their own transforms).
+            let scene_root = world.spawn();
+            world.insert(scene_root, registry::gltf_normalize(&gscene));
+            world.insert(scene_root, dreamcoast_scene::Name("scene-root".to_owned()));
+            world.insert(imported, dreamcoast_scene::Parent(scene_root));
+            // Optionally spin the imported sub-tree's root node to prove that
+            // `propagate_transforms` moves the whole hierarchy (Stage B verification).
+            let spin = std::env::var("GLTF_SPIN")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok());
+            if let (Some(deg), Some(lt)) = (spin, world.get_mut::<LocalTransform>(imported)) {
+                lt.rotation = Quat::from_rotation_y(deg.to_radians());
+            }
+        } else {
+            // The procedural gallery (default) — byte-identical to Stage A.
+            let mesh_model = mesh_registry.upload(&device, model)?;
+            let mesh_sphere = mesh_registry.upload(&device, &sphere)?;
+            let mesh_cube = mesh_registry.upload(&device, &cube)?;
+            let mat_model = material_registry.add(MaterialDesc {
+                base_color: model.material.base_color_factor,
+                metallic: model.material.metallic_factor,
+                roughness: model.material.roughness_factor,
+                tex: [base_index, mr_index, normal_index, emissive_index],
+            });
+            let mat_chrome = material_registry.add(MaterialDesc {
+                base_color: [0.95, 0.96, 0.97, 1.0],
+                metallic: 1.0,
+                roughness: 0.08,
+                tex: [NO_TEXTURE; 4],
+            });
+            let mat_copper = material_registry.add(MaterialDesc {
+                base_color: [0.95, 0.64, 0.54, 1.0],
+                metallic: 1.0,
+                roughness: 0.35,
+                tex: [NO_TEXTURE; 4],
+            });
+            let mat_red = material_registry.add(MaterialDesc {
+                base_color: [0.85, 0.25, 0.2, 1.0],
+                metallic: 0.0,
+                roughness: 0.5,
+                tex: [NO_TEXTURE; 4],
+            });
+            // Spawn order defines the deterministic draw / TLAS-instance order (model,
+            // chrome, copper, cube) — the order the legacy flat list used.
+            world
+                .spawn_node()
+                .named("model")
+                .with(MeshInstance::new(mesh_model, mat_model))
+                .with(LocalTransform::IDENTITY);
+            world
+                .spawn_node()
+                .named("chrome-sphere")
+                .with(MeshInstance::new(mesh_sphere, mat_chrome))
+                .with(LocalTransform::trs(
+                    Vec3::new(-r * 1.7, r * 0.75, r * 0.5),
+                    r * 0.75,
+                ));
+            world
+                .spawn_node()
+                .named("copper-sphere")
+                .with(MeshInstance::new(mesh_sphere, mat_copper))
+                .with(LocalTransform::trs(
+                    Vec3::new(r * 1.9, r * 0.5, -r * 0.4),
+                    r * 0.5,
+                ));
+            world
+                .spawn_node()
+                .named("red-cube")
+                .with(MeshInstance::new(mesh_cube, mat_red))
+                .with(LocalTransform::trs(
+                    Vec3::new(0.0, r * 0.45, -r * 2.0),
+                    r * 0.45,
+                ));
+        }
         dreamcoast_scene::propagate_transforms(&mut world);
 
         // Materialize the ECS draw list into the flat `SceneObject` list the GPU passes
         // consume. (Static scene → built once; later stages rebuild on scene change.)
         let scene = build_scene(&world, &mesh_registry, &material_registry);
         let scene_radius = r * 3.0;
+        // RT instance-table mesh sources, aligned 1:1 with the draw list (TLAS order).
+        let scene_meshes: Vec<&MeshData> = if gallery_scene {
+            vec![model, &sphere, &sphere, &cube]
+        } else {
+            world
+                .draw_list()
+                .iter()
+                .map(|d| &gltf_cpu_meshes[d.mesh.0 as usize])
+                .collect()
+        };
 
         // Ground plane (separate handle: also used by the environment capture).
         let ground = ground_mesh(scene_radius * 1.3, 0.0);
@@ -665,11 +714,12 @@ impl App {
             &device,
             backend,
             &scene,
-            &[model, &sphere, &sphere, &cube],
+            &scene_meshes,
             &ground,
             &ground_vbuf,
             &ground_ibuf,
             ground_count,
+            gallery_scene,
         )?;
 
         // Stage C1: fuse the opaque scene objects into one world-space triangle soup
@@ -677,7 +727,11 @@ impl App {
         // analytically at trace time. Transforms are translation + uniform scale, so
         // normals carry through (re-normalized after the 3x3). The avocado/spheres/cube
         // are disjoint, so the closest-triangle sign convention gives the union SDF.
-        if gdf.has_gdf_trace() {
+        // Gallery-only: the fuse hardcodes the 4-object layout + per-object albedo. The
+        // glTF path leaves the scene GDF unregistered, so every GDF/SW-RT feature
+        // auto-disables (they all gate on `gdf.has_scene_sdf()`) and lighting falls back
+        // to the captured-cube IBL — generalizing GDF to arbitrary scenes is later work.
+        if gallery_scene && gdf.has_gdf_trace() {
             let objs: [(&MeshData, Mat4); 4] = [
                 (model, Mat4::IDENTITY),
                 (&sphere, scene[1].transform),
@@ -917,7 +971,9 @@ impl App {
         // SW-RT hybrid reflection (specular) + GDF GI (diffuse scene bounce) + sky irradiance.
         // `P11_LEGACY_IBL` restores the captured-cube path (prefilter-cube specular + scene
         // capture) for comparison.
-        let legacy_ibl = std::env::var_os("P11_LEGACY_IBL").is_some();
+        // The glTF path has no scene GDF, so use the well-defined captured-cube IBL
+        // (this also forces `swrt_reflect` off below).
+        let legacy_ibl = !gallery_scene || std::env::var_os("P11_LEGACY_IBL").is_some();
         let swrt_ok = reflect.has_ssr()
             && reflect.has_gdf_reflect()
             && reflect.has_composite()

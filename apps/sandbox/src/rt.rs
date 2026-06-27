@@ -68,6 +68,10 @@ impl RtSystem {
         ground_vbuf: &Buffer,
         ground_ibuf: &Buffer,
         ground_count: u32,
+        // Build the sample-scene BLAS/TLAS + path-tracer instance table. Off for the
+        // glTF path: its primitive count (one vertex+index storage buffer each) would
+        // overflow the 64-slot bindless storage-buffer table, and HW RT is gallery-only.
+        build_scene_accel: bool,
     ) -> anyhow::Result<Self> {
         // Phase 8 M3: inline ray-query trace pipeline (compute + `RayQuery`). Only on
         // RT-capable devices; the bindless block then carries the scene TLAS (binding
@@ -193,7 +197,7 @@ impl RtSystem {
         // TLAS over their instances, then register the TLAS in the bindless table so
         // the inline-trace compute pass (M3) can trace it. The scene outlives the
         // frame loop (the TLAS must stay alive while it is bound).
-        let scene_rt = if device.has_raytracing() {
+        let scene_rt = if device.has_raytracing() && build_scene_accel {
             let mut geoms: Vec<RtGeometry> = scene
                 .iter()
                 .map(|o| RtGeometry {
