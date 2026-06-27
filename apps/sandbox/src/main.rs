@@ -1078,7 +1078,17 @@ impl App {
             if build_cache {
                 let cards = fuse::build_surface_cards(&obj_aabb);
                 let num_cards = (cards.len() / 64) as u32;
-                gdf.build_surface_cache(&device, &cards, num_cards)?;
+                // QHD/UHD track: the surface-cache atlas tile is runtime-tunable (`P11_CACHE_TILE`)
+                // so content can trade cache cost + atlas memory for reflection-cache sharpness.
+                // Default 32 = unchanged (byte-identical). Measured: tile 16 cuts the relight only
+                // ~30% (the relight isn't purely texel-bound at spp1/period40) while blurring
+                // reflections (max ~94 LSB) — a poor default, so it stays opt-in. Built once here.
+                let cache_tile = std::env::var("P11_CACHE_TILE")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .unwrap_or(32)
+                    .clamp(4, 64);
+                gdf.build_surface_cache(&device, &cards, num_cards, cache_tile)?;
             }
         }
 

@@ -59,6 +59,32 @@ QHD를 scale s로 렌더 = 내부 (2560s×1440s) 비용 → 내부 해상도 스
   가능 — 정확히 Sponza 트랙서 남긴 VK 구조적 격차. 해법 = **async-compute로 캐시 relight를 raster/per-pixel과
   오버랩**(해상도 독립이라 UHD에도 동일하게 유효). = Stage 3.
 
+## Stage 3 — 캐시 비용 공략 시도 + 정직한 결론 (2026-06-28)
+
+VK QHD가 해상도-독립 `sdf_cache_light`에 막혀(스케일 낮춰도 ~87fps 바닥), 두 방향 검토:
+
+### (a) async-compute로 캐시 오버랩 — 보류(RHI 깊은 작업)
+설계는 검증됨: **ping-pong 덕에 데이터 레이스 없음**(소비자가 read 버퍼, async가 write 버퍼). 컴퓨트 큐
++ `volume_to_sampled` + `storage_buffer_barrier` 모두 존재. **그러나** 기존 `submit_async`는 *동일 프레임*
+graphics-waits-compute(직렬)용이고 D3D12는 내부 cross-queue fence로 세마포어를 무시 → **진짜 1프레임 지연
+오버랩은 rhi-vulkan/rhi-d3d12에 새 cross-frame 컴퓨트 동기화가 필요**(행/플리커 리스크, 양 백엔드 상이).
+별도 집중 트랙으로 분리.
+
+### (b) 캐시 tile 축소 — 미미(기본 채택 안 함)
+`CARD_TILE`을 런타임화(`card_tile`, 셰이더는 이미 push `tile` 파라미터). 콘텐츠 tile 16 측정: 캐시
+relight **DX 3.1→2.3 / VK 4.9→4.1ms (~30%만)** — spp1/period40에선 캐시가 순수 텍셀바운드가 아님. 반면
+반사가 흐려짐(HD 델타 0.041/ch, **max 94**). VK는 여전히 90fps 미달. **→ 기본 32 유지(무회귀), tile은
+`P11_CACHE_TILE` 튜닝 노브로만 노출**(UHD 아틀라스 메모리 절감 + opt-in). 갤러리 32 강제(바이트 동일).
+
+### 정직한 결론 — "선명한 QHD 90fps"의 답은 비용 절감이 아니라 **시간적 업스케일러(TAAU)**
+- DX QHD 90fps는 scale ~0.45에서 됨(소프트). VK는 cache-floor로 더 낮은 스케일 필요.
+- per-pixel(gdf_gi/reflect/denoiser)은 이미 하프해상+spp1로 최적화 — 추가 절감 미미.
+- 비용 절감으로 도달 가능한 스케일(~0.4–0.5)은 **바이리니어 업스케일로는 본질적으로 흐림**.
+- **shipping 엔진이 QHD/UHD 고프레임을 내는 방식 = 저해상 렌더 + 시간적 재구성(DLSS/FSR2/TAAU)**: jitter +
+  히스토리 재투영으로 0.5 스케일을 네이티브급으로 복원. 엔진에 temporal 인프라(reproject/EMA) 이미 다수 →
+  TAAU가 자연스러운 다음 단계. **이게 사용자의 "선명함" 목표의 실제 해법.**
+- 보조: async-compute(VK/UHD 헤드룸, 별도 RHI 트랙), 컬링(UHD 복잡 씬 지오메트리 — 별도).
+
 ## 제안 아키텍처 (검토 필요)
 
 1. **내부 렌더 해상도 디커플링 (기반)**: 모든 무거운 패스(g-buffer + GDF + 디노이저 + 라이팅)를 **내부
