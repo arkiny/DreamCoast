@@ -17,6 +17,7 @@
 use rhi_types::Format;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+    DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC5_UNORM,
     DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
     DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT,
 };
@@ -64,6 +65,9 @@ fn to_dxgi_format(format: Format) -> DXGI_FORMAT {
         Format::Rg16Float => DXGI_FORMAT_R16G16_FLOAT,
         Format::R32Float => DXGI_FORMAT_R32_FLOAT,
         Format::Depth32Float => DXGI_FORMAT_D32_FLOAT,
+        Format::Bc1Srgb => DXGI_FORMAT_BC1_UNORM_SRGB,
+        Format::Bc1Unorm => DXGI_FORMAT_BC1_UNORM,
+        Format::Bc5Unorm => DXGI_FORMAT_BC5_UNORM,
     }
 }
 
@@ -78,5 +82,8 @@ fn to_dxgi_swapchain_format(format: Format) -> DXGI_FORMAT {
         Format::Rg16Float => DXGI_FORMAT_R16G16_FLOAT,
         Format::R32Float => DXGI_FORMAT_R32_FLOAT,
         Format::Depth32Float => DXGI_FORMAT_D32_FLOAT,
+        Format::Bc1Srgb | Format::Bc1Unorm | Format::Bc5Unorm => {
+            unreachable!("block-compressed formats are never swapchain formats")
+        }
     }
 }

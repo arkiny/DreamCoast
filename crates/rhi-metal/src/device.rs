@@ -778,6 +778,66 @@ impl MetalDevice {
         Ok(MetalTexture::new(index))
     }
 
+    /// Create a sampled texture from pre-compressed BCn mip levels (Phase 12 M3) —
+    /// no mip generation; the GPU samples the blocks natively (zero decode cost).
+    /// `Shared` storage lets the CPU fill each level via block-pitched `replaceRegion`.
+    pub fn create_texture_compressed(
+        &self,
+        desc: &TextureDesc,
+        levels: &[Vec<u8>],
+    ) -> Result<MetalTexture> {
+        let block_bytes = desc
+            .format
+            .block_bytes()
+            .ok_or_else(|| rhi_err("create_texture_compressed: not a block format"))?;
+        let td = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                pixel_format(desc.format),
+                desc.width as usize,
+                desc.height as usize,
+                true,
+            )
+        };
+        unsafe {
+            td.setMipmapLevelCount(levels.len().max(1));
+        }
+        td.setUsage(MTLTextureUsage::ShaderRead);
+        td.setStorageMode(MTLStorageMode::Shared);
+        let texture = self
+            .shared
+            .device
+            .newTextureWithDescriptor(&td)
+            .ok_or_else(|| rhi_err("compressed newTexture failed"))?;
+
+        for (mip, level) in levels.iter().enumerate() {
+            let w = (desc.width >> mip).max(1) as usize;
+            let h = (desc.height >> mip).max(1) as usize;
+            let region = MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize {
+                    width: w,
+                    height: h,
+                    depth: 1,
+                },
+            };
+            // One BCn "row" is a row of 4×4 blocks.
+            let bytes_per_row = w.div_ceil(4) * block_bytes;
+            let ptr = NonNull::new(level.as_ptr() as *mut c_void)
+                .ok_or_else(|| rhi_err("create_texture_compressed: null level pointer"))?;
+            unsafe {
+                texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    region,
+                    mip,
+                    ptr,
+                    bytes_per_row,
+                );
+            }
+        }
+
+        let index = self.shared.register(texture, true);
+        Ok(MetalTexture::new(index))
+    }
+
     /// Create a depth buffer (`Depth32Float`) usable as a render attachment, and
     /// reserve a bindless slot (its handle is written so the M4 shadow pass can
     /// sample it; it is not made resident here since M3 only uses it as a target).

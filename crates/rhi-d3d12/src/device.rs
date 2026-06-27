@@ -636,6 +636,15 @@ impl D3d12Device {
         D3d12Texture::new(self.shared.clone(), desc, pixels)
     }
 
+    /// Create a sampled texture from pre-compressed BCn mip levels (Phase 12 M3).
+    pub fn create_texture_compressed(
+        &self,
+        desc: &TextureDesc,
+        levels: &[Vec<u8>],
+    ) -> Result<D3d12Texture, EngineError> {
+        D3d12Texture::new_compressed(self.shared.clone(), desc, levels)
+    }
+
     pub fn create_depth_buffer(&self, extent: Extent2D) -> Result<D3d12DepthBuffer, EngineError> {
         D3d12DepthBuffer::new(self.shared.clone(), extent)
     }

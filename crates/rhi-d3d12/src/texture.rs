@@ -40,13 +40,32 @@ impl D3d12Texture {
         desc: &TextureDesc,
         pixels: &[u8],
     ) -> Result<Self, EngineError> {
+        // CPU-generated mip chain (identical bytes across backends — the
+        // cross-backend-parity rule; see rhi_types::generate_mip_chain).
+        let levels = rhi_types::generate_mip_chain(pixels, desc.width, desc.height, desc.format);
+        Self::upload(device, desc, &levels)
+    }
+
+    /// Create a sampled texture from pre-compressed BCn mip levels (Phase 12 M3) —
+    /// no mip generation; the GPU samples the blocks natively (zero decode cost).
+    pub(crate) fn new_compressed(
+        device: Rc<DeviceShared>,
+        desc: &TextureDesc,
+        levels: &[Vec<u8>],
+    ) -> Result<Self, EngineError> {
+        Self::upload(device, desc, levels)
+    }
+
+    /// Shared upload: DEFAULT-heap texture filled from `levels` (one entry per mip,
+    /// already in the texture's format — RGBA8 rows or BCn block rows). The
+    /// `GetCopyableFootprints` row pitch handles both uncompressed and block rows.
+    fn upload(
+        device: Rc<DeviceShared>,
+        desc: &TextureDesc,
+        levels: &[Vec<u8>],
+    ) -> Result<Self, EngineError> {
         unsafe {
             let format = to_dxgi_format(desc.format);
-
-            // CPU-generated mip chain (identical bytes across backends — the
-            // cross-backend-parity rule; see rhi_types::generate_mip_chain).
-            let levels =
-                rhi_types::generate_mip_chain(pixels, desc.width, desc.height, desc.format);
             let mip_levels = levels.len() as u32;
 
             // DEFAULT-heap texture (full mip chain) in COPY_DEST.
