@@ -169,6 +169,26 @@ pub(crate) fn resolve_asset_path(path: &str) -> PathBuf {
         .unwrap_or_else(|| rel.to_path_buf())
 }
 
+/// Writable directory for cooked `.dcasset` files (Phase 12 M1). Local-only,
+/// gitignored (`cache/dcasset/`) — never committed. Resolved like the read-side
+/// asset path but for writing: the dev workspace root when it exists (so cooked
+/// assets are shared across `cargo run` from any cwd), else beside the executable
+/// for a shipped layout. The cook creates the directory on first write.
+pub(crate) fn cooked_cache_dir() -> PathBuf {
+    // `CARGO_MANIFEST_DIR` is `<root>/apps/sandbox`; the workspace root is two up.
+    if let Some(root) = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2)
+        && root.exists()
+    {
+        return root.join("cache").join("dcasset");
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        return dir.join("cache").join("dcasset");
+    }
+    PathBuf::from("cache/dcasset")
+}
+
 /// `--log-file <path>`: mirror logs to a file (see `main`). `None` when absent.
 pub(crate) fn log_file_path() -> Option<String> {
     let mut args = std::env::args().skip(1);

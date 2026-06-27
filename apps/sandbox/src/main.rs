@@ -194,14 +194,18 @@ fn run() -> anyhow::Result<()> {
     let captures = screenshot_captures();
     let screenshot_mode = !captures.is_empty();
 
-    // Load a glTF model if present, else fall back to a procedural cube. The path
-    // is resolved relative to the executable (not the cwd) so the model loads when
-    // the app is launched from anywhere, not just the repo root.
-    let model_path = app::resolve_asset_path(&model_path());
-    let mut model = match dreamcoast_asset::load_gltf(&model_path) {
-        Ok(m) => {
+    // Load the model via the cooked-asset pipeline (Phase 12 M1): a fresh
+    // `.dcasset` loads directly (no glTF parse / texture decode); a miss cooks from
+    // glTF and caches. Falls back to a procedural cube when neither exists. The
+    // source path is resolved relative to the executable (not the cwd) so it loads
+    // when launched from anywhere, not just the repo root.
+    let model_ref = model_path();
+    let model_path = app::resolve_asset_path(&model_ref);
+    let cache_dir = app::cooked_cache_dir();
+    let mut model = match dreamcoast_asset::cook::load_cooked(&model_path, &model_ref, &cache_dir) {
+        Ok((m, outcome)) => {
             info!(
-                "loaded {}: {} verts, {} indices",
+                "loaded {} ({outcome:?}): {} verts, {} indices",
                 model_path.display(),
                 m.vertices.len(),
                 m.indices.len()
@@ -210,7 +214,7 @@ fn run() -> anyhow::Result<()> {
         }
         Err(e) => {
             info!(
-                "no glTF at {} ({e}); using procedural cube",
+                "no model at {} ({e}); using procedural cube",
                 model_path.display()
             );
             dreamcoast_asset::unit_cube()
