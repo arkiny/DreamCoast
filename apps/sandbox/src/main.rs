@@ -484,6 +484,9 @@ struct App {
     gdf_gi: bool,
     /// C3 hemisphere rays per pixel.
     gi_spp: u32,
+    /// Stage D2: surface-cache amortized-relight period (round-robin card budget; 1 = legacy
+    /// every-frame, forced for the gallery anchor). Higher = cheaper `sdf_cache_light`.
+    cache_relight_period: u32,
     /// C4: spatio-temporal denoise of the noisy C3 GI.
     gi_denoise: bool,
     /// Previous frame's view-projection (world -> clip) for C4 temporal reprojection.
@@ -1128,6 +1131,19 @@ impl App {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(qp.gi_spp)
             .clamp(1, 256);
+        // Stage D2: surface-cache amortized-relight period. The gallery is the byte-identical
+        // regression anchor, so it is forced to 1 (every-frame relight = legacy) just like the
+        // clipmap level count above; content scenes (Sponza) take the tier default and amortize.
+        // `P11_CACHE_RELIGHT_PERIOD` overrides either way.
+        let cache_relight_period = std::env::var("P11_CACHE_RELIGHT_PERIOD")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(if gallery_scene {
+                1
+            } else {
+                qp.cache_relight_period
+            })
+            .max(1);
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
         let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", qp.gi_denoise);
         // C5 screen-space reflections (viz toggle).
@@ -1358,6 +1374,7 @@ impl App {
             gdf_ao,
             gdf_gi,
             gi_spp,
+            cache_relight_period,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
             gdf_ssr,
@@ -1730,6 +1747,7 @@ impl App {
                 gdf_ao,
                 gdf_gi,
                 gi_spp,
+                cache_relight_period,
                 gi_denoise,
                 gdf_ssr,
                 gdf_reflect,
@@ -1749,6 +1767,7 @@ impl App {
                 current_level,
                 pending_level,
                 streaming,
+                is_gallery,
                 ..
             } = self;
             let async_compute_supported = *async_compute_supported;
@@ -1819,6 +1838,12 @@ impl App {
                         // Re-derive each knob from the preset, preserving the same capability gates
                         // used at construction so a tier can't enable a feature the device lacks.
                         *gi_spp = p.gi_spp.clamp(1, 256);
+                        // Gallery stays the byte-identical anchor (period 1); content amortizes.
+                        *cache_relight_period = if *is_gallery {
+                            1
+                        } else {
+                            p.cache_relight_period.max(1)
+                        };
                         *gi_denoise = gi.has_denoise() && p.gi_denoise;
                         *reflect_cache = *swrt_reflect
                             && gdf.has_surface_cache()
@@ -2405,6 +2430,7 @@ impl App {
                     8,
                     self.frame_no as u32,
                     self.scene_cache_reset,
+                    self.cache_relight_period,
                 );
                 self.scene_cache_reset = false;
                 Some(ext)

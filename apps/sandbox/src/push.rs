@@ -510,6 +510,7 @@ pub(crate) fn cache_light_push(
     ray_max: f32,
     clip_desc: u32,
     clip_count: u32,
+    relight_period: u32,
 ) -> [u8; 128] {
     let mut pc = [0u8; 128];
     let u = [
@@ -549,6 +550,9 @@ pub(crate) fn cache_light_push(
     // Stage B clipmap descriptor (uint4 clip at offset 112): x = index, y = level count.
     pc[112..116].copy_from_slice(&clip_desc.to_le_bytes());
     pc[116..120].copy_from_slice(&clip_count.to_le_bytes());
+    // Stage D2: clip.z carries the amortized-relight period (round-robin card budget; 1 = legacy
+    // every-frame). clip.w stays spare. See sdf_cache_light.slang.
+    pc[120..124].copy_from_slice(&relight_period.to_le_bytes());
     pc
 }
 
