@@ -371,6 +371,9 @@ struct App {
     flip_y: u32,
     model_radius: f32,
     scene_radius: f32,
+    /// World-space focus point the orbit camera frames (scene AABB centre at native
+    /// scale; the gallery's legacy focus otherwise).
+    scene_center: Vec3,
     screenshot_mode: bool,
     captures: Vec<Capture>,
     validation_on: bool,
@@ -619,6 +622,9 @@ impl App {
         // Stage D: the streaming manager (world mode only). Chunks load on demand from
         // the camera, so `world`/registries above stay empty in this mode.
         let mut streaming: Option<world::Streaming> = None;
+        // World-space AABB of the placed scene (metres), used to frame the camera at the
+        // scene's native scale. `None` keeps the legacy gallery framing.
+        let mut scene_bounds: Option<level::Bounds> = None;
 
         if world_mode {
             // Stage D: load the level graph + the level files its chunks reference.
@@ -645,7 +651,7 @@ impl App {
                 .unwrap_or(0);
             // Stage E: load through the cook (RON → cooked .dcasset, cache-keyed).
             let level = level::load(std::path::Path::new(&level_paths[current_level]))?;
-            level::build_level(
+            scene_bounds = level::build_level(
                 &device,
                 &level,
                 &mut world,
@@ -672,20 +678,21 @@ impl App {
                 &mut textures,
             )?;
             let imported = dreamcoast_scene::instantiate_gltf(&mut world, &gscene, &prim_handles);
-            // Normalize the import to the unit-radius, on-ground convention via a
-            // transformable wrapper root (so the glTF nodes keep their own transforms).
+            // Place at native (1 unit = 1 m) scale under a wrapper root (so the whole
+            // import can be spun/inspected); the camera frames it from its AABB below.
             let scene_root = world.spawn();
-            world.insert(scene_root, registry::gltf_normalize(&gscene));
+            world.insert(scene_root, LocalTransform::IDENTITY);
             world.insert(scene_root, dreamcoast_scene::Name("scene-root".to_owned()));
             world.insert(imported, dreamcoast_scene::Parent(scene_root));
-            // Optionally spin the imported sub-tree's root node to prove that
-            // `propagate_transforms` moves the whole hierarchy (Stage B verification).
+            // Optionally spin the import to prove `propagate_transforms` moves the whole
+            // hierarchy (Stage B verification).
             let spin = std::env::var("GLTF_SPIN")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok());
-            if let (Some(deg), Some(lt)) = (spin, world.get_mut::<LocalTransform>(imported)) {
+            if let (Some(deg), Some(lt)) = (spin, world.get_mut::<LocalTransform>(scene_root)) {
                 lt.rotation = Quat::from_rotation_y(deg.to_radians());
             }
+            scene_bounds = registry::gltf_bounds(&gscene);
         } else {
             // The procedural gallery (default) — byte-identical to Stage A.
             let mesh_model = mesh_registry.upload(&device, model)?;
@@ -753,21 +760,32 @@ impl App {
         // consume. (Static scene → built once; later stages rebuild on scene change. In
         // world mode `world` is empty — the per-frame list comes from the streamer.)
         let scene = build_scene(&world, &mesh_registry, &material_registry);
-        // World mode spans multiple chunks, so the ground (and camera framing) must be
-        // larger than the single-scene default.
-        let scene_radius = if world_mode { 14.0 } else { r * 3.0 };
+        // Frame the camera at the scene's native scale: derive the centre + radius from
+        // the placed-geometry AABB (Sponza fills its real ~20 m, lanterns their ~2 m).
+        // The gallery keeps its exact legacy framing (byte-identical baseline); world
+        // mode has no single AABB (streaming), so it uses a fixed extent.
+        let (scene_center, scene_radius) = match scene_bounds {
+            Some((min, max)) => {
+                let center = (min + max) * 0.5;
+                let radius = (0.5 * (max - min).length()).max(0.5);
+                (center, radius)
+            }
+            None if world_mode => (Vec3::new(0.0, 2.0, 0.0), 28.0),
+            None => (Vec3::new(0.0, r * 0.6, 0.0), r * 3.0), // gallery legacy framing
+        };
+        if let Some((min, max)) = scene_bounds {
+            let s = max - min;
+            info!(
+                "scene bounds (m): size [{:.2}, {:.2}, {:.2}], centre [{:.2}, {:.2}, {:.2}]",
+                s.x, s.y, s.z, scene_center.x, scene_center.y, scene_center.z
+            );
+        }
         // World mode drives streaming from a free-fly camera. Seed its eye from
         // `WORLD_CAM="x,y,z"` (default above the chunk row, looking along it) so a
         // headless capture can position the camera; interactively, WASD flies it.
         let world_fly = world_mode.then(|| {
-            let eye = std::env::var("WORLD_CAM")
-                .ok()
-                .and_then(|v| {
-                    let n: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-                    (n.len() == 3).then(|| Vec3::new(n[0], n[1], n[2]))
-                })
-                .unwrap_or(Vec3::new(0.0, 4.0, 9.0));
-            camera::FlyCamera::from_look(eye, Vec3::new(eye.x, 0.0, 0.0), scene_radius * 0.4)
+            let eye = parse_vec3_env("WORLD_CAM").unwrap_or(Vec3::new(0.0, 3.0, 9.0));
+            camera::FlyCamera::from_look(eye, Vec3::new(eye.x, 2.0, 0.0), scene_radius * 0.4)
         });
         // RT instance-table mesh sources, aligned 1:1 with the draw list (TLAS order).
         // Only the gallery builds the HW-RT scene accel; glTF/level paths pass nothing
@@ -1231,6 +1249,7 @@ impl App {
             flip_y,
             model_radius,
             scene_radius,
+            scene_center,
             screenshot_mode,
             captures,
             validation_on,
@@ -1360,7 +1379,7 @@ impl App {
         let mut mesh_registry = MeshRegistry::new();
         let mut material_registry = MaterialRegistry::new();
         let mut textures: Vec<Texture> = Vec::new();
-        level::build_level(
+        let bounds = level::build_level(
             &self.device,
             &level,
             &mut world,
@@ -1375,6 +1394,11 @@ impl App {
         self.material_registry = material_registry;
         self._textures = textures;
         self.current_level = idx;
+        // Re-frame the camera for the new level's native-scale bounds.
+        if let Some((min, max)) = bounds {
+            self.scene_center = (min + max) * 0.5;
+            self.scene_radius = (0.5 * (max - min).length()).max(0.5);
+        }
         info!(
             "hot-swapped to level '{path}' ({} entities)",
             level.entities.len()
@@ -1530,7 +1554,7 @@ impl App {
             let eye = center + dist * Vec3::new(cp * self.angle.cos(), sp, cp * self.angle.sin());
             (center, eye)
         } else {
-            let focus = Vec3::new(0.0, self.model_radius * 0.6, 0.0);
+            let focus = self.scene_center;
             let dist = self.scene_radius * 1.6;
             let eye = focus
                 + Vec3::new(
@@ -1558,6 +1582,15 @@ impl App {
             (fly.focus(), fly.position)
         } else {
             (focus, eye)
+        };
+        // Diagnostic camera override: `CAM_EYE="x,y,z"` (+ optional `CAM_TARGET`) places
+        // the camera at a fixed pose for headless inspection of any scene (e.g. flying
+        // inside an imported environment like Sponza). Applies before streaming so it
+        // can also drive chunk loading.
+        let (focus, eye) = match (parse_vec3_env("CAM_EYE"), parse_vec3_env("CAM_TARGET")) {
+            (Some(e), Some(t)) => (t, e),
+            (Some(e), None) => (focus, e),
+            _ => (focus, eye),
         };
 
         // Stage D: stream chunks in/out around the camera, then rebuild the draw list
@@ -3188,6 +3221,13 @@ fn normalize3(v: [f32; 3]) -> [f32; 4] {
 /// looking from the sun's direction toward it. Returned column-major (glam's
 /// `to_cols_array`), matching the shader's `mul(M, v)` convention. No Vulkan
 /// Y-flip — the pbr shader handles the per-backend shadow-UV flip.
+/// Parse a `"x,y,z"` environment variable into a `Vec3` (for the diagnostic camera).
+fn parse_vec3_env(name: &str) -> Option<Vec3> {
+    let v = std::env::var(name).ok()?;
+    let n: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    (n.len() == 3).then(|| Vec3::new(n[0], n[1], n[2]))
+}
+
 fn light_view_proj(sun_dir: [f32; 3], center: Vec3, radius: f32) -> Mat4 {
     let dir = Vec3::new(sun_dir[0], sun_dir[1], sun_dir[2]).normalize_or_zero();
     let dir = if dir == Vec3::ZERO { Vec3::Y } else { dir };

@@ -20,9 +20,36 @@ use rhi::{Device, Texture};
 
 use crate::NO_TEXTURE;
 use crate::registry::{
-    MaterialDesc, MaterialRegistry, MeshRegistry, PrimitiveHandles, gltf_normalize,
-    upload_gltf_scene,
+    MaterialDesc, MaterialRegistry, MeshRegistry, PrimitiveHandles, gltf_bounds, upload_gltf_scene,
 };
+
+/// The world-space AABB of a placed scene (metres), for framing the camera.
+pub(crate) type Bounds = (Vec3, Vec3);
+
+/// Expand `[min, max]` by the 8 corners of a local AABB transformed by `place`.
+fn expand_bounds(min: &mut Vec3, max: &mut Vec3, place: Mat4, lmin: Vec3, lmax: Vec3) {
+    for &x in &[lmin.x, lmax.x] {
+        for &y in &[lmin.y, lmax.y] {
+            for &z in &[lmin.z, lmax.z] {
+                let p = place.transform_point3(Vec3::new(x, y, z));
+                *min = min.min(p);
+                *max = max.max(p);
+            }
+        }
+    }
+}
+
+/// A mesh's local AABB.
+fn mesh_bounds(mesh: &dreamcoast_asset::MeshData) -> (Vec3, Vec3) {
+    let mut min = Vec3::splat(f32::MAX);
+    let mut max = Vec3::splat(f32::MIN);
+    for v in &mesh.vertices {
+        let p = Vec3::from(v.pos);
+        min = min.min(p);
+        max = max.max(p);
+    }
+    (min, max)
+}
 
 /// Load a `.level` through the cook (Phase 12 Stage E): the RON cooks to a binary
 /// `.dcasset` on first load and is read from that cache thereafter (no RON re-parse).
@@ -86,12 +113,16 @@ pub(crate) fn build_level(
     // World-space offset applied to every entity (Stage D chunk placement; Vec3::ZERO
     // for a standalone level).
     origin: Vec3,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Bounds>> {
     // Cache each glTF asset's import + uploaded handles so a row of the same model
     // (e.g. lanterns) uploads once.
     let mut gltf_cache: HashMap<String, (GltfScene, PrimitiveHandles)> = HashMap::new();
+    let mut bmin = Vec3::splat(f32::MAX);
+    let mut bmax = Vec3::splat(f32::MIN);
 
     for ent in &level.entities {
+        // Assets are placed at their authored (native, 1 unit = 1 m) scale by the entity
+        // transform — no auto-normalization, so a building stays building-sized.
         let place = Mat4::from_translation(origin) * Mat4::from_cols_array(&ent.transform);
         if is_gltf(&ent.asset) {
             if !gltf_cache.contains_key(&ent.asset) {
@@ -102,13 +133,13 @@ pub(crate) fn build_level(
             }
             let (gscene, handles) = &gltf_cache[&ent.asset];
             let imported = instantiate_gltf(world, gscene, handles);
-            // Placement root = entity transform composed with the asset's unit-size
-            // normalization (so authored transforms are in unit-asset space).
-            let place_mat = place * gltf_normalize(gscene).matrix();
             let root = world.spawn();
-            world.insert(root, local_from_cols(&place_mat.to_cols_array()));
+            world.insert(root, local_from_cols(&place.to_cols_array()));
             world.insert(root, Name(ent.asset.clone()));
             world.insert(imported, Parent(root));
+            if let Some((lmin, lmax)) = gltf_bounds(gscene) {
+                expand_bounds(&mut bmin, &mut bmax, place, lmin, lmax);
+            }
         } else {
             let mesh = match ent.asset.as_str() {
                 "sphere" => uv_sphere(48, 32),
@@ -117,6 +148,8 @@ pub(crate) fn build_level(
                     return Err(anyhow::anyhow!("level: unknown procedural asset '{other}'"));
                 }
             };
+            let (lmin, lmax) = mesh_bounds(&mesh);
+            expand_bounds(&mut bmin, &mut bmax, place, lmin, lmax);
             let mesh_handle = meshes.upload(device, &mesh)?;
             let material = materials.add(desc_from_override(ent.material_override));
             world
@@ -125,7 +158,7 @@ pub(crate) fn build_level(
                 .with(local_from_cols(&place.to_cols_array()));
         }
     }
-    Ok(())
+    Ok((bmin.x <= bmax.x).then_some((bmin, bmax)))
 }
 
 /// Discover the `.level` files in `dir`, writing the built-in levels first if missing
@@ -152,6 +185,10 @@ pub(crate) fn ensure_level_files(dir: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// A column-major translation + uniform-scale transform as a `[f32; 16]`.
+///
+/// Transforms are in **metres** (the engine convention: 1 unit = 1 m). Assets load at
+/// their authored native scale, so a level scales mis-authored assets here — e.g. the
+/// Khronos Avocado is ~6 cm and the Lantern ~26 m, both placed to a sensible size.
 fn trs(x: f32, y: f32, z: f32, s: f32) -> [f32; 16] {
     (Mat4::from_translation(Vec3::new(x, y, z)) * Mat4::from_scale(Vec3::splat(s))).to_cols_array()
 }
@@ -163,8 +200,9 @@ pub(crate) fn gallery_level() -> LevelData {
     LevelData {
         entities: vec![
             LevelEntity {
+                // The 6 cm avocado scaled up to ~1 m to sit with the procedural spheres.
                 asset: "assets/model.glb".into(),
-                transform: trs(0.0, 0.0, 0.0, 1.0),
+                transform: trs(0.0, 0.0, 0.0, 18.0),
                 material_override: None,
             },
             LevelEntity {
@@ -205,13 +243,14 @@ pub(crate) fn gallery_level() -> LevelData {
 /// times from a level file.
 pub(crate) fn lanterns_level() -> LevelData {
     use dreamcoast_asset::level::{Camera, Environment, Light};
+    // The Lantern is authored at ~26 m; scale it to a ~4 m street-lamp size.
     let lantern = |x: f32| LevelEntity {
         asset: "assets/Lantern.glb".into(),
-        transform: trs(x, 0.0, 0.0, 0.9),
+        transform: trs(x, 0.0, 0.0, 0.15),
         material_override: None,
     };
     LevelData {
-        entities: vec![lantern(-2.2), lantern(0.0), lantern(2.2)],
+        entities: vec![lantern(-4.0), lantern(0.0), lantern(4.0)],
         lights: vec![Light {
             kind: LightKind::Directional,
             vec: [-0.4, -1.0, -0.3],
