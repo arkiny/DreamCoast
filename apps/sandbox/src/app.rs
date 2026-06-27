@@ -2,6 +2,8 @@
 //! per backend, screenshot capture + PNG save, and CLI-flag parsing (model path,
 //! log file, backend, validation, screenshots). No render-loop state.
 
+use std::path::{Path, PathBuf};
+
 use anyhow::anyhow;
 use rhi::{BackendKind, Device, ReadbackLayout, Semaphore};
 
@@ -126,6 +128,45 @@ pub(crate) fn model_path() -> String {
         }
     }
     MODEL_PATH.to_string()
+}
+
+/// Resolve an asset path so the app finds its data regardless of the current
+/// working directory (launched from an IDE, a different cwd, or a shipped install).
+///
+/// Default asset paths like `assets/model.glb` are relative, and resolving them
+/// against the cwd breaks the moment the process is started from anywhere but the
+/// repo root — the model silently falls back to the procedural cube. Instead, an
+/// absolute path is used as-is; a relative path is tried against, in order:
+///   1. the current working directory (preserves running from the repo root),
+///   2. the executable's directory and each ancestor — covers a shipped layout
+///      (`assets/` beside the binary) and `cargo run` from any cwd, where the exe
+///      sits at `<repo>/target/<profile>/` so an ancestor is the repo root,
+///   3. the crate's compile-time workspace root (a dev-build belt-and-suspenders).
+///
+/// The first existing candidate wins; if none exist the original path is returned
+/// unchanged so the caller's missing-asset handling and error text stay meaningful.
+pub(crate) fn resolve_asset_path(path: &str) -> PathBuf {
+    let rel = Path::new(path);
+    if rel.is_absolute() {
+        return rel.to_path_buf();
+    }
+
+    let mut bases: Vec<PathBuf> = vec![PathBuf::from(".")];
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        bases.extend(exe_dir.ancestors().map(Path::to_path_buf));
+    }
+    // `CARGO_MANIFEST_DIR` is `<root>/apps/sandbox`; the workspace root is two up.
+    if let Some(root) = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2) {
+        bases.push(root.to_path_buf());
+    }
+
+    bases
+        .iter()
+        .map(|base| base.join(rel))
+        .find(|candidate| candidate.exists())
+        .unwrap_or_else(|| rel.to_path_buf())
 }
 
 /// `--log-file <path>`: mirror logs to a file (see `main`). `None` when absent.
