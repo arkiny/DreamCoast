@@ -16,11 +16,13 @@
 mod components;
 mod draw_list;
 mod ecs;
+mod gltf_instance;
 mod node;
 mod transform;
 
 pub use components::{MaterialHandle, MeshHandle, MeshInstance, Name};
 pub use draw_list::Drawable;
 pub use ecs::{Entity, World};
+pub use gltf_instance::instantiate_gltf;
 pub use node::NodeRef;
 pub use transform::{Children, LocalTransform, Parent, WorldTransform, propagate_transforms};

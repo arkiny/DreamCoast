@@ -118,16 +118,26 @@ pub(crate) fn upload_mesh(
     device: &Device,
     model: &MeshData,
 ) -> anyhow::Result<(Buffer, Buffer, u32)> {
+    upload_geometry(device, &model.vertices, &model.indices)
+}
+
+/// Upload raw vertex/index slices into GPU vertex/index buffers (the inner of
+/// [`upload_mesh`]; also used by the registry-based glTF primitive upload).
+pub(crate) fn upload_geometry(
+    device: &Device,
+    vertices: &[MeshVertex],
+    indices: &[u32],
+) -> anyhow::Result<(Buffer, Buffer, u32)> {
     let vbytes = unsafe {
         std::slice::from_raw_parts(
-            model.vertices.as_ptr() as *const u8,
-            std::mem::size_of_val(model.vertices.as_slice()),
+            vertices.as_ptr() as *const u8,
+            std::mem::size_of_val(vertices),
         )
     };
     let ibytes = unsafe {
         std::slice::from_raw_parts(
-            model.indices.as_ptr() as *const u8,
-            std::mem::size_of_val(model.indices.as_slice()),
+            indices.as_ptr() as *const u8,
+            std::mem::size_of_val(indices),
         )
     };
     let vbuf = device.create_buffer(&BufferDesc {
@@ -140,7 +150,29 @@ pub(crate) fn upload_mesh(
         usage: BufferUsage::Index,
     })?;
     ibuf.write(ibytes)?;
-    Ok((vbuf, ibuf, model.indices.len() as u32))
+    Ok((vbuf, ibuf, indices.len() as u32))
+}
+
+/// Upload a decoded RGBA8 image as a bindless sampled texture (mips generated at
+/// upload), returning its bindless index. The inner of [`upload_texture`]'s `Rgba8`
+/// arm; used directly by the glTF importer to dedup shared images.
+pub(crate) fn upload_image_rgba8(
+    device: &Device,
+    store: &mut Vec<Texture>,
+    img: &dreamcoast_asset::ImageData,
+    format: Format,
+) -> anyhow::Result<u32> {
+    let t = device.create_texture(
+        &TextureDesc {
+            width: img.width,
+            height: img.height,
+            format,
+        },
+        &img.rgba8,
+    )?;
+    let idx = t.bindless_index();
+    store.push(t);
+    Ok(idx)
 }
 
 /// Create a sampled texture from decoded image data and return its bindless index,

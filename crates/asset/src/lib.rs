@@ -9,10 +9,12 @@ use dreamcoast_core::EngineError;
 pub mod bc;
 pub mod cook;
 pub mod dcasset;
+pub mod gltf_scene;
 pub mod level;
 pub mod primitives;
 pub mod sdf;
 
+pub use gltf_scene::{GltfMaterial, GltfNode, GltfPrimitive, GltfScene, load_gltf_scene};
 pub use primitives::{cornell_box, unit_cube, uv_sphere};
 
 /// A mesh vertex (matches `rhi::VertexLayout::Mesh`: 32-byte stride).
