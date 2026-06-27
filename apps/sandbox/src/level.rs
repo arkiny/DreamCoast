@@ -65,6 +65,18 @@ pub(crate) fn load(path: &Path) -> anyhow::Result<LevelData> {
     Ok(level)
 }
 
+/// A level's authored camera as `(eye, target)`, or `None` if it's the default (the
+/// renderer then frames the scene by its AABB instead).
+pub(crate) fn level_camera(level: &LevelData) -> Option<(Vec3, Vec3)> {
+    use dreamcoast_asset::level::Camera;
+    (level.camera != Camera::default()).then(|| {
+        (
+            Vec3::from(level.camera.position),
+            Vec3::from(level.camera.target),
+        )
+    })
+}
+
 /// Whether an asset key names a glTF file (vs a procedural primitive).
 fn is_gltf(asset: &str) -> bool {
     let a = asset.to_ascii_lowercase();
@@ -274,7 +286,15 @@ pub(crate) fn sponza_level() -> LevelData {
             material_override: None,
         }],
         lights: vec![],
-        camera: Camera::default(),
+        // The iconic Sponza atrium angle: standing in the open courtyard looking down
+        // the length, the draped arcades receding on both sides.
+        camera: Camera {
+            position: [-6.0, 2.0, 0.0],
+            target: [8.0, 3.0, -5.0],
+            fov_y_deg: 60.0,
+            znear: 0.05,
+            zfar: 100.0,
+        },
         environment: Environment::default(),
     }
 }

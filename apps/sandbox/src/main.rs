@@ -374,6 +374,9 @@ struct App {
     /// World-space focus point the orbit camera frames (scene AABB centre at native
     /// scale; the gallery's legacy focus otherwise).
     scene_center: Vec3,
+    /// A level's authored camera (eye, target), applied as the initial view when the
+    /// level defines a non-default camera. `None` falls back to the orbit framing.
+    level_view: Option<(Vec3, Vec3)>,
     screenshot_mode: bool,
     captures: Vec<Capture>,
     validation_on: bool,
@@ -625,6 +628,8 @@ impl App {
         // World-space AABB of the placed scene (metres), used to frame the camera at the
         // scene's native scale. `None` keeps the legacy gallery framing.
         let mut scene_bounds: Option<level::Bounds> = None;
+        // A level's authored camera (applied as the initial view if non-default).
+        let mut level_view: Option<(Vec3, Vec3)> = None;
 
         if world_mode {
             // Stage D: load the level graph + the level files its chunks reference.
@@ -651,6 +656,7 @@ impl App {
                 .unwrap_or(0);
             // Stage E: load through the cook (RON → cooked .dcasset, cache-keyed).
             let level = level::load(std::path::Path::new(&level_paths[current_level]))?;
+            level_view = level::level_camera(&level);
             scene_bounds = level::build_level(
                 &device,
                 &level,
@@ -1250,6 +1256,7 @@ impl App {
             model_radius,
             scene_radius,
             scene_center,
+            level_view,
             screenshot_mode,
             captures,
             validation_on,
@@ -1375,6 +1382,7 @@ impl App {
         self.device.wait_idle()?;
         let path = self.level_paths[idx].clone();
         let level = level::load(std::path::Path::new(&path))?;
+        self.level_view = level::level_camera(&level);
         let mut world = World::new();
         let mut mesh_registry = MeshRegistry::new();
         let mut material_registry = MaterialRegistry::new();
@@ -1553,6 +1561,9 @@ impl App {
             let (sp, cp) = (pitch.sin(), pitch.cos());
             let eye = center + dist * Vec3::new(cp * self.angle.cos(), sp, cp * self.angle.sin());
             (center, eye)
+        } else if let Some((eye, target)) = self.level_view {
+            // A level's authored camera (e.g. the Sponza demo angle) is the base view.
+            (target, eye)
         } else {
             let focus = self.scene_center;
             let dist = self.scene_radius * 1.6;
