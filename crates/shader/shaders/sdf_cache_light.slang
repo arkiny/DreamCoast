@@ -81,8 +81,9 @@ float3 geo_normal(float3 p)
 {
     const float e = 0.012;
     float2 k = float2(1.0, -1.0);
-    return normalize(k.xyy * geo_inside(p + k.xyy * e) + k.yyx * geo_inside(p + k.yyx * e)
-                     + k.yxy * geo_inside(p + k.yxy * e) + k.xxx * geo_inside(p + k.xxx * e));
+    float3 grad = k.xyy * geo_inside(p + k.xyy * e) + k.yyx * geo_inside(p + k.yyx * e)
+                  + k.yxy * geo_inside(p + k.yxy * e) + k.xxx * geo_inside(p + k.xxx * e);
+    return safe_normalize(grad, float3(0.0, 1.0, 0.0));
 }
 
 // Soft penumbra shadow toward the sun (object occluders only).
@@ -167,8 +168,10 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     // Temporal EMA (skip on reset) — static cache converges; damps gather noise.
     if (pc.reset == 0u)
     {
-        float3 prev = asfloat(g.storage_buffers[pc.cache_rad_read].Load3(t * 16u));
+        float3 prev = make_finite(asfloat(g.storage_buffers[pc.cache_rad_read].Load3(t * 16u)));
         radiance = lerp(prev, radiance, pc.params.y);
     }
-    g.storage_buffers[pc.cache_rad_write].Store4(t * 16u, asuint(float4(radiance, 1.0)));
+    // Sanitize before storing: a NaN here would spread through the cache's gather + EMA
+    // every frame (the "black creeps in" failure on complex scenes).
+    g.storage_buffers[pc.cache_rad_write].Store4(t * 16u, asuint(float4(make_finite(radiance), 1.0)));
 }

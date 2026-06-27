@@ -127,6 +127,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         accum = gi_cur;
     }
 
+    // Sanitize before storing: a NaN would persist in the history and spread via the EMA.
+    accum = make_finite(accum);
     g.storage_buffers[pc.hist_write].Store4(idx * 16u, asuint(float4(accum, len)));
     g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(world_pos, 1.0)));
     g.storage_images[pc.out_index][tid.xy] = float4(accum, 1.0);

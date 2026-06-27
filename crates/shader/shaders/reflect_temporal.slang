@@ -125,6 +125,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         }
     }
 
+    // Sanitize before storing: a NaN would persist in the accumulator and spread via EMA.
+    accum = make_finite(accum);
     g.storage_buffers[pc.accum_write].Store4(idx * 16u, asuint(float4(accum, len)));
     g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(world_pos, 1.0)));
 
