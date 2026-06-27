@@ -115,15 +115,32 @@ crates/shader/compiled/                 # 쿡된 셰이더 에셋 루트 (per-OS
 각 단계 게이트 = `cargo fmt --all` + `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets`
 + **양 백엔드(VK/DX) 픽셀 동일** + Vulkan 검증 클린(셰이더 바이트코드가 동일하므로 렌더 무회귀가 기준).
 
-- **M4.1 — 콘텐츠 해시 + 매니페스트.** `build.rs`에 무의존 해시 + `manifest.json` 읽기/쓰기.
-  잡별 키 계산(소스+공유 include+파라미터+slangc 버전). 아직 캐시 디렉터리 없이 OUT_DIR 유지하되
-  **해시 히트면 slangc 생략** 로직만 먼저. (이미 측정 가능한 빌드 단축.)
+- **M4.1 — 콘텐츠 해시 + 매니페스트. ✅ 완료(2026-06-27).** `build.rs`에 무의존 FNV-1a 해시 +
+  `shader-cache-manifest.txt`(OUT_DIR) 읽기/쓰기. 잡별 키 = `FNV(slangc -v + 공유 include + 소스 +
+  {target,entry,stage,profile,defines})`, `profile_for`/`defines_for` 단일 소스로 키·slangc 인자 동시 산출
+  (드리프트 불가). 해시 히트 AND 산출물 실재 → slangc 생략. **측정(Windows d3d12+vulkan):** 콜드 118 compiled,
+  `touch`(동일 바이트) **58s→3s, 0 compiled/118 cached**, 단일 편집 4 compiled(해당 잡만), 바이트코드
+  120/120 동일(무회귀). M4.5 빌드 병렬화로 콜드 빌드도 단축 예정.
 - **M4.2 — per-OS 캐시 디렉터리.** 산출물을 `crates/shader/compiled/<os>/`로 이동, `include_bytes!`가
   거기서 임베드(6a). `target_selected`와 일치하는 OS 네임스페이싱. cache miss/hit 로그.
 - **M4.3 — gitignore 반영(로컬 캐시).** 캐시 디렉터리/매니페스트를 `.gitignore`에 반영(§5 결정 =
   로컬 전용). fresh checkout은 1회 풀 컴파일, 이후 무변경 빌드는 캐시 히트로 재컴파일 생략을 검증.
-- **M4.4(선택) — 정밀 의존성.** slangc depfile로 잡별 include 집합 좁히기(§3 2단계).
-- **M4.5(선택) — 런타임 에셋 로드.** 6b. 핫리로드 합류 지점.
+- **M4.4 — 퍼뮤테이션 매트릭스.** `Job`에 `variants`(이름 붙은 define-set) 선언 → **(잡 × 변형 × 타깃)**
+  카테시안을 전부 미리 쿡, 변형별 accessor(`<key>_<variant>_<suffix>()`) 생성, 런타임은 define-mask로
+  변형 선택(`load_shader_pair` 소비처 변경). 캐시/해시/스킵 로직은 **무변경**(데이터 확장만) — `defines`가
+  M4.1부터 키의 1급 필드라 변형은 순수 데이터다. 첫 변형 후보 = `RenderQuality` 한 노브 또는 섀도우 모드
+  특수화로 경로 검증.
+- **M4.5 — 빌드 병렬화.** 캐시-미스 잡들의 `slangc` 서브프로세스를 스레드풀로 동시 실행(현재 ~118 cell
+  순차 → 콜드 빌드 5-8× 단축 목표). 무의존(`std::thread` + 채널). 캐시 스킵 로직과 직교: 미스만 병렬 컴파일,
+  매니페스트는 조인 후 1회 기록. 산출물 바이트는 불변(병렬은 스케줄링만 바꿈).
+- **M4.6(선택) — 정밀 의존성.** slangc depfile로 잡별 include 집합 좁히기(§3 2단계).
+- **M4.7(선택) — 런타임 에셋 로드.** 6b. 핫리로드 합류 지점.
+
+> **연계(별개 런타임 트랙): Phase 12 M5 — 비동기 파이프라인 컴파일.** 런타임 `create_*_pipeline`(드라이버
+> PSO/VkPipeline 빌드)을 백그라운드 스레드로 돌리고, **준비 전 해당 패스의 드로우를 지연**(완료 시 그림;
+> 머스트-드로우 케이스는 상주 `DefaultLoading` 폴백). 빌드타임 slangc 캐시(M4)와 별개 — 베이크된 바이트코드의
+> 드라이버 컴파일이며 §9 런타임-Slang 제외와 무관(새 의존성 없음). 별도 `docs/phase-12-m5-async-pipeline.md`에
+> 리뷰된 계획 후 구현.
 
 ## 8. 검증
 
@@ -140,4 +157,26 @@ crates/shader/compiled/                 # 쿡된 셰이더 에셋 루트 (per-OS
 - 런타임 Slang 인프로세스 컴파일·리플렉션·핫리로드([shader-system-todo]) — 별개 *런타임* 트랙.
 - `.dcasset` 바이너리 컨테이너(메시/SDF) — Phase 12 M1–M3. 셰이더 캐시는 **독립 산출물**
   (별도 디렉터리 + 매니페스트)로, P11/P12 본선 의존 없이 단독 진행 가능.
-- 셰이더 변형(permutation)/specialization 관리 — 현재 잡 모델은 고정 엔트리포인트 집합이라 불필요.
+- 셰이더 변형(permutation)/specialization 관리는 **M4.4로 계획**(이전엔 비범위였으나 범용 게임 엔진은
+  머티리얼 피처 플래그·섀도우 모드·`RenderQuality` 특수화 등으로 필요). **단, 캐시 키는 M4.1부터 `defines`를
+  1급 필드로 해싱**한다 — 오늘도 Metal이 `rt_common.slang`을 `RT_METAL_TARGET=1`로 컴파일(같은 소스, 다른
+  바이트코드)하므로 **정확성상 필수**다(변형 미지원이라도 키에 defines가 빠지면 캐시가 틀린다).
+
+## 10. M4.1 실행 체크리스트 (콘텐츠 해시 + 매니페스트 + 스킵)
+
+> **베이스라인(2026-06-27, Windows/d3d12+vulkan 측정):** 순수 무변경 2회차 빌드는 cargo의 mtime 게이트가
+> `build.rs`를 아예 재실행하지 않아 이미 slangc 0회(~1s). **실제 비용은 mtime-무효화(같은 내용, `touch`/
+> `git checkout`/`stash pop`/`.slang`에 `cargo fmt`)와 단일 셰이더 편집** — 둘 다 현재 **전체 ~60×2 아티팩트
+> 재컴파일 = ~58s**. M4.1의 측정 목표: mtime-only → slangc 0회, 단일 편집 → 해당 잡만.
+
+- [x] **무의존 해시:** FNV-1a 64-bit를 `build.rs`에 인라인(빌드-deps 0 유지, §4-A).
+- [x] **단일 진실 키:** `profile_for(target,stage)` + `defines_for(target)` 헬퍼를 **키 계산과 slangc 인자
+      양쪽**에서 사용(드리프트 금지, CLAUDE.md 규칙 4). 키 = `FNV(slangc -v + 공유 include 바이트 + 소스
+      바이트 + {target,entry,stage,profile,defines})`. 공유 include(§3-1단계 보수적)는 전 잡 base 해시에 fold.
+- [x] **매니페스트:** OUT_DIR에 `shader-cache-manifest.txt`(`<key>.<ext>  <hex>` 라인). 읽기/비교/쓰기.
+- [x] **스킵 로직:** 키 일치 **AND** 아티팩트 실재 → slangc 생략·`emit_some`; 미스 → 컴파일 후 매니페스트 갱신.
+      (M4.1은 OUT_DIR 유지; metal RT-pipeline 멀티출력 분기는 캐시 미적용 = Windows 무영향, M4.2 이후.)
+- [x] **빌드 로그 메트릭:** `cargo:warning=shader-cache: {compiled} compiled, {hits} cached`.
+- [x] **검증(게이트) ✅:** fmt + clippy(-D) 클린; **바이트코드 무회귀** = 캐시 전/후 아티팩트 **120/120 바이트
+      동일**(픽셀 패리티보다 강한 증명); `touch` → **0 컴파일/118 cached**(58s→3s); 단일 편집 gbuffer → **4 컴파일**
+      (vs+fs × spirv+dxil)만; `slangc -v`는 base 해시 fold로 전체 무효화 경로 확보.
