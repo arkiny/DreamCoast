@@ -20,7 +20,8 @@ use rhi::{Device, Texture};
 
 use crate::NO_TEXTURE;
 use crate::registry::{
-    MaterialDesc, MaterialRegistry, MeshRegistry, PrimitiveHandles, gltf_bounds, upload_gltf_scene,
+    MaterialDesc, MaterialRegistry, MeshRegistry, PrimitiveHandles, gltf_bounds,
+    representative_albedo, upload_gltf_scene,
 };
 
 /// The world-space AABB of a placed scene (metres), for framing the camera.
@@ -101,12 +102,14 @@ fn desc_from_override(ov: Option<MaterialOverride>) -> MaterialDesc {
             metallic: o.metallic,
             roughness: o.roughness,
             tex: [NO_TEXTURE; 4],
+            albedo: representative_albedo(None, o.base_color_factor),
         },
         None => MaterialDesc {
             base_color: [0.8, 0.8, 0.8, 1.0],
             metallic: 0.0,
             roughness: 0.6,
             tex: [NO_TEXTURE; 4],
+            albedo: representative_albedo(None, [0.8, 0.8, 0.8, 1.0]),
         },
     }
 }
