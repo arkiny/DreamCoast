@@ -11,12 +11,107 @@
 //! still builds (e.g. the empty-window milestone). Obtain slangc and rebuild to
 //! enable shaders. A nonzero slangc exit (an actual compile error) DOES fail.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
 const RT_PIPELINE_ISECT_KEY: &str = "rt_pipeline_isect";
 const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
+
+// FNV-1a 64-bit — dependency-free content hash for the shader cook cache (Phase 12
+// M4, shader-asset-cache.md §4 option A). Collision risk is irrelevant for a build
+// cache key; this keeps `crates/shader` at zero build-dependencies.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Fold `bytes` into the running FNV-1a hash `h` (seed with `FNV_OFFSET`).
+fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// HLSL shader profile for a (target, stage), or `None` for the Metal target (which
+/// derives everything from the stage). **Single source of truth** shared by both the
+/// cache key and the slangc `-profile` arg below, so the key can never drift from what
+/// is actually compiled. Ray-tracing stages need a DXIL *library* (`lib_6_5`); inline
+/// `RayQuery` requires >= 6.5. SPIR-V uses `sm_6_5` for every stage (RT comes from the
+/// stage capability).
+fn profile_for(target: &str, stage: &str) -> Option<&'static str> {
+    match target {
+        "spirv" => Some("sm_6_5"),
+        "dxil" => Some(if is_rt_stage(stage) {
+            "lib_6_5"
+        } else {
+            "sm_6_5"
+        }),
+        _ => None,
+    }
+}
+
+/// Preprocessor `-D` defines for a target. **Single source of truth** for both the
+/// cache key and the slangc args. Slang's Metal target rejects the
+/// `NonUniformResourceIndex` intrinsic (E36107) that SPIR-V/DXIL need for per-ray
+/// descriptor selection; `RT_METAL_TARGET` compiles it out (Metal indexes argument
+/// buffers non-uniformly without the decoration). This is also why the key MUST hash
+/// defines even before permutations exist (M4.4): the same `rt_common.slang` produces
+/// different bytecode with vs. without this define.
+fn defines_for(target: &str) -> &'static [(&'static str, &'static str)] {
+    match target {
+        "metallib" => &[("RT_METAL_TARGET", "1")],
+        _ => &[],
+    }
+}
+
+/// `slangc -v` output (stdout+stderr) — folded into the base hash so a compiler
+/// upgrade invalidates every cache entry.
+fn slangc_version(slangc: &Path) -> Vec<u8> {
+    Command::new(slangc)
+        .arg("-v")
+        .output()
+        .ok()
+        .map(|o| {
+            let mut v = o.stdout;
+            v.extend_from_slice(&o.stderr);
+            v
+        })
+        .unwrap_or_default()
+}
+
+/// Load the cook-cache manifest (`<artifact>  <hex-hash>` per line). Missing/corrupt
+/// lines are simply skipped — a malformed manifest degrades to a full recompile, never
+/// a wrong cache hit.
+fn load_manifest(path: &Path) -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((name, hex)) = line.split_once(char::is_whitespace)
+                && let Ok(h) = u64::from_str_radix(hex.trim(), 16)
+            {
+                map.insert(name.to_string(), h);
+            }
+        }
+    }
+    map
+}
+
+/// Write the manifest back, sorted for deterministic diffs.
+fn save_manifest(path: &Path, map: &HashMap<String, u64>) {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut text = String::new();
+    for (name, hash) in entries {
+        text.push_str(&format!("{name}  {hash:016x}\n"));
+    }
+    let _ = std::fs::write(path, text);
+}
 
 /// One shader entry point to compile.
 struct Job {
@@ -480,8 +575,29 @@ fn main() {
     let mut rt_pipeline_isect_emitted = false;
     let mut rt_pipeline_dispatch_emitted = false;
 
+    // --- Shader cook cache (Phase 12 M4.1): content-hash + manifest, skip slangc on
+    // hit. The base hash folds the compiler version and the shared includes (§3 step 1,
+    // conservative) into every job's key, so a compiler upgrade or a shared-include edit
+    // invalidates all entries. M4.1 keeps artifacts in OUT_DIR; M4.2 relocates them to a
+    // persistent per-OS cache dir.
+    let manifest_path = out_dir.join("shader-cache-manifest.txt");
+    let mut manifest = load_manifest(&manifest_path);
+    let mut base_hash = fnv1a(&slangc_version(&slangc), FNV_OFFSET);
+    for inc in [
+        "bindless.slang",
+        "rt_common.slang",
+        "rt_pipeline_metal_rootsig.json",
+    ] {
+        if let Ok(bytes) = std::fs::read(shader_dir.join(inc)) {
+            base_hash = fnv1a(&bytes, base_hash);
+        }
+    }
+    let mut cache_compiled = 0usize;
+    let mut cache_hits = 0usize;
+
     for job in JOBS {
         let src_path = shader_dir.join(job.src);
+        let src_bytes = std::fs::read(&src_path).unwrap_or_default();
         for (target, ext, suffix, required) in TARGETS {
             // Emit a `None` accessor for targets this platform doesn't use, so the
             // generated `<key>_<suffix>()` function always exists.
@@ -553,36 +669,40 @@ fn main() {
                 continue;
             }
 
+            // Cache key for this (job, target): base (compiler + shared includes)
+            // folded with the source bytes and the exact compile params. profile_for /
+            // defines_for are the single source for both the key and the slangc args, so
+            // the key can never claim a hit for bytecode compiled with different flags.
+            let profile = profile_for(target, job.stage);
+            let defines = defines_for(target);
+            let defines_str: String = defines.iter().map(|(k, v)| format!("{k}={v};")).collect();
+            let params = format!(
+                "t={target};e={};s={};p={};d={defines_str}",
+                job.entry,
+                job.stage,
+                profile.unwrap_or(""),
+            );
+            let key_hash = fnv1a(params.as_bytes(), fnv1a(&src_bytes, base_hash));
+            let artifact_name = format!("{}.{}", job.key, ext);
+            if manifest.get(&artifact_name) == Some(&key_hash) && out_path.exists() {
+                // Identical source + params + compiler → byte-identical bytecode already
+                // on disk. Skip the slangc subprocess entirely.
+                emit_some(&mut generated, job.key, suffix, &out_path);
+                cache_hits += 1;
+                continue;
+            }
+
             let mut command = slang_command(&slangc, &shader_tool_home);
             command
                 .arg(&src_path)
                 .args(["-target", target])
                 .args(["-entry", job.entry])
                 .args(["-stage", job.stage]);
-            // Slang's Metal target rejects the `NonUniformResourceIndex` intrinsic
-            // (E36107) that SPIR-V/DXIL need for per-ray descriptor selection; Metal
-            // indexes argument-buffer arrays non-uniformly without it. Drop the
-            // decoration only for the direct metallib compile (inline `csMain`). The
-            // M7 RT-pipeline path goes through DXC, so it keeps the decoration.
-            if *target == "metallib" {
-                command.args(["-D", "RT_METAL_TARGET=1"]);
+            for &(k, v) in defines {
+                command.args(["-D", &format!("{k}={v}")]);
             }
-            // The HLSL shader profile applies to the SPIR-V / DXIL targets; the
-            // Metal target derives everything it needs from the stage. Ray-tracing
-            // stages compile to a DXIL *library* (lib_6_5+) — inline `RayQuery`
-            // inside a hit shader requires >= 6.5; SPIR-V uses the same `sm_6_5`
-            // profile as every other stage (the RT capability comes from the stage).
-            if *target == "spirv" {
-                command.args(["-profile", "sm_6_5"]);
-            } else if *target == "dxil" {
-                command.args([
-                    "-profile",
-                    if is_rt_stage(job.stage) {
-                        "lib_6_5"
-                    } else {
-                        "sm_6_5"
-                    },
-                ]);
+            if let Some(p) = profile {
+                command.args(["-profile", p]);
             }
             // By default Slang names the SPIR-V entry point "main"; preserve the
             // real name so the pipeline can bind it by entry name.
@@ -597,6 +717,8 @@ fn main() {
 
             if output.status.success() {
                 emit_some(&mut generated, job.key, suffix, &out_path);
+                manifest.insert(artifact_name, key_hash);
+                cache_compiled += 1;
             } else if *required {
                 panic!(
                     "slangc failed for {} [{}/{}]:\n{}\n{}",
@@ -628,6 +750,9 @@ fn main() {
     if !rt_pipeline_dispatch_emitted {
         emit_none(&mut generated, RT_PIPELINE_DISPATCH_KEY, "metallib");
     }
+
+    save_manifest(&manifest_path, &manifest);
+    println!("cargo:warning=shader-cache: {cache_compiled} compiled, {cache_hits} cached");
 
     std::fs::write(out_dir.join("shaders.rs"), generated).unwrap();
 }
