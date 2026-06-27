@@ -140,6 +140,50 @@ pub(crate) struct SceneObject {
     pub(crate) casts_shadow: bool,
 }
 
+/// A level's lighting (sun + point lights), applied in the `Globals` assembly in
+/// place of the gallery's hardcoded code-default lights. `None` keeps the gallery
+/// defaults (byte-identical baseline).
+struct LevelLighting {
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    point_pos: [[f32; 4]; 4],
+    point_color: [[f32; 4]; 4],
+    point_count: i32,
+}
+
+/// Build a [`LevelLighting`] from a level's environment + lights: the environment sun
+/// (overridden by an explicit directional light), and up to 4 point lights.
+fn level_lighting(level: &dreamcoast_asset::LevelData) -> LevelLighting {
+    use dreamcoast_asset::level::LightKind;
+    let env = level.environment;
+    let mut sun_dir = env.sun_dir;
+    let mut sun_intensity = env.sun_intensity;
+    let mut point_pos = [[0.0f32; 4]; 4];
+    let mut point_color = [[0.0f32; 4]; 4];
+    let mut count = 0usize;
+    for l in &level.lights {
+        match l.kind {
+            LightKind::Directional => {
+                sun_dir = l.vec;
+                sun_intensity = l.intensity;
+            }
+            LightKind::Point if count < 4 => {
+                point_pos[count] = [l.vec[0], l.vec[1], l.vec[2], 0.0];
+                point_color[count] = [l.color[0], l.color[1], l.color[2], l.intensity];
+                count += 1;
+            }
+            LightKind::Point => {}
+        }
+    }
+    LevelLighting {
+        sun_dir,
+        sun_intensity,
+        point_pos,
+        point_color,
+        point_count: count as i32,
+    }
+}
+
 /// Per-frame globals, mirrored by `Globals` in pbr.slang. All members are 16-byte
 /// vectors so the std140 (Vulkan) and cbuffer (D3D12) layouts agree.
 #[repr(C)]
@@ -377,6 +421,12 @@ struct App {
     /// A level's authored camera (eye, target), applied as the initial view when the
     /// level defines a non-default camera. `None` falls back to the orbit framing.
     level_view: Option<(Vec3, Vec3)>,
+    /// A level's lighting (sun + point lights), replacing the gallery's code-default
+    /// lights. `None` keeps the gallery defaults (byte-identical).
+    level_lighting: Option<LevelLighting>,
+    /// True only for the hardcoded gallery (its legacy shadow framing is byte-identical;
+    /// other modes frame the shadow box on the scene AABB).
+    is_gallery: bool,
     screenshot_mode: bool,
     captures: Vec<Capture>,
     validation_on: bool,
@@ -630,6 +680,8 @@ impl App {
         let mut scene_bounds: Option<level::Bounds> = None;
         // A level's authored camera (applied as the initial view if non-default).
         let mut level_view: Option<(Vec3, Vec3)> = None;
+        // A level's lighting, replacing the gallery's code-default sun + point lights.
+        let mut level_lighting_override: Option<LevelLighting> = None;
 
         if world_mode {
             // Stage D: load the level graph + the level files its chunks reference.
@@ -657,6 +709,7 @@ impl App {
             // Stage E: load through the cook (RON → cooked .dcasset, cache-keyed).
             let level = level::load(std::path::Path::new(&level_paths[current_level]))?;
             level_view = level::level_camera(&level);
+            level_lighting_override = Some(level_lighting(&level));
             scene_bounds = level::build_level(
                 &device,
                 &level,
@@ -676,7 +729,7 @@ impl App {
                 gscene.materials.len(),
                 gscene.images.len()
             );
-            let (prim_handles, _cpu) = registry::upload_gltf_scene(
+            let prim_handles = registry::upload_gltf_scene(
                 &device,
                 &gscene,
                 &mut mesh_registry,
@@ -1243,7 +1296,11 @@ impl App {
             streaming,
             ground_vbuf,
             ground_ibuf,
-            ground_count,
+            // The hardcoded flat ground is a gallery-only code default. Every other mode
+            // brings its own floor (a level's asset geometry, or a "ground" entity — so a
+            // streamed chunk carries its own ground patch). Drawing 0 indices keeps the
+            // buffers valid but renders nothing.
+            ground_count: if gallery_scene { ground_count } else { 0 },
             pools,
             command_buffers,
             image_available,
@@ -1257,6 +1314,8 @@ impl App {
             scene_radius,
             scene_center,
             level_view,
+            level_lighting: level_lighting_override,
+            is_gallery: gallery_scene,
             screenshot_mode,
             captures,
             validation_on,
@@ -1383,6 +1442,7 @@ impl App {
         let path = self.level_paths[idx].clone();
         let level = level::load(std::path::Path::new(&path))?;
         self.level_view = level::level_camera(&level);
+        self.level_lighting = Some(level_lighting(&level));
         let mut world = World::new();
         let mut mesh_registry = MeshRegistry::new();
         let mut material_registry = MaterialRegistry::new();
@@ -2045,6 +2105,38 @@ impl App {
         let cmd = &self.command_buffers[fif];
         cmd.begin()?;
 
+        // Lighting: a level supplies its own sun + point lights; otherwise the gallery's
+        // code-default sun + two coloured point lights (preserved exactly = byte-identical).
+        let r = self.model_radius;
+        let point_intensity = r * r * 8.0;
+        let (sun_dir, sun_intensity, point_count, point_pos, point_color) =
+            match &self.level_lighting {
+                Some(ll) => (
+                    ll.sun_dir,
+                    ll.sun_intensity,
+                    ll.point_count,
+                    ll.point_pos,
+                    ll.point_color,
+                ),
+                None => (
+                    self.sun_dir,
+                    self.sun_intensity,
+                    2,
+                    [
+                        [r * 2.0, r * 1.5, 0.0, 0.0],
+                        [-r * 2.0, r * 1.0, r * 1.5, 0.0],
+                        [0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0],
+                    ],
+                    [
+                        [1.0, 0.35, 0.2, point_intensity],
+                        [0.3, 0.5, 1.0, point_intensity],
+                        [0.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 0.0],
+                    ],
+                ),
+            };
+
         // (Re)capture the environment into the "write" cube set before the main graph
         // samples it (see `ibl.rs`). The reflection probe is fixed at the scene centre
         // (`focus`), NOT the camera, to avoid per-surface parallax error.
@@ -2069,8 +2161,8 @@ impl App {
             &self.ground_ibuf,
             self.ground_count,
             focus,
-            self.sun_dir,
-            self.sun_intensity,
+            sun_dir,
+            sun_intensity,
             self.ambient,
             self.flip_y,
             self.backend == BackendKind::Vulkan,
@@ -2082,35 +2174,27 @@ impl App {
         // Directional light view-projection: an orthographic box covering the whole
         // scene, looking from the sun toward it. Backend-neutral (the pbr shader
         // handles the Vulkan/D3D12 shadow-UV flip).
-        let shadow_center = Vec3::new(0.0, self.model_radius * 0.5, 0.0);
-        let light_vp = light_view_proj(self.sun_dir, shadow_center, self.scene_radius);
+        let shadow_center = if self.is_gallery {
+            Vec3::new(0.0, self.model_radius * 0.5, 0.0)
+        } else {
+            self.scene_center
+        };
+        let light_vp = light_view_proj(sun_dir, shadow_center, self.scene_radius);
 
         // Write this frame's globals slice.
-        let r = self.model_radius;
-        let point_intensity = r * r * 8.0;
         let globals = Globals {
             camera_pos: [eye.x, eye.y, eye.z, 0.0],
-            sun_direction: normalize3(self.sun_dir),
-            sun_color: [1.0, 1.0, 1.0, self.sun_intensity],
+            sun_direction: normalize3(sun_dir),
+            sun_color: [1.0, 1.0, 1.0, sun_intensity],
             ambient: [self.ambient, self.ambient, self.ambient, self.exposure],
             counts: [
-                if self.point_lights_on { 2 } else { 0 },
+                if self.point_lights_on { point_count } else { 0 },
                 self.debug_view as i32,
                 (PREFILTER_MIPS - 1) as i32, // prefilter max LOD
                 self.shadows_on as i32,
             ],
-            point_pos: [
-                [r * 2.0, r * 1.5, 0.0, 0.0],
-                [-r * 2.0, r * 1.0, r * 1.5, 0.0],
-                [0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0],
-            ],
-            point_color: [
-                [1.0, 0.35, 0.2, point_intensity],
-                [0.3, 0.5, 1.0, point_intensity],
-                [0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0],
-            ],
+            point_pos,
+            point_color,
             light_view_proj: light_vp.to_cols_array(),
             shadow: [
                 self.shadow_bias,

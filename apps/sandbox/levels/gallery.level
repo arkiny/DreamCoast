@@ -1,6 +1,15 @@
 (
     entities: [
         (
+            asset: "ground",
+            transform: (6.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            material_override: Some((
+                base_color_factor: (0.8, 0.8, 0.8, 1.0),
+                metallic: 0.0,
+                roughness: 0.9,
+            )),
+        ),
+        (
             asset: "assets/model.glb",
             transform: (18.0, 0.0, 0.0, 0.0, 0.0, 18.0, 0.0, 0.0, 0.0, 0.0, 18.0, 0.0, 0.0, 0.0, 0.0, 1.0),
             material_override: None,

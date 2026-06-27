@@ -1,6 +1,15 @@
 (
     entities: [
         (
+            asset: "ground",
+            transform: (8.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            material_override: Some((
+                base_color_factor: (0.8, 0.8, 0.8, 1.0),
+                metallic: 0.0,
+                roughness: 0.9,
+            )),
+        ),
+        (
             asset: "assets/Lantern.glb",
             transform: (0.15, 0.0, 0.0, 0.0, 0.0, 0.15, 0.0, 0.0, 0.0, 0.0, 0.15, 0.0, -4.0, 0.0, 0.0, 1.0),
             material_override: None,
