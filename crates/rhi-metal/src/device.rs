@@ -89,10 +89,14 @@ pub(crate) const VOLUME_BASE: u32 = TLAS_SLOT + 1;
 /// volumes).
 pub(crate) const STORAGE_VOLUME_BASE: u32 = VOLUME_BASE + VOLUME_COUNT;
 
+/// Argument-buffer slot of the REPEAT/wrap sampler (`Bindless.samp_wrap`, declared LAST
+/// in `bindless.slang`, after the storage volumes), for tiling material textures.
+pub(crate) const SAMP_WRAP_SLOT: u32 = STORAGE_VOLUME_BASE + STORAGE_VOLUME_COUNT;
+
 /// Total number of 8-byte handle slots in the bindless argument buffer: textures,
-/// sampler, cubes, storage images, storage buffers, the TLAS slot, then the sampled
-/// + storage volume tables (Phase 11 Stage B).
-pub(crate) const ARG_BUFFER_SLOTS: u32 = STORAGE_VOLUME_BASE + STORAGE_VOLUME_COUNT;
+/// sampler, cubes, storage images, storage buffers, the TLAS slot, the sampled + storage
+/// volume tables, then the wrap sampler.
+pub(crate) const ARG_BUFFER_SLOTS: u32 = SAMP_WRAP_SLOT + 1;
 
 type MetalTextureHandle = Retained<ProtocolObject<dyn MTLTexture>>;
 type SampledTextureSlots = Vec<Option<MetalTextureHandle>>;
@@ -122,6 +126,7 @@ pub(crate) struct DeviceShared {
     /// handles directly (Apple Silicon argument buffers tier 2).
     pub arg_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
+    sampler_wrap: Retained<ProtocolObject<dyn MTLSamplerState>>,
     /// Next free bindless texture slot. `Cell`: the Metal backend is single-threaded
     /// (`Rc`, not `Arc`), so no atomics are needed.
     tex_next: Cell<u32>,
@@ -482,23 +487,25 @@ impl MetalInstance {
             .newBufferWithLength_options(arg_len, MTLResourceOptions::StorageModeShared)
             .ok_or_else(|| rhi_err("bindless argument buffer alloc failed"))?;
 
-        // One shared trilinear / repeat sampler (matches the Vulkan immutable
-        // sampler; the bindless table holds a single `samp`).
-        let sd = MTLSamplerDescriptor::new();
-        sd.setMinFilter(MTLSamplerMinMagFilter::Linear);
-        sd.setMagFilter(MTLSamplerMinMagFilter::Linear);
-        sd.setMipFilter(MTLSamplerMipFilter::Linear);
-        sd.setSAddressMode(MTLSamplerAddressMode::Repeat);
-        sd.setTAddressMode(MTLSamplerAddressMode::Repeat);
-        // Required because the sampler is encoded into the bindless argument buffer
-        // via `gpuResourceID()` below. Without this, `gpuResourceID()` is invalid for
-        // argument-buffer use and Metal shader validation (MTL_SHADER_VALIDATION=1)
-        // faults on the sampler slot.
-        sd.setSupportArgumentBuffers(true);
-        let sampler = self
-            .device
-            .newSamplerStateWithDescriptor(&sd)
-            .ok_or_else(|| rhi_err("newSamplerState failed"))?;
+        // Two shared trilinear samplers matching Vulkan/D3D12: `samp` (CLAMP — cubes,
+        // volumes, G-buffer) and `samp_wrap` (REPEAT — tiling material textures).
+        let make_sampler = |mode: MTLSamplerAddressMode| {
+            let sd = MTLSamplerDescriptor::new();
+            sd.setMinFilter(MTLSamplerMinMagFilter::Linear);
+            sd.setMagFilter(MTLSamplerMinMagFilter::Linear);
+            sd.setMipFilter(MTLSamplerMipFilter::Linear);
+            sd.setSAddressMode(mode);
+            sd.setTAddressMode(mode);
+            // Required because the sampler is encoded into the bindless argument buffer
+            // via `gpuResourceID()` below. Without this, `gpuResourceID()` is invalid for
+            // argument-buffer use and Metal shader validation faults on the sampler slot.
+            sd.setSupportArgumentBuffers(true);
+            self.device
+                .newSamplerStateWithDescriptor(&sd)
+                .ok_or_else(|| rhi_err("newSamplerState failed"))
+        };
+        let sampler = make_sampler(MTLSamplerAddressMode::ClampToEdge)?;
+        let sampler_wrap = make_sampler(MTLSamplerAddressMode::Repeat)?;
 
         let shared = Rc::new(DeviceShared {
             device: self.device.clone(),
@@ -507,6 +514,7 @@ impl MetalInstance {
             layer: self.layer.clone(),
             arg_buffer,
             sampler,
+            sampler_wrap,
             tex_next: Cell::new(0),
             cube_next: Cell::new(0),
             storage_img_next: Cell::new(0),
@@ -526,6 +534,8 @@ impl MetalInstance {
         // The sampler sits at the slot just past the texture array (Slang assigns it
         // id `BINDLESS_COUNT` in the argument-buffer struct).
         shared.write_handle(BINDLESS_COUNT, shared.sampler.gpuResourceID());
+        // The wrap sampler (`samp_wrap`) is the last argument-buffer slot.
+        shared.write_handle(SAMP_WRAP_SLOT, shared.sampler_wrap.gpuResourceID());
 
         Ok(MetalDevice { shared })
     }

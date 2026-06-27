@@ -56,6 +56,7 @@ pub(crate) struct DeviceShared {
     pub bindless_layout: vk::DescriptorSetLayout,
     pub bindless_set: vk::DescriptorSet,
     pub bindless_sampler: vk::Sampler,
+    pub bindless_sampler_wrap: vk::Sampler,
     bindless_next: AtomicU32,
     cube_next: AtomicU32,
     storage_image_next: AtomicU32,
@@ -266,8 +267,13 @@ impl DeviceShared {
 
             let mem_props = raw.get_physical_device_memory_properties(instance.physical_device);
 
-            let (bindless_pool, bindless_layout, bindless_set, bindless_sampler) =
-                create_bindless(&device, has_raytracing)?;
+            let (
+                bindless_pool,
+                bindless_layout,
+                bindless_set,
+                bindless_sampler,
+                bindless_sampler_wrap,
+            ) = create_bindless(&device, has_raytracing)?;
             let (globals_pool, globals_layout, globals_set) = create_globals(&device)?;
 
             Ok(Self {
@@ -282,6 +288,7 @@ impl DeviceShared {
                 bindless_layout,
                 bindless_set,
                 bindless_sampler,
+                bindless_sampler_wrap,
                 bindless_next: AtomicU32::new(0),
                 cube_next: AtomicU32::new(0),
                 storage_image_next: AtomicU32::new(0),
@@ -534,6 +541,7 @@ fn create_bindless(
         vk::DescriptorSetLayout,
         vk::DescriptorSet,
         vk::Sampler,
+        vk::Sampler,
     ),
     EngineError,
 > {
@@ -549,6 +557,19 @@ fn create_bindless(
             .max_lod(vk::LOD_CLAMP_NONE);
         let sampler = device.create_sampler(&sampler_ci, None).map_err(vk_err)?;
         let immutable = [sampler];
+        // Binding 8: a REPEAT/wrap variant for tiling material textures (glTF UVs > 1).
+        let sampler_wrap_ci = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .max_lod(vk::LOD_CLAMP_NONE);
+        let sampler_wrap = device
+            .create_sampler(&sampler_wrap_ci, None)
+            .map_err(vk_err)?;
+        let immutable_wrap = [sampler_wrap];
 
         // The ray-tracing pipeline stages also touch the bindless tables (Phase 8):
         // raygen writes the output image and reads the accumulation/instance buffers
@@ -649,6 +670,16 @@ fn create_bindless(
                 .stage_flags(vk::ShaderStageFlags::COMPUTE | rt_stages),
         );
         flags.push(dynamic);
+        // Binding 8: the REPEAT/wrap sampler (immutable), for tiling material textures.
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(8)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(sampled_stages)
+                .immutable_samplers(&immutable_wrap),
+        );
+        flags.push(vk::DescriptorBindingFlags::empty());
         let mut flags_ci =
             vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
         let layout_ci = vk::DescriptorSetLayoutCreateInfo::default()
@@ -665,7 +696,7 @@ fn create_bindless(
                 .descriptor_count(BINDLESS_COUNT + CUBE_COUNT + VOLUME_COUNT), // 0 + 2 + 6
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
-                .descriptor_count(1),
+                .descriptor_count(2), // binding 1 (clamp) + binding 8 (wrap)
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(STORAGE_IMAGE_COUNT + STORAGE_VOLUME_COUNT), // 3 + 7
@@ -694,7 +725,7 @@ fn create_bindless(
             .set_layouts(&layouts);
         let set = device.allocate_descriptor_sets(&alloc).map_err(vk_err)?[0];
 
-        Ok((pool, layout, set, sampler))
+        Ok((pool, layout, set, sampler, sampler_wrap))
     }
 }
 
@@ -758,6 +789,8 @@ impl Drop for DeviceShared {
             self.device
                 .destroy_descriptor_set_layout(self.globals_layout, None);
             self.device.destroy_sampler(self.bindless_sampler, None);
+            self.device
+                .destroy_sampler(self.bindless_sampler_wrap, None);
             self.device.destroy_command_pool(self.command_pool, None);
             if self.has_dedicated_compute {
                 self.device
