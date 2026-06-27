@@ -77,7 +77,7 @@ actually lives (there is no separate engine binary). Key modules:
   lighting** pass, and tonemap. `push.rs` holds the push-constant byte packers.
 - `gdf.rs` / `gi.rs` / `reflect.rs` — Phase 11 software ray tracing against a baked **global
   distance field** (GDF): AO, 1-bounce diffuse GI (`gdf_gi`), GGX reflections (`gdf_reflect`),
-  and a Lumen-style mesh-card **surface cache** (`sdf_cache_*`).
+  and a mesh-card **surface cache** (`sdf_cache_*`).
 - `rt.rs` — hardware ray tracing (DXR + VK_KHR): BLAS/TLAS, the **path tracer** (ground truth),
   and the Cornell-box scene.
 - `ibl.rs` — procedural sky → env cube → irradiance/prefilter cubes + the BRDF LUT.
