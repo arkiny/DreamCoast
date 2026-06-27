@@ -15,11 +15,13 @@ use tracing::warn;
 
 use crate::registry::{MaterialRegistry, MeshRegistry};
 
-/// Surface-cache atlas budget: the maximum number of mesh cards (atlas = `cards · tile²`
-/// texels in flat buffers, re-lit every frame). Caps atlas memory and per-frame relight
-/// cost for large scenes; 6 cards / drawable ⇒ ~680 drawables. Above this the largest
-/// drawables are kept (most screen-relevant) and the rest logged — never silently dropped.
-pub(crate) const MAX_CARDS: u32 = 4096;
+/// Surface-cache atlas budget: the maximum number of mesh cards. The atlas is
+/// `cards · CARD_TILE²` texels across four flat buffers (captured pos + albedo + a
+/// radiance ping-pong) re-lit every frame, so cost is linear in card count: at
+/// `CARD_TILE = 32` this cap is ~1024·1024·16 B·4 ≈ 67 MB and ~1.05 M texels re-lit/frame.
+/// 6 cards / drawable ⇒ ~170 drawables fit; above this the largest-volume drawables (most
+/// screen-relevant) keep cards and the rest are logged — never silently dropped.
+pub(crate) const MAX_CARDS: u32 = 1024;
 
 /// The fused scene: one world-space triangle soup ready for the GDF bake, plus the
 /// per-drawable AABBs the surface-cache cards are built from.
