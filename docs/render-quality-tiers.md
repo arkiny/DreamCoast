@@ -79,16 +79,39 @@
 
 ## Phase 분할
 
-- **Phase 1 — 티어 스캐폴드 + 노브 배선 (셰이더 탭 포함).**
-  `quality.rs`(enum+프리셋+선택), 전 노브의 `unwrap_or` 기본값을 프리셋에서 공급(개별 env 우선),
+- **Phase 1 ✅ (`4df8e63`) — 티어 스캐폴드 + 노브 배선 (셰이더 탭 포함).**
+  `quality.rs`(enum+프리셋+`env_bool`), 전 노브의 `unwrap_or` 기본값을 프리셋에서 공급(개별 env 우선),
   소프트-PCF 탭을 `shadow.w`로 런타임화(pbr.slang). UI에 현재 티어 표시.
-  - 검증: 미설정 ≡ Med ≡ 현재(바이트 동일, no-reg 6.039/ch), DX≡VK 0.000(하드 경로).
-- **Phase 2 — 티어 특성화(measure & tune).**
-  Low/Med/High 각각 PT 잔차 + `PROFILE_GPU` 코스트 + DX≡VK 측정, 매핑 수치를 데이터로 확정/조정.
-  High 소프트섀도우의 잔차/게이트 영향 정직 보고. 표를 측정값으로 갱신.
-- (선택) **Phase 3 — RenderQuality{...} 프레임당 UI/런타임 전환** + 플랫폼 자동 선택 훅(저사양 폴백).
+  - 검증: 미설정 ≡ Med ≡ 기존(바이트 동일, no-reg 6.039/ch), DX≡VK 0.000(하드 경로). clippy/fmt clean.
+- **Phase 2 ✅ — 티어 특성화(measure).** 아래 [측정 결과](#측정-결과-phase-2-d3d12-rtx-2070-super) 참조.
+  데이터가 매핑을 검증(튜닝 불필요): Low=싼 폴백, High=게임 미적 품질.
+- **Phase 3 ✅ — 런타임 UI 전환 + 플랫폼 기본 seam.**
+  ImGui 콤보(`low|med|high`)가 프리셋을 라이브 노브에 재적용(생성시와 동일한 capability 게이트 유지;
+  매 프레임 그래프 재빌드라 즉시 반영). 수동 선택은 시작 env 오버라이드를 대체(env는 *초기 상태*만 시드).
+  `RenderQuality::platform_default()` = 미설정 시 기본 티어 seam(현재 Med; 향후 per-GPU 선택이 꽂히는 지점,
+  GPU perf-tier 룩업 없이 가짜 감지 안 함 — 정직). 시작 시 활성 티어 `info!` 로그(헤드리스 캡처/프로파일 관측).
 
 각 Phase는 자체 검증 커밋·푸시. 수치는 정직 보고.
+
+## 측정 결과 (Phase 2, d3d12 RTX 2070 SUPER)
+
+| 티어 | PT 잔차/ch | DX≡VK/ch | GPU 코스트 | gdf_gi |
+|---|---|---|---|---|
+| **Low** | **6.019** | 0.000 | **3.96 ms** (−29%) | 2.06 ms (spp4) |
+| **Med** | **6.039** | 0.000 | **5.58 ms** (기준) | 3.48 ms (spp8) |
+| **High** | **6.722** | **0.009** (max 32) | **11.74 ms** (+110%) | 9.40 ms (spp16+캐시), +gdf_ao 0.04 ms |
+
+### 정직한 해석 (이 작은 테스트 씬 한정)
+1. **Low가 Med보다 PT 잔차 미세하게 더 좋고(6.019<6.039) 29% 싸다.** 이 씬은 GDF 지배라 무거운 반사
+   기능(reflect_cache·풀미러 SSR·spp8)이 PT 패리티를 못 올림 — `reflection-sdf-resolution.md`의 "SW-RT
+   실용 바닥" 재확인. Low는 손해 없는 저사양 폴백.
+2. **High PT 잔차는 *나빠짐*(6.722).** 미적 소프트섀도우가 near-sharp PT 태양과 벌어짐(예측대로). High는
+   *게임 미적 품질*(소프트섀도우·멀티바운스 GI 캐시·AO·2× GI)용이지 이 마이크로벤치 패리티용이 아님.
+3. **DX≡VK**: Low/Med=0.000(결정적 하드섀도우). **High=0.009(max 32)** — 소프트섀도우 페넘브라
+   가장자리(V-flip×IGN 회전), 사전 합의된 옵트인 한계로 **≤0.001 게이트 밖**(설계상 허용). **Low의
+   stochastic SSR은 이 씬서 거의 miss라 발산 안 함(0.000) — 온스크린 반사 많은 씬에선 잠재 발산**(scene-dependent).
+4. **매핑 튜닝 불필요**: 데이터가 설계 의도(Low=코스트↓·동등 품질, High=2× 코스트로 게임 품질)를 확인.
+   이 테스트 씬은 PT-패리티가 노브에 둔감 — 티어 가치는 *코스트 스케일링(Low)*과 *미적 품질(High, 풍부한 씬)*.
 
 ## 검증 (전 Phase 공통)
 - `RENDER_QUALITY={low,med,high}` 각각: `tools/rt-compare.py` PT 잔차 + `PROFILE_GPU` 코스트 +

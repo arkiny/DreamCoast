@@ -805,6 +805,7 @@ impl App {
         // first and falls back to `qp.*`, so an explicit `P11_*`/`SHADOW_*` override always wins.
         let quality = quality::RenderQuality::from_env();
         let qp = quality::preset(quality);
+        info!("RenderQuality tier: {} (RENDER_QUALITY)", quality.label());
         // Phase 7: route the HDR result through a compute post-process (3x3 blur into
         // a storage image) before tonemapping. Initial state seedable via env var so
         // headless screenshots can exercise each demo (`P7_COMPUTE_POST=1`, etc.).
@@ -1280,6 +1281,7 @@ impl App {
                 shadows_on,
                 shadow_bias,
                 shadow_softness,
+                shadow_taps,
                 quality,
                 override_material,
                 metallic_override,
@@ -1307,6 +1309,7 @@ impl App {
                 scene_gdf,
                 gdf_ao,
                 gdf_gi,
+                gi_spp,
                 gi_denoise,
                 gdf_ssr,
                 gdf_reflect,
@@ -1315,6 +1318,7 @@ impl App {
                 gdf_color,
                 cache_viz,
                 surface_cache,
+                reflect_cache,
                 firefly_clamp,
                 reflect_max_roughness,
                 ssr_stochastic,
@@ -1334,10 +1338,44 @@ impl App {
                         dt * 1000.0
                     ));
                     ui.text(format!("scene: {} objects + ground", scene.len()));
-                    ui.text(format!(
-                        "RenderQuality: {} (RENDER_QUALITY)",
-                        quality.label()
-                    ));
+                    // RenderQuality tier (Stage D): switching re-applies the preset to the live
+                    // knobs below (capability-gated). A manual pick supersedes any startup env
+                    // override — the env seam only seeds the initial state. The graph is rebuilt
+                    // every frame, so the new tier takes effect immediately.
+                    let mut tier_idx = match *quality {
+                        quality::RenderQuality::Low => 0usize,
+                        quality::RenderQuality::Med => 1,
+                        quality::RenderQuality::High => 2,
+                    };
+                    if ui.combo_simple_string(
+                        "RenderQuality",
+                        &mut tier_idx,
+                        &["low", "med", "high"],
+                    ) {
+                        let nq = [
+                            quality::RenderQuality::Low,
+                            quality::RenderQuality::Med,
+                            quality::RenderQuality::High,
+                        ][tier_idx];
+                        *quality = nq;
+                        let p = quality::preset(nq);
+                        // Re-derive each knob from the preset, preserving the same capability gates
+                        // used at construction so a tier can't enable a feature the device lacks.
+                        *gi_spp = p.gi_spp.clamp(1, 256);
+                        *gi_denoise = gi.has_denoise() && p.gi_denoise;
+                        *reflect_cache = *swrt_reflect
+                            && gdf.has_surface_cache()
+                            && gdf.has_cache_lighting()
+                            && p.reflect_cache;
+                        *surface_cache =
+                            gdf.has_surface_cache() && gdf.has_cache_lighting() && p.surface_cache;
+                        *ssr_stochastic = p.ssr_stochastic;
+                        *reflect_max_roughness = p.reflect_max_roughness;
+                        *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && p.gdf_ao;
+                        *firefly_clamp = p.firefly_clamp;
+                        *shadow_softness = p.shadow_softness;
+                        *shadow_taps = p.shadow_taps.clamp(1, 16);
+                    }
                     ui.text(format!(
                         "validation: {}",
                         if validation_on { "on" } else { "off" }
