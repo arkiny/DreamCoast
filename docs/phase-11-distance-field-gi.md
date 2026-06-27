@@ -150,6 +150,11 @@ GDF를 ray-march해 **디퓨즈 GI(1+ 바운스)·AO·반사**를 stochastic 샘
 라이팅(Phase 6)의 ambient/GI 항으로 합성한다. Stage B의 GDF는 *단위 큐브 데모*(고정 카메라)였으므로
 Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실제 디퍼드 G-buffer**에서 march한다.
 
+> **→ Metal 구현 완료** (M3 box 검증; 세부는 metal-backend.md "Phase 11 Stage C"). Stage C
+> 셰이더는 전부 metallib로 그대로 컴파일됐고, 유일한 Metal 갭은 C7 SSR이 추가한 컴퓨트
+> 파이프라인 `uniform_buffer`(per-frame globals UBO 바인딩)뿐이라 `rhi-metal`에만 반영해
+> 해결했다. 공유 셰이더 무변경 → **Vulkan/D3D12 무회귀**.
+
 ### Stage C의 최종 목표 — 캡처 기반 IBL을 SW-RT로 대체 (사용자 확정 2026-06-26)
 지금까지 [rt-pbr-parity.md](rt-pbr-parity.md)(PT가 정답)와 [realtime-env-capture.md](realtime-env-capture.md)
 (캡처 기반 IBL)가 거듭 확인한 결론: **split-sum 큐브 IBL은 PT 반사를 근본적으로 못 따라간다** — 단일 프로브

@@ -293,6 +293,11 @@ per-instance 트랜스폼을 공급하는 단일 소스가 된다. 테스트는 
   Metal API+GPU validation layer까지 통과. RT 텍스처 머티리얼은 hit UV 보간 + mip0 `Load`
   기반 bilinear 샘플링으로 base/mr/normal/emissive를 inline과 M7 양쪽에 적용했고, M7
   converter descriptor table도 sampled texture/cube/storage/TLAS 범위를 채우도록 갱신.
+- **Phase 11 SW-RT 패리티: Stage B(3D 볼륨/GDF) + Stage C(GDF AO·GI·SSR·GDF 반사·Lumen
+  surface cache) 모두 Metal에서 완료·검증**(M3 box). Stage C의 유일한 Metal 갭은 컴퓨트
+  파이프라인의 `uniform_buffer`(SSR의 per-frame globals UBO 바인딩)였고 `rhi-metal`에만
+  반영해 해결 — 공유 셰이더/`rhi-types`/렌더 그래프 무변경이라 **Vulkan/D3D12 무회귀**.
+  세부: [metal-backend.md](metal-backend.md) "Phase 11 Stage B/C".
 
 ## 상용 엔진 확장 — 런타임/툴링 계층 (Phase 15+) — 🧭 전략 계획
 
