@@ -33,6 +33,7 @@ mod app;
 mod camera;
 mod cull;
 mod deferred;
+mod fuse;
 mod gdf;
 mod gi;
 mod ibl;
@@ -761,29 +762,43 @@ impl App {
             let mesh_model = mesh_registry.upload(&device, model)?;
             let mesh_sphere = mesh_registry.upload(&device, &sphere)?;
             let mesh_cube = mesh_registry.upload(&device, &cube)?;
+            // The loaded model is textured: its representative GI albedo is the base-color
+            // texture's linear average × factor (the procedural objects use their factor's
+            // RGB). `representative_albedo` is the one definition the fuse later reads.
             let mat_model = material_registry.add(MaterialDesc {
                 base_color: model.material.base_color_factor,
                 metallic: model.material.metallic_factor,
                 roughness: model.material.roughness_factor,
                 tex: [base_index, mr_index, normal_index, emissive_index],
+                albedo: registry::representative_albedo(
+                    model
+                        .material
+                        .base_color
+                        .as_ref()
+                        .map(|t| t.average_linear()),
+                    model.material.base_color_factor,
+                ),
             });
             let mat_chrome = material_registry.add(MaterialDesc {
                 base_color: [0.95, 0.96, 0.97, 1.0],
                 metallic: 1.0,
                 roughness: 0.08,
                 tex: [NO_TEXTURE; 4],
+                albedo: registry::representative_albedo(None, [0.95, 0.96, 0.97, 1.0]),
             });
             let mat_copper = material_registry.add(MaterialDesc {
                 base_color: [0.95, 0.64, 0.54, 1.0],
                 metallic: 1.0,
                 roughness: 0.35,
                 tex: [NO_TEXTURE; 4],
+                albedo: registry::representative_albedo(None, [0.95, 0.64, 0.54, 1.0]),
             });
             let mat_red = material_registry.add(MaterialDesc {
                 base_color: [0.85, 0.25, 0.2, 1.0],
                 metallic: 0.0,
                 roughness: 0.5,
                 tex: [NO_TEXTURE; 4],
+                albedo: registry::representative_albedo(None, [0.85, 0.25, 0.2, 1.0]),
             });
             // Spawn order defines the deterministic draw / TLAS-instance order (model,
             // chrome, copper, cube) — the order the legacy flat list used.
@@ -880,103 +895,28 @@ impl App {
             gallery_scene,
         )?;
 
-        // Stage C1: fuse the opaque scene objects into one world-space triangle soup
-        // and register it as the scene GDF (baked once on the graph). Ground is handled
-        // analytically at trace time. Transforms are translation + uniform scale, so
-        // normals carry through (re-normalized after the 3x3). The avocado/spheres/cube
-        // are disjoint, so the closest-triangle sign convention gives the union SDF.
-        // Gallery-only: the fuse hardcodes the 4-object layout + per-object albedo. The
-        // glTF path leaves the scene GDF unregistered, so every GDF/SW-RT feature
-        // auto-disables (they all gate on `gdf.has_scene_sdf()`) and lighting falls back
-        // to the captured-cube IBL — generalizing GDF to arbitrary scenes is later work.
+        // Scalable-GI Stage 0: fuse the opaque draw list into one world-space triangle
+        // soup and register it as the scene GDF (baked once on the graph). Ground is
+        // handled analytically at trace time; disjoint objects give the union SDF via the
+        // closest-triangle sign convention. Geometry + albedo come from the registries
+        // (`fuse::fuse_scene` — the single fuse path), so the same routine fuses the
+        // gallery, an imported glTF scene, or a level. The byte layout matches the legacy
+        // gallery fuse, so the gallery's baked field is byte-identical.
+        //
+        // For now the scene GDF is still gallery-gated: the glTF/level paths leave it
+        // unregistered, so every GDF/SW-RT feature auto-disables (they gate on
+        // `gdf.has_scene_sdf()`) and lighting falls back to the captured-cube IBL —
+        // Stage D relaxes this gate to arbitrary scenes.
         if gallery_scene && gdf.has_gdf_trace() {
-            let objs: [(&MeshData, Mat4); 4] = [
-                (model, Mat4::IDENTITY),
-                (&sphere, scene[1].transform),
-                (&sphere, scene[2].transform),
-                (&cube, scene[3].transform),
-            ];
-            // C8a per-object representative linear albedo (tagged onto each triangle so the
-            // albedo bake can color a voxel by its nearest triangle). The loaded model is
-            // textured, so its color lives in the base-color image, not the factor — average
-            // the texture (sRGB -> linear) × factor for a representative albedo; the
-            // procedural objects use their (linear) base color directly.
-            let f = model.material.base_color_factor;
-            let avocado_albedo: [f32; 3] = match &model.material.base_color {
-                // `average_linear` works for both RGBA8 and BC textures (for BC it
-                // decodes only the smallest mip — already the box-filtered average).
-                Some(tex) => {
-                    let a = tex.average_linear();
-                    [a[0] * f[0], a[1] * f[1], a[2] * f[2]]
-                }
-                None => [f[0], f[1], f[2]],
-            };
-            let obj_albedo: [[f32; 3]; 4] = [
-                avocado_albedo,
-                [
-                    scene[1].base_color[0],
-                    scene[1].base_color[1],
-                    scene[1].base_color[2],
-                ],
-                [
-                    scene[2].base_color[0],
-                    scene[2].base_color[1],
-                    scene[2].base_color[2],
-                ],
-                [
-                    scene[3].base_color[0],
-                    scene[3].base_color[1],
-                    scene[3].base_color[2],
-                ],
-            ];
-            let mut fused_v: Vec<u8> = Vec::new();
-            let mut fused_i: Vec<u8> = Vec::new();
-            let mut tri_albedo: Vec<u8> = Vec::new();
-            let mut base: u32 = 0;
-            let mut amin = [f32::MAX; 3];
-            let mut amax = [f32::MIN; 3];
-            // C8b1: per-object world AABB (for the surface-cache mesh cards).
-            let mut obj_aabb: [([f32; 3], [f32; 3]); 4] = [([f32::MAX; 3], [f32::MIN; 3]); 4];
-            for (oi, (m, xf)) in objs.into_iter().enumerate() {
-                for v in &m.vertices {
-                    let p = xf.transform_point3(Vec3::from(v.pos));
-                    let n = xf
-                        .transform_vector3(Vec3::from(v.normal))
-                        .normalize_or_zero();
-                    amin = [amin[0].min(p.x), amin[1].min(p.y), amin[2].min(p.z)];
-                    amax = [amax[0].max(p.x), amax[1].max(p.y), amax[2].max(p.z)];
-                    let (omin, omax) = &mut obj_aabb[oi];
-                    *omin = [omin[0].min(p.x), omin[1].min(p.y), omin[2].min(p.z)];
-                    *omax = [omax[0].max(p.x), omax[1].max(p.y), omax[2].max(p.z)];
-                    fused_v.extend_from_slice(&p.x.to_le_bytes());
-                    fused_v.extend_from_slice(&p.y.to_le_bytes());
-                    fused_v.extend_from_slice(&p.z.to_le_bytes());
-                    fused_v.extend_from_slice(&n.x.to_le_bytes());
-                    fused_v.extend_from_slice(&n.y.to_le_bytes());
-                    fused_v.extend_from_slice(&n.z.to_le_bytes());
-                    fused_v.extend_from_slice(&v.uv[0].to_le_bytes());
-                    fused_v.extend_from_slice(&v.uv[1].to_le_bytes());
-                }
-                for &ix in &m.indices {
-                    fused_i.extend_from_slice(&(ix + base).to_le_bytes());
-                }
-                // One albedo record (float3, 12 B) per triangle of this object, in the same
-                // fused-triangle order the bake indexes.
-                for _ in 0..(m.indices.len() / 3) {
-                    for c in obj_albedo[oi] {
-                        tri_albedo.extend_from_slice(&c.to_le_bytes());
-                    }
-                }
-                base += m.vertices.len() as u32;
-            }
-            // Pad the AABB by 10% per axis so the zero-isosurface isn't clipped at the
-            // volume edge (≥0.05 world units).
-            for i in 0..3 {
-                let pad = ((amax[i] - amin[i]) * 0.1).max(0.05);
-                amin[i] -= pad;
-                amax[i] += pad;
-            }
-            let tri_count = (fused_i.len() / 4 / 3) as u32;
+            let fused = fuse::fuse_scene(&world, &mesh_registry, &material_registry);
+            let fused_v = fused.vtx;
+            let fused_i = fused.idx;
+            let tri_albedo = fused.tri_albedo;
+            let amin = fused.aabb_min;
+            let amax = fused.aabb_max;
+            let tri_count = fused.tri_count;
+            // Per-drawable world AABBs (for the surface-cache mesh cards).
+            let obj_aabb = fused.drawable_aabb;
             // Phase 12 M2: cook the scene SDF (deterministic CPU bake, cached as a
             // `.dcasset` keyed on the fused geometry + grid) and upload it, replacing
             // the one-time GPU bake. A fresh cache loads directly; a miss bakes + saves.

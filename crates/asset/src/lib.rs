@@ -36,6 +36,15 @@ pub struct ImageData {
     pub rgba8: Vec<u8>,
 }
 
+impl ImageData {
+    /// A representative linear-space average colour (sRGB-decoded) — the RGBA8 path of
+    /// [`TexData::average_linear`], exposed so the glTF/level importer can derive a
+    /// constant albedo for a textured material from its raw decoded image.
+    pub fn average_linear(&self) -> [f32; 3] {
+        average_rgba8_linear(&self.rgba8)
+    }
+}
+
 /// A material texture as carried by a cooked asset: either raw RGBA8 (mips are
 /// generated at GPU upload) or **pre-cooked BCn block data** with its full mip
 /// chain (Phase 12 M3). Block-compressed data is sampled GPU-natively, so it costs

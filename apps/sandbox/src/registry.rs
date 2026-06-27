@@ -29,10 +29,20 @@ pub(crate) struct GpuMesh {
     pub(crate) vertex_count: u32,
 }
 
-/// Owns every uploaded [`GpuMesh`], addressed by [`MeshHandle`].
+/// The CPU-side geometry kept alongside each [`GpuMesh`] so the scalable-GI fuse
+/// ([`crate::fuse`]) can rebuild the world-space triangle soup straight from the
+/// draw list. Sponza-scale memory (~10 MB) is accepted — the GDF bake needs it.
+pub(crate) struct MeshCpu {
+    pub(crate) vertices: Vec<MeshVertex>,
+    pub(crate) indices: Vec<u32>,
+}
+
+/// Owns every uploaded [`GpuMesh`], addressed by [`MeshHandle`]. The parallel `cpu`
+/// vector holds each mesh's CPU geometry in the same index order (the fuse reads it).
 #[derive(Default)]
 pub(crate) struct MeshRegistry {
     meshes: Vec<Rc<GpuMesh>>,
+    cpu: Vec<MeshCpu>,
 }
 
 impl MeshRegistry {
@@ -48,7 +58,13 @@ impl MeshRegistry {
         mesh: &MeshData,
     ) -> anyhow::Result<MeshHandle> {
         let (vbuf, ibuf, index_count) = upload_mesh(device, mesh)?;
-        Ok(self.push(vbuf, ibuf, index_count, mesh.vertices.len() as u32))
+        Ok(self.push(
+            vbuf,
+            ibuf,
+            index_count,
+            mesh.vertices.clone(),
+            mesh.indices.clone(),
+        ))
     }
 
     /// Upload raw vertex/index slices (a glTF primitive) and return its handle.
@@ -59,7 +75,7 @@ impl MeshRegistry {
         indices: &[u32],
     ) -> anyhow::Result<MeshHandle> {
         let (vbuf, ibuf, index_count) = upload_geometry(device, vertices, indices)?;
-        Ok(self.push(vbuf, ibuf, index_count, vertices.len() as u32))
+        Ok(self.push(vbuf, ibuf, index_count, vertices.to_vec(), indices.to_vec()))
     }
 
     fn push(
@@ -67,21 +83,28 @@ impl MeshRegistry {
         vbuf: Buffer,
         ibuf: Buffer,
         index_count: u32,
-        vertex_count: u32,
+        vertices: Vec<MeshVertex>,
+        indices: Vec<u32>,
     ) -> MeshHandle {
         let handle = MeshHandle(self.meshes.len() as u32);
         self.meshes.push(Rc::new(GpuMesh {
             vbuf,
             ibuf,
             index_count,
-            vertex_count,
+            vertex_count: vertices.len() as u32,
         }));
+        self.cpu.push(MeshCpu { vertices, indices });
         handle
     }
 
     /// Resolve a handle to a shared [`GpuMesh`] (cheap `Rc` clone).
     pub(crate) fn get(&self, handle: MeshHandle) -> Rc<GpuMesh> {
         self.meshes[handle.0 as usize].clone()
+    }
+
+    /// Resolve a handle to its CPU geometry (the fuse's single geometry source).
+    pub(crate) fn cpu(&self, handle: MeshHandle) -> &MeshCpu {
+        &self.cpu[handle.0 as usize]
     }
 }
 
@@ -94,6 +117,21 @@ pub(crate) struct MaterialDesc {
     pub(crate) metallic: f32,
     pub(crate) roughness: f32,
     pub(crate) tex: [u32; 4],
+    /// Representative linear albedo for the GDF/SW-RT GI: the base-color texture's
+    /// linear average × factor, or the factor's RGB when untextured (see
+    /// [`representative_albedo`]). The single source the fuse tags onto every triangle.
+    pub(crate) albedo: [f32; 3],
+}
+
+/// A material's representative linear albedo for the GDF/GI bake. `tex_average` is the
+/// base-color texture's linear-space average (`None` when untextured); the result is
+/// that average modulated by the base-color factor, falling back to the factor's RGB.
+/// One definition so every site (gallery, glTF, level) derives the same value.
+pub(crate) fn representative_albedo(tex_average: Option<[f32; 3]>, factor: [f32; 4]) -> [f32; 3] {
+    match tex_average {
+        Some(a) => [a[0] * factor[0], a[1] * factor[1], a[2] * factor[2]],
+        None => [factor[0], factor[1], factor[2]],
+    }
 }
 
 /// Owns every material descriptor, addressed by [`MaterialHandle`].
@@ -192,11 +230,18 @@ pub(crate) fn upload_gltf_scene(
             resolve(textures, m.normal, false)?,
             resolve(textures, m.emissive, true)?,
         ];
+        // Representative albedo from the base-color image's linear average × factor
+        // (the GDF/GI single source); untextured → the factor's RGB.
+        let albedo = representative_albedo(
+            m.base_color.map(|i| scene.images[i].average_linear()),
+            m.base_color_factor,
+        );
         material_handles.push(materials.add(MaterialDesc {
             base_color: m.base_color_factor,
             metallic: m.metallic_factor,
             roughness: m.roughness_factor,
             tex,
+            albedo,
         }));
     }
     // Fallback for primitives with no material (glTF default material).
@@ -205,6 +250,7 @@ pub(crate) fn upload_gltf_scene(
         metallic: Material::default().metallic_factor,
         roughness: Material::default().roughness_factor,
         tex: [NO_TEXTURE; 4],
+        albedo: representative_albedo(None, Material::default().base_color_factor),
     });
 
     let mut per_mesh: Vec<Vec<(MeshHandle, MaterialHandle)>> =
