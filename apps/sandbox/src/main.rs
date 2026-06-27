@@ -783,6 +783,19 @@ impl App {
                 Some(&sdf_bytes),
                 Some([&alb[0], &alb[1], &alb[2]]),
             )?;
+            // Phase 12 item 3: optional GPU→CPU volume-readback round-trip check. Reads
+            // the just-uploaded scene SDF back and confirms it equals the bytes we
+            // uploaded — validating `Device::read_volume` on the live backend.
+            if std::env::var_os("P12_VERIFY_VOLUME").is_some()
+                && let Some(vol) = gdf.scene_gdf_volume()
+            {
+                let back = device.read_volume(vol, sdf_dim, sdf_dim, sdf_dim, 4)?;
+                let mismatches = back.iter().zip(&sdf_bytes).filter(|(a, b)| a != b).count();
+                info!(
+                    "volume readback round-trip ({sdf_dim}^3): {} bytes, {mismatches} mismatch(es)",
+                    back.len()
+                );
+            }
             // C8b1: 6 axis-aligned mesh cards per object (Lumen-style box-projection cards).
             // Each 64-B record = center.xyz/trace_depth, normal.xyz, u_axis.xyz (half-extent),
             // v_axis.xyz (half-extent). The capture pass sphere-traces the GDF inward from each

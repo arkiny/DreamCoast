@@ -12,10 +12,11 @@ use std::rc::Rc;
 use dreamcoast_core::EngineError;
 use rhi_types::VolumeDesc;
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD,
-    D3D12_MEMORY_POOL_UNKNOWN, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_DESC,
-    D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_GENERIC_READ,
+    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK,
+    D3D12_HEAP_TYPE_UPLOAD, D3D12_MEMORY_POOL_UNKNOWN, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST,
+    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_GENERIC_READ,
     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATES,
     D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -213,6 +214,101 @@ impl D3d12Volume {
                 storage_index,
                 state: Cell::new(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             })
+        }
+    }
+
+    /// Read the volume back to host memory (Phase 12 item 3) as `w*h*d*bpp` tightly
+    /// packed bytes (`x + dim*(y + dim*z)` order). Copies the texture into a READBACK
+    /// buffer through the 256-byte-aligned footprint, then de-pads each row.
+    pub(crate) fn read_back(
+        &self,
+        device: &DeviceShared,
+        w: u32,
+        _h: u32,
+        d: u32,
+        bpp: u32,
+    ) -> Result<Vec<u8>, EngineError> {
+        unsafe {
+            let res_desc = self.resource.GetDesc();
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut num_rows = 0u32;
+            let mut row_size = 0u64;
+            let mut total = 0u64;
+            device.device.GetCopyableFootprints(
+                &res_desc,
+                0,
+                1,
+                0,
+                Some(&mut fp),
+                Some(&mut num_rows),
+                Some(&mut row_size),
+                Some(&mut total),
+            );
+
+            let mut readback: Option<ID3D12Resource> = None;
+            device
+                .device
+                .CreateCommittedResource(
+                    &heap(D3D12_HEAP_TYPE_READBACK),
+                    D3D12_HEAP_FLAG_NONE,
+                    &buffer_desc(total),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .map_err(d3d_err)?;
+            let readback =
+                readback.ok_or_else(|| EngineError::Rhi("readback buffer null".into()))?;
+
+            let prior = self.state.get();
+            device.immediate_submit(|list| {
+                transition(
+                    list,
+                    &self.resource,
+                    prior,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                );
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(&readback))),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: fp,
+                    },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(&self.resource))),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                transition(
+                    list,
+                    &self.resource,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    prior,
+                );
+            })?;
+
+            // Map and de-pad: tight row = w*bpp; padded row = footprint RowPitch; rows
+            // = num_rows per slice × depth slices, laid contiguously.
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut ptr)).map_err(d3d_err)?;
+            let base = (ptr as *const u8).add(fp.Offset as usize);
+            let dst_pitch = (w * bpp) as usize;
+            let src_pitch = fp.Footprint.RowPitch as usize;
+            let rows = num_rows as usize * d as usize;
+            let mut out = vec![0u8; dst_pitch * rows];
+            for row in 0..rows {
+                std::ptr::copy_nonoverlapping(
+                    base.add(row * src_pitch),
+                    out.as_mut_ptr().add(row * dst_pitch),
+                    dst_pitch,
+                );
+            }
+            readback.Unmap(0, None);
+            Ok(out)
         }
     }
 

@@ -222,6 +222,108 @@ impl VulkanVolume {
         }
     }
 
+    /// Read the volume back to host memory (Phase 12 item 3) as `w*h*d*bpp`
+    /// tightly-packed bytes in `x + dim*(y + dim*z)` order — the inverse of
+    /// `new_init`. Synchronous: copies the image into a host-visible buffer via a
+    /// one-shot submit, then maps it. Vulkan packs the copy tightly (no row pad),
+    /// so the buffer is returned as-is. Leaves the image back in its prior layout.
+    pub(crate) fn read_back(
+        &self,
+        w: u32,
+        h: u32,
+        d: u32,
+        bpp: u32,
+    ) -> Result<Vec<u8>, EngineError> {
+        let device = &self.device;
+        let size = (w as u64) * (h as u64) * (d as u64) * (bpp as u64);
+        unsafe {
+            // Host-visible TRANSFER_DST buffer for the readback.
+            let ci = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = device.device.create_buffer(&ci, None).map_err(vk_err)?;
+            let req = device.device.get_buffer_memory_requirements(buffer);
+            let mem_type = device.find_memory_type(
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type);
+            let memory = device
+                .device
+                .allocate_memory(&alloc, None)
+                .map_err(vk_err)?;
+            device
+                .device
+                .bind_buffer_memory(buffer, memory, 0)
+                .map_err(vk_err)?;
+
+            let prior = self.layout.get();
+            let range = color_subresource_range();
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: d,
+                });
+            device.immediate_submit(|cmd| {
+                crate::texture::image_barrier(
+                    &device.device,
+                    cmd,
+                    self.image,
+                    range,
+                    prior,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::PipelineStageFlags::COMPUTE_SHADER
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                );
+                device.device.cmd_copy_image_to_buffer(
+                    cmd,
+                    self.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    buffer,
+                    &[region],
+                );
+                crate::texture::image_barrier(
+                    &device.device,
+                    cmd,
+                    self.image,
+                    range,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    prior,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER
+                        | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                );
+            })?;
+
+            let ptr = device
+                .device
+                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                .map_err(vk_err)? as *const u8;
+            let mut out = vec![0u8; size as usize];
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), size as usize);
+            device.device.unmap_memory(memory);
+            device.device.destroy_buffer(buffer, None);
+            device.device.free_memory(memory, None);
+            Ok(out)
+        }
+    }
+
     pub(crate) fn image(&self) -> vk::Image {
         self.image
     }
