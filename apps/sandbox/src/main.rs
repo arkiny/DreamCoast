@@ -194,19 +194,25 @@ fn run() -> anyhow::Result<()> {
     let captures = screenshot_captures();
     let screenshot_mode = !captures.is_empty();
 
-    // Load a glTF model if present, else fall back to a procedural cube.
-    let model_path = model_path();
+    // Load a glTF model if present, else fall back to a procedural cube. The path
+    // is resolved relative to the executable (not the cwd) so the model loads when
+    // the app is launched from anywhere, not just the repo root.
+    let model_path = app::resolve_asset_path(&model_path());
     let mut model = match dreamcoast_asset::load_gltf(&model_path) {
         Ok(m) => {
             info!(
-                "loaded {model_path}: {} verts, {} indices",
+                "loaded {}: {} verts, {} indices",
+                model_path.display(),
                 m.vertices.len(),
                 m.indices.len()
             );
             m
         }
         Err(e) => {
-            info!("no glTF at {model_path} ({e}); using procedural cube");
+            info!(
+                "no glTF at {} ({e}); using procedural cube",
+                model_path.display()
+            );
             dreamcoast_asset::unit_cube()
         }
     };
