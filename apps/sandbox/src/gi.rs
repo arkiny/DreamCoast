@@ -147,6 +147,7 @@ impl GiSystem {
         ch: u32,
         flip_y: u32,
         clip: (u32, u32),
+        clip_vols: &'a [&'a Volume],
     ) -> ResourceId {
         let aop = self.ao_pipeline.as_ref().expect("gdf ao pipeline");
         let out = graph.create_storage_image("gdf_ao_out", HDR_FORMAT, extent);
@@ -170,6 +171,9 @@ impl GiSystem {
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.volume_to_sampled(scene_gdf);
+                for v in clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
                 cmd.bind_compute_pipeline(aop);
                 cmd.push_constants_compute(&gdf_ao_push(
                     &inv_view_proj,
@@ -225,6 +229,7 @@ impl GiSystem {
         cache: Option<([u32; 5], ResourceId)>,
         clamp_max: f32,
         clip: (u32, u32),
+        clip_vols: &'a [&'a Volume],
     ) -> ResourceId {
         let gip = self.gi_pipeline.as_ref().expect("gdf gi pipeline");
         let out = graph.create_storage_image("gdf_gi_out", HDR_FORMAT, extent);
@@ -254,6 +259,9 @@ impl GiSystem {
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.volume_to_sampled(scene_gdf);
+                for v in clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
                 let albedo_rgb = if let Some((vols, _)) = albedo {
                     for v in vols.iter() {
                         cmd.volume_to_sampled(v);
