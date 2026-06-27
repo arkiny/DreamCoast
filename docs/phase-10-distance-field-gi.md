@@ -1,6 +1,6 @@
-# Phase 11 — 소프트웨어 레이트레이싱 + Distance-Field GI (세부 계획 / 스텁)
+# Phase 10 — 소프트웨어 레이트레이싱 + Distance-Field GI (세부 계획 / 스텁)
 
-상위: [ROADMAP.md](ROADMAP.md) Phase 11. **전제: Phase 7(컴퓨트)**. Phase 8 HW RT와 **별개 경로** —
+상위: [ROADMAP.md](ROADMAP.md) Phase 10. **전제: Phase 7(컴퓨트)**. Phase 8 HW RT와 **별개 경로** —
 하드웨어 RT 없이 컴퓨트만으로 동적 GI/반사/AO를 근사한다(넓은 씬·저사양 타깃). 무편향 패스트레이서
 ([rt-pbr-parity.md](rt-pbr-parity.md))가 정답 레퍼런스.
 
@@ -31,7 +31,7 @@ HW RT 파이프라인(Phase 8) 없이 컴퓨트 셰이더로 레이를 추적하
 - TLAS/머티리얼 테이블 plumbing 없음 — `bindless.slang`의 `storage_images[]`만 사용, `compute_supported`
   게이트(순수 컴퓨트). push 112B(`sdf_trace_push`, rt_trace와 동일 레이아웃 + sun.w=강도). 통합은 M3
   `rt_trace` viz와 동형: 컴퓨트 패스가 `sdf_out` storage image에 쓰고 tonemap이 HDR 대신 표시
-  (`rt_out.or(sdf_out).or(hdr_post)`). 토글: env `P11_SDF` + UI "Software ray tracing (Phase 11)".
+  (`rt_out.or(sdf_out).or(hdr_post)`). 토글: env `P11_SDF` + UI "Software ray tracing (Phase 10)".
 - **검증(RTX 2070 SUPER):** build+fmt+clippy(-D warnings) 클린. VK·DX 렌더 정상(구3+박스+그라운드+스카이,
   매끄러운 gradient 노멀). **VK≡DX: 920k 픽셀 중 1픽셀만 >2 차이**(실루엣 엣지 1px — 반복 march의
   SPIR-V/DXIL fp contraction 차이; mean 0.0002/ch). Vulkan VUID 0. SDF-off 기본 래스터 씬 byte-identical
@@ -140,17 +140,17 @@ HW RT 파이프라인(Phase 8) 없이 컴퓨트 셰이더로 레이를 추적하
 
 신규 RHI: 3D(볼륨) 텍스처 + UAV, 3D 디스패치. (Phase 7 storage image의 3D 확장.)
 
-> **GDF 베이크 영속화는 별도 워크스트림으로 승격됨 → [Phase 12 — 에셋 파이프라인](phase-12-asset-pipeline.md).**
+> **GDF 베이크 영속화는 별도 워크스트림으로 승격됨 → [Phase 11 — 에셋 파이프라인](phase-11-asset-pipeline.md).**
 > 사용자 요청대로 SDF 베이크만이 아니라 **메시까지 함께 직렬화하는 쿠킹된 에셋(`.dcasset`)** 개념이라
 > 규모가 커서 `crates/asset`의 크로스컷팅 인프라(독립 Phase)로 분리했다. Stage B의 per-mesh SDF 베이크
-> 결과가 Phase 12 M2의 SDF 청크로 영속화된다. (메시 직렬화 M1은 Phase 11과 독립적으로 먼저 가능.)
+> 결과가 Phase 11 M2의 SDF 청크로 영속화된다. (메시 직렬화 M1은 Phase 10과 독립적으로 먼저 가능.)
 
 ## Stage C — Stochastic Lighting
 GDF를 ray-march해 **디퓨즈 GI(1+ 바운스)·AO·반사**를 stochastic 샘플하고, 결과를 디퍼드
 라이팅(Phase 6)의 ambient/GI 항으로 합성한다. Stage B의 GDF는 *단위 큐브 데모*(고정 카메라)였으므로
 Stage C는 먼저 **실제 씬을 월드 공간 GDF로 굽고**, 그것을 **실제 디퍼드 G-buffer**에서 march한다.
 
-> **→ Metal 구현 완료** (M3 box 검증; 세부는 metal-backend.md "Phase 11 Stage C"). Stage C
+> **→ Metal 구현 완료** (M3 box 검증; 세부는 metal-backend.md "Phase 10 Stage C"). Stage C
 > 셰이더는 전부 metallib로 그대로 컴파일됐고, 유일한 Metal 갭은 C7 SSR이 추가한 컴퓨트
 > 파이프라인 `uniform_buffer`(per-frame globals UBO 바인딩)뿐이라 `rhi-metal`에만 반영해
 > 해결했다. 공유 셰이더 무변경 → **Vulkan/D3D12 무회귀**.

@@ -10,16 +10,16 @@ DreamCoast is a custom renderer + engine layered directly on **raw Vulkan
 implementing them by hand, behind a single self-designed RHI.
 
 The Windows backends (Vulkan + D3D12) are complete through Phase 9 (tooling &
-profiling). **Phase 11 (software-RT distance-field GI) is complete** — GDF-based
+profiling). **Phase 10 (software-RT distance-field GI) is complete** — GDF-based
 AO, 1-bounce diffuse GI, and hybrid SW-RT reflections (SSR + GDF + sky) are now
 the default ambient, with a mesh-card surface cache and a
 `RenderQuality{low,med,high}` tier (Stage D) layered on top. The residual vs the
 path tracer (≈3.45/ch) is an accepted limit set by the 48³ GDF resolution.
-**Phase 12 (cooked-asset pipeline) is complete** — meshes, the scene SDF/albedo
+**Phase 11 (cooked-asset pipeline) is complete** — meshes, the scene SDF/albedo
 bakes, and BCn-compressed textures cook to a single deterministic `.dcasset`
 binary (loaded directly, no glTF re-parse / re-bake), alongside the per-OS shader
 bytecode cook cache. The engine is now moving along its **infrastructure track**
-(Phase 13 scene graph → Phase 14 animation); **Phase 10 (virtual geometry) is
+(Phase 12 scene graph → Phase 13 animation); **Phase 14 (virtual geometry) is
 deferred** to an advanced-rendering track after that foundation is in place. The
 native **Metal backend for macOS**
 is at near-full parity — including Phase-8 ray tracing (inline `RayQuery` **and** the
@@ -27,7 +27,7 @@ DXR-style RT pipeline via Metal Shader Converter); the main gap is the Phase-9
 profiling / marker tooling. See [`docs/metal-backend.md`](docs/metal-backend.md).
 
 Beyond the graphics core, the roadmap now extends toward a **general-purpose game
-engine**: Phase 14 adds skeletal animation + GPU skinning and an FBX importer, and a
+engine**: Phase 13 adds skeletal animation + GPU skinning and an FBX importer, and a
 planned **Phase 15+ runtime / tooling layer** (job system, physics, audio, input,
 scripting, game UI, VFX, AI, networking, and a standalone editor) sits behind
 RHI-style backend facades so third-party libraries can later be swapped for
@@ -88,23 +88,23 @@ Backend parity is a hard rule: every milestone must produce identical results on
 - [x] **Phase 7** — Compute / GPGPU (async compute, GPU particles, GPU culling + indirect draw)
 - [x] **Phase 8** — Ray tracing (DXR + VK_KHR) — inline ray query + full RT pipeline/SBT
 - [x] **Phase 9** — Tooling & profiling (per-pass GPU timestamps, debug markers, validation toggle, sample browser)
-- [ ] **Phase 10** — Virtual geometry (cluster-LOD, GPU culling/HZB, SW raster) —
-  ⏸️ **deferred / re-sequenced**: an advanced-rendering track scheduled after the
-  engine foundation (Phase 13 scene graph + Phase 14 animation). No hard dependency
-  on 13/14, but more valuable with a real scene to stress it, and it needs new RHI
-  (mesh shaders, 64-bit atomics, BDA) + external-dep approval (`meshopt`/`metis`).
-- [x] **Phase 11** — Software ray tracing + distance-field GI — Stages A–D complete on Windows:
+- [x] **Phase 10** — Software ray tracing + distance-field GI — Stages A–D complete on Windows:
   compute SW-RT, baked global distance field, stochastic GDF GI/AO + hybrid SW-RT
   reflections (now the default ambient, replacing captured-cube IBL), a mesh-card
   surface cache, and a `RenderQuality` tier. Stages A–C verified on Metal. The
   residual vs the path tracer (≈3.45/ch) is an accepted 48³-GDF-resolution limit.
-- [x] **Phase 12** — Cooked-asset pipeline + shader bytecode cook cache: meshes +
+- [x] **Phase 11** — Cooked-asset pipeline + shader bytecode cook cache: meshes +
   textures + scene SDF/albedo bakes cook to one deterministic `.dcasset` (chunk
   container; loaded directly, no glTF re-parse / re-bake). GPU-native BCn texture
   compression (BC1/3/4/5/7, opt-in `Off/Fast/High` tier, zero runtime decompress),
   a `.dclevel` scene chunk, and volume GPU↔CPU readback. DX≡VK byte-identical cooks.
-- [ ] **Phase 13** — Scene graph + level streaming (self-made ECS) — planned
-- [ ] **Phase 14** — Skeletal animation + GPU skinning / skin cache + FBX importer (ufbx / FBX SDK) — planned
+- [ ] **Phase 12** — Scene graph + level streaming (self-made ECS) — planned
+- [ ] **Phase 13** — Skeletal animation + GPU skinning / skin cache + FBX importer (ufbx / FBX SDK) — planned
+- [ ] **Phase 14** — Virtual geometry (cluster-LOD, GPU culling/HZB, SW raster) —
+  ⏸️ **deferred / re-sequenced**: an advanced-rendering track scheduled after the
+  engine foundation (Phase 12 scene graph + Phase 13 animation). No hard dependency
+  on 12/13, but more valuable with a real scene to stress it, and it needs new RHI
+  (mesh shaders, 64-bit atomics, BDA) + external-dep approval (`meshopt`/`metis`).
 - [ ] **Phase 15+** — Commercial runtime & tooling layer: job system, physics, audio,
   input, scripting (Luau + WASM), game UI, VFX, animation graph, AI, networking, and a
   standalone editor — strategy planned, see
@@ -117,7 +117,7 @@ GUI, and assets, so it tracks the phase list above rather than carrying a separa
 milestone roadmap. It is at near-full parity with the Windows backends: the
 deferred-PBR renderer, the Phase-7 compute / async / indirect-draw demos, Phase-8
 ray tracing via **both** the inline `RayQuery` path and the DXR-style RT pipeline
-(through Apple Metal Shader Converter), and the Phase-11 Stage A/B software-RT +
+(through Apple Metal Shader Converter), and the Phase-10 Stage A/B software-RT +
 distance-field-volume work all run on Metal. Toolchain setup and per-milestone
 bring-up notes live in [`docs/metal-backend.md`](docs/metal-backend.md).
 
@@ -184,7 +184,7 @@ apps/
 The engine crates carry the `dreamcoast-` prefix; the `rhi-*` crates are the
 Render Hardware Interface layer kept as their own sub-namespace. This is the
 layout as it exists today; planned crates for the upcoming phases — `anim`
-(Phase 14), and the Phase 15+ `jobs` / `physics` / `audio` / `script` / `net`
+(Phase 13), and the Phase 15+ `jobs` / `physics` / `audio` / `script` / `net`
 facades (+ their backends) / `ui` / `vfx` / `ai` crates and an `apps/editor` —
 are described in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 

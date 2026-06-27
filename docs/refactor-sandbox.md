@@ -45,7 +45,7 @@ Feature groups (setup line / loop line):
 - **Particles** — sim+draw pipelines, ping-pong buffers (727 / 2121, 2878). Most
   self-contained → the pattern-establishing first cut.
 - **GPU cull** — args/visible buffers, reset/cull/draw pipelines (812 / 2171, 2839).
-- **SW-RT / GDF (Phase 11)** — volumes, bake mesh, sdf_trace + B1–B4 pipelines +
+- **SW-RT / GDF (Phase 10)** — volumes, bake mesh, sdf_trace + B1–B4 pipelines +
   instance table + done-flags (376–578 / 2361–2838). Biggest single win.
 - **HW RT (Phase 8)** — BLAS/TLAS, instance tables, Cornell scene, rt pipelines
   (604–715, 1124–1256 / 2253). 

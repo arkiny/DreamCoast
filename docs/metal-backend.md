@@ -828,11 +828,11 @@ warnings" cargo clippy --workspace --all-targets` clean. Screenshots (Read-verif
 - Vulkan validation VUID 0 (incl. the RT-pipeline path); D3D12 debug-layer clean.
 - D3D12 texture-upload-loop refactor is byte-identical to the pre-refactor capture.
 
-## Phase 11 Stage B — 3D volume textures / GDF on Metal (done, verified this M3 box)
+## Phase 10 Stage B — 3D volume textures / GDF on Metal (done, verified this M3 box)
 
-Phase 11 Stage B (SW ray tracing the **global distance field**) shipped on Vulkan /
+Phase 10 Stage B (SW ray tracing the **global distance field**) shipped on Vulkan /
 D3D12 first and left the Metal backend a stub
-([phase-11-distance-field-gi.md](phase-11-distance-field-gi.md) B1: "Metal은
+([phase-10-distance-field-gi.md](phase-10-distance-field-gi.md) B1: "Metal은
 스텁 — argument buffer 볼륨 슬롯은 메탈 세션이 구현"). The `bindless.slang` block
 grew two new arrays — `Texture3D<float> volumes[64]` (binding 6, trilinear-sampled)
 and `RWTexture3D<float> storage_volumes[64]` (binding 7, the SDF-bake / GDF-merge
@@ -854,7 +854,7 @@ fixed here:
 - **Argument-buffer slots (`device.rs`).** `VOLUME_COUNT` / `STORAGE_VOLUME_COUNT`
   = 64; `VOLUME_BASE = TLAS_SLOT + 1`, `STORAGE_VOLUME_BASE = VOLUME_BASE +
   VOLUME_COUNT`, `ARG_BUFFER_SLOTS` grown by 128 (now 1346). **Pin (verified via
-  `slangc -target metal`):** even though none of the Phase 11 shaders trace, Slang's
+  `slangc -target metal`):** even though none of the Phase 10 shaders trace, Slang's
   Metal target keeps the `tlas` member in the argument-buffer struct (it does **not**
   compact unused members — the M4 finding, now confirmed for `tlas`), so the MSL
   layout is `… storage_buffers[64], tlas, volumes[64], storage_volumes[64]` and the
@@ -895,9 +895,9 @@ results:
 the shared `Format` / shaders, verified on Windows); the rest is `rhi-metal`-only
 Rust, so Vulkan / D3D12 are unaffected.
 
-## Phase 11 Stage C — GDF GI / reflections / SSR / surface cache on Metal (done, verified this M3 box)
+## Phase 10 Stage C — GDF GI / reflections / SSR / surface cache on Metal (done, verified this M3 box)
 
-Phase 11 Stage C (GDF ambient occlusion, stochastic 1-bounce diffuse GI, screen-space
+Phase 10 Stage C (GDF ambient occlusion, stochastic 1-bounce diffuse GI, screen-space
 + GDF reflections, the Lumen-style mesh-card surface cache, and a `RenderQuality` tier)
 shipped on Vulkan / D3D12 first and landed on `main` as one large drop (origin/main
 `041caae`). On macOS it brought up cleanly on the first fetch with **one** real RHI gap.

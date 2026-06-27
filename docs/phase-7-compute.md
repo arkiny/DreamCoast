@@ -1,7 +1,7 @@
 # Phase 7 — 컴퓨트 / GPGPU 세부 계획
 
 > 상위 로드맵: [ROADMAP.md](ROADMAP.md). **상태: ✅ 완료** (RTX 2070 SUPER, 두 백엔드 / 빌드·fmt·clippy(-D warnings)·런타임 + **Vulkan 검증 레이어 클린** 검증, M4–M6 스크린샷 픽셀 일치).
-> 전제: Phase 6(디퍼드 PBR + 렌더그래프) ✅ 완료. 이 Phase는 Phase 8(RT)·Phase 10(Virtual Geometry)의 전제다.
+> 전제: Phase 6(디퍼드 PBR + 렌더그래프) ✅ 완료. 이 Phase는 Phase 8(RT)·Phase 14(Virtual Geometry)의 전제다.
 
 ## Context
 
@@ -15,7 +15,7 @@ Phase 7은 여기에 **컴퓨트 패스**와 **read-write(UAV/storage) 리소스
 ## 확정 사항 (사용자)
 
 - **예제 범위: 세 가지 모두** — (1) 컴퓨트 포스트프로세싱, (2) GPU 파티클 시뮬레이션, (3) GPU 컬링 + indirect draw.
-  GPU 컬링은 Phase 10(Virtual Geometry)의 전제를 바로 깔아준다.
+  GPU 컬링은 Phase 14(Virtual Geometry)의 전제를 바로 깔아준다.
 - **그래프 통합: 렌더그래프 1급 컴퓨트 패스** — 그래프에 compute pass + storage 리소스 + 자동 storage 배리어 도입.
   엔진 원칙 #4(렌더그래프 = 모든 기법의 척추)에 부합.
 
@@ -120,7 +120,7 @@ Phase 7은 여기에 **컴퓨트 패스**와 **read-write(UAV/storage) 리소스
 - 셰이더 atomic(`InterlockedAdd`)로 가시 카운트 누적.
 - ImGui로 인스턴스 그리드 크기/컬링 on-off, 컬링 통계(가시/전체) 표시.
 - **검증**: 카메라 밖 인스턴스가 args에서 빠짐(통계로 확인), 컬링 on/off 화면 일치(보이는 것만), 두 백엔드 일치.
-- Phase 10 전제(인다이렉트·atomic·GPU-driven) 확보.
+- Phase 14 전제(인다이렉트·atomic·GPU-driven) 확보.
 
 ### M7 — 마무리
 
@@ -158,5 +158,5 @@ Phase 7은 여기에 **컴퓨트 패스**와 **read-write(UAV/storage) 리소스
   폴리시로 분리 구현 ✅: [async-compute.md](async-compute.md) 참조(단일 큐 경로는 폴백으로 보존).
 - 바인드리스 슬롯 monotonic(상한) — storage 테이블도 free-list 없음(Phase 5에서 이월된 과제).
 - 파티클은 단일 버퍼 in-place(더블 버퍼/정렬/충돌 없음) — 데모 수준.
-- 컬링은 프러스텀만(오클루전/HZB는 Phase 10).
+- 컬링은 프러스텀만(오클루전/HZB는 Phase 14).
 - (이월) 런타임 Slang 리플렉션/핫리로드 — 빌드타임 임베드 유지.

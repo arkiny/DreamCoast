@@ -1,4 +1,4 @@
-# RenderQuality 티어 (Phase 11 Stage D)
+# RenderQuality 티어 (Phase 10 Stage D)
 
 > **상태: 계획.** 트랙 전반에 흩어진 품질 노브를 단일 `RenderQuality{Low,Med,High}` enum 한 곳으로
 > 묶어 런타임/플랫폼별로 선택만 하면 되게 한다(저사양=저티어 폴백). 각 기능은 이미 "기본 off/저비용 +

@@ -23,7 +23,7 @@
 | 셰이더 | Slang → DXIL(D3D12) + SPIR-V(Vulkan) + metallib(Metal) 동시 컴파일 |
 | UI | Dear ImGui (`imgui` crate + 커스텀 RHI 렌더 백엔드) |
 | 수학 | `glam` (SIMD, de-facto 표준) |
-| 에셋 임포트 | glTF (`gltf` crate) · **FBX**(ufbx 기본 / Autodesk FBX SDK 옵션 — `tools/` fetch 스크립트, Phase 14) |
+| 에셋 임포트 | glTF (`gltf` crate) · **FBX**(ufbx 기본 / Autodesk FBX SDK 옵션 — `tools/` fetch 스크립트, Phase 13) |
 | 목표 기법 | PBR/디퍼드 · 레이트레이싱(DXR/VK_KHR) · 컴퓨트/GPGPU · 렌더그래프 · **스켈레탈 애니메이션/GPU 스키닝** |
 
 ## 워크스페이스 구조 (제안)
@@ -37,8 +37,8 @@ engine/                 # cargo workspace root
 │   ├── rhi-d3d12/      # windows-rs 기반 D3D12 백엔드
 │   ├── shader/         # Slang 컴파일 파이프라인 + 리플렉션 + 핫리로드
 │   ├── render/         # 렌더그래프 + PBR/디퍼드/RT/컴퓨트 패스
-│   ├── scene/          # 자체 ECS + 씬 그래프(변환 계층 컴포넌트) + 레벨/스트리밍 — RHI 비의존 (Phase 13)
-│   ├── anim/           # 스켈레톤·클립·포즈 샘플링/블렌딩 + 본 팔레트 — RHI 비의존 (Phase 14)
+│   ├── scene/          # 자체 ECS + 씬 그래프(변환 계층 컴포넌트) + 레벨/스트리밍 — RHI 비의존 (Phase 12)
+│   ├── anim/           # 스켈레톤·클립·포즈 샘플링/블렌딩 + 본 팔레트 — RHI 비의존 (Phase 13)
 │   ├── asset/          # glTF + FBX(ufbx/SDK) 모델, 스킨/애니메이션, 텍스처(KTX2/DDS) 로딩
 │   ├── gui/            # imgui-rs + 커스텀 RHI 렌더 백엔드
 │   ├── core/           # 공통 유틸(로깅, 에러, 핸들/풀, 수학 재노출)
@@ -88,7 +88,7 @@ engine/                 # cargo workspace root
 - **완료 기준**: 빈 창이 뜨고, Slang 셰이더가 두 포맷으로 컴파일됨
   (셰이더 컴파일은 slangc 확보 시 활성화)
 - **후속(계획)**: 빌드 시 매번 전 셰이더 재컴파일 → **per-OS 바이트코드 쿡 캐시 + 콘텐츠 해시 기반
-  증분 재컴파일**로 개선 (Phase 12 M4, [shader-asset-cache.md](shader-asset-cache.md))
+  증분 재컴파일**로 개선 (Phase 11 M4, [shader-asset-cache.md](shader-asset-cache.md))
 
 ### Phase 1 — RHI 코어 + Vulkan 백엔드 (Hello Triangle) — ✅ 완료
 세부: [phase-1-rhi-vulkan.md](phase-1-rhi-vulkan.md)
@@ -155,23 +155,8 @@ engine/                 # cargo workspace root
 - **완료 기준 달성**: 패스별 GPU ms 프로파일러 + 디버그 마커가 두 백엔드에서 동작(검증 클린),
   샌드박스에서 기법 자유 전환. M1·M2·M3 모두 완료.
 
-### Phase 10 — Virtual Geometry — ⏸️ 보류 / 재배치 (고급 렌더링 트랙, **Phase 14 이후**)
-세부: [phase-10-virtual-geometry.md](phase-10-virtual-geometry.md)
-> **순서 조정 (2026-06-27):** Phase 10은 초기 계획상 번호이나, Phase 11(SW-RT)이 먼저 완료되며
-> 건너뛰었다. 현재 엔진은 **인프라 방향(Phase 12 에셋 → 13 씬 그래프 → 14 애니메이션)**으로 진행
-> 중이라, Virtual Geometry는 **엔진 토대(13·14) 이후의 고급 렌더링 트랙으로 재배치**한다. 번호 10은
-> 유지(11·12는 이미 그 번호로 완료/참조). 13·14에 하드 의존은 없으나, ①씬그래프 기반 실제 고밀도
-> 씬이 있어야 데모 가치가 크고, ②새 RHI(메시 셰이더·64-bit 아토믹·indirect count·BDA)+외부 의존
-> 승인을 한 번에 묶는 게 효율적이라 후순위로 둔다. 고밀도 메시 요구가 먼저 생기고 전제 조건이
-> 갖춰지면 앞당겨도 무방(13/14 비차단).
-- 클러스터 LOD DAG(meshlet 그룹 단순화) + 뷰 종속 컷 선택 + GPU 컬링/HZB 2-pass 오클루전 +
-  컴퓨트 SW 래스터 + 비저빌리티 버퍼 → 머티리얼 해석으로 **Phase 6 디퍼드 G-buffer** 재사용
-- 전제: **Phase 7(컴퓨트/GPU-driven)** ✅. 신규 RHI: 메시 셰이더, 64-bit 아토믹, 인다이렉트 카운트,
-  BDA. 외부 의존 `meshopt`(+선택 `metis`) 사용자 승인 필요
-- **완료 기준**: 고밀도 메시가 화면 적응 LOD로 크랙/팝핑 없이 렌더, SW/HW 경로 seam 없음, 두 백엔드 일치
-
-### Phase 11 — 소프트웨어 레이트레이싱 + Distance-Field GI — ✅ 완료 (Stage A–D, 양 백엔드)
-세부: [phase-11-distance-field-gi.md](phase-11-distance-field-gi.md)
+### Phase 10 — 소프트웨어 레이트레이싱 + Distance-Field GI — ✅ 완료 (Stage A–D, 양 백엔드)
+세부: [phase-10-distance-field-gi.md](phase-10-distance-field-gi.md)
 하드웨어 RT(Phase 8) 없이도 동작하는, **컴퓨트 기반 소프트웨어 레이트레이싱 → 전역 거리장(Global
 Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/AO를 구현한다. 전제: **Phase 7
 (컴퓨트/GPU-driven)**. Phase 8 HW RT와는 별개 경로(저사양/넓은 씬용 근사 GI).
@@ -190,7 +175,7 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
     −38%), C8a per-voxel 알베도→컬러, **C8b 메시-카드 서피스 캐시(캡처→라이팅→멀티바운스→컨슈머
     룩업, `P11_SURFACE_CACHE` opt-in)**. **레거시 캡처-큐브 IBL → 기본값을 SW-RT 반사+GDF GI로 전환,
     `P11_LEGACY_IBL` 플래그로 격하**(씬 캡처 sky-only).
-  - **반사 트랙 마무리 C8c–C8j ✅** (세부 [phase-11-distance-field-gi.md](phase-11-distance-field-gi.md)):
+  - **반사 트랙 마무리 C8c–C8j ✅** (세부 [phase-10-distance-field-gi.md](phase-10-distance-field-gi.md)):
     러프니스-aware 컴포짓 + GDF 러프니스 프리필터(C8c/C8c2) → **풀-res 미러 SSR을 정확 소스로 복원 +
     reflection max-roughness 임계**(`P11_REFLECT_MAX_ROUGHNESS`, C8d) → 구리 하이라이트 blow-out·이중
     디렉셔널 스펙큘러 수정(반사된 태양 디스크 제거, C8e/C8f) → 서피스 캐시 히트 라디언스 반사(C8g) →
@@ -198,7 +183,7 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
     하이브리드-vs-PT **≈3.45/ch**(컬러·러프니스·이중스펙·blow-out 모두 처리; 풀-res 미러 2.58이 best-known).
   - **남은 본질 한계 = GDF 저해상 48³ SDF 블롭 형상** — 해상도/클립맵 레버는 측정으로 기각·종료
     (이 작은 테스트 씬 한정, [reflection-sdf-resolution.md](reflection-sdf-resolution.md)). 이 PT 잔차
-    (≈3.45/ch)는 **불가피한 한계로 수용하고 Phase 11 완료 처리**. 추가 반사 작업은 *실제 게임 씬*에서
+    (≈3.45/ch)는 **불가피한 한계로 수용하고 Phase 10 완료 처리**. 추가 반사 작업은 *실제 게임 씬*에서
     측정-구동으로 재개. NEXT 후보: 동적 오브젝트 GDF 갱신.
 - **Stage D — RenderQuality 티어 (확장성, ✅ 구현, 가로지르는 항목):** 이 씬/엔진은 차후 범용 게임용이라,
   트랙 전반에 흩어진 품질 노브(GI spp, 반사 GGX 샘플/디노이즈 반경, 소프트 그림자 PCSS 샘플 수,
@@ -214,15 +199,15 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
   레퍼런스 대비 그럴듯하게 수렴, 검증 클린. → **충족·완료**(잔차는 48³ GDF 해상도가 지배하는 본질
   한계로 수용; 정밀화는 실제 게임 씬에서 측정-구동 재개).
 
-### Phase 12 — 에셋 파이프라인 / 쿠킹된 에셋 — ✅ 완료 (양 백엔드)
-세부: [phase-12-asset-pipeline.md](phase-12-asset-pipeline.md)
+### Phase 11 — 에셋 파이프라인 / 쿠킹된 에셋 — ✅ 완료 (양 백엔드)
+세부: [phase-11-asset-pipeline.md](phase-11-asset-pipeline.md)
 **크로스컷팅 엔진 인프라** — `crates/asset`의 자산 직렬화 계층. 가공된 **메시 지오메트리 + 베이크 데이터
 (SDF/albedo) + 압축 텍스처를 하나의 `.dcasset` 바이너리로 cook → 저장 → 런타임 직접 로드**. 매 실행
 glTF 재파싱 + 텍스처 디코드 + SDF/albedo 재베이크를 없앤다. 수동 little-endian 청크 컨테이너
 (헤더 + 타입/오프셋/크기 디렉터리), 무효화 키 `{version, source_hash, cook_params_hash}`, 결정적 CPU
 쿡(크로스백엔드 바이트 동일), gitignored `/cache/`.
 - **M1 ✅ — 메시 직렬화**(헤더 + 메시 청크 + 텍스처 청크; cook glTF→.dcasset, 런타임 직접 로드, glTF
-  부재 시 shipped 로드). Phase 11과 독립.
+  부재 시 shipped 로드). Phase 10과 독립.
 - **M2 ✅ — SDF + albedo 베이크 청크**: scene GDF 베이크를 **GPU→CPU 베이크로 전환**해 영속화
   (`sdf_bake.slang` Rust 포팅) + RHI 볼륨 업로드(`create_volume_init`)로 GPU 베이크 패스 대체.
 - **M3 ✅ — 텍스처 BCn 블록 압축**(GPU 네이티브, 런타임 해제비용 0): BC1/BC3/BC4/BC5/**BC7** 인코더 +
@@ -232,14 +217,14 @@ glTF 재파싱 + 텍스처 디코드 + SDF/albedo 재베이크를 없앤다. 수
 - **M4 ✅ — 셰이더 바이트코드 쿡 캐시 (per-OS, 콘텐츠 해시)**: 세부 [shader-asset-cache.md](shader-asset-cache.md).
   `.slang`을 OS별 바이트코드 에셋으로 쿡 + 콘텐츠 해시 → 바뀐 셰이더만 재컴파일. 무변경 빌드 0 slangc.
 - **아이템 — 추가 산출**: `.dclevel` 씬/레벨 청크(엔티티+트랜스폼+머티리얼 오버라이드+라이트/카메라/환경,
-  Phase 13 Stage E 기반), 볼륨 readback `Device::read_volume`(GPU 산출 볼륨의 데이터-레벨 쿡/검증).
+  Phase 12 Stage E 기반), 볼륨 readback `Device::read_volume`(GPU 산출 볼륨의 데이터-레벨 쿡/검증).
 - **완료 기준 달성**: glTF 재파싱·재베이크 없이 `.dcasset` 로드로 동일 렌더(DX≡VK 0.000/ch, 기준선
   무회귀), run2=CacheHit startup 가속, 베이크 바이트 동일 캐시. clippy/fmt 클린.
 - **남은 후속(선택)**: BC7 멀티모드(품질), 추가 베이크 페이로드(BVH/라이트맵/프로브), 텍스처 압축 기본화
-  RenderQuality 결속. **씬/레벨 렌더 구동은 Phase 13 Stage E**가 `.dclevel` 포맷에 결속.
+  RenderQuality 결속. **씬/레벨 렌더 구동은 Phase 12 Stage E**가 `.dclevel` 포맷에 결속.
 
-### Phase 13 — 씬 그래프 + 레벨 스트리밍 — 🧪 실험적 / 계획
-세부: [phase-13-scene-graph.md](phase-13-scene-graph.md)
+### Phase 12 — 씬 그래프 + 레벨 스트리밍 — 🧪 실험적 / 계획
+세부: [phase-12-scene-graph.md](phase-12-scene-graph.md)
 렌더 그래프(Phase 5)가 "어떻게 그리는가"라면, 씬 그래프는 "무엇이 어디에 존재하는가"의 공간·논리 표현이다.
 **DreamCoast는 학습용을 넘어 장기적으로 직접 게임 개발에 쓸 엔진**이므로, 씬 표현은 게임 런타임에 맞는
 **자체 제작 ECS**를 1급 코어로 둔다(RHI·렌더그래프를 from-scratch로 만든 철학과 일관, 외부 ECS 의존 없음).
@@ -251,22 +236,22 @@ glTF 재파싱 + 텍스처 디코드 + SDF/albedo 재베이크를 없앤다. 수
 per-instance 트랜스폼을 공급하는 단일 소스가 된다. 테스트는 보유 애셋(Avocado/BoomBox/Lantern)으로 구동.
 전제: Phase 4(애셋)·5(렌더그래프)·8(RT).
 - **선행조건**: P1 자유 비행 카메라(현 궤도 전용 → Stage D 주행용), P2 레지스트리 기반 다중 머티리얼
-  업로드, P3 Phase 12 `.dcasset` 골격(레벨/월드 *바이너리* 쿡만 차단; RON 텍스트는 무관).
-- **직렬화**: 레벨/월드 데이터 모델은 처음부터 serde-ready(RON 텍스트 로드·저장) → 차후 Phase 12
+  업로드, P3 Phase 11 `.dcasset` 골격(레벨/월드 *바이너리* 쿡만 차단; RON 텍스트는 무관).
+- **직렬화**: 레벨/월드 데이터 모델은 처음부터 serde-ready(RON 텍스트 로드·저장) → 차후 Phase 11
   컨테이너로 쿡(위 교차 참조).
 - **Stage 0** 자유 비행 카메라 → **A** 자체 ECS 코어 + 컴포넌트 트랜스폼 계층 + 기존 씬 마이그레이션(픽셀
   회귀) → **B** 전체 glTF 계층 임포트(Lantern 3메시, `Parent`/`Children`) → **C** 선언적 `.level` 포맷 +
   로더/세이브 + 런타임 전환 → **D** 레벨 그래프(`LevelGraph`) + 카메라 기반 청크 스트리밍(엔티티
-  스폰/디스폰) → **E**(선택, Phase 12 이후) 쿡된 바이너리 레벨/월드.
+  스폰/디스폰) → **E**(선택, Phase 11 이후) 쿡된 바이너리 레벨/월드.
 - **완료 기준**: ECS 씬이 단일 드로우 리스트로 세 소비처(래스터/RT/컬)를 공급, glTF 계층이 올바른 상대
   트랜스폼으로 렌더, 선언적 레벨 핫스왑, 카메라 주행 시 청크 스트림 인/아웃(엔티티 디스폰, 누수 없음), 두
   백엔드 픽셀 일치, 검증 클린.
-- **범위 외**: glTF 애니메이션/스키닝(→ **Phase 14**), ECS 멀티스레드 스케줄링·변경 감지(계층/ECS가
+- **범위 외**: glTF 애니메이션/스키닝(→ **Phase 13**), ECS 멀티스레드 스케줄링·변경 감지(계층/ECS가
   잠금 해제하는 후속이나 본 Phase 제외).
 
-### Phase 14 — 스켈레탈 애니메이션 + GPU 스키닝/스킨 캐시 — 🧪 실험적 / 계획
-세부: [phase-14-animation-skinning.md](phase-14-animation-skinning.md)
-범용 게임용 엔진(Phase 13)에 거의 모든 동적 콘텐츠의 기반인 **스켈레탈 애니메이션 + GPU 스키닝**을
+### Phase 13 — 스켈레탈 애니메이션 + GPU 스키닝/스킨 캐시 — 🧪 실험적 / 계획
+세부: [phase-13-animation-skinning.md](phase-13-animation-skinning.md)
+범용 게임용 엔진(Phase 12)에 거의 모든 동적 콘텐츠의 기반인 **스켈레탈 애니메이션 + GPU 스키닝**을
 추가한다. 핵심은 **GPU 스킨 캐시** — 스킨된 정점을 정점 셰이더가 아니라 **프레임당 한 번 컴퓨트로
 계산해 버퍼에 캐시**하고, G-buffer·섀도우·HW 패스트레이서(BLAS)·SW-RT GDF 등 **모든 지오메트리
 소비처가 그 단일 버퍼를 공유**한다(*skin once, consume many*; 멀티 소비처/RT 엔진의 GPU 스킨 캐시 패턴과 동일 동기). 정점 셰이더
@@ -284,8 +269,8 @@ per-instance 트랜스폼을 공급하는 단일 소스가 된다. 테스트는 
   `fbx-sdk`). 서드파티 → `tools/fetch-ufbx.{ps1,sh}` / `tools/fetch-fbxsdk.ps1`로 확보(gitignored, 게이트
   다운로드는 안내·배치). glTF와 **동일 중립 타입**(`SkinnedModel`)으로 매핑.
 - **확장성**: 스키닝 품질 노브(갱신 레이트/최대 영향치/본 LOD)를 `RenderQuality` 티어 seam에 접속(`P14_*`).
-- **전제**: Phase 8(RT, Stage D만) — 완료. Phase 13(씬 그래프)은 **시너지·하드 의존 아님**(단일 스킨
-  인스턴스로 독립 출하, 재생 상태/다중 인스턴스는 Phase 13 ECS `AnimationPlayer`/`SkinnedMesh`로 승격).
+- **전제**: Phase 8(RT, Stage D만) — 완료. Phase 12(씬 그래프)은 **시너지·하드 의존 아님**(단일 스킨
+  인스턴스로 독립 출하, 재생 상태/다중 인스턴스는 Phase 12 ECS `AnimationPlayer`/`SkinnedMesh`로 승격).
 - **완료 기준**: 스킨 메시가 GPU 스키닝/스킨 캐시로 애니메이션, CPU 스킨 ≡ GPU 스킨 픽셀 일치, 스킨된
   BLAS로 패스트레이서 잔차가 정적 메시 수준 수렴, glTF/FBX가 같은 스켈레톤·클립으로 같은 렌더, 두 백엔드
   픽셀 일치, 검증 클린.
@@ -307,11 +292,27 @@ per-instance 트랜스폼을 공급하는 단일 소스가 된다. 테스트는 
   Metal API+GPU validation layer까지 통과. RT 텍스처 머티리얼은 hit UV 보간 + mip0 `Load`
   기반 bilinear 샘플링으로 base/mr/normal/emissive를 inline과 M7 양쪽에 적용했고, M7
   converter descriptor table도 sampled texture/cube/storage/TLAS 범위를 채우도록 갱신.
-- **Phase 11 SW-RT 패리티: Stage B(3D 볼륨/GDF) + Stage C(GDF AO·GI·SSR·GDF 반사·Lumen
+- **Phase 10 SW-RT 패리티: Stage B(3D 볼륨/GDF) + Stage C(GDF AO·GI·SSR·GDF 반사·Lumen
   surface cache) 모두 Metal에서 완료·검증**(M3 box). Stage C의 유일한 Metal 갭은 컴퓨트
   파이프라인의 `uniform_buffer`(SSR의 per-frame globals UBO 바인딩)였고 `rhi-metal`에만
   반영해 해결 — 공유 셰이더/`rhi-types`/렌더 그래프 무변경이라 **Vulkan/D3D12 무회귀**.
-  세부: [metal-backend.md](metal-backend.md) "Phase 11 Stage B/C".
+  세부: [metal-backend.md](metal-backend.md) "Phase 10 Stage B/C".
+
+### Phase 14 — Virtual Geometry — 🧪 계획 (재배치됨, 고급 렌더링 트랙)
+세부: [phase-14-virtual-geometry.md](phase-14-virtual-geometry.md)
+> **순서 조정 (2026-06-27):** Virtual Geometry는 초기에 **Phase 10**으로 계획됐으나, SW-RT(현 Phase 10)가
+> 먼저 완료되며 건너뛰었다. 엔진이 인프라 트랙(Phase 11 에셋 → 12 씬 그래프 → 13 애니메이션)으로 진행하면서
+> **맨 뒤 Phase 14(고급 렌더링 트랙)로 재배치**하고 뒤 phase 번호를 당겨 공석을 없앴다(SW-RT 11→10, 에셋
+> 12→11, 씬그래프 13→12, 애니메이션 14→13; 상용 트랙은 15+ 유지). 12·13에 하드 의존은 없으나 ①씬그래프
+> 기반 실제 고밀도 씬이 있어야 데모 가치가 크고 ②새 RHI(메시 셰이더·64-bit 아토믹·indirect count·BDA)+
+> 외부 의존(`meshopt`/`metis`) 승인을 한 번에 묶는 게 효율적이라 후순위다. 고밀도 메시 요구가 먼저 생기고
+> 전제가 갖춰지면 앞당겨도 무방(12/13 비차단). 주: 커밋 이력·코드 env 변수(`P11_*`/`P12_*` 등)는 원래
+> 번호 유지 — 문서만 재번호.
+- 클러스터 LOD DAG(meshlet 그룹 단순화) + 뷰 종속 컷 선택 + GPU 컬링/HZB 2-pass 오클루전 +
+  컴퓨트 SW 래스터 + 비저빌리티 버퍼 → 머티리얼 해석으로 **Phase 6 디퍼드 G-buffer** 재사용
+- 전제: **Phase 7(컴퓨트/GPU-driven)** ✅. 신규 RHI: 메시 셰이더, 64-bit 아토믹, 인다이렉트 카운트,
+  BDA. 외부 의존 `meshopt`(+선택 `metis`) 사용자 승인 필요
+- **완료 기준**: 고밀도 메시가 화면 적응 LOD로 크랙/팝핑 없이 렌더, SW/HW 경로 seam 없음, 두 백엔드 일치
 
 ## 상용 엔진 확장 — 런타임/툴링 계층 (Phase 15+) — 🧭 전략 계획
 
@@ -349,7 +350,7 @@ facade trait 뒤에 성숙 라이브러리 백엔드를 격리 → 차후 자체
 - **windows-rs D3D12 ergonomics**: raw COM 인터페이스라 RAII 래퍼 설계 필요. Phase 2.
 - **RT 추상화**: SBT 레이아웃·AS 빌드 인터페이스의 두 API 공통화 난이도 높음. Phase 8.
 - **FBX 외부 의존 + 버퍼 다용도**: `cc`+ufbx 벤더링/FBX SDK 게이트 다운로드(승인 대상), 스킨 캐시 버퍼의
-  `Vertex|Storage|AccelInput` 상태 전이 두 API 통일, 비균등 스케일 노멀 매트릭스. Phase 14.
+  `Vertex|Storage|AccelInput` 상태 전이 두 API 통일, 비균등 스케일 노멀 매트릭스. Phase 13.
 - **상용 확장(Phase 15+)**: 서드파티 의존 승인(Rapier/Jolt·kira·Luau(mlua)/wasmtime·Recast 등, facade 뒤 격리), 결정성
   vs 멀티스레드/피직스(고정 타임스텝), 에디터↔런타임 결합(리플렉션/직렬화 선결), 범위 폭주(수직 슬라이스
   절단 유지), 백엔드 추상화 누수. 세부: [commercial-engine-gap-analysis.md](commercial-engine-gap-analysis.md).

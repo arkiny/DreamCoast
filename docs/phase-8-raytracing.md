@@ -1,7 +1,7 @@
 # Phase 8 — 레이트레이싱 세부 계획
 
 > 상위 로드맵: [ROADMAP.md](ROADMAP.md). **상태: ✅ 완료** (M1–M6, 두 백엔드 검증). 검증 결과는 아래 [검증 결과](#검증-결과-m1m6) 참조.
-> 전제: [Phase 7](phase-7-compute.md) ✅ (컴퓨트/GPU-driven, 바인드리스 storage, async compute) + [Phase 6](phase-6-pbr.md) ✅ (디퍼드 G-buffer, IBL). Phase 8은 Phase 10(Virtual Geometry)과 무관하게 독립적인 하드웨어 RT 트랙이다.
+> 전제: [Phase 7](phase-7-compute.md) ✅ (컴퓨트/GPU-driven, 바인드리스 storage, async compute) + [Phase 6](phase-6-pbr.md) ✅ (디퍼드 G-buffer, IBL). Phase 8은 Phase 14(Virtual Geometry)과 무관하게 독립적인 하드웨어 RT 트랙이다.
 
 ## Context
 
