@@ -157,6 +157,9 @@ engine/                 # cargo workspace root
 
 ### Phase 10 — 소프트웨어 레이트레이싱 + Distance-Field GI — ✅ 완료 (Stage A–D, 양 백엔드)
 세부: [phase-10-distance-field-gi.md](phase-10-distance-field-gi.md)
+> **확장 트랙(계획): Scalable GI** — [scalable-gi.md](scalable-gi.md). GDF GI를 갤러리 전용에서
+> 임의/대형 씬(Sponza)으로 일반화: surface-cache 단일화(per-voxel albedo 볼륨 제거) + 베이크 가속
+> (BVH/그리드) + 클립맵/고해상 SDF + 캐시 아틀라스 일반화. 접근 C→A(계획 먼저, 첫 스테이지=베이크 가속).
 하드웨어 RT(Phase 8) 없이도 동작하는, **컴퓨트 기반 소프트웨어 레이트레이싱 → 전역 거리장(Global
 Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/AO를 구현한다. 전제: **Phase 7
 (컴퓨트/GPU-driven)**. Phase 8 HW RT와는 별개 경로(저사양/넓은 씬용 근사 GI).
