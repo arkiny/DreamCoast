@@ -163,7 +163,7 @@ engine/                 # cargo workspace root
   BDA. 외부 의존 `meshopt`(+선택 `metis`) 사용자 승인 필요
 - **완료 기준**: 고밀도 메시가 화면 적응 LOD로 크랙/팝핑 없이 렌더, SW/HW 경로 seam 없음, 두 백엔드 일치
 
-### Phase 11 — 소프트웨어 레이트레이싱 + Distance-Field GI — 🧪 실험적 (Stage A–D 구현, 양 백엔드)
+### Phase 11 — 소프트웨어 레이트레이싱 + Distance-Field GI — ✅ 완료 (Stage A–D, 양 백엔드)
 세부: [phase-11-distance-field-gi.md](phase-11-distance-field-gi.md)
 하드웨어 RT(Phase 8) 없이도 동작하는, **컴퓨트 기반 소프트웨어 레이트레이싱 → 전역 거리장(Global
 Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/AO를 구현한다. 전제: **Phase 7
@@ -190,8 +190,9 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
     밉-피라미드 프리필터(C8h) → **스토캐스틱 GGX GDF 반사 + 시공간 디노이즈**(C8j). 현재
     하이브리드-vs-PT **≈3.45/ch**(컬러·러프니스·이중스펙·blow-out 모두 처리; 풀-res 미러 2.58이 best-known).
   - **남은 본질 한계 = GDF 저해상 48³ SDF 블롭 형상** — 해상도/클립맵 레버는 측정으로 기각·종료
-    (이 작은 테스트 씬 한정, [reflection-sdf-resolution.md](reflection-sdf-resolution.md)). 추가 반사 작업은
-    *실제 게임 씬*에서 측정-구동으로 재개. NEXT 후보: 동적 오브젝트 GDF 갱신.
+    (이 작은 테스트 씬 한정, [reflection-sdf-resolution.md](reflection-sdf-resolution.md)). 이 PT 잔차
+    (≈3.45/ch)는 **불가피한 한계로 수용하고 Phase 11 완료 처리**. 추가 반사 작업은 *실제 게임 씬*에서
+    측정-구동으로 재개. NEXT 후보: 동적 오브젝트 GDF 갱신.
 - **Stage D — RenderQuality 티어 (확장성, ✅ 구현, 가로지르는 항목):** 이 씬/엔진은 차후 범용 게임용이라,
   트랙 전반에 흩어진 품질 노브(GI spp, 반사 GGX 샘플/디노이즈 반경, 소프트 그림자 PCSS 샘플 수,
   서피스-캐시 해상도)를 **단일 `RenderQuality{low,med,high}` enum 한 곳으로** 묶어 런타임/플랫폼별로
@@ -203,7 +204,8 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
     개별 `P11_*`/`SHADOW_*` env 오버라이드 우선. 측정(d3d12): Low 6.019/ch·3.96ms, Med 6.039·5.58, High
     6.722·11.74(미적 소프트섀도우라 PT 잔차↑·DX≡VK 0.009 옵트인). 측정 기각 레버(SDF 해상도/CARD_TILE) 제외.
 - **완료 기준**: 동적 씬에서 HW RT 없이 GDF 기반 GI/AO가 두 백엔드에서 동작, 패스트레이서(Phase 8)
-  레퍼런스 대비 그럴듯하게 수렴, 검증 클린.
+  레퍼런스 대비 그럴듯하게 수렴, 검증 클린. → **충족·완료**(잔차는 48³ GDF 해상도가 지배하는 본질
+  한계로 수용; 정밀화는 실제 게임 씬에서 측정-구동 재개).
 
 ### Phase 12 — 에셋 파이프라인 / 쿠킹된 에셋 — 🧪 실험적 / 계획
 세부: [phase-12-asset-pipeline.md](phase-12-asset-pipeline.md)
