@@ -244,6 +244,7 @@ impl GiSystem {
         clamp_max: f32,
         clip: (u32, u32),
         clip_vols: &'a [&'a Volume],
+        max_steps: u32,
     ) -> ResourceId {
         let gip = self.gi_pipeline.as_ref().expect("gdf gi pipeline");
         let out = graph.create_storage_image("gdf_gi_out", HDR_FORMAT, extent);
@@ -316,6 +317,7 @@ impl GiSystem {
                     clip.0,               // clipmap descriptor index
                     clip.1,               // clipmap level count
                     crate::GROUND_ALBEDO, // analytic ground material (floor bounce hits)
+                    max_steps,            // D3: bounce-ray march step cap
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

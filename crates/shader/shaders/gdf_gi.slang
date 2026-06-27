@@ -50,6 +50,7 @@ struct GiPush
     uint clip_desc;         // Stage B: clipmap descriptor storage-buffer index
     uint clip_count;        // Stage B: clipmap level count (1 = single volume = legacy)
     float3 ground_albedo;   // analytic ground material (not in the albedo volume)
+    uint max_steps;         // Stage D3: bounce-ray march step cap (64 = legacy / gallery)
 };
 
 [[vk::push_constant]]
@@ -158,11 +159,12 @@ float gi_shadow(float3 origin, float3 dir)
 // Sphere-trace a bounce ray; returns the incoming radiance along it (0 if it escapes).
 float3 trace_bounce(float3 origin, float3 dir)
 {
-    const int MAX_STEPS = 64;
+    // Stage D3: content lowers the step cap (cheaper march); gallery passes 64 = legacy.
+    int max_steps = int(max(pc.max_steps, 1u));
     const float HIT_EPS = 0.001;
     float t = pc.params.y; // start past the surface bias
     float maxt = pc.params.x;
-    for (int i = 0; i < MAX_STEPS; i++)
+    for (int i = 0; i < max_steps; i++)
     {
         float3 p = origin + dir * t;
         float d = scene_march(p);
