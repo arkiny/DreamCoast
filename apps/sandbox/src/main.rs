@@ -1043,14 +1043,13 @@ impl App {
                     back.len()
                 );
             }
-            // Stage C/D: the surface-cache atlas (cards + per-card texel buffers) is only
-            // allocated when a consumer will actually re-light it — the gallery's SW-RT
-            // reflection/GI. Content scenes currently light via the captured-cube IBL
-            // (legacy_ibl below), so allocating the (potentially hundreds-of-MB) atlas for
-            // them would be pure waste; the content surface cache lands with the Stage D
-            // lighting flip. Cards themselves are cheap and draw-list-driven (fuse.rs).
-            let build_surface_cache = gallery_scene;
-            if build_surface_cache {
+            // Stage C/D: the surface-cache atlas (cards + per-card texel buffers, re-lit each
+            // frame) is allocated only when a consumer uses it — the gallery's SW-RT
+            // reflection/GI, or a content scene opted into the GDF ambient (P11_GDF_CONTENT).
+            // Content on the default IBL path skips it, avoiding the ~67 MB atlas + per-frame
+            // relight cost. The MAX_CARDS budget (fuse.rs) bounds it; cards are draw-list-driven.
+            let build_cache = gallery_scene || std::env::var_os("P11_GDF_CONTENT").is_some();
+            if build_cache {
                 let cards = fuse::build_surface_cards(&obj_aabb);
                 let num_cards = (cards.len() / 64) as u32;
                 gdf.build_surface_cache(&device, &cards, num_cards)?;
@@ -1108,9 +1107,18 @@ impl App {
         // SW-RT hybrid reflection (specular) + GDF GI (diffuse scene bounce) + sky irradiance.
         // `P11_LEGACY_IBL` restores the captured-cube path (prefilter-cube specular + scene
         // capture) for comparison.
-        // The glTF path has no scene GDF, so use the well-defined captured-cube IBL
-        // (this also forces `swrt_reflect` off below).
-        let legacy_ibl = !gallery_scene || std::env::var_os("P11_LEGACY_IBL").is_some();
+        // Stage D lighting: the gallery uses the SW-RT GDF ambient by default (tuned for it,
+        // byte-identical reference). Content scenes (levels/glTF) keep the captured-cube IBL
+        // by default — it looks great on a large open scene like Sponza, whereas the GDF
+        // 1-bounce GI still needs sky-intensity / multi-bounce / exposure tuning there (open
+        // courtyards read dark). `P11_GDF_CONTENT=1` opts a content scene into the GDF ambient
+        // (the clipmap geometry is validated; this is the lighting-quality tuning seam → the
+        // measurement-driven Stage E). Scenes without a scene GDF (world streaming) always
+        // use the IBL.
+        let content_gdf = !gallery_scene && std::env::var_os("P11_GDF_CONTENT").is_some();
+        let legacy_ibl = !gdf.has_scene_sdf()
+            || std::env::var_os("P11_LEGACY_IBL").is_some()
+            || (!gallery_scene && !content_gdf);
         let swrt_ok = reflect.has_ssr()
             && reflect.has_gdf_reflect()
             && reflect.has_composite()
