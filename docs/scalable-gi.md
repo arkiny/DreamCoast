@@ -123,6 +123,34 @@ Phase 10에서 만든 GDF(global distance field) 기반 SW-RT GI/AO/반사는 **
   갤러리보다 클 수밖에 없음(정직 보고). 목표는 "임의 씬에서 그럴듯한 GI"이지 PT 일치가 아님.
 - **per-chunk 스트리밍 GI(Stage D 월드)**: 이번 트랙 범위 외(정적 레벨 우선). 스트리밍 GI는 후속.
 
+## 진행 상황 (2026-06-27 — Stage 0~D 완료, E는 정직 보고)
+
+| Stage | 커밋 | 결과 |
+|---|---|---|
+| 0 fuse | `962c34d` | draw-list fuse + 레지스트리 CPU 지오 (갤러리 바이트 동일) |
+| A 베이크 가속 | `43bab80` | 균일 그리드 ring 검색, brute와 **비트 동일**(real Sponza assert + 캐시 byte-compare). **Sponza 262k tri 48³: 757s→0.33s** |
+| B1 플래너 | `02af466` | `clipmap.rs::plan_levels` (씬 크기 자동산정, 4 테스트) |
+| B2a/b 샘플링 | `9d406bf`/`dac7e8b` | `clipmap.slang` — 7개 SW-RT 셰이더가 디스크립터 경유 샘플 (L1=레거시 동일) |
+| B3 멀티레벨 | `8e3c6aa` | finer 레벨 볼륨 빌드 + 디스크립터 + 패스별 transition |
+| C 아틀라스 | `5995649` | `fuse::build_surface_cards` 일반화 + MAX_CARDS 예산 |
+| D-build | `9ce08b8` | 콘텐츠 씬 GDF/클립맵 빌드(Sponza 4레벨), analytic ground 비활성 |
+| D-lighting | `4171839` | 콘텐츠 GDF ambient 배선(`P11_GDF_CONTENT` opt-in), 캐시 예산 게이트 |
+
+**검증 결과:**
+- 갤러리: 전 스테이지 **바이트 동일**(DX/VK 0.000/ch, DX≡VK 0.000, Vulkan 검증 클린).
+- Sponza 클립맵 **지오메트리 검증됨**: `P11_SCENE_GDF` 트레이스가 기둥·아치·벽을 해상(4레벨 vs 1레벨
+  = 31.9/ch — 48³ 블롭이 인식 가능한 건축물로). 트레이스 자체 DX≡VK는 복잡 SDF 256-step march의
+  본질적 FP 분기로 1레벨 0.026·4레벨 0.041/ch(갤러리=단순→0.000); **디버그 viz 한정**, 프로덕션
+  파리티는 라이팅 렌더 기준.
+
+**미결(측정 주도 후속):**
+- **콘텐츠 GDF 라이팅 튜닝(Stage E 본체)**: Sponza에서 GDF 1-bounce GI가 **어둡다**(열린 코트야드는
+  IBL 큐브의 풀 스카이 조명이 필요한데 GI sky-fill 0.25 + 1바운스로는 미달). 콘텐츠 디폴트는 IBL 유지
+  (보기 좋음·무회귀), `P11_GDF_CONTENT`로 GDF 진입(튜닝 seam). 끌어올리려면: 스카이 강도, **서피스
+  캐시 멀티바운스**, 노출, content용 IBL 이라디언스 캡처 여부 확인.
+- **서피스 캐시 단일화(albedo 볼륨 제거)**: 계획의 GI=캐시-radiance-소스 단일화는 미적용(현 GI=
+  per-voxel albedo 볼륨 경로). 갤러리 재baseline을 동반하므로 라이팅 튜닝과 함께 측정 주도로.
+
 ## 향후 정합성 — 카메라 이동 GDF 스트리밍 (대형 월드)
 
 대형 월드에서는 단일 정적 GDF가 불가능하므로 **카메라 이동에 따라 GDF(거리장 + 서피스 캐시)를
