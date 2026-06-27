@@ -58,11 +58,34 @@ Phase 10에서 만든 GDF(global distance field) 기반 SW-RT GI/AO/반사는 **
 - **검증:** 갤러리 SDF/albedo 베이크 결과 **비트 동일**(가속=결과 불변); Sponza 48³ 베이크 시간이
   분→초 단위로(측정 보고). 일반 fuse(Stage 0)와 결합해 Sponza scene SDF가 실제로 빌드됨.
 
-### Stage B — SDF 해상도 (클립맵 / 고해상)
-- 48³ 고정 → 씬 크기 기반 적응 해상도 또는 **카메라 중심 클립맵**(다중 해상 SDF, 근거리 고해상).
-  대형 씬에서 기둥/아치 표현. 메모리·베이크 예산과 조율.
-- **검증:** Sponza 기둥/아치가 SDF trace(`P11_SCENE_GDF`)에서 식별 가능; 갤러리 무회귀(해상도 변경이
-  갤러리엔 영향 없도록 게이트).
+### Stage B — SDF 해상도 = 카메라 중심 클립맵 (확정 2026-06-27)
+
+48³ 단일 볼륨 → **카메라 중심 클립맵**(다중 해상 SDF, 근거리 고해상). 사용자 결정: 스트리밍의 직접
+기반이 되도록 적응 단일해상이 아닌 **클립맵을 지금** 구축([[gdf-streaming-future]]). 대형 씬에서
+기둥/아치(≈0.5m)를 표현하려면 근거리 voxel ≈0.1m 필요(48³ × 30m = 0.6m는 블롭).
+
+**모델.** `L`개 동심 큐브 레벨, 모두 같은 voxel 해상도(`scene_dim`, 기본 48³). 레벨 `i`의 half-extent
+= `base_half · 2^i`(레벨 0=최고해상/최소영역). 레벨 0..L-2는 (스냅된) **카메라 위치 중심**, 최외곽
+레벨 L-1은 **씬 전체 AABB를 덮도록**(씬 중심, half=H+pad) → 전역 커버리지 보장(=오늘의 단일 볼륨).
+`L`은 씬 크기에서 산정: `base_half` = 레벨0 목표 voxel(≈0.1m)×dim/2, `L` = ceil(log2(H/base_half))+1,
+메모리 예산으로 캡.
+
+**서브스테이지 (각 독립 커밋·게이트):**
+- **B1 (Rust 자료구조+베이크+캐시).** `gdf.rs`의 `scene_gdf`/`scene_albedo`/`scene_aabb`를
+  `Vec<ClipLevel{ sdf, albedo[3], aabb_min/max }>`로. 레벨별로 `bake_sdf_from_fused`(Stage A 그리드로
+  빠름)+`load_or_bake_scene_*`(키=fused+dim+레벨AABB → 레벨마다 별도 캐시). 셰이더가 읽을 **클립
+  디스크립터 스토리지 버퍼**(레벨당 aabb_min/max+sdf_idx+albedo_idx[3], +clip_count) 빌드.
+  **갤러리=L1**(오늘의 AABB 그대로) → 단일 볼륨과 동치. 게이트: 갤러리 바이트 동일.
+- **B2 (셰이더 통합 샘플링).** 신규 `clipmap.slang`: `sample_scene_sdf/occ/march/normal/albedo(p)`가
+  최내곽 포함 레벨 선택→샘플(미포함=다음 레벨, 최외곽 폴백). gdf_gi/gdf_reflect/gdf_trace/gdf_ao/
+  sdf_cache_capture/sdf_cache_light이 각자 복제한 `geo_inside/geo_march/albedo_at`를 이 include로 교체.
+  **L1 경로는 `(p-MIN)/(MAX-MIN)` 동일 산술**(추가 연산 0)로 갤러리 바이트 동일. 게이트: 갤러리
+  DX/VK 바이트 동일 + DX≡VK.
+- **B3 (Sponza 다중레벨 시연).** 레벨 경로에서 클립맵 빌드(임시 게이트; 정식 활성화는 Stage D).
+  Sponza 코트야드에서 기둥/아치가 SDF trace로 식별. 양 백엔드. (Stage D 전이라 임시 토글로 검증.)
+
+- **검증:** Sponza 기둥/아치가 SDF trace(`P11_SCENE_GDF`)에서 식별 가능; 갤러리 무회귀(클립맵 L1이
+  단일 볼륨과 바이트 동일). 카메라 추종 per-frame 업데이트는 스트리밍 후속(B는 1회 베이크, 정적).
 
 ### Stage C — surface cache 아틀라스 일반화
 - 카드를 **draw-list 기반 per-drawable(또는 per-primitive)** 로 생성; 아틀라스 동적 할당(카드 수에

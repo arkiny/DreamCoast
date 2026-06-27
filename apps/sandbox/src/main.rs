@@ -31,6 +31,7 @@ use tracing::info;
 
 mod app;
 mod camera;
+mod clipmap;
 mod cull;
 mod deferred;
 mod fuse;
@@ -921,6 +922,22 @@ impl App {
             // `.dcasset` keyed on the fused geometry + grid) and upload it, replacing
             // the one-time GPU bake. A fresh cache loads directly; a miss bakes + saves.
             let sdf_dim = gdf.scene_dim();
+            // Stage B (clipmap): plan the camera-centered level scheme. The gallery is the
+            // byte-identical regression reference, so it is pinned to a single level
+            // (max_levels = 1) = the legacy 48³ volume — the clipmap's finer levels are for
+            // content scenes (Sponza), wired on the level/glTF path in Stage D. The
+            // finer-level bake + GPU upload + shader sampling land in the following B
+            // sub-stages; this records the plan (unit-tested in clipmap.rs).
+            let clip_center = [
+                (amin[0] + amax[0]) * 0.5,
+                (amin[1] + amax[1]) * 0.5,
+                (amin[2] + amax[2]) * 0.5,
+            ];
+            let clip = clipmap::plan_levels(amin, amax, clip_center, sdf_dim, 0.1, 1);
+            info!(
+                "GDF clipmap: {} level(s) (gallery = single-level reference)",
+                clip.level_count()
+            );
             let (sdf_vol, sdf_outcome) = dreamcoast_asset::cook::load_or_bake_scene_sdf(
                 &fused_v,
                 &fused_i,
