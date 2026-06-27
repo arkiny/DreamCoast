@@ -113,6 +113,116 @@ fn save_manifest(path: &Path, map: &HashMap<String, u64>) {
     let _ = std::fs::write(path, text);
 }
 
+/// The cache identity of one `(job, target)` cell: its content-hash key, the artifact
+/// file name, the embed/output path, and the resolved profile/defines. Computed once
+/// (the `profile_for`/`defines_for` single source) and used by both the parallel
+/// pre-pass and the sequential emit loop so the two can never disagree on hit vs. miss.
+struct CellKey {
+    key_hash: u64,
+    artifact_name: String,
+    out_path: PathBuf,
+    profile: Option<&'static str>,
+    defines: &'static [(&'static str, &'static str)],
+}
+
+fn cell_key(
+    base_hash: u64,
+    src_bytes: &[u8],
+    job: &Job,
+    target: &str,
+    ext: &str,
+    cache_dir: &Path,
+    out_dir: &Path,
+) -> CellKey {
+    let profile = profile_for(target, job.stage);
+    let defines = defines_for(target);
+    let defines_str: String = defines.iter().map(|(k, v)| format!("{k}={v};")).collect();
+    let params = format!(
+        "t={target};e={};s={};p={};d={defines_str}",
+        job.entry,
+        job.stage,
+        profile.unwrap_or(""),
+    );
+    let key_hash = fnv1a(params.as_bytes(), fnv1a(src_bytes, base_hash));
+    let artifact_name = format!("{}.{}", job.key, ext);
+    // Cached artifacts live in the persistent per-OS cache dir; the Metal RT-pipeline
+    // branch is uncached scratch and stays in OUT_DIR.
+    let out_path = if target == "metallib" && is_rt_stage(job.stage) {
+        out_dir.join(&artifact_name)
+    } else {
+        cache_dir.join(&artifact_name)
+    };
+    CellKey {
+        key_hash,
+        artifact_name,
+        out_path,
+        profile,
+        defines,
+    }
+}
+
+/// One queued slangc compile (a cache miss). `command` is fully built and ready to run.
+struct WorkItem {
+    artifact_name: String,
+    command: Command,
+}
+
+/// The result of running one `WorkItem`'s slangc.
+struct Outcome {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run the queued slangc compiles concurrently (Phase 12 M4.5), keyed by artifact name.
+/// Only cache *misses* reach here, so a cold/changed build's wall-clock drops from the
+/// sum of all compiles to roughly `ceil(misses / threads)` of the slowest. Threads only
+/// change *when* each slangc runs, never its inputs — bytecode is byte-for-byte
+/// identical to the sequential path. Dependency-free (`std::thread` + a shared queue).
+fn compile_parallel(work: Vec<WorkItem>) -> HashMap<String, Outcome> {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    if work.is_empty() {
+        return HashMap::new();
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(work.len());
+    let queue = Arc::new(Mutex::new(work.into_iter().collect::<VecDeque<_>>()));
+    let results = Arc::new(Mutex::new(HashMap::new()));
+    let mut handles = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        let queue = Arc::clone(&queue);
+        let results = Arc::clone(&results);
+        handles.push(std::thread::spawn(move || {
+            loop {
+                let item = queue.lock().unwrap().pop_front();
+                let Some(mut item) = item else { break };
+                let output = item
+                    .command
+                    .output()
+                    .unwrap_or_else(|e| panic!("failed to launch slangc: {e}"));
+                results.lock().unwrap().insert(
+                    item.artifact_name,
+                    Outcome {
+                        success: output.status.success(),
+                        stdout: output.stdout,
+                        stderr: output.stderr,
+                    },
+                );
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    Arc::into_inner(results)
+        .expect("all worker threads have joined, so this is the last Arc")
+        .into_inner()
+        .unwrap()
+}
+
 /// One shader entry point to compile.
 struct Job {
     /// Source file under `shaders/`.
@@ -606,6 +716,50 @@ fn main() {
     let mut cache_compiled = 0usize;
     let mut cache_hits = 0usize;
 
+    // M4.5 pre-pass: collect every main-branch cache MISS and compile them in parallel.
+    // Cache hits and the macOS-only Metal RT-pipeline branch are handled inline in the
+    // emit loop below; only plain slangc misses are parallelized. The emit loop recomputes
+    // the same `cell_key`, so its hit/miss decision matches this pass exactly.
+    let mut work: Vec<WorkItem> = Vec::new();
+    for job in JOBS {
+        let src_bytes = std::fs::read(shader_dir.join(job.src)).unwrap_or_default();
+        for (target, ext, _suffix, _required) in TARGETS {
+            if !target_selected(target, &target_os)
+                || (*target == "metallib" && is_rt_stage(job.stage))
+            {
+                continue;
+            }
+            let ck = cell_key(
+                base_hash, &src_bytes, job, target, ext, &cache_dir, &out_dir,
+            );
+            if manifest.get(&ck.artifact_name) == Some(&ck.key_hash) && ck.out_path.exists() {
+                continue; // cache hit — no compile needed
+            }
+            let mut command = slang_command(&slangc, &shader_tool_home);
+            command
+                .arg(shader_dir.join(job.src))
+                .args(["-target", target])
+                .args(["-entry", job.entry])
+                .args(["-stage", job.stage]);
+            for &(k, v) in ck.defines {
+                command.args(["-D", &format!("{k}={v}")]);
+            }
+            if let Some(p) = ck.profile {
+                command.args(["-profile", p]);
+            }
+            // Preserve the real SPIR-V entry-point name (Slang defaults to "main").
+            if *target == "spirv" {
+                command.arg("-fvk-use-entrypoint-name");
+            }
+            command.arg("-o").arg(&ck.out_path);
+            work.push(WorkItem {
+                artifact_name: ck.artifact_name,
+                command,
+            });
+        }
+    }
+    let results = compile_parallel(work);
+
     for job in JOBS {
         let src_path = shader_dir.join(job.src);
         let src_bytes = std::fs::read(&src_path).unwrap_or_default();
@@ -620,15 +774,9 @@ fn main() {
                 continue;
             }
 
-            // Cached artifacts go to the persistent per-OS cache dir; the Metal
-            // RT-pipeline branch is uncached scratch and stays in OUT_DIR.
-            let out_path = if *target == "metallib" && is_rt_stage(job.stage) {
-                out_dir.join(format!("{}.{}", job.key, ext))
-            } else {
-                cache_dir.join(format!("{}.{}", job.key, ext))
-            };
-
             if *target == "metallib" && is_rt_stage(job.stage) {
+                // Metal RT-pipeline: uncached scratch in OUT_DIR (macOS-only).
+                let out_path = out_dir.join(format!("{}.{}", job.key, ext));
                 match compile_rt_pipeline_metal(MetalRtCompileRequest {
                     manifest_dir: &manifest_dir,
                     shader_dir: &shader_dir,
@@ -686,55 +834,27 @@ fn main() {
                 continue;
             }
 
-            // Cache key for this (job, target): base (compiler + shared includes)
-            // folded with the source bytes and the exact compile params. profile_for /
-            // defines_for are the single source for both the key and the slangc args, so
-            // the key can never claim a hit for bytecode compiled with different flags.
-            let profile = profile_for(target, job.stage);
-            let defines = defines_for(target);
-            let defines_str: String = defines.iter().map(|(k, v)| format!("{k}={v};")).collect();
-            let params = format!(
-                "t={target};e={};s={};p={};d={defines_str}",
-                job.entry,
-                job.stage,
-                profile.unwrap_or(""),
+            // Same cache identity as the pre-pass: emit from the on-disk cache (hit) or
+            // from the parallel compile result (miss). cell_key (via profile_for /
+            // defines_for) is the single source so a hit can never claim bytecode that
+            // was compiled with different flags.
+            let ck = cell_key(
+                base_hash, &src_bytes, job, target, ext, &cache_dir, &out_dir,
             );
-            let key_hash = fnv1a(params.as_bytes(), fnv1a(&src_bytes, base_hash));
-            let artifact_name = format!("{}.{}", job.key, ext);
-            if manifest.get(&artifact_name) == Some(&key_hash) && out_path.exists() {
+            if manifest.get(&ck.artifact_name) == Some(&ck.key_hash) && ck.out_path.exists() {
                 // Identical source + params + compiler → byte-identical bytecode already
-                // on disk. Skip the slangc subprocess entirely.
-                emit_some(&mut generated, job.key, suffix, &out_path);
+                // on disk. The slangc subprocess was skipped entirely.
+                emit_some(&mut generated, job.key, suffix, &ck.out_path);
                 cache_hits += 1;
                 continue;
             }
+            let outcome = results
+                .get(&ck.artifact_name)
+                .expect("every cache miss was queued for compilation in the pre-pass");
 
-            let mut command = slang_command(&slangc, &shader_tool_home);
-            command
-                .arg(&src_path)
-                .args(["-target", target])
-                .args(["-entry", job.entry])
-                .args(["-stage", job.stage]);
-            for &(k, v) in defines {
-                command.args(["-D", &format!("{k}={v}")]);
-            }
-            if let Some(p) = profile {
-                command.args(["-profile", p]);
-            }
-            // By default Slang names the SPIR-V entry point "main"; preserve the
-            // real name so the pipeline can bind it by entry name.
-            if *target == "spirv" {
-                command.arg("-fvk-use-entrypoint-name");
-            }
-            let output = command
-                .arg("-o")
-                .arg(&out_path)
-                .output()
-                .unwrap_or_else(|e| panic!("failed to launch slangc: {e}"));
-
-            if output.status.success() {
-                emit_some(&mut generated, job.key, suffix, &out_path);
-                manifest.insert(artifact_name, key_hash);
+            if outcome.success {
+                emit_some(&mut generated, job.key, suffix, &ck.out_path);
+                manifest.insert(ck.artifact_name, ck.key_hash);
                 cache_compiled += 1;
             } else if *required {
                 panic!(
@@ -742,8 +862,8 @@ fn main() {
                     job.src,
                     job.entry,
                     target,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
+                    String::from_utf8_lossy(&outcome.stdout),
+                    String::from_utf8_lossy(&outcome.stderr),
                 );
             } else {
                 println!(
@@ -751,7 +871,7 @@ fn main() {
                     job.src,
                     job.entry,
                     target,
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    String::from_utf8_lossy(&outcome.stderr).trim()
                 );
                 emit_none(&mut generated, job.key, suffix);
                 if *target == "metallib" && is_rt_stage(job.stage) {
