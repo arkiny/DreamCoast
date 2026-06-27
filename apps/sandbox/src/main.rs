@@ -1044,11 +1044,11 @@ impl App {
                 );
             }
             // Stage C/D: the surface-cache atlas (cards + per-card texel buffers, re-lit each
-            // frame) is allocated only when a consumer uses it — the gallery's SW-RT
-            // reflection/GI, or a content scene opted into the GDF ambient (P11_GDF_CONTENT).
-            // Content on the default IBL path skips it, avoiding the ~67 MB atlas + per-frame
-            // relight cost. The MAX_CARDS budget (fuse.rs) bounds it; cards are draw-list-driven.
-            let build_cache = gallery_scene || std::env::var_os("P11_GDF_CONTENT").is_some();
+            // frame) feeds the SW-RT reflection/GI. It is the default ambient for any GDF
+            // scene now, so build it unless the IBL escape hatch is forced (then it would be
+            // unused — skip the ~67 MB atlas + per-frame relight). MAX_CARDS (fuse.rs) bounds
+            // it; cards are draw-list-driven.
+            let build_cache = std::env::var_os("P11_LEGACY_IBL").is_none();
             if build_cache {
                 let cards = fuse::build_surface_cards(&obj_aabb);
                 let num_cards = (cards.len() / 64) as u32;
@@ -1107,18 +1107,12 @@ impl App {
         // SW-RT hybrid reflection (specular) + GDF GI (diffuse scene bounce) + sky irradiance.
         // `P11_LEGACY_IBL` restores the captured-cube path (prefilter-cube specular + scene
         // capture) for comparison.
-        // Stage D lighting: the gallery uses the SW-RT GDF ambient by default (tuned for it,
-        // byte-identical reference). Content scenes (levels/glTF) keep the captured-cube IBL
-        // by default — it looks great on a large open scene like Sponza, whereas the GDF
-        // 1-bounce GI still needs sky-intensity / multi-bounce / exposure tuning there (open
-        // courtyards read dark). `P11_GDF_CONTENT=1` opts a content scene into the GDF ambient
-        // (the clipmap geometry is validated; this is the lighting-quality tuning seam → the
-        // measurement-driven Stage E). Scenes without a scene GDF (world streaming) always
-        // use the IBL.
-        let content_gdf = !gallery_scene && std::env::var_os("P11_GDF_CONTENT").is_some();
-        let legacy_ibl = !gdf.has_scene_sdf()
-            || std::env::var_os("P11_LEGACY_IBL").is_some()
-            || (!gallery_scene && !content_gdf);
+        // Stage D lighting flip: any scene WITH a scene GDF (the gallery and now content
+        // levels/glTF, via the clipmap) uses the SW-RT GDF ambient by default — the camera-
+        // centered clipmap is the default for content. `P11_LEGACY_IBL` restores the captured-
+        // cube IBL (the escape hatch / comparison). Scenes without a scene GDF (world
+        // streaming) always use the IBL.
+        let legacy_ibl = !gdf.has_scene_sdf() || std::env::var_os("P11_LEGACY_IBL").is_some();
         let swrt_ok = reflect.has_ssr()
             && reflect.has_gdf_reflect()
             && reflect.has_composite()
