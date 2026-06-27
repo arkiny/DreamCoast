@@ -487,6 +487,9 @@ struct App {
     /// Stage D2: surface-cache amortized-relight period (round-robin card budget; 1 = legacy
     /// every-frame, forced for the gallery anchor). Higher = cheaper `sdf_cache_light`.
     cache_relight_period: u32,
+    /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
+    /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
+    gi_half_res: bool,
     /// C4: spatio-temporal denoise of the noisy C3 GI.
     gi_denoise: bool,
     /// Previous frame's view-projection (world -> clip) for C4 temporal reprojection.
@@ -1144,6 +1147,11 @@ impl App {
                 qp.cache_relight_period
             })
             .max(1);
+        // Stage D1: half-res GI trace + bilateral upsample. Gallery stays full-res (the
+        // byte-identical anchor); content scenes take the tier default. `P11_GI_HALF_RES`
+        // overrides. Needs the upsample pipeline (capability-gated).
+        let gi_half_res = gi.has_upsample()
+            && quality::env_bool("P11_GI_HALF_RES", !gallery_scene && qp.gi_half_res);
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
         let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", qp.gi_denoise);
         // C5 screen-space reflections (viz toggle).
@@ -1375,6 +1383,7 @@ impl App {
             gdf_gi,
             gi_spp,
             cache_relight_period,
+            gi_half_res,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
             gdf_ssr,
@@ -1748,6 +1757,7 @@ impl App {
                 gdf_gi,
                 gi_spp,
                 cache_relight_period,
+                gi_half_res,
                 gi_denoise,
                 gdf_ssr,
                 gdf_reflect,
@@ -1844,6 +1854,8 @@ impl App {
                         } else {
                             p.cache_relight_period.max(1)
                         };
+                        // Half-res GI: content-only (gallery full-res = byte-identical anchor).
+                        *gi_half_res = gi.has_upsample() && !*is_gallery && p.gi_half_res;
                         *gi_denoise = gi.has_denoise() && p.gi_denoise;
                         *reflect_cache = *swrt_reflect
                             && gdf.has_surface_cache()
@@ -2476,7 +2488,17 @@ impl App {
         // Stage C3: 1-bounce diffuse GI added to the ambient term, optionally denoised (C4).
         let gdf_gi_out = match (self.gdf_gi, scene_gdf_vol, scene_gdf_ext) {
             (true, Some(vol), Some(ext)) => {
-                let raw = self.gi.record_gi(
+                // Stage D1: trace at half res (1/4 the rays) when enabled, then joint-bilateral
+                // upsample to full res before the denoiser. gdf_gi.slang samples the G-buffer by
+                // normalized UV, so a half extent + half dims trace correctly with no shader change.
+                let half_gi = self.gi_half_res;
+                let (gw, gh) = if half_gi { (hcw, hch) } else { (cw, ch) };
+                let gi_extent = if half_gi {
+                    Extent2D::new(gw, gh)
+                } else {
+                    extent
+                };
+                let traced = self.gi.record_gi(
                     &mut graph,
                     vol,
                     ext,
@@ -2484,12 +2506,12 @@ impl App {
                     scene_aabb_max,
                     g_depth,
                     g_normal,
-                    extent,
+                    gi_extent,
                     inv_view_proj,
                     self.sun_dir,
                     self.sun_intensity,
-                    cw,
-                    ch,
+                    gw,
+                    gh,
                     self.flip_y,
                     self.gi_spp,
                     self.frame_no as u32,
@@ -2499,6 +2521,25 @@ impl App {
                     scene_clip,
                     &scene_clip_vols,
                 );
+                let raw = if half_gi {
+                    self.gi.record_upsample(
+                        &mut graph,
+                        traced,
+                        g_depth,
+                        g_normal,
+                        extent,
+                        inv_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        gw,
+                        gh,
+                        self.flip_y,
+                    )
+                } else {
+                    traced
+                };
                 let out = if gi_denoise_active {
                     self.gi.record_denoise(
                         &mut graph,

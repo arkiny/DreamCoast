@@ -89,6 +89,11 @@ pub struct QualityPreset {
     /// call site). Higher = cheaper `sdf_cache_light`, slower convergence. UE Lumen surface-cache
     /// update budget; see `sdf_cache_light.slang` and `docs/sponza-perf.md`.
     pub cache_relight_period: u32,
+    /// Stage D1 (Sponza 60fps): trace the C3 GI at half resolution + joint-bilateral upsample
+    /// (1/4 the rays) (`P11_GI_HALF_RES`). Forced off for the gallery anchor (full-res =
+    /// byte-identical) at the call site. UE5 Lumen screen-probe / Frostbite half-res GI; see
+    /// `gdf_gi_upsample.slang`.
+    pub gi_half_res: bool,
 }
 
 /// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
@@ -108,6 +113,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             shadow_softness: 0.0,
             shadow_taps: 8,
             cache_relight_period: 8,
+            gi_half_res: true,
         },
         // Default — identical to the pre-tier behavior. Do not change without re-baselining no-reg.
         RenderQuality::Med => QualityPreset {
@@ -122,6 +128,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             shadow_softness: 0.0,
             shadow_taps: 16,
             cache_relight_period: 4,
+            gi_half_res: true,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
@@ -137,6 +144,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             shadow_softness: 0.03,
             shadow_taps: 16,
             cache_relight_period: 1,
+            gi_half_res: false,
         },
     }
 }

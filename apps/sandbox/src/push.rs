@@ -874,6 +874,48 @@ pub(crate) fn gdf_atrous_push(
     pc
 }
 
+/// Pack the Stage D1 half-res GI upsample push block (128 bytes): inv_view_proj (64) +
+/// (gi_half, depth, normal, out, width, height, half_width, half_height, flip_y) uints
+/// (64..100) + params float4 (pos_sigma, normal_power) at the next 16-byte row (112).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gdf_gi_upsample_push(
+    inv_view_proj: &[f32; 16],
+    gi_half_index: u32,
+    depth_index: u32,
+    normal_index: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    half_width: u32,
+    half_height: u32,
+    flip_y: u32,
+    pos_sigma: f32,
+    normal_power: f32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let u = [
+        gi_half_index,
+        depth_index,
+        normal_index,
+        out_index,
+        width,
+        height,
+        half_width,
+        half_height,
+        flip_y,
+    ];
+    for (i, v) in u.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // float4 params at offset 112 (the next 16-byte boundary after the 9 uints).
+    pc[112..116].copy_from_slice(&pos_sigma.to_le_bytes());
+    pc[116..120].copy_from_slice(&normal_power.to_le_bytes());
+    pc
+}
+
 /// Pack the Phase 11 Stage C5 SSR push block (192 bytes): view_proj (64) +
 /// inv_view_proj (64) + cam_pos (16) + (depth, normal, material, color, out) +
 /// (width, height, flip_y) (32 across two rows) + (max_dist, thickness, steps,

@@ -16,11 +16,14 @@ use rhi::{
 
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
-use crate::push::{gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_temporal_push};
+use crate::push::{
+    gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_gi_upsample_push, gdf_temporal_push,
+};
 
 pub(crate) struct GiSystem {
     ao_pipeline: Option<ComputePipeline>, // C2 GDF ambient occlusion
     gi_pipeline: Option<ComputePipeline>, // C3 GDF 1-bounce diffuse GI
+    upsample_pipeline: Option<ComputePipeline>, // D1 half-res GI joint-bilateral upsample
     temporal_pipeline: Option<ComputePipeline>, // C4 temporal reprojection
     atrous_pipeline: Option<ComputePipeline>, // C4 spatial à-trous
     /// C4 GI denoiser history: ping-pong float4/pixel storage buffers — `gi_hist`
@@ -76,6 +79,13 @@ impl GiSystem {
             "gdf_gi",
             224,
         )?;
+        let upsample_pipeline = compute(
+            dreamcoast_shader::gdf_gi_upsample_cs_spirv,
+            dreamcoast_shader::gdf_gi_upsample_cs_dxil,
+            dreamcoast_shader::gdf_gi_upsample_cs_metallib,
+            "gdf_gi_upsample",
+            128,
+        )?;
         let temporal_pipeline = compute(
             dreamcoast_shader::gdf_temporal_cs_spirv,
             dreamcoast_shader::gdf_temporal_cs_dxil,
@@ -93,6 +103,7 @@ impl GiSystem {
         Ok(Self {
             ao_pipeline,
             gi_pipeline,
+            upsample_pipeline,
             temporal_pipeline,
             atrous_pipeline,
             gi_hist: [None, None],
@@ -108,6 +119,9 @@ impl GiSystem {
     }
     pub(crate) fn has_gi(&self) -> bool {
         self.gi_pipeline.is_some()
+    }
+    pub(crate) fn has_upsample(&self) -> bool {
+        self.upsample_pipeline.is_some()
     }
     pub(crate) fn has_denoise(&self) -> bool {
         self.temporal_pipeline.is_some() && self.atrous_pipeline.is_some()
@@ -302,6 +316,71 @@ impl GiSystem {
                     clip.0,               // clipmap descriptor index
                     clip.1,               // clipmap level count
                     crate::GROUND_ALBEDO, // analytic ground material (floor bounce hits)
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
+    /// Stage D1: joint-bilateral upsample of the half-res GI to full resolution. The C3 trace
+    /// (the dominant Sponza cost) runs at half res (1/4 the rays); this reconstructs the full-res
+    /// indirect irradiance with a depth/normal-aware guided upscale before the full-res denoiser
+    /// and lighting consume it. `gi_half` is the half-res GI; `depth`/`normal` are the full-res
+    /// G-buffer. Returns the full-res GI image. See `gdf_gi_upsample.slang`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_upsample<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        gi_half: ResourceId,
+        depth: ResourceId,
+        normal: ResourceId,
+        full_extent: Extent2D,
+        inv_view_proj: [f32; 16],
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        cw: u32,
+        ch: u32,
+        hw: u32,
+        hh: u32,
+        flip_y: u32,
+    ) -> ResourceId {
+        let up = self
+            .upsample_pipeline
+            .as_ref()
+            .expect("gi upsample pipeline");
+        let out = graph.create_storage_image("gdf_gi_full", HDR_FORMAT, full_extent);
+        // Same edge-stopping scale as the à-trous denoiser so the upsample preserves the
+        // same silhouettes (world-position sigma = a small fraction of the scene diagonal).
+        let pos_sigma = Self::diag(aabb_min, aabb_max) * 0.03;
+        let normal_power = 32.0_f32;
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "gdf_gi_upsample",
+                storage_writes: vec![out],
+                reads: vec![gi_half, depth, normal],
+            },
+            move |ctx| {
+                let gi_half_index = ctx.sampled_index(gi_half);
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(up);
+                cmd.push_constants_compute(&gdf_gi_upsample_push(
+                    &inv_view_proj,
+                    gi_half_index,
+                    depth_index,
+                    normal_index,
+                    out_index,
+                    cw,
+                    ch,
+                    hw,
+                    hh,
+                    flip_y,
+                    pos_sigma,
+                    normal_power,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
