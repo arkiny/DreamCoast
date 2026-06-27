@@ -2297,6 +2297,10 @@ impl App {
         // trace (whichever runs first bakes).
         let scene_gdf_vol = self.gdf.scene_gdf_volume();
         let (scene_aabb_min, scene_aabb_max) = self.gdf.scene_aabb();
+        // Stage B: the clipmap descriptor the SW-RT shaders sample the scene field through
+        // (single level today = the legacy volume). `(0, 1)` is an inert fallback never used
+        // (the GDF passes gate on `scene_gdf_vol.is_some()`, which implies a descriptor).
+        let scene_clip = self.gdf.clip_descriptor().unwrap_or((0, 1));
         let scene_gdf_ext = if (self.gdf_ao
             || self.gdf_gi
             || self.gdf_reflect
@@ -2436,6 +2440,7 @@ impl App {
                     scene_albedo,
                     gi_cache_arg,
                     firefly_max,
+                    scene_clip,
                 );
                 let out = if gi_denoise_active {
                     self.gi.record_denoise(

@@ -91,6 +91,12 @@ pub(crate) struct GdfSystem {
     cache_radiance: [Option<StorageBuffer>; 2],
     cache_frame: u32,
     cache_light_pipeline: Option<ComputePipeline>,
+    /// Stage B (clipmap): the scene-GDF descriptor storage buffer the SW-RT shaders read
+    /// to select a level — 48 bytes/level `{ aabb_min, aabb_max, sdf_idx, albedo_idx[3] }`,
+    /// finest→coarsest. A single-level descriptor (the gallery) reproduces the legacy
+    /// single-volume sampling byte-for-byte; `clipmap.slang` consumes it.
+    clip_desc: Option<StorageBuffer>,
+    clip_count: u32,
 }
 
 /// Surface-cache card atlas tile edge (texels per card side). 6 cards / object.
@@ -356,6 +362,8 @@ impl GdfSystem {
             cache_radiance: [None, None],
             cache_frame: 0,
             cache_light_pipeline,
+            clip_desc: None,
+            clip_count: 0,
         })
     }
 
@@ -447,7 +455,60 @@ impl GdfSystem {
                 )?);
             }
         }
+        // Stage B (clipmap): build the descriptor the SW-RT shaders sample through. For now
+        // this is a single level (the coarsest, = the volume just built) so the gallery
+        // reads exactly the legacy field; the finer camera-centered levels are prepended by
+        // `set_clip_levels` (B3 / Stage D) for content scenes.
+        self.build_clip_descriptor(device)?;
         Ok(())
+    }
+
+    /// (Re)build the clipmap descriptor storage buffer from the current scene levels. Each
+    /// 48-byte record is `{ float4 aabb_min, float4 aabb_max, uint4(sdf_idx, alb_r, alb_g,
+    /// alb_b) }`, ordered finest→coarsest. Today only the coarsest (the `scene_gdf` volume
+    /// over `scene_aabb`) exists, so the descriptor has one level.
+    fn build_clip_descriptor(&mut self, device: &Device) -> anyhow::Result<()> {
+        let Some(sdf) = self.scene_gdf.as_ref() else {
+            return Ok(());
+        };
+        let (ar, ag, ab) = match self.scene_albedo.as_ref() {
+            Some(v) => (
+                v[0].sampled_index(),
+                v[1].sampled_index(),
+                v[2].sampled_index(),
+            ),
+            None => (u32::MAX, u32::MAX, u32::MAX),
+        };
+        let mut bytes = Vec::with_capacity(48);
+        let push_f3 = |v: [f32; 3], bytes: &mut Vec<u8>| {
+            for c in v {
+                bytes.extend_from_slice(&c.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0.0f32.to_le_bytes()); // .w pad
+        };
+        push_f3(self.scene_aabb_min, &mut bytes);
+        push_f3(self.scene_aabb_max, &mut bytes);
+        for u in [sdf.sampled_index(), ar, ag, ab] {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        self.clip_count = 1;
+        self.clip_desc = Some(device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: bytes.len() as u64,
+                stride: 48,
+                indirect: false,
+            },
+            &bytes,
+        )?);
+        Ok(())
+    }
+
+    /// Stage B: the clipmap descriptor `(storage-buffer index, level count)` the SW-RT
+    /// shaders sample the scene field through, or `None` until a scene GDF is built.
+    pub(crate) fn clip_descriptor(&self) -> Option<(u32, u32)> {
+        self.clip_desc
+            .as_ref()
+            .map(|b| (b.storage_index(), self.clip_count))
     }
 
     pub(crate) fn has_scene_sdf(&self) -> bool {
