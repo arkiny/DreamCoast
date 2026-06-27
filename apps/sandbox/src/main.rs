@@ -556,6 +556,10 @@ struct App {
     /// The scene passes (g-buffer → GDF → lighting → HDR) render here; tonemap downscales to the
     /// swapchain backbuffer. Lets headless perf measure true QHD/UHD regardless of display size.
     render_res: Option<(u32, u32)>,
+    /// QHD/UHD track: internal render scale (fraction of the display extent), the production knob
+    /// for dynamic resolution. `1.0` = native (byte-identical). Ignored when `render_res` (absolute)
+    /// is set. `RENDER_SCALE` env / `quality.rs` tier.
+    render_scale: f32,
     // Profiler UI state.
     profiler_on: bool,
     slot_pass_names: Vec<Vec<String>>,
@@ -1308,6 +1312,12 @@ impl App {
             let h = b.trim().parse::<u32>().ok()?.clamp(240, 4320);
             Some((w, h))
         });
+        // QHD/UHD track: internal render scale (production knob). `RENDER_SCALE` overrides the tier.
+        let render_scale = std::env::var("RENDER_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(qp.render_scale)
+            .clamp(0.25, 1.0);
         let profiler_on = std::env::var("PROFILE_GPU").is_ok();
         let slot_pass_names: Vec<Vec<String>> = vec![Vec::new(); FRAMES_IN_FLIGHT];
         let render_finished = build_render_finished(&device, swapchain.image_count())?;
@@ -1479,6 +1489,7 @@ impl App {
             multibounce: true,
             legacy_ibl,
             render_res,
+            render_scale,
             profiler_on,
             slot_pass_names,
             gpu_timings: Vec::new(),
@@ -1620,7 +1631,14 @@ impl App {
             let e = self.swapchain.extent_2d();
             (e.width, e.height)
         };
-        let (cw, ch) = self.render_res.unwrap_or((sw, sh));
+        let (cw, ch) = match self.render_res {
+            Some(r) => r, // absolute override (headless QHD/UHD measurement)
+            None if (self.render_scale - 1.0).abs() < 1e-4 => (sw, sh), // native (byte-identical)
+            None => (
+                ((sw as f32 * self.render_scale).round() as u32).max(64),
+                ((sh as f32 * self.render_scale).round() as u32).max(64),
+            ),
+        };
 
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32();
