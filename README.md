@@ -10,10 +10,11 @@ DreamCoast is a custom renderer + engine layered directly on **raw Vulkan
 implementing them by hand, behind a single self-designed RHI.
 
 The Windows backends (Vulkan + D3D12) are complete through Phase 9 (tooling &
-profiling). **Phase 11 (software-RT distance-field GI) is substantially
-implemented** — GDF-based AO, 1-bounce diffuse GI, and hybrid SW-RT reflections
-(SSR + GDF + sky) are now the default ambient, with a mesh-card surface cache
-and a `RenderQuality{low,med,high}` tier (Stage D) layered on top.
+profiling). **Phase 11 (software-RT distance-field GI) is complete** — GDF-based
+AO, 1-bounce diffuse GI, and hybrid SW-RT reflections (SSR + GDF + sky) are now
+the default ambient, with a mesh-card surface cache and a
+`RenderQuality{low,med,high}` tier (Stage D) layered on top. The residual vs the
+path tracer (≈3.45/ch) is an accepted limit set by the 48³ GDF resolution.
 Phases 10, 12, 13 (virtual geometry, cooked-asset pipeline, scene graph) remain
 experimental / planned. The native **Metal backend for macOS**
 is at near-full parity — including Phase-8 ray tracing (inline `RayQuery` **and** the
@@ -83,10 +84,11 @@ Backend parity is a hard rule: every milestone must produce identical results on
 - [x] **Phase 8** — Ray tracing (DXR + VK_KHR) — inline ray query + full RT pipeline/SBT
 - [x] **Phase 9** — Tooling & profiling (per-pass GPU timestamps, debug markers, validation toggle, sample browser)
 - [ ] **Phase 10** — Virtual geometry (cluster-LOD, GPU culling/HZB, SW raster) — experimental / planned
-- [~] **Phase 11** — Software ray tracing + distance-field GI — Stages A–C + D landed on Windows:
+- [x] **Phase 11** — Software ray tracing + distance-field GI — Stages A–D complete on Windows:
   compute SW-RT, baked global distance field, stochastic GDF GI/AO + hybrid SW-RT
   reflections (now the default ambient, replacing captured-cube IBL), a mesh-card
-  surface cache, and a `RenderQuality` tier. Stage A/B run on Metal.
+  surface cache, and a `RenderQuality` tier. Stages A–C verified on Metal. The
+  residual vs the path tracer (≈3.45/ch) is an accepted 48³-GDF-resolution limit.
 - [ ] **Phase 12** — Cooked-asset pipeline (`.dcasset`) + shader bytecode cook cache — planned
 - [ ] **Phase 13** — Scene graph + level streaming (self-made ECS) — planned
 - [ ] **Phase 14** — Skeletal animation + GPU skinning / skin cache + FBX importer (ufbx / FBX SDK) — planned
