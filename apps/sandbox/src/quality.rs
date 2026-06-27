@@ -27,7 +27,7 @@ pub enum RenderQuality {
 }
 
 impl RenderQuality {
-    /// Resolve the active tier from `RENDER_QUALITY` (unset / unrecognized => `Med`).
+    /// Resolve the active tier from `RENDER_QUALITY` (unset / unrecognized => platform default).
     pub fn from_env() -> Self {
         match std::env::var("RENDER_QUALITY")
             .ok()
@@ -36,9 +36,18 @@ impl RenderQuality {
             .as_deref()
         {
             Some("low") => RenderQuality::Low,
+            Some("med") | Some("medium") => RenderQuality::Med,
             Some("high") => RenderQuality::High,
-            _ => RenderQuality::Med,
+            _ => Self::platform_default(),
         }
+    }
+
+    /// The default tier when `RENDER_QUALITY` is unset. `Med` everywhere today (= the legacy
+    /// no-reg baseline). This is the seam where future per-platform / per-GPU selection plugs in:
+    /// a low-end mobile/iGPU would map to `Low`, a high-end desktop GPU to `High`. Kept honest —
+    /// without a GPU perf-tier lookup we don't fake detection, so it returns `Med` for now.
+    pub fn platform_default() -> RenderQuality {
+        RenderQuality::Med
     }
 
     pub fn label(self) -> &'static str {
