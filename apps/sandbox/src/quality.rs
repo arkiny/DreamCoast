@@ -121,8 +121,8 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
         // Low-end fallback: reflection hit cache off, cheap stochastic half-res SSR, half the
         // GI samples, lower reflection roughness cutoff (GDF takes over sooner). Hard shadows.
         RenderQuality::Low => QualityPreset {
-            gi_spp: 4,
-            gi_max_steps: 32,
+            gi_spp: 2,
+            gi_max_steps: 24,
             reflect_max_steps: 64,
             gi_denoise: true,
             reflect_cache: false,
@@ -133,15 +133,15 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 8,
-            cache_relight_period: 16,
+            cache_relight_period: 48,
             gi_half_res: true,
-            cache_relight_spp: 4,
+            cache_relight_spp: 2,
             reflect_half_res: true,
         },
         // Default — identical to the pre-tier behavior. Do not change without re-baselining no-reg.
         RenderQuality::Med => QualityPreset {
-            gi_spp: 4,
-            gi_max_steps: 32,
+            gi_spp: 2,
+            gi_max_steps: 24,
             reflect_max_steps: 96,
             gi_denoise: true,
             reflect_cache: true,
@@ -152,12 +152,12 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 16,
-            // Stage D2b/D3: with camera-visibility feedback (off-screen cards relit 8x less) and
-            // the period-aware EMA alpha keeping warmup convergence, the base period rises toward
-            // UE's 32/64. 16 + relight spp 4 brings sdf_cache_light into the frame budget.
-            cache_relight_period: 16,
+            // Stage D2b/D3: visibility feedback (off-screen cards relit 8x less) + period-aware EMA
+            // alpha let the period reach UE's 32 range; gather spp 2 (denoised) + half-res GI/reflect
+            // bring the GDF SW-RT stack into the 60fps frame budget on both backends.
+            cache_relight_period: 32,
             gi_half_res: true,
-            cache_relight_spp: 4,
+            cache_relight_spp: 2,
             reflect_half_res: true,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
