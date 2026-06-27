@@ -30,6 +30,7 @@ use rhi::{
 use tracing::info;
 
 mod app;
+mod camera;
 mod cull;
 mod deferred;
 mod gdf;
@@ -471,9 +472,16 @@ struct App {
     // from all sides. `None` = normal whole-scene framing. `diag_pitch` = elevation.
     diag_obj: Option<usize>,
     diag_pitch: Option<f32>,
+    // Stage 0 free-fly camera. `cam_mode` defaults to Orbit (the screenshot/parity
+    // baseline); Tab toggles to Fly interactively. `fly` is lazily seeded from the
+    // current orbit view on first switch so there is no jump.
+    cam_mode: camera::CameraMode,
+    fly: Option<camera::FlyCamera>,
+    tab_prev: bool,
 }
 
 const VK_F2: u16 = 0x71;
+const VK_TAB: u16 = 0x09;
 const SCREENSHOT_WARMUP: u64 = 3;
 // Path-trace screenshots need a long warmup so the static-camera accumulation
 // converges before the frame is captured.
@@ -1162,6 +1170,9 @@ impl App {
             angle: diag_angle.unwrap_or(if screenshot_mode { 0.7 } else { 0.0 }),
             diag_obj,
             diag_pitch,
+            cam_mode: camera::CameraMode::Orbit,
+            fly: None,
+            tab_prev: false,
         })
     }
 
@@ -1240,6 +1251,23 @@ impl App {
             self.angle += dt * 0.6; // hold a fixed view when capturing
         }
 
+        // Stage 0: Tab toggles the free-fly camera (interactive only — never during a
+        // headless capture, so the parity baseline stays the fixed orbit). Re-seed the
+        // fly camera from the current orbit view each time it is entered.
+        if !self.screenshot_mode {
+            let tab = self.window.input().key_down(VK_TAB);
+            if tab && !self.tab_prev {
+                self.cam_mode = match self.cam_mode {
+                    camera::CameraMode::Orbit => camera::CameraMode::Fly,
+                    camera::CameraMode::Fly => camera::CameraMode::Orbit,
+                };
+                if self.cam_mode == camera::CameraMode::Fly {
+                    self.fly = None; // force re-seed from the orbit view below
+                }
+            }
+            self.tab_prev = tab;
+        }
+
         // Path-trace + GI-denoise screenshots need a long warmup so the static-camera
         // accumulation converges before the frame is captured.
         let warmup = if self.path_trace && !self.rt_debug {
@@ -1299,6 +1327,19 @@ impl App {
                     self.scene_radius * 0.55,
                     self.angle.sin() * dist,
                 );
+            (focus, eye)
+        };
+        // Stage 0: in fly mode, override the orbit framing with the free camera. Seed
+        // it from the orbit view on first entry so the switch is seamless. Headless
+        // captures never reach here (cam_mode stays Orbit), so the baseline is fixed.
+        let (focus, eye) = if self.cam_mode == camera::CameraMode::Fly && !self.screenshot_mode {
+            let seed_speed = self.scene_radius * 0.8;
+            let fly = self
+                .fly
+                .get_or_insert_with(|| camera::FlyCamera::from_look(eye, focus, seed_speed));
+            fly.update(self.window.input(), dt);
+            (fly.focus(), fly.position)
+        } else {
             (focus, eye)
         };
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
