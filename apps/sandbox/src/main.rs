@@ -923,21 +923,23 @@ impl App {
             // the one-time GPU bake. A fresh cache loads directly; a miss bakes + saves.
             let sdf_dim = gdf.scene_dim();
             // Stage B (clipmap): plan the camera-centered level scheme. The gallery is the
-            // byte-identical regression reference, so it is pinned to a single level
-            // (max_levels = 1) = the legacy 48³ volume — the clipmap's finer levels are for
-            // content scenes (Sponza), wired on the level/glTF path in Stage D. The
-            // finer-level bake + GPU upload + shader sampling land in the following B
-            // sub-stages; this records the plan (unit-tested in clipmap.rs).
+            // byte-identical regression reference, so it stays single-level by default
+            // (= the legacy 48³ volume). `P11_GDF_CLIP_LEVELS=N` opts into an N-level clipmap
+            // (B3 multi-level path verification); the finer levels are cooked over their
+            // sub-AABBs (Stage A grid bake, cached) and installed. Default activation for
+            // content scenes (Sponza) lands in Stage D.
             let clip_center = [
                 (amin[0] + amax[0]) * 0.5,
                 (amin[1] + amax[1]) * 0.5,
                 (amin[2] + amax[2]) * 0.5,
             ];
-            let clip = clipmap::plan_levels(amin, amax, clip_center, sdf_dim, 0.1, 1);
-            info!(
-                "GDF clipmap: {} level(s) (gallery = single-level reference)",
-                clip.level_count()
-            );
+            let clip_max_levels = std::env::var("P11_GDF_CLIP_LEVELS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1);
+            let clip = clipmap::plan_levels(amin, amax, clip_center, sdf_dim, 0.1, clip_max_levels);
+            info!("GDF clipmap: {} level(s)", clip.level_count());
             let (sdf_vol, sdf_outcome) = dreamcoast_asset::cook::load_or_bake_scene_sdf(
                 &fused_v,
                 &fused_i,
@@ -976,6 +978,50 @@ impl App {
                 Some(&sdf_bytes),
                 Some([&alb[0], &alb[1], &alb[2]]),
             )?;
+            // Stage B3: cook + install the finer clipmap levels (every level but the
+            // coarsest, which `build_scene_sdf` just created). Each is keyed on its own
+            // sub-AABB so the cache stores them separately; off unless P11_GDF_CLIP_LEVELS>1.
+            if clip.level_count() > 1 {
+                let finer = &clip.levels[..clip.level_count() - 1];
+                let mut sdf_store: Vec<Vec<u8>> = Vec::new();
+                let mut alb_store: Vec<[Vec<u8>; 3]> = Vec::new();
+                for (lmin, lmax) in finer {
+                    let (v, _) = dreamcoast_asset::cook::load_or_bake_scene_sdf(
+                        &fused_v,
+                        &fused_i,
+                        sdf_dim,
+                        *lmin,
+                        *lmax,
+                        &app::cooked_cache_dir(),
+                    );
+                    sdf_store.push(v.to_le_bytes());
+                    let (av, _) = dreamcoast_asset::cook::load_or_bake_scene_albedo(
+                        &fused_v,
+                        &fused_i,
+                        &tri_albedo,
+                        sdf_dim,
+                        *lmin,
+                        *lmax,
+                        &app::cooked_cache_dir(),
+                    );
+                    alb_store.push([
+                        av.channel_le_bytes(0),
+                        av.channel_le_bytes(1),
+                        av.channel_le_bytes(2),
+                    ]);
+                }
+                let level_data: Vec<crate::gdf::ClipLevelData> = finer
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (lmin, lmax))| crate::gdf::ClipLevelData {
+                        aabb_min: *lmin,
+                        aabb_max: *lmax,
+                        sdf: &sdf_store[i],
+                        albedo: Some([&alb_store[i][0], &alb_store[i][1], &alb_store[i][2]]),
+                    })
+                    .collect();
+                gdf.set_clip_levels(&device, &level_data)?;
+            }
             // Phase 12 item 3: optional GPU→CPU volume-readback round-trip check. Reads
             // the just-uploaded scene SDF back and confirms it equals the bytes we
             // uploaded — validating `Device::read_volume` on the live backend.
@@ -2249,6 +2295,10 @@ impl App {
         }
 
         let extent = Extent2D::new(cw, ch);
+        // Stage B3: the finer clipmap-level volumes each GDF pass transitions to sampled
+        // (empty for the single-level gallery). Bound before the graph so it outlives the
+        // pass closures that borrow it.
+        let scene_clip_vols = self.gdf.clip_level_volumes();
         let mut graph = RenderGraph::new();
         let backbuffer = graph.import_backbuffer(self.swapchain.format(), extent);
         let g_albedo = graph.create_color("g_albedo", GB_ALBEDO_FMT, extent);
@@ -2415,6 +2465,7 @@ impl App {
                 ch,
                 self.flip_y,
                 scene_clip,
+                &scene_clip_vols,
             )),
             _ => None,
         };
@@ -2442,6 +2493,7 @@ impl App {
                     gi_cache_arg,
                     firefly_max,
                     scene_clip,
+                    &scene_clip_vols,
                 );
                 let out = if gi_denoise_active {
                     self.gi.record_denoise(
@@ -2578,6 +2630,7 @@ impl App {
                     scene_albedo,
                     reflect_cache_arg,
                     scene_clip,
+                    &scene_clip_vols,
                 );
                 // C8j: temporally resolve the stochastic GGX GDF reflection (UE-style; the rough
                 // lobe is sampled by real rays + denoised, so it's correctly blurred without an
@@ -2932,6 +2985,7 @@ impl App {
                 scene_albedo,
                 reflect_cache_arg,
                 scene_clip,
+                &scene_clip_vols,
             )),
             _ => None,
         };
@@ -3007,6 +3061,7 @@ impl App {
                     scene_albedo,
                     reflect_cache_arg,
                     scene_clip,
+                    &scene_clip_vols,
                 );
                 // Standalone viz: no temporal resolve buffers here, so feed the GDF reflection
                 // straight into the composite (the resolve runs only in the lighting-fed path).

@@ -635,6 +635,7 @@ impl ReflectSystem {
         albedo: Option<(&'a [Volume; 3], ResourceId)>,
         cache: Option<([u32; 5], ResourceId)>,
         clip: (u32, u32),
+        clip_vols: &'a [&'a Volume],
     ) -> ResourceId {
         let pipe = self
             .reflect_pipeline
@@ -674,6 +675,9 @@ impl ReflectSystem {
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.volume_to_sampled(scene_gdf);
+                for v in clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
                 let albedo_rgb = if let Some((vols, _)) = albedo {
                     for v in vols.iter() {
                         cmd.volume_to_sampled(v);

@@ -97,6 +97,28 @@ pub(crate) struct GdfSystem {
     /// single-volume sampling byte-for-byte; `clipmap.slang` consumes it.
     clip_desc: Option<StorageBuffer>,
     clip_count: u32,
+    /// Stage B3: the **finer** clipmap levels (camera-centered, higher resolution near the
+    /// camera), each its own SDF + albedo volumes over its own AABB. The coarsest level
+    /// stays in `scene_gdf`/`scene_albedo` (global coverage). Empty ⇒ single-level (gallery).
+    clip_levels: Vec<ClipLevel>,
+}
+
+/// A finer clipmap level: its own SDF (+ optional albedo) volumes over a sub-AABB of the
+/// scene, sampled when a query point falls inside it (closer ⇒ higher resolution).
+struct ClipLevel {
+    sdf: Volume,
+    albedo: Option<[Volume; 3]>,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+}
+
+/// A baked finer clipmap level ready for upload: its world AABB + the cooked SDF bytes and
+/// optional per-channel albedo bytes (the same little-endian f32 layout the coarsest uses).
+pub(crate) struct ClipLevelData<'a> {
+    pub(crate) aabb_min: [f32; 3],
+    pub(crate) aabb_max: [f32; 3],
+    pub(crate) sdf: &'a [u8],
+    pub(crate) albedo: Option<[&'a [u8]; 3]>,
 }
 
 /// Surface-cache card atlas tile edge (texels per card side). 6 cards / object.
@@ -364,6 +386,7 @@ impl GdfSystem {
             cache_light_pipeline,
             clip_desc: None,
             clip_count: 0,
+            clip_levels: Vec::new(),
         })
     }
 
@@ -465,33 +488,56 @@ impl GdfSystem {
 
     /// (Re)build the clipmap descriptor storage buffer from the current scene levels. Each
     /// 48-byte record is `{ float4 aabb_min, float4 aabb_max, uint4(sdf_idx, alb_r, alb_g,
-    /// alb_b) }`, ordered finest→coarsest. Today only the coarsest (the `scene_gdf` volume
-    /// over `scene_aabb`) exists, so the descriptor has one level.
+    /// alb_b) }`, ordered **finest→coarsest**: the B3 finer levels first, then the coarsest
+    /// (`scene_gdf` over `scene_aabb`). A scene with no finer levels (gallery) gets one
+    /// record = the legacy single volume.
     fn build_clip_descriptor(&mut self, device: &Device) -> anyhow::Result<()> {
-        let Some(sdf) = self.scene_gdf.as_ref() else {
+        if self.scene_gdf.is_none() {
             return Ok(());
-        };
-        let (ar, ag, ab) = match self.scene_albedo.as_ref() {
-            Some(v) => (
-                v[0].sampled_index(),
-                v[1].sampled_index(),
-                v[2].sampled_index(),
-            ),
-            None => (u32::MAX, u32::MAX, u32::MAX),
-        };
-        let mut bytes = Vec::with_capacity(48);
-        let push_f3 = |v: [f32; 3], bytes: &mut Vec<u8>| {
-            for c in v {
-                bytes.extend_from_slice(&c.to_le_bytes());
-            }
-            bytes.extend_from_slice(&0.0f32.to_le_bytes()); // .w pad
-        };
-        push_f3(self.scene_aabb_min, &mut bytes);
-        push_f3(self.scene_aabb_max, &mut bytes);
-        for u in [sdf.sampled_index(), ar, ag, ab] {
-            bytes.extend_from_slice(&u.to_le_bytes());
         }
-        self.clip_count = 1;
+        let mut bytes = Vec::with_capacity(48 * (self.clip_levels.len() + 1));
+        let push_level = |mn: [f32; 3], mx: [f32; 3], idx: [u32; 4], bytes: &mut Vec<u8>| {
+            for v in [mn[0], mn[1], mn[2], 0.0] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [mx[0], mx[1], mx[2], 0.0] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            for u in idx {
+                bytes.extend_from_slice(&u.to_le_bytes());
+            }
+        };
+        let alb_idx = |a: Option<&[Volume; 3]>| -> [u32; 3] {
+            match a {
+                Some(v) => [
+                    v[0].sampled_index(),
+                    v[1].sampled_index(),
+                    v[2].sampled_index(),
+                ],
+                None => [u32::MAX; 3],
+            }
+        };
+        // Finer levels first (finest = level 0 of the plan).
+        for lv in &self.clip_levels {
+            let a = alb_idx(lv.albedo.as_ref());
+            push_level(
+                lv.aabb_min,
+                lv.aabb_max,
+                [lv.sdf.sampled_index(), a[0], a[1], a[2]],
+                &mut bytes,
+            );
+        }
+        // Coarsest = the scene volume (global coverage).
+        let sdf = self.scene_gdf.as_ref().unwrap();
+        let a = alb_idx(self.scene_albedo.as_ref());
+        push_level(
+            self.scene_aabb_min,
+            self.scene_aabb_max,
+            [sdf.sampled_index(), a[0], a[1], a[2]],
+            &mut bytes,
+        );
+
+        self.clip_count = self.clip_levels.len() as u32 + 1;
         self.clip_desc = Some(device.create_storage_buffer_init(
             &StorageBufferDesc {
                 size: bytes.len() as u64,
@@ -501,6 +547,61 @@ impl GdfSystem {
             &bytes,
         )?);
         Ok(())
+    }
+
+    /// Stage B3: install the finer (camera-centered) clipmap levels from their cooked SDF +
+    /// albedo bytes, ordered **finest first**, and rebuild the descriptor. Each becomes its
+    /// own GPU volume over its sub-AABB; the coarsest stays in `scene_gdf`. No-op without a
+    /// scene GDF / compute support.
+    pub(crate) fn set_clip_levels(
+        &mut self,
+        device: &Device,
+        levels: &[ClipLevelData],
+    ) -> anyhow::Result<()> {
+        if self.scene_gdf.is_none() {
+            return Ok(());
+        }
+        let dim = self.scene_dim;
+        let vd = VolumeDesc {
+            width: dim,
+            height: dim,
+            depth: dim,
+            format: Format::R32Float,
+        };
+        let mut out = Vec::with_capacity(levels.len());
+        for lv in levels {
+            let albedo = match lv.albedo {
+                Some(ch) => Some([
+                    device.create_volume_init(&vd, ch[0])?,
+                    device.create_volume_init(&vd, ch[1])?,
+                    device.create_volume_init(&vd, ch[2])?,
+                ]),
+                None => None,
+            };
+            out.push(ClipLevel {
+                sdf: device.create_volume_init(&vd, lv.sdf)?,
+                albedo,
+                aabb_min: lv.aabb_min,
+                aabb_max: lv.aabb_max,
+            });
+        }
+        self.clip_levels = out;
+        self.build_clip_descriptor(device)?;
+        Ok(())
+    }
+
+    /// Stage B3: the finer-level SDF + albedo volumes that a consumer must transition to
+    /// the sampled state before sampling the clipmap (the coarsest is handled separately).
+    /// Empty for a single-level (gallery) clipmap.
+    pub(crate) fn clip_level_volumes(&self) -> Vec<&Volume> {
+        let mut v = Vec::new();
+        for lv in &self.clip_levels {
+            v.push(&lv.sdf);
+            if let Some(a) = &lv.albedo {
+                v.extend(a.iter());
+            }
+        }
+        v
     }
 
     /// Stage B: the clipmap descriptor `(storage-buffer index, level count)` the SW-RT
@@ -700,6 +801,7 @@ impl GdfSystem {
         let num_texels = num_cards * CARD_TILE * CARD_TILE;
         let sampled = vol.sampled_index();
         let clip = self.clip_descriptor().unwrap_or((0, 1));
+        let clip_vols = self.clip_level_volumes();
         let aabb_min = self.scene_aabb_min;
         let aabb_max = self.scene_aabb_max;
         let diag = {
@@ -719,6 +821,9 @@ impl GdfSystem {
             move |ctx| {
                 let cmd = ctx.cmd();
                 cmd.volume_to_sampled(vol);
+                for v in &clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&cache_light_push(
                     cards,
@@ -780,6 +885,7 @@ impl GdfSystem {
         let num_texels = num_cards * CARD_TILE * CARD_TILE;
         let sampled = vol.sampled_index();
         let clip = self.clip_descriptor().unwrap_or((0, 1));
+        let clip_vols = self.clip_level_volumes();
         let aabb_min = self.scene_aabb_min;
         let aabb_max = self.scene_aabb_max;
         let diag = {
@@ -803,6 +909,9 @@ impl GdfSystem {
             move |ctx| {
                 let cmd = ctx.cmd();
                 cmd.volume_to_sampled(vol);
+                for v in &clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
                 let albedo_rgb = if let Some(vols) = albedo {
                     for v in vols.iter() {
                         cmd.volume_to_sampled(v);
@@ -903,6 +1012,7 @@ impl GdfSystem {
         let sampled = vol.sampled_index();
         // Stage B: sample the scene field through the clipmap descriptor (1 level today).
         let clip = self.clip_descriptor().unwrap_or((0, 1));
+        let clip_vols = self.clip_level_volumes();
         // Sample clamp = AABB diagonal: exceeds the field's true max distance so the
         // march never wrongly clamps (the fused bake fills every voxel — no sparse
         // sentinel), while keeping the empty-space step bounded.
@@ -924,6 +1034,9 @@ impl GdfSystem {
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.volume_to_sampled(vol);
+                for v in &clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
                 cmd.bind_compute_pipeline(tracep);
                 cmd.push_constants_compute(&gdf_trace_push(
                     &inv_view_proj,
