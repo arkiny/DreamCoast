@@ -197,12 +197,12 @@ impl RtSystem {
             let mut geoms: Vec<RtGeometry> = scene
                 .iter()
                 .map(|o| RtGeometry {
-                    vertex_buffer: &o.vbuf,
-                    index_buffer: &o.ibuf,
+                    vertex_buffer: &o.mesh.vbuf,
+                    index_buffer: &o.mesh.ibuf,
                     geometry: BlasGeometry {
-                        vertex_count: o.vertex_count,
+                        vertex_count: o.mesh.vertex_count,
                         vertex_stride: 32,
-                        index_count: o.index_count,
+                        index_count: o.mesh.index_count,
                     },
                 })
                 .collect();
