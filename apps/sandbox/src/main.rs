@@ -742,6 +742,20 @@ impl App {
                 amax[i] += pad;
             }
             let tri_count = (fused_i.len() / 4 / 3) as u32;
+            // Phase 12 M2: cook the scene SDF (deterministic CPU bake, cached as a
+            // `.dcasset` keyed on the fused geometry + grid) and upload it, replacing
+            // the one-time GPU bake. A fresh cache loads directly; a miss bakes + saves.
+            let sdf_dim = gdf.scene_dim();
+            let (sdf_vol, sdf_outcome) = dreamcoast_asset::cook::load_or_bake_scene_sdf(
+                &fused_v,
+                &fused_i,
+                sdf_dim,
+                amin,
+                amax,
+                &app::cooked_cache_dir(),
+            );
+            info!("scene SDF {sdf_dim}^3 ({sdf_outcome:?})");
+            let sdf_bytes = sdf_vol.to_le_bytes();
             gdf.build_scene_sdf(
                 &device,
                 &fused_v,
@@ -750,6 +764,7 @@ impl App {
                 tri_count,
                 amin,
                 amax,
+                Some(&sdf_bytes),
             )?;
             // C8b1: 6 axis-aligned mesh cards per object (Lumen-style box-projection cards).
             // Each 64-B record = center.xyz/trace_depth, normal.xyz, u_axis.xyz (half-extent),
@@ -985,6 +1000,10 @@ impl App {
         let _ = window.take_resized();
         info!("entering render loop");
 
+        // Read before `gdf` is moved into the struct (Phase 12 M2): a cooked SDF
+        // was uploaded, so the one-time GPU bake is pre-satisfied.
+        let scene_gdf_cooked = gdf.scene_sdf_is_cooked();
+
         Ok(Self {
             window,
             _instance: instance,
@@ -1088,7 +1107,9 @@ impl App {
             firefly_clamp,
             reflect_max_roughness,
             ssr_stochastic,
-            scene_gdf_baked: false,
+            // Phase 12 M2: a cooked SDF was uploaded into the scene GDF, so the
+            // one-time GPU bake is already satisfied — latch it as baked.
+            scene_gdf_baked: scene_gdf_cooked,
             scene_albedo_baked: false,
             scene_cache_captured: false,
             scene_cache_reset: true,
