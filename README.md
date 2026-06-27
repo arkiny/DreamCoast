@@ -14,12 +14,22 @@ profiling). **Phase 10 (software-RT distance-field GI) is complete** — GDF-bas
 AO, 1-bounce diffuse GI, and hybrid SW-RT reflections (SSR + GDF + sky) are now
 the default ambient, with a mesh-card surface cache and a
 `RenderQuality{low,med,high}` tier (Stage D) layered on top. The residual vs the
-path tracer (≈3.45/ch) is an accepted limit set by the 48³ GDF resolution.
+path tracer (≈3.45/ch) is an accepted limit set by the 48³ GDF resolution. The
+**Scalable-GI track** then generalized GDF GI from the gallery to arbitrary, large
+content scenes (Sponza): a uniform-grid-accelerated bake (a 262k-triangle Sponza
+SDF bake dropped from 757 s to 0.33 s, bit-identical to brute force), a
+camera-centred SDF **clipmap**, and a generalized surface-cache atlas make GDF
+ambient the default for imported levels too — see
+[`docs/scalable-gi.md`](docs/scalable-gi.md).
 **Phase 11 (cooked-asset pipeline) is complete** — meshes, the scene SDF/albedo
 bakes, and BCn-compressed textures cook to a single deterministic `.dcasset`
 binary (loaded directly, no glTF re-parse / re-bake), alongside the per-OS shader
-bytecode cook cache. The engine is now moving along its **infrastructure track**
-(Phase 12 scene graph → Phase 13 animation); **Phase 14 (virtual geometry) is
+bytecode cook cache. **Phase 12 (scene graph + level streaming) is complete** — a
+from-scratch ECS + transform hierarchy, full glTF hierarchy import, declarative RON
+levels with hot-swap, camera-driven chunk streaming, and cooked binary `.dclevel`
+assets; the engine convention is settled at **1 unit = 1 metre** (assets load at
+native scale, the camera frames the scene). The engine is now moving toward
+**Phase 13 (skeletal animation + GPU skinning)**; **Phase 14 (virtual geometry) is
 deferred** to an advanced-rendering track after that foundation is in place. The
 native **Metal backend for macOS**
 is at near-full parity — including Phase-8 ray tracing (inline `RayQuery` **and** the

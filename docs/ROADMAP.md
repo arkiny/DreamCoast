@@ -157,9 +157,12 @@ engine/                 # cargo workspace root
 
 ### Phase 10 — 소프트웨어 레이트레이싱 + Distance-Field GI — ✅ 완료 (Stage A–D, 양 백엔드)
 세부: [phase-10-distance-field-gi.md](phase-10-distance-field-gi.md)
-> **확장 트랙(계획): Scalable GI** — [scalable-gi.md](scalable-gi.md). GDF GI를 갤러리 전용에서
-> 임의/대형 씬(Sponza)으로 일반화: surface-cache 단일화(per-voxel albedo 볼륨 제거) + 베이크 가속
-> (BVH/그리드) + 클립맵/고해상 SDF + 캐시 아틀라스 일반화. 접근 C→A(계획 먼저, 첫 스테이지=베이크 가속).
+> **확장 트랙: Scalable GI — ✅ Stage 0–D 완료 (Sponza GDF가 콘텐츠 씬 기본 ambient)** —
+> [scalable-gi.md](scalable-gi.md). GDF GI를 갤러리 전용에서 임의/대형 씬(Sponza)으로 일반화 완료:
+> Stage 0(draw-list fuse + 레지스트리 CPU 지오) · A(**베이크 그리드 가속 — Sponza 262k tri 48³
+> 757s→0.33s, brute와 비트 동일**) · B(카메라 중심 클립맵, 4레벨) · C(캐시 아틀라스 일반화) · D(콘텐츠
+> 씬 GDF ambient 기본, NaN-오염 temporal 버퍼 sanitize). Stage E(Sponza 품질)는 정직 보고. 갤러리
+> 매 스테이지 바이트 동일.
 하드웨어 RT(Phase 8) 없이도 동작하는, **컴퓨트 기반 소프트웨어 레이트레이싱 → 전역 거리장(Global
 Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/AO를 구현한다. 전제: **Phase 7
 (컴퓨트/GPU-driven)**. Phase 8 HW RT와는 별개 경로(저사양/넓은 씬용 근사 GI).
@@ -228,8 +231,14 @@ glTF 재파싱 + 텍스처 디코드 + SDF/albedo 재베이크를 없앤다. 수
   애셋화**(쿡 컨테이너 토대는 본 Phase에서 완료, 런타임/레벨 결속은 진행 중인 Phase 12로) →
   [material-assets.md](material-assets.md).
 
-### Phase 12 — 씬 그래프 + 레벨 스트리밍 — 🧪 실험적 / 계획
+### Phase 12 — 씬 그래프 + 레벨 스트리밍 — ✅ 완료 (Stage 0–E, 양 백엔드)
 세부: [phase-12-scene-graph.md](phase-12-scene-graph.md)
+> **완료(2026-06-27)**: Stage 0(자유비행 카메라) · A(자체 ECS + 트랜스폼 계층 + 하드코딩 씬
+> 마이그레이션 + Mesh/Material 레지스트리) · B(전체 glTF 계층 임포트 — Lantern 3메시, `Parent`/
+> `Children`; Sponza 25머티리얼/103프리미티브) · C(선언적 RON `.level` + 핫스왑) · D(레벨 그래프
+> `.world` + 카메라 기반 청크 스트리밍) · E(쿡된 바이너리 `.dclevel`, `CHUNK_LEVEL`). 더해 **엔진 단위
+> 스케일 확정(1u=1m, native, 카메라가 씬 AABB 프레이밍)**, 레벨 라이팅(레벨 애셋에 kind별 라이트 직렬화),
+> 양면 셰이딩(임포트 씬 외벽 비침 제거). 갤러리 전 과정 바이트 동일, DX≡VK ≤0.001, 검증 클린.
 렌더 그래프(Phase 5)가 "어떻게 그리는가"라면, 씬 그래프는 "무엇이 어디에 존재하는가"의 공간·논리 표현이다.
 **DreamCoast는 학습용을 넘어 장기적으로 직접 게임 개발에 쓸 엔진**이므로, 씬 표현은 게임 런타임에 맞는
 **자체 제작 ECS**를 1급 코어로 둔다(RHI·렌더그래프를 from-scratch로 만든 철학과 일관, 외부 ECS 의존 없음).
