@@ -5,12 +5,19 @@
 //! optional material override), lights, a camera, and the environment. It carries
 //! no GPU handles; the runtime resolves the asset references and builds the scene.
 //!
-//! It serializes into the same `.dcasset` chunk container as everything else (a
-//! `CHUNK_LEVEL`, see [`crate::dcasset::write_level`] / [`read_level`]) so a level
-//! is just another cooked asset. Wiring it to drive the live render is Phase 13.
+//! It serializes two ways from this one model (single source of truth): **RON text**
+//! (Phase 12 Stage C — [`load_ron`] / [`save_ron`], human-authored `.level` files)
+//! and the binary `.dcasset` `CHUNK_LEVEL` (see [`crate::dcasset::write_level`] /
+//! [`read_level`], the Stage E cooked form). The data model is identical; only the
+//! container differs.
+
+use std::path::Path;
+
+use dreamcoast_core::EngineError;
+use serde::{Deserialize, Serialize};
 
 /// A whole scene: entities + lights + camera + environment.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct LevelData {
     pub entities: Vec<Entity>,
     pub lights: Vec<Light>,
@@ -18,8 +25,29 @@ pub struct LevelData {
     pub environment: Environment,
 }
 
+impl LevelData {
+    /// Load a level from a RON text file (Stage C authored `.level`).
+    pub fn load_ron(path: impl AsRef<Path>) -> Result<Self, EngineError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| EngineError::Asset(format!("level read: {e}")))?;
+        ron::from_str(&text).map_err(|e| EngineError::Asset(format!("level parse: {e}")))
+    }
+
+    /// Serialize this level to RON text (pretty-printed for hand-editing).
+    pub fn to_ron(&self) -> Result<String, EngineError> {
+        ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())
+            .map_err(|e| EngineError::Asset(format!("level serialize: {e}")))
+    }
+
+    /// Save this level to a RON text file.
+    pub fn save_ron(&self, path: impl AsRef<Path>) -> Result<(), EngineError> {
+        std::fs::write(path, self.to_ron()?)
+            .map_err(|e| EngineError::Asset(format!("level write: {e}")))
+    }
+}
+
 /// One placed instance of a cooked asset.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entity {
     /// Logical asset key — the same stable reference the mesh cook is keyed on
     /// (e.g. `assets/model.glb`), resolved to a `.dcasset` at load.
@@ -31,7 +59,7 @@ pub struct Entity {
 }
 
 /// Per-instance material scalar overrides.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MaterialOverride {
     pub base_color_factor: [f32; 4],
     pub metallic: f32,
@@ -39,14 +67,14 @@ pub struct MaterialOverride {
 }
 
 /// Light type tag.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LightKind {
     Directional,
     Point,
 }
 
 /// A scene light. `vec` is the direction (directional) or position (point).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Light {
     pub kind: LightKind,
     pub vec: [f32; 3],
@@ -55,7 +83,7 @@ pub struct Light {
 }
 
 /// The level's default camera.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Camera {
     pub position: [f32; 3],
     pub target: [f32; 3],
@@ -77,7 +105,7 @@ impl Default for Camera {
 }
 
 /// Environment / sky + sun.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Environment {
     pub sun_dir: [f32; 3],
     pub sun_intensity: f32,
@@ -91,5 +119,46 @@ impl Default for Environment {
             sun_intensity: 3.0,
             sky_tint: [0.6, 0.7, 0.9],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ron_roundtrip() {
+        let level = LevelData {
+            entities: vec![
+                Entity {
+                    asset: "assets/Lantern.glb".into(),
+                    transform: [
+                        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0,
+                        1.0,
+                    ],
+                    material_override: None,
+                },
+                Entity {
+                    asset: "sphere".into(),
+                    transform: [0.0; 16],
+                    material_override: Some(MaterialOverride {
+                        base_color_factor: [0.95, 0.64, 0.54, 1.0],
+                        metallic: 1.0,
+                        roughness: 0.35,
+                    }),
+                },
+            ],
+            lights: vec![Light {
+                kind: LightKind::Directional,
+                vec: [-0.4, -1.0, -0.3],
+                color: [1.0, 0.95, 0.9],
+                intensity: 3.0,
+            }],
+            camera: Camera::default(),
+            environment: Environment::default(),
+        };
+        let text = level.to_ron().expect("serialize");
+        let parsed: LevelData = ron::from_str(&text).expect("parse");
+        assert_eq!(parsed, level);
     }
 }

@@ -1,0 +1,205 @@
+//! Declarative levels (Phase 12 Stage C): instantiate an `asset::LevelData` into the
+//! ECS, plus the sandbox's built-in authored levels.
+//!
+//! A level is a flat list of placed entities, each referencing an asset by a logical
+//! key — either a glTF file path (imported via Stage B and normalized to unit size)
+//! or a procedural primitive (`sphere` / `cube`). The same `LevelData` model is the
+//! single source of truth shared with the binary `.dcasset` cook (Stage E). Levels
+//! render through the rasterizer + captured-cube IBL (the GDF/HW-RT path is
+//! gallery-only), so switching levels needs no GDF rebuild.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use dreamcoast_asset::level::{Entity as LevelEntity, LightKind, MaterialOverride};
+use dreamcoast_asset::{GltfScene, LevelData, load_gltf_scene, unit_cube, uv_sphere};
+use dreamcoast_core::glam::{Mat4, Vec3};
+use dreamcoast_scene::{LocalTransform, MeshInstance, Name, Parent, World, instantiate_gltf};
+use rhi::{Device, Texture};
+
+use crate::NO_TEXTURE;
+use crate::registry::{
+    MaterialDesc, MaterialRegistry, MeshRegistry, PrimitiveHandles, gltf_normalize,
+    upload_gltf_scene,
+};
+
+/// Whether an asset key names a glTF file (vs a procedural primitive).
+fn is_gltf(asset: &str) -> bool {
+    let a = asset.to_ascii_lowercase();
+    a.ends_with(".glb") || a.ends_with(".gltf")
+}
+
+/// Decompose a column-major `[f32; 16]` world matrix into a `LocalTransform`.
+fn local_from_cols(transform: &[f32; 16]) -> LocalTransform {
+    let (scale, rotation, translation) =
+        Mat4::from_cols_array(transform).to_scale_rotation_translation();
+    LocalTransform {
+        translation,
+        rotation,
+        scale,
+    }
+}
+
+fn desc_from_override(ov: Option<MaterialOverride>) -> MaterialDesc {
+    match ov {
+        Some(o) => MaterialDesc {
+            base_color: o.base_color_factor,
+            metallic: o.metallic,
+            roughness: o.roughness,
+            tex: [NO_TEXTURE; 4],
+        },
+        None => MaterialDesc {
+            base_color: [0.8, 0.8, 0.8, 1.0],
+            metallic: 0.0,
+            roughness: 0.6,
+            tex: [NO_TEXTURE; 4],
+        },
+    }
+}
+
+/// Instantiate a `LevelData` into `world`, uploading geometry/materials/textures into
+/// the registries. glTF assets are imported + normalized to unit size, then placed by
+/// the entity transform; procedural assets spawn a single entity with the override
+/// material. The same glTF file referenced by several entities is imported once.
+pub(crate) fn build_level(
+    device: &Device,
+    level: &LevelData,
+    world: &mut World,
+    meshes: &mut MeshRegistry,
+    materials: &mut MaterialRegistry,
+    textures: &mut Vec<Texture>,
+) -> anyhow::Result<()> {
+    // Cache each glTF asset's import + uploaded handles so a row of the same model
+    // (e.g. lanterns) uploads once.
+    let mut gltf_cache: HashMap<String, (GltfScene, PrimitiveHandles)> = HashMap::new();
+
+    for ent in &level.entities {
+        let place = Mat4::from_cols_array(&ent.transform);
+        if is_gltf(&ent.asset) {
+            if !gltf_cache.contains_key(&ent.asset) {
+                let gscene = load_gltf_scene(&ent.asset)?;
+                let (handles, _cpu) =
+                    upload_gltf_scene(device, &gscene, meshes, materials, textures)?;
+                gltf_cache.insert(ent.asset.clone(), (gscene, handles));
+            }
+            let (gscene, handles) = &gltf_cache[&ent.asset];
+            let imported = instantiate_gltf(world, gscene, handles);
+            // Placement root = entity transform composed with the asset's unit-size
+            // normalization (so authored transforms are in unit-asset space).
+            let place_mat = place * gltf_normalize(gscene).matrix();
+            let root = world.spawn();
+            world.insert(root, local_from_cols(&place_mat.to_cols_array()));
+            world.insert(root, Name(ent.asset.clone()));
+            world.insert(imported, Parent(root));
+        } else {
+            let mesh = match ent.asset.as_str() {
+                "sphere" => uv_sphere(48, 32),
+                "cube" => unit_cube(),
+                other => {
+                    return Err(anyhow::anyhow!("level: unknown procedural asset '{other}'"));
+                }
+            };
+            let mesh_handle = meshes.upload(device, &mesh)?;
+            let material = materials.add(desc_from_override(ent.material_override));
+            world
+                .spawn_node()
+                .with(MeshInstance::new(mesh_handle, material))
+                .with(local_from_cols(&ent.transform));
+        }
+    }
+    Ok(())
+}
+
+/// Discover the `.level` files in `dir`, writing the built-in levels first if missing
+/// (so the files exist for hot-swap + hand editing). Returns the sorted path list.
+pub(crate) fn ensure_level_files(dir: &Path) -> anyhow::Result<Vec<String>> {
+    std::fs::create_dir_all(dir)?;
+    for (name, builder) in [
+        ("gallery.level", gallery_level as fn() -> LevelData),
+        ("lanterns.level", lanterns_level as fn() -> LevelData),
+    ] {
+        let path = dir.join(name);
+        if !path.exists() {
+            builder().save_ron(&path)?;
+        }
+    }
+    let mut paths: Vec<String> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "level"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+/// A column-major translation + uniform-scale transform as a `[f32; 16]`.
+fn trs(x: f32, y: f32, z: f32, s: f32) -> [f32; 16] {
+    (Mat4::from_translation(Vec3::new(x, y, z)) * Mat4::from_scale(Vec3::splat(s))).to_cols_array()
+}
+
+/// The migrated gallery, in declarative form: the avocado glTF + chrome/copper
+/// spheres + a red cube (mirrors the hardcoded gallery's layout/materials).
+pub(crate) fn gallery_level() -> LevelData {
+    use dreamcoast_asset::level::{Camera, Environment};
+    LevelData {
+        entities: vec![
+            LevelEntity {
+                asset: "assets/model.glb".into(),
+                transform: trs(0.0, 0.0, 0.0, 1.0),
+                material_override: None,
+            },
+            LevelEntity {
+                asset: "sphere".into(),
+                transform: trs(-1.7, 0.75, 0.5, 0.75),
+                material_override: Some(MaterialOverride {
+                    base_color_factor: [0.95, 0.96, 0.97, 1.0],
+                    metallic: 1.0,
+                    roughness: 0.08,
+                }),
+            },
+            LevelEntity {
+                asset: "sphere".into(),
+                transform: trs(1.9, 0.5, -0.4, 0.5),
+                material_override: Some(MaterialOverride {
+                    base_color_factor: [0.95, 0.64, 0.54, 1.0],
+                    metallic: 1.0,
+                    roughness: 0.35,
+                }),
+            },
+            LevelEntity {
+                asset: "cube".into(),
+                transform: trs(0.0, 0.45, -2.0, 0.45),
+                material_override: Some(MaterialOverride {
+                    base_color_factor: [0.85, 0.25, 0.2, 1.0],
+                    metallic: 0.0,
+                    roughness: 0.5,
+                }),
+            },
+        ],
+        lights: vec![],
+        camera: Camera::default(),
+        environment: Environment::default(),
+    }
+}
+
+/// A row of Lantern instances — exercises instancing the same glTF hierarchy several
+/// times from a level file.
+pub(crate) fn lanterns_level() -> LevelData {
+    use dreamcoast_asset::level::{Camera, Environment, Light};
+    let lantern = |x: f32| LevelEntity {
+        asset: "assets/Lantern.glb".into(),
+        transform: trs(x, 0.0, 0.0, 0.9),
+        material_override: None,
+    };
+    LevelData {
+        entities: vec![lantern(-2.2), lantern(0.0), lantern(2.2)],
+        lights: vec![Light {
+            kind: LightKind::Directional,
+            vec: [-0.4, -1.0, -0.3],
+            color: [1.0, 0.95, 0.9],
+            intensity: 3.0,
+        }],
+        camera: Camera::default(),
+        environment: Environment::default(),
+    }
+}

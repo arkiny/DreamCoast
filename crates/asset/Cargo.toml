@@ -11,3 +11,7 @@ gltf.workspace = true
 # Backend-agnostic types — used only for the shared CPU mip-chain generator so
 # cooked BCn mips match the uncompressed upload path (no GPU dependency).
 rhi-types.workspace = true
+# Declarative level (de)serialization (Phase 12 Stage C). RON text now; the binary
+# .dclevel cook (Stage E) reuses the same serde-ready LevelData model.
+serde.workspace = true
+ron.workspace = true
