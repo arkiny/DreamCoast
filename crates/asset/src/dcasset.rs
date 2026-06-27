@@ -453,6 +453,45 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_with_textures() {
+        // A 2x1 base-color + a 1x1 normal texture; the other two slots stay None.
+        let mut mesh = sample_mesh();
+        mesh.material.base_color = Some(ImageData {
+            width: 2,
+            height: 1,
+            rgba8: vec![10, 20, 30, 40, 50, 60, 70, 80],
+        });
+        mesh.material.normal = Some(ImageData {
+            width: 1,
+            height: 1,
+            rgba8: vec![128, 128, 255, 255],
+        });
+
+        let bytes = write(&mesh, 1);
+        let (_, decoded) = read(&bytes).expect("decode");
+        assert_mesh_eq(&mesh, &decoded);
+
+        let bc = decoded.material.base_color.expect("base_color present");
+        assert_eq!((bc.width, bc.height), (2, 1));
+        assert_eq!(bc.rgba8, vec![10, 20, 30, 40, 50, 60, 70, 80]);
+        let n = decoded.material.normal.expect("normal present");
+        assert_eq!((n.width, n.height), (1, 1));
+        assert_eq!(n.rgba8, vec![128, 128, 255, 255]);
+        // Slots that were None must round-trip back to None (no stray chunks).
+        assert!(decoded.material.metallic_roughness.is_none());
+        assert!(decoded.material.emissive.is_none());
+    }
+
+    #[test]
+    fn only_present_textures_become_chunks() {
+        // No textures -> exactly one chunk (the mesh); the chunk_count u32 sits at
+        // the end of the fixed header.
+        let bytes = write(&sample_mesh(), 0);
+        let count = u32::from_le_bytes(bytes[HEADER_SIZE - 4..HEADER_SIZE].try_into().unwrap());
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn bad_magic_is_rejected() {
         let mut bytes = write(&sample_mesh(), 0);
         bytes[0] = b'X';
