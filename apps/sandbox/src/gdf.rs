@@ -95,6 +95,10 @@ pub(crate) struct GdfSystem {
     /// relight budget, + the compute pipeline that fills it. `None` until the cache is built.
     card_vis: Option<StorageBuffer>,
     cache_vis_pipeline: Option<ComputePipeline>,
+    /// QHD/UHD track: surface-cache atlas tile edge (texels/card side), runtime so content can use
+    /// a smaller tile (cheaper, resolution-INDEPENDENT relight) while the gallery keeps `CARD_TILE`
+    /// (byte-identical). Set in `build_surface_cache`; all cache shaders take it as a push param.
+    card_tile: u32,
     /// Stage B (clipmap): the scene-GDF descriptor storage buffer the SW-RT shaders read
     /// to select a level — 48 bytes/level `{ aabb_min, aabb_max, sdf_idx, albedo_idx[3] }`,
     /// finest→coarsest. A single-level descriptor (the gallery) reproduces the legacy
@@ -405,6 +409,7 @@ impl GdfSystem {
             cache_light_pipeline,
             card_vis: None,
             cache_vis_pipeline,
+            card_tile: CARD_TILE,
             clip_desc: None,
             clip_count: 0,
             clip_levels: Vec::new(),
@@ -734,10 +739,12 @@ impl GdfSystem {
         device: &Device,
         cards: &[u8],
         num_cards: u32,
+        tile: u32,
     ) -> anyhow::Result<()> {
         if self.cache_capture_pipeline.is_none() || num_cards == 0 {
             return Ok(());
         }
+        self.card_tile = tile.clamp(4, 64);
         self.cards = Some(device.create_storage_buffer_init(
             &StorageBufferDesc {
                 size: cards.len() as u64,
@@ -746,7 +753,7 @@ impl GdfSystem {
             },
             cards,
         )?);
-        let texels = (num_cards * CARD_TILE * CARD_TILE) as u64;
+        let texels = (num_cards * self.card_tile * self.card_tile) as u64;
         let make = || -> anyhow::Result<Option<StorageBuffer>> {
             Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
                 size: texels * 16,
@@ -799,7 +806,7 @@ impl GdfSystem {
         let pos = self.cache_pos.as_ref()?.storage_index();
         let write = (self.cache_frame % 2) as usize;
         let rad = self.cache_radiance[write].as_ref()?.storage_index();
-        Some((cards, pos, rad, self.num_cards, CARD_TILE))
+        Some((cards, pos, rad, self.num_cards, self.card_tile))
     }
 
     /// Stage D2b: fill the per-card visibility buffer for this frame's camera (frustum planes,
@@ -882,7 +889,7 @@ impl GdfSystem {
             .expect("rad")
             .storage_index();
         let num_cards = self.num_cards;
-        let num_texels = num_cards * CARD_TILE * CARD_TILE;
+        let num_texels = num_cards * self.card_tile * self.card_tile;
         let sampled = vol.sampled_index();
         let clip = self.clip_descriptor().unwrap_or((0, 1));
         let clip_vols = self.clip_level_volumes();
@@ -921,7 +928,7 @@ impl GdfSystem {
                     rad_write,
                     sampled,
                     num_cards,
-                    CARD_TILE,
+                    self.card_tile,
                     num_texels,
                     spp,
                     frame,
@@ -972,7 +979,7 @@ impl GdfSystem {
             .storage_index();
         let albedo = albedo_ext.and(self.scene_albedo.as_ref());
         let num_cards = self.num_cards;
-        let num_texels = num_cards * CARD_TILE * CARD_TILE;
+        let num_texels = num_cards * self.card_tile * self.card_tile;
         let sampled = vol.sampled_index();
         let clip = self.clip_descriptor().unwrap_or((0, 1));
         let clip_vols = self.clip_level_volumes();
@@ -1016,8 +1023,19 @@ impl GdfSystem {
                 };
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&cache_capture_push(
-                    cards, cpos, calb, sampled, num_cards, CARD_TILE, num_texels, albedo_rgb,
-                    clip.0, clip.1, aabb_min, aabb_max, diag,
+                    cards,
+                    cpos,
+                    calb,
+                    sampled,
+                    num_cards,
+                    self.card_tile,
+                    num_texels,
+                    albedo_rgb,
+                    clip.0,
+                    clip.1,
+                    aabb_min,
+                    aabb_max,
+                    diag,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())
@@ -1055,7 +1073,13 @@ impl GdfSystem {
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&cache_view_push(
-                    cpos, src_index, out_index, num_cards, CARD_TILE, cw, ch,
+                    cpos,
+                    src_index,
+                    out_index,
+                    num_cards,
+                    self.card_tile,
+                    cw,
+                    ch,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
