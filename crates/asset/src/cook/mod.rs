@@ -13,9 +13,11 @@
 //! Submodules: [`texture`] (BCn compression policy + tiers), [`scene`] (the scene
 //! SDF / albedo bakes).
 
+mod level;
 mod scene;
 mod texture;
 
+pub use level::load_or_cook_level;
 pub use scene::{load_or_bake_scene_albedo, load_or_bake_scene_sdf};
 pub use texture::TexCompress;
 

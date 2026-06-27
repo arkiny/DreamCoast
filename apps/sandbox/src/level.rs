@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use dreamcoast_asset::cook::load_or_cook_level;
 use dreamcoast_asset::level::{Entity as LevelEntity, LightKind, MaterialOverride};
 use dreamcoast_asset::{GltfScene, LevelData, load_gltf_scene, unit_cube, uv_sphere};
 use dreamcoast_core::glam::{Mat4, Vec3};
@@ -22,6 +23,20 @@ use crate::registry::{
     MaterialDesc, MaterialRegistry, MeshRegistry, PrimitiveHandles, gltf_normalize,
     upload_gltf_scene,
 };
+
+/// Load a `.level` through the cook (Phase 12 Stage E): the RON cooks to a binary
+/// `.dcasset` on first load and is read from that cache thereafter (no RON re-parse).
+/// The cache key is the level's file name (stable, cwd-independent).
+pub(crate) fn load(path: &Path) -> anyhow::Result<LevelData> {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    let key = format!("levels/{name}");
+    let (level, outcome) = load_or_cook_level(path, &key, &crate::app::cooked_cache_dir())?;
+    tracing::info!("level '{}' ({outcome:?})", path.display());
+    Ok(level)
+}
 
 /// Whether an asset key names a glTF file (vs a procedural primitive).
 fn is_gltf(asset: &str) -> bool {
@@ -120,6 +135,7 @@ pub(crate) fn ensure_level_files(dir: &Path) -> anyhow::Result<Vec<String>> {
     for (name, builder) in [
         ("gallery.level", gallery_level as fn() -> LevelData),
         ("lanterns.level", lanterns_level as fn() -> LevelData),
+        ("sponza.level", sponza_level as fn() -> LevelData),
     ] {
         let path = dir.join(name);
         if !path.exists() {
@@ -202,6 +218,23 @@ pub(crate) fn lanterns_level() -> LevelData {
             color: [1.0, 0.95, 0.9],
             intensity: 3.0,
         }],
+        camera: Camera::default(),
+        environment: Environment::default(),
+    }
+}
+
+/// A single Sponza instance — the large multi-material asset used for the Stage E
+/// cooked-level verification. (Sponza is fetched locally via tools/fetch-sponza;
+/// loading this level errors cleanly if it's absent.)
+pub(crate) fn sponza_level() -> LevelData {
+    use dreamcoast_asset::level::{Camera, Environment};
+    LevelData {
+        entities: vec![LevelEntity {
+            asset: "assets/Sponza/Sponza.gltf".into(),
+            transform: trs(0.0, 0.0, 0.0, 1.0),
+            material_override: None,
+        }],
+        lights: vec![],
         camera: Camera::default(),
         environment: Environment::default(),
     }
