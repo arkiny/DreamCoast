@@ -67,6 +67,59 @@
 - 보수적 스테이지(A/B/C) 갤러리 바이트 동일; 품질 영향(D)은 RenderQuality 티어 + 잔차 측정. 정직 보고
   (어느 패스가 얼마 줄었는지 표).
 
+## Stage 0 — 측정 결과 (2026-06-27, RTX 2070 SUPER, 1280×720, RENDER_QUALITY 미설정=Med)
+
+`PROFILE_GPU=1 LEVEL=sponza … --screenshot-clean`. 스티디 스테이트(워밍업 아님, 4프레임 안정).
+패스별 GPU ms, 양 백엔드 + 데모 앵글 + 2개 대체 앵글.
+
+| 패스 | 전선 | DX 데모 | VK 데모 | DX 네이브* | DX 오버뷰† |
+|---|---|---:|---:|---:|---:|
+| **sdf_cache_light** | **B** | **357.5** | **773.6** | **461.8** | **446.5** |
+| **gdf_gi** | **B** | **120.0** | **246.0** | **145.5** | **17.4** |
+| gdf_reflect | B | 11.6 | 15.1 | 10.8 | 7.6 |
+| reflect_temporal | B | 0.56 | 0.56 | 0.57 | 0.61 |
+| gdf_atrous ×2 | B | 0.75 | 1.31 | 0.69 | 0.73 |
+| gdf_temporal | B | 0.19 | 0.21 | 0.18 | 0.18 |
+| ssr | B | 0.22 | 0.22 | 0.04 | 0.27 |
+| reflect_composite | B | 0.04 | 0.04 | 0.04 | 0.04 |
+| shadow | **A** | 0.78 | 1.28 | 0.78 | 0.78 |
+| gbuffer | **A** | 0.71 | 0.76 | 0.84 | 0.85 |
+| lighting+lit_history+tonemap+ui | 기타 | 0.19 | 0.25 | 0.19 | 0.21 |
+| **프레임 총합 (GPU)** | | **492.6** | **1039.3** | **621.4** | **475.2** |
+
+\* `CAM_EYE="-14,2,0" CAM_TARGET="14,2,0"` (네이브 길이 방향). † `CAM_EYE="10,12,8" CAM_TARGET="0,2,0"` (탑다운 오버뷰).
+
+### 귀속 (Top-3 + 전선 비중)
+- **(B) GDF SW-RT ≈ 프레임의 99%.** **(A) 지오메트리(shadow+gbuffer) ≈ 1.5ms = ~0.3%(DX)/~0.2%(VK).** 기타 <0.3ms.
+- **GPU 바운드, 컴퓨트 지배** (패스 합 ≈ 보고된 총합 = GPU 타임스탬프 구간; 두 컴퓨트 패스가 전부).
+- **Top-1 `sdf_cache_light` (DX 357 / VK 774ms)** — 카메라와 **거의 무관**(네이브 462, 오버뷰 446 — 뷰 독립).
+  근본 원인: `record_cache_light`가 매 프레임 **전 카드 아틀라스**(`num_cards×32² ≤ 1.05M 텍셀`)를 **고정
+  spp=8**로 **무조건** 재조명(예산/피드백/가시성 우선순위 없음; temporal α=0.35만 누적). `dispatch(num_texels/64)`.
+  → **Stage D2(재조명 예산/피드백)가 단일 최대 레버.** Med에서 `reflect_cache=true`가 이 패스를 켠다(반사 히트 캐시 소비자).
+- **Top-2 `gdf_gi` (DX 120 / VK 246ms)** — 풀스크린 × spp × march, **뷰 의존**(오버뷰 17ms로 급감 = 화면 GI 픽셀 수).
+  → **Stage D1(하프해상)·D3(march/LOD).**
+- **Top-3 `gdf_reflect` (7–15ms)** — → D1/D3 부차.
+
+### 측정이 지배하는 결론 (노력 배분 재정렬)
+1. **사용자가 제안한 컬링(A: 프러스텀/오클루전/커버리지)은 GPU 프레임타임을 의미 있게 못 줄인다** — 지오 제출
+   (shadow+gbuffer)이 통틀어 ~1.5ms뿐. 문서의 정직한 프레이밍이 **측정으로 확증**됨. 16.6ms 목표엔 ~96.5% 절감
+   필요한데 컬링 상한이 ~1.5ms. → **Stage A/B/C는 60fps 경로에서 보류**(CPU 제출 비용/더 조밀한 씬 확장성용으로만
+   추후, GPU 예산엔 무관).
+2. **확정 스테이지 순서: D2 → D1/D3 → (필요시) 재조명 켜짐 정책 재검토 → A/B 보류.**
+   - **Stage D2 먼저**: `sdf_cache_light`를 매 프레임 전량 재조명 → **per-frame relight 예산 + 라운드로빈/가시성
+     우선순위**(persistent radiance는 이미 있음 = temporal α). 1.05M 텍셀을 예: 1/4·1/8로 분할 상각 → 357ms를
+     비례 절감. 양 백엔드 동일 구조(VK 2.1× 절대값 차이는 throughput, 파리티 버그 아님).
+   - **Stage D1/D3 다음**: `gdf_gi` 하프해상 트레이스+디노이저 업스케일(≈4× 레이↓) + march/clipmap LOD.
+   - 두 레버로도 16.6ms 미달 시: Med에서 `reflect_cache`(→`sdf_cache_light` 강제)의 비용 대비 효용을 티어로
+     재검토(반사 캐시를 High 전용/하프해상 캐시로).
+3. **백엔드 노트**: VK가 두 컴퓨트 패스에서 DX 대비 ~2.1× 느림(동일 알고리즘) — 디스패치 점유율/occupancy
+   격차로 추정. **렌더 픽셀 파리티(DX≡VK)와 무관한 throughput 차이**지만, D2/D1 최적화 시 VK 절대 예산이 더
+   빡빡하므로 **양 백엔드 모두 ≤16.6ms 게이트**를 엄격 적용.
+
+> 다음 작업: **Stage D2** 착수(`gdf.rs record_cache_light` + `gi.rs`/`quality.rs`에 relight 예산 노브). 게이트:
+> PROFILE_GPU before/after, 양 백엔드, DX≡VK ≤0.001, 갤러리 무회귀(캐시 패스는 갤러리 미사용 → 자동 바이트 동일),
+> Sponza GDF GI 품질 `tools/rt-compare.py` 잔차 수용, Vulkan 검증 클린, fmt+clippy.
+
 ## 설계 제약 (CLAUDE.md 5원칙)
 1. **근본 원인**: 마이크로 패치 금지. 비용의 근원(풀스크린 레이 수 / 카드 텍셀 수 / 미컬링 드로우)을 줄인다.
 2. **측정 주도**: `PROFILE_GPU`가 성공 지표. 모든 before/after를 ms로 보고.
