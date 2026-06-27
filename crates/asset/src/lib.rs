@@ -6,6 +6,7 @@ use std::path::Path;
 
 use dreamcoast_core::EngineError;
 
+pub mod bc;
 pub mod cook;
 pub mod dcasset;
 pub mod sdf;
