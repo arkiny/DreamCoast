@@ -307,14 +307,35 @@ pub(crate) fn sponza_level() -> LevelData {
             transform: trs(0.0, 0.0, 0.0, 1.0),
             material_override: None,
         }],
-        // Lights live in the level asset, serialized by kind. Sponza is lit by a single
-        // directional sun angled down into the open courtyard (no code-default lights).
-        lights: vec![Light {
-            kind: LightKind::Directional,
-            vec: [0.3, -0.9, 0.25],
-            color: [1.0, 0.96, 0.9],
-            intensity: 4.0,
-        }],
+        // Lights live in the level asset, serialized by kind (directional `vec` is the
+        // travel direction). A directional sun into the open courtyard plus warm/cool
+        // point lights down the nave — a test bed for the lighting model + future GI.
+        lights: vec![
+            Light {
+                kind: LightKind::Directional,
+                vec: [0.3, -0.9, 0.25],
+                color: [1.0, 0.96, 0.9],
+                intensity: 4.0,
+            },
+            Light {
+                kind: LightKind::Point,
+                vec: [1.0, 1.2, -2.0],
+                color: [1.0, 0.6, 0.3], // warm, near the camera in the nave
+                intensity: 50.0,
+            },
+            Light {
+                kind: LightKind::Point,
+                vec: [8.0, 1.5, -3.0],
+                color: [1.0, 0.6, 0.3], // warm, down the nave
+                intensity: 60.0,
+            },
+            Light {
+                kind: LightKind::Point,
+                vec: [-4.0, 1.5, 3.0],
+                color: [0.4, 0.5, 1.0], // cool fill across the courtyard
+                intensity: 40.0,
+            },
+        ],
         // The iconic Sponza atrium angle: standing in the open courtyard looking down
         // the length, the draped arcades receding on both sides.
         camera: Camera {

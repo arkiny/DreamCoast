@@ -155,8 +155,12 @@ struct LevelLighting {
 /// (overridden by an explicit directional light), and up to 4 point lights.
 fn level_lighting(level: &dreamcoast_asset::LevelData) -> LevelLighting {
     use dreamcoast_asset::level::LightKind;
+    // A level authors a directional light's `vec` as the direction the light *travels*
+    // (the glTF convention — "the sun shines down" = a downward vector). The renderer's
+    // `sun_direction` is the direction *toward* the sun, so negate.
+    let toward_sun = |v: [f32; 3]| [-v[0], -v[1], -v[2]];
     let env = level.environment;
-    let mut sun_dir = env.sun_dir;
+    let mut sun_dir = toward_sun(env.sun_dir);
     let mut sun_intensity = env.sun_intensity;
     let mut point_pos = [[0.0f32; 4]; 4];
     let mut point_color = [[0.0f32; 4]; 4];
@@ -164,7 +168,7 @@ fn level_lighting(level: &dreamcoast_asset::LevelData) -> LevelLighting {
     for l in &level.lights {
         match l.kind {
             LightKind::Directional => {
-                sun_dir = l.vec;
+                sun_dir = toward_sun(l.vec);
                 sun_intensity = l.intensity;
             }
             LightKind::Point if count < 4 => {
