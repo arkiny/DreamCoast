@@ -8,6 +8,7 @@ use dreamcoast_core::EngineError;
 
 pub mod cook;
 pub mod dcasset;
+pub mod sdf;
 
 /// A mesh vertex (matches `rhi::VertexLayout::Mesh`: 32-byte stride).
 #[repr(C)]
