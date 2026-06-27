@@ -711,6 +711,22 @@ impl Device {
         }
     }
 
+    /// Create a 3D volume seeded with host `data` — a deterministic CPU bake
+    /// uploaded verbatim instead of a GPU compute bake (Phase 12 M2). `data` is
+    /// `width*height*depth` voxels in `x + dim*(y + dim*z)` order. The volume is
+    /// left ready to sample (trilinear). Both backends upload identical bytes, so
+    /// the field is byte-identical across Vulkan and D3D12 by construction.
+    pub fn create_volume_init(&self, desc: &VolumeDesc, data: &[u8]) -> Result<Volume> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => Ok(Volume::Vulkan(d.create_volume_init(desc, data)?)),
+            #[cfg(windows)]
+            Self::D3d12(d) => Ok(Volume::D3d12(d.create_volume_init(desc, data)?)),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => Ok(Volume::Metal(d.create_volume_init(desc, data)?)),
+        }
+    }
+
     /// Create a render-target cubemap (6 faces, `mip_levels` each) for IBL.
     pub fn create_cubemap(&self, desc: &CubemapDesc) -> Result<Cubemap> {
         match self {

@@ -178,7 +178,9 @@ impl D3d12Texture {
     }
 }
 
-fn heap(ty: windows::Win32::Graphics::Direct3D12::D3D12_HEAP_TYPE) -> D3D12_HEAP_PROPERTIES {
+pub(crate) fn heap(
+    ty: windows::Win32::Graphics::Direct3D12::D3D12_HEAP_TYPE,
+) -> D3D12_HEAP_PROPERTIES {
     D3D12_HEAP_PROPERTIES {
         Type: ty,
         CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
@@ -188,7 +190,7 @@ fn heap(ty: windows::Win32::Graphics::Direct3D12::D3D12_HEAP_TYPE) -> D3D12_HEAP
     }
 }
 
-fn buffer_desc(size: u64) -> D3D12_RESOURCE_DESC {
+pub(crate) fn buffer_desc(size: u64) -> D3D12_RESOURCE_DESC {
     D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Alignment: 0,
@@ -206,7 +208,7 @@ fn buffer_desc(size: u64) -> D3D12_RESOURCE_DESC {
     }
 }
 
-fn transition(
+pub(crate) fn transition(
     list: &ID3D12GraphicsCommandList,
     resource: &ID3D12Resource,
     before: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES,

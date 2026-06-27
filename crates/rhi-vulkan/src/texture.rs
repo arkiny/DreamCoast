@@ -181,7 +181,7 @@ impl Drop for VulkanTexture {
 }
 
 /// Create a host-visible staging buffer pre-filled with `pixels`.
-fn create_staging(
+pub(crate) fn create_staging(
     device: &DeviceShared,
     pixels: &[u8],
 ) -> Result<(vk::Buffer, vk::DeviceMemory), EngineError> {
@@ -218,7 +218,7 @@ fn create_staging(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn image_barrier(
+pub(crate) fn image_barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,
