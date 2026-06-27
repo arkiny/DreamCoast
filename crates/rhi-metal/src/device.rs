@@ -864,6 +864,68 @@ impl MetalDevice {
         ))
     }
 
+    /// Create a 3D volume seeded with host `data` (Phase 12 M2: a CPU-baked SDF
+    /// uploaded instead of a GPU bake). `data` is `width*height*depth` voxels in
+    /// `x + dim*(y + dim*z)` order. `Shared` storage lets the CPU fill it via
+    /// `replaceRegion` directly (Apple Silicon unified memory — no staging/blit).
+    pub fn create_volume_init(
+        &self,
+        desc: &rhi_types::VolumeDesc,
+        data: &[u8],
+    ) -> Result<crate::resources::MetalVolume> {
+        let bpp = bytes_per_pixel(desc.format);
+        let (w, h, d) = (
+            desc.width.max(1) as usize,
+            desc.height.max(1) as usize,
+            desc.depth.max(1) as usize,
+        );
+        let td = MTLTextureDescriptor::new();
+        td.setTextureType(MTLTextureType::Type3D);
+        td.setPixelFormat(pixel_format(desc.format));
+        unsafe {
+            td.setWidth(w);
+            td.setHeight(h);
+            td.setDepth(d);
+            td.setMipmapLevelCount(1);
+        }
+        td.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
+        td.setStorageMode(MTLStorageMode::Shared);
+        let texture = self
+            .shared
+            .device
+            .newTextureWithDescriptor(&td)
+            .ok_or_else(|| rhi_err("volume newTexture failed"))?;
+
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize {
+                width: w,
+                height: h,
+                depth: d,
+            },
+        };
+        let ptr = NonNull::new(data.as_ptr() as *mut c_void)
+            .ok_or_else(|| rhi_err("create_volume_init: null data pointer"))?;
+        unsafe {
+            texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+                region,
+                0,
+                0,
+                ptr,
+                w * bpp,
+                w * h * bpp,
+            );
+        }
+
+        let sampled_index = self.shared.register_volume(&texture);
+        let storage_index = self.shared.register_storage_volume(&texture);
+        Ok(crate::resources::MetalVolume::new(
+            texture,
+            sampled_index,
+            storage_index,
+        ))
+    }
+
     /// Create an offscreen color render target (color attachment + bindless
     /// sampled) with its own dedicated allocation.
     pub fn create_render_target(&self, desc: &RenderTargetDesc) -> Result<MetalRenderTarget> {

@@ -688,6 +688,16 @@ impl D3d12Device {
         crate::volume::D3d12Volume::new(self.shared.clone(), desc)
     }
 
+    /// Create a 3D volume seeded with host `data` (Phase 12 M2: CPU-baked SDF
+    /// uploaded instead of a GPU bake), left ready to sample.
+    pub fn create_volume_init(
+        &self,
+        desc: &rhi_types::VolumeDesc,
+        data: &[u8],
+    ) -> Result<crate::volume::D3d12Volume, EngineError> {
+        crate::volume::D3d12Volume::new_init(self.shared.clone(), desc, data)
+    }
+
     pub fn render_target_memory(
         &self,
         desc: &RenderTargetDesc,

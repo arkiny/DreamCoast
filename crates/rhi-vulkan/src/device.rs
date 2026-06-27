@@ -911,6 +911,16 @@ impl VulkanDevice {
         crate::volume::VulkanVolume::new(self.shared.clone(), desc)
     }
 
+    /// Create a 3D volume seeded with host `data` (Phase 12 M2: CPU-baked SDF
+    /// uploaded instead of a GPU bake), left ready to sample.
+    pub fn create_volume_init(
+        &self,
+        desc: &rhi_types::VolumeDesc,
+        data: &[u8],
+    ) -> Result<crate::volume::VulkanVolume, EngineError> {
+        crate::volume::VulkanVolume::new_init(self.shared.clone(), desc, data)
+    }
+
     /// Memory footprint of an aliasable render target (for graph alias planning).
     pub fn render_target_memory(
         &self,

@@ -5,20 +5,27 @@
 //! (NON_PIXEL_SHADER_RESOURCE), mirroring the 2D storage render target.
 
 use std::cell::Cell;
+use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use dreamcoast_core::EngineError;
 use rhi_types::VolumeDesc;
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
-    D3D12_MEMORY_POOL_UNKNOWN, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE3D,
-    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-    D3D12_RESOURCE_STATES, D3D12_TEXTURE_LAYOUT_UNKNOWN, ID3D12Resource,
+    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD,
+    D3D12_MEMORY_POOL_UNKNOWN, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_DESC,
+    D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_GENERIC_READ,
+    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATES,
+    D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+    D3D12_TEXTURE_LAYOUT_UNKNOWN, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
 use crate::device::DeviceShared;
 use crate::instance::d3d_err;
+use crate::texture::{buffer_desc, heap, transition};
 use crate::to_dxgi_format;
 
 /// A device-local 3D texture registered in both bindless volume tables.
@@ -80,6 +87,131 @@ impl D3d12Volume {
                 sampled_index,
                 storage_index,
                 state: Cell::new(initial),
+            })
+        }
+    }
+
+    /// Create a 3D volume seeded with host `data` (Phase 12 M2: a CPU-baked SDF
+    /// uploaded instead of a GPU bake). `data` is `width*height*depth` voxels in
+    /// `x + dim*(y + dim*z)` order. Allocates the texture in COPY_DEST, copies the
+    /// bytes through an UPLOAD buffer (respecting the 256-byte row pitch across all
+    /// height*depth rows), and transitions to NON_PIXEL_SHADER_RESOURCE to sample.
+    pub(crate) fn new_init(
+        device: Rc<DeviceShared>,
+        desc: &VolumeDesc,
+        data: &[u8],
+    ) -> Result<Self, EngineError> {
+        unsafe {
+            let res_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+                Alignment: 0,
+                Width: desc.width.max(1) as u64,
+                Height: desc.height.max(1),
+                DepthOrArraySize: desc.depth.max(1) as u16,
+                MipLevels: 1,
+                Format: to_dxgi_format(desc.format),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            };
+            let mut res: Option<ID3D12Resource> = None;
+            device
+                .device
+                .CreateCommittedResource(
+                    &heap(D3D12_HEAP_TYPE_DEFAULT),
+                    D3D12_HEAP_FLAG_NONE,
+                    &res_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut res,
+                )
+                .map_err(d3d_err)?;
+            let resource = res.ok_or_else(|| EngineError::Rhi("volume null".into()))?;
+
+            // Copyable footprint of the single 3D subresource: padded row pitch, the
+            // row count per depth slice, the unpadded source row size, and total size.
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut num_rows = 0u32;
+            let mut row_size = 0u64;
+            let mut total = 0u64;
+            device.device.GetCopyableFootprints(
+                &res_desc,
+                0,
+                1,
+                0,
+                Some(&mut fp),
+                Some(&mut num_rows),
+                Some(&mut row_size),
+                Some(&mut total),
+            );
+
+            let mut upload: Option<ID3D12Resource> = None;
+            device
+                .device
+                .CreateCommittedResource(
+                    &heap(D3D12_HEAP_TYPE_UPLOAD),
+                    D3D12_HEAP_FLAG_NONE,
+                    &buffer_desc(total),
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut upload,
+                )
+                .map_err(d3d_err)?;
+            let upload = upload.ok_or_else(|| EngineError::Rhi("upload buffer null".into()))?;
+
+            // Fill the upload buffer: every (slice, row) tightly-packed source row
+            // copied to its padded destination row. For a 3D texture the slices are
+            // contiguous, so height*depth rows of `RowPitch` cover the whole volume.
+            let dst_pitch = fp.Footprint.RowPitch as usize;
+            let src_pitch = row_size as usize;
+            let rows = num_rows as usize * desc.depth.max(1) as usize;
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut ptr)).map_err(d3d_err)?;
+            let base = (ptr as *mut u8).add(fp.Offset as usize);
+            for row in 0..rows {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(row * src_pitch),
+                    base.add(row * dst_pitch),
+                    src_pitch.min(data.len().saturating_sub(row * src_pitch)),
+                );
+            }
+            upload.Unmap(0, None);
+
+            device.immediate_submit(|list| {
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(&resource))),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(std::mem::transmute_copy(&upload))),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: fp,
+                    },
+                };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                transition(
+                    list,
+                    &resource,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                );
+            })?;
+
+            let sampled_index = device.register_volume(&resource, desc.format);
+            let storage_index =
+                device.register_storage_volume(&resource, desc.format, desc.depth.max(1));
+            Ok(Self {
+                resource,
+                sampled_index,
+                storage_index,
+                state: Cell::new(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             })
         }
     }
