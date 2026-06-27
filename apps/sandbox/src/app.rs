@@ -89,6 +89,15 @@ pub(crate) fn interactive_screenshot_path() -> String {
     format!("screenshot_{secs}.png")
 }
 
+/// CAPTURE_SEQ frame path: insert a zero-padded index before the extension
+/// (`out.png` -> `out.0000.png`) so a sequence dumps to adjacent files.
+pub(crate) fn seq_capture_path(base: &str, i: u64) -> String {
+    match base.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}.{i:04}.{ext}"),
+        None => format!("{base}.{i:04}"),
+    }
+}
+
 /// Save BGRA readback bytes (rows padded to `layout.row_pitch`) as a PNG. The
 /// swapchain stores sRGB-encoded bytes, so they map straight to a PNG after the
 /// B<->R channel swap; padding is dropped per row.

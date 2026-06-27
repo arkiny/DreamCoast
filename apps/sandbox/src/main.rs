@@ -448,6 +448,11 @@ struct App {
     is_gallery: bool,
     screenshot_mode: bool,
     captures: Vec<Capture>,
+    /// QHD/UHD measurement: `CAPTURE_SEQ=N` dumps N consecutive frames with the camera
+    /// advancing a fixed deterministic step each frame (temporal-stability frame-to-frame
+    /// diff). `None` = the normal fixed-camera capture. Measurement-only (never the parity
+    /// baseline path).
+    capture_seq: Option<u32>,
     validation_on: bool,
     async_compute_supported: bool,
     path_spp: u32,
@@ -1458,6 +1463,10 @@ impl App {
             is_gallery: gallery_scene,
             screenshot_mode,
             captures,
+            capture_seq: std::env::var("CAPTURE_SEQ")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&n| n > 0),
             validation_on,
             async_compute_supported,
             path_spp: 8,
@@ -1711,6 +1720,16 @@ impl App {
         let sim_dt = dt.clamp(0.0, 1.0 / 30.0);
         if !self.screenshot_mode {
             self.angle += dt * 0.6; // hold a fixed view when capturing
+        } else if self.capture_seq.is_some() {
+            // CAPTURE_SEQ: advance the camera a fixed deterministic step per frame so the
+            // dumped sequence exercises the temporal passes under motion (stability diff).
+            // `CAPTURE_SEQ_STEP` (radians/frame, default 0.015) tunes it; 0 = static (a
+            // shimmer/convergence test — the sequence should diff to ~0 when stable).
+            let step = std::env::var("CAPTURE_SEQ_STEP")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.015);
+            self.angle += step;
         }
 
         // Stage 0: Tab toggles the free-fly camera (interactive only — never during a
@@ -1754,9 +1773,21 @@ impl App {
         let f2_pressed = f2 && !self.f2_prev;
         self.f2_prev = f2;
         let capture_this_frame: Option<Capture> = if self.screenshot_mode {
-            self.frame_no
-                .checked_sub(warmup)
-                .and_then(|i| self.captures.get(i as usize).cloned())
+            match self.capture_seq {
+                // CAPTURE_SEQ: frames [warmup, warmup+N) each dump to `<path>.NNNN.png`.
+                Some(n) => self
+                    .frame_no
+                    .checked_sub(warmup)
+                    .filter(|&i| i < n as u64)
+                    .map(|i| Capture {
+                        path: seq_capture_path(&self.captures[0].path, i),
+                        include_ui: self.captures[0].include_ui,
+                    }),
+                None => self
+                    .frame_no
+                    .checked_sub(warmup)
+                    .and_then(|i| self.captures.get(i as usize).cloned()),
+            }
         } else if f2_pressed {
             Some(Capture {
                 path: interactive_screenshot_path(),
@@ -3673,8 +3704,13 @@ impl App {
         self.fif = (self.fif + 1) % FRAMES_IN_FLIGHT;
         self.frame_no += 1;
 
-        // In screenshot mode, stop once every requested capture is saved.
-        if self.screenshot_mode && self.frame_no >= warmup + self.captures.len() as u64 {
+        // In screenshot mode, stop once every requested capture is saved (CAPTURE_SEQ
+        // dumps N frames, else one per requested path).
+        let total_captures = self
+            .capture_seq
+            .map(|n| n as u64)
+            .unwrap_or(self.captures.len() as u64);
+        if self.screenshot_mode && self.frame_no >= warmup + total_captures {
             return Ok(false);
         }
         Ok(true)
