@@ -20,6 +20,7 @@
 // the lighting pass applies the camera exposure to the whole ambient + direct sum.
 
 #include "bindless.slang"
+#include "clipmap.slang"
 #include "surface_cache.slang"
 
 static const float PI = 3.14159265359;
@@ -46,8 +47,8 @@ struct GiPush
     uint4 cache;            // C8b3: cards, cache_pos, cache_rad, num_cards (cards=0xFFFFFFFF = off)
     uint cache_tile;        // surface-cache atlas tile edge
     float clamp_max;        // firefly clamp: max bounce-sample radiance component (1e30 = off)
-    uint pad_c1;
-    uint pad_c2;
+    uint clip_desc;         // Stage B: clipmap descriptor storage-buffer index
+    uint clip_count;        // Stage B: clipmap level count (1 = single volume = legacy)
     float3 ground_albedo;   // analytic ground material (not in the albedo volume)
 };
 
@@ -86,27 +87,26 @@ float3 cosine_hemisphere(float3 n, inout uint rng)
     return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
 }
 
-// --- GDF field (same trilinear sample + ground union as gdf_trace.slang). ---
+// --- GDF field via the clipmap (single level ⇒ identical to the legacy single volume +
+// ground union of gdf_trace.slang). ---
+ClipMap gi_clip()
+{
+    ClipMap c;
+    c.desc = pc.clip_desc;
+    c.count = pc.clip_count;
+    return c;
+}
+
 float geo_inside(float3 p)
 {
-    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
-    if (any(uvw < 0.0) || any(uvw > 1.0))
-        return 1e3;
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
+    return cm_geo_inside(gi_clip(), p, pc.aabb_max.w);
 }
 
 // Geometry distance for marching: outside the box, return the (clamped) box distance so
 // the empty bounding box never reads as a surface while the ray steps sensibly.
 float geo_march(float3 p)
 {
-    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
-    if (any(uvw < 0.0) || any(uvw > 1.0))
-    {
-        float3 q = abs(p - 0.5 * (GDF_MIN + GDF_MAX)) - 0.5 * (GDF_MAX - GDF_MIN);
-        float box = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-        return max(box, 0.003);
-    }
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
+    return cm_geo_march(gi_clip(), p, pc.aabb_max.w);
 }
 
 float scene_march(float3 p)
@@ -123,12 +123,7 @@ float scene_occ(float3 p)
 // bound (albedo_r == 0xFFFFFFFF). The albedo grid shares the distance field's voxel grid.
 float3 albedo_at(float3 p)
 {
-    if (pc.albedo_r == 0xFFFFFFFFu)
-        return float3(pc.params.w, pc.params.w, pc.params.w);
-    float3 uvw = saturate((p - GDF_MIN) / (GDF_MAX - GDF_MIN));
-    return float3(g.volumes[pc.albedo_r].SampleLevel(g.samp, uvw, 0.0).x,
-                  g.volumes[pc.albedo_g].SampleLevel(g.samp, uvw, 0.0).x,
-                  g.volumes[pc.albedo_b].SampleLevel(g.samp, uvw, 0.0).x);
+    return cm_albedo(gi_clip(), p, pc.params.w);
 }
 
 float3 scene_normal(float3 p)

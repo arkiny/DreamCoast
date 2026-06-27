@@ -701,6 +701,8 @@ pub(crate) fn gdf_gi_push(
     hit_albedo: f32,
     cache: [u32; 5],
     clamp_max: f32,
+    clip_desc: u32,
+    clip_count: u32,
     ground_albedo: [f32; 3],
 ) -> [u8; 224] {
     let mut pc = [0u8; 224];
@@ -743,6 +745,10 @@ pub(crate) fn gdf_gi_push(
     }
     // Firefly clamp (pad_c0 slot after cache_tile): 1e30 = off.
     pc[196..200].copy_from_slice(&clamp_max.to_le_bytes());
+    // Stage B clipmap descriptor (former pad_c1/pad_c2 slots): storage-buffer index +
+    // level count (1 = single volume = legacy single-level field).
+    pc[200..204].copy_from_slice(&clip_desc.to_le_bytes());
+    pc[204..208].copy_from_slice(&clip_count.to_le_bytes());
     // Analytic-ground albedo (float3 at offset 208): floor bounce hits re-light with this
     // instead of albedo_at() (no ground data in the volume -> nearest object's colour).
     for (i, v) in ground_albedo.iter().enumerate() {
