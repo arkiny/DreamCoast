@@ -131,7 +131,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 36, // 4 G-buffer indices + flip_y + shadow + gdf_ao + gdf_gi + reflect
+            push_constant_size: 40, // G-buffer indices + flip_y + shadow + gdf_ao + gdf_gi + reflect + two_sided
             bindless: true,
             uniform_buffer: true,
             depth_test: false,
@@ -349,6 +349,7 @@ impl DeferredRenderer {
         reflect: Option<ResourceId>,
         globals_offset: u64,
         flip_y: u32,
+        two_sided: bool,
     ) {
         let mut reads = vec![
             gbuf.albedo,
@@ -394,6 +395,7 @@ impl DeferredRenderer {
                     ao_index,
                     gi_index,
                     reflect_index,
+                    two_sided as u32,
                 ));
                 cmd.draw(3, 1);
                 Ok(())
@@ -497,6 +499,7 @@ fn gbuffer_push(
 /// Pack the lighting push block: 4 G-buffer indices + flip_y + shadow_index +
 /// gdf_ao_index + gdf_gi_index + reflect_index (36 bytes). The GDF / reflect indices are
 /// `u32::MAX` when the C2 AO / C3 GI / C7c hybrid-reflection images are absent.
+#[allow(clippy::too_many_arguments)]
 fn pbr_push(
     indices: [u32; 4],
     flip_y: u32,
@@ -504,8 +507,9 @@ fn pbr_push(
     gdf_ao_index: u32,
     gdf_gi_index: u32,
     reflect_index: u32,
-) -> [u8; 36] {
-    let mut pc = [0u8; 36];
+    two_sided: u32,
+) -> [u8; 40] {
+    let mut pc = [0u8; 40];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -514,6 +518,7 @@ fn pbr_push(
     pc[24..28].copy_from_slice(&gdf_ao_index.to_le_bytes());
     pc[28..32].copy_from_slice(&gdf_gi_index.to_le_bytes());
     pc[32..36].copy_from_slice(&reflect_index.to_le_bytes());
+    pc[36..40].copy_from_slice(&two_sided.to_le_bytes());
     pc
 }
 

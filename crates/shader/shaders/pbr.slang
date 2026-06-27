@@ -38,6 +38,7 @@ struct PushConstants
     uint gdf_ao_index; // Stage-C2 GDF AO image (0xFFFFFFFF = absent)
     uint gdf_gi_index; // Stage-C3 GDF indirect-irradiance image (0xFFFFFFFF = absent)
     uint reflect_index; // Stage-C7c hybrid SW-RT reflection image (0xFFFFFFFF = legacy IBL prefilter cube)
+    uint two_sided; // 1 = orient the G-buffer normal toward the viewer (two-sided surfaces)
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -339,6 +340,13 @@ float4 fsMain(VSOutput input) : SV_Target
     float3 world_pos = pos.xyz;
     float3 n = normalize(normal);
     float3 v = normalize(globals.camera_pos.xyz - world_pos);
+    // Two-sided surfaces (e.g. an imported building's single-sided walls seen from the
+    // inside): the engine rasterizes with no back-face culling, so a back-face arrives
+    // with its geometric normal pointing away from the camera. Orient it toward the
+    // viewer so it shades correctly. View-dependent (not SV_IsFrontFace) to stay
+    // winding/Y-flip agnostic across backends.
+    if (pc.two_sided != 0 && dot(n, v) < 0.0)
+        n = -n;
     float3 f0 = lerp(float3(0.04), albedo, metallic);
 
     float3 lo = float3(0.0);
