@@ -45,6 +45,7 @@ mod reflect;
 mod registry;
 mod rt;
 mod smoketest;
+mod world;
 use app::*;
 use cull::*;
 use deferred::*;
@@ -349,6 +350,9 @@ struct App {
     level_paths: Vec<String>,
     current_level: usize,
     pending_level: Option<usize>,
+    // Stage D streaming: present in world mode (`WORLD`). Owns the level graph + the
+    // resident chunk arenas; the per-frame draw list comes from it instead of `world`.
+    streaming: Option<world::Streaming>,
     ground_vbuf: Buffer,
     ground_ibuf: Buffer,
     ground_count: u32,
@@ -580,23 +584,28 @@ impl App {
         };
 
         // Build the scene as ECS entities: the procedural gallery (default), a full
-        // glTF scene (`SCENE_GLTF=<path>`, Stage B), or a declarative level
-        // (`LEVEL=<name>`, Stage C). A ground plane is kept separate (it's also the
-        // environment-capture geometry). `sphere`/`cube` are always built — the gallery
-        // uses them, and they're cheap.
+        // glTF scene (`SCENE_GLTF=<path>`, Stage B), a declarative level (`LEVEL=<name>`,
+        // Stage C), or a streaming world of chunks (`WORLD`, Stage D). A ground plane is
+        // kept separate (it's also the environment-capture geometry). `sphere`/`cube`
+        // are always built — the gallery uses them, and they're cheap.
         let r = model_radius;
         let sphere = dreamcoast_asset::uv_sphere(48, 32);
         let cube = dreamcoast_asset::unit_cube();
-        // `LEVEL` (any value, optionally a level file stem to pick) enables level mode.
-        let level_select = std::env::var("LEVEL").ok();
-        let scene_gltf_path = if level_select.is_some() {
+        // Scene-mode env vars (precedence: WORLD > LEVEL > SCENE_GLTF > gallery).
+        let world_mode = std::env::var_os("WORLD").is_some();
+        let level_select = if world_mode {
+            None
+        } else {
+            std::env::var("LEVEL").ok()
+        };
+        let scene_gltf_path = if world_mode || level_select.is_some() {
             None
         } else {
             std::env::var("SCENE_GLTF").ok()
         };
-        // The gallery is the only scene with the GDF/HW-RT path; glTF + levels use the
-        // captured-cube IBL (forced via `legacy_ibl` below).
-        let gallery_scene = level_select.is_none() && scene_gltf_path.is_none();
+        // The gallery is the only scene with the GDF/HW-RT path; glTF + levels + worlds
+        // use the captured-cube IBL (forced via `legacy_ibl` below).
+        let gallery_scene = !world_mode && level_select.is_none() && scene_gltf_path.is_none();
         let levels_dir = std::path::PathBuf::from("apps/sandbox/levels");
 
         // Registries own the GPU meshes + material descriptors the scene's handles
@@ -607,8 +616,23 @@ impl App {
         // Level-mode hot-swap state: the discovered `.level` files + the loaded index.
         let mut level_paths: Vec<String> = Vec::new();
         let mut current_level = 0usize;
+        // Stage D: the streaming manager (world mode only). Chunks load on demand from
+        // the camera, so `world`/registries above stay empty in this mode.
+        let mut streaming: Option<world::Streaming> = None;
 
-        if let Some(select) = &level_select {
+        if world_mode {
+            // Stage D: load the level graph + the level files its chunks reference.
+            level::ensure_level_files(&levels_dir)?;
+            let world_path = world::ensure_world_file(&levels_dir)?;
+            let graph = dreamcoast_asset::LevelGraph::load_ron(&world_path)?;
+            info!(
+                "world '{}': {} chunks, stream_radius {}",
+                world_path.display(),
+                graph.chunks.len(),
+                graph.stream_radius
+            );
+            streaming = Some(world::Streaming::new(graph, levels_dir.clone()));
+        } else if let Some(select) = &level_select {
             // Stage C: load a declarative level (auto-writing the built-in levels first).
             level_paths = level::ensure_level_files(&levels_dir)?;
             current_level = level_paths
@@ -632,6 +656,7 @@ impl App {
                 &mut mesh_registry,
                 &mut material_registry,
                 &mut textures,
+                Vec3::ZERO,
             )?;
         } else if let Some(path) = &scene_gltf_path {
             // Stage B: import the whole node hierarchy + every primitive/material/image.
@@ -729,9 +754,25 @@ impl App {
         dreamcoast_scene::propagate_transforms(&mut world);
 
         // Materialize the ECS draw list into the flat `SceneObject` list the GPU passes
-        // consume. (Static scene → built once; later stages rebuild on scene change.)
+        // consume. (Static scene → built once; later stages rebuild on scene change. In
+        // world mode `world` is empty — the per-frame list comes from the streamer.)
         let scene = build_scene(&world, &mesh_registry, &material_registry);
-        let scene_radius = r * 3.0;
+        // World mode spans multiple chunks, so the ground (and camera framing) must be
+        // larger than the single-scene default.
+        let scene_radius = if world_mode { 14.0 } else { r * 3.0 };
+        // World mode drives streaming from a free-fly camera. Seed its eye from
+        // `WORLD_CAM="x,y,z"` (default above the chunk row, looking along it) so a
+        // headless capture can position the camera; interactively, WASD flies it.
+        let world_fly = world_mode.then(|| {
+            let eye = std::env::var("WORLD_CAM")
+                .ok()
+                .and_then(|v| {
+                    let n: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                    (n.len() == 3).then(|| Vec3::new(n[0], n[1], n[2]))
+                })
+                .unwrap_or(Vec3::new(0.0, 4.0, 9.0));
+            camera::FlyCamera::from_look(eye, Vec3::new(eye.x, 0.0, 0.0), scene_radius * 0.4)
+        });
         // RT instance-table mesh sources, aligned 1:1 with the draw list (TLAS order).
         // Only the gallery builds the HW-RT scene accel; glTF/level paths pass nothing
         // (RtSystem::new skips the table when `build_scene_accel` is false).
@@ -1179,6 +1220,7 @@ impl App {
             level_paths,
             current_level,
             pending_level: None,
+            streaming,
             ground_vbuf,
             ground_ibuf,
             ground_count,
@@ -1287,8 +1329,12 @@ impl App {
             angle: diag_angle.unwrap_or(if screenshot_mode { 0.7 } else { 0.0 }),
             diag_obj,
             diag_pitch,
-            cam_mode: camera::CameraMode::Orbit,
-            fly: None,
+            cam_mode: if world_mode {
+                camera::CameraMode::Fly
+            } else {
+                camera::CameraMode::Orbit
+            },
+            fly: world_fly,
             tab_prev: false,
         })
     }
@@ -1325,6 +1371,7 @@ impl App {
             &mut mesh_registry,
             &mut material_registry,
             &mut textures,
+            Vec3::ZERO,
         )?;
         dreamcoast_scene::propagate_transforms(&mut world);
         self.world = world;
@@ -1467,9 +1514,13 @@ impl App {
 
         // Materialize this frame's draw list from the ECS world (the single source of
         // truth). Static scene → identical every frame; the rebuild is cheap (no GPU
-        // re-upload, just handle resolution + Rc clones). Later stages rebuild this when
-        // entities spawn/despawn.
-        let scene = build_scene(&self.world, &self.mesh_registry, &self.material_registry);
+        // re-upload, just handle resolution + Rc clones). In world mode the list comes
+        // from the streamer instead (rebuilt after the camera moves, below).
+        let mut scene = if self.streaming.is_some() {
+            Vec::new()
+        } else {
+            build_scene(&self.world, &self.mesh_registry, &self.material_registry)
+        };
 
         // Orbiting camera framing the whole sample scene — or, in single-object
         // diagnostic mode, a tight orbit centred on one scene object so it can be
@@ -1495,17 +1546,35 @@ impl App {
         };
         // Stage 0: in fly mode, override the orbit framing with the free camera. Seed
         // it from the orbit view on first entry so the switch is seamless. Headless
-        // captures never reach here (cam_mode stays Orbit), so the baseline is fixed.
-        let (focus, eye) = if self.cam_mode == camera::CameraMode::Fly && !self.screenshot_mode {
+        // captures stay in Orbit for the gallery baseline; world mode (Stage D) is the
+        // exception — it flies even headless (static at `WORLD_CAM`) so streaming can be
+        // positioned and captured.
+        let fly_active = self.cam_mode == camera::CameraMode::Fly
+            && (!self.screenshot_mode || self.streaming.is_some());
+        let (focus, eye) = if fly_active {
             let seed_speed = self.scene_radius * 0.8;
             let fly = self
                 .fly
                 .get_or_insert_with(|| camera::FlyCamera::from_look(eye, focus, seed_speed));
-            fly.update(self.window.input(), dt);
+            if !self.screenshot_mode {
+                fly.update(self.window.input(), dt);
+            }
             (fly.focus(), fly.position)
         } else {
             (focus, eye)
         };
+
+        // Stage D: stream chunks in/out around the camera, then rebuild the draw list
+        // from the resident chunks (each chunk's transforms already include its origin).
+        if let Some(streaming) = &mut self.streaming {
+            if streaming.update(&self.device, eye)? {
+                info!(
+                    "streaming: resident chunks {:?}",
+                    streaming.loaded_indices()
+                );
+            }
+            scene = streaming.build_scene();
+        }
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
         let proj_noflip =
             Mat4::perspective_rh(60f32.to_radians(), cw as f32 / ch as f32, 0.05, 100.0);
@@ -1594,6 +1663,7 @@ impl App {
                 level_paths,
                 current_level,
                 pending_level,
+                streaming,
                 ..
             } = self;
             let async_compute_supported = *async_compute_supported;
@@ -1607,6 +1677,19 @@ impl App {
                         dt * 1000.0
                     ));
                     ui.text(format!("scene: {} objects + ground", scene.len()));
+                    // Stage D: streaming chunk readout (world mode). Fly (WASD) across the
+                    // chunk row to stream them in/out.
+                    if let Some(s) = streaming.as_ref() {
+                        let loaded = s.loaded_indices();
+                        ui.text(format!(
+                            "world: {}/{} chunks (r={:.0})",
+                            loaded.len(),
+                            s.chunk_count(),
+                            s.stream_radius()
+                        ));
+                        let names: Vec<&str> = loaded.iter().map(|&i| s.chunk_name(i)).collect();
+                        ui.text(format!("  loaded: [{}]", names.join(", ")));
+                    }
                     // Stage C: level hot-swap dropdown (level mode only). Selecting a level
                     // requests a rebuild applied at the next frame's start (deferred so the
                     // GPU can idle first). The file names (stems) label the entries.

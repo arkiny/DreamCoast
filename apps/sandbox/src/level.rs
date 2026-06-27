@@ -68,13 +68,16 @@ pub(crate) fn build_level(
     meshes: &mut MeshRegistry,
     materials: &mut MaterialRegistry,
     textures: &mut Vec<Texture>,
+    // World-space offset applied to every entity (Stage D chunk placement; Vec3::ZERO
+    // for a standalone level).
+    origin: Vec3,
 ) -> anyhow::Result<()> {
     // Cache each glTF asset's import + uploaded handles so a row of the same model
     // (e.g. lanterns) uploads once.
     let mut gltf_cache: HashMap<String, (GltfScene, PrimitiveHandles)> = HashMap::new();
 
     for ent in &level.entities {
-        let place = Mat4::from_cols_array(&ent.transform);
+        let place = Mat4::from_translation(origin) * Mat4::from_cols_array(&ent.transform);
         if is_gltf(&ent.asset) {
             if !gltf_cache.contains_key(&ent.asset) {
                 let gscene = load_gltf_scene(&ent.asset)?;
@@ -104,7 +107,7 @@ pub(crate) fn build_level(
             world
                 .spawn_node()
                 .with(MeshInstance::new(mesh_handle, material))
-                .with(local_from_cols(&ent.transform));
+                .with(local_from_cols(&place.to_cols_array()));
         }
     }
     Ok(())
