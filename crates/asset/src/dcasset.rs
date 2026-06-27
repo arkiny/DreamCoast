@@ -23,6 +23,7 @@
 use dreamcoast_core::EngineError;
 
 use crate::bc::BcFormat;
+use crate::level::{Camera, Entity, Environment, LevelData, Light, LightKind, MaterialOverride};
 use crate::sdf::{AlbedoVolumes, SdfVolume};
 use crate::{ImageData, Material, MeshData, MeshVertex, TexData};
 
@@ -41,6 +42,8 @@ const CHUNK_TEXTURE: u32 = 2;
 const CHUNK_SDF: u32 = 3;
 /// Albedo volumes chunk: `dim`, then three `dim³` R32F channels (R,G,B) (M2 ext).
 const CHUNK_ALBEDO: u32 = 4;
+/// Level / scene chunk: entities + lights + camera + environment (Phase 12 item 2).
+const CHUNK_LEVEL: u32 = 5;
 
 // Texture slot tags (texture chunk `slot` field) — which `Material` field a decoded
 // image fills. Kept distinct from chunk tags so the two namespaces never collide.
@@ -124,6 +127,11 @@ impl Writer {
     fn bytes(&mut self, v: &[u8]) {
         self.buf.extend_from_slice(v);
     }
+    /// A length-prefixed UTF-8 string (`u32` byte length + bytes).
+    fn str(&mut self, s: &str) {
+        self.u32(s.len() as u32);
+        self.buf.extend_from_slice(s.as_bytes());
+    }
 }
 
 // --- little-endian reader ---------------------------------------------------
@@ -158,6 +166,13 @@ impl<'a> Reader<'a> {
 
     fn u32(&mut self) -> Result<u32, EngineError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    /// A length-prefixed UTF-8 string written by [`Writer::str`].
+    fn str(&mut self) -> Result<String, EngineError> {
+        let n = self.u32()? as usize;
+        let bytes = self.take(n)?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| EngineError::Asset("dcasset: invalid utf-8 string".into()))
     }
     fn u64(&mut self) -> Result<u64, EngineError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
@@ -513,6 +528,183 @@ fn decode_albedo(r: &mut Reader) -> Result<AlbedoVolumes, EngineError> {
     Ok(AlbedoVolumes { dim, channels })
 }
 
+// Light kind tags stored in a level chunk.
+const LIGHT_DIRECTIONAL: u32 = 0;
+const LIGHT_POINT: u32 = 1;
+
+/// Serialize a level/scene into a `.dcasset` (single level chunk). `src_hash` is the
+/// invalidation key (e.g. a hash of the authored scene description).
+pub fn write_level(level: &LevelData, src_hash: u64) -> Vec<u8> {
+    let payload = encode_level(level);
+    let payload_start = HEADER_SIZE + DIR_ENTRY_SIZE;
+    let mut w = Writer::default();
+    w.bytes(&MAGIC);
+    w.u32(VERSION);
+    w.u32(0);
+    w.u64(src_hash);
+    w.u64(cook_params_hash());
+    w.u32(1);
+    w.u32(CHUNK_LEVEL);
+    w.u64(payload_start as u64);
+    w.u64(payload.len() as u64);
+    w.bytes(&payload);
+    w.buf
+}
+
+/// Decode a `.dcasset` buffer's level chunk into its [`Header`] and [`LevelData`].
+pub fn read_level(bytes: &[u8]) -> Result<(Header, LevelData), EngineError> {
+    let header = read_header(bytes)?;
+    let mut r = Reader::at(bytes, HEADER_SIZE - 4);
+    let chunk_count = r.u32()?;
+    let mut dir = Vec::with_capacity(chunk_count as usize);
+    for _ in 0..chunk_count {
+        let ty = r.u32()?;
+        let offset = r.u64()? as usize;
+        let size = r.u64()? as usize;
+        dir.push((ty, offset, size));
+    }
+    for (ty, offset, size) in dir {
+        if ty != CHUNK_LEVEL {
+            continue;
+        }
+        let end = offset
+            .checked_add(size)
+            .filter(|&e| e <= bytes.len())
+            .ok_or_else(|| EngineError::Asset("dcasset: level chunk out of bounds".into()))?;
+        let mut cr = Reader::at(&bytes[..end], offset);
+        return Ok((header, decode_level(&mut cr)?));
+    }
+    Err(EngineError::Asset("dcasset: missing level chunk".into()))
+}
+
+fn encode_level(level: &LevelData) -> Vec<u8> {
+    let mut w = Writer::default();
+    // Entities.
+    w.u32(level.entities.len() as u32);
+    for e in &level.entities {
+        w.str(&e.asset);
+        for f in e.transform {
+            w.f32(f);
+        }
+        match &e.material_override {
+            Some(o) => {
+                w.u32(1);
+                for c in o.base_color_factor {
+                    w.f32(c);
+                }
+                w.f32(o.metallic);
+                w.f32(o.roughness);
+            }
+            None => w.u32(0),
+        }
+    }
+    // Lights.
+    w.u32(level.lights.len() as u32);
+    for l in &level.lights {
+        w.u32(match l.kind {
+            LightKind::Directional => LIGHT_DIRECTIONAL,
+            LightKind::Point => LIGHT_POINT,
+        });
+        for c in l.vec {
+            w.f32(c);
+        }
+        for c in l.color {
+            w.f32(c);
+        }
+        w.f32(l.intensity);
+    }
+    // Camera.
+    let c = &level.camera;
+    for v in c.position {
+        w.f32(v);
+    }
+    for v in c.target {
+        w.f32(v);
+    }
+    w.f32(c.fov_y_deg);
+    w.f32(c.znear);
+    w.f32(c.zfar);
+    // Environment.
+    let env = &level.environment;
+    for v in env.sun_dir {
+        w.f32(v);
+    }
+    w.f32(env.sun_intensity);
+    for v in env.sky_tint {
+        w.f32(v);
+    }
+    w.buf
+}
+
+fn decode_level(r: &mut Reader) -> Result<LevelData, EngineError> {
+    let vec3 =
+        |r: &mut Reader| -> Result<[f32; 3], EngineError> { Ok([r.f32()?, r.f32()?, r.f32()?]) };
+
+    let entity_count = r.u32()?;
+    let mut entities = Vec::with_capacity(entity_count as usize);
+    for _ in 0..entity_count {
+        let asset = r.str()?;
+        let mut transform = [0.0f32; 16];
+        for t in &mut transform {
+            *t = r.f32()?;
+        }
+        let material_override = if r.u32()? != 0 {
+            Some(MaterialOverride {
+                base_color_factor: [r.f32()?, r.f32()?, r.f32()?, r.f32()?],
+                metallic: r.f32()?,
+                roughness: r.f32()?,
+            })
+        } else {
+            None
+        };
+        entities.push(Entity {
+            asset,
+            transform,
+            material_override,
+        });
+    }
+
+    let light_count = r.u32()?;
+    let mut lights = Vec::with_capacity(light_count as usize);
+    for _ in 0..light_count {
+        let kind = match r.u32()? {
+            LIGHT_DIRECTIONAL => LightKind::Directional,
+            LIGHT_POINT => LightKind::Point,
+            other => {
+                return Err(EngineError::Asset(format!(
+                    "dcasset: unknown light kind {other}"
+                )));
+            }
+        };
+        lights.push(Light {
+            kind,
+            vec: vec3(r)?,
+            color: vec3(r)?,
+            intensity: r.f32()?,
+        });
+    }
+
+    let camera = Camera {
+        position: vec3(r)?,
+        target: vec3(r)?,
+        fov_y_deg: r.f32()?,
+        znear: r.f32()?,
+        zfar: r.f32()?,
+    };
+    let environment = Environment {
+        sun_dir: vec3(r)?,
+        sun_intensity: r.f32()?,
+        sky_tint: vec3(r)?,
+    };
+
+    Ok(LevelData {
+        entities,
+        lights,
+        camera,
+        environment,
+    })
+}
+
 /// Encode the SDF chunk payload: `dim`, `aabb_min`, `aabb_max`, then the voxels.
 fn encode_sdf(vol: &SdfVolume) -> Vec<u8> {
     let mut w = Writer::default();
@@ -817,6 +1009,64 @@ mod tests {
         assert_eq!(header.source_hash, 0x5151);
         assert_eq!(decoded.dim, 2);
         assert_eq!(decoded.channels, vol.channels);
+    }
+
+    #[test]
+    fn level_chunk_roundtrip() {
+        use crate::level::*;
+        let level = LevelData {
+            entities: vec![
+                Entity {
+                    asset: "assets/model.glb".into(),
+                    transform: [
+                        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 3.0, 4.0,
+                        1.0,
+                    ],
+                    material_override: Some(MaterialOverride {
+                        base_color_factor: [0.2, 0.4, 0.6, 1.0],
+                        metallic: 0.3,
+                        roughness: 0.7,
+                    }),
+                },
+                Entity {
+                    asset: "assets/sphere".into(),
+                    transform: [0.0; 16],
+                    material_override: None,
+                },
+            ],
+            lights: vec![
+                Light {
+                    kind: LightKind::Directional,
+                    vec: [-0.4, -1.0, -0.3],
+                    color: [1.0, 0.95, 0.9],
+                    intensity: 3.0,
+                },
+                Light {
+                    kind: LightKind::Point,
+                    vec: [1.0, 2.0, 3.0],
+                    color: [0.5, 0.6, 1.0],
+                    intensity: 8.0,
+                },
+            ],
+            camera: Camera {
+                position: [0.0, 1.5, 4.0],
+                target: [0.0, 0.5, 0.0],
+                fov_y_deg: 50.0,
+                znear: 0.05,
+                zfar: 200.0,
+            },
+            environment: Environment {
+                sun_dir: [-0.3, -0.9, -0.2],
+                sun_intensity: 4.0,
+                sky_tint: [0.6, 0.7, 0.95],
+            },
+        };
+        let bytes = write_level(&level, 0x1e7e1);
+        let (header, decoded) = read_level(&bytes).expect("decode");
+        assert_eq!(header.source_hash, 0x1e7e1);
+        assert_eq!(decoded, level);
+        // Deterministic.
+        assert_eq!(write_level(&level, 0x1e7e1), bytes);
     }
 
     #[test]
