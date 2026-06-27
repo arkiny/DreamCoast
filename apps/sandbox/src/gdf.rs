@@ -223,7 +223,7 @@ impl GdfSystem {
             dreamcoast_shader::sdf_cache_light_cs_dxil,
             dreamcoast_shader::sdf_cache_light_cs_metallib,
             "sdf_cache_light",
-            112,
+            128,
             [64, 1, 1],
         )?;
         let trace_pipeline = compute(
@@ -699,6 +699,7 @@ impl GdfSystem {
         let num_cards = self.num_cards;
         let num_texels = num_cards * CARD_TILE * CARD_TILE;
         let sampled = vol.sampled_index();
+        let clip = self.clip_descriptor().unwrap_or((0, 1));
         let aabb_min = self.scene_aabb_min;
         let aabb_max = self.scene_aabb_max;
         let diag = {
@@ -742,6 +743,8 @@ impl GdfSystem {
                     if reset { 1.0 } else { 0.35 }, // temporal alpha
                     diag * 0.01,                    // surface bias
                     diag,                           // gather ray max distance
+                    clip.0,
+                    clip.1,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())
@@ -776,6 +779,7 @@ impl GdfSystem {
         let num_cards = self.num_cards;
         let num_texels = num_cards * CARD_TILE * CARD_TILE;
         let sampled = vol.sampled_index();
+        let clip = self.clip_descriptor().unwrap_or((0, 1));
         let aabb_min = self.scene_aabb_min;
         let aabb_max = self.scene_aabb_max;
         let diag = {
@@ -814,7 +818,7 @@ impl GdfSystem {
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&cache_capture_push(
                     cards, cpos, calb, sampled, num_cards, CARD_TILE, num_texels, albedo_rgb,
-                    aabb_min, aabb_max, diag,
+                    clip.0, clip.1, aabb_min, aabb_max, diag,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())
@@ -897,6 +901,8 @@ impl GdfSystem {
             self.record_scene_bake(graph, gdf_ext);
         }
         let sampled = vol.sampled_index();
+        // Stage B: sample the scene field through the clipmap descriptor (1 level today).
+        let clip = self.clip_descriptor().unwrap_or((0, 1));
         // Sample clamp = AABB diagonal: exceeds the field's true max distance so the
         // march never wrongly clamps (the fused bake fills every voxel — no sparse
         // sentinel), while keeping the empty-space step bounded.
@@ -930,6 +936,8 @@ impl GdfSystem {
                     flip_y,
                     sampled,
                     0, // mode 0: sample the baked GDF (no analytic reference)
+                    clip.0,
+                    clip.1,
                     aabb_min,
                     aabb_max,
                     0.0, // world ground plane at y = 0
@@ -1190,6 +1198,8 @@ impl GdfSystem {
                     flip_y,
                     gdf_sampled,
                     mode,
+                    0,               // clip_desc unused (legacy single-volume path)
+                    0,               // clip_count 0 ⇒ sample gdf_sampled directly (B4 unit-cube)
                     [0.0, 0.0, 0.0], // unit-cube GDF extent (B4)
                     [1.0, 1.0, 1.0],
                     0.2, // ground plane height

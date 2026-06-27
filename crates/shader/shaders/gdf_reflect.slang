@@ -17,6 +17,7 @@
 // applies exposure), like the C1 scene-GDF trace.
 
 #include "bindless.slang"
+#include "clipmap.slang"
 #include "surface_cache.slang"
 
 struct ReflectPush
@@ -41,8 +42,8 @@ struct ReflectPush
     uint frame;             // C8j: RNG decorrelation for the per-frame GGX jitter
     uint4 cache;            // C8b3: cards, cache_pos, cache_rad, num_cards (cards=0xFFFFFFFF = off)
     uint cache_tile;        // surface-cache atlas tile edge
-    uint pad_c0;
-    uint pad_c1;
+    uint clip_desc;         // Stage B: clipmap descriptor storage-buffer index
+    uint clip_count;        // Stage B: clipmap level count (1 = single volume = legacy)
     uint pad_c2;
     // float3 must sit on a 16-byte boundary or SPIR-V (vec3 align 16) and DXIL (4-byte pack)
     // disagree on its offset — keep it as its own aligned row.
@@ -86,28 +87,26 @@ float3 sample_ggx(float3 n, float roughness, inout uint rng)
     return normalize(t * (st * cos(phi)) + bvec * (st * sin(phi)) + n * ct);
 }
 
-// Distance to the baked geometry inside the GDF box (trilinear sample, clamped). Outside
-// the box: no geometry. (Same as the C3 GI / B4 trace `geo_inside`.)
+ClipMap reflect_clip()
+{
+    ClipMap c;
+    c.desc = pc.clip_desc;
+    c.count = pc.clip_count;
+    return c;
+}
+
+// Distance to the baked geometry via the clipmap (single level ⇒ identical to the legacy
+// single-volume sample). Outside every level: no geometry.
 float geo_inside(float3 p)
 {
-    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
-    if (any(uvw < 0.0) || any(uvw > 1.0))
-        return 1e3;
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
+    return cm_geo_inside(reflect_clip(), p, pc.aabb_max.w);
 }
 
 // Marching distance: outside the box, return the (clamped) box distance so the empty
 // bounding box never reads as a surface while the ray steps sensibly.
 float geo_march(float3 p)
 {
-    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
-    if (any(uvw < 0.0) || any(uvw > 1.0))
-    {
-        float3 q = abs(p - 0.5 * (GDF_MIN + GDF_MAX)) - 0.5 * (GDF_MAX - GDF_MIN);
-        float box = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-        return max(box, 0.003);
-    }
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
+    return cm_geo_march(reflect_clip(), p, pc.aabb_max.w);
 }
 
 float scene_march(float3 p)
@@ -124,12 +123,7 @@ float scene_occ(float3 p)
 // distance field's voxel grid; gives colored reflections instead of grey.
 float3 albedo_at(float3 p)
 {
-    if (pc.albedo_r == 0xFFFFFFFFu)
-        return float3(pc.params.y, pc.params.y, pc.params.y);
-    float3 uvw = saturate((p - GDF_MIN) / (GDF_MAX - GDF_MIN));
-    return float3(g.volumes[pc.albedo_r].SampleLevel(g.samp, uvw, 0.0).x,
-                  g.volumes[pc.albedo_g].SampleLevel(g.samp, uvw, 0.0).x,
-                  g.volumes[pc.albedo_b].SampleLevel(g.samp, uvw, 0.0).x);
+    return cm_albedo(reflect_clip(), p, pc.params.y);
 }
 
 float3 scene_normal(float3 p)

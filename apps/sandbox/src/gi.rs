@@ -67,7 +67,7 @@ impl GiSystem {
             dreamcoast_shader::gdf_ao_cs_dxil,
             dreamcoast_shader::gdf_ao_cs_metallib,
             "gdf_ao",
-            144,
+            160,
         )?;
         let gi_pipeline = compute(
             dreamcoast_shader::gdf_gi_cs_spirv,
@@ -146,6 +146,7 @@ impl GiSystem {
         cw: u32,
         ch: u32,
         flip_y: u32,
+        clip: (u32, u32),
     ) -> ResourceId {
         let aop = self.ao_pipeline.as_ref().expect("gdf ao pipeline");
         let out = graph.create_storage_image("gdf_ao_out", HDR_FORMAT, extent);
@@ -186,6 +187,8 @@ impl GiSystem {
                     reach,
                     strength,
                     bias,
+                    clip.0,
+                    clip.1,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

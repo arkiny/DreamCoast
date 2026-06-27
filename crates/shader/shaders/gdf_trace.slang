@@ -17,6 +17,7 @@
 // camera exposure + filmic curve, exactly like the Stage-A SW-RT and path-tracer paths.
 
 #include "bindless.slang"
+#include "clipmap.slang"
 
 // The analytic field the bake came from (B2): a sphere at the unit-cube centre.
 // Only used by the `mode` bit0 reference path (the B4 unit-cube correctness check).
@@ -34,8 +35,8 @@ struct GdfPush
     uint flip_y;            // bit0: 1 = Vulkan (clip-space Y down)
     uint gdf_sampled;       // volumes[] (SRV) index of the merged GDF
     uint mode;              // bit0: 1 = analytic reference field instead of the GDF
-    uint pad0;
-    uint pad1;
+    uint clip_desc;         // Stage B: clipmap descriptor storage-buffer index
+    uint clip_count;        // Stage B: clipmap level count (1 = single volume = legacy)
     // The GDF world extent (the volume's AABB) + ground plane height in .w. B4 passes
     // the unit cube + 0.2; Stage C1 passes the world scene AABB + ground y=0.
     float4 aabb_min;        // xyz volume min, w = ground plane Y
@@ -54,37 +55,50 @@ ConstantBuffer<GdfPush> pc : register(b0, space0);
 // geometry, so this returns a large distance: occlusion/shadow queries must not see
 // the empty bounding box as a solid (which would tile the ground with the box's square
 // isocontours). The primary march adds a box proxy separately (`geo_march`).
+ClipMap trace_clip()
+{
+    ClipMap c;
+    c.desc = pc.clip_desc;
+    c.count = pc.clip_count;
+    return c;
+}
+
 float geo_inside(float3 p)
 {
     if ((pc.mode & 1u) != 0u)
         return length(p - REF_CENTRE) - REF_RADIUS;
-
-    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
-    if (any(uvw < 0.0) || any(uvw > 1.0))
-        return 1e3; // outside the box: no geometry here
-    // Clamp the sample so a sparse GDF's empty-voxel sentinel can't make the march
-    // overshoot. The clamp (aabb_max.w) exceeds the field's true max distance — 0.6 for
-    // the unit-cube B4 field, the world extent for the C1 scene field.
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
+    // clip_count == 0: the legacy single-volume path (the B4 unit-cube debug trace, which
+    // samples `gdf_sampled` over `aabb`, not a scene clipmap). The clamp (aabb_max.w)
+    // exceeds the field's true max distance.
+    if (pc.clip_count == 0u)
+    {
+        float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
+        if (any(uvw < 0.0) || any(uvw > 1.0))
+            return 1e3;
+        return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
+    }
+    return cm_geo_inside(trace_clip(), p, pc.aabb_max.w);
 }
 
 // Geometry distance for the *primary* march: like `geo_inside`, but outside the box it
 // returns the (clamped) box distance so the camera ray advances toward the GDF without
-// the box boundary ever registering as a surface. Wrap-addressing is dodged because the
-// sampler is only touched inside [0,1].
+// the box boundary ever registering as a surface.
 float geo_march(float3 p)
 {
     if ((pc.mode & 1u) != 0u)
         return length(p - REF_CENTRE) - REF_RADIUS;
-
-    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
-    if (any(uvw < 0.0) || any(uvw > 1.0))
+    if (pc.clip_count == 0u)
     {
-        float3 q = abs(p - 0.5 * (GDF_MIN + GDF_MAX)) - 0.5 * (GDF_MAX - GDF_MIN);
-        float box = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-        return max(box, 0.003); // never below the hit epsilon -> box is not a surface
+        float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
+        if (any(uvw < 0.0) || any(uvw > 1.0))
+        {
+            float3 q = abs(p - 0.5 * (GDF_MIN + GDF_MAX)) - 0.5 * (GDF_MAX - GDF_MIN);
+            float box = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+            return max(box, 0.003);
+        }
+        return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
     }
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
+    return cm_geo_march(trace_clip(), p, pc.aabb_max.w);
 }
 
 // Scene distance for the primary march (geometry-with-box-proxy unioned with ground).

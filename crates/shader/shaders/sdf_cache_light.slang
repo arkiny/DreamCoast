@@ -9,6 +9,7 @@
 // frame's gather — and the C8b3 GI / reflection consumers — read.
 
 #include "bindless.slang"
+#include "clipmap.slang"
 #include "surface_cache.slang"
 
 static const float PI = 3.14159265359;
@@ -31,13 +32,19 @@ struct CacheLightPush
     float4 aabb_min;      // xyz GDF world min, w = ground plane Y
     float4 aabb_max;      // xyz GDF world max, w = sample distance clamp
     float4 params;        // x sky_fill, y temporal alpha, z surface bias, w ray max dist
+    uint4 clip;           // Stage B clipmap: x = descriptor index, y = level count
 };
 
 [[vk::push_constant]]
 ConstantBuffer<CacheLightPush> pc : register(b0, space0);
 
-#define GDF_MIN (pc.aabb_min.xyz)
-#define GDF_MAX (pc.aabb_max.xyz)
+ClipMap light_clip()
+{
+    ClipMap c;
+    c.desc = pc.clip.x;
+    c.count = pc.clip.y;
+    return c;
+}
 
 uint pcg(inout uint state)
 {
@@ -60,24 +67,15 @@ float3 cosine_hemisphere(float3 n, inout uint rng)
     return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
 }
 
-// Object-only geometry field (no ground union — cards are object surfaces).
+// Object-only geometry field (no ground union — cards are object surfaces). Single level
+// ⇒ identical to the legacy single-volume sample.
 float geo_inside(float3 p)
 {
-    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
-    if (any(uvw < 0.0) || any(uvw > 1.0))
-        return 1e3;
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
+    return cm_geo_inside(light_clip(), p, pc.aabb_max.w);
 }
 float geo_march(float3 p)
 {
-    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
-    if (any(uvw < 0.0) || any(uvw > 1.0))
-    {
-        float3 q = abs(p - 0.5 * (GDF_MIN + GDF_MAX)) - 0.5 * (GDF_MAX - GDF_MIN);
-        float box = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-        return max(box, 0.003);
-    }
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
+    return cm_geo_march(light_clip(), p, pc.aabb_max.w);
 }
 float3 geo_normal(float3 p)
 {

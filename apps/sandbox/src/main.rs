@@ -2414,6 +2414,7 @@ impl App {
                 cw,
                 ch,
                 self.flip_y,
+                scene_clip,
             )),
             _ => None,
         };
@@ -2576,6 +2577,7 @@ impl App {
                     self.frame_no as u32,
                     scene_albedo,
                     reflect_cache_arg,
+                    scene_clip,
                 );
                 // C8j: temporally resolve the stochastic GGX GDF reflection (UE-style; the rough
                 // lobe is sampled by real rays + denoised, so it's correctly blurred without an
@@ -2929,6 +2931,7 @@ impl App {
                 self.frame_no as u32,
                 scene_albedo,
                 reflect_cache_arg,
+                scene_clip,
             )),
             _ => None,
         };
@@ -3003,6 +3006,7 @@ impl App {
                     self.frame_no as u32,
                     scene_albedo,
                     reflect_cache_arg,
+                    scene_clip,
                 );
                 // Standalone viz: no temporal resolve buffers here, so feed the GDF reflection
                 // straight into the composite (the resolve runs only in the lighting-fed path).
