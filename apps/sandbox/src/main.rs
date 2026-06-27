@@ -296,7 +296,19 @@ fn run() -> anyhow::Result<()> {
     let model_radius = bounds.radius;
 
     let title = format!("DreamCoast Sandbox — {backend:?}");
-    let mut window = Window::new(&title, 1280, 720)?;
+    // The window client size IS the final (present) resolution: render_scale fractions it for the
+    // internal scene render, and the upscale (TAAU / tonemap) reconstructs back to this size.
+    // `WINDOW_RES=WxH` opens at the display size for QHD/UHD output (clamped by the OS work area);
+    // default HD 1280x720 keeps the headless screenshot baselines unchanged.
+    let (win_w, win_h) = std::env::var("WINDOW_RES")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once(['x', 'X', ','])?;
+            Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))
+        })
+        .map(|(w, h)| (w.clamp(320, 7680), h.clamp(240, 4320)))
+        .unwrap_or((1280, 720));
+    let mut window = Window::new(&title, win_w, win_h)?;
     let (w, h) = window.size();
 
     // Validation is a launch-time choice (instance-level): on by default, off via
@@ -1323,11 +1335,13 @@ impl App {
             Some((w, h))
         });
         // QHD/UHD track: internal render scale (production knob). `RENDER_SCALE` overrides the tier.
+        // Min internal scale clamped to 0.6667 (2/3): below that the TAAU upscale can't reconstruct
+        // enough detail for a sharp result (per the QHD/UHD plan).
         let render_scale = std::env::var("RENDER_SCALE")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
             .unwrap_or(qp.render_scale)
-            .clamp(0.25, 1.0);
+            .clamp(0.6667, 1.0);
         let profiler_on = std::env::var("PROFILE_GPU").is_ok();
         let slot_pass_names: Vec<Vec<String>> = vec![Vec::new(); FRAMES_IN_FLIGHT];
         let render_finished = build_render_finished(&device, swapchain.image_count())?;
