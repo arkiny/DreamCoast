@@ -46,7 +46,7 @@ engine/                 # cargo workspace root
 │   ├── jobs/           # work-stealing 잡 시스템 / 태스크 그래프 (P15, S)
 │   ├── physics/        # 피직스 facade(중립 타입) — physics-rapier/jolt 백엔드 (P16, S/B)
 │   ├── audio/          # 오디오 facade — audio-kira/miniaudio 백엔드 (P17, S/B)
-│   ├── script/         # 스크립트 facade — script-lua(mlua)/wasm 백엔드 (P25, S/B)
+│   ├── script/         # 스크립트 facade — script-luau(기본, mlua) + script-wasm(샌드박스, wasmtime) (P25, S/B)
 │   ├── net/            # 네트워킹 facade — 리플리케이션/트랜스포트 백엔드 (P30, S/B)
 │   ├── ui/             # 게임 리테인드 UI + 텍스트 셰이핑 + i18n (P26, S)
 │   ├── vfx/            # Niagara式 파티클/VFX 그래프 (P28, S)
@@ -310,7 +310,7 @@ facade trait 뒤에 성숙 라이브러리 백엔드를 격리 → 차후 자체
 - **T1→T2 렌더 완성도** — **20 AA(TAA)+포스트 스택+투명/OIT [S]**(P14 모션벡터) · **21 다광원
   클러스터드+CSM+데칼+프로브 [S]** · **22 대기/볼류메트릭 [S]** · **23 월드(지형/식생/물/버추얼 텍스처)
   [S]** · **24 머티리얼 그래프+고급 셰이딩(SSS/헤어/클로스) [S]**.
-- **T2 게임플레이 breadth** — **25 스크립팅 [S/B]**(facade + mlua/WASM) · **26 게임 UI [S/B]**(리테인드+
+- **T2 게임플레이 breadth** — **25 스크립팅 [S/B]**(facade + **Luau 기본**(mlua luau feature) + WASM 샌드박스) · **26 게임 UI [S/B]**(리테인드+
   텍스트 셰이핑+i18n) · **27 고급 애니메이션 [S]**(스테이트머신/블렌드트리·IK·리타깃, P14 확장) ·
   **28 VFX 저작 [S]**(Niagara式, P7 위) · **29 AI/내비 [S/B]**(navmesh+BT) · **30 네트워킹/리플리케이션
   [S/B]**.
@@ -331,7 +331,7 @@ facade trait 뒤에 성숙 라이브러리 백엔드를 격리 → 차후 자체
 - **RT 추상화**: SBT 레이아웃·AS 빌드 인터페이스의 두 API 공통화 난이도 높음. Phase 8.
 - **FBX 외부 의존 + 버퍼 다용도**: `cc`+ufbx 벤더링/FBX SDK 게이트 다운로드(승인 대상), 스킨 캐시 버퍼의
   `Vertex|Storage|AccelInput` 상태 전이 두 API 통일, 비균등 스케일 노멀 매트릭스. Phase 14.
-- **상용 확장(Phase 15+)**: 서드파티 의존 승인(Rapier/Jolt·kira·mlua·Recast 등, facade 뒤 격리), 결정성
+- **상용 확장(Phase 15+)**: 서드파티 의존 승인(Rapier/Jolt·kira·Luau(mlua)/wasmtime·Recast 등, facade 뒤 격리), 결정성
   vs 멀티스레드/피직스(고정 타임스텝), 에디터↔런타임 결합(리플렉션/직렬화 선결), 범위 폭주(수직 슬라이스
   절단 유지), 백엔드 추상화 누수. 세부: [commercial-engine-gap-analysis.md](commercial-engine-gap-analysis.md).
 
