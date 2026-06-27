@@ -14,6 +14,10 @@
 # Downloaded sample assets (fetched at runtime; cube fallback otherwise)
 /assets/
 
+# Cooked-asset cache (Phase 12 M1; .dcasset binaries cooked from glTF on a cache
+# miss). Local-only, re-cooked on demand — not committed (§ M4-aligned policy).
+/cache/
+
 # Screenshot output (--screenshot[/-clean] flags, F2 captures)
 /tmp/
 /screenshot_*.png
