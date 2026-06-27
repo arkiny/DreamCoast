@@ -2660,6 +2660,9 @@ impl App {
             swrt_reflect_out,
             globals_offset,
             self.flip_y,
+            // Two-sided shading for imported scenes (single-sided walls seen from inside);
+            // the gallery stays single-sided so its baseline is byte-identical.
+            !self.is_gallery,
         );
         // C7c: capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
         // Reads the lit `hdr` (not the post-blur), so it sequences after the lighting pass.
