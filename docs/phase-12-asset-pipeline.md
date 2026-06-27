@@ -113,10 +113,23 @@ DX≡VK 0.000/ch(max 5=기준선)** — GPU→CPU 전환 무회귀, SW-RT 결과
   이 에셋엔 유리, BC7은 고주파 컬러용(유닛 테스트가 우위 입증). 측정-구동 선택지로 티어 제공.
 - 후속: BC7 멀티모드/파티션(품질↑), 압축 기본화 RenderQuality 결속, 실제 게임 텍스처 VRAM 측정.
 
+### 아이템 2 — `.dclevel` 씬/레벨 청크 ✅ (`8b7259b`, Phase 13 Stage E 기반)
+`crates/asset/src/level.rs` `LevelData{entities, lights, camera, environment}` — 엔티티는 쿡된
+에셋을 **논리 키로 참조** + 월드 트랜스폼 + 머티리얼 오버라이드, 라이트(directional/point), 카메라, 환경.
+GPU 핸들 없음(런타임이 ref 해석). dcasset `CHUNK_LEVEL`(=5) + write_level/read_level(같은 컨테이너,
+Writer/Reader에 길이접두 UTF-8 문자열 추가). round-trip+결정성 테스트. **라이브 렌더 구동(데이터-주도
+씬 셋업)은 Phase 13** — 여기선 포맷만 확정해 레벨 저작/쿡 가능하게.
+
+### 아이템 3 — 볼륨 readback (GPU→CPU) ✅ (`63855f7`)
+M2가 업로드만 추가했던 볼륨 I/O 완성: `Device::read_volume`(create_volume_init의 역). w·h·d·bpp 타이트
+바이트. vulkan(host buffer+copy_image_to_buffer, 타이트), d3d12(READBACK heap+256B footprint→행 de-pad),
+metal(getBytes). 샌드박스 `P12_VERIFY_VOLUME=1`=업로드 SDF 리드백 후 바이트 비교. **검증: 442368B, 양
+백엔드 0 mismatch**(DX row-pitch de-pad 검증). GPU 산출 볼륨을 데이터 레벨에서 쿡/검증 가능.
+
 ### M3+ — 컨테이너 확장 (후속, 선택)
 - 추가 베이크 페이로드(BVH, 라이트맵, 프로브)를 청크로. Phase 10/11 산출물과 연계.
 - 에셋 의존성 그래프 등은 필요 시 설계.
-- **씬/레벨 청크 (Phase 13 결속):** `.dclevel`/`.dcworld`를 같은 컨테이너에 청크 타입으로 추가 —
+- **씬/레벨 청크 Phase 13 본구현:** 위 `.dclevel` 포맷을 실제 씬그래프에 결속 (Stage E) —
   엔티티(애셋 source-hash 참조)+트랜스폼+머티리얼 오버라이드+라이트/카메라/환경, 월드는 청크 그래프
   (인접·월드 배치·스트리밍 반경)를 직렬화. Phase 13 Stage E가 이 M3을 채운다. 자세히는
   [phase-13-scene-graph.md](phase-13-scene-graph.md) "직렬화 & 차후 애셋화".
