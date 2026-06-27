@@ -113,6 +113,11 @@ pub struct QualityPreset {
     /// upsample (1/4 the rays) (`P11_REFLECT_HALF_RES`). Forced off for the gallery anchor
     /// (full-res = byte-identical). Reuses `gdf_gi_upsample.slang`.
     pub reflect_half_res: bool,
+    /// QHD/UHD track: internal render-resolution scale (fraction of the display extent the scene
+    /// renders at; tonemap upscales to the display) (`RENDER_SCALE`). `1.0` = native (byte-
+    /// identical). The seam for a future dynamic-resolution controller; default 1.0 at every tier
+    /// (the scale that hits a given fps depends on the display resolution + target, not the tier).
+    pub render_scale: f32,
 }
 
 /// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
@@ -137,6 +142,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_half_res: true,
             cache_relight_spp: 2,
             reflect_half_res: true,
+            render_scale: 1.0,
         },
         // Default — identical to the pre-tier behavior. Do not change without re-baselining no-reg.
         RenderQuality::Med => QualityPreset {
@@ -159,6 +165,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_half_res: true,
             cache_relight_spp: 1,
             reflect_half_res: true,
+            render_scale: 1.0,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
@@ -179,6 +186,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_half_res: false,
             cache_relight_spp: 8,
             reflect_half_res: false,
+            render_scale: 1.0,
         },
     }
 }
