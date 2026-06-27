@@ -707,6 +707,19 @@ impl D3d12Device {
         crate::volume::D3d12Volume::new_init(self.shared.clone(), desc, data)
     }
 
+    /// Read a 3D volume back to host memory (Phase 12 item 3): `w*h*d*bpp` tightly
+    /// packed bytes (`x + dim*(y + dim*z)` order).
+    pub fn read_volume(
+        &self,
+        volume: &crate::volume::D3d12Volume,
+        w: u32,
+        h: u32,
+        d: u32,
+        bytes_per_voxel: u32,
+    ) -> Result<Vec<u8>, EngineError> {
+        volume.read_back(&self.shared, w, h, d, bytes_per_voxel)
+    }
+
     pub fn render_target_memory(
         &self,
         desc: &RenderTargetDesc,

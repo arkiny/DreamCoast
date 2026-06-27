@@ -986,6 +986,43 @@ impl MetalDevice {
         ))
     }
 
+    /// Read a 3D volume back to host memory (Phase 12 item 3): `w*h*d*bpp` tightly
+    /// packed bytes (`x + dim*(y + dim*z)` order). `getBytes` reads a Shared/Managed
+    /// texture directly (the `create_volume_init` storage mode).
+    pub fn read_volume(
+        &self,
+        volume: &crate::resources::MetalVolume,
+        w: u32,
+        h: u32,
+        d: u32,
+        bytes_per_voxel: u32,
+    ) -> Result<Vec<u8>> {
+        let (w, h, d, bpp) = (w as usize, h as usize, d as usize, bytes_per_voxel as usize);
+        let mut out = vec![0u8; w * h * d * bpp];
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize {
+                width: w,
+                height: h,
+                depth: d,
+            },
+        };
+        let ptr = NonNull::new(out.as_mut_ptr() as *mut c_void)
+            .ok_or_else(|| rhi_err("read_volume: null dst"))?;
+        unsafe {
+            volume
+                .texture
+                .getBytes_bytesPerRow_bytesPerImage_fromRegion_mipmapLevel(
+                    ptr,
+                    w * bpp,
+                    w * h * bpp,
+                    region,
+                    0,
+                );
+        }
+        Ok(out)
+    }
+
     /// Create an offscreen color render target (color attachment + bindless
     /// sampled) with its own dedicated allocation.
     pub fn create_render_target(&self, desc: &RenderTargetDesc) -> Result<MetalRenderTarget> {

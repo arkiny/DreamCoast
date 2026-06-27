@@ -746,6 +746,30 @@ impl Device {
         }
     }
 
+    /// Read a 3D volume back to host memory (Phase 12 item 3) — the inverse of
+    /// [`Device::create_volume_init`]. Returns `w*h*d*bytes_per_voxel` tightly
+    /// packed bytes in `x + dim*(y + dim*z)` order. Synchronous (one-shot copy +
+    /// map). Lets a GPU-produced volume be cooked / verified at the data level.
+    pub fn read_volume(
+        &self,
+        volume: &Volume,
+        w: u32,
+        h: u32,
+        d: u32,
+        bytes_per_voxel: u32,
+    ) -> Result<Vec<u8>> {
+        match (self, volume) {
+            #[cfg(windows)]
+            (Self::Vulkan(dev), Volume::Vulkan(v)) => dev.read_volume(v, w, h, d, bytes_per_voxel),
+            #[cfg(windows)]
+            (Self::D3d12(dev), Volume::D3d12(v)) => dev.read_volume(v, w, h, d, bytes_per_voxel),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(dev), Volume::Metal(v)) => dev.read_volume(v, w, h, d, bytes_per_voxel),
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
     /// Create a render-target cubemap (6 faces, `mip_levels` each) for IBL.
     pub fn create_cubemap(&self, desc: &CubemapDesc) -> Result<Cubemap> {
         match self {

@@ -930,6 +930,19 @@ impl VulkanDevice {
         crate::volume::VulkanVolume::new_init(self.shared.clone(), desc, data)
     }
 
+    /// Read a 3D volume back to host memory (Phase 12 item 3): `w*h*d*bpp` tightly
+    /// packed bytes (`x + dim*(y + dim*z)` order).
+    pub fn read_volume(
+        &self,
+        volume: &crate::volume::VulkanVolume,
+        w: u32,
+        h: u32,
+        d: u32,
+        bytes_per_voxel: u32,
+    ) -> Result<Vec<u8>, EngineError> {
+        volume.read_back(w, h, d, bytes_per_voxel)
+    }
+
     /// Memory footprint of an aliasable render target (for graph alias planning).
     pub fn render_target_memory(
         &self,
