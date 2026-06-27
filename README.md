@@ -18,8 +18,10 @@ path tracer (≈3.45/ch) is an accepted limit set by the 48³ GDF resolution.
 **Phase 12 (cooked-asset pipeline) is complete** — meshes, the scene SDF/albedo
 bakes, and BCn-compressed textures cook to a single deterministic `.dcasset`
 binary (loaded directly, no glTF re-parse / re-bake), alongside the per-OS shader
-bytecode cook cache. Phases 10 and 13 (virtual geometry, scene graph) remain
-experimental / planned. The native **Metal backend for macOS**
+bytecode cook cache. The engine is now moving along its **infrastructure track**
+(Phase 13 scene graph → Phase 14 animation); **Phase 10 (virtual geometry) is
+deferred** to an advanced-rendering track after that foundation is in place. The
+native **Metal backend for macOS**
 is at near-full parity — including Phase-8 ray tracing (inline `RayQuery` **and** the
 DXR-style RT pipeline via Metal Shader Converter); the main gap is the Phase-9
 profiling / marker tooling. See [`docs/metal-backend.md`](docs/metal-backend.md).
@@ -86,7 +88,11 @@ Backend parity is a hard rule: every milestone must produce identical results on
 - [x] **Phase 7** — Compute / GPGPU (async compute, GPU particles, GPU culling + indirect draw)
 - [x] **Phase 8** — Ray tracing (DXR + VK_KHR) — inline ray query + full RT pipeline/SBT
 - [x] **Phase 9** — Tooling & profiling (per-pass GPU timestamps, debug markers, validation toggle, sample browser)
-- [ ] **Phase 10** — Virtual geometry (cluster-LOD, GPU culling/HZB, SW raster) — experimental / planned
+- [ ] **Phase 10** — Virtual geometry (cluster-LOD, GPU culling/HZB, SW raster) —
+  ⏸️ **deferred / re-sequenced**: an advanced-rendering track scheduled after the
+  engine foundation (Phase 13 scene graph + Phase 14 animation). No hard dependency
+  on 13/14, but more valuable with a real scene to stress it, and it needs new RHI
+  (mesh shaders, 64-bit atomics, BDA) + external-dep approval (`meshopt`/`metis`).
 - [x] **Phase 11** — Software ray tracing + distance-field GI — Stages A–D complete on Windows:
   compute SW-RT, baked global distance field, stochastic GDF GI/AO + hybrid SW-RT
   reflections (now the default ambient, replacing captured-cube IBL), a mesh-card
