@@ -19,8 +19,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
     DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC3_UNORM,
     DXGI_FORMAT_BC3_UNORM_SRGB, DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC5_UNORM,
-    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-    DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT,
+    DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_BC7_UNORM_SRGB, DXGI_FORMAT_D32_FLOAT,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R16G16_FLOAT,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT,
 };
 
 mod accel;
@@ -72,6 +73,8 @@ fn to_dxgi_format(format: Format) -> DXGI_FORMAT {
         Format::Bc3Srgb => DXGI_FORMAT_BC3_UNORM_SRGB,
         Format::Bc3Unorm => DXGI_FORMAT_BC3_UNORM,
         Format::Bc4Unorm => DXGI_FORMAT_BC4_UNORM,
+        Format::Bc7Srgb => DXGI_FORMAT_BC7_UNORM_SRGB,
+        Format::Bc7Unorm => DXGI_FORMAT_BC7_UNORM,
     }
 }
 
@@ -91,7 +94,9 @@ fn to_dxgi_swapchain_format(format: Format) -> DXGI_FORMAT {
         | Format::Bc5Unorm
         | Format::Bc3Srgb
         | Format::Bc3Unorm
-        | Format::Bc4Unorm => {
+        | Format::Bc4Unorm
+        | Format::Bc7Srgb
+        | Format::Bc7Unorm => {
             unreachable!("block-compressed formats are never swapchain formats")
         }
     }
