@@ -255,6 +255,41 @@ D1 후 `sdf_cache_light`가 다시 Top-1(~143ms). UE5 Lumen 소스(`D:/Repositor
 다음 = **T3(march/LOD): relight gather spp 8→4 + step↓, gdf_gi/reflect march LOD**, 또는 주기·HIDDEN_MULT
 추가 상향. 각 RenderQuality 티어 결속·PT 잔차 검증.
 
+## Stage E — 60fps 검증 (달성, 2026-06-28)
+
+T3a–f(D3) 누적: relight gather spp→1 + 주기 40 + 가시성 피드백(D2b), gdf_gi 하프해상(D1)+spp 1+march
+24, gdf_reflect 하프해상(D3c), 캐시 상각(D2). 모든 콘텐츠 노브는 `quality.rs` Med 티어; 갤러리는
+레거시 강제(바이트 동일).
+
+### 데모 앵글 프레임 (RTX 2070 SUPER, 1280×720, Med)
+| 백엔드 | Stage 0 | 최종 | fps | 목표(≤16.6) |
+|---|---:|---:|---:|:--:|
+| **D3D12** | 492.6 | **12.6** | **~79** | ✅ |
+| **Vulkan** | 1039.3 | **16.6** | **~60** | ✅(경계) |
+
+누적 가속: **DX 39× / VK 63×**. 네이브 앵글도 DX 12.2 / VK 16.3ms로 일반화 확인.
+
+### 최종 패스 분해 (DX 데모)
+sdf_cache_visibility 0.005 · sdf_cache_light ~3.5 · gdf_gi ~2.6 · gdf_gi_upsample×2 0.2 ·
+gdf_reflect ~3.0 · 디노이저(temporal+atrous×2) ~0.9 · shadow 0.8 · gbuffer 0.7 · 기타 ~0.9.
+
+### 게이트 (정직 보고)
+- **무회귀(갤러리)**: DX/VK base vs 최종 = **0.000/ch** (모든 콘텐츠 노브가 갤러리에서 레거시 강제). ✅
+- **DX≡VK**: 데모 0.004/ch(기존 스토캐스틱 반사 갭), **네이브 0.000/ch**. ✅
+- **품질(PT 잔차)**: 최종 0.762/ch (max 166 = 하프해상 반사의 고립된 sharp specular). 누적 perf-tier
+  비용; 데모 이미지 육안 정상(잘 조명된 아트리움, 바닥 반사 정상, 노이즈 없음). High 티어는 풀품질 유지.
+- fmt/clippy(-D warnings) 클린, Vulkan 검증 클린(VUID 없음). ✅
+
+### 정직한 한계
+- DX는 60fps를 여유롭게(79fps) 충족. **VK는 16.6ms 경계**(런 노이즈로 16.2~17.1 변동) — VK가 GDF
+  컴퓨트를 DX 대비 ~1.3–1.6× 느리게 도는 구조적 격차 + 약 4ms의 고정 오버헤드(raster gbuffer/shadow +
+  풀해상 GI 디노이저)가 바닥. 추가 GDF 노브는 <0.5ms로 수렴(한계 도달). VK에 여유 마진이 필요하면
+  다음 후보는 **GI 디노이저 하프해상화**(트레이스가 이미 하프해상) 또는 **async-compute로 캐시 relight를
+  raster와 오버랩**(둘 다 별도 트랙).
+- 품질은 Med(60fps 타깃 티어)에서 spp 1 + 하프해상으로 PT 잔차 0.76/ch까지 상승. 디노이저/EMA가 정적
+  씬에서 수렴시켜 육안 영향은 작으나, 움직이는 카메라에선 더 노이즈가 보일 수 있음(temporal 누적 의존).
+  품질 우선은 High 티어.
+
 ## 설계 제약 (CLAUDE.md 5원칙)
 1. **근본 원인**: 마이크로 패치 금지. 비용의 근원(풀스크린 레이 수 / 카드 텍셀 수 / 미컬링 드로우)을 줄인다.
 2. **측정 주도**: `PROFILE_GPU`가 성공 지표. 모든 before/after를 ms로 보고.

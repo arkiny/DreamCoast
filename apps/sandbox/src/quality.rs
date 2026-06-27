@@ -140,7 +140,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
         },
         // Default — identical to the pre-tier behavior. Do not change without re-baselining no-reg.
         RenderQuality::Med => QualityPreset {
-            gi_spp: 2,
+            gi_spp: 1,
             gi_max_steps: 24,
             reflect_max_steps: 96,
             gi_denoise: true,
@@ -155,9 +155,9 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             // Stage D2b/D3: visibility feedback (off-screen cards relit 8x less) + period-aware EMA
             // alpha let the period reach UE's 32 range; gather spp 2 (denoised) + half-res GI/reflect
             // bring the GDF SW-RT stack into the 60fps frame budget on both backends.
-            cache_relight_period: 32,
+            cache_relight_period: 40,
             gi_half_res: true,
-            cache_relight_spp: 2,
+            cache_relight_spp: 1,
             reflect_half_res: true,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
