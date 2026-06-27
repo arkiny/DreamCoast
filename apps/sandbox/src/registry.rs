@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use dreamcoast_asset::{GltfScene, Material, MeshData, MeshVertex};
 use dreamcoast_core::glam::{Mat4, Quat, Vec3};
-use dreamcoast_scene::{LocalTransform, MaterialHandle, MeshHandle, World};
+use dreamcoast_scene::{MaterialHandle, MeshHandle, World};
 use rhi::{Buffer, Device, Format, Texture};
 
 use crate::mesh::{upload_geometry, upload_image_rgba8, upload_mesh};
@@ -233,14 +233,13 @@ pub(crate) fn upload_gltf_scene(
     Ok((per_mesh, cpu_meshes))
 }
 
-/// The transform that fits an imported glTF scene into the engine's canonical units:
-/// recenter its footprint on the origin, rest its base on `y = 0`, and uniformly
-/// scale so its bounding-sphere radius is 1.0 (mirrors `normalize_on_ground` for a
-/// single mesh, but applied to the whole hierarchy via the wrapper root).
-pub(crate) fn gltf_normalize(scene: &GltfScene) -> LocalTransform {
+/// The world-space AABB of an imported glTF scene at its **native** (authored) scale,
+/// walking the node hierarchy with accumulated transforms. Returns `None` if the scene
+/// has no geometry. The engine treats glTF native units as **metres** (1 unit = 1 m) —
+/// assets are placed at this scale, not rescaled, so a building stays building-sized.
+pub(crate) fn gltf_bounds(scene: &GltfScene) -> Option<(Vec3, Vec3)> {
     let mut min = Vec3::splat(f32::MAX);
     let mut max = Vec3::splat(f32::MIN);
-    // Walk the hierarchy, accumulating world matrices, expanding the world AABB.
     let mut stack: Vec<(usize, Mat4)> = scene.roots.iter().map(|&r| (r, Mat4::IDENTITY)).collect();
     while let Some((idx, parent)) = stack.pop() {
         let n = &scene.nodes[idx];
@@ -263,17 +262,5 @@ pub(crate) fn gltf_normalize(scene: &GltfScene) -> LocalTransform {
             stack.push((child, world));
         }
     }
-    if min.x > max.x {
-        return LocalTransform::IDENTITY; // no geometry
-    }
-    let size = max - min;
-    let radius = (0.5 * size.length()).max(1e-6);
-    let s = 1.0 / radius;
-    let cx = (min.x + max.x) * 0.5;
-    let cz = (min.z + max.z) * 0.5;
-    LocalTransform {
-        translation: Vec3::new(-cx * s, -min.y * s, -cz * s),
-        rotation: Quat::IDENTITY,
-        scale: Vec3::splat(s),
-    }
+    (min.x <= max.x).then_some((min, max))
 }

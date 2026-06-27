@@ -3,7 +3,7 @@
         (
             name: "west",
             level: "lanterns.level",
-            origin: (-6.0, 0.0, 0.0),
+            origin: (-16.0, 0.0, 0.0),
         ),
         (
             name: "center",
@@ -13,12 +13,12 @@
         (
             name: "east",
             level: "lanterns.level",
-            origin: (6.0, 0.0, 0.0),
+            origin: (16.0, 0.0, 0.0),
         ),
     ],
     edges: [
         (0, 1),
         (1, 2),
     ],
-    stream_radius: 12.0,
+    stream_radius: 24.0,
 )

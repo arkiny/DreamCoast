@@ -105,7 +105,8 @@ impl Streaming {
         let mut meshes = MeshRegistry::new();
         let mut materials = MaterialRegistry::new();
         let mut textures: Vec<Texture> = Vec::new();
-        build_level(
+        // The chunk's own AABB isn't needed (world framing is fixed); ignore it.
+        let _bounds = build_level(
             device,
             &level_data,
             &mut world,
@@ -137,6 +138,8 @@ impl Streaming {
 }
 
 /// The built-in demo world: three Lantern chunks in a row along X, linked into a line.
+/// Spacing/radius are in metres (1 unit = 1 m): each chunk is a ~8 m row of lanterns,
+/// placed 16 m apart so they don't overlap.
 pub(crate) fn demo_world() -> LevelGraph {
     let chunk = |name: &str, x: f32| WorldChunk {
         name: name.to_owned(),
@@ -145,12 +148,12 @@ pub(crate) fn demo_world() -> LevelGraph {
     };
     LevelGraph {
         chunks: vec![
-            chunk("west", -6.0),
+            chunk("west", -16.0),
             chunk("center", 0.0),
-            chunk("east", 6.0),
+            chunk("east", 16.0),
         ],
         edges: vec![(0, 1), (1, 2)],
-        stream_radius: 12.0,
+        stream_radius: 24.0,
     }
 }
 
