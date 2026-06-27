@@ -19,26 +19,35 @@ use crate::bc::{self, BcFormat};
 use crate::sdf::{self, AlbedoVolumes, SdfVolume};
 use crate::{ImageData, Material, MeshData, TexData, dcasset, load_gltf};
 
-/// Per-slot texture-compression policy (Phase 12 M3). **Perceptual colour**
-/// (base colour, emissive) compresses to BC1; **normals** to BC5 (near-lossless).
-/// **Data textures** — metallic-roughness and anything carrying linear/vector data
-/// — are left uncompressed, because block compression corrupts non-perceptual
-/// values. Textures with meaningful alpha also stay uncompressed (BC1 drops alpha).
+/// Per-slot texture-compression policy (Phase 12 M3). **Perceptual colour** (base
+/// colour, emissive) compresses to BC1, or **BC3** when the texture has real alpha
+/// (transparency preserved); **normals** to BC5 (near-lossless). **Data textures** —
+/// metallic-roughness and anything carrying linear/vector data — are left
+/// uncompressed, because block compression corrupts non-perceptual values.
 fn compress_material(material: &mut Material) {
-    take_compress(&mut material.base_color, BcFormat::Bc1, true, true);
-    take_compress(&mut material.emissive, BcFormat::Bc1, true, true);
-    take_compress(&mut material.normal, BcFormat::Bc5, false, false);
+    compress_colour(&mut material.base_color, true);
+    compress_colour(&mut material.emissive, true);
+    take_compress(&mut material.normal, BcFormat::Bc5, false);
     // metallic_roughness: data texture — intentionally left uncompressed.
 }
 
-/// Compress one slot in place if it holds an uncompressed image eligible for `fmt`.
-/// `srgb` tags the colour space; `skip_if_alpha` keeps RGBA8 when the image has
-/// real transparency (BC1 has no usable alpha).
-fn take_compress(slot: &mut Option<TexData>, fmt: BcFormat, srgb: bool, skip_if_alpha: bool) {
+/// Compress a colour slot: BC3 when it has real alpha (kept), else BC1.
+fn compress_colour(slot: &mut Option<TexData>, srgb: bool) {
     if let Some(TexData::Rgba8(im)) = slot {
-        if skip_if_alpha && im.rgba8.chunks_exact(4).any(|p| p[3] != 255) {
-            return; // transparency present — keep lossless
-        }
+        let has_alpha = im.rgba8.chunks_exact(4).any(|p| p[3] != 255);
+        let fmt = if has_alpha {
+            BcFormat::Bc3
+        } else {
+            BcFormat::Bc1
+        };
+        *slot = Some(compress_image(im, fmt, srgb));
+    }
+}
+
+/// Compress one slot in place if it holds an uncompressed image (no alpha concern —
+/// for normals / non-colour data the alpha channel is unused).
+fn take_compress(slot: &mut Option<TexData>, fmt: BcFormat, srgb: bool) {
+    if let Some(TexData::Rgba8(im)) = slot {
         *slot = Some(compress_image(im, fmt, srgb));
     }
 }
@@ -61,6 +70,8 @@ fn compress_image(im: &ImageData, fmt: BcFormat, srgb: bool) -> TexData {
             let h = (im.height >> mip).max(1);
             match fmt {
                 BcFormat::Bc1 => bc::encode_bc1(lvl, w, h),
+                BcFormat::Bc3 => bc::encode_bc3(lvl, w, h),
+                BcFormat::Bc4 => bc::encode_bc4(lvl, w, h),
                 BcFormat::Bc5 => bc::encode_bc5(lvl, w, h),
             }
         })
@@ -403,14 +414,21 @@ mod tests {
     }
 
     #[test]
-    fn alpha_base_color_stays_uncompressed() {
-        // A base colour with real transparency must not lose its alpha to BC1.
+    fn alpha_base_color_uses_bc3() {
+        // A base colour with real transparency compresses to BC3, which keeps alpha
+        // (BC1 would drop it).
         let mut m = Material {
             base_color: Some(solid_image(4, 4, [200, 100, 50, 128])),
             ..Material::default()
         };
         compress_material(&mut m);
-        assert!(matches!(m.base_color, Some(TexData::Rgba8(_))));
+        assert!(matches!(
+            m.base_color,
+            Some(TexData::Bc {
+                format: BcFormat::Bc3,
+                ..
+            })
+        ));
     }
 
     #[test]

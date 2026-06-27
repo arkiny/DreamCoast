@@ -56,6 +56,12 @@ pub enum Format {
     /// BC5 block-compressed two-channel (RG) unorm, for normals. 16 bytes / 4×4
     /// block.
     Bc5Unorm,
+    /// BC3 (DXT5) block-compressed RGBA, sRGB. 16 bytes / 4×4 block (colour + alpha).
+    Bc3Srgb,
+    /// BC3 (DXT5) block-compressed RGBA, unorm. 16 bytes / 4×4 block.
+    Bc3Unorm,
+    /// BC4 block-compressed single-channel (R) unorm. 8 bytes / 4×4 block.
+    Bc4Unorm,
 }
 
 impl Format {
@@ -64,7 +70,7 @@ impl Format {
     pub fn is_srgb(self) -> bool {
         matches!(
             self,
-            Format::Bgra8Srgb | Format::Rgba8Srgb | Format::Bc1Srgb
+            Format::Bgra8Srgb | Format::Rgba8Srgb | Format::Bc1Srgb | Format::Bc3Srgb
         )
     }
 
@@ -72,8 +78,8 @@ impl Format {
     /// (an uncompressed format). The block edge is always 4 texels.
     pub fn block_bytes(self) -> Option<usize> {
         match self {
-            Format::Bc1Srgb | Format::Bc1Unorm => Some(8),
-            Format::Bc5Unorm => Some(16),
+            Format::Bc1Srgb | Format::Bc1Unorm | Format::Bc4Unorm => Some(8),
+            Format::Bc5Unorm | Format::Bc3Srgb | Format::Bc3Unorm => Some(16),
             _ => None,
         }
     }

@@ -173,6 +173,9 @@ pub(crate) fn upload_texture(
             let gpu_format = match (format, srgb) {
                 (BcFormat::Bc1, true) => Format::Bc1Srgb,
                 (BcFormat::Bc1, false) => Format::Bc1Unorm,
+                (BcFormat::Bc3, true) => Format::Bc3Srgb,
+                (BcFormat::Bc3, false) => Format::Bc3Unorm,
+                (BcFormat::Bc4, _) => Format::Bc4Unorm,
                 (BcFormat::Bc5, _) => Format::Bc5Unorm,
             };
             device.create_texture_compressed(
