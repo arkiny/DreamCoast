@@ -575,12 +575,23 @@ fn main() {
     let mut rt_pipeline_isect_emitted = false;
     let mut rt_pipeline_dispatch_emitted = false;
 
-    // --- Shader cook cache (Phase 12 M4.1): content-hash + manifest, skip slangc on
-    // hit. The base hash folds the compiler version and the shared includes (§3 step 1,
-    // conservative) into every job's key, so a compiler upgrade or a shared-include edit
-    // invalidates all entries. M4.1 keeps artifacts in OUT_DIR; M4.2 relocates them to a
-    // persistent per-OS cache dir.
-    let manifest_path = out_dir.join("shader-cache-manifest.txt");
+    // --- Shader cook cache (Phase 12 M4.1/M4.2): content-hash + manifest, skip slangc
+    // on hit. The base hash folds the compiler version and the shared includes (§3 step
+    // 1, conservative) into every job's key, so a compiler upgrade or a shared-include
+    // edit invalidates all entries.
+    //
+    // M4.2: cooked bytecode + manifest live in a persistent per-OS cache dir under the
+    // crate (`compiled/<os>/`), embedded via `include_bytes!` from there — so they
+    // survive a `cargo clean` of `target/` and a no-change rebuild costs zero slangc.
+    // The dir is local-only (gitignored, §5). The Metal RT-pipeline branch stays on
+    // OUT_DIR (uncached, macOS-only — see the branch below).
+    let cache_dir = manifest_dir.join("compiled").join(if target_os.is_empty() {
+        "unknown"
+    } else {
+        target_os.as_str()
+    });
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let manifest_path = cache_dir.join("manifest.txt");
     let mut manifest = load_manifest(&manifest_path);
     let mut base_hash = fnv1a(&slangc_version(&slangc), FNV_OFFSET);
     for inc in [
@@ -609,7 +620,13 @@ fn main() {
                 continue;
             }
 
-            let out_path = out_dir.join(format!("{}.{}", job.key, ext));
+            // Cached artifacts go to the persistent per-OS cache dir; the Metal
+            // RT-pipeline branch is uncached scratch and stays in OUT_DIR.
+            let out_path = if *target == "metallib" && is_rt_stage(job.stage) {
+                out_dir.join(format!("{}.{}", job.key, ext))
+            } else {
+                cache_dir.join(format!("{}.{}", job.key, ext))
+            };
 
             if *target == "metallib" && is_rt_stage(job.stage) {
                 match compile_rt_pipeline_metal(MetalRtCompileRequest {
