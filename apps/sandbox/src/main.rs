@@ -1035,48 +1035,10 @@ impl App {
                     back.len()
                 );
             }
-            // C8b1: 6 axis-aligned mesh cards per object (Lumen-style box-projection cards).
-            // Each 64-B record = center.xyz/trace_depth, normal.xyz, u_axis.xyz (half-extent),
-            // v_axis.xyz (half-extent). The capture pass sphere-traces the GDF inward from each
-            // card-plane texel to the object surface.
-            let mut cards: Vec<u8> = Vec::new();
-            let push4 = |v: [f32; 3], w: f32, buf: &mut Vec<u8>| {
-                for c in v {
-                    buf.extend_from_slice(&c.to_le_bytes());
-                }
-                buf.extend_from_slice(&w.to_le_bytes());
-            };
-            for (omin, omax) in obj_aabb {
-                let center = [
-                    (omin[0] + omax[0]) * 0.5,
-                    (omin[1] + omax[1]) * 0.5,
-                    (omin[2] + omax[2]) * 0.5,
-                ];
-                let half = [
-                    (omax[0] - omin[0]) * 0.5,
-                    (omax[1] - omin[1]) * 0.5,
-                    (omax[2] - omin[2]) * 0.5,
-                ];
-                for axis in 0..3 {
-                    for &sign in &[1.0f32, -1.0] {
-                        let mut normal = [0.0f32; 3];
-                        normal[axis] = sign;
-                        let mut fc = center;
-                        fc[axis] = if sign > 0.0 { omax[axis] } else { omin[axis] };
-                        let t1 = (axis + 1) % 3;
-                        let t2 = (axis + 2) % 3;
-                        let mut u_axis = [0.0f32; 3];
-                        u_axis[t1] = half[t1];
-                        let mut v_axis = [0.0f32; 3];
-                        v_axis[t2] = half[t2];
-                        let depth = (omax[axis] - omin[axis]).max(1e-4);
-                        push4(fc, depth, &mut cards);
-                        push4(normal, 0.0, &mut cards);
-                        push4(u_axis, 0.0, &mut cards);
-                        push4(v_axis, 0.0, &mut cards);
-                    }
-                }
-            }
+            // Stage C: surface-cache mesh cards from the per-drawable world AABBs (6 axis-
+            // aligned cards each), draw-list-driven + atlas-budget-capped (fuse.rs). For the
+            // gallery (4 drawables → 24 cards) this is byte-identical to the legacy loop.
+            let cards = fuse::build_surface_cards(&obj_aabb);
             let num_cards = (cards.len() / 64) as u32;
             gdf.build_surface_cache(&device, &cards, num_cards)?;
         }
