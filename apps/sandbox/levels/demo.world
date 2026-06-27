@@ -1,0 +1,24 @@
+(
+    chunks: [
+        (
+            name: "west",
+            level: "lanterns.level",
+            origin: (-6.0, 0.0, 0.0),
+        ),
+        (
+            name: "center",
+            level: "lanterns.level",
+            origin: (0.0, 0.0, 0.0),
+        ),
+        (
+            name: "east",
+            level: "lanterns.level",
+            origin: (6.0, 0.0, 0.0),
+        ),
+    ],
+    edges: [
+        (0, 1),
+        (1, 2),
+    ],
+    stream_radius: 12.0,
+)
