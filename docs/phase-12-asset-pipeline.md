@@ -75,9 +75,35 @@ DX≡VK 0.000/ch(max 5=기준선)** — GPU→CPU 전환 무회귀, SW-RT 결과
 - 미대상(설계대로): 클립맵 동적 부분(런타임 갱신), per-voxel albedo 볼륨(C8a, 별도 GPU 베이크 유지 —
   후속 M2 확장 후보), 디버그용 per-mesh `volume`(렌더 비소비).
 
-### M3 — 확장 (후속, 선택)
+### M3 — 텍스처 블록 압축 (BCn) — ✅ 완료 (텍스처 트랙)
+요구: 텍스처 압축하되 **런타임 압축 해제 비용 최소**. 답=**GPU 네이티브 BCn**(하드웨어가 4×4 블록
+직접 샘플 → 해제 단계 0, 디스크+VRAM 동시 절감, KTX2/DDS가 예고한 경로). 손실이라 **옵트인**
+(`P12_TEX_COMPRESS=1`, 기본 off=렌더 바이트 동일).
+
+- **M3.1 (`0df7152`)** — CPU BC 인코더 `crates/asset/src/bc.rs`(무의존·결정적): **BC1**(컬러 8:1,
+  bbox 엔드포인트+565+2bit) + **BC5**(노멀 2×BC4, 16B/블록). 디코더(블록 1개→평균색). 테스트:
+  RMSE 한계·크기·비4배수 차원.
+- **M3.2 (`e9e5898`)** — RHI `Format::{Bc1Srgb,Bc1Unorm,Bc5Unorm}` + VK/DX/Metal 매핑 +
+  `Device::create_texture_compressed`(미리 압축된 BCn mip 업로드: VK 블록패킹 자동, DX
+  GetCopyableFootprints 블록 row pitch, Metal 블록피치 replaceRegion). create_texture를 공유
+  `upload` 헬퍼로 리팩터.
+- **M3.3 (`2f77dd8`)** — `TexData{Rgba8|Bc}`가 Material의 `Option<ImageData>` 대체. dcasset
+  텍스처 청크에 kind 태그+BC 페이로드. **per-slot 정책**: base_color/emissive→BC1, normal→BC5,
+  **metallic_roughness+데이터 텍스처=무압축**(블록압축이 비지각/벡터-선형 값 손상 — 사용자 요구),
+  알파 있는 base_color도 무손실 유지. cook 압축은 `generate_mip_chain`(rhi-types, 패리티 단일소스)
+  으로 mip 생성 후 BC 인코딩. 플래그는 캐시 키에 포함(토글 재쿡). 샌드박스 upload_texture가
+  Bc→create_texture_compressed 라우팅, GI 알베도는 average_linear(BC는 최소 mip 1블록만 디코드).
+
+검증(RTX 2070 SUPER, Avocado): 기본(무압축) 렌더 = 기준선 **0.000/ch**(무회귀). 압축 시
+`.dcasset` **50.4MB→25.2MB(-50%**; metallic_roughness 의도적 무압축이라 더 안 줄음), 렌더 델타 vs
+기준선 0.591/ch(손실·옵트인), **DX≡VK 0.000/ch**(양 백엔드 동일 블록 업로드). 런타임 해제비용 0.
+19 asset 테스트, clippy/fmt 클린.
+- 후속: BC7(고품질 컬러)·BC4(단채널)·BC3(알파), 압축 기본화는 RenderQuality/cook 티어로, 텍스처
+  VRAM 측정.
+
+### M3+ — 컨테이너 확장 (후속, 선택)
 - 추가 베이크 페이로드(BVH, 라이트맵, 프로브)를 청크로. Phase 10/11 산출물과 연계.
-- 텍스처(KTX2/DDS) 참조·임베드, 에셋 의존성 그래프 등은 필요 시 설계.
+- 에셋 의존성 그래프 등은 필요 시 설계.
 - **씬/레벨 청크 (Phase 13 결속):** `.dclevel`/`.dcworld`를 같은 컨테이너에 청크 타입으로 추가 —
   엔티티(애셋 source-hash 참조)+트랜스폼+머티리얼 오버라이드+라이트/카메라/환경, 월드는 청크 그래프
   (인접·월드 배치·스트리밍 반경)를 직렬화. Phase 13 Stage E가 이 M3을 채운다. 자세히는
