@@ -103,6 +103,16 @@ pub struct QualityPreset {
     /// the legacy 64 for the gallery anchor (byte-identical). Fewer steps = cheaper march; the
     /// indirect bounce is low-frequency + denoised, so a shorter march holds up for content.
     pub gi_max_steps: u32,
+    /// Stage D3 (Sponza 60fps): GGX reflection-ray march step cap (`P11_REFLECT_MAX_STEPS`).
+    /// Forced to the legacy 96 for the gallery anchor (byte-identical). The reflection is
+    /// temporally accumulated, so a shorter march holds up for content. NOTE: capping the march
+    /// too low makes distant reflection rays leak sky — half-res is the cheaper lever (full march,
+    /// 1/4 the pixels), so keep this near the legacy 96 except on Low.
+    pub reflect_max_steps: u32,
+    /// Stage D3 (Sponza 60fps): trace the GGX reflection at half resolution + joint-bilateral
+    /// upsample (1/4 the rays) (`P11_REFLECT_HALF_RES`). Forced off for the gallery anchor
+    /// (full-res = byte-identical). Reuses `gdf_gi_upsample.slang`.
+    pub reflect_half_res: bool,
 }
 
 /// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
@@ -113,6 +123,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
         RenderQuality::Low => QualityPreset {
             gi_spp: 4,
             gi_max_steps: 32,
+            reflect_max_steps: 64,
             gi_denoise: true,
             reflect_cache: false,
             surface_cache: false,
@@ -125,11 +136,13 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             cache_relight_period: 16,
             gi_half_res: true,
             cache_relight_spp: 4,
+            reflect_half_res: true,
         },
         // Default — identical to the pre-tier behavior. Do not change without re-baselining no-reg.
         RenderQuality::Med => QualityPreset {
             gi_spp: 4,
             gi_max_steps: 32,
+            reflect_max_steps: 96,
             gi_denoise: true,
             reflect_cache: true,
             surface_cache: false,
@@ -145,12 +158,14 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             cache_relight_period: 16,
             gi_half_res: true,
             cache_relight_spp: 4,
+            reflect_half_res: true,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
         RenderQuality::High => QualityPreset {
             gi_spp: 16,
             gi_max_steps: 64,
+            reflect_max_steps: 96,
             gi_denoise: true,
             reflect_cache: true,
             surface_cache: true,
@@ -163,6 +178,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             cache_relight_period: 1,
             gi_half_res: false,
             cache_relight_spp: 8,
+            reflect_half_res: false,
         },
     }
 }

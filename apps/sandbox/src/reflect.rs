@@ -636,6 +636,7 @@ impl ReflectSystem {
         cache: Option<([u32; 5], ResourceId)>,
         clip: (u32, u32),
         clip_vols: &'a [&'a Volume],
+        max_steps: u32,
     ) -> ResourceId {
         let pipe = self
             .reflect_pipeline
@@ -718,6 +719,7 @@ impl ReflectSystem {
                     clip.0,
                     clip.1,
                     crate::GROUND_ALBEDO, // analytic ground material (floor reflection hits)
+                    max_steps,            // D3: reflection-ray march step cap
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
