@@ -904,11 +904,12 @@ impl App {
         // gallery, an imported glTF scene, or a level. The byte layout matches the legacy
         // gallery fuse, so the gallery's baked field is byte-identical.
         //
-        // For now the scene GDF is still gallery-gated: the glTF/level paths leave it
-        // unregistered, so every GDF/SW-RT feature auto-disables (they gate on
-        // `gdf.has_scene_sdf()`) and lighting falls back to the captured-cube IBL —
-        // Stage D relaxes this gate to arbitrary scenes.
-        if gallery_scene && gdf.has_gdf_trace() {
+        // Stage D: build the scene GDF for ANY non-streaming scene with geometry — the
+        // gallery, an imported glTF, or a level (Sponza). `fuse_scene` + the Stage A grid
+        // bake + the clipmap make this affordable. World streaming stays out of scope (no
+        // single AABB). The gallery is byte-identical (same fuse → same bake → same cards).
+        let build_scene_gdf = !world_mode && gdf.has_gdf_trace() && !world.draw_list().is_empty();
+        if build_scene_gdf {
             let fused = fuse::fuse_scene(&world, &mesh_registry, &material_registry);
             let fused_v = fused.vtx;
             let fused_i = fused.idx;
@@ -933,10 +934,13 @@ impl App {
                 (amin[1] + amax[1]) * 0.5,
                 (amin[2] + amax[2]) * 0.5,
             ];
+            // The gallery stays single-level (byte-identical reference); content scenes
+            // (Sponza) default to a 4-level clipmap (auto-trimmed by extent in plan_levels)
+            // — the camera-centered clipmap is the default for content, per the design.
             let clip_max_levels = std::env::var("P11_GDF_CLIP_LEVELS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(1)
+                .unwrap_or(if gallery_scene { 1 } else { 4 })
                 .max(1);
             let clip = clipmap::plan_levels(amin, amax, clip_center, sdf_dim, 0.1, clip_max_levels);
             info!("GDF clipmap: {} level(s)", clip.level_count());
@@ -978,6 +982,10 @@ impl App {
                 Some(&sdf_bytes),
                 Some([&alb[0], &alb[1], &alb[2]]),
             )?;
+            // Stage D: the gallery's floor is analytic (y = 0, no floor geometry); content
+            // scenes carry their floor as real geometry, so disable the analytic ground
+            // (a very low Y) to avoid a spurious second floor in the SW-RT march.
+            gdf.set_scene_ground_y(if gallery_scene { 0.0 } else { -1.0e9 });
             // Stage B3: cook + install the finer clipmap levels (every level but the
             // coarsest, which `build_scene_sdf` just created). Each is keyed on its own
             // sub-AABB so the cache stores them separately; off unless P11_GDF_CLIP_LEVELS>1.
@@ -1035,12 +1043,18 @@ impl App {
                     back.len()
                 );
             }
-            // Stage C: surface-cache mesh cards from the per-drawable world AABBs (6 axis-
-            // aligned cards each), draw-list-driven + atlas-budget-capped (fuse.rs). For the
-            // gallery (4 drawables → 24 cards) this is byte-identical to the legacy loop.
-            let cards = fuse::build_surface_cards(&obj_aabb);
-            let num_cards = (cards.len() / 64) as u32;
-            gdf.build_surface_cache(&device, &cards, num_cards)?;
+            // Stage C/D: the surface-cache atlas (cards + per-card texel buffers) is only
+            // allocated when a consumer will actually re-light it — the gallery's SW-RT
+            // reflection/GI. Content scenes currently light via the captured-cube IBL
+            // (legacy_ibl below), so allocating the (potentially hundreds-of-MB) atlas for
+            // them would be pure waste; the content surface cache lands with the Stage D
+            // lighting flip. Cards themselves are cheap and draw-list-driven (fuse.rs).
+            let build_surface_cache = gallery_scene;
+            if build_surface_cache {
+                let cards = fuse::build_surface_cards(&obj_aabb);
+                let num_cards = (cards.len() / 64) as u32;
+                gdf.build_surface_cache(&device, &cards, num_cards)?;
+            }
         }
 
         let gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;

@@ -101,6 +101,11 @@ pub(crate) struct GdfSystem {
     /// camera), each its own SDF + albedo volumes over its own AABB. The coarsest level
     /// stays in `scene_gdf`/`scene_albedo` (global coverage). Empty ⇒ single-level (gallery).
     clip_levels: Vec<ClipLevel>,
+    /// Stage D: the analytic ground-plane height the SW-RT marches union with the GDF. The
+    /// gallery's floor is *analytic* (y = 0, no floor geometry in the fuse); content scenes
+    /// (Sponza) carry their floor as real geometry, so the analytic ground is disabled
+    /// (a very low Y) to avoid a spurious second floor.
+    scene_ground_y: f32,
 }
 
 /// A finer clipmap level: its own SDF (+ optional albedo) volumes over a sub-AABB of the
@@ -387,7 +392,15 @@ impl GdfSystem {
             clip_desc: None,
             clip_count: 0,
             clip_levels: Vec::new(),
+            scene_ground_y: 0.0,
         })
+    }
+
+    /// Stage D: set the analytic ground-plane height (0 for the gallery; a disabling low Y
+    /// for content scenes whose floor is real geometry). Read by the scene-GDF trace today;
+    /// the lighting-path passes pick it up at the Stage D lighting flip.
+    pub(crate) fn set_scene_ground_y(&mut self, y: f32) {
+        self.scene_ground_y = y;
     }
 
     /// Stage C1: register the fused world-space scene geometry (a single triangle soup
@@ -1013,6 +1026,7 @@ impl GdfSystem {
         // Stage B: sample the scene field through the clipmap descriptor (1 level today).
         let clip = self.clip_descriptor().unwrap_or((0, 1));
         let clip_vols = self.clip_level_volumes();
+        let ground_y = self.scene_ground_y;
         // Sample clamp = AABB diagonal: exceeds the field's true max distance so the
         // march never wrongly clamps (the fused bake fills every voxel — no sparse
         // sentinel), while keeping the empty-space step bounded.
@@ -1053,7 +1067,7 @@ impl GdfSystem {
                     clip.1,
                     aabb_min,
                     aabb_max,
-                    0.0, // world ground plane at y = 0
+                    ground_y, // analytic ground (gallery y=0; disabled for content)
                     diag,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
