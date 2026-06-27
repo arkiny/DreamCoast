@@ -207,24 +207,29 @@ Distance Field) → 그에 대한 stochastic lighting**으로 동적 GI/반사/A
   레퍼런스 대비 그럴듯하게 수렴, 검증 클린. → **충족·완료**(잔차는 48³ GDF 해상도가 지배하는 본질
   한계로 수용; 정밀화는 실제 게임 씬에서 측정-구동 재개).
 
-### Phase 12 — 에셋 파이프라인 / 쿠킹된 에셋 — 🧪 실험적 / 계획
+### Phase 12 — 에셋 파이프라인 / 쿠킹된 에셋 — ✅ 완료 (양 백엔드)
 세부: [phase-12-asset-pipeline.md](phase-12-asset-pipeline.md)
 **크로스컷팅 엔진 인프라** — `crates/asset`의 자산 직렬화 계층. 가공된 **메시 지오메트리 + 베이크 데이터
-(SDF, 향후 BVH/라이트맵)를 하나의 `.dcasset` 바이너리로 cook → 저장 → 런타임 직접 로드**. 매 실행
-glTF 재파싱 + SDF 재베이크를 없앤다. Phase 11 Stage B의 GDF 베이크 영속화가 직접 동기.
-- **M1 — 메시 직렬화**(.dcasset 골격: 헤더 + 메시 청크; cook glTF→.dcasset, 런타임 직접 로드). Phase 11과 독립.
-- **M2 — SDF 베이크 청크 통합**(Phase 11 B2 결과 영속화 + 로드). Stage B 이후.
-- **M3 — 확장**(후속·선택: BVH/라이트맵/프로브, 텍스처 참조).
-- **M4 — 셰이더 바이트코드 쿡 캐시 (per-OS, 콘텐츠 해시)**: 세부 [shader-asset-cache.md](shader-asset-cache.md).
-  `.slang`을 **OS별 바이트코드 에셋**(Windows SPIR-V+DXIL / macOS metallib)으로 쿡 + **소스 내용 해시
-  + mtime**으로 변경 감지 → 바뀐 셰이더만 자동 재컴파일(현재는 mtime만 보고 매 빌드 전 잡 재컴파일).
-  매니페스트 + 무의존 해시. **P11/P12 본선과 독립**(셰이더 캐시는 별도 산출물, 단독 진행 가능).
-- **완료 기준**: glTF 재파싱·재베이크 없이 `.dcasset` 로드로 동일 렌더(양 백엔드 일치), startup 가속,
-  베이크 결과 바이트 동일 캐시. **M4**: 무변경 빌드 시 slangc 호출 0회, 단일 셰이더 변경 시 해당 잡만
-  재컴파일, 최종 바이트코드 무회귀(양 백엔드 픽셀 일치).
-- **교차 (Phase 13)**: 차후 **씬/레벨 청크**(`.dclevel`/`.dcworld`)를 같은 `.dcasset` 컨테이너에 추가 —
-  Phase 13 Stage E 또는 본 Phase의 M3. 엔티티(애셋 source-hash 참조)+트랜스폼+라이트/카메라/환경, 월드는
-  청크 그래프(인접·배치·스트리밍 반경)를 직렬화. [phase-13-scene-graph.md](phase-13-scene-graph.md) 참조.
+(SDF/albedo) + 압축 텍스처를 하나의 `.dcasset` 바이너리로 cook → 저장 → 런타임 직접 로드**. 매 실행
+glTF 재파싱 + 텍스처 디코드 + SDF/albedo 재베이크를 없앤다. 수동 little-endian 청크 컨테이너
+(헤더 + 타입/오프셋/크기 디렉터리), 무효화 키 `{version, source_hash, cook_params_hash}`, 결정적 CPU
+쿡(크로스백엔드 바이트 동일), gitignored `/cache/`.
+- **M1 ✅ — 메시 직렬화**(헤더 + 메시 청크 + 텍스처 청크; cook glTF→.dcasset, 런타임 직접 로드, glTF
+  부재 시 shipped 로드). Phase 11과 독립.
+- **M2 ✅ — SDF + albedo 베이크 청크**: scene GDF 베이크를 **GPU→CPU 베이크로 전환**해 영속화
+  (`sdf_bake.slang` Rust 포팅) + RHI 볼륨 업로드(`create_volume_init`)로 GPU 베이크 패스 대체.
+- **M3 ✅ — 텍스처 BCn 블록 압축**(GPU 네이티브, 런타임 해제비용 0): BC1/BC3/BC4/BC5/**BC7** 인코더 +
+  RHI 포맷(VK/DX/Metal). cook `TexCompress{Off,Fast,High}` 티어(`P12_TEX_COMPRESS`), per-slot 정책
+  (컬러→BC1/BC7, 노멀→BC5, **데이터 텍스처 무압축**), 옵트인(기본 off=무회귀). Avocado: Off 50.4MB /
+  Fast 25.2MB / High 28.0MB.
+- **M4 ✅ — 셰이더 바이트코드 쿡 캐시 (per-OS, 콘텐츠 해시)**: 세부 [shader-asset-cache.md](shader-asset-cache.md).
+  `.slang`을 OS별 바이트코드 에셋으로 쿡 + 콘텐츠 해시 → 바뀐 셰이더만 재컴파일. 무변경 빌드 0 slangc.
+- **아이템 — 추가 산출**: `.dclevel` 씬/레벨 청크(엔티티+트랜스폼+머티리얼 오버라이드+라이트/카메라/환경,
+  Phase 13 Stage E 기반), 볼륨 readback `Device::read_volume`(GPU 산출 볼륨의 데이터-레벨 쿡/검증).
+- **완료 기준 달성**: glTF 재파싱·재베이크 없이 `.dcasset` 로드로 동일 렌더(DX≡VK 0.000/ch, 기준선
+  무회귀), run2=CacheHit startup 가속, 베이크 바이트 동일 캐시. clippy/fmt 클린.
+- **남은 후속(선택)**: BC7 멀티모드(품질), 추가 베이크 페이로드(BVH/라이트맵/프로브), 텍스처 압축 기본화
+  RenderQuality 결속. **씬/레벨 렌더 구동은 Phase 13 Stage E**가 `.dclevel` 포맷에 결속.
 
 ### Phase 13 — 씬 그래프 + 레벨 스트리밍 — 🧪 실험적 / 계획
 세부: [phase-13-scene-graph.md](phase-13-scene-graph.md)
