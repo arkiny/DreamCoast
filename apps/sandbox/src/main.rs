@@ -1792,8 +1792,24 @@ impl App {
             let eye = center + dist * Vec3::new(cp * self.angle.cos(), sp, cp * self.angle.sin());
             (center, eye)
         } else if let Some((eye, target)) = self.level_view {
-            // A level's authored camera (e.g. the Sponza demo angle) is the base view.
-            (target, eye)
+            // A level's authored camera (e.g. the Sponza demo angle). Headless captures
+            // hold it fixed (the byte-identical parity baseline); interactively, orbit it
+            // around the level focus so the scene can be inspected from any side. Seeded
+            // from the authored camera so `self.angle == 0` reproduces it exactly (no jump
+            // on launch), then the per-frame `self.angle += dt*0.6` spins it. Tab still
+            // switches to the free-fly camera (seeded from this resolved pose) below.
+            if self.screenshot_mode {
+                (target, eye)
+            } else {
+                let offset = eye - target;
+                let rh = (offset.x * offset.x + offset.z * offset.z).sqrt();
+                let base = offset.z.atan2(offset.x);
+                let a = base + self.angle;
+                (
+                    target,
+                    target + Vec3::new(rh * a.cos(), offset.y, rh * a.sin()),
+                )
+            }
         } else {
             let focus = self.scene_center;
             let dist = self.scene_radius * 1.6;
