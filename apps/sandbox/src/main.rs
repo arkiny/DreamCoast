@@ -551,6 +551,11 @@ struct App {
     /// Off by default — the SW-RT hybrid reflection + GDF GI are the default ambient.
     legacy_ibl: bool,
 
+    /// QHD/UHD track: offscreen render extent override (`RENDER_RES=WxH`), decoupled from the
+    /// window/swapchain. `None` => render at the swapchain extent (default, byte-identical).
+    /// The scene passes (g-buffer → GDF → lighting → HDR) render here; tonemap downscales to the
+    /// swapchain backbuffer. Lets headless perf measure true QHD/UHD regardless of display size.
+    render_res: Option<(u32, u32)>,
     // Profiler UI state.
     profiler_on: bool,
     slot_pass_names: Vec<Vec<String>>,
@@ -1296,6 +1301,13 @@ impl App {
             compute_done.push(device.create_semaphore()?);
             query_heaps.push(device.create_query_heap(MAX_QUERIES)?);
         }
+        // QHD/UHD track: parse the offscreen render-extent override (`RENDER_RES=WxH`).
+        let render_res = std::env::var("RENDER_RES").ok().and_then(|s| {
+            let (a, b) = s.split_once(['x', 'X', ','])?;
+            let w = a.trim().parse::<u32>().ok()?.clamp(320, 7680);
+            let h = b.trim().parse::<u32>().ok()?.clamp(240, 4320);
+            Some((w, h))
+        });
         let profiler_on = std::env::var("PROFILE_GPU").is_ok();
         let slot_pass_names: Vec<Vec<String>> = vec![Vec::new(); FRAMES_IN_FLIGHT];
         let render_finished = build_render_finished(&device, swapchain.image_count())?;
@@ -1466,6 +1478,7 @@ impl App {
             realtime_env: true,
             multibounce: true,
             legacy_ibl,
+            render_res,
             profiler_on,
             slot_pass_names,
             gpu_timings: Vec::new(),
@@ -1599,10 +1612,15 @@ impl App {
                 return Ok(true);
             }
         };
-        let (cw, ch) = {
+        // The swapchain (display) extent presents the final image; the *render* extent is where
+        // the scene passes run. They are equal by default (byte-identical), but `RENDER_RES`
+        // decouples them so headless can render the scene at QHD/UHD offscreen and the tonemap
+        // downscales to the (display-bound) swapchain backbuffer. QHD/UHD perf track.
+        let (sw, sh) = {
             let e = self.swapchain.extent_2d();
             (e.width, e.height)
         };
+        let (cw, ch) = self.render_res.unwrap_or((sw, sh));
 
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32();
@@ -2368,13 +2386,16 @@ impl App {
             self.reflect.prepare_reflect_accum(&self.device, cw, ch)?;
         }
 
-        let extent = Extent2D::new(cw, ch);
+        let extent = Extent2D::new(cw, ch); // scene render extent (RENDER_RES or swapchain)
+        let swap_extent = Extent2D::new(sw, sh); // display/backbuffer extent
         // Stage B3: the finer clipmap-level volumes each GDF pass transitions to sampled
         // (empty for the single-level gallery). Bound before the graph so it outlives the
         // pass closures that borrow it.
         let scene_clip_vols = self.gdf.clip_level_volumes();
         let mut graph = RenderGraph::new();
-        let backbuffer = graph.import_backbuffer(self.swapchain.format(), extent);
+        // The backbuffer is the actual swapchain image (display extent); tonemap samples the
+        // render-extent HDR by UV, so a render≠display extent just means a downscale at present.
+        let backbuffer = graph.import_backbuffer(self.swapchain.format(), swap_extent);
         let g_albedo = graph.create_color("g_albedo", GB_ALBEDO_FMT, extent);
         let g_normal = graph.create_color("g_normal", GB_NORMAL_FMT, extent);
         let g_material = graph.create_color("g_material", GB_MATERIAL_FMT, extent);
@@ -3317,7 +3338,7 @@ impl App {
             self.cull.record_draw(
                 &mut graph,
                 backbuffer,
-                extent,
+                swap_extent,
                 args_ext,
                 visible_ext,
                 view_proj.to_cols_array(),
