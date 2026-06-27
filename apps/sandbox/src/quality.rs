@@ -127,7 +127,10 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 16,
-            cache_relight_period: 4,
+            // Stage D2b: with camera-visibility feedback (off-screen cards relit 4x less), the
+            // base period can rise from D2's 4 toward UE's 32/64 — 8 stays converged in the
+            // 64-frame screenshot warmup while ~halving the on-screen relight cost again.
+            cache_relight_period: 8,
             gi_half_res: true,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection

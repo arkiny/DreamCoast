@@ -23,8 +23,8 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::mesh::{index_bytes, vertex_bytes};
 use crate::push::{
-    cache_capture_push, cache_light_push, cache_view_push, gdf_merge_push, gdf_trace_push,
-    sdf_albedo_bake_push, sdf_bake_push, sdf_trace_push, volume_push,
+    cache_capture_push, cache_light_push, cache_view_push, cache_vis_push, gdf_merge_push,
+    gdf_trace_push, sdf_albedo_bake_push, sdf_bake_push, sdf_trace_push, volume_push,
 };
 
 /// Volume edge length in voxels (cube). The bake/merge/view all share it.
@@ -91,6 +91,10 @@ pub(crate) struct GdfSystem {
     cache_radiance: [Option<StorageBuffer>; 2],
     cache_frame: u32,
     cache_light_pipeline: Option<ComputePipeline>,
+    /// Stage D2b: per-card camera-frustum visibility (1 uint/card; 1 = on-screen) driving the
+    /// relight budget, + the compute pipeline that fills it. `None` until the cache is built.
+    card_vis: Option<StorageBuffer>,
+    cache_vis_pipeline: Option<ComputePipeline>,
     /// Stage B (clipmap): the scene-GDF descriptor storage buffer the SW-RT shaders read
     /// to select a level — 48 bytes/level `{ aabb_min, aabb_max, sdf_idx, albedo_idx[3] }`,
     /// finest→coarsest. A single-level descriptor (the gallery) reproduces the legacy
@@ -253,6 +257,16 @@ impl GdfSystem {
             128,
             [64, 1, 1],
         )?;
+        // Stage D2b: per-card camera-frustum visibility for the relight budget.
+        let cache_vis_pipeline = compute(
+            "csMain",
+            dreamcoast_shader::sdf_cache_visibility_cs_spirv,
+            dreamcoast_shader::sdf_cache_visibility_cs_dxil,
+            dreamcoast_shader::sdf_cache_visibility_cs_metallib,
+            "sdf_cache_visibility",
+            112,
+            [64, 1, 1],
+        )?;
         let trace_pipeline = compute(
             "csMain",
             dreamcoast_shader::gdf_trace_cs_spirv,
@@ -389,6 +403,8 @@ impl GdfSystem {
             cache_radiance: [None, None],
             cache_frame: 0,
             cache_light_pipeline,
+            card_vis: None,
+            cache_vis_pipeline,
             clip_desc: None,
             clip_count: 0,
             clip_levels: Vec::new(),
@@ -741,9 +757,24 @@ impl GdfSystem {
         self.cache_pos = make()?;
         self.cache_albedo = make()?;
         self.cache_radiance = [make()?, make()?];
+        // Stage D2b: 1 uint / card visibility flag (filled each frame by record_cache_visibility).
+        self.card_vis = Some(device.create_storage_buffer(&StorageBufferDesc {
+            size: (num_cards as u64) * 4,
+            stride: 4,
+            indirect: false,
+        })?);
         self.num_cards = num_cards;
         self.cache_frame = 0;
         Ok(())
+    }
+
+    /// Stage D2b: the per-card visibility buffer's bindless storage index (for the relight pass),
+    /// or `None` when the cache / visibility pipeline isn't built.
+    pub(crate) fn card_vis_index(&self) -> Option<u32> {
+        Some(self.card_vis.as_ref()?.storage_index())
+    }
+    pub(crate) fn has_cache_visibility(&self) -> bool {
+        self.cache_vis_pipeline.is_some() && self.card_vis.is_some()
     }
 
     pub(crate) fn has_surface_cache(&self) -> bool {
@@ -771,6 +802,36 @@ impl GdfSystem {
         Some((cards, pos, rad, self.num_cards, CARD_TILE))
     }
 
+    /// Stage D2b: fill the per-card visibility buffer for this frame's camera (frustum planes,
+    /// Y-flip-free so DX≡VK). Records the compute pass and returns the visibility graph handle to
+    /// pass into `record_cache_light` (for the read barrier). `None` without the cache / pipeline.
+    pub(crate) fn record_cache_visibility<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        planes: [[f32; 4]; 6],
+    ) -> Option<ResourceId> {
+        let pipe = self.cache_vis_pipeline.as_ref()?;
+        let cards = self.cards.as_ref()?.storage_index();
+        let out = self.card_vis.as_ref()?.storage_index();
+        let num_cards = self.num_cards;
+        let vis_ext = graph.import_external("card_vis");
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "sdf_cache_visibility",
+                storage_writes: vec![vis_ext],
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&cache_vis_push(&planes, cards, out, num_cards));
+                cmd.dispatch(num_cards.div_ceil(64), 1, 1);
+                Ok(())
+            },
+        );
+        Some(vis_ext)
+    }
+
     /// C8b2: re-light the surface cache this frame — direct sun (GDF soft-shadow) + sky +
     /// an indirect gather that reads last frame's radiance (multibounce). Reads the captured
     /// geometry (`scene_cache_ext`) + the scene GDF; writes the `lit_ext` handle (the freshly
@@ -788,7 +849,15 @@ impl GdfSystem {
         frame: u32,
         reset: bool,
         relight_period: u32,
+        card_vis_ext: Option<ResourceId>,
     ) {
+        // Stage D2b: feed the per-card visibility buffer index to the shader (sentinel = off =
+        // uniform period). When present, declare it as a read so the graph barriers the relight
+        // after this frame's visibility pass.
+        let card_vis_index = match card_vis_ext {
+            Some(_) => self.card_vis_index().unwrap_or(u32::MAX),
+            None => u32::MAX,
+        };
         let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
         let pipe = self
             .cache_light_pipeline
@@ -826,11 +895,15 @@ impl GdfSystem {
             ];
             (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
         };
+        let mut reads = vec![scene_gdf_ext, scene_cache_ext];
+        if let Some(vis) = card_vis_ext {
+            reads.push(vis); // barrier the relight after this frame's visibility pass
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "sdf_cache_light",
                 storage_writes: vec![lit_ext],
-                reads: vec![scene_gdf_ext, scene_cache_ext],
+                reads,
             },
             move |ctx| {
                 let cmd = ctx.cmd();
@@ -865,6 +938,7 @@ impl GdfSystem {
                     clip.0,
                     clip.1,
                     relight_period.max(1),
+                    card_vis_index,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())

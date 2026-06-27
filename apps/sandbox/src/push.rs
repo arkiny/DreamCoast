@@ -511,6 +511,7 @@ pub(crate) fn cache_light_push(
     clip_desc: u32,
     clip_count: u32,
     relight_period: u32,
+    card_vis_index: u32,
 ) -> [u8; 128] {
     let mut pc = [0u8; 128];
     let u = [
@@ -551,8 +552,10 @@ pub(crate) fn cache_light_push(
     pc[112..116].copy_from_slice(&clip_desc.to_le_bytes());
     pc[116..120].copy_from_slice(&clip_count.to_le_bytes());
     // Stage D2: clip.z carries the amortized-relight period (round-robin card budget; 1 = legacy
-    // every-frame). clip.w stays spare. See sdf_cache_light.slang.
+    // every-frame). Stage D2b: clip.w carries the per-card visibility buffer index (0xFFFFFFFF =
+    // no feedback => uniform period). See sdf_cache_light.slang.
     pc[120..124].copy_from_slice(&relight_period.to_le_bytes());
+    pc[124..128].copy_from_slice(&card_vis_index.to_le_bytes());
     pc
 }
 
@@ -871,6 +874,27 @@ pub(crate) fn gdf_atrous_push(
     }
     pc[96..100].copy_from_slice(&pos_sigma.to_le_bytes());
     pc[100..104].copy_from_slice(&normal_power.to_le_bytes());
+    pc
+}
+
+/// Pack the Stage D2b surface-cache visibility push block (112 bytes): 6 frustum planes
+/// (96, xyz inward normal + w) + (cards_index, out_index, num_cards, pad) uints (96..112).
+pub(crate) fn cache_vis_push(
+    planes: &[[f32; 4]; 6],
+    cards_index: u32,
+    out_index: u32,
+    num_cards: u32,
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
+    for (i, p) in planes.iter().enumerate() {
+        for (j, v) in p.iter().enumerate() {
+            let o = i * 16 + j * 4;
+            pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    pc[96..100].copy_from_slice(&cards_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&out_index.to_le_bytes());
+    pc[104..108].copy_from_slice(&num_cards.to_le_bytes());
     pc
 }
 
