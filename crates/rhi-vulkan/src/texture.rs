@@ -164,6 +164,139 @@ impl VulkanTexture {
         }
     }
 
+    /// Create a sampled texture from **pre-compressed** block data (Phase 12 M3):
+    /// `levels[i]` is mip `i`'s BCn blocks (already cooked), level 0 full-res. No
+    /// mip generation — the GPU samples the blocks natively (zero decode cost).
+    pub(crate) fn new_compressed(
+        device: Arc<DeviceShared>,
+        desc: &TextureDesc,
+        levels: &[Vec<u8>],
+    ) -> Result<Self, EngineError> {
+        unsafe {
+            let format = to_vk_format(desc.format);
+            let mip_levels = levels.len().max(1) as u32;
+            let full_range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: mip_levels,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let image_ci = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width: desc.width,
+                    height: desc.height,
+                    depth: 1,
+                })
+                .mip_levels(mip_levels)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image = device
+                .device
+                .create_image(&image_ci, None)
+                .map_err(vk_err)?;
+            let req = device.device.get_image_memory_requirements(image);
+            let mem_type = device
+                .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type);
+            let memory = device
+                .device
+                .allocate_memory(&alloc, None)
+                .map_err(vk_err)?;
+            device
+                .device
+                .bind_image_memory(image, memory, 0)
+                .map_err(vk_err)?;
+
+            // Stage all compressed levels back-to-back; one copy region per level at
+            // its block-packed offset. Vulkan derives the block layout from `format`.
+            let mut staging_bytes: Vec<u8> = Vec::new();
+            let mut regions: Vec<vk::BufferImageCopy> = Vec::with_capacity(levels.len());
+            for (mip, level) in levels.iter().enumerate() {
+                let offset = staging_bytes.len() as u64;
+                staging_bytes.extend_from_slice(level);
+                regions.push(
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .mip_level(mip as u32)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        )
+                        .image_extent(vk::Extent3D {
+                            width: (desc.width >> mip).max(1),
+                            height: (desc.height >> mip).max(1),
+                            depth: 1,
+                        }),
+                );
+            }
+            let (staging, staging_mem) = create_staging(&device, &staging_bytes)?;
+            device.immediate_submit(|cmd| {
+                image_barrier(
+                    &device.device,
+                    cmd,
+                    image,
+                    full_range,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                );
+                device.device.cmd_copy_buffer_to_image(
+                    cmd,
+                    staging,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &regions,
+                );
+                image_barrier(
+                    &device.device,
+                    cmd,
+                    image,
+                    full_range,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                );
+            })?;
+            device.device.destroy_buffer(staging, None);
+            device.device.free_memory(staging_mem, None);
+
+            let view_ci = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(full_range);
+            let view = device
+                .device
+                .create_image_view(&view_ci, None)
+                .map_err(vk_err)?;
+            let index = device.register_sampled_image(view);
+            Ok(Self {
+                device,
+                image,
+                memory,
+                view,
+                index,
+            })
+        }
+    }
+
     /// The texture's index in the bindless table.
     pub fn bindless_index(&self) -> u32 {
         self.index

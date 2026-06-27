@@ -676,6 +676,25 @@ impl Device {
         }
     }
 
+    /// Create a sampled texture from pre-compressed BCn mip levels (Phase 12 M3).
+    /// `desc.format` must be a block-compressed format; `levels[i]` holds mip `i`'s
+    /// blocks (level 0 full-res). The GPU samples the blocks natively — there is no
+    /// decompression at load, and both backends upload identical bytes.
+    pub fn create_texture_compressed(
+        &self,
+        desc: &TextureDesc,
+        levels: &[Vec<u8>],
+    ) -> Result<Texture> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => Ok(Texture::Vulkan(d.create_texture_compressed(desc, levels)?)),
+            #[cfg(windows)]
+            Self::D3d12(d) => Ok(Texture::D3d12(d.create_texture_compressed(desc, levels)?)),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => Ok(Texture::Metal(d.create_texture_compressed(desc, levels)?)),
+        }
+    }
+
     pub fn create_depth_buffer(&self, extent: Extent2D) -> Result<DepthBuffer> {
         match self {
             #[cfg(windows)]

@@ -49,13 +49,49 @@ pub enum Format {
     R32Float,
     /// 32-bit float depth.
     Depth32Float,
+    /// BC1 (DXT1) block-compressed RGB, sRGB. 8 bytes / 4×4 block (Phase 12 M3).
+    Bc1Srgb,
+    /// BC1 (DXT1) block-compressed RGB, unorm. 8 bytes / 4×4 block.
+    Bc1Unorm,
+    /// BC5 block-compressed two-channel (RG) unorm, for normals. 16 bytes / 4×4
+    /// block.
+    Bc5Unorm,
 }
 
 impl Format {
     /// True for sRGB-encoded color formats (their RGB channels must be downsampled
     /// in linear space).
     pub fn is_srgb(self) -> bool {
-        matches!(self, Format::Bgra8Srgb | Format::Rgba8Srgb)
+        matches!(
+            self,
+            Format::Bgra8Srgb | Format::Rgba8Srgb | Format::Bc1Srgb
+        )
+    }
+
+    /// Compressed bytes per 4×4 block for a block-compressed format, else `None`
+    /// (an uncompressed format). The block edge is always 4 texels.
+    pub fn block_bytes(self) -> Option<usize> {
+        match self {
+            Format::Bc1Srgb | Format::Bc1Unorm => Some(8),
+            Format::Bc5Unorm => Some(16),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a block-compressed (BCn) format.
+    pub fn is_block_compressed(self) -> bool {
+        self.block_bytes().is_some()
+    }
+
+    /// Row pitch (bytes) and row count for one mip of `width×height` in this format:
+    /// for BCn a "row" is a row of 4×4 blocks; for uncompressed it is a pixel row.
+    /// Used to size staging copies. Assumes 4 bytes/pixel for uncompressed (the only
+    /// uncompressed textures uploaded via `create_texture`).
+    pub fn upload_pitch(self, width: u32, height: u32) -> (usize, usize) {
+        match self.block_bytes() {
+            Some(bb) => (width.div_ceil(4) as usize * bb, height.div_ceil(4) as usize),
+            None => (width as usize * 4, height as usize),
+        }
     }
 }
 

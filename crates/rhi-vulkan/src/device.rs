@@ -872,6 +872,15 @@ impl VulkanDevice {
         VulkanTexture::new(self.shared.clone(), desc, pixels)
     }
 
+    /// Create a sampled texture from pre-compressed BCn mip levels (Phase 12 M3).
+    pub fn create_texture_compressed(
+        &self,
+        desc: &TextureDesc,
+        levels: &[Vec<u8>],
+    ) -> Result<VulkanTexture, EngineError> {
+        VulkanTexture::new_compressed(self.shared.clone(), desc, levels)
+    }
+
     /// Create a depth buffer sized to `extent`.
     pub fn create_depth_buffer(&self, extent: Extent2D) -> Result<VulkanDepthBuffer, EngineError> {
         VulkanDepthBuffer::new(self.shared.clone(), extent)

@@ -56,10 +56,16 @@ pub(crate) fn pixel_format(format: Format) -> MTLPixelFormat {
         // Single-channel 32-bit float: signed distance for the Phase 11 volume
         // (`Texture3D<float>` / `RWTexture3D<float>` in `bindless.slang`).
         Format::R32Float => MTLPixelFormat::R32Float,
+        // BCn block compression (Phase 12 M3). Supported on Apple Silicon GPUs.
+        Format::Bc1Srgb => MTLPixelFormat::BC1_RGBA_sRGB,
+        Format::Bc1Unorm => MTLPixelFormat::BC1_RGBA,
+        Format::Bc5Unorm => MTLPixelFormat::BC5_RGUnorm,
     }
 }
 
 /// Bytes per pixel for a [`Format`], for computing a texture upload's row pitch.
+/// Block-compressed formats have no per-pixel size; callers use the block-aware
+/// upload path instead (`Format::upload_pitch`).
 pub(crate) fn bytes_per_pixel(format: Format) -> usize {
     match format {
         Format::Bgra8Unorm
@@ -70,5 +76,8 @@ pub(crate) fn bytes_per_pixel(format: Format) -> usize {
         | Format::Depth32Float
         | Format::R32Float => 4,
         Format::Rgba16Float => 8,
+        Format::Bc1Srgb | Format::Bc1Unorm | Format::Bc5Unorm => {
+            unreachable!("block-compressed formats use the block upload path")
+        }
     }
 }
