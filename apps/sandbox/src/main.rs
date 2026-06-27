@@ -492,6 +492,8 @@ struct App {
     cache_feedback: bool,
     /// Stage D3: surface-cache relight indirect-gather rays/texel (gallery forced to legacy 8).
     cache_relight_spp: u32,
+    /// Stage D3: C3 GI bounce-ray march step cap (gallery forced to legacy 64).
+    gi_max_steps: u32,
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
     /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
     gi_half_res: bool,
@@ -1134,10 +1136,18 @@ impl App {
         let gdf_gi = gi.has_gi()
             && gdf.has_scene_sdf()
             && (!legacy_ibl || std::env::var_os("P11_GDF_GI").is_some());
+        // Stage D3: gallery forced to the legacy 8 (byte-identical anchor); content takes the tier.
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(qp.gi_spp)
+            .unwrap_or(if gallery_scene { 8 } else { qp.gi_spp })
+            .clamp(1, 256);
+        // Stage D3: C3 bounce-ray march step cap. Gallery forced to the legacy 64 (byte-identical);
+        // content takes the tier value. `P11_GI_MAX_STEPS` overrides.
+        let gi_max_steps = std::env::var("P11_GI_MAX_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(if gallery_scene { 64 } else { qp.gi_max_steps })
             .clamp(1, 256);
         // Stage D2: surface-cache amortized-relight period. The gallery is the byte-identical
         // regression anchor, so it is forced to 1 (every-frame relight = legacy) just like the
@@ -1407,6 +1417,7 @@ impl App {
             cache_relight_period,
             cache_feedback,
             cache_relight_spp,
+            gi_max_steps,
             gi_half_res,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
@@ -2562,6 +2573,7 @@ impl App {
                     firefly_max,
                     scene_clip,
                     &scene_clip_vols,
+                    self.gi_max_steps,
                 );
                 let raw = if half_gi {
                     self.gi.record_upsample(

@@ -99,6 +99,10 @@ pub struct QualityPreset {
     /// The gather dominates `sdf_cache_light`; halving it ~halves the pass. Denoised by the
     /// cache's temporal EMA, so fewer rays converge to the same static result.
     pub cache_relight_spp: u32,
+    /// Stage D3 (Sponza 60fps): C3 GI bounce-ray march step cap (`P11_GI_MAX_STEPS`). Forced to
+    /// the legacy 64 for the gallery anchor (byte-identical). Fewer steps = cheaper march; the
+    /// indirect bounce is low-frequency + denoised, so a shorter march holds up for content.
+    pub gi_max_steps: u32,
 }
 
 /// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
@@ -108,6 +112,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
         // GI samples, lower reflection roughness cutoff (GDF takes over sooner). Hard shadows.
         RenderQuality::Low => QualityPreset {
             gi_spp: 4,
+            gi_max_steps: 32,
             gi_denoise: true,
             reflect_cache: false,
             surface_cache: false,
@@ -123,7 +128,8 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
         },
         // Default — identical to the pre-tier behavior. Do not change without re-baselining no-reg.
         RenderQuality::Med => QualityPreset {
-            gi_spp: 8,
+            gi_spp: 4,
+            gi_max_steps: 32,
             gi_denoise: true,
             reflect_cache: true,
             surface_cache: false,
@@ -144,6 +150,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
         RenderQuality::High => QualityPreset {
             gi_spp: 16,
+            gi_max_steps: 64,
             gi_denoise: true,
             reflect_cache: true,
             surface_cache: true,

@@ -728,6 +728,7 @@ pub(crate) fn gdf_gi_push(
     clip_desc: u32,
     clip_count: u32,
     ground_albedo: [f32; 3],
+    max_steps: u32,
 ) -> [u8; 224] {
     let mut pc = [0u8; 224];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -778,6 +779,9 @@ pub(crate) fn gdf_gi_push(
     for (i, v) in ground_albedo.iter().enumerate() {
         pc[208 + i * 4..212 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
+    // Stage D3: bounce-ray march step cap (the .w after ground_albedo). Content lowers it; the
+    // gallery passes the legacy 64 (byte-identical).
+    pc[220..224].copy_from_slice(&max_steps.to_le_bytes());
     pc
 }
 
