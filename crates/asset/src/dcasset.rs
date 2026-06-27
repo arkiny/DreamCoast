@@ -22,8 +22,9 @@
 
 use dreamcoast_core::EngineError;
 
+use crate::bc::BcFormat;
 use crate::sdf::SdfVolume;
-use crate::{ImageData, Material, MeshData, MeshVertex};
+use crate::{ImageData, Material, MeshData, MeshVertex, TexData};
 
 /// Container magic. The trailing NUL keeps it a fixed 8 bytes and ASCII-greppable.
 pub const MAGIC: [u8; 8] = *b"DCASSET\0";
@@ -200,13 +201,47 @@ fn encode_mesh(mesh: &MeshData) -> Vec<u8> {
     w.buf
 }
 
-/// Encode one texture chunk payload: `slot`, dimensions, then RGBA8 pixels.
-fn encode_texture(slot: u32, img: &ImageData) -> Vec<u8> {
+// Texture-encoding kinds (the `kind` field of a texture chunk).
+const TEX_KIND_RGBA8: u32 = 0;
+const TEX_KIND_BC: u32 = 1;
+// BcFormat tags (stored in a BC texture chunk).
+const BC_FMT_BC1: u32 = 0;
+const BC_FMT_BC5: u32 = 1;
+
+/// Encode one texture chunk payload: `slot`, a kind tag, dimensions, then either
+/// RGBA8 pixels or the BCn block mips (Phase 12 M3).
+fn encode_texture(slot: u32, tex: &TexData) -> Vec<u8> {
     let mut w = Writer::default();
     w.u32(slot);
-    w.u32(img.width);
-    w.u32(img.height);
-    w.bytes(&img.rgba8);
+    match tex {
+        TexData::Rgba8(img) => {
+            w.u32(TEX_KIND_RGBA8);
+            w.u32(img.width);
+            w.u32(img.height);
+            w.bytes(&img.rgba8);
+        }
+        TexData::Bc {
+            format,
+            srgb,
+            width,
+            height,
+            mips,
+        } => {
+            w.u32(TEX_KIND_BC);
+            w.u32(width.to_owned());
+            w.u32(height.to_owned());
+            w.u32(match format {
+                BcFormat::Bc1 => BC_FMT_BC1,
+                BcFormat::Bc5 => BC_FMT_BC5,
+            });
+            w.u32(u32::from(*srgb));
+            w.u32(mips.len() as u32);
+            for mip in mips {
+                w.u32(mip.len() as u32);
+                w.bytes(mip);
+            }
+        }
+    }
     w.buf
 }
 
@@ -307,7 +342,7 @@ pub fn read(bytes: &[u8]) -> Result<(Header, MeshData), EngineError> {
     }
 
     let mut mesh: Option<(Vec<MeshVertex>, Vec<u32>, Material)> = None;
-    let mut pending_textures: Vec<(u32, ImageData)> = Vec::new();
+    let mut pending_textures: Vec<(u32, TexData)> = Vec::new();
 
     for (ty, offset, size) in dir {
         // Validate the slice the directory points at before reading it.
@@ -325,12 +360,12 @@ pub fn read(bytes: &[u8]) -> Result<(Header, MeshData), EngineError> {
 
     let (vertices, indices, mut material) =
         mesh.ok_or_else(|| EngineError::Asset("dcasset: missing mesh chunk".into()))?;
-    for (slot, img) in pending_textures {
+    for (slot, tex) in pending_textures {
         match slot {
-            TEX_BASE_COLOR => material.base_color = Some(img),
-            TEX_METALLIC_ROUGHNESS => material.metallic_roughness = Some(img),
-            TEX_NORMAL => material.normal = Some(img),
-            TEX_EMISSIVE => material.emissive = Some(img),
+            TEX_BASE_COLOR => material.base_color = Some(tex),
+            TEX_METALLIC_ROUGHNESS => material.metallic_roughness = Some(tex),
+            TEX_NORMAL => material.normal = Some(tex),
+            TEX_EMISSIVE => material.emissive = Some(tex),
             _ => {} // unknown slot: ignore
         }
     }
@@ -464,23 +499,56 @@ fn decode_mesh(r: &mut Reader) -> Result<(Vec<MeshVertex>, Vec<u32>, Material), 
 }
 
 /// Decode a texture chunk payload into its slot tag and RGBA8 image.
-fn decode_texture(r: &mut Reader) -> Result<(u32, ImageData), EngineError> {
+fn decode_texture(r: &mut Reader) -> Result<(u32, TexData), EngineError> {
     let slot = r.u32()?;
+    let kind = r.u32()?;
     let width = r.u32()?;
     let height = r.u32()?;
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| EngineError::Asset("dcasset: texture size overflow".into()))?;
-    let rgba8 = r.take(expected)?.to_vec();
-    Ok((
-        slot,
-        ImageData {
-            width,
-            height,
-            rgba8,
-        },
-    ))
+    let tex = match kind {
+        TEX_KIND_RGBA8 => {
+            let expected = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|n| n.checked_mul(4))
+                .ok_or_else(|| EngineError::Asset("dcasset: texture size overflow".into()))?;
+            let rgba8 = r.take(expected)?.to_vec();
+            TexData::Rgba8(ImageData {
+                width,
+                height,
+                rgba8,
+            })
+        }
+        TEX_KIND_BC => {
+            let format = match r.u32()? {
+                BC_FMT_BC1 => BcFormat::Bc1,
+                BC_FMT_BC5 => BcFormat::Bc5,
+                other => {
+                    return Err(EngineError::Asset(format!(
+                        "dcasset: unknown bc format {other}"
+                    )));
+                }
+            };
+            let srgb = r.u32()? != 0;
+            let mip_count = r.u32()? as usize;
+            let mut mips = Vec::with_capacity(mip_count);
+            for _ in 0..mip_count {
+                let len = r.u32()? as usize;
+                mips.push(r.take(len)?.to_vec());
+            }
+            TexData::Bc {
+                format,
+                srgb,
+                width,
+                height,
+                mips,
+            }
+        }
+        other => {
+            return Err(EngineError::Asset(format!(
+                "dcasset: unknown texture kind {other}"
+            )));
+        }
+    };
+    Ok((slot, tex))
 }
 
 #[cfg(test)]
@@ -551,34 +619,73 @@ mod tests {
         assert_eq!(write(&mesh, 7), write(&mesh, 7));
     }
 
+    fn rgba8(tex: &TexData) -> &ImageData {
+        match tex {
+            TexData::Rgba8(im) => im,
+            TexData::Bc { .. } => panic!("expected uncompressed texture"),
+        }
+    }
+
     #[test]
     fn roundtrip_with_textures() {
         // A 2x1 base-color + a 1x1 normal texture; the other two slots stay None.
         let mut mesh = sample_mesh();
-        mesh.material.base_color = Some(ImageData {
+        mesh.material.base_color = Some(TexData::Rgba8(ImageData {
             width: 2,
             height: 1,
             rgba8: vec![10, 20, 30, 40, 50, 60, 70, 80],
-        });
-        mesh.material.normal = Some(ImageData {
+        }));
+        mesh.material.normal = Some(TexData::Rgba8(ImageData {
             width: 1,
             height: 1,
             rgba8: vec![128, 128, 255, 255],
-        });
+        }));
 
         let bytes = write(&mesh, 1);
         let (_, decoded) = read(&bytes).expect("decode");
         assert_mesh_eq(&mesh, &decoded);
 
-        let bc = decoded.material.base_color.expect("base_color present");
+        let bc = rgba8(decoded.material.base_color.as_ref().expect("base_color"));
         assert_eq!((bc.width, bc.height), (2, 1));
         assert_eq!(bc.rgba8, vec![10, 20, 30, 40, 50, 60, 70, 80]);
-        let n = decoded.material.normal.expect("normal present");
+        let n = rgba8(decoded.material.normal.as_ref().expect("normal"));
         assert_eq!((n.width, n.height), (1, 1));
         assert_eq!(n.rgba8, vec![128, 128, 255, 255]);
         // Slots that were None must round-trip back to None (no stray chunks).
         assert!(decoded.material.metallic_roughness.is_none());
         assert!(decoded.material.emissive.is_none());
+    }
+
+    #[test]
+    fn roundtrip_compressed_texture() {
+        // A BC-compressed base-color slot (2 mips) must round-trip byte-exact.
+        let mut mesh = sample_mesh();
+        mesh.material.base_color = Some(TexData::Bc {
+            format: BcFormat::Bc1,
+            srgb: true,
+            width: 8,
+            height: 8,
+            mips: vec![vec![1u8; 8 * 2 * 2], vec![2u8; 8]],
+        });
+        let bytes = write(&mesh, 1);
+        let (_, decoded) = read(&bytes).expect("decode");
+        match decoded.material.base_color.expect("base_color") {
+            TexData::Bc {
+                format,
+                srgb,
+                width,
+                height,
+                mips,
+            } => {
+                assert_eq!(format, BcFormat::Bc1);
+                assert!(srgb);
+                assert_eq!((width, height), (8, 8));
+                assert_eq!(mips.len(), 2);
+                assert_eq!(mips[0], vec![1u8; 32]);
+                assert_eq!(mips[1], vec![2u8; 8]);
+            }
+            TexData::Rgba8(_) => panic!("expected compressed"),
+        }
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! path-tracer instance table, mesh/texture uploads, the ground quad, model
 //! normalization, and the fallback checker texture. No render-loop state.
 
-use dreamcoast_asset::{ImageData, MeshData, MeshVertex};
+use dreamcoast_asset::bc::BcFormat;
+use dreamcoast_asset::{MeshData, MeshVertex, TexData};
 use rhi::{
     Buffer, BufferDesc, BufferUsage, Device, Format, StorageBufferDesc, Texture, TextureDesc,
 };
@@ -144,20 +145,46 @@ pub(crate) fn upload_mesh(
 
 /// Create a sampled texture from decoded image data and return its bindless index,
 /// keeping the texture alive in `store`.
+/// Upload a material texture (bindless). Uncompressed `Rgba8` uses `rgba8_format`
+/// (the slot's colour space) and generates mips at upload; pre-cooked `Bc` data
+/// (Phase 12 M3) uploads its block mips via the GPU-native path — no decompression.
 pub(crate) fn upload_texture(
     device: &Device,
     store: &mut Vec<Texture>,
-    img: &ImageData,
-    format: Format,
+    tex: &TexData,
+    rgba8_format: Format,
 ) -> anyhow::Result<u32> {
-    let t = device.create_texture(
-        &TextureDesc {
-            width: img.width,
-            height: img.height,
+    let t = match tex {
+        TexData::Rgba8(img) => device.create_texture(
+            &TextureDesc {
+                width: img.width,
+                height: img.height,
+                format: rgba8_format,
+            },
+            &img.rgba8,
+        )?,
+        TexData::Bc {
             format,
-        },
-        &img.rgba8,
-    )?;
+            srgb,
+            width,
+            height,
+            mips,
+        } => {
+            let gpu_format = match (format, srgb) {
+                (BcFormat::Bc1, true) => Format::Bc1Srgb,
+                (BcFormat::Bc1, false) => Format::Bc1Unorm,
+                (BcFormat::Bc5, _) => Format::Bc5Unorm,
+            };
+            device.create_texture_compressed(
+                &TextureDesc {
+                    width: *width,
+                    height: *height,
+                    format: gpu_format,
+                },
+                mips,
+            )?
+        }
+    };
     let idx = t.bindless_index();
     store.push(t);
     Ok(idx)

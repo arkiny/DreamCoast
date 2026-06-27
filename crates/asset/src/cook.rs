@@ -13,9 +13,66 @@
 use std::path::{Path, PathBuf};
 
 use dreamcoast_core::EngineError;
+use rhi_types::Format;
 
+use crate::bc::{self, BcFormat};
 use crate::sdf::{self, SdfVolume};
-use crate::{MeshData, dcasset, load_gltf};
+use crate::{ImageData, Material, MeshData, TexData, dcasset, load_gltf};
+
+/// Per-slot texture-compression policy (Phase 12 M3). **Perceptual colour**
+/// (base colour, emissive) compresses to BC1; **normals** to BC5 (near-lossless).
+/// **Data textures** — metallic-roughness and anything carrying linear/vector data
+/// — are left uncompressed, because block compression corrupts non-perceptual
+/// values. Textures with meaningful alpha also stay uncompressed (BC1 drops alpha).
+fn compress_material(material: &mut Material) {
+    take_compress(&mut material.base_color, BcFormat::Bc1, true, true);
+    take_compress(&mut material.emissive, BcFormat::Bc1, true, true);
+    take_compress(&mut material.normal, BcFormat::Bc5, false, false);
+    // metallic_roughness: data texture — intentionally left uncompressed.
+}
+
+/// Compress one slot in place if it holds an uncompressed image eligible for `fmt`.
+/// `srgb` tags the colour space; `skip_if_alpha` keeps RGBA8 when the image has
+/// real transparency (BC1 has no usable alpha).
+fn take_compress(slot: &mut Option<TexData>, fmt: BcFormat, srgb: bool, skip_if_alpha: bool) {
+    if let Some(TexData::Rgba8(im)) = slot {
+        if skip_if_alpha && im.rgba8.chunks_exact(4).any(|p| p[3] != 255) {
+            return; // transparency present — keep lossless
+        }
+        *slot = Some(compress_image(im, fmt, srgb));
+    }
+}
+
+/// Block-compress an RGBA8 image to a full BCn mip chain. Mips come from the shared
+/// `generate_mip_chain` (the cross-backend-parity single source) so cooked mips
+/// match the uncompressed upload path, then each level is BC-encoded.
+fn compress_image(im: &ImageData, fmt: BcFormat, srgb: bool) -> TexData {
+    let format = if srgb {
+        Format::Rgba8Srgb
+    } else {
+        Format::Rgba8Unorm
+    };
+    let levels = rhi_types::generate_mip_chain(&im.rgba8, im.width, im.height, format);
+    let mips = levels
+        .iter()
+        .enumerate()
+        .map(|(mip, lvl)| {
+            let w = (im.width >> mip).max(1);
+            let h = (im.height >> mip).max(1);
+            match fmt {
+                BcFormat::Bc1 => bc::encode_bc1(lvl, w, h),
+                BcFormat::Bc5 => bc::encode_bc5(lvl, w, h),
+            }
+        })
+        .collect();
+    TexData::Bc {
+        format: fmt,
+        srgb,
+        width: im.width,
+        height: im.height,
+        mips,
+    }
+}
 
 /// Which path [`load_cooked`] took, for the caller to log (startup speedup is
 /// observable as the second run reporting `CacheHit` instead of `Cooked`).
@@ -65,6 +122,7 @@ pub fn load_cooked(
     source: &Path,
     cache_key: &str,
     cache_dir: &Path,
+    compress: bool,
 ) -> Result<(MeshData, LoadOutcome), EngineError> {
     let cache_file = cache_path(cache_dir, cache_key);
 
@@ -81,22 +139,28 @@ pub fn load_cooked(
         )));
     };
 
-    let src_hash = dcasset::source_hash(&src_bytes);
+    // Key folds the source bytes + the compression policy, so toggling compression
+    // re-cooks (a BC-compressed asset and an RGBA8 one are different bytes).
+    let key = dcasset::hash_update(dcasset::source_hash(&src_bytes), &[u8::from(compress)]);
 
     // Hit: a cached header whose key matches the live source → decode it, no parse.
     if let Ok(bytes) = std::fs::read(&cache_file)
         && let Ok(header) = dcasset::read_header(&bytes)
         && header.version == dcasset::VERSION
-        && header.source_hash == src_hash
+        && header.source_hash == key
         && header.cook_params_hash == dcasset::cook_params_hash()
         && let Ok((_, mesh)) = dcasset::read(&bytes)
     {
         return Ok((mesh, LoadOutcome::CacheHit));
     }
 
-    // Miss: cook from glTF and write the cache (write failure is non-fatal).
-    let mesh = load_gltf(source)?;
-    let cooked = dcasset::write(&mesh, src_hash);
+    // Miss: cook from glTF (optionally block-compressing eligible textures) and
+    // write the cache (write failure is non-fatal).
+    let mut mesh = load_gltf(source)?;
+    if compress {
+        compress_material(&mut mesh.material);
+    }
+    let cooked = dcasset::write(&mesh, key);
     if let Err(e) = write_atomic(&cache_file, &cooked) {
         tracing_warn(&format!(
             "failed to write cooked asset {}: {e}",
@@ -234,7 +298,7 @@ mod tests {
         std::fs::write(cache_path(&tmp.0, key), bytes).unwrap();
 
         let (mesh, outcome) =
-            load_cooked(Path::new("does/not/exist.glb"), key, &tmp.0).expect("load");
+            load_cooked(Path::new("does/not/exist.glb"), key, &tmp.0, false).expect("load");
         assert_eq!(outcome, LoadOutcome::CacheHitNoSource);
         assert_eq!(mesh.vertices.len(), 1);
     }
@@ -242,7 +306,88 @@ mod tests {
     #[test]
     fn missing_source_and_cache_is_an_error() {
         let tmp = TempDir::new("empty");
-        let r = load_cooked(Path::new("nope.glb"), "nope.glb", &tmp.0);
+        let r = load_cooked(Path::new("nope.glb"), "nope.glb", &tmp.0, false);
         assert!(r.is_err());
+    }
+
+    fn solid_image(w: u32, h: u32, rgba: [u8; 4]) -> TexData {
+        TexData::Rgba8(ImageData {
+            width: w,
+            height: h,
+            rgba8: rgba.repeat((w * h) as usize),
+        })
+    }
+
+    #[test]
+    fn compression_policy_per_slot() {
+        let mut m = Material {
+            base_color: Some(solid_image(8, 8, [200, 100, 50, 255])),
+            metallic_roughness: Some(solid_image(8, 8, [0, 128, 200, 255])),
+            normal: Some(solid_image(8, 8, [128, 128, 255, 255])),
+            emissive: Some(solid_image(8, 8, [10, 20, 30, 255])),
+            ..Material::default()
+        };
+        compress_material(&mut m);
+
+        // Perceptual colour -> BC1; normals -> BC5; data texture stays RGBA8.
+        assert!(matches!(
+            m.base_color,
+            Some(TexData::Bc {
+                format: BcFormat::Bc1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            m.emissive,
+            Some(TexData::Bc {
+                format: BcFormat::Bc1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            m.normal,
+            Some(TexData::Bc {
+                format: BcFormat::Bc5,
+                ..
+            })
+        ));
+        assert!(
+            matches!(m.metallic_roughness, Some(TexData::Rgba8(_))),
+            "metallic-roughness is a data texture and must stay uncompressed"
+        );
+    }
+
+    #[test]
+    fn alpha_base_color_stays_uncompressed() {
+        // A base colour with real transparency must not lose its alpha to BC1.
+        let mut m = Material {
+            base_color: Some(solid_image(4, 4, [200, 100, 50, 128])),
+            ..Material::default()
+        };
+        compress_material(&mut m);
+        assert!(matches!(m.base_color, Some(TexData::Rgba8(_))));
+    }
+
+    #[test]
+    fn compression_shrinks_and_roundtrips() {
+        let mut m = Material {
+            base_color: Some(solid_image(64, 64, [200, 100, 50, 255])),
+            ..Material::default()
+        };
+        let raw = match m.base_color.as_ref().unwrap() {
+            TexData::Rgba8(im) => im.rgba8.len(),
+            _ => unreachable!(),
+        };
+        compress_material(&mut m);
+        let compressed: usize = match m.base_color.as_ref().unwrap() {
+            TexData::Bc { mips, .. } => mips.iter().map(|m| m.len()).sum(),
+            _ => unreachable!(),
+        };
+        // BC1 is 8:1 on the base level; even with the full mip chain it is far
+        // smaller than the single uncompressed level.
+        assert!(
+            compressed < raw / 4,
+            "compressed {compressed} should be << raw {raw}"
+        );
     }
 }
