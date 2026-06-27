@@ -749,6 +749,23 @@ impl App {
             );
             info!("scene SDF {sdf_dim}^3 ({sdf_outcome:?})");
             let sdf_bytes = sdf_vol.to_le_bytes();
+            // C8a per-voxel albedo volumes: cooked the same way (CPU bake, cached),
+            // uploaded so the one-time GPU albedo bake is skipped too.
+            let (albedo_vol, alb_outcome) = dreamcoast_asset::cook::load_or_bake_scene_albedo(
+                &fused_v,
+                &fused_i,
+                &tri_albedo,
+                sdf_dim,
+                amin,
+                amax,
+                &app::cooked_cache_dir(),
+            );
+            info!("scene albedo {sdf_dim}^3 ({alb_outcome:?})");
+            let alb = [
+                albedo_vol.channel_le_bytes(0),
+                albedo_vol.channel_le_bytes(1),
+                albedo_vol.channel_le_bytes(2),
+            ];
             gdf.build_scene_sdf(
                 &device,
                 &fused_v,
@@ -758,6 +775,7 @@ impl App {
                 amin,
                 amax,
                 Some(&sdf_bytes),
+                Some([&alb[0], &alb[1], &alb[2]]),
             )?;
             // C8b1: 6 axis-aligned mesh cards per object (Lumen-style box-projection cards).
             // Each 64-B record = center.xyz/trace_depth, normal.xyz, u_axis.xyz (half-extent),
@@ -993,9 +1011,10 @@ impl App {
         let _ = window.take_resized();
         info!("entering render loop");
 
-        // Read before `gdf` is moved into the struct (Phase 12 M2): a cooked SDF
-        // was uploaded, so the one-time GPU bake is pre-satisfied.
+        // Read before `gdf` is moved into the struct (Phase 12 M2): the cooked SDF /
+        // albedo were uploaded, so their one-time GPU bakes are pre-satisfied.
         let scene_gdf_cooked = gdf.scene_sdf_is_cooked();
+        let scene_albedo_cooked = gdf.scene_albedo_is_cooked();
 
         Ok(Self {
             window,
@@ -1103,7 +1122,7 @@ impl App {
             // Phase 12 M2: a cooked SDF was uploaded into the scene GDF, so the
             // one-time GPU bake is already satisfied — latch it as baked.
             scene_gdf_baked: scene_gdf_cooked,
-            scene_albedo_baked: false,
+            scene_albedo_baked: scene_albedo_cooked,
             scene_cache_captured: false,
             scene_cache_reset: true,
             path_trace_pipeline,
