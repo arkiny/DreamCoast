@@ -490,6 +490,8 @@ struct App {
     /// Stage D2b: drive the relight budget by per-card camera-frustum visibility (off-screen
     /// cards relit far less). Off for the gallery anchor. Pure perf (on-screen image invariant).
     cache_feedback: bool,
+    /// Stage D3: surface-cache relight indirect-gather rays/texel (gallery forced to legacy 8).
+    cache_relight_spp: u32,
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
     /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
     gi_half_res: bool,
@@ -1156,6 +1158,17 @@ impl App {
         // visibility pipeline (capability-gated). `P11_CACHE_FEEDBACK` overrides.
         let cache_feedback =
             gdf.has_cache_visibility() && quality::env_bool("P11_CACHE_FEEDBACK", !gallery_scene);
+        // Stage D3: relight gather rays/texel. Gallery forced to the legacy 8 (byte-identical);
+        // content takes the tier value. `P11_CACHE_RELIGHT_SPP` overrides.
+        let cache_relight_spp = std::env::var("P11_CACHE_RELIGHT_SPP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(if gallery_scene {
+                8
+            } else {
+                qp.cache_relight_spp
+            })
+            .max(1);
         // Stage D1: half-res GI trace + bilateral upsample. Gallery stays full-res (the
         // byte-identical anchor); content scenes take the tier default. `P11_GI_HALF_RES`
         // overrides. Needs the upsample pipeline (capability-gated).
@@ -1393,6 +1406,7 @@ impl App {
             gi_spp,
             cache_relight_period,
             cache_feedback,
+            cache_relight_spp,
             gi_half_res,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
@@ -2450,6 +2464,14 @@ impl App {
                 } else {
                     None
                 };
+                // Stage D3: period-aware temporal alpha keeps the visible cards converged within
+                // the screenshot warmup as the period rises (more weight per relight); gallery
+                // (feedback off) keeps the legacy 0.35 = byte-identical.
+                let relight_alpha = if self.cache_feedback {
+                    (0.35 * (self.cache_relight_period as f32 / 8.0)).clamp(0.35, 0.8)
+                } else {
+                    0.35
+                };
                 self.gdf.record_cache_light(
                     &mut graph,
                     gdf_ext,
@@ -2457,11 +2479,12 @@ impl App {
                     ext,
                     self.sun_dir,
                     self.sun_intensity,
-                    8,
+                    self.cache_relight_spp,
                     self.frame_no as u32,
                     self.scene_cache_reset,
                     self.cache_relight_period,
                     card_vis_ext,
+                    relight_alpha,
                 );
                 self.scene_cache_reset = false;
                 Some(ext)

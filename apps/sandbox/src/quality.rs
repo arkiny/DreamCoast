@@ -94,6 +94,11 @@ pub struct QualityPreset {
     /// byte-identical) at the call site. UE5 Lumen screen-probe / Frostbite half-res GI; see
     /// `gdf_gi_upsample.slang`.
     pub gi_half_res: bool,
+    /// Stage D3 (Sponza 60fps): surface-cache relight indirect-gather rays per texel
+    /// (`P11_CACHE_RELIGHT_SPP`). Forced to the legacy 8 for the gallery anchor (byte-identical).
+    /// The gather dominates `sdf_cache_light`; halving it ~halves the pass. Denoised by the
+    /// cache's temporal EMA, so fewer rays converge to the same static result.
+    pub cache_relight_spp: u32,
 }
 
 /// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
@@ -112,8 +117,9 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 8,
-            cache_relight_period: 8,
+            cache_relight_period: 16,
             gi_half_res: true,
+            cache_relight_spp: 4,
         },
         // Default — identical to the pre-tier behavior. Do not change without re-baselining no-reg.
         RenderQuality::Med => QualityPreset {
@@ -127,11 +133,12 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 16,
-            // Stage D2b: with camera-visibility feedback (off-screen cards relit 4x less), the
-            // base period can rise from D2's 4 toward UE's 32/64 — 8 stays converged in the
-            // 64-frame screenshot warmup while ~halving the on-screen relight cost again.
-            cache_relight_period: 8,
+            // Stage D2b/D3: with camera-visibility feedback (off-screen cards relit 8x less) and
+            // the period-aware EMA alpha keeping warmup convergence, the base period rises toward
+            // UE's 32/64. 16 + relight spp 4 brings sdf_cache_light into the frame budget.
+            cache_relight_period: 16,
             gi_half_res: true,
+            cache_relight_spp: 4,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
@@ -148,6 +155,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             shadow_taps: 16,
             cache_relight_period: 1,
             gi_half_res: false,
+            cache_relight_spp: 8,
         },
     }
 }

@@ -126,7 +126,7 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     // off-screen cards relight HIDDEN_MULT× less often (most of a dense scene's cards are out of
     // any one view, and they don't affect the current image — UE5 Lumen's visibility/staleness
     // priority). `clip.w == 0xFFFFFFFF` ⇒ no feedback ⇒ uniform period (Stage D2 behavior).
-    const uint HIDDEN_MULT = 4u;
+    const uint HIDDEN_MULT = 8u;
     uint period = relight_period;
     if (pc.clip.w != 0xFFFFFFFFu)
     {
