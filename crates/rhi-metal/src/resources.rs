@@ -288,4 +288,9 @@ pub struct MetalComputePipeline {
     pub(crate) threads_per_group: MTLSize,
     /// Bind the bindless argument buffer + make storage resources resident.
     pub(crate) bindless: bool,
+    /// Bind the per-frame globals UBO (Stage C7 SSR reprojection reads
+    /// `globals.prev_view_proj`). When set, the globals buffer binds at
+    /// [`GLOBALS_BUFFER_INDEX`] and the bindless block shifts to
+    /// [`BINDLESS_BUFFER_INDEX_WITH_GLOBALS`], mirroring the graphics path.
+    pub(crate) uses_globals: bool,
 }

@@ -103,6 +103,7 @@ pub(crate) fn build_compute(
             depth: z.max(1) as usize,
         },
         bindless: desc.bindless,
+        uses_globals: desc.uniform_buffer,
     })
 }
 
