@@ -106,7 +106,259 @@ fn closest_on_triangle(p: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f
     ]
 }
 
-/// The bake inputs shared by every Z-slab: the voxel grid + the decoded mesh.
+/// The result of a nearest-triangle query: the closest triangle's index, the distance
+/// to it, and `p - q` (closest point) so the SDF sign can be derived without recomputing
+/// the closest point. Defaults match a zero-triangle mesh (distance ∞, outward sign).
+struct Hit {
+    dist: f32,
+    tri: usize,
+    dp: [f32; 3],
+}
+
+/// A uniform spatial grid over the bake AABB binning triangles by the cells their AABB
+/// overlaps (Scalable-GI Stage A). It turns the per-voxel nearest-triangle search from
+/// O(triangles) into O(near cells), which is what lets the bake scale to Sponza-sized
+/// meshes. CSR layout: `cell_tris[cell_start[c]..cell_start[c+1]]` are cell `c`'s tris.
+///
+/// **Determinism:** the grid is a pure function of the inputs, and the query
+/// (ring-expanding with a conservative stop and a lowest-triangle-index tiebreak)
+/// returns the *same* winner as the brute-force scan — so the baked field is byte-for-
+/// byte identical with or without the grid (`grid_matches_brute` proves it).
+struct TriGrid {
+    res: [usize; 3],
+    /// `res[a] / extent[a]` (0 on a degenerate axis → everything maps to cell 0).
+    inv_cell: [f32; 3],
+    origin: [f32; 3],
+    /// Smallest cell edge — the per-shell distance bound's conservative unit.
+    min_cell: f32,
+    cell_start: Vec<u32>,
+    cell_tris: Vec<u32>,
+}
+
+impl TriGrid {
+    /// Pick a per-axis resolution: ~`cbrt(tri_count)` cells along the longest axis,
+    /// others proportional to their extent (so cells stay roughly cubic), each clamped
+    /// to `[1, MAX_GRID_RES]`. Resolution only affects speed, never the result.
+    fn choose_res(ext: [f32; 3], tri_count: usize) -> [usize; 3] {
+        const MAX_GRID_RES: f32 = 128.0;
+        let n = tri_count.max(1) as f32;
+        let max_ext = ext[0].max(ext[1]).max(ext[2]).max(1e-6);
+        let base = n.cbrt().clamp(1.0, MAX_GRID_RES);
+        let axis = |e: f32| ((e / max_ext) * base).ceil().clamp(1.0, MAX_GRID_RES) as usize;
+        [axis(ext[0]), axis(ext[1]), axis(ext[2])]
+    }
+
+    /// The `[lo, hi]` inclusive cell range an AABB `[mn, mx]` overlaps (clamped to grid).
+    fn cell_range(&self, mn: [f32; 3], mx: [f32; 3]) -> ([usize; 3], [usize; 3]) {
+        let mut lo = [0usize; 3];
+        let mut hi = [0usize; 3];
+        for a in 0..3 {
+            let l = ((mn[a] - self.origin[a]) * self.inv_cell[a]).floor();
+            let h = ((mx[a] - self.origin[a]) * self.inv_cell[a]).floor();
+            lo[a] = (l.max(0.0) as usize).min(self.res[a] - 1);
+            hi[a] = (h.max(0.0) as usize).min(self.res[a] - 1);
+        }
+        (lo, hi)
+    }
+
+    #[inline]
+    fn cell_index(&self, x: usize, y: usize, z: usize) -> usize {
+        x + self.res[0] * (y + self.res[1] * z)
+    }
+
+    /// Build the grid from the mesh's triangles.
+    fn build(
+        positions: &[[f32; 3]],
+        indices: &[u32],
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+    ) -> Self {
+        let tri_count = indices.len() / 3;
+        let ext = [
+            aabb_max[0] - aabb_min[0],
+            aabb_max[1] - aabb_min[1],
+            aabb_max[2] - aabb_min[2],
+        ];
+        let res = Self::choose_res(ext, tri_count);
+        let inv_cell = [
+            if ext[0] > 0.0 {
+                res[0] as f32 / ext[0]
+            } else {
+                0.0
+            },
+            if ext[1] > 0.0 {
+                res[1] as f32 / ext[1]
+            } else {
+                0.0
+            },
+            if ext[2] > 0.0 {
+                res[2] as f32 / ext[2]
+            } else {
+                0.0
+            },
+        ];
+        let min_cell = (0..3)
+            .map(|a| {
+                if res[a] > 0 {
+                    ext[a] / res[a] as f32
+                } else {
+                    0.0
+                }
+            })
+            .filter(|&c| c > 0.0)
+            .fold(f32::MAX, f32::min);
+        let min_cell = if min_cell == f32::MAX { 1e-6 } else { min_cell };
+        let ncells = res[0] * res[1] * res[2];
+
+        let mut grid = TriGrid {
+            res,
+            inv_cell,
+            origin: aabb_min,
+            min_cell,
+            cell_start: vec![0u32; ncells + 1],
+            cell_tris: Vec::new(),
+        };
+
+        // Per-triangle AABB → overlapping cell range. Count, prefix-sum, then fill.
+        let tri_aabb = |tri: usize| -> ([f32; 3], [f32; 3]) {
+            let a = positions[indices[tri * 3] as usize];
+            let b = positions[indices[tri * 3 + 1] as usize];
+            let c = positions[indices[tri * 3 + 2] as usize];
+            let mut mn = a;
+            let mut mx = a;
+            for v in [b, c] {
+                for k in 0..3 {
+                    mn[k] = mn[k].min(v[k]);
+                    mx[k] = mx[k].max(v[k]);
+                }
+            }
+            (mn, mx)
+        };
+        for tri in 0..tri_count {
+            let (mn, mx) = tri_aabb(tri);
+            let (lo, hi) = grid.cell_range(mn, mx);
+            for z in lo[2]..=hi[2] {
+                for y in lo[1]..=hi[1] {
+                    for x in lo[0]..=hi[0] {
+                        let ci = grid.cell_index(x, y, z);
+                        grid.cell_start[ci + 1] += 1;
+                    }
+                }
+            }
+        }
+        for i in 0..ncells {
+            grid.cell_start[i + 1] += grid.cell_start[i];
+        }
+        grid.cell_tris = vec![0u32; grid.cell_start[ncells] as usize];
+        let mut cursor: Vec<u32> = grid.cell_start[..ncells].to_vec();
+        for tri in 0..tri_count {
+            let (mn, mx) = tri_aabb(tri);
+            let (lo, hi) = grid.cell_range(mn, mx);
+            for z in lo[2]..=hi[2] {
+                for y in lo[1]..=hi[1] {
+                    for x in lo[0]..=hi[0] {
+                        let c = grid.cell_index(x, y, z);
+                        grid.cell_tris[cursor[c] as usize] = tri as u32;
+                        cursor[c] += 1;
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    /// Nearest triangle to `p`, expanding Chebyshev shells of cells until no unsearched
+    /// shell can hold anything closer. `visited` is a per-thread scratch stamp (sized to
+    /// the triangle count) so a triangle binned into several cells is tested once per
+    /// query; `stamp` is bumped by the caller per voxel.
+    ///
+    /// Tiebreak: among triangles at the exact minimum distance, the lowest index wins —
+    /// matching the brute scan's `if d < best` (strict), so the winner (hence the SDF
+    /// sign and albedo) is byte-identical.
+    fn nearest(
+        &self,
+        p: [f32; 3],
+        positions: &[[f32; 3]],
+        indices: &[u32],
+        visited: &mut [u32],
+        stamp: u32,
+    ) -> Hit {
+        let mut best = Hit {
+            dist: 1e30,
+            tri: 0,
+            dp: [0.0; 3],
+        };
+        let pc: [i32; 3] = std::array::from_fn(|a| {
+            let c = ((p[a] - self.origin[a]) * self.inv_cell[a]).floor() as i32;
+            c.clamp(0, self.res[a] as i32 - 1)
+        });
+        let max_r = (0..3)
+            .map(|a| pc[a].max(self.res[a] as i32 - 1 - pc[a]))
+            .max()
+            .unwrap_or(0);
+
+        let mut r = 0i32;
+        loop {
+            // Process every cell at Chebyshev distance exactly `r` from `pc`.
+            for dz in -r..=r {
+                let z = pc[2] + dz;
+                if z < 0 || z >= self.res[2] as i32 {
+                    continue;
+                }
+                for dy in -r..=r {
+                    let y = pc[1] + dy;
+                    if y < 0 || y >= self.res[1] as i32 {
+                        continue;
+                    }
+                    for dx in -r..=r {
+                        if dx.abs().max(dy.abs()).max(dz.abs()) != r {
+                            continue; // already covered by an inner shell
+                        }
+                        let x = pc[0] + dx;
+                        if x < 0 || x >= self.res[0] as i32 {
+                            continue;
+                        }
+                        let c = self.cell_index(x as usize, y as usize, z as usize);
+                        for &t in &self.cell_tris
+                            [self.cell_start[c] as usize..self.cell_start[c + 1] as usize]
+                        {
+                            let tri = t as usize;
+                            if visited[tri] == stamp {
+                                continue;
+                            }
+                            visited[tri] = stamp;
+                            let a = positions[indices[tri * 3] as usize];
+                            let b = positions[indices[tri * 3 + 1] as usize];
+                            let cc = positions[indices[tri * 3 + 2] as usize];
+                            let q = closest_on_triangle(p, a, b, cc);
+                            let dp = sub(p, q);
+                            let d = dot(dp, dp).sqrt();
+                            // Strict-less keeps the first (lowest-index) at the min; the
+                            // equal-distance branch lets an even lower index win on ties.
+                            if d < best.dist || (d == best.dist && tri < best.tri) {
+                                best = Hit { dist: d, tri, dp };
+                            }
+                        }
+                    }
+                }
+            }
+            // Distance from `p` to any cell in shell r+1 is ≥ r·min_cell. Stop (strict)
+            // once nothing unsearched can match `best` — equal-distance ties in the next
+            // shell are kept by the non-strict bound.
+            if best.dist < r as f32 * self.min_cell {
+                break;
+            }
+            r += 1;
+            if r > max_r {
+                break;
+            }
+        }
+        best
+    }
+}
+
+/// The bake inputs shared by every Z-slab: the voxel grid params, the decoded mesh, and
+/// the acceleration grid (built once, borrowed read-only by every slab thread).
 /// Grouped so the per-slab worker takes a single borrow (and to keep the argument
 /// count sane).
 struct BakeCtx<'a> {
@@ -116,6 +368,7 @@ struct BakeCtx<'a> {
     positions: &'a [[f32; 3]],
     normals: &'a [[f32; 3]],
     indices: &'a [u32],
+    grid: &'a TriGrid,
 }
 
 /// Bake one Z-slab `[z0, z1)` of the volume into `out` (the matching slice).
@@ -128,9 +381,13 @@ fn bake_slab(out: &mut [f32], z0: u32, z1: u32, ctx: &BakeCtx) {
         positions,
         normals,
         indices,
+        grid,
     } = *ctx;
     let tri_count = indices.len() / 3;
     let inv_dim = 1.0 / dim as f32;
+    // Per-thread visit stamps so the grid query tests each triangle once per voxel.
+    let mut visited = vec![0u32; tri_count];
+    let mut stamp = 0u32;
     for z in z0..z1 {
         for y in 0..dim {
             for x in 0..dim {
@@ -144,36 +401,28 @@ fn bake_slab(out: &mut [f32], z0: u32, z1: u32, ctx: &BakeCtx) {
                     aabb_min[1] + (aabb_max[1] - aabb_min[1]) * t[1],
                     aabb_min[2] + (aabb_max[2] - aabb_min[2]) * t[2],
                 ];
-                let mut best = 1e30_f32;
+                stamp += 1;
+                let hit = grid.nearest(p, positions, indices, &mut visited, stamp);
                 let mut sign_d = 1.0_f32;
-                for tri in 0..tri_count {
-                    let i0 = indices[tri * 3] as usize;
-                    let i1 = indices[tri * 3 + 1] as usize;
-                    let i2 = indices[tri * 3 + 2] as usize;
-                    let a = positions[i0];
-                    let b = positions[i1];
-                    let c = positions[i2];
-                    let q = closest_on_triangle(p, a, b, c);
-                    let dp = sub(p, q);
-                    let d = dot(dp, dp).sqrt();
-                    if d < best {
-                        best = d;
-                        // Sign by the closest triangle's averaged (outward) vertex
-                        // normals: dot(p-q, n) < 0 ⇒ inside (negative). Winding-
-                        // independent, matching the shader.
-                        let n0 = normals[i0];
-                        let n1 = normals[i1];
-                        let n2 = normals[i2];
-                        let n = [
-                            n0[0] + n1[0] + n2[0],
-                            n0[1] + n1[1] + n2[1],
-                            n0[2] + n1[2] + n2[2],
-                        ];
-                        sign_d = if dot(dp, n) < 0.0 { -1.0 } else { 1.0 };
-                    }
+                if tri_count > 0 {
+                    // Sign by the closest triangle's averaged (outward) vertex normals:
+                    // dot(p-q, n) < 0 ⇒ inside (negative). Winding-independent, matching
+                    // the shader.
+                    let i0 = indices[hit.tri * 3] as usize;
+                    let i1 = indices[hit.tri * 3 + 1] as usize;
+                    let i2 = indices[hit.tri * 3 + 2] as usize;
+                    let n0 = normals[i0];
+                    let n1 = normals[i1];
+                    let n2 = normals[i2];
+                    let n = [
+                        n0[0] + n1[0] + n2[0],
+                        n0[1] + n1[1] + n2[1],
+                        n0[2] + n1[2] + n2[2],
+                    ];
+                    sign_d = if dot(hit.dp, n) < 0.0 { -1.0 } else { 1.0 };
                 }
                 let local = ((z - z0) * dim * dim + y * dim + x) as usize;
-                out[local] = best * sign_d;
+                out[local] = hit.dist * sign_d;
             }
         }
     }
@@ -206,6 +455,10 @@ pub fn bake_sdf_from_fused(
     let slab = dim * dim;
     let mut voxels = vec![0.0_f32; (slab * dim) as usize];
 
+    // Stage A: one acceleration grid over the bake AABB, built once and shared by every
+    // slab thread (read-only) — the per-voxel search is then O(near cells), not O(tris).
+    let grid = TriGrid::build(&positions, &indices, aabb_min, aabb_max);
+
     // Parallelize over Z slabs. Each slab writes a disjoint, contiguous region, so
     // the output splits cleanly with no locking. std::thread only (no rayon dep).
     let threads = std::thread::available_parallelism()
@@ -222,6 +475,7 @@ pub fn bake_sdf_from_fused(
         positions: &positions,
         normals: &normals,
         indices: &indices,
+        grid: &grid,
     };
     std::thread::scope(|scope| {
         let mut rest = voxels.as_mut_slice();
@@ -276,10 +530,13 @@ fn bake_albedo_slab(out: &mut [f32], z0: u32, z1: u32, ctx: &BakeCtx, tri_albedo
         aabb_max,
         positions,
         indices,
+        grid,
         ..
     } = *ctx;
     let tri_count = indices.len() / 3;
     let inv_dim = 1.0 / dim as f32;
+    let mut visited = vec![0u32; tri_count];
+    let mut stamp = 0u32;
     for z in z0..z1 {
         for y in 0..dim {
             for x in 0..dim {
@@ -293,22 +550,13 @@ fn bake_albedo_slab(out: &mut [f32], z0: u32, z1: u32, ctx: &BakeCtx, tri_albedo
                     aabb_min[1] + (aabb_max[1] - aabb_min[1]) * t[1],
                     aabb_min[2] + (aabb_max[2] - aabb_min[2]) * t[2],
                 ];
-                let mut best = 1e30_f32;
-                let mut best_tri = 0usize;
-                for tri in 0..tri_count {
-                    let a = positions[indices[tri * 3] as usize];
-                    let b = positions[indices[tri * 3 + 1] as usize];
-                    let c = positions[indices[tri * 3 + 2] as usize];
-                    let q = closest_on_triangle(p, a, b, c);
-                    let dp = sub(p, q);
-                    let d = dot(dp, dp);
-                    if d < best {
-                        best = d;
-                        best_tri = tri;
-                    }
-                }
+                stamp += 1;
+                // Same nearest-triangle search as the SDF (sqrt-distance ordering picks
+                // the same argmin as the brute squared-distance scan), so the winning
+                // triangle — hence its albedo — is byte-identical.
+                let hit = grid.nearest(p, positions, indices, &mut visited, stamp);
                 let albedo = if tri_count > 0 {
-                    tri_albedo[best_tri]
+                    tri_albedo[hit.tri]
                 } else {
                     [0.7, 0.7, 0.7]
                 };
@@ -360,6 +608,10 @@ pub fn bake_albedo_from_fused(
     // RGB interleaved (3 floats / voxel) so the parallel split stays one contiguous
     // output; deinterleaved into channels afterwards.
     let mut interleaved = vec![0.0_f32; (slab * dim * 3) as usize];
+    // Stage A: the same acceleration grid as the SDF bake (built from the identical
+    // fused geometry), so the nearest-triangle winner — hence each voxel's albedo — is
+    // byte-identical with the brute scan.
+    let grid = TriGrid::build(&positions, &indices, aabb_min, aabb_max);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -373,6 +625,7 @@ pub fn bake_albedo_from_fused(
         positions: &positions,
         normals: &normals,
         indices: &indices,
+        grid: &grid,
     };
     std::thread::scope(|scope| {
         let mut rest = interleaved.as_mut_slice();
@@ -503,5 +756,303 @@ mod tests {
         let a = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, 12, [0.0; 3], [1.0; 3]);
         let b = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, 12, [0.0; 3], [1.0; 3]);
         assert_eq!(a.channels, b.channels);
+    }
+
+    /// Two unit spheres (radius 0.18) at different positions, fused like the engine —
+    /// a multi-object mesh so the nearest-triangle search crosses grid cells and picks
+    /// between objects, exercising the ring expansion (not just one convex blob).
+    fn two_spheres_fused() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let centres = [[0.3_f32, 0.5, 0.5], [0.75, 0.45, 0.6]];
+        let mut vtx = Vec::new();
+        let mut idx = Vec::new();
+        let mut tri_albedo = Vec::new();
+        let mut base = 0u32;
+        for (oi, c) in centres.into_iter().enumerate() {
+            let mut s = uv_sphere(20, 14);
+            for v in &mut s.vertices {
+                v.pos = [
+                    v.pos[0] * 0.18 + c[0],
+                    v.pos[1] * 0.18 + c[1],
+                    v.pos[2] * 0.18 + c[2],
+                ];
+            }
+            for v in &s.vertices {
+                for f in v.pos.iter().chain(&v.normal).chain(&v.uv) {
+                    vtx.extend_from_slice(&f.to_le_bytes());
+                }
+            }
+            for &i in &s.indices {
+                idx.extend_from_slice(&(i + base).to_le_bytes());
+            }
+            let colour = if oi == 0 {
+                [0.8_f32, 0.2, 0.2]
+            } else {
+                [0.2, 0.4, 0.9]
+            };
+            for _ in 0..(s.indices.len() / 3) {
+                for ch in colour {
+                    tri_albedo.extend_from_slice(&ch.to_le_bytes());
+                }
+            }
+            base += s.vertices.len() as u32;
+        }
+        (vtx, idx, tri_albedo)
+    }
+
+    /// Decode the fused buffers the same way the bakes do (for the brute references).
+    fn decode(vtx: &[u8], idx: &[u8]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>) {
+        let vc = vtx.len() / VTX_STRIDE;
+        let mut pos = Vec::with_capacity(vc);
+        let mut nrm = Vec::with_capacity(vc);
+        for v in 0..vc {
+            pos.push(read_vec3(vtx, v * VTX_STRIDE));
+            nrm.push(read_vec3(vtx, v * VTX_STRIDE + 12));
+        }
+        let indices = idx
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        (pos, nrm, indices)
+    }
+
+    /// Brute-force SDF (the pre-Stage-A O(voxel·triangle) scan) — the reference the
+    /// grid-accelerated bake must reproduce bit-for-bit.
+    fn brute_sdf(vtx: &[u8], idx: &[u8], dim: u32, amin: [f32; 3], amax: [f32; 3]) -> Vec<f32> {
+        let (pos, nrm, indices) = decode(vtx, idx);
+        let tri_count = indices.len() / 3;
+        let inv = 1.0 / dim as f32;
+        let mut out = vec![0.0f32; (dim * dim * dim) as usize];
+        for z in 0..dim {
+            for y in 0..dim {
+                for x in 0..dim {
+                    // Match the slab's exact float grouping (t first, then scale) so the
+                    // reference position is bit-identical to the production bake.
+                    let t = [
+                        (x as f32 + 0.5) * inv,
+                        (y as f32 + 0.5) * inv,
+                        (z as f32 + 0.5) * inv,
+                    ];
+                    let p = [
+                        amin[0] + (amax[0] - amin[0]) * t[0],
+                        amin[1] + (amax[1] - amin[1]) * t[1],
+                        amin[2] + (amax[2] - amin[2]) * t[2],
+                    ];
+                    let mut best = 1e30f32;
+                    let mut sign_d = 1.0f32;
+                    for tri in 0..tri_count {
+                        let i0 = indices[tri * 3] as usize;
+                        let i1 = indices[tri * 3 + 1] as usize;
+                        let i2 = indices[tri * 3 + 2] as usize;
+                        let q = closest_on_triangle(p, pos[i0], pos[i1], pos[i2]);
+                        let dp = sub(p, q);
+                        let d = dot(dp, dp).sqrt();
+                        if d < best {
+                            best = d;
+                            let n = [
+                                nrm[i0][0] + nrm[i1][0] + nrm[i2][0],
+                                nrm[i0][1] + nrm[i1][1] + nrm[i2][1],
+                                nrm[i0][2] + nrm[i1][2] + nrm[i2][2],
+                            ];
+                            sign_d = if dot(dp, n) < 0.0 { -1.0 } else { 1.0 };
+                        }
+                    }
+                    out[(x + dim * (y + dim * z)) as usize] = best * sign_d;
+                }
+            }
+        }
+        out
+    }
+
+    /// Brute-force albedo (pre-Stage-A) — picks the nearest triangle's colour.
+    fn brute_albedo(
+        vtx: &[u8],
+        idx: &[u8],
+        tri_albedo: &[u8],
+        dim: u32,
+        amin: [f32; 3],
+        amax: [f32; 3],
+    ) -> [Vec<f32>; 3] {
+        let (pos, _nrm, indices) = decode(vtx, idx);
+        let tri_count = indices.len() / 3;
+        let tri_col: Vec<[f32; 3]> = tri_albedo
+            .chunks_exact(12)
+            .map(|c| {
+                [
+                    f32::from_le_bytes(c[0..4].try_into().unwrap()),
+                    f32::from_le_bytes(c[4..8].try_into().unwrap()),
+                    f32::from_le_bytes(c[8..12].try_into().unwrap()),
+                ]
+            })
+            .collect();
+        let inv = 1.0 / dim as f32;
+        let n = (dim * dim * dim) as usize;
+        let mut ch = [vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]];
+        for z in 0..dim {
+            for y in 0..dim {
+                for x in 0..dim {
+                    let t = [
+                        (x as f32 + 0.5) * inv,
+                        (y as f32 + 0.5) * inv,
+                        (z as f32 + 0.5) * inv,
+                    ];
+                    let p = [
+                        amin[0] + (amax[0] - amin[0]) * t[0],
+                        amin[1] + (amax[1] - amin[1]) * t[1],
+                        amin[2] + (amax[2] - amin[2]) * t[2],
+                    ];
+                    let mut best = 1e30f32;
+                    let mut best_tri = 0usize;
+                    for tri in 0..tri_count {
+                        let q = closest_on_triangle(
+                            p,
+                            pos[indices[tri * 3] as usize],
+                            pos[indices[tri * 3 + 1] as usize],
+                            pos[indices[tri * 3 + 2] as usize],
+                        );
+                        let dp = sub(p, q);
+                        let d = dot(dp, dp);
+                        if d < best {
+                            best = d;
+                            best_tri = tri;
+                        }
+                    }
+                    let col = if tri_count > 0 {
+                        tri_col[best_tri]
+                    } else {
+                        [0.7, 0.7, 0.7]
+                    };
+                    let i = (x + dim * (y + dim * z)) as usize;
+                    ch[0][i] = col[0];
+                    ch[1][i] = col[1];
+                    ch[2][i] = col[2];
+                }
+            }
+        }
+        ch
+    }
+
+    #[test]
+    fn grid_sdf_matches_brute() {
+        // Multi-object mesh + a padded, non-cubic AABB (like a real scene) so the grid's
+        // ring expansion and tiebreak are genuinely exercised.
+        let (vtx, idx, _) = two_spheres_fused();
+        let dim = 24;
+        let amin = [0.0f32, 0.1, 0.2];
+        let amax = [1.1f32, 0.9, 1.0];
+        let grid = bake_sdf_from_fused(&vtx, &idx, dim, amin, amax);
+        let brute = brute_sdf(&vtx, &idx, dim, amin, amax);
+        assert_eq!(
+            grid.voxels, brute,
+            "grid-accelerated SDF must be byte-identical to the brute scan"
+        );
+    }
+
+    #[test]
+    fn grid_albedo_matches_brute() {
+        let (vtx, idx, tri_albedo) = two_spheres_fused();
+        let dim = 24;
+        let amin = [0.0f32, 0.1, 0.2];
+        let amax = [1.1f32, 0.9, 1.0];
+        let grid = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, dim, amin, amax);
+        let brute = brute_albedo(&vtx, &idx, &tri_albedo, dim, amin, amax);
+        assert_eq!(
+            grid.channels, brute,
+            "grid-accelerated albedo must be byte-identical to the brute scan"
+        );
+    }
+
+    /// Stage A measurement (ignored by default — needs the local-only Sponza asset).
+    /// Run with `cargo test -p dreamcoast-asset --release bench_sponza -- --ignored
+    /// --nocapture`. Loads Sponza, fuses its whole hierarchy to world space, then times
+    /// the grid (production, parallel) vs the brute (serial reference) SDF bake at 48³ —
+    /// and `assert_eq!`s them, so it doubles as the bit-identity proof on a real
+    /// 260k-triangle mesh.
+    #[test]
+    #[ignore = "benchmark: requires local assets/Sponza/Sponza.gltf"]
+    fn bench_sponza_bake() {
+        use dreamcoast_core::glam::{Mat4, Quat, Vec3};
+        use std::time::Instant;
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/Sponza/Sponza.gltf"
+        );
+        if !std::path::Path::new(path).exists() {
+            eprintln!("Sponza absent at {path} — skipping benchmark");
+            return;
+        }
+        let scene = crate::load_gltf_scene(path).expect("load Sponza");
+
+        // Fuse the whole node hierarchy to world space (the engine's native 1u=1m scale).
+        let mut vtx: Vec<u8> = Vec::new();
+        let mut idx: Vec<u8> = Vec::new();
+        let mut base = 0u32;
+        let mut amin = [f32::MAX; 3];
+        let mut amax = [f32::MIN; 3];
+        let mut stack: Vec<(usize, Mat4)> =
+            scene.roots.iter().map(|&r| (r, Mat4::IDENTITY)).collect();
+        while let Some((ni, parent)) = stack.pop() {
+            let n = &scene.nodes[ni];
+            let world = parent
+                * Mat4::from_scale_rotation_translation(
+                    Vec3::from(n.scale),
+                    Quat::from_array(n.rotation),
+                    Vec3::from(n.translation),
+                );
+            if let Some(mi) = n.mesh {
+                for prim in &scene.meshes[mi] {
+                    for v in &prim.vertices {
+                        let p = world.transform_point3(Vec3::from(v.pos));
+                        let nn = world
+                            .transform_vector3(Vec3::from(v.normal))
+                            .normalize_or_zero();
+                        amin = [amin[0].min(p.x), amin[1].min(p.y), amin[2].min(p.z)];
+                        amax = [amax[0].max(p.x), amax[1].max(p.y), amax[2].max(p.z)];
+                        for f in [p.x, p.y, p.z, nn.x, nn.y, nn.z, v.uv[0], v.uv[1]] {
+                            vtx.extend_from_slice(&f.to_le_bytes());
+                        }
+                    }
+                    for &i in &prim.indices {
+                        idx.extend_from_slice(&(i + base).to_le_bytes());
+                    }
+                    base += prim.vertices.len() as u32;
+                }
+            }
+            for &c in &n.children {
+                stack.push((c, world));
+            }
+        }
+        for i in 0..3 {
+            let pad = ((amax[i] - amin[i]) * 0.1).max(0.05);
+            amin[i] -= pad;
+            amax[i] += pad;
+        }
+        let tris = idx.len() / 4 / 3;
+        eprintln!(
+            "Sponza fused: {} verts, {tris} tris, AABB size [{:.1}, {:.1}, {:.1}] m",
+            vtx.len() / VTX_STRIDE,
+            amax[0] - amin[0],
+            amax[1] - amin[1],
+            amax[2] - amin[2],
+        );
+
+        let dim = 48;
+        let t0 = Instant::now();
+        let grid = bake_sdf_from_fused(&vtx, &idx, dim, amin, amax);
+        let grid_ms = t0.elapsed().as_secs_f64() * 1e3;
+        eprintln!("grid bake (parallel) {dim}^3: {grid_ms:.0} ms");
+
+        let t1 = Instant::now();
+        let brute = brute_sdf(&vtx, &idx, dim, amin, amax);
+        let brute_ms = t1.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "brute bake (serial) {dim}^3: {brute_ms:.0} ms  ({:.0}x slower than parallel grid)",
+            brute_ms / grid_ms
+        );
+
+        assert_eq!(
+            grid.voxels, brute,
+            "Sponza grid bake must be byte-identical to the brute scan"
+        );
     }
 }
