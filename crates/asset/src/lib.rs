@@ -15,6 +15,7 @@ pub mod primitives;
 pub mod sdf;
 
 pub use gltf_scene::{GltfMaterial, GltfNode, GltfPrimitive, GltfScene, load_gltf_scene};
+pub use level::LevelData;
 pub use primitives::{cornell_box, unit_cube, uv_sphere};
 
 /// A mesh vertex (matches `rhi::VertexLayout::Mesh`: 32-byte stride).

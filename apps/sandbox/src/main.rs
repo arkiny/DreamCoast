@@ -36,6 +36,7 @@ mod deferred;
 mod gdf;
 mod gi;
 mod ibl;
+mod level;
 mod mesh;
 mod particle;
 mod push;
@@ -342,6 +343,12 @@ struct App {
     world: World,
     mesh_registry: MeshRegistry,
     material_registry: MaterialRegistry,
+    // Stage C level hot-swap: the discovered `.level` files, the loaded index, and a
+    // pending selection from the UI (applied at the next frame's start). Empty unless
+    // started in level mode (`LEVEL`).
+    level_paths: Vec<String>,
+    current_level: usize,
+    pending_level: Option<usize>,
     ground_vbuf: Buffer,
     ground_ibuf: Buffer,
     ground_count: u32,
@@ -572,25 +579,61 @@ impl App {
             None => NO_TEXTURE,
         };
 
-        // Build the scene as ECS entities: either the procedural gallery (default) or a
-        // full glTF scene imported via `SCENE_GLTF=<path>` (Stage B). A ground plane is
-        // kept separate (it's also the environment-capture geometry). `sphere`/`cube`
-        // are always built — the gallery uses them, and they're cheap.
+        // Build the scene as ECS entities: the procedural gallery (default), a full
+        // glTF scene (`SCENE_GLTF=<path>`, Stage B), or a declarative level
+        // (`LEVEL=<name>`, Stage C). A ground plane is kept separate (it's also the
+        // environment-capture geometry). `sphere`/`cube` are always built — the gallery
+        // uses them, and they're cheap.
         let r = model_radius;
         let sphere = dreamcoast_asset::uv_sphere(48, 32);
         let cube = dreamcoast_asset::unit_cube();
-        let scene_gltf_path = std::env::var("SCENE_GLTF").ok();
-        let gallery_scene = scene_gltf_path.is_none();
+        // `LEVEL` (any value, optionally a level file stem to pick) enables level mode.
+        let level_select = std::env::var("LEVEL").ok();
+        let scene_gltf_path = if level_select.is_some() {
+            None
+        } else {
+            std::env::var("SCENE_GLTF").ok()
+        };
+        // The gallery is the only scene with the GDF/HW-RT path; glTF + levels use the
+        // captured-cube IBL (forced via `legacy_ibl` below).
+        let gallery_scene = level_select.is_none() && scene_gltf_path.is_none();
+        let levels_dir = std::path::PathBuf::from("apps/sandbox/levels");
 
         // Registries own the GPU meshes + material descriptors the scene's handles
         // point at (P2). Unique geometry uploads once — the two spheres share a handle.
         let mut mesh_registry = MeshRegistry::new();
         let mut material_registry = MaterialRegistry::new();
         let mut world = World::new();
-        // glTF path only: CPU geometry per mesh handle, for the RT instance table.
-        let mut gltf_cpu_meshes: Vec<MeshData> = Vec::new();
+        // Level-mode hot-swap state: the discovered `.level` files + the loaded index.
+        let mut level_paths: Vec<String> = Vec::new();
+        let mut current_level = 0usize;
 
-        if let Some(path) = &scene_gltf_path {
+        if let Some(select) = &level_select {
+            // Stage C: load a declarative level (auto-writing the built-in levels first).
+            level_paths = level::ensure_level_files(&levels_dir)?;
+            current_level = level_paths
+                .iter()
+                .position(|p| {
+                    std::path::Path::new(p)
+                        .file_stem()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(select))
+                })
+                .unwrap_or(0);
+            let level = dreamcoast_asset::LevelData::load_ron(&level_paths[current_level])?;
+            info!(
+                "level '{}' ({} entities)",
+                level_paths[current_level],
+                level.entities.len()
+            );
+            level::build_level(
+                &device,
+                &level,
+                &mut world,
+                &mut mesh_registry,
+                &mut material_registry,
+                &mut textures,
+            )?;
+        } else if let Some(path) = &scene_gltf_path {
             // Stage B: import the whole node hierarchy + every primitive/material/image.
             let gscene = dreamcoast_asset::load_gltf_scene(path)?;
             info!(
@@ -600,14 +643,13 @@ impl App {
                 gscene.materials.len(),
                 gscene.images.len()
             );
-            let (prim_handles, cpu) = registry::upload_gltf_scene(
+            let (prim_handles, _cpu) = registry::upload_gltf_scene(
                 &device,
                 &gscene,
                 &mut mesh_registry,
                 &mut material_registry,
                 &mut textures,
             )?;
-            gltf_cpu_meshes = cpu;
             let imported = dreamcoast_scene::instantiate_gltf(&mut world, &gscene, &prim_handles);
             // Normalize the import to the unit-radius, on-ground convention via a
             // transformable wrapper root (so the glTF nodes keep their own transforms).
@@ -691,14 +733,12 @@ impl App {
         let scene = build_scene(&world, &mesh_registry, &material_registry);
         let scene_radius = r * 3.0;
         // RT instance-table mesh sources, aligned 1:1 with the draw list (TLAS order).
+        // Only the gallery builds the HW-RT scene accel; glTF/level paths pass nothing
+        // (RtSystem::new skips the table when `build_scene_accel` is false).
         let scene_meshes: Vec<&MeshData> = if gallery_scene {
             vec![model, &sphere, &sphere, &cube]
         } else {
-            world
-                .draw_list()
-                .iter()
-                .map(|d| &gltf_cpu_meshes[d.mesh.0 as usize])
-                .collect()
+            Vec::new()
         };
 
         // Ground plane (separate handle: also used by the environment capture).
@@ -1136,6 +1176,9 @@ impl App {
             world,
             mesh_registry,
             material_registry,
+            level_paths,
+            current_level,
+            pending_level: None,
             ground_vbuf,
             ground_ibuf,
             ground_count,
@@ -1263,10 +1306,51 @@ impl App {
         Ok(())
     }
 
+    /// Hot-swap to level `idx` (Stage C): rebuild the ECS world + registries +
+    /// textures from the level file. Waits for the GPU to idle first so the resources
+    /// the previous frames referenced are safe to drop. The per-frame draw list is
+    /// materialized from `self.world`, so the next frame picks up the new scene.
+    fn load_level(&mut self, idx: usize) -> anyhow::Result<()> {
+        self.device.wait_idle()?;
+        let path = self.level_paths[idx].clone();
+        let level = dreamcoast_asset::LevelData::load_ron(&path)?;
+        let mut world = World::new();
+        let mut mesh_registry = MeshRegistry::new();
+        let mut material_registry = MaterialRegistry::new();
+        let mut textures: Vec<Texture> = Vec::new();
+        level::build_level(
+            &self.device,
+            &level,
+            &mut world,
+            &mut mesh_registry,
+            &mut material_registry,
+            &mut textures,
+        )?;
+        dreamcoast_scene::propagate_transforms(&mut world);
+        self.world = world;
+        self.mesh_registry = mesh_registry;
+        self.material_registry = material_registry;
+        self._textures = textures;
+        self.current_level = idx;
+        info!(
+            "hot-swapped to level '{path}' ({} entities)",
+            level.entities.len()
+        );
+        Ok(())
+    }
+
     /// One iteration of the render loop. Returns `false` when the loop should stop
     /// (screenshot mode done); `true` to continue (including the skip-this-frame
     /// cases — zero-size window, failed acquire).
     fn frame(&mut self) -> anyhow::Result<bool> {
+        // Apply a pending level hot-swap requested from the UI last frame.
+        if let Some(idx) = self.pending_level.take() {
+            self.load_level(idx)?;
+        }
+        self.window.pump_events();
+        if self.window.take_resized() {
+            self.needs_recreate = true;
+        }
         self.window.pump_events();
         if self.window.take_resized() {
             self.needs_recreate = true;
@@ -1507,6 +1591,9 @@ impl App {
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
+                level_paths,
+                current_level,
+                pending_level,
                 ..
             } = self;
             let async_compute_supported = *async_compute_supported;
@@ -1520,6 +1607,26 @@ impl App {
                         dt * 1000.0
                     ));
                     ui.text(format!("scene: {} objects + ground", scene.len()));
+                    // Stage C: level hot-swap dropdown (level mode only). Selecting a level
+                    // requests a rebuild applied at the next frame's start (deferred so the
+                    // GPU can idle first). The file names (stems) label the entries.
+                    if !level_paths.is_empty() {
+                        let names: Vec<&str> = level_paths
+                            .iter()
+                            .map(|p| {
+                                std::path::Path::new(p)
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or(p)
+                            })
+                            .collect();
+                        let mut sel = *current_level;
+                        if ui.combo_simple_string("level", &mut sel, &names)
+                            && sel != *current_level
+                        {
+                            *pending_level = Some(sel);
+                        }
+                    }
                     // RenderQuality tier (Stage D): switching re-applies the preset to the live
                     // knobs below (capability-gated). A manual pick supersedes any startup env
                     // override — the env seam only seeds the initial state. The graph is rebuilt
