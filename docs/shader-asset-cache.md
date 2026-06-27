@@ -121,10 +121,13 @@ crates/shader/compiled/                 # 쿡된 셰이더 에셋 루트 (per-OS
   (드리프트 불가). 해시 히트 AND 산출물 실재 → slangc 생략. **측정(Windows d3d12+vulkan):** 콜드 118 compiled,
   `touch`(동일 바이트) **58s→3s, 0 compiled/118 cached**, 단일 편집 4 compiled(해당 잡만), 바이트코드
   120/120 동일(무회귀). M4.5 빌드 병렬화로 콜드 빌드도 단축 예정.
-- **M4.2 — per-OS 캐시 디렉터리.** 산출물을 `crates/shader/compiled/<os>/`로 이동, `include_bytes!`가
-  거기서 임베드(6a). `target_selected`와 일치하는 OS 네임스페이싱. cache miss/hit 로그.
-- **M4.3 — gitignore 반영(로컬 캐시).** 캐시 디렉터리/매니페스트를 `.gitignore`에 반영(§5 결정 =
-  로컬 전용). fresh checkout은 1회 풀 컴파일, 이후 무변경 빌드는 캐시 히트로 재컴파일 생략을 검증.
+- **M4.2 — per-OS 캐시 디렉터리. ✅ 완료(2026-06-27).** 산출물 + 매니페스트를
+  `crates/shader/compiled/<target_os>/`(예: `windows/`)로 이동, `include_bytes!`가 거기서 임베드(6a).
+  Metal RT-pipeline 분기는 OUT_DIR scratch 유지(uncached, macOS 전용). **검증:** 118 산출물 byte-동일,
+  **`cargo clean` 후 재빌드 = 0 slangc**(캐시가 `target/` 밖이라 생존), 양 백엔드 렌더 DX≡VK 0.000/ch.
+- **M4.3 — gitignore 반영(로컬 캐시). ✅ 완료(2026-06-27).** `.gitignore` 예약 `/shaders/compiled/` →
+  실제 경로 `/crates/shader/compiled/`로 정정(§5 로컬 전용). 캐시 산출물·매니페스트 미커밋 확인. fresh
+  checkout = 1회 풀 컴파일, 이후 무변경/`cargo clean` 빌드는 캐시 히트(M4.2 검증과 동일).
 - **M4.4 — 퍼뮤테이션 매트릭스.** `Job`에 `variants`(이름 붙은 define-set) 선언 → **(잡 × 변형 × 타깃)**
   카테시안을 전부 미리 쿡, 변형별 accessor(`<key>_<variant>_<suffix>()`) 생성, 런타임은 define-mask로
   변형 선택(`load_shader_pair` 소비처 변경). 캐시/해시/스킵 로직은 **무변경**(데이터 확장만) — `defines`가
