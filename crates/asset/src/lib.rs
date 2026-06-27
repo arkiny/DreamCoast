@@ -27,6 +27,74 @@ pub struct ImageData {
     pub rgba8: Vec<u8>,
 }
 
+/// A material texture as carried by a cooked asset: either raw RGBA8 (mips are
+/// generated at GPU upload) or **pre-cooked BCn block data** with its full mip
+/// chain (Phase 12 M3). Block-compressed data is sampled GPU-natively, so it costs
+/// nothing to decompress at runtime; the cook decides per slot which to use (color
+/// → BC, data textures like metallic-roughness → RGBA8).
+pub enum TexData {
+    /// Uncompressed RGBA8, single level. The upload generates the mip chain.
+    Rgba8(ImageData),
+    /// Pre-cooked BCn blocks, one entry per mip (level 0 full-res).
+    Bc {
+        format: bc::BcFormat,
+        /// Whether the colour data is sRGB-encoded (BC1 base/emissive) — picks the
+        /// `_SRGB` GPU format at upload.
+        srgb: bool,
+        width: u32,
+        height: u32,
+        mips: Vec<Vec<u8>>,
+    },
+}
+
+impl TexData {
+    /// Image dimensions (level 0).
+    pub fn dimensions(&self) -> (u32, u32) {
+        match self {
+            TexData::Rgba8(im) => (im.width, im.height),
+            TexData::Bc { width, height, .. } => (*width, *height),
+        }
+    }
+
+    /// A representative linear-space average colour — used by the GI to derive a
+    /// constant albedo for a textured object. For RGBA8 it averages every texel;
+    /// for BCn it decodes the **smallest mip** (already the box-filtered average) so
+    /// the cost is one block, not the whole image.
+    pub fn average_linear(&self) -> [f32; 3] {
+        match self {
+            TexData::Rgba8(im) => average_rgba8_linear(&im.rgba8),
+            TexData::Bc { format, mips, .. } => {
+                let Some(last) = mips.last() else {
+                    return [0.0; 3];
+                };
+                let rgba = bc::decode_block_rgba8(*format, last);
+                average_rgba8_linear(&rgba)
+            }
+        }
+    }
+}
+
+/// Average an RGBA8 buffer's RGB channels in linear space (sRGB-decoded).
+fn average_rgba8_linear(rgba8: &[u8]) -> [f32; 3] {
+    let mut acc = [0f64; 3];
+    let n = (rgba8.len() / 4).max(1) as f64;
+    for px in rgba8.chunks_exact(4) {
+        for (c, a) in acc.iter_mut().enumerate() {
+            let s = px[c] as f64 / 255.0;
+            *a += if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            };
+        }
+    }
+    [
+        (acc[0] / n) as f32,
+        (acc[1] / n) as f32,
+        (acc[2] / n) as f32,
+    ]
+}
+
 /// A metallic-roughness PBR material: scalar factors plus optional textures.
 /// Textures that are `None` mean "use the factor". Color-space note: `base_color`
 /// and `emissive` are sRGB-encoded (sample as sRGB → linear); `metallic_roughness`
@@ -36,10 +104,10 @@ pub struct Material {
     pub metallic_factor: f32,
     pub roughness_factor: f32,
     pub emissive_factor: [f32; 3],
-    pub base_color: Option<ImageData>,
-    pub metallic_roughness: Option<ImageData>,
-    pub normal: Option<ImageData>,
-    pub emissive: Option<ImageData>,
+    pub base_color: Option<TexData>,
+    pub metallic_roughness: Option<TexData>,
+    pub normal: Option<TexData>,
+    pub emissive: Option<TexData>,
 }
 
 impl Default for Material {
@@ -111,7 +179,7 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<MeshData, EngineError> {
     let pbr = mat.pbr_metallic_roughness();
     let tex = |info: Option<gltf::texture::Info>| {
         info.and_then(|i| images.get(i.texture().source().index()))
-            .map(image_to_rgba8)
+            .map(|d| TexData::Rgba8(image_to_rgba8(d)))
     };
     let material = Material {
         base_color_factor: pbr.base_color_factor(),
@@ -123,7 +191,7 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<MeshData, EngineError> {
         normal: mat
             .normal_texture()
             .and_then(|n| images.get(n.texture().source().index()))
-            .map(image_to_rgba8),
+            .map(|d| TexData::Rgba8(image_to_rgba8(d))),
         emissive: tex(mat.emissive_texture()),
     };
 

@@ -231,6 +231,75 @@ pub fn encode_bc5(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     out
 }
 
+/// Decode a single 4×4 block (the smallest mip of a cooked texture) to a 16-texel
+/// RGBA8 buffer. Used to recover a representative average colour cheaply, without
+/// decompressing a full image. BC5 fills R,G and leaves B=0, A=255.
+pub fn decode_block_rgba8(fmt: BcFormat, block: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; 16 * 4];
+    match fmt {
+        BcFormat::Bc1 => {
+            let c0 = u16::from_le_bytes([block[0], block[1]]);
+            let c1 = u16::from_le_bytes([block[2], block[3]]);
+            let idx = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+            let e0 = expand565(c0);
+            let e1 = expand565(c1);
+            let pal = [
+                e0,
+                e1,
+                [
+                    (2 * e0[0] + e1[0]) / 3,
+                    (2 * e0[1] + e1[1]) / 3,
+                    (2 * e0[2] + e1[2]) / 3,
+                ],
+                [
+                    (e0[0] + 2 * e1[0]) / 3,
+                    (e0[1] + 2 * e1[1]) / 3,
+                    (e0[2] + 2 * e1[2]) / 3,
+                ],
+            ];
+            for p in 0..16 {
+                let k = ((idx >> (2 * p)) & 3) as usize;
+                out[p * 4] = pal[k][0] as u8;
+                out[p * 4 + 1] = pal[k][1] as u8;
+                out[p * 4 + 2] = pal[k][2] as u8;
+                out[p * 4 + 3] = 255;
+            }
+        }
+        BcFormat::Bc5 => {
+            let r = decode_bc4_block(&block[0..8]);
+            let g = decode_bc4_block(&block[8..16]);
+            for p in 0..16 {
+                out[p * 4] = r[p];
+                out[p * 4 + 1] = g[p];
+                out[p * 4 + 3] = 255;
+            }
+        }
+    }
+    out
+}
+
+/// Decode one BC4 block to its 16 single-channel values (shared by [`decode_block_rgba8`]).
+fn decode_bc4_block(block: &[u8]) -> [u8; 16] {
+    let r0 = block[0] as i32;
+    let r1 = block[1] as i32;
+    let mut bits = 0u64;
+    for (k, &b) in block[2..8].iter().enumerate() {
+        bits |= (b as u64) << (8 * k);
+    }
+    let mut pal = [0i32; 8];
+    pal[0] = r0;
+    pal[1] = r1;
+    for k in 1..7 {
+        pal[k + 1] = ((7 - k as i32) * r0 + k as i32 * r1) / 7;
+    }
+    let mut out = [0u8; 16];
+    for (p, o) in out.iter_mut().enumerate() {
+        let idx = ((bits >> (3 * p)) & 7) as usize;
+        *o = pal[idx] as u8;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,27 +347,6 @@ mod tests {
                     }
                 }
             }
-        }
-        out
-    }
-
-    fn decode_bc4_channel(block: &[u8]) -> [u8; 16] {
-        let r0 = block[0] as i32;
-        let r1 = block[1] as i32;
-        let mut bits = 0u64;
-        for (k, &b) in block[2..8].iter().enumerate() {
-            bits |= (b as u64) << (8 * k);
-        }
-        let mut pal = [0i32; 8];
-        pal[0] = r0;
-        pal[1] = r1;
-        for k in 1..7 {
-            pal[k + 1] = ((7 - k as i32) * r0 + k as i32 * r1) / 7;
-        }
-        let mut out = [0u8; 16];
-        for (p, o) in out.iter_mut().enumerate() {
-            let idx = ((bits >> (3 * p)) & 7) as usize;
-            *o = pal[idx] as u8;
         }
         out
     }
@@ -362,8 +410,8 @@ mod tests {
         for by in 0..blocks(h) {
             for bx in 0..bw {
                 let base = ((by * bw + bx) * 16) as usize;
-                let r = decode_bc4_channel(&enc[base..base + 8]);
-                let g = decode_bc4_channel(&enc[base + 8..base + 16]);
+                let r = decode_bc4_block(&enc[base..base + 8]);
+                let g = decode_bc4_block(&enc[base + 8..base + 16]);
                 for j in 0..4 {
                     for i in 0..4 {
                         let (x, y) = (bx * 4 + i, by * 4 + j);

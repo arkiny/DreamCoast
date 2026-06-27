@@ -8,3 +8,6 @@ publish.workspace = true
 [dependencies]
 dreamcoast-core.workspace = true
 gltf.workspace = true
+# Backend-agnostic types — used only for the shared CPU mip-chain generator so
+# cooked BCn mips match the uncompressed upload path (no GPU dependency).
+rhi-types.workspace = true

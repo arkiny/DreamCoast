@@ -202,7 +202,16 @@ fn run() -> anyhow::Result<()> {
     let model_ref = model_path();
     let model_path = app::resolve_asset_path(&model_ref);
     let cache_dir = app::cooked_cache_dir();
-    let mut model = match dreamcoast_asset::cook::load_cooked(&model_path, &model_ref, &cache_dir) {
+    // Phase 12 M3: opt-in BCn texture compression in the cook (default off keeps the
+    // render byte-for-byte; `P12_TEX_COMPRESS=1` shrinks disk + VRAM, GPU-native so
+    // there is no decompression cost at load). Data textures stay uncompressed.
+    let compress_tex = std::env::var_os("P12_TEX_COMPRESS").is_some_and(|v| v == "1");
+    let mut model = match dreamcoast_asset::cook::load_cooked(
+        &model_path,
+        &model_ref,
+        &cache_dir,
+        compress_tex,
+    ) {
         Ok((m, outcome)) => {
             info!(
                 "loaded {} ({outcome:?}): {} verts, {} indices",
@@ -650,31 +659,15 @@ impl App {
             // textured, so its color lives in the base-color image, not the factor — average
             // the texture (sRGB -> linear) × factor for a representative albedo; the
             // procedural objects use their (linear) base color directly.
+            let f = model.material.base_color_factor;
             let avocado_albedo: [f32; 3] = match &model.material.base_color {
-                Some(img) => {
-                    let mut acc = [0f64; 3];
-                    let n = (img.rgba8.len() / 4).max(1) as f64;
-                    for px in img.rgba8.chunks_exact(4) {
-                        for (c, a) in acc.iter_mut().enumerate() {
-                            let s = px[c] as f64 / 255.0;
-                            *a += if s <= 0.04045 {
-                                s / 12.92
-                            } else {
-                                ((s + 0.055) / 1.055).powf(2.4)
-                            };
-                        }
-                    }
-                    let f = model.material.base_color_factor;
-                    [
-                        (acc[0] / n) as f32 * f[0],
-                        (acc[1] / n) as f32 * f[1],
-                        (acc[2] / n) as f32 * f[2],
-                    ]
+                // `average_linear` works for both RGBA8 and BC textures (for BC it
+                // decodes only the smallest mip — already the box-filtered average).
+                Some(tex) => {
+                    let a = tex.average_linear();
+                    [a[0] * f[0], a[1] * f[1], a[2] * f[2]]
                 }
-                None => {
-                    let f = model.material.base_color_factor;
-                    [f[0], f[1], f[2]]
-                }
+                None => [f[0], f[1], f[2]],
             };
             let obj_albedo: [[f32; 3]; 4] = [
                 avocado_albedo,
