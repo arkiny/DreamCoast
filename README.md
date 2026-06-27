@@ -10,25 +10,38 @@ DreamCoast is a custom renderer + engine layered directly on **raw Vulkan
 implementing them by hand, behind a single self-designed RHI.
 
 The Windows backends (Vulkan + D3D12) are complete through Phase 9 (tooling &
-profiling), with Phases 10–13 (virtual geometry, software-RT distance-field GI,
-cooked-asset pipeline, scene graph) planned. The native **Metal backend for macOS**
+profiling). **Phase 11 (software-RT distance-field GI) is substantially
+implemented** — GDF-based AO, 1-bounce diffuse GI, and hybrid SW-RT reflections
+(SSR + GDF + sky) are now the default ambient, with a mesh-card surface cache
+and a `RenderQuality{low,med,high}` tier (Stage D) layered on top.
+Phases 10, 12, 13 (virtual geometry, cooked-asset pipeline, scene graph) remain
+experimental / planned. The native **Metal backend for macOS**
 is at near-full parity — including Phase-8 ray tracing (inline `RayQuery` **and** the
 DXR-style RT pipeline via Metal Shader Converter); the main gap is the Phase-9
 profiling / marker tooling. See [`docs/metal-backend.md`](docs/metal-backend.md).
 
+Beyond the graphics core, the roadmap now extends toward a **general-purpose game
+engine**: Phase 14 adds skeletal animation + GPU skinning and an FBX importer, and a
+planned **Phase 15+ runtime / tooling layer** (job system, physics, audio, input,
+scripting, game UI, VFX, AI, networking, and a standalone editor) sits behind
+RHI-style backend facades so third-party libraries can later be swapped for
+from-scratch implementations. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and the
+[`commercial-engine gap analysis`](docs/commercial-engine-gap-analysis.md).
+
 ## Built with an AI agent
 
-This repository is also a record of a way of working: every milestone was
-designed and implemented **together with [Claude Code](https://claude.com/claude-code)**
-acting as a pair programmer. The human sets direction, reviews, and decides
-trade-offs; the agent explores the codebase, writes the implementation, runs both
-backends, and keeps the plans honest.
+This repository is also a record of a way of working: every milestone is
+designed — and, once approved, implemented — **together with
+[Claude Code](https://claude.com/claude-code)** acting as a pair programmer. The
+human sets direction, reviews, and decides trade-offs; the agent explores the
+codebase, writes the implementation, runs both backends, and keeps the plans honest.
 
 The process is part of the artifact:
 
-- **[`docs/ROADMAP.md`](docs/ROADMAP.md)** — the macro plan (Phases 0–13 + Metal backend).
-- **[`docs/phase-N-*.md`](docs/)** — a detailed, reviewed plan written and signed
-  off *before* each phase is implemented.
+- **[`docs/ROADMAP.md`](docs/ROADMAP.md)** — the macro plan (Phases 0–14, a planned
+  Phase 15+ runtime/tooling layer, and the Metal backend).
+- **[`docs/phase-N-*.md`](docs/)** (plus topic and strategy docs) — a detailed,
+  reviewed plan, with the key decisions recorded, signed off *before* the work starts.
 - Each phase lands as its own commit, verified on both backends.
 
 It's a case study in what AI-assisted systems programming actually looks like on
@@ -70,9 +83,17 @@ Backend parity is a hard rule: every milestone must produce identical results on
 - [x] **Phase 8** — Ray tracing (DXR + VK_KHR) — inline ray query + full RT pipeline/SBT
 - [x] **Phase 9** — Tooling & profiling (per-pass GPU timestamps, debug markers, validation toggle, sample browser)
 - [ ] **Phase 10** — Virtual geometry (cluster-LOD, GPU culling/HZB, SW raster) — experimental / planned
-- [ ] **Phase 11** — Software ray tracing + distance-field GI — Stage A done; B/C planned
+- [~] **Phase 11** — Software ray tracing + distance-field GI — Stages A–C + D landed on Windows:
+  compute SW-RT, baked global distance field, stochastic GDF GI/AO + hybrid SW-RT
+  reflections (now the default ambient, replacing captured-cube IBL), a mesh-card
+  surface cache, and a `RenderQuality` tier. Stage A/B run on Metal.
 - [ ] **Phase 12** — Cooked-asset pipeline (`.dcasset`) + shader bytecode cook cache — planned
-- [ ] **Phase 13** — Scene graph + level streaming — planned
+- [ ] **Phase 13** — Scene graph + level streaming (self-made ECS) — planned
+- [ ] **Phase 14** — Skeletal animation + GPU skinning / skin cache + FBX importer (ufbx / FBX SDK) — planned
+- [ ] **Phase 15+** — Commercial runtime & tooling layer: job system, physics, audio,
+  input, scripting (Luau + WASM), game UI, VFX, animation graph, AI, networking, and a
+  standalone editor — strategy planned, see
+  [`docs/commercial-engine-gap-analysis.md`](docs/commercial-engine-gap-analysis.md)
 
 ### Metal backend (macOS)
 
@@ -146,7 +167,11 @@ apps/
 ```
 
 The engine crates carry the `dreamcoast-` prefix; the `rhi-*` crates are the
-Render Hardware Interface layer kept as their own sub-namespace.
+Render Hardware Interface layer kept as their own sub-namespace. This is the
+layout as it exists today; planned crates for the upcoming phases — `anim`
+(Phase 14), and the Phase 15+ `jobs` / `physics` / `audio` / `script` / `net`
+facades (+ their backends) / `ui` / `vfx` / `ai` crates and an `apps/editor` —
+are described in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## License
 
