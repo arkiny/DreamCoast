@@ -535,6 +535,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gdf_gi_cs",
     },
+    // Stage D1 (Sponza 60fps): joint-bilateral upsample of the half-res GI to full res.
+    Job {
+        src: "gdf_gi_upsample.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_gi_upsample_cs",
+    },
     // Phase 11 Stage C (C4): spatio-temporal denoise of the noisy GI.
     Job {
         src: "gdf_temporal.slang",
