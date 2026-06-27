@@ -634,6 +634,7 @@ impl ReflectSystem {
         frame: u32,
         albedo: Option<(&'a [Volume; 3], ResourceId)>,
         cache: Option<([u32; 5], ResourceId)>,
+        clip: (u32, u32),
     ) -> ResourceId {
         let pipe = self
             .reflect_pipeline
@@ -710,6 +711,8 @@ impl ReflectSystem {
                     albedo_rgb,
                     frame,
                     cache_idx,
+                    clip.0,
+                    clip.1,
                     crate::GROUND_ALBEDO, // analytic ground material (floor reflection hits)
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);

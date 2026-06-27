@@ -16,13 +16,14 @@
 // are translation + uniform scale (direction preserved).
 
 #include "bindless.slang"
+#include "clipmap.slang"
 
 struct AoPush
 {
     float4x4 inv_view_proj; // clip -> world (surface reconstruction)
     uint depth_index;       // sampled G-buffer depth
     uint normal_index;      // sampled G-buffer world normal
-    uint gdf_sampled;       // volumes[] (SRV) index of the scene GDF
+    uint gdf_sampled;       // volumes[] (SRV) index of the scene GDF (legacy; clipmap below)
     uint out_index;         // storage-image index (AO output)
     uint width;
     uint height;
@@ -31,6 +32,7 @@ struct AoPush
     float4 aabb_min;        // xyz GDF world min, w = ground plane Y
     float4 aabb_max;        // xyz GDF world max, w = sample distance clamp
     float4 params;          // x = AO reach (world units), y = strength, z = bias, w unused
+    uint4 clip;             // Stage B clipmap: x = descriptor index, y = level count
 };
 
 [[vk::push_constant]]
@@ -40,16 +42,15 @@ ConstantBuffer<AoPush> pc : register(b0, space0);
 #define GDF_MAX (pc.aabb_max.xyz)
 #define GROUND_Y (pc.aabb_min.w)
 
-// Distance to the baked scene geometry inside the GDF box (trilinear sample,
-// clamped so a finite field max can't make a query overshoot). Outside the box
-// there is no geometry, so a large distance is returned — the empty bounding box
-// must never read as a solid occluder.
+// Distance to the baked scene geometry via the clipmap (single level ⇒ identical to the
+// legacy single-volume sample, clamped). Outside every level, a large distance — the
+// empty bounding box must never read as a solid occluder.
 float geo_inside(float3 p)
 {
-    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
-    if (any(uvw < 0.0) || any(uvw > 1.0))
-        return 1e3;
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
+    ClipMap c;
+    c.desc = pc.clip.x;
+    c.count = pc.clip.y;
+    return cm_geo_inside(c, p, pc.aabb_max.w);
 }
 
 // Occlusion distance: baked geometry unioned with the analytic ground plane (y=0),

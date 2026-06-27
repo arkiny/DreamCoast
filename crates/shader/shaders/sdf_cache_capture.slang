@@ -12,21 +12,22 @@
 // `card * (tile*tile) + ty*tile + tx`, like the GI-denoiser / lit-color history.
 
 #include "bindless.slang"
+#include "clipmap.slang"
 
 struct CacheCapturePush
 {
     uint cards_index;     // storage buffer of card records (64 B each)
     uint cache_pos_index; // storage buffer out: float4(hit pos, valid)
     uint cache_alb_index; // storage buffer out: float4(albedo rgb, 0)
-    uint gdf_sampled;     // volumes[] (SRV) index of the scene GDF
+    uint gdf_sampled;     // volumes[] (SRV) index of the scene GDF (legacy; clipmap below)
     uint num_cards;
     uint tile;            // card atlas tile edge (texels per side)
     uint num_texels;      // num_cards * tile * tile
-    uint pad0;
+    uint clip_desc;       // Stage B: clipmap descriptor storage-buffer index
     uint albedo_r;        // C8a albedo channel volumes (0xFFFFFFFF = constant 0.7)
     uint albedo_g;
     uint albedo_b;
-    uint pad1;
+    uint clip_count;      // Stage B: clipmap level count (1 = single volume = legacy)
     float4 aabb_min;      // xyz GDF world min, w unused
     float4 aabb_max;      // xyz GDF world max, w = sample distance clamp
 };
@@ -34,30 +35,24 @@ struct CacheCapturePush
 [[vk::push_constant]]
 ConstantBuffer<CacheCapturePush> pc : register(b0, space0);
 
-#define GDF_MIN (pc.aabb_min.xyz)
-#define GDF_MAX (pc.aabb_max.xyz)
+ClipMap cap_clip()
+{
+    ClipMap c;
+    c.desc = pc.clip_desc;
+    c.count = pc.clip_count;
+    return c;
+}
 
-// Object-only geometry distance (no ground union — cards capture object surfaces).
+// Object-only geometry distance (no ground union — cards capture object surfaces). Single
+// level ⇒ identical to the legacy single-volume sample.
 float geo_march(float3 p)
 {
-    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
-    if (any(uvw < 0.0) || any(uvw > 1.0))
-    {
-        float3 q = abs(p - 0.5 * (GDF_MIN + GDF_MAX)) - 0.5 * (GDF_MAX - GDF_MIN);
-        float box = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-        return max(box, 0.003);
-    }
-    return min(g.volumes[pc.gdf_sampled].SampleLevel(g.samp, uvw, 0.0).x, pc.aabb_max.w);
+    return cm_geo_march(cap_clip(), p, pc.aabb_max.w);
 }
 
 float3 albedo_at(float3 p)
 {
-    if (pc.albedo_r == 0xFFFFFFFFu)
-        return float3(0.7, 0.7, 0.7);
-    float3 uvw = saturate((p - GDF_MIN) / (GDF_MAX - GDF_MIN));
-    return float3(g.volumes[pc.albedo_r].SampleLevel(g.samp, uvw, 0.0).x,
-                  g.volumes[pc.albedo_g].SampleLevel(g.samp, uvw, 0.0).x,
-                  g.volumes[pc.albedo_b].SampleLevel(g.samp, uvw, 0.0).x);
+    return cm_albedo(cap_clip(), p, 0.7);
 }
 
 [shader("compute")]

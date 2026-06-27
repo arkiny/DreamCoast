@@ -419,6 +419,8 @@ pub(crate) fn cache_capture_push(
     tile: u32,
     num_texels: u32,
     albedo_rgb: [u32; 3],
+    clip_desc: u32,
+    clip_count: u32,
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     dist_clamp: f32,
@@ -432,11 +434,11 @@ pub(crate) fn cache_capture_push(
         num_cards,
         tile,
         num_texels,
-        0,
+        clip_desc, // Stage B: former pad0
         albedo_rgb[0],
         albedo_rgb[1],
         albedo_rgb[2],
-        0,
+        clip_count, // Stage B: former pad1
     ];
     for (i, v) in u.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
@@ -506,8 +508,10 @@ pub(crate) fn cache_light_push(
     alpha: f32,
     bias: f32,
     ray_max: f32,
-) -> [u8; 112] {
-    let mut pc = [0u8; 112];
+    clip_desc: u32,
+    clip_count: u32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
     let u = [
         cards_index,
         cache_pos_index,
@@ -542,6 +546,9 @@ pub(crate) fn cache_light_push(
     pc[100..104].copy_from_slice(&alpha.to_le_bytes());
     pc[104..108].copy_from_slice(&bias.to_le_bytes());
     pc[108..112].copy_from_slice(&ray_max.to_le_bytes());
+    // Stage B clipmap descriptor (uint4 clip at offset 112): x = index, y = level count.
+    pc[112..116].copy_from_slice(&clip_desc.to_le_bytes());
+    pc[116..120].copy_from_slice(&clip_count.to_le_bytes());
     pc
 }
 
@@ -586,6 +593,8 @@ pub(crate) fn gdf_trace_push(
     flip_y: u32,
     gdf_sampled: u32,
     mode: u32,
+    clip_desc: u32,
+    clip_count: u32,
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     ground_y: f32,
@@ -609,6 +618,9 @@ pub(crate) fn gdf_trace_push(
     pc[108..112].copy_from_slice(&flip_y.to_le_bytes());
     pc[112..116].copy_from_slice(&gdf_sampled.to_le_bytes());
     pc[116..120].copy_from_slice(&mode.to_le_bytes());
+    // Stage B clipmap descriptor (former pad0/pad1 slots).
+    pc[120..124].copy_from_slice(&clip_desc.to_le_bytes());
+    pc[124..128].copy_from_slice(&clip_count.to_le_bytes());
     // aabb_min.xyz + ground_y in .w
     for (i, v) in aabb_min.iter().enumerate() {
         pc[128 + i * 4..132 + i * 4].copy_from_slice(&v.to_le_bytes());
@@ -644,8 +656,10 @@ pub(crate) fn gdf_ao_push(
     reach: f32,
     strength: f32,
     bias: f32,
-) -> [u8; 144] {
-    let mut pc = [0u8; 144];
+    clip_desc: u32,
+    clip_count: u32,
+) -> [u8; 160] {
+    let mut pc = [0u8; 160];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -668,6 +682,9 @@ pub(crate) fn gdf_ao_push(
     pc[128..132].copy_from_slice(&reach.to_le_bytes());
     pc[132..136].copy_from_slice(&strength.to_le_bytes());
     pc[136..140].copy_from_slice(&bias.to_le_bytes());
+    // Stage B clipmap descriptor (uint4 clip at offset 144): x = index, y = level count.
+    pc[144..148].copy_from_slice(&clip_desc.to_le_bytes());
+    pc[148..152].copy_from_slice(&clip_count.to_le_bytes());
     pc
 }
 
@@ -1009,6 +1026,8 @@ pub(crate) fn gdf_reflect_push(
     albedo_rgb: [u32; 3],
     frame: u32,
     cache: [u32; 5],
+    clip_desc: u32,
+    clip_count: u32,
     ground_albedo: [f32; 3],
 ) -> [u8; 240] {
     let mut pc = [0u8; 240];
@@ -1052,6 +1071,9 @@ pub(crate) fn gdf_reflect_push(
     for (i, v) in cache.iter().enumerate() {
         pc[192 + i * 4..196 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
+    // Stage B clipmap descriptor (former pad_c0/pad_c1 slots).
+    pc[212..216].copy_from_slice(&clip_desc.to_le_bytes());
+    pc[216..220].copy_from_slice(&clip_count.to_le_bytes());
     // Analytic-ground albedo (float3 on its own 16-byte-aligned row, offset 224): floor hits
     // re-light with this instead of albedo_at() (no ground data -> nearest object's colour).
     // 16-aligned so SPIR-V (vec3 align 16) and DXIL agree on the offset.
