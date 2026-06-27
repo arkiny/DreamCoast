@@ -105,8 +105,13 @@ DX≡VK 0.000/ch(max 5=기준선)** — GPU→CPU 전환 무회귀, SW-RT 결과
 `.dcasset` **50.4MB→25.2MB(-50%**; metallic_roughness 의도적 무압축이라 더 안 줄음), 렌더 델타 vs
 기준선 0.591/ch(손실·옵트인), **DX≡VK 0.000/ch**(양 백엔드 동일 블록 업로드). 런타임 해제비용 0.
 19 asset 테스트, clippy/fmt 클린.
-- 후속: BC7(고품질 컬러)·BC4(단채널)·BC3(알파), 압축 기본화는 RenderQuality/cook 티어로, 텍스처
-  VRAM 측정.
+- **M3 확장 — BC3/BC4/BC7 + 압축 티어 (`e83f307`/`226b033`)**: BC3(알파, BC4+BC1 조합), BC4(단채널),
+  **BC7(고품질 RGBA, mode 6)** 인코더 추가 + RHI 포맷(VK/DX/Metal). cook에 **`TexCompress{Off,Fast,High}`
+  티어**: Fast=BC1/BC3(크기), High=BC7(품질). 노멀=BC5 고정, 데이터 텍스처=무압축. `P12_TEX_COMPRESS=1|fast|high`.
+  **측정(Avocado): Off 50.35MB/0.000, Fast 25.19MB/0.591, High 27.98MB/0.593, BC7 mode-6 GPU 샘플 정확
+  (DX≡VK 0.000).** 정직한 발견: 이 매끈한 에셋은 BC7≈BC1(BC7-vs-BC1 렌더 0.008/ch)인데 BC7이 더 큼 → Fast가
+  이 에셋엔 유리, BC7은 고주파 컬러용(유닛 테스트가 우위 입증). 측정-구동 선택지로 티어 제공.
+- 후속: BC7 멀티모드/파티션(품질↑), 압축 기본화 RenderQuality 결속, 실제 게임 텍스처 VRAM 측정.
 
 ### M3+ — 컨테이너 확장 (후속, 선택)
 - 추가 베이크 페이로드(BVH, 라이트맵, 프로브)를 청크로. Phase 10/11 산출물과 연계.
