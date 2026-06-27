@@ -211,6 +211,7 @@ const BC_FMT_BC1: u32 = 0;
 const BC_FMT_BC5: u32 = 1;
 const BC_FMT_BC3: u32 = 2;
 const BC_FMT_BC4: u32 = 3;
+const BC_FMT_BC7: u32 = 4;
 
 /// Encode one texture chunk payload: `slot`, a kind tag, dimensions, then either
 /// RGBA8 pixels or the BCn block mips (Phase 12 M3).
@@ -239,6 +240,7 @@ fn encode_texture(slot: u32, tex: &TexData) -> Vec<u8> {
                 BcFormat::Bc5 => BC_FMT_BC5,
                 BcFormat::Bc3 => BC_FMT_BC3,
                 BcFormat::Bc4 => BC_FMT_BC4,
+                BcFormat::Bc7 => BC_FMT_BC7,
             });
             w.u32(u32::from(*srgb));
             w.u32(mips.len() as u32);
@@ -606,6 +608,7 @@ fn decode_texture(r: &mut Reader) -> Result<(u32, TexData), EngineError> {
                 BC_FMT_BC5 => BcFormat::Bc5,
                 BC_FMT_BC3 => BcFormat::Bc3,
                 BC_FMT_BC4 => BcFormat::Bc4,
+                BC_FMT_BC7 => BcFormat::Bc7,
                 other => {
                     return Err(EngineError::Asset(format!(
                         "dcasset: unknown bc format {other}"

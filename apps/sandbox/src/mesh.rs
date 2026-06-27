@@ -177,6 +177,8 @@ pub(crate) fn upload_texture(
                 (BcFormat::Bc3, false) => Format::Bc3Unorm,
                 (BcFormat::Bc4, _) => Format::Bc4Unorm,
                 (BcFormat::Bc5, _) => Format::Bc5Unorm,
+                (BcFormat::Bc7, true) => Format::Bc7Srgb,
+                (BcFormat::Bc7, false) => Format::Bc7Unorm,
             };
             device.create_texture_compressed(
                 &TextureDesc {

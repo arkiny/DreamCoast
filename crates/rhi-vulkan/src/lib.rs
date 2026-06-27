@@ -73,6 +73,8 @@ fn to_vk_format(format: rhi_types::Format) -> vk::Format {
         rhi_types::Format::Bc3Srgb => vk::Format::BC3_SRGB_BLOCK,
         rhi_types::Format::Bc3Unorm => vk::Format::BC3_UNORM_BLOCK,
         rhi_types::Format::Bc4Unorm => vk::Format::BC4_UNORM_BLOCK,
+        rhi_types::Format::Bc7Srgb => vk::Format::BC7_SRGB_BLOCK,
+        rhi_types::Format::Bc7Unorm => vk::Format::BC7_UNORM_BLOCK,
     }
 }
 

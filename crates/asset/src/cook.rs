@@ -19,26 +19,56 @@ use crate::bc::{self, BcFormat};
 use crate::sdf::{self, AlbedoVolumes, SdfVolume};
 use crate::{ImageData, Material, MeshData, TexData, dcasset, load_gltf};
 
+/// Texture-compression tier for the cook (Phase 12, items 1a–1c). Picks the colour
+/// codec; `Off` keeps textures uncompressed (render byte-identical). The trade is
+/// size vs quality — and it is **content-dependent**: on smooth textures BC1 ≈ BC7
+/// (measured 0.008/ch on the sample asset) at half the size, while BC7 pulls ahead
+/// on high-frequency colour. Normals always use BC5; data textures stay uncompressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TexCompress {
+    /// No compression — RGBA8, render byte-for-byte unchanged.
+    Off,
+    /// Size-first: BC1 colour (BC3 when alpha), 8:1. Best when textures are smooth.
+    Fast,
+    /// Quality-first: BC7 colour (RGBA, 4:1). Best on complex / high-frequency colour.
+    High,
+}
+
+impl TexCompress {
+    /// Whether any compression happens.
+    fn enabled(self) -> bool {
+        self != TexCompress::Off
+    }
+    /// A stable tag folded into the cache key so changing the tier re-cooks.
+    fn tag(self) -> u8 {
+        match self {
+            TexCompress::Off => 0,
+            TexCompress::Fast => 1,
+            TexCompress::High => 2,
+        }
+    }
+}
+
 /// Per-slot texture-compression policy (Phase 12 M3). **Perceptual colour** (base
-/// colour, emissive) compresses to BC1, or **BC3** when the texture has real alpha
-/// (transparency preserved); **normals** to BC5 (near-lossless). **Data textures** —
-/// metallic-roughness and anything carrying linear/vector data — are left
-/// uncompressed, because block compression corrupts non-perceptual values.
-fn compress_material(material: &mut Material) {
-    compress_colour(&mut material.base_color, true);
-    compress_colour(&mut material.emissive, true);
+/// colour, emissive) compresses per the `tier` (BC1/BC3 for `Fast`, BC7 for `High`);
+/// **normals** to BC5 (near-lossless). **Data textures** — metallic-roughness and
+/// anything carrying linear/vector data — are left uncompressed, because block
+/// compression corrupts non-perceptual values.
+fn compress_material(material: &mut Material, tier: TexCompress) {
+    compress_colour(&mut material.base_color, true, tier);
+    compress_colour(&mut material.emissive, true, tier);
     take_compress(&mut material.normal, BcFormat::Bc5, false);
     // metallic_roughness: data texture — intentionally left uncompressed.
 }
 
-/// Compress a colour slot: BC3 when it has real alpha (kept), else BC1.
-fn compress_colour(slot: &mut Option<TexData>, srgb: bool) {
+/// Compress a colour slot: `High` → BC7 (keeps alpha); `Fast` → BC1, or BC3 when the
+/// texture has real alpha (BC1 would drop it).
+fn compress_colour(slot: &mut Option<TexData>, srgb: bool, tier: TexCompress) {
     if let Some(TexData::Rgba8(im)) = slot {
-        let has_alpha = im.rgba8.chunks_exact(4).any(|p| p[3] != 255);
-        let fmt = if has_alpha {
-            BcFormat::Bc3
-        } else {
-            BcFormat::Bc1
+        let fmt = match tier {
+            TexCompress::High => BcFormat::Bc7,
+            _ if im.rgba8.chunks_exact(4).any(|p| p[3] != 255) => BcFormat::Bc3,
+            _ => BcFormat::Bc1,
         };
         *slot = Some(compress_image(im, fmt, srgb));
     }
@@ -73,6 +103,7 @@ fn compress_image(im: &ImageData, fmt: BcFormat, srgb: bool) -> TexData {
                 BcFormat::Bc3 => bc::encode_bc3(lvl, w, h),
                 BcFormat::Bc4 => bc::encode_bc4(lvl, w, h),
                 BcFormat::Bc5 => bc::encode_bc5(lvl, w, h),
+                BcFormat::Bc7 => bc::encode_bc7(lvl, w, h),
             }
         })
         .collect();
@@ -133,7 +164,7 @@ pub fn load_cooked(
     source: &Path,
     cache_key: &str,
     cache_dir: &Path,
-    compress: bool,
+    tex: TexCompress,
 ) -> Result<(MeshData, LoadOutcome), EngineError> {
     let cache_file = cache_path(cache_dir, cache_key);
 
@@ -150,9 +181,9 @@ pub fn load_cooked(
         )));
     };
 
-    // Key folds the source bytes + the compression policy, so toggling compression
-    // re-cooks (a BC-compressed asset and an RGBA8 one are different bytes).
-    let key = dcasset::hash_update(dcasset::source_hash(&src_bytes), &[u8::from(compress)]);
+    // Key folds the source bytes + the compression tier, so changing the tier
+    // re-cooks (each tier produces different bytes).
+    let key = dcasset::hash_update(dcasset::source_hash(&src_bytes), &[tex.tag()]);
 
     // Hit: a cached header whose key matches the live source → decode it, no parse.
     if let Ok(bytes) = std::fs::read(&cache_file)
@@ -168,8 +199,8 @@ pub fn load_cooked(
     // Miss: cook from glTF (optionally block-compressing eligible textures) and
     // write the cache (write failure is non-fatal).
     let mut mesh = load_gltf(source)?;
-    if compress {
-        compress_material(&mut mesh.material);
+    if tex.enabled() {
+        compress_material(&mut mesh.material, tex);
     }
     let cooked = dcasset::write(&mesh, key);
     if let Err(e) = write_atomic(&cache_file, &cooked) {
@@ -353,8 +384,13 @@ mod tests {
         let bytes = dcasset::write(&tiny_mesh(), 123);
         std::fs::write(cache_path(&tmp.0, key), bytes).unwrap();
 
-        let (mesh, outcome) =
-            load_cooked(Path::new("does/not/exist.glb"), key, &tmp.0, false).expect("load");
+        let (mesh, outcome) = load_cooked(
+            Path::new("does/not/exist.glb"),
+            key,
+            &tmp.0,
+            TexCompress::Off,
+        )
+        .expect("load");
         assert_eq!(outcome, LoadOutcome::CacheHitNoSource);
         assert_eq!(mesh.vertices.len(), 1);
     }
@@ -362,7 +398,7 @@ mod tests {
     #[test]
     fn missing_source_and_cache_is_an_error() {
         let tmp = TempDir::new("empty");
-        let r = load_cooked(Path::new("nope.glb"), "nope.glb", &tmp.0, false);
+        let r = load_cooked(Path::new("nope.glb"), "nope.glb", &tmp.0, TexCompress::Off);
         assert!(r.is_err());
     }
 
@@ -383,9 +419,9 @@ mod tests {
             emissive: Some(solid_image(8, 8, [10, 20, 30, 255])),
             ..Material::default()
         };
-        compress_material(&mut m);
+        compress_material(&mut m, TexCompress::Fast);
 
-        // Perceptual colour -> BC1; normals -> BC5; data texture stays RGBA8.
+        // Fast: perceptual colour -> BC1; normals -> BC5; data texture stays RGBA8.
         assert!(matches!(
             m.base_color,
             Some(TexData::Bc {
@@ -414,14 +450,29 @@ mod tests {
     }
 
     #[test]
-    fn alpha_base_color_uses_bc3() {
-        // A base colour with real transparency compresses to BC3, which keeps alpha
-        // (BC1 would drop it).
+    fn high_tier_uses_bc7() {
+        let mut m = Material {
+            base_color: Some(solid_image(8, 8, [200, 100, 50, 255])),
+            ..Material::default()
+        };
+        compress_material(&mut m, TexCompress::High);
+        assert!(matches!(
+            m.base_color,
+            Some(TexData::Bc {
+                format: BcFormat::Bc7,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fast_tier_alpha_uses_bc3() {
+        // Fast tier on a transparent base colour: BC3 (keeps alpha; BC1 would drop it).
         let mut m = Material {
             base_color: Some(solid_image(4, 4, [200, 100, 50, 128])),
             ..Material::default()
         };
-        compress_material(&mut m);
+        compress_material(&mut m, TexCompress::Fast);
         assert!(matches!(
             m.base_color,
             Some(TexData::Bc {
@@ -441,13 +492,13 @@ mod tests {
             TexData::Rgba8(im) => im.rgba8.len(),
             _ => unreachable!(),
         };
-        compress_material(&mut m);
+        compress_material(&mut m, TexCompress::Fast);
         let compressed: usize = match m.base_color.as_ref().unwrap() {
             TexData::Bc { mips, .. } => mips.iter().map(|m| m.len()).sum(),
             _ => unreachable!(),
         };
-        // BC1 is 8:1 on the base level; even with the full mip chain it is far
-        // smaller than the single uncompressed level.
+        // BC1 is 8:1 on the base level; even with the full mip chain it stays well
+        // under a quarter of the single uncompressed level.
         assert!(
             compressed < raw / 4,
             "compressed {compressed} should be << raw {raw}"

@@ -203,9 +203,15 @@ fn run() -> anyhow::Result<()> {
     let model_path = app::resolve_asset_path(&model_ref);
     let cache_dir = app::cooked_cache_dir();
     // Phase 12 M3: opt-in BCn texture compression in the cook (default off keeps the
-    // render byte-for-byte; `P12_TEX_COMPRESS=1` shrinks disk + VRAM, GPU-native so
-    // there is no decompression cost at load). Data textures stay uncompressed.
-    let compress_tex = std::env::var_os("P12_TEX_COMPRESS").is_some_and(|v| v == "1");
+    // render byte-for-byte; GPU-native so there is no decompression cost at load).
+    // `P12_TEX_COMPRESS=1|fast` → BC1/BC3 (size-first), `=high|bc7` → BC7
+    // (quality-first). Data textures stay uncompressed either way.
+    use dreamcoast_asset::cook::TexCompress;
+    let compress_tex = match std::env::var("P12_TEX_COMPRESS").ok().as_deref() {
+        Some("1") | Some("fast") => TexCompress::Fast,
+        Some("high") | Some("bc7") => TexCompress::High,
+        _ => TexCompress::Off,
+    };
     let mut model = match dreamcoast_asset::cook::load_cooked(
         &model_path,
         &model_ref,
