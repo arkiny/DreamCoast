@@ -1893,9 +1893,17 @@ impl App {
             let validation_on = self.validation_on;
             let backend = self.backend;
             let path_spp = self.path_spp;
+            // ImGui's display size, mouse hit-testing and clip rects all live in WINDOW
+            // (backbuffer) pixels — the UI pass renders into the swapchain backbuffer
+            // `(sw,sh)`, and `input.mouse_position()` returns client-area pixels in that
+            // same space. With an internal render scale `(cw,ch)` decoupled from the
+            // window, using the internal extent here stretched the UI vertices to the
+            // backbuffer while leaving the mouse + scissor in the smaller space — widgets
+            // were clipped away when dragged and the hit-test was off. Always feed the
+            // output extent so all three agree (cw==sw on the default path = unchanged).
             let ui = self
                 .gui
-                .new_frame(dt, [cw as f32, ch as f32], self.window.input());
+                .new_frame(dt, [sw as f32, sh as f32], self.window.input());
             let App {
                 gdf,
                 gi,
