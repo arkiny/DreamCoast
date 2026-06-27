@@ -120,13 +120,26 @@ pub(crate) fn prefilter_push(
     pc
 }
 
-/// Pack the tonemap push block: hdr_index + mode + flip_y + pad (16 bytes).
-pub(crate) fn post_push(hdr_index: u32, mode: u32, flip_y: u32, exposure: f32) -> [u8; 16] {
-    let mut pc = [0u8; 16];
+/// Pack the tonemap push block (32 bytes): hdr_index + mode + flip_y + exposure (16) +
+/// sharpen + inv_w + inv_h + pad (16, the QHD/UHD post-upscale sharpen).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn post_push(
+    hdr_index: u32,
+    mode: u32,
+    flip_y: u32,
+    exposure: f32,
+    sharpen: f32,
+    inv_w: f32,
+    inv_h: f32,
+) -> [u8; 32] {
+    let mut pc = [0u8; 32];
     pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
     pc[4..8].copy_from_slice(&mode.to_le_bytes());
     pc[8..12].copy_from_slice(&flip_y.to_le_bytes());
     pc[12..16].copy_from_slice(&exposure.to_le_bytes());
+    pc[16..20].copy_from_slice(&sharpen.to_le_bytes());
+    pc[20..24].copy_from_slice(&inv_w.to_le_bytes());
+    pc[24..28].copy_from_slice(&inv_h.to_le_bytes());
     pc
 }
 
@@ -899,6 +912,75 @@ pub(crate) fn cache_vis_push(
     pc[96..100].copy_from_slice(&cards_index.to_le_bytes());
     pc[100..104].copy_from_slice(&out_index.to_le_bytes());
     pc[104..108].copy_from_slice(&num_cards.to_le_bytes());
+    pc
+}
+
+/// Pack the QHD/UHD FXAA push block (16 bytes): in_index, out_index, width, height.
+pub(crate) fn fxaa_push(in_index: u32, out_index: u32, width: u32, height: u32) -> [u8; 16] {
+    let mut pc = [0u8; 16];
+    pc[0..4].copy_from_slice(&in_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&out_index.to_le_bytes());
+    pc[8..12].copy_from_slice(&width.to_le_bytes());
+    pc[12..16].copy_from_slice(&height.to_le_bytes());
+    pc
+}
+
+/// Pack the QHD/UHD TAAU push block (208 bytes): inv_view_proj (64) + prev_view_proj (64) +
+/// 13 uints (hdr, depth, out, hist_r/w, pos_r/w, out_w/h, in_w/h, flip, reset) at 128..180 +
+/// params float4 (reject_dist, max_hist, min_alpha) at the next 16-byte row (192).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn taau_push(
+    inv_view_proj: &[f32; 16],
+    prev_view_proj: &[f32; 16],
+    hdr_index: u32,
+    depth_index: u32,
+    out_index: u32,
+    hist_read: u32,
+    hist_write: u32,
+    pos_read: u32,
+    pos_write: u32,
+    out_width: u32,
+    out_height: u32,
+    in_width: u32,
+    in_height: u32,
+    flip_y: u32,
+    reset: u32,
+    reject_dist: f32,
+    max_hist: f32,
+    variance_gamma: f32,
+    jitter_uv: [f32; 2],
+) -> [u8; 224] {
+    let mut pc = [0u8; 224];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in prev_view_proj.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let u = [
+        hdr_index,
+        depth_index,
+        out_index,
+        hist_read,
+        hist_write,
+        pos_read,
+        pos_write,
+        out_width,
+        out_height,
+        in_width,
+        in_height,
+        flip_y,
+        reset,
+    ];
+    for (i, v) in u.iter().enumerate() {
+        pc[128 + i * 4..132 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[192..196].copy_from_slice(&reject_dist.to_le_bytes());
+    pc[196..200].copy_from_slice(&max_hist.to_le_bytes());
+    pc[200..204].copy_from_slice(&variance_gamma.to_le_bytes());
+    // float4 jitter (xy = current jitter in UV) at the next 16-byte row.
+    pc[208..212].copy_from_slice(&jitter_uv[0].to_le_bytes());
+    pc[212..216].copy_from_slice(&jitter_uv[1].to_le_bytes());
     pc
 }
 

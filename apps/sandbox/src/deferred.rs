@@ -158,7 +158,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 16, // hdr_index + mode + flip_y + pad
+            push_constant_size: 32, // hdr_index + mode + flip_y + exposure + sharpen + inv_w/h
             bindless: true,
             uniform_buffer: false,
             depth_test: false,
@@ -435,6 +435,7 @@ impl DeferredRenderer {
     /// trace / SW-RT) to the backbuffer, encoding sRGB in-shader. `exposure` is 1.0
     /// for the rasterized path (exposure already baked into lighting) and the camera
     /// exposure for the raw-radiance RT/SW-RT sources.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_tonemap<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
@@ -443,6 +444,9 @@ impl DeferredRenderer {
         post_mode: u32,
         flip_y: u32,
         exposure: f32,
+        sharpen: f32,
+        inv_w: f32,
+        inv_h: f32,
     ) {
         graph.add_pass(
             PassInfo {
@@ -455,7 +459,9 @@ impl DeferredRenderer {
                 let hdr_index = ctx.sampled_index(src);
                 let cmd = ctx.cmd();
                 cmd.bind_graphics_pipeline(&self.post_pipeline);
-                cmd.push_constants(&post_push(hdr_index, post_mode, flip_y, exposure));
+                cmd.push_constants(&post_push(
+                    hdr_index, post_mode, flip_y, exposure, sharpen, inv_w, inv_h,
+                ));
                 cmd.draw(3, 1);
                 Ok(())
             },

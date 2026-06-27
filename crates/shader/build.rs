@@ -549,6 +549,20 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "sdf_cache_visibility_cs",
     },
+    // QHD/UHD track: temporal upsampling (TAAU) — low-res jittered render -> full-res accumulation.
+    Job {
+        src: "taau.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "taau_cs",
+    },
+    // QHD/UHD track: HDR-aware FXAA (the Decima FXAA->TAA pre-pass that stabilizes the jitter).
+    Job {
+        src: "fxaa.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "fxaa_cs",
+    },
     // Phase 11 Stage C (C4): spatio-temporal denoise of the noisy GI.
     Job {
         src: "gdf_temporal.slang",
