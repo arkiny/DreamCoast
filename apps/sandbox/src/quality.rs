@@ -83,6 +83,12 @@ pub struct QualityPreset {
     /// Soft-shadow blocker/PCF tap count, written to `globals.shadow.w` (`SHADOW_TAPS`).
     /// Only consumed by the soft path (softness > 0); clamped to [1, 16] (POISSON16) in the shader.
     pub shadow_taps: u32,
+    /// Stage D2 (Sponza 60fps): surface-cache amortized-relight period — relight `1/period` of the
+    /// cards per frame (round-robin), the rest persist their radiance (`P11_CACHE_RELIGHT_PERIOD`).
+    /// `1` = the legacy every-frame relight (byte-identical; forced for the gallery anchor at the
+    /// call site). Higher = cheaper `sdf_cache_light`, slower convergence. UE Lumen surface-cache
+    /// update budget; see `sdf_cache_light.slang` and `docs/sponza-perf.md`.
+    pub cache_relight_period: u32,
 }
 
 /// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
@@ -101,6 +107,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 8,
+            cache_relight_period: 8,
         },
         // Default — identical to the pre-tier behavior. Do not change without re-baselining no-reg.
         RenderQuality::Med => QualityPreset {
@@ -114,6 +121,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 16,
+            cache_relight_period: 4,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
@@ -128,6 +136,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             firefly_clamp: true,
             shadow_softness: 0.03,
             shadow_taps: 16,
+            cache_relight_period: 1,
         },
     }
 }

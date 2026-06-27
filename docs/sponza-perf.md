@@ -120,6 +120,38 @@
 > PROFILE_GPU before/after, 양 백엔드, DX≡VK ≤0.001, 갤러리 무회귀(캐시 패스는 갤러리 미사용 → 자동 바이트 동일),
 > Sponza GDF GI 품질 `tools/rt-compare.py` 잔차 수용, Vulkan 검증 클린, fmt+clippy.
 
+## Stage D2 — surface-cache 상각 재조명 (완료, 2026-06-27)
+
+`sdf_cache_light`(Stage 0 Top-1)가 매 프레임 **전 카드 아틀라스를 무조건 재조명**하던 것을 **라운드로빈
+갱신 예산**으로 전환. UE5 Lumen surface-cache update budget(D. Wright et al., Epic Games, SIGGRAPH 2022
+"Lumen: Real-time GI in UE5") 참고 — 매 프레임 `1/period`의 카드만 재조명, 나머지는 직전 radiance를
+ping-pong write로 carry-forward(소비자는 항상 완전한 아틀라스를 읽음). 캐시는 EMA로 누적되는 거의 정적
+신호라 정적 씬에선 같은 고정점에 수렴.
+
+- **노브(단일 소스)**: `quality.rs` `cache_relight_period` (Low 8 / **Med 4** / High 1). 셰이더는
+  `period=1`이면 매 프레임 전량 = **레거시 바이트 동일**. `P11_CACHE_RELIGHT_PERIOD` 오버라이드. **갤러리는
+  무회귀 앵커라 호출부에서 1로 강제**(`clip_max_levels`와 동일 패턴), 콘텐츠(Sponza)만 티어값으로 상각.
+- 파일: `sdf_cache_light.slang`(card 선택 + carry-forward), `push.rs`(`clip.z`=period), `gdf.rs`
+  (`record_cache_light` 인자), `quality.rs`(티어 노브), `main.rs`(배선 + UI 재적용, 갤러리 게이트).
+
+### before/after (RTX 2070 SUPER, 1280×720, Med=period4)
+| 패스 | DX before | DX after | VK before | VK after |
+|---|---:|---:|---:|---:|
+| **sdf_cache_light** | 357.5 | **103.2** (−3.5×) | 773.6 | **193.9** (−4.0×) |
+| gdf_gi | 120.0 | 122.4 | 246.0 | 103.6 |
+| gdf_reflect | 11.6 | 11.8 | 15.1 | 12.8 |
+| **프레임 총합** | **492.6** | **240.8** | **1039.3** | **314.3** |
+
+→ `sdf_cache_light`가 4× 줄어 **새 Top-1은 `gdf_gi`**(DX 122 / VK 104ms). 다음 레버는 **Stage D1/D3**
+(gdf_gi 하프해상 + march/clipmap LOD). D2 단독으론 60fps 미달(예상대로 — B 전선은 다축).
+
+### 게이트 (정직 보고)
+- **무회귀(갤러리)**: DX/VK base vs D2 = **0.000/ch** (VK max 0 = bit-identical, DX max 1 = run-to-run GPU 비결정성). period=1 강제로 바이트 동일. ✓
+- **품질(Sponza 상각 델타)**: base vs D2 raster = **0.004/ch, max 1 LSB** (0–255 스케일) → 64프레임 워밍업 내 완전 수렴, **지각 불가**. ✓
+- **DX≡VK(Sponza)**: D2 후 0.004/ch — 단 **D2 전에도 0.004/ch (max 228)** → **D2는 파리티 중립**. 이 갭은 콘텐츠 경로의 **기존** 스토캐스틱 반사 firefly 소수 픽셀 차이(갤러리 바이트동일 게이트와 무관, D2가 도입한 것 아님). ✓
+- **PT 잔차(Sponza)**: base 0.001 → D2 0.004/ch (둘 다 sub-LSB, 노이즈 내). ✓
+- **fmt/clippy(-D warnings) 클린, Vulkan 검증 클린**(VUID 없음; 기존 `VK_NV_external_memory` interop 노트만, D2 무관). ✓
+
 ## 설계 제약 (CLAUDE.md 5원칙)
 1. **근본 원인**: 마이크로 패치 금지. 비용의 근원(풀스크린 레이 수 / 카드 텍셀 수 / 미컬링 드로우)을 줄인다.
 2. **측정 주도**: `PROFILE_GPU`가 성공 지표. 모든 before/after를 ms로 보고.

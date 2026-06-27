@@ -111,6 +111,27 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     if (t >= pc.num_texels)
         return;
 
+    // Stage D2 (Sponza 60fps) — amortized relight budget. Re-lighting all `num_cards*tile^2`
+    // texels every frame (the legacy path) is the dominant Sponza cost. Instead refresh only a
+    // round-robin slice of cards each frame and persist the rest, since the cache is a temporally
+    // accumulated, mostly-static signal (EMA below). This is UE5 Lumen's "surface cache update
+    // budget": a fixed fraction of cards relit per frame, the others keep last frame's radiance.
+    //   Ref: D. Wright et al. (Epic Games), "Lumen: Real-time Global Illumination in UE5",
+    //        SIGGRAPH 2022 Advances in Real-Time Rendering.
+    // `relight_period == 1` ⇒ every card every frame ⇒ byte-identical to the legacy path (the
+    // gallery regression anchor passes period 1). `reset` always relights all cards (first frame).
+    uint relight_period = max(pc.clip.z, 1u);
+    uint card = t / max(pc.tile * pc.tile, 1u);
+    bool selected = (pc.reset != 0u) || ((card % relight_period) == (pc.frame % relight_period));
+    if (!selected)
+    {
+        // Persist: carry last frame's radiance into the write (ping-pong) buffer so the GI /
+        // reflection consumers always read a fully-populated atlas; only the heavy march is skipped.
+        g.storage_buffers[pc.cache_rad_write].Store4(
+            t * 16u, g.storage_buffers[pc.cache_rad_read].Load4(t * 16u));
+        return;
+    }
+
     float4 pos = asfloat(g.storage_buffers[pc.cache_pos_index].Load4(t * 16u));
     if (pos.w < 0.5)
     {

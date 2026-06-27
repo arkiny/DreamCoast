@@ -787,6 +787,7 @@ impl GdfSystem {
         spp: u32,
         frame: u32,
         reset: bool,
+        relight_period: u32,
     ) {
         let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
         let pipe = self
@@ -863,6 +864,7 @@ impl GdfSystem {
                     diag,                           // gather ray max distance
                     clip.0,
                     clip.1,
+                    relight_period.max(1),
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())
