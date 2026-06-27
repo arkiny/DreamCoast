@@ -60,6 +60,9 @@ pub(crate) fn pixel_format(format: Format) -> MTLPixelFormat {
         Format::Bc1Srgb => MTLPixelFormat::BC1_RGBA_sRGB,
         Format::Bc1Unorm => MTLPixelFormat::BC1_RGBA,
         Format::Bc5Unorm => MTLPixelFormat::BC5_RGUnorm,
+        Format::Bc3Srgb => MTLPixelFormat::BC3_RGBA_sRGB,
+        Format::Bc3Unorm => MTLPixelFormat::BC3_RGBA,
+        Format::Bc4Unorm => MTLPixelFormat::BC4_RUnorm,
     }
 }
 
@@ -76,7 +79,12 @@ pub(crate) fn bytes_per_pixel(format: Format) -> usize {
         | Format::Depth32Float
         | Format::R32Float => 4,
         Format::Rgba16Float => 8,
-        Format::Bc1Srgb | Format::Bc1Unorm | Format::Bc5Unorm => {
+        Format::Bc1Srgb
+        | Format::Bc1Unorm
+        | Format::Bc5Unorm
+        | Format::Bc3Srgb
+        | Format::Bc3Unorm
+        | Format::Bc4Unorm => {
             unreachable!("block-compressed formats use the block upload path")
         }
     }

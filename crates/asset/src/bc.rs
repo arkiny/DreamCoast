@@ -19,8 +19,13 @@
 /// Which block codec to apply to a texture slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BcFormat {
-    /// BC1 / DXT1, RGB (sRGB), 8 bytes per 4×4 block.
+    /// BC1 / DXT1, RGB, 8 bytes per 4×4 block.
     Bc1,
+    /// BC3 / DXT5, RGBA (BC1 colour + BC4 alpha), 16 bytes per 4×4 block. For colour
+    /// textures with real transparency.
+    Bc3,
+    /// BC4, single channel (R), 8 bytes per 4×4 block. For grayscale / mask data.
+    Bc4,
     /// BC5, two channels (RG), 16 bytes per 4×4 block.
     Bc5,
 }
@@ -29,8 +34,8 @@ impl BcFormat {
     /// Compressed bytes per 4×4 block.
     pub fn block_bytes(self) -> usize {
         match self {
-            BcFormat::Bc1 => 8,
-            BcFormat::Bc5 => 16,
+            BcFormat::Bc1 | BcFormat::Bc4 => 8,
+            BcFormat::Bc3 | BcFormat::Bc5 => 16,
         }
     }
 }
@@ -231,37 +236,59 @@ pub fn encode_bc5(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     out
 }
 
+/// Compress an RGBA8 image to BC3 / DXT5 (RGBA): a BC4 alpha block followed by a
+/// BC1 colour block, 16 bytes / 4×4 block. Unlike BC1 this keeps real alpha.
+pub fn encode_bc3(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (bw, bh) = (blocks(width), blocks(height));
+    let mut out = Vec::with_capacity((bw * bh) as usize * 16);
+    for by in 0..bh {
+        for bx in 0..bw {
+            out.extend_from_slice(&encode_bc4_block(rgba, width, height, bx, by, 3)); // alpha
+            out.extend_from_slice(&encode_bc1_block(rgba, width, height, bx, by)); // colour
+        }
+    }
+    out
+}
+
+/// Compress the R channel of an RGBA8 image to BC4 (single channel), 8 bytes /
+/// 4×4 block. For grayscale masks / single-channel data.
+pub fn encode_bc4(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (bw, bh) = (blocks(width), blocks(height));
+    let mut out = Vec::with_capacity((bw * bh) as usize * 8);
+    for by in 0..bh {
+        for bx in 0..bw {
+            out.extend_from_slice(&encode_bc4_block(rgba, width, height, bx, by, 0));
+        }
+    }
+    out
+}
+
 /// Decode a single 4×4 block (the smallest mip of a cooked texture) to a 16-texel
 /// RGBA8 buffer. Used to recover a representative average colour cheaply, without
-/// decompressing a full image. BC5 fills R,G and leaves B=0, A=255.
+/// decompressing a full image. BC5 fills R,G; BC4 fills R; BC3 decodes colour+alpha.
 pub fn decode_block_rgba8(fmt: BcFormat, block: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; 16 * 4];
     match fmt {
         BcFormat::Bc1 => {
-            let c0 = u16::from_le_bytes([block[0], block[1]]);
-            let c1 = u16::from_le_bytes([block[2], block[3]]);
-            let idx = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
-            let e0 = expand565(c0);
-            let e1 = expand565(c1);
-            let pal = [
-                e0,
-                e1,
-                [
-                    (2 * e0[0] + e1[0]) / 3,
-                    (2 * e0[1] + e1[1]) / 3,
-                    (2 * e0[2] + e1[2]) / 3,
-                ],
-                [
-                    (e0[0] + 2 * e1[0]) / 3,
-                    (e0[1] + 2 * e1[1]) / 3,
-                    (e0[2] + 2 * e1[2]) / 3,
-                ],
-            ];
+            let rgb = decode_bc1_colors(block);
             for p in 0..16 {
-                let k = ((idx >> (2 * p)) & 3) as usize;
-                out[p * 4] = pal[k][0] as u8;
-                out[p * 4 + 1] = pal[k][1] as u8;
-                out[p * 4 + 2] = pal[k][2] as u8;
+                out[p * 4..p * 4 + 3].copy_from_slice(&rgb[p]);
+                out[p * 4 + 3] = 255;
+            }
+        }
+        BcFormat::Bc3 => {
+            // 8 bytes alpha (BC4), then 8 bytes colour (BC1).
+            let alpha = decode_bc4_block(&block[0..8]);
+            let rgb = decode_bc1_colors(&block[8..16]);
+            for p in 0..16 {
+                out[p * 4..p * 4 + 3].copy_from_slice(&rgb[p]);
+                out[p * 4 + 3] = alpha[p];
+            }
+        }
+        BcFormat::Bc4 => {
+            let r = decode_bc4_block(block);
+            for p in 0..16 {
+                out[p * 4] = r[p];
                 out[p * 4 + 3] = 255;
             }
         }
@@ -274,6 +301,35 @@ pub fn decode_block_rgba8(fmt: BcFormat, block: &[u8]) -> Vec<u8> {
                 out[p * 4 + 3] = 255;
             }
         }
+    }
+    out
+}
+
+/// Decode a BC1 colour block to its 16 RGB texels (shared by BC1 / BC3 decode).
+fn decode_bc1_colors(block: &[u8]) -> [[u8; 3]; 16] {
+    let c0 = u16::from_le_bytes([block[0], block[1]]);
+    let c1 = u16::from_le_bytes([block[2], block[3]]);
+    let idx = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    let e0 = expand565(c0);
+    let e1 = expand565(c1);
+    let pal = [
+        e0,
+        e1,
+        [
+            (2 * e0[0] + e1[0]) / 3,
+            (2 * e0[1] + e1[1]) / 3,
+            (2 * e0[2] + e1[2]) / 3,
+        ],
+        [
+            (e0[0] + 2 * e1[0]) / 3,
+            (e0[1] + 2 * e1[1]) / 3,
+            (e0[2] + 2 * e1[2]) / 3,
+        ],
+    ];
+    let mut out = [[0u8; 3]; 16];
+    for (p, o) in out.iter_mut().enumerate() {
+        let k = ((idx >> (2 * p)) & 3) as usize;
+        *o = [pal[k][0] as u8, pal[k][1] as u8, pal[k][2] as u8];
     }
     out
 }
@@ -388,6 +444,56 @@ mod tests {
         let dec = decode_bc1(&enc, w, h);
         let err = rmse(&src, &dec, &[0, 1, 2]);
         assert!(err < 6.0, "BC1 ramp RMSE {err} too high");
+    }
+
+    #[test]
+    fn bc3_preserves_alpha() {
+        // A colour ramp with a varying alpha ramp — BC3 keeps both (unlike BC1).
+        let (w, h) = (16, 16);
+        let mut src = Vec::with_capacity((w * h * 4) as usize);
+        for _y in 0..h {
+            for x in 0..w {
+                let t = (x * 255 / w) as u8;
+                src.extend_from_slice(&[t, t, t, 255 - t]);
+            }
+        }
+        let enc = encode_bc3(&src, w, h);
+        assert_eq!(enc.len(), compressed_len(BcFormat::Bc3, w, h));
+        assert_eq!(enc.len(), src.len() / 4); // 4:1 vs RGBA8
+
+        // Decode block-by-block and check the alpha channel survived.
+        let (bw, _) = (blocks(w), blocks(h));
+        let mut dec = vec![0u8; src.len()];
+        for by in 0..blocks(h) {
+            for bx in 0..bw {
+                let texels =
+                    decode_block_rgba8(BcFormat::Bc3, &enc[((by * bw + bx) * 16) as usize..]);
+                for j in 0..4 {
+                    for i in 0..4 {
+                        let (x, y) = (bx * 4 + i, by * 4 + j);
+                        if x >= w || y >= h {
+                            continue;
+                        }
+                        let o = ((y * w + x) * 4) as usize;
+                        dec[o..o + 4].copy_from_slice(&texels[(j * 4 + i) as usize * 4..][..4]);
+                    }
+                }
+            }
+        }
+        assert!(rmse(&src, &dec, &[3]) < 6.0, "BC3 alpha RMSE too high");
+        assert!(
+            rmse(&src, &dec, &[0, 1, 2]) < 6.0,
+            "BC3 colour RMSE too high"
+        );
+    }
+
+    #[test]
+    fn bc4_size() {
+        let (w, h) = (8, 8);
+        let src = gradient(w, h);
+        let enc = encode_bc4(&src, w, h);
+        assert_eq!(enc.len(), compressed_len(BcFormat::Bc4, w, h));
+        assert_eq!(enc.len(), src.len() / 8); // single channel, 8:1
     }
 
     #[test]
