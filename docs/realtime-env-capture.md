@@ -1,10 +1,10 @@
 # Real-time environment capture (camera-based) — plan
 
-> **상태 갱신 (2026-06-26): 씬 캡처는 Phase 11 Stage C(SW-RT)로 대체 예정.** 아래 캡처 기반 IBL은
+> **상태 갱신 (2026-06-26): 씬 캡처는 Phase 10 Stage C(SW-RT)로 대체 예정.** 아래 캡처 기반 IBL은
 > ✅ 동작하지만, 단일 프로브 시차·이웃 오브젝트 미반영·프록시 부정합이 근본 한계(아래 "알려진 한계"
 > + [rt-pbr-parity.md](rt-pbr-parity.md) 결론). 사용자 확정 방향에 따라 **디퓨즈 IBL → GDF 디퓨즈
 > GI**, **스페큘러 IBL → SSR + GDF 하이브리드 반사**로 교체하고, 이 env 큐브는 **스카이 전용
-> 폴백/디퓨즈 스카이 irradiance**로 격하한다. 세부: [phase-11-distance-field-gi.md](phase-11-distance-field-gi.md)
+> 폴백/디퓨즈 스카이 irradiance**로 격하한다. 세부: [phase-10-distance-field-gi.md](phase-10-distance-field-gi.md)
 > Stage C(C5 SSR · C6 GDF 반사 · C7 하이브리드 합성 + IBL 대체). 이 문서는 그 베이스라인/비교 대상.
 
 > Phase 6 IBL은 시작 시 1회 큐브 캡처. 이 문서는 **실시간(매 프레임/타임슬라이스) 환경 캡처**로

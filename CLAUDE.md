@@ -75,7 +75,7 @@ actually lives (there is no separate engine binary). Key modules:
 - `deferred.rs` — the deferred backbone: shadow-depth, **G-buffer fill** (4 MRT: albedo+AO,
   world normal, material[metallic/rough/AO], **world position**), the full-screen **PBR
   lighting** pass, and tonemap. `push.rs` holds the push-constant byte packers.
-- `gdf.rs` / `gi.rs` / `reflect.rs` — Phase 11 software ray tracing against a baked **global
+- `gdf.rs` / `gi.rs` / `reflect.rs` — Phase 10 software ray tracing against a baked **global
   distance field** (GDF): AO, 1-bounce diffuse GI (`gdf_gi`), GGX reflections (`gdf_reflect`),
   and a mesh-card **surface cache** (`sdf_cache_*`).
 - `rt.rs` — hardware ray tracing (DXR + VK_KHR): BLAS/TLAS, the **path tracer** (ground truth),

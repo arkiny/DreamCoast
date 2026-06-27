@@ -1,6 +1,6 @@
-# Phase 13 — 씬 그래프 + 레벨 스트리밍 (세부 계획)
+# Phase 12 — 씬 그래프 + 레벨 스트리밍 (세부 계획)
 
-상위: [ROADMAP.md](ROADMAP.md) Phase 13.
+상위: [ROADMAP.md](ROADMAP.md) Phase 12.
 
 ## 동기 / 배경
 
@@ -82,15 +82,15 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
   N 프리미티브 / M 머티리얼 glTF(Lantern)는 레지스트리 기반 업로드 루프(텍스처 dedup, 머티리얼별
   `MaterialHandle` 하나)가 필요. Stage A가 `MeshRegistry` / `MaterialRegistry` 도입 시 이 경로를
   일반화해 Stage B 임포터가 재사용하게 한다.
-- **P3 — Phase 12 `.dcasset` 컨테이너 (레벨/월드 *바이너리* 쿡만 차단).** 레벨/월드의 쿡된 바이너리
-  형태(아래 직렬화 참조)는 Phase 12의 `.dcasset` 청크 컨테이너를 재사용하는데, 그 골격(M1 메시 직렬화)이
-  **계획됐으나 미구현**(`docs/phase-12-asset-pipeline.md`). RON **텍스트** 직렬화는 선행조건 없이
-  Stage C/D에서 출하; 바이너리 쿡은 Phase 12 M1 뒤로 순서화. 새 선행조건 추가가 아니라 교차 Phase
+- **P3 — Phase 11 `.dcasset` 컨테이너 (레벨/월드 *바이너리* 쿡만 차단).** 레벨/월드의 쿡된 바이너리
+  형태(아래 직렬화 참조)는 Phase 11의 `.dcasset` 청크 컨테이너를 재사용하는데, 그 골격(M1 메시 직렬화)이
+  **계획됐으나 미구현**(`docs/phase-11-asset-pipeline.md`). RON **텍스트** 직렬화는 선행조건 없이
+  Stage C/D에서 출하; 바이너리 쿡은 Phase 11 M1 뒤로 순서화. 새 선행조건 추가가 아니라 교차 Phase
   순서 기록일 뿐.
 
-## 직렬화 & 차후 애셋화 (Phase 12 교차)
+## 직렬화 & 차후 애셋화 (Phase 11 교차)
 
-레벨(Stage C)과 월드(Stage D)는 처음부터 직렬화 가능하게 설계해, Phase 12가 메시/SDF에 하듯 차후 엔진
+레벨(Stage C)과 월드(Stage D)는 처음부터 직렬화 가능하게 설계해, Phase 11가 메시/SDF에 하듯 차후 엔진
 애셋으로 쿡할 수 있게 한다.
 
 - **지금 (Stage C/D): RON 텍스트, 왕복 serde.** 데이터 모델에 `serde::{Serialize, Deserialize}` 유도 —
@@ -98,12 +98,12 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
   `CameraDesc`, `Environment`, `World`(청크 리스트 + 배치 + 그래프 인접). 샌드박스가 `.level` /
   `.world`를 **로드·저장 양쪽**. 모델을 지금 serde-ready로 두면 차후 바이너리 쿡은 *데이터 모델* 변경이
   아니라 *포맷* 변경이 된다.
-- **차후 (Phase 12 결속): 쿡된 바이너리 `.dclevel` / `.dcworld`.** Phase 12 `.dcasset` 컨테이너에
+- **차후 (Phase 11 결속): 쿡된 바이너리 `.dclevel` / `.dcworld`.** Phase 11 `.dcasset` 컨테이너에
   씬/레벨 **청크 타입** 추가: 엔티티 리스트(애셋을 경로가 아닌 **source hash**로 참조), 트랜스폼,
   머티리얼 오버라이드, 라이트, 카메라, 환경, 그리고 (월드) 청크 그래프(인접 + 월드 공간 배치 + 스트리밍
-  반경) 저장. `source_hash` + cook 파라미터로 키잉, 크로스백엔드 바이트 동일 — Phase 12 캐싱 모델과 동일.
-  **Phase 12 신규 마일스톤(M3 "씬/레벨 청크")** 또는 Phase 13 **Stage E**로 안착, Phase 12 M1 이후.
-  `docs/ROADMAP.md`(Phase 12·13)와 `docs/phase-12-asset-pipeline.md`에 교차 참조 추가.
+  반경) 저장. `source_hash` + cook 파라미터로 키잉, 크로스백엔드 바이트 동일 — Phase 11 캐싱 모델과 동일.
+  **Phase 11 신규 마일스톤(M3 "씬/레벨 청크")** 또는 Phase 12 **Stage E**로 안착, Phase 11 M1 이후.
+  `docs/ROADMAP.md`(Phase 11·13)와 `docs/phase-11-asset-pipeline.md`에 교차 참조 추가.
 
 ## 단계별 (Stages)
 
@@ -169,18 +169,18 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
 - `LevelGraph` 데이터 모델 serde-ready(청크 리스트 + 배치 + 그래프 인접 + 스트리밍 반경); 샌드박스가
   `.world`를 **로드·저장 양쪽**.
 - **검증:** 카메라 주행이 청크를 올바르게 로드/언로드(엔티티 디스폰 + GPU 누수 없음); VK ≡ DX; 검증 클린.
-- **비동기 PSO 컴파일(Phase 12 M5 전체를 여기서 착수):** 청크 스트림-인 시 새 머티리얼이 **런타임
-  파이프라인(PSO/VkPipeline) 생성**을 유발 → 프레임 히치. [phase-12-m5-async-pipeline.md](phase-12-m5-async-pipeline.md)
+- **비동기 PSO 컴파일(Phase 11 M5 전체를 여기서 착수):** 청크 스트림-인 시 새 머티리얼이 **런타임
+  파이프라인(PSO/VkPipeline) 생성**을 유발 → 프레임 히치. [phase-11-m5-async-pipeline.md](phase-11-m5-async-pipeline.md)
   의 **M5.1**(준비성 슬롯 + 지연 드로우: 미준비 PSO 패스는 준비될 때까지 스킵, 9개 렌더 모듈 ~22 PSO 사이트를
   `PipelineSlot`화)과 **M5.2**(배경 스레드 PSO 컴파일, 백엔드 `Send`/`Sync` 감사 후)를 **이 Stage D에서 함께**
   구현한다. 근거: M5.1은 전 렌더러 리팩터링인데 현 정적 씬 이득이 미미(시작 ~1s)하고, **실가치는 스트리밍이
   생겨야 exercise·end-to-end 검증** 가능 → 스트리밍 컨텍스트에서 인프라+배경컴파일을 같이 land(2026-06-27 결정).
   청크 로드 예산(프레임당 1청크)과 PSO 생성/컴파일 예산을 함께 조율.
 
-### Stage E — 쿡된 바이너리 레벨/월드 (Phase 12 M1 이후; Phase 12 결속)
-- Phase 12 `.dcasset` 컨테이너에 씬/레벨 **청크 타입** 추가; `.level`/`.world` → 바이너리 쿡,
+### Stage E — 쿡된 바이너리 레벨/월드 (Phase 11 M1 이후; Phase 11 결속)
+- Phase 11 `.dcasset` 컨테이너에 씬/레벨 **청크 타입** 추가; `.level`/`.world` → 바이너리 쿡,
   `source_hash` + cook 파라미터로 키잉, 크로스백엔드 바이트 동일. 런타임은 쿡된 형태를 직접 로드(RON
-  재파싱 없음). **Phase 12 M3**으로 안착할 수도 — Phase 12 M1 구현 시 결정. **P3** 게이트.
+  재파싱 없음). **Phase 11 M3**으로 안착할 수도 — Phase 11 M1 구현 시 결정. **P3** 게이트.
 - **검증:** 쿡된 로드가 RON 경로와 동일 렌더(양 백엔드); 바이트 동일 캐시.
 
 ## 파일 (생성 / 수정)
@@ -193,9 +193,9 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
   씬 그래프 구성 + 레지스트리 + `draw_list()` 소비(Stage A/C/D); 레벨/월드 전환+저장 UI.
 - **수정** `apps/sandbox/src/{rt.rs, cull.rs, mesh.rs}` — 레지스트리 기반 다중 머티리얼 업로드(P2);
   인스턴스를 `draw_list()`로 공급; 씬 변경 시 TLAS 재빌드.
-- **수정** `docs/ROADMAP.md` — Phase 12 뒤에 **Phase 13 — 씬 그래프 + 레벨 스트리밍**(🧪 계획) 추가,
-  워크스페이스 구조 섹션에 `crates/scene` 기재, Phase 12 ↔ 13 직렬화 교차 참조(쿡된 레벨/월드 청크) 기록.
-- **수정** `docs/phase-12-asset-pipeline.md` — 차후 씬/레벨 청크(Stage E / M3) 명기.
+- **수정** `docs/ROADMAP.md` — Phase 11 뒤에 **Phase 12 — 씬 그래프 + 레벨 스트리밍**(🧪 계획) 추가,
+  워크스페이스 구조 섹션에 `crates/scene` 기재, Phase 11 ↔ 13 직렬화 교차 참조(쿡된 레벨/월드 청크) 기록.
+- **수정** `docs/phase-11-asset-pipeline.md` — 차후 씬/레벨 청크(Stage E / M3) 명기.
 
 ## 리스크 / 미결
 - **ECS 스토리지 모델 (Stage A 세부 결정):** 아키타입(순회 빠름, 구현 복잡) vs 스파스셋(추가/삭제 빠름,
@@ -207,7 +207,7 @@ RHI 비의존 — `glam` + `dreamcoast-asset` + `dreamcoast-core`에만 의존(`
 - **언로드 시 리소스 수명 (Stage D):** 청크의 비공유 GPU 리소스만 해제하도록 refcount / per-chunk arena
   필요 — Stage D에서 상세.
 - **`ron` 의존성:** Stage C에서 사용자 승인 필요(대안: `serde_json` 또는 손수 만든 최소 파서).
-- **glTF 애니메이션 / 스키닝:** 계층이 잠금 해제하는 자연스러운 후속이나 Phase 13 **범위 외**(향후 작업
+- **glTF 애니메이션 / 스키닝:** 계층이 잠금 해제하는 자연스러운 후속이나 Phase 12 **범위 외**(향후 작업
   으로 기록).
 
 ## 검증 (Stage별)

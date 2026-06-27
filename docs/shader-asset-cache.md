@@ -1,7 +1,7 @@
 # 셰이더 바이트코드 쿡 캐시 (Shader Asset Cache)
 
-> **상태:** 🧪 계획 (미구현). 빌드 인프라 / 크로스컷팅 — [ROADMAP](ROADMAP.md) **Phase 12 M4**.
-> **연관:** [phase-12-asset-pipeline.md](phase-12-asset-pipeline.md)(쿡된 에셋 트랙), [phase-0-foundations.md](phase-0-foundations.md)(Slang 빌드 통합).
+> **상태:** 🧪 계획 (미구현). 빌드 인프라 / 크로스컷팅 — [ROADMAP](ROADMAP.md) **Phase 11 M4**.
+> **연관:** [phase-11-asset-pipeline.md](phase-11-asset-pipeline.md)(쿡된 에셋 트랙), [phase-0-foundations.md](phase-0-foundations.md)(Slang 빌드 통합).
 > **무관(별개 트랙):** 런타임 Slang 리플렉션/핫리로드는 *런타임* 문제로 이 문서 범위 밖.
 
 ## 1. 문제 (Why)
@@ -110,7 +110,7 @@ crates/shader/compiled/                 # 쿡된 셰이더 에셋 루트 (per-OS
 사용자 표현("어셋화해서 사용")은 6a로 충분히 충족된다(빌드타임 캐시 = 더 이상 매번 컴파일 안 함).
 6b는 런타임 교체가 필요해질 때.
 
-## 7. 마일스톤 (Phase 12 M4)
+## 7. 마일스톤 (Phase 11 M4)
 
 각 단계 게이트 = `cargo fmt --all` + `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets`
 + **양 백엔드(VK/DX) 픽셀 동일** + Vulkan 검증 클린(셰이더 바이트코드가 동일하므로 렌더 무회귀가 기준).
@@ -141,10 +141,10 @@ crates/shader/compiled/                 # 쿡된 셰이더 에셋 루트 (per-OS
 - **M4.6(선택) — 정밀 의존성.** slangc depfile로 잡별 include 집합 좁히기(§3 2단계).
 - **M4.7(선택) — 런타임 에셋 로드.** 6b. 핫리로드 합류 지점.
 
-> **연계(별개 런타임 트랙): Phase 12 M5 — 비동기 파이프라인 컴파일.** 런타임 `create_*_pipeline`(드라이버
+> **연계(별개 런타임 트랙): Phase 11 M5 — 비동기 파이프라인 컴파일.** 런타임 `create_*_pipeline`(드라이버
 > PSO/VkPipeline 빌드)을 백그라운드 스레드로 돌리고, **준비 전 해당 패스의 드로우를 지연**(완료 시 그림;
 > 머스트-드로우 케이스는 상주 `DefaultLoading` 폴백). 빌드타임 slangc 캐시(M4)와 별개 — 베이크된 바이트코드의
-> 드라이버 컴파일이며 §9 런타임-Slang 제외와 무관(새 의존성 없음). 별도 `docs/phase-12-m5-async-pipeline.md`에
+> 드라이버 컴파일이며 §9 런타임-Slang 제외와 무관(새 의존성 없음). 별도 `docs/phase-11-m5-async-pipeline.md`에
 > 리뷰된 계획 후 구현.
 
 ## 8. 검증
@@ -160,7 +160,7 @@ crates/shader/compiled/                 # 쿡된 셰이더 에셋 루트 (per-OS
 ## 9. 비범위 (Out of scope)
 
 - 런타임 Slang 인프로세스 컴파일·리플렉션·핫리로드([shader-system-todo]) — 별개 *런타임* 트랙.
-- `.dcasset` 바이너리 컨테이너(메시/SDF) — Phase 12 M1–M3. 셰이더 캐시는 **독립 산출물**
+- `.dcasset` 바이너리 컨테이너(메시/SDF) — Phase 11 M1–M3. 셰이더 캐시는 **독립 산출물**
   (별도 디렉터리 + 매니페스트)로, P11/P12 본선 의존 없이 단독 진행 가능.
 - 셰이더 변형(permutation)/specialization 관리는 **M4.4로 계획**(이전엔 비범위였으나 범용 게임 엔진은
   머티리얼 피처 플래그·섀도우 모드·`RenderQuality` 특수화 등으로 필요). **단, 캐시 키는 M4.1부터 `defines`를
