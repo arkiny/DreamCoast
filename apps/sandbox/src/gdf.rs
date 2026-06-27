@@ -850,6 +850,7 @@ impl GdfSystem {
         reset: bool,
         relight_period: u32,
         card_vis_ext: Option<ResourceId>,
+        alpha: f32,
     ) {
         // Stage D2b: feed the per-card visibility buffer index to the shader (sentinel = off =
         // uniform period). When present, declare it as a read so the graph barriers the relight
@@ -931,10 +932,10 @@ impl GdfSystem {
                     0.0,
                     aabb_max,
                     diag,
-                    0.25,                           // sky fill irradiance
-                    if reset { 1.0 } else { 0.35 }, // temporal alpha
-                    diag * 0.01,                    // surface bias
-                    diag,                           // gather ray max distance
+                    0.25,                            // sky fill irradiance
+                    if reset { 1.0 } else { alpha }, // temporal alpha (D3: period-aware)
+                    diag * 0.01,                     // surface bias
+                    diag,                            // gather ray max distance
                     clip.0,
                     clip.1,
                     relight_period.max(1),
