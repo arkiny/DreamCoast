@@ -1103,6 +1103,7 @@ pub(crate) fn gdf_reflect_push(
     clip_desc: u32,
     clip_count: u32,
     ground_albedo: [f32; 3],
+    max_steps: u32,
 ) -> [u8; 240] {
     let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -1148,6 +1149,8 @@ pub(crate) fn gdf_reflect_push(
     // Stage B clipmap descriptor (former pad_c0/pad_c1 slots).
     pc[212..216].copy_from_slice(&clip_desc.to_le_bytes());
     pc[216..220].copy_from_slice(&clip_count.to_le_bytes());
+    // Stage D3: reflection-ray march step cap (former pad_c2). Content lowers it; gallery = 96.
+    pc[220..224].copy_from_slice(&max_steps.to_le_bytes());
     // Analytic-ground albedo (float3 on its own 16-byte-aligned row, offset 224): floor hits
     // re-light with this instead of albedo_at() (no ground data -> nearest object's colour).
     // 16-aligned so SPIR-V (vec3 align 16) and DXIL agree on the offset.

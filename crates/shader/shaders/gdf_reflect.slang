@@ -44,7 +44,7 @@ struct ReflectPush
     uint cache_tile;        // surface-cache atlas tile edge
     uint clip_desc;         // Stage B: clipmap descriptor storage-buffer index
     uint clip_count;        // Stage B: clipmap level count (1 = single volume = legacy)
-    uint pad_c2;
+    uint max_steps;         // Stage D3: reflection-ray march step cap (96 = legacy / gallery)
     // float3 must sit on a 16-byte boundary or SPIR-V (vec3 align 16) and DXIL (4-byte pack)
     // disagree on its offset — keep it as its own aligned row.
     float3 ground_albedo;   // analytic ground material (not in the albedo volume)
@@ -224,13 +224,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float sky_fill = pc.params.z;
     float bias = pc.params.w;
 
-    // Sphere-trace the reflection ray.
-    const int MAX_STEPS = 96;
+    // Sphere-trace the reflection ray. Stage D3: content lowers the step cap; gallery = 96.
+    int max_steps = int(max(pc.max_steps, 1u));
     const float HIT_EPS = 0.001;
     float t = bias;
     bool hit = false;
     float3 hp = p;
-    for (int i = 0; i < MAX_STEPS; i++)
+    for (int i = 0; i < max_steps; i++)
     {
         float3 rp = p + dir * t;
         float d = scene_march(rp);

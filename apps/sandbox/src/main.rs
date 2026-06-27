@@ -494,6 +494,10 @@ struct App {
     cache_relight_spp: u32,
     /// Stage D3: C3 GI bounce-ray march step cap (gallery forced to legacy 64).
     gi_max_steps: u32,
+    /// Stage D3: GGX reflection-ray march step cap (gallery forced to legacy 96).
+    reflect_max_steps: u32,
+    /// Stage D3: trace the GGX reflection at half resolution + bilateral upsample (gallery off).
+    reflect_half_res: bool,
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
     /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
     gi_half_res: bool,
@@ -1229,6 +1233,24 @@ impl App {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(qp.reflect_max_roughness);
+        // Stage D3: reflection-ray march step cap. Gallery forced to the legacy 96 (byte-identical);
+        // content takes the tier value. `P11_REFLECT_MAX_STEPS` overrides.
+        let reflect_max_steps = std::env::var("P11_REFLECT_MAX_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(if gallery_scene {
+                96
+            } else {
+                qp.reflect_max_steps
+            })
+            .clamp(1, 256);
+        // Stage D3: half-res reflection trace + bilateral upsample (reuses the GI upsample).
+        // Gallery forced off (full-res = byte-identical anchor); content takes the tier value.
+        let reflect_half_res = gi.has_upsample()
+            && quality::env_bool(
+                "P11_REFLECT_HALF_RES",
+                !gallery_scene && qp.reflect_half_res,
+            );
         // C8d: default to the full-res mirror SSR; opt into the stochastic glossy path to compare.
         let ssr_stochastic = quality::env_bool("P11_SSR_STOCHASTIC", qp.ssr_stochastic);
         // Diagnostic single-object orbit: frame one scene object tightly so it can be
@@ -1418,6 +1440,8 @@ impl App {
             cache_feedback,
             cache_relight_spp,
             gi_max_steps,
+            reflect_max_steps,
+            reflect_half_res,
             gi_half_res,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
@@ -2708,7 +2732,17 @@ impl App {
                         )
                         .0
                 };
-                let gdf_refl = self.reflect.record_gdf_reflect(
+                // Stage D3: trace the reflection at half res (1/4 the rays) + bilateral upsample
+                // to full res before the temporal resolve. gdf_reflect.slang samples the G-buffer
+                // by normalized UV, so a half extent + half dims trace correctly (no shader change).
+                let refl_half = self.reflect_half_res;
+                let (rw, rh) = if refl_half { (hcw, hch) } else { (cw, ch) };
+                let refl_extent = if refl_half {
+                    Extent2D::new(rw, rh)
+                } else {
+                    extent
+                };
+                let refl_traced = self.reflect.record_gdf_reflect(
                     &mut graph,
                     vol,
                     ext,
@@ -2717,20 +2751,40 @@ impl App {
                     g_depth,
                     g_normal,
                     g_material,
-                    extent,
+                    refl_extent,
                     inv_view_proj,
                     eye,
                     self.sun_dir,
                     self.sun_intensity,
-                    cw,
-                    ch,
+                    rw,
+                    rh,
                     self.flip_y,
                     self.frame_no as u32,
                     scene_albedo,
                     reflect_cache_arg,
                     scene_clip,
                     &scene_clip_vols,
+                    self.reflect_max_steps,
                 );
+                let gdf_refl = if refl_half {
+                    self.gi.record_upsample(
+                        &mut graph,
+                        refl_traced,
+                        g_depth,
+                        g_normal,
+                        extent,
+                        inv_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        rw,
+                        rh,
+                        self.flip_y,
+                    )
+                } else {
+                    refl_traced
+                };
                 // C8j: temporally resolve the stochastic GGX GDF reflection (UE-style; the rough
                 // lobe is sampled by real rays + denoised, so it's correctly blurred without an
                 // image-space prefilter that over-brightens rough metals).
@@ -3085,6 +3139,7 @@ impl App {
                 reflect_cache_arg,
                 scene_clip,
                 &scene_clip_vols,
+                self.reflect_max_steps,
             )),
             _ => None,
         };
@@ -3161,6 +3216,7 @@ impl App {
                     reflect_cache_arg,
                     scene_clip,
                     &scene_clip_vols,
+                    self.reflect_max_steps,
                 );
                 // Standalone viz: no temporal resolve buffers here, so feed the GDF reflection
                 // straight into the composite (the resolve runs only in the lighting-fed path).
