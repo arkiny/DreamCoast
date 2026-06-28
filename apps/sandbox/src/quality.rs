@@ -130,6 +130,13 @@ pub struct QualityPreset {
     /// identical). The seam for a future dynamic-resolution controller; default 1.0 at every tier
     /// (the scale that hits a given fps depends on the display resolution + target, not the tier).
     pub render_scale: f32,
+    /// P3 (Lumen-parity SW-RT): cone-trace LOD march slope (`P_CONE_K`). The SW-RT march loops
+    /// (GI bounce / reflection / surface-cache gather + their soft-shadow marches) widen the step
+    /// with distance: floor `max(d, cone_k·t)` and shadow ceiling `max(0.2, cone_k·t)`. Fewer steps
+    /// at distance (grazing rays stop crawling). `0.0` = legacy linear march (byte-identical; forced
+    /// for the gallery anchor at the call site). Higher = cheaper march, softer distant GI/reflection.
+    /// Denoised/EMA signals tolerate it; see `docs/lumen-parity-swrt.md`.
+    pub gdf_cone_k: f32,
 }
 
 /// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
@@ -154,6 +161,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_half_res: true,
             cache_relight_spp: 2,
             reflect_half_res: true,
+            gdf_cone_k: 0.05,
             // Low-end / high-res performance mode: render at 2/3 of the output extent and let the
             // TAAU jitter reconstruction (B-track) upscale it. 2/3 (not 1/2) keeps detailed scenes
             // legible — at 1/2 the internal resolution undersamples texture/geometry detail enough
@@ -184,6 +192,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             cache_relight_spp: 1,
             reflect_half_res: true,
             render_scale: 1.0,
+            gdf_cone_k: 0.02,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
@@ -205,6 +214,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             cache_relight_spp: 8,
             reflect_half_res: false,
             render_scale: 1.0,
+            gdf_cone_k: 0.0,
         },
     }
 }

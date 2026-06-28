@@ -263,7 +263,7 @@ impl GdfSystem {
             dreamcoast_shader::sdf_cache_light_cs_dxil,
             dreamcoast_shader::sdf_cache_light_cs_metallib,
             "sdf_cache_light",
-            128,
+            144,
             [64, 1, 1],
         )?;
         // Stage D2b: per-card camera-frustum visibility for the relight budget.
@@ -877,6 +877,7 @@ impl GdfSystem {
         relight_period: u32,
         card_vis_ext: Option<ResourceId>,
         alpha: f32,
+        cone_k: f32,
     ) {
         // Stage D2b: feed the per-card visibility buffer index to the shader (sentinel = off =
         // uniform period). When present, declare it as a read so the graph barriers the relight
@@ -966,6 +967,7 @@ impl GdfSystem {
                     clip.1,
                     relight_period.max(1),
                     card_vis_index,
+                    cone_k,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())
@@ -994,6 +996,7 @@ impl GdfSystem {
         relight_period: u32,
         alpha: f32,
         feedback: bool,
+        cone_k: f32,
     ) {
         let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
         let pipe = self
@@ -1078,6 +1081,7 @@ impl GdfSystem {
             clip.1,
             relight_period.max(1),
             card_vis_index,
+            cone_k,
         ));
         cmd.dispatch(num_texels.div_ceil(64), 1, 1);
         // Make the relight write available before the queue signals (graphics reads it next frame).
