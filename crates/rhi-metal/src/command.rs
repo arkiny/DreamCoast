@@ -18,8 +18,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLEvent;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLComputeCommandEncoder, MTLIndexType, MTLLoadAction, MTLOrigin,
-    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassColorAttachmentDescriptor,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLFence, MTLIndexType, MTLLoadAction,
+    MTLOrigin, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassColorAttachmentDescriptor,
     MTLRenderPassDepthAttachmentDescriptor, MTLRenderPassDescriptor, MTLRenderStages, MTLResource,
     MTLResourceUsage, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLViewport,
 };
@@ -59,6 +59,17 @@ pub struct MetalCommandBuffer {
     /// threadgroup counts into `dispatchThreadgroups:threadsPerThreadgroup:`.
     pipeline_threads: Cell<MTLSize>,
     rt_push_constants: RefCell<Vec<u8>>,
+    /// Cross-encoder hazard fence. Metal only auto-tracks read-after-write hazards for
+    /// resources reached *directly* by an encoder; a transient written as a render
+    /// attachment (e.g. the G-buffer depth) and then read in a *compute* pass through the
+    /// bindless argument buffer is NOT auto-synchronized, so the compute pass can sample the
+    /// freshly-cleared texture (the cause of the Sponza GI/reflection temporal shimmer on
+    /// Metal). We serialize the main-queue encoder chain explicitly: every encoder updates
+    /// this fence on close and waits on it at open, mirroring the explicit barriers the
+    /// Vulkan/D3D12 backends already emit. One fence is reused; `fence_pending` gates the
+    /// first encoder of each command buffer (nothing to wait on yet).
+    fence: Retained<ProtocolObject<dyn MTLFence>>,
+    fence_pending: Cell<bool>,
 }
 
 impl MetalCommandBuffer {
@@ -66,9 +77,15 @@ impl MetalCommandBuffer {
         shared: Rc<DeviceShared>,
         queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     ) -> Self {
+        let fence = shared
+            .device
+            .newFence()
+            .expect("MTLDevice::newFence returned nil");
         Self {
             shared,
             queue,
+            fence,
+            fence_pending: Cell::new(false),
             cmd: RefCell::new(None),
             encoder: RefCell::new(None),
             compute_encoder: RefCell::new(None),
@@ -86,12 +103,43 @@ impl MetalCommandBuffer {
 
     /// End whichever encoder (render or compute) is currently open. Compute passes
     /// have no explicit `end_rendering`, so the next encoder start closes them.
+    ///
+    /// Before ending, the encoder updates the cross-encoder hazard [`Self::fence`] so the
+    /// next encoder can wait on its writes (see the `fence` field). `fence_pending` is set
+    /// whenever a real encoder closed, so the *first* encoder of a command buffer (which has
+    /// nothing to wait for) skips the wait.
     fn end_any_encoder(&self) {
         if let Some(enc) = self.encoder.borrow_mut().take() {
+            enc.updateFence_afterStages(
+                &self.fence,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
             enc.endEncoding();
+            self.fence_pending.set(true);
         }
         if let Some(enc) = self.compute_encoder.borrow_mut().take() {
+            enc.updateFence(&self.fence);
             enc.endEncoding();
+            self.fence_pending.set(true);
+        }
+    }
+
+    /// Wait the hazard fence on a freshly opened render encoder (before any stage runs), so
+    /// it sees the writes of every prior encoder in this command buffer. No-op for the first
+    /// encoder (nothing recorded the fence yet).
+    fn wait_fence_render(&self, enc: &ProtocolObject<dyn MTLRenderCommandEncoder>) {
+        if self.fence_pending.get() {
+            enc.waitForFence_beforeStages(
+                &self.fence,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
+        }
+    }
+
+    /// Wait the hazard fence on a freshly opened compute encoder.
+    fn wait_fence_compute(&self, enc: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
+        if self.fence_pending.get() {
+            enc.waitForFence(&self.fence);
         }
     }
 
@@ -103,6 +151,7 @@ impl MetalCommandBuffer {
         let enc = cmd
             .renderCommandEncoderWithDescriptor(pass)
             .expect("failed to create render command encoder");
+        self.wait_fence_render(&enc);
         *self.encoder.borrow_mut() = Some(enc);
     }
 
@@ -117,6 +166,8 @@ impl MetalCommandBuffer {
         *self.present.borrow_mut() = None;
         *self.index_buffer.borrow_mut() = None;
         self.rt_push_constants.borrow_mut().clear();
+        // Fresh command buffer: the fence carries no in-buffer producer yet.
+        self.fence_pending.set(false);
         Ok(())
     }
 
@@ -230,13 +281,14 @@ impl MetalCommandBuffer {
         let enc = cmd
             .renderCommandEncoderWithDescriptor(&pass)
             .expect("failed to create render command encoder");
+        self.wait_fence_render(&enc);
         *self.encoder.borrow_mut() = Some(enc);
     }
 
     pub fn end_rendering(&self) {
-        if let Some(enc) = self.encoder.borrow_mut().take() {
-            enc.endEncoding();
-        }
+        // Route through end_any_encoder so the render encoder records the hazard fence (a
+        // following compute pass that samples this pass's attachments must wait on it).
+        self.end_any_encoder();
     }
 
     pub fn set_viewport_scissor(&self, swapchain: &MetalSwapchain) {
@@ -408,6 +460,9 @@ impl MetalCommandBuffer {
             .or_else(|| self.present.borrow().clone())
             .expect("copy_swapchain_to_buffer without an acquired drawable");
         let texture = drawable.texture();
+        // Close (and fence) any open encoder so this blit sees the render pass that drew the
+        // swapchain image it is copying.
+        self.end_any_encoder();
         let cmd = self.cmd.borrow();
         let cmd = cmd
             .as_ref()
@@ -415,6 +470,9 @@ impl MetalCommandBuffer {
         let blit = cmd
             .blitCommandEncoder()
             .expect("failed to create blit command encoder");
+        if self.fence_pending.get() {
+            blit.waitForFence(&self.fence);
+        }
         let width = texture.width();
         let height = texture.height();
         unsafe {
@@ -543,6 +601,7 @@ impl MetalCommandBuffer {
             cmd.computeCommandEncoder()
                 .expect("failed to create compute command encoder")
         };
+        self.wait_fence_compute(&enc);
         enc.setComputePipelineState(&pipeline.state);
         // Per-frame globals UBO (Stage C7 SSR reprojection reads `globals.prev_view_proj`):
         // bound at GLOBALS_BUFFER_INDEX with the `set_globals` offset, mirroring the
@@ -641,6 +700,7 @@ impl MetalCommandBuffer {
             cmd.computeCommandEncoder()
                 .expect("failed to create RT compute command encoder")
         };
+        self.wait_fence_compute(&enc);
         enc.setComputePipelineState(pipeline.state());
         self.pipeline_threads.set(pipeline.threads_per_group());
         *self.compute_encoder.borrow_mut() = Some(enc);
