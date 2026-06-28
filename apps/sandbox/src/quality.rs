@@ -140,11 +140,22 @@ pub struct QualityPreset {
     /// P1 (Lumen-parity SW-RT): GI trace-resolution divisor when `gi_half_res` is on — trace the
     /// C3 GI at `1/div` of the render extent per axis, then joint-bilateral upsample (the spatial
     /// half of UE5 Lumen's ScreenProbeGather: sparser trace origins, guided interpolation).
-    /// `2` = the legacy half-res (Stage D1). `4` = quarter-res (16x fewer origins than full, 4x
-    /// fewer than half) — the indirect bounce is low-frequency + temporally denoised, so coarser
-    /// origins hold up for content. Only active where `gi_half_res` is (content; the gallery traces
-    /// full-res = byte-identical). `P_GI_RES_DIV` override. See `docs/lumen-parity-swrt.md`.
+    /// `2` = the legacy half-res (Stage D1). `3` = third-res — measured sweet spot: gdf_gi ~-48% vs
+    /// half with DX=VK back at the baseline ~0.006/ch. `4` = quarter-res is faster still (~-65%) but
+    /// over-reaches: each divergent coarse stochastic GI ray spreads over a larger upsample footprint,
+    /// raising the DX=VK gap to ~0.117/ch (a broad parity divergence, not just fireflies) — rejected.
+    /// Only active where `gi_half_res` is (content; the gallery traces full-res = byte-identical).
+    /// `P_GI_RES_DIV` override. See `docs/lumen-parity-swrt.md`.
     pub gi_res_div: u32,
+    /// Reflection temporal-resolve history neighbourhood clamp (`reflect_temporal.slang`): removes the
+    /// view-dependent specular smear when the camera rotates (stale reprojected history dragged across
+    /// chrome). A scalability permutation: `0` = off (byte-identical legacy resolve; forced for the
+    /// gallery anchor), `1` = hard AABB clamp (cheapest), `2` = variance clamp (mean +- gamma*sigma,
+    /// gentler on sharp mirrors). `P_REFL_CLAMP` override. See `docs/lumen-parity-swrt.md`.
+    pub reflect_history_clamp: u32,
+    /// Variance-clamp tightness for `reflect_history_clamp == 2` (`P_REFL_CLAMP_GAMMA`). Lower = tighter
+    /// (more lag removed, more risk of clipping valid history); ~1.0-1.5 typical. Ignored for modes 0/1.
+    pub reflect_clamp_gamma: f32,
 }
 
 /// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
@@ -170,7 +181,9 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             cache_relight_spp: 2,
             reflect_half_res: true,
             gdf_cone_k: 0.05,
-            gi_res_div: 4,
+            gi_res_div: 3,
+            reflect_history_clamp: 1, // hard (cheapest) — kills rotation smear
+            reflect_clamp_gamma: 1.25,
             // Low-end / high-res performance mode: render at 2/3 of the output extent and let the
             // TAAU jitter reconstruction (B-track) upscale it. 2/3 (not 1/2) keeps detailed scenes
             // legible — at 1/2 the internal resolution undersamples texture/geometry detail enough
@@ -202,7 +215,9 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             reflect_half_res: true,
             render_scale: 1.0,
             gdf_cone_k: 0.02,
-            gi_res_div: 4,
+            gi_res_div: 3,
+            reflect_history_clamp: 1, // hard (matches the WIP default) — kills rotation smear
+            reflect_clamp_gamma: 1.25,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
@@ -226,6 +241,8 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             render_scale: 1.0,
             gdf_cone_k: 0.0,
             gi_res_div: 2,
+            reflect_history_clamp: 2, // variance (gentler on sharp mirrors) — quality tier
+            reflect_clamp_gamma: 1.25,
         },
     }
 }

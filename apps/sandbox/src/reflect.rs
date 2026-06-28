@@ -124,7 +124,7 @@ impl ReflectSystem {
             dreamcoast_shader::reflect_temporal_cs_dxil,
             dreamcoast_shader::reflect_temporal_cs_metallib,
             "reflect_temporal",
-            208,
+            224,
             false,
         )?;
         Ok(Self {
@@ -494,6 +494,8 @@ impl ReflectSystem {
         max_len: f32,
         firefly_clamp: f32,
         tonemap_range: f32,
+        clamp_mode: u32,
+        clamp_gamma: f32,
     ) -> ResourceId {
         let pipe = self
             .temporal_pipeline
@@ -551,6 +553,8 @@ impl ReflectSystem {
                     max_len,
                     firefly_clamp,
                     tonemap_range,
+                    clamp_mode,
+                    clamp_gamma,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
