@@ -2700,9 +2700,10 @@ impl App {
         //      negative offset pulls them back to the full-res mip the upscaler reconstructs to.
         //   2. taa_mip_bias (~-1, Stage 8): the PRIMARY distant-sharpness lever. With sub-pixel
         //      jitter the temporal accumulation super-samples, so we can bias toward sharper mips and
-        //      let TAA resolve the aliasing — this is why UE looks sharp at distance without
-        //      anisotropy. It applies even at native (term 1 = 0) under forced TAA. Only added when
-        //      jitter is active (no jitter => no temporal supersampling to hide the aliasing).
+        //      let TAA resolve the aliasing — this is UE/DLSS's primary approach to distant-texture
+        //      sharpness (UE also uses hardware anisotropic filtering, but that's the grazing-surface
+        //      lever — see Stage 9 / P_ANISO — not the distance one). Applies even at native (term 1
+        //      = 0) under forced TAA. Only added with jitter (no jitter => no supersampling to hide it).
         // Gallery (TAA off => taau_active false) keeps bias 0 => SampleBias(.,0)==Sample() => byte
         // identical. Driver-independent LOD offset on the existing trilinear sampler (no DX≡VK risk).
         let mip_bias = if taau_active {
