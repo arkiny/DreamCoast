@@ -191,7 +191,7 @@ impl TaauSystem {
         // 16-frame history balances stability (jitter hidden) against gather-accumulation softening;
         // the FXAA pre-pass removes the per-frame edge aliasing that long history used to mask, so
         // it need not run longer. gamma = variance-box half-width (γσ), ~1 = standard.
-        let max_hist = 16.0_f32;
+        let max_hist = 32.0_f32;
         let gamma = 1.0_f32;
         graph.add_compute_pass(
             ComputePassInfo {
