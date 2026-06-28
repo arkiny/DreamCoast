@@ -536,6 +536,9 @@ struct App {
     gi_half_res: bool,
     /// P1 (Lumen-parity): GI trace divisor when `gi_half_res` is on (2 = half, 4 = quarter probes).
     gi_res_div: u32,
+    /// Reflection temporal history clamp (0 off / 1 hard / 2 variance; gallery forced 0) + variance γ.
+    reflect_history_clamp: u32,
+    reflect_clamp_gamma: f32,
     /// C4: spatio-temporal denoise of the noisy C3 GI.
     gi_denoise: bool,
     /// Previous frame's view-projection (world -> clip) for C4 temporal reprojection.
@@ -1366,6 +1369,23 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(if gallery_scene { 0.0 } else { qp.gdf_cone_k })
             .clamp(0.0, 1.0);
+        // Reflection history clamp permutation (0 off / 1 hard / 2 variance). Gallery forced to 0
+        // (byte-identical legacy resolve = regression anchor); content takes the tier. `P_REFL_CLAMP`
+        // + `P_REFL_CLAMP_GAMMA` override.
+        let reflect_history_clamp = std::env::var("P_REFL_CLAMP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(if gallery_scene {
+                0
+            } else {
+                qp.reflect_history_clamp
+            })
+            .min(2);
+        let reflect_clamp_gamma = std::env::var("P_REFL_CLAMP_GAMMA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(qp.reflect_clamp_gamma)
+            .clamp(0.0, 8.0);
         // Stage D3: half-res reflection trace + bilateral upsample (reuses the GI upsample).
         // Gallery forced off (full-res = byte-identical anchor); content takes the tier value.
         let reflect_half_res = gi.has_upsample()
@@ -1598,6 +1618,8 @@ impl App {
             reflect_half_res,
             gi_half_res,
             gi_res_div,
+            reflect_history_clamp,
+            reflect_clamp_gamma,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
             prev_view_proj_taau: Mat4::IDENTITY.to_cols_array(),
@@ -2126,6 +2148,8 @@ impl App {
                 cache_relight_period,
                 gi_half_res,
                 gi_res_div,
+                reflect_history_clamp,
+                reflect_clamp_gamma,
                 gi_denoise,
                 gdf_ssr,
                 gdf_reflect,
@@ -2225,6 +2249,13 @@ impl App {
                         // Half-res GI: content-only (gallery full-res = byte-identical anchor).
                         *gi_half_res = gi.has_upsample() && !*is_gallery && p.gi_half_res;
                         *gi_res_div = p.gi_res_div.clamp(1, 16); // P1: GI trace divisor
+                        // Reflection history clamp: content takes the tier, gallery forced off (anchor).
+                        *reflect_history_clamp = if *is_gallery {
+                            0
+                        } else {
+                            p.reflect_history_clamp.min(2)
+                        };
+                        *reflect_clamp_gamma = p.reflect_clamp_gamma;
 
                         *gi_denoise = gi.has_denoise() && p.gi_denoise;
                         *reflect_cache = *swrt_reflect
@@ -3155,6 +3186,8 @@ impl App {
                     64.0,
                     firefly_max,
                     0.25, // tonemap-space range for stable HDR accumulation
+                    self.reflect_history_clamp,
+                    self.reflect_clamp_gamma,
                 );
                 Some(self.reflect.record_composite(
                     &mut graph,

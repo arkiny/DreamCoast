@@ -117,14 +117,43 @@ VK gdf_gi 0.97→1.04, DX 0.71→0.76 — march-heavy 셰이더는 큰 그룹이
 이지 단순 threadgroup 튜닝으로 안 줄어듦. **검증된 VK 레버는 async-compute**(qhd Stage 6, +33%, opt-in
 `P_ASYNC_CACHE`)로 이미 존재. subgroup/VGPR 심층 튜닝은 별도 측정 트랙.
 
-## 누적 결과 (P3 + P1, 2026-06-28)
+## P1 정정 — div 4→3 (마스킹됐던 DX≡VK 회귀 수정, 2026-06-28)
+반사 history-clamp 재측정 중 발견: **P1의 쿼터-res(div4) GI가 DX≡VK를 0.016→0.117/ch로 키웠다**(coarse
+스토캐스틱 GI 레이의 FP 발산이 bilateral 업스케일로 더 넓은 풋프린트에 퍼져 **브로드 파리티 발산**, firefly만
+이 아님). **이 갭은 reflect_temporal의 (당시 무조건) clamp가 마스킹**해 P1 커밋 게이트가 0.005로 거짓 통과했다.
+clamp를 roughness-게이트하자 마스킹이 풀려 노출됨. div 스윕(no-clamp):
+
+| div | gdf_gi DX | DX≡VK |
+|---:|---:|---:|
+| 2 (half, 레거시) | ~2.0 | 0.016 |
+| **3 (정정 채택)** | **~1.02** | **0.006** |
+| 4 (quarter, 기각) | ~0.71 | **0.117** |
+
+→ **Low/Med `gi_res_div` 4→3**: gdf_gi −48%(half 대비) 유지하며 DX≡VK 베이스라인 복원. div4의 추가 0.3ms는
+20× 파리티 악화 값어치 없음. **교훈: 마스킹 가능한 패스(여기선 반사 clamp)가 켜진 채로 파리티 게이트를 재면
+안 된다** — 격리 측정 필요.
+
+## 반사 history-clamp 퍼뮤테이션 (사용자 WIP 확장, 2026-06-28)
+사용자 WIP(회전 시 시점의존 specular 히스토리가 stale → 크롬에 어두운 끌림 smear; TAA neighborhood clamp로
+제거)를 **스케일러블 퍼뮤테이션**으로 일반화. `reflect_temporal.slang` `clamp_mode`:
+- **0 off**: clamp 스킵 = 레거시 resolve 바이트 동일(갤러리 강제).
+- **1 hard**: 톤맵공간 이웃 AABB [cmin,cmax]로 clamp. 가장 쌈.
+- **2 variance**: mean±γσ(AABB 교집합), Salvi/Karis 분산 클리핑. firefly 이웃에 robust(γ로 타이트니스 조절).
+**roughness 게이트(핵심 수정)**: sr=0(near-mirror)는 clamp **스킵** — 측정 결과 샤프 미러는 3×3 이웃이
+고주파 반사를 담기 너무 좁아 실루엣에 **hard dark band**를 만들었음(회전 갤러리 크롬에서 mode2 1.201/ch 발산).
+게이트 후 1.201→**0.003**(band 제거). 미러는 per-frame 재트레이스+EMA로 안정. 노브 `quality.rs
+reflect_history_clamp`(Low/Med 1=hard·**갤러리 0 강제** / High 2=variance) + `reflect_clamp_gamma`(1.25),
+`P_REFL_CLAMP`/`P_REFL_CLAMP_GAMMA` 오버라이드. push 208→224, 3 모드 perf 동일(0.70ms, 통계 누적 무료).
+
+## 누적 결과 (P3 + P1@div3 + 반사 clamp, 2026-06-28, 정직 정정)
 | | DX 데모 | VK 데모 |
 |---|---:|---:|
 | Stage 0 (baseline) | 12.59ms (79fps) | 16.74ms (60fps, 경계) |
-| **P3 + P1** | **10.40ms (96fps)** | **12.72ms (79fps)** |
-가속 1.21×/1.32×. GDF march 스택(gi+reflect+cache march): P3 cone-trace(거리 LOD) + P1 sparse 프로브
-(쿼터-res GI). gdf_gi 단독 2.59→0.71(DX)/4.31→0.97(VK). 양 백엔드 갤러리 바이트 동일, DX≡VK 0.005/ch,
-누적 품질 델타 0.534/ch(한도 0.76 내). P2/P4/P5는 측정상 ROI 제한/음수로 보류(위 참조).
+| **최종** | **10.84ms (~92fps)** | **14.26ms (~70fps)** |
+가속 1.16×/1.17×. P3 cone-trace + P1 third-res GI(gdf_gi DX 2.59→1.02) + 반사 history-clamp(회전 smear 제거).
+**게이트(엄밀 재측정)**: 갤러리 vs **진짜 레거시**(WIP-free stash 빌드) DX 0.000(max 1)/VK 0.000(max 0=
+bit-identical) — 앵커 마스킹 없이 증명. DX≡VK 0.005/ch. 누적 품질 델타 0.607/ch(한도 0.76 내). fmt/clippy/
+Vulkan 검증 클린. P2/P4/P5는 측정상 ROI 제한/음수로 보류(위 참조).
 
 ## 하지 말 것
 - 측정 없이 추측. 갤러리 무회귀 위반(노브는 갤러리 레거시 강제). DX≡VK 깨기. Vulkan 검증 경고.

@@ -31,6 +31,8 @@ struct ReflTemporalPush
     uint reset;              // 1 = ignore history (first frame / view change)
     uint material_index;     // sampled G-buffer material (g = roughness) for the spatial radius
     float4 params;           // x = reject dist, y = max history len, z = firefly clamp, w = tonemap range
+    uint clamp_mode;         // history neighbourhood clamp: 0 = off, 1 = hard AABB, 2 = variance (mean +- g*sigma)
+    float clamp_gamma;       // variance-clamp tightness (mode 2); ignored otherwise
 };
 
 [[vk::push_constant]]
@@ -132,14 +134,40 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // depth-weighted neighbourhood (each neighbour pixel traced a DIFFERENT GGX ray) to cut the
     // per-pixel variance before temporal accumulation — UE resolves spatially + temporally. Sharp
     // surfaces (chrome) use radius 0 (no blur).
+    //
+    // The SAME neighbourhood also builds the statistics for a TAA-style neighbourhood clamp of the
+    // reprojected history (below). A specular reflection is view-dependent, so on a moving/rotating
+    // camera the surface-reprojected history is STALE — without a clamp it drags the previous
+    // direction's radiance (dark off-screen sky / shadowed geometry) across the chrome as a black
+    // smear (the "no history" trails). Clamping the history into the current frame's local reflection
+    // range kills that lag while keeping the static accumulation (history already in range -> a
+    // no-op, so the converged screenshot/parity baseline is preserved). UE Lumen / Frostbite
+    // reflections clamp the same way.
+    //
+    // Two permutations (`pc.clamp_mode`), so the strength scales with the RenderQuality tier:
+    //   1 = HARD: clamp to the tonemap-space colour AABB [cmin, cmax]. Cheapest, but on a sharp
+    //       mirror (high spatial frequency) a 3x3 box can be too tight -> can clip valid history.
+    //   2 = VARIANCE: clamp to mean +- gamma*sigma (intersected with the AABB) — Salvi/Karis variance
+    //       clipping. Gentler on high-frequency mirrors; `clamp_gamma` tunes the tightness.
+    //   0 = OFF: no clamp (byte-identical to the pre-clamp resolve; the spatial average below is
+    //       computed over the same `sr` set regardless, so OFF reproduces the legacy output exactly).
+    // The neighbourhood is always >= 3x3 (`cr`) so even a sharp mirror (spatial radius 0) has stats.
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
     int sr = clamp(int(roughness * 8.0), 0, 3);
+    int cr = max(sr, 1);
     float2 texel = 1.0 / res;
-    float3 ssum = g.textures[pc.refl_index].SampleLevel(g.samp, uv, 0.0).rgb;
+    float3 center = g.textures[pc.refl_index].SampleLevel(g.samp, uv, 0.0).rgb;
+    float3 ssum = center; // linear average (radius sr) — to_tm'd at the end, unchanged from before
     float swsum = 1.0;
-    for (int dy = -sr; dy <= sr; dy++)
+    float3 center_tm = to_tm(center);
+    float3 cmin = center_tm; // tonemap-space colour AABB (radius cr) for the hard clamp
+    float3 cmax = center_tm;
+    float3 m1 = center_tm;             // 1st/2nd moments (tonemap space) for the variance clamp
+    float3 m2 = center_tm * center_tm;
+    float mcnt = 1.0;
+    for (int dy = -cr; dy <= cr; dy++)
     {
-        for (int dx = -sr; dx <= sr; dx++)
+        for (int dx = -cr; dx <= cr; dx++)
         {
             if (dx == 0 && dy == 0)
                 continue;
@@ -147,11 +175,34 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float dz = g.textures[pc.depth_index].SampleLevel(g.samp, nuv, 0.0).r;
             if (dz >= 1.0 || abs(dz - depth) > 0.003)
                 continue; // different surface — would bleed across the silhouette
-            ssum += g.textures[pc.refl_index].SampleLevel(g.samp, nuv, 0.0).rgb;
-            swsum += 1.0;
+            float3 nrefl = g.textures[pc.refl_index].SampleLevel(g.samp, nuv, 0.0).rgb;
+            float3 ntm = to_tm(nrefl);
+            cmin = min(cmin, ntm);
+            cmax = max(cmax, ntm);
+            m1 += ntm;
+            m2 += ntm * ntm;
+            mcnt += 1.0;
+            if (abs(dx) <= sr && abs(dy) <= sr)
+            {
+                ssum += nrefl; // average only over the (narrower) spatial radius — value unchanged
+                swsum += 1.0;
+            }
         }
     }
     float3 sample_tm = to_tm(ssum / swsum);
+
+    // Resolve the clamp box once (per the permutation). OFF leaves it as the full AABB but the clamp
+    // is skipped entirely below, so OFF stays byte-identical to the legacy resolve.
+    float3 clamp_lo = cmin;
+    float3 clamp_hi = cmax;
+    if (pc.clamp_mode == 2u)
+    {
+        float3 mean = m1 / mcnt;
+        float3 sigma = sqrt(max(m2 / mcnt - mean * mean, float3(0.0, 0.0, 0.0)));
+        // mean +- gamma*sigma, intersected with the true neighbourhood AABB so it never exceeds it.
+        clamp_lo = max(cmin, mean - pc.clamp_gamma * sigma);
+        clamp_hi = min(cmax, mean + pc.clamp_gamma * sigma);
+    }
 
     float3 accum = sample_tm;
     float len = 1.0;
@@ -170,6 +221,17 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 fetch_refl_history(puv, world_pos, hist_rgb, hist_len);
                 if (hist_len > 0.5)
                 {
+                    // Neighbourhood-clamp the (view-dependent) stale history into this frame's local
+                    // reflection range before blending — removes the dark drag on a rotating camera.
+                    // OFF (mode 0) skips it -> byte-identical legacy resolve.
+                    //
+                    // ROUGHNESS GATE: only clamp glossy/rough reflections (sr > 0, i.e. roughness >=
+                    // ~0.125), where a 3x3 neighbourhood is a valid radiance bound. A near-mirror
+                    // (sr == 0) carries high-frequency detail that the tight box would clip into a
+                    // hard dark band on the silhouette (measured on the gallery chrome sphere); mirrors
+                    // are kept stable by the per-frame re-trace + EMA instead.
+                    if (pc.clamp_mode != 0u && sr > 0)
+                        hist_rgb = clamp(hist_rgb, clamp_lo, clamp_hi);
                     len = min(hist_len + 1.0, pc.params.y);
                     accum = lerp(hist_rgb, sample_tm, 1.0 / len);
                 }

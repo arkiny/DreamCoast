@@ -1305,8 +1305,10 @@ pub(crate) fn reflect_temporal_push(
     max_len: f32,
     firefly_clamp: f32,
     tonemap_range: f32,
-) -> [u8; 208] {
-    let mut pc = [0u8; 208];
+    clamp_mode: u32,
+    clamp_gamma: f32,
+) -> [u8; 224] {
+    let mut pc = [0u8; 224];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1332,6 +1334,10 @@ pub(crate) fn reflect_temporal_push(
     pc[196..200].copy_from_slice(&max_len.to_le_bytes());
     pc[200..204].copy_from_slice(&firefly_clamp.to_le_bytes());
     pc[204..208].copy_from_slice(&tonemap_range.to_le_bytes());
+    // History neighbourhood-clamp permutation (own 16-byte row at 208): mode (0 off / 1 hard /
+    // 2 variance) + variance gamma. mode 0 => the shader skips the clamp = byte-identical legacy.
+    pc[208..212].copy_from_slice(&clamp_mode.to_le_bytes());
+    pc[212..216].copy_from_slice(&clamp_gamma.to_le_bytes());
     pc
 }
 
