@@ -454,7 +454,10 @@ impl GiSystem {
         cw: u32,
         ch: u32,
         flip_y: u32,
-        neighborhood_clamp: bool,
+        // Temporal history-clamp mode (params.w): 0 = off (let the EMA converge — kills the static
+        // shimmer the hard clamp caused on the noisy spp1 GI), ~1.0 = hard 3x3 min/max (legacy,
+        // gallery byte-identical anchor), > 1.5 = variance clamp with gamma = this value.
+        temporal_clamp: f32,
     ) -> ResourceId {
         let tempp = self.temporal_pipeline.as_ref().expect("temporal pipeline");
         let atrousp = self.atrous_pipeline.as_ref().expect("atrous pipeline");
@@ -508,7 +511,7 @@ impl GiSystem {
                     reject_dist,
                     max_hist,
                     1.0 / max_hist,
-                    if neighborhood_clamp { 1.0 } else { 0.0 },
+                    temporal_clamp,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

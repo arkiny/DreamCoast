@@ -539,6 +539,9 @@ struct App {
     /// Reflection temporal history clamp (0 off / 1 hard / 2 variance; gallery forced 0) + variance γ.
     reflect_history_clamp: u32,
     reflect_clamp_gamma: f32,
+    /// GI temporal denoiser history-clamp (gdf_temporal params.w): 0 off (content; fixes shimmer),
+    /// 1 hard (gallery legacy byte-identical), >1.5 variance γ.
+    gi_temporal_clamp: f32,
     /// C4: spatio-temporal denoise of the noisy C3 GI.
     gi_denoise: bool,
     /// Previous frame's view-projection (world -> clip) for C4 temporal reprojection.
@@ -1386,6 +1389,17 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(qp.reflect_clamp_gamma)
             .clamp(0.0, 8.0);
+        // GI temporal history clamp: gallery forced to 1.0 (hard 3x3 = legacy byte-identical anchor);
+        // content takes the tier (0.0 = off = the static-shimmer fix). `P_GI_TEMPORAL_CLAMP` override.
+        let gi_temporal_clamp = std::env::var("P_GI_TEMPORAL_CLAMP")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(if gallery_scene {
+                1.0
+            } else {
+                qp.gi_temporal_clamp
+            })
+            .clamp(0.0, 16.0);
         // Stage D3: half-res reflection trace + bilateral upsample (reuses the GI upsample).
         // Gallery forced off (full-res = byte-identical anchor); content takes the tier value.
         let reflect_half_res = gi.has_upsample()
@@ -1620,6 +1634,7 @@ impl App {
             gi_res_div,
             reflect_history_clamp,
             reflect_clamp_gamma,
+            gi_temporal_clamp,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
             prev_view_proj_taau: Mat4::IDENTITY.to_cols_array(),
@@ -2150,6 +2165,7 @@ impl App {
                 gi_res_div,
                 reflect_history_clamp,
                 reflect_clamp_gamma,
+                gi_temporal_clamp,
                 gi_denoise,
                 gdf_ssr,
                 gdf_reflect,
@@ -2256,7 +2272,12 @@ impl App {
                             p.reflect_history_clamp.min(2)
                         };
                         *reflect_clamp_gamma = p.reflect_clamp_gamma;
-
+                        // GI temporal clamp: gallery forced hard (1.0 legacy); content takes tier.
+                        *gi_temporal_clamp = if *is_gallery {
+                            1.0
+                        } else {
+                            p.gi_temporal_clamp
+                        };
                         *gi_denoise = gi.has_denoise() && p.gi_denoise;
                         *reflect_cache = *swrt_reflect
                             && gdf.has_surface_cache()
@@ -3013,7 +3034,7 @@ impl App {
                         cw,
                         ch,
                         temporal_flip,
-                        self.firefly_clamp,
+                        self.gi_temporal_clamp,
                     )
                 } else {
                     raw
