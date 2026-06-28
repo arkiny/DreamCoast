@@ -489,11 +489,21 @@ impl MetalInstance {
 
         // Two shared trilinear samplers matching Vulkan/D3D12: `samp` (CLAMP — cubes,
         // volumes, G-buffer) and `samp_wrap` (REPEAT — tiling material textures).
-        let make_sampler = |mode: MTLSamplerAddressMode| {
+        // 1b: opt-in anisotropic filtering for the wrap sampler (grazing material surfaces).
+        // `P_ANISO=<N>` (clamped to Metal's [1,16]) sets maxAnisotropy on the wrap sampler; unset
+        // (or <=1) keeps maxAnisotropy 1 => byte-identical and no DX≡VK risk by default. Driver-
+        // dependent filtering => opt-in only (see docs/qhd-perf.md Stage 9).
+        let aniso = std::env::var("P_ANISO")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .map(|v| (v.round() as usize).clamp(1, 16))
+            .unwrap_or(1);
+        let make_sampler = |mode: MTLSamplerAddressMode, max_aniso: usize| {
             let sd = MTLSamplerDescriptor::new();
             sd.setMinFilter(MTLSamplerMinMagFilter::Linear);
             sd.setMagFilter(MTLSamplerMinMagFilter::Linear);
             sd.setMipFilter(MTLSamplerMipFilter::Linear);
+            sd.setMaxAnisotropy(max_aniso);
             sd.setSAddressMode(mode);
             sd.setTAddressMode(mode);
             // Required because the sampler is encoded into the bindless argument buffer
@@ -504,8 +514,9 @@ impl MetalInstance {
                 .newSamplerStateWithDescriptor(&sd)
                 .ok_or_else(|| rhi_err("newSamplerState failed"))
         };
-        let sampler = make_sampler(MTLSamplerAddressMode::ClampToEdge)?;
-        let sampler_wrap = make_sampler(MTLSamplerAddressMode::Repeat)?;
+        // Clamp sampler (cubes/volumes/G-buffer) stays isotropic; only the wrap sampler opts in.
+        let sampler = make_sampler(MTLSamplerAddressMode::ClampToEdge, 1)?;
+        let sampler_wrap = make_sampler(MTLSamplerAddressMode::Repeat, aniso)?;
 
         let shared = Rc::new(DeviceShared {
             device: self.device.clone(),
