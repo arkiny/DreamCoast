@@ -526,6 +526,9 @@ struct App {
     gi_max_steps: u32,
     /// Stage D3: GGX reflection-ray march step cap (gallery forced to legacy 96).
     reflect_max_steps: u32,
+    /// P3 (Lumen-parity): cone-trace LOD march slope for the SW-RT march loops (gallery forced 0 =
+    /// legacy linear march = byte-identical). Content takes the tier value.
+    gdf_cone_k: f32,
     /// Stage D3: trace the GGX reflection at half resolution + bilateral upsample (gallery off).
     reflect_half_res: bool,
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
@@ -1346,6 +1349,13 @@ impl App {
                 qp.reflect_max_steps
             })
             .clamp(1, 256);
+        // P3 (Lumen-parity SW-RT): cone-trace LOD march slope. Gallery forced to 0 (legacy linear
+        // march = byte-identical anchor); content takes the tier value. `P_CONE_K` overrides.
+        let gdf_cone_k = std::env::var("P_CONE_K")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(if gallery_scene { 0.0 } else { qp.gdf_cone_k })
+            .clamp(0.0, 1.0);
         // Stage D3: half-res reflection trace + bilateral upsample (reuses the GI upsample).
         // Gallery forced off (full-res = byte-identical anchor); content takes the tier value.
         let reflect_half_res = gi.has_upsample()
@@ -1574,6 +1584,7 @@ impl App {
             cache_relight_spp,
             gi_max_steps,
             reflect_max_steps,
+            gdf_cone_k,
             reflect_half_res,
             gi_half_res,
             gi_denoise,
@@ -2842,6 +2853,7 @@ impl App {
                         self.cache_relight_period,
                         card_vis_ext,
                         relight_alpha,
+                        self.gdf_cone_k,
                     );
                     self.scene_cache_reset = false;
                 }
@@ -2921,6 +2933,7 @@ impl App {
                     scene_clip,
                     &scene_clip_vols,
                     self.gi_max_steps,
+                    self.gdf_cone_k,
                 );
                 let raw = if half_gi {
                     self.gi.record_upsample(
@@ -3088,6 +3101,7 @@ impl App {
                     scene_clip,
                     &scene_clip_vols,
                     self.reflect_max_steps,
+                    self.gdf_cone_k,
                 );
                 let gdf_refl = if refl_half {
                     self.gi.record_upsample(
@@ -3468,6 +3482,7 @@ impl App {
                 scene_clip,
                 &scene_clip_vols,
                 self.reflect_max_steps,
+                self.gdf_cone_k,
             )),
             _ => None,
         };
@@ -3545,6 +3560,7 @@ impl App {
                     scene_clip,
                     &scene_clip_vols,
                     self.reflect_max_steps,
+                    self.gdf_cone_k,
                 );
                 // Standalone viz: no temporal resolve buffers here, so feed the GDF reflection
                 // straight into the composite (the resolve runs only in the lighting-fed path).
@@ -3806,6 +3822,7 @@ impl App {
                 self.cache_relight_period,
                 relight_alpha,
                 self.cache_feedback,
+                self.gdf_cone_k,
             );
             ccmd.end()?;
             let cur = (self.frame_no % 2) as usize;

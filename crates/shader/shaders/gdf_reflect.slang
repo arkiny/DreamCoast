@@ -48,6 +48,7 @@ struct ReflectPush
     // float3 must sit on a 16-byte boundary or SPIR-V (vec3 align 16) and DXIL (4-byte pack)
     // disagree on its offset — keep it as its own aligned row.
     float3 ground_albedo;   // analytic ground material (not in the albedo volume)
+    float cone_k;           // P3: cone-trace LOD slope (0 = legacy linear march = byte-identical)
 };
 
 [[vk::push_constant]]
@@ -168,7 +169,8 @@ float refl_shadow(float3 origin, float3 dir, float maxt)
         if (h < 0.002)
             return 0.0;
         res = min(res, 16.0 * h / t);
-        t += clamp(h, 0.01, 0.2);
+        // P3 cone-trace LOD: widen the max step with distance (cone_k=0 => clamp(.,0.01,0.2) legacy).
+        t += clamp(h, 0.01, max(0.2, pc.cone_k * t));
         if (t > maxt)
             break;
     }
@@ -240,7 +242,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             hit = true;
             break;
         }
-        t += max(d, 0.01);
+        // P3 cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01) legacy).
+        t += max(d, max(0.01, pc.cone_k * t));
         if (t > max_dist)
             break;
     }

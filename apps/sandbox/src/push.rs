@@ -525,8 +525,9 @@ pub(crate) fn cache_light_push(
     clip_count: u32,
     relight_period: u32,
     card_vis_index: u32,
-) -> [u8; 128] {
-    let mut pc = [0u8; 128];
+    cone_k: f32,
+) -> [u8; 144] {
+    let mut pc = [0u8; 144];
     let u = [
         cards_index,
         cache_pos_index,
@@ -569,6 +570,8 @@ pub(crate) fn cache_light_push(
     // no feedback => uniform period). See sdf_cache_light.slang.
     pc[120..124].copy_from_slice(&relight_period.to_le_bytes());
     pc[124..128].copy_from_slice(&card_vis_index.to_le_bytes());
+    // P3: cone-trace LOD slope on its own 16-byte-aligned row (offset 128). 0 = legacy linear march.
+    pc[128..132].copy_from_slice(&cone_k.to_le_bytes());
     pc
 }
 
@@ -742,8 +745,9 @@ pub(crate) fn gdf_gi_push(
     clip_count: u32,
     ground_albedo: [f32; 3],
     max_steps: u32,
-) -> [u8; 224] {
-    let mut pc = [0u8; 224];
+    cone_k: f32,
+) -> [u8; 240] {
+    let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -795,6 +799,8 @@ pub(crate) fn gdf_gi_push(
     // Stage D3: bounce-ray march step cap (the .w after ground_albedo). Content lowers it; the
     // gallery passes the legacy 64 (byte-identical).
     pc[220..224].copy_from_slice(&max_steps.to_le_bytes());
+    // P3: cone-trace LOD slope on its own 16-byte-aligned row (offset 224). 0 = legacy linear march.
+    pc[224..228].copy_from_slice(&cone_k.to_le_bytes());
     pc
 }
 
@@ -1186,6 +1192,7 @@ pub(crate) fn gdf_reflect_push(
     clip_count: u32,
     ground_albedo: [f32; 3],
     max_steps: u32,
+    cone_k: f32,
 ) -> [u8; 240] {
     let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -1239,6 +1246,9 @@ pub(crate) fn gdf_reflect_push(
     for (i, v) in ground_albedo.iter().enumerate() {
         pc[224 + i * 4..228 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
+    // P3: cone-trace LOD slope reuses the float3 ground_albedo's .w padding (offset 236; the block
+    // is already 240 bytes). 0 = legacy linear march = byte-identical.
+    pc[236..240].copy_from_slice(&cone_k.to_le_bytes());
     pc
 }
 

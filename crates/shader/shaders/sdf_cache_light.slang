@@ -33,6 +33,7 @@ struct CacheLightPush
     float4 aabb_max;      // xyz GDF world max, w = sample distance clamp
     float4 params;        // x sky_fill, y temporal alpha, z surface bias, w ray max dist
     uint4 clip;           // Stage B clipmap: x = descriptor index, y = level count
+    float cone_k;         // P3: cone-trace LOD slope (0 = legacy linear march = byte-identical)
 };
 
 [[vk::push_constant]]
@@ -96,7 +97,8 @@ float sun_shadow(float3 origin, float3 dir)
         if (h < 0.002)
             return 0.0;
         res = min(res, 16.0 * h / t);
-        t += clamp(h, 0.01, 0.2);
+        // P3 cone-trace LOD: widen the max step with distance (cone_k=0 => clamp(.,0.01,0.2) legacy).
+        t += clamp(h, 0.01, max(0.2, pc.cone_k * t));
         if (t > maxt)
             break;
     }
@@ -184,7 +186,8 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
                                                  pc.num_cards, pc.tile, cache_hit);
                 break;
             }
-            tt += max(d, 0.01);
+            // P3 cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01) legacy).
+            tt += max(d, max(0.01, pc.cone_k * tt));
             if (tt > maxt)
                 break;
         }
