@@ -156,6 +156,13 @@ pub struct QualityPreset {
     /// Variance-clamp tightness for `reflect_history_clamp == 2` (`P_REFL_CLAMP_GAMMA`). Lower = tighter
     /// (more lag removed, more risk of clipping valid history); ~1.0-1.5 typical. Ignored for modes 0/1.
     pub reflect_clamp_gamma: f32,
+    /// GI temporal denoiser history-clamp mode (`gdf_temporal.slang` params.w), `P_GI_TEMPORAL_CLAMP`:
+    /// `0` = off — the measured fix for the static GI shimmer (the legacy hard 3x3 clamp is built from
+    /// the noisy spp1 GI, so it drags the converged history back to per-frame noise = flicker; off lets
+    /// the EMA converge, with the per-sample firefly clamp + a-trous still catching fireflies). `1` =
+    /// hard 3x3 min/max (legacy; forced for the gallery byte-identical anchor). `> 1.5` = variance clamp
+    /// with gamma = this value (a wide outlier reject that still converges). Content defaults off.
+    pub gi_temporal_clamp: f32,
 }
 
 /// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
@@ -184,6 +191,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_res_div: 3,
             reflect_history_clamp: 1, // hard (cheapest) — kills rotation smear
             reflect_clamp_gamma: 1.25,
+            gi_temporal_clamp: 0.0,
             // Low-end / high-res performance mode: render at 2/3 of the output extent and let the
             // TAAU jitter reconstruction (B-track) upscale it. 2/3 (not 1/2) keeps detailed scenes
             // legible — at 1/2 the internal resolution undersamples texture/geometry detail enough
@@ -218,6 +226,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_res_div: 3,
             reflect_history_clamp: 1, // hard (matches the WIP default) — kills rotation smear
             reflect_clamp_gamma: 1.25,
+            gi_temporal_clamp: 0.0,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
@@ -243,6 +252,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_res_div: 2,
             reflect_history_clamp: 2, // variance (gentler on sharp mirrors) — quality tier
             reflect_clamp_gamma: 1.25,
+            gi_temporal_clamp: 0.0,
         },
     }
 }

@@ -145,7 +145,25 @@ clamp를 roughness-게이트하자 마스킹이 풀려 노출됨. div 스윕(no-
 reflect_history_clamp`(Low/Med 1=hard·**갤러리 0 강제** / High 2=variance) + `reflect_clamp_gamma`(1.25),
 `P_REFL_CLAMP`/`P_REFL_CLAMP_GAMMA` 오버라이드. push 208→224, 3 모드 perf 동일(0.70ms, 통계 누적 무료).
 
-## 누적 결과 (P3 + P1@div3 + 반사 clamp, 2026-06-28, 정직 정정)
+## 깜빡임(temporal shimmer) 조사 + GI temporal clamp 수정 (2026-06-28)
+사용자가 **Metal에서 깜빡임**을 보고, Windows도 확인 요청. `CAPTURE_SEQ=N STEP=0`(정적 카메라 N프레임)으로
+프레임간 diff = 깜빡임을 정량화:
+- **갤러리 DX: 0.003/ch** (안정). **Sponza DX: 0.225/ch**(max ~140) — **Windows도 깜빡임 = Metal 전용 버그
+  아닌 알고리즘적 시간 불안정**.
+- 격리: 레거시(div2,no-clamp) 0.108 / **div3 0.258**(div가 증폭) / div3+full 0.225.
+- **근본 원인 = `gdf_temporal.slang`의 GI temporal neighborhood clamp**: reprojected 히스토리를 **현재
+  noisy spp1 GI의 3×3 hard min/max box**로 clamp하는데, box가 매 프레임 노이즈 중심이라 **수렴한 히스토리를
+  노이즈로 끌어내림** → 매 프레임 fresh 노이즈 = 셔머. (반사 clamp 샤프미러 문제와 동형.) max_hist↑로는 안
+  잡힘(clamp가 누적을 캡). **temporal clamp만 끄면(per-sample firefly clamp 유지) 0.225→0.020/ch(11×↓)**.
+- **수정 = GI temporal clamp 퍼뮤테이션**(반사 clamp와 동일 구조): `gdf_temporal` params.w로 0=off / 1=hard
+  (레거시) / >1.5=variance(γ). **콘텐츠=off**(EMA 수렴 허용; firefly는 per-sample clamp+à-trous, ghost는
+  월드위치 disocclusion이 담당), **갤러리=1.0 hard 강제(바이트동일)**. 노브 `quality.rs gi_temporal_clamp`,
+  `P_GI_TEMPORAL_CLAMP`. div2/div3 공통 기존 이슈를 둘 다 해결.
+- **검증**: 갤러리 vs 진짜 레거시 DX 0.000(max1)/VK 0.000(max0). Sponza 정적 셔머 **0.225→0.020**. 회전
+  Sponza(STEP 0.02) 육안 정상(ghosting/스미어 없음 — disocclusion이 모션 처리). DX≡VK 0.022(노이즈 바닥
+  0.017 수준; GI clamp가 억제하던 미세 발산 노출, 파리티 중립). gdf_temporal 0.19ms 무변. fmt/clippy/검증 클린.
+
+## 누적 결과 (P3 + P1@div3 + 반사 clamp + GI temporal clamp 수정, 2026-06-28, 정직 정정)
 | | DX 데모 | VK 데모 |
 |---|---:|---:|
 | Stage 0 (baseline) | 12.59ms (79fps) | 16.74ms (60fps, 경계) |

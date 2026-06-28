@@ -143,24 +143,49 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float len;
     if (hist_len > 0.5)
     {
-        // Neighborhood clamp (params.w > 0.5): clip the reprojected history to the current
-        // GI's 3x3 min/max box before accumulating — removes history fireflies / ghosting.
+        // Temporal history clamp permutation (pc.params.w):
+        //   <= 0.5 : OFF — let the EMA converge. The hard min/max box below is built from the
+        //            NOISY spp1 GI, so it sits on the per-frame noise and drags the converged
+        //            history back to noise every frame -> static shimmer (the rotating-camera-free
+        //            flicker). Off lets the accumulation average out; the per-sample firefly clamp
+        //            (gdf_gi clamp_max) + the spatial a-trous still suppress fireflies, and the
+        //            world-position disocclusion test handles ghosting. (Content default.)
+        //   ~1.0   : HARD 3x3 min/max box (legacy; the gallery byte-identical anchor).
+        //   > 1.5  : VARIANCE — clamp to mean +- gamma*sigma (gamma = params.w), a wide box that
+        //            rejects only true outliers while allowing convergence.
         if (pc.params.w > 0.5)
         {
             float2 ts = 1.0 / float2(pc.width, pc.height);
             float3 mn = gi_cur, mx = gi_cur;
+            float3 m1 = gi_cur, m2 = gi_cur * gi_cur;
+            float cnt = 1.0;
             for (int dy = -1; dy <= 1; dy++)
             {
                 for (int dx = -1; dx <= 1; dx++)
                 {
+                    if (dx == 0 && dy == 0)
+                        continue;
                     float3 c = g.textures[pc.gi_raw_index]
                                    .SampleLevel(g.samp, uv + float2(dx, dy) * ts, 0.0)
                                    .rgb;
                     mn = min(mn, c);
                     mx = max(mx, c);
+                    m1 += c;
+                    m2 += c * c;
+                    cnt += 1.0;
                 }
             }
-            hist_rgb = clamp(hist_rgb, mn, mx);
+            if (pc.params.w > 1.5)
+            {
+                float3 mean = m1 / cnt;
+                float3 sig = sqrt(max(m2 / cnt - mean * mean, float3(0.0, 0.0, 0.0)));
+                float gma = pc.params.w;
+                hist_rgb = clamp(hist_rgb, mean - gma * sig, mean + gma * sig);
+            }
+            else
+            {
+                hist_rgb = clamp(hist_rgb, mn, mx); // hard (legacy)
+            }
         }
         len = min(hist_len + 1.0, pc.params.y);
         float alpha = max(1.0 / len, pc.params.z); // EMA weight on the new sample
