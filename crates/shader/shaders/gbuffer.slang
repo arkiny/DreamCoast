@@ -41,7 +41,7 @@ struct PushConstants
 {
     float4x4 mvp;
     float4 base_color_factor;
-    float4 mr_factor;     // x metallic, y roughness
+    float4 mr_factor;     // x metallic, y roughness, z texture mip LOD bias (TAAU), w unused
     uint4 tex;            // x base_color, y metallic_roughness, z normal, w emissive
     float4x4 model;       // object -> world (for world-space position + normal outputs)
 };
@@ -86,16 +86,21 @@ GBufferOut fsMain(VSOutput input)
     // Material textures use the REPEAT/wrap sampler: floor tiles / brick courses tile via
     // glTF UVs > 1 (CLAMP would smear one edge texel across the whole surface). Untextured
     // or in-[0,1] UVs (the gallery avocado) are unaffected → byte-identical.
+    // `mip_bias` (mr_factor.z) is the DLSS/FSR2-style negative LOD bias = log2(render_scale) when
+    // rendering at a reduced internal resolution for TAAU: it pulls in sharper mips so the temporal
+    // upscaler can reconstruct full-res texture detail (otherwise the low-res derivatives pick
+    // blurry mips and the result stays soft). 0 on the native path = byte-identical to Sample().
+    float mip_bias = pc.mr_factor.z;
     float3 albedo = pc.base_color_factor.rgb;
     if (pc.tex.x != NO_TEXTURE)
-        albedo *= g.textures[pc.tex.x].Sample(g.samp_wrap, input.uv).rgb;
+        albedo *= g.textures[pc.tex.x].SampleBias(g.samp_wrap, input.uv, mip_bias).rgb;
 
     float metallic = pc.mr_factor.x;
     float roughness = pc.mr_factor.y;
     if (pc.tex.y != NO_TEXTURE)
     {
         // glTF metallic-roughness: G = roughness, B = metallic.
-        float3 mr = g.textures[pc.tex.y].Sample(g.samp_wrap, input.uv).rgb;
+        float3 mr = g.textures[pc.tex.y].SampleBias(g.samp_wrap, input.uv, mip_bias).rgb;
         roughness *= mr.g;
         metallic *= mr.b;
     }
@@ -103,7 +108,7 @@ GBufferOut fsMain(VSOutput input)
     float3 n = normalize(input.world_normal);
     if (pc.tex.z != NO_TEXTURE)
     {
-        float3 tn = g.textures[pc.tex.z].Sample(g.samp_wrap, input.uv).rgb * 2.0 - 1.0;
+        float3 tn = g.textures[pc.tex.z].SampleBias(g.samp_wrap, input.uv, mip_bias).rgb * 2.0 - 1.0;
         n = apply_normal_map(n, input.world_pos, input.uv, tn);
     }
 

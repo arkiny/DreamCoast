@@ -1398,8 +1398,6 @@ impl App {
             Some((w, h))
         });
         // QHD/UHD track: internal render scale (production knob). `RENDER_SCALE` overrides the tier.
-        // Min internal scale clamped to 0.6667 (2/3): below that the TAAU upscale can't reconstruct
-        // enough detail for a sharp result (per the QHD/UHD plan).
         let render_scale = std::env::var("RENDER_SCALE")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
@@ -1745,6 +1743,34 @@ impl App {
         // and isn't a path-trace/debug capture. It jitters the camera + reconstructs full-res from
         // history. When render == output (default), it's inactive (byte-identical).
         let taau_active = self.taau_on && self.taau.has_taau() && cw < sw && ch < sh;
+        // One-time readout of the resolved resolution path so it's obvious at a glance what the
+        // scene is actually rendering at vs the output (and whether TAAU upscaling is even on).
+        if self.frame_no == 0 {
+            let pct = if sw > 0 {
+                100.0 * cw as f32 / sw as f32
+            } else {
+                100.0
+            };
+            info!(
+                "render: internal {}x{} -> output {}x{} ({:.1}% scale, {}x area), TAAU={}, jitter={}",
+                cw,
+                ch,
+                sw,
+                sh,
+                pct,
+                if cw > 0 {
+                    (sw as f32 / cw as f32).powi(2)
+                } else {
+                    1.0
+                },
+                if taau_active { "on" } else { "off (native)" },
+                if taau_active && self.taau_jitter {
+                    "on"
+                } else {
+                    "off"
+                },
+            );
+        }
         // When TAAU runs with sub-pixel jitter, the jitter IS the anti-aliasing (super-sampling
         // reconstruction); the spatial FXAA pre-pass then only blurs and — because it smooths each
         // jittered frame's edges differently — adds temporal variance, so it is skipped in the
@@ -2638,6 +2664,15 @@ impl App {
         // then the optional compute-post blur.
         self.deferred
             .record_shadow(&mut graph, shadow_map, &scene, light_vp);
+        // DLSS/FSR2-style texture LOD bias when rendering below the output resolution for TAAU:
+        // log2(internal/output). It pulls in sharper mips so the temporal upscaler can reconstruct
+        // full-res texture detail (without it the low-res derivatives fetch blurry mips and the
+        // result stays soft — visible on detailed scenes like Sponza). 0 on the native path.
+        let mip_bias = if taau_active {
+            (cw as f32 / sw as f32).log2()
+        } else {
+            0.0
+        };
         self.deferred.record_gbuffer(
             &mut graph,
             gbuf,
@@ -2650,6 +2685,7 @@ impl App {
             self.override_material,
             self.metallic_override,
             self.roughness_override,
+            mip_bias,
         );
         // Stage C2/C3 (GDF-lighting consumers, see `gi.rs`) share the world scene GDF:
         // import its handle once + record the one-time fused-scene bake (the volume is
