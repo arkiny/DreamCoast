@@ -41,7 +41,7 @@ struct PushConstants
 {
     float4x4 mvp;
     float4 base_color_factor;
-    float4 mr_factor;     // x metallic, y roughness, z texture mip LOD bias (TAAU), w unused
+    float4 mr_factor;     // x metallic, y roughness, z texture mip LOD bias (TAAU), w alpha cutoff
     uint4 tex;            // x base_color, y metallic_roughness, z normal, w emissive
     float4x4 model;       // object -> world (for world-space position + normal outputs)
 };
@@ -91,9 +91,18 @@ GBufferOut fsMain(VSOutput input)
     // upscaler can reconstruct full-res texture detail (otherwise the low-res derivatives pick
     // blurry mips and the result stays soft). 0 on the native path = byte-identical to Sample().
     float mip_bias = pc.mr_factor.z;
+    // Masked (alphaMode MASK) materials: discard fragments whose base-color alpha is below the
+    // cutoff (mr_factor.w). `cutoff <= 0` = opaque -> the branch never runs and only `.rgb` is used,
+    // so opaque/untextured draws (the whole gallery) are byte-identical to the pre-mask path.
+    float cutoff = pc.mr_factor.w;
     float3 albedo = pc.base_color_factor.rgb;
     if (pc.tex.x != NO_TEXTURE)
-        albedo *= g.textures[pc.tex.x].SampleBias(g.samp_wrap, input.uv, mip_bias).rgb;
+    {
+        float4 bc = g.textures[pc.tex.x].SampleBias(g.samp_wrap, input.uv, mip_bias);
+        albedo *= bc.rgb;
+        if (cutoff > 0.0 && bc.a * pc.base_color_factor.a < cutoff)
+            discard;
+    }
 
     float metallic = pc.mr_factor.x;
     float roughness = pc.mr_factor.y;

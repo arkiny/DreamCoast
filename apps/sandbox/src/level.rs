@@ -103,6 +103,7 @@ fn desc_from_override(ov: Option<MaterialOverride>) -> MaterialDesc {
             roughness: o.roughness,
             tex: [NO_TEXTURE; 4],
             albedo: representative_albedo(None, o.base_color_factor),
+            alpha_cutoff: 0.0,
         },
         None => MaterialDesc {
             base_color: [0.8, 0.8, 0.8, 1.0],
@@ -110,6 +111,7 @@ fn desc_from_override(ov: Option<MaterialOverride>) -> MaterialDesc {
             roughness: 0.6,
             tex: [NO_TEXTURE; 4],
             albedo: representative_albedo(None, [0.8, 0.8, 0.8, 1.0]),
+            alpha_cutoff: 0.0,
         },
     }
 }

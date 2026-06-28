@@ -117,6 +117,10 @@ pub(crate) struct MaterialDesc {
     pub(crate) metallic: f32,
     pub(crate) roughness: f32,
     pub(crate) tex: [u32; 4],
+    /// Alpha-test cutoff for `alphaMode: MASK` materials; `0.0` = opaque (no test). The single
+    /// value driving both the G-buffer cutout and the masked-shadow alpha test (see the
+    /// `gbuffer`/`shadow` passes), packed into the push constants' spare `mr_factor.w` slot.
+    pub(crate) alpha_cutoff: f32,
     /// Representative linear albedo for the GDF/SW-RT GI: the base-color texture's
     /// linear average × factor, or the factor's RGB when untextured (see
     /// [`representative_albedo`]). The single source the fuse tags onto every triangle.
@@ -179,6 +183,7 @@ pub(crate) fn build_scene(
                 metallic: mat.metallic,
                 roughness: mat.roughness,
                 tex: mat.tex,
+                alpha_cutoff: mat.alpha_cutoff,
                 casts_shadow: d.casts_shadow,
             }
         })
@@ -242,6 +247,7 @@ pub(crate) fn upload_gltf_scene(
             roughness: m.roughness_factor,
             tex,
             albedo,
+            alpha_cutoff: m.alpha_cutoff,
         }));
     }
     // Fallback for primitives with no material (glTF default material).
@@ -251,6 +257,7 @@ pub(crate) fn upload_gltf_scene(
         roughness: Material::default().roughness_factor,
         tex: [NO_TEXTURE; 4],
         albedo: representative_albedo(None, Material::default().base_color_factor),
+        alpha_cutoff: 0.0,
     });
 
     let mut per_mesh: Vec<Vec<(MeshHandle, MaterialHandle)>> =

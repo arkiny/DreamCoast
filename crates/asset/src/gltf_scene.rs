@@ -45,6 +45,11 @@ pub struct GltfMaterial {
     pub metallic_roughness: Option<usize>,
     pub normal: Option<usize>,
     pub emissive: Option<usize>,
+    /// Alpha-test cutoff for `alphaMode: MASK` materials (fragments with base-color alpha
+    /// below this are discarded). `0.0` means no alpha test — `OPAQUE` (and, for now, `BLEND`,
+    /// which is handled as opaque until true alpha blending lands). Single source for the
+    /// renderer's masked cutout + masked shadows.
+    pub alpha_cutoff: f32,
 }
 
 /// A whole imported glTF scene: node hierarchy + per-mesh primitives + materials +
@@ -78,6 +83,13 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<GltfScene, EngineError>
             let pbr = m.pbr_metallic_roughness();
             let src =
                 |info: Option<gltf::texture::Info>| info.map(|i| i.texture().source().index());
+            // Only MASK is alpha-tested; OPAQUE and BLEND carry no cutoff (BLEND is treated as
+            // opaque until true alpha blending lands — see the renderer's gbuffer/shadow passes).
+            // glTF's default cutoff is 0.5 when MASK omits `alphaCutoff`.
+            let alpha_cutoff = match m.alpha_mode() {
+                gltf::material::AlphaMode::Mask => m.alpha_cutoff().unwrap_or(0.5),
+                _ => 0.0,
+            };
             GltfMaterial {
                 base_color_factor: pbr.base_color_factor(),
                 metallic_factor: pbr.metallic_factor(),
@@ -87,6 +99,7 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<GltfScene, EngineError>
                 metallic_roughness: src(pbr.metallic_roughness_texture()),
                 normal: m.normal_texture().map(|n| n.texture().source().index()),
                 emissive: src(m.emissive_texture()),
+                alpha_cutoff,
             }
         })
         .collect();
