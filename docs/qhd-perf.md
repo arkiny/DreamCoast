@@ -192,8 +192,19 @@ Part B(지터 재구성)가 실현했으니, 이제 **TAAU 켠 상태로** rende
 - **진짜 QHD(3.69MP) 투영**: 디스플레이가 출력을 2052로 클램프해 스왑체인 QHD 직접 측정 불가. 내부=QHD×0.5(1280×720)를
   `RENDER_RES`로 측정: DX 13.3ms(75fps)/VK 16.9ms(59fps). → **진짜 QHD 90fps는 DX 내부 ~0.4**(Stage 2의 ~0.44 재확인),
   단 이번엔 바이리니어가 아니라 **선명한 TAAU**. 기법(내부 렌더 스케일+시간적 재구성)은 UHD까지 그대로 확장.
-- **운영화**: `quality.rs` **Low 티어 render_scale 0.5**(저사양/고해상 성능 모드 = 내부 0.5 + TAAU; `RENDER_QUALITY=low`).
-  Med(기본)=1.0 유지=갤러리 바이트동일 앵커. 갤러리 무회귀 0.000/ch 확인.
+- **운영화**: `quality.rs` **Low 티어 render_scale 0.6667**(저사양/고해상 성능 모드 = 내부 2/3 + TAAU;
+  `RENDER_QUALITY=low`). 처음 0.5로 잡았으나 0.5는 디테일 씬(Sponza)서 텍스처/지오 언더샘플로 재구성해도
+  소프트=가시성 저하 → **2/3로 상향**(아래 mip-bias와 함께 네이티브에 근접). Med(기본)=1.0=갤러리 바이트동일 앵커.
+
+## Stage 7 — TAAU 업스케일 블러 근본수정: 텍스처 mip LOD bias (2026-06-28)
+
+정적(수렴) 상태에서도 Sponza 업스케일이 심하게 흐림(선명도 2.6 vs 네이티브 7.3). 원인: **G-buffer가 텍스처를
+`.Sample()`(화면공간 미분 자동 LOD)로 샘플** → 저해상 렌더는 미분이 ~2× 커져 더 흐린 mip 선택 → TAAU가 흐린
+mip만 누적 → 수렴해도 소프트. 갤러리는 텍스처가 없어 안 보였고 Sponza(조밀 텍스처)서 표출. **수정 = DLSS/FSR2
+표준 음의 LOD bias `log2(내부/출력)`** 를 G-buffer 텍스처 샘플(albedo/MR/normal)에 `SampleBias`로 적용
+(빈 `mr_factor.z` 재사용, 네이티브 bias 0 → `SampleBias(.,0)==Sample()` → 갤러리 0.000 바이트 동일). 측정
+(Sponza 0.6667): 선명도 2.619→2.928, vs-네이티브 4.399→3.892, **육안상 네이티브 근접**. DX≡VK 0.002. 시작 시
+`render: internal WxH -> output WxH (NN% scale, TAAU=...)` 로그 추가로 실효 스케일 즉시 확인.
 
 **트랙 결론**: 내부 렌더 스케일 + TAAU 시간적 재구성으로 **무거운 씬을 거의 네이티브 품질로 고프레임**에 도달
 (DX Sponza 42→94fps). 남은 격차는 VK 구조적 바닥(async-compute 후속)과 진짜 QHD 출력의 디스플레이 클램프(측정 한계).
