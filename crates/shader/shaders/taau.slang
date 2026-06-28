@@ -219,5 +219,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     accum = make_finite(accum);
     g.storage_buffers[pc.hist_write].Store4(idx * 16u, asuint(float4(accum, len)));
     g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(world_pos, 1.0)));
-    g.storage_images[pc.out_index][tid.xy] = float4(hist_rgb, 1.0); // DEBUG fetched history
+    // Output the accumulated result: for disoccluded / no-history pixels this is `cur` (the current
+    // frame), so newly-revealed regions show the live frame instead of empty (black) history.
+    g.storage_images[pc.out_index][tid.xy] = float4(accum, 1.0);
 }
