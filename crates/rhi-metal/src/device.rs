@@ -1033,11 +1033,12 @@ impl MetalDevice {
         unsafe {
             volume
                 .texture
-                .getBytes_bytesPerRow_bytesPerImage_fromRegion_mipmapLevel(
+                .getBytes_bytesPerRow_bytesPerImage_fromRegion_mipmapLevel_slice(
                     ptr,
                     w * bpp,
                     w * h * bpp,
                     region,
+                    0,
                     0,
                 );
         }
