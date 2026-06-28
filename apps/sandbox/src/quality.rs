@@ -15,6 +15,18 @@
 //! higher tiers; one place owns the tier→knob table; measurement-rejected knobs are excluded
 //! (`P11_GDF_DIM` resolution, `CARD_TILE` — see `docs/reflection-sdf-resolution.md`).
 
+/// QHD/UHD track (Stage 8): TAA-aware texture LOD bias. When sub-pixel jitter is active the
+/// temporal accumulation super-samples the image, so we can bias the G-buffer texture fetches
+/// toward *sharper* mips and let TAA resolve the extra aliasing — this is the PRIMARY lever for
+/// distant-texture sharpness (the UE/DLSS/FSR2 approach), not anisotropy. It is added on top of
+/// the resolution term `log2(internal/output)` and applies even at native resolution under forced
+/// TAA (`P_TAAU_FORCE`). Driver-independent (a plain LOD offset on the existing trilinear sampler),
+/// so it carries no DX≡VK risk. `-1.0` ≈ one mip sharper; tuning range -0.5..-1.5 (too negative ->
+/// motion shimmer the temporal pass can't hide). Overridable via the `TAA_MIP_BIAS` env for sweeps.
+/// Single source of truth — read once in `main.rs`. Gallery (TAA off => no jitter) never applies it,
+/// so the byte-identical anchor is preserved.
+pub const TAA_MIP_BIAS: f32 = -1.0;
+
 /// Render quality tier. `Med` is the default (unset env) and matches the legacy behavior.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderQuality {

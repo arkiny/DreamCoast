@@ -600,6 +600,14 @@ struct App {
     /// resolve all reproject history sub-pixel-accurately (B1/B2), so the jitter resolves into sharp
     /// detail instead of shimmer. Only active when TAAU is (cw<sw); `P_TAAU_JITTER=0` forces it off.
     taau_jitter: bool,
+    /// `P_TAAU_FORCE=1`: run TAAU even at native resolution (internal == output) — i.e. temporal
+    /// anti-aliasing (jitter + accumulation, no upscale). Opt-in so the default native path stays
+    /// byte-identical (TAAU off when render==output).
+    taau_force: bool,
+    /// QHD/UHD Stage 8: TAA-aware texture LOD bias added when jitter is active (the primary
+    /// distant-texture sharpness lever). Resolved once from `quality::TAA_MIP_BIAS` with a
+    /// `TAA_MIP_BIAS` env override for sweeps. See `quality.rs` for the rationale.
+    taa_mip_bias: f32,
     // Profiler UI state.
     profiler_on: bool,
     slot_pass_names: Vec<Vec<String>>,
@@ -1590,6 +1598,11 @@ impl App {
             taau,
             taau_on: quality::env_bool("P_TAAU", true),
             taau_jitter: quality::env_bool("P_TAAU_JITTER", true),
+            taau_force: quality::env_bool("P_TAAU_FORCE", false),
+            taa_mip_bias: std::env::var("TAA_MIP_BIAS")
+                .ok()
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .unwrap_or(quality::TAA_MIP_BIAS),
             profiler_on,
             slot_pass_names,
             gpu_timings: Vec::new(),
@@ -1746,7 +1759,13 @@ impl App {
         // QHD/UHD track: TAAU is active when the scene renders below the output resolution (upscale)
         // and isn't a path-trace/debug capture. It jitters the camera + reconstructs full-res from
         // history. When render == output (default), it's inactive (byte-identical).
-        let taau_active = self.taau_on && self.taau.has_taau() && cw < sw && ch < sh;
+        // TAAU runs when the scene renders below the output (upscale), or — with P_TAAU_FORCE — at
+        // native (internal == output) as plain temporal AA (jitter + accumulation, no upscale).
+        let taau_active = self.taau_on
+            && self.taau.has_taau()
+            && cw <= sw
+            && ch <= sh
+            && (cw < sw || ch < sh || self.taau_force);
         // One-time readout of the resolved resolution path so it's obvious at a glance what the
         // scene is actually rendering at vs the output (and whether TAAU upscaling is even on).
         if self.frame_no == 0 {
@@ -2668,12 +2687,25 @@ impl App {
         // then the optional compute-post blur.
         self.deferred
             .record_shadow(&mut graph, shadow_map, &scene, light_vp);
-        // DLSS/FSR2-style texture LOD bias when rendering below the output resolution for TAAU:
-        // log2(internal/output). It pulls in sharper mips so the temporal upscaler can reconstruct
-        // full-res texture detail (without it the low-res derivatives fetch blurry mips and the
-        // result stays soft — visible on detailed scenes like Sponza). 0 on the native path.
+        // TAA-aware texture LOD bias for the G-buffer texture fetches (Stage 7 + Stage 8). Two terms:
+        //   1. log2(internal/output): the DLSS/FSR2 resolution term — at a reduced internal
+        //      resolution the screen-space derivatives are ~2x larger and fetch blurry mips, so this
+        //      negative offset pulls them back to the full-res mip the upscaler reconstructs to.
+        //   2. taa_mip_bias (~-1, Stage 8): the PRIMARY distant-sharpness lever. With sub-pixel
+        //      jitter the temporal accumulation super-samples, so we can bias toward sharper mips and
+        //      let TAA resolve the aliasing — this is why UE looks sharp at distance without
+        //      anisotropy. It applies even at native (term 1 = 0) under forced TAA. Only added when
+        //      jitter is active (no jitter => no temporal supersampling to hide the aliasing).
+        // Gallery (TAA off => taau_active false) keeps bias 0 => SampleBias(.,0)==Sample() => byte
+        // identical. Driver-independent LOD offset on the existing trilinear sampler (no DX≡VK risk).
         let mip_bias = if taau_active {
-            (cw as f32 / sw as f32).log2()
+            let scale_bias = (cw as f32 / sw as f32).log2();
+            let taa_bias = if taau_jitter_active {
+                self.taa_mip_bias
+            } else {
+                0.0
+            };
+            scale_bias + taa_bias
         } else {
             0.0
         };
