@@ -137,6 +137,14 @@ pub struct QualityPreset {
     /// for the gallery anchor at the call site). Higher = cheaper march, softer distant GI/reflection.
     /// Denoised/EMA signals tolerate it; see `docs/lumen-parity-swrt.md`.
     pub gdf_cone_k: f32,
+    /// P1 (Lumen-parity SW-RT): GI trace-resolution divisor when `gi_half_res` is on — trace the
+    /// C3 GI at `1/div` of the render extent per axis, then joint-bilateral upsample (the spatial
+    /// half of UE5 Lumen's ScreenProbeGather: sparser trace origins, guided interpolation).
+    /// `2` = the legacy half-res (Stage D1). `4` = quarter-res (16x fewer origins than full, 4x
+    /// fewer than half) — the indirect bounce is low-frequency + temporally denoised, so coarser
+    /// origins hold up for content. Only active where `gi_half_res` is (content; the gallery traces
+    /// full-res = byte-identical). `P_GI_RES_DIV` override. See `docs/lumen-parity-swrt.md`.
+    pub gi_res_div: u32,
 }
 
 /// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
@@ -162,6 +170,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             cache_relight_spp: 2,
             reflect_half_res: true,
             gdf_cone_k: 0.05,
+            gi_res_div: 4,
             // Low-end / high-res performance mode: render at 2/3 of the output extent and let the
             // TAAU jitter reconstruction (B-track) upscale it. 2/3 (not 1/2) keeps detailed scenes
             // legible — at 1/2 the internal resolution undersamples texture/geometry detail enough
@@ -193,6 +202,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             reflect_half_res: true,
             render_scale: 1.0,
             gdf_cone_k: 0.02,
+            gi_res_div: 4,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
@@ -215,6 +225,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             reflect_half_res: false,
             render_scale: 1.0,
             gdf_cone_k: 0.0,
+            gi_res_div: 2,
         },
     }
 }

@@ -534,6 +534,8 @@ struct App {
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
     /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
     gi_half_res: bool,
+    /// P1 (Lumen-parity): GI trace divisor when `gi_half_res` is on (2 = half, 4 = quarter probes).
+    gi_res_div: u32,
     /// C4: spatio-temporal denoise of the noisy C3 GI.
     gi_denoise: bool,
     /// Previous frame's view-projection (world -> clip) for C4 temporal reprojection.
@@ -1293,6 +1295,14 @@ impl App {
         // overrides. Needs the upsample pipeline (capability-gated).
         let gi_half_res = gi.has_upsample()
             && quality::env_bool("P11_GI_HALF_RES", !gallery_scene && qp.gi_half_res);
+        // P1 (Lumen-parity): GI trace-resolution divisor used when `gi_half_res` is on (2 = legacy
+        // half, 4 = quarter = sparser screen-space probes). Only affects content (the gallery traces
+        // full-res). `P_GI_RES_DIV` overrides the tier.
+        let gi_res_div = std::env::var("P_GI_RES_DIV")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(qp.gi_res_div)
+            .clamp(1, 16);
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
         let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", qp.gi_denoise);
         // C5 screen-space reflections (viz toggle).
@@ -1587,6 +1597,7 @@ impl App {
             gdf_cone_k,
             reflect_half_res,
             gi_half_res,
+            gi_res_div,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
             prev_view_proj_taau: Mat4::IDENTITY.to_cols_array(),
@@ -2114,6 +2125,7 @@ impl App {
                 gi_spp,
                 cache_relight_period,
                 gi_half_res,
+                gi_res_div,
                 gi_denoise,
                 gdf_ssr,
                 gdf_reflect,
@@ -2212,6 +2224,8 @@ impl App {
                         };
                         // Half-res GI: content-only (gallery full-res = byte-identical anchor).
                         *gi_half_res = gi.has_upsample() && !*is_gallery && p.gi_half_res;
+                        *gi_res_div = p.gi_res_div.clamp(1, 16); // P1: GI trace divisor
+
                         *gi_denoise = gi.has_denoise() && p.gi_denoise;
                         *reflect_cache = *swrt_reflect
                             && gdf.has_surface_cache()
@@ -2903,13 +2917,13 @@ impl App {
                 // Stage D1: trace at half res (1/4 the rays) when enabled, then joint-bilateral
                 // upsample to full res before the denoiser. gdf_gi.slang samples the G-buffer by
                 // normalized UV, so a half extent + half dims trace correctly with no shader change.
+                // P1: trace at 1/div of the render extent (2 = legacy half, 4 = quarter probes),
+                // then the bilateral upsample (gdf_gi_upsample.slang, generic over the source dims)
+                // reconstructs full res. Content-only; the gallery is full-res (byte-identical).
                 let half_gi = self.gi_half_res;
-                let (gw, gh) = if half_gi { (hcw, hch) } else { (cw, ch) };
-                let gi_extent = if half_gi {
-                    Extent2D::new(gw, gh)
-                } else {
-                    extent
-                };
+                let div = if half_gi { self.gi_res_div.max(1) } else { 1 };
+                let (gw, gh) = (cw.div_ceil(div), ch.div_ceil(div));
+                let gi_extent = Extent2D::new(gw, gh);
                 let traced = self.gi.record_gi(
                     &mut graph,
                     vol,
