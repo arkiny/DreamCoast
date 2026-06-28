@@ -64,6 +64,58 @@ float3 clip_aabb(float3 amin, float3 amax, float3 q)
 }
 float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
+// Bilinear (sub-pixel) history fetch from the ping-pong storage buffers. The history lives in a
+// raw buffer (no hardware sampler), so do the 2x2 tap + weighting by hand. CRITICAL for jitter:
+// integer-texel (floor) reprojection discards the sub-pixel offset, so the jittered low-res frames
+// land incoherently and the jitter degrades into shimmer; a sub-pixel-accurate fetch instead lets
+// the jitter act as a stable super-sampling signal. Each tap is validated against the disocclusion
+// test (stored world point) and dropped if it was a different surface; surviving taps are
+// re-normalized so a silhouette doesn't pull in background history. Returns rgb+len in `out_rgb` /
+// `out_len`, with `out_len <= 0` meaning "no usable history".
+void fetch_history_bilinear(float2 puv, float3 world_pos, out float3 out_rgb, out float out_len)
+{
+    out_rgb = float3(0, 0, 0);
+    out_len = 0.0;
+    float2 res = float2(pc.out_width, pc.out_height);
+    float2 sp = puv * res - 0.5; // texel-center convention so an exact reprojection is a no-op
+    float2 base = floor(sp);
+    float2 f = sp - base;
+    float w[4] = { (1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y };
+    int2 off[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+
+    float3 rgb_sum = float3(0, 0, 0);
+    float len_sum = 0.0;
+    float wsum = 0.0;
+    [unroll] for (int i = 0; i < 4; i++)
+    {
+        int2 p = int2(base) + off[i];
+        if (p.x < 0 || p.y < 0 || p.x >= int(pc.out_width) || p.y >= int(pc.out_height))
+            continue;
+        uint pidx = uint(p.y) * pc.out_width + uint(p.x);
+        float4 pp = asfloat(g.storage_buffers[pc.pos_read].Load4(pidx * 16u));
+        // Accept any tap that holds a real prior surface (pp.w). NO hard geometric disocclusion:
+        // a hard world-point reject left silhouette + grazing bands stuck at len 1 (full jitter
+        // crawl), because under jitter those pixels flip sub-pixel coverage every frame and must
+        // ACCUMULATE into an anti-aliased average rather than reset. The YCoCg neighborhood clip in
+        // the caller is the anti-ghost for genuine (camera-motion) disocclusion — new content has a
+        // different colour and is clipped out (Karis 2014).
+        if (pp.w > 0.5)
+        {
+            float4 ph = asfloat(g.storage_buffers[pc.hist_read].Load4(pidx * 16u));
+            rgb_sum += w[i] * ph.rgb;
+            len_sum += w[i] * ph.a;
+            wsum += w[i];
+        }
+    }
+    // Require a majority of the bilinear footprint to be valid; otherwise it's a disocclusion edge
+    // and falling back to "no history" (current sample) is safer than a mostly-stale blend.
+    if (wsum > 0.5)
+    {
+        out_rgb = rgb_sum / wsum;
+        out_len = len_sum / wsum;
+    }
+}
+
 float3 reconstruct(float2 cuv, float depth, float sy)
 {
     float2 ndc = float2(cuv.x * 2.0 - 1.0, (cuv.y * 2.0 - 1.0) * sy);
@@ -97,11 +149,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float sy = (pc.flip_y & 1u) != 0u ? 1.0 : -1.0;
     float2 its = 1.0 / float2(pc.in_width, pc.in_height);
 
-    // 3x3 neighborhood pass: YCoCg moments (for the variance box) + closest-depth (for dilation).
+    // 3x3 neighborhood pass: YCoCg moments for the variance box (the anti-ghost color distribution).
     float3 m1 = float3(0, 0, 0); // sum of YCoCg
     float3 m2 = float3(0, 0, 0); // sum of YCoCg^2
-    float closest_depth = depth;
-    float2 closest_uv = cuv;
     for (int dy = -1; dy <= 1; dy++)
     {
         for (int dx = -1; dx <= 1; dx++)
@@ -110,12 +160,6 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float3 c = rgb_to_ycocg(g.textures[pc.hdr_index].SampleLevel(g.samp, suv, 0.0).rgb);
             m1 += c;
             m2 += c * c;
-            float d = g.textures[pc.depth_index].SampleLevel(g.samp, suv, 0.0).r;
-            if (d < closest_depth)
-            {
-                closest_depth = d;
-                closest_uv = suv;
-            }
         }
     }
     float3 mean = m1 / 9.0;
@@ -127,7 +171,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // World point of THIS pixel (validation + storage) and of the closest neighbor (reprojection
     // motion — closest-depth dilation so silhouettes fetch the foreground history).
     float3 world_pos = reconstruct(cuv, depth, sy);
-    float3 world_reproj = reconstruct(closest_uv, closest_depth, sy);
+    // Reproject THIS pixel's own surface. Closest-depth dilation (fetching the foreground's history
+    // at silhouettes) is omitted on purpose: under sub-pixel jitter it makes the reprojection target
+    // oscillate fg/bg every frame, fetching a different history each time -> edge crawl. Own-surface
+    // reprojection keeps each output pixel accumulating its own coverage into an anti-aliased edge.
+    float3 world_reproj = world_pos;
 
     float3 hist_rgb = float3(0, 0, 0);
     float hist_len = 0.0;
@@ -140,17 +188,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float2 puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
             if (all(puv >= 0.0) && all(puv <= 1.0) && pndc.z >= 0.0 && pndc.z <= 1.0)
             {
-                int2 ppix = int2(floor(puv * float2(pc.out_width, pc.out_height)));
-                ppix = clamp(ppix, int2(0, 0), int2(pc.out_width - 1, pc.out_height - 1));
-                uint pidx = uint(ppix.y) * pc.out_width + uint(ppix.x);
-                float4 ph = asfloat(g.storage_buffers[pc.hist_read].Load4(pidx * 16u));
-                float4 pp = asfloat(g.storage_buffers[pc.pos_read].Load4(pidx * 16u));
-                // Disocclusion: reject when the prior front surface was a different world point.
-                if (pp.w > 0.5 && distance(world_pos, pp.xyz) < pc.params.x)
-                {
-                    hist_rgb = ph.rgb;
-                    hist_len = ph.a;
-                }
+                // Sub-pixel-accurate (bilinear) history reprojection — see fetch_history_bilinear.
+                fetch_history_bilinear(puv, world_pos, hist_rgb, hist_len);
             }
         }
     }
@@ -163,9 +202,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         // distribution is snapped onto the box; in-distribution history passes through (stable).
         float3 hist_y = clip_aabb(box_min, box_max, rgb_to_ycocg(hist_rgb));
         hist_rgb = ycocg_to_rgb(hist_y);
-        // Straight EMA: the clip already rejects stale (moving) history, so long, stable
-        // accumulation hides the jitter. alpha floors at 1/max_hist (len is capped). The per-frame
-        // edge aliasing that would otherwise destabilize this is removed by the FXAA pre-pass.
+        // Straight EMA: the clip rejects stale (camera-moved) history, so long, stable accumulation
+        // hides the jitter and resolves sub-pixel detail. alpha floors at 1/max_hist (len capped).
         len = min(hist_len + 1.0, pc.params.y);
         float alpha = 1.0 / len;
         accum = lerp(hist_rgb, cur, alpha);
@@ -179,5 +217,5 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     accum = make_finite(accum);
     g.storage_buffers[pc.hist_write].Store4(idx * 16u, asuint(float4(accum, len)));
     g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(world_pos, 1.0)));
-    g.storage_images[pc.out_index][tid.xy] = float4(accum, 1.0);
+    g.storage_images[pc.out_index][tid.xy] = float4(hist_rgb, 1.0); // DEBUG fetched history
 }

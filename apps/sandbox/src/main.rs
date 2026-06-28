@@ -1919,9 +1919,14 @@ impl App {
             };
             proj.z_axis.x -= jx;
             proj.z_axis.y -= jy * sy;
-            // The jitter shifts NDC by +jx/+jy*sy; in UV that is (jx*0.5, jy*0.5) (the sy cancels
-            // with the UV-Y flip). The TAAU samples the internal frame at `uv + jitter_uv`.
-            taau_jitter_uv = [jx * 0.5, jy * 0.5];
+            // UV-space shift the jitter gives the on-screen content, so the TAAU can sample the
+            // internal frame at `uv + jitter_uv` to fetch the content that landed on the stable
+            // output pixel. Working it through both conventions (jitter NDC shift -> rendered
+            // screen UV -> the shader's reconstruct() UV->NDC, which uses sy = flip_y?1:-1):
+            //   Δuv.x = +jx/2,  Δuv.y = -jy/2   — identical on D3D12 AND Vulkan (the two Y flips
+            // cancel to a single net negation). The previous +jy/2 left a ~1px vertical
+            // reprojection error, so the history fetch missed and the jitter degraded to shimmer.
+            taau_jitter_uv = [jx * 0.5, -jy * 0.5];
         }
         let view_proj = proj * view;
         // Frustum culling uses the Y-flip-free matrix so the visible set (and the
