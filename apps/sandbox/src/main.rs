@@ -1604,10 +1604,14 @@ impl App {
             angle: diag_angle.unwrap_or(if screenshot_mode { 0.7 } else { 0.0 }),
             diag_obj,
             diag_pitch,
-            cam_mode: if world_mode {
-                camera::CameraMode::Fly
-            } else {
+            // Non-gallery scenes (level / glTF / world) start in the free-fly camera: static at
+            // the authored pose, then WASD + Q/E (down/up) move and right-mouse-drag looks. The
+            // gallery keeps the auto-orbit demo view. Tab toggles between the two. Headless captures
+            // ignore this (fly is gated off in screenshot mode -> the fixed parity pose).
+            cam_mode: if gallery_scene {
                 camera::CameraMode::Orbit
+            } else {
+                camera::CameraMode::Fly
             },
             fly: world_fly,
             tab_prev: false,
