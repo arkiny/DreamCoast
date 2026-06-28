@@ -1680,10 +1680,10 @@ impl App {
         if let Some(idx) = self.pending_level.take() {
             self.load_level(idx)?;
         }
-        self.window.pump_events();
-        if self.window.take_resized() {
-            self.needs_recreate = true;
-        }
+        // Pump Win32 messages ONCE per frame. A second pump_events here re-ran begin_frame (which
+        // latches frame_start_pos = current cursor pos and clears the wheel) AFTER the first pump had
+        // already drained every WM_MOUSEMOVE — so mouse_delta()/wheel collapsed to 0 every frame and
+        // right-mouse look (and wheel speed) silently did nothing, while held keys (WASD) still worked.
         self.window.pump_events();
         if self.window.take_resized() {
             self.needs_recreate = true;
