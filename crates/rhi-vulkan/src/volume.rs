@@ -37,6 +37,10 @@ impl VulkanVolume {
                 height: desc.height.max(1),
                 depth: desc.depth.max(1),
             };
+            // CONCURRENT across graphics+compute (like storage buffers) so the async-compute
+            // queue can sample the volume (e.g. the GDF surface-cache relight) without per-use
+            // queue-family ownership transfers. Only when a dedicated compute family exists.
+            let families = [device.graphics_family, device.compute_family];
             let image_ci = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_3D)
                 .format(format)
@@ -46,8 +50,14 @@ impl VulkanVolume {
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
                 .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image_ci = if device.has_dedicated_compute {
+                image_ci
+                    .sharing_mode(vk::SharingMode::CONCURRENT)
+                    .queue_family_indices(&families)
+            } else {
+                image_ci.sharing_mode(vk::SharingMode::EXCLUSIVE)
+            };
             let image = device
                 .device
                 .create_image(&image_ci, None)
@@ -112,6 +122,9 @@ impl VulkanVolume {
                 height: desc.height.max(1),
                 depth: desc.depth.max(1),
             };
+            // CONCURRENT across graphics+compute (see VulkanVolume::new) so the async-compute
+            // queue can sample this volume without queue-family ownership transfers.
+            let families = [device.graphics_family, device.compute_family];
             let image_ci = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_3D)
                 .format(format)
@@ -125,8 +138,14 @@ impl VulkanVolume {
                         | vk::ImageUsageFlags::STORAGE
                         | vk::ImageUsageFlags::TRANSFER_DST,
                 )
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image_ci = if device.has_dedicated_compute {
+                image_ci
+                    .sharing_mode(vk::SharingMode::CONCURRENT)
+                    .queue_family_indices(&families)
+            } else {
+                image_ci.sharing_mode(vk::SharingMode::EXCLUSIVE)
+            };
             let image = device
                 .device
                 .create_image(&image_ci, None)
