@@ -1378,7 +1378,11 @@ impl App {
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
             .unwrap_or(qp.render_scale)
-            .clamp(0.6667, 1.0);
+            // Floor at 1/3 (DLSS "ultra performance" territory): below that even a temporal
+            // reconstruction can't hold up. The TAAU jitter reconstruction (B-track) makes the
+            // 0.4–0.6 range viable, which is what QHD/UHD high-fps needs; 1.0 stays the default
+            // (byte-identical native).
+            .clamp(0.3333, 1.0);
         let profiler_on = std::env::var("PROFILE_GPU").is_ok();
         let slot_pass_names: Vec<Vec<String>> = vec![Vec::new(); FRAMES_IN_FLIGHT];
         let render_finished = build_render_finished(&device, swapchain.image_count())?;

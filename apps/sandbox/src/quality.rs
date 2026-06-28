@@ -142,7 +142,11 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_half_res: true,
             cache_relight_spp: 2,
             reflect_half_res: true,
-            render_scale: 1.0,
+            // Low-end / high-res performance mode: render the scene at half the output extent and
+            // let the TAAU jitter reconstruction (B-track) upscale it. Measured (Sponza, output
+            // 2052x1133): internal 0.5 takes d3d12 24.0 -> 10.6ms (42 -> 94fps) at near-native
+            // quality. The reconstruction needs the jitter, which is on by default in this path.
+            render_scale: 0.5,
         },
         // Default — identical to the pre-tier behavior. Do not change without re-baselining no-reg.
         RenderQuality::Med => QualityPreset {
