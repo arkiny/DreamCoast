@@ -100,6 +100,16 @@ pub struct MeshData {
 - *멀티-슬롯 메시 기각(1차)*: glTF primitive 1개 = 슬롯 1개로 시작. N-슬롯은 Phase 12 Stage B
   멀티-프리미티브 임포트와 함께 후속(슬롯 배열로 자연 확장).
 
+> **알파 모드 — MASK 구현됨 (2026-06-28, `cb2e1ca`).** 위 `alpha: AlphaMode`의 **MASK(알파 테스트)**
+> 부분은 런타임 렌더 경로에 먼저 들어갔다(에셋-그래프 쿡과 독립). 임포터가 `alphaMode`/`alphaCutoff`를
+> 읽어 `GltfMaterial.alpha_cutoff`(MASK=cutoff, 기본 0.5; OPAQUE/BLEND=0)에 보존 → 단일 값으로
+> `MaterialDesc`→`SceneObject`→푸시상수(`mr_factor.w`) 전파. `gbuffer.slang`(컷아웃)과 `shadow.slang`
+> (마스크드 그림자 구멍) 양쪽이 `alpha*factor.a < cutoff`면 discard. cutoff 0(불투명)은 텍스처 샘플/discard
+> 미진입 = **바이트 동일**. cull=NONE이라 마스크드 폴리지는 양면. **BLEND(진짜 알파 블렌딩)는 후속.**
+> **텍스처 알파 주의:** 마스크드 base_color는 알파가 필요 → 라이브 glTF 경로는 RGBA8 무압축이라 보존되지만,
+> 쿡 BCn(`P12_TEX_COMPRESS`)이 마스크드 컬러에 BC1(1-bit 알파)을 쓰면 컷아웃이 깨진다 → 마스크드 컬러는
+> 무압축/BC7로 라우팅하는 게 후속 과제(현재 쿡은 머티리얼 alpha-mode 비인지). [cooked-asset-policy] 참조.
+
 ### 애셋 그래프 / 쿡
 
 기존 `.dcasset` 컨테이너에 청크 타입만 추가하고, **각 애셋을 독립 키로 쿡**한다:
