@@ -156,6 +156,25 @@ impl DeviceShared {
                         .any(|e| e.extension_name_as_c_str() == Ok(name))
                 });
 
+            // 1b: opt-in anisotropic filtering for the wrap sampler (grazing material surfaces —
+            // floor tiles viewed obliquely). `P_ANISO=<N>` enables it, clamped to the device's
+            // maxSamplerAnisotropy; unset (or <=1) keeps it OFF so the sampler + device feature are
+            // created exactly as before => byte-identical and no DX≡VK risk by default. Anisotropy
+            // is driver-dependent, so this is opt-in only (see docs/qhd-perf.md Stage 9).
+            let aniso_req = std::env::var("P_ANISO")
+                .ok()
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .unwrap_or(1.0);
+            let phys_features = raw_inst.get_physical_device_features(instance.physical_device);
+            let phys_limits = raw_inst
+                .get_physical_device_properties(instance.physical_device)
+                .limits;
+            let max_anisotropy = if aniso_req > 1.0 && phys_features.sampler_anisotropy != 0 {
+                aniso_req.min(phys_limits.max_sampler_anisotropy)
+            } else {
+                1.0
+            };
+
             let mut device_extensions = vec![ash::khr::swapchain::NAME.as_ptr()];
             if has_raytracing {
                 for name in &rt_extensions {
@@ -185,7 +204,9 @@ impl DeviceShared {
             let base_features = vk::PhysicalDeviceFeatures::default()
                 .shader_storage_image_write_without_format(true)
                 // The particle draw's vertex stage reads a storage buffer (UAV).
-                .vertex_pipeline_stores_and_atomics(true);
+                .vertex_pipeline_stores_and_atomics(true)
+                // 1b: only requested + supported when P_ANISO opts in (else false = unchanged).
+                .sampler_anisotropy(max_anisotropy > 1.0);
             // RT feature structs (Phase 8) — only chained when the extensions are
             // enabled, else validation rejects the unsupported feature structs.
             let mut accel_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
@@ -273,7 +294,7 @@ impl DeviceShared {
                 bindless_set,
                 bindless_sampler,
                 bindless_sampler_wrap,
-            ) = create_bindless(&device, has_raytracing)?;
+            ) = create_bindless(&device, has_raytracing, max_anisotropy)?;
             let (globals_pool, globals_layout, globals_set) = create_globals(&device)?;
 
             Ok(Self {
@@ -535,6 +556,7 @@ impl DeviceShared {
 fn create_bindless(
     device: &ash::Device,
     has_raytracing: bool,
+    max_anisotropy: f32,
 ) -> Result<
     (
         vk::DescriptorPool,
@@ -558,6 +580,7 @@ fn create_bindless(
         let sampler = device.create_sampler(&sampler_ci, None).map_err(vk_err)?;
         let immutable = [sampler];
         // Binding 8: a REPEAT/wrap variant for tiling material textures (glTF UVs > 1).
+        // 1b: anisotropy only when P_ANISO opted in (max_anisotropy > 1); else identical to before.
         let sampler_wrap_ci = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -565,6 +588,8 @@ fn create_bindless(
             .address_mode_u(vk::SamplerAddressMode::REPEAT)
             .address_mode_v(vk::SamplerAddressMode::REPEAT)
             .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .anisotropy_enable(max_anisotropy > 1.0)
+            .max_anisotropy(max_anisotropy)
             .max_lod(vk::LOD_CLAMP_NONE);
         let sampler_wrap = device
             .create_sampler(&sampler_wrap_ci, None)
