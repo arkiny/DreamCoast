@@ -1711,6 +1711,18 @@ impl App {
         // and isn't a path-trace/debug capture. It jitters the camera + reconstructs full-res from
         // history. When render == output (default), it's inactive (byte-identical).
         let taau_active = self.taau_on && self.taau.has_taau() && cw < sw && ch < sh;
+        // When TAAU runs with sub-pixel jitter, the jitter IS the anti-aliasing (super-sampling
+        // reconstruction); the spatial FXAA pre-pass then only blurs and — because it smooths each
+        // jittered frame's edges differently — adds temporal variance, so it is skipped in the
+        // jitter path. The non-jittered upscale (no temporal reconstruction) keeps FXAA to soften
+        // the bilinear aliasing.
+        let taau_jitter_active = taau_active && self.taau_jitter;
+        // B2: when the camera is sub-pixel jittered, the screen-space temporal passes (GI denoiser,
+        // reflection resolve) must reproject history with sub-pixel (bilinear) accuracy or the
+        // jitter blurs/destabilizes their accumulation. bit1 of the flip word selects that path in
+        // gdf_temporal/reflect_temporal; cleared (no jitter) = integer-floor fetch = byte-identical
+        // to the legacy path. Computed once here, applied at both call sites.
+        let temporal_flip = self.flip_y | if taau_jitter_active { 2 } else { 0 };
 
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32();
@@ -2822,7 +2834,7 @@ impl App {
                         scene_aabb_max,
                         cw,
                         ch,
-                        self.flip_y,
+                        temporal_flip,
                         self.firefly_clamp,
                     )
                 } else {
@@ -2990,7 +3002,7 @@ impl App {
                     inv_view_proj,
                     self.prev_view_proj,
                     eye,
-                    self.flip_y,
+                    temporal_flip,
                     self.scene_radius * 0.02,
                     64.0,
                     firefly_max,
@@ -3471,7 +3483,7 @@ impl App {
             let main_lit = hdr_post.unwrap_or(hdr);
             // Decima FXAA→TAA: spatially anti-alias the jittered internal frame first so its edges
             // don't flicker frame to frame, then temporally upsample. Stabilizes the jitter.
-            let taau_in = if self.taau.has_fxaa() {
+            let taau_in = if self.taau.has_fxaa() && !taau_jitter_active {
                 self.taau.record_fxaa(&mut graph, main_lit, extent, cw, ch)
             } else {
                 main_lit

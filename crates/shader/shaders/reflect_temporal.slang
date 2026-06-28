@@ -43,6 +43,60 @@ float3 reconstruct(float2 uv, float depth)
     float4 h = mul(pc.inv_view_proj, float4(ndc, depth, 1.0));
     return h.xyz / h.w;
 }
+
+// Fetch reprojected history (accumulated tonemap-space rgb + length). bit1 of flip_y selects a
+// sub-pixel-accurate bilinear fetch — required when the camera is sub-pixel jittered (TAAU), so the
+// reflection accumulation tracks the jittered reprojection instead of snapping to integer texels
+// (which blurs the resolved reflection). Default (bit1 clear) keeps the integer-floor fetch so the
+// non-jittered path stays byte-identical. Per-tap disocclusion via the stored world point.
+void fetch_refl_history(float2 puv, float3 world_pos, out float3 out_rgb, out float out_len)
+{
+    out_rgb = float3(0, 0, 0);
+    out_len = 0.0;
+    float2 res = float2(pc.width, pc.height);
+    if ((pc.flip_y & 2u) == 0u)
+    {
+        int2 ppix = clamp(int2(floor(puv * res)), int2(0, 0),
+                          int2(int(pc.width) - 1, int(pc.height) - 1));
+        uint pidx = uint(ppix.y) * pc.width + uint(ppix.x);
+        float4 pp = asfloat(g.storage_buffers[pc.pos_read].Load4(pidx * 16u));
+        if (pp.w > 0.5 && distance(world_pos, pp.xyz) < pc.params.x)
+        {
+            float4 ph = asfloat(g.storage_buffers[pc.accum_read].Load4(pidx * 16u));
+            out_rgb = ph.rgb;
+            out_len = ph.a;
+        }
+        return;
+    }
+    float2 sp = puv * res - 0.5;
+    float2 base = floor(sp);
+    float2 f = sp - base;
+    float w[4] = { (1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y };
+    int2 off[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+    float3 rgb_sum = float3(0, 0, 0);
+    float len_sum = 0.0;
+    float wsum = 0.0;
+    [unroll] for (int i = 0; i < 4; i++)
+    {
+        int2 p = int2(base) + off[i];
+        if (p.x < 0 || p.y < 0 || p.x >= int(pc.width) || p.y >= int(pc.height))
+            continue;
+        uint pidx = uint(p.y) * pc.width + uint(p.x);
+        float4 pp = asfloat(g.storage_buffers[pc.pos_read].Load4(pidx * 16u));
+        if (pp.w > 0.5 && distance(world_pos, pp.xyz) < pc.params.x)
+        {
+            float4 ph = asfloat(g.storage_buffers[pc.accum_read].Load4(pidx * 16u));
+            rgb_sum += w[i] * ph.rgb;
+            len_sum += w[i] * ph.a;
+            wsum += w[i];
+        }
+    }
+    if (wsum > 0.5)
+    {
+        out_rgb = rgb_sum / wsum;
+        out_len = len_sum / wsum;
+    }
+}
 // Tonemap-weighted space for stable HDR averaging (UE RGBToDenoiserSpace).
 float3 to_tm(float3 v) { return v / (1.0 + dot(v, float3(0.2126, 0.7152, 0.0722)) * pc.params.w); }
 float3 from_tm(float3 v)
@@ -111,15 +165,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float2 puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
             if (all(puv >= 0.0) && all(puv <= 1.0))
             {
-                int2 ppix = clamp(int2(floor(puv * res)), int2(0, 0),
-                                  int2(int(pc.width) - 1, int(pc.height) - 1));
-                uint pidx = uint(ppix.y) * pc.width + uint(ppix.x);
-                float4 ph = asfloat(g.storage_buffers[pc.accum_read].Load4(pidx * 16u));
-                float4 pp = asfloat(g.storage_buffers[pc.pos_read].Load4(pidx * 16u));
-                if (pp.w > 0.5 && distance(world_pos, pp.xyz) < pc.params.x)
+                float3 hist_rgb;
+                float hist_len;
+                fetch_refl_history(puv, world_pos, hist_rgb, hist_len);
+                if (hist_len > 0.5)
                 {
-                    len = min(ph.a + 1.0, pc.params.y);
-                    accum = lerp(ph.rgb, sample_tm, 1.0 / len);
+                    len = min(hist_len + 1.0, pc.params.y);
+                    accum = lerp(hist_rgb, sample_tm, 1.0 / len);
                 }
             }
         }

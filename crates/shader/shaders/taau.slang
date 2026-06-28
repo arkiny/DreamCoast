@@ -107,9 +107,11 @@ void fetch_history_bilinear(float2 puv, float3 world_pos, out float3 out_rgb, ou
             wsum += w[i];
         }
     }
-    // Require a majority of the bilinear footprint to be valid; otherwise it's a disocclusion edge
-    // and falling back to "no history" (current sample) is safer than a mostly-stale blend.
-    if (wsum > 0.5)
+    // Accept whenever ANY of the footprint is a real prior surface (re-normalized by the valid
+    // weight). A higher threshold left foreground silhouette pixels whose 2x2 footprint straddles
+    // the background (sky stores w=0) stuck at "no history" -> those 1px edges crawled every frame;
+    // re-normalizing over just the valid taps lets them accumulate into a stable anti-aliased edge.
+    if (wsum > 1e-3)
     {
         out_rgb = rgb_sum / wsum;
         out_len = len_sum / wsum;
