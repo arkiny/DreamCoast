@@ -585,10 +585,11 @@ struct App {
     /// frames when the internal render extent is smaller than the output. `P_TAAU=0` disables.
     taau: taau::TaauSystem,
     taau_on: bool,
-    /// QHD/UHD: camera sub-pixel jitter for TAAU. Default OFF — on this engine's heavy GDF GI /
-    /// reflection temporal stack the jitter destabilizes those passes (per-frame G-buffer shimmer)
-    /// faster than TAAU can resolve it. FXAA supplies the spatial AA instead; `P_TAAU_JITTER=1`
-    /// re-enables jitter once the jitter is coordinated across all temporal accumulators.
+    /// QHD/UHD: camera sub-pixel jitter for TAAU. Default ON in the upscale path — the jitter is the
+    /// super-sampling signal that reconstructs full-res detail (Halton(2,3), ±0.5px). It is now
+    /// coordinated across every screen-space temporal accumulator: TAAU + GI denoiser + reflection
+    /// resolve all reproject history sub-pixel-accurately (B1/B2), so the jitter resolves into sharp
+    /// detail instead of shimmer. Only active when TAAU is (cw<sw); `P_TAAU_JITTER=0` forces it off.
     taau_jitter: bool,
     // Profiler UI state.
     profiler_on: bool,
@@ -1557,7 +1558,7 @@ impl App {
             render_scale,
             taau,
             taau_on: quality::env_bool("P_TAAU", true),
-            taau_jitter: quality::env_bool("P_TAAU_JITTER", false),
+            taau_jitter: quality::env_bool("P_TAAU_JITTER", true),
             profiler_on,
             slot_pass_names,
             gpu_timings: Vec::new(),
