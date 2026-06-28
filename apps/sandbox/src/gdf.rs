@@ -15,8 +15,8 @@
 use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_render::{ComputePassInfo, RenderGraph, ResourceId};
 use rhi::{
-    BackendKind, ComputePipeline, ComputePipelineDesc, Device, Extent2D, Format, StorageBuffer,
-    StorageBufferDesc, Volume, VolumeDesc,
+    BackendKind, CommandBuffer, ComputePipeline, ComputePipelineDesc, Device, Extent2D, Format,
+    StorageBuffer, StorageBufferDesc, Volume, VolumeDesc,
 };
 
 use crate::HDR_FORMAT;
@@ -86,10 +86,15 @@ pub(crate) struct GdfSystem {
     num_cards: u32,
     cache_capture_pipeline: Option<ComputePipeline>,
     cache_view_pipeline: Option<ComputePipeline>,
-    /// C8b2: ping-pong cached radiance (re-lit each frame; the gather reads last frame's for
-    /// multibounce). `cache_frame` selects the read/write pair.
-    cache_radiance: [Option<StorageBuffer>; 2],
+    /// C8b2: ring of cached radiance (re-lit each frame; the gather reads last frame's for
+    /// multibounce). `cache_frame` selects the read/write slot. The sync path uses a 2-slot
+    /// ping-pong ([0]/[1], %2); the async-compute path uses a 3-slot ring (%3) so the slot the
+    /// async queue writes is never one an in-flight graphics frame still reads (no WAR hazard).
+    cache_radiance: [Option<StorageBuffer>; 3],
     cache_frame: u32,
+    /// Async-compute relight: the surface-cache relight runs on the compute queue overlapping the
+    /// graphics frame, and consumers read the PREVIOUS frame's radiance (1-frame latency). Opt-in.
+    cache_async: bool,
     cache_light_pipeline: Option<ComputePipeline>,
     /// Stage D2b: per-card camera-frustum visibility (1 uint/card; 1 = on-screen) driving the
     /// relight budget, + the compute pipeline that fills it. `None` until the cache is built.
@@ -404,8 +409,9 @@ impl GdfSystem {
             num_cards: 0,
             cache_capture_pipeline,
             cache_view_pipeline,
-            cache_radiance: [None, None],
+            cache_radiance: [None, None, None],
             cache_frame: 0,
+            cache_async: false,
             cache_light_pipeline,
             card_vis: None,
             cache_vis_pipeline,
@@ -763,7 +769,7 @@ impl GdfSystem {
         };
         self.cache_pos = make()?;
         self.cache_albedo = make()?;
-        self.cache_radiance = [make()?, make()?];
+        self.cache_radiance = [make()?, make()?, make()?];
         // Stage D2b: 1 uint / card visibility flag (filled each frame by record_cache_visibility).
         self.card_vis = Some(device.create_storage_buffer(&StorageBufferDesc {
             size: (num_cards as u64) * 4,
@@ -792,6 +798,12 @@ impl GdfSystem {
         self.cache_light_pipeline.is_some()
     }
 
+    /// Opt into running the surface-cache relight on the async-compute queue (consumers read the
+    /// previous frame's radiance). Switches the radiance ring from a 2-slot ping-pong to 3 slots.
+    pub(crate) fn set_cache_async(&mut self, on: bool) {
+        self.cache_async = on;
+    }
+
     /// Bump the cache radiance ping-pong (end-of-frame), so next frame's gather + the
     /// consumers read the buffer this frame lit.
     pub(crate) fn advance_cache(&mut self) {
@@ -804,8 +816,15 @@ impl GdfSystem {
     pub(crate) fn surface_cache_read(&self) -> Option<(u32, u32, u32, u32, u32)> {
         let cards = self.cards.as_ref()?.storage_index();
         let pos = self.cache_pos.as_ref()?.storage_index();
-        let write = (self.cache_frame % 2) as usize;
-        let rad = self.cache_radiance[write].as_ref()?.storage_index();
+        // Sync: consumers read the slot this frame's (graph) relight wrote. Async: the relight runs
+        // on the compute queue overlapping this frame, so consumers read the PREVIOUS frame's slot
+        // (the most recent completed relight; the cross-queue semaphore guards it).
+        let slot = if self.cache_async {
+            ((self.cache_frame + 2) % 3) as usize
+        } else {
+            (self.cache_frame % 2) as usize
+        };
+        let rad = self.cache_radiance[slot].as_ref()?.storage_index();
         Some((cards, pos, rad, self.num_cards, self.card_tile))
     }
 
@@ -952,6 +971,117 @@ impl GdfSystem {
                 Ok(())
             },
         );
+    }
+
+    /// Async-compute relight: record the per-card visibility and surface-cache relight directly
+    /// onto a compute command buffer (not the render graph) so it runs on the async-compute queue,
+    /// overlapping the graphics frame. Writes the current ring slot (`cache_frame % 3`); both the
+    /// gather and the graphics consumers read the previous slot `((cache_frame + 2) % 3)`. The
+    /// scene GDF, albedo and clip volumes are already in SHADER_READ_ONLY (baked once) so no layout
+    /// transition is needed; the radiance/cards/positions storage buffers are CONCURRENT-shared.
+    /// Manual barriers order the visibility write before the relight read, and the relight write
+    /// before the queue signal.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_cache_async(
+        &self,
+        cmd: &CommandBuffer,
+        planes: [[f32; 4]; 6],
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        spp: u32,
+        frame: u32,
+        reset: bool,
+        relight_period: u32,
+        alpha: f32,
+        feedback: bool,
+    ) {
+        let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
+        let pipe = self
+            .cache_light_pipeline
+            .as_ref()
+            .expect("cache light pipeline");
+        let cards = self.cards.as_ref().expect("cards").storage_index();
+        let cpos = self.cache_pos.as_ref().expect("cache pos").storage_index();
+        let calb = self
+            .cache_albedo
+            .as_ref()
+            .expect("cache albedo")
+            .storage_index();
+        // 3-slot ring: write this frame's slot, gather + consumers read the previous slot.
+        let read = ((self.cache_frame + 2) % 3) as usize;
+        let write = (self.cache_frame % 3) as usize;
+        let rad_read_buf = self.cache_radiance[read].as_ref().expect("rad read");
+        let rad_write_buf = self.cache_radiance[write].as_ref().expect("rad write");
+        let rad_read = rad_read_buf.storage_index();
+        let rad_write = rad_write_buf.storage_index();
+        let num_cards = self.num_cards;
+        let num_texels = num_cards * self.card_tile * self.card_tile;
+        let sampled = vol.sampled_index();
+        let clip = self.clip_descriptor().unwrap_or((0, 1));
+        let aabb_min = self.scene_aabb_min;
+        let aabb_max = self.scene_aabb_max;
+        let diag = {
+            let d = [
+                aabb_max[0] - aabb_min[0],
+                aabb_max[1] - aabb_min[1],
+                aabb_max[2] - aabb_min[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+
+        // Per-card camera visibility (this frame), read by the relight budget. Same as the graph
+        // path's record_cache_visibility, recorded inline on the compute queue.
+        let card_vis_index = match (
+            feedback,
+            self.cache_vis_pipeline.as_ref(),
+            self.card_vis.as_ref(),
+        ) {
+            (true, Some(vis_pipe), Some(vis_buf)) => {
+                let vis_out = vis_buf.storage_index();
+                cmd.bind_compute_pipeline(vis_pipe);
+                cmd.push_constants_compute(&cache_vis_push(&planes, cards, vis_out, num_cards));
+                cmd.dispatch(num_cards.div_ceil(64), 1, 1);
+                cmd.storage_buffer_barrier_compute(vis_buf); // visibility write -> relight read
+                vis_out
+            }
+            _ => u32::MAX,
+        };
+
+        // The gather reads the previous slot, written by the previous async submit on this queue —
+        // order that write before this read.
+        cmd.storage_buffer_barrier_compute(rad_read_buf);
+        cmd.bind_compute_pipeline(pipe);
+        cmd.push_constants_compute(&cache_light_push(
+            cards,
+            cpos,
+            calb,
+            rad_read,
+            rad_write,
+            sampled,
+            num_cards,
+            self.card_tile,
+            num_texels,
+            spp,
+            frame,
+            u32::from(reset),
+            sun_dir,
+            sun_intensity,
+            aabb_min,
+            0.0,
+            aabb_max,
+            diag,
+            0.25,
+            if reset { 1.0 } else { alpha },
+            diag * 0.01,
+            diag,
+            clip.0,
+            clip.1,
+            relight_period.max(1),
+            card_vis_index,
+        ));
+        cmd.dispatch(num_texels.div_ceil(64), 1, 1);
+        // Make the relight write available before the queue signals (graphics reads it next frame).
+        cmd.storage_buffer_barrier_compute(rad_write_buf);
     }
 
     /// C8b1: capture the surface cache once — per card texel, sphere-trace the scene GDF

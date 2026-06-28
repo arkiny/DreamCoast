@@ -198,6 +198,42 @@ Part B(지터 재구성)가 실현했으니, 이제 **TAAU 켠 상태로** rende
 **트랙 결론**: 내부 렌더 스케일 + TAAU 시간적 재구성으로 **무거운 씬을 거의 네이티브 품질로 고프레임**에 도달
 (DX Sponza 42→94fps). 남은 격차는 VK 구조적 바닥(async-compute 후속)과 진짜 QHD 출력의 디스플레이 클램프(측정 한계).
 
+## Stage 6 — async-compute 캐시 relight 오버랩 (VK 헤드룸, 2026-06-28)
+
+Stage 2/3에서 VK가 해상도-독립 `sdf_cache_light`(VK 프레임의 ~34%, 최대 단일 패스)에 막혀 90fps 미달이라
+했고, Stage 5에서도 VK는 0.33까지 낮춰야 했다. 그 relight를 **async-compute 큐로 옮겨 그래픽스 프레임과
+오버랩**(소비자는 1프레임 지연된 radiance 읽음 — 캐시는 이미 상각+EMA라 무영향). **opt-in `P_ASYNC_CACHE=1`**.
+
+구현(기존 프리미티브 최대 재사용 = 리스크 최소):
+- **볼륨 CONCURRENT 공유**(Step 1 `c3e3ad5`): GDF/albedo/clip 3D 볼륨을 graphics+compute 패밀리 공유로
+  (relight가 compute 큐에서 샘플). 바이트 동일.
+- **3-슬롯 radiance 링**(2→3): async가 쓰는 슬롯이 in-flight 그래픽스 프레임이 읽는 슬롯과 절대 안 겹침
+  → **WAR 해저드 제거**(추가 graphics→compute 세마포어 불필요). 남은 건 RAW(graphics-waits-compute)뿐.
+- **off-graph relight**: `record_cache_async`가 visibility+relight를 compute 커맨드버퍼에 직접 기록
+  (compute 전용 배리어 `storage_buffer_barrier_compute` 신설 — 컴퓨트 패밀리는 vertex/fragment 스테이지 불가).
+  볼륨은 베이크 후 SHADER_READ_ONLY 고정이라 레이아웃 전이 불필요(volume_to_sampled는 이미 no-op).
+- **cross-frame 동기화 = 기존 submit_async 재사용 + 재배치**: 그래픽스를 컴퓨트 submit *앞에* 내보내
+  (D3D12는 async_fence가 monotonic이라 직전 값을 대기), Vulkan은 전용 `cache_done[2]`(프레임 패리티) 바이너리
+  세마포어로 직전 relight 대기(VERTEX 대기 스테이지가 큐 전체를 게이트 → 컴퓨트 소비자 정합). compute
+  커맨드버퍼 재사용 게이트용 `cache_compute_fence`(per-fif) 신설 + `ComputeQueue::submit_fenced`.
+
+### 측정 (Sponza GDF, 출력 2052×1133, RENDER_SCALE 0.5, PROFILE_GPU 그래픽스 큐, 3회)
+| | sync | async | 비고 |
+|---|---:|---:|---|
+| **VK** | 14.7–15.3ms (~68fps) | **9.7–10.4ms (~101fps ✅)** | sdf_cache_light(5ms)가 그래픽스 큐에서 사라짐 |
+| DX | 11.1–12.4ms | 7.7–14.5ms (편차 큼) | D3D12 cross-queue 스케줄링 불안정 → 권장 안 함 |
+
+- **VK: 일관된 ~33%(≈5ms) 단축 → 0.5에서 90fps 돌파(101fps)**. Stage 5에서 VK가 90fps에 0.33 필요했던 걸
+  **0.5(더 선명)로 올림**. compute 경합으로 gdf_reflect가 다소 느려지나 순이득 큼.
+- **DX는 편차 과대**(7.7–14.5ms): D3D12 큐 스케줄링이 1프레임 지연 마진을 들쭉날쭉 소화 → 스톨. DX는 이미
+  sync로 0.5 근처 90fps라 async 불필요. **기본 off 유지, DX엔 권장 안 함**.
+- **정확성/안정성**: async 출력 vs sync 수렴 0.153/ch(1프레임 지연=무시 가능), **정적 프레임간 diff
+  async 0.149 == sync 0.149(max 251 동일)** = async가 떨림 추가 안 함(잔차는 Sponza 스토캐스틱+TAAU). Vulkan
+  검증 클린, 갤러리(기본 off) DX/VK 0.000 바이트 동일. 티어 미결속(opt-in 노브로만 노출).
+
+**결론**: async-compute로 **VK QHD 헤드룸 확보**(VK 0.5 = 101fps, sync 대비 +33%). DX는 스케줄링 편차로
+보류(기본 off). VK/UHD 고프레임의 마지막 구조적 레버 = ✅(VK), DX 후속(드라이버 스케줄링/우선순위 조사).
+
 ## 게이트 (Sponza 트랙과 동일)
 - PROFILE_GPU before/after, 양 백엔드, **갤러리 무회귀(render_scale=1=바이트 동일 앵커)**, DX≡VK,
   Vulkan 검증 클린, fmt+clippy. 업스케일 품질은 PT 잔차 + 육안 + (가능하면) 풀해상 레퍼런스 대비.

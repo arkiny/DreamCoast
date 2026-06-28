@@ -1219,7 +1219,21 @@ impl MetalComputeQueue {
     /// the graphics submit's fence.
     pub fn submit(&self, cmd: &MetalCommandBuffer, signal: &MetalSemaphore) -> Result<()> {
         let _ = &self.shared;
-        cmd.commit_signaling(signal.event(), signal.next_value());
+        let _ = cmd.commit_signaling(signal.event(), signal.next_value());
+        Ok(())
+    }
+
+    /// Submit async-compute work, signaling `signal`'s event (graphics waits it) AND `fence` (CPU
+    /// reuse tracking) — for the cross-frame cache relight.
+    pub fn submit_fenced(
+        &self,
+        cmd: &MetalCommandBuffer,
+        signal: &MetalSemaphore,
+        fence: &MetalFence,
+    ) -> Result<()> {
+        let _ = &self.shared;
+        let committed = cmd.commit_signaling(signal.event(), signal.next_value());
+        fence.set(committed);
         Ok(())
     }
 }
