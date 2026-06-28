@@ -62,9 +62,29 @@ step 수 감소. UE/Frostbite의 거리 기반 cone/LOD march. 단일 노브 `gd
   perf-tier 수용(sponza 트랙 한도 0.76 대비 여유). High 티어는 cone_k=0=풀품질. ✓
 - fmt/clippy(-D warnings) 클린, Vulkan 검증 클린(기존 `VK_NV_external_memory` 노트만). ✓
 
-### P1 — 스크린 프로브 GI (최대 레버, 분석 격차①)
-픽셀당 GI 레이를 **16×16 타일당 1 프로브** 추적 + depth/normal-aware 보간으로 교체. 추적 원점 ~64× 감소.
-기존 `gdf_gi_upsample.slang`(joint-bilateral) 인프라 재사용. RenderQuality 티어 결속.
+### P1 — sparse 스크린 GI 프로브 (최대 레버, 분석 격차①) (완료, 2026-06-28)
+GI 추적을 더 sparse한 해상도로 — **하프(1/2)→쿼터(1/4)** = 추적 원점 4× 감소(풀해상 대비 16×). 기존
+`gdf_gi_upsample.slang`(joint-bilateral)이 이름만 "half"일 뿐 수학은 **임의 배율 bilinear + edge-stopping**
+이라 source dims만 바꾸면 그대로 재사용. 이게 UE5 Lumen ScreenProbeGather의 **공간 sparse 절반**(sparser
+추적 원점 + guided 보간); octahedral 방향 프로브는 후속 정제. **단일 노브 `quality.rs gi_res_div`**
+(Low/Med **4**=쿼터 / High 2[half_res off라 무효]). `gi_half_res` 게이팅 재사용 → 콘텐츠만, 갤러리는
+풀해상(바이트 동일). `P_GI_RES_DIV` 오버라이드. 파일: `quality.rs`/`main.rs`(노브+배선; 셰이더 무변).
+
+#### before/after (RTX 2070 SUPER, 1280×720, Med; before = P3)
+| 패스 | DX before→after | VK before→after |
+|---|---:|---:|
+| **gdf_gi** | 2.01 → **0.71** (−65%) | 2.93 → **0.97** (−67%) |
+| **프레임 총합** | 11.97 → **10.40** (~96fps) | 14.36 → **12.72** (~79fps) |
+
+누적(baseline→P1): **DX 12.59→10.40 (79→96fps), VK 16.74→12.72 (60→79fps).** 새 Top-2 = sdf_cache_light
+(DX 3.0 / VK 4.4) + gdf_reflect (DX 2.8 / VK 3.4) → P2가 캐시 공략.
+
+#### 게이트 (정직 보고)
+- **무회귀(갤러리)**: DX 0.000/ch(max 1), VK 0.000/ch(max 0=bit-identical). 갤러리 풀해상=불변. ✓
+- **DX≡VK(Sponza)**: 0.005/ch(max 229) — P3와 동일, 파리티 중립. ✓
+- **품질**: P3→P1 마진 0.357/ch(max 25, 0.04% >8); 누적 base→P1 0.534/ch(0.39% >8, sponza 한도 0.76 내).
+  쿼터-res GI가 temporal EMA+à-trous로 잘 수렴 — Sponza 데모 육안 정상(얼룩/광 누설 없음). ✓
+- fmt/clippy 클린, Vulkan 검증 클린. ✓
 
 ### P2 — 샘플 기반 캐시 피드백 + 우선순위 (VK 바닥, 분석 격차④)
 `sdf_cache_light`의 이진 카메라-가시성을 **GI/reflect 소비자가 실제 샘플한 카드 마크 + staleness 버킷**으로.
