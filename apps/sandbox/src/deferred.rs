@@ -265,6 +265,7 @@ impl DeferredRenderer {
         override_material: bool,
         metallic_override: f32,
         roughness_override: f32,
+        mip_bias: f32,
     ) {
         let sky = ClearColor {
             r: ambient,
@@ -305,6 +306,7 @@ impl DeferredRenderer {
                         obj.base_color,
                         m,
                         rgh,
+                        mip_bias,
                         [obj.tex[0], mr_tex, obj.tex[2], obj.tex[3]],
                         obj.transform.to_cols_array(),
                     ));
@@ -319,6 +321,7 @@ impl DeferredRenderer {
                     [GROUND_ALBEDO[0], GROUND_ALBEDO[1], GROUND_ALBEDO[2], 1.0],
                     0.0,
                     0.9,
+                    0.0, // ground is untextured -> bias irrelevant
                     [NO_TEXTURE; 4],
                     Mat4::IDENTITY.to_cols_array(),
                 ));
@@ -473,11 +476,13 @@ impl DeferredRenderer {
 /// metallic/roughness(16), texture indices u32x4 (16), model mat4 (64). `model` is the
 /// object->world transform the vertex shader uses for the world-space position and
 /// normal G-buffer outputs (the `mvp` already folds it in for clip space).
+#[allow(clippy::too_many_arguments)]
 fn gbuffer_push(
     mvp: [f32; 16],
     base_color: [f32; 4],
     metallic: f32,
     roughness: f32,
+    mip_bias: f32,
     tex: [u32; 4],
     model: [f32; 16],
 ) -> [u8; 176] {
@@ -491,6 +496,7 @@ fn gbuffer_push(
     }
     pc[80..84].copy_from_slice(&metallic.to_le_bytes());
     pc[84..88].copy_from_slice(&roughness.to_le_bytes());
+    pc[88..92].copy_from_slice(&mip_bias.to_le_bytes()); // mr_factor.z = texture LOD bias
     for (i, t) in tex.iter().enumerate() {
         let o = 96 + i * 4;
         pc[o..o + 4].copy_from_slice(&t.to_le_bytes());
