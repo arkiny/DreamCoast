@@ -140,6 +140,9 @@ pub(crate) struct SceneObject {
     /// base color, metallic-roughness, normal, emissive bindless indices
     /// (`NO_TEXTURE` if absent).
     pub(crate) tex: [u32; 4],
+    /// Alpha-test cutoff for `alphaMode: MASK` (0.0 = opaque, no test). Drives the G-buffer
+    /// cutout discard and the masked-shadow discard from one value.
+    pub(crate) alpha_cutoff: f32,
     pub(crate) casts_shadow: bool,
 }
 
@@ -871,6 +874,7 @@ impl App {
                         .map(|t| t.average_linear()),
                     model.material.base_color_factor,
                 ),
+                alpha_cutoff: 0.0,
             });
             let mat_chrome = material_registry.add(MaterialDesc {
                 base_color: [0.95, 0.96, 0.97, 1.0],
@@ -878,6 +882,7 @@ impl App {
                 roughness: 0.08,
                 tex: [NO_TEXTURE; 4],
                 albedo: registry::representative_albedo(None, [0.95, 0.96, 0.97, 1.0]),
+                alpha_cutoff: 0.0,
             });
             let mat_copper = material_registry.add(MaterialDesc {
                 base_color: [0.95, 0.64, 0.54, 1.0],
@@ -885,6 +890,7 @@ impl App {
                 roughness: 0.35,
                 tex: [NO_TEXTURE; 4],
                 albedo: registry::representative_albedo(None, [0.95, 0.64, 0.54, 1.0]),
+                alpha_cutoff: 0.0,
             });
             let mat_red = material_registry.add(MaterialDesc {
                 base_color: [0.85, 0.25, 0.2, 1.0],
@@ -892,6 +898,7 @@ impl App {
                 roughness: 0.5,
                 tex: [NO_TEXTURE; 4],
                 albedo: registry::representative_albedo(None, [0.85, 0.25, 0.2, 1.0]),
+                alpha_cutoff: 0.0,
             });
             // Spawn order defines the deterministic draw / TLAS-instance order (model,
             // chrome, copper, cube) — the order the legacy flat list used.

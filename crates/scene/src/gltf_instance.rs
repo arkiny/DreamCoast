@@ -143,6 +143,7 @@ mod tests {
                 metallic_roughness: None,
                 normal: None,
                 emissive: None,
+                alpha_cutoff: 0.0,
             }],
             images: vec![],
         }

@@ -102,10 +102,11 @@ impl DeferredRenderer {
             fragment_entry: "fsMain",
             color_formats: &[], // depth-only
             topology: PrimitiveTopology::TriangleList,
-            vertex_layout: VertexLayout::MeshPosition,
+            // Full mesh layout (pos/normal/uv): the UV feeds the masked alpha-test discard.
+            vertex_layout: VertexLayout::Mesh,
             blend: BlendMode::Opaque,
-            push_constant_size: 64, // light_mvp mat4
-            bindless: true,         // for the root-constants param (push constants)
+            push_constant_size: 80, // light_mvp mat4(64) + base_color_tex u32 + alpha_cutoff f32 + pad8
+            bindless: true,         // push constants + the bindless base-color texture (masked)
             uniform_buffer: false,
             depth_test: true,
             depth_format: Some(DEPTH_FORMAT),
@@ -238,7 +239,10 @@ impl DeferredRenderer {
                         continue;
                     }
                     let lmvp = (light_vp * obj.transform).to_cols_array();
-                    cmd.push_constants(&mat4_bytes(&lmvp));
+                    // Masked casters carry their base-color texture + cutoff so the depth pass
+                    // discards the same texels the lit pass does; opaque casters pass cutoff 0
+                    // (base-color index unused) -> depth-only, identical to the pre-mask pass.
+                    cmd.push_constants(&shadow_push(lmvp, obj.tex[0], obj.alpha_cutoff));
                     cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
                     cmd.bind_index_buffer(&obj.mesh.ibuf, true);
                     cmd.draw_indexed(obj.mesh.index_count, 0, 0);
@@ -307,6 +311,7 @@ impl DeferredRenderer {
                         m,
                         rgh,
                         mip_bias,
+                        obj.alpha_cutoff,
                         [obj.tex[0], mr_tex, obj.tex[2], obj.tex[3]],
                         obj.transform.to_cols_array(),
                     ));
@@ -322,6 +327,7 @@ impl DeferredRenderer {
                     0.0,
                     0.9,
                     0.0, // ground is untextured -> bias irrelevant
+                    0.0, // opaque -> no alpha test
                     [NO_TEXTURE; 4],
                     Mat4::IDENTITY.to_cols_array(),
                 ));
@@ -483,6 +489,7 @@ fn gbuffer_push(
     metallic: f32,
     roughness: f32,
     mip_bias: f32,
+    alpha_cutoff: f32,
     tex: [u32; 4],
     model: [f32; 16],
 ) -> [u8; 176] {
@@ -497,6 +504,7 @@ fn gbuffer_push(
     pc[80..84].copy_from_slice(&metallic.to_le_bytes());
     pc[84..88].copy_from_slice(&roughness.to_le_bytes());
     pc[88..92].copy_from_slice(&mip_bias.to_le_bytes()); // mr_factor.z = texture LOD bias
+    pc[92..96].copy_from_slice(&alpha_cutoff.to_le_bytes()); // mr_factor.w = alpha-test cutoff
     for (i, t) in tex.iter().enumerate() {
         let o = 96 + i * 4;
         pc[o..o + 4].copy_from_slice(&t.to_le_bytes());
@@ -534,11 +542,15 @@ fn pbr_push(
     pc
 }
 
-/// View a column-major 4x4 matrix as push-constant bytes.
-fn mat4_bytes(m: &[f32; 16]) -> [u8; 64] {
-    let mut pc = [0u8; 64];
-    for (i, f) in m.iter().enumerate() {
+/// Pack the shadow push block (80 bytes): light_mvp (64), base_color bindless index (u32),
+/// alpha cutoff (f32), then 8 bytes padding. `cutoff == 0` (opaque) leaves the texture index
+/// unused — the shadow shader stays depth-only, identical to the pre-mask pass.
+fn shadow_push(light_mvp: [f32; 16], base_color_tex: u32, alpha_cutoff: f32) -> [u8; 80] {
+    let mut pc = [0u8; 80];
+    for (i, f) in light_mvp.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
+    pc[64..68].copy_from_slice(&base_color_tex.to_le_bytes());
+    pc[68..72].copy_from_slice(&alpha_cutoff.to_le_bytes());
     pc
 }
