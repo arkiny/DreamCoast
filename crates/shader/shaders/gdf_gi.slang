@@ -49,9 +49,13 @@ struct GiPush
     float clamp_max;        // firefly clamp: max bounce-sample radiance component (1e30 = off)
     uint clip_desc;         // Stage B: clipmap descriptor storage-buffer index
     uint clip_count;        // Stage B: clipmap level count (1 = single volume = legacy)
-    float3 ground_albedo;   // analytic ground material (not in the albedo volume)
+    // xyz = analytic ground material (not in the albedo volume); w = cone_k (P3 cone-trace LOD
+    // slope; 0 = legacy linear march). float4, NOT float3 + a trailing scalar: HLSL/SPIR-V pack
+    // a scalar after a float3 at +12 but MSL pads the float3 to +16, so the old layout mis-read
+    // the following scalars on Metal (max_steps picked up cone_k's bytes -> wrong GI). A float4's
+    // .w sits at +12 on all three backends; max_steps then gets its own clean 16-byte row.
+    float4 ground_albedo;
     uint max_steps;         // Stage D3: bounce-ray march step cap (64 = legacy / gallery)
-    float cone_k;           // P3: cone-trace LOD slope (0 = legacy linear march = byte-identical)
 };
 
 [[vk::push_constant]]
@@ -151,7 +155,7 @@ float gi_shadow(float3 origin, float3 dir)
             return 0.0;
         res = min(res, 16.0 * h / t);
         // P3 cone-trace LOD: widen the max step with distance (cone_k=0 => clamp(.,0.01,0.2) legacy).
-        t += clamp(h, 0.01, max(0.2, pc.cone_k * t));
+        t += clamp(h, 0.01, max(0.2, pc.ground_albedo.w * t));
         if (t > maxt)
             break;
     }
@@ -195,7 +199,7 @@ float3 trace_bounce(float3 origin, float3 dir)
             // nearest object's colour for a ground hit — use the ground's own albedo
             // ([0.8], matching deferred.rs) so floor bounce isn't tinted by nearby objects.
             bool is_ground = (p.y - GROUND_Y) < geo_inside(p);
-            float3 hit_albedo = is_ground ? pc.ground_albedo : albedo_at(p);
+            float3 hit_albedo = is_ground ? pc.ground_albedo.xyz : albedo_at(p);
             // Lambertian: the bounce surface re-emits albedo/PI * irradiance — the same
             // 1/PI the deferred direct term uses. Omitting it over-brightened indirect
             // diffuse by ~PI (the GDF-GI over-lighting vs the path tracer).
@@ -203,7 +207,7 @@ float3 trace_bounce(float3 origin, float3 dir)
             return hit_albedo * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / PI);
         }
         // P3 cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01) legacy).
-        t += max(d, max(0.01, pc.cone_k * t));
+        t += max(d, max(0.01, pc.ground_albedo.w * t));
         if (t > maxt)
             break;
     }

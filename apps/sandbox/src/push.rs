@@ -791,16 +791,18 @@ pub(crate) fn gdf_gi_push(
     // level count (1 = single volume = legacy single-level field).
     pc[200..204].copy_from_slice(&clip_desc.to_le_bytes());
     pc[204..208].copy_from_slice(&clip_count.to_le_bytes());
-    // Analytic-ground albedo (float3 at offset 208): floor bounce hits re-light with this
-    // instead of albedo_at() (no ground data in the volume -> nearest object's colour).
+    // Analytic-ground albedo as a float4 at offset 208 (xyz = albedo, w = cone_k): floor bounce
+    // hits re-light with xyz instead of albedo_at(). Packed float4 (not float3 + trailing scalars)
+    // so the Metal/MSL push layout matches HLSL/SPIR-V — a scalar after a float3 packs at +12 on
+    // HLSL/SPIR-V but pads to +16 on MSL, which previously mis-aligned max_steps/cone_k on Metal.
     for (i, v) in ground_albedo.iter().enumerate() {
         pc[208 + i * 4..212 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
-    // Stage D3: bounce-ray march step cap (the .w after ground_albedo). Content lowers it; the
-    // gallery passes the legacy 64 (byte-identical).
-    pc[220..224].copy_from_slice(&max_steps.to_le_bytes());
-    // P3: cone-trace LOD slope on its own 16-byte-aligned row (offset 224). 0 = legacy linear march.
-    pc[224..228].copy_from_slice(&cone_k.to_le_bytes());
+    // P3 cone-trace LOD slope = ground_albedo.w (offset 220). 0 = legacy linear march.
+    pc[220..224].copy_from_slice(&cone_k.to_le_bytes());
+    // Stage D3: bounce-ray march step cap on its own 16-byte row (offset 224). Content lowers it;
+    // the gallery passes the legacy 64.
+    pc[224..228].copy_from_slice(&max_steps.to_le_bytes());
     pc
 }
 
