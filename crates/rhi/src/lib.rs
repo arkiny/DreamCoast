@@ -1641,6 +1641,22 @@ impl CommandBuffer {
         }
     }
 
+    /// COMPUTE-stage-only UAV barrier, for command buffers recorded on the async-compute queue
+    /// (whose family can't reference the vertex/fragment stages of `storage_buffer_barrier`). On
+    /// D3D12/Metal a UAV barrier is queue-agnostic, so it falls back to the regular barrier.
+    pub fn storage_buffer_barrier_compute(&self, buffer: &StorageBuffer) {
+        match (self, buffer) {
+            #[cfg(windows)]
+            (Self::Vulkan(c), StorageBuffer::Vulkan(b)) => c.storage_buffer_barrier_compute(b),
+            #[cfg(windows)]
+            (Self::D3d12(c), StorageBuffer::D3d12(b)) => c.storage_buffer_barrier(b),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(c), StorageBuffer::Metal(b)) => c.storage_buffer_barrier(b),
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
     /// Transition a storage buffer (compute write) into indirect-args state for
     /// `draw_indexed_indirect`.
     pub fn storage_buffer_to_indirect(&self, buffer: &StorageBuffer) {
@@ -1889,6 +1905,33 @@ impl ComputeQueue {
             (Self::D3d12(q), CommandBuffer::D3d12(c), Semaphore::D3d12(s)) => q.submit(c, s),
             #[cfg(target_os = "macos")]
             (Self::Metal(q), CommandBuffer::Metal(c), Semaphore::Metal(s)) => q.submit(c, s),
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Submit async-compute work, signaling `signal` (graphics waits it) AND `fence` (so the CPU
+    /// knows the compute command buffer is free to re-record). For the cross-frame cache relight,
+    /// where the graphics fence does not transitively cover this frame's compute submission.
+    pub fn submit_fenced(
+        &self,
+        cmd: &CommandBuffer,
+        signal: &Semaphore,
+        fence: &Fence,
+    ) -> Result<()> {
+        match (self, cmd, signal, fence) {
+            #[cfg(windows)]
+            (Self::Vulkan(q), CommandBuffer::Vulkan(c), Semaphore::Vulkan(s), Fence::Vulkan(f)) => {
+                q.submit_fenced(c, s, f)
+            }
+            #[cfg(windows)]
+            (Self::D3d12(q), CommandBuffer::D3d12(c), Semaphore::D3d12(s), Fence::D3d12(f)) => {
+                q.submit_fenced(c, s, f)
+            }
+            #[cfg(target_os = "macos")]
+            (Self::Metal(q), CommandBuffer::Metal(c), Semaphore::Metal(s), Fence::Metal(f)) => {
+                q.submit_fenced(c, s, f)
+            }
             #[cfg(windows)]
             _ => unreachable!("{MIXED}"),
         }

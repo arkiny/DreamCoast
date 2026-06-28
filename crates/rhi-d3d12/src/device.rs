@@ -785,6 +785,34 @@ impl D3d12ComputeQueue {
             Ok(())
         }
     }
+
+    /// Submit async-compute work, signaling the cross-queue `async_fence` (the graphics queue waits
+    /// it) AND `fence` (so the CPU knows the compute command list is free to re-record). The
+    /// `_signal` semaphore is a D3D12 no-op (facade parity with Vulkan).
+    pub fn submit_fenced(
+        &self,
+        cmd: &D3d12CommandBuffer,
+        _signal: &D3d12Semaphore,
+        fence: &D3d12Fence,
+    ) -> Result<(), EngineError> {
+        unsafe {
+            let list: ID3D12CommandList = cmd.list().cast().map_err(d3d_err)?;
+            self.shared.compute_queue.ExecuteCommandLists(&[Some(list)]);
+            let value = self.shared.async_value.get() + 1;
+            self.shared.async_value.set(value);
+            self.shared
+                .compute_queue
+                .Signal(&self.shared.async_fence, value)
+                .map_err(d3d_err)?;
+            let fv = fence.next_value();
+            self.shared
+                .compute_queue
+                .Signal(fence.raw(), fv)
+                .map_err(d3d_err)?;
+            fence.set_target(fv);
+            Ok(())
+        }
+    }
 }
 
 /// The device's DIRECT queue.

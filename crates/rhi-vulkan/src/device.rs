@@ -1072,6 +1072,29 @@ impl VulkanComputeQueue {
                 .map_err(vk_err)
         }
     }
+
+    /// Submit async-compute work, signaling `signal` (the graphics queue waits it) AND `fence` on
+    /// completion. The fence lets the CPU know the compute command buffer is free to re-record —
+    /// needed for the cross-frame cache relight, where the graphics fence does NOT transitively
+    /// cover this frame's compute (graphics waits the PREVIOUS frame's relight).
+    pub fn submit_fenced(
+        &self,
+        cmd: &VulkanCommandBuffer,
+        signal: &VulkanSemaphore,
+        fence: &VulkanFence,
+    ) -> Result<(), EngineError> {
+        unsafe {
+            let command_buffers = [cmd.raw()];
+            let signal_semaphores = [signal.raw()];
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores);
+            self.shared
+                .device
+                .queue_submit(self.shared.compute_queue, &[submit], fence.raw())
+                .map_err(vk_err)
+        }
+    }
 }
 
 /// The device's queue. Submits command buffers and presents swapchain images.

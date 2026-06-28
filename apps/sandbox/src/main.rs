@@ -427,6 +427,15 @@ struct App {
     in_flight: Vec<Fence>,
     compute_command_buffers: Vec<CommandBuffer>,
     compute_done: Vec<Semaphore>,
+    /// Async-compute surface-cache relight: opt-in toggle + the two cross-frame "relight done"
+    /// semaphores (compute frame N signals `cache_done[N%2]`; graphics frame N waits the previous,
+    /// `cache_done[(N-1)%2]`, so the consumer reads of last frame's radiance are GPU-ordered).
+    async_cache_on: bool,
+    cache_done: Vec<Semaphore>,
+    /// Per-fif fence the async relight signals, so its compute command buffer isn't re-recorded
+    /// while still pending (the graphics fence only transitively covers the PREVIOUS frame's
+    /// relight, not this frame's, on the cross-frame path).
+    cache_compute_fence: Vec<Fence>,
     query_heaps: Vec<QueryHeap>,
     render_finished: Vec<Semaphore>,
 
@@ -1171,6 +1180,16 @@ impl App {
         let async_compute_supported = device.has_async_compute();
         let async_compute_on = async_compute_supported
             && (std::env::var_os("ASYNC_COMPUTE").is_some() || !screenshot_mode);
+        // Async-compute surface-cache relight (QHD/UHD track): the resolution-independent
+        // `sdf_cache_light` pass (the biggest cost in the VK frame) runs on the compute queue
+        // overlapping the graphics frame; consumers read the previous frame's radiance (1-frame
+        // latency, hidden by the cache's existing amortization + EMA). Opt-in (`P_ASYNC_CACHE`);
+        // needs a dedicated compute queue + the cache-lighting pipeline. Particles fall back to the
+        // graph sim when this is on (the two would contend for the single compute submission).
+        let async_cache_on = async_compute_supported
+            && gdf.has_cache_lighting()
+            && std::env::var_os("P_ASYNC_CACHE").is_some();
+        gdf.set_cache_async(async_cache_on);
         let gpu_cull = compute_supported && std::env::var_os("P7_CULL").is_some();
         // Phase 8 M3: replace the rasterized image with an inline ray-query trace.
         let path_trace =
@@ -1351,6 +1370,12 @@ impl App {
         let compute_queue = device.compute_queue();
         let mut compute_command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
         let mut compute_done = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        // Two cross-frame "cache relight done" semaphores (indexed by frame parity, NOT fif): the
+        // async relight signals one, next frame's graphics waits it (1-frame latency).
+        let cache_done = vec![device.create_semaphore()?, device.create_semaphore()?];
+        // Per-fif compute-completion fences (created signaled, like in_flight) gating reuse of the
+        // async relight's compute command buffer.
+        let mut cache_compute_fence = Vec::with_capacity(FRAMES_IN_FLIGHT);
         // GPU profiler: one timestamp query heap per frame in flight (read back after
         // that slot's fence, so the results never stall the GPU). MAX_QUERIES covers
         // (scheduled passes + 1) boundaries with headroom (Phase 9 M1).
@@ -1362,6 +1387,7 @@ impl App {
             in_flight.push(device.create_fence(true)?);
             compute_command_buffers.push(device.create_compute_command_buffer()?);
             compute_done.push(device.create_semaphore()?);
+            cache_compute_fence.push(device.create_fence(true)?);
             query_heaps.push(device.create_query_heap(MAX_QUERIES)?);
         }
         // QHD/UHD track: parse the offscreen render-extent override (`RENDER_RES=WxH`).
@@ -1457,6 +1483,9 @@ impl App {
             in_flight,
             compute_command_buffers,
             compute_done,
+            async_cache_on,
+            cache_done,
+            cache_compute_fence,
             query_heaps,
             render_finished,
             flip_y,
@@ -2695,41 +2724,47 @@ impl App {
             }
             _ => None,
         };
-        // C8b2: re-light the cache (direct sun + sky + multibounce gather from last frame).
+        // Stage D3: period-aware temporal alpha keeps the visible cards converged within the
+        // screenshot warmup as the period rises; gallery (feedback off) keeps the legacy 0.35.
+        let relight_alpha = if self.cache_feedback {
+            (0.35 * (self.cache_relight_period as f32 / 8.0)).clamp(0.35, 0.8)
+        } else {
+            0.35
+        };
+        // This frame's reset flag, captured for the async relight (recorded in the submit section);
+        // the in-graph (sync) path consumes it inline below.
+        let cache_reset_this_frame = self.scene_cache_reset;
+        // C8b2: re-light the cache (direct sun + sky + multibounce gather from last frame). Async:
+        // the relight runs on the compute queue (submit section) and consumers read the previous
+        // frame's radiance — the graph handle is only a placeholder for the consumer reads (the
+        // cross-queue semaphore orders the data). Sync: record visibility + relight in-graph.
         let scene_cache_lit_ext = match (scene_gdf_ext, scene_cache_ext) {
             (Some(gdf_ext), Some(cache_ext)) if self.gdf.has_cache_lighting() => {
                 let ext = graph.import_external("scene_cache_lit");
-                // Stage D2b: fill per-card camera visibility (Y-flip-free planes => DX≡VK), then
-                // relight on-screen cards at the budget period and off-screen cards far less often.
-                let card_vis_ext = if self.cache_feedback {
-                    self.gdf
-                        .record_cache_visibility(&mut graph, frustum_planes(cull_view_proj))
-                } else {
-                    None
-                };
-                // Stage D3: period-aware temporal alpha keeps the visible cards converged within
-                // the screenshot warmup as the period rises (more weight per relight); gallery
-                // (feedback off) keeps the legacy 0.35 = byte-identical.
-                let relight_alpha = if self.cache_feedback {
-                    (0.35 * (self.cache_relight_period as f32 / 8.0)).clamp(0.35, 0.8)
-                } else {
-                    0.35
-                };
-                self.gdf.record_cache_light(
-                    &mut graph,
-                    gdf_ext,
-                    cache_ext,
-                    ext,
-                    self.sun_dir,
-                    self.sun_intensity,
-                    self.cache_relight_spp,
-                    self.frame_no as u32,
-                    self.scene_cache_reset,
-                    self.cache_relight_period,
-                    card_vis_ext,
-                    relight_alpha,
-                );
-                self.scene_cache_reset = false;
+                if !self.async_cache_on {
+                    // Stage D2b: per-card camera visibility (Y-flip-free planes => DX≡VK).
+                    let card_vis_ext = if self.cache_feedback {
+                        self.gdf
+                            .record_cache_visibility(&mut graph, frustum_planes(cull_view_proj))
+                    } else {
+                        None
+                    };
+                    self.gdf.record_cache_light(
+                        &mut graph,
+                        gdf_ext,
+                        cache_ext,
+                        ext,
+                        self.sun_dir,
+                        self.sun_intensity,
+                        self.cache_relight_spp,
+                        self.frame_no as u32,
+                        cache_reset_this_frame,
+                        self.cache_relight_period,
+                        card_vis_ext,
+                        relight_alpha,
+                    );
+                    self.scene_cache_reset = false;
+                }
                 Some(ext)
             }
             _ => None,
@@ -3073,7 +3108,12 @@ impl App {
         let particle_write = self.particles.write_index();
         // Run the sim on the async-compute queue this frame? (Else it's a graph
         // compute pass on the graphics queue, below.)
-        let async_sim = self.particles_on && self.async_compute_supported && self.async_compute_on;
+        // Async cache relight owns the per-frame compute submission; particles fall back to the
+        // graph sim when it's on (avoids two consumers of the single compute command buffer).
+        let async_sim = self.particles_on
+            && self.async_compute_supported
+            && self.async_compute_on
+            && !self.async_cache_on;
         if let (false, Some(particles_ext)) = (async_sim, particles_ext) {
             self.particles
                 .record_sim(&mut graph, particles_ext, sim_dt, self.elapsed);
@@ -3662,6 +3702,58 @@ impl App {
                 signal,
                 &self.in_flight[fif],
             )?;
+        } else if self.async_cache_on && scene_cache_lit_ext.is_some() {
+            // Async surface-cache relight: record visibility + relight onto the compute command
+            // buffer and run it on the compute queue, overlapping this graphics frame. The graphics
+            // queue GPU-waits on the PREVIOUS frame's relight (1-frame latency) so its consumer
+            // reads of last frame's radiance are ordered; the 3-slot ring guarantees the slot this
+            // frame writes is not one an in-flight graphics frame still reads (no WAR). Submit
+            // graphics BEFORE the compute signal so D3D12's fence wait targets the previous value.
+            // The compute command buffer for this fif may still be pending from 2 frames ago (the
+            // graphics fence doesn't cover it on the cross-frame path) — wait its own fence first.
+            self.cache_compute_fence[fif].wait()?;
+            self.cache_compute_fence[fif].reset()?;
+            let ccmd = &self.compute_command_buffers[fif];
+            ccmd.begin()?;
+            self.gdf.record_cache_async(
+                ccmd,
+                frustum_planes(cull_view_proj),
+                self.sun_dir,
+                self.sun_intensity,
+                self.cache_relight_spp,
+                self.frame_no as u32,
+                cache_reset_this_frame,
+                self.cache_relight_period,
+                relight_alpha,
+                self.cache_feedback,
+            );
+            ccmd.end()?;
+            let cur = (self.frame_no % 2) as usize;
+            if self.frame_no == 0 {
+                // No previous relight to wait on; graphics submits normally, the relight still
+                // signals so frame 1's wait pairs up.
+                self.queue.submit(
+                    cmd,
+                    &self.image_available[fif],
+                    signal,
+                    &self.in_flight[fif],
+                )?;
+            } else {
+                let prev = ((self.frame_no + 1) % 2) as usize; // (N-1) mod 2
+                self.queue.submit_async(
+                    cmd,
+                    &self.image_available[fif],
+                    &self.cache_done[prev],
+                    signal,
+                    &self.in_flight[fif],
+                )?;
+            }
+            self.compute_queue.submit_fenced(
+                ccmd,
+                &self.cache_done[cur],
+                &self.cache_compute_fence[fif],
+            )?;
+            self.scene_cache_reset = false;
         } else {
             self.queue.submit(
                 cmd,

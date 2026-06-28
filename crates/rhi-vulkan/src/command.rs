@@ -908,6 +908,18 @@ impl VulkanCommandBuffer {
         );
     }
 
+    /// UAV barrier on a storage buffer, COMPUTE-stage only — for use on the async-compute queue
+    /// (whose family does not support the vertex/fragment stages of `storage_buffer_barrier`).
+    pub fn storage_buffer_barrier_compute(&self, buffer: &VulkanStorageBuffer) {
+        self.buffer_memory_barrier(
+            buffer.raw(),
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+        );
+    }
+
     /// Order a compute write to an indirect-args buffer before its consumption by
     /// `draw_indexed_indirect`.
     pub fn storage_buffer_to_indirect(&self, buffer: &VulkanStorageBuffer) {

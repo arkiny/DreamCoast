@@ -137,7 +137,11 @@ impl MetalCommandBuffer {
 
     /// End any open encoder, signal `event` to `value` (cross-queue ordering for
     /// async compute), and commit. Used by [`crate::device::MetalComputeQueue`].
-    pub(crate) fn commit_signaling(&self, event: &ProtocolObject<dyn MTLEvent>, value: u64) {
+    pub(crate) fn commit_signaling(
+        &self,
+        event: &ProtocolObject<dyn MTLEvent>,
+        value: u64,
+    ) -> Retained<ProtocolObject<dyn MTLCommandBuffer>> {
         self.end_any_encoder();
         let cb = self
             .cmd
@@ -146,6 +150,7 @@ impl MetalCommandBuffer {
             .expect("commit_signaling() without begin()");
         cb.encodeSignalEvent_value(event, value);
         cb.commit();
+        cb
     }
 
     /// Commit the recorded work (ending any open encoder and recording the
