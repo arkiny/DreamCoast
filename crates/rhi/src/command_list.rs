@@ -577,6 +577,34 @@ impl CommandList {
             .push(RhiCommand::SetViewportScissor);
     }
 
+    /// Append `other`'s commands onto this list, rebasing its arena offsets so the
+    /// result is identical to having recorded `other`'s commands directly after this
+    /// list's. Used to concatenate per-pass IR buckets — recorded independently (in
+    /// parallel on job workers, M4 B4) — back into render-graph schedule order.
+    pub fn append(&self, other: CommandList) {
+        let mut dst = self.inner.borrow_mut();
+        let src = other.inner.into_inner();
+        // Offsets in `src`'s commands index `src`'s arenas; after we append those
+        // arenas onto `dst`'s, every `src` offset shifts by `dst`'s current length.
+        let push_base = dst.push.len() as u32;
+        let labels_base = dst.labels.len() as u32;
+        let targets_base = dst.targets.len() as u32;
+        for mut c in src.cmds {
+            match &mut c {
+                RhiCommand::PushConstants { off, .. }
+                | RhiCommand::PushConstantsCompute { off, .. }
+                | RhiCommand::PushConstantsRt { off, .. } => *off += push_base,
+                RhiCommand::BeginDebugLabel { off, .. } => *off += labels_base,
+                RhiCommand::BeginRenderingTargets { off, .. } => *off += targets_base,
+                _ => {}
+            }
+            dst.cmds.push(c);
+        }
+        dst.push.extend_from_slice(&src.push);
+        dst.labels.extend_from_slice(&src.labels);
+        dst.targets.extend_from_slice(&src.targets);
+    }
+
     /// Clear for reuse next frame (keeps allocations).
     pub fn clear(&self) {
         let mut i = self.inner.borrow_mut();
@@ -1192,5 +1220,38 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<CommandList>();
         assert_send::<RhiCommand>();
+    }
+
+    #[test]
+    fn append_concatenates_with_rebased_arenas() {
+        // Recording into one list vs into two buckets + append must produce the same
+        // command stream and arena bytes (with the bucket's offsets rebased).
+        let seq = CommandList::new();
+        seq.push_constants(&[1, 2]);
+        seq.draw(3, 1);
+        seq.push_constants_compute(&[9]);
+        seq.push_constants(&[3, 4]);
+
+        let a = CommandList::new();
+        a.push_constants(&[1, 2]);
+        a.draw(3, 1);
+        let b = CommandList::new();
+        b.push_constants_compute(&[9]);
+        b.push_constants(&[3, 4]);
+        a.append(b);
+
+        assert_eq!(a.len(), seq.len());
+        // Arena bytes match the sequential recording.
+        assert_eq!(a.inner.borrow().push, seq.inner.borrow().push);
+        assert_eq!(a.inner.borrow().push, vec![1, 2, 9, 3, 4]);
+        // The appended `push_constants(&[3,4])` offset was rebased to point past the
+        // first list's arena (so it resolves to [3, 4], not [1, 2]).
+        let inner = a.inner.borrow();
+        match inner.cmds.last().unwrap() {
+            RhiCommand::PushConstants { off, len } => {
+                assert_eq!(&inner.push[*off as usize..(*off + *len) as usize], &[3, 4]);
+            }
+            _ => panic!("expected PushConstants last"),
+        }
     }
 }
