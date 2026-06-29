@@ -74,7 +74,11 @@ float calc_ao(float3 p, float3 n)
         occ += (h - d) * sca;
         sca *= 0.92;
     }
-    return saturate(1.0 - pc.params.y * occ);
+    // Exponential (Beer-Lambert-like) attenuation rather than `saturate(1 - k·occ)`: occlusion
+    // asymptotes toward — but never reaches — zero, so a visible concave corner (which still sees
+    // most of the sky) keeps a soft AO instead of crushing to pure black. The linear form clamped
+    // to 0 in corners and, with weak indirect fill, burned the recesses black.
+    return exp(-pc.params.y * max(occ, 0.0));
 }
 
 [shader("compute")]

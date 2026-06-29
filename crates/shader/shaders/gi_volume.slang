@@ -141,10 +141,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp);
             float3 alb = is_ground ? pc.ground.xyz : albedo_at(hp);
             float sky_fill = pc.params.z * (0.5 + 0.5 * hn.y);
-            // Outgoing radiance = albedo/PI * (direct sun + sky fill + previous-frame indirect at
-            // the hit). The last term is the multibounce that propagates light into enclosed areas.
+            // Outgoing radiance toward the probe (Lambertian). The DIRECT sun + sky fill are
+            // irradiance, so they get the albedo/PI BRDF. The multibounce `indirect` is the stored
+            // average incoming RADIANCE (the volume holds E/PI); converting it to irradiance (×PI)
+            // before the albedo/PI BRDF cancels the PI, so it re-enters as albedo·indirect. Folding
+            // it under the same 1/PI (the old code) made every bounce PI× too weak — interiors that
+            // rely on multibounce (deep nave) came out ~10× too dark per the extra 1/PI each hop.
             float3 indirect = read_volume(hp);
-            sum += alb * (pc.sun.w * ndl * sh + sky_fill + indirect) * (1.0 / GV_PI);
+            sum += alb * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / GV_PI) + alb * indirect;
         }
         else
         {
