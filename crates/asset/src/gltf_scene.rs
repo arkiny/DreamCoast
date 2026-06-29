@@ -40,6 +40,17 @@ pub struct GltfPrimitive {
     pub joints: Option<Vec<[u16; 4]>>,
     /// Per-vertex skin weights, 4 per vertex (parallel to `joints`).
     pub weights: Option<Vec<[f32; 4]>>,
+    /// Morph targets (per-vertex position/normal deltas), in target order; empty if
+    /// the primitive has no morph targets. The animation's morph-weight channel
+    /// (parallel order) blends them: `vertex += Σ wᵢ · targetᵢ.delta` (CPU side data).
+    pub morph_targets: Vec<MorphTarget>,
+}
+
+/// One morph target's per-vertex deltas (parallel to a primitive's `vertices`).
+/// `normals` is present only when the target supplies normal deltas.
+pub struct MorphTarget {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Option<Vec<[f32; 3]>>,
 }
 
 /// A skin: the joint nodes it animates plus their inverse-bind matrices (column-major
@@ -90,13 +101,15 @@ pub struct GltfChannel {
     pub data: ChannelData,
 }
 
-/// The typed output samples of a [`GltfChannel`] (which TRS property it drives).
-/// Morph-target weights are intentionally not parsed here (Stage C).
+/// The typed output samples of a [`GltfChannel`] (which property it drives).
 pub enum ChannelData {
     Translation(Vec<[f32; 3]>),
     /// `[x, y, z, w]` quaternions.
     Rotation(Vec<[f32; 4]>),
     Scale(Vec<[f32; 3]>),
+    /// Morph-target weights — `num_targets` values per keyframe, flattened
+    /// (`times.len() × num_targets`), in target order (Stage C).
+    Weights(Vec<f32>),
 }
 
 /// One animation clip: a set of node-TRS channels and its total duration (the
@@ -260,8 +273,10 @@ fn read_animation(anim: &gltf::Animation, buffers: &[gltf::buffer::Data]) -> Glt
             Some(ReadOutputs::Translations(t)) => ChannelData::Translation(t.collect()),
             Some(ReadOutputs::Rotations(r)) => ChannelData::Rotation(r.into_f32().collect()),
             Some(ReadOutputs::Scales(s)) => ChannelData::Scale(s.collect()),
-            // Morph-target weights are Stage C; skip them for now.
-            Some(ReadOutputs::MorphTargetWeights(_)) | None => continue,
+            Some(ReadOutputs::MorphTargetWeights(w)) => {
+                ChannelData::Weights(w.into_f32().collect())
+            }
+            None => continue,
         };
         channels.push(GltfChannel {
             target_node: ch.target().node().index(),
@@ -314,11 +329,21 @@ fn read_primitive(prim: &gltf::Primitive, buffers: &[gltf::buffer::Data]) -> Glt
     let joints = reader.read_joints(0).map(|j| j.into_u16().collect());
     let weights = reader.read_weights(0).map(|w| w.into_f32().collect());
 
+    // Morph targets: per-vertex position (+ optional normal) deltas, in target order.
+    let morph_targets = reader
+        .read_morph_targets()
+        .map(|(pos, nrm, _tangent)| MorphTarget {
+            positions: pos.map(Iterator::collect).unwrap_or_default(),
+            normals: nrm.map(Iterator::collect),
+        })
+        .collect();
+
     GltfPrimitive {
         vertices,
         indices,
         material: prim.material().index(),
         joints,
         weights,
+        morph_targets,
     }
 }

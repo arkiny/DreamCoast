@@ -17,12 +17,23 @@ use glam::{Quat, Vec3};
 use crate::ecs::{Entity, World};
 use crate::transform::LocalTransform;
 
-/// A TRS keyframe track (one of translation / rotation / scale).
+/// A keyframe track: a node's translation / rotation / scale, or a mesh's
+/// morph-target weights (`num_targets` values per keyframe, flattened).
 enum Track {
     Translation(Vec<Vec3>),
     Rotation(Vec<Quat>),
     Scale(Vec<Vec3>),
+    Weights {
+        num_targets: usize,
+        values: Vec<f32>,
+    },
 }
+
+/// The current morph-target weights of a mesh node, written by [`advance_animation`]
+/// from a morph-weight channel (Stage C). The renderer blends the primitive's morph
+/// targets by these (`vertex += Σ wᵢ · targetᵢ`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MorphWeights(pub Vec<f32>);
 
 /// One animation channel resolved to a target entity.
 struct Channel {
@@ -59,6 +70,19 @@ impl AnimationClip {
                     }
                     ChannelData::Scale(v) => {
                         Track::Scale(v.iter().map(|a| Vec3::from_array(*a)).collect())
+                    }
+                    ChannelData::Weights(v) => {
+                        // values = num_targets per keyframe (×3 for cubic-spline tangents).
+                        let keys = ch.times.len().max(1);
+                        let per_key = if ch.interpolation == Interpolation::CubicSpline {
+                            v.len() / (3 * keys)
+                        } else {
+                            v.len() / keys
+                        };
+                        Track::Weights {
+                            num_targets: per_key,
+                            values: v.clone(),
+                        }
                     }
                 };
                 Some(Channel {
@@ -111,6 +135,7 @@ enum TrsValue {
     Translation(Vec3),
     Rotation(Quat),
     Scale(Vec3),
+    Weights(Vec<f32>),
 }
 
 /// Advance every [`AnimationPlayer`] by `dt` (looping over the clip duration), sample
@@ -153,11 +178,15 @@ pub fn advance_animation(world: &mut World, dt: f32) {
             p.time = u.new_time;
         }
         for w in u.writes {
-            if let Some(lt) = world.get_mut::<LocalTransform>(w.target) {
+            // Morph weights live in their own component; TRS goes to LocalTransform.
+            if let TrsValue::Weights(weights) = w.value {
+                world.insert(w.target, MorphWeights(weights));
+            } else if let Some(lt) = world.get_mut::<LocalTransform>(w.target) {
                 match w.value {
                     TrsValue::Translation(t) => lt.translation = t,
                     TrsValue::Rotation(r) => lt.rotation = r,
                     TrsValue::Scale(s) => lt.scale = s,
+                    TrsValue::Weights(_) => unreachable!(),
                 }
             }
         }
@@ -172,11 +201,69 @@ fn sample_channel(ch: &Channel, t: f32) -> Option<TrsWrite> {
         }
         Track::Scale(v) => TrsValue::Scale(sample_vec3(&ch.times, v, ch.interpolation, t)?),
         Track::Rotation(v) => TrsValue::Rotation(sample_quat(&ch.times, v, ch.interpolation, t)?),
+        Track::Weights {
+            num_targets,
+            values,
+        } => TrsValue::Weights(sample_weights(
+            &ch.times,
+            values,
+            *num_targets,
+            ch.interpolation,
+            t,
+        )?),
     };
     Some(TrsWrite {
         target: ch.target,
         value,
     })
+}
+
+/// Sample a morph-weight track at time `t`: each of the `num_targets` weights is
+/// interpolated independently (the output buffer is `num_targets`-major per key).
+fn sample_weights(
+    times: &[f32],
+    values: &[f32],
+    num_targets: usize,
+    interp: Interpolation,
+    t: f32,
+) -> Option<Vec<f32>> {
+    if num_targets == 0 {
+        return Some(Vec::new());
+    }
+    let (i0, i1, s) = segment(times, t)?;
+    // Value of weight `w` at key `k` (CubicSpline stores [in,val,out] per key → val at
+    // the middle of each key's `3*num_targets` block).
+    let val = |k: usize, w: usize| -> f32 {
+        let base = match interp {
+            Interpolation::CubicSpline => (3 * k + 1) * num_targets,
+            _ => k * num_targets,
+        };
+        values[base + w]
+    };
+    Some(
+        (0..num_targets)
+            .map(|w| match interp {
+                Interpolation::Step => val(i0, w),
+                Interpolation::Linear => val(i0, w) + (val(i1, w) - val(i0, w)) * s,
+                Interpolation::CubicSpline => {
+                    if i0 == i1 {
+                        val(i0, w)
+                    } else {
+                        let dt = times[i1] - times[i0];
+                        let p0 = values[(3 * i0 + 1) * num_targets + w];
+                        let m0 = values[(3 * i0 + 2) * num_targets + w] * dt;
+                        let p1 = values[(3 * i1 + 1) * num_targets + w];
+                        let m1 = values[(3 * i1) * num_targets + w] * dt;
+                        let (s2, s3) = (s * s, s * s * s);
+                        (2.0 * s3 - 3.0 * s2 + 1.0) * p0
+                            + (s3 - 2.0 * s2 + s) * m0
+                            + (-2.0 * s3 + 3.0 * s2) * p1
+                            + (s3 - s2) * m1
+                    }
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Locate the keyframe segment for time `t`: returns `(i0, i1, s)` where `s` is the

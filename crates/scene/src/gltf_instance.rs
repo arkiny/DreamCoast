@@ -152,6 +152,7 @@ mod tests {
                 material: Some(0),
                 joints: None,
                 weights: None,
+                morph_targets: vec![],
             }]],
             materials: vec![GltfMaterial {
                 base_color_factor: [1.0; 4],

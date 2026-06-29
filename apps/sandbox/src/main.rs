@@ -40,6 +40,7 @@ mod gi;
 mod ibl;
 mod level;
 mod mesh;
+mod morph;
 mod particle;
 mod push;
 mod quality;
@@ -423,6 +424,9 @@ struct App {
     /// CPU-skinned primitives (animation Stage B). Empty unless an imported glTF scene
     /// has skins; each is re-skinned + uploaded per frame (inline path only).
     skinned: Vec<skin::SkinnedMesh>,
+    /// CPU-morphed primitives (animation Stage C). Empty unless an imported glTF scene
+    /// has morph targets; each is re-blended + uploaded per frame (inline path only).
+    morphed: Vec<morph::MorphMesh>,
     // Stage C level hot-swap: the discovered `.level` files, the loaded index, and a
     // pending selection from the UI (applied at the next frame's start). Empty unless
     // started in level mode (`LEVEL`).
@@ -849,6 +853,7 @@ impl App {
         // scene's native scale. `None` keeps the legacy gallery framing.
         let mut scene_bounds: Option<level::Bounds> = None;
         let mut gltf_skinned: Vec<skin::SkinnedMesh> = Vec::new();
+        let mut gltf_morphed: Vec<morph::MorphMesh> = Vec::new();
         // A level's authored camera (applied as the initial view if non-default).
         let mut level_view: Option<(Vec3, Vec3)> = None;
         // A level's lighting, replacing the gallery's code-default sun + point lights.
@@ -964,6 +969,17 @@ impl App {
                     "skinning: {} skinned primitive(s) (GPU)",
                     gltf_skinned.len()
                 );
+            }
+            // Animation Stage C: CPU-blend any morph-target primitives each frame.
+            gltf_morphed = morph::build_morph_meshes(
+                &device,
+                &gscene,
+                &prim_handles,
+                &node_map,
+                &mesh_registry,
+            )?;
+            if !gltf_morphed.is_empty() {
+                info!("morph: {} morph primitive(s) (CPU)", gltf_morphed.len());
             }
             scene_bounds = registry::gltf_bounds(&gscene);
         } else {
@@ -1735,6 +1751,7 @@ impl App {
             mesh_registry,
             material_registry,
             skinned: gltf_skinned,
+            morphed: gltf_morphed,
             level_paths,
             current_level,
             pending_level: None,
@@ -2405,6 +2422,12 @@ impl App {
         if !self.skinned.is_empty() && self.rhi_thread.is_none() {
             skin::update_palettes(&mut self.skinned, &self.world, fif)?;
             skin::patch_scene(&self.skinned, &mut scene, fif);
+        }
+        // Animation Stage C: CPU-blend morph targets + swap to this frame's buffer.
+        // Inline path only (the per-frame vertex write relies on the frame-start fence).
+        if !self.morphed.is_empty() && self.rhi_thread.is_none() {
+            morph::apply_morph(&mut self.morphed, &self.world, fif)?;
+            morph::patch_scene(&self.morphed, &mut scene, fif);
         }
 
         // Orbiting camera framing the whole sample scene — or, in single-object

@@ -141,9 +141,27 @@ the documented D3D12 1-LSB run-to-run noise); default gallery byte-identical `06
 regression); **zero VK-validation / D3D12-debug-layer errors** on the VS storage-buffer read +
 per-frame host-write path (only the benign NV-external loader query); clippy `-D warnings` clean.
 
-### Stage C — morph targets (optional)
-Morph-weight channels → weighted sum of position/normal deltas. Test:
-**AnimatedMorphCube**.
+### Stage C — morph targets — **DONE (CPU, all backends)**
+The animation's morph-weight channel blends a primitive's morph targets:
+`vertex = base + Σ wᵢ · targetᵢ` (position + normal deltas). Done on the CPU (like
+B.1) to avoid a 4th shader/pipeline variant (and the skinned×morphed combinatorial
+case) — it reuses the existing g-buffer/shadow pipelines unchanged, so it works on all
+backends with **no parity gate** (CPU math + an already-DX≡VK pipeline).
+
+- **`crates/asset`:** parse `read_morph_targets()` → `GltfPrimitive.morph_targets`
+  (per-vertex pos/normal deltas) + the `Weights` animation channel (previously skipped).
+- **`crates/scene` (`animation.rs`):** a `Weights` track + a `MorphWeights(Vec<f32>)`
+  component; `advance_animation` samples the weight channel (all 3 interpolation modes,
+  per-target) and writes `MorphWeights` to the mesh node.
+- **`apps/sandbox/morph.rs`:** `MorphMesh` (bind geometry + targets + per-fif vertex
+  ring); `apply_morph` blends `base + Σ wᵢ·targetᵢ` from the node's `MorphWeights` and
+  writes the fif ring buffer; `patch_scene` swaps the drawable to it (the node transform
+  is kept — morphed verts are local, unlike skinning). Inline path only (per-frame
+  vertex write uses the frame-start fence wait).
+
+Verified (Metal): default `b9778dcc`; **AnimatedMorphCube** morphs (frames differ),
+run-to-run identical (deterministic); scene 34 + asset 18 tests; clippy/fmt clean. CPU
+math + existing pipeline → effectively backend-agnostic (VK/DX run the same draw).
 
 ## Parallelization on the job system (planned)
 

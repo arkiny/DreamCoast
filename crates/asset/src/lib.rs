@@ -17,7 +17,7 @@ pub mod sdf;
 
 pub use gltf_scene::{
     ChannelData, GltfAnimation, GltfChannel, GltfMaterial, GltfNode, GltfPrimitive, GltfScene,
-    GltfSkin, Interpolation, load_gltf_scene,
+    GltfSkin, Interpolation, MorphTarget, load_gltf_scene,
 };
 pub use level::LevelData;
 pub use level_graph::{LevelGraph, WorldChunk};
