@@ -13,6 +13,7 @@
 //! free of GPU types. The renderer turns a [`draw_list::Drawable`] list into actual
 //! draw calls.
 
+mod animation;
 mod components;
 mod draw_list;
 mod ecs;
@@ -21,10 +22,11 @@ mod node;
 mod schedule;
 mod transform;
 
+pub use animation::{AnimationClip, AnimationPlayer, advance_animation};
 pub use components::{MaterialHandle, MeshHandle, MeshInstance, Name};
 pub use draw_list::Drawable;
 pub use ecs::{Entity, World, WorldCell};
-pub use gltf_instance::instantiate_gltf;
+pub use gltf_instance::{instantiate_gltf, instantiate_gltf_mapped};
 pub use node::NodeRef;
 pub use schedule::{Access, SystemSchedule};
 pub use transform::{

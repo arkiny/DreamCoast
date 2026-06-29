@@ -15,7 +15,10 @@ pub mod level_graph;
 pub mod primitives;
 pub mod sdf;
 
-pub use gltf_scene::{GltfMaterial, GltfNode, GltfPrimitive, GltfScene, load_gltf_scene};
+pub use gltf_scene::{
+    ChannelData, GltfAnimation, GltfChannel, GltfMaterial, GltfNode, GltfPrimitive, GltfScene,
+    Interpolation, load_gltf_scene,
+};
 pub use level::LevelData;
 pub use level_graph::{LevelGraph, WorldChunk};
 pub use primitives::{cornell_box, unit_cube, uv_sphere};

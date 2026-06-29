@@ -24,13 +24,25 @@ pub fn instantiate_gltf(
     scene: &GltfScene,
     primitive_handles: &[Vec<(MeshHandle, MaterialHandle)>],
 ) -> Entity {
+    instantiate_gltf_mapped(world, scene, primitive_handles).0
+}
+
+/// Like [`instantiate_gltf`], but also returns the node-index → entity map (indexed
+/// by glTF node index), so animation channels (which target node indices) can be
+/// resolved to the entities created here.
+pub fn instantiate_gltf_mapped(
+    world: &mut World,
+    scene: &GltfScene,
+    primitive_handles: &[Vec<(MeshHandle, MaterialHandle)>],
+) -> (Entity, Vec<Option<Entity>>) {
+    let mut map = vec![None; scene.nodes.len()];
     let roots: Vec<Entity> = scene
         .roots
         .iter()
-        .map(|&r| spawn_node(world, scene, primitive_handles, r, None))
+        .map(|&r| spawn_node(world, scene, primitive_handles, r, None, &mut map))
         .collect();
 
-    match roots.as_slice() {
+    let root = match roots.as_slice() {
         [single] => *single,
         _ => {
             // Wrap multiple top-level nodes under one transformable root.
@@ -43,7 +55,8 @@ pub fn instantiate_gltf(
             world.insert(root, Children(roots));
             root
         }
-    }
+    };
+    (root, map)
 }
 
 fn spawn_node(
@@ -52,9 +65,11 @@ fn spawn_node(
     primitive_handles: &[Vec<(MeshHandle, MaterialHandle)>],
     node_idx: usize,
     parent: Option<Entity>,
+    map: &mut [Option<Entity>],
 ) -> Entity {
     let node = &scene.nodes[node_idx];
     let entity = world.spawn();
+    map[node_idx] = Some(entity);
     world.insert(
         entity,
         LocalTransform {
@@ -87,7 +102,7 @@ fn spawn_node(
     }
 
     for &child in &node.children {
-        spawn_node(world, scene, primitive_handles, child, Some(entity));
+        spawn_node(world, scene, primitive_handles, child, Some(entity), map);
     }
     entity
 }
@@ -146,6 +161,7 @@ mod tests {
                 alpha_cutoff: 0.0,
             }],
             images: vec![],
+            animations: vec![],
         }
     }
 
