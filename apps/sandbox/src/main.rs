@@ -1122,9 +1122,8 @@ impl App {
         // consume. (Static scene → built once; later stages rebuild on scene change. In
         // world mode `world` is empty — the per-frame list comes from the streamer.)
         let scene = build_scene(&world, &mesh_registry, &material_registry);
-        // Decal/transparent census (deferred-decal Stage A1): classification is wired
-        // through to the draw list but no decal pass runs yet, so this only reports — the
-        // render stays byte-identical. The A3 decal pass will consume the `Decal` tag.
+        // Decal/transparent census. Decals are tinted into the G-buffer by the deferred decal
+        // pass (`record_decals`); transparents still fall back to opaque (track B).
         {
             use dreamcoast_asset::MaterialKind;
             let decals = scene
@@ -1137,8 +1136,8 @@ impl App {
                 .count();
             if decals + transparents > 0 {
                 info!(
-                    "material kinds: {decals} decal, {transparents} transparent (of {} drawables; \
-                     decal pass not yet wired — opaque fallback)",
+                    "material kinds: {decals} decal (deferred decal pass), {transparents} \
+                     transparent (opaque fallback) of {} drawables",
                     scene.len()
                 );
             }
@@ -3369,6 +3368,11 @@ impl App {
             self.roughness_override,
             mip_bias,
         );
+        // Deferred surface-decal pass (decals A3): tint the G-buffer albedo for `kind == Decal`
+        // drawables after the opaque fill, before lighting. No-op (no pass) when the scene has
+        // no decals, so the gallery / non-decal scenes stay byte-identical.
+        self.deferred
+            .record_decals(&mut graph, gbuf, &scene, view_proj, mip_bias);
         // Stage C2/C3 (GDF-lighting consumers, see `gi.rs`) share the world scene GDF:
         // import its handle once + record the one-time fused-scene bake (the volume is
         // owned by `GdfSystem`), then AO + GI read it. Recorded before lighting so the

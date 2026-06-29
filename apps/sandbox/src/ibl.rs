@@ -108,6 +108,7 @@ impl IblSystem {
             bindless: true,         // for the root-constants param (push constants)
             uniform_buffer: false,
             depth_test: false,
+            depth_write: false,
             depth_format: None,
         })?;
 
@@ -136,6 +137,7 @@ impl IblSystem {
             bindless: true,
             uniform_buffer: false,
             depth_test: true, // occlusion when capturing the scene into the cube
+            depth_write: true,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -163,6 +165,7 @@ impl IblSystem {
             bindless: true,
             uniform_buffer: false,
             depth_test: false,
+            depth_write: false,
             depth_format: None,
         })?;
 
@@ -190,6 +193,7 @@ impl IblSystem {
             bindless: true,
             uniform_buffer: false,
             depth_test: false,
+            depth_write: false,
             depth_format: None,
         })?;
 
@@ -217,6 +221,7 @@ impl IblSystem {
             bindless: true,
             uniform_buffer: false,
             depth_test: false,
+            depth_write: false,
             depth_format: None,
         })?;
 
