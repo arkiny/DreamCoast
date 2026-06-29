@@ -653,8 +653,9 @@ impl<'a> RenderGraph<'a> {
 
         // Replay the recorded IR onto the real command buffer. In B2 this is on the
         // same thread (behaviour-identical to direct recording); B3 moves it to the
-        // RHI thread.
-        list.translate(cmd)?;
+        // RHI thread. The backbuffer's swapchain + image index are frame-global, so
+        // the IR doesn't store them per-command — supply them here at translate.
+        list.translate(cmd, swapchain, image_index)?;
         Ok(())
     }
 

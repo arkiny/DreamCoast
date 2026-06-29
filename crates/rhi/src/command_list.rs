@@ -336,17 +336,15 @@ pub enum RhiCommand {
         len: u32,
     },
     EndDebugLabel,
-    TransitionToRenderTarget {
-        swapchain: ResPtr<Swapchain>,
-        image_index: u32,
-    },
-    TransitionToPresent {
-        swapchain: ResPtr<Swapchain>,
-        image_index: u32,
-    },
+    // The backbuffer is a *frame-global* target: the swapchain + acquired image
+    // index are the same for every backbuffer command in a frame, so they aren't
+    // stored per-command — [`CommandList::translate`] supplies them from its
+    // context. This is what lets the RHI thread (M4 B3) own the swapchain and
+    // resolve the image index at translate time, so the record thread never needs
+    // the acquired index to build the IR.
+    TransitionToRenderTarget,
+    TransitionToPresent,
     BeginRendering {
-        swapchain: ResPtr<Swapchain>,
-        image_index: u32,
         color_clear: Option<ClearColor>,
         depth: Option<ResPtr<DepthBuffer>>,
     },
@@ -394,13 +392,9 @@ pub enum RhiCommand {
     },
     EndRendering,
     CopySwapchainToBuffer {
-        swapchain: ResPtr<Swapchain>,
-        image_index: u32,
         buffer: ResPtr<Buffer>,
     },
-    SetViewportScissor {
-        swapchain: ResPtr<Swapchain>,
-    },
+    SetViewportScissor,
     SetViewportScissorExtent {
         extent: Extent2D,
     },
@@ -556,10 +550,20 @@ impl CommandList {
 
     /// Replay every recorded command onto a real backend [`CommandBuffer`].
     ///
+    /// `swapchain` + `image_index` resolve the frame's backbuffer commands (the IR
+    /// stores neither per-command — they're frame-global). The inline path passes
+    /// the same swapchain/index it recorded with (behaviour-identical); the RHI
+    /// thread (M4 B3) passes its own owned swapchain + freshly acquired index.
+    ///
     /// # Safety contract
     /// Every resource referenced by the list must still be alive (guaranteed by the
     /// M4 handoff: the recorder keeps them alive until the frame's fence signals).
-    pub fn translate(&self, cmd: &CommandBuffer) -> Result<()> {
+    pub fn translate(
+        &self,
+        cmd: &CommandBuffer,
+        swapchain: &Swapchain,
+        image_index: u32,
+    ) -> Result<()> {
         let inner = self.inner.borrow();
         let blob = |off: u32, len: u32| &inner.push[off as usize..(off + len) as usize];
         for c in &inner.cmds {
@@ -579,21 +583,14 @@ impl CommandList {
                     cmd.begin_debug_label(s)
                 }
                 RhiCommand::EndDebugLabel => cmd.end_debug_label(),
-                RhiCommand::TransitionToRenderTarget {
+                RhiCommand::TransitionToRenderTarget => {
+                    cmd.transition_to_render_target(swapchain, image_index)
+                }
+                RhiCommand::TransitionToPresent => {
+                    cmd.transition_to_present(swapchain, image_index)
+                }
+                RhiCommand::BeginRendering { color_clear, depth } => cmd.begin_rendering(
                     swapchain,
-                    image_index,
-                } => cmd.transition_to_render_target(unsafe { swapchain.get() }, image_index),
-                RhiCommand::TransitionToPresent {
-                    swapchain,
-                    image_index,
-                } => cmd.transition_to_present(unsafe { swapchain.get() }, image_index),
-                RhiCommand::BeginRendering {
-                    swapchain,
-                    image_index,
-                    color_clear,
-                    depth,
-                } => cmd.begin_rendering(
-                    unsafe { swapchain.get() },
                     image_index,
                     color_clear,
                     depth.map(|d| unsafe { d.get() }),
@@ -649,18 +646,10 @@ impl CommandList {
                     unsafe { depth.get() },
                 ),
                 RhiCommand::EndRendering => cmd.end_rendering(),
-                RhiCommand::CopySwapchainToBuffer {
-                    swapchain,
-                    image_index,
-                    buffer,
-                } => {
-                    cmd.copy_swapchain_to_buffer(unsafe { swapchain.get() }, image_index, unsafe {
-                        buffer.get()
-                    })
+                RhiCommand::CopySwapchainToBuffer { buffer } => {
+                    cmd.copy_swapchain_to_buffer(swapchain, image_index, unsafe { buffer.get() })
                 }
-                RhiCommand::SetViewportScissor { swapchain } => {
-                    cmd.set_viewport_scissor(unsafe { swapchain.get() })
-                }
+                RhiCommand::SetViewportScissor => cmd.set_viewport_scissor(swapchain),
                 RhiCommand::SetViewportScissorExtent { extent } => {
                     cmd.set_viewport_scissor_extent(extent)
                 }
@@ -777,28 +766,23 @@ impl Recorder for CommandList {
     fn end_debug_label(&self) {
         self.inner.borrow_mut().cmds.push(RhiCommand::EndDebugLabel);
     }
-    fn transition_to_render_target(&self, swapchain: &Swapchain, image_index: u32) {
+    fn transition_to_render_target(&self, _swapchain: &Swapchain, _image_index: u32) {
+        // swapchain + image_index are frame-global (resolved at translate).
         self.inner
             .borrow_mut()
             .cmds
-            .push(RhiCommand::TransitionToRenderTarget {
-                swapchain: ResPtr::new(swapchain),
-                image_index,
-            });
+            .push(RhiCommand::TransitionToRenderTarget);
     }
-    fn transition_to_present(&self, swapchain: &Swapchain, image_index: u32) {
+    fn transition_to_present(&self, _swapchain: &Swapchain, _image_index: u32) {
         self.inner
             .borrow_mut()
             .cmds
-            .push(RhiCommand::TransitionToPresent {
-                swapchain: ResPtr::new(swapchain),
-                image_index,
-            });
+            .push(RhiCommand::TransitionToPresent);
     }
     fn begin_rendering(
         &self,
-        swapchain: &Swapchain,
-        image_index: u32,
+        _swapchain: &Swapchain,
+        _image_index: u32,
         color_clear: Option<ClearColor>,
         depth: Option<&DepthBuffer>,
     ) {
@@ -806,8 +790,6 @@ impl Recorder for CommandList {
             .borrow_mut()
             .cmds
             .push(RhiCommand::BeginRendering {
-                swapchain: ResPtr::new(swapchain),
-                image_index,
                 color_clear,
                 depth: depth.map(ResPtr::new),
             });
@@ -926,23 +908,19 @@ impl Recorder for CommandList {
     fn end_rendering(&self) {
         self.inner.borrow_mut().cmds.push(RhiCommand::EndRendering);
     }
-    fn copy_swapchain_to_buffer(&self, swapchain: &Swapchain, image_index: u32, buffer: &Buffer) {
+    fn copy_swapchain_to_buffer(&self, _swapchain: &Swapchain, _image_index: u32, buffer: &Buffer) {
         self.inner
             .borrow_mut()
             .cmds
             .push(RhiCommand::CopySwapchainToBuffer {
-                swapchain: ResPtr::new(swapchain),
-                image_index,
                 buffer: ResPtr::new(buffer),
             });
     }
-    fn set_viewport_scissor(&self, swapchain: &Swapchain) {
+    fn set_viewport_scissor(&self, _swapchain: &Swapchain) {
         self.inner
             .borrow_mut()
             .cmds
-            .push(RhiCommand::SetViewportScissor {
-                swapchain: ResPtr::new(swapchain),
-            });
+            .push(RhiCommand::SetViewportScissor);
     }
     fn set_viewport_scissor_extent(&self, extent: Extent2D) {
         self.inner
