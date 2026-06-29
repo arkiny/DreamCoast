@@ -420,6 +420,25 @@ impl<'a> RenderGraph<'a> {
         Ok(())
     }
 
+    /// Like [`Self::record`] but records the graph's passes **in parallel** on `jobs`
+    /// (M4 B4): each scheduled pass builds its own IR bucket on a worker, then the
+    /// buckets are concatenated in schedule order. Recording order is irrelevant to
+    /// the result — GPU ordering lives in the barrier commands, stitched in schedule
+    /// order at concat — so the output IR is identical to sequential recording.
+    /// Profiling is unsupported here (it is inherently sequential); pass the threaded
+    /// path, which doesn't profile.
+    pub fn record_parallel(
+        self,
+        device: &Device,
+        pool: &mut ResourcePool,
+        aliasing: bool,
+        jobs: &dreamcoast_jobs::JobSystem,
+    ) -> Result<CommandList, EngineError> {
+        let list = CommandList::new();
+        self.record_into(&list, device, pool, aliasing, None, Some(jobs))?;
+        Ok(list)
+    }
+
     /// Compile and record the frame into a backend-agnostic, `Send` [`CommandList`]
     /// — *without* translating or touching the swapchain. This is the record-thread
     /// half of the M4 B3 split: the RHI thread later [`CommandList::translate`]s the
@@ -438,7 +457,7 @@ impl<'a> RenderGraph<'a> {
         profiler: Option<&mut GraphProfiler>,
     ) -> Result<CommandList, EngineError> {
         let list = CommandList::new();
-        self.record_into(&list, device, pool, aliasing, profiler)?;
+        self.record_into(&list, device, pool, aliasing, profiler, None)?;
         Ok(list)
     }
 
@@ -452,6 +471,7 @@ impl<'a> RenderGraph<'a> {
         pool: &mut ResourcePool,
         aliasing: bool,
         mut profiler: Option<&mut GraphProfiler>,
+        jobs: Option<&dreamcoast_jobs::JobSystem>,
     ) -> Result<(), EngineError> {
         let compiled = self.compile();
         if tracing::enabled!(tracing::Level::TRACE) {
@@ -538,23 +558,68 @@ impl<'a> RenderGraph<'a> {
             !c.is_empty() && self.resources[c[0].0.0].backbuffer
         });
 
-        for &pass_idx in &compiled.schedule {
-            // Timestamp this pass's start boundary (query index = passes seen so far).
-            if let (true, Some(p)) = (profile, profiler.as_mut()) {
-                let idx = p.names.len() as u32;
-                list.write_timestamp(p.heap, idx);
-                p.names.push(self.passes[pass_idx].name.clone());
+        if let Some(jobs) = jobs.filter(|_| !profile) {
+            // M4 B4 — parallel recording: each scheduled pass builds its own bucket on
+            // a worker, then we concatenate the buckets in schedule order. GPU ordering
+            // is unaffected (it lives in the barrier commands, stitched in schedule
+            // order here), so the IR is identical to the sequential path.
+            let pool_ref: &ResourcePool = pool;
+            let mut slots: Vec<Option<&mut PassNode>> = self.passes.iter_mut().map(Some).collect();
+            let mut pass_jobs: Vec<PassJob> = compiled
+                .schedule
+                .iter()
+                .map(|&i| PassJob {
+                    pass: slots[i]
+                        .take()
+                        .expect("each pass is scheduled at most once"),
+                    resources: &self.resources,
+                    pool: pool_ref,
+                    color_locs: &color_locs,
+                    depth_slots: &depth_slots,
+                    alias_barrier: &alias_barrier,
+                    is_first_backbuffer: first_backbuffer == Some(i),
+                    bucket: CommandList::new(),
+                    result: Ok(()),
+                })
+                .collect();
+            // The closure captures nothing external (all context is in `job`), so it is
+            // trivially `Send + Sync`; `PassJob` is `Send` by the handoff contract above.
+            jobs.parallel_for(&mut pass_jobs, 1, |_, job| {
+                job.result = record_pass(
+                    job.pass,
+                    job.resources,
+                    job.pool,
+                    job.color_locs,
+                    job.depth_slots,
+                    job.alias_barrier,
+                    job.is_first_backbuffer,
+                    &job.bucket,
+                );
+            });
+            // Concatenate in schedule order; surface the first pass that failed.
+            for job in pass_jobs {
+                job.result?;
+                list.append(job.bucket);
             }
-            record_pass(
-                &mut self.passes[pass_idx],
-                &self.resources,
-                pool,
-                &color_locs,
-                &depth_slots,
-                &alias_barrier,
-                first_backbuffer == Some(pass_idx),
-                list,
-            )?;
+        } else {
+            for &pass_idx in &compiled.schedule {
+                // Timestamp this pass's start boundary (query index = passes seen so far).
+                if let (true, Some(p)) = (profile, profiler.as_mut()) {
+                    let idx = p.names.len() as u32;
+                    list.write_timestamp(p.heap, idx);
+                    p.names.push(self.passes[pass_idx].name.clone());
+                }
+                record_pass(
+                    &mut self.passes[pass_idx],
+                    &self.resources,
+                    pool,
+                    &color_locs,
+                    &depth_slots,
+                    &alias_barrier,
+                    first_backbuffer == Some(pass_idx),
+                    list,
+                )?;
+            }
         }
 
         // Final timestamp boundary, then resolve the whole heap (D3D12) for readback.
@@ -830,6 +895,34 @@ fn record_pass(
     bucket.end_debug_label();
     Ok(())
 }
+
+/// One pass's parallel-recording work unit (M4 B4): exclusive access to its pass
+/// node, the read-only graph context it records against, its private output
+/// [`CommandList`] bucket, and where the result lands. The context is carried inline
+/// (rather than captured by the worker closure) so the closure captures nothing —
+/// Rust 2021 disjoint capture would otherwise reach through any shared wrapper and
+/// capture the individual `!Sync` field references.
+struct PassJob<'a, 'r> {
+    pass: &'r mut PassNode<'a>,
+    resources: &'r [Resource],
+    pool: &'r ResourcePool,
+    color_locs: &'r HashMap<ResourceId, ColorLoc>,
+    depth_slots: &'r HashMap<ResourceId, usize>,
+    alias_barrier: &'r HashMap<ResourceId, bool>,
+    is_first_backbuffer: bool,
+    bucket: CommandList,
+    result: Result<(), EngineError>,
+}
+
+// SAFETY: each `PassJob` is handed to exactly one worker — its `&mut PassNode` is
+// non-aliasing (distinct pass index) and its `bucket` is written only by that worker.
+// The pass node + context hold `!Send`/`!Sync` backend handles, but during the
+// parallel region every worker only *reads* the shared context and only *borrows* the
+// pass's resources to bake `ResPtr`s — none clones/drops an `Rc<DeviceShared>`,
+// creates a resource, or writes shared memory (audited: pass closures are
+// recording-only; per-frame uploads + resource creation happen before `execute`). So
+// no backend refcount/state is mutated off the record thread.
+unsafe impl Send for PassJob<'_, '_> {}
 
 /// Round `value` up to a multiple of `align` (a power-of-two or any `>= 1`).
 fn align_up(value: u64, align: u64) -> u64 {

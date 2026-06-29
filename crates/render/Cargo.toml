@@ -7,5 +7,6 @@ publish.workspace = true
 
 [dependencies]
 dreamcoast-core.workspace = true
+dreamcoast-jobs.workspace = true
 rhi.workspace = true
 tracing.workspace = true

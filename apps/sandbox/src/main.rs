@@ -452,6 +452,11 @@ struct App {
     /// submits + presents, overlapping the record thread's next frame (record N+1 ∥
     /// submit N). `None` = the default single-thread inline path (byte-identical).
     rhi_thread: Option<rhi_thread::RhiThread>,
+    /// M4 B4: record the render graph's passes in parallel on the job system (each
+    /// pass builds its own IR bucket, concatenated in schedule order). Opt-in
+    /// (`P15_PARALLEL_RECORD`) and only on the threaded path (profiler-free); default
+    /// off = sequential recording (byte-identical).
+    parallel_record: bool,
     /// Cached swapchain extent/format/readback-layout, kept in sync at construction
     /// and on resize. The record thread reads these (instead of the swapchain) while
     /// the RHI thread owns the swapchain.
@@ -1699,6 +1704,7 @@ impl App {
             query_heaps,
             render_finished,
             rhi_thread: None,
+            parallel_record: std::env::var_os("P15_PARALLEL_RECORD").is_some(),
             swap_extent_cached,
             swap_format_cached,
             readback_layout_cached,
@@ -4408,12 +4414,16 @@ impl App {
             // Threaded: append the graph onto the frame IR (after any IBL capture) and
             // ship it. The RHI thread acquires + translates + submits + presents, and
             // copies/saves the capture itself, overlapping this thread's next frame.
+            // M4 B4: optionally record the graph's passes in parallel on the job
+            // workers (each builds its own IR bucket, concatenated in schedule order).
+            let jobs = self.parallel_record.then(dreamcoast_jobs::global);
             graph.record_into(
                 &frame_list,
                 &self.device,
                 &mut self.pools[fif],
                 self.aliasing,
                 None,
+                jobs,
             )?;
             self.slot_pass_names[fif] = Vec::new();
             let capture = capture_this_frame.as_ref().map(|c| rhi_thread::CaptureReq {
