@@ -689,6 +689,22 @@ impl Device {
         }
     }
 
+    /// Create a HOST-VISIBLE storage buffer for per-frame host writes via [`StorageBuffer::write`]
+    /// (the GPU-skinning joint palette — animation Stage B.2c). Registered in the same bindless
+    /// table the shaders read; only the memory is CPU-writable (VK: HOST_COHERENT mapped; D3D12:
+    /// CUSTOM L0 write-combine UAV-capable heap; Metal: Shared). For data uploaded once, use
+    /// [`Self::create_storage_buffer_init`] (device-local) instead.
+    pub fn create_storage_buffer_host(&self, desc: &StorageBufferDesc) -> Result<StorageBuffer> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => Ok(StorageBuffer::Vulkan(d.create_storage_buffer_host(desc)?)),
+            #[cfg(windows)]
+            Self::D3d12(d) => Ok(StorageBuffer::D3d12(d.create_storage_buffer_host(desc)?)),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => Ok(StorageBuffer::Metal(d.create_storage_buffer(desc)?)),
+        }
+    }
+
     /// Create a device-local storage buffer seeded with host `data` (Phase 8: RT
     /// geometry + per-instance table read by the path tracer).
     pub fn create_storage_buffer_init(

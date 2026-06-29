@@ -908,6 +908,14 @@ impl VulkanDevice {
         crate::buffer::VulkanStorageBuffer::new(self.shared.clone(), desc)
     }
 
+    /// Host-visible storage buffer for per-frame host writes (GPU-skinning palette, B.2c).
+    pub fn create_storage_buffer_host(
+        &self,
+        desc: &rhi_types::StorageBufferDesc,
+    ) -> Result<crate::buffer::VulkanStorageBuffer, EngineError> {
+        crate::buffer::VulkanStorageBuffer::new_host(self.shared.clone(), desc)
+    }
+
     /// Create a storage buffer seeded with host data (Phase 8: RT geometry +
     /// instance table read by the path tracer).
     pub fn create_storage_buffer_init(

@@ -121,8 +121,25 @@ palette write uses the frame-start fence wait).
 skinned casters with it so their shadow matches the deformed mesh (the shared per-fif
 palette is reused). `shadow_push` 80→96 (skin u32x4 = 0 on the static path). Verified:
 default `b9778dcc`; SimpleSkin shadow follows the deform (image updates vs the
-bind-pose-shadow B.2a), deterministic; clippy/fmt clean. **Next: B.2c Windows VK/DX
-host-visible `StorageBuffer::write` + the DX≡VK shader gate.**
+bind-pose-shadow B.2a), deterministic; clippy/fmt clean.
+
+**B.2c DONE (GPU skinning enabled on VK + D3D12, RTX 2070 SUPER, 2026-06-29):** the
+per-frame palette needs a host-writable storage buffer that the VS still reads from the
+bindless table. Added `Device::create_storage_buffer_host` + a real `StorageBuffer::write`:
+- **VK:** a HOST_VISIBLE | HOST_COHERENT, persistently-mapped storage buffer → `write()` is a
+  plain mapped memcpy (no staging/flush); same STORAGE_BUFFER bindless descriptor as before, so
+  the VS read path is unchanged.
+- **D3D12:** a DEFAULT/UPLOAD heap can't be both CPU-writable and a UAV, so the palette uses a
+  **CUSTOM L0 (system-memory) write-combine heap** with `ALLOW_UNORDERED_ACCESS` — CPU-mappable
+  AND UAV-capable; `write()` = memcpy, the GPU reads the UAV over PCIe. Registered in the same
+  bindless UAV table.
+- `skin.rs` probe + palette ring now use `create_storage_buffer_host`.
+
+Verified: both backends log `skinning: 1 skinned primitive(s) (GPU)` (probe passes → GPU path,
+not the bind-pose fallback); SimpleSkin renders the deformed mesh; **DX≡VK 0.000/ch** (max 1 =
+the documented D3D12 1-LSB run-to-run noise); default gallery byte-identical `06BDD797…` (no
+regression); **zero VK-validation / D3D12-debug-layer errors** on the VS storage-buffer read +
+per-frame host-write path (only the benign NV-external loader query); clippy `-D warnings` clean.
 
 ### Stage C — morph targets (optional)
 Morph-weight channels → weighted sum of position/normal deltas. Test:
@@ -163,5 +180,5 @@ fixed-timestep loop and stays deterministic.
 - Default capture byte-identical (`b9778dcc`) — animation is opt-in.
 - Any job-system parallelization must stay **bit-identical** to the serial path
   (snapshot → pure parallel compute → sequential write-back).
-- Metal verified here; VK/DX parity pending (Stage A is CPU-only → low risk; Stage B
-  touches shaders → full DX≡VK gate).
+- Metal verified on the macOS box; **Stage B GPU skinning (B.2a/b/c) verified on Windows
+  VK/DX (RTX 2070 SUPER) — DX≡VK 0.000/ch on SimpleSkin, no validation errors** (see B.2c).

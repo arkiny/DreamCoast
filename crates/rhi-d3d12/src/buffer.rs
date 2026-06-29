@@ -7,8 +7,9 @@ use std::rc::Rc;
 use dreamcoast_core::EngineError;
 use rhi_types::{BufferDesc, BufferUsage, StorageBufferDesc};
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES,
-    D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD,
+    D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_HEAP_FLAG_NONE,
+    D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_CUSTOM, D3D12_HEAP_TYPE_DEFAULT,
+    D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD, D3D12_MEMORY_POOL_L0,
     D3D12_MEMORY_POOL_UNKNOWN, D3D12_RANGE, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST,
     D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -150,6 +151,10 @@ pub struct D3d12StorageBuffer {
     resource: ID3D12Resource,
     index: u32,
     state: Cell<D3D12_RESOURCE_STATES>,
+    /// Persistently-mapped host pointer for the host-visible (`new_host`) variant — the per-frame
+    /// GPU-skinning palette (animation Stage B.2c); null for the default DEFAULT-heap buffer.
+    mapped: *mut u8,
+    size: u64,
 }
 
 impl D3d12StorageBuffer {
@@ -201,6 +206,70 @@ impl D3d12StorageBuffer {
                 resource,
                 index,
                 state: Cell::new(initial),
+                mapped: std::ptr::null_mut(),
+                size: desc.size,
+            })
+        }
+    }
+
+    /// Host-visible, persistently-mapped storage buffer (animation Stage B.2c): the per-frame
+    /// GPU-skinning joint palette the vertex shader reads from `g.storage_buffers[]`. A DEFAULT
+    /// (UPLOAD) heap can't be both CPU-writable and a UAV, so this uses a CUSTOM **L0** (system
+    /// memory) **write-combine** heap, which is CPU-mappable AND UAV-capable — `write()` is a plain
+    /// memcpy and the GPU reads the UAV directly (over PCIe), matching the VK HOST_COHERENT /
+    /// Metal Shared semantics. Registered in the same bindless UAV table as every storage buffer.
+    pub(crate) fn new_host(
+        device: Rc<DeviceShared>,
+        desc: &StorageBufferDesc,
+    ) -> Result<Self, EngineError> {
+        unsafe {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                CreationNodeMask: 1,
+                VisibleNodeMask: 1,
+            };
+            let res_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Alignment: 0,
+                Width: desc.size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            };
+            let initial = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            let mut res: Option<ID3D12Resource> = None;
+            device
+                .device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &res_desc,
+                    initial,
+                    None,
+                    &mut res,
+                )
+                .map_err(d3d_err)?;
+            let resource =
+                res.ok_or_else(|| EngineError::Rhi("host storage buffer null".into()))?;
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            resource.Map(0, None, Some(&mut ptr)).map_err(d3d_err)?;
+            let index = device.register_storage_buffer(&resource, desc.size);
+            Ok(Self {
+                device,
+                resource,
+                index,
+                state: Cell::new(initial),
+                mapped: ptr as *mut u8,
+                size: desc.size,
             })
         }
     }
@@ -296,14 +365,19 @@ impl D3d12StorageBuffer {
         self.index
     }
 
-    /// Host-write the buffer (GPU-skinning joint palette). These storage buffers live
-    /// in a `DEFAULT` heap, so a direct host write is not yet supported — the
-    /// upload-heap storage-buffer variant is animation Stage B.2c (Windows). GPU
-    /// skinning falls back to the CPU path on D3D12 until then.
-    pub fn write(&self, _data: &[u8]) -> Result<(), EngineError> {
-        Err(EngineError::Rhi(
-            "host-write of a D3D12 storage buffer not implemented (animation B.2c)".into(),
-        ))
+    /// Host-write the buffer (GPU-skinning joint palette). Valid only for the host-visible
+    /// `new_host` variant (CUSTOM L0 write-combine heap, persistently mapped → plain memcpy,
+    /// immediately GPU-visible). The default DEFAULT-heap buffer is not host-writable.
+    pub fn write(&self, data: &[u8]) -> Result<(), EngineError> {
+        if self.mapped.is_null() {
+            return Err(EngineError::Rhi(
+                "host-write of a DEFAULT-heap D3D12 storage buffer (use create_storage_buffer_host)"
+                    .into(),
+            ));
+        }
+        let n = (data.len() as u64).min(self.size) as usize;
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.mapped, n) };
+        Ok(())
     }
 
     pub(crate) fn resource(&self) -> &ID3D12Resource {
