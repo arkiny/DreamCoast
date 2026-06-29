@@ -3317,7 +3317,9 @@ impl App {
                     rw,
                     rh,
                     self.flip_y,
-                    self.frame_no as u32,
+                    // Content: fixed frame (0) → temporally stable GGX jitter (no reflection
+                    // sparkle). Gallery: real frame → byte-identical legacy anchor.
+                    if self.is_gallery { self.frame_no as u32 } else { 0 },
                     scene_albedo,
                     reflect_cache_arg,
                     scene_clip,
@@ -3720,7 +3722,8 @@ impl App {
                 cw,
                 ch,
                 self.flip_y,
-                self.frame_no as u32,
+                // Content: fixed frame (0) → stable GGX jitter; gallery: real frame (anchor).
+                if self.is_gallery { self.frame_no as u32 } else { 0 },
                 scene_albedo,
                 reflect_cache_arg,
                 scene_clip,
@@ -3798,7 +3801,9 @@ impl App {
                     cw,
                     ch,
                     self.flip_y,
-                    self.frame_no as u32,
+                    // Content: fixed frame (0) → temporally stable GGX jitter (no reflection
+                    // sparkle). Gallery: real frame → byte-identical legacy anchor.
+                    if self.is_gallery { self.frame_no as u32 } else { 0 },
                     scene_albedo,
                     reflect_cache_arg,
                     scene_clip,
