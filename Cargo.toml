@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/core",
+    "crates/jobs",
     "crates/platform",
     "crates/shader",
     "crates/rhi-types",
@@ -25,6 +26,7 @@ publish = false
 [workspace.dependencies]
 # Internal crates
 dreamcoast-core = { path = "crates/core" }
+dreamcoast-jobs = { path = "crates/jobs" }
 dreamcoast-platform = { path = "crates/platform" }
 dreamcoast-shader = { path = "crates/shader" }
 rhi-types = { path = "crates/rhi-types" }

@@ -8,3 +8,4 @@ publish.workspace = true
 [dependencies]
 glam.workspace = true
 dreamcoast-asset.workspace = true
+dreamcoast-jobs.workspace = true
