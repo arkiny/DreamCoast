@@ -71,9 +71,39 @@ across all three backends — high cross-backend risk, Metal-only verifiable her
   animated nodes).
 
 Test: **SimpleSkin** (the mesh visibly bends), then CC-BY characters (Fox /
-CesiumMan / RiggedFigure, attribution-tracked). **Stage B.2 (later, optional):** move
-skinning to the GPU (skinned vertex layout + joint-palette SSBO + skinning vertex
-shader) as a perf optimization — that one takes the full DX≡VK gate.
+CesiumMan / RiggedFigure, attribution-tracked).
+
+#### Stage B.2 — GPU skinning (vertex-pulling) — next
+Move the per-vertex deform onto the GPU so the bind-pose vertex buffer is uploaded
+**once** and only a small joint palette is updated per frame. Chosen design =
+**vertex pulling**, which needs **no vertex-layout / backend-attribute change** (the
+big cross-backend risk): the skinned pipeline reuses `VertexLayout::Mesh`, and a
+skinning vertex shader reads the extra per-vertex data + palette from **bindless
+storage buffers** (`bindless.slang`'s `storage_buffers[64]`, already visible to any
+`bindless` pipeline's vertex stage) indexed by `SV_VertexID`. So the only
+cross-backend surface is the single-source shader (Metal-verify → Windows parity) +
+the per-frame palette upload.
+
+- **`StorageBuffer::write` (rhi + 3 backends):** add a host-write to the storage
+  buffer (Metal `StorageModeShared` is already host-visible — trivial; VK/DX need a
+  host-visible storage buffer variant — Windows-verified). The dynamic palette uses a
+  per-fif ring of these.
+- **Buffers per skinned mesh:** joints (`uint4`/vertex) + weights (`float4`/vertex) =
+  static storage buffers (`create_storage_buffer_init`, uploaded once); palette
+  (`float4x4`/joint = `joint_world × inverse_bind`) = per-fif writable storage buffer,
+  updated each frame from the ECS joint world transforms.
+- **Shaders:** a skinning g-buffer vertex shader (+ a skinning shadow VS) that reads
+  the bind pos/normal from the `Mesh` attributes and `joints/weights/palette` from the
+  bindless storage buffers by `SV_VertexID`, then outputs `Σ wᵢ · paletteᵢ · v`. The
+  fragment shaders are unchanged.
+- **Pipelines + draw:** a skinned g-buffer + skinned shadow pipeline (`Mesh` layout,
+  skinning VS); push constants carry the joints/weights/palette bindless indices. The
+  g-buffer/shadow passes branch to the skinned pipeline for skinned draws.
+
+Verification: default byte-identical (`b9778dcc`); **GPU-skinned SimpleSkin matches
+the CPU-skinned (B.1) result** (cross-check); full DX≡VK gate on Windows (the skinning
+shader + SSBO-read-in-VS). Staged: B.2a g-buffer (Metal) → B.2b skinned shadows →
+B.2c Windows VK/DX. CPU skinning (B.1) stays as the fallback / non-bindless path.
 
 ### Stage C — morph targets (optional)
 Morph-weight channels → weighted sum of position/normal deltas. Test:
