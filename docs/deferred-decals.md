@@ -4,9 +4,14 @@
 [phase-11-asset-pipeline.md](phase-11-asset-pipeline.md)(glTF 머티리얼 임포트),
 [sponza-perf.md](sponza-perf.md)(Sponza 컨텍스트).
 
-상태: **A1–A3 구현 완료, macOS/Metal 검증됨 — VK/D3D12 컴파일 + DX≡VK 게이트는 Windows 보류**.
-A4의 roughness 블렌드(선택)는 보류(아래 스테이징 참고). 후속 트랙 B(포워드 투명)는
-[§ 후속](#후속-트랙-b--포워드-투명) 참고.
+상태: **A1–A3 구현 완료 + Windows DX≡VK 게이트 통과 (2026-06-30, RTX 2070 SUPER)**. Metal 검증(macOS)에
+이어 Windows에서 VK/D3D12 컴파일·검증 클린·DX≡VK 확인. A4의 roughness 블렌드(선택)는 보류(아래 스테이징
+참고). 후속 트랙 B(포워드 투명)는 [§ 후속](#후속-트랙-b--포워드-투명) 참고.
+
+> **Windows 게이트에서 잡은 크로스백엔드 갭:** A2의 `DecalAlbedo`는 G-buffer MRT에 비균등 per-attachment
+> 블렌드를 줘서 Vulkan **`independentBlend` 디바이스 피처**가 필요한데(D3D12 `IndependentBlendEnable`/Metal은
+> 항상 가능) 활성화가 빠져 있었다 → `rhi-vulkan` 디바이스 생성에 `independent_blend(true)` 추가
+> (`crates/rhi-vulkan/src/device.rs`). Metal 단독으로는 못 잡는, Windows 게이트의 전형적 케이스.
 
 ## 문제 (RenderDoc로 근본 원인 확정, 2026-06-30)
 
@@ -109,12 +114,13 @@ Sponza dirt_decal은 표면에 동일평면으로 놓인 **메시 데칼**(glTF 
   프리셋(per-RT 배열 대신, 리스크 최소화) — RT0 RGB 알파블렌드(write mask RGB→A=AO 보존),
   RT≥1 write-mask off. VK `PipelineColorBlendAttachmentState[]`+`color_write_mask`, D3D12
   `IndependentBlendEnable`+per-RT, Metal `writeMask`. 기존 파이프라인 무영향. Metal 바이트 동일.
-  **VK/D3D12 컴파일 + DX≡VK는 Windows 보류**.
+  **Windows: VK `independent_blend` 피처 누락 → 추가(`device.rs`); 이후 VK/D3D12 컴파일·검증 클린.**
 - **A3 — 데칼 패스 + 셰이더 (albedo 블렌드)** ✅ (`73e2f0c`): gbuffer.slang `fsDecal`(RT0만 출력),
   `gbuffer_decal_pipeline`(DecalAlbedo + depth-test/no-write — `GraphicsPipelineDesc.depth_write`
   신설), `record_decals`(G-buffer load+블렌드), `record_gbuffer`는 `kind==Decal` 스킵. 그래프
   WAW/RAW가 gbuffer→decals→lighting 정렬. **Metal 검증: Sponza 검은 패치 → 먼지 틴트(석재 보임),
-  갤러리 바이트 동일(무회귀)**. DX≡VK는 Windows 보류.
+  갤러리 바이트 동일(무회귀)**. **Windows DX≡VK 통과: Sponza 데모 앵글 0.000/ch(max 11=기존 스토캐스틱
+  firefly, 데칼 무관), 갤러리 0.000 무회귀, 검은 패치→밝은 석재, VK/DX 검증 클린.**
 - **A4 — roughness 블렌드(선택, 보류) + 마무리**: RT2.g 블렌드는 `dirt_decal`이 MR 텍스처가 없어
   (roughnessFactor 1.0뿐) 이득이 작고 RT2 per-RT 블렌드(write mask=G)라는 추가 크로스백엔드 표면을
   Metal 단독으로는 검증 못 하므로 **보류** — Windows 복구 시 DX≡VK와 함께 평가. 마무리(문서·메모리)는 완료.
