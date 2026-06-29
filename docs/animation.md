@@ -41,7 +41,15 @@ Translate/Rotate/Scale tracks on nodes. No vertex-format change, no shader chang
   `gscene.animations` + the node map and attach an `AnimationPlayer`; call
   `advance_animation` next to `advance_spin` in the frame loop.
 
-### Stage B — vertex skinning — **CPU skinning first** (this stage)
+### Stage B — vertex skinning — **CPU skinning (B.1) DONE on Metal**
+
+Verified: `SCENE_GLTF=assets/SimpleSkin/SimpleSkin.gltf GLTF_ANIM=0 CAPTURE_SEQ=8
+CAPTURE_SEQ_STEP=0` — the column visibly deforms (frames differ) and is run-to-run
+identical (deterministic); default capture byte-identical (`b9778dcc`); clippy/fmt
+clean. Skinning runs on the inline path only (the per-frame vertex write relies on
+the frame-start fence wait; skinned + `P15_RHI_THREAD` is skipped). Implementation
+below.
+
 The backend vertex layout is a fixed enum (`pos/normal/uv`, stride 32) defined per
 backend; a GPU skinning path would change that layout + the g-buffer/shadow shaders
 across all three backends — high cross-backend risk, Metal-only verifiable here. So
