@@ -398,21 +398,58 @@ impl<'a> RenderGraph<'a> {
         }
     }
 
-    /// Compile and run the graph against the RHI for one frame.
-    ///
-    /// `pool` caches realized targets across frames; the backbuffer is taken from
-    /// `swapchain`/`image_index`. When `aliasing` is set, transient color targets
-    /// are placed into a shared heap by [`Self::plan_aliasing`] so targets with
-    /// non-overlapping lifetimes reuse memory; otherwise each gets its own
-    /// dedicated allocation.
+    /// Compile and run the graph against the RHI for one frame: build the IR and
+    /// translate it onto `cmd` (same thread). The backbuffer is taken from
+    /// `swapchain`/`image_index`. See [`Self::record`] for the threaded split.
     #[allow(clippy::too_many_arguments)]
     pub fn execute(
-        mut self,
+        self,
         device: &Device,
         pool: &mut ResourcePool,
         cmd: &CommandBuffer,
         swapchain: &Swapchain,
         image_index: u32,
+        aliasing: bool,
+        profiler: Option<&mut GraphProfiler>,
+    ) -> Result<(), EngineError> {
+        let list = self.record(device, pool, aliasing, profiler)?;
+        // Replay the recorded IR onto the real command buffer (B2: same thread,
+        // behaviour-identical to direct recording). The backbuffer's swapchain +
+        // image index are frame-global, supplied here at translate.
+        list.translate(cmd, swapchain, image_index)?;
+        Ok(())
+    }
+
+    /// Compile and record the frame into a backend-agnostic, `Send` [`CommandList`]
+    /// — *without* translating or touching the swapchain. This is the record-thread
+    /// half of the M4 B3 split: the RHI thread later [`CommandList::translate`]s the
+    /// returned list onto a command buffer with its own owned swapchain + freshly
+    /// acquired image index, so the record thread never needs to acquire.
+    ///
+    /// `pool` caches realized targets across frames. When `aliasing` is set,
+    /// transient color targets are placed into a shared heap by
+    /// [`Self::plan_aliasing`] so targets with non-overlapping lifetimes reuse
+    /// memory; otherwise each gets its own dedicated allocation.
+    pub fn record(
+        self,
+        device: &Device,
+        pool: &mut ResourcePool,
+        aliasing: bool,
+        profiler: Option<&mut GraphProfiler>,
+    ) -> Result<CommandList, EngineError> {
+        let list = CommandList::new();
+        self.record_into(&list, device, pool, aliasing, profiler)?;
+        Ok(list)
+    }
+
+    /// Append the frame's commands onto an existing [`CommandList`]. Lets the caller
+    /// prepend pre-graph imperative work (e.g. the IBL environment capture) into the
+    /// same `Send` list that ships to the RHI thread (M4 B3), preserving record order.
+    pub fn record_into(
+        mut self,
+        list: &CommandList,
+        device: &Device,
+        pool: &mut ResourcePool,
         aliasing: bool,
         mut profiler: Option<&mut GraphProfiler>,
     ) -> Result<(), EngineError> {
@@ -426,12 +463,6 @@ impl<'a> RenderGraph<'a> {
             tracing::trace!("render graph schedule: {}", names.join(" -> "));
         }
         pool.begin_frame();
-
-        // M4 B2: record the whole frame into a backend-agnostic IR list, then
-        // translate it onto the real command buffer at the end. Behaviourally
-        // identical to recording `cmd` directly (same thread, same order); the IR is
-        // what lets B3 ship recording to a separate RHI thread.
-        let list = CommandList::new();
 
         // Plan transient aliasing (per-resource heap offsets + which targets need
         // an aliasing/discard barrier before their first write).
@@ -565,7 +596,7 @@ impl<'a> RenderGraph<'a> {
                     .find_map(|&w| color_locs.get(&w).map(|_| self.resources[w.0].extent))
                     .unwrap_or_default();
                 let mut ctx = PassContext {
-                    cmd: &list,
+                    cmd: list,
                     sampled,
                     storage,
                     extent,
@@ -604,11 +635,11 @@ impl<'a> RenderGraph<'a> {
                 if first_res.backbuffer {
                     let clear = colors[0].1;
                     if !backbuffer_is_rt {
-                        list.transition_to_render_target(swapchain, image_index);
+                        list.backbuffer_to_render_target();
                         backbuffer_is_rt = true;
                     }
-                    list.begin_rendering(swapchain, image_index, clear, depth_ref);
-                    list.set_viewport_scissor(swapchain);
+                    list.begin_backbuffer_rendering(clear, depth_ref);
+                    list.set_backbuffer_viewport();
                 } else {
                     for &(id, _) in colors {
                         let target = pool.color_target(&color_locs[&id]);
@@ -630,7 +661,7 @@ impl<'a> RenderGraph<'a> {
 
             // Run the graphics pass's record closure.
             let mut ctx = PassContext {
-                cmd: &list,
+                cmd: list,
                 sampled,
                 storage: HashMap::new(),
                 extent,
@@ -648,14 +679,9 @@ impl<'a> RenderGraph<'a> {
         }
 
         if backbuffer_is_rt {
-            list.transition_to_present(swapchain, image_index);
+            list.backbuffer_to_present();
         }
 
-        // Replay the recorded IR onto the real command buffer. In B2 this is on the
-        // same thread (behaviour-identical to direct recording); B3 moves it to the
-        // RHI thread. The backbuffer's swapchain + image index are frame-global, so
-        // the IR doesn't store them per-command — supply them here at translate.
-        list.translate(cmd, swapchain, image_index)?;
         Ok(())
     }
 

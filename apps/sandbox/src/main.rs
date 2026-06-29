@@ -23,9 +23,9 @@ use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
 use dreamcoast_render::{GraphProfiler, PassInfo, RenderGraph, ResourceId, ResourcePool};
 use rhi::{
-    BackendKind, Buffer, BufferDesc, BufferUsage, CommandBuffer, ComputeQueue, Device, Extent2D,
-    Fence, Format, Instance, InstanceDesc, PresentMode, QueryHeap, Queue, Semaphore, Swapchain,
-    SwapchainDesc, Texture,
+    BackendKind, Buffer, BufferDesc, BufferUsage, CommandBuffer, CommandList, ComputeQueue, Device,
+    Extent2D, Fence, Format, Instance, InstanceDesc, PresentMode, QueryHeap, Queue, ReadbackLayout,
+    Recorder, Semaphore, Swapchain, SwapchainDesc, Texture,
 };
 use tracing::info;
 
@@ -45,6 +45,7 @@ mod push;
 mod quality;
 mod reflect;
 mod registry;
+mod rhi_thread;
 mod rt;
 mod smoketest;
 mod taau;
@@ -387,9 +388,12 @@ struct App {
     window: Window,
     _instance: Instance,
     device: Device,
-    queue: Queue,
+    // `queue`/`swapchain` are `None` while the RHI thread owns them (P15_RHI_THREAD,
+    // M4 B3): they're moved into the worker at spawn and reclaimed at join. In the
+    // default inline path they're always `Some` — use [`App::queue`]/[`App::swapchain`].
+    queue: Option<Queue>,
     compute_queue: ComputeQueue,
-    swapchain: Swapchain,
+    swapchain: Option<Swapchain>,
     backend: BackendKind,
     gui: Gui,
 
@@ -441,6 +445,19 @@ struct App {
     cache_compute_fence: Vec<Fence>,
     query_heaps: Vec<QueryHeap>,
     render_finished: Vec<Semaphore>,
+    /// Phase 15 M4 B3: the RHI (submit) thread. `Some` when `P15_RHI_THREAD` is set —
+    /// it solely owns `queue`/`swapchain`/`command_buffers`/`image_available`/
+    /// `in_flight`/`render_finished` (moved at spawn). The record thread builds a
+    /// `Send` `CommandList` per frame and ships it; the worker acquires + translates +
+    /// submits + presents, overlapping the record thread's next frame (record N+1 ∥
+    /// submit N). `None` = the default single-thread inline path (byte-identical).
+    rhi_thread: Option<rhi_thread::RhiThread>,
+    /// Cached swapchain extent/format/readback-layout, kept in sync at construction
+    /// and on resize. The record thread reads these (instead of the swapchain) while
+    /// the RHI thread owns the swapchain.
+    swap_extent_cached: Extent2D,
+    swap_format_cached: Format,
+    readback_layout_cached: ReadbackLayout,
 
     // Launch-time constants.
     flip_y: u32,
@@ -1631,13 +1648,20 @@ impl App {
         let scene_gdf_cooked = gdf.scene_sdf_is_cooked();
         let scene_albedo_cooked = gdf.scene_albedo_is_cooked();
 
+        // Snapshot the swapchain's extent/format/readback-layout before it is moved
+        // into the struct, so the record thread can read them while the RHI thread
+        // owns the swapchain (M4 B3). Kept in sync on resize.
+        let swap_extent_cached = swapchain.extent_2d();
+        let swap_format_cached = swapchain.format();
+        let readback_layout_cached = device.swapchain_readback_layout(&swapchain);
+
         Ok(Self {
             window,
             _instance: instance,
             device,
-            queue,
+            queue: Some(queue),
             compute_queue,
-            swapchain,
+            swapchain: Some(swapchain),
             backend,
             gui,
             deferred,
@@ -1674,6 +1698,10 @@ impl App {
             cache_compute_fence,
             query_heaps,
             render_finished,
+            rhi_thread: None,
+            swap_extent_cached,
+            swap_format_cached,
+            readback_layout_cached,
             flip_y,
             model_radius,
             scene_radius,
@@ -1845,17 +1873,144 @@ impl App {
         })
     }
 
+    /// The graphics queue (inline path). Panics if the RHI thread owns it.
+    fn queue(&self) -> &Queue {
+        self.queue
+            .as_ref()
+            .expect("queue is owned by the RHI thread")
+    }
+
+    /// The swapchain (inline path). Panics if the RHI thread owns it.
+    fn swapchain(&self) -> &Swapchain {
+        self.swapchain
+            .as_ref()
+            .expect("swapchain is owned by the RHI thread")
+    }
+
+    /// Mutable swapchain (inline path / resize). Panics if the RHI thread owns it.
+    fn swapchain_mut(&mut self) -> &mut Swapchain {
+        self.swapchain
+            .as_mut()
+            .expect("swapchain is owned by the RHI thread")
+    }
+
+    /// Swapchain extent — from the live swapchain when inline, else the cached value
+    /// (the RHI thread owns the swapchain).
+    fn swap_extent(&self) -> Extent2D {
+        self.swapchain
+            .as_ref()
+            .map(|s| s.extent_2d())
+            .unwrap_or(self.swap_extent_cached)
+    }
+
+    /// Swapchain format — live when inline, else cached (RHI thread owns it).
+    fn swap_format(&self) -> Format {
+        self.swapchain
+            .as_ref()
+            .map(|s| s.format())
+            .unwrap_or(self.swap_format_cached)
+    }
+
     /// Run the render loop until the window closes (or, in screenshot mode, every
     /// requested capture is saved).
     fn run(&mut self) -> anyhow::Result<()> {
+        // M4 B3: opt into the separate RHI (submit) thread. Default off = the inline
+        // single-thread path (byte-identical). Async-compute paths stay on the inline
+        // path, so the worker is only spawned for the normal submit config.
+        if std::env::var_os("P15_RHI_THREAD").is_some() {
+            if self.async_cache_on || self.particles_on {
+                info!(
+                    "P15_RHI_THREAD ignored: async-compute (cache/particle) paths use the \
+                     inline submitter"
+                );
+            } else {
+                self.spawn_rhi_thread()?;
+            }
+        }
         while !self.window.should_close() {
             if !self.frame()? {
                 break;
             }
         }
+        // Reclaim the boundary objects from the worker before shutdown so they (and
+        // device-idle/teardown) run single-threaded again.
+        if let Some(rhi) = self.rhi_thread.take() {
+            self.reclaim_rhi_objects(rhi.join());
+        }
         self.device.wait_idle()?;
         info!("shutting down");
         Ok(())
+    }
+
+    /// Move the boundary objects (queue/swapchain/per-fif command buffers + frame
+    /// fences/semaphores) into a freshly spawned RHI thread, plus persistent per-fif
+    /// readback buffers it copies captures into (created here, dropped on the record
+    /// thread at reclaim — never on the worker).
+    fn spawn_rhi_thread(&mut self) -> anyhow::Result<()> {
+        let layout = self.readback_layout_cached;
+        let fif = self.command_buffers.len();
+        let mut readback = Vec::with_capacity(fif);
+        for _ in 0..fif {
+            readback.push(self.device.create_buffer(&BufferDesc {
+                size: layout.size,
+                usage: BufferUsage::Readback,
+            })?);
+        }
+        let objects = rhi_thread::ThreadObjects {
+            queue: self.queue.take().expect("queue present before spawn"),
+            swapchain: self
+                .swapchain
+                .take()
+                .expect("swapchain present before spawn"),
+            command_buffers: std::mem::take(&mut self.command_buffers),
+            image_available: std::mem::take(&mut self.image_available),
+            in_flight: std::mem::take(&mut self.in_flight),
+            render_finished: std::mem::take(&mut self.render_finished),
+            readback,
+            readback_layout: layout,
+        };
+        self.rhi_thread = Some(rhi_thread::RhiThread::spawn(objects));
+        info!("P15_RHI_THREAD: render-graph \u{2194} RHI thread split active");
+        Ok(())
+    }
+
+    /// Put the worker's reclaimed objects back into `self` (after `join`). The
+    /// readback buffers in `o` drop here, on the record thread (Rc-safe).
+    fn reclaim_rhi_objects(&mut self, o: rhi_thread::ThreadObjects) {
+        self.queue = Some(o.queue);
+        self.swapchain = Some(o.swapchain);
+        self.command_buffers = o.command_buffers;
+        self.image_available = o.image_available;
+        self.in_flight = o.in_flight;
+        self.render_finished = o.render_finished;
+    }
+
+    /// Recreate the swapchain (resize) on the inline path: idle, recreate, drop
+    /// cached transients, rebuild the per-image present semaphores, and refresh the
+    /// extent/format/readback-layout caches.
+    fn recreate_swapchain(&mut self, ww: u32, wh: u32) -> anyhow::Result<()> {
+        self.device.wait_idle()?;
+        self.swapchain_mut()
+            .recreate(&swapchain_desc(Extent2D::new(ww, wh)))?;
+        for p in &mut self.pools {
+            p.clear(); // transient extents changed; drop cached targets
+        }
+        let count = self.swapchain().image_count();
+        self.render_finished = build_render_finished(&self.device, count)?;
+        self.swap_extent_cached = self.swapchain().extent_2d();
+        self.swap_format_cached = self.swapchain().format();
+        self.readback_layout_cached = self.device.swapchain_readback_layout(self.swapchain());
+        self.needs_recreate = false;
+        Ok(())
+    }
+
+    /// Resize under the RHI thread: reclaim the objects (join), recreate inline, then
+    /// respawn the worker (which rebuilds its readback buffers for the new size).
+    fn recreate_threaded(&mut self, ww: u32, wh: u32) -> anyhow::Result<()> {
+        let rhi = self.rhi_thread.take().expect("rhi thread present");
+        self.reclaim_rhi_objects(rhi.join());
+        self.recreate_swapchain(ww, wh)?;
+        self.spawn_rhi_thread()
     }
 
     /// Hot-swap to level `idx` (Stage C): rebuild the ECS world + registries +
@@ -1915,21 +2070,24 @@ impl App {
         if self.window.take_resized() {
             self.needs_recreate = true;
         }
+        // The worker flags an out-of-date swapchain (present/acquire) here so the
+        // resize below runs on the record thread (it owns the swapchain after join).
+        if let Some(rhi) = &self.rhi_thread
+            && rhi.take_recreate()
+        {
+            self.needs_recreate = true;
+        }
         let (ww, wh) = self.window.size();
         if ww == 0 || wh == 0 {
             std::thread::sleep(std::time::Duration::from_millis(16));
             return Ok(true);
         }
         if self.needs_recreate {
-            self.device.wait_idle()?;
-            self.swapchain
-                .recreate(&swapchain_desc(Extent2D::new(ww, wh)))?;
-            for p in &mut self.pools {
-                p.clear(); // transient extents changed; drop cached targets
+            if self.rhi_thread.is_some() {
+                self.recreate_threaded(ww, wh)?;
+            } else {
+                self.recreate_swapchain(ww, wh)?;
             }
-            self.render_finished =
-                build_render_finished(&self.device, self.swapchain.image_count())?;
-            self.needs_recreate = false;
         }
 
         // Wait for this frame slot's previous submission to finish BEFORE the acquire
@@ -1937,21 +2095,29 @@ impl App {
         // acquiring with a semaphore that still has a pending wait from that earlier
         // submit (VUID-vkAcquireNextImageKHR-semaphore-01779). This is the standard
         // frames-in-flight order: wait → reset → acquire → record → submit.
+        //
+        // M4 B3: when the RHI thread owns the swapchain it does wait+acquire itself;
+        // the record half is backbuffer-relative (the IR carries no image index), so
+        // it needs none here. `image_index` is then only used on the inline submit
+        // path (the threaded path ships the IR and lets the worker resolve it).
         let fif = self.fif;
-        self.in_flight[fif].wait()?;
-
-        // Acquire the drawable up front: its *actual* pixel size is the single source
-        // of truth for this whole frame (ImGui display size, camera aspect, render
-        // extent, viewport). A failed acquire skips here, BEFORE the ImGui frame is
-        // started, so NewFrame/Render stay balanced.
-        let image_index = match self
-            .swapchain
-            .acquire_next_image(&self.image_available[fif])?
-        {
-            Some(i) => i,
-            None => {
-                self.needs_recreate = true;
-                return Ok(true);
+        let image_index = if self.rhi_thread.is_some() {
+            0
+        } else {
+            self.in_flight[fif].wait()?;
+            // Acquire the drawable up front: its *actual* pixel size is the single
+            // source of truth for this whole frame (ImGui display size, camera aspect,
+            // render extent, viewport). A failed acquire skips here, BEFORE the ImGui
+            // frame is started, so NewFrame/Render stay balanced.
+            match self
+                .swapchain()
+                .acquire_next_image(&self.image_available[fif])?
+            {
+                Some(i) => i,
+                None => {
+                    self.needs_recreate = true;
+                    return Ok(true);
+                }
             }
         };
         // The swapchain (display) extent presents the final image; the *render* extent is where
@@ -1959,7 +2125,7 @@ impl App {
         // decouples them so headless can render the scene at QHD/UHD offscreen and the tonemap
         // downscales to the (display-bound) swapchain backbuffer. QHD/UHD perf track.
         let (sw, sh) = {
-            let e = self.swapchain.extent_2d();
+            let e = self.swap_extent();
             (e.width, e.height)
         };
         let (cw, ch) = match self.render_res {
@@ -2749,10 +2915,20 @@ impl App {
             }
         }
 
-        self.in_flight[fif].reset()?;
-
-        let cmd = &self.command_buffers[fif];
-        cmd.begin()?;
+        // Inline path: reset this slot's fence and open its command buffer. When the
+        // RHI thread owns the command buffers (`cmd` is `None`), the worker does the
+        // reset + begin/translate/end itself; the record thread builds `frame_list`
+        // instead and ships it.
+        let cmd: Option<&CommandBuffer> = if self.rhi_thread.is_some() {
+            None
+        } else {
+            self.in_flight[fif].reset()?;
+            let cmd = &self.command_buffers[fif];
+            cmd.begin()?;
+            Some(cmd)
+        };
+        // The whole frame's IR (capture + graph, in record order) when threaded.
+        let frame_list = CommandList::new();
 
         // Lighting: a level supplies its own sun + point lights; otherwise the gallery's
         // code-default sun + two coloured point lights (preserved exactly = byte-identical).
@@ -2811,8 +2987,14 @@ impl App {
         } else {
             (&scene, self.multibounce)
         };
+        // Record the (occasional) environment capture into the same target the frame
+        // uses: the real command buffer inline, or the shipped IR list when threaded.
+        let capture_rec: &dyn Recorder = match cmd {
+            Some(c) => c,
+            None => &frame_list,
+        };
         self.ibl.maybe_capture(
-            cmd,
+            capture_rec,
             self.realtime_env,
             cap_multibounce,
             cap_scene,
@@ -2960,7 +3142,7 @@ impl App {
         let mut graph = RenderGraph::new();
         // The backbuffer is the actual swapchain image (display extent); tonemap samples the
         // render-extent HDR by UV, so a render≠display extent just means a downscale at present.
-        let backbuffer = graph.import_backbuffer(self.swapchain.format(), swap_extent);
+        let backbuffer = graph.import_backbuffer(self.swap_format(), swap_extent);
         let g_albedo = graph.create_color("g_albedo", GB_ALBEDO_FMT, extent);
         let g_normal = graph.create_color("g_normal", GB_NORMAL_FMT, extent);
         let g_material = graph.create_color("g_material", GB_MATERIAL_FMT, extent);
@@ -4089,128 +4271,159 @@ impl App {
                 |ctx| self.gui.render(&self.device, ctx.cmd(), fif),
             );
         }
+        // Profiler is inline-only: the threaded path's query-heap readback would need
+        // to cross the RHI-thread fence, so it's disabled under P15_RHI_THREAD.
         let mut profiler = self
             .profiler_on
             .then(|| GraphProfiler::new(&self.query_heaps[fif]));
-        graph.execute(
-            &self.device,
-            &mut self.pools[fif],
-            cmd,
-            &self.swapchain,
-            image_index,
-            self.aliasing,
-            profiler.as_mut(),
-        )?;
-        // Remember this slot's scheduled pass names so the next readback (after this
-        // frame's fence) can pair them with the timestamp boundaries.
-        self.slot_pass_names[fif] = match &profiler {
-            Some(p) => p.names.clone(),
-            None => Vec::new(),
-        };
-
-        // For a screenshot, copy the just-rendered backbuffer into a readback buffer
-        // in the same command buffer (before it ends).
-        let readback = if capture_this_frame.is_some() {
-            let layout = self.device.swapchain_readback_layout(&self.swapchain);
-            let buf = self.device.create_buffer(&BufferDesc {
-                size: layout.size,
-                usage: BufferUsage::Readback,
-            })?;
-            cmd.copy_swapchain_to_buffer(&self.swapchain, image_index, &buf);
-            Some((buf, layout))
-        } else {
-            None
-        };
-
-        cmd.end()?;
-
-        let signal = &self.render_finished[image_index as usize];
-        if async_sim {
-            // Record the particle sim into this frame's compute command buffer and run
-            // it on the compute queue (overlapping graphics), signaling `compute_done`;
-            // the graphics submit GPU-waits on it so the particle draw's vertex-stage
-            // read sees the freshly written buffer.
-            let ccmd = &self.compute_command_buffers[fif];
-            ccmd.begin()?;
-            ccmd.bind_compute_pipeline(self.particles.sim_pipeline());
-            ccmd.push_constants_compute(&particle_sim_push(
-                self.particles.buffer_storage_index(particle_read),
-                self.particles.buffer_storage_index(particle_write),
-                PARTICLE_COUNT as u32,
-                sim_dt,
-                self.elapsed,
-                0,
-            ));
-            ccmd.dispatch((PARTICLE_COUNT as u32).div_ceil(64), 1, 1);
-            ccmd.end()?;
-            self.compute_queue.submit(ccmd, &self.compute_done[fif])?;
-            self.queue.submit_async(
+        let threaded = cmd.is_none();
+        // Inline-path readback buffer (None when threaded — the worker owns its own).
+        let mut readback: Option<(Buffer, ReadbackLayout)> = None;
+        if let Some(cmd) = cmd {
+            graph.execute(
+                &self.device,
+                &mut self.pools[fif],
                 cmd,
-                &self.image_available[fif],
-                &self.compute_done[fif],
-                signal,
-                &self.in_flight[fif],
+                self.swapchain.as_ref().expect("inline swapchain"),
+                image_index,
+                self.aliasing,
+                profiler.as_mut(),
             )?;
-        } else if self.async_cache_on && scene_cache_lit_ext.is_some() {
-            // Async surface-cache relight: record visibility + relight onto the compute command
-            // buffer and run it on the compute queue, overlapping this graphics frame. The graphics
-            // queue GPU-waits on the PREVIOUS frame's relight (1-frame latency) so its consumer
-            // reads of last frame's radiance are ordered; the 3-slot ring guarantees the slot this
-            // frame writes is not one an in-flight graphics frame still reads (no WAR). Submit
-            // graphics BEFORE the compute signal so D3D12's fence wait targets the previous value.
-            // The compute command buffer for this fif may still be pending from 2 frames ago (the
-            // graphics fence doesn't cover it on the cross-frame path) — wait its own fence first.
-            self.cache_compute_fence[fif].wait()?;
-            self.cache_compute_fence[fif].reset()?;
-            let ccmd = &self.compute_command_buffers[fif];
-            ccmd.begin()?;
-            self.gdf.record_cache_async(
-                ccmd,
-                frustum_planes(cull_view_proj),
-                self.sun_dir,
-                self.sun_intensity,
-                self.cache_relight_spp,
-                self.frame_no as u32,
-                cache_reset_this_frame,
-                self.cache_relight_period,
-                relight_alpha,
-                self.cache_feedback,
-                self.gdf_cone_k,
-            );
-            ccmd.end()?;
-            let cur = (self.frame_no % 2) as usize;
-            if self.frame_no == 0 {
-                // No previous relight to wait on; graphics submits normally, the relight still
-                // signals so frame 1's wait pairs up.
-                self.queue.submit(
+            // Remember this slot's scheduled pass names so the next readback (after
+            // this frame's fence) can pair them with the timestamp boundaries.
+            self.slot_pass_names[fif] = match &profiler {
+                Some(p) => p.names.clone(),
+                None => Vec::new(),
+            };
+
+            // For a screenshot, copy the just-rendered backbuffer into a readback
+            // buffer in the same command buffer (before it ends).
+            if capture_this_frame.is_some() {
+                let layout = self
+                    .device
+                    .swapchain_readback_layout(self.swapchain.as_ref().expect("inline swapchain"));
+                let buf = self.device.create_buffer(&BufferDesc {
+                    size: layout.size,
+                    usage: BufferUsage::Readback,
+                })?;
+                cmd.copy_swapchain_to_buffer(
+                    self.swapchain.as_ref().expect("inline swapchain"),
+                    image_index,
+                    &buf,
+                );
+                readback = Some((buf, layout));
+            }
+
+            cmd.end()?;
+
+            let signal = &self.render_finished[image_index as usize];
+            if async_sim {
+                // Record the particle sim into this frame's compute command buffer and run
+                // it on the compute queue (overlapping graphics), signaling `compute_done`;
+                // the graphics submit GPU-waits on it so the particle draw's vertex-stage
+                // read sees the freshly written buffer.
+                let ccmd = &self.compute_command_buffers[fif];
+                ccmd.begin()?;
+                ccmd.bind_compute_pipeline(self.particles.sim_pipeline());
+                ccmd.push_constants_compute(&particle_sim_push(
+                    self.particles.buffer_storage_index(particle_read),
+                    self.particles.buffer_storage_index(particle_write),
+                    PARTICLE_COUNT as u32,
+                    sim_dt,
+                    self.elapsed,
+                    0,
+                ));
+                ccmd.dispatch((PARTICLE_COUNT as u32).div_ceil(64), 1, 1);
+                ccmd.end()?;
+                self.compute_queue.submit(ccmd, &self.compute_done[fif])?;
+                self.queue().submit_async(
                     cmd,
                     &self.image_available[fif],
+                    &self.compute_done[fif],
                     signal,
                     &self.in_flight[fif],
                 )?;
+            } else if self.async_cache_on && scene_cache_lit_ext.is_some() {
+                // Async surface-cache relight: record visibility + relight onto the compute command
+                // buffer and run it on the compute queue, overlapping this graphics frame. The graphics
+                // queue GPU-waits on the PREVIOUS frame's relight (1-frame latency) so its consumer
+                // reads of last frame's radiance are ordered; the 3-slot ring guarantees the slot this
+                // frame writes is not one an in-flight graphics frame still reads (no WAR). Submit
+                // graphics BEFORE the compute signal so D3D12's fence wait targets the previous value.
+                // The compute command buffer for this fif may still be pending from 2 frames ago (the
+                // graphics fence doesn't cover it on the cross-frame path) — wait its own fence first.
+                self.cache_compute_fence[fif].wait()?;
+                self.cache_compute_fence[fif].reset()?;
+                let ccmd = &self.compute_command_buffers[fif];
+                ccmd.begin()?;
+                self.gdf.record_cache_async(
+                    ccmd,
+                    frustum_planes(cull_view_proj),
+                    self.sun_dir,
+                    self.sun_intensity,
+                    self.cache_relight_spp,
+                    self.frame_no as u32,
+                    cache_reset_this_frame,
+                    self.cache_relight_period,
+                    relight_alpha,
+                    self.cache_feedback,
+                    self.gdf_cone_k,
+                );
+                ccmd.end()?;
+                let cur = (self.frame_no % 2) as usize;
+                if self.frame_no == 0 {
+                    // No previous relight to wait on; graphics submits normally, the relight still
+                    // signals so frame 1's wait pairs up.
+                    self.queue().submit(
+                        cmd,
+                        &self.image_available[fif],
+                        signal,
+                        &self.in_flight[fif],
+                    )?;
+                } else {
+                    let prev = ((self.frame_no + 1) % 2) as usize; // (N-1) mod 2
+                    self.queue().submit_async(
+                        cmd,
+                        &self.image_available[fif],
+                        &self.cache_done[prev],
+                        signal,
+                        &self.in_flight[fif],
+                    )?;
+                }
+                self.compute_queue.submit_fenced(
+                    ccmd,
+                    &self.cache_done[cur],
+                    &self.cache_compute_fence[fif],
+                )?;
+                self.scene_cache_reset = false;
             } else {
-                let prev = ((self.frame_no + 1) % 2) as usize; // (N-1) mod 2
-                self.queue.submit_async(
+                self.queue().submit(
                     cmd,
                     &self.image_available[fif],
-                    &self.cache_done[prev],
                     signal,
                     &self.in_flight[fif],
                 )?;
             }
-            self.compute_queue.submit_fenced(
-                ccmd,
-                &self.cache_done[cur],
-                &self.cache_compute_fence[fif],
-            )?;
-            self.scene_cache_reset = false;
         } else {
-            self.queue.submit(
-                cmd,
-                &self.image_available[fif],
-                signal,
-                &self.in_flight[fif],
+            // Threaded: append the graph onto the frame IR (after any IBL capture) and
+            // ship it. The RHI thread acquires + translates + submits + presents, and
+            // copies/saves the capture itself, overlapping this thread's next frame.
+            graph.record_into(
+                &frame_list,
+                &self.device,
+                &mut self.pools[fif],
+                self.aliasing,
+                None,
             )?;
+            self.slot_pass_names[fif] = Vec::new();
+            let capture = capture_this_frame.as_ref().map(|c| rhi_thread::CaptureReq {
+                path: c.path.clone(),
+                include_ui: c.include_ui,
+            });
+            self.rhi_thread
+                .as_ref()
+                .expect("rhi thread")
+                .submit(frame_list, fif, capture);
         }
         // Swap the particle ping-pong parity for the next simulated frame (deferred to
         // here so the graph's `&self` borrows have ended — see `particle.rs`).
@@ -4254,20 +4467,31 @@ impl App {
         self.prev_view_proj = view_proj.to_cols_array();
         self.prev_view_proj_taau = view_proj_stable.to_cols_array();
 
-        // Wait for the GPU (copy included), read the buffer back, and save a PNG.
-        if let (Some(cap), Some((buf, layout))) = (capture_this_frame.as_ref(), readback.as_ref()) {
-            self.in_flight[fif].wait()?;
-            let mut bytes = vec![0u8; layout.size as usize];
-            buf.read_into(&mut bytes)?;
-            save_screenshot(&cap.path, &bytes, layout)?;
-            info!(
-                "saved screenshot {} ({}x{}, ui={})",
-                cap.path, layout.width, layout.height, cap.include_ui
-            );
-        }
+        // Inline present + capture readback. Threaded: the RHI thread did both (its
+        // capture readback waits the same frame fence → byte-identical + deterministic).
+        if !threaded {
+            // Wait for the GPU (copy included), read the buffer back, and save a PNG.
+            if let (Some(cap), Some((buf, layout))) =
+                (capture_this_frame.as_ref(), readback.as_ref())
+            {
+                self.in_flight[fif].wait()?;
+                let mut bytes = vec![0u8; layout.size as usize];
+                buf.read_into(&mut bytes)?;
+                save_screenshot(&cap.path, &bytes, layout)?;
+                info!(
+                    "saved screenshot {} ({}x{}, ui={})",
+                    cap.path, layout.width, layout.height, cap.include_ui
+                );
+            }
 
-        if self.queue.present(&self.swapchain, image_index, signal)? {
-            self.needs_recreate = true;
+            let signal = &self.render_finished[image_index as usize];
+            if self.queue().present(
+                self.swapchain.as_ref().expect("inline swapchain"),
+                image_index,
+                signal,
+            )? {
+                self.needs_recreate = true;
+            }
         }
         self.fif = (self.fif + 1) % FRAMES_IN_FLIGHT;
         self.frame_no += 1;
