@@ -15,9 +15,9 @@ use dreamcoast_core::EngineError;
 
 use crate::{ImageData, MeshVertex, image_to_rgba8};
 
-/// One node in the glTF hierarchy. `children`/`mesh` are indices into
-/// [`GltfScene::nodes`] / [`GltfScene::meshes`]. Transform is TRS (rotation is the
-/// `[x, y, z, w]` quaternion).
+/// One node in the glTF hierarchy. `children`/`mesh`/`skin` are indices into
+/// [`GltfScene::nodes`] / [`GltfScene::meshes`] / [`GltfScene::skins`]. Transform is
+/// TRS (rotation is the `[x, y, z, w]` quaternion).
 pub struct GltfNode {
     pub name: Option<String>,
     pub translation: [f32; 3],
@@ -25,13 +25,29 @@ pub struct GltfNode {
     pub scale: [f32; 3],
     pub children: Vec<usize>,
     pub mesh: Option<usize>,
+    /// Index into [`GltfScene::skins`] if this node's mesh is skinned.
+    pub skin: Option<usize>,
 }
 
 /// One primitive: geometry + an optional material index (into [`GltfScene::materials`]).
+/// `joints`/`weights` (per-vertex, parallel to `vertices`) are present only on skinned
+/// primitives; they are kept off the GPU [`MeshVertex`] (CPU-only skinning side data).
 pub struct GltfPrimitive {
     pub vertices: Vec<MeshVertex>,
     pub indices: Vec<u32>,
     pub material: Option<usize>,
+    /// Per-vertex joint indices (into the owning node's skin's `joints`), 4 per vertex.
+    pub joints: Option<Vec<[u16; 4]>>,
+    /// Per-vertex skin weights, 4 per vertex (parallel to `joints`).
+    pub weights: Option<Vec<[f32; 4]>>,
+}
+
+/// A skin: the joint nodes it animates plus their inverse-bind matrices (column-major
+/// `[f32; 16]`). `inverse_bind[i]` pairs with `joints[i]`; empty means identity per
+/// joint (the glTF default when the accessor is omitted).
+pub struct GltfSkin {
+    pub joints: Vec<usize>,
+    pub inverse_bind: Vec<[f32; 16]>,
 }
 
 /// A material with its texture slots referenced by **image index** (into
@@ -103,6 +119,8 @@ pub struct GltfScene {
     pub images: Vec<ImageData>,
     /// Animation clips (node TRS tracks); empty for a static scene.
     pub animations: Vec<GltfAnimation>,
+    /// Skins (joint sets + inverse-bind matrices); empty for an unskinned scene.
+    pub skins: Vec<GltfSkin>,
 }
 
 impl GltfScene {
@@ -166,6 +184,22 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<GltfScene, EngineError>
                 scale,
                 children: n.children().map(|c| c.index()).collect(),
                 mesh: n.mesh().map(|m| m.index()),
+                skin: n.skin().map(|s| s.index()),
+            }
+        })
+        .collect();
+
+    let skins: Vec<GltfSkin> = doc
+        .skins()
+        .map(|s| {
+            let reader = s.reader(|b| buffers.get(b.index()).map(|d| d.0.as_slice()));
+            let inverse_bind = reader
+                .read_inverse_bind_matrices()
+                .map(|it| it.map(flatten_mat4).collect())
+                .unwrap_or_default();
+            GltfSkin {
+                joints: s.joints().map(|j| j.index()).collect(),
+                inverse_bind,
             }
         })
         .collect();
@@ -188,7 +222,17 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<GltfScene, EngineError>
         materials,
         images,
         animations,
+        skins,
     })
+}
+
+/// Flatten glTF's `[[f32; 4]; 4]` (column-major columns) into a flat `[f32; 16]`.
+fn flatten_mat4(m: [[f32; 4]; 4]) -> [f32; 16] {
+    let mut out = [0.0f32; 16];
+    for (c, col) in m.iter().enumerate() {
+        out[c * 4..c * 4 + 4].copy_from_slice(col);
+    }
+    out
 }
 
 /// Read one animation clip's node-TRS channels. Morph-target-weight channels are
@@ -265,9 +309,16 @@ fn read_primitive(prim: &gltf::Primitive, buffers: &[gltf::buffer::Data]) -> Glt
         })
         .collect();
 
+    // Skinning side data (CPU-only; off the GPU `MeshVertex`). Present only when the
+    // primitive carries the JOINTS_0/WEIGHTS_0 attributes.
+    let joints = reader.read_joints(0).map(|j| j.into_u16().collect());
+    let weights = reader.read_weights(0).map(|w| w.into_f32().collect());
+
     GltfPrimitive {
         vertices,
         indices,
         material: prim.material().index(),
+        joints,
+        weights,
     }
 }

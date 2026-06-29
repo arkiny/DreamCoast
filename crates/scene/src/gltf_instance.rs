@@ -133,6 +133,7 @@ mod tests {
                     scale: [1.0, 1.0, 1.0],
                     children: vec![1],
                     mesh: Some(0),
+                    skin: None,
                 },
                 GltfNode {
                     name: Some("child".into()),
@@ -141,6 +142,7 @@ mod tests {
                     scale: [1.0, 1.0, 1.0],
                     children: vec![],
                     mesh: Some(0),
+                    skin: None,
                 },
             ],
             roots: vec![0],
@@ -148,6 +150,8 @@ mod tests {
                 vertices: vec![],
                 indices: vec![],
                 material: Some(0),
+                joints: None,
+                weights: None,
             }]],
             materials: vec![GltfMaterial {
                 base_color_factor: [1.0; 4],
@@ -162,6 +166,7 @@ mod tests {
             }],
             images: vec![],
             animations: vec![],
+            skins: vec![],
         }
     }
 
