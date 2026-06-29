@@ -542,6 +542,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gi_volume_cs",
     },
+    // Physical-camera auto-exposure: meter the lit HDR → adapted exposure storage buffer.
+    Job {
+        src: "auto_exposure.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "auto_exposure_cs",
+    },
     // Stage D1 (Sponza 60fps): joint-bilateral upsample of the half-res GI to full res.
     Job {
         src: "gdf_gi_upsample.slang",

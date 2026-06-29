@@ -479,6 +479,10 @@ struct App {
     /// capture (`sky.slang`). Legacy 6.0 (gallery anchor); content lowers it so the direct sun
     /// dominates the sky physically, interiors filled by multibounce GI. `SKY_GAIN` overrides.
     sky_gain: f32,
+    /// Physical-camera auto-exposure: meter the lit HDR each frame and adapt the exposure (vs the
+    /// fixed EV100). Opt-in (`AUTO_EXPOSURE`); off → the lighting uses the static `exposure` and is
+    /// byte-identical (the gallery anchor never auto-exposes).
+    auto_exposure: bool,
     /// UE-style multi-bounce energy compensation strength for the GDF GI (0 = off = gallery anchor;
     /// ~0.6 content). Written to `globals.probe_box_max.w`; see pbr.slang. `P_GI_MULTIBOUNCE`.
     gi_multibounce: f32,
@@ -1223,6 +1227,11 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(6.0)
             .max(0.0);
+        // Physical-camera auto-exposure (see the field). Opt-in, never the gallery (fixed-exposure
+        // anchor), and only when the metering pipeline built.
+        let auto_exposure = std::env::var_os("AUTO_EXPOSURE").is_some()
+            && !gallery_scene
+            && deferred.exposure_buf_index().is_some();
         let ambient = 0.04f32;
         // On by default; `NO_POINT_LIGHTS=1` disables them (the path tracer has no
         // point lights, so a fair raster-vs-ground-truth comparison turns these off).
@@ -1645,6 +1654,7 @@ impl App {
                 })
                 .max(0.0),
             sky_gain,
+            auto_exposure,
             gi_multibounce: std::env::var("P_GI_MULTIBOUNCE")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
@@ -1995,6 +2005,7 @@ impl App {
             || self.reflect_cache
             || taau_active
             || self.gi_volume
+            || self.auto_exposure
             || (self.swrt_reflect && self.reflect.has_reflect_temporal())
         {
             // The surface cache / stochastic GGX reflection accrue a sample per frame + temporally
@@ -2193,6 +2204,7 @@ impl App {
             let ui = self
                 .gui
                 .new_frame(dt, [sw as f32, sh as f32], self.window.input());
+            let has_auto_exposure = self.deferred.exposure_buf_index().is_some();
             let App {
                 gdf,
                 gi,
@@ -2203,6 +2215,7 @@ impl App {
                 sun_intensity,
                 ambient,
                 exposure,
+                auto_exposure,
                 point_lights_on,
                 shadows_on,
                 shadow_bias,
@@ -2387,6 +2400,9 @@ impl App {
                         ui.slider("Sun intensity", 0.0, 32.0, sun_intensity);
                         ui.slider("Ambient", 0.0, 0.5, ambient);
                         ui.slider("Exposure", 0.1, 4.0, exposure);
+                        if has_auto_exposure {
+                            ui.checkbox("Auto exposure", auto_exposure);
+                        }
                         ui.checkbox("Point lights", point_lights_on);
                         ui.checkbox("Shadows", shadows_on);
                         ui.slider("Shadow bias", 0.0, 0.01, shadow_bias);
@@ -3354,7 +3370,22 @@ impl App {
             // Two-sided shading for imported scenes (single-sided walls seen from inside);
             // the gallery stays single-sided so its baseline is byte-identical.
             !self.is_gallery,
+            // Auto-exposure: when on, the lighting reads the adapted exposure from the metering
+            // buffer; off → sentinel (use the static globals.ambient.a, byte-identical anchor).
+            if self.auto_exposure {
+                self.deferred.exposure_buf_index().unwrap_or(u32::MAX)
+            } else {
+                u32::MAX
+            },
         );
+        // Auto-exposure metering: read this frame's lit HDR, adapt the exposure for next frame.
+        // After lighting (the `hdr` read orders it). `adapt` = 1-exp(-dt·speed) (eye/iris speed).
+        if self.auto_exposure {
+            let speed = 2.5f32;
+            let adapt = 1.0 - (-dt * speed).exp();
+            self.deferred
+                .record_auto_exposure(&mut graph, hdr, 0.18, adapt, 1.0e-6, 4.0);
+        }
         // C7c: capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
         // Reads the lit `hdr` (not the post-blur), so it sequences after the lighting pass.
         if swrt_reflect_out.is_some() {
