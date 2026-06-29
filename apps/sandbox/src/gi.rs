@@ -331,16 +331,22 @@ impl GiSystem {
         let aop = self.ao_pipeline.as_ref().expect("gdf ao pipeline");
         let out = graph.create_storage_image("gdf_ao_out", HDR_FORMAT, extent);
         let sampled = scene_gdf.sampled_index();
-        // AO is a LOCAL contact effect at a fixed physical scale (1 unit = 1 m), not a
-        // fraction of the whole scene: `diag * 0.07` is fine for a small gallery (diag ~4 ->
-        // 0.28 m) but on a building (Sponza diag ~37 -> 2.6 m) it treats every wall/column
-        // within 2.6 m as an occluder, so the whole interior reads as occluded and AO crushes
-        // the ambient (luma 58 -> 14). Cap the reach + bias to a physical contact distance so
-        // AO darkens only true corners/contacts regardless of scene size (PBR-correct local AO).
+        // AO is a LOCAL contact effect at a fixed physical scale (1 unit = 1 m), not a fraction of
+        // the whole scene, so the reach is a metric distance (capped) regardless of scene size —
+        // `diag * 0.07` alone would make a big scene (Sponza diag ~37 -> 2.6 m) treat every wall
+        // within 2.6 m as an occluder. The exponential falloff (gdf_ao.slang) never crushes to pure
+        // black, so the strength + reach can be pushed for a clearly-visible occlusion contact
+        // without the old `saturate(1-k·occ)` corner blow-out. `AO_STRENGTH` / `AO_REACH` tune it.
         let diag = Self::diag(aabb_min, aabb_max);
-        let reach = (diag * 0.07).min(0.5);
+        let reach = std::env::var("AO_REACH")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or((diag * 0.07).min(1.0));
         let bias = (diag * 0.004).min(0.02);
-        let strength = 1.6;
+        let strength = std::env::var("AO_STRENGTH")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(3.0);
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "gdf_ao",
