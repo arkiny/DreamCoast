@@ -146,6 +146,9 @@ pub(crate) struct SceneObject {
     /// Alpha-test cutoff for `alphaMode: MASK` (0.0 = opaque, no test). Drives the G-buffer
     /// cutout discard and the masked-shadow discard from one value.
     pub(crate) alpha_cutoff: f32,
+    /// Renderer routing tag from material classification (deferred-decal pass split). `Opaque`
+    /// for procedural/level drawables; glTF imports may be `Decal`/`Transparent`.
+    pub(crate) kind: dreamcoast_asset::MaterialKind,
     pub(crate) casts_shadow: bool,
     /// GPU-skinning storage-buffer indices `[joints, weights, palette, joint_count]`
     /// when this drawable is skinned (animation Stage B.2); `None` = static. Set by the
@@ -1027,6 +1030,7 @@ impl App {
                     model.material.base_color_factor,
                 ),
                 alpha_cutoff: 0.0,
+                kind: dreamcoast_asset::MaterialKind::Opaque,
             });
             let mat_chrome = material_registry.add(MaterialDesc {
                 base_color: [0.95, 0.96, 0.97, 1.0],
@@ -1035,6 +1039,7 @@ impl App {
                 tex: [NO_TEXTURE; 4],
                 albedo: registry::representative_albedo(None, [0.95, 0.96, 0.97, 1.0]),
                 alpha_cutoff: 0.0,
+                kind: dreamcoast_asset::MaterialKind::Opaque,
             });
             let mat_copper = material_registry.add(MaterialDesc {
                 base_color: [0.95, 0.64, 0.54, 1.0],
@@ -1043,6 +1048,7 @@ impl App {
                 tex: [NO_TEXTURE; 4],
                 albedo: registry::representative_albedo(None, [0.95, 0.64, 0.54, 1.0]),
                 alpha_cutoff: 0.0,
+                kind: dreamcoast_asset::MaterialKind::Opaque,
             });
             let mat_red = material_registry.add(MaterialDesc {
                 base_color: [0.85, 0.25, 0.2, 1.0],
@@ -1051,6 +1057,7 @@ impl App {
                 tex: [NO_TEXTURE; 4],
                 albedo: registry::representative_albedo(None, [0.85, 0.25, 0.2, 1.0]),
                 alpha_cutoff: 0.0,
+                kind: dreamcoast_asset::MaterialKind::Opaque,
             });
             // Spawn order defines the deterministic draw / TLAS-instance order (model,
             // chrome, copper, cube) — the order the legacy flat list used.
@@ -1115,6 +1122,27 @@ impl App {
         // consume. (Static scene → built once; later stages rebuild on scene change. In
         // world mode `world` is empty — the per-frame list comes from the streamer.)
         let scene = build_scene(&world, &mesh_registry, &material_registry);
+        // Decal/transparent census (deferred-decal Stage A1): classification is wired
+        // through to the draw list but no decal pass runs yet, so this only reports — the
+        // render stays byte-identical. The A3 decal pass will consume the `Decal` tag.
+        {
+            use dreamcoast_asset::MaterialKind;
+            let decals = scene
+                .iter()
+                .filter(|o| o.kind == MaterialKind::Decal)
+                .count();
+            let transparents = scene
+                .iter()
+                .filter(|o| o.kind == MaterialKind::Transparent)
+                .count();
+            if decals + transparents > 0 {
+                info!(
+                    "material kinds: {decals} decal, {transparents} transparent (of {} drawables; \
+                     decal pass not yet wired — opaque fallback)",
+                    scene.len()
+                );
+            }
+        }
         // Frame the camera at the scene's native scale: derive the centre + radius from
         // the placed-geometry AABB (Sponza fills its real ~20 m, lanterns their ~2 m).
         // The gallery keeps its exact legacy framing (byte-identical baseline); world

@@ -61,6 +61,52 @@ pub struct GltfSkin {
     pub inverse_bind: Vec<[f32; 16]>,
 }
 
+/// glTF `alphaMode` — how a material's base-color alpha is interpreted. Preserved from
+/// import (the single source) so the renderer can route OPAQUE/MASK/BLEND differently.
+/// `MASK` carries the alpha-test cutoff; `BLEND` covers both surface decals and true
+/// transparency (glTF has no decal flag — see [`classify_material`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AlphaMode {
+    #[default]
+    Opaque,
+    Mask,
+    Blend,
+}
+
+/// How the renderer should treat a material, derived from [`AlphaMode`] + authoring hints.
+/// glTF lacks a decal flag (decals and true transparents both author as `BLEND`), so this
+/// is the engine's own routing tag: `Decal` modifies an already-lit surface's G-buffer
+/// (albedo tint), `Transparent` is a real OVER-blended surface (track B, currently still
+/// drawn as opaque). See [`classify_material`] — the one place this is decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MaterialKind {
+    #[default]
+    Opaque,
+    Masked,
+    Decal,
+    Transparent,
+}
+
+/// Decide a material's [`MaterialKind`] from its `alphaMode` and name. **This is the single,
+/// isolated home for decal/transparent classification** so the heuristic can be replaced
+/// wholesale later (an authoring convention, a `KHR_*` extension, or scene metadata) without
+/// touching the renderer. Short-term: a `BLEND` material whose name contains "decal" is a
+/// surface decal (the Intel Sponza `dirt_decal` convention); any other `BLEND` is treated as
+/// `Transparent` (track B — still opaque-fallback in the renderer for now).
+pub fn classify_material(name: Option<&str>, alpha_mode: AlphaMode) -> MaterialKind {
+    match alpha_mode {
+        AlphaMode::Opaque => MaterialKind::Opaque,
+        AlphaMode::Mask => MaterialKind::Masked,
+        AlphaMode::Blend => {
+            if name.is_some_and(|n| n.to_ascii_lowercase().contains("decal")) {
+                MaterialKind::Decal
+            } else {
+                MaterialKind::Transparent
+            }
+        }
+    }
+}
+
 /// A material with its texture slots referenced by **image index** (into
 /// [`GltfScene::images`]) so shared images upload once.
 pub struct GltfMaterial {
@@ -73,10 +119,13 @@ pub struct GltfMaterial {
     pub normal: Option<usize>,
     pub emissive: Option<usize>,
     /// Alpha-test cutoff for `alphaMode: MASK` materials (fragments with base-color alpha
-    /// below this are discarded). `0.0` means no alpha test — `OPAQUE` (and, for now, `BLEND`,
-    /// which is handled as opaque until true alpha blending lands). Single source for the
-    /// renderer's masked cutout + masked shadows.
+    /// below this are discarded). `0.0` means no alpha test — `OPAQUE`/`BLEND` carry none.
+    /// Single source for the renderer's masked cutout + masked shadows.
     pub alpha_cutoff: f32,
+    /// glTF `alphaMode`, preserved from import (the single source for OPAQUE/MASK/BLEND routing).
+    pub alpha_mode: AlphaMode,
+    /// Engine routing tag derived once at import via [`classify_material`] (`alpha_mode` + name).
+    pub kind: MaterialKind,
 }
 
 /// Keyframe interpolation mode for an animation sampler (glTF's three modes).
@@ -156,13 +205,19 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<GltfScene, EngineError>
             let pbr = m.pbr_metallic_roughness();
             let src =
                 |info: Option<gltf::texture::Info>| info.map(|i| i.texture().source().index());
-            // Only MASK is alpha-tested; OPAQUE and BLEND carry no cutoff (BLEND is treated as
-            // opaque until true alpha blending lands — see the renderer's gbuffer/shadow passes).
-            // glTF's default cutoff is 0.5 when MASK omits `alphaCutoff`.
-            let alpha_cutoff = match m.alpha_mode() {
-                gltf::material::AlphaMode::Mask => m.alpha_cutoff().unwrap_or(0.5),
+            // Preserve alphaMode (single source) and derive the engine routing tag once.
+            let alpha_mode = match m.alpha_mode() {
+                gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
+                gltf::material::AlphaMode::Mask => AlphaMode::Mask,
+                gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+            };
+            // Only MASK is alpha-tested; OPAQUE/BLEND carry no cutoff. glTF's default cutoff
+            // is 0.5 when MASK omits `alphaCutoff`.
+            let alpha_cutoff = match alpha_mode {
+                AlphaMode::Mask => m.alpha_cutoff().unwrap_or(0.5),
                 _ => 0.0,
             };
+            let kind = classify_material(m.name(), alpha_mode);
             GltfMaterial {
                 base_color_factor: pbr.base_color_factor(),
                 metallic_factor: pbr.metallic_factor(),
@@ -173,6 +228,8 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<GltfScene, EngineError>
                 normal: m.normal_texture().map(|n| n.texture().source().index()),
                 emissive: src(m.emissive_texture()),
                 alpha_cutoff,
+                alpha_mode,
+                kind,
             }
         })
         .collect();
@@ -345,5 +402,57 @@ fn read_primitive(prim: &gltf::Primitive, buffers: &[gltf::buffer::Data]) -> Glt
         joints,
         weights,
         morph_targets,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_opaque_and_mask_ignore_name() {
+        // OPAQUE/MASK never become decals regardless of name.
+        assert_eq!(
+            classify_material(None, AlphaMode::Opaque),
+            MaterialKind::Opaque
+        );
+        assert_eq!(
+            classify_material(Some("dirt_decal"), AlphaMode::Opaque),
+            MaterialKind::Opaque
+        );
+        assert_eq!(
+            classify_material(None, AlphaMode::Mask),
+            MaterialKind::Masked
+        );
+        assert_eq!(
+            classify_material(Some("foliage_decal"), AlphaMode::Mask),
+            MaterialKind::Masked
+        );
+    }
+
+    #[test]
+    fn classify_blend_decal_by_name() {
+        // BLEND + "decal" in the name → surface decal (case-insensitive, substring).
+        assert_eq!(
+            classify_material(Some("dirt_decal"), AlphaMode::Blend),
+            MaterialKind::Decal
+        );
+        assert_eq!(
+            classify_material(Some("Decal_Grime_01"), AlphaMode::Blend),
+            MaterialKind::Decal
+        );
+    }
+
+    #[test]
+    fn classify_blend_without_decal_is_transparent() {
+        // BLEND without the decal hint → transparent (track B; opaque-fallback for now).
+        assert_eq!(
+            classify_material(Some("glass"), AlphaMode::Blend),
+            MaterialKind::Transparent
+        );
+        assert_eq!(
+            classify_material(None, AlphaMode::Blend),
+            MaterialKind::Transparent
+        );
     }
 }
