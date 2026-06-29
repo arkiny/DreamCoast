@@ -47,6 +47,10 @@ pub(crate) struct DeferredRenderer {
     /// G-buffer fill for GPU-morphed meshes (animation Stage C optimization): the
     /// `vsMainMorphed` vertex-pulling entry point of the same shader.
     gbuffer_morphed_pipeline: GraphicsPipeline,
+    /// Deferred surface-decal fill (decals A3): the `fsDecal` entry of the same shader with
+    /// the `DecalAlbedo` per-RT blend (RT0 albedo blend, rest masked) + depth-test/no-write.
+    /// Runs after the opaque G-buffer fill to tint already-shaded surfaces (the dirt_decal fix).
+    gbuffer_decal_pipeline: GraphicsPipeline,
     /// Depth-only shadow fill for GPU-morphed casters (so the shadow follows the morph).
     shadow_morphed_pipeline: GraphicsPipeline,
     pbr_pipeline: GraphicsPipeline,
@@ -98,6 +102,7 @@ impl DeferredRenderer {
             bindless: true,
             uniform_buffer: false,
             depth_test: true,
+            depth_write: true,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -131,6 +136,7 @@ impl DeferredRenderer {
             bindless: true,
             uniform_buffer: false,
             depth_test: true,
+            depth_write: true,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -164,6 +170,45 @@ impl DeferredRenderer {
             bindless: true,
             uniform_buffer: false,
             depth_test: true,
+            depth_write: true,
+            depth_format: Some(DEPTH_FORMAT),
+        })?;
+
+        // Deferred decal fill (decals A3): the `fsDecal` entry of the same shader (shares
+        // `vsMain` + the Mesh vertex layout), with the `DecalAlbedo` per-RT blend so it tints
+        // the G-buffer albedo while leaving normal / metallic / roughness / world-pos as the
+        // underlying surface's. Depth-tests against the opaque depth (occluded by closer
+        // geometry) but does NOT write depth (`depth_write: false`) — it must not perturb the
+        // opaque depth that downstream passes read. Same 4 MRT formats + push size as the fill.
+        let (gb_decal_vs, gb_decal_fs) = load_shader_pair(
+            backend,
+            dreamcoast_shader::gbuffer_vs_spirv,
+            dreamcoast_shader::gbuffer_decal_fs_spirv,
+            dreamcoast_shader::gbuffer_vs_dxil,
+            dreamcoast_shader::gbuffer_decal_fs_dxil,
+            dreamcoast_shader::gbuffer_vs_metallib,
+            dreamcoast_shader::gbuffer_decal_fs_metallib,
+            "gbuffer_decal",
+        )?;
+        let gbuffer_decal_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            vertex_bytes: gb_decal_vs,
+            fragment_bytes: gb_decal_fs,
+            vertex_entry: "vsMain",
+            fragment_entry: "fsDecal",
+            color_formats: &[
+                GB_ALBEDO_FMT,
+                GB_NORMAL_FMT,
+                GB_MATERIAL_FMT,
+                GB_POSITION_FMT,
+            ],
+            topology: PrimitiveTopology::TriangleList,
+            vertex_layout: VertexLayout::Mesh,
+            blend: BlendMode::DecalAlbedo,
+            push_constant_size: 208,
+            bindless: true,
+            uniform_buffer: false,
+            depth_test: true,
+            depth_write: false,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -194,6 +239,7 @@ impl DeferredRenderer {
             bindless: true,          // push constants + the bindless base-color texture (masked)
             uniform_buffer: false,
             depth_test: true,
+            depth_write: true,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -222,6 +268,7 @@ impl DeferredRenderer {
             bindless: true,
             uniform_buffer: false,
             depth_test: true,
+            depth_write: true,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -250,6 +297,7 @@ impl DeferredRenderer {
             bindless: true,
             uniform_buffer: false,
             depth_test: true,
+            depth_write: true,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -277,6 +325,7 @@ impl DeferredRenderer {
             bindless: true,
             uniform_buffer: true,
             depth_test: false,
+            depth_write: false,
             depth_format: None,
         })?;
 
@@ -304,6 +353,7 @@ impl DeferredRenderer {
             bindless: true,
             uniform_buffer: false,
             depth_test: false,
+            depth_write: false,
             depth_format: None,
         })?;
 
@@ -398,6 +448,7 @@ impl DeferredRenderer {
             gbuffer_pipeline,
             gbuffer_skinned_pipeline,
             gbuffer_morphed_pipeline,
+            gbuffer_decal_pipeline,
             shadow_morphed_pipeline,
             pbr_pipeline,
             post_pipeline,
@@ -600,6 +651,14 @@ impl DeferredRenderer {
                 let cmd = ctx.cmd();
                 cmd.bind_graphics_pipeline(&self.gbuffer_pipeline);
                 for obj in scene {
+                    // Decals are not opaque surfaces: they tint the G-buffer albedo in the
+                    // later `record_decals` pass instead of writing their own (diffuse-less)
+                    // material here. Skipping them is what stops a decal from overwriting the
+                    // surface as opaque (the dirt_decal fix). Non-decal scenes have none →
+                    // this loop is byte-identical for them.
+                    if obj.kind == dreamcoast_asset::MaterialKind::Decal {
+                        continue;
+                    }
                     let obj_mvp = (view_proj * obj.transform).to_cols_array();
                     let (m, rgh, mr_tex) = if override_material {
                         (metallic_override, roughness_override, NO_TEXTURE)
@@ -651,6 +710,72 @@ impl DeferredRenderer {
                 cmd.bind_vertex_buffer(ground_vbuf, 32);
                 cmd.bind_index_buffer(ground_ibuf, true);
                 cmd.draw_indexed(ground_count, 0, 0);
+                Ok(())
+            },
+        );
+    }
+
+    /// Deferred surface-decal pass (decals A3): runs after `record_gbuffer`, before lighting.
+    /// Each `kind == Decal` drawable is rasterized with the `DecalAlbedo` blend so it tints the
+    /// G-buffer albedo it sits on (RT0 RGB alpha-blend) while RT1/RT2/RT3 are write-masked off —
+    /// the underlying surface keeps its own normal / metallic / roughness / world-pos, so the
+    /// lighting that runs next shades the decal with the *surface's* inputs (the dirt_decal fix:
+    /// a diffuse-less BLEND decal can no longer overwrite stone as opaque black metal). The
+    /// G-buffer targets are LOADED (no clear) to preserve the opaque fill; depth is bound for
+    /// testing only (no write). Returns immediately when the scene has no decals, so non-decal
+    /// scenes get no extra pass (byte-identical).
+    pub(crate) fn record_decals<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        targets: GBufferTargets,
+        scene: &'a [SceneObject],
+        view_proj: Mat4,
+        mip_bias: f32,
+    ) {
+        if !scene
+            .iter()
+            .any(|o| o.kind == dreamcoast_asset::MaterialKind::Decal)
+        {
+            return;
+        }
+        graph.add_pass(
+            PassInfo {
+                name: "decals",
+                // Load (no clear) every G-buffer target: the decal blends into the albedo and
+                // leaves the rest untouched via the pipeline's per-RT write mask.
+                colors: vec![
+                    (targets.albedo, None),
+                    (targets.normal, None),
+                    (targets.material, None),
+                    (targets.position, None),
+                ],
+                depth: Some(targets.depth),
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.bind_graphics_pipeline(&self.gbuffer_decal_pipeline);
+                for obj in scene {
+                    if obj.kind != dreamcoast_asset::MaterialKind::Decal {
+                        continue;
+                    }
+                    let obj_mvp = (view_proj * obj.transform).to_cols_array();
+                    cmd.push_constants(&gbuffer_push(
+                        obj_mvp,
+                        obj.base_color,
+                        obj.metallic,
+                        obj.roughness,
+                        mip_bias,
+                        obj.alpha_cutoff,
+                        obj.tex,
+                        obj.transform.to_cols_array(),
+                        [0; 4], // decals are static geometry (not skinned)
+                        [0; 4], // not morphed
+                    ));
+                    cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
+                    cmd.bind_index_buffer(&obj.mesh.ibuf, true);
+                    cmd.draw_indexed(obj.mesh.index_count, 0, 0);
+                }
                 Ok(())
             },
         );
