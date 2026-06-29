@@ -22,7 +22,7 @@ mod node;
 mod schedule;
 mod transform;
 
-pub use animation::{AnimationClip, AnimationPlayer, advance_animation};
+pub use animation::{AnimationClip, AnimationPlayer, MorphWeights, advance_animation};
 pub use components::{MaterialHandle, MeshHandle, MeshInstance, Name};
 pub use draw_list::Drawable;
 pub use ecs::{Entity, World, WorldCell};
