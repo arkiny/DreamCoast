@@ -590,6 +590,11 @@ struct App {
     scene_cache_reset: bool,
     path_trace_pipeline: bool,
     realtime_env: bool,
+    /// Per-frame dynamic sun (time-of-day): when on, the sun arcs across the sky from
+    /// `elapsed`, so the physical atmosphere + IBL recapture each frame (already per-frame
+    /// via `realtime_env`) visibly drive a moving sky. Off by default (static, deterministic
+    /// screenshots). `TIME_OF_DAY` env / UI toggle. Infrastructure for future time-of-day.
+    time_of_day: bool,
     multibounce: bool,
     /// Deprecated legacy captured-cube IBL path (prefilter-cube specular + scene capture).
     /// Off by default — the SW-RT hybrid reflection + GDF GI are the default ambient.
@@ -1660,6 +1665,7 @@ impl App {
             scene_cache_reset: true,
             path_trace_pipeline,
             realtime_env: true,
+            time_of_day: std::env::var_os("TIME_OF_DAY").is_some(),
             multibounce: true,
             legacy_ibl,
             render_res,
@@ -2140,6 +2146,7 @@ impl App {
                 metallic_override,
                 roughness_override,
                 realtime_env,
+                time_of_day,
                 multibounce,
                 legacy_ibl,
                 post_mode,
@@ -2330,6 +2337,7 @@ impl App {
                         if *legacy_ibl {
                             ui.text_disabled("  - prefilter-cube specular + scene capture");
                             ui.checkbox("Real-time env capture", realtime_env);
+                            ui.checkbox("Time-of-day (dynamic sun)", time_of_day);
                             ui.checkbox("Multi-bounce reflections", multibounce);
                         } else {
                             ui.text_disabled("  - default: SW-RT specular + GDF GI diffuse");
@@ -2556,7 +2564,7 @@ impl App {
         // code-default sun + two coloured point lights (preserved exactly = byte-identical).
         let r = self.model_radius;
         let point_intensity = r * r * 8.0;
-        let (sun_dir, sun_intensity, point_count, point_pos, point_color) =
+        let (mut sun_dir, sun_intensity, point_count, point_pos, point_color) =
             match &self.level_lighting {
                 Some(ll) => (
                     ll.sun_dir,
@@ -2583,6 +2591,16 @@ impl App {
                     ],
                 ),
             };
+
+        // Time-of-day: arc the sun across the sky from elapsed time. The atmosphere + IBL
+        // already recapture per frame (`realtime_env`), and `maybe_capture` re-marches the sky
+        // on the sun change, so the physical sky moves with the sun. Off by default (static).
+        if self.time_of_day {
+            let t = self.elapsed * 0.15; // ~40 s/day; future: bind to a day-length setting
+            let height = (t.sin() * 0.5 + 0.5) * 0.85 + 0.06; // stay above the horizon
+            let horiz = (1.0 - height * height).max(0.0).sqrt();
+            sun_dir = [t.cos() * horiz, height, t.sin() * horiz * 0.4];
+        }
 
         // (Re)capture the environment into the "write" cube set before the main graph
         // samples it (see `ibl.rs`). The reflection probe is fixed at the scene centre
