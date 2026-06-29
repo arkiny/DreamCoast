@@ -63,6 +63,19 @@ pub(crate) fn build_skinned_meshes(
     node_map: &[Option<Entity>],
     registry: &MeshRegistry,
 ) -> anyhow::Result<Vec<SkinnedMesh>> {
+    // GPU skinning needs a host-writable storage buffer for the per-frame palette. On
+    // a backend without it (Vulkan/D3D12 until animation Stage B.2c), skip skinning
+    // entirely — the meshes then render their (static) bind pose via the normal path
+    // rather than reading an un-updatable palette. Metal supports it (Shared storage).
+    let probe = device.create_storage_buffer_init(&storage_desc(64, 64), &[0u8; 64])?;
+    if probe.write(&[0u8; 64]).is_err() {
+        tracing::warn!(
+            "GPU skinning unavailable on this backend (no storage-buffer host-write); \
+             skinned meshes render bind-pose (animation Stage B.2c)"
+        );
+        return Ok(Vec::new());
+    }
+
     let mut skinned = Vec::new();
     for node in &gscene.nodes {
         let (Some(mesh_idx), Some(skin_idx)) = (node.mesh, node.skin) else {
