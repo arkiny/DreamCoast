@@ -86,6 +86,37 @@ backend_enum!(/// A hardware ray-tracing pipeline + shader binding table (Phase 
 backend_enum!(/// A GPU timestamp query heap for per-pass profiling (Phase 9 M1).
     QueryHeap => rhi_vulkan::VulkanQueryHeap, rhi_d3d12::D3d12QueryHeap, rhi_metal::MetalQueryHeap);
 
+// Phase 15 M4 B3 — the RHI-thread handoff boundary.
+//
+// These objects are not `Send` by default: the backend types hold an
+// `Rc<DeviceShared>` (non-atomic refcount) + `RefCell`/`Cell` interior mutability
+// (Metal), and objc2/ash/COM handles. The B3 design (`P15_RHI_THREAD`) moves a
+// fixed set of them — the graphics/compute queues, the swapchain, the per-fif
+// command buffers, and the frame fences/semaphores — onto a single RHI thread that
+// *solely owns* them for the program's lifetime.
+//
+// SAFETY: soundness rests on the M4 handoff contract, not on these types becoming
+// thread-safe:
+//   * Single-owner handoff — each boundary object is moved to the RHI thread once
+//     at boot and is never touched by the record thread again; at most one thread
+//     accesses it at any instant, so the inner `RefCell`/`Cell` is never aliased.
+//   * No concurrent `Rc` traffic — the record thread keeps `Device` (sharing the
+//     same `Rc<DeviceShared>`), but the handoff guarantees no `Rc` *clone/drop* of
+//     the moved objects happens off-thread during a frame: the RHI thread only
+//     *borrows* through them, and teardown drops them after the RHI thread has
+//     joined (single-threaded again).
+//   * objc2 backing — `MTLCommandQueue`/`MTLDevice` are documented thread-safe;
+//     `MTLCommandBuffer` encoding is single-thread but each per-fif buffer lives on
+//     exactly one thread here, and commit from another thread is allowed.
+// VK/DX `Send` soundness (ash handles / D3D12 COM) is asserted by the same
+// single-owner contract but verified only on the Windows box (parity pending).
+unsafe impl Send for Queue {}
+unsafe impl Send for ComputeQueue {}
+unsafe impl Send for Swapchain {}
+unsafe impl Send for CommandBuffer {}
+unsafe impl Send for Fence {}
+unsafe impl Send for Semaphore {}
+
 /// One mesh's geometry for a BLAS build: its vertex + index buffers plus the
 /// plain shape data (Phase 8). Pairs facade [`Buffer`] handles with [`BlasGeometry`].
 pub struct RtGeometry<'a> {
