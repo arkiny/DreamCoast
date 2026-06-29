@@ -105,7 +105,11 @@ pub struct MeshData {
 > 읽어 `GltfMaterial.alpha_cutoff`(MASK=cutoff, 기본 0.5; OPAQUE/BLEND=0)에 보존 → 단일 값으로
 > `MaterialDesc`→`SceneObject`→푸시상수(`mr_factor.w`) 전파. `gbuffer.slang`(컷아웃)과 `shadow.slang`
 > (마스크드 그림자 구멍) 양쪽이 `alpha*factor.a < cutoff`면 discard. cutoff 0(불투명)은 텍스처 샘플/discard
-> 미진입 = **바이트 동일**. cull=NONE이라 마스크드 폴리지는 양면. **BLEND(진짜 알파 블렌딩)는 후속.**
+> 미진입 = **바이트 동일**. cull=NONE이라 마스크드 폴리지는 양면. **BLEND(진짜 알파 블렌딩)는 후속**
+> — 현재 BLEND는 opaque로 폴백한다. 이 폴백이 Intel Sponza의 `dirt_decal`(BLEND 데칼)을 검은 불투명
+> 금속으로 만든 원인(RenderDoc 확정). 트랙 A = **deferred 데칼** [deferred-decals.md](deferred-decals.md),
+> 트랙 B = 포워드 투명(glass). `alphaMode`를 cutoff뿐 아니라 `AlphaMode`/`MaterialKind`로 보존하는 게
+> 데칼/투명 분류의 전제(A1).
 > **텍스처 알파 주의:** 마스크드 base_color는 알파가 필요 → 라이브 glTF 경로는 RGBA8 무압축이라 보존되지만,
 > 쿡 BCn(`P12_TEX_COMPRESS`)이 마스크드 컬러에 BC1(1-bit 알파)을 쓰면 컷아웃이 깨진다 → 마스크드 컬러는
 > 무압축/BC7로 라우팅하는 게 후속 과제(현재 쿡은 머티리얼 alpha-mode 비인지). [cooked-asset-policy] 참조.
