@@ -1218,9 +1218,9 @@ impl App {
         //      The per-frame direct path reads the same `level_lighting` sun, so this unifies them.
         //   3. The code default — gallery keeps its overhead [0.4,0.8,0.4] (byte-identical anchor);
         //      a code-built content scene (e.g. `SCENE_GLTF`) takes the ~68° nave-clearing angle.
-        // (auto-normalized in the push packers). Intensity is resolved per-space below: the
-        // sky/atmosphere is physical lux; a level's directional `intensity` is the direct-light
-        // strength — only the *direction* is shared, so the two unit spaces stay independent.
+        // (auto-normalized in the push packers). Both direction AND intensity resolve from the SAME
+        // source so the sky's sun, the cast shadows, the direct shading, the IBL/GI, and the camera
+        // exposure all agree — a level's lighting is in physical lux, so it drives every consumer.
         let sun_dir = parse_vec3_env("SUN_DIR")
             .map(|v| [v.x, v.y, v.z])
             .or_else(|| level_lighting_override.as_ref().map(|ll| ll.sun_dir))
@@ -1233,10 +1233,15 @@ impl App {
                 // raking shadows. The roofed side aisles stay indirect (bounce/ambient) as in reality.
                 [0.3, 0.9, 0.2]
             });
+        // Sun illuminance (lux). Unified with the direction: `SUN_LUX`/`SUN_INTENSITY` > the loaded
+        // level's directional intensity > the code default. So `self.sun_intensity` (which drives the
+        // sky/atmosphere/IBL capture + the GI/reflection bounce) equals the level's authored sun — no
+        // drift between the direct light and the sky/indirect.
         let sun_intensity = std::env::var("SUN_LUX")
             .or_else(|_| std::env::var("SUN_INTENSITY"))
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
+            .or_else(|| level_lighting_override.as_ref().map(|ll| ll.sun_intensity))
             .unwrap_or(if gallery_scene { 3.0 } else { 100_000.0 })
             .max(0.0);
         // Sun:sky ratio fed to the env capture (see the `sky_gain` field). Kept at 6.0 by default:
