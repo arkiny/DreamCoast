@@ -397,6 +397,12 @@ float4 fsMain(VSOutput input) : SV_Target
     {
         float3 e = g.textures[pc.gdf_gi_index].Sample(g.samp, input.uv).rgb;
         gi = (1.0 - metallic) * albedo * e;
+        // Multi-bounce energy compensation (UE DistantIlluminationRescale / Jimenez): the GDF GI is
+        // a SINGLE bounce, so it misses the infinite-bounce energy that fills interiors. In an
+        // environment of ~the surface albedo, the geometric series 1/(1 - albedo) restores it.
+        // globals.probe_box_max.w = per-scene strength (0 = off = the gallery anchor; ~0.6 for
+        // content); the max() clamps the boost to <=4x so a near-white albedo can't blow up.
+        gi /= max(1.0 - albedo * globals.probe_box_max.w, 0.25);
     }
     ambient += gi;
 
