@@ -89,33 +89,47 @@ pub(crate) fn build_morph_meshes(
 /// Blend each morph mesh by its node's current weights and write the result into this
 /// frame's ring buffer. Call after the animation advances and after this slot's fence
 /// has been waited (the per-frame vertex write reuses the ring buffer).
+///
+/// The per-vertex blend is distributed over the job system (`parallel_for` across the
+/// disjoint output vertices — all plain `Send` data, so no `unsafe`). Each output is a
+/// pure function of `base[i]` + the targets + weights, so the result is **bit-identical**
+/// to the serial loop (and to the headless capture); the `vbuf.write` upload stays
+/// serial. Small meshes stay in one chunk via the grain size.
 pub(crate) fn apply_morph(
     morphed: &mut [MorphMesh],
     world: &World,
     fif: usize,
 ) -> anyhow::Result<()> {
+    let jobs = dreamcoast_jobs::global();
     for m in morphed.iter_mut() {
-        let weights = world.get::<MorphWeights>(m.node).map(|w| w.0.as_slice());
-        for (i, base) in m.base.iter().enumerate() {
-            let mut pos = Vec3::from_array(base.pos);
-            let mut nrm = Vec3::from_array(base.normal);
-            if let Some(weights) = weights {
-                for (t, target) in m.targets.iter().enumerate() {
-                    let w = weights.get(t).copied().unwrap_or(0.0);
-                    if w != 0.0 {
-                        pos += w * Vec3::from_array(target.positions[i]);
-                        if let Some(nd) = &target.normals {
-                            nrm += w * Vec3::from_array(nd[i]);
-                        }
+        let weights: Vec<f32> = world
+            .get::<MorphWeights>(m.node)
+            .map(|w| w.0.clone())
+            .unwrap_or_default();
+        // Disjoint borrows so the parallel closure can read the bind geometry/targets
+        // while it writes the output vertices.
+        let (base, targets, out) = (&m.base, &m.targets, &mut m.out);
+        let weights = &weights;
+        // ~256 vertices/chunk: enough work per job to amortise scheduling on big
+        // blendshape meshes, while tiny ones stay in a single chunk.
+        jobs.parallel_for(out, 256, |i, out_v| {
+            let mut pos = Vec3::from_array(base[i].pos);
+            let mut nrm = Vec3::from_array(base[i].normal);
+            for (t, target) in targets.iter().enumerate() {
+                let w = weights.get(t).copied().unwrap_or(0.0);
+                if w != 0.0 {
+                    pos += w * Vec3::from_array(target.positions[i]);
+                    if let Some(nd) = &target.normals {
+                        nrm += w * Vec3::from_array(nd[i]);
                     }
                 }
             }
-            m.out[i] = MeshVertex {
+            *out_v = MeshVertex {
                 pos: pos.to_array(),
                 normal: nrm.normalize_or_zero().to_array(),
-                uv: base.uv,
+                uv: base[i].uv,
             };
-        }
+        });
         m.ring[fif].vbuf.write(mesh::vertex_slice_bytes(&m.out))?;
     }
     Ok(())
