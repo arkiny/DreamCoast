@@ -33,11 +33,18 @@ and D3D12 (≤ 0.001 avg/channel, verified on an RTX 2070 SUPER); Metal is at ne
 - **Cooked assets** — meshes, scene SDF/albedo bakes, and BCn-compressed textures cook to
   one deterministic `.dcasset`; a self-made ECS + glTF hierarchy import, RON levels, and
   camera-driven chunk streaming. Convention: **1 unit = 1 metre**.
+- **Multithreaded frame** — a from-scratch work-stealing **job system**, a fixed-timestep
+  sim loop, a parallel ECS schedule, and a UE-style **render-graph ↔ RHI thread split** with
+  1-frame overlap + parallel pass recording (`P15_RHI_THREAD` / `P15_PARALLEL_RECORD`).
+- **glTF animation** — node TRS clips (all 3 interpolation modes), **GPU vertex skinning**
+  (vertex-pulling, Metal+VK+D3D12) + skinned shadows, and morph targets — driven from the
+  ECS (`SCENE_GLTF=<gltf> GLTF_ANIM`).
 
-Phases 0–12 are complete; current work is the physically-based lighting track and Phase 13
-(skeletal animation + GPU skinning). The full plan — including a Phase 15+ runtime/tooling
-layer and the macOS Metal backend — is in [`docs/ROADMAP.md`](docs/ROADMAP.md), with a
-reviewed design doc per phase in [`docs/`](docs/).
+Phases 0–12 are complete, plus the Phase 15 multithread core (M1–M4: job system →
+render/RHI thread split → parallel recording) and glTF **animation** (node + skinning +
+morph). The full plan — including the Phase 15+ runtime/tooling layer and the macOS Metal
+backend — is in [`docs/ROADMAP.md`](docs/ROADMAP.md), with a reviewed design doc per phase
+in [`docs/`](docs/) (animation: [`docs/animation.md`](docs/animation.md)).
 
 ## Built with an AI agent
 

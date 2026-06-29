@@ -79,6 +79,14 @@ engine/                 # cargo workspace root
 
 각 Phase의 세부 계획 문서 링크는 진행하며 채운다.
 
+> **현황 스냅샷 (2026-06):** Phase 0–12 완료 + Metal 백엔드. **Phase 15 멀티스레드 코어 M1–M4 완료** —
+> 잡 시스템(`crates/jobs`, work-stealing) → 고정 타임스텝 → ECS 병렬 스케줄 → **렌더그래프↔RHI 스레드
+> 분리(1프레임 오버랩, `P15_RHI_THREAD`) + 병렬 패스 기록(`P15_PARALLEL_RECORD`)**, VK/DX/Metal 3백엔드
+> 인증. **glTF 애니메이션**(Phase 13 범위) 완료 — 노드 TRS(3보간) · **GPU 스키닝**(vertex-pulling,
+> 3백엔드) + 스킨 섀도우 · 모프 타깃(잡 병렬). 세부: [animation.md](animation.md),
+> [phase-15-m4-render-rhi-threads.md](phase-15-m4-render-rhi-threads.md). 워커 수 = `코어-1`(`JOBS_THREADS`로
+> override). **모프 최적화 후속**: GPU 컴퓨트 모프 + 스파스 델타(<20% 정점만) — animation.md "Stage C 최적화" 참조.
+
 ### Phase 0 — 기반 다지기 (Foundations) — ✅ 완료
 세부: [phase-0-foundations.md](phase-0-foundations.md)
 - cargo workspace 골격, 의존성 확정
