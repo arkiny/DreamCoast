@@ -48,6 +48,10 @@ struct PushConstants
     // joints (uint4) + weights (float4) and the joint palette (float4x4 per joint).
     // Only read by `vsMainSkinned`; 0 / unused on the non-skinned path.
     uint4 skin;           // x joints, y weights, z palette, w joint_count
+    // GPU morph (Stage C optimization): the static per-target per-vertex pos/normal
+    // deltas (two float4 per vertex/target) + the small per-frame weights buffer. Only
+    // read by `vsMainMorphed`; 0 / unused on the non-morphed path.
+    uint4 morph;          // x deltas, y weights, z target_count, w vertex_count
 };
 
 [[vk::push_constant]]
@@ -108,6 +112,44 @@ VSOutput vsMainSkinned(VSInput input, uint vid : SV_VertexID)
     o.clip = mul(pc.mvp, pos);
     o.world_pos = mul(pc.model, pos).xyz;
     o.world_normal = mul((float3x3)pc.model, nrm.xyz);
+    o.uv = input.uv;
+    return o;
+}
+
+// GPU vertex-pulling morph (Stage C optimization): blend the bind-pose position +
+// normal with the active morph targets — `vertex = base + Σ wᵢ·deltaᵢ` — reading each
+// target's per-vertex pos/normal delta from a static bindless storage buffer (by vertex
+// id) and the weights from a small per-frame buffer. This moves the per-vertex blend
+// the CPU path (`apply_morph`) did onto the GPU, so the CPU does no per-vertex work and
+// the bind-pose buffer is uploaded once. Morphed vertices stay in the mesh node's local
+// space (unlike skinning), so `pc.model`/`pc.mvp` apply normally. Each delta is stored
+// as two `float4` (pos.xyz, nrm.xyz) = 32 bytes, matching the skinning `Load<float4>`
+// access pattern (16-byte aligned on every backend).
+[shader("vertex")]
+VSOutput vsMainMorphed(VSInput input, uint vid : SV_VertexID)
+{
+    RWByteAddressBuffer deltas = g.storage_buffers[pc.morph.x];
+    RWByteAddressBuffer weights = g.storage_buffers[pc.morph.y];
+    uint target_count = pc.morph.z;
+    uint vertex_count = pc.morph.w;
+
+    float3 pos = input.pos;
+    float3 nrm = input.normal;
+    for (uint t = 0; t < target_count; ++t)
+    {
+        float w = weights.Load<float>(t * 4);
+        if (w != 0.0)
+        {
+            uint base = (t * vertex_count + vid) * 32;
+            pos += w * deltas.Load<float4>(base + 0).xyz;
+            nrm += w * deltas.Load<float4>(base + 16).xyz;
+        }
+    }
+
+    VSOutput o;
+    o.clip = mul(pc.mvp, float4(pos, 1.0));
+    o.world_pos = mul(pc.model, float4(pos, 1.0)).xyz;
+    o.world_normal = mul((float3x3)pc.model, nrm); // fsMain re-normalizes
     o.uv = input.uv;
     return o;
 }

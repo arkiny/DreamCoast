@@ -152,6 +152,11 @@ pub(crate) struct SceneObject {
     /// per-frame skinning patch; the G-buffer pass draws these with the skinned pipeline
     /// + the bind-pose vertex buffer (the vertex shader does the deform).
     pub(crate) skin: Option<[u32; 4]>,
+    /// GPU-morph indices `[deltas, weights, target_count, vertex_count]` when this drawable
+    /// is GPU-morphed (animation Stage C optimization); `None` = not morphed (or CPU-morphed,
+    /// which instead swaps the vertex buffer). Set by the per-frame morph patch; the
+    /// G-buffer/shadow passes draw these with the morph pipeline + the bind-pose buffer.
+    pub(crate) morph: Option<[u32; 4]>,
 }
 
 /// A level's lighting (sun + point lights), applied in the `Globals` assembly in
@@ -436,9 +441,10 @@ struct App {
     /// CPU-skinned primitives (animation Stage B). Empty unless an imported glTF scene
     /// has skins; each is re-skinned + uploaded per frame (inline path only).
     skinned: Vec<skin::SkinnedMesh>,
-    /// CPU-morphed primitives (animation Stage C). Empty unless an imported glTF scene
-    /// has morph targets; each is re-blended + uploaded per frame (inline path only).
-    morphed: Vec<morph::MorphMesh>,
+    /// Morph-target primitives (animation Stage C). Empty unless an imported glTF scene
+    /// has morph targets; GPU primitives write a per-frame weights buffer (the VS blends),
+    /// CPU ones re-blend + upload a vertex ring each frame (inline path only).
+    morphed: morph::MorphSet,
     // Stage C level hot-swap: the discovered `.level` files, the loaded index, and a
     // pending selection from the UI (applied at the next frame's start). Empty unless
     // started in level mode (`LEVEL`).
@@ -865,7 +871,7 @@ impl App {
         // scene's native scale. `None` keeps the legacy gallery framing.
         let mut scene_bounds: Option<level::Bounds> = None;
         let mut gltf_skinned: Vec<skin::SkinnedMesh> = Vec::new();
-        let mut gltf_morphed: Vec<morph::MorphMesh> = Vec::new();
+        let mut gltf_morphed = morph::MorphSet::default();
         // A level's authored camera (applied as the initial view if non-default).
         let mut level_view: Option<(Vec3, Vec3)> = None;
         // A level's lighting, replacing the gallery's code-default sun + point lights.
@@ -982,7 +988,8 @@ impl App {
                     gltf_skinned.len()
                 );
             }
-            // Animation Stage C: CPU-blend any morph-target primitives each frame.
+            // Animation Stage C: blend any morph-target primitives each frame (GPU
+            // vertex-pulling where host storage is available, else CPU).
             gltf_morphed = morph::build_morph_meshes(
                 &device,
                 &gscene,
@@ -991,7 +998,11 @@ impl App {
                 &mesh_registry,
             )?;
             if !gltf_morphed.is_empty() {
-                info!("morph: {} morph primitive(s) (CPU)", gltf_morphed.len());
+                info!(
+                    "morph: {} GPU + {} CPU morph primitive(s)",
+                    gltf_morphed.gpu_count(),
+                    gltf_morphed.cpu_count()
+                );
             }
             scene_bounds = registry::gltf_bounds(&gscene);
         } else {
@@ -2435,8 +2446,9 @@ impl App {
             skin::update_palettes(&mut self.skinned, &self.world, fif)?;
             skin::patch_scene(&self.skinned, &mut scene, fif);
         }
-        // Animation Stage C: CPU-blend morph targets + swap to this frame's buffer.
-        // Inline path only (the per-frame vertex write relies on the frame-start fence).
+        // Animation Stage C: blend morph targets (GPU = write the per-frame weights
+        // buffer; CPU = re-blend the vertex ring) + patch this frame's drawables. Inline
+        // path only (the per-frame storage/vertex write relies on the frame-start fence).
         if !self.morphed.is_empty() && self.rhi_thread.is_none() {
             morph::apply_morph(&mut self.morphed, &self.world, fif)?;
             morph::patch_scene(&self.morphed, &mut scene, fif);

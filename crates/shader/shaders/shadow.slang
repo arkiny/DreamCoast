@@ -35,6 +35,9 @@ struct PushConstants
     // GPU skinning (Stage B.2b): bindless storage-buffer indices for joints / weights /
     // palette + joint count. Only read by `vsMainSkinned`; unused on the static path.
     uint4 skin;
+    // GPU morph (Stage C optimization): per-target per-vertex deltas + per-frame weights.
+    // Only read by `vsMainMorphed`; unused on the static / skinned paths.
+    uint4 morph; // x deltas, y weights, z target_count, w vertex_count
 };
 
 [[vk::push_constant]]
@@ -80,6 +83,35 @@ VSOutput vsMainSkinned(VSInput input, uint vid : SV_VertexID)
 
     VSOutput o;
     o.clip = mul(pc.light_mvp, pos);
+    o.uv = input.uv;
+    return o;
+}
+
+// Morphed shadow vertex shader: blend the bind-pose position with the active morph
+// targets (vertex pulling, matching gbuffer.slang's `vsMainMorphed`), then transform by
+// the light view-projection so the cast shadow follows the morph. Morphed verts are in
+// local space, so `light_mvp` already folds in the node transform.
+[shader("vertex")]
+VSOutput vsMainMorphed(VSInput input, uint vid : SV_VertexID)
+{
+    RWByteAddressBuffer deltas = g.storage_buffers[pc.morph.x];
+    RWByteAddressBuffer weights = g.storage_buffers[pc.morph.y];
+    uint target_count = pc.morph.z;
+    uint vertex_count = pc.morph.w;
+
+    float3 pos = input.pos;
+    for (uint t = 0; t < target_count; ++t)
+    {
+        float w = weights.Load<float>(t * 4);
+        if (w != 0.0)
+        {
+            uint base = (t * vertex_count + vid) * 32;
+            pos += w * deltas.Load<float4>(base + 0).xyz;
+        }
+    }
+
+    VSOutput o;
+    o.clip = mul(pc.light_mvp, float4(pos, 1.0));
     o.uv = input.uv;
     return o;
 }

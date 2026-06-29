@@ -44,6 +44,11 @@ pub(crate) struct DeferredRenderer {
     /// G-buffer fill for GPU-skinned meshes (animation Stage B.2): same as
     /// `gbuffer_pipeline` but with the `vsMainSkinned` vertex-pulling entry point.
     gbuffer_skinned_pipeline: GraphicsPipeline,
+    /// G-buffer fill for GPU-morphed meshes (animation Stage C optimization): the
+    /// `vsMainMorphed` vertex-pulling entry point of the same shader.
+    gbuffer_morphed_pipeline: GraphicsPipeline,
+    /// Depth-only shadow fill for GPU-morphed casters (so the shadow follows the morph).
+    shadow_morphed_pipeline: GraphicsPipeline,
     pbr_pipeline: GraphicsPipeline,
     post_pipeline: GraphicsPipeline,
     post_compute_pipeline: ComputePipeline,
@@ -89,7 +94,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::Mesh,
             blend: BlendMode::Opaque,
-            push_constant_size: 192, // mvp(64) + base_color(16) + mr(16) + tex u32x4(16) + model mat4(64)
+            push_constant_size: 208, // +skin u32x4(16) + morph u32x4(16) over the 176-byte core
             bindless: true,
             uniform_buffer: false,
             depth_test: true,
@@ -122,7 +127,40 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::Mesh,
             blend: BlendMode::Opaque,
-            push_constant_size: 192,
+            push_constant_size: 208,
+            bindless: true,
+            uniform_buffer: false,
+            depth_test: true,
+            depth_format: Some(DEPTH_FORMAT),
+        })?;
+
+        // GPU-morph variant of the G-buffer fill (vertex-pulling morph VS) — the
+        // `vsMainMorphed` entry of the same shader, sharing the G-buffer fragment.
+        let (gb_morph_vs, gb_morph_fs) = load_shader_pair(
+            backend,
+            dreamcoast_shader::gbuffer_morphed_vs_spirv,
+            dreamcoast_shader::gbuffer_fs_spirv,
+            dreamcoast_shader::gbuffer_morphed_vs_dxil,
+            dreamcoast_shader::gbuffer_fs_dxil,
+            dreamcoast_shader::gbuffer_morphed_vs_metallib,
+            dreamcoast_shader::gbuffer_fs_metallib,
+            "gbuffer_morphed",
+        )?;
+        let gbuffer_morphed_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            vertex_bytes: gb_morph_vs,
+            fragment_bytes: gb_morph_fs,
+            vertex_entry: "vsMainMorphed",
+            fragment_entry: "fsMain",
+            color_formats: &[
+                GB_ALBEDO_FMT,
+                GB_NORMAL_FMT,
+                GB_MATERIAL_FMT,
+                GB_POSITION_FMT,
+            ],
+            topology: PrimitiveTopology::TriangleList,
+            vertex_layout: VertexLayout::Mesh,
+            blend: BlendMode::Opaque,
+            push_constant_size: 208,
             bindless: true,
             uniform_buffer: false,
             depth_test: true,
@@ -150,8 +188,8 @@ impl DeferredRenderer {
             // Full mesh layout (pos/normal/uv): the UV feeds the masked alpha-test discard.
             vertex_layout: VertexLayout::Mesh,
             blend: BlendMode::Opaque,
-            push_constant_size: 96, // light_mvp(64) + base_color_tex u32 + alpha_cutoff f32 + pad8 + skin u32x4(16)
-            bindless: true,         // push constants + the bindless base-color texture (masked)
+            push_constant_size: 112, // light_mvp(64) + tex u32 + cutoff f32 + pad8 + skin u32x4(16) + morph u32x4(16)
+            bindless: true,          // push constants + the bindless base-color texture (masked)
             uniform_buffer: false,
             depth_test: true,
             depth_format: Some(DEPTH_FORMAT),
@@ -177,7 +215,34 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::Mesh,
             blend: BlendMode::Opaque,
-            push_constant_size: 96,
+            push_constant_size: 112,
+            bindless: true,
+            uniform_buffer: false,
+            depth_test: true,
+            depth_format: Some(DEPTH_FORMAT),
+        })?;
+
+        // GPU-morph variant of the shadow fill (morph shadow VS).
+        let (shadow_morph_vs, shadow_morph_fs) = load_shader_pair(
+            backend,
+            dreamcoast_shader::shadow_morphed_vs_spirv,
+            dreamcoast_shader::shadow_fs_spirv,
+            dreamcoast_shader::shadow_morphed_vs_dxil,
+            dreamcoast_shader::shadow_fs_dxil,
+            dreamcoast_shader::shadow_morphed_vs_metallib,
+            dreamcoast_shader::shadow_fs_metallib,
+            "shadow_morphed",
+        )?;
+        let shadow_morphed_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            vertex_bytes: shadow_morph_vs,
+            fragment_bytes: shadow_morph_fs,
+            vertex_entry: "vsMainMorphed",
+            fragment_entry: "fsMain",
+            color_formats: &[], // depth-only
+            topology: PrimitiveTopology::TriangleList,
+            vertex_layout: VertexLayout::Mesh,
+            blend: BlendMode::Opaque,
+            push_constant_size: 112,
             bindless: true,
             uniform_buffer: false,
             depth_test: true,
@@ -328,6 +393,8 @@ impl DeferredRenderer {
             shadow_skinned_pipeline,
             gbuffer_pipeline,
             gbuffer_skinned_pipeline,
+            gbuffer_morphed_pipeline,
+            shadow_morphed_pipeline,
             pbr_pipeline,
             post_pipeline,
             post_compute_pipeline,
@@ -452,10 +519,13 @@ impl DeferredRenderer {
                         continue;
                     }
                     let lmvp = (light_vp * obj.transform).to_cols_array();
-                    // Skinned casters deform on the GPU (their shadow matches the lit mesh)
-                    // via the skinned shadow pipeline; static casters keep the bound one.
+                    // Deformed casters deform on the GPU (their shadow matches the lit mesh)
+                    // via the skinned / morph shadow pipeline; static casters keep the bound
+                    // one. A drawable is at most one of skinned / morphed.
                     if obj.skin.is_some() {
                         cmd.bind_graphics_pipeline(&self.shadow_skinned_pipeline);
+                    } else if obj.morph.is_some() {
+                        cmd.bind_graphics_pipeline(&self.shadow_morphed_pipeline);
                     }
                     // Masked casters carry their base-color texture + cutoff so the depth pass
                     // discards the same texels the lit pass does; opaque casters pass cutoff 0
@@ -465,11 +535,12 @@ impl DeferredRenderer {
                         obj.tex[0],
                         obj.alpha_cutoff,
                         obj.skin.unwrap_or([0; 4]),
+                        obj.morph.unwrap_or([0; 4]),
                     ));
                     cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
                     cmd.bind_index_buffer(&obj.mesh.ibuf, true);
                     cmd.draw_indexed(obj.mesh.index_count, 0, 0);
-                    if obj.skin.is_some() {
+                    if obj.skin.is_some() || obj.morph.is_some() {
                         cmd.bind_graphics_pipeline(&self.shadow_pipeline); // restore
                     }
                 }
@@ -531,11 +602,14 @@ impl DeferredRenderer {
                     } else {
                         (obj.metallic, obj.roughness, obj.tex[1])
                     };
-                    // GPU-skinned objects use the vertex-pulling pipeline (skin indices
-                    // in the push); the bind-pose vertex buffer is the same. Static
-                    // objects keep the already-bound pipeline (gallery byte-identical).
+                    // GPU-deformed objects use a vertex-pulling pipeline (skin / morph
+                    // indices in the push); the bind-pose vertex buffer is the same. Static
+                    // objects keep the already-bound pipeline (gallery byte-identical). A
+                    // drawable is at most one of skinned / morphed.
                     if obj.skin.is_some() {
                         cmd.bind_graphics_pipeline(&self.gbuffer_skinned_pipeline);
+                    } else if obj.morph.is_some() {
+                        cmd.bind_graphics_pipeline(&self.gbuffer_morphed_pipeline);
                     }
                     cmd.push_constants(&gbuffer_push(
                         obj_mvp,
@@ -547,11 +621,12 @@ impl DeferredRenderer {
                         [obj.tex[0], mr_tex, obj.tex[2], obj.tex[3]],
                         obj.transform.to_cols_array(),
                         obj.skin.unwrap_or([0; 4]),
+                        obj.morph.unwrap_or([0; 4]),
                     ));
                     cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
                     cmd.bind_index_buffer(&obj.mesh.ibuf, true);
                     cmd.draw_indexed(obj.mesh.index_count, 0, 0);
-                    if obj.skin.is_some() {
+                    if obj.skin.is_some() || obj.morph.is_some() {
                         cmd.bind_graphics_pipeline(&self.gbuffer_pipeline); // restore
                     }
                 }
@@ -567,6 +642,7 @@ impl DeferredRenderer {
                     [NO_TEXTURE; 4],
                     Mat4::IDENTITY.to_cols_array(),
                     [0; 4], // not skinned
+                    [0; 4], // not morphed
                 ));
                 cmd.bind_vertex_buffer(ground_vbuf, 32);
                 cmd.bind_index_buffer(ground_ibuf, true);
@@ -717,11 +793,12 @@ impl DeferredRenderer {
     }
 }
 
-/// Pack the G-buffer push block (192 bytes): mvp(64), base_color(16),
-/// metallic/roughness(16), texture indices u32x4 (16), model mat4 (64), skin u32x4 (16).
-/// `model` is the object->world transform the vertex shader uses for the world-space
-/// position and normal G-buffer outputs (the `mvp` already folds it in for clip space);
-/// `skin` carries the GPU-skinning storage-buffer indices (0 on the non-skinned path).
+/// Pack the G-buffer push block (208 bytes): mvp(64), base_color(16),
+/// metallic/roughness(16), texture indices u32x4 (16), model mat4 (64), skin u32x4 (16),
+/// morph u32x4 (16). `model` is the object->world transform the vertex shader uses for the
+/// world-space position and normal G-buffer outputs (the `mvp` already folds it in for clip
+/// space); `skin` carries the GPU-skinning storage-buffer indices (0 on the non-skinned
+/// path), `morph` the GPU-morph indices (0 on the non-morphed path).
 #[allow(clippy::too_many_arguments)]
 fn gbuffer_push(
     mvp: [f32; 16],
@@ -735,8 +812,11 @@ fn gbuffer_push(
     // GPU skinning (Stage B.2): bindless storage-buffer indices for joints / weights /
     // palette + joint count. `[0; 4]` on the non-skinned path (`vsMain` ignores it).
     skin: [u32; 4],
-) -> [u8; 192] {
-    let mut pc = [0u8; 192];
+    // GPU morph (Stage C optimization): deltas / weights bindless indices + target_count +
+    // vertex_count. `[0; 4]` on the non-morphed path (`vsMain`/`vsMainSkinned` ignore it).
+    morph: [u32; 4],
+) -> [u8; 208] {
+    let mut pc = [0u8; 208];
     for (i, f) in mvp.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
@@ -758,6 +838,10 @@ fn gbuffer_push(
     }
     for (i, s) in skin.iter().enumerate() {
         let o = 176 + i * 4;
+        pc[o..o + 4].copy_from_slice(&s.to_le_bytes());
+    }
+    for (i, s) in morph.iter().enumerate() {
+        let o = 192 + i * 4;
         pc[o..o + 4].copy_from_slice(&s.to_le_bytes());
     }
     pc
@@ -830,16 +914,18 @@ fn ae_resolve_push(
     pc
 }
 
-/// Pack the shadow push block (96 bytes): light_mvp (64), base_color bindless index (u32),
-/// alpha cutoff (f32), 8 bytes padding, then skin u32x4 (16). `cutoff == 0` (opaque) leaves
-/// the texture index unused; `skin == 0` is the non-skinned path (`vsMain` ignores it).
+/// Pack the shadow push block (112 bytes): light_mvp (64), base_color bindless index (u32),
+/// alpha cutoff (f32), 8 bytes padding, skin u32x4 (16), then morph u32x4 (16). `cutoff == 0`
+/// (opaque) leaves the texture index unused; `skin == 0` / `morph == 0` are the non-deformed
+/// paths (`vsMain` ignores both).
 fn shadow_push(
     light_mvp: [f32; 16],
     base_color_tex: u32,
     alpha_cutoff: f32,
     skin: [u32; 4],
-) -> [u8; 96] {
-    let mut pc = [0u8; 96];
+    morph: [u32; 4],
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
     for (i, f) in light_mvp.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
@@ -847,6 +933,10 @@ fn shadow_push(
     pc[68..72].copy_from_slice(&alpha_cutoff.to_le_bytes());
     for (i, s) in skin.iter().enumerate() {
         let o = 80 + i * 4;
+        pc[o..o + 4].copy_from_slice(&s.to_le_bytes());
+    }
+    for (i, s) in morph.iter().enumerate() {
+        let o = 96 + i * 4;
         pc[o..o + 4].copy_from_slice(&s.to_le_bytes());
     }
     pc

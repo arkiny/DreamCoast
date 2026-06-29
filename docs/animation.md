@@ -163,20 +163,44 @@ Verified (Metal): default `b9778dcc`; **AnimatedMorphCube** morphs (frames diffe
 run-to-run identical (deterministic); scene 34 + asset 18 tests; clippy/fmt clean. CPU
 math + existing pipeline → effectively backend-agnostic (VK/DX run the same draw).
 
-### Stage C optimization — faster morph (research, future)
+### Stage C optimization — faster morph
 
 CPU morph (`base + Σ wᵢ·targetᵢ` over every vertex, re-uploaded each frame) is the slow
 path for big blendshape meshes (face rigs: 50–150 targets × 10k+ verts). The job-system
 parallelization (above) is the cheap first win; the bigger ones, ordered by payoff (per
 current literature + UE/Unity practice):
 
-1. **GPU compute / vertex-pulling morph** (the real fix). Move the blend to the GPU like
-   our GPU skinning (B.2): deltas in storage buffers, weights in a small per-frame buffer,
-   accumulated in a compute pass *or* directly in the skinning vertex shader (`vsMain*`
-   already vertex-pulls). UE enables exactly this on SM5 ("GPU calculation of morph
-   targets") so the CPU does no per-vertex work. The clean unification here is **one GPU
-   deform shader** (skin ⊕ morph) to avoid the skinned×morphed pipeline blowup — share the
-   storage-buffer read path that B.2 already built.
+1. **GPU compute / vertex-pulling morph** (the real fix) — **DONE (vertex-pulling, all
+   backends)**. The per-vertex blend moved onto the GPU exactly like GPU skinning (B.2):
+   the bind-pose buffer uploads **once**, the per-target per-vertex deltas live in a static
+   bindless storage buffer (target-major, two `float4`/vertex = pos.xyz0, nrm.xyz0 — the
+   16-byte-aligned `Load<float4>` access B.2 proved cross-backend), and per frame only a
+   tiny weights buffer (one `f32`/target) is written. `gbuffer.slang`/`shadow.slang`'s
+   `vsMainMorphed` reads them by `SV_VertexID` and outputs `base + Σ wᵢ·deltaᵢ` (`pos`
+   blends + the matching `nrm`, re-normalized in `fsMain`). So the CPU does **no per-vertex
+   work** and there is no per-frame vertex re-upload. Morphed verts stay in node-local space
+   (unlike skinning), so `pc.mvp`/`pc.model` apply normally.
+   - **`apps/sandbox/morph.rs`:** `MorphSet { gpu, cpu }`; `build_gpu_mesh` packs the static
+     deltas (`create_storage_buffer_init`) + a per-fif weights ring (`create_storage_buffer_host`,
+     the B.2c host-visible storage write on all 3 backends); `apply_morph` writes the weights
+     buffer (cheap) for GPU primitives + still does the job-parallel CPU blend for any CPU
+     ones; `patch_scene` tags the GPU drawable with `SceneObject.morph` indices. The CPU
+     blend stays as the fallback (no host storage) and the cross-check reference (`MORPH_CPU=1`).
+   - **`apps/sandbox/deferred.rs`:** `gbuffer_morphed_pipeline` + `shadow_morphed_pipeline`
+     (the `vsMainMorphed` entry of the shared shader); the g-buffer/shadow passes branch to
+     them for morphed draws. `gbuffer_push` 192→208, `shadow_push` 96→112 (a trailing
+     `morph uint4`; `[0;4]` on the non-morph path → static/skinned byte-identical).
+
+   Verified (Metal): default `b9778dcc` (byte-identical, morph opt-in); **AnimatedMorphCube**
+   morphs on the GPU (4 capture frames differ), run-to-run identical (deterministic);
+   **GPU == CPU reference (`MORPH_CPU=1`) to avg 0.000/ch** (frames 1–3 byte-identical; frame 0
+   max 5 = silhouette-edge AA, the same class as the B.2 skinning cross-check); scene 34 +
+   asset 18 tests; clippy `-D warnings` / fmt clean. Inline path only (the per-frame storage
+   write reuses the frame-start fence wait, like B.1/B.2/CPU morph). VK/DX run the identical
+   single-source shader + the B.2c host-storage path → expected DX≡VK (Windows gate pending,
+   same as B.2c was). A future step can unify into **one deform shader** (skin ⊕ morph) once
+   a skinned+morph asset exists to gate it — the morph deltas + skin palette already share
+   the bindless storage-buffer read path, so it collapses the skinned×morphed pipeline blowup.
 2. **Sparse blendshapes** (biggest memory + bandwidth win). Store only the vertices a
    target actually moves — typically ~80% smaller, since a facial expression touches <20%
    of the mesh. Pair each target with a small index list; the compute/VS scatters only
