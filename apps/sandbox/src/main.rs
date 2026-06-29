@@ -1210,12 +1210,20 @@ impl App {
         // `EV100` override the content values. Because the whole atmosphere scales with the sun
         // and the exposure compensates, the absolute lux is meaningful (not just relative): it is
         // what a light meter would read, and EV100 is what a camera would dial.
-        // Direction TO the sun. The gallery keeps its overhead [0.4,0.8,0.4] (anchor). Content
-        // scenes take a LOWER angle so the sun rakes under the arcade arches and into the interior
-        // (an overhead sun only reaches the open-atrium floor, leaving the roofed side aisles dark).
-        // `SUN_DIR="x,y,z"` overrides (auto-normalized in the push packers).
+        // Direction TO the sun. ONE source of truth, resolved in priority order:
+        //   1. `SUN_DIR="x,y,z"` env — explicit override, always wins.
+        //   2. A loaded level (`.dclevel`) — its authored sun drives the sky/atmosphere/IBL/GI
+        //      *and* the direct lighting + shadows, so the sky's sun, the cast shadows, and the
+        //      shaded surfaces all agree (no drift between the lit image and the visible sun).
+        //      The per-frame direct path reads the same `level_lighting` sun, so this unifies them.
+        //   3. The code default — gallery keeps its overhead [0.4,0.8,0.4] (byte-identical anchor);
+        //      a code-built content scene (e.g. `SCENE_GLTF`) takes the ~68° nave-clearing angle.
+        // (auto-normalized in the push packers). Intensity is resolved per-space below: the
+        // sky/atmosphere is physical lux; a level's directional `intensity` is the direct-light
+        // strength — only the *direction* is shared, so the two unit spaces stay independent.
         let sun_dir = parse_vec3_env("SUN_DIR")
             .map(|v| [v.x, v.y, v.z])
+            .or_else(|| level_lighting_override.as_ref().map(|ll| ll.sun_dir))
             .unwrap_or(if gallery_scene {
                 [0.4, 0.8, 0.4]
             } else {
