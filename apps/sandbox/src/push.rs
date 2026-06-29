@@ -1420,6 +1420,7 @@ pub(crate) fn reflect_temporal_push(
 /// Pack the Phase 11 Stage C7b lit-history push block (32 bytes): the lit-HDR sampled
 /// index, the history storage-buffer index, width/height, and `inv_exposure` (recovers
 /// raw radiance from the exposure-baked HDR).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lit_history_push(
     hdr_index: u32,
     out_buffer: u32,
@@ -1427,6 +1428,7 @@ pub(crate) fn lit_history_push(
     height: u32,
     inv_exposure: f32,
     clamp_max: f32,
+    exposure_buf: u32,
 ) -> [u8; 32] {
     let mut pc = [0u8; 32];
     pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
@@ -1435,6 +1437,7 @@ pub(crate) fn lit_history_push(
     pc[12..16].copy_from_slice(&height.to_le_bytes());
     pc[16..20].copy_from_slice(&inv_exposure.to_le_bytes());
     pc[20..24].copy_from_slice(&clamp_max.to_le_bytes());
+    pc[24..28].copy_from_slice(&exposure_buf.to_le_bytes());
     pc
 }
 

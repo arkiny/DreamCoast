@@ -3398,7 +3398,7 @@ impl App {
             let speed = 2.5f32;
             let adapt = 1.0 - (-dt * speed).exp();
             self.deferred
-                .record_auto_exposure(&mut graph, hdr, 0.18, adapt, 1.0e-6, 4.0);
+                .record_auto_exposure(&mut graph, hdr, cw, ch, 0.12, adapt, 1.0e-6, 4.0);
         }
         // C7c: capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
         // Reads the lit `hdr` (not the post-blur), so it sequences after the lighting pass.
@@ -3410,6 +3410,11 @@ impl App {
                 ch,
                 1.0 / self.exposure.max(1e-4),
                 firefly_max,
+                if self.auto_exposure {
+                    self.deferred.exposure_buf_index().unwrap_or(u32::MAX)
+                } else {
+                    u32::MAX
+                },
             );
         }
         if let Some(hdr_post) = hdr_post {
@@ -3813,6 +3818,11 @@ impl App {
                     ch,
                     1.0 / self.exposure.max(1e-4),
                     firefly_max,
+                    if self.auto_exposure {
+                        self.deferred.exposure_buf_index().unwrap_or(u32::MAX)
+                    } else {
+                        u32::MAX
+                    },
                 );
                 Some(composite)
             }
