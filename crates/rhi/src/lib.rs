@@ -20,6 +20,9 @@ pub use rhi_types::*;
 use dreamcoast_core::EngineError;
 use dreamcoast_platform::Window;
 
+mod command_list;
+pub use command_list::{CommandList, RhiCommand};
+
 type Result<T> = std::result::Result<T, EngineError>;
 
 /// Panic message for impossible cross-backend argument mixes.
