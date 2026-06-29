@@ -18,6 +18,21 @@ radiance로 저장 후 끝에서 1회 노출). 따라서 모든 광원이 같은
 - 맑은 정오 직사광 ≈ 100,000 lx, sunny-16 ≈ EV15. 광량계가 읽을 값이 sun lux, 카메라가 돌릴 값이 EV100.
 - 점광원: glTF KHR_lights_punctual은 point/spot를 candela로 저작 → 그대로 사용. 루멘 Φ는 `I=Φ/4π`.
 
+## 실내 조명 — sun 각도 · AO · 멀티바운스 (`a53d0d8` 외)
+
+Sponza 실내가 검게 타던 문제. 셋 다 콘텐츠 한정(갤러리 앵커 0.000 불변):
+
+- **sun 각도**: 좁은 nave(~12m 벽)는 저각 sun이 벽 그림자에 완전히 가려 바닥에 직사광이 **전혀** 안 들어온다
+  (직사광-only 디버그뷰 ~2 luma; overhead 55°도 동일). 콘텐츠 기본을 **고각 `[0.3,0.9,0.2]`(~68°)** 로 — 벽을
+  넘어 바닥에 직사광(22.6)·기둥 raking 그림자. 지붕 덮인 측랑은 실제처럼 간접광으로 남는다. `SUN_DIR` override.
+- **AO exp falloff**: `gdf_ao`가 `saturate(1-k·occ)`라 오목 코너서 **정확히 0**(가시 recess도 하늘 대부분이
+  보이는데 순검정). **`exp(-k·occ)`**(Beer-Lambert) 로 — 0에 점근하되 도달 안 함 → 코너가 soft AO.
+- **GI 멀티바운스 π**: `gi_volume`이 저장된 평균-radiance `indirect`를 (irradiance인) direct 항과 같은
+  `albedo/PI` BRDF에 묶어 매 바운스 π배 약했다. `albedo*indirect`로(저장값이 radiance라 ×π 후 BRDF의 /π와 상쇄)
+  — surface-cache 관례와 일치. 깊은 nave처럼 멀티바운스 의존 영역이 ~10× 어둡던 원인.
+
+측정: 실내 전체 lit 27→44, recess 검정 해소. DX≡VK 0.005, clippy 클린.
+
 ## env 큐브 clamp (의도된 설계, UE식)
 
 env 캡처 큐브는 Rgba16Float(max ~65504). lux sun이 `sky.slang`의 baked sun 디스크를 +inf로 overflow시켜
