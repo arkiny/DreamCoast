@@ -39,6 +39,8 @@ struct PushConstants
     uint gdf_gi_index; // Stage-C3 GDF indirect-irradiance image (0xFFFFFFFF = absent)
     uint reflect_index; // Stage-C7c hybrid SW-RT reflection image (0xFFFFFFFF = legacy IBL prefilter cube)
     uint two_sided; // 1 = orient the G-buffer normal toward the viewer (two-sided surfaces)
+    uint exposure_buf_index; // auto-exposure: storage buffer holding the adapted exposure at offset 0
+                             // (0xFFFFFFFF = use the static globals.ambient.a)
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -305,9 +307,20 @@ float3 shade(float3 n, float3 v, float3 l, float3 radiance, float3 albedo,
     return (kd * albedo / PI + specular) * radiance * n_dot_l;
 }
 
+// Camera exposure applied to the whole (ambient + direct) sum. Auto-exposure stores the adapted
+// value in a storage buffer (offset 0); otherwise the static EV100-derived globals.ambient.a is
+// used. A sentinel index keeps the non-auto path bit-identical to the pre-auto-exposure lighting.
+float scene_exposure()
+{
+    if (pc.exposure_buf_index != 0xFFFFFFFFu)
+        return asfloat(g.storage_buffers[pc.exposure_buf_index].Load(0));
+    return globals.ambient.a;
+}
+
 [shader("fragment")]
 float4 fsMain(VSOutput input) : SV_Target
 {
+    float exposure = scene_exposure();
     float4 albedo_ao = g.textures[pc.albedo_index].Sample(g.samp, input.uv);
     float3 normal = g.textures[pc.normal_index].Sample(g.samp, input.uv).xyz;
     float4 mat = g.textures[pc.material_index].Sample(g.samp, input.uv);
@@ -328,7 +341,7 @@ float4 fsMain(VSOutput input) : SV_Target
             // skybox stays clean sky; the gradient is low-frequency so half-res is
             // imperceptible.
             float3 sky = g.cubes[globals.ibl.x].SampleLevel(g.samp, dir, 1.0).rgb;
-            return float4(sky * globals.ambient.a, 1.0); // a = exposure
+            return float4(sky * exposure, 1.0);
         }
         return float4(globals.ambient.rgb, 1.0);
     }
@@ -410,7 +423,7 @@ float4 fsMain(VSOutput input) : SV_Target
     }
     ambient += gi;
 
-    float3 color = (ambient + lo) * globals.ambient.a; // a = exposure
+    float3 color = (ambient + lo) * exposure;
 
     // Debug views (counts.y): 1 albedo, 2 normal, 3 metallic, 4 roughness,
     // 5 world pos, 6 AO, 7 direct light, 8 IBL ambient, 9 GDF AO, 10 GDF GI. 0 = lit.
@@ -421,10 +434,10 @@ float4 fsMain(VSOutput input) : SV_Target
     else if (dbg == 4) color = float3(roughness);
     else if (dbg == 5) color = frac(world_pos);
     else if (dbg == 6) color = float3(ao);
-    else if (dbg == 7) color = lo * globals.ambient.a;      // direct lighting only
-    else if (dbg == 8) color = ambient * globals.ambient.a; // IBL ambient only
-    else if (dbg == 9) color = float3(gdf_ao);              // GDF AO factor
-    else if (dbg == 10) color = gi * globals.ambient.a;     // GDF indirect diffuse
+    else if (dbg == 7) color = lo * exposure;      // direct lighting only
+    else if (dbg == 8) color = ambient * exposure; // IBL ambient only
+    else if (dbg == 9) color = float3(gdf_ao);     // GDF AO factor
+    else if (dbg == 10) color = gi * exposure;     // GDF indirect diffuse
 
     return float4(color, 1.0);
 }

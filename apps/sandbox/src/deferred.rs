@@ -15,7 +15,7 @@ use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourceId};
 use rhi::{
     BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, ComputePipeline,
     ComputePipelineDesc, Format, GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology,
-    VertexLayout,
+    StorageBuffer, StorageBufferDesc, VertexLayout,
 };
 
 use crate::app::{load_compute_shader, load_shader_pair};
@@ -42,6 +42,10 @@ pub(crate) struct DeferredRenderer {
     pbr_pipeline: GraphicsPipeline,
     post_pipeline: GraphicsPipeline,
     post_compute_pipeline: ComputePipeline,
+    /// Physical-camera auto-exposure: the metering compute pipeline + the persistent 1-element
+    /// storage buffer holding the adapted exposure (read by the lighting pass when auto on).
+    auto_exposure_pipeline: Option<ComputePipeline>,
+    exposure_buf: Option<StorageBuffer>,
     /// Per-frame globals uniform buffer (one `GLOBALS_SLICE` slice per frame-in-flight).
     globals_buffer: Buffer,
 }
@@ -132,7 +136,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 40, // G-buffer indices + flip_y + shadow + gdf_ao + gdf_gi + reflect + two_sided
+            push_constant_size: 44, // G-buffer indices + flip_y + shadow + gdf_ao + gdf_gi + reflect + two_sided + exposure_buf
             bindless: true,
             uniform_buffer: true,
             depth_test: false,
@@ -184,6 +188,40 @@ impl DeferredRenderer {
             threads_per_group: [8, 8, 1],
         })?;
 
+        // Physical-camera auto-exposure: the metering compute pipeline + a persistent 8-byte
+        // storage buffer [exposure, scene_luminance]. Seeded with a sensible content exposure so
+        // the first frame (before the first metering pass runs) isn't black; it adapts within a
+        // frame or two. Compute-gated like the other compute features.
+        let (auto_exposure_pipeline, exposure_buf) = if let Ok(cs) = load_compute_shader(
+            backend,
+            dreamcoast_shader::auto_exposure_cs_spirv,
+            dreamcoast_shader::auto_exposure_cs_dxil,
+            dreamcoast_shader::auto_exposure_cs_metallib,
+            "auto_exposure",
+        ) {
+            let pipe = device.create_compute_pipeline(&ComputePipelineDesc {
+                compute_bytes: cs,
+                compute_entry: "csMain",
+                push_constant_size: 32, // hdr + expo_buf + key + adapt + min + max + pad8
+                bindless: true,
+                uniform_buffer: false,
+                threads_per_group: [16, 16, 1],
+            })?;
+            let seed = [1.0e-4f32, 0.0f32];
+            let bytes: Vec<u8> = seed.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let buf = device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: bytes.len() as u64,
+                    stride: 4,
+                    indirect: false,
+                },
+                &bytes,
+            )?;
+            (Some(pipe), Some(buf))
+        } else {
+            (None, None)
+        };
+
         // Per-frame globals uniform buffer (one 256-byte slice per frame-in-flight).
         let globals_buffer = device.create_buffer(&BufferDesc {
             size: GLOBALS_SLICE * FRAMES_IN_FLIGHT as u64,
@@ -197,8 +235,53 @@ impl DeferredRenderer {
             pbr_pipeline,
             post_pipeline,
             post_compute_pipeline,
+            auto_exposure_pipeline,
+            exposure_buf,
             globals_buffer,
         })
+    }
+
+    /// The bindless storage-buffer index of the adapted-exposure buffer (lighting reads it when
+    /// auto-exposure is on). `None` if the metering pipeline failed to build.
+    pub(crate) fn exposure_buf_index(&self) -> Option<u32> {
+        self.exposure_buf.as_ref().map(|b| b.storage_index())
+    }
+
+    /// Auto-exposure metering: read the lit `hdr`, reduce its log-average luminance, and write the
+    /// time-adapted exposure into the persistent buffer for next frame's lighting. Runs after the
+    /// lighting pass (the `hdr` read orders it). `key` = target grey, `adapt` = this frame's EMA
+    /// factor (`1-exp(-dt·speed)`), `[min_exp,max_exp]` clamp the exposure.
+    pub(crate) fn record_auto_exposure<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        hdr: ResourceId,
+        key: f32,
+        adapt: f32,
+        min_exp: f32,
+        max_exp: f32,
+    ) {
+        let (Some(pipe), Some(buf)) = (&self.auto_exposure_pipeline, &self.exposure_buf) else {
+            return;
+        };
+        let buf_idx = buf.storage_index();
+        let ext = graph.import_external("exposure_buf");
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "auto_exposure",
+                storage_writes: vec![ext],
+                reads: vec![hdr],
+            },
+            move |ctx| {
+                let hdr_idx = ctx.sampled_index(hdr);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&ae_push(
+                    hdr_idx, buf_idx, key, adapt, min_exp, max_exp,
+                ));
+                cmd.dispatch(1, 1, 1);
+                Ok(())
+            },
+        );
     }
 
     /// Write this frame's globals slice (packed by `run()` via `globals_bytes`) at
@@ -359,6 +442,7 @@ impl DeferredRenderer {
         globals_offset: u64,
         flip_y: u32,
         two_sided: bool,
+        exposure_buf_index: u32,
     ) {
         let mut reads = vec![
             gbuf.albedo,
@@ -405,6 +489,7 @@ impl DeferredRenderer {
                     gi_index,
                     reflect_index,
                     two_sided as u32,
+                    exposure_buf_index,
                 ));
                 cmd.draw(3, 1);
                 Ok(())
@@ -528,8 +613,9 @@ fn pbr_push(
     gdf_gi_index: u32,
     reflect_index: u32,
     two_sided: u32,
-) -> [u8; 40] {
-    let mut pc = [0u8; 40];
+    exposure_buf_index: u32,
+) -> [u8; 44] {
+    let mut pc = [0u8; 44];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -539,6 +625,20 @@ fn pbr_push(
     pc[28..32].copy_from_slice(&gdf_gi_index.to_le_bytes());
     pc[32..36].copy_from_slice(&reflect_index.to_le_bytes());
     pc[36..40].copy_from_slice(&two_sided.to_le_bytes());
+    pc[40..44].copy_from_slice(&exposure_buf_index.to_le_bytes());
+    pc
+}
+
+/// Pack the auto-exposure push block (32 bytes): hdr sampled index, exposure storage-buffer
+/// index, target grey `key`, this-frame EMA `adapt`, and the `[min,max]` exposure clamp.
+fn ae_push(hdr: u32, expo_buf: u32, key: f32, adapt: f32, min_exp: f32, max_exp: f32) -> [u8; 32] {
+    let mut pc = [0u8; 32];
+    pc[0..4].copy_from_slice(&hdr.to_le_bytes());
+    pc[4..8].copy_from_slice(&expo_buf.to_le_bytes());
+    pc[8..12].copy_from_slice(&key.to_le_bytes());
+    pc[12..16].copy_from_slice(&adapt.to_le_bytes());
+    pc[16..20].copy_from_slice(&min_exp.to_le_bytes());
+    pc[20..24].copy_from_slice(&max_exp.to_le_bytes());
     pc
 }
 
