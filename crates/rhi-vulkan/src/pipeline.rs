@@ -258,22 +258,51 @@ unsafe fn build(
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
-        let color_blend_attachment = match desc.blend {
-            BlendMode::Opaque => vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .blend_enable(false),
-            BlendMode::AlphaBlend => vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .blend_enable(true)
-                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .color_blend_op(vk::BlendOp::ADD)
-                .src_alpha_blend_factor(vk::BlendFactor::ONE)
-                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .alpha_blend_op(vk::BlendOp::ADD),
+        // One blend state per color attachment. Opaque/AlphaBlend replicate a single state
+        // across every MRT output; DecalAlbedo is per-attachment (RT0 blends, rest masked).
+        let opaque_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(false);
+        let alpha_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD);
+        let attachments: Vec<vk::PipelineColorBlendAttachmentState> = match desc.blend {
+            BlendMode::Opaque => vec![opaque_attachment; desc.color_formats.len()],
+            BlendMode::AlphaBlend => vec![alpha_attachment; desc.color_formats.len()],
+            // Deferred-decal preset (see `BlendMode::DecalAlbedo`): attachment 0 alpha-blends
+            // its RGB into the G-buffer albedo (write mask RGB preserves A = baked AO); every
+            // other attachment is masked off so the decal leaves the rest of the G-buffer
+            // (normal / metallic / roughness / world-pos) untouched.
+            BlendMode::DecalAlbedo => (0..desc.color_formats.len())
+                .map(|i| {
+                    if i == 0 {
+                        vk::PipelineColorBlendAttachmentState::default()
+                            .color_write_mask(
+                                vk::ColorComponentFlags::R
+                                    | vk::ColorComponentFlags::G
+                                    | vk::ColorComponentFlags::B,
+                            )
+                            .blend_enable(true)
+                            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                            .color_blend_op(vk::BlendOp::ADD)
+                            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                            .alpha_blend_op(vk::BlendOp::ADD)
+                    } else {
+                        vk::PipelineColorBlendAttachmentState::default()
+                            .color_write_mask(vk::ColorComponentFlags::empty())
+                            .blend_enable(false)
+                    }
+                })
+                .collect(),
         };
-        // One blend state per color attachment (same blend for all MRT outputs).
-        let attachments = vec![color_blend_attachment; desc.color_formats.len()];
         let color_blend =
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];

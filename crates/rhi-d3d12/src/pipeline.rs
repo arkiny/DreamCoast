@@ -9,6 +9,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::{
     D3D_ROOT_SIGNATURE_VERSION_1, D3D12_BLEND_DESC, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE,
     D3D12_BLEND_OP_ADD, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_ZERO, D3D12_COLOR_WRITE_ENABLE_ALL,
+    D3D12_COLOR_WRITE_ENABLE_BLUE, D3D12_COLOR_WRITE_ENABLE_GREEN, D3D12_COLOR_WRITE_ENABLE_RED,
     D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_LESS, D3D12_COMPARISON_FUNC_NEVER,
     D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
     D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_WRITE_MASK_ALL,
@@ -558,9 +559,50 @@ fn rasterizer_default() -> D3D12_RASTERIZER_DESC {
 }
 
 fn blend_state(mode: BlendMode) -> D3D12_BLEND_DESC {
+    // Deferred-decal preset (see `BlendMode::DecalAlbedo`): per-RT independent blend —
+    // RT0 alpha-blends RGB into the G-buffer albedo (write mask RGB preserves A = baked AO),
+    // every other RT is write-masked off so the decal leaves normal / metallic / roughness /
+    // world-pos untouched. Needs `IndependentBlendEnable = TRUE`.
+    if matches!(mode, BlendMode::DecalAlbedo) {
+        let rt0 = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            LogicOpEnable: false.into(),
+            SrcBlend: D3D12_BLEND_SRC_ALPHA,
+            DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: (D3D12_COLOR_WRITE_ENABLE_RED.0
+                | D3D12_COLOR_WRITE_ENABLE_GREEN.0
+                | D3D12_COLOR_WRITE_ENABLE_BLUE.0) as u8,
+        };
+        let masked = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: false.into(),
+            LogicOpEnable: false.into(),
+            SrcBlend: D3D12_BLEND_ONE,
+            DestBlend: D3D12_BLEND_ZERO,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_ZERO,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: 0,
+        };
+        let mut render_target = [masked; 8];
+        render_target[0] = rt0;
+        return D3D12_BLEND_DESC {
+            AlphaToCoverageEnable: false.into(),
+            IndependentBlendEnable: true.into(),
+            RenderTarget: render_target,
+        };
+    }
+
     let (enable, src, dst) = match mode {
         BlendMode::Opaque => (false, D3D12_BLEND_ONE, D3D12_BLEND_ZERO),
         BlendMode::AlphaBlend => (true, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA),
+        BlendMode::DecalAlbedo => unreachable!("handled above"),
     };
     let rt = D3D12_RENDER_TARGET_BLEND_DESC {
         BlendEnable: enable.into(),
