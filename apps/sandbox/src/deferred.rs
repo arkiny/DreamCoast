@@ -334,8 +334,12 @@ impl DeferredRenderer {
             move |ctx| {
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(resolve_pipe);
+                // Full geometric mean over the histogram (lo=0, hi=1): the trimmed-percentile mean
+                // shifts on a few sub-ULP-different bright pixels and amplifies into a cross-backend
+                // exposure drift; the full mean barely moves (one pixel changing bin shifts it by
+                // ~1/N), so DX≡VK holds. Robust to outliers via the log-average, not a hard cutoff.
                 cmd.push_constants_compute(&ae_resolve_push(
-                    hist_idx, expo_idx, num_pixels, key, adapt, min_exp, max_exp, 0.0, 0.9,
+                    hist_idx, expo_idx, num_pixels, key, adapt, min_exp, max_exp, 0.0, 1.0,
                 ));
                 cmd.dispatch(1, 1, 1);
                 Ok(())

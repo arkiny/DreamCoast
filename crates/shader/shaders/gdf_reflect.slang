@@ -213,6 +213,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 dir;
     if (roughness > 0.04)
     {
+        // GGX importance-sampled reflection ray. `pc.frame` decorrelates the jitter per frame; the
+        // host passes a FIXED frame (0) for content so the per-pixel jitter is temporally STABLE —
+        // the temporal pass can't average a 1-ray/frame stochastic lobe to convergence (auto-exposure
+        // shifts reject the history too), so a frame-varying ray leaves sparkle, while a fixed jitter
+        // + the resolve's spatial gather reconstructs the lobe smoothly. The gallery passes the real
+        // frame to stay byte-identical to its legacy anchor.
         uint rng = (tid.x * 1973u + tid.y * 9277u + pc.frame * 26699u) | 1u;
         float3 h = sample_ggx(n, roughness, rng);
         dir = reflect(-v, h);
