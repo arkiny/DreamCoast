@@ -100,6 +100,22 @@ impl MetalStorageBuffer {
     pub fn storage_index(&self) -> u32 {
         self.index
     }
+
+    /// Host-write the buffer's contents (used for the per-frame skin joint palette).
+    /// Only valid for a host-visible (`StorageModeShared`) buffer — i.e. one created
+    /// via `create_storage_buffer_init`; a `Private` buffer's `contents()` is not
+    /// CPU-addressable. Bounds-checked against the allocated length.
+    pub fn write(&self, data: &[u8]) -> crate::Result<()> {
+        if data.len() > self.buffer.length() {
+            return Err(crate::rhi_err("storage buffer write out of bounds"));
+        }
+        let dst = self.buffer.contents().as_ptr() as *mut u8;
+        if dst.is_null() {
+            return Err(crate::rhi_err("storage buffer is not host-visible"));
+        }
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
+        Ok(())
+    }
 }
 
 /// A sampled 2D texture registered in the bindless argument buffer. The `MTLTexture`

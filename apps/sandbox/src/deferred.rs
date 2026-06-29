@@ -84,7 +84,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::Mesh,
             blend: BlendMode::Opaque,
-            push_constant_size: 176, // mvp(64) + base_color(16) + mr(16) + tex u32x4(16) + model mat4(64)
+            push_constant_size: 192, // mvp(64) + base_color(16) + mr(16) + tex u32x4(16) + model mat4(64)
             bindless: true,
             uniform_buffer: false,
             depth_test: true,
@@ -460,6 +460,7 @@ impl DeferredRenderer {
                         obj.alpha_cutoff,
                         [obj.tex[0], mr_tex, obj.tex[2], obj.tex[3]],
                         obj.transform.to_cols_array(),
+                        [0; 4], // not skinned
                     ));
                     cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
                     cmd.bind_index_buffer(&obj.mesh.ibuf, true);
@@ -476,6 +477,7 @@ impl DeferredRenderer {
                     0.0, // opaque -> no alpha test
                     [NO_TEXTURE; 4],
                     Mat4::IDENTITY.to_cols_array(),
+                    [0; 4], // not skinned
                 ));
                 cmd.bind_vertex_buffer(ground_vbuf, 32);
                 cmd.bind_index_buffer(ground_ibuf, true);
@@ -626,10 +628,11 @@ impl DeferredRenderer {
     }
 }
 
-/// Pack the G-buffer push block (176 bytes): mvp(64), base_color(16),
-/// metallic/roughness(16), texture indices u32x4 (16), model mat4 (64). `model` is the
-/// object->world transform the vertex shader uses for the world-space position and
-/// normal G-buffer outputs (the `mvp` already folds it in for clip space).
+/// Pack the G-buffer push block (192 bytes): mvp(64), base_color(16),
+/// metallic/roughness(16), texture indices u32x4 (16), model mat4 (64), skin u32x4 (16).
+/// `model` is the object->world transform the vertex shader uses for the world-space
+/// position and normal G-buffer outputs (the `mvp` already folds it in for clip space);
+/// `skin` carries the GPU-skinning storage-buffer indices (0 on the non-skinned path).
 #[allow(clippy::too_many_arguments)]
 fn gbuffer_push(
     mvp: [f32; 16],
@@ -640,8 +643,11 @@ fn gbuffer_push(
     alpha_cutoff: f32,
     tex: [u32; 4],
     model: [f32; 16],
-) -> [u8; 176] {
-    let mut pc = [0u8; 176];
+    // GPU skinning (Stage B.2): bindless storage-buffer indices for joints / weights /
+    // palette + joint count. `[0; 4]` on the non-skinned path (`vsMain` ignores it).
+    skin: [u32; 4],
+) -> [u8; 192] {
+    let mut pc = [0u8; 192];
     for (i, f) in mvp.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
@@ -660,6 +666,10 @@ fn gbuffer_push(
     for (i, f) in model.iter().enumerate() {
         let o = 112 + i * 4;
         pc[o..o + 4].copy_from_slice(&f.to_le_bytes());
+    }
+    for (i, s) in skin.iter().enumerate() {
+        let o = 176 + i * 4;
+        pc[o..o + 4].copy_from_slice(&s.to_le_bytes());
     }
     pc
 }

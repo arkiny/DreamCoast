@@ -252,6 +252,16 @@ impl VulkanStorageBuffer {
         self.index
     }
 
+    /// Host-write the buffer (GPU-skinning joint palette). These storage buffers are
+    /// `DEVICE_LOCAL`, so a direct host write is not yet supported — the host-visible
+    /// storage-buffer variant is animation Stage B.2c (Windows). GPU skinning falls
+    /// back to the CPU path on Vulkan until then.
+    pub fn write(&self, _data: &[u8]) -> Result<(), EngineError> {
+        Err(EngineError::Rhi(
+            "host-write of a Vulkan storage buffer not implemented (animation B.2c)".into(),
+        ))
+    }
+
     pub(crate) fn raw(&self) -> vk::Buffer {
         self.buffer
     }

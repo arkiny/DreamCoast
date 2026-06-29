@@ -44,6 +44,10 @@ struct PushConstants
     float4 mr_factor;     // x metallic, y roughness, z texture mip LOD bias (TAAU), w alpha cutoff
     uint4 tex;            // x base_color, y metallic_roughness, z normal, w emissive
     float4x4 model;       // object -> world (for world-space position + normal outputs)
+    // GPU skinning (Stage B.2): bindless storage-buffer indices for the per-vertex
+    // joints (uint4) + weights (float4) and the joint palette (float4x4 per joint).
+    // Only read by `vsMainSkinned`; 0 / unused on the non-skinned path.
+    uint4 skin;           // x joints, y weights, z palette, w joint_count
 };
 
 [[vk::push_constant]]
@@ -58,6 +62,52 @@ VSOutput vsMain(VSInput input)
     // so the 3x3 transforms the normal direction correctly once re-normalized in fsMain).
     o.world_pos = mul(pc.model, float4(input.pos, 1.0)).xyz;
     o.world_normal = mul((float3x3)pc.model, input.normal);
+    o.uv = input.uv;
+    return o;
+}
+
+// Transform `v` by joint `j`'s palette matrix, done as an explicit column-major
+// `M*v` (the palette is packed column-major — cols at +0/+16/+32/+48 — the same
+// layout the engine packs the push `mvp`/`model` with, so no Load<float4x4> /
+// matrix-majorness ambiguity).
+float4 joint_mul(uint palette_index, uint j, float4 v)
+{
+    RWByteAddressBuffer palette = g.storage_buffers[palette_index];
+    uint base = j * 64;
+    float4 c0 = palette.Load<float4>(base + 0);
+    float4 c1 = palette.Load<float4>(base + 16);
+    float4 c2 = palette.Load<float4>(base + 32);
+    float4 c3 = palette.Load<float4>(base + 48);
+    return c0 * v.x + c1 * v.y + c2 * v.z + c3 * v.w;
+}
+
+// GPU vertex-pulling skinning: read this vertex's joints/weights from bindless
+// storage buffers (by vertex id) and blend the per-joint transformed bind-pose
+// position/normal — linear-blend skinning, blending the transformed points (= the
+// weighted joint matrices applied), which avoids any matrix construction. The palette
+// already places the vertex in scene/world space, so `pc.model` is identity for a
+// skinned draw.
+[shader("vertex")]
+VSOutput vsMainSkinned(VSInput input, uint vid : SV_VertexID)
+{
+    RWByteAddressBuffer joints_buf = g.storage_buffers[pc.skin.x];
+    RWByteAddressBuffer weights_buf = g.storage_buffers[pc.skin.y];
+    uint4 j = joints_buf.Load<uint4>(vid * 16);    // 4 x u32
+    float4 w = weights_buf.Load<float4>(vid * 16); // 4 x f32
+    uint p = pc.skin.z;
+
+    float4 bind_pos = float4(input.pos, 1.0);
+    float4 bind_nrm = float4(input.normal, 0.0); // direction (w = 0)
+
+    float4 pos = w.x * joint_mul(p, j.x, bind_pos) + w.y * joint_mul(p, j.y, bind_pos)
+               + w.z * joint_mul(p, j.z, bind_pos) + w.w * joint_mul(p, j.w, bind_pos);
+    float4 nrm = w.x * joint_mul(p, j.x, bind_nrm) + w.y * joint_mul(p, j.y, bind_nrm)
+               + w.z * joint_mul(p, j.z, bind_nrm) + w.w * joint_mul(p, j.w, bind_nrm);
+
+    VSOutput o;
+    o.clip = mul(pc.mvp, pos);
+    o.world_pos = mul(pc.model, pos).xyz;
+    o.world_normal = mul((float3x3)pc.model, nrm.xyz);
     o.uv = input.uv;
     return o;
 }

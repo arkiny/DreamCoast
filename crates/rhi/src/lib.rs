@@ -192,6 +192,20 @@ impl StorageBuffer {
             Self::Metal(b) => b.storage_index(),
         }
     }
+
+    /// Host-write the buffer's contents (per-frame, e.g. the GPU-skinning joint
+    /// palette). Requires a host-visible storage buffer (created via
+    /// [`Device::create_storage_buffer_init`]). See each backend for support.
+    pub fn write(&self, data: &[u8]) -> Result<()> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(b) => b.write(data),
+            #[cfg(windows)]
+            Self::D3d12(b) => b.write(data),
+            #[cfg(target_os = "macos")]
+            Self::Metal(b) => b.write(data),
+        }
+    }
 }
 
 impl RenderTarget {
