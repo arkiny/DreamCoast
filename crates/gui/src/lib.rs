@@ -10,9 +10,8 @@ use dreamcoast_core::EngineError;
 use dreamcoast_platform::Input;
 use imgui::{Context, DrawCmd, DrawData, DrawIdx, DrawVert};
 use rhi::{
-    BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, CommandBuffer, Device, Format,
-    GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, Rect2D, Texture, TextureDesc,
-    VertexLayout,
+    BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, Device, Format, GraphicsPipeline,
+    GraphicsPipelineDesc, PrimitiveTopology, Recorder, Rect2D, Texture, TextureDesc, VertexLayout,
 };
 
 /// Per-frame-in-flight dynamic geometry buffers (grown as needed).
@@ -134,7 +133,7 @@ impl Gui {
     pub fn render(
         &mut self,
         device: &Device,
-        cmd: &CommandBuffer,
+        cmd: &dyn Recorder,
         frame_index: usize,
     ) -> Result<(), EngineError> {
         let draw_data: &DrawData = self.ctx.render();

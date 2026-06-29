@@ -21,7 +21,7 @@ use dreamcoast_core::EngineError;
 use dreamcoast_platform::Window;
 
 mod command_list;
-pub use command_list::{CommandList, RhiCommand};
+pub use command_list::{CommandList, Recorder, RhiCommand};
 
 type Result<T> = std::result::Result<T, EngineError>;
 

@@ -1,24 +1,27 @@
-//! Phase 15 M4 (option B) — a **backend-agnostic command-list IR**.
+//! Phase 15 M4 (option B) — a **backend-agnostic command-list IR** + the
+//! [`Recorder`] trait that lets a pass record either *immediately* onto a real
+//! [`CommandBuffer`] or *deferred* into a `Send` [`CommandList`].
 //!
-//! The render-graph (record) thread builds a [`CommandList`] — a flat, `Send`
-//! vector of [`RhiCommand`]s mirroring the [`CommandBuffer`] API — instead of
-//! calling the backend command buffer directly. A single RHI thread later
-//! [`CommandList::translate`]s it onto a real [`CommandBuffer`] and submits. Because
-//! the list is pure data, it crosses threads freely and independent passes can
-//! build separate lists in parallel (M4 B4) — none of which requires the backend's
-//! `Rc<DeviceShared>` to become thread-safe.
+//! The render-graph (record) thread records into a [`CommandList`] — a flat, `Send`
+//! vector of [`RhiCommand`]s mirroring the [`CommandBuffer`] API — and a single RHI
+//! thread later [`CommandList::translate`]s it onto a real [`CommandBuffer`] and
+//! submits. Because the list is pure data it crosses threads freely and independent
+//! passes can build separate lists in parallel (M4 B4) — none of which requires the
+//! backend's `Rc<DeviceShared>` to become thread-safe.
 //!
-//! **Resource references.** Commands that bind a resource store a [`ResPtr`] — a
-//! raw `*const` to the borrowed facade resource, wrapped `Send`. This is sound
-//! under the M4 handoff contract: the record thread keeps every referenced resource
-//! alive until the RHI thread signals the frame done (the per-frame fence), so the
-//! pointer is always valid when `translate` dereferences it, and only one thread
-//! touches the list at a time (ownership passes with the list). In B1/B2 record and
-//! translate run on the same thread, so validity is trivial.
+//! **One recording API, two targets.** Passes and helpers take `&dyn Recorder`.
+//! [`CommandBuffer`] implements it by forwarding to its inherent immediate methods
+//! (used by the compute-queue / IBL-capture paths that submit directly); a
+//! [`CommandList`] implements it by appending IR (used by the render graph). The
+//! trait takes `&self` (with interior mutability in `CommandList`) so a shared
+//! `&CommandBuffer` — which is all the direct paths hold — satisfies it too.
 //!
-//! **Status (B1):** this module is *additive* — the renderer still records directly
-//! into a `CommandBuffer`. B2 routes the passes through [`CommandList`]; B3 moves
-//! `translate` + submit onto the RHI thread.
+//! **Resource references.** Commands store a [`ResPtr`] — a `Send`-wrapped `*const`
+//! to the borrowed facade resource — valid for the frame under the M4 handoff
+//! contract: the recorder keeps every referenced resource alive until the RHI
+//! thread signals the frame done, so the pointer is always valid at `translate`.
+
+use std::cell::RefCell;
 
 use rhi_types::{ClearColor, Extent2D, Rect2D};
 
@@ -57,12 +60,264 @@ impl<T> ResPtr<T> {
     }
 }
 
-/// One recorded command, mirroring a [`CommandBuffer`] method. Holds only `Send`
-/// data (primitives, `Copy` descriptors, [`ResPtr`]s, and offsets into the list's
-/// push-constant / target arenas).
+/// The recording API shared by immediate ([`CommandBuffer`]) and deferred
+/// ([`CommandList`]) targets. Mirrors the [`CommandBuffer`] command surface (minus
+/// `begin`/`end`, which the frame loop calls directly on the real buffer). `&self`
+/// so a shared `&CommandBuffer` satisfies it.
+pub trait Recorder {
+    fn reset_queries(&self, heap: &QueryHeap, first: u32, count: u32);
+    fn write_timestamp(&self, heap: &QueryHeap, index: u32);
+    fn resolve_queries(&self, heap: &QueryHeap, count: u32);
+    fn begin_debug_label(&self, name: &str);
+    fn end_debug_label(&self);
+    fn transition_to_render_target(&self, swapchain: &Swapchain, image_index: u32);
+    fn transition_to_present(&self, swapchain: &Swapchain, image_index: u32);
+    fn begin_rendering(
+        &self,
+        swapchain: &Swapchain,
+        image_index: u32,
+        color_clear: Option<ClearColor>,
+        depth: Option<&DepthBuffer>,
+    );
+    fn begin_rendering_target(
+        &self,
+        target: &RenderTarget,
+        color_clear: Option<ClearColor>,
+        depth: Option<&DepthBuffer>,
+    );
+    fn begin_rendering_targets(
+        &self,
+        targets: &[(&RenderTarget, Option<ClearColor>)],
+        depth: Option<&DepthBuffer>,
+    );
+    fn set_globals(&self, buffer: &Buffer, offset: u64);
+    fn begin_rendering_depth_only(&self, depth: &DepthBuffer);
+    fn depth_to_render_target(&self, depth: &DepthBuffer);
+    fn depth_to_sampled(&self, depth: &DepthBuffer);
+    fn cube_to_color(&self, cube: &Cubemap);
+    fn cube_to_sampled(&self, cube: &Cubemap);
+    fn begin_rendering_cube_face(
+        &self,
+        cube: &Cubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+    );
+    fn begin_rendering_cube_face_depth(
+        &self,
+        cube: &Cubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+        depth: &DepthBuffer,
+    );
+    fn end_rendering(&self);
+    fn copy_swapchain_to_buffer(&self, swapchain: &Swapchain, image_index: u32, buffer: &Buffer);
+    fn set_viewport_scissor(&self, swapchain: &Swapchain);
+    fn set_viewport_scissor_extent(&self, extent: Extent2D);
+    fn rt_to_render_target(&self, target: &RenderTarget);
+    fn rt_to_sampled(&self, target: &RenderTarget);
+    fn aliasing_barrier(&self, target: &RenderTarget);
+    fn bind_graphics_pipeline(&self, pipeline: &GraphicsPipeline);
+    fn draw(&self, vertex_count: u32, instance_count: u32);
+    fn bind_compute_pipeline(&self, pipeline: &ComputePipeline);
+    fn dispatch(&self, x: u32, y: u32, z: u32);
+    fn push_constants_compute(&self, data: &[u8]);
+    fn bind_raytracing_pipeline(&self, pipeline: &RaytracingPipeline);
+    fn push_constants_rt(&self, data: &[u8]);
+    fn trace_rays(&self, pipeline: &RaytracingPipeline, width: u32, height: u32);
+    fn rt_to_storage(&self, target: &RenderTarget);
+    fn volume_to_storage(&self, volume: &Volume);
+    fn volume_to_sampled(&self, volume: &Volume);
+    fn storage_to_sampled(&self, target: &RenderTarget);
+    fn storage_buffer_barrier(&self, buffer: &StorageBuffer);
+    fn storage_buffer_barrier_compute(&self, buffer: &StorageBuffer);
+    fn storage_buffer_to_indirect(&self, buffer: &StorageBuffer);
+    fn storage_buffer_to_storage(&self, buffer: &StorageBuffer);
+    fn draw_indexed_indirect(&self, buffer: &StorageBuffer, offset: u64, draw_count: u32);
+    fn set_scissor(&self, rect: Rect2D);
+    fn bind_vertex_buffer(&self, buffer: &Buffer, stride: u32);
+    fn bind_index_buffer(&self, buffer: &Buffer, wide: bool);
+    fn push_constants(&self, data: &[u8]);
+    fn draw_indexed(&self, index_count: u32, first_index: u32, vertex_offset: i32);
+}
+
+/// [`CommandBuffer`] records immediately by forwarding to its inherent methods.
+impl Recorder for CommandBuffer {
+    fn reset_queries(&self, heap: &QueryHeap, first: u32, count: u32) {
+        CommandBuffer::reset_queries(self, heap, first, count)
+    }
+    fn write_timestamp(&self, heap: &QueryHeap, index: u32) {
+        CommandBuffer::write_timestamp(self, heap, index)
+    }
+    fn resolve_queries(&self, heap: &QueryHeap, count: u32) {
+        CommandBuffer::resolve_queries(self, heap, count)
+    }
+    fn begin_debug_label(&self, name: &str) {
+        CommandBuffer::begin_debug_label(self, name)
+    }
+    fn end_debug_label(&self) {
+        CommandBuffer::end_debug_label(self)
+    }
+    fn transition_to_render_target(&self, swapchain: &Swapchain, image_index: u32) {
+        CommandBuffer::transition_to_render_target(self, swapchain, image_index)
+    }
+    fn transition_to_present(&self, swapchain: &Swapchain, image_index: u32) {
+        CommandBuffer::transition_to_present(self, swapchain, image_index)
+    }
+    fn begin_rendering(
+        &self,
+        swapchain: &Swapchain,
+        image_index: u32,
+        color_clear: Option<ClearColor>,
+        depth: Option<&DepthBuffer>,
+    ) {
+        CommandBuffer::begin_rendering(self, swapchain, image_index, color_clear, depth)
+    }
+    fn begin_rendering_target(
+        &self,
+        target: &RenderTarget,
+        color_clear: Option<ClearColor>,
+        depth: Option<&DepthBuffer>,
+    ) {
+        CommandBuffer::begin_rendering_target(self, target, color_clear, depth)
+    }
+    fn begin_rendering_targets(
+        &self,
+        targets: &[(&RenderTarget, Option<ClearColor>)],
+        depth: Option<&DepthBuffer>,
+    ) {
+        CommandBuffer::begin_rendering_targets(self, targets, depth)
+    }
+    fn set_globals(&self, buffer: &Buffer, offset: u64) {
+        CommandBuffer::set_globals(self, buffer, offset)
+    }
+    fn begin_rendering_depth_only(&self, depth: &DepthBuffer) {
+        CommandBuffer::begin_rendering_depth_only(self, depth)
+    }
+    fn depth_to_render_target(&self, depth: &DepthBuffer) {
+        CommandBuffer::depth_to_render_target(self, depth)
+    }
+    fn depth_to_sampled(&self, depth: &DepthBuffer) {
+        CommandBuffer::depth_to_sampled(self, depth)
+    }
+    fn cube_to_color(&self, cube: &Cubemap) {
+        CommandBuffer::cube_to_color(self, cube)
+    }
+    fn cube_to_sampled(&self, cube: &Cubemap) {
+        CommandBuffer::cube_to_sampled(self, cube)
+    }
+    fn begin_rendering_cube_face(
+        &self,
+        cube: &Cubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+    ) {
+        CommandBuffer::begin_rendering_cube_face(self, cube, face, mip, clear)
+    }
+    fn begin_rendering_cube_face_depth(
+        &self,
+        cube: &Cubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+        depth: &DepthBuffer,
+    ) {
+        CommandBuffer::begin_rendering_cube_face_depth(self, cube, face, mip, clear, depth)
+    }
+    fn end_rendering(&self) {
+        CommandBuffer::end_rendering(self)
+    }
+    fn copy_swapchain_to_buffer(&self, swapchain: &Swapchain, image_index: u32, buffer: &Buffer) {
+        CommandBuffer::copy_swapchain_to_buffer(self, swapchain, image_index, buffer)
+    }
+    fn set_viewport_scissor(&self, swapchain: &Swapchain) {
+        CommandBuffer::set_viewport_scissor(self, swapchain)
+    }
+    fn set_viewport_scissor_extent(&self, extent: Extent2D) {
+        CommandBuffer::set_viewport_scissor_extent(self, extent)
+    }
+    fn rt_to_render_target(&self, target: &RenderTarget) {
+        CommandBuffer::rt_to_render_target(self, target)
+    }
+    fn rt_to_sampled(&self, target: &RenderTarget) {
+        CommandBuffer::rt_to_sampled(self, target)
+    }
+    fn aliasing_barrier(&self, target: &RenderTarget) {
+        CommandBuffer::aliasing_barrier(self, target)
+    }
+    fn bind_graphics_pipeline(&self, pipeline: &GraphicsPipeline) {
+        CommandBuffer::bind_graphics_pipeline(self, pipeline)
+    }
+    fn draw(&self, vertex_count: u32, instance_count: u32) {
+        CommandBuffer::draw(self, vertex_count, instance_count)
+    }
+    fn bind_compute_pipeline(&self, pipeline: &ComputePipeline) {
+        CommandBuffer::bind_compute_pipeline(self, pipeline)
+    }
+    fn dispatch(&self, x: u32, y: u32, z: u32) {
+        CommandBuffer::dispatch(self, x, y, z)
+    }
+    fn push_constants_compute(&self, data: &[u8]) {
+        CommandBuffer::push_constants_compute(self, data)
+    }
+    fn bind_raytracing_pipeline(&self, pipeline: &RaytracingPipeline) {
+        CommandBuffer::bind_raytracing_pipeline(self, pipeline)
+    }
+    fn push_constants_rt(&self, data: &[u8]) {
+        CommandBuffer::push_constants_rt(self, data)
+    }
+    fn trace_rays(&self, pipeline: &RaytracingPipeline, width: u32, height: u32) {
+        CommandBuffer::trace_rays(self, pipeline, width, height)
+    }
+    fn rt_to_storage(&self, target: &RenderTarget) {
+        CommandBuffer::rt_to_storage(self, target)
+    }
+    fn volume_to_storage(&self, volume: &Volume) {
+        CommandBuffer::volume_to_storage(self, volume)
+    }
+    fn volume_to_sampled(&self, volume: &Volume) {
+        CommandBuffer::volume_to_sampled(self, volume)
+    }
+    fn storage_to_sampled(&self, target: &RenderTarget) {
+        CommandBuffer::storage_to_sampled(self, target)
+    }
+    fn storage_buffer_barrier(&self, buffer: &StorageBuffer) {
+        CommandBuffer::storage_buffer_barrier(self, buffer)
+    }
+    fn storage_buffer_barrier_compute(&self, buffer: &StorageBuffer) {
+        CommandBuffer::storage_buffer_barrier_compute(self, buffer)
+    }
+    fn storage_buffer_to_indirect(&self, buffer: &StorageBuffer) {
+        CommandBuffer::storage_buffer_to_indirect(self, buffer)
+    }
+    fn storage_buffer_to_storage(&self, buffer: &StorageBuffer) {
+        CommandBuffer::storage_buffer_to_storage(self, buffer)
+    }
+    fn draw_indexed_indirect(&self, buffer: &StorageBuffer, offset: u64, draw_count: u32) {
+        CommandBuffer::draw_indexed_indirect(self, buffer, offset, draw_count)
+    }
+    fn set_scissor(&self, rect: Rect2D) {
+        CommandBuffer::set_scissor(self, rect)
+    }
+    fn bind_vertex_buffer(&self, buffer: &Buffer, stride: u32) {
+        CommandBuffer::bind_vertex_buffer(self, buffer, stride)
+    }
+    fn bind_index_buffer(&self, buffer: &Buffer, wide: bool) {
+        CommandBuffer::bind_index_buffer(self, buffer, wide)
+    }
+    fn push_constants(&self, data: &[u8]) {
+        CommandBuffer::push_constants(self, data)
+    }
+    fn draw_indexed(&self, index_count: u32, first_index: u32, vertex_offset: i32) {
+        CommandBuffer::draw_indexed(self, index_count, first_index, vertex_offset)
+    }
+}
+
+/// One recorded command, mirroring a [`Recorder`] method. Holds only `Send` data
+/// (primitives, `Copy` descriptors, [`ResPtr`]s, and offsets into the list arenas).
 pub enum RhiCommand {
-    Begin,
-    End,
     ResetQueries {
         heap: ResPtr<QueryHeap>,
         first: u32,
@@ -101,7 +356,6 @@ pub enum RhiCommand {
         depth: Option<ResPtr<DepthBuffer>>,
     },
     BeginRenderingTargets {
-        /// Range into [`CommandList::targets`].
         off: u32,
         len: u32,
         depth: Option<ResPtr<DepthBuffer>>,
@@ -241,12 +495,8 @@ pub enum RhiCommand {
     },
 }
 
-/// A flat, `Send` list of [`RhiCommand`]s plus side arenas for variable-length
-/// data (push-constant blobs, MRT target lists, debug-label strings). The
-/// recording methods mirror [`CommandBuffer`] so passes migrate by swapping the
-/// receiver (M4 B2).
 #[derive(Default)]
-pub struct CommandList {
+struct Inner {
     cmds: Vec<RhiCommand>,
     /// Arena for push-constant byte blobs; commands store `(off, len)` ranges.
     push: Vec<u8>,
@@ -256,7 +506,27 @@ pub struct CommandList {
     labels: Vec<u8>,
 }
 
-// SAFETY: every field is `Send` (the `ResPtr`s are `Send` by the handoff contract).
+impl Inner {
+    #[inline]
+    fn push_blob(&mut self, data: &[u8]) -> (u32, u32) {
+        let off = self.push.len() as u32;
+        self.push.extend_from_slice(data);
+        (off, data.len() as u32)
+    }
+}
+
+/// A flat, `Send` list of [`RhiCommand`]s the render-graph thread records (via the
+/// [`Recorder`] impl) and the RHI thread [`translate`](CommandList::translate)s onto
+/// a real [`CommandBuffer`]. Interior mutability (`RefCell`) lets it record through
+/// `&self`, matching the trait and the direct-path `&CommandBuffer`.
+#[derive(Default)]
+pub struct CommandList {
+    inner: RefCell<Inner>,
+}
+
+// SAFETY: `Inner` is `Send` (the `ResPtr`s are `Send` by the handoff contract); the
+// `RefCell` only blocks `Sync`, which is fine — the list is owned by one thread at a
+// time and never shared concurrently.
 unsafe impl Send for CommandList {}
 
 impl CommandList {
@@ -266,334 +536,23 @@ impl CommandList {
     }
 
     /// Clear for reuse next frame (keeps allocations).
-    pub fn clear(&mut self) {
-        self.cmds.clear();
-        self.push.clear();
-        self.targets.clear();
-        self.labels.clear();
+    pub fn clear(&self) {
+        let mut i = self.inner.borrow_mut();
+        i.cmds.clear();
+        i.push.clear();
+        i.targets.clear();
+        i.labels.clear();
     }
 
     /// Number of recorded commands.
     pub fn len(&self) -> usize {
-        self.cmds.len()
+        self.inner.borrow().cmds.len()
     }
 
     /// Whether nothing has been recorded.
     pub fn is_empty(&self) -> bool {
-        self.cmds.is_empty()
+        self.inner.borrow().cmds.is_empty()
     }
-
-    #[inline]
-    fn push_blob(&mut self, data: &[u8]) -> (u32, u32) {
-        let off = self.push.len() as u32;
-        self.push.extend_from_slice(data);
-        (off, data.len() as u32)
-    }
-
-    // --- recording API (mirrors CommandBuffer) -------------------------------
-
-    pub fn begin(&mut self) {
-        self.cmds.push(RhiCommand::Begin);
-    }
-    pub fn end(&mut self) {
-        self.cmds.push(RhiCommand::End);
-    }
-    pub fn reset_queries(&mut self, heap: &QueryHeap, first: u32, count: u32) {
-        self.cmds.push(RhiCommand::ResetQueries {
-            heap: ResPtr::new(heap),
-            first,
-            count,
-        });
-    }
-    pub fn write_timestamp(&mut self, heap: &QueryHeap, index: u32) {
-        self.cmds.push(RhiCommand::WriteTimestamp {
-            heap: ResPtr::new(heap),
-            index,
-        });
-    }
-    pub fn resolve_queries(&mut self, heap: &QueryHeap, count: u32) {
-        self.cmds.push(RhiCommand::ResolveQueries {
-            heap: ResPtr::new(heap),
-            count,
-        });
-    }
-    pub fn begin_debug_label(&mut self, name: &str) {
-        let off = self.labels.len() as u32;
-        self.labels.extend_from_slice(name.as_bytes());
-        let len = name.len() as u32;
-        self.cmds.push(RhiCommand::BeginDebugLabel { off, len });
-    }
-    pub fn end_debug_label(&mut self) {
-        self.cmds.push(RhiCommand::EndDebugLabel);
-    }
-    pub fn transition_to_render_target(&mut self, swapchain: &Swapchain, image_index: u32) {
-        self.cmds.push(RhiCommand::TransitionToRenderTarget {
-            swapchain: ResPtr::new(swapchain),
-            image_index,
-        });
-    }
-    pub fn transition_to_present(&mut self, swapchain: &Swapchain, image_index: u32) {
-        self.cmds.push(RhiCommand::TransitionToPresent {
-            swapchain: ResPtr::new(swapchain),
-            image_index,
-        });
-    }
-    pub fn begin_rendering(
-        &mut self,
-        swapchain: &Swapchain,
-        image_index: u32,
-        color_clear: Option<ClearColor>,
-        depth: Option<&DepthBuffer>,
-    ) {
-        self.cmds.push(RhiCommand::BeginRendering {
-            swapchain: ResPtr::new(swapchain),
-            image_index,
-            color_clear,
-            depth: depth.map(ResPtr::new),
-        });
-    }
-    pub fn begin_rendering_target(
-        &mut self,
-        target: &RenderTarget,
-        color_clear: Option<ClearColor>,
-        depth: Option<&DepthBuffer>,
-    ) {
-        self.cmds.push(RhiCommand::BeginRenderingTarget {
-            target: ResPtr::new(target),
-            color_clear,
-            depth: depth.map(ResPtr::new),
-        });
-    }
-    pub fn begin_rendering_targets(
-        &mut self,
-        targets: &[(&RenderTarget, Option<ClearColor>)],
-        depth: Option<&DepthBuffer>,
-    ) {
-        let off = self.targets.len() as u32;
-        for (t, c) in targets {
-            self.targets.push((ResPtr::new(*t), *c));
-        }
-        let len = targets.len() as u32;
-        self.cmds.push(RhiCommand::BeginRenderingTargets {
-            off,
-            len,
-            depth: depth.map(ResPtr::new),
-        });
-    }
-    pub fn set_globals(&mut self, buffer: &Buffer, offset: u64) {
-        self.cmds.push(RhiCommand::SetGlobals {
-            buffer: ResPtr::new(buffer),
-            offset,
-        });
-    }
-    pub fn begin_rendering_depth_only(&mut self, depth: &DepthBuffer) {
-        self.cmds.push(RhiCommand::BeginRenderingDepthOnly {
-            depth: ResPtr::new(depth),
-        });
-    }
-    pub fn depth_to_render_target(&mut self, depth: &DepthBuffer) {
-        self.cmds.push(RhiCommand::DepthToRenderTarget {
-            depth: ResPtr::new(depth),
-        });
-    }
-    pub fn depth_to_sampled(&mut self, depth: &DepthBuffer) {
-        self.cmds.push(RhiCommand::DepthToSampled {
-            depth: ResPtr::new(depth),
-        });
-    }
-    pub fn cube_to_color(&mut self, cube: &Cubemap) {
-        self.cmds.push(RhiCommand::CubeToColor {
-            cube: ResPtr::new(cube),
-        });
-    }
-    pub fn cube_to_sampled(&mut self, cube: &Cubemap) {
-        self.cmds.push(RhiCommand::CubeToSampled {
-            cube: ResPtr::new(cube),
-        });
-    }
-    pub fn begin_rendering_cube_face(
-        &mut self,
-        cube: &Cubemap,
-        face: u32,
-        mip: u32,
-        clear: Option<ClearColor>,
-    ) {
-        self.cmds.push(RhiCommand::BeginRenderingCubeFace {
-            cube: ResPtr::new(cube),
-            face,
-            mip,
-            clear,
-        });
-    }
-    pub fn begin_rendering_cube_face_depth(
-        &mut self,
-        cube: &Cubemap,
-        face: u32,
-        mip: u32,
-        clear: Option<ClearColor>,
-        depth: &DepthBuffer,
-    ) {
-        self.cmds.push(RhiCommand::BeginRenderingCubeFaceDepth {
-            cube: ResPtr::new(cube),
-            face,
-            mip,
-            clear,
-            depth: ResPtr::new(depth),
-        });
-    }
-    pub fn end_rendering(&mut self) {
-        self.cmds.push(RhiCommand::EndRendering);
-    }
-    pub fn copy_swapchain_to_buffer(
-        &mut self,
-        swapchain: &Swapchain,
-        image_index: u32,
-        buffer: &Buffer,
-    ) {
-        self.cmds.push(RhiCommand::CopySwapchainToBuffer {
-            swapchain: ResPtr::new(swapchain),
-            image_index,
-            buffer: ResPtr::new(buffer),
-        });
-    }
-    pub fn set_viewport_scissor(&mut self, swapchain: &Swapchain) {
-        self.cmds.push(RhiCommand::SetViewportScissor {
-            swapchain: ResPtr::new(swapchain),
-        });
-    }
-    pub fn set_viewport_scissor_extent(&mut self, extent: Extent2D) {
-        self.cmds
-            .push(RhiCommand::SetViewportScissorExtent { extent });
-    }
-    pub fn rt_to_render_target(&mut self, target: &RenderTarget) {
-        self.cmds.push(RhiCommand::RtToRenderTarget {
-            target: ResPtr::new(target),
-        });
-    }
-    pub fn rt_to_sampled(&mut self, target: &RenderTarget) {
-        self.cmds.push(RhiCommand::RtToSampled {
-            target: ResPtr::new(target),
-        });
-    }
-    pub fn aliasing_barrier(&mut self, target: &RenderTarget) {
-        self.cmds.push(RhiCommand::AliasingBarrier {
-            target: ResPtr::new(target),
-        });
-    }
-    pub fn bind_graphics_pipeline(&mut self, pipeline: &GraphicsPipeline) {
-        self.cmds.push(RhiCommand::BindGraphicsPipeline {
-            pipeline: ResPtr::new(pipeline),
-        });
-    }
-    pub fn draw(&mut self, vertex_count: u32, instance_count: u32) {
-        self.cmds.push(RhiCommand::Draw {
-            vertex_count,
-            instance_count,
-        });
-    }
-    pub fn bind_compute_pipeline(&mut self, pipeline: &ComputePipeline) {
-        self.cmds.push(RhiCommand::BindComputePipeline {
-            pipeline: ResPtr::new(pipeline),
-        });
-    }
-    pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
-        self.cmds.push(RhiCommand::Dispatch { x, y, z });
-    }
-    pub fn push_constants_compute(&mut self, data: &[u8]) {
-        let (off, len) = self.push_blob(data);
-        self.cmds.push(RhiCommand::PushConstantsCompute { off, len });
-    }
-    pub fn bind_raytracing_pipeline(&mut self, pipeline: &RaytracingPipeline) {
-        self.cmds.push(RhiCommand::BindRaytracingPipeline {
-            pipeline: ResPtr::new(pipeline),
-        });
-    }
-    pub fn push_constants_rt(&mut self, data: &[u8]) {
-        let (off, len) = self.push_blob(data);
-        self.cmds.push(RhiCommand::PushConstantsRt { off, len });
-    }
-    pub fn trace_rays(&mut self, pipeline: &RaytracingPipeline, width: u32, height: u32) {
-        self.cmds.push(RhiCommand::TraceRays {
-            pipeline: ResPtr::new(pipeline),
-            width,
-            height,
-        });
-    }
-    pub fn rt_to_storage(&mut self, target: &RenderTarget) {
-        self.cmds.push(RhiCommand::RtToStorage {
-            target: ResPtr::new(target),
-        });
-    }
-    pub fn volume_to_storage(&mut self, volume: &Volume) {
-        self.cmds.push(RhiCommand::VolumeToStorage {
-            volume: ResPtr::new(volume),
-        });
-    }
-    pub fn volume_to_sampled(&mut self, volume: &Volume) {
-        self.cmds.push(RhiCommand::VolumeToSampled {
-            volume: ResPtr::new(volume),
-        });
-    }
-    pub fn storage_to_sampled(&mut self, target: &RenderTarget) {
-        self.cmds.push(RhiCommand::StorageToSampled {
-            target: ResPtr::new(target),
-        });
-    }
-    pub fn storage_buffer_barrier(&mut self, buffer: &StorageBuffer) {
-        self.cmds.push(RhiCommand::StorageBufferBarrier {
-            buffer: ResPtr::new(buffer),
-        });
-    }
-    pub fn storage_buffer_barrier_compute(&mut self, buffer: &StorageBuffer) {
-        self.cmds.push(RhiCommand::StorageBufferBarrierCompute {
-            buffer: ResPtr::new(buffer),
-        });
-    }
-    pub fn storage_buffer_to_indirect(&mut self, buffer: &StorageBuffer) {
-        self.cmds.push(RhiCommand::StorageBufferToIndirect {
-            buffer: ResPtr::new(buffer),
-        });
-    }
-    pub fn storage_buffer_to_storage(&mut self, buffer: &StorageBuffer) {
-        self.cmds.push(RhiCommand::StorageBufferToStorage {
-            buffer: ResPtr::new(buffer),
-        });
-    }
-    pub fn draw_indexed_indirect(&mut self, buffer: &StorageBuffer, offset: u64, draw_count: u32) {
-        self.cmds.push(RhiCommand::DrawIndexedIndirect {
-            buffer: ResPtr::new(buffer),
-            offset,
-            draw_count,
-        });
-    }
-    pub fn set_scissor(&mut self, rect: Rect2D) {
-        self.cmds.push(RhiCommand::SetScissor { rect });
-    }
-    pub fn bind_vertex_buffer(&mut self, buffer: &Buffer, stride: u32) {
-        self.cmds.push(RhiCommand::BindVertexBuffer {
-            buffer: ResPtr::new(buffer),
-            stride,
-        });
-    }
-    pub fn bind_index_buffer(&mut self, buffer: &Buffer, wide: bool) {
-        self.cmds.push(RhiCommand::BindIndexBuffer {
-            buffer: ResPtr::new(buffer),
-            wide,
-        });
-    }
-    pub fn push_constants(&mut self, data: &[u8]) {
-        let (off, len) = self.push_blob(data);
-        self.cmds.push(RhiCommand::PushConstants { off, len });
-    }
-    pub fn draw_indexed(&mut self, index_count: u32, first_index: u32, vertex_offset: i32) {
-        self.cmds.push(RhiCommand::DrawIndexed {
-            index_count,
-            first_index,
-            vertex_offset,
-        });
-    }
-
-    // --- translation (RHI thread) --------------------------------------------
 
     /// Replay every recorded command onto a real backend [`CommandBuffer`].
     ///
@@ -601,11 +560,10 @@ impl CommandList {
     /// Every resource referenced by the list must still be alive (guaranteed by the
     /// M4 handoff: the recorder keeps them alive until the frame's fence signals).
     pub fn translate(&self, cmd: &CommandBuffer) -> Result<()> {
-        let blob = |off: u32, len: u32| &self.push[off as usize..(off + len) as usize];
-        for c in &self.cmds {
+        let inner = self.inner.borrow();
+        let blob = |off: u32, len: u32| &inner.push[off as usize..(off + len) as usize];
+        for c in &inner.cmds {
             match *c {
-                RhiCommand::Begin => cmd.begin()?,
-                RhiCommand::End => cmd.end()?,
                 RhiCommand::ResetQueries { heap, first, count } => {
                     cmd.reset_queries(unsafe { heap.get() }, first, count)
                 }
@@ -616,7 +574,7 @@ impl CommandList {
                     cmd.resolve_queries(unsafe { heap.get() }, count)
                 }
                 RhiCommand::BeginDebugLabel { off, len } => {
-                    let s = std::str::from_utf8(&self.labels[off as usize..(off + len) as usize])
+                    let s = std::str::from_utf8(&inner.labels[off as usize..(off + len) as usize])
                         .unwrap_or("");
                     cmd.begin_debug_label(s)
                 }
@@ -650,7 +608,7 @@ impl CommandList {
                     depth.map(|d| unsafe { d.get() }),
                 ),
                 RhiCommand::BeginRenderingTargets { off, len, depth } => {
-                    let slice = &self.targets[off as usize..(off + len) as usize];
+                    let slice = &inner.targets[off as usize..(off + len) as usize];
                     let resolved: Vec<(&RenderTarget, Option<ClearColor>)> = slice
                         .iter()
                         .map(|(t, c)| (unsafe { t.get() }, *c))
@@ -695,9 +653,11 @@ impl CommandList {
                     swapchain,
                     image_index,
                     buffer,
-                } => cmd.copy_swapchain_to_buffer(unsafe { swapchain.get() }, image_index, unsafe {
-                    buffer.get()
-                }),
+                } => {
+                    cmd.copy_swapchain_to_buffer(unsafe { swapchain.get() }, image_index, unsafe {
+                        buffer.get()
+                    })
+                }
                 RhiCommand::SetViewportScissor { swapchain } => {
                     cmd.set_viewport_scissor(unsafe { swapchain.get() })
                 }
@@ -780,36 +740,425 @@ impl CommandList {
     }
 }
 
+/// [`CommandList`] records by appending IR (interior-mutable, so `&self`).
+impl Recorder for CommandList {
+    fn reset_queries(&self, heap: &QueryHeap, first: u32, count: u32) {
+        self.inner.borrow_mut().cmds.push(RhiCommand::ResetQueries {
+            heap: ResPtr::new(heap),
+            first,
+            count,
+        });
+    }
+    fn write_timestamp(&self, heap: &QueryHeap, index: u32) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::WriteTimestamp {
+                heap: ResPtr::new(heap),
+                index,
+            });
+    }
+    fn resolve_queries(&self, heap: &QueryHeap, count: u32) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::ResolveQueries {
+                heap: ResPtr::new(heap),
+                count,
+            });
+    }
+    fn begin_debug_label(&self, name: &str) {
+        let mut i = self.inner.borrow_mut();
+        let off = i.labels.len() as u32;
+        i.labels.extend_from_slice(name.as_bytes());
+        let len = name.len() as u32;
+        i.cmds.push(RhiCommand::BeginDebugLabel { off, len });
+    }
+    fn end_debug_label(&self) {
+        self.inner.borrow_mut().cmds.push(RhiCommand::EndDebugLabel);
+    }
+    fn transition_to_render_target(&self, swapchain: &Swapchain, image_index: u32) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::TransitionToRenderTarget {
+                swapchain: ResPtr::new(swapchain),
+                image_index,
+            });
+    }
+    fn transition_to_present(&self, swapchain: &Swapchain, image_index: u32) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::TransitionToPresent {
+                swapchain: ResPtr::new(swapchain),
+                image_index,
+            });
+    }
+    fn begin_rendering(
+        &self,
+        swapchain: &Swapchain,
+        image_index: u32,
+        color_clear: Option<ClearColor>,
+        depth: Option<&DepthBuffer>,
+    ) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BeginRendering {
+                swapchain: ResPtr::new(swapchain),
+                image_index,
+                color_clear,
+                depth: depth.map(ResPtr::new),
+            });
+    }
+    fn begin_rendering_target(
+        &self,
+        target: &RenderTarget,
+        color_clear: Option<ClearColor>,
+        depth: Option<&DepthBuffer>,
+    ) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BeginRenderingTarget {
+                target: ResPtr::new(target),
+                color_clear,
+                depth: depth.map(ResPtr::new),
+            });
+    }
+    fn begin_rendering_targets(
+        &self,
+        targets: &[(&RenderTarget, Option<ClearColor>)],
+        depth: Option<&DepthBuffer>,
+    ) {
+        let mut i = self.inner.borrow_mut();
+        let off = i.targets.len() as u32;
+        for (t, c) in targets {
+            i.targets.push((ResPtr::new(*t), *c));
+        }
+        let len = targets.len() as u32;
+        i.cmds.push(RhiCommand::BeginRenderingTargets {
+            off,
+            len,
+            depth: depth.map(ResPtr::new),
+        });
+    }
+    fn set_globals(&self, buffer: &Buffer, offset: u64) {
+        self.inner.borrow_mut().cmds.push(RhiCommand::SetGlobals {
+            buffer: ResPtr::new(buffer),
+            offset,
+        });
+    }
+    fn begin_rendering_depth_only(&self, depth: &DepthBuffer) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BeginRenderingDepthOnly {
+                depth: ResPtr::new(depth),
+            });
+    }
+    fn depth_to_render_target(&self, depth: &DepthBuffer) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::DepthToRenderTarget {
+                depth: ResPtr::new(depth),
+            });
+    }
+    fn depth_to_sampled(&self, depth: &DepthBuffer) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::DepthToSampled {
+                depth: ResPtr::new(depth),
+            });
+    }
+    fn cube_to_color(&self, cube: &Cubemap) {
+        self.inner.borrow_mut().cmds.push(RhiCommand::CubeToColor {
+            cube: ResPtr::new(cube),
+        });
+    }
+    fn cube_to_sampled(&self, cube: &Cubemap) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::CubeToSampled {
+                cube: ResPtr::new(cube),
+            });
+    }
+    fn begin_rendering_cube_face(
+        &self,
+        cube: &Cubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+    ) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BeginRenderingCubeFace {
+                cube: ResPtr::new(cube),
+                face,
+                mip,
+                clear,
+            });
+    }
+    fn begin_rendering_cube_face_depth(
+        &self,
+        cube: &Cubemap,
+        face: u32,
+        mip: u32,
+        clear: Option<ClearColor>,
+        depth: &DepthBuffer,
+    ) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BeginRenderingCubeFaceDepth {
+                cube: ResPtr::new(cube),
+                face,
+                mip,
+                clear,
+                depth: ResPtr::new(depth),
+            });
+    }
+    fn end_rendering(&self) {
+        self.inner.borrow_mut().cmds.push(RhiCommand::EndRendering);
+    }
+    fn copy_swapchain_to_buffer(&self, swapchain: &Swapchain, image_index: u32, buffer: &Buffer) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::CopySwapchainToBuffer {
+                swapchain: ResPtr::new(swapchain),
+                image_index,
+                buffer: ResPtr::new(buffer),
+            });
+    }
+    fn set_viewport_scissor(&self, swapchain: &Swapchain) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::SetViewportScissor {
+                swapchain: ResPtr::new(swapchain),
+            });
+    }
+    fn set_viewport_scissor_extent(&self, extent: Extent2D) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::SetViewportScissorExtent { extent });
+    }
+    fn rt_to_render_target(&self, target: &RenderTarget) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::RtToRenderTarget {
+                target: ResPtr::new(target),
+            });
+    }
+    fn rt_to_sampled(&self, target: &RenderTarget) {
+        self.inner.borrow_mut().cmds.push(RhiCommand::RtToSampled {
+            target: ResPtr::new(target),
+        });
+    }
+    fn aliasing_barrier(&self, target: &RenderTarget) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::AliasingBarrier {
+                target: ResPtr::new(target),
+            });
+    }
+    fn bind_graphics_pipeline(&self, pipeline: &GraphicsPipeline) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BindGraphicsPipeline {
+                pipeline: ResPtr::new(pipeline),
+            });
+    }
+    fn draw(&self, vertex_count: u32, instance_count: u32) {
+        self.inner.borrow_mut().cmds.push(RhiCommand::Draw {
+            vertex_count,
+            instance_count,
+        });
+    }
+    fn bind_compute_pipeline(&self, pipeline: &ComputePipeline) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BindComputePipeline {
+                pipeline: ResPtr::new(pipeline),
+            });
+    }
+    fn dispatch(&self, x: u32, y: u32, z: u32) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::Dispatch { x, y, z });
+    }
+    fn push_constants_compute(&self, data: &[u8]) {
+        let mut i = self.inner.borrow_mut();
+        let (off, len) = i.push_blob(data);
+        i.cmds.push(RhiCommand::PushConstantsCompute { off, len });
+    }
+    fn bind_raytracing_pipeline(&self, pipeline: &RaytracingPipeline) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BindRaytracingPipeline {
+                pipeline: ResPtr::new(pipeline),
+            });
+    }
+    fn push_constants_rt(&self, data: &[u8]) {
+        let mut i = self.inner.borrow_mut();
+        let (off, len) = i.push_blob(data);
+        i.cmds.push(RhiCommand::PushConstantsRt { off, len });
+    }
+    fn trace_rays(&self, pipeline: &RaytracingPipeline, width: u32, height: u32) {
+        self.inner.borrow_mut().cmds.push(RhiCommand::TraceRays {
+            pipeline: ResPtr::new(pipeline),
+            width,
+            height,
+        });
+    }
+    fn rt_to_storage(&self, target: &RenderTarget) {
+        self.inner.borrow_mut().cmds.push(RhiCommand::RtToStorage {
+            target: ResPtr::new(target),
+        });
+    }
+    fn volume_to_storage(&self, volume: &Volume) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::VolumeToStorage {
+                volume: ResPtr::new(volume),
+            });
+    }
+    fn volume_to_sampled(&self, volume: &Volume) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::VolumeToSampled {
+                volume: ResPtr::new(volume),
+            });
+    }
+    fn storage_to_sampled(&self, target: &RenderTarget) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::StorageToSampled {
+                target: ResPtr::new(target),
+            });
+    }
+    fn storage_buffer_barrier(&self, buffer: &StorageBuffer) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::StorageBufferBarrier {
+                buffer: ResPtr::new(buffer),
+            });
+    }
+    fn storage_buffer_barrier_compute(&self, buffer: &StorageBuffer) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::StorageBufferBarrierCompute {
+                buffer: ResPtr::new(buffer),
+            });
+    }
+    fn storage_buffer_to_indirect(&self, buffer: &StorageBuffer) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::StorageBufferToIndirect {
+                buffer: ResPtr::new(buffer),
+            });
+    }
+    fn storage_buffer_to_storage(&self, buffer: &StorageBuffer) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::StorageBufferToStorage {
+                buffer: ResPtr::new(buffer),
+            });
+    }
+    fn draw_indexed_indirect(&self, buffer: &StorageBuffer, offset: u64, draw_count: u32) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::DrawIndexedIndirect {
+                buffer: ResPtr::new(buffer),
+                offset,
+                draw_count,
+            });
+    }
+    fn set_scissor(&self, rect: Rect2D) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::SetScissor { rect });
+    }
+    fn bind_vertex_buffer(&self, buffer: &Buffer, stride: u32) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BindVertexBuffer {
+                buffer: ResPtr::new(buffer),
+                stride,
+            });
+    }
+    fn bind_index_buffer(&self, buffer: &Buffer, wide: bool) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BindIndexBuffer {
+                buffer: ResPtr::new(buffer),
+                wide,
+            });
+    }
+    fn push_constants(&self, data: &[u8]) {
+        let mut i = self.inner.borrow_mut();
+        let (off, len) = i.push_blob(data);
+        i.cmds.push(RhiCommand::PushConstants { off, len });
+    }
+    fn draw_indexed(&self, index_count: u32, first_index: u32, vertex_offset: i32) {
+        self.inner.borrow_mut().cmds.push(RhiCommand::DrawIndexed {
+            index_count,
+            first_index,
+            vertex_offset,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn records_commands_and_arenas() {
-        let mut list = CommandList::new();
+        let list = CommandList::new();
         assert!(list.is_empty());
-        list.begin();
         list.draw(3, 1);
         list.push_constants(&[1, 2, 3, 4]);
         list.dispatch(8, 1, 1);
         list.push_constants_compute(&[9, 9]);
         list.draw_indexed(36, 0, 0);
-        list.end();
-        // 7 commands recorded, push arena holds both blobs back to back.
-        assert_eq!(list.len(), 7);
-        assert_eq!(list.push, vec![1, 2, 3, 4, 9, 9]);
+        assert_eq!(list.len(), 5);
+        assert_eq!(list.inner.borrow().push, vec![1, 2, 3, 4, 9, 9]);
     }
 
     #[test]
-    fn clear_resets_but_keeps_capacity() {
-        let mut list = CommandList::new();
-        list.begin();
+    fn clear_resets() {
+        let list = CommandList::new();
+        list.draw(1, 1);
         list.push_constants(&[1, 2, 3]);
-        list.end();
-        assert_eq!(list.len(), 3);
+        assert_eq!(list.len(), 2);
         list.clear();
         assert!(list.is_empty());
-        assert!(list.push.is_empty());
+        assert!(list.inner.borrow().push.is_empty());
     }
 
     #[test]
