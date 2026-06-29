@@ -4,7 +4,9 @@
 [phase-11-asset-pipeline.md](phase-11-asset-pipeline.md)(glTF 머티리얼 임포트),
 [sponza-perf.md](sponza-perf.md)(Sponza 컨텍스트).
 
-상태: **계획 / 미구현 (리뷰 대기)**. 후속 트랙 B(포워드 투명)는 [§ 후속](#후속-트랙-b--포워드-투명) 참고.
+상태: **A1–A3 구현 완료, macOS/Metal 검증됨 — VK/D3D12 컴파일 + DX≡VK 게이트는 Windows 보류**.
+A4의 roughness 블렌드(선택)는 보류(아래 스테이징 참고). 후속 트랙 B(포워드 투명)는
+[§ 후속](#후속-트랙-b--포워드-투명) 참고.
 
 ## 문제 (RenderDoc로 근본 원인 확정, 2026-06-30)
 
@@ -99,13 +101,23 @@ Sponza dirt_decal은 표면에 동일평면으로 놓인 **메시 데칼**(glTF 
 - `clippy -D warnings` / `fmt` 클린, VK 검증·D3D12 디버그레이어 무에러.
 
 ## 스테이징 (각 단계 = 검증된 단일 커밋)
-- **A1 — 임포트/분류 (CPU, 렌더 무변경)**: `AlphaMode`/`MaterialKind` 파싱 + 전파 + 데칼 draw 분리.
-  데칼 패스 미연결 → **바이트 동일**. 유닛 테스트(분류).
-- **A2 — RHI per-RT 블렌드/write-mask (크로스백엔드)**: `GraphicsPipelineDesc` 확장 + 3 백엔드.
-  기존 파이프라인 영향 0(기본 = 현행). DX≡VK 게이트.
-- **A3 — 데칼 패스 + 셰이더 (albedo 블렌드)**: `decal.slang` + `gbuffer_decal_pipeline` + 배선.
-  Sponza 먼지 패치 정상화. DX≡VK + 갤러리 무회귀.
-- **A4 — roughness 블렌드(선택) + 마무리**: RT2.g 블렌드, 검증·문서·메모리.
+- **A1 — 임포트/분류 (CPU, 렌더 무변경)** ✅ (`152b869`): `AlphaMode`/`MaterialKind`를
+  `crates/asset`에 추가, 격리된 `classify_material(name, alpha_mode)`로 임포트 시 분류
+  (BLEND+name "decal"→Decal, 그 외 BLEND→Transparent). `MaterialDesc`/`SceneObject`에 `kind`
+  전파. 데칼 패스 미연결 → **렌더 SHA 바이트 동일**. 분류 유닛테스트 3개. Sponza census = 4 decal.
+- **A2 — RHI per-RT 블렌드/write-mask (크로스백엔드)** ✅ (`003eee5`): `BlendMode::DecalAlbedo`
+  프리셋(per-RT 배열 대신, 리스크 최소화) — RT0 RGB 알파블렌드(write mask RGB→A=AO 보존),
+  RT≥1 write-mask off. VK `PipelineColorBlendAttachmentState[]`+`color_write_mask`, D3D12
+  `IndependentBlendEnable`+per-RT, Metal `writeMask`. 기존 파이프라인 무영향. Metal 바이트 동일.
+  **VK/D3D12 컴파일 + DX≡VK는 Windows 보류**.
+- **A3 — 데칼 패스 + 셰이더 (albedo 블렌드)** ✅ (`73e2f0c`): gbuffer.slang `fsDecal`(RT0만 출력),
+  `gbuffer_decal_pipeline`(DecalAlbedo + depth-test/no-write — `GraphicsPipelineDesc.depth_write`
+  신설), `record_decals`(G-buffer load+블렌드), `record_gbuffer`는 `kind==Decal` 스킵. 그래프
+  WAW/RAW가 gbuffer→decals→lighting 정렬. **Metal 검증: Sponza 검은 패치 → 먼지 틴트(석재 보임),
+  갤러리 바이트 동일(무회귀)**. DX≡VK는 Windows 보류.
+- **A4 — roughness 블렌드(선택, 보류) + 마무리**: RT2.g 블렌드는 `dirt_decal`이 MR 텍스처가 없어
+  (roughnessFactor 1.0뿐) 이득이 작고 RT2 per-RT 블렌드(write mask=G)라는 추가 크로스백엔드 표면을
+  Metal 단독으로는 검증 못 하므로 **보류** — Windows 복구 시 DX≡VK와 함께 평가. 마무리(문서·메모리)는 완료.
 
 ## 스케일링 / 품질 노브 (한 곳)
 - 데칼은 **정확성**(기본 on). 토글/캡은 `quality.rs` 한 곳: `decals_on`, `max_decals`(드로우 캡), 추후
