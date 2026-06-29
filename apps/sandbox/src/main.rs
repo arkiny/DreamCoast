@@ -475,6 +475,9 @@ struct App {
     sun_intensity: f32,
     ambient: f32,
     exposure: f32,
+    /// UE-style multi-bounce energy compensation strength for the GDF GI (0 = off = gallery anchor;
+    /// ~0.6 content). Written to `globals.probe_box_max.w`; see pbr.slang. `P_GI_MULTIBOUNCE`.
+    gi_multibounce: f32,
     point_lights_on: bool,
     shadows_on: bool,
     shadow_bias: f32,
@@ -1584,6 +1587,10 @@ impl App {
             sun_intensity,
             ambient,
             exposure: 0.6,
+            gi_multibounce: std::env::var("P_GI_MULTIBOUNCE")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(if gallery_scene { 0.0 } else { 0.6 }),
             point_lights_on,
             shadows_on: true,
             shadow_bias: 0.0015,
@@ -2680,7 +2687,7 @@ impl App {
                 self.scene_radius * 1.3,
                 self.scene_radius * 2.0,
                 self.scene_radius * 1.3,
-                0.0,
+                self.gi_multibounce, // w: GI multi-bounce energy compensation strength (pbr.slang)
             ],
             // Last frame's view-projection (updated end-of-frame) so the SSR history
             // sample reprojects the world hit point into the previous frame (Stage C7b).
