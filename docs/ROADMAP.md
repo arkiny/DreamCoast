@@ -364,6 +364,10 @@ facade trait 뒤에 성숙 라이브러리 백엔드를 격리 → 차후 자체
 - **T1→T2 렌더 완성도** — **20 AA(TAA)+포스트 스택+투명/OIT [S]**(P14 모션벡터) · **21 다광원
   클러스터드+CSM+데칼+프로브 [S]** · **22 대기/볼류메트릭 [S]** · **23 월드(지형/식생/물/버추얼 텍스처)
   [S]** · **24 머티리얼 그래프+고급 셰이딩(SSS/헤어/클로스) [S]**.
+  - **데칼(21) — Intel Sponza `dirt_decal`로 앞당겨짐**: RenderDoc로 "검은 기둥" = BLEND 데칼이 opaque로
+    석재를 덮는 것(metallic 파이프라인은 정상)으로 확정. **트랙 A = deferred(G-buffer) 데칼** 계획
+    [deferred-decals.md](deferred-decals.md)(임포트 분류 → RHI per-RT 블렌드/write-mask → 데칼 패스),
+    트랙 B = 포워드 투명(20, glass)으로 분리.
 - **T2 게임플레이 breadth** — **25 스크립팅 [S/B]**(facade + **Luau 기본**(mlua luau feature) + WASM 샌드박스) · **26 게임 UI [S/B]**(리테인드+
   텍스트 셰이핑+i18n) · **27 고급 애니메이션 [S]**(스테이트머신/블렌드트리·IK·리타깃, P14 확장) ·
   **28 VFX 저작 [S]**(Niagara式, P7 위) · **29 AI/내비 [S/B]**(navmesh+BT) · **30 네트워킹/리플리케이션
