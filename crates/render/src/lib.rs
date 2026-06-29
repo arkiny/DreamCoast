@@ -30,8 +30,8 @@ use std::collections::HashMap;
 
 use dreamcoast_core::EngineError;
 use rhi::{
-    ClearColor, CommandBuffer, DepthBuffer, Device, Extent2D, Format, QueryHeap, RenderTarget,
-    RenderTargetDesc, Swapchain, TransientHeap,
+    ClearColor, CommandBuffer, CommandList, DepthBuffer, Device, Extent2D, Format, QueryHeap,
+    Recorder, RenderTarget, RenderTargetDesc, Swapchain, TransientHeap,
 };
 
 /// Collects per-pass GPU timestamps during [`RenderGraph::execute`].
@@ -135,16 +135,18 @@ pub struct ComputePassInfo<'a> {
 
 /// Per-pass context handed to a record closure during execution.
 pub struct PassContext<'a> {
-    cmd: &'a CommandBuffer,
+    cmd: &'a dyn Recorder,
     sampled: HashMap<ResourceId, u32>,
     storage: HashMap<ResourceId, u32>,
     extent: Extent2D,
 }
 
 impl<'a> PassContext<'a> {
-    /// The frame command buffer (for a graphics pass a render pass is already open;
-    /// for a compute pass no render pass is open — bind a compute pipeline).
-    pub fn cmd(&self) -> &CommandBuffer {
+    /// The frame recorder (for a graphics pass a render pass is already open; for a
+    /// compute pass no render pass is open — bind a compute pipeline). Backed by the
+    /// IR [`CommandList`] (M4): passes record into it, the RHI thread translates it
+    /// onto a real command buffer.
+    pub fn cmd(&self) -> &dyn Recorder {
         self.cmd
     }
 
@@ -425,6 +427,12 @@ impl<'a> RenderGraph<'a> {
         }
         pool.begin_frame();
 
+        // M4 B2: record the whole frame into a backend-agnostic IR list, then
+        // translate it onto the real command buffer at the end. Behaviourally
+        // identical to recording `cmd` directly (same thread, same order); the IR is
+        // what lets B3 ship recording to a separate RHI thread.
+        let list = CommandList::new();
+
         // Plan transient aliasing (per-resource heap offsets + which targets need
         // an aliasing/discard barrier before their first write).
         let mut alias_barrier: HashMap<ResourceId, bool> = HashMap::new();
@@ -488,7 +496,7 @@ impl<'a> RenderGraph<'a> {
             // Reset the whole pool (not just the boundaries we write): the host
             // reads all `count` slots back, and Vulkan requires every queried slot
             // to have been reset since creation.
-            cmd.reset_queries(p.heap, 0, p.heap.count());
+            list.reset_queries(p.heap, 0, p.heap.count());
         }
 
         let mut backbuffer_is_rt = false;
@@ -496,24 +504,24 @@ impl<'a> RenderGraph<'a> {
             // Timestamp this pass's start boundary (query index = passes seen so far).
             if let (true, Some(p)) = (profile, profiler.as_mut()) {
                 let idx = p.names.len() as u32;
-                cmd.write_timestamp(p.heap, idx);
+                list.write_timestamp(p.heap, idx);
                 p.names.push(self.passes[pass_idx].name.clone());
             }
             // Name this pass's region for GPU captures (RenderDoc/PIX/NSight). The
             // barriers + draws below land inside the marker; closed at the end of
             // both the compute and graphics paths.
-            cmd.begin_debug_label(&self.passes[pass_idx].name);
+            list.begin_debug_label(&self.passes[pass_idx].name);
             // Barriers: reads -> sampled. A storage image read after a compute
             // write transitions from UAV/GENERAL; plain color/depth from attachment.
             for &r in &self.passes[pass_idx].reads {
                 if let Some(loc) = color_locs.get(&r) {
                     if self.resources[r.0].storage {
-                        cmd.storage_to_sampled(pool.color_target(loc));
+                        list.storage_to_sampled(pool.color_target(loc));
                     } else {
-                        cmd.rt_to_sampled(pool.color_target(loc));
+                        list.rt_to_sampled(pool.color_target(loc));
                     }
                 } else if let Some(&slot) = depth_slots.get(&r) {
-                    cmd.depth_to_sampled(pool.depth(slot));
+                    list.depth_to_sampled(pool.depth(slot));
                 }
             }
 
@@ -539,7 +547,7 @@ impl<'a> RenderGraph<'a> {
             if self.passes[pass_idx].kind == PassKind::Compute {
                 for &w in &self.passes[pass_idx].storage_writes {
                     if let Some(loc) = color_locs.get(&w) {
-                        cmd.rt_to_storage(pool.color_target(loc));
+                        list.rt_to_storage(pool.color_target(loc));
                     }
                 }
                 let storage: HashMap<ResourceId, u32> = self.passes[pass_idx]
@@ -557,13 +565,13 @@ impl<'a> RenderGraph<'a> {
                     .find_map(|&w| color_locs.get(&w).map(|_| self.resources[w.0].extent))
                     .unwrap_or_default();
                 let mut ctx = PassContext {
-                    cmd,
+                    cmd: &list,
                     sampled,
                     storage,
                     extent,
                 };
                 (self.passes[pass_idx].record)(&mut ctx)?;
-                cmd.end_debug_label();
+                list.end_debug_label();
                 continue;
             }
 
@@ -573,7 +581,7 @@ impl<'a> RenderGraph<'a> {
                 .depth
                 .map(|d| pool.depth(depth_slots[&d]));
             if let Some(d) = depth_ref {
-                cmd.depth_to_render_target(d);
+                list.depth_to_render_target(d);
             }
 
             // Resolve the color attachments, transition them for writing, and
@@ -586,9 +594,9 @@ impl<'a> RenderGraph<'a> {
                     .depth
                     .expect("depth-only pass needs a depth attachment");
                 let d = depth_ref.expect("depth-only pass needs a depth attachment");
-                cmd.begin_rendering_depth_only(d);
+                list.begin_rendering_depth_only(d);
                 let extent = self.resources[depth_id.0].extent;
-                cmd.set_viewport_scissor_extent(extent);
+                list.set_viewport_scissor_extent(extent);
                 extent
             } else {
                 let first_res = &self.resources[colors[0].0.0];
@@ -596,52 +604,57 @@ impl<'a> RenderGraph<'a> {
                 if first_res.backbuffer {
                     let clear = colors[0].1;
                     if !backbuffer_is_rt {
-                        cmd.transition_to_render_target(swapchain, image_index);
+                        list.transition_to_render_target(swapchain, image_index);
                         backbuffer_is_rt = true;
                     }
-                    cmd.begin_rendering(swapchain, image_index, clear, depth_ref);
-                    cmd.set_viewport_scissor(swapchain);
+                    list.begin_rendering(swapchain, image_index, clear, depth_ref);
+                    list.set_viewport_scissor(swapchain);
                 } else {
                     for &(id, _) in colors {
                         let target = pool.color_target(&color_locs[&id]);
                         if alias_barrier.get(&id).copied().unwrap_or(false) {
-                            cmd.aliasing_barrier(target);
+                            list.aliasing_barrier(target);
                         } else {
-                            cmd.rt_to_render_target(target);
+                            list.rt_to_render_target(target);
                         }
                     }
                     let targets: Vec<(&RenderTarget, Option<ClearColor>)> = colors
                         .iter()
                         .map(|&(id, clear)| (pool.color_target(&color_locs[&id]), clear))
                         .collect();
-                    cmd.begin_rendering_targets(&targets, depth_ref);
-                    cmd.set_viewport_scissor_extent(extent);
+                    list.begin_rendering_targets(&targets, depth_ref);
+                    list.set_viewport_scissor_extent(extent);
                 }
                 extent
             };
 
             // Run the graphics pass's record closure.
             let mut ctx = PassContext {
-                cmd,
+                cmd: &list,
                 sampled,
                 storage: HashMap::new(),
                 extent,
             };
             (self.passes[pass_idx].record)(&mut ctx)?;
-            cmd.end_rendering();
-            cmd.end_debug_label();
+            list.end_rendering();
+            list.end_debug_label();
         }
 
         // Final timestamp boundary, then resolve the whole heap (D3D12) for readback.
         if let (true, Some(p)) = (profile, profiler.as_mut()) {
             let count = p.names.len() as u32;
-            cmd.write_timestamp(p.heap, count);
-            cmd.resolve_queries(p.heap, count + 1);
+            list.write_timestamp(p.heap, count);
+            list.resolve_queries(p.heap, count + 1);
         }
 
         if backbuffer_is_rt {
-            cmd.transition_to_present(swapchain, image_index);
+            list.transition_to_present(swapchain, image_index);
         }
+
+        // Replay the recorded IR onto the real command buffer. In B2 this is on the
+        // same thread (behaviour-identical to direct recording); B3 moves it to the
+        // RHI thread.
+        list.translate(cmd)?;
         Ok(())
     }
 
