@@ -357,6 +357,13 @@ const JOBS: &[Job] = &[
         stage: "vertex",
         key: "shadow_vs",
     },
+    // GPU-skinning variant of the shadow vertex shader (animation Stage B.2b).
+    Job {
+        src: "shadow.slang",
+        entry: "vsMainSkinned",
+        stage: "vertex",
+        key: "shadow_skinned_vs",
+    },
     Job {
         src: "shadow.slang",
         entry: "fsMain",

@@ -114,8 +114,15 @@ tags skinned drawables (`SceneObject.skin`) which the g-buffer pass draws with
 `b9778dcc`; SimpleSkin deforms on the GPU, **deterministic** (run-to-run identical),
 and matches the CPU reference to **avg 0.182/ch (0.14% of channels off by >8 — edge
 AA only)** → the column-major palette convention is correct. Inline path only (the
-palette write uses the frame-start fence wait). **Next: B.2b skinned shadows, B.2c
-Windows VK/DX `StorageBuffer::write` + the DX≡VK shader gate.**
+palette write uses the frame-start fence wait).
+
+**B.2b DONE (skinned shadows, Metal):** a `vsMainSkinned` entry in `shadow.slang`
+(same column-major joint-pull) + a `shadow_skinned_pipeline`; the shadow pass draws
+skinned casters with it so their shadow matches the deformed mesh (the shared per-fif
+palette is reused). `shadow_push` 80→96 (skin u32x4 = 0 on the static path). Verified:
+default `b9778dcc`; SimpleSkin shadow follows the deform (image updates vs the
+bind-pose-shadow B.2a), deterministic; clippy/fmt clean. **Next: B.2c Windows VK/DX
+host-visible `StorageBuffer::write` + the DX≡VK shader gate.**
 
 ### Stage C — morph targets (optional)
 Morph-weight channels → weighted sum of position/normal deltas. Test:

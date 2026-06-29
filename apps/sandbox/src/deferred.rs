@@ -38,6 +38,8 @@ pub(crate) struct GBufferTargets {
 
 pub(crate) struct DeferredRenderer {
     shadow_pipeline: GraphicsPipeline,
+    /// Depth-only shadow fill for GPU-skinned casters (animation Stage B.2b).
+    shadow_skinned_pipeline: GraphicsPipeline,
     gbuffer_pipeline: GraphicsPipeline,
     /// G-buffer fill for GPU-skinned meshes (animation Stage B.2): same as
     /// `gbuffer_pipeline` but with the `vsMainSkinned` vertex-pulling entry point.
@@ -148,8 +150,35 @@ impl DeferredRenderer {
             // Full mesh layout (pos/normal/uv): the UV feeds the masked alpha-test discard.
             vertex_layout: VertexLayout::Mesh,
             blend: BlendMode::Opaque,
-            push_constant_size: 80, // light_mvp mat4(64) + base_color_tex u32 + alpha_cutoff f32 + pad8
+            push_constant_size: 96, // light_mvp(64) + base_color_tex u32 + alpha_cutoff f32 + pad8 + skin u32x4(16)
             bindless: true,         // push constants + the bindless base-color texture (masked)
+            uniform_buffer: false,
+            depth_test: true,
+            depth_format: Some(DEPTH_FORMAT),
+        })?;
+
+        // GPU-skinning variant of the shadow fill (skinning shadow VS).
+        let (shadow_skin_vs, shadow_skin_fs) = load_shader_pair(
+            backend,
+            dreamcoast_shader::shadow_skinned_vs_spirv,
+            dreamcoast_shader::shadow_fs_spirv,
+            dreamcoast_shader::shadow_skinned_vs_dxil,
+            dreamcoast_shader::shadow_fs_dxil,
+            dreamcoast_shader::shadow_skinned_vs_metallib,
+            dreamcoast_shader::shadow_fs_metallib,
+            "shadow_skinned",
+        )?;
+        let shadow_skinned_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            vertex_bytes: shadow_skin_vs,
+            fragment_bytes: shadow_skin_fs,
+            vertex_entry: "vsMainSkinned",
+            fragment_entry: "fsMain",
+            color_formats: &[], // depth-only
+            topology: PrimitiveTopology::TriangleList,
+            vertex_layout: VertexLayout::Mesh,
+            blend: BlendMode::Opaque,
+            push_constant_size: 96,
+            bindless: true,
             uniform_buffer: false,
             depth_test: true,
             depth_format: Some(DEPTH_FORMAT),
@@ -296,6 +325,7 @@ impl DeferredRenderer {
 
         Ok(Self {
             shadow_pipeline,
+            shadow_skinned_pipeline,
             gbuffer_pipeline,
             gbuffer_skinned_pipeline,
             pbr_pipeline,
@@ -422,13 +452,26 @@ impl DeferredRenderer {
                         continue;
                     }
                     let lmvp = (light_vp * obj.transform).to_cols_array();
+                    // Skinned casters deform on the GPU (their shadow matches the lit mesh)
+                    // via the skinned shadow pipeline; static casters keep the bound one.
+                    if obj.skin.is_some() {
+                        cmd.bind_graphics_pipeline(&self.shadow_skinned_pipeline);
+                    }
                     // Masked casters carry their base-color texture + cutoff so the depth pass
                     // discards the same texels the lit pass does; opaque casters pass cutoff 0
                     // (base-color index unused) -> depth-only, identical to the pre-mask pass.
-                    cmd.push_constants(&shadow_push(lmvp, obj.tex[0], obj.alpha_cutoff));
+                    cmd.push_constants(&shadow_push(
+                        lmvp,
+                        obj.tex[0],
+                        obj.alpha_cutoff,
+                        obj.skin.unwrap_or([0; 4]),
+                    ));
                     cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
                     cmd.bind_index_buffer(&obj.mesh.ibuf, true);
                     cmd.draw_indexed(obj.mesh.index_count, 0, 0);
+                    if obj.skin.is_some() {
+                        cmd.bind_graphics_pipeline(&self.shadow_pipeline); // restore
+                    }
                 }
                 Ok(())
             },
@@ -787,15 +830,24 @@ fn ae_resolve_push(
     pc
 }
 
-/// Pack the shadow push block (80 bytes): light_mvp (64), base_color bindless index (u32),
-/// alpha cutoff (f32), then 8 bytes padding. `cutoff == 0` (opaque) leaves the texture index
-/// unused — the shadow shader stays depth-only, identical to the pre-mask pass.
-fn shadow_push(light_mvp: [f32; 16], base_color_tex: u32, alpha_cutoff: f32) -> [u8; 80] {
-    let mut pc = [0u8; 80];
+/// Pack the shadow push block (96 bytes): light_mvp (64), base_color bindless index (u32),
+/// alpha cutoff (f32), 8 bytes padding, then skin u32x4 (16). `cutoff == 0` (opaque) leaves
+/// the texture index unused; `skin == 0` is the non-skinned path (`vsMain` ignores it).
+fn shadow_push(
+    light_mvp: [f32; 16],
+    base_color_tex: u32,
+    alpha_cutoff: f32,
+    skin: [u32; 4],
+) -> [u8; 96] {
+    let mut pc = [0u8; 96];
     for (i, f) in light_mvp.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
     pc[64..68].copy_from_slice(&base_color_tex.to_le_bytes());
     pc[68..72].copy_from_slice(&alpha_cutoff.to_le_bytes());
+    for (i, s) in skin.iter().enumerate() {
+        let o = 80 + i * 4;
+        pc[o..o + 4].copy_from_slice(&s.to_le_bytes());
+    }
     pc
 }
