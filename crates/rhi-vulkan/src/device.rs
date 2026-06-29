@@ -209,6 +209,11 @@ impl DeviceShared {
                 // (pbr.slang scene_exposure). Without this, a fragment-stage storage-buffer access
                 // through a writable (RW) bindless declaration trips VUID-RuntimeSpirv-NonWritable.
                 .fragment_stores_and_atomics(true)
+                // The deferred decal pipeline (decals A2/A3) gives the G-buffer MRTs differing
+                // per-attachment blend/write-mask states (RT0 alpha-blends, RT≥1 masked off);
+                // Vulkan requires `independentBlend` for non-uniform per-attachment blend state
+                // (D3D12 IndependentBlendEnable / Metal per-attachment are always available).
+                .independent_blend(true)
                 // 1b: only requested + supported when P_ANISO opts in (else false = unchanged).
                 .sampler_anisotropy(max_anisotropy > 1.0);
             // RT feature structs (Phase 8) — only chained when the extensions are
