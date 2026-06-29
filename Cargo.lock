@@ -327,6 +327,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dreamcoast-jobs"
+version = "0.0.0"
+dependencies = [
+ "dreamcoast-core",
+ "tracing",
+]
+
+[[package]]
 name = "dreamcoast-platform"
 version = "0.0.0"
 dependencies = [
@@ -353,6 +361,7 @@ name = "dreamcoast-scene"
 version = "0.0.0"
 dependencies = [
  "dreamcoast-asset",
+ "dreamcoast-jobs",
  "glam",
 ]
 
@@ -1335,6 +1344,7 @@ dependencies = [
  "dreamcoast-asset",
  "dreamcoast-core",
  "dreamcoast-gui",
+ "dreamcoast-jobs",
  "dreamcoast-platform",
  "dreamcoast-render",
  "dreamcoast-scene",

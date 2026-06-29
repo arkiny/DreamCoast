@@ -1,0 +1,10 @@
+[package]
+name = "dreamcoast-jobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dreamcoast-core.workspace = true
+tracing.workspace = true

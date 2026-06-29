@@ -18,11 +18,16 @@ mod draw_list;
 mod ecs;
 mod gltf_instance;
 mod node;
+mod schedule;
 mod transform;
 
 pub use components::{MaterialHandle, MeshHandle, MeshInstance, Name};
 pub use draw_list::Drawable;
-pub use ecs::{Entity, World};
+pub use ecs::{Entity, World, WorldCell};
 pub use gltf_instance::instantiate_gltf;
 pub use node::NodeRef;
-pub use transform::{Children, LocalTransform, Parent, WorldTransform, propagate_transforms};
+pub use schedule::{Access, SystemSchedule};
+pub use transform::{
+    Children, LocalTransform, Parent, Spin, WorldTransform, advance_spin, propagate_transforms,
+    propagate_transforms_parallel, propagate_transforms_system,
+};

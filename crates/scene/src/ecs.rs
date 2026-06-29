@@ -221,6 +221,16 @@ impl World {
             .expect("storage type matches TypeId")
     }
 
+    /// Type-erased, legitimately-mutable pointer to `T`'s storage, creating it if
+    /// absent. The pointer is derived from `&mut self`, so writing through it later
+    /// is sound (not a shared-to-mut cast). The scheduler calls this once per
+    /// system component while holding the exclusive `&mut World`, before any
+    /// parallel work, to build each [`WorldCell`]'s disjoint pointer table.
+    pub(crate) fn storage_ptr<T: 'static>(&mut self) -> (TypeId, *mut ()) {
+        let ptr = self.storage_mut::<T>() as *mut SparseSet<T> as *mut ();
+        (TypeId::of::<T>(), ptr)
+    }
+
     /// Attach (or replace) component `value` on `e`.
     pub fn insert<T: 'static>(&mut self, e: Entity, value: T) {
         self.storage_mut::<T>().insert(e, value);
@@ -255,6 +265,115 @@ impl World {
         a.iter()
             .filter_map(|(e, av)| b.get(e).map(|bv| (e, av, bv)))
             .collect()
+    }
+
+    /// Ensure a storage for component `T` exists. Called single-threaded before a
+    /// parallel system schedule so that concurrent [`WorldCell`] writers never need
+    /// to create a storage (which would structurally mutate the storage map and
+    /// race with other workers). Idempotent.
+    pub fn register<T: 'static>(&mut self) {
+        self.storage_mut::<T>();
+    }
+}
+
+/// A `Send` view onto a disjoint slice of a [`World`] for **one system running in
+/// a parallel batch**.
+///
+/// The cell holds a small table of type-erased storage pointers, resolved by the
+/// [`SystemSchedule`](crate::SystemSchedule) up front while it held the exclusive
+/// `&mut World` (so the write pointers are legitimately mutable, not shared-to-mut
+/// casts). Soundness rests on the scheduler contract: two systems run concurrently
+/// only when their declared access is **write-disjoint with no read-write
+/// overlap**, so the pointer tables of concurrent cells reference disjoint storages
+/// for writes (and at most shared reads). No `&World`/`&mut World` is ever formed
+/// in the parallel region, so there is no whole-world aliasing.
+///
+/// `reads`/`writes` are retained only so each accessor can `debug_assert` it was
+/// declared — a mis-declared system trips in debug rather than corrupting memory.
+///
+/// Structural mutation (spawn/despawn) is deliberately **not** offered — it would
+/// touch shared `World` bookkeeping. Such changes belong outside the parallel
+/// region.
+pub struct WorldCell<'w> {
+    /// `(TypeId, *mut SparseSet<T> erased)` for every component this system may
+    /// touch. Writes use it as `*mut`, reads as `*const`.
+    ptrs: Vec<(TypeId, *mut ())>,
+    reads: Vec<TypeId>,
+    writes: Vec<TypeId>,
+    _marker: std::marker::PhantomData<&'w mut World>,
+}
+
+// SAFETY: the raw pointers are only dereferenced for this cell's declared
+// (disjoint, per the scheduler contract) storages; the Vecs are Send. See the
+// type-level doc for the full argument.
+unsafe impl Send for WorldCell<'_> {}
+unsafe impl Sync for WorldCell<'_> {}
+
+impl<'w> WorldCell<'w> {
+    pub(crate) fn new(
+        ptrs: Vec<(TypeId, *mut ())>,
+        reads: Vec<TypeId>,
+        writes: Vec<TypeId>,
+    ) -> Self {
+        Self {
+            ptrs,
+            reads,
+            writes,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    fn may_read(&self, t: TypeId) -> bool {
+        self.reads.contains(&t) || self.writes.contains(&t)
+    }
+
+    #[inline]
+    fn storage_ptr<T: 'static>(&self) -> *mut SparseSet<T> {
+        let t = TypeId::of::<T>();
+        self.ptrs
+            .iter()
+            .find(|(id, _)| *id == t)
+            .map(|(_, p)| *p as *mut SparseSet<T>)
+            .expect("component storage not in this system's access set")
+    }
+
+    /// Snapshot every `(Entity, T)` for a **read** component, in insertion order.
+    /// Returns owned copies so the borrow does not escape the call (fits the
+    /// snapshot → compute → write-back pattern).
+    pub fn collect_read<T: 'static + Clone>(&self) -> Vec<(Entity, T)> {
+        debug_assert!(
+            self.may_read(TypeId::of::<T>()),
+            "system read undeclared component"
+        );
+        // SAFETY: read-only access to T's storage; the scheduler guarantees no
+        // concurrent writer to a component this cell only reads.
+        let storage = unsafe { &*self.storage_ptr::<T>() };
+        storage.iter().map(|(e, v)| (e, v.clone())).collect()
+    }
+
+    /// Read-copy of a single **read** component on `e`.
+    pub fn get_copy<T: 'static + Copy>(&self, e: Entity) -> Option<T> {
+        debug_assert!(
+            self.may_read(TypeId::of::<T>()),
+            "system read undeclared component"
+        );
+        // SAFETY: read-only access; see `collect_read`.
+        let storage = unsafe { &*self.storage_ptr::<T>() };
+        storage.get(e).copied()
+    }
+
+    /// Insert (or overwrite) a **write** component on `e`.
+    pub fn insert<T: 'static>(&self, e: Entity, value: T) {
+        debug_assert!(
+            self.writes.contains(&TypeId::of::<T>()),
+            "system wrote undeclared component"
+        );
+        // SAFETY: the scheduler guarantees this cell is the sole accessor of T's
+        // storage for the batch, and the pointer was derived from `&mut World`, so
+        // forming `&mut` to that one SparseSet aliases nothing else.
+        let storage = unsafe { &mut *self.storage_ptr::<T>() };
+        storage.insert(e, value);
     }
 }
 

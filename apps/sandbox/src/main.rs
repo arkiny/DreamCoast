@@ -655,6 +655,13 @@ struct App {
     last: Instant,
     elapsed: f32,
     angle: f32,
+    /// Previous frame's orbit `angle`, kept so the rendered camera can interpolate
+    /// between the last and current fixed-timestep sim states (M2 fixed timestep).
+    prev_angle: f32,
+    /// Leftover real time not yet consumed by a whole fixed sim step. Carries the
+    /// fractional remainder frame-to-frame; `remainder / FIXED_DT` is the render
+    /// interpolation alpha. Interactive only — headless capture bypasses it.
+    sim_accumulator: f32,
     // Diagnostic: tight orbit centred on one scene object (by index) for inspecting it
     // from all sides. `None` = normal whole-scene framing. `diag_pitch` = elevation.
     diag_obj: Option<usize>,
@@ -933,11 +940,12 @@ impl App {
             });
             // Spawn order defines the deterministic draw / TLAS-instance order (model,
             // chrome, copper, cube) — the order the legacy flat list used.
-            world
+            let model_e = world
                 .spawn_node()
                 .named("model")
                 .with(MeshInstance::new(mesh_model, mat_model))
-                .with(LocalTransform::IDENTITY);
+                .with(LocalTransform::IDENTITY)
+                .id();
             world
                 .spawn_node()
                 .named("chrome-sphere")
@@ -954,16 +962,40 @@ impl App {
                     Vec3::new(r * 1.9, r * 0.5, -r * 0.4),
                     r * 0.5,
                 ));
-            world
+            let cube_e = world
                 .spawn_node()
                 .named("red-cube")
                 .with(MeshInstance::new(mesh_cube, mat_red))
                 .with(LocalTransform::trs(
                     Vec3::new(0.0, r * 0.45, -r * 2.0),
                     r * 0.45,
-                ));
+                ))
+                .id();
+
+            // Phase 15 verification: `P15_SPIN[=<rad/s>]` attaches a `Spin` to the
+            // (asymmetric, so visibly rotating) model + cube. The fixed-timestep
+            // loop advances them each step and the per-frame parallel propagate +
+            // draw renders the motion. Default (unset) = no Spin → byte-identical
+            // gallery, so the parity baseline is untouched.
+            if let Ok(raw) = std::env::var("P15_SPIN") {
+                let speed = raw.parse::<f32>().ok().filter(|s| *s != 0.0).unwrap_or(1.0);
+                world.insert(
+                    model_e,
+                    dreamcoast_scene::Spin {
+                        axis: Vec3::Y,
+                        speed,
+                    },
+                );
+                world.insert(
+                    cube_e,
+                    dreamcoast_scene::Spin {
+                        axis: Vec3::new(0.3, 1.0, 0.0),
+                        speed: speed * 1.5,
+                    },
+                );
+            }
         }
-        dreamcoast_scene::propagate_transforms(&mut world);
+        dreamcoast_scene::propagate_transforms_parallel(&mut world, dreamcoast_jobs::global());
 
         // Materialize the ECS draw list into the flat `SceneObject` list the GPU passes
         // consume. (Static scene → built once; later stages rebuild on scene change. In
@@ -1337,9 +1369,8 @@ impl App {
         // speckle a single-bounce stochastic march leaves behind (which the temporal denoiser can't
         // fully clear). Default ON for content, never the gallery (the byte-identical anchor stays on
         // the legacy march); `P_GI_VOLUME=0` forces the march back.
-        let gi_volume = quality::env_bool("P_GI_VOLUME", !gallery_scene)
-            && gdf_gi
-            && gi.has_gi_volume();
+        let gi_volume =
+            quality::env_bool("P_GI_VOLUME", !gallery_scene) && gdf_gi && gi.has_gi_volume();
         // Stage D3: gallery forced to the legacy 8 (byte-identical anchor); content takes the tier.
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
@@ -1796,6 +1827,8 @@ impl App {
             // Fixed view in screenshot mode for reproducible output; `DIAG_ANGLE`
             // overrides it (degrees) for capturing the chosen object from a fixed side.
             angle: diag_angle.unwrap_or(if screenshot_mode { 0.7 } else { 0.0 }),
+            prev_angle: diag_angle.unwrap_or(if screenshot_mode { 0.7 } else { 0.0 }),
+            sim_accumulator: 0.0,
             diag_obj,
             diag_pitch,
             // Non-gallery scenes (level / glTF / world) start in the free-fly camera: static at
@@ -1848,7 +1881,7 @@ impl App {
             &mut textures,
             Vec3::ZERO,
         )?;
-        dreamcoast_scene::propagate_transforms(&mut world);
+        dreamcoast_scene::propagate_transforms_parallel(&mut world, dreamcoast_jobs::global());
         self.world = world;
         self.mesh_registry = mesh_registry;
         self.material_registry = material_registry;
@@ -1991,22 +2024,64 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32();
         self.last = now;
-        self.elapsed += dt;
-        // Clamp the sim step so a long stall (e.g. resize) can't explode particles.
-        let sim_dt = dt.clamp(0.0, 1.0 / 30.0);
-        if !self.screenshot_mode {
-            self.angle += dt * 0.6; // hold a fixed view when capturing
-        } else if self.capture_seq.is_some() {
-            // CAPTURE_SEQ: advance the camera a fixed deterministic step per frame so the
-            // dumped sequence exercises the temporal passes under motion (stability diff).
-            // `CAPTURE_SEQ_STEP` (radians/frame, default 0.015) tunes it; 0 = static (a
-            // shimmer/convergence test — the sequence should diff to ~0 when stable).
-            let step = std::env::var("CAPTURE_SEQ_STEP")
-                .ok()
-                .and_then(|s| s.parse::<f32>().ok())
-                .unwrap_or(0.015);
-            self.angle += step;
+
+        // --- Fixed-timestep simulation (M2) ---------------------------------------
+        // The sim advances in whole `FIXED_DT` steps so motion is framerate-
+        // independent and deterministic given the same dt sequence; the renderer
+        // interpolates between the previous and current sim state by `render_alpha`.
+        // **Headless capture is byte-identical by construction**: it is already
+        // frame-counted and deterministic, so it bypasses the accumulator entirely
+        // and keeps the exact legacy per-frame advance (fixed angle, real-dt
+        // `elapsed`, CAPTURE_SEQ step).
+        const FIXED_DT: f32 = 1.0 / 60.0;
+        const MAX_STEPS: u32 = 5; // backlog cap — avoids the spiral of death after a stall
+        self.prev_angle = self.angle;
+        let render_alpha: f32;
+        let sim_dt; // step length handed to per-frame GPU sim (particles)
+        if self.screenshot_mode {
+            // Unchanged legacy capture path (see above).
+            self.elapsed += dt;
+            sim_dt = dt.clamp(0.0, 1.0 / 30.0);
+            render_alpha = 1.0;
+            if self.capture_seq.is_some() {
+                // CAPTURE_SEQ: advance the camera a fixed deterministic step per frame so the
+                // dumped sequence exercises the temporal passes under motion (stability diff).
+                // `CAPTURE_SEQ_STEP` (radians/frame, default 0.015) tunes it; 0 = static (a
+                // shimmer/convergence test — the sequence should diff to ~0 when stable).
+                let step = std::env::var("CAPTURE_SEQ_STEP")
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.015);
+                self.angle += step;
+                // Advance animated objects one deterministic step per captured frame
+                // so a CAPTURE_SEQ dump shows (reproducible) object motion, not just
+                // camera motion. No-op when no entity carries `Spin`.
+                dreamcoast_scene::advance_spin(&mut self.world, FIXED_DT);
+            }
+            self.prev_angle = self.angle; // no interpolation when capturing
+        } else {
+            self.sim_accumulator += dt;
+            let mut steps = 0u32;
+            while self.sim_accumulator >= FIXED_DT && steps < MAX_STEPS {
+                self.sim_accumulator -= FIXED_DT;
+                steps += 1;
+                self.elapsed += FIXED_DT;
+                self.angle += FIXED_DT * 0.6;
+                // Animated objects advance one fixed step (framerate-independent,
+                // deterministic). No-op when nothing carries `Spin`.
+                dreamcoast_scene::advance_spin(&mut self.world, FIXED_DT);
+            }
+            if steps == MAX_STEPS {
+                // Stalled longer than the cap: drop the backlog rather than chasing it.
+                self.sim_accumulator = 0.0;
+            }
+            render_alpha = self.sim_accumulator / FIXED_DT;
+            // Particles step by the sim time actually consumed this frame (0 when no
+            // whole step elapsed → they hold still, the correct fixed-step behavior).
+            sim_dt = steps as f32 * FIXED_DT;
         }
+        // Rendered orbit angle interpolates between the last and current sim step.
+        let render_angle = self.prev_angle + (self.angle - self.prev_angle) * render_alpha;
 
         // Stage 0: Tab toggles the free-fly camera (interactive only — never during a
         // headless capture, so the parity baseline stays the fixed orbit). Re-seed the
@@ -2079,13 +2154,18 @@ impl App {
             .map(|c| c.include_ui)
             .unwrap_or(true);
 
-        // Materialize this frame's draw list from the ECS world (the single source of
-        // truth). Static scene → identical every frame; the rebuild is cheap (no GPU
-        // re-upload, just handle resolution + Rc clones). In world mode the list comes
-        // from the streamer instead (rebuilt after the camera moves, below).
+        // Re-derive world transforms from the (possibly just-animated) locals via the
+        // parallel ECS pass, then materialize the draw list. For a static scene this
+        // recomputes identical matrices (byte-identical), so the gallery baseline is
+        // unaffected; for animated objects it pushes their new pose to the draw list.
+        // World/streaming mode keeps its own path (the world is empty here).
         let mut scene = if self.streaming.is_some() {
             Vec::new()
         } else {
+            dreamcoast_scene::propagate_transforms_parallel(
+                &mut self.world,
+                dreamcoast_jobs::global(),
+            );
             build_scene(&self.world, &self.mesh_registry, &self.material_registry)
         };
 
@@ -2098,7 +2178,8 @@ impl App {
             let dist = radius * 4.5;
             let pitch = self.diag_pitch.unwrap_or(0.18); // slight elevation by default
             let (sp, cp) = (pitch.sin(), pitch.cos());
-            let eye = center + dist * Vec3::new(cp * self.angle.cos(), sp, cp * self.angle.sin());
+            let eye =
+                center + dist * Vec3::new(cp * render_angle.cos(), sp, cp * render_angle.sin());
             (center, eye)
         } else if let Some((eye, target)) = self.level_view {
             // A level's authored camera (e.g. the Sponza demo angle). Headless captures
@@ -2113,7 +2194,7 @@ impl App {
                 let offset = eye - target;
                 let rh = (offset.x * offset.x + offset.z * offset.z).sqrt();
                 let base = offset.z.atan2(offset.x);
-                let a = base + self.angle;
+                let a = base + render_angle;
                 (
                     target,
                     target + Vec3::new(rh * a.cos(), offset.y, rh * a.sin()),
@@ -2124,9 +2205,9 @@ impl App {
             let dist = self.scene_radius * 1.6;
             let eye = focus
                 + Vec3::new(
-                    self.angle.cos() * dist,
+                    render_angle.cos() * dist,
                     self.scene_radius * 0.55,
-                    self.angle.sin() * dist,
+                    render_angle.sin() * dist,
                 );
             (focus, eye)
         };
@@ -3325,7 +3406,11 @@ impl App {
                     self.flip_y,
                     // Content: fixed frame (0) → temporally stable GGX jitter (no reflection
                     // sparkle). Gallery: real frame → byte-identical legacy anchor.
-                    if self.is_gallery { self.frame_no as u32 } else { 0 },
+                    if self.is_gallery {
+                        self.frame_no as u32
+                    } else {
+                        0
+                    },
                     scene_albedo,
                     reflect_cache_arg,
                     scene_clip,
@@ -3729,7 +3814,11 @@ impl App {
                 ch,
                 self.flip_y,
                 // Content: fixed frame (0) → stable GGX jitter; gallery: real frame (anchor).
-                if self.is_gallery { self.frame_no as u32 } else { 0 },
+                if self.is_gallery {
+                    self.frame_no as u32
+                } else {
+                    0
+                },
                 scene_albedo,
                 reflect_cache_arg,
                 scene_clip,
@@ -3809,7 +3898,11 @@ impl App {
                     self.flip_y,
                     // Content: fixed frame (0) → temporally stable GGX jitter (no reflection
                     // sparkle). Gallery: real frame → byte-identical legacy anchor.
-                    if self.is_gallery { self.frame_no as u32 } else { 0 },
+                    if self.is_gallery {
+                        self.frame_no as u32
+                    } else {
+                        0
+                    },
                     scene_albedo,
                     reflect_cache_arg,
                     scene_clip,

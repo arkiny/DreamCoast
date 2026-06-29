@@ -341,6 +341,13 @@ facade trait 뒤에 성숙 라이브러리 백엔드를 격리 → 차후 자체
 
 - **T0 토대 — Phase 15 잡 시스템/멀티스레드 코어 + 병렬 렌더 [S].** work-stealing 스케줄러, 태스크
   그래프, 병렬 RHI 커맨드 기록, 고정 타임스텝 sim, 결정적 스케줄. *멀티스레드 전 시스템의 전제.*
+  세부: [phase-15-job-system.md](phase-15-job-system.md) — **M1–M3 ✅ (macOS/Metal 검증, Windows VK/DX
+  패리티 대기)**. from-scratch Chase-Lev deque(외부 의존 0, `crates/jobs`); **M1 잡 시스템 코어**(deque
+  /워커 풀/scope/parallel_for/태스크 그래프, 12 테스트) → **M2 고정 타임스텝 sim**(누적기+보간 알파,
+  헤드리스 캡처 바이트 동일 baseline 대조 입증) → **M3 ECS 시스템 병렬 스케줄**(`Access`/`SystemSchedule`
+  /`WorldCell` disjoint-storage 병렬 + 병렬 `propagate_transforms`, 병렬≡순차 bit-identical) → **M-verify
+  움직이는 오브젝트**(`Spin`+`advance_spin`, `P15_SPIN`; 고정스텝 sim→병렬 propagate→드로우, 카메라
+  고정 캡처로 오브젝트 모션 결정적 렌더 입증). 병렬 RHI 커맨드 기록(M4)은 후속 격리(미착수).
 - **T1 런타임 코어** — **16 피직스 [S/B]**(facade + Rapier/Jolt) · **17 오디오 [S/B]**(facade + kira/
   miniaudio) · **18 입력/플랫폼 서비스 [S]**(액션 매핑·게임패드·설정 영속화) · **19 ECS 성숙 + 프리팹/
   세이브 [S]**(시스템 스케줄링·이벤트·직렬화).
