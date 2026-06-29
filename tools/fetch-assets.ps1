@@ -15,12 +15,36 @@ New-Item -ItemType Directory -Force $assets | Out-Null
 $base = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models'
 $headers = @{ 'User-Agent' = 'engine-fetch-assets' }
 
-# name, author, license (all CC0 1.0 Universal), is-default-model
+# name, author (all CC0 1.0 Universal), is-default-model, kind:
+#   binary   -> a single self-contained glTF-Binary/<name>.glb
+#   separate -> glTF/<name>.gltf + its external buffers/images (into assets/<name>/)
 $models = @(
-    @{ Name = 'Avocado'; Author = 'Microsoft'; Default = $true },
-    @{ Name = 'BoomBox'; Author = 'Microsoft'; Default = $false },
-    @{ Name = 'Lantern'; Author = 'sbtron'; Default = $false }
+    @{ Name = 'Avocado'; Author = 'Microsoft'; Default = $true; Kind = 'binary' },
+    @{ Name = 'BoomBox'; Author = 'Microsoft'; Default = $false; Kind = 'binary' },
+    @{ Name = 'Lantern'; Author = 'sbtron'; Default = $false; Kind = 'binary' },
+    # Animation bring-up (Phase 15) — all CC0. Node TRS + interpolation modes,
+    # vertex skinning (the minimal rig), and morph targets.
+    @{ Name = 'InterpolationTest'; Author = 'Khronos'; Default = $false; Kind = 'binary' },
+    @{ Name = 'AnimatedMorphCube'; Author = 'Microsoft'; Default = $false; Kind = 'binary' },
+    @{ Name = 'AnimatedCube'; Author = 'UX3D (Norbert Nopper)'; Default = $false; Kind = 'separate' },
+    @{ Name = 'SimpleSkin'; Author = 'Marco Hutter'; Default = $false; Kind = 'separate' }
 )
+
+# Download a glTF-separate model: the .gltf plus every external resource it
+# references (buffers + images), resolved relative to the model's glTF/ dir, into
+# assets/<name>/. (`gltf::import` in the loader resolves those relative URIs.)
+function Get-SeparateModel($name) {
+    $dir = Join-Path $assets $name
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $gltf = Join-Path $dir "$name.gltf"
+    Invoke-WebRequest -Uri "$base/$name/glTF/$name.gltf" -OutFile $gltf -Headers $headers
+    foreach ($u in [regex]::Matches((Get-Content -Raw $gltf), '"uri"\s*:\s*"([^"]+)"')) {
+        $uri = $u.Groups[1].Value
+        if ($uri -and -not $uri.StartsWith('data:')) {
+            Invoke-WebRequest -Uri "$base/$name/glTF/$uri" -OutFile (Join-Path $dir $uri) -Headers $headers
+        }
+    }
+}
 
 $credits = @(
     '# Asset credits',
@@ -36,13 +60,19 @@ $credits = @(
 )
 
 foreach ($m in $models) {
-    $url = "$base/$($m.Name)/glTF-Binary/$($m.Name).glb"
-    $out = Join-Path $assets "$($m.Name).glb"
-    Invoke-WebRequest -Uri $url -OutFile $out -Headers $headers
-    "downloaded $($m.Name).glb ($([math]::Round((Get-Item $out).Length / 1KB)) KB)"
-    if ($m.Default) {
-        Copy-Item $out (Join-Path $assets 'model.glb') -Force
-        "  -> set as default assets/model.glb"
+    if ($m.Kind -eq 'separate') {
+        Get-SeparateModel $m.Name
+        "downloaded $($m.Name)/ (glTF + buffers; load assets/$($m.Name)/$($m.Name).gltf)"
+    }
+    else {
+        $url = "$base/$($m.Name)/glTF-Binary/$($m.Name).glb"
+        $out = Join-Path $assets "$($m.Name).glb"
+        Invoke-WebRequest -Uri $url -OutFile $out -Headers $headers
+        "downloaded $($m.Name).glb ($([math]::Round((Get-Item $out).Length / 1KB)) KB)"
+        if ($m.Default) {
+            Copy-Item $out (Join-Path $assets 'model.glb') -Force
+            "  -> set as default assets/model.glb"
+        }
     }
     $credits += "- **$($m.Name)** by $($m.Author) - CC0 1.0 Universal - $base/$($m.Name)"
 }
