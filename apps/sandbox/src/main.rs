@@ -515,6 +515,10 @@ struct App {
     gdf_ao: bool,
     /// C3: GDF 1-bounce diffuse GI added to the deferred ambient term.
     gdf_gi: bool,
+    /// UE GI-fidelity: world irradiance volume (DDGI-lite radiance cache). When on, the GI pass
+    /// samples a multibounce-propagating world volume instead of a single-bounce ray march — the
+    /// real fix for deep-interior darkness. Content-only (`P_GI_VOLUME`); gallery forced off.
+    gi_volume: bool,
     /// C3 hemisphere rays per pixel.
     gi_spp: u32,
     /// Stage D2: surface-cache amortized-relight period (round-robin card budget; 1 = legacy
@@ -1264,6 +1268,13 @@ impl App {
         let gdf_gi = gi.has_gi()
             && gdf.has_scene_sdf()
             && (!legacy_ibl || std::env::var_os("P11_GDF_GI").is_some());
+        // UE GI-fidelity: the world irradiance volume (DDGI-lite). Opt-in content feature
+        // (`P_GI_VOLUME=1`), never the gallery (the byte-identical anchor stays single-bounce),
+        // and only when the GI pass + the volume pipeline exist.
+        let gi_volume = std::env::var_os("P_GI_VOLUME").is_some()
+            && !gallery_scene
+            && gdf_gi
+            && gi.has_gi_volume();
         // Stage D3: gallery forced to the legacy 8 (byte-identical anchor); content takes the tier.
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
@@ -1637,6 +1648,7 @@ impl App {
             scene_gdf,
             gdf_ao,
             gdf_gi,
+            gi_volume,
             gi_spp,
             cache_relight_period,
             cache_feedback,
@@ -1935,6 +1947,7 @@ impl App {
             || self.surface_cache
             || self.reflect_cache
             || taau_active
+            || self.gi_volume
             || (self.swrt_reflect && self.reflect.has_reflect_temporal())
         {
             // The surface cache / stochastic GGX reflection accrue a sample per frame + temporally
@@ -3004,6 +3017,32 @@ impl App {
                 let div = if half_gi { self.gi_res_div.max(1) } else { 1 };
                 let (gw, gh) = (cw.div_ceil(div), ch.div_ceil(div));
                 let gi_extent = Extent2D::new(gw, gh);
+                // UE GI-fidelity: update + bind the world irradiance volume (DDGI-lite). The update
+                // propagates last frame's volume into hits (multibounce), so deep interiors fill in
+                // over frames. When bound, the GI pass samples the volume instead of marching.
+                let gi_volume_arg = if self.gi_volume {
+                    self.gi
+                        .record_gi_volume(
+                            &mut graph,
+                            vol,
+                            ext,
+                            scene_aabb_min,
+                            scene_aabb_max,
+                            self.sun_dir,
+                            self.sun_intensity,
+                            scene_clip,
+                            &scene_clip_vols,
+                            scene_albedo,
+                            crate::GROUND_ALBEDO,
+                            self.frame_no as u32,
+                            self.gi_spp,
+                            0.1,
+                        )
+                        .zip(self.gi.gi_volume_sampled())
+                        .map(|(vext, idx)| (idx, vext))
+                } else {
+                    None
+                };
                 let traced = self.gi.record_gi(
                     &mut graph,
                     vol,
@@ -3028,6 +3067,7 @@ impl App {
                     &scene_clip_vols,
                     self.gi_max_steps,
                     self.gdf_cone_k,
+                    gi_volume_arg,
                 );
                 let raw = if half_gi {
                     self.gi.record_upsample(
@@ -3985,6 +4025,10 @@ impl App {
         // C8b2: advance the surface-cache radiance ping-pong (next frame reads this frame's).
         if scene_cache_lit_ext.is_some() {
             self.gdf.advance_cache();
+        }
+        // UE GI-fidelity: advance the world irradiance volume ping-pong (next frame reads this).
+        if self.gi_volume {
+            self.gi.advance_gi_volume();
         }
         // QHD/UHD TAAU: advance the history ping-pong (next frame reprojects this frame's).
         if taau_active {

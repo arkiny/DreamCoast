@@ -10,15 +10,19 @@
 
 use dreamcoast_render::{ComputePassInfo, RenderGraph, ResourceId};
 use rhi::{
-    BackendKind, ComputePipeline, ComputePipelineDesc, Device, Extent2D, StorageBuffer,
-    StorageBufferDesc, Volume,
+    BackendKind, ComputePipeline, ComputePipelineDesc, Device, Extent2D, Format, StorageBuffer,
+    StorageBufferDesc, Volume, VolumeDesc,
 };
 
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
     gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_gi_upsample_push, gdf_temporal_push,
+    gi_volume_push,
 };
+
+/// World-space GI irradiance-volume (DDGI-lite radiance cache) probe-grid resolution.
+const GI_VOL_DIM: u32 = 32;
 
 pub(crate) struct GiSystem {
     ao_pipeline: Option<ComputePipeline>, // C2 GDF ambient occlusion
@@ -36,6 +40,11 @@ pub(crate) struct GiSystem {
     gi_denoise_frame: u32,
     /// Lighting/quality key; a change (sun, spp, …) resets the accumulation.
     gi_denoise_key: Option<u64>,
+    /// UE GI-fidelity track: world-space irradiance volume (DDGI-lite radiance cache). Update
+    /// pipeline + 6 R32F volumes (ping-pong [read|write] x RGB; reuses the albedo 3-volume pattern).
+    gi_vol_pipeline: Option<ComputePipeline>,
+    gi_vol: [[Option<Volume>; 3]; 2],
+    gi_vol_frame: u32,
 }
 
 impl GiSystem {
@@ -100,6 +109,29 @@ impl GiSystem {
             "gdf_atrous",
             112,
         )?;
+        let gi_vol_pipeline = compute(
+            dreamcoast_shader::gi_volume_cs_spirv,
+            dreamcoast_shader::gi_volume_cs_dxil,
+            dreamcoast_shader::gi_volume_cs_metallib,
+            "gi_volume",
+            160,
+        )?;
+        // 6 R32F volumes: ping-pong [read|write] x RGB. Empty (zero) at start = no fill until the
+        // update converges; the lighting falls back gracefully (e = 0).
+        let mut gi_vol: [[Option<Volume>; 3]; 2] = [[None, None, None], [None, None, None]];
+        if gi_vol_pipeline.is_some() {
+            let vd = VolumeDesc {
+                width: GI_VOL_DIM,
+                height: GI_VOL_DIM,
+                depth: GI_VOL_DIM,
+                format: Format::R32Float,
+            };
+            for set in gi_vol.iter_mut() {
+                for ch in set.iter_mut() {
+                    *ch = Some(device.create_volume(&vd)?);
+                }
+            }
+        }
         Ok(Self {
             ao_pipeline,
             gi_pipeline,
@@ -111,7 +143,140 @@ impl GiSystem {
             gi_denoise_extent: (0, 0),
             gi_denoise_frame: 0,
             gi_denoise_key: None,
+            gi_vol_pipeline,
+            gi_vol,
+            gi_vol_frame: 0,
         })
+    }
+
+    pub(crate) fn has_gi_volume(&self) -> bool {
+        self.gi_vol_pipeline.is_some()
+    }
+
+    /// The sampled-volume indices (R,G,B) of the volume the GI pass should READ this frame — the
+    /// one the update pass wrote (write slot = frame % 2). `None` if the volume isn't built.
+    pub(crate) fn gi_volume_sampled(&self) -> Option<[u32; 3]> {
+        let w = (self.gi_vol_frame % 2) as usize;
+        let s = &self.gi_vol[w];
+        Some([
+            s[0].as_ref()?.sampled_index(),
+            s[1].as_ref()?.sampled_index(),
+            s[2].as_ref()?.sampled_index(),
+        ])
+    }
+
+    /// Advance the volume ping-pong (end-of-frame, after submit), like the denoiser counter.
+    pub(crate) fn advance_gi_volume(&mut self) {
+        self.gi_vol_frame = self.gi_vol_frame.saturating_add(1);
+    }
+
+    /// UE GI-fidelity track: update the world irradiance volume (DDGI-lite). Each probe casts
+    /// sphere rays into the scene GDF, shades hits (direct + the PREVIOUS volume = multibounce),
+    /// EMA-accumulates into the write slot. Returns the write graph handle (a read dep for the GI
+    /// pass that samples it). `None` without the pipeline/volumes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_gi_volume<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        scene_gdf: &'a Volume,
+        scene_gdf_ext: ResourceId,
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        clip: (u32, u32),
+        clip_vols: &'a [&'a Volume],
+        albedo: Option<(&'a [Volume; 3], ResourceId)>,
+        ground_albedo: [f32; 3],
+        frame: u32,
+        spp: u32,
+        alpha: f32,
+    ) -> Option<ResourceId> {
+        let pipe = self.gi_vol_pipeline.as_ref()?;
+        let read = ((self.gi_vol_frame + 1) % 2) as usize;
+        let write = (self.gi_vol_frame % 2) as usize;
+        let rv = &self.gi_vol[read];
+        let wv = &self.gi_vol[write];
+        let read_idx = [
+            rv[0].as_ref()?.sampled_index(),
+            rv[1].as_ref()?.sampled_index(),
+            rv[2].as_ref()?.sampled_index(),
+        ];
+        let write_idx = [
+            wv[0].as_ref()?.storage_index(),
+            wv[1].as_ref()?.storage_index(),
+            wv[2].as_ref()?.storage_index(),
+        ];
+        let diag = Self::diag(aabb_min, aabb_max);
+        let reset = u32::from(self.gi_vol_frame == 0);
+        let vol_ext = graph.import_external("gi_volume_w");
+        let mut reads = vec![scene_gdf_ext];
+        if let Some((_, ext)) = albedo {
+            reads.push(ext);
+        }
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "gi_volume",
+                storage_writes: vec![vol_ext],
+                reads,
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(scene_gdf);
+                for v in clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
+                for ch in rv.iter().flatten() {
+                    cmd.volume_to_sampled(ch);
+                }
+                let albedo_idx = if let Some((vols, _)) = albedo {
+                    for v in vols.iter() {
+                        cmd.volume_to_sampled(v);
+                    }
+                    [
+                        vols[0].sampled_index(),
+                        vols[1].sampled_index(),
+                        vols[2].sampled_index(),
+                    ]
+                } else {
+                    [u32::MAX; 3]
+                };
+                for ch in wv.iter().flatten() {
+                    cmd.volume_to_storage(ch);
+                }
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&gi_volume_push(
+                    aabb_min,
+                    0.0, // ground plane y = 0
+                    aabb_max,
+                    diag, // sample distance clamp
+                    sun_dir,
+                    sun_intensity,
+                    [GI_VOL_DIM, GI_VOL_DIM, GI_VOL_DIM],
+                    frame,
+                    read_idx,
+                    reset,
+                    write_idx,
+                    albedo_idx,
+                    clip.0,
+                    clip.1,
+                    spp as f32,
+                    diag,  // ray max distance = scene diagonal
+                    0.4,   // sky fill radiance
+                    alpha, // EMA alpha
+                    ground_albedo,
+                    diag * 0.01, // surface bias
+                ));
+                let g = GI_VOL_DIM.div_ceil(4);
+                cmd.dispatch(g, g, g);
+                // Transition the just-written volumes back to sampled so the GI pass can read them.
+                for ch in wv.iter().flatten() {
+                    cmd.volume_to_sampled(ch);
+                }
+                Ok(())
+            },
+        );
+        Some(vol_ext)
     }
 
     pub(crate) fn has_ao(&self) -> bool {
@@ -249,6 +414,9 @@ impl GiSystem {
         clip_vols: &'a [&'a Volume],
         max_steps: u32,
         cone_k: f32,
+        // UE GI-fidelity: when present, the GI pass SAMPLES this world irradiance volume (R/G/B
+        // sampled indices + the update pass's write graph handle) instead of marching rays.
+        gi_volume: Option<([u32; 3], ResourceId)>,
     ) -> ResourceId {
         let gip = self.gi_pipeline.as_ref().expect("gdf gi pipeline");
         let out = graph.create_storage_image("gdf_gi_out", HDR_FORMAT, extent);
@@ -265,6 +433,10 @@ impl GiSystem {
         if let Some((_, ext)) = cache {
             reads.push(ext);
         }
+        if let Some((_, ext)) = gi_volume {
+            reads.push(ext); // barrier the GI sample after the volume update
+        }
+        let vol_rgb = gi_volume.map(|(idx, _)| idx).unwrap_or([u32::MAX; 3]);
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
         graph.add_compute_pass(
             ComputePassInfo {
@@ -323,6 +495,7 @@ impl GiSystem {
                     crate::GROUND_ALBEDO, // analytic ground material (floor bounce hits)
                     max_steps,            // D3: bounce-ray march step cap
                     cone_k,               // P3: cone-trace LOD slope (0 = legacy)
+                    vol_rgb,              // GI-fidelity: irradiance-volume sampled indices (or MAX)
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

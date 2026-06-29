@@ -746,6 +746,7 @@ pub(crate) fn gdf_gi_push(
     ground_albedo: [f32; 3],
     max_steps: u32,
     cone_k: f32,
+    vol_rgb: [u32; 3],
 ) -> [u8; 240] {
     let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -803,6 +804,72 @@ pub(crate) fn gdf_gi_push(
     // Stage D3: bounce-ray march step cap on its own 16-byte row (offset 224). Content lowers it;
     // the gallery passes the legacy 64.
     pc[224..228].copy_from_slice(&max_steps.to_le_bytes());
+    // GI irradiance-volume sampled indices (R/G/B) — 3 contiguous uints after max_steps (offset
+    // 228..240), Metal-safe (all scalars). 0xFFFFFFFF = off (trace rays instead of sampling).
+    pc[228..232].copy_from_slice(&vol_rgb[0].to_le_bytes());
+    pc[232..236].copy_from_slice(&vol_rgb[1].to_le_bytes());
+    pc[236..240].copy_from_slice(&vol_rgb[2].to_le_bytes());
+    pc
+}
+
+/// Pack the GI irradiance-volume (DDGI-lite) update push block (160 bytes): aabb_min(+ground_y),
+/// aabb_max(+dist_clamp), sun(+intensity), dims(+frame), read_rgb(+reset), write_rgb, albedo_rgb,
+/// clip(desc,count), params(spp,ray_max,sky_fill,alpha), ground(xyz albedo, w bias). See gi_volume.slang.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gi_volume_push(
+    aabb_min: [f32; 3],
+    ground_y: f32,
+    aabb_max: [f32; 3],
+    dist_clamp: f32,
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    dims: [u32; 3],
+    frame: u32,
+    read_rgb: [u32; 3],
+    reset: u32,
+    write_rgb: [u32; 3],
+    albedo_rgb: [u32; 3],
+    clip_desc: u32,
+    clip_count: u32,
+    spp: f32,
+    ray_max: f32,
+    sky_fill: f32,
+    alpha: f32,
+    ground_albedo: [f32; 3],
+    bias: f32,
+) -> [u8; 160] {
+    let mut pc = [0u8; 160];
+    let put3 = |pc: &mut [u8], o: usize, v: [f32; 3]| {
+        for (i, x) in v.iter().enumerate() {
+            pc[o + i * 4..o + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+        }
+    };
+    let put3u = |pc: &mut [u8], o: usize, v: [u32; 3]| {
+        for (i, x) in v.iter().enumerate() {
+            pc[o + i * 4..o + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+        }
+    };
+    let sun = normalize3(sun_dir);
+    put3(&mut pc, 0, aabb_min);
+    pc[12..16].copy_from_slice(&ground_y.to_le_bytes());
+    put3(&mut pc, 16, aabb_max);
+    pc[28..32].copy_from_slice(&dist_clamp.to_le_bytes());
+    put3(&mut pc, 32, [sun[0], sun[1], sun[2]]);
+    pc[44..48].copy_from_slice(&sun_intensity.to_le_bytes());
+    put3u(&mut pc, 48, dims);
+    pc[60..64].copy_from_slice(&frame.to_le_bytes());
+    put3u(&mut pc, 64, read_rgb);
+    pc[76..80].copy_from_slice(&reset.to_le_bytes());
+    put3u(&mut pc, 80, write_rgb);
+    put3u(&mut pc, 96, albedo_rgb);
+    pc[112..116].copy_from_slice(&clip_desc.to_le_bytes());
+    pc[116..120].copy_from_slice(&clip_count.to_le_bytes());
+    pc[128..132].copy_from_slice(&spp.to_le_bytes());
+    pc[132..136].copy_from_slice(&ray_max.to_le_bytes());
+    pc[136..140].copy_from_slice(&sky_fill.to_le_bytes());
+    pc[140..144].copy_from_slice(&alpha.to_le_bytes());
+    put3(&mut pc, 144, ground_albedo);
+    pc[156..160].copy_from_slice(&bias.to_le_bytes());
     pc
 }
 
