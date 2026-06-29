@@ -175,8 +175,20 @@ refcount·공유 상태 변형 0.
 
 **검증 ✅ (Metal):** 기본 / 스레드-순차 / **스레드-병렬 ×3 모두 byte-identical `b9778dcc`**(병렬 결정적·
 무경합); `P15_SPIN=8 CAPTURE_SEQ=4` 모션 4프레임이 병렬=순차 프레임별 동일; clippy `-D warnings`/fmt 클린,
-rhi 4(append 포함) + render 테스트. 기본 off 무회귀. **Windows VK/DX 패리티 대기**(순수 CPU IR 병렬화라
-백엔드 분기 위험 낮음 — 결정적 동일 IR이지만 Windows 재검 정직 보고).
+rhi 4(append 포함) + render 테스트. 기본 off 무회귀.
+
+**검증 ✅ (Windows VK/DX, RTX 2070 SUPER, 2026-06-29):** `tools/verify-rhi-thread.ps1` 게이트 2b
+(`P15_RHI_THREAD=1 P15_PARALLEL_RECORD=1` == flag-off).
+- **Vulkan:** 병렬 기록 캡처가 flag-off와 **바이트 동일**(SHA `06BDD797…`, B3 flag-on과도 동일 해시) —
+  잡 워커들의 병렬 패스-IR 생성 + 스케줄-순 concat이 결정적으로 동일한 IR을 만든다(data race 없음).
+- **D3D12:** 병렬 기록이 flag-off와 **D3D12 자체 1-LSB 런-투-런 노이즈 내에서 동일**(on-vs-off 0.0000 ≤
+  off-vs-off 0.0000) — 병렬화가 그 기존 노이즈 이상의 차이를 만들지 않음.
+- **검증 레이어:** flag-on+parallel 전 구간에서 **VK validation / D3D12 디버그 레이어(InfoQueue 브리지)
+  ERROR·CORRUPTION 0건** (기존 별건 경고 2종 제외 — `g.storage_buffers` fragment NonWritable[auto-exposure
+  유래], NV-external 로더 쿼리). → `PassJob`/`Send` 가정·잡 워커의 리소스 접근 안전.
+- 다른 게이트(default·P15_SPIN)도 전부 PASS, DX≡VK 0.001/ch.
+
+**결론: B4 병렬 렌더그래프 IR 기록은 VK/DX 양쪽에서 정확** — 결정적 동일 IR, data race·검증 에러 없음.
 
 ## 리스크 / 미결
 - **IR 커버리지 = 큰 표면** — 현 cmd 메서드 전부를 IR 커맨드로. 단계적(B1 서브셋→B2 전수)으로, 미구현
