@@ -52,8 +52,48 @@ pub struct GltfMaterial {
     pub alpha_cutoff: f32,
 }
 
+/// Keyframe interpolation mode for an animation sampler (glTF's three modes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interpolation {
+    /// Hold the previous keyframe's value until the next.
+    Step,
+    /// Linear blend between adjacent keyframes (spherical for rotations).
+    Linear,
+    /// Cubic Hermite spline; outputs are `[in-tangent, value, out-tangent]` per key.
+    CubicSpline,
+}
+
+/// One node-animation channel: the keyframe times plus the typed outputs for a
+/// single TRS property of a single target node. For `CubicSpline` the output vector
+/// has `3 * times.len()` entries (in-tangent, value, out-tangent per key).
+pub struct GltfChannel {
+    /// Index into [`GltfScene::nodes`] of the animated node.
+    pub target_node: usize,
+    pub interpolation: Interpolation,
+    pub times: Vec<f32>,
+    pub data: ChannelData,
+}
+
+/// The typed output samples of a [`GltfChannel`] (which TRS property it drives).
+/// Morph-target weights are intentionally not parsed here (Stage C).
+pub enum ChannelData {
+    Translation(Vec<[f32; 3]>),
+    /// `[x, y, z, w]` quaternions.
+    Rotation(Vec<[f32; 4]>),
+    Scale(Vec<[f32; 3]>),
+}
+
+/// One animation clip: a set of node-TRS channels and its total duration (the
+/// largest keyframe time across channels), in seconds.
+pub struct GltfAnimation {
+    pub name: Option<String>,
+    pub channels: Vec<GltfChannel>,
+    pub duration: f32,
+}
+
 /// A whole imported glTF scene: node hierarchy + per-mesh primitives + materials +
-/// shared images. `roots` are the top-level nodes of the default scene.
+/// shared images + animation clips. `roots` are the top-level nodes of the default
+/// scene.
 pub struct GltfScene {
     pub nodes: Vec<GltfNode>,
     pub roots: Vec<usize>,
@@ -61,6 +101,8 @@ pub struct GltfScene {
     pub meshes: Vec<Vec<GltfPrimitive>>,
     pub materials: Vec<GltfMaterial>,
     pub images: Vec<ImageData>,
+    /// Animation clips (node TRS tracks); empty for a static scene.
+    pub animations: Vec<GltfAnimation>,
 }
 
 impl GltfScene {
@@ -134,13 +176,61 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<GltfScene, EngineError>
         .map(|s| s.nodes().map(|n| n.index()).collect())
         .unwrap_or_default();
 
+    let animations = doc
+        .animations()
+        .map(|anim| read_animation(&anim, &buffers))
+        .collect();
+
     Ok(GltfScene {
         nodes,
         roots,
         meshes,
         materials,
         images,
+        animations,
     })
+}
+
+/// Read one animation clip's node-TRS channels. Morph-target-weight channels are
+/// skipped (Stage C); duration is the largest keyframe time across channels.
+fn read_animation(anim: &gltf::Animation, buffers: &[gltf::buffer::Data]) -> GltfAnimation {
+    use gltf::animation::Interpolation as Gi;
+    use gltf::animation::util::ReadOutputs;
+
+    let mut duration = 0.0f32;
+    let mut channels = Vec::new();
+    for ch in anim.channels() {
+        let interpolation = match ch.sampler().interpolation() {
+            Gi::Step => Interpolation::Step,
+            Gi::Linear => Interpolation::Linear,
+            Gi::CubicSpline => Interpolation::CubicSpline,
+        };
+        let reader = ch.reader(|b| buffers.get(b.index()).map(|d| d.0.as_slice()));
+        let Some(times) = reader.read_inputs().map(|i| i.collect::<Vec<f32>>()) else {
+            continue;
+        };
+        if let Some(&last) = times.last() {
+            duration = duration.max(last);
+        }
+        let data = match reader.read_outputs() {
+            Some(ReadOutputs::Translations(t)) => ChannelData::Translation(t.collect()),
+            Some(ReadOutputs::Rotations(r)) => ChannelData::Rotation(r.into_f32().collect()),
+            Some(ReadOutputs::Scales(s)) => ChannelData::Scale(s.collect()),
+            // Morph-target weights are Stage C; skip them for now.
+            Some(ReadOutputs::MorphTargetWeights(_)) | None => continue,
+        };
+        channels.push(GltfChannel {
+            target_node: ch.target().node().index(),
+            interpolation,
+            times,
+            data,
+        });
+    }
+    GltfAnimation {
+        name: anim.name().map(str::to_owned),
+        channels,
+        duration,
+    }
 }
 
 /// Read one primitive's geometry (positions/normals/uvs/indices) into a
