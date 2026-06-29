@@ -38,8 +38,8 @@
         ),
     ],
     camera: (
-        position: (-6.0, 2.0, 0.0),
-        target: (8.0, 3.0, -5.0),
+        position: (-9.0, 1.4, -0.3),
+        target: (6.0, 2.4, -0.3),
         fov_y_deg: 60.0,
         znear: 0.05,
         zfar: 100.0,

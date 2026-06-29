@@ -1325,11 +1325,13 @@ impl App {
         let gdf_gi = gi.has_gi()
             && gdf.has_scene_sdf()
             && (!legacy_ibl || std::env::var_os("P11_GDF_GI").is_some());
-        // UE GI-fidelity: the world irradiance volume (DDGI-lite). Opt-in content feature
-        // (`P_GI_VOLUME=1`), never the gallery (the byte-identical anchor stays single-bounce),
-        // and only when the GI pass + the volume pipeline exist.
-        let gi_volume = std::env::var_os("P_GI_VOLUME").is_some()
-            && !gallery_scene
+        // UE GI-fidelity: the world irradiance volume (DDGI-lite) = our world-space RADIANCE CACHE,
+        // the same idea Lumen uses. It replaces the per-pixel 1-spp GI march with a smooth, stable
+        // volume sample — so high-variance lighting (e.g. point lights) doesn't produce the firefly
+        // speckle a single-bounce stochastic march leaves behind (which the temporal denoiser can't
+        // fully clear). Default ON for content, never the gallery (the byte-identical anchor stays on
+        // the legacy march); `P_GI_VOLUME=0` forces the march back.
+        let gi_volume = quality::env_bool("P_GI_VOLUME", !gallery_scene)
             && gdf_gi
             && gi.has_gi_volume();
         // Stage D3: gallery forced to the legacy 8 (byte-identical anchor); content takes the tier.
