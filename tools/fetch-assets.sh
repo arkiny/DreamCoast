@@ -18,12 +18,36 @@ mkdir -p "$assets"
 
 base='https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models'
 
-# name|author|is-default
+# name|author|is-default|kind
+#   kind = binary   -> a single self-contained glTF-Binary/<name>.glb
+#   kind = separate -> glTF/<name>.gltf + its external buffers/images (into assets/<name>/)
 models=(
-    "Avocado|Microsoft|true"
-    "BoomBox|Microsoft|false"
-    "Lantern|sbtron|false"
+    "Avocado|Microsoft|true|binary"
+    "BoomBox|Microsoft|false|binary"
+    "Lantern|sbtron|false|binary"
+    # Animation bring-up (Phase 15) — all CC0. Node TRS + interpolation modes,
+    # vertex skinning (the minimal rig), and morph targets.
+    "InterpolationTest|Khronos|false|binary"
+    "AnimatedMorphCube|Microsoft|false|binary"
+    "AnimatedCube|UX3D (Norbert Nopper)|false|separate"
+    "SimpleSkin|Marco Hutter|false|separate"
 )
+
+# Download a glTF-separate model: the .gltf plus every external resource it
+# references (buffers + images), resolved relative to the model's glTF/ dir, into
+# assets/<name>/. (`gltf::import` in the loader resolves those relative URIs.)
+fetch_separate() {
+    local name="$1"
+    local dir="$assets/$name"
+    mkdir -p "$dir"
+    curl -fsSL -A 'engine-fetch-assets' -o "$dir/$name.gltf" "$base/$name/glTF/$name.gltf"
+    grep -oE '"uri"[[:space:]]*:[[:space:]]*"[^"]+"' "$dir/$name.gltf" \
+        | sed -E 's/.*"([^"]+)"$/\1/' \
+        | while IFS= read -r uri; do
+            [[ -z "$uri" || "$uri" == data:* ]] && continue
+            curl -fsSL -A 'engine-fetch-assets' -o "$dir/$uri" "$base/$name/glTF/$uri"
+        done
+}
 
 credits="$assets/CREDITS.md"
 {
@@ -40,15 +64,21 @@ credits="$assets/CREDITS.md"
 } > "$credits"
 
 for entry in "${models[@]}"; do
-    IFS='|' read -r name author is_default <<< "$entry"
-    url="$base/$name/glTF-Binary/$name.glb"
-    out="$assets/$name.glb"
-    curl -fsSL -A 'engine-fetch-assets' -o "$out" "$url"
-    kb=$(( ($(wc -c < "$out") + 512) / 1024 ))
-    echo "downloaded $name.glb (${kb} KB)"
-    if [[ "$is_default" == "true" ]]; then
-        cp -f "$out" "$assets/model.glb"
-        echo "  -> set as default assets/model.glb"
+    IFS='|' read -r name author is_default kind <<< "$entry"
+    if [[ "$kind" == "separate" ]]; then
+        fetch_separate "$name"
+        kb=$(( ($(wc -c < "$assets/$name/$name.gltf") + 512) / 1024 ))
+        echo "downloaded $name/ (glTF + buffers; load assets/$name/$name.gltf, ${kb} KB)"
+    else
+        url="$base/$name/glTF-Binary/$name.glb"
+        out="$assets/$name.glb"
+        curl -fsSL -A 'engine-fetch-assets' -o "$out" "$url"
+        kb=$(( ($(wc -c < "$out") + 512) / 1024 ))
+        echo "downloaded $name.glb (${kb} KB)"
+        if [[ "$is_default" == "true" ]]; then
+            cp -f "$out" "$assets/model.glb"
+            echo "  -> set as default assets/model.glb"
+        fi
     fi
     echo "- **$name** by $author - CC0 1.0 Universal - $base/$name" >> "$credits"
 done
