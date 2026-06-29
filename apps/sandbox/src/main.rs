@@ -1230,9 +1230,12 @@ impl App {
         let gdf_trace_analytic = std::env::var_os("P11_GDF_ANALYTIC").is_some();
         // Stage C1: trace the world-space scene GDF from the live camera.
         let scene_gdf = gdf.has_scene_sdf() && std::env::var_os("P11_SCENE_GDF").is_some();
-        // Stage C2: GDF AO multiplied into the deferred ambient term.
-        let gdf_ao =
-            gi.has_ao() && gdf.has_scene_sdf() && quality::env_bool("P11_GDF_AO", qp.gdf_ao);
+        // Stage C2: GDF contact AO into the deferred ambient term. Gallery forced off (byte-
+        // identical anchor); content takes the tier (Med now on — the contact-scale reach fix
+        // makes AO add depth, not crush the interior). `P11_GDF_AO` overrides either way.
+        let gdf_ao = gi.has_ao()
+            && gdf.has_scene_sdf()
+            && quality::env_bool("P11_GDF_AO", !gallery_scene && qp.gdf_ao);
         // Deprecate the legacy captured-cube IBL: by default the deferred ambient is the
         // SW-RT hybrid reflection (specular) + GDF GI (diffuse scene bounce) + sky irradiance.
         // `P11_LEGACY_IBL` restores the captured-cube path (prefilter-cube specular + scene
@@ -2287,7 +2290,7 @@ impl App {
                             gdf.has_surface_cache() && gdf.has_cache_lighting() && p.surface_cache;
                         *ssr_stochastic = p.ssr_stochastic;
                         *reflect_max_roughness = p.reflect_max_roughness;
-                        *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && p.gdf_ao;
+                        *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && !*is_gallery && p.gdf_ao;
                         *firefly_clamp = p.firefly_clamp;
                         *shadow_softness = p.shadow_softness;
                         *shadow_taps = p.shadow_taps.clamp(1, 16);

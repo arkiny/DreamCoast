@@ -210,7 +210,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             surface_cache: false,
             ssr_stochastic: false,
             reflect_max_roughness: 0.5,
-            gdf_ao: false,
+            gdf_ao: true, // PBR contact AO (fixed contact-scale reach) — depth for content
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 16,
