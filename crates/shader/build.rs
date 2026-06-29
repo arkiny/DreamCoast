@@ -345,6 +345,13 @@ const JOBS: &[Job] = &[
         stage: "vertex",
         key: "gbuffer_skinned_vs",
     },
+    // GPU-morph variant of the G-buffer vertex shader (animation Stage C optimization).
+    Job {
+        src: "gbuffer.slang",
+        entry: "vsMainMorphed",
+        stage: "vertex",
+        key: "gbuffer_morphed_vs",
+    },
     Job {
         src: "gbuffer.slang",
         entry: "fsMain",
@@ -363,6 +370,13 @@ const JOBS: &[Job] = &[
         entry: "vsMainSkinned",
         stage: "vertex",
         key: "shadow_skinned_vs",
+    },
+    // GPU-morph variant of the shadow vertex shader (animation Stage C optimization).
+    Job {
+        src: "shadow.slang",
+        entry: "vsMainMorphed",
+        stage: "vertex",
+        key: "shadow_morphed_vs",
     },
     Job {
         src: "shadow.slang",
