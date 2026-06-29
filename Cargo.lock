@@ -352,6 +352,7 @@ name = "dreamcoast-render"
 version = "0.0.0"
 dependencies = [
  "dreamcoast-core",
+ "dreamcoast-jobs",
  "rhi",
  "tracing",
 ]
