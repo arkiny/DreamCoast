@@ -347,7 +347,9 @@ facade trait 뒤에 성숙 라이브러리 백엔드를 격리 → 차후 자체
   헤드리스 캡처 바이트 동일 baseline 대조 입증) → **M3 ECS 시스템 병렬 스케줄**(`Access`/`SystemSchedule`
   /`WorldCell` disjoint-storage 병렬 + 병렬 `propagate_transforms`, 병렬≡순차 bit-identical) → **M-verify
   움직이는 오브젝트**(`Spin`+`advance_spin`, `P15_SPIN`; 고정스텝 sim→병렬 propagate→드로우, 카메라
-  고정 캡처로 오브젝트 모션 결정적 렌더 입증). 병렬 RHI 커맨드 기록(M4)은 후속 격리(미착수).
+  고정 캡처로 오브젝트 모션 결정적 렌더 입증). **M4 렌더그래프↔RHI 스레드 분리** 🚧 설계 확정·진행 중
+  ([phase-15-m4-render-rhi-threads.md](phase-15-m4-render-rhi-threads.md)): `Rc<DeviceShared>` 공유로 단순
+  Send 불가 → **옵션 B(RHI 커맨드-리스트 IR)** 채택(B1 IR→B2 라우팅→B3 RHI 스레드→B4 병렬 IR).
 - **T1 런타임 코어** — **16 피직스 [S/B]**(facade + Rapier/Jolt) · **17 오디오 [S/B]**(facade + kira/
   miniaudio) · **18 입력/플랫폼 서비스 [S]**(액션 매핑·게임패드·설정 영속화) · **19 ECS 성숙 + 프리팹/
   세이브 [S]**(시스템 스케줄링·이벤트·직렬화).
