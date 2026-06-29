@@ -121,6 +121,17 @@ pub(crate) fn upload_mesh(
     upload_geometry(device, &model.vertices, &model.indices)
 }
 
+/// View a `MeshVertex` slice as raw bytes (the GPU vertex-buffer layout). Used to
+/// (re-)write a vertex buffer, e.g. the per-frame CPU-skinned vertices.
+pub(crate) fn vertex_slice_bytes(vertices: &[MeshVertex]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            vertices.as_ptr() as *const u8,
+            std::mem::size_of_val(vertices),
+        )
+    }
+}
+
 /// Upload raw vertex/index slices into GPU vertex/index buffers (the inner of
 /// [`upload_mesh`]; also used by the registry-based glTF primitive upload).
 pub(crate) fn upload_geometry(

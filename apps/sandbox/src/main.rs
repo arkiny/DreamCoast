@@ -47,6 +47,7 @@ mod reflect;
 mod registry;
 mod rhi_thread;
 mod rt;
+mod skin;
 mod smoketest;
 mod taau;
 mod world;
@@ -414,6 +415,9 @@ struct App {
     world: World,
     mesh_registry: MeshRegistry,
     material_registry: MaterialRegistry,
+    /// CPU-skinned primitives (animation Stage B). Empty unless an imported glTF scene
+    /// has skins; each is re-skinned + uploaded per frame (inline path only).
+    skinned: Vec<skin::SkinnedMesh>,
     // Stage C level hot-swap: the discovered `.level` files, the loaded index, and a
     // pending selection from the UI (applied at the next frame's start). Empty unless
     // started in level mode (`LEVEL`).
@@ -839,6 +843,7 @@ impl App {
         // World-space AABB of the placed scene (metres), used to frame the camera at the
         // scene's native scale. `None` keeps the legacy gallery framing.
         let mut scene_bounds: Option<level::Bounds> = None;
+        let mut gltf_skinned: Vec<skin::SkinnedMesh> = Vec::new();
         // A level's authored camera (applied as the initial view if non-default).
         let mut level_view: Option<(Vec3, Vec3)> = None;
         // A level's lighting, replacing the gallery's code-default sun + point lights.
@@ -940,6 +945,20 @@ impl App {
                         gscene.animations.len()
                     ),
                 }
+            }
+            // Animation Stage B: CPU-skin any skinned primitives each frame.
+            gltf_skinned = skin::build_skinned_meshes(
+                &device,
+                &gscene,
+                &prim_handles,
+                &node_map,
+                &mesh_registry,
+            )?;
+            if !gltf_skinned.is_empty() {
+                info!(
+                    "skinning: {} skinned primitive(s) (CPU)",
+                    gltf_skinned.len()
+                );
             }
             scene_bounds = registry::gltf_bounds(&gscene);
         } else {
@@ -1710,6 +1729,7 @@ impl App {
             world,
             mesh_registry,
             material_registry,
+            skinned: gltf_skinned,
             level_paths,
             current_level,
             pending_level: None,
@@ -2371,6 +2391,16 @@ impl App {
             );
             build_scene(&self.world, &self.mesh_registry, &self.material_registry)
         };
+
+        // Animation Stage B: CPU-skin the skinned primitives and swap each skinned
+        // drawable to this frame-in-flight's vertex buffer. Inline path only — the
+        // per-frame vertex write relies on this slot's fence having been waited at
+        // frame start (the RHI thread defers that wait; skinning + P15_RHI_THREAD is
+        // not supported in B.1).
+        if !self.skinned.is_empty() && self.rhi_thread.is_none() {
+            skin::skin_and_upload(&mut self.skinned, &self.world, fif)?;
+            skin::patch_scene(&self.skinned, &mut scene, fif);
+        }
 
         // Orbiting camera framing the whole sample scene — or, in single-object
         // diagnostic mode, a tight orbit centred on one scene object so it can be
