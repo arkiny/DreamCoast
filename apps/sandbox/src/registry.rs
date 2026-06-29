@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use dreamcoast_asset::{GltfScene, Material, MeshData, MeshVertex};
+use dreamcoast_asset::{GltfScene, Material, MaterialKind, MeshData, MeshVertex};
 use dreamcoast_core::glam::{Mat4, Quat, Vec3};
 use dreamcoast_scene::{MaterialHandle, MeshHandle, World};
 use rhi::{Buffer, Device, Format, Texture};
@@ -125,6 +125,10 @@ pub(crate) struct MaterialDesc {
     /// linear average × factor, or the factor's RGB when untextured (see
     /// [`representative_albedo`]). The single source the fuse tags onto every triangle.
     pub(crate) albedo: [f32; 3],
+    /// Renderer routing tag (classified once at glTF import). `Opaque` for procedural/level
+    /// materials; only glTF imports can be `Decal`/`Transparent`. Drives the deferred-decal
+    /// pass split (decals modify the G-buffer's albedo instead of overwriting it as opaque).
+    pub(crate) kind: MaterialKind,
 }
 
 /// A material's representative linear albedo for the GDF/GI bake. `tex_average` is the
@@ -184,6 +188,7 @@ pub(crate) fn build_scene(
                 roughness: mat.roughness,
                 tex: mat.tex,
                 alpha_cutoff: mat.alpha_cutoff,
+                kind: mat.kind,
                 casts_shadow: d.casts_shadow,
                 skin: None,
                 morph: None,
@@ -250,6 +255,7 @@ pub(crate) fn upload_gltf_scene(
             tex,
             albedo,
             alpha_cutoff: m.alpha_cutoff,
+            kind: m.kind,
         }));
     }
     // Fallback for primitives with no material (glTF default material).
@@ -260,6 +266,7 @@ pub(crate) fn upload_gltf_scene(
         tex: [NO_TEXTURE; 4],
         albedo: representative_albedo(None, Material::default().base_color_factor),
         alpha_cutoff: 0.0,
+        kind: MaterialKind::Opaque,
     });
 
     let mut per_mesh: Vec<Vec<(MeshHandle, MaterialHandle)>> =
