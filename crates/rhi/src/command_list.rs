@@ -529,6 +529,54 @@ impl CommandList {
         Self::default()
     }
 
+    // --- Backbuffer commands (M4 B3) ---------------------------------------
+    //
+    // The backbuffer's swapchain + acquired image index are frame-global and
+    // resolved at [`translate`](Self::translate). These inherent recorders let the
+    // record thread build the IR with *no* swapchain/index in hand — the enabler
+    // for the RHI thread owning the swapchain and acquiring off the record thread.
+    // (The `Recorder` trait keeps the swapchain-taking signatures so the immediate
+    // `CommandBuffer` path still satisfies it; the list just ignores those args.)
+
+    /// Record a backbuffer transition to the render-target state.
+    pub fn backbuffer_to_render_target(&self) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::TransitionToRenderTarget);
+    }
+
+    /// Record a backbuffer transition to the present state.
+    pub fn backbuffer_to_present(&self) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::TransitionToPresent);
+    }
+
+    /// Begin rendering into the backbuffer (optional color clear + depth).
+    pub fn begin_backbuffer_rendering(
+        &self,
+        color_clear: Option<ClearColor>,
+        depth: Option<&DepthBuffer>,
+    ) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BeginRendering {
+                color_clear,
+                depth: depth.map(ResPtr::new),
+            });
+    }
+
+    /// Set the viewport + scissor to the backbuffer extent.
+    pub fn set_backbuffer_viewport(&self) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::SetViewportScissor);
+    }
+
     /// Clear for reuse next frame (keeps allocations).
     pub fn clear(&self) {
         let mut i = self.inner.borrow_mut();

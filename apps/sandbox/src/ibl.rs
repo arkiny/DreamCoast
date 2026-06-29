@@ -372,7 +372,7 @@ impl IblSystem {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn maybe_capture(
         &mut self,
-        cmd: &CommandBuffer,
+        cmd: &dyn rhi::Recorder,
         realtime_env: bool,
         multibounce: bool,
         scene: &[SceneObject],
@@ -447,7 +447,7 @@ impl IblSystem {
 /// sky-independent and generated once (see [`generate_brdf_lut`]).
 #[allow(clippy::too_many_arguments)]
 fn record_environment_capture(
-    cmd: &CommandBuffer,
+    cmd: &dyn rhi::Recorder,
     ibl: &IblResources,
     write: &CubeSet,
     prev: Option<&CubeSet>,
