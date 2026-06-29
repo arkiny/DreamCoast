@@ -88,7 +88,7 @@ pub(crate) fn build(
     let depth_stencil = if desc.depth_test {
         let dsd = MTLDepthStencilDescriptor::new();
         dsd.setDepthCompareFunction(MTLCompareFunction::LessEqual);
-        dsd.setDepthWriteEnabled(true);
+        dsd.setDepthWriteEnabled(desc.depth_write);
         Some(
             device
                 .newDepthStencilStateWithDescriptor(&dsd)

@@ -334,7 +334,7 @@ unsafe fn build(
 
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(desc.depth_test)
-            .depth_write_enable(desc.depth_test)
+            .depth_write_enable(desc.depth_write)
             .depth_compare_op(vk::CompareOp::LESS);
 
         let color_formats: Vec<vk::Format> = desc

@@ -314,8 +314,12 @@ pub struct GraphicsPipelineDesc<'a> {
     /// Whether the pipeline binds the per-frame globals uniform buffer (camera,
     /// lights, shadow, IBL). Only the deferred PBR passes opt in.
     pub uniform_buffer: bool,
-    /// Enable depth test + write (compare LESS).
+    /// Enable depth testing (compare LESS on Vulkan/D3D12, LESS_EQUAL on Metal).
     pub depth_test: bool,
+    /// Enable depth writes. Normally equal to `depth_test`; a deferred **decal** pass sets
+    /// `depth_test: true, depth_write: false` so it is occluded by closer geometry but does
+    /// not perturb the opaque depth buffer that downstream passes read.
+    pub depth_write: bool,
     /// Depth attachment format the pipeline renders against (`None` = no depth).
     pub depth_format: Option<Format>,
 }

@@ -76,6 +76,7 @@ impl ParticleSystem {
                 bindless: true,
                 uniform_buffer: false,
                 depth_test: false,
+                depth_write: false,
                 depth_format: None,
             })?)
         } else {

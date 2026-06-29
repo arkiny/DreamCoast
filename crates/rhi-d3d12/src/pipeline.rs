@@ -116,7 +116,7 @@ impl D3d12GraphicsPipeline {
                 PS: shader_bytecode(desc.fragment_bytes),
                 RasterizerState: rasterizer_default(),
                 BlendState: blend_state(desc.blend),
-                DepthStencilState: depth_state(desc.depth_test),
+                DepthStencilState: depth_state(desc.depth_test, desc.depth_write),
                 SampleMask: u32::MAX,
                 InputLayout: input_layout,
                 PrimitiveTopologyType: topology,
@@ -623,10 +623,10 @@ fn blend_state(mode: BlendMode) -> D3D12_BLEND_DESC {
     }
 }
 
-fn depth_state(test: bool) -> D3D12_DEPTH_STENCIL_DESC {
+fn depth_state(test: bool, write: bool) -> D3D12_DEPTH_STENCIL_DESC {
     D3D12_DEPTH_STENCIL_DESC {
         DepthEnable: test.into(),
-        DepthWriteMask: if test {
+        DepthWriteMask: if write {
             D3D12_DEPTH_WRITE_MASK_ALL
         } else {
             D3D12_DEPTH_WRITE_MASK_ZERO

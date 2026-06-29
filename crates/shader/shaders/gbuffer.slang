@@ -220,3 +220,26 @@ GBufferOut fsMain(VSOutput input)
     o.position = float4(input.world_pos, 1.0);
     return o;
 }
+
+// Deferred surface-decal fragment shader (decals A3). A decal is a mesh laid coplanar on
+// an already-shaded opaque surface; it must TINT the surface's albedo, not replace it with
+// its own (diffuse-less) lighting inputs. So it writes ONLY RT0 = float4(albedo, alpha):
+// the `DecalAlbedo` blend state alpha-blends the RGB into the G-buffer albedo (write mask
+// RGB preserves RT0.a = the surface's baked AO) and write-masks RT1/RT2/RT3 off, leaving the
+// underlying normal / metallic / roughness / world-pos intact. That is what stops the Intel
+// Sponza `dirt_decal` (BLEND, no MR texture → metallicFactor 1.0) from painting the stone as
+// opaque black metal — the stone keeps its own metalness/normal and only its colour is dusted.
+[shader("fragment")]
+float4 fsDecal(VSOutput input) : SV_Target0
+{
+    float mip_bias = pc.mr_factor.z;
+    float3 albedo = pc.base_color_factor.rgb;
+    float alpha = pc.base_color_factor.a;
+    if (pc.tex.x != NO_TEXTURE)
+    {
+        float4 bc = g.textures[pc.tex.x].SampleBias(g.samp_wrap, input.uv, mip_bias);
+        albedo *= bc.rgb;
+        alpha *= bc.a;
+    }
+    return float4(albedo, alpha);
+}
