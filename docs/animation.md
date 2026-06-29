@@ -196,9 +196,19 @@ current literature + UE/Unity practice):
    **GPU == CPU reference (`MORPH_CPU=1`) to avg 0.000/ch** (frames 1–3 byte-identical; frame 0
    max 5 = silhouette-edge AA, the same class as the B.2 skinning cross-check); scene 34 +
    asset 18 tests; clippy `-D warnings` / fmt clean. Inline path only (the per-frame storage
-   write reuses the frame-start fence wait, like B.1/B.2/CPU morph). VK/DX run the identical
-   single-source shader + the B.2c host-storage path → expected DX≡VK (Windows gate pending,
-   same as B.2c was). A future step can unify into **one deform shader** (skin ⊕ morph) once
+   write reuses the frame-start fence wait, like B.1/B.2/CPU morph).
+
+   **Windows VK/DX gate DONE (RTX 2070 SUPER, 2026-06-30):** both backends log
+   `morph: 1 GPU + 0 CPU morph primitive(s)` (host-storage probe passes → GPU path, not the
+   CPU fallback) and morph the cube on the GPU. **DX≡VK 0.001/ch (max 1 = the documented
+   D3D12 1-LSB run-to-run noise) on all 4 `AnimatedMorphCube` capture frames**; **GPU == CPU
+   reference (`MORPH_CPU=1`) 0.000/ch** on Windows too; default gallery DX≡VK 0.001/ch (max 5 =
+   baseline noise, morph opt-in → no regression). No VK-validation / D3D12 debug-layer errors
+   on the morph storage-buffer VS read + per-frame host-write path (only the pre-existing
+   benign NV-external loader query + the long-standing shadow-pipeline "location 1 not consumed"
+   lint, which the default scene shares — the shadow VS needs only position). The single-source
+   shader + the B.2c host-storage path carry DX≡VK exactly as B.2c did. A future step can unify
+   into **one deform shader** (skin ⊕ morph) once
    a skinned+morph asset exists to gate it — the morph deltas + skin palette already share
    the bindless storage-buffer read path, so it collapses the skinned×morphed pipeline blowup.
 2. **Sparse blendshapes** (biggest memory + bandwidth win). Store only the vertices a
@@ -257,3 +267,6 @@ fixed-timestep loop and stays deterministic.
   (snapshot → pure parallel compute → sequential write-back).
 - Metal verified on the macOS box; **Stage B GPU skinning (B.2a/b/c) verified on Windows
   VK/DX (RTX 2070 SUPER) — DX≡VK 0.000/ch on SimpleSkin, no validation errors** (see B.2c).
+- **Stage C GPU morph verified on Windows VK/DX (RTX 2070 SUPER, 2026-06-30) — DX≡VK 0.001/ch
+  (max 1 = 1-LSB noise) on AnimatedMorphCube, GPU == CPU `MORPH_CPU=1` 0.000/ch, default
+  no-regression** (see the Stage C optimization section).
