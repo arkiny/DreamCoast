@@ -18,3 +18,9 @@ rhi.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 image.workspace = true
+
+# Debug-only: in-app RenderDoc frame-capture trigger (RDOC_CAPTURE=1, run under
+# `renderdoccmd capture`). Loads the injected RenderDoc module at runtime; a no-op
+# (RenderDoc::new() → Err → None) when not running under RenderDoc.
+[target.'cfg(windows)'.dependencies]
+renderdoc = "0.12"
