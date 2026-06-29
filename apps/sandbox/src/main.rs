@@ -475,6 +475,10 @@ struct App {
     sun_intensity: f32,
     ambient: f32,
     exposure: f32,
+    /// Atmosphere inscatter→radiance gain — the sun:sky illuminance ratio knob fed to the env
+    /// capture (`sky.slang`). Legacy 6.0 (gallery anchor); content lowers it so the direct sun
+    /// dominates the sky physically, interiors filled by multibounce GI. `SKY_GAIN` overrides.
+    sky_gain: f32,
     /// UE-style multi-bounce energy compensation strength for the GDF GI (0 = off = gallery anchor;
     /// ~0.6 content). Written to `globals.probe_box_max.w`; see pbr.slang. `P_GI_MULTIBOUNCE`.
     gi_multibounce: f32,
@@ -1209,6 +1213,16 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(if gallery_scene { 3.0 } else { 100_000.0 })
             .max(0.0);
+        // Sun:sky ratio fed to the env capture (see the `sky_gain` field). Kept at 6.0 by default:
+        // measurement showed that lowering it for "physical sun dominance" darkens open-roof
+        // interiors (Sponza's atrium legitimately receives strong skylight), regressing exactly the
+        // interior brightness we want. It is exposed as the `SKY_GAIN` knob for closed scenes that
+        // want the sun to dominate, with the interior then filled by multibounce GI instead.
+        let sky_gain = std::env::var("SKY_GAIN")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(6.0)
+            .max(0.0);
         let ambient = 0.04f32;
         // On by default; `NO_POINT_LIGHTS=1` disables them (the path tracer has no
         // point lights, so a fair raster-vs-ground-truth comparison turns these off).
@@ -1535,6 +1549,7 @@ impl App {
             ambient,
             flip_y,
             backend == BackendKind::Vulkan,
+            sky_gain,
         )?;
 
         let mut window = window;
@@ -1629,6 +1644,7 @@ impl App {
                     }
                 })
                 .max(0.0),
+            sky_gain,
             gi_multibounce: std::env::var("P_GI_MULTIBOUNCE")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
@@ -2682,6 +2698,7 @@ impl App {
             self.ambient,
             self.flip_y,
             self.backend == BackendKind::Vulkan,
+            self.sky_gain,
         );
 
         // The main lighting pass samples the most recently written set.

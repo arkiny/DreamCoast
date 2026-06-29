@@ -80,7 +80,13 @@ pub(crate) fn capture_push(
 
 /// Pack the sky push block: sun float4 (xyz dir, w intensity) + face + flip_y +
 /// pad (32 bytes).
-pub(crate) fn sky_push(sun_dir: [f32; 3], intensity: f32, face: u32, flip_y: u32) -> [u8; 32] {
+pub(crate) fn sky_push(
+    sun_dir: [f32; 3],
+    intensity: f32,
+    face: u32,
+    flip_y: u32,
+    sky_gain: f32,
+) -> [u8; 32] {
     let n = normalize3(sun_dir);
     let mut pc = [0u8; 32];
     for (i, v) in n.iter().take(3).enumerate() {
@@ -89,6 +95,7 @@ pub(crate) fn sky_push(sun_dir: [f32; 3], intensity: f32, face: u32, flip_y: u32
     pc[12..16].copy_from_slice(&intensity.to_le_bytes());
     pc[16..20].copy_from_slice(&face.to_le_bytes());
     pc[20..24].copy_from_slice(&flip_y.to_le_bytes());
+    pc[24..28].copy_from_slice(&sky_gain.to_le_bytes());
     pc
 }
 
