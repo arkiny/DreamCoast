@@ -39,6 +39,9 @@ pub(crate) struct GBufferTargets {
 pub(crate) struct DeferredRenderer {
     shadow_pipeline: GraphicsPipeline,
     gbuffer_pipeline: GraphicsPipeline,
+    /// G-buffer fill for GPU-skinned meshes (animation Stage B.2): same as
+    /// `gbuffer_pipeline` but with the `vsMainSkinned` vertex-pulling entry point.
+    gbuffer_skinned_pipeline: GraphicsPipeline,
     pbr_pipeline: GraphicsPipeline,
     post_pipeline: GraphicsPipeline,
     post_compute_pipeline: ComputePipeline,
@@ -85,6 +88,39 @@ impl DeferredRenderer {
             vertex_layout: VertexLayout::Mesh,
             blend: BlendMode::Opaque,
             push_constant_size: 192, // mvp(64) + base_color(16) + mr(16) + tex u32x4(16) + model mat4(64)
+            bindless: true,
+            uniform_buffer: false,
+            depth_test: true,
+            depth_format: Some(DEPTH_FORMAT),
+        })?;
+
+        // GPU-skinning variant of the G-buffer fill (vertex-pulling skinning VS) —
+        // the `vsMainSkinned` entry of the same shader, sharing the G-buffer fragment.
+        let (gb_skin_vs, gb_skin_fs) = load_shader_pair(
+            backend,
+            dreamcoast_shader::gbuffer_skinned_vs_spirv,
+            dreamcoast_shader::gbuffer_fs_spirv,
+            dreamcoast_shader::gbuffer_skinned_vs_dxil,
+            dreamcoast_shader::gbuffer_fs_dxil,
+            dreamcoast_shader::gbuffer_skinned_vs_metallib,
+            dreamcoast_shader::gbuffer_fs_metallib,
+            "gbuffer_skinned",
+        )?;
+        let gbuffer_skinned_pipeline = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            vertex_bytes: gb_skin_vs,
+            fragment_bytes: gb_skin_fs,
+            vertex_entry: "vsMainSkinned",
+            fragment_entry: "fsMain",
+            color_formats: &[
+                GB_ALBEDO_FMT,
+                GB_NORMAL_FMT,
+                GB_MATERIAL_FMT,
+                GB_POSITION_FMT,
+            ],
+            topology: PrimitiveTopology::TriangleList,
+            vertex_layout: VertexLayout::Mesh,
+            blend: BlendMode::Opaque,
+            push_constant_size: 192,
             bindless: true,
             uniform_buffer: false,
             depth_test: true,
@@ -261,6 +297,7 @@ impl DeferredRenderer {
         Ok(Self {
             shadow_pipeline,
             gbuffer_pipeline,
+            gbuffer_skinned_pipeline,
             pbr_pipeline,
             post_pipeline,
             post_compute_pipeline,
@@ -451,6 +488,12 @@ impl DeferredRenderer {
                     } else {
                         (obj.metallic, obj.roughness, obj.tex[1])
                     };
+                    // GPU-skinned objects use the vertex-pulling pipeline (skin indices
+                    // in the push); the bind-pose vertex buffer is the same. Static
+                    // objects keep the already-bound pipeline (gallery byte-identical).
+                    if obj.skin.is_some() {
+                        cmd.bind_graphics_pipeline(&self.gbuffer_skinned_pipeline);
+                    }
                     cmd.push_constants(&gbuffer_push(
                         obj_mvp,
                         obj.base_color,
@@ -460,11 +503,14 @@ impl DeferredRenderer {
                         obj.alpha_cutoff,
                         [obj.tex[0], mr_tex, obj.tex[2], obj.tex[3]],
                         obj.transform.to_cols_array(),
-                        [0; 4], // not skinned
+                        obj.skin.unwrap_or([0; 4]),
                     ));
                     cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
                     cmd.bind_index_buffer(&obj.mesh.ibuf, true);
                     cmd.draw_indexed(obj.mesh.index_count, 0, 0);
+                    if obj.skin.is_some() {
+                        cmd.bind_graphics_pipeline(&self.gbuffer_pipeline); // restore
+                    }
                 }
                 // Ground plane (plain matte material, no textures). Albedo from the shared
                 // GROUND_ALBEDO single source (also fed to the GI / reflection re-light passes).

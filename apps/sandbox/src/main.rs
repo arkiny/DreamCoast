@@ -146,6 +146,11 @@ pub(crate) struct SceneObject {
     /// cutout discard and the masked-shadow discard from one value.
     pub(crate) alpha_cutoff: f32,
     pub(crate) casts_shadow: bool,
+    /// GPU-skinning storage-buffer indices `[joints, weights, palette, joint_count]`
+    /// when this drawable is skinned (animation Stage B.2); `None` = static. Set by the
+    /// per-frame skinning patch; the G-buffer pass draws these with the skinned pipeline
+    /// + the bind-pose vertex buffer (the vertex shader does the deform).
+    pub(crate) skin: Option<[u32; 4]>,
 }
 
 /// A level's lighting (sun + point lights), applied in the `Globals` assembly in
@@ -956,7 +961,7 @@ impl App {
             )?;
             if !gltf_skinned.is_empty() {
                 info!(
-                    "skinning: {} skinned primitive(s) (CPU)",
+                    "skinning: {} skinned primitive(s) (GPU)",
                     gltf_skinned.len()
                 );
             }
@@ -2398,7 +2403,7 @@ impl App {
         // frame start (the RHI thread defers that wait; skinning + P15_RHI_THREAD is
         // not supported in B.1).
         if !self.skinned.is_empty() && self.rhi_thread.is_none() {
-            skin::skin_and_upload(&mut self.skinned, &self.world, fif)?;
+            skin::update_palettes(&mut self.skinned, &self.world, fif)?;
             skin::patch_scene(&self.skinned, &mut scene, fif);
         }
 

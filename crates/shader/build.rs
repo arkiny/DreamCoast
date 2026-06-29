@@ -338,6 +338,13 @@ const JOBS: &[Job] = &[
         stage: "vertex",
         key: "gbuffer_vs",
     },
+    // GPU-skinning variant of the G-buffer vertex shader (animation Stage B.2).
+    Job {
+        src: "gbuffer.slang",
+        entry: "vsMainSkinned",
+        stage: "vertex",
+        key: "gbuffer_skinned_vs",
+    },
     Job {
         src: "gbuffer.slang",
         entry: "fsMain",

@@ -185,6 +185,7 @@ pub(crate) fn build_scene(
                 tex: mat.tex,
                 alpha_cutoff: mat.alpha_cutoff,
                 casts_shadow: d.casts_shadow,
+                skin: None,
             }
         })
         .collect()

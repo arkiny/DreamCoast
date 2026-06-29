@@ -105,6 +105,18 @@ the CPU-skinned (B.1) result** (cross-check); full DX≡VK gate on Windows (the 
 shader + SSBO-read-in-VS). Staged: B.2a g-buffer (Metal) → B.2b skinned shadows →
 B.2c Windows VK/DX. CPU skinning (B.1) stays as the fallback / non-bindless path.
 
+**B.2a DONE (g-buffer GPU skinning, Metal):** `vsMainSkinned` reads joints/weights +
+the per-fif palette from bindless storage buffers; `SkinnedMesh` owns the static
+joints/weights buffers + the palette ring (`update_palettes` writes
+`joint_world × inverse_bind` each frame via `StorageBuffer::write`); `patch_scene`
+tags skinned drawables (`SceneObject.skin`) which the g-buffer pass draws with
+`gbuffer_skinned_pipeline` + the bind-pose vertex buffer. Verified: default
+`b9778dcc`; SimpleSkin deforms on the GPU, **deterministic** (run-to-run identical),
+and matches the CPU reference to **avg 0.182/ch (0.14% of channels off by >8 — edge
+AA only)** → the column-major palette convention is correct. Inline path only (the
+palette write uses the frame-start fence wait). **Next: B.2b skinned shadows, B.2c
+Windows VK/DX `StorageBuffer::write` + the DX≡VK shader gate.**
+
 ### Stage C — morph targets (optional)
 Morph-weight channels → weighted sum of position/normal deltas. Test:
 **AnimatedMorphCube**.
