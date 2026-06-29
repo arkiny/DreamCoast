@@ -317,8 +317,13 @@ pub(crate) fn sponza_level() -> LevelData {
         // point lights down the nave — a test bed for the lighting model + future GI.
         lights: vec![
             Light {
+                // Travel direction; negated to "toward sun" = (0.3, 0.9, 0.2) ≈ 68° elevation, high
+                // enough to clear the ~12 m nave walls and floor-light the atrium. This is the ONE
+                // sun: it drives direct lighting + shadows AND (via `self.sun_dir`) the
+                // sky/atmosphere/IBL/GI, so the visible sun, the shadows, and the shading agree.
+                // Keep in lockstep with `levels/sponza.level`.
                 kind: LightKind::Directional,
-                vec: [0.3, -0.9, 0.25],
+                vec: [-0.3, -0.9, -0.2],
                 color: [1.0, 0.96, 0.9],
                 intensity: 4.0,
             },
