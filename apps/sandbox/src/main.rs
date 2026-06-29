@@ -1210,7 +1210,19 @@ impl App {
         // `EV100` override the content values. Because the whole atmosphere scales with the sun
         // and the exposure compensates, the absolute lux is meaningful (not just relative): it is
         // what a light meter would read, and EV100 is what a camera would dial.
-        let sun_dir = [0.4f32, 0.8, 0.4];
+        // Direction TO the sun. The gallery keeps its overhead [0.4,0.8,0.4] (anchor). Content
+        // scenes take a LOWER angle so the sun rakes under the arcade arches and into the interior
+        // (an overhead sun only reaches the open-atrium floor, leaving the roofed side aisles dark).
+        // `SUN_DIR="x,y,z"` overrides (auto-normalized in the push packers).
+        let sun_dir = parse_vec3_env("SUN_DIR")
+            .map(|v| [v.x, v.y, v.z])
+            .unwrap_or(if gallery_scene {
+                [0.4, 0.8, 0.4]
+            } else {
+                // ~35° elevation 3/4 angle: low enough to rake under the arcades and front/side-light
+                // the interior columns and floor, instead of the overhead sun that left them dark.
+                [-0.4, 0.35, 0.3]
+            });
         let sun_intensity = std::env::var("SUN_LUX")
             .or_else(|_| std::env::var("SUN_INTENSITY"))
             .ok()
