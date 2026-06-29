@@ -209,6 +209,38 @@ unsafe fn build(
                     .vertex_binding_descriptions(&vtx_bindings)
                     .vertex_attribute_descriptions(&vtx_attrs[..2])
             }
+            VertexLayout::MeshPositionUv => {
+                vtx_bindings = [vk::VertexInputBindingDescription::default()
+                    .binding(0)
+                    .stride(32)
+                    .input_rate(vk::VertexInputRate::VERTEX)];
+                // Position (location 0) + uv (location 1) over the shared 32-byte
+                // mesh buffer; the normal bytes at offset 12 are simply not read.
+                // The shadow VS omits NORMAL from its input struct, so SPIR-V packs
+                // uv at location 1 (no gap) — exactly these two attributes.
+                vtx_attrs = [
+                    vk::VertexInputAttributeDescription::default()
+                        .location(0)
+                        .binding(0)
+                        .format(vk::Format::R32G32B32_SFLOAT)
+                        .offset(0),
+                    vk::VertexInputAttributeDescription::default()
+                        .location(1)
+                        .binding(0)
+                        .format(vk::Format::R32G32_SFLOAT)
+                        .offset(24),
+                    // Unused third slot (the shared `vtx_attrs` array is 3 long);
+                    // only the first two are bound below.
+                    vk::VertexInputAttributeDescription::default()
+                        .location(2)
+                        .binding(0)
+                        .format(vk::Format::R32G32_SFLOAT)
+                        .offset(24),
+                ];
+                vk::PipelineVertexInputStateCreateInfo::default()
+                    .vertex_binding_descriptions(&vtx_bindings)
+                    .vertex_attribute_descriptions(&vtx_attrs[..2])
+            }
         };
 
         let topology = match desc.topology {

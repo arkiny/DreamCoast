@@ -11,12 +11,14 @@
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
 
-// POSITION + TEXCOORD are consumed (NORMAL is declared to match the shared mesh
-// vertex layout but unused). The UV feeds the masked alpha test.
+// POSITION + TEXCOORD only (NORMAL is omitted — the shadow pass is depth + an
+// alpha-test discard, neither of which needs the normal). Declaring only the
+// consumed attributes keeps every backend's input signature to two elements, so
+// the `MeshPositionUv` vertex layout (pos@0, uv@24 over the shared 32-byte mesh
+// buffer) matches exactly with no "attribute not consumed" validation warning.
 struct VSInput
 {
     float3 pos : POSITION;
-    float3 normal : NORMAL;
     float2 uv : TEXCOORD;
 };
 

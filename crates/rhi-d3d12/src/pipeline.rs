@@ -71,6 +71,13 @@ impl D3d12GraphicsPipeline {
                 input_elem(s!("NORMAL"), DXGI_FORMAT_R32G32B32_FLOAT, 12),
                 input_elem(s!("TEXCOORD"), DXGI_FORMAT_R32G32_FLOAT, 24),
             ];
+            // Same interleaved mesh buffer, POSITION + TEXCOORD only (normal
+            // skipped): the shadow VS reads position for depth and uv for
+            // alpha-cutout. Non-contiguous in `mesh_elems`, so its own array.
+            let mesh_pos_uv_elems = [
+                input_elem(s!("POSITION"), DXGI_FORMAT_R32G32B32_FLOAT, 0),
+                input_elem(s!("TEXCOORD"), DXGI_FORMAT_R32G32_FLOAT, 24),
+            ];
             let input_layout = match desc.vertex_layout {
                 VertexLayout::None => D3D12_INPUT_LAYOUT_DESC::default(),
                 VertexLayout::ImGui => D3D12_INPUT_LAYOUT_DESC {
@@ -90,6 +97,11 @@ impl D3d12GraphicsPipeline {
                 VertexLayout::MeshPosNormal => D3D12_INPUT_LAYOUT_DESC {
                     pInputElementDescs: mesh_elems.as_ptr(),
                     NumElements: 2,
+                },
+                // Position + uv, normal skipped (shadow pass).
+                VertexLayout::MeshPositionUv => D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: mesh_pos_uv_elems.as_ptr(),
+                    NumElements: mesh_pos_uv_elems.len() as u32,
                 },
             };
 

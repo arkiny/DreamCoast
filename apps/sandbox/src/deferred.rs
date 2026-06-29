@@ -185,8 +185,10 @@ impl DeferredRenderer {
             fragment_entry: "fsMain",
             color_formats: &[], // depth-only
             topology: PrimitiveTopology::TriangleList,
-            // Full mesh layout (pos/normal/uv): the UV feeds the masked alpha-test discard.
-            vertex_layout: VertexLayout::Mesh,
+            // Pos + uv (normal skipped): depth needs position, the masked alpha-test
+            // discard needs uv; the shadow VS reads no normal, so declaring it would
+            // trip the "location 1 not consumed" validation warning.
+            vertex_layout: VertexLayout::MeshPositionUv,
             blend: BlendMode::Opaque,
             push_constant_size: 112, // light_mvp(64) + tex u32 + cutoff f32 + pad8 + skin u32x4(16) + morph u32x4(16)
             bindless: true,          // push constants + the bindless base-color texture (masked)
@@ -213,7 +215,8 @@ impl DeferredRenderer {
             fragment_entry: "fsMain",
             color_formats: &[], // depth-only
             topology: PrimitiveTopology::TriangleList,
-            vertex_layout: VertexLayout::Mesh,
+            // Pos + uv (normal skipped) — same as the static shadow VS.
+            vertex_layout: VertexLayout::MeshPositionUv,
             blend: BlendMode::Opaque,
             push_constant_size: 112,
             bindless: true,
@@ -240,7 +243,8 @@ impl DeferredRenderer {
             fragment_entry: "fsMain",
             color_formats: &[], // depth-only
             topology: PrimitiveTopology::TriangleList,
-            vertex_layout: VertexLayout::Mesh,
+            // Pos + uv (normal skipped) — same as the static shadow VS.
+            vertex_layout: VertexLayout::MeshPositionUv,
             blend: BlendMode::Opaque,
             push_constant_size: 112,
             bindless: true,

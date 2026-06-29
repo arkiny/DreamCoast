@@ -129,39 +129,54 @@ pub(crate) fn load_function(
 /// (vertices synthesized from the vertex id). Attributes mirror the Vulkan backend
 /// and all source from the single buffer at [`VERTEX_BUFFER_INDEX`].
 fn vertex_descriptor(layout: VertexLayout) -> Option<Retained<MTLVertexDescriptor>> {
-    // (format, offset) per attribute, plus the buffer stride.
-    let (attrs, stride): (&[(MTLVertexFormat, usize)], usize) = match layout {
+    // (attribute location, format, offset) per attribute, plus the buffer stride.
+    // The location is explicit (not the array index) so a layout can skip an
+    // attribute the shader doesn't consume — e.g. `MeshPositionUv` provides
+    // locations 0 and 2 with no 1, matching the shadow VS's `[[attribute]]` set.
+    let (attrs, stride): (&[(usize, MTLVertexFormat, usize)], usize) = match layout {
         VertexLayout::None => return None,
         VertexLayout::ImGui => (
             &[
-                (MTLVertexFormat::Float2, 0),
-                (MTLVertexFormat::Float2, 8),
-                (MTLVertexFormat::UChar4Normalized, 16),
+                (0, MTLVertexFormat::Float2, 0),
+                (1, MTLVertexFormat::Float2, 8),
+                (2, MTLVertexFormat::UChar4Normalized, 16),
             ],
             20,
         ),
         VertexLayout::Mesh => (
             &[
-                (MTLVertexFormat::Float3, 0),
-                (MTLVertexFormat::Float3, 12),
-                (MTLVertexFormat::Float2, 24),
+                (0, MTLVertexFormat::Float3, 0),
+                (1, MTLVertexFormat::Float3, 12),
+                (2, MTLVertexFormat::Float2, 24),
             ],
             32,
         ),
-        VertexLayout::MeshPosition => (&[(MTLVertexFormat::Float3, 0)], 32),
+        VertexLayout::MeshPosition => (&[(0, MTLVertexFormat::Float3, 0)], 32),
         VertexLayout::MeshPosNormal => (
-            &[(MTLVertexFormat::Float3, 0), (MTLVertexFormat::Float3, 12)],
+            &[
+                (0, MTLVertexFormat::Float3, 0),
+                (1, MTLVertexFormat::Float3, 12),
+            ],
+            32,
+        ),
+        // Position (attribute 0) + uv (attribute 1), normal skipped. The shadow
+        // VS omits NORMAL, so Slang packs uv at attribute 1 over the 32-byte buffer.
+        VertexLayout::MeshPositionUv => (
+            &[
+                (0, MTLVertexFormat::Float3, 0),
+                (1, MTLVertexFormat::Float2, 24),
+            ],
             32,
         ),
     };
 
     let vd = MTLVertexDescriptor::new();
     let vd_attrs = vd.attributes();
-    for (location, (format, offset)) in attrs.iter().enumerate() {
+    for (location, format, offset) in attrs.iter().copied() {
         let a = unsafe { vd_attrs.objectAtIndexedSubscript(location) };
-        a.setFormat(*format);
+        a.setFormat(format);
         unsafe {
-            a.setOffset(*offset);
+            a.setOffset(offset);
             a.setBufferIndex(VERTEX_BUFFER_INDEX);
         }
     }

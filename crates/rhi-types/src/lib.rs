@@ -259,6 +259,13 @@ pub enum VertexLayout {
     /// Mesh vertex buffer, position + normal consumed, uv skipped (32-byte
     /// stride). Used by the environment-capture forward pass.
     MeshPosNormal,
+    /// Mesh vertex buffer, position + uv consumed, normal skipped (32-byte
+    /// stride). The shadow pass VS reads `POSITION` for depth and `TEXCOORD` for
+    /// alpha-cutout but omits `NORMAL` from its input struct, so each backend's
+    /// input signature is just those two (uv packs to SPIR-V location 1, no gap).
+    /// Declaring only what the shader consumes keeps the Vulkan validation layer
+    /// quiet (no "attribute not consumed" warning).
+    MeshPositionUv,
 }
 
 /// Color blending mode for the single color attachment.
