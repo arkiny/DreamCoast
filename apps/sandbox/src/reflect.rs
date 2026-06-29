@@ -566,6 +566,7 @@ impl ReflectSystem {
     /// C7b: capture this frame's lit HDR into the ping-pong history buffer (raw radiance =
     /// `hdr * inv_exposure`) so the next frame's history-mode SSR can sample it. Runs after
     /// the lighting pass. `prepare_history` must have run this frame.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_lit_history<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
@@ -574,6 +575,7 @@ impl ReflectSystem {
         ch: u32,
         inv_exposure: f32,
         clamp_max: f32,
+        exposure_buf: u32,
     ) {
         let pipe = self
             .lit_history_pipeline
@@ -602,6 +604,7 @@ impl ReflectSystem {
                     ch,
                     inv_exposure,
                     clamp_max,
+                    exposure_buf,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

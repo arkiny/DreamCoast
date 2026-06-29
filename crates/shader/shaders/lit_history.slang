@@ -21,9 +21,10 @@ struct LitHistoryPush
     uint out_buffer;    // storage buffer: raw-radiance history (this frame's write)
     uint width;
     uint height;
-    float inv_exposure; // 1 / camera exposure (recovers raw radiance)
+    float inv_exposure; // 1 / static camera exposure (recovers raw radiance)
     float clamp_max;    // firefly clamp: max raw-radiance component stored (1e30 = off)
-    uint pad1;
+    uint exposure_buf;  // auto-exposure: storage buffer with the adapted exposure (0xFFFFFFFF = use
+                        // inv_exposure). Keeps the de-exposure consistent with what the lighting baked.
     uint pad2;
 };
 
@@ -39,7 +40,16 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 
     uint idx = tid.y * pc.width + tid.x;
     float2 uv = (float2(tid.xy) + 0.5) / float2(pc.width, pc.height);
-    float3 rgb = g.textures[pc.hdr_index].SampleLevel(g.samp, uv, 0.0).rgb * pc.inv_exposure;
+    // De-expose with the SAME exposure the lighting baked: the auto-exposure buffer when bound,
+    // else the static inv_exposure. Otherwise an adapting exposure would scale the reflection
+    // history wrong.
+    float inv_exp = pc.inv_exposure;
+    if (pc.exposure_buf != 0xFFFFFFFFu)
+    {
+        float e = asfloat(g.storage_buffers[pc.exposure_buf].Load(0));
+        inv_exp = 1.0 / max(e, 1e-8);
+    }
+    float3 rgb = g.textures[pc.hdr_index].SampleLevel(g.samp, uv, 0.0).rgb * inv_exp;
     // Firefly clamp at the reflection source: bound the raw radiance the SSR history feeds
     // back, so a blown-out specular highlight can't become a reflected speckle. Hue-preserving
     // (scales by the max component). `clamp_max = 1e30` disables it (byte-identical).

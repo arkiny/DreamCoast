@@ -42,9 +42,12 @@ pub(crate) struct DeferredRenderer {
     pbr_pipeline: GraphicsPipeline,
     post_pipeline: GraphicsPipeline,
     post_compute_pipeline: ComputePipeline,
-    /// Physical-camera auto-exposure: the metering compute pipeline + the persistent 1-element
-    /// storage buffer holding the adapted exposure (read by the lighting pass when auto on).
-    auto_exposure_pipeline: Option<ComputePipeline>,
+    /// Physical-camera auto-exposure: the histogram + resolve compute pipelines, a 256-bin
+    /// luminance histogram buffer, and the persistent 1-element exposure buffer (adapted value
+    /// read by the lighting pass when auto on).
+    ae_histogram_pipeline: Option<ComputePipeline>,
+    ae_resolve_pipeline: Option<ComputePipeline>,
+    ae_hist_buf: Option<StorageBuffer>,
     exposure_buf: Option<StorageBuffer>,
     /// Per-frame globals uniform buffer (one `GLOBALS_SLICE` slice per frame-in-flight).
     globals_buffer: Buffer,
@@ -188,28 +191,52 @@ impl DeferredRenderer {
             threads_per_group: [8, 8, 1],
         })?;
 
-        // Physical-camera auto-exposure: the metering compute pipeline + a persistent 8-byte
-        // storage buffer [exposure, scene_luminance]. Seeded with a sensible content exposure so
-        // the first frame (before the first metering pass runs) isn't black; it adapts within a
-        // frame or two. Compute-gated like the other compute features.
-        let (auto_exposure_pipeline, exposure_buf) = if let Ok(cs) = load_compute_shader(
-            backend,
-            dreamcoast_shader::auto_exposure_cs_spirv,
-            dreamcoast_shader::auto_exposure_cs_dxil,
-            dreamcoast_shader::auto_exposure_cs_metallib,
-            "auto_exposure",
-        ) {
-            let pipe = device.create_compute_pipeline(&ComputePipelineDesc {
-                compute_bytes: cs,
-                compute_entry: "csMain",
-                push_constant_size: 32, // hdr + expo_buf + key + adapt + min + max + pad8
+        // Physical-camera auto-exposure: a luminance-histogram metering (csHistogram → csResolve)
+        // plus a persistent 256-bin histogram buffer (seeded 0) and an 8-byte [exposure,
+        // scene_luminance] buffer (seeded with a sensible content exposure so the first frame,
+        // before metering runs, isn't black; it adapts within a frame or two). Compute-gated.
+        let ae = (|| -> anyhow::Result<_> {
+            let hist_cs = load_compute_shader(
+                backend,
+                dreamcoast_shader::auto_exposure_histogram_cs_spirv,
+                dreamcoast_shader::auto_exposure_histogram_cs_dxil,
+                dreamcoast_shader::auto_exposure_histogram_cs_metallib,
+                "auto_exposure_histogram",
+            )?;
+            let resolve_cs = load_compute_shader(
+                backend,
+                dreamcoast_shader::auto_exposure_resolve_cs_spirv,
+                dreamcoast_shader::auto_exposure_resolve_cs_dxil,
+                dreamcoast_shader::auto_exposure_resolve_cs_metallib,
+                "auto_exposure_resolve",
+            )?;
+            let hist_pipe = device.create_compute_pipeline(&ComputePipelineDesc {
+                compute_bytes: hist_cs,
+                compute_entry: "csHistogram",
+                push_constant_size: 16, // hdr + hist_buf + width + height
                 bindless: true,
                 uniform_buffer: false,
                 threads_per_group: [16, 16, 1],
             })?;
+            let resolve_pipe = device.create_compute_pipeline(&ComputePipelineDesc {
+                compute_bytes: resolve_cs,
+                compute_entry: "csResolve",
+                push_constant_size: 48, // hist + expo + num_pixels + key + adapt + min + max + lo + hi
+                bindless: true,
+                uniform_buffer: false,
+                threads_per_group: [256, 1, 1],
+            })?;
+            let hist = device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: 256 * 4,
+                    stride: 4,
+                    indirect: false,
+                },
+                &vec![0u8; 256 * 4],
+            )?;
             let seed = [1.0e-4f32, 0.0f32];
             let bytes: Vec<u8> = seed.iter().flat_map(|f| f.to_le_bytes()).collect();
-            let buf = device.create_storage_buffer_init(
+            let expo = device.create_storage_buffer_init(
                 &StorageBufferDesc {
                     size: bytes.len() as u64,
                     stride: 4,
@@ -217,9 +244,11 @@ impl DeferredRenderer {
                 },
                 &bytes,
             )?;
-            (Some(pipe), Some(buf))
-        } else {
-            (None, None)
+            Ok((hist_pipe, resolve_pipe, hist, expo))
+        })();
+        let (ae_histogram_pipeline, ae_resolve_pipeline, ae_hist_buf, exposure_buf) = match ae {
+            Ok((h, r, hb, e)) => (Some(h), Some(r), Some(hb), Some(e)),
+            Err(_) => (None, None, None, None),
         };
 
         // Per-frame globals uniform buffer (one 256-byte slice per frame-in-flight).
@@ -235,7 +264,9 @@ impl DeferredRenderer {
             pbr_pipeline,
             post_pipeline,
             post_compute_pipeline,
-            auto_exposure_pipeline,
+            ae_histogram_pipeline,
+            ae_resolve_pipeline,
+            ae_hist_buf,
             exposure_buf,
             globals_buffer,
         })
@@ -247,36 +278,64 @@ impl DeferredRenderer {
         self.exposure_buf.as_ref().map(|b| b.storage_index())
     }
 
-    /// Auto-exposure metering: read the lit `hdr`, reduce its log-average luminance, and write the
-    /// time-adapted exposure into the persistent buffer for next frame's lighting. Runs after the
-    /// lighting pass (the `hdr` read orders it). `key` = target grey, `adapt` = this frame's EMA
-    /// factor (`1-exp(-dt·speed)`), `[min_exp,max_exp]` clamp the exposure.
+    /// Auto-exposure metering: bin the lit `hdr` into a luminance histogram (pass 1), then resolve
+    /// the trimmed-percentile geometric-mean luminance into the time-adapted exposure for next
+    /// frame's lighting (pass 2, which also clears the histogram). Runs after the lighting pass
+    /// (the `hdr` read orders it). `key` = target grey, `adapt` = this frame's EMA factor, and
+    /// `[min_exp,max_exp]` clamp the exposure.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_auto_exposure<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
         hdr: ResourceId,
+        cw: u32,
+        ch: u32,
         key: f32,
         adapt: f32,
         min_exp: f32,
         max_exp: f32,
     ) {
-        let (Some(pipe), Some(buf)) = (&self.auto_exposure_pipeline, &self.exposure_buf) else {
+        let (Some(hist_pipe), Some(resolve_pipe), Some(hist_buf), Some(expo_buf)) = (
+            &self.ae_histogram_pipeline,
+            &self.ae_resolve_pipeline,
+            &self.ae_hist_buf,
+            &self.exposure_buf,
+        ) else {
             return;
         };
-        let buf_idx = buf.storage_index();
-        let ext = graph.import_external("exposure_buf");
+        let hist_idx = hist_buf.storage_index();
+        let expo_idx = expo_buf.storage_index();
+        let hist_ext = graph.import_external("ae_histogram");
+        let expo_ext = graph.import_external("exposure_buf");
+        // Pass 1: per-pixel histogram (reads hdr, writes the histogram buffer).
         graph.add_compute_pass(
             ComputePassInfo {
-                name: "auto_exposure",
-                storage_writes: vec![ext],
+                name: "ae_histogram",
+                storage_writes: vec![hist_ext],
                 reads: vec![hdr],
             },
             move |ctx| {
                 let hdr_idx = ctx.sampled_index(hdr);
                 let cmd = ctx.cmd();
-                cmd.bind_compute_pipeline(pipe);
-                cmd.push_constants_compute(&ae_push(
-                    hdr_idx, buf_idx, key, adapt, min_exp, max_exp,
+                cmd.bind_compute_pipeline(hist_pipe);
+                cmd.push_constants_compute(&ae_hist_push(hdr_idx, hist_idx, cw, ch));
+                cmd.dispatch(cw.div_ceil(16), ch.div_ceil(16), 1);
+                Ok(())
+            },
+        );
+        // Pass 2: resolve the exposure + clear the histogram (single 256-thread group).
+        let num_pixels = cw * ch;
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "ae_resolve",
+                storage_writes: vec![expo_ext, hist_ext],
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(resolve_pipe);
+                cmd.push_constants_compute(&ae_resolve_push(
+                    hist_idx, expo_idx, num_pixels, key, adapt, min_exp, max_exp, 0.0, 0.9,
                 ));
                 cmd.dispatch(1, 1, 1);
                 Ok(())
@@ -629,16 +688,42 @@ fn pbr_push(
     pc
 }
 
-/// Pack the auto-exposure push block (32 bytes): hdr sampled index, exposure storage-buffer
-/// index, target grey `key`, this-frame EMA `adapt`, and the `[min,max]` exposure clamp.
-fn ae_push(hdr: u32, expo_buf: u32, key: f32, adapt: f32, min_exp: f32, max_exp: f32) -> [u8; 32] {
-    let mut pc = [0u8; 32];
+/// Pack the auto-exposure histogram push block (16 bytes): hdr sampled index, histogram
+/// storage-buffer index, and the frame width/height.
+fn ae_hist_push(hdr: u32, hist_buf: u32, width: u32, height: u32) -> [u8; 16] {
+    let mut pc = [0u8; 16];
     pc[0..4].copy_from_slice(&hdr.to_le_bytes());
+    pc[4..8].copy_from_slice(&hist_buf.to_le_bytes());
+    pc[8..12].copy_from_slice(&width.to_le_bytes());
+    pc[12..16].copy_from_slice(&height.to_le_bytes());
+    pc
+}
+
+/// Pack the auto-exposure resolve push block (48 bytes): histogram + exposure buffer indices,
+/// pixel count, target grey `key`, this-frame EMA `adapt`, the `[min,max]` exposure clamp, and
+/// the `[lo,hi]` percentile window kept for the trimmed mean.
+#[allow(clippy::too_many_arguments)]
+fn ae_resolve_push(
+    hist_buf: u32,
+    expo_buf: u32,
+    num_pixels: u32,
+    key: f32,
+    adapt: f32,
+    min_exp: f32,
+    max_exp: f32,
+    lo_pct: f32,
+    hi_pct: f32,
+) -> [u8; 48] {
+    let mut pc = [0u8; 48];
+    pc[0..4].copy_from_slice(&hist_buf.to_le_bytes());
     pc[4..8].copy_from_slice(&expo_buf.to_le_bytes());
-    pc[8..12].copy_from_slice(&key.to_le_bytes());
-    pc[12..16].copy_from_slice(&adapt.to_le_bytes());
-    pc[16..20].copy_from_slice(&min_exp.to_le_bytes());
-    pc[20..24].copy_from_slice(&max_exp.to_le_bytes());
+    pc[8..12].copy_from_slice(&num_pixels.to_le_bytes());
+    pc[12..16].copy_from_slice(&key.to_le_bytes());
+    pc[16..20].copy_from_slice(&adapt.to_le_bytes());
+    pc[20..24].copy_from_slice(&min_exp.to_le_bytes());
+    pc[24..28].copy_from_slice(&max_exp.to_le_bytes());
+    pc[28..32].copy_from_slice(&lo_pct.to_le_bytes());
+    pc[32..36].copy_from_slice(&hi_pct.to_le_bytes());
     pc
 }
 
