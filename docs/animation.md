@@ -79,10 +79,40 @@ shader) as a perf optimization — that one takes the full DX≡VK gate.
 Morph-weight channels → weighted sum of position/normal deltas. Test:
 **AnimatedMorphCube**.
 
+## Parallelization on the job system (planned)
+
+Animation work is CPU-heavy and embarrassingly parallel, so it should be distributed
+across `dreamcoast_jobs` workers — the same pattern as `propagate_transforms_parallel`
+(Phase 15 M3) and the M4 B4 parallel render-graph recording (`jobs.parallel_for`,
+deterministic = bit-identical to the sequential run). Done as an opt-in optimization
+once the single-threaded path is correct; **determinism (and the headless
+byte-identical capture) must be preserved** — every parallelized unit stays a pure
+function of immutable snapshots, like `resolve_world`. Targets, cheapest-to-richest:
+
+1. **CPU skinning (`skin_and_upload`) — the prime target.** The per-vertex LBS deform
+   (`Σ wᵢ · paletteᵢ · v` + normal) is the dominant cost and fully independent per
+   vertex. Build each mesh's palette (small, sequential), then `parallel_for` over the
+   vertex range writing into the disjoint `out` slots; the `vbuf.write` upload stays
+   sequential. Multiple skinned meshes can also parallelize across meshes. Pure per
+   vertex → bit-identical to the serial loop. (When GPU skinning (B.2) lands it
+   subsumes this; until then CPU skinning is the main per-frame animation cost.)
+2. **Animation sampling (`advance_animation`).** Players/channels are independent; the
+   sample pass (read clips → compute the TRS writes) parallelizes over players, with
+   the `LocalTransform`/clock write-back applied sequentially (the two-pass shape it
+   already has, mirroring `advance_spin`). Lower priority — sampling is cheap next to
+   skinning until clip/joint counts get large.
+3. **Transform propagation** is already parallel (`propagate_transforms_parallel`).
+
+The natural end state is a per-frame animation stage on the job graph: sample (∥ over
+players) → propagate (∥, existing) → skin (∥ over vertices) → build draw list. Fits the
+fixed-timestep loop and stays deterministic.
+
 ## Verification (per stage)
 - Unit tests for the parser + sampler (deterministic, interpolation modes).
 - Headless: `SCENE_GLTF=… GLTF_ANIM=0 CAPTURE_SEQ=4` → frames differ (motion) AND
   run-to-run identical (deterministic), like the `P15_SPIN` sequence.
 - Default capture byte-identical (`b9778dcc`) — animation is opt-in.
+- Any job-system parallelization must stay **bit-identical** to the serial path
+  (snapshot → pure parallel compute → sequential write-back).
 - Metal verified here; VK/DX parity pending (Stage A is CPU-only → low risk; Stage B
   touches shaders → full DX≡VK gate).
