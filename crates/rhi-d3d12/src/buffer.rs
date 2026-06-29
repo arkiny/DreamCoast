@@ -296,6 +296,16 @@ impl D3d12StorageBuffer {
         self.index
     }
 
+    /// Host-write the buffer (GPU-skinning joint palette). These storage buffers live
+    /// in a `DEFAULT` heap, so a direct host write is not yet supported — the
+    /// upload-heap storage-buffer variant is animation Stage B.2c (Windows). GPU
+    /// skinning falls back to the CPU path on D3D12 until then.
+    pub fn write(&self, _data: &[u8]) -> Result<(), EngineError> {
+        Err(EngineError::Rhi(
+            "host-write of a D3D12 storage buffer not implemented (animation B.2c)".into(),
+        ))
+    }
+
     pub(crate) fn resource(&self) -> &ID3D12Resource {
         &self.resource
     }
