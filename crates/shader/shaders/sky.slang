@@ -145,7 +145,12 @@ float3 procedural_sky(float3 dir, float3 sun_dir, float sun_intensity)
         float c = saturate(cos_t);
         col += atm_transmittance(ro, sun_dir) * sun_intensity * pow(c, 4000.0) * 8.0;
     }
-    return max(col, float3(0.0, 0.0, 0.0));
+    // The env cube is Rgba16Float (max ~65504). With the sun authored in lux (~1e5), the baked
+    // sun disk would overflow to +inf and poison the IBL convolution. Clamp to a safe HDR ceiling:
+    // the env disk only feeds reflections/irradiance, while the analytic directional light carries
+    // the real sun energy in the lighting pass. Gallery intensities (≤~24 here) are far below this,
+    // so its env is unchanged (byte-identical anchor).
+    return clamp(col, float3(0.0, 0.0, 0.0), float3(60000.0, 60000.0, 60000.0));
 }
 
 [shader("fragment")]

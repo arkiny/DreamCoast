@@ -1194,9 +1194,21 @@ impl App {
         // frame slot's fence has signaled — no cross-frame hazards).
         let pools: Vec<ResourcePool> = (0..FRAMES_IN_FLIGHT).map(|_| ResourcePool::new()).collect();
 
-        // UI-controlled lighting state defaults.
+        // Physically-based directional "sun" lighting. Content scenes author the sun in real
+        // photometric units — **illuminance in lux** (clear-sky noon sun ≈ 100,000 lx) — and map
+        // it to display with a physical-camera **EV100** exposure (`exposure = 1/(1.2·2^EV100)`,
+        // sunny-16 ≈ EV15). The gallery keeps its legacy arbitrary 3.0 / 0.6 (the byte-identical
+        // regression anchor — a synthetic test scene, its look is not a target). `SUN_LUX` /
+        // `EV100` override the content values. Because the whole atmosphere scales with the sun
+        // and the exposure compensates, the absolute lux is meaningful (not just relative): it is
+        // what a light meter would read, and EV100 is what a camera would dial.
         let sun_dir = [0.4f32, 0.8, 0.4];
-        let sun_intensity = 3.0f32;
+        let sun_intensity = std::env::var("SUN_LUX")
+            .or_else(|_| std::env::var("SUN_INTENSITY"))
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(if gallery_scene { 3.0 } else { 100_000.0 })
+            .max(0.0);
         let ambient = 0.04f32;
         // On by default; `NO_POINT_LIGHTS=1` disables them (the path tracer has no
         // point lights, so a fair raster-vs-ground-truth comparison turns these off).
@@ -1597,7 +1609,26 @@ impl App {
             sun_dir,
             sun_intensity,
             ambient,
-            exposure: 0.6,
+            // Camera exposure (pre-filmic, applied as `(ambient+lo)·exposure`). Gallery keeps the
+            // legacy 0.6 (anchor). Content derives it from a physical-camera **EV100** so the lux
+            // sun exposes correctly: `exposure = 1/(1.2·2^EV100)`. Default EV100 ≈ 14 (a touch under
+            // sunny-16 to favour the bounce-lit interior, as a metered interior shot would). `EV100`
+            // sets the stop directly; `EXPOSURE` still overrides the raw multiplier if given.
+            exposure: std::env::var("EXPOSURE")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or_else(|| {
+                    if gallery_scene {
+                        0.6
+                    } else {
+                        let ev100 = std::env::var("EV100")
+                            .ok()
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .unwrap_or(14.0);
+                        ev100_to_exposure(ev100)
+                    }
+                })
+                .max(0.0),
             gi_multibounce: std::env::var("P_GI_MULTIBOUNCE")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
@@ -2337,7 +2368,7 @@ impl App {
                     if ui.collapsing_header("Lighting", open) {
                         ui.combo_simple_string("Debug view", debug_view, &DEBUG_VIEWS);
                         ui.input_float3("Sun dir", sun_dir).build();
-                        ui.slider("Sun intensity", 0.0, 10.0, sun_intensity);
+                        ui.slider("Sun intensity", 0.0, 32.0, sun_intensity);
                         ui.slider("Ambient", 0.0, 0.5, ambient);
                         ui.slider("Exposure", 0.1, 4.0, exposure);
                         ui.checkbox("Point lights", point_lights_on);
@@ -4081,6 +4112,14 @@ fn globals_bytes(g: &Globals) -> &[u8] {
 fn normalize3(v: [f32; 3]) -> [f32; 4] {
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-5);
     [v[0] / len, v[1] / len, v[2] / len, 0.0]
+}
+
+/// Physical-camera exposure multiplier from an EV100 stop. `EV100 = log2(N²/t)` at ISO 100;
+/// the linear exposure that maps scene luminance to [0,1] before the filmic curve is
+/// `1 / (1.2 · 2^EV100)` (the 1.2 is the standard ISO 100 saturation-based constant, q·S/K).
+/// Higher EV100 = brighter scene / darker image (shorter exposure); sunny-16 ≈ EV15.
+fn ev100_to_exposure(ev100: f32) -> f32 {
+    1.0 / (1.2 * 2f32.powf(ev100))
 }
 
 /// Directional-light view-projection: an orthographic box centered on `center`,
