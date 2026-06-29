@@ -530,7 +530,14 @@ impl<'a> RenderGraph<'a> {
             list.reset_queries(p.heap, 0, p.heap.count());
         }
 
-        let mut backbuffer_is_rt = false;
+        // The backbuffer's first-use transition is the only cross-pass sequential
+        // bit; precompute which scheduled pass owns it (the first backbuffer writer)
+        // so per-pass recording needs no running flag (and can run out of order).
+        let first_backbuffer = compiled.schedule.iter().copied().find(|&i| {
+            let c = &self.passes[i].colors;
+            !c.is_empty() && self.resources[c[0].0.0].backbuffer
+        });
+
         for &pass_idx in &compiled.schedule {
             // Timestamp this pass's start boundary (query index = passes seen so far).
             if let (true, Some(p)) = (profile, profiler.as_mut()) {
@@ -538,137 +545,16 @@ impl<'a> RenderGraph<'a> {
                 list.write_timestamp(p.heap, idx);
                 p.names.push(self.passes[pass_idx].name.clone());
             }
-            // Name this pass's region for GPU captures (RenderDoc/PIX/NSight). The
-            // barriers + draws below land inside the marker; closed at the end of
-            // both the compute and graphics paths.
-            list.begin_debug_label(&self.passes[pass_idx].name);
-            // Barriers: reads -> sampled. A storage image read after a compute
-            // write transitions from UAV/GENERAL; plain color/depth from attachment.
-            for &r in &self.passes[pass_idx].reads {
-                if let Some(loc) = color_locs.get(&r) {
-                    if self.resources[r.0].storage {
-                        list.storage_to_sampled(pool.color_target(loc));
-                    } else {
-                        list.rt_to_sampled(pool.color_target(loc));
-                    }
-                } else if let Some(&slot) = depth_slots.get(&r) {
-                    list.depth_to_sampled(pool.depth(slot));
-                }
-            }
-
-            // Sampled-index map (color targets + depth/shadow maps), shared by both
-            // pass kinds.
-            let sampled: HashMap<ResourceId, u32> = self.passes[pass_idx]
-                .reads
-                .iter()
-                .filter_map(|&r| {
-                    if let Some(loc) = color_locs.get(&r) {
-                        Some((r, pool.color_target(loc).bindless_index()))
-                    } else {
-                        depth_slots
-                            .get(&r)
-                            .map(|&slot| (r, pool.depth(slot).bindless_index()))
-                    }
-                })
-                .collect();
-
-            // Compute pass: transition storage-image writes to UAV, then dispatch
-            // (no render pass). External storage-buffer writes barrier explicitly in
-            // the closure.
-            if self.passes[pass_idx].kind == PassKind::Compute {
-                for &w in &self.passes[pass_idx].storage_writes {
-                    if let Some(loc) = color_locs.get(&w) {
-                        list.rt_to_storage(pool.color_target(loc));
-                    }
-                }
-                let storage: HashMap<ResourceId, u32> = self.passes[pass_idx]
-                    .storage_writes
-                    .iter()
-                    .filter_map(|&w| {
-                        color_locs
-                            .get(&w)
-                            .and_then(|loc| pool.color_target(loc).storage_index().map(|i| (w, i)))
-                    })
-                    .collect();
-                let extent = self.passes[pass_idx]
-                    .storage_writes
-                    .iter()
-                    .find_map(|&w| color_locs.get(&w).map(|_| self.resources[w.0].extent))
-                    .unwrap_or_default();
-                let mut ctx = PassContext {
-                    cmd: list,
-                    sampled,
-                    storage,
-                    extent,
-                };
-                (self.passes[pass_idx].record)(&mut ctx)?;
-                list.end_debug_label();
-                continue;
-            }
-
-            // Transition this pass's depth attachment for writing (a shadow map
-            // reused across frames may be in shader-read from the prior frame).
-            let depth_ref = self.passes[pass_idx]
-                .depth
-                .map(|d| pool.depth(depth_slots[&d]));
-            if let Some(d) = depth_ref {
-                list.depth_to_render_target(d);
-            }
-
-            // Resolve the color attachments, transition them for writing, and
-            // begin the render pass. A depth-only pass (no colors) is a shadow
-            // map; the backbuffer (when written) is always a single attachment;
-            // other offscreen passes may write 1..N (MRT).
-            let colors = &self.passes[pass_idx].colors;
-            let extent = if colors.is_empty() {
-                let depth_id = self.passes[pass_idx]
-                    .depth
-                    .expect("depth-only pass needs a depth attachment");
-                let d = depth_ref.expect("depth-only pass needs a depth attachment");
-                list.begin_rendering_depth_only(d);
-                let extent = self.resources[depth_id.0].extent;
-                list.set_viewport_scissor_extent(extent);
-                extent
-            } else {
-                let first_res = &self.resources[colors[0].0.0];
-                let extent = first_res.extent;
-                if first_res.backbuffer {
-                    let clear = colors[0].1;
-                    if !backbuffer_is_rt {
-                        list.backbuffer_to_render_target();
-                        backbuffer_is_rt = true;
-                    }
-                    list.begin_backbuffer_rendering(clear, depth_ref);
-                    list.set_backbuffer_viewport();
-                } else {
-                    for &(id, _) in colors {
-                        let target = pool.color_target(&color_locs[&id]);
-                        if alias_barrier.get(&id).copied().unwrap_or(false) {
-                            list.aliasing_barrier(target);
-                        } else {
-                            list.rt_to_render_target(target);
-                        }
-                    }
-                    let targets: Vec<(&RenderTarget, Option<ClearColor>)> = colors
-                        .iter()
-                        .map(|&(id, clear)| (pool.color_target(&color_locs[&id]), clear))
-                        .collect();
-                    list.begin_rendering_targets(&targets, depth_ref);
-                    list.set_viewport_scissor_extent(extent);
-                }
-                extent
-            };
-
-            // Run the graphics pass's record closure.
-            let mut ctx = PassContext {
-                cmd: list,
-                sampled,
-                storage: HashMap::new(),
-                extent,
-            };
-            (self.passes[pass_idx].record)(&mut ctx)?;
-            list.end_rendering();
-            list.end_debug_label();
+            record_pass(
+                &mut self.passes[pass_idx],
+                &self.resources,
+                pool,
+                &color_locs,
+                &depth_slots,
+                &alias_barrier,
+                first_backbuffer == Some(pass_idx),
+                list,
+            )?;
         }
 
         // Final timestamp boundary, then resolve the whole heap (D3D12) for readback.
@@ -678,7 +564,7 @@ impl<'a> RenderGraph<'a> {
             list.resolve_queries(p.heap, count + 1);
         }
 
-        if backbuffer_is_rt {
+        if first_backbuffer.is_some() {
             list.backbuffer_to_present();
         }
 
@@ -796,6 +682,153 @@ impl<'a> RenderGraph<'a> {
             placements,
         })
     }
+}
+
+/// Record one scheduled pass's full IR sub-sequence — debug label, read→sampled
+/// barriers, attachment transitions + `begin_rendering`, the pass's record closure,
+/// and the closing `end_rendering`/label — onto `bucket`.
+///
+/// Free of `&self` and of any cross-pass sequential state (the one such bit, the
+/// backbuffer's first-use transition, is passed in as `is_first_backbuffer`), so it
+/// can run on a job worker into a private bucket and be concatenated back in
+/// schedule order (M4 B4). The profiler timestamp is recorded by the caller (it is
+/// inline-only and inherently sequential), just before this call.
+#[allow(clippy::too_many_arguments)]
+fn record_pass(
+    pass: &mut PassNode,
+    resources: &[Resource],
+    pool: &ResourcePool,
+    color_locs: &HashMap<ResourceId, ColorLoc>,
+    depth_slots: &HashMap<ResourceId, usize>,
+    alias_barrier: &HashMap<ResourceId, bool>,
+    is_first_backbuffer: bool,
+    bucket: &CommandList,
+) -> Result<(), EngineError> {
+    // Name this pass's region for GPU captures (RenderDoc/PIX/NSight); the barriers +
+    // draws below land inside the marker, closed at the end of both pass kinds.
+    bucket.begin_debug_label(&pass.name);
+    // Barriers: reads -> sampled. A storage image read after a compute write
+    // transitions from UAV/GENERAL; plain color/depth from attachment.
+    for &r in &pass.reads {
+        if let Some(loc) = color_locs.get(&r) {
+            if resources[r.0].storage {
+                bucket.storage_to_sampled(pool.color_target(loc));
+            } else {
+                bucket.rt_to_sampled(pool.color_target(loc));
+            }
+        } else if let Some(&slot) = depth_slots.get(&r) {
+            bucket.depth_to_sampled(pool.depth(slot));
+        }
+    }
+
+    // Sampled-index map (color targets + depth/shadow maps), shared by both kinds.
+    let sampled: HashMap<ResourceId, u32> = pass
+        .reads
+        .iter()
+        .filter_map(|&r| {
+            if let Some(loc) = color_locs.get(&r) {
+                Some((r, pool.color_target(loc).bindless_index()))
+            } else {
+                depth_slots
+                    .get(&r)
+                    .map(|&slot| (r, pool.depth(slot).bindless_index()))
+            }
+        })
+        .collect();
+
+    // Compute pass: transition storage-image writes to UAV, then dispatch (no render
+    // pass). External storage-buffer writes barrier explicitly in the closure.
+    if pass.kind == PassKind::Compute {
+        for &w in &pass.storage_writes {
+            if let Some(loc) = color_locs.get(&w) {
+                bucket.rt_to_storage(pool.color_target(loc));
+            }
+        }
+        let storage: HashMap<ResourceId, u32> = pass
+            .storage_writes
+            .iter()
+            .filter_map(|&w| {
+                color_locs
+                    .get(&w)
+                    .and_then(|loc| pool.color_target(loc).storage_index().map(|i| (w, i)))
+            })
+            .collect();
+        let extent = pass
+            .storage_writes
+            .iter()
+            .find_map(|&w| color_locs.get(&w).map(|_| resources[w.0].extent))
+            .unwrap_or_default();
+        let mut ctx = PassContext {
+            cmd: bucket,
+            sampled,
+            storage,
+            extent,
+        };
+        (pass.record)(&mut ctx)?;
+        bucket.end_debug_label();
+        return Ok(());
+    }
+
+    // Transition this pass's depth attachment for writing (a shadow map reused across
+    // frames may be in shader-read from the prior frame).
+    let depth_ref = pass.depth.map(|d| pool.depth(depth_slots[&d]));
+    if let Some(d) = depth_ref {
+        bucket.depth_to_render_target(d);
+    }
+
+    // Resolve the color attachments, transition them for writing, and begin the
+    // render pass. A depth-only pass (no colors) is a shadow map; the backbuffer (when
+    // written) is always a single attachment; other offscreen passes may write 1..N.
+    let colors = &pass.colors;
+    let extent = if colors.is_empty() {
+        let depth_id = pass
+            .depth
+            .expect("depth-only pass needs a depth attachment");
+        let d = depth_ref.expect("depth-only pass needs a depth attachment");
+        bucket.begin_rendering_depth_only(d);
+        let extent = resources[depth_id.0].extent;
+        bucket.set_viewport_scissor_extent(extent);
+        extent
+    } else {
+        let first_res = &resources[colors[0].0.0];
+        let extent = first_res.extent;
+        if first_res.backbuffer {
+            let clear = colors[0].1;
+            if is_first_backbuffer {
+                bucket.backbuffer_to_render_target();
+            }
+            bucket.begin_backbuffer_rendering(clear, depth_ref);
+            bucket.set_backbuffer_viewport();
+        } else {
+            for &(id, _) in colors {
+                let target = pool.color_target(&color_locs[&id]);
+                if alias_barrier.get(&id).copied().unwrap_or(false) {
+                    bucket.aliasing_barrier(target);
+                } else {
+                    bucket.rt_to_render_target(target);
+                }
+            }
+            let targets: Vec<(&RenderTarget, Option<ClearColor>)> = colors
+                .iter()
+                .map(|&(id, clear)| (pool.color_target(&color_locs[&id]), clear))
+                .collect();
+            bucket.begin_rendering_targets(&targets, depth_ref);
+            bucket.set_viewport_scissor_extent(extent);
+        }
+        extent
+    };
+
+    // Run the graphics pass's record closure.
+    let mut ctx = PassContext {
+        cmd: bucket,
+        sampled,
+        storage: HashMap::new(),
+        extent,
+    };
+    (pass.record)(&mut ctx)?;
+    bucket.end_rendering();
+    bucket.end_debug_label();
+    Ok(())
 }
 
 /// Round `value` up to a multiple of `align` (a power-of-two or any `>= 1`).
