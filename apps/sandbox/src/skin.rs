@@ -67,7 +67,7 @@ pub(crate) fn build_skinned_meshes(
     // a backend without it (Vulkan/D3D12 until animation Stage B.2c), skip skinning
     // entirely — the meshes then render their (static) bind pose via the normal path
     // rather than reading an un-updatable palette. Metal supports it (Shared storage).
-    let probe = device.create_storage_buffer_init(&storage_desc(64, 64), &[0u8; 64])?;
+    let probe = device.create_storage_buffer_host(&storage_desc(64, 64))?;
     if probe.write(&[0u8; 64]).is_err() {
         tracing::warn!(
             "GPU skinning unavailable on this backend (no storage-buffer host-write); \
@@ -129,8 +129,9 @@ pub(crate) fn build_skinned_meshes(
             let mut palette_bufs = Vec::with_capacity(FRAMES_IN_FLIGHT);
             let mut palette_idx = Vec::with_capacity(FRAMES_IN_FLIGHT);
             for _ in 0..FRAMES_IN_FLIGHT {
-                let pb =
-                    device.create_storage_buffer_init(&storage_desc(palette_size, 64), &zeros)?;
+                // Host-visible (B.2c): rebuilt + written every frame in `update_palettes`.
+                let pb = device.create_storage_buffer_host(&storage_desc(palette_size, 64))?;
+                pb.write(&zeros)?; // seed (the first frame's update overwrites it anyway)
                 palette_idx.push(pb.storage_index());
                 palette_bufs.push(pb);
             }
