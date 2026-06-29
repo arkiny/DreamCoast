@@ -552,6 +552,60 @@ impl D3d12Device {
         D3d12CommandBuffer::new(self.shared.clone())
     }
 
+    /// Drain the D3D12 debug-layer info queue into the tracing log and return the number of
+    /// ERROR/CORRUPTION messages seen (Phase 15 M4 B3 verification: the D3D12 debug layer writes
+    /// to OutputDebugString, invisible to our logs — this bridges it to tracing like the Vulkan
+    /// validation messenger, so threading violations surface where we can see them). No-op (0)
+    /// when the debug layer isn't active (the device doesn't expose an `ID3D12InfoQueue`).
+    pub fn drain_debug_messages(&self) -> u64 {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_MESSAGE, D3D12_MESSAGE_SEVERITY_CORRUPTION, D3D12_MESSAGE_SEVERITY_ERROR,
+            D3D12_MESSAGE_SEVERITY_WARNING, ID3D12InfoQueue,
+        };
+        let Ok(iq) = self.shared.device.cast::<ID3D12InfoQueue>() else {
+            return 0;
+        };
+        let mut errors = 0u64;
+        unsafe {
+            let n = iq.GetNumStoredMessages();
+            for i in 0..n {
+                let mut len: usize = 0;
+                if iq.GetMessage(i, None, &mut len).is_err() || len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; len];
+                let msg = buf.as_mut_ptr() as *mut D3D12_MESSAGE;
+                if iq.GetMessage(i, Some(msg), &mut len).is_err() {
+                    continue;
+                }
+                let m = &*msg;
+                let desc = if m.pDescription.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(m.pDescription as *const i8)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                match m.Severity {
+                    D3D12_MESSAGE_SEVERITY_CORRUPTION | D3D12_MESSAGE_SEVERITY_ERROR => {
+                        tracing::error!("D3D12 debug layer: {desc}");
+                        errors += 1;
+                    }
+                    // WARNING/INFO are demoted to debug: real workloads emit benign perf
+                    // warnings (e.g. a clear with no committed clear value) every frame, which
+                    // would flood the log. Only ERROR/CORRUPTION (the threading/correctness
+                    // signal) is surfaced by default; raise the log level to see the rest.
+                    D3D12_MESSAGE_SEVERITY_WARNING => {
+                        tracing::debug!("D3D12 debug layer (warn): {desc}");
+                    }
+                    _ => tracing::trace!("D3D12 debug layer: {desc}"),
+                }
+            }
+            iq.ClearStoredMessages();
+        }
+        errors
+    }
+
     /// Create a timestamp query heap of `count` queries (Phase 9 profiling).
     pub fn create_query_heap(
         &self,

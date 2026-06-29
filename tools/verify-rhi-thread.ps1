@@ -41,6 +41,31 @@ $fails = [System.Collections.Generic.List[string]]::new()
 
 function Hash($p) { (Get-FileHash -Algorithm SHA256 $p).Hash }
 
+# rt-compare avg abs diff / channel between two PNGs (0 if identical).
+function AvgDiff($a, $b) {
+    $out = & python tools/rt-compare.py $a $b "$OutDir/_tmp_diff.png" 2>&1
+    $m = $out | Select-String -Pattern 'avg abs diff / channel:\s*([\d.]+)' | Select-Object -First 1
+    if ($m) { [double]$m.Matches[0].Groups[1].Value } else { [double]::NaN }
+}
+
+# Gate: flag-on must match flag-off. Bit-exact when the backend is deterministic run-to-run
+# (Vulkan); when it is NOT (D3D12 has a ~1-LSB run-to-run jitter), require flag-on to stay within
+# the backend's own off-vs-off noise floor — i.e. the RHI thread adds nothing beyond it.
+function GateMatch($label, $off, $off2, $on) {
+    if ((Hash $off) -eq (Hash $on)) {
+        Write-Host "  [PASS] $label : flag-on == flag-off (bit-exact $(Hash $on))" -ForegroundColor Green
+        return $true
+    }
+    $noise = AvgDiff $off $off2          # backend's own run-to-run noise
+    $onVsOff = AvgDiff $off $on          # flag-on vs flag-off
+    if ($onVsOff -le ($noise + 0.0005)) {
+        Write-Host ("  [PASS] {0} : non-deterministic backend; flag-on within run-to-run noise (on-vs-off {1:n4} <= off-vs-off {2:n4})" -f $label, $onVsOff, $noise) -ForegroundColor Green
+        return $true
+    }
+    Write-Host ("  [FAIL] {0} : flag-on diverges beyond noise (on-vs-off {1:n4} > off-vs-off {2:n4})" -f $label, $onVsOff, $noise) -ForegroundColor Red
+    return $false
+}
+
 # Run one headless capture with the given env vars set just for this process call.
 function Capture {
     param([string]$Backend, [hashtable]$EnvVars, [string]$OutPng)
@@ -65,41 +90,30 @@ if ($LASTEXITCODE -ne 0) { throw "build failed" }
 foreach ($b in $Backends) {
     Write-Host "`n== backend: $b ==" -ForegroundColor Cyan
 
-    # 1+2: default capture, flag-off vs flag-on (bit-exact).
+    # 1+2: default capture. Two flag-off runs (noise floor) + one flag-on.
     $off = "$OutDir/${b}_off.png"
+    $off2 = "$OutDir/${b}_off2.png"
     $on = "$OutDir/${b}_on.png"
     Capture $b @{}                      $off
+    Capture $b @{}                      $off2
     Capture $b @{ P15_RHI_THREAD = '1' } $on
-    if ((Hash $off) -eq (Hash $on)) {
-        Write-Host "  [PASS] $b default: flag-on == flag-off  ($(Hash $off))" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  [FAIL] $b default: flag-on != flag-off" -ForegroundColor Red
-        Write-Host "         off=$(Hash $off)  on=$(Hash $on)"
-        $fails.Add("$b default off!=on")
-    }
+    if (-not (GateMatch "$b default" $off $off2 $on)) { $fails.Add("$b default off!=on") }
 
-    # 3: P15_SPIN motion sequence, flag-off vs flag-on, frame-for-frame.
+    # 3: P15_SPIN motion sequence — flag-off (x2 for noise) vs flag-on, frame-for-frame.
     $spinEnv = @{ P15_SPIN = '8'; CAPTURE_SEQ = '4'; CAPTURE_SEQ_STEP = '0' }
-    $soff = "$OutDir/${b}_spin_off.png"
-    $son = "$OutDir/${b}_spin_on.png"
-    Capture $b $spinEnv                                    $soff
-    Capture $b ($spinEnv + @{ P15_RHI_THREAD = '1' })      $son
+    Capture $b $spinEnv                                  "$OutDir/${b}_spin_off.png"
+    Capture $b $spinEnv                                  "$OutDir/${b}_spin_off2.png"
+    Capture $b ($spinEnv + @{ P15_RHI_THREAD = '1' })    "$OutDir/${b}_spin_on.png"
     $seqOk = $true
     foreach ($i in 0..3) {
         $fi = '{0:d4}' -f $i
         $a = "$OutDir/${b}_spin_off.$fi.png"
+        $a2 = "$OutDir/${b}_spin_off2.$fi.png"
         $c = "$OutDir/${b}_spin_on.$fi.png"
-        if (-not (Test-Path $a) -or -not (Test-Path $c)) { $seqOk = $false; continue }
-        if ((Hash $a) -ne (Hash $c)) { $seqOk = $false }
+        if (-not (Test-Path $a) -or -not (Test-Path $a2) -or -not (Test-Path $c)) { $seqOk = $false; continue }
+        if (-not (GateMatch "$b spin f$i" $a $a2 $c)) { $seqOk = $false }
     }
-    if ($seqOk) {
-        Write-Host "  [PASS] $b P15_SPIN seq: flag-on == flag-off (4 frames)" -ForegroundColor Green
-    }
-    else {
-        Write-Host "  [FAIL] $b P15_SPIN seq: frame mismatch off vs on" -ForegroundColor Red
-        $fails.Add("$b spin seq off!=on")
-    }
+    if (-not $seqOk) { $fails.Add("$b spin seq off!=on") }
 }
 
 # Cross-backend DX==VK parity on the flag-on captures (informational).
