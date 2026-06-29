@@ -715,6 +715,27 @@ impl MetalDevice {
         Ok(MetalStorageBuffer::new(buffer, index))
     }
 
+    /// Host-visible storage buffer (`StorageModeShared`) for per-frame CPU writes —
+    /// the GPU-skinning joint palette (animation Stage B.2c). Unified memory makes the
+    /// `Shared` buffer CPU-writable via `contents()`, so [`MetalStorageBuffer::write`]
+    /// works; registered in the same bindless table as the device-local variant. (The
+    /// device-local `create_storage_buffer` is `Private` — not a guaranteed host write.)
+    pub fn create_storage_buffer_host(
+        &self,
+        desc: &StorageBufferDesc,
+    ) -> Result<MetalStorageBuffer> {
+        let buffer = self
+            .shared
+            .device
+            .newBufferWithLength_options(
+                desc.size.max(1) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or_else(|| rhi_err("host storage buffer alloc failed"))?;
+        let index = self.shared.register_storage_buffer(&buffer);
+        Ok(MetalStorageBuffer::new(buffer, index))
+    }
+
     /// Host-seeded storage buffer (Phase 8 RT geometry + per-instance table read by
     /// the path tracer). Apple Silicon is unified-memory, so a `Shared` buffer is
     /// CPU-writable directly (no staging blit); register it in the bindless
