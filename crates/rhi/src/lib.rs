@@ -701,7 +701,7 @@ impl Device {
             #[cfg(windows)]
             Self::D3d12(d) => Ok(StorageBuffer::D3d12(d.create_storage_buffer_host(desc)?)),
             #[cfg(target_os = "macos")]
-            Self::Metal(d) => Ok(StorageBuffer::Metal(d.create_storage_buffer(desc)?)),
+            Self::Metal(d) => Ok(StorageBuffer::Metal(d.create_storage_buffer_host(desc)?)),
         }
     }
 
