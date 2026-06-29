@@ -1,5 +1,14 @@
 # RenderQuality 티어 (Phase 10 Stage D)
 
+> **렌더링 아키텍처 결정 (2026-06-29): 모든 티어는 SW-RT, HW-RT는 별도 옵션.**
+> `RenderQuality{Low,Med,High}` **세 티어 모두 GDF 소프트웨어 레이트레이싱(SW-RT)** 을 기본 렌더 경로로
+> 쓴다 — AO·diffuse GI(DDGI 라디언스 캐시 볼륨)·하이브리드 SW-RT 반사·surface cache. 티어는 그 SW-RT의
+> 샘플 수/해상도/디노이즈 강도만 조절한다(HW-RT를 끌어오지 않는다).
+> **하드웨어 레이트레이싱(DXR / VK_KHR)** 은 티어와 무관한 **명시적 옵션**으로 분리한다:
+> `--raytracing` 플래그(레거시 `P8_PATHTRACE` env도 유효)로 path tracer 전체 렌더를 켠다. 이는 SW-RT의
+> 정합 기준(ground truth)이자 HW-RT 데모 경로이며, 기본 렌더는 언제나 SW-RT다. (`P8_RT_DEBUG` RT-디버그
+> 뷰, `P8_CORNELL` 코넬박스 씬도 같은 부류의 분리된 opt-in.)
+>
 > **상태: 계획.** 트랙 전반에 흩어진 품질 노브를 단일 `RenderQuality{Low,Med,High}` enum 한 곳으로
 > 묶어 런타임/플랫폼별로 선택만 하면 되게 한다(저사양=저티어 폴백). 각 기능은 이미 "기본 off/저비용 +
 > env·플래그 seam"으로 설계돼 있으므로(`SHADOW_SOFTNESS`/`SOFT_SHADOWS`, `P11_*`, 셰이더 상수 블록),

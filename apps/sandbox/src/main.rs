@@ -1291,9 +1291,10 @@ impl App {
             && std::env::var_os("P_ASYNC_CACHE").is_some();
         gdf.set_cache_async(async_cache_on);
         let gpu_cull = compute_supported && std::env::var_os("P7_CULL").is_some();
-        // Phase 8 M3: replace the rasterized image with an inline ray-query trace.
-        let path_trace =
-            rt.has_trace() && rt.has_scene() && std::env::var_os("P8_PATHTRACE").is_some();
+        // Hardware ray tracing (DXR / VK_KHR) path tracer — the explicit `--raytracing` option
+        // (or the legacy `P8_PATHTRACE` env). Separate from the SW-RT RenderQuality tiers, which
+        // all use the GDF software path; this swaps the whole render for the HW-RT ground truth.
+        let path_trace = rt.has_trace() && rt.has_scene() && crate::app::raytracing_enabled();
         let rt_debug = device.has_raytracing() && std::env::var_os("P8_RT_DEBUG").is_some();
         let cornell = rt.has_cornell() && std::env::var_os("P8_CORNELL").is_some();
         let sdf_trace = gdf.has_sdf_trace() && std::env::var_os("P11_SDF").is_some();
