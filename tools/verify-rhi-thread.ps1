@@ -11,6 +11,9 @@
       2. flag-on (P15_RHI_THREAD=1) capture  ==  flag-off capture
          -> proves the worker's acquire/translate/submit/present + the `unsafe impl
             Send` on the boundary types are correct on this backend.
+      2b. parallel recording (P15_RHI_THREAD=1 P15_PARALLEL_RECORD=1) == flag-off
+         -> proves M4 B4 parallel per-pass IR recording has no data race (it must
+            produce deterministically identical IR).
       3. P15_SPIN motion sequence (4 frames): flag-on == flag-off, frame-for-frame
          -> proves the 1-frame overlap stays deterministic with moving objects.
 
@@ -98,6 +101,13 @@ foreach ($b in $Backends) {
     Capture $b @{}                      $off2
     Capture $b @{ P15_RHI_THREAD = '1' } $on
     if (-not (GateMatch "$b default" $off $off2 $on)) { $fails.Add("$b default off!=on") }
+
+    # 2b (M4 B4): parallel render-graph recording (threaded path only). Must match
+    # flag-off within the same noise floor — parallel produces deterministically
+    # identical IR, so this also checks the parallel recording has no data race.
+    $par = "$OutDir/${b}_par.png"
+    Capture $b @{ P15_RHI_THREAD = '1'; P15_PARALLEL_RECORD = '1' } $par
+    if (-not (GateMatch "$b parallel-record" $off $off2 $par)) { $fails.Add("$b parallel off!=on") }
 
     # 3: P15_SPIN motion sequence — flag-off (x2 for noise) vs flag-on, frame-for-frame.
     $spinEnv = @{ P15_SPIN = '8'; CAPTURE_SEQ = '4'; CAPTURE_SEQ_STEP = '0' }
