@@ -1219,9 +1219,11 @@ impl App {
             .unwrap_or(if gallery_scene {
                 [0.4, 0.8, 0.4]
             } else {
-                // ~35° elevation 3/4 angle: low enough to rake under the arcades and front/side-light
-                // the interior columns and floor, instead of the overhead sun that left them dark.
-                [-0.4, 0.35, 0.3]
+                // ~68° elevation, slightly off-axis. A narrow nave with ~12 m walls needs a HIGH sun
+                // to clear the walls and put direct light on the floor (a low sun is fully blocked —
+                // the wall shadow covers the whole nave); the slight X/Z tilt gives the columns
+                // raking shadows. The roofed side aisles stay indirect (bounce/ambient) as in reality.
+                [0.3, 0.9, 0.2]
             });
         let sun_intensity = std::env::var("SUN_LUX")
             .or_else(|_| std::env::var("SUN_INTENSITY"))
