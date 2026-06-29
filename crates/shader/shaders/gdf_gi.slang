@@ -56,6 +56,9 @@ struct GiPush
     // .w sits at +12 on all three backends; max_steps then gets its own clean 16-byte row.
     float4 ground_albedo;
     uint max_steps;         // Stage D3: bounce-ray march step cap (64 = legacy / gallery)
+    uint vol_r;             // GI irradiance-volume R sampled index (0xFFFFFFFF = off -> trace rays)
+    uint vol_g;             // green
+    uint vol_b;             // blue (4 contiguous uints w/ max_steps -> Metal-safe row, no float3 pad)
 };
 
 [[vk::push_constant]]
@@ -235,6 +238,26 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float2 ndc = float2(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * sy);
     float4 hpos = mul(pc.inv_view_proj, float4(ndc, depth, 1.0));
     float3 world_pos = hpos.xyz / hpos.w;
+
+    // GI irradiance-volume mode (DDGI-lite radiance cache): instead of marching per-pixel rays,
+    // sample the world-space irradiance volume (updated in gi_volume.slang with multibounce). This
+    // is the indirect E the lighting multiplies by albedo; it fills enclosed interiors a single
+    // bounce can't reach. Feeds the existing temporal+a-trous denoiser unchanged.
+    if (pc.vol_r != 0xFFFFFFFFu)
+    {
+        float3 uvw = (world_pos - GDF_MIN) / (GDF_MAX - GDF_MIN);
+        float3 e = float3(0.0, 0.0, 0.0);
+        if (all(uvw >= 0.0) && all(uvw <= 1.0))
+        {
+            uvw = saturate(uvw);
+            e = float3(g.volumes[pc.vol_r].SampleLevel(g.samp, uvw, 0.0).x,
+                       g.volumes[pc.vol_g].SampleLevel(g.samp, uvw, 0.0).x,
+                       g.volumes[pc.vol_b].SampleLevel(g.samp, uvw, 0.0).x);
+        }
+        g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
+        return;
+    }
+
     float3 n = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, uv, 0.0).xyz);
 
     uint spp = max(pc.spp, 1u);

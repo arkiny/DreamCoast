@@ -535,6 +535,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gdf_gi_cs",
     },
+    // UE GI-fidelity track: world-space irradiance volume (DDGI-lite radiance cache) update.
+    Job {
+        src: "gi_volume.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gi_volume_cs",
+    },
     // Stage D1 (Sponza 60fps): joint-bilateral upsample of the half-res GI to full res.
     Job {
         src: "gdf_gi_upsample.slang",
