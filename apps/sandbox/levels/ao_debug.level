@@ -1,0 +1,72 @@
+// AO debug scene — matte grey primitives on a ground plane arranged to exercise ambient
+// occlusion: a sphere + cube resting on the floor (contact AO), two cubes touching (a crease),
+// and a cube tucked into a wall corner. Use `LEVEL=ao_debug DEBUG_VIEW=9` to view the raw AO
+// factor (white = unoccluded, dark = occluded), or the lit image for the composited result.
+// Lighting is physical lux + a moderate sun so the ambient (where AO lives) is visible.
+(
+    entities: [
+        (
+            asset: "ground",
+            transform: (8.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            material_override: Some((
+                base_color_factor: (0.8, 0.8, 0.8, 1.0),
+                metallic: 0.0,
+                roughness: 0.95,
+            )),
+        ),
+        // Sphere resting on the floor — a soft contact-AO ring where it meets the ground.
+        (
+            asset: "sphere",
+            transform: (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -3.5, 1.0, 0.0, 1.0),
+            material_override: Some((base_color_factor: (0.8, 0.8, 0.8, 1.0), metallic: 0.0, roughness: 0.95)),
+        ),
+        // Cube resting on the floor — contact AO along the base edges.
+        (
+            asset: "cube",
+            transform: (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -0.5, 1.0, 0.0, 1.0),
+            material_override: Some((base_color_factor: (0.8, 0.8, 0.8, 1.0), metallic: 0.0, roughness: 0.95)),
+        ),
+        // Two cubes touching — a vertical crease that should darken strongly.
+        (
+            asset: "cube",
+            transform: (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.5, 1.0, -1.0, 1.0),
+            material_override: Some((base_color_factor: (0.8, 0.8, 0.8, 1.0), metallic: 0.0, roughness: 0.95)),
+        ),
+        (
+            asset: "cube",
+            transform: (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.5, 1.0, 1.0, 1.0),
+            material_override: Some((base_color_factor: (0.8, 0.8, 0.8, 1.0), metallic: 0.0, roughness: 0.95)),
+        ),
+        // A wall + a cube tucked against it — a 90° corner (floor + wall + box).
+        (
+            asset: "cube",
+            transform: (0.3, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 5.8, 2.0, 0.0, 1.0),
+            material_override: Some((base_color_factor: (0.8, 0.8, 0.8, 1.0), metallic: 0.0, roughness: 0.95)),
+        ),
+        (
+            asset: "cube",
+            transform: (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 4.5, 1.0, 0.0, 1.0),
+            material_override: Some((base_color_factor: (0.8, 0.8, 0.8, 1.0), metallic: 0.0, roughness: 0.95)),
+        ),
+    ],
+    lights: [
+        (
+            kind: Directional,
+            vec: (-0.3, -0.8, -0.4),
+            color: (1.0, 0.97, 0.92),
+            intensity: 100000.0,
+        ),
+    ],
+    camera: (
+        position: (0.0, 4.5, 11.0),
+        target: (1.0, 0.8, 0.0),
+        fov_y_deg: 50.0,
+        znear: 0.05,
+        zfar: 100.0,
+    ),
+    environment: (
+        sun_dir: (-0.3, -0.8, -0.4),
+        sun_intensity: 100000.0,
+        sky_tint: (0.6, 0.7, 0.9),
+    ),
+)
