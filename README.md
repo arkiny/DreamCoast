@@ -26,7 +26,8 @@ and D3D12 (≤ 0.001 avg/channel, verified on an RTX 2070 SUPER); Metal is at ne
   and a `RenderQuality{low,med,high}` tier sit on top.
   See [`docs/scalable-gi.md`](docs/scalable-gi.md), [`docs/gi-radiance-cache.md`](docs/gi-radiance-cache.md).
 - **Hardware ray tracing** — DXR + `VK_KHR_ray_tracing`, inline `RayQuery` and a full
-  RT pipeline; a path tracer is the ground-truth parity reference.
+  RT pipeline; a path tracer is the ground-truth parity reference. SW-RT is the default at
+  every quality tier — HW-RT is a separate, explicit option (`--raytracing`).
 - **Render graph** — per-frame graph with transient-resource aliasing; every technique
   hangs off it.
 - **Cooked assets** — meshes, scene SDF/albedo bakes, and BCn-compressed textures cook to
@@ -55,6 +56,10 @@ cargo run -p sandbox -- --backend vulkan      # or: --backend d3d12
 
 # macOS (defaults to Metal)
 cargo run -p sandbox -- --backend metal
+
+# Hardware ray tracing (DXR / VK_KHR path tracer). The default renderer is software-RT
+# (GDF) at every quality tier; HW-RT is a separate, explicit option:
+cargo run -p sandbox -- --backend d3d12 --raytracing
 ```
 
 Shaders compile from a single Slang source to SPIR-V + DXIL + metallib via `slangc`

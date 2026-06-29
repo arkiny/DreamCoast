@@ -239,3 +239,12 @@ pub(crate) fn select_backend() -> BackendKind {
 pub(crate) fn validation_enabled() -> bool {
     !std::env::args().skip(1).any(|a| a == "--no-validation")
 }
+
+/// Whether to render with the HARDWARE ray-tracing path tracer (DXR / VK_KHR) instead of the
+/// default software-RT (GDF) renderer. All `RenderQuality` tiers use SW-RT; HW-RT is a separate,
+/// explicit option — `--raytracing` (or the legacy `P8_PATHTRACE` env). Requires a GPU + scene
+/// with ray tracing available (it falls back to SW-RT otherwise).
+pub(crate) fn raytracing_enabled() -> bool {
+    std::env::args().skip(1).any(|a| a == "--raytracing")
+        || std::env::var_os("P8_PATHTRACE").is_some()
+}
