@@ -2027,7 +2027,23 @@ impl App {
                 self.spawn_rhi_thread()?;
             }
         }
+        // Debug: trigger one RenderDoc frame capture (RDOC_CAPTURE=1, under
+        // `renderdoccmd capture`). No-op when not running under RenderDoc.
+        #[cfg(windows)]
+        let mut rdoc = std::env::var_os("RDOC_CAPTURE")
+            .and_then(|_| renderdoc::RenderDoc::<renderdoc::V141>::new().ok());
+        #[cfg(windows)]
+        let mut rdoc_triggered = false;
         while !self.window.should_close() {
+            #[cfg(windows)]
+            if let Some(rd) = rdoc.as_mut()
+                && !rdoc_triggered
+                && self.frame_no >= 2
+            {
+                rd.trigger_capture();
+                rdoc_triggered = true;
+                info!("RenderDoc: frame capture triggered");
+            }
             if !self.frame()? {
                 break;
             }
