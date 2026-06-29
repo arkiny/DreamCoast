@@ -163,6 +163,39 @@ Verified (Metal): default `b9778dcc`; **AnimatedMorphCube** morphs (frames diffe
 run-to-run identical (deterministic); scene 34 + asset 18 tests; clippy/fmt clean. CPU
 math + existing pipeline → effectively backend-agnostic (VK/DX run the same draw).
 
+### Stage C optimization — faster morph (research, future)
+
+CPU morph (`base + Σ wᵢ·targetᵢ` over every vertex, re-uploaded each frame) is the slow
+path for big blendshape meshes (face rigs: 50–150 targets × 10k+ verts). The job-system
+parallelization (above) is the cheap first win; the bigger ones, ordered by payoff (per
+current literature + UE/Unity practice):
+
+1. **GPU compute / vertex-pulling morph** (the real fix). Move the blend to the GPU like
+   our GPU skinning (B.2): deltas in storage buffers, weights in a small per-frame buffer,
+   accumulated in a compute pass *or* directly in the skinning vertex shader (`vsMain*`
+   already vertex-pulls). UE enables exactly this on SM5 ("GPU calculation of morph
+   targets") so the CPU does no per-vertex work. The clean unification here is **one GPU
+   deform shader** (skin ⊕ morph) to avoid the skinned×morphed pipeline blowup — share the
+   storage-buffer read path that B.2 already built.
+2. **Sparse blendshapes** (biggest memory + bandwidth win). Store only the vertices a
+   target actually moves — typically ~80% smaller, since a facial expression touches <20%
+   of the mesh. Pair each target with a small index list; the compute/VS scatters only
+   those. Unity/Unreal ship sparse formats natively.
+3. **Per-frame "morph baking"** (UE 5.5): pre-sum the active targets into a single delta
+   buffer once per frame on the GPU, so the deform shader reads one delta stream regardless
+   of active-target count.
+4. **LOD / active-set culling**: cap simultaneously-active targets, drop or simplify morphs
+   at distance.
+
+Path for this engine: a `create_storage_buffer_host` palette/weights buffer + delta storage
+buffers (B.2c already added host-visible storage writes on all 3 backends), a unified
+skin+morph vertex shader, then sparse-index compaction. Full DX≡VK gate (shader + buffers).
+
+Sources: [Improving blendshape performance for crowds (GPU/GPGPU)](https://dl.acm.org/doi/10.1145/2994258.2994275),
+[UE5.5 performance highlights (morph baking, GPU skinning)](https://tomlooman.com/unreal-engine-5-5-performance-highlights/),
+[Blend shapes & morph targets — sparse/LOD overview](https://mocaponline.com/blogs/mocap-news/blend-shapes-morph-targets-guide),
+[Morph target animation overview](https://grokipedia.com/page/Morph_target_animation).
+
 ## Parallelization on the job system (planned)
 
 Animation work is CPU-heavy and embarrassingly parallel, so it should be distributed

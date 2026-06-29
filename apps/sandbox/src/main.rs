@@ -242,6 +242,18 @@ fn main() -> anyhow::Result<()> {
         unsafe { std::env::set_var("DREAMCOAST_LOG_FILE", path) };
     }
     init_logging();
+    // Size the job-system worker pool from the machine's core count before any
+    // parallel work (propagate / parallel record / morph) touches the global pool.
+    // Default = `available_parallelism() - 1` worker threads (the main thread is the
+    // other participant); `JOBS_THREADS=<n>` overrides for benchmarking.
+    let job_threads = std::env::var("JOBS_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    dreamcoast_jobs::init_global(job_threads);
+    info!(
+        "job system: {} worker threads (+ main)",
+        dreamcoast_jobs::global().num_workers()
+    );
     // Log any fatal error before it propagates: under a GPU capture tool
     // (RenderDoc) stdout/stderr are redirected away, so a bare `Err` return would
     // vanish. With `DREAMCOAST_LOG_FILE` set this lands the real cause in the file.
