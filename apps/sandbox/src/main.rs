@@ -897,7 +897,8 @@ impl App {
                 &mut material_registry,
                 &mut textures,
             )?;
-            let imported = dreamcoast_scene::instantiate_gltf(&mut world, &gscene, &prim_handles);
+            let (imported, node_map) =
+                dreamcoast_scene::instantiate_gltf_mapped(&mut world, &gscene, &prim_handles);
             // Place at native (1 unit = 1 m) scale under a wrapper root (so the whole
             // import can be spun/inspected); the camera frames it from its AABB below.
             let scene_root = world.spawn();
@@ -911,6 +912,34 @@ impl App {
                 .and_then(|v| v.parse::<f32>().ok());
             if let (Some(deg), Some(lt)) = (spin, world.get_mut::<LocalTransform>(scene_root)) {
                 lt.rotation = Quat::from_rotation_y(deg.to_radians());
+            }
+            // Animation Stage A: play one of the glTF's clips. `GLTF_ANIM[=<index>]`
+            // (default clip 0) attaches an `AnimationPlayer` whose channels target the
+            // imported node entities; the frame loop's `advance_animation` drives it.
+            // No-op without `GLTF_ANIM` or without node-TRS clips (byte-identical).
+            if let Ok(sel) = std::env::var("GLTF_ANIM") {
+                let idx = sel.trim().parse::<usize>().unwrap_or(0);
+                match gscene.animations.get(idx) {
+                    Some(anim) => {
+                        let clip = dreamcoast_scene::AnimationClip::from_gltf(anim, &node_map);
+                        if clip.is_empty() {
+                            info!("animation: clip {idx} has no node-TRS channels for this scene");
+                        } else {
+                            let dur = clip.duration;
+                            let player = world.spawn();
+                            world.insert(player, dreamcoast_scene::AnimationPlayer::new(clip));
+                            info!(
+                                "animation: playing clip {idx} '{}' ({} channels, {dur:.2}s)",
+                                anim.name.as_deref().unwrap_or("<unnamed>"),
+                                anim.channels.len(),
+                            );
+                        }
+                    }
+                    None => info!(
+                        "animation: no clip {idx} ({} available)",
+                        gscene.animations.len()
+                    ),
+                }
             }
             scene_bounds = registry::gltf_bounds(&gscene);
         } else {
@@ -2227,8 +2256,9 @@ impl App {
                 self.angle += step;
                 // Advance animated objects one deterministic step per captured frame
                 // so a CAPTURE_SEQ dump shows (reproducible) object motion, not just
-                // camera motion. No-op when no entity carries `Spin`.
+                // camera motion. No-op when no entity carries `Spin` / `AnimationPlayer`.
                 dreamcoast_scene::advance_spin(&mut self.world, FIXED_DT);
+                dreamcoast_scene::advance_animation(&mut self.world, FIXED_DT);
             }
             self.prev_angle = self.angle; // no interpolation when capturing
         } else {
@@ -2240,8 +2270,9 @@ impl App {
                 self.elapsed += FIXED_DT;
                 self.angle += FIXED_DT * 0.6;
                 // Animated objects advance one fixed step (framerate-independent,
-                // deterministic). No-op when nothing carries `Spin`.
+                // deterministic). No-op when nothing carries `Spin` / `AnimationPlayer`.
                 dreamcoast_scene::advance_spin(&mut self.world, FIXED_DT);
+                dreamcoast_scene::advance_animation(&mut self.world, FIXED_DT);
             }
             if steps == MAX_STEPS {
                 // Stalled longer than the cap: drop the backlog rather than chasing it.
