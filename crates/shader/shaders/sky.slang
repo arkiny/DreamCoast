@@ -54,84 +54,97 @@ float3 cube_direction(uint face, float2 uv)
     return normalize(dir);
 }
 
-// Physically-based daylight sky — Preetham et al., "A Practical Analytic Model for
-// Daylight" (SIGGRAPH 1999). The Perez luminance/chromaticity distribution fitted to
-// measured CIE clear-sky data, parameterised by turbidity. This replaces the ad-hoc
-// blue gradient: the integrated sky irradiance becomes a balanced daylight white (warm
-// near the horizon, blue at the zenith) instead of an over-saturated blue, so a sun-
-// shadowed interior is no longer flooded with unphysical blue. Output is linear HDR.
-static const float SKY_PI = 3.14159265359;
+// Physically-based atmosphere — single-scattering ray-march (Rayleigh + Mie + ozone) in
+// the spirit of Bruneton 2008 / Hillaire 2020 (UE5 Sky Atmosphere). Earth parameters; the
+// view ray is integrated through the atmosphere with a per-sample sun-transmittance march,
+// so the sky is physically derived from sun elevation: blue zenith, brighter/whiter horizon,
+// reddening as the sun nears the horizon. The env cube is generated infrequently (startup /
+// sun change), so the nested march is affordable without the full per-frame LUT pipeline.
+static const float ATM_PI = 3.14159265359;
+static const float PLANET_R = 6360.0; // km
+static const float ATMOS_R = 6460.0;  // km (100 km atmosphere)
+static const float3 RAY_BETA = float3(5.802, 13.558, 33.1) * 1e-3; // Rayleigh scattering /km (RGB)
+static const float MIE_BETA = 3.996e-3;   // Mie scattering /km
+static const float MIE_EXT = 4.44e-3;     // Mie extinction /km (scatter + absorb)
+static const float3 OZONE_BETA = float3(0.650, 1.881, 0.085) * 1e-3; // ozone absorption /km
+static const float H_RAY = 8.0; // Rayleigh scale height km
+static const float H_MIE = 1.2; // Mie scale height km
+static const float MIE_G = 0.8; // Mie phase asymmetry
 
-// Perez F(theta, gamma) = (1 + A e^{B/cos theta})(1 + C e^{D gamma} + E cos^2 gamma).
-float perez(float cos_theta, float gamma, float A, float B, float C, float D, float E)
+// (rayleigh, mie, ozone) density at altitude h (km). Ozone is a tent peaking ~25 km.
+float3 atm_density(float h)
 {
-    float ct = max(cos_theta, 0.01); // clamp at the horizon (1/cos blows up)
-    return (1.0 + A * exp(B / ct)) * (1.0 + C * exp(D * gamma) + E * cos(gamma) * cos(gamma));
+    return float3(exp(-h / H_RAY), exp(-h / H_MIE), max(0.0, 1.0 - abs(h - 25.0) / 15.0));
 }
 
-// xyY -> linear sRGB.
-float3 xyY_to_rgb(float x, float y, float Y)
+// Ray-sphere: returns (near, far) t; (-1,-1) on miss. Origin may be inside (near < 0).
+float2 atm_ray_sphere(float3 ro, float3 rd, float radius)
 {
-    float yy = max(y, 1e-4);
-    float X = x / yy * Y;
-    float Z = (1.0 - x - y) / yy * Y;
-    float3 rgb = float3(3.2404542 * X - 1.5371385 * Y - 0.4985314 * Z,
-                        -0.9692660 * X + 1.8760108 * Y + 0.0415560 * Z,
-                        0.0556434 * X - 0.2040259 * Y + 1.0572252 * Z);
-    return max(rgb, float3(0.0, 0.0, 0.0));
+    float b = dot(ro, rd);
+    float c = dot(ro, ro) - radius * radius;
+    float disc = b * b - c;
+    if (disc < 0.0)
+        return float2(-1.0, -1.0);
+    float s = sqrt(disc);
+    return float2(-b - s, -b + s);
+}
+
+// Transmittance from p toward `dir` to the atmosphere edge (8-tap optical-depth march).
+float3 atm_transmittance(float3 p, float3 dir)
+{
+    float t_top = atm_ray_sphere(p, dir, ATMOS_R).y;
+    if (t_top <= 0.0)
+        return float3(1.0, 1.0, 1.0);
+    const int N = 8;
+    float dt = t_top / float(N);
+    float3 od = float3(0.0, 0.0, 0.0); // (rayleigh, mie, ozone) optical-depth accumulators
+    for (int i = 0; i < N; i++)
+    {
+        float h = length(p + dir * (float(i) + 0.5) * dt) - PLANET_R;
+        od += atm_density(h) * dt;
+    }
+    float3 tau = RAY_BETA * od.x + MIE_EXT * od.y + OZONE_BETA * od.z;
+    return exp(-tau);
 }
 
 float3 procedural_sky(float3 dir, float3 sun_dir, float sun_intensity)
 {
-    const float T = 2.5; // turbidity: ~2-3 = clear sky
-    float theta_s = acos(clamp(sun_dir.y, 0.0, 1.0)); // sun zenith angle
-    float cos_theta = dir.y;                          // view: cos(zenith)
-    float cos_gamma = clamp(dot(dir, sun_dir), -1.0, 1.0);
-    float gamma = acos(cos_gamma); // angle between view and sun
+    float3 ro = float3(0.0, PLANET_R + 0.5, 0.0); // viewer ~500 m above the surface
+    float t_top = atm_ray_sphere(ro, dir, ATMOS_R).y;
+    float2 gnd = atm_ray_sphere(ro, dir, PLANET_R);
+    float t_max = (gnd.x > 0.0) ? gnd.x : t_top; // stop at the ground if the ray hits it
 
-    // Perez distribution coefficients (linear in turbidity), for Y / x / y.
-    float AY = 0.1787 * T - 1.4630, BY = -0.3554 * T + 0.4275, CY = -0.0227 * T + 5.3251,
-          DY = 0.1206 * T - 2.5771, EY = -0.0670 * T + 0.3703;
-    float Ax = -0.0193 * T - 0.2592, Bx = -0.0665 * T + 0.0008, Cx = -0.0004 * T + 0.2125,
-          Dx = -0.0641 * T - 0.8989, Ex = -0.0033 * T + 0.0452;
-    float Ay = -0.0167 * T - 0.2608, By = -0.0950 * T + 0.0092, Cy = -0.0079 * T + 0.2102,
-          Dy = -0.0441 * T - 1.6537, Ey = -0.0109 * T + 0.0529;
+    float cos_t = clamp(dot(dir, sun_dir), -1.0, 1.0);
+    float phaseR = 3.0 / (16.0 * ATM_PI) * (1.0 + cos_t * cos_t);
+    float g = MIE_G;
+    float phaseM = (1.0 - g * g)
+                   / (4.0 * ATM_PI * pow(1.0 + g * g - 2.0 * g * cos_t, 1.5));
 
-    // Zenith chromaticity (polynomial in turbidity + sun zenith angle).
-    float ts = theta_s, ts2 = ts * ts, ts3 = ts2 * ts, T2 = T * T;
-    float xz = T2 * (0.00166 * ts3 - 0.00375 * ts2 + 0.00209 * ts)
-               + T * (-0.02903 * ts3 + 0.06377 * ts2 - 0.03202 * ts + 0.00394)
-               + (0.11693 * ts3 - 0.21196 * ts2 + 0.06052 * ts + 0.25886);
-    float yz = T2 * (0.00275 * ts3 - 0.00610 * ts2 + 0.00317 * ts)
-               + T * (-0.04214 * ts3 + 0.08970 * ts2 - 0.04153 * ts + 0.00516)
-               + (0.15346 * ts3 - 0.26756 * ts2 + 0.06670 * ts + 0.26688);
-    // Zenith luminance (kcd/m^2); used relatively, scaled to the engine range below.
-    float chi = (4.0 / 9.0 - T / 120.0) * (SKY_PI - 2.0 * theta_s);
-    float Yz = (4.0453 * T - 4.9710) * tan(chi) - 0.2155 * T + 2.4192;
+    const int N = 24;
+    float dt = max(t_max, 0.0) / float(N);
+    float3 inscatter = float3(0.0, 0.0, 0.0);
+    float3 view_od = float3(0.0, 0.0, 0.0); // optical depth camera -> sample
+    for (int i = 0; i < N; i++)
+    {
+        float3 sp = ro + dir * (float(i) + 0.5) * dt;
+        float h = length(sp) - PLANET_R;
+        float3 d = atm_density(h) * dt;
+        view_od += d;
+        float3 view_tr = exp(-(RAY_BETA * view_od.x + MIE_EXT * view_od.y + OZONE_BETA * view_od.z));
+        float3 sun_tr = atm_transmittance(sp, sun_dir);
+        inscatter += (RAY_BETA * d.x * phaseR + MIE_BETA * d.y * phaseM) * sun_tr * view_tr;
+    }
+    // Sun illuminance scale: the engine's sun_intensity drives the whole atmosphere; the
+    // constant maps the per-km scattering integral into the engine's linear-radiance range.
+    float3 col = inscatter * sun_intensity * 6.0;
 
-    // Sky = zenith value * F(view) / F(zenith,sun). Below the horizon fades to a dim
-    // neutral ground so the env cube's lower hemisphere isn't black/negative.
-    float denomY = perez(cos(theta_s), 0.0, AY, BY, CY, DY, EY);
-    float fx = perez(cos_theta, gamma, Ax, Bx, Cx, Dx, Ex)
-               / perez(cos(theta_s), 0.0, Ax, Bx, Cx, Dx, Ex);
-    float fy = perez(cos_theta, gamma, Ay, By, Cy, Dy, Ey)
-               / perez(cos(theta_s), 0.0, Ay, By, Cy, Dy, Ey);
-    float fY = perez(cos_theta, gamma, AY, BY, CY, DY, EY) / max(denomY, 1e-3);
-    float x = xz * fx;
-    float y = yz * fy;
-    float Y = max(Yz, 0.0) * fY;
-
-    // Map kcd/m^2 luminance into the engine's linear-radiance range (calibrated so the
-    // overall scene brightness stays in the same ballpark as before).
-    const float SKY_SCALE = 0.05;
-    float3 col = xyY_to_rgb(x, y, Y) * SKY_SCALE;
-    if (cos_theta < 0.0)
-        col = lerp(col, float3(0.16, 0.15, 0.14) * 0.3, saturate(-cos_theta * 4.0));
-
-    // Sun: a sharp HDR disk plus a soft glow (the analytic sky already brightens near the
-    // sun via the Perez term; this adds the bright disk the IBL convolution needs).
-    float c = saturate(cos_gamma);
-    col += sun_intensity * (pow(c, 4000.0) * 6.0 + pow(c, 32.0) * 0.4);
+    // Sharp HDR sun disk (the IBL convolution turns it into the directional highlight); only
+    // when the view ray actually reaches the sky (not blocked by the ground).
+    if (gnd.x <= 0.0)
+    {
+        float c = saturate(cos_t);
+        col += atm_transmittance(ro, sun_dir) * sun_intensity * pow(c, 4000.0) * 8.0;
+    }
     return max(col, float3(0.0, 0.0, 0.0));
 }
 
