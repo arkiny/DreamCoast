@@ -143,6 +143,7 @@ pub(crate) fn run_triangle_test(
         bindless: false,
         uniform_buffer: false,
         depth_test: false,
+        depth_write: false,
         depth_format: None,
     })?;
 
@@ -292,6 +293,7 @@ pub(crate) fn run_mesh_test(
         bindless: true,
         uniform_buffer: false,
         depth_test: true,
+        depth_write: true,
         depth_format: Some(DEPTH_FORMAT),
     })?;
 

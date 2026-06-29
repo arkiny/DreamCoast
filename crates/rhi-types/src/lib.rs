@@ -268,13 +268,23 @@ pub enum VertexLayout {
     MeshPositionUv,
 }
 
-/// Color blending mode for the single color attachment.
+/// Color blending mode. `Opaque`/`AlphaBlend` apply uniformly to every color attachment;
+/// `DecalAlbedo` is a per-attachment **G-buffer decal** preset (see its docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlendMode {
-    /// Opaque (no blending).
+    /// Opaque (no blending), write all channels.
     Opaque,
-    /// Standard src-alpha / one-minus-src-alpha blending (UI).
+    /// Standard src-alpha / one-minus-src-alpha blending on every attachment (UI).
     AlphaBlend,
+    /// Deferred surface-decal preset for the deferred **G-buffer** MRT layout
+    /// (`RT0` albedo+AO, `RT1` normal, `RT2` material, `RT3` world-pos): attachment **0**
+    /// alpha-blends its RGB into the albedo with a write mask of **RGB only** (so the
+    /// baked AO in `RT0.a` is preserved), and every attachment **≥ 1** is write-masked
+    /// **off** — the decal leaves normal / metallic / roughness / world-pos untouched, so
+    /// the underlying surface keeps its own lighting inputs. This is what stops a decal
+    /// from overwriting the surface as opaque metal (the Intel Sponza `dirt_decal` fix).
+    /// Only meaningful for a pipeline rendering the G-buffer MRT set.
+    DecalAlbedo,
 }
 
 /// Graphics pipeline parameters.
@@ -304,8 +314,12 @@ pub struct GraphicsPipelineDesc<'a> {
     /// Whether the pipeline binds the per-frame globals uniform buffer (camera,
     /// lights, shadow, IBL). Only the deferred PBR passes opt in.
     pub uniform_buffer: bool,
-    /// Enable depth test + write (compare LESS).
+    /// Enable depth testing (compare LESS on Vulkan/D3D12, LESS_EQUAL on Metal).
     pub depth_test: bool,
+    /// Enable depth writes. Normally equal to `depth_test`; a deferred **decal** pass sets
+    /// `depth_test: true, depth_write: false` so it is occluded by closer geometry but does
+    /// not perturb the opaque depth buffer that downstream passes read.
+    pub depth_write: bool,
     /// Depth attachment format the pipeline renders against (`None` = no depth).
     pub depth_format: Option<Format>,
 }

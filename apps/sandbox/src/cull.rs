@@ -117,6 +117,7 @@ impl CullSystem {
                 bindless: true,
                 uniform_buffer: false,
                 depth_test: true,
+                depth_write: true,
                 depth_format: Some(DEPTH_FORMAT),
             })?)
         } else {

@@ -11,9 +11,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBlendFactor, MTLBlendOperation, MTLCompareFunction, MTLDepthStencilDescriptor, MTLDevice,
-    MTLFunction, MTLLibrary, MTLRenderPipelineDescriptor, MTLSize, MTLVertexDescriptor,
-    MTLVertexFormat, MTLVertexStepFunction,
+    MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCompareFunction,
+    MTLDepthStencilDescriptor, MTLDevice, MTLFunction, MTLLibrary, MTLRenderPipelineDescriptor,
+    MTLSize, MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
 };
 use rhi_types::{BlendMode, ComputePipelineDesc, GraphicsPipelineDesc, VertexLayout};
 
@@ -32,19 +32,40 @@ pub(crate) fn build(
     pd.setVertexFunction(Some(&vs));
     pd.setFragmentFunction(Some(&fs));
 
-    // Color attachments (one per format; MRT shares one blend mode).
+    // Color attachments (one per format). Opaque/AlphaBlend share one mode across all MRT;
+    // DecalAlbedo is per-attachment (RT0 blends RGB, the rest are write-masked off).
     let attachments = pd.colorAttachments();
     for (i, format) in desc.color_formats.iter().enumerate() {
         let attach = unsafe { attachments.objectAtIndexedSubscript(i) };
         attach.setPixelFormat(pixel_format(*format));
-        if matches!(desc.blend, BlendMode::AlphaBlend) {
-            attach.setBlendingEnabled(true);
-            attach.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
-            attach.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-            attach.setRgbBlendOperation(MTLBlendOperation::Add);
-            attach.setSourceAlphaBlendFactor(MTLBlendFactor::One);
-            attach.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-            attach.setAlphaBlendOperation(MTLBlendOperation::Add);
+        match desc.blend {
+            BlendMode::Opaque => {}
+            BlendMode::AlphaBlend => {
+                attach.setBlendingEnabled(true);
+                attach.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+                attach.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+                attach.setRgbBlendOperation(MTLBlendOperation::Add);
+                attach.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+                attach.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+                attach.setAlphaBlendOperation(MTLBlendOperation::Add);
+            }
+            // Deferred-decal preset (see `BlendMode::DecalAlbedo`): attachment 0 alpha-blends
+            // its RGB into the G-buffer albedo with a write mask of RGB only (A = baked AO is
+            // preserved); every other attachment is masked off so the decal leaves the rest of
+            // the G-buffer (normal / metallic / roughness / world-pos) untouched.
+            BlendMode::DecalAlbedo => {
+                if i == 0 {
+                    attach.setBlendingEnabled(true);
+                    attach.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+                    attach.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+                    attach.setRgbBlendOperation(MTLBlendOperation::Add);
+                    attach.setWriteMask(
+                        MTLColorWriteMask::Red | MTLColorWriteMask::Green | MTLColorWriteMask::Blue,
+                    );
+                } else {
+                    attach.setWriteMask(MTLColorWriteMask::empty());
+                }
+            }
         }
     }
 
@@ -67,7 +88,7 @@ pub(crate) fn build(
     let depth_stencil = if desc.depth_test {
         let dsd = MTLDepthStencilDescriptor::new();
         dsd.setDepthCompareFunction(MTLCompareFunction::LessEqual);
-        dsd.setDepthWriteEnabled(true);
+        dsd.setDepthWriteEnabled(desc.depth_write);
         Some(
             device
                 .newDepthStencilStateWithDescriptor(&dsd)

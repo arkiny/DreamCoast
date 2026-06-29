@@ -104,6 +104,7 @@ fn desc_from_override(ov: Option<MaterialOverride>) -> MaterialDesc {
             tex: [NO_TEXTURE; 4],
             albedo: representative_albedo(None, o.base_color_factor),
             alpha_cutoff: 0.0,
+            kind: dreamcoast_asset::MaterialKind::Opaque,
         },
         None => MaterialDesc {
             base_color: [0.8, 0.8, 0.8, 1.0],
@@ -112,6 +113,7 @@ fn desc_from_override(ov: Option<MaterialOverride>) -> MaterialDesc {
             tex: [NO_TEXTURE; 4],
             albedo: representative_albedo(None, [0.8, 0.8, 0.8, 1.0]),
             alpha_cutoff: 0.0,
+            kind: dreamcoast_asset::MaterialKind::Opaque,
         },
     }
 }
