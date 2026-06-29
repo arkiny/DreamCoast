@@ -166,12 +166,15 @@ impl GiSystem {
         let aop = self.ao_pipeline.as_ref().expect("gdf ao pipeline");
         let out = graph.create_storage_image("gdf_ao_out", HDR_FORMAT, extent);
         let sampled = scene_gdf.sampled_index();
-        // The scene extent sets the world-unit AO scale: a fraction of the AABB diagonal
-        // for the sampling reach + a small surface bias, with the clamp = full diagonal
-        // (exceeds the field's true max, so a query never wrongly clamps).
+        // AO is a LOCAL contact effect at a fixed physical scale (1 unit = 1 m), not a
+        // fraction of the whole scene: `diag * 0.07` is fine for a small gallery (diag ~4 ->
+        // 0.28 m) but on a building (Sponza diag ~37 -> 2.6 m) it treats every wall/column
+        // within 2.6 m as an occluder, so the whole interior reads as occluded and AO crushes
+        // the ambient (luma 58 -> 14). Cap the reach + bias to a physical contact distance so
+        // AO darkens only true corners/contacts regardless of scene size (PBR-correct local AO).
         let diag = Self::diag(aabb_min, aabb_max);
-        let reach = diag * 0.07;
-        let bias = diag * 0.004;
+        let reach = (diag * 0.07).min(0.5);
+        let bias = (diag * 0.004).min(0.02);
         let strength = 1.6;
         graph.add_compute_pass(
             ComputePassInfo {
