@@ -4496,6 +4496,11 @@ impl App {
         self.fif = (self.fif + 1) % FRAMES_IN_FLIGHT;
         self.frame_no += 1;
 
+        // Bridge the D3D12 debug layer into the log (it otherwise only reaches OutputDebugString).
+        // Catches validation/threading violations — e.g. the Phase 15 M4 B3 RHI submit thread's
+        // cross-thread queue submit / present. No-op on Vulkan (already bridged) / Metal.
+        self.device.drain_debug_messages();
+
         // In screenshot mode, stop once every requested capture is saved (CAPTURE_SEQ
         // dumps N frames, else one per requested path).
         let total_captures = self

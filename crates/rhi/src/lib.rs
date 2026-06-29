@@ -530,6 +530,21 @@ impl Device {
         }
     }
 
+    /// Drain backend debug-layer / validation messages into the tracing log, returning the count
+    /// of ERROR-severity messages. D3D12's debug layer otherwise only reaches OutputDebugString;
+    /// Vulkan already bridges validation via its debug messenger (so this is 0 there — nothing
+    /// queued) and Metal has no equivalent. Used to certify threading paths (Phase 15 M4 B3).
+    pub fn drain_debug_messages(&self) -> u64 {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(_) => 0,
+            #[cfg(windows)]
+            Self::D3d12(d) => d.drain_debug_messages(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(_) => 0,
+        }
+    }
+
     /// Whether a DXR-style ray-tracing *pipeline* (raygen/miss/closesthit + SBT,
     /// [`CommandBuffer::trace_rays`]) is available. True on Vulkan/D3D12 when ray
     /// tracing is supported; always false on Metal, whose hardware ray tracing is
