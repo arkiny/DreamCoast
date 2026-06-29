@@ -205,6 +205,10 @@ impl DeviceShared {
                 .shader_storage_image_write_without_format(true)
                 // The particle draw's vertex stage reads a storage buffer (UAV).
                 .vertex_pipeline_stores_and_atomics(true)
+                // The deferred lighting FRAGMENT stage reads the auto-exposure storage buffer
+                // (pbr.slang scene_exposure). Without this, a fragment-stage storage-buffer access
+                // through a writable (RW) bindless declaration trips VUID-RuntimeSpirv-NonWritable.
+                .fragment_stores_and_atomics(true)
                 // 1b: only requested + supported when P_ANISO opts in (else false = unchanged).
                 .sampler_anisotropy(max_anisotropy > 1.0);
             // RT feature structs (Phase 8) — only chained when the extensions are
