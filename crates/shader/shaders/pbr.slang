@@ -359,7 +359,11 @@ float4 fsMain(VSOutput input) : SV_Target
             * sun_shadow(world_pos, input.pos.xy);
     }
 
-    // Point lights.
+    // Point lights. point_color.a is the luminous intensity in CANDELA (lm/sr) — the same
+    // photometric unit as the lux sun, so the single end-of-pass exposure maps both. The inverse-
+    // square `atten` converts candela → illuminance (lux) at the surface: E = I / d². (glTF
+    // KHR_lights_punctual authors point/spot intensity in candela already; a light specified in
+    // lumens Φ converts as I = Φ / 4π.)
     int count = min(globals.counts.x, 4);
     for (int i = 0; i < count; ++i)
     {

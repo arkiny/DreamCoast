@@ -14,10 +14,11 @@ struct VSOutput
 
 struct PushConstants
 {
-    float4 sun;   // xyz = direction TO the sun (normalized), w = intensity
-    uint face;    // cube face index 0..5 (+X,-X,+Y,-Y,+Z,-Z)
-    uint flip_y;  // 0 = D3D12 (Y up), 1 = Vulkan (Y down)
-    uint2 pad;
+    float4 sun;     // xyz = direction TO the sun (normalized), w = intensity
+    uint face;      // cube face index 0..5 (+X,-X,+Y,-Y,+Z,-Z)
+    uint flip_y;    // 0 = D3D12 (Y up), 1 = Vulkan (Y down)
+    float sky_gain; // inscatter→radiance gain (sun:sky ratio knob; legacy 6.0)
+    uint pad;
 };
 
 [[vk::push_constant]]
@@ -107,7 +108,7 @@ float3 atm_transmittance(float3 p, float3 dir)
     return exp(-tau);
 }
 
-float3 procedural_sky(float3 dir, float3 sun_dir, float sun_intensity)
+float3 procedural_sky(float3 dir, float3 sun_dir, float sun_intensity, float sky_gain)
 {
     float3 ro = float3(0.0, PLANET_R + 0.5, 0.0); // viewer ~500 m above the surface
     float t_top = atm_ray_sphere(ro, dir, ATMOS_R).y;
@@ -134,9 +135,11 @@ float3 procedural_sky(float3 dir, float3 sun_dir, float sun_intensity)
         float3 sun_tr = atm_transmittance(sp, sun_dir);
         inscatter += (RAY_BETA * d.x * phaseR + MIE_BETA * d.y * phaseM) * sun_tr * view_tr;
     }
-    // Sun illuminance scale: the engine's sun_intensity drives the whole atmosphere; the
-    // constant maps the per-km scattering integral into the engine's linear-radiance range.
-    float3 col = inscatter * sun_intensity * 6.0;
+    // Sun illuminance scale: the engine's sun_intensity drives the whole atmosphere; `sky_gain`
+    // maps the per-km scattering integral into radiance and sets the sun:sky illuminance ratio
+    // (legacy 6.0 = the gallery anchor; content lowers it so the direct sun dominates the sky as
+    // it does physically, with interiors filled by multibounce GI rather than a flat sky ambient).
+    float3 col = inscatter * sun_intensity * sky_gain;
 
     // Sharp HDR sun disk (the IBL convolution turns it into the directional highlight); only
     // when the view ray actually reaches the sky (not blocked by the ground).
@@ -157,6 +160,6 @@ float3 procedural_sky(float3 dir, float3 sun_dir, float sun_intensity)
 float4 fsMain(VSOutput input) : SV_Target
 {
     float3 dir = cube_direction(pc.face, input.uv);
-    float3 col = procedural_sky(dir, normalize(pc.sun.xyz), pc.sun.w);
+    float3 col = procedural_sky(dir, normalize(pc.sun.xyz), pc.sun.w, pc.sky_gain);
     return float4(col, 1.0);
 }

@@ -334,6 +334,7 @@ impl IblSystem {
         ambient: f32,
         flip_y: u32,
         vulkan: bool,
+        sky_gain: f32,
     ) -> anyhow::Result<()> {
         let res = self.resources(ground_vbuf, ground_ibuf, ground_count);
         let init_cmd = device.create_command_buffer()?;
@@ -354,6 +355,7 @@ impl IblSystem {
                 ambient,
                 flip_y,
                 vulkan,
+                sky_gain,
             );
         }
         init_cmd.end()?;
@@ -383,6 +385,7 @@ impl IblSystem {
         ambient: f32,
         flip_y: u32,
         vulkan: bool,
+        sky_gain: f32,
     ) {
         let sun_changed = (sun_dir, sun_intensity) != self.last_sun;
         if !(realtime_env || !self.env_captured || sun_changed) {
@@ -415,6 +418,7 @@ impl IblSystem {
             ambient,
             flip_y,
             vulkan,
+            sky_gain,
         );
         self.last_written = write;
         self.env_parity += 1;
@@ -456,6 +460,7 @@ fn record_environment_capture(
     ambient: f32,
     flip_y: u32,
     vulkan: bool,
+    sky_gain: f32,
 ) {
     let env_index = write.env.bindless_index();
     let env_mips = write.env.mip_levels();
@@ -481,7 +486,7 @@ fn record_environment_capture(
             cmd.begin_rendering_cube_face(&write.env, face, mip, Some(ClearColor::BLACK));
             cmd.set_viewport_scissor_extent(Extent2D::new(size, size));
             cmd.bind_graphics_pipeline(ibl.sky_pipeline);
-            cmd.push_constants(&sky_push(sun_dir, sun_intensity, face, flip_y));
+            cmd.push_constants(&sky_push(sun_dir, sun_intensity, face, flip_y, sky_gain));
             cmd.draw(3, 1);
             cmd.end_rendering();
         }
