@@ -34,7 +34,7 @@ struct GdfPush
     uint height;
     uint flip_y;            // bit0: 1 = Vulkan (clip-space Y down)
     uint gdf_sampled;       // volumes[] (SRV) index of the merged GDF
-    uint mode;              // bit0: 1 = analytic reference field instead of the GDF
+    uint mode;              // bit0: 1 = analytic reference field; bit1: 1 = UE-style clay viz
     uint clip_desc;         // Stage B: clipmap descriptor storage-buffer index
     uint clip_count;        // Stage B: clipmap level count (1 = single volume = legacy)
     // The GDF world extent (the volume's AABB) + ground plane height in .w. B4 passes
@@ -219,16 +219,39 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     if (sphere_trace(pc.cam_pos.xyz, dir, hit_p))
     {
         float3 n = scene_normal(hit_p);
-        // Ground vs baked geometry: whichever term defines the surface here picks the
-        // albedo (no material in the GDF — Stage C adds a surface cache).
-        bool on_ground = (hit_p.y - GROUND_Y) < geo_inside(hit_p);
-        float3 albedo = on_ground ? float3(0.82, 0.82, 0.85) : float3(0.28, 0.55, 0.12);
         float ndl = max(dot(n, sun_dir), 0.0);
         float shadow = ndl > 0.0 ? soft_shadow(hit_p + n * 0.002, sun_dir, 24.0) : 1.0;
         float ao = calc_ao(hit_p, n);
-        float3 direct = albedo * sun_i * ndl * shadow;
-        float3 ambient = albedo * lerp(0.15, 0.35, saturate(n.y * 0.5 + 0.5)) * ao;
-        color = direct + ambient;
+        if ((pc.mode & 2u) != 0u)
+        {
+            // UE-style "Visualize Global Distance Field" (DistanceFieldVisualization.usf):
+            // a single neutral *clay* albedo so the image reads the GDF's resolved SHAPE and
+            // gradient normal — not a fake surface color. UE shades N·L (directional) + a sky
+            // fill, NO hard shadow — so the clay reads smoothly. We map an ambient-lifted N·L
+            // into the scene's exposure (× sun_i, like the lit path) so it survives the shared
+            // tonemap without crushing to black/white. AO adds contact depth. Toggling the GDF
+            // source (fused vs per-mesh composite) under this view shows what each resolves.
+            const float3 clay = float3(0.6, 0.6, 0.62);
+            // Shade at the SAME magnitude as the real direct term (× sun_i × 1/π) so it lands
+            // mid-grey under the scene's shared tonemap exposure — not blown white. No hard
+            // self-shadow (UE's viz doesn't shadow); a sun_i-scaled hemispheric ambient lifts
+            // shaded faces to dark-grey instead of black. AO adds contact depth.
+            const float INV_PI = 0.31830989;
+            float3 direct = clay * sun_i * ndl * INV_PI;
+            float3 ambient =
+                clay * sun_i * INV_PI * 0.25 * lerp(0.6, 1.0, saturate(n.y * 0.5 + 0.5)) * ao;
+            color = direct + ambient;
+        }
+        else
+        {
+            // Ground vs baked geometry: whichever term defines the surface here picks the
+            // albedo (no material in the GDF — Stage C adds a surface cache).
+            bool on_ground = (hit_p.y - GROUND_Y) < geo_inside(hit_p);
+            float3 albedo = on_ground ? float3(0.82, 0.82, 0.85) : float3(0.28, 0.55, 0.12);
+            float3 direct = albedo * sun_i * ndl * shadow;
+            float3 ambient = albedo * lerp(0.15, 0.35, saturate(n.y * 0.5 + 0.5)) * ao;
+            color = direct + ambient;
+        }
     }
     else
     {
