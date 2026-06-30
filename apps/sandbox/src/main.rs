@@ -633,6 +633,10 @@ struct App {
     gi_half_res: bool,
     /// P1 (Lumen-parity): GI trace divisor when `gi_half_res` is on (2 = half, 4 = quarter probes).
     gi_res_div: u32,
+    /// Screen-space radiance probe GI: replace the world-volume / ray-march GI consumption with
+    /// per-tile screen probes traced into an octahedral atlas + a per-pixel gather. Content-only
+    /// (`SCREEN_PROBE`); the gallery keeps its current GI path (byte-identical anchor).
+    screen_probe: bool,
     /// Reflection temporal history clamp (0 off / 1 hard / 2 variance; gallery forced 0) + variance γ.
     reflect_history_clamp: u32,
     reflect_clamp_gamma: f32,
@@ -1789,6 +1793,12 @@ impl App {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(qp.gi_res_div)
             .clamp(1, 16);
+        // Screen-space radiance probe GI (P1+): opt-in. Replaces the GI consumption (world-volume
+        // sample / per-pixel ray march) with per-tile screen probes + a per-pixel gather. Default
+        // OFF, so the gallery anchor (no env) stays byte-identical; an explicit `SCREEN_PROBE=1`
+        // turns it on for any scene — including the gallery, so the technique can be measured
+        // against the path-traced ground truth (the only path-traceable scene).
+        let screen_probe = gi.has_screen_probe() && quality::env_bool("SCREEN_PROBE", false);
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
         let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", qp.gi_denoise);
         // C5 screen-space reflections (viz toggle).
@@ -2161,6 +2171,7 @@ impl App {
             reflect_half_res,
             gi_half_res,
             gi_res_div,
+            screen_probe,
             reflect_history_clamp,
             reflect_clamp_gamma,
             gi_temporal_clamp,
@@ -3790,6 +3801,57 @@ impl App {
         // path and consumed by the lighting (occludes the IBL diffuse skylight). `None` otherwise.
         let mut gi_skyvis_out: Option<ResourceId> = None;
         let gdf_gi_out = match (self.gdf_gi, scene_gdf_vol, scene_gdf_ext) {
+            (true, Some(vol), Some(ext)) if self.screen_probe => {
+                // Screen-space radiance probes (P1+): per-tile probe trace into an octahedral
+                // atlas + a per-pixel gather replace the GI consumption (world-volume sample /
+                // ray march). Full-res output; denoise (temporal + à-trous) for stability like the
+                // ray-march path. Indoor skylight occlusion (sky-vis) is reintroduced in P3.
+                let traced = self.gi.record_screen_probe(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    extent,
+                    inv_view_proj,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    cw,
+                    ch,
+                    self.flip_y,
+                    self.frame_no as u32,
+                    scene_albedo,
+                    gi_cache_arg,
+                    firefly_max,
+                    scene_clip,
+                    &scene_clip_vols,
+                    self.gi_max_steps,
+                    self.gdf_cone_k,
+                );
+                gi_skyvis_out = None;
+                let out = if gi_denoise_active {
+                    self.gi.record_denoise(
+                        &mut graph,
+                        traced,
+                        g_depth,
+                        g_normal,
+                        extent,
+                        inv_view_proj,
+                        self.prev_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        temporal_flip,
+                        self.gi_temporal_clamp,
+                    )
+                } else {
+                    traced
+                };
+                Some(out)
+            }
             (true, Some(vol), Some(ext)) => {
                 // Stage D1: trace at half res (1/4 the rays) when enabled, then joint-bilateral
                 // upsample to full res before the denoiser. gdf_gi.slang samples the G-buffer by
