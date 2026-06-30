@@ -498,6 +498,7 @@ pub(crate) fn cache_capture_push(
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     dist_clamp: f32,
+    card_albedo_index: u32,
 ) -> [u8; 80] {
     let mut pc = [0u8; 80];
     let u = [
@@ -520,6 +521,9 @@ pub(crate) fn cache_capture_push(
     for (i, v) in aabb_min.iter().enumerate() {
         pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
+    // C: pack the per-card source-albedo buffer index into the unused `aabb_min.w` slot
+    // (bytes 60..64) — no layout/size change (DX≡VK-safe). 0xFFFFFFFF ⇒ legacy volume path.
+    pc[60..64].copy_from_slice(&card_albedo_index.to_le_bytes());
     for (i, v) in aabb_max.iter().enumerate() {
         pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
