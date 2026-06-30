@@ -73,6 +73,20 @@ S0,S1(완료) → G1(퀵윈, 독립) → G2(GPU composite) → G3(static/dynamic
 ```
 G1·C는 즉시 착수 가능(독립). G2가 동적(G3)·일부 sparse(G4) 빌드의 토대.
 
+## 디버그 뷰 — UE "Visualize Global Distance Field" (구현됨)
+UE `DistanceFieldVisualization.usf`(`VisualizeMeshDistanceFieldCS`, `USE_GLOBAL_DISTANCE_FIELD`)를
+따라 `gdf_trace.slang`에 **clay 뷰**(mode bit1) 추가: 카메라 레이로 씬 클립맵을 sphere-march →
+gradient-normal N·L를 **중립 clay 단색**(가짜 표면색·하드섀도우 없음)으로 셰이딩 → 필드가 실제로
+해상하는 지오메트리를 읽는다. `P11_SCENE_GDF=1`로 활성, `GDF_VIEW_GAIN`(기본 0.05)이 씬 HDR 태양을
+공유 톤맵에서 mid-grey로. **검증(Metal, sponza_intel)**: fused GDF가 깔끔한 clay(기둥·아치·blobby
+커튼 덩어리·바닥; 열린 nave=검정)로 읽힘.
+
+**★ 뷰가 즉시 잡아낸 버그(이 뷰의 가치)**: per-mesh 합성(`P11_PERMESH_GDF`)은 **primary 트레이스에서
+degenerate**(flat clay = 카메라가 어디서나 "내부"로 읽힘). GI 바운스(짧은 레이)는 견뎠지만 카메라
+레이가 드러냄. 원인 후보 = 한 메시의 비일관 노멀(커튼 doubleSided 등) per-mesh DF가 음수 영역으로
+`min` 합성을 오염 → 열린 공간이 "내부". **G2의 정합성 선결 과제**(watertight 처리 / ray-stabbing 부호 /
+음수 영역 클램프). 단일 소스 합성기(`compose.rs`)에서 수정.
+
 ## 잘 맞는 부분(유지) — 회귀 주의
 - 소비측 SW march(AO/GI/반사) + `gdf_cone_k` cone-LOD + **GTAO(근거리)×DFAO(원거리) 레이어링**
   (`gtao.slang`)은 UE GTAO×DFAO를 그대로 따름 → 표현/업데이트 리팩터 중 **소비 인터페이스 불변** 유지.
