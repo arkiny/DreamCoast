@@ -107,6 +107,18 @@ pub fn classify_material(name: Option<&str>, alpha_mode: AlphaMode) -> MaterialK
     }
 }
 
+/// Alpha-test cutoff applied to `Transparent` (non-decal `BLEND`) materials so foliage and other
+/// thin alpha surfaces render as **alpha-tested cutouts** in the deferred pipeline. A deferred
+/// G-buffer can't do true order-independent transparency, so a `BLEND` leaf/grate would otherwise
+/// fall back to an opaque quad (its alpha ignored → a solid card). Treating it as a cutout instead
+/// reconstructs the shape from the base-color alpha (the Intel Sponza cypress `LeafSpring` keeps no
+/// `alphaCutoff` of its own — its leaf silhouette lives entirely in the texture alpha). glTF's own
+/// `MASK` default cutoff is `0.5`; matching it keeps one consistent threshold for every cutout. The
+/// soft-edged upgrade (hashed/dithered alpha resolved by TAA) keeps this as its hard-test fallback.
+/// **Single source** for the foliage cutoff — derived once at import in [`load_gltf_scene`]; true
+/// glass/transparency (track B forward OIT) will route around it.
+pub const FOLIAGE_ALPHA_CUTOFF: f32 = 0.5;
+
 /// A material with its texture slots referenced by **image index** (into
 /// [`GltfScene::images`]) so shared images upload once.
 pub struct GltfMaterial {
@@ -211,13 +223,16 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<GltfScene, EngineError>
                 gltf::material::AlphaMode::Mask => AlphaMode::Mask,
                 gltf::material::AlphaMode::Blend => AlphaMode::Blend,
             };
-            // Only MASK is alpha-tested; OPAQUE/BLEND carry no cutoff. glTF's default cutoff
-            // is 0.5 when MASK omits `alphaCutoff`.
-            let alpha_cutoff = match alpha_mode {
-                AlphaMode::Mask => m.alpha_cutoff().unwrap_or(0.5),
-                _ => 0.0,
-            };
             let kind = classify_material(m.name(), alpha_mode);
+            // Cutoff feeds the G-buffer + shadow alpha-test discard. `MASK` carries glTF's own
+            // cutoff (default 0.5). A non-decal `BLEND` surface (`Transparent` — foliage/grates)
+            // has no true-OIT path here, so it renders as a cutout at a derived foliage cutoff
+            // (see [`FOLIAGE_ALPHA_CUTOFF`]); `OPAQUE` and decals carry none.
+            let alpha_cutoff = match kind {
+                MaterialKind::Masked => m.alpha_cutoff().unwrap_or(0.5),
+                MaterialKind::Transparent => FOLIAGE_ALPHA_CUTOFF,
+                MaterialKind::Opaque | MaterialKind::Decal => 0.0,
+            };
             GltfMaterial {
                 base_color_factor: pbr.base_color_factor(),
                 metallic_factor: pbr.metallic_factor(),
