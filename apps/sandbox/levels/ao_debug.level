@@ -67,6 +67,6 @@
     environment: (
         sun_dir: (-0.3, -0.8, -0.4),
         sun_intensity: 100000.0,
-        sky_tint: (0.6, 0.7, 0.9),
+        sky_white_balance: (1.0, 1.0, 1.0),
     ),
 )

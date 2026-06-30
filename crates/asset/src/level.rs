@@ -109,7 +109,11 @@ impl Default for Camera {
 pub struct Environment {
     pub sun_dir: [f32; 3],
     pub sun_intensity: f32,
-    pub sky_tint: [f32; 3],
+    /// Per-channel gain on the procedural sky radiance — the env capture that drives the visible
+    /// sky plus the IBL irradiance/prefilter cubes (hence the IBL and SW-RT GI ambient). A value of
+    /// `(1, 1, 1)` is neutral; warming it (e.g. `(1.2, 1.05, 0.8)`) takes the blue out of a high-sun
+    /// sky's ambient without tinting the direct sun. The `SKY_WB` env var overrides it.
+    pub sky_white_balance: [f32; 3],
 }
 
 impl Default for Environment {
@@ -117,7 +121,7 @@ impl Default for Environment {
         Self {
             sun_dir: [-0.4, -1.0, -0.3],
             sun_intensity: 3.0,
-            sky_tint: [0.6, 0.7, 0.9],
+            sky_white_balance: [1.0, 1.0, 1.0],
         }
     }
 }

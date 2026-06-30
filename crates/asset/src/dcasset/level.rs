@@ -75,7 +75,7 @@ fn encode_level(level: &LevelData) -> Vec<u8> {
         w.f32(v);
     }
     w.f32(env.sun_intensity);
-    for v in env.sky_tint {
+    for v in env.sky_white_balance {
         w.f32(v);
     }
     w.buf
@@ -139,7 +139,7 @@ fn decode_level(r: &mut Reader) -> Result<LevelData, EngineError> {
     let environment = Environment {
         sun_dir: vec3(r)?,
         sun_intensity: r.f32()?,
-        sky_tint: vec3(r)?,
+        sky_white_balance: vec3(r)?,
     };
 
     Ok(LevelData {
@@ -200,7 +200,7 @@ mod tests {
             environment: Environment {
                 sun_dir: [-0.3, -0.9, -0.2],
                 sun_intensity: 4.0,
-                sky_tint: [0.6, 0.7, 0.95],
+                sky_white_balance: [1.0, 0.95, 0.9],
             },
         };
         let bytes = write_level(&level, 0x1e7e1);

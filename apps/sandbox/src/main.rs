@@ -535,6 +535,10 @@ struct App {
     /// capture (`sky.slang`). Legacy 6.0 (gallery anchor); content lowers it so the direct sun
     /// dominates the sky physically, interiors filled by multibounce GI. `SKY_GAIN` overrides.
     sky_gain: f32,
+    /// Sky white balance — per-channel gain on the procedural sky radiance fed to the env capture
+    /// (`sky.slang`). Warms/neutralises the IBL + SW-RT GI ambient (the sky-sourced fill) without
+    /// tinting the direct sun. `[1,1,1]` = neutral (no-op). `SKY_WB`/level `sky_white_balance` set it.
+    sky_wb: [f32; 3],
     /// Physical-camera auto-exposure: meter the lit HDR each frame and adapt the exposure (vs the
     /// fixed EV100). Opt-in (`AUTO_EXPOSURE`); off → the lighting uses the static `exposure` and is
     /// byte-identical (the gallery anchor never auto-exposes).
@@ -879,6 +883,8 @@ impl App {
         let mut level_view: Option<(Vec3, Vec3)> = None;
         // A level's lighting, replacing the gallery's code-default sun + point lights.
         let mut level_lighting_override: Option<LevelLighting> = None;
+        // A level's sky white balance (per-channel sky-radiance gain), captured for the IBL.
+        let mut level_sky_wb: Option<[f32; 3]> = None;
 
         if world_mode {
             // Stage D: load the level graph + the level files its chunks reference.
@@ -907,6 +913,7 @@ impl App {
             let level = level::load(std::path::Path::new(&level_paths[current_level]))?;
             level_view = level::level_camera(&level);
             level_lighting_override = Some(level_lighting(&level));
+            level_sky_wb = Some(level.environment.sky_white_balance);
             scene_bounds = level::build_level(
                 &device,
                 &level,
@@ -1449,6 +1456,14 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(6.0)
             .max(0.0);
+        // Sky white balance — a per-channel gain on the procedural sky radiance (env capture), so it
+        // warms/neutralises the IBL + SW-RT GI ambient without tinting the direct sun. Resolved like
+        // the sun: `SKY_WB="r,g,b"` env wins, else the loaded level's `environment.sky_white_balance`,
+        // else neutral `[1,1,1]` (a no-op → byte-identical to the pre-knob capture).
+        let sky_wb = parse_vec3_env("SKY_WB")
+            .map(|v| [v.x, v.y, v.z])
+            .or(level_sky_wb)
+            .unwrap_or([1.0, 1.0, 1.0]);
         // Physical-camera auto-exposure (see the field). Opt-in, never the gallery (fixed-exposure
         // anchor), and only when the metering pipeline built.
         let auto_exposure = std::env::var_os("AUTO_EXPOSURE").is_some()
@@ -1783,6 +1798,7 @@ impl App {
             flip_y,
             backend == BackendKind::Vulkan,
             sky_gain,
+            sky_wb,
         )?;
 
         let mut window = window;
@@ -1892,6 +1908,7 @@ impl App {
                 })
                 .max(0.0),
             sky_gain,
+            sky_wb,
             auto_exposure,
             gi_multibounce: std::env::var("P_GI_MULTIBOUNCE")
                 .ok()
@@ -3192,6 +3209,7 @@ impl App {
             self.flip_y,
             self.backend == BackendKind::Vulkan,
             self.sky_gain,
+            self.sky_wb,
         );
 
         // The main lighting pass samples the most recently written set.
