@@ -32,7 +32,8 @@ struct PushConstants
 {
     float4x4 light_mvp;  // light view-projection (model is identity)
     uint base_color_tex; // base-color bindless index (NO_TEXTURE if absent)
-    float alpha_cutoff;  // >0 = masked (alpha-test); 0 = opaque (no test)
+    float alpha_cutoff;  // |cutoff| = alpha-test threshold (0 = opaque). Sign selects the
+                         // G-buffer's hard-vs-hashed mode; the shadow always uses |cutoff|.
     float2 _pad;
     // GPU skinning (Stage B.2b): bindless storage-buffer indices for joints / weights /
     // palette + joint count. Only read by `vsMainSkinned`; unused on the static path.
@@ -122,12 +123,16 @@ VSOutput vsMainMorphed(VSInput input, uint vid : SV_VertexID)
 void fsMain(VSOutput input)
 {
     // Opaque (cutoff 0) never touches the texture -> depth-only, byte-identical to the
-    // pre-mask pass. Masked materials discard sub-cutoff texels so the shadow has the
-    // same holes as the lit geometry (uses the wrap sampler to match the G-buffer).
-    if (pc.alpha_cutoff > 0.0 && pc.base_color_tex != NO_TEXTURE)
+    // pre-mask pass. Masked / foliage materials discard sub-cutoff texels so the shadow has
+    // the same holes as the lit geometry (uses the wrap sampler to match the G-buffer). The
+    // G-buffer may render this leaf with HASHED alpha (signalled by a negative cutoff), but the
+    // shadow map isn't TAA-resolved, so it always uses the |cutoff| hard test for a crisp,
+    // noise-free cutout shadow.
+    float cutoff = abs(pc.alpha_cutoff);
+    if (cutoff > 0.0 && pc.base_color_tex != NO_TEXTURE)
     {
         float a = g.textures[pc.base_color_tex].Sample(g.samp_wrap, input.uv).a;
-        if (a < pc.alpha_cutoff)
+        if (a < cutoff)
             discard;
     }
 }

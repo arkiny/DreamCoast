@@ -1121,7 +1121,7 @@ impl App {
         // Materialize the ECS draw list into the flat `SceneObject` list the GPU passes
         // consume. (Static scene → built once; later stages rebuild on scene change. In
         // world mode `world` is empty — the per-frame list comes from the streamer.)
-        let scene = build_scene(&world, &mesh_registry, &material_registry);
+        let mut scene = build_scene(&world, &mesh_registry, &material_registry);
         // Decal/transparent census. Decals are tinted into the G-buffer by the deferred decal
         // pass (`record_decals`); transparents still fall back to opaque (track B).
         {
@@ -1139,6 +1139,28 @@ impl App {
                     "material kinds: {decals} decal (deferred decal pass), {transparents} \
                      transparent (opaque fallback) of {} drawables",
                     scene.len()
+                );
+            }
+        }
+        // Foliage soft edges (opt-in, approach C). By default `Transparent` foliage renders as a
+        // crisp alpha-tested cutout (positive `alpha_cutoff`). `FOLIAGE_HASHED=1` flips that cutoff
+        // NEGATIVE for foliage drawables, which switches gbuffer.slang to a world-space hashed
+        // (stochastic) alpha test; the camera's sub-pixel TAA jitter then resolves the dither into
+        // soft, translucent leaf edges — so pair it with `P_TAAU_FORCE=1` (TAA at native res). The
+        // magnitude is unchanged, so shadows (which use |cutoff|) stay crisp. Default off keeps the
+        // crisp cutout and the byte-identical non-foliage baseline (no `Transparent` is touched).
+        if quality::env_bool("FOLIAGE_HASHED", false) {
+            let mut n = 0;
+            for o in scene.iter_mut() {
+                if o.kind == dreamcoast_asset::MaterialKind::Transparent && o.alpha_cutoff > 0.0 {
+                    o.alpha_cutoff = -o.alpha_cutoff;
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                info!(
+                    "foliage: hashed alpha on {n} transparent drawable(s) — needs TAA \
+                     (P_TAAU_FORCE=1 at native res) to resolve the dither into soft edges"
                 );
             }
         }
