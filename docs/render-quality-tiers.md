@@ -127,3 +127,37 @@
   DX≡VK(Low/Med ≤0.001, High는 소프트 경로 0.0165 표기).
 - Med = 미설정 = 현재 6.039/ch 바이트 동일(no-reg).
 - clippy `-D warnings` clean, fmt clean.
+
+## 후속(계획) — AO 파라미터화 + 베이크드 occlusion 캡처
+
+> **상태: 계획.** 현재 GDF AO는 `P11_GDF_AO`(on/off, High 전용) **하나만** 티어에 들어와 있고, 강도/범위
+> 노브(`AO_STRENGTH`/`AO_REACH`/`AO_FLOOR`, [`apps/sandbox/src/gi.rs`])는 **env-only**다. 기본값은
+> `strength 2.0 / reach (diag·0.07).min(0.5) / floor 0.3`로 한 번 상향(`1.5/–/0.4`이 실내에서 너무
+> 옅었음 — DEBUG_VIEW=9 기준 darkened<200 픽셀 1.4%→31.9%). 모두 **push-constant**라 백엔드 동일값 =
+> DX≡VK-safe. 이걸 정식 파라미터로 끌어올리는 게 후속 작업.
+
+### (1) 런타임/티어 노브로 승격
+- `QualityPreset`에 `ao_strength`/`ao_reach`/`ao_floor` 추가, `gi.rs`의 `.unwrap_or(<하드코딩>)`을
+  `.unwrap_or(preset.ao_*)`로 교체(개별 env 항상 우선 — 기존 seam 유지). Low/Med/High별 강도 매핑.
+- ImGui 슬라이더(strength/floor) → 라이브 노브 재적용(소프트 그림자 탭과 같은 패턴). 매 프레임 그래프
+  재빌드라 즉시 반영. 셰이더 재빌드 불필요(이미 push-constant).
+- no-reg 주의: **Med의 AO 기본을 바꾸면 GDF-AO 씬 출력이 변한다**(이번 2.0/0.3 상향이 그 예). 티어
+  승격 시 Med 기본을 무엇으로 고정할지(현 2.0/0.3 유지 권장) 명시하고 그 시점 베이스라인 재캡처.
+
+### (2) 머티리얼 **베이크드 occlusion**(glTF `occlusionTexture`) 캡처 — 현재 **미구현**
+> **조사 결과(2026-06-30):** 엔진은 glTF occlusion을 **임포트하지 않고**(`GltfMaterial`에 occlusion
+> 필드 없음 — base_color/MR/normal/emissive만), G-buffer는 **베이크드 AO를 1.0으로 하드코딩**한다
+> (`gbuffer.slang`: `albedo.a=1.0`, `material.b=1.0`). 게다가 **Intel Sponza 3종(main 28 / 사이프러스 3
+> / 커튼 4 머티리얼)에 `occlusionTexture`가 0개**라 캡처할 데이터 자체가 없다 → 현재 화면 AO는 **전적으로
+> 런타임 GDF AO**. 그래서 이번 "AO 진하게"도 GDF 노브로 처리한 게 맞는 레버였다.
+- 후속 구현(occlusion을 저작한 에셋이 들어올 때 의미):
+  - `GltfMaterial`/`MaterialDesc`/`SceneObject`에 occlusion 텍스처 인덱스(+`strength`) 캡처. 단일소스
+    임포트(`gltf_scene.rs`)에 한정. 텍스처 슬롯 1개 추가(현 `tex[4]` 확장 또는 emissive와 패킹).
+  - ORM 패킹 인지: glTF는 보통 occlusion을 **MR 텍스처의 R채널**에 패킹(occlusionTexture가 MR과 같은
+    이미지를 가리킴). 임포트 시 동일 이미지면 R=occlusion으로 함께 읽기(추가 업로드 없음).
+  - `gbuffer.slang fsMain`: `ao_baked = lerp(1, occTex.r, strength)`를 RT0.a / RT2.b에 기록(현 하드코딩
+    1.0 대체). PBR 라이팅이 이미 RT의 AO를 ambient에 곱하므로 **베이크드 AO × 런타임 GDF AO**가 자연 합성.
+  - no-reg: occlusion 텍스처 **없는** 머티리얼은 1.0 폴백 → 기존 씬(Intel Sponza 포함) **바이트 동일**.
+    DX≡VK: 텍스처 샘플 1개 추가(좌표 동일) — 데칼/마스크와 같은 크로스백엔드 표면, 게이트로 검증.
+- 우선순위: (1) 노브 승격이 먼저(즉효·저위험). (2) 베이크드 occlusion은 **해당 에셋이 생길 때** 착수
+  (지금 Intel Sponza엔 소스가 없어 가치 0).
