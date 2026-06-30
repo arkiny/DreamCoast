@@ -138,11 +138,18 @@ fn encode_mesh(mesh: &MeshData) -> Vec<u8> {
     w.buf
 }
 
-/// Encode one texture chunk payload: `slot`, a kind tag, dimensions, then either
-/// RGBA8 pixels or the BCn block mips (Phase 12 M3).
+/// Encode one texture chunk payload: `slot` then the texture data ([`encode_texdata`]).
 fn encode_texture(slot: u32, tex: &TexData) -> Vec<u8> {
     let mut w = Writer::default();
     w.u32(slot);
+    encode_texdata(&mut w, tex);
+    w.buf
+}
+
+/// Append a `TexData` (kind tag, dimensions, then RGBA8 pixels or the BCn block mips)
+/// to `w`. Shared by the mesh texture chunk and the glTF-scene chunk so the on-disk
+/// texture encoding has a single definition.
+pub(crate) fn encode_texdata(w: &mut Writer, tex: &TexData) {
     match tex {
         TexData::Rgba8(img) => {
             w.u32(TEX_KIND_RGBA8);
@@ -175,7 +182,6 @@ fn encode_texture(slot: u32, tex: &TexData) -> Vec<u8> {
             }
         }
     }
-    w.buf
 }
 
 /// Collect every chunk for `mesh` as `(type, payload)` pairs, in write order.
@@ -233,6 +239,12 @@ fn decode_mesh(r: &mut Reader) -> Result<(Vec<MeshVertex>, Vec<u32>, Material), 
 /// Decode a texture chunk payload into its slot tag and texture data.
 fn decode_texture(r: &mut Reader) -> Result<(u32, TexData), EngineError> {
     let slot = r.u32()?;
+    Ok((slot, decode_texdata(r)?))
+}
+
+/// Decode a `TexData` (kind tag, dimensions, then pixels / BC mips) written by
+/// [`encode_texdata`]. Shared by the mesh texture chunk and the glTF-scene chunk.
+pub(crate) fn decode_texdata(r: &mut Reader) -> Result<TexData, EngineError> {
     let kind = r.u32()?;
     let width = r.u32()?;
     let height = r.u32()?;
@@ -283,7 +295,7 @@ fn decode_texture(r: &mut Reader) -> Result<(u32, TexData), EngineError> {
             )));
         }
     };
-    Ok((slot, tex))
+    Ok(tex)
 }
 
 #[cfg(test)]

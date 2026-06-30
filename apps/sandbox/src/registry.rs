@@ -13,13 +13,12 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use dreamcoast_asset::cook::{TexCompress, TexSlot, compress_image_for_slot};
 use dreamcoast_asset::{GltfScene, Material, MaterialKind, MeshData, MeshVertex};
 use dreamcoast_core::glam::{Mat4, Quat, Vec3};
 use dreamcoast_scene::{MaterialHandle, MeshHandle, World};
 use rhi::{Buffer, Device, Format, Texture};
 
-use crate::mesh::{upload_geometry, upload_image_rgba8, upload_mesh, upload_texture};
+use crate::mesh::{upload_geometry, upload_mesh, upload_texture};
 use crate::{NO_TEXTURE, SceneObject};
 
 /// An uploaded mesh: vertex/index buffers + their counts.
@@ -212,49 +211,38 @@ pub(crate) fn upload_gltf_scene(
     meshes: &mut MeshRegistry,
     materials: &mut MaterialRegistry,
     textures: &mut Vec<Texture>,
-    compress: TexCompress,
 ) -> anyhow::Result<PrimitiveHandles> {
-    // Dedup images by (glTF image index, sRGB) so a shared texture uploads once. The
-    // same image is rarely used across colour spaces, so keying on both is safe. The
-    // per-slot policy (`TexSlot`) is folded in too: the same image used as both a colour
-    // and a normal map (rare) would compress differently, so cache on the slot as well.
-    let mut image_cache: HashMap<(usize, bool, TexSlot), u32> = HashMap::new();
-    let mut resolve = |textures: &mut Vec<Texture>,
-                       slot: Option<usize>,
-                       srgb: bool,
-                       kind: TexSlot|
-     -> anyhow::Result<u32> {
-        let Some(idx) = slot else {
-            return Ok(NO_TEXTURE);
+    // The scene's texture table is already cooked (block-compressed where eligible) by
+    // `cook::load_or_cook_gltf_scene`, so upload just pushes each `TexData` to the GPU —
+    // no per-slot compression here. Dedup by (image index, sRGB) so a shared texture
+    // uploads once; `srgb` only selects the RGBA8 format (BC data carries its own).
+    let mut image_cache: HashMap<(usize, bool), u32> = HashMap::new();
+    let mut resolve =
+        |textures: &mut Vec<Texture>, slot: Option<usize>, srgb: bool| -> anyhow::Result<u32> {
+            let Some(idx) = slot else {
+                return Ok(NO_TEXTURE);
+            };
+            if let Some(&bindless) = image_cache.get(&(idx, srgb)) {
+                return Ok(bindless);
+            }
+            let format = if srgb {
+                Format::Rgba8Srgb
+            } else {
+                Format::Rgba8Unorm
+            };
+            let bindless = upload_texture(device, textures, &scene.images[idx], format)?;
+            image_cache.insert((idx, srgb), bindless);
+            Ok(bindless)
         };
-        if let Some(&bindless) = image_cache.get(&(idx, srgb, kind)) {
-            return Ok(bindless);
-        }
-        let format = if srgb {
-            Format::Rgba8Srgb
-        } else {
-            Format::Rgba8Unorm
-        };
-        let img = &scene.images[idx];
-        // Block-compress eligible slots (colour → BC1/BC3/BC7, normal → BC5) per the cook's
-        // single-source policy; data textures + `Off` fall through to the RGBA8 upload. The
-        // compressed path uploads BC blocks directly (GPU-native, no decompression at load).
-        let bindless = match compress_image_for_slot(img, kind, srgb, compress) {
-            Some(bc) => upload_texture(device, textures, &bc, format)?,
-            None => upload_image_rgba8(device, textures, img, format)?,
-        };
-        image_cache.insert((idx, srgb, kind), bindless);
-        Ok(bindless)
-    };
 
     // Materials: base-color / emissive are sRGB; metallic-roughness / normal linear.
     let mut material_handles: Vec<MaterialHandle> = Vec::with_capacity(scene.materials.len());
     for m in &scene.materials {
         let tex = [
-            resolve(textures, m.base_color, true, TexSlot::Colour)?,
-            resolve(textures, m.metallic_roughness, false, TexSlot::Data)?,
-            resolve(textures, m.normal, false, TexSlot::Normal)?,
-            resolve(textures, m.emissive, true, TexSlot::Colour)?,
+            resolve(textures, m.base_color, true)?,
+            resolve(textures, m.metallic_roughness, false)?,
+            resolve(textures, m.normal, false)?,
+            resolve(textures, m.emissive, true)?,
         ];
         // Representative albedo from the base-color image's linear average × factor
         // (the GDF/GI single source); untextured → the factor's RGB.
