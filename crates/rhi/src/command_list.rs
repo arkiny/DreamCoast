@@ -84,11 +84,13 @@ pub trait Recorder {
         target: &RenderTarget,
         color_clear: Option<ClearColor>,
         depth: Option<&DepthBuffer>,
+        depth_clear: bool,
     );
     fn begin_rendering_targets(
         &self,
         targets: &[(&RenderTarget, Option<ClearColor>)],
         depth: Option<&DepthBuffer>,
+        depth_clear: bool,
     );
     fn set_globals(&self, buffer: &Buffer, offset: u64);
     fn begin_rendering_depth_only(&self, depth: &DepthBuffer);
@@ -179,15 +181,17 @@ impl Recorder for CommandBuffer {
         target: &RenderTarget,
         color_clear: Option<ClearColor>,
         depth: Option<&DepthBuffer>,
+        depth_clear: bool,
     ) {
-        CommandBuffer::begin_rendering_target(self, target, color_clear, depth)
+        CommandBuffer::begin_rendering_target(self, target, color_clear, depth, depth_clear)
     }
     fn begin_rendering_targets(
         &self,
         targets: &[(&RenderTarget, Option<ClearColor>)],
         depth: Option<&DepthBuffer>,
+        depth_clear: bool,
     ) {
-        CommandBuffer::begin_rendering_targets(self, targets, depth)
+        CommandBuffer::begin_rendering_targets(self, targets, depth, depth_clear)
     }
     fn set_globals(&self, buffer: &Buffer, offset: u64) {
         CommandBuffer::set_globals(self, buffer, offset)
@@ -352,11 +356,13 @@ pub enum RhiCommand {
         target: ResPtr<RenderTarget>,
         color_clear: Option<ClearColor>,
         depth: Option<ResPtr<DepthBuffer>>,
+        depth_clear: bool,
     },
     BeginRenderingTargets {
         off: u32,
         len: u32,
         depth: Option<ResPtr<DepthBuffer>>,
+        depth_clear: bool,
     },
     SetGlobals {
         buffer: ResPtr<Buffer>,
@@ -675,18 +681,29 @@ impl CommandList {
                     target,
                     color_clear,
                     depth,
+                    depth_clear,
                 } => cmd.begin_rendering_target(
                     unsafe { target.get() },
                     color_clear,
                     depth.map(|d| unsafe { d.get() }),
+                    depth_clear,
                 ),
-                RhiCommand::BeginRenderingTargets { off, len, depth } => {
+                RhiCommand::BeginRenderingTargets {
+                    off,
+                    len,
+                    depth,
+                    depth_clear,
+                } => {
                     let slice = &inner.targets[off as usize..(off + len) as usize];
                     let resolved: Vec<(&RenderTarget, Option<ClearColor>)> = slice
                         .iter()
                         .map(|(t, c)| (unsafe { t.get() }, *c))
                         .collect();
-                    cmd.begin_rendering_targets(&resolved, depth.map(|d| unsafe { d.get() }))
+                    cmd.begin_rendering_targets(
+                        &resolved,
+                        depth.map(|d| unsafe { d.get() }),
+                        depth_clear,
+                    )
                 }
                 RhiCommand::SetGlobals { buffer, offset } => {
                     cmd.set_globals(unsafe { buffer.get() }, offset)
@@ -875,6 +892,7 @@ impl Recorder for CommandList {
         target: &RenderTarget,
         color_clear: Option<ClearColor>,
         depth: Option<&DepthBuffer>,
+        depth_clear: bool,
     ) {
         self.inner
             .borrow_mut()
@@ -883,12 +901,14 @@ impl Recorder for CommandList {
                 target: ResPtr::new(target),
                 color_clear,
                 depth: depth.map(ResPtr::new),
+                depth_clear,
             });
     }
     fn begin_rendering_targets(
         &self,
         targets: &[(&RenderTarget, Option<ClearColor>)],
         depth: Option<&DepthBuffer>,
+        depth_clear: bool,
     ) {
         let mut i = self.inner.borrow_mut();
         let off = i.targets.len() as u32;
@@ -900,6 +920,7 @@ impl Recorder for CommandList {
             off,
             len,
             depth: depth.map(ResPtr::new),
+            depth_clear,
         });
     }
     fn set_globals(&self, buffer: &Buffer, offset: u64) {
