@@ -79,16 +79,18 @@ pub(crate) fn capture_push(
 }
 
 /// Pack the sky push block: sun float4 (xyz dir, w intensity) + face + flip_y +
-/// pad (32 bytes).
+/// sky_gain + pad, then the sky white-balance float4 (xyz gain, w unused) — 48 bytes.
+/// `wb = [1, 1, 1]` is a neutral no-op (the shader's `col *= wb` is exact ×1).
 pub(crate) fn sky_push(
     sun_dir: [f32; 3],
     intensity: f32,
     face: u32,
     flip_y: u32,
     sky_gain: f32,
-) -> [u8; 32] {
+    wb: [f32; 3],
+) -> [u8; 48] {
     let n = normalize3(sun_dir);
-    let mut pc = [0u8; 32];
+    let mut pc = [0u8; 48];
     for (i, v) in n.iter().take(3).enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -96,6 +98,10 @@ pub(crate) fn sky_push(
     pc[16..20].copy_from_slice(&face.to_le_bytes());
     pc[20..24].copy_from_slice(&flip_y.to_le_bytes());
     pc[24..28].copy_from_slice(&sky_gain.to_le_bytes());
+    // wb at offset 32 (float4, 16-byte aligned to match the HLSL cbuffer layout).
+    for (i, v) in wb.iter().take(3).enumerate() {
+        pc[32 + i * 4..32 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
     pc
 }
 

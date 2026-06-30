@@ -418,7 +418,7 @@ pub(crate) fn sponza_intel_level() -> LevelData {
         environment: Environment {
             sun_dir: [-0.3, -0.9, -0.2],
             sun_intensity: 100000.0,
-            sky_tint: [0.6, 0.7, 0.9],
+            sky_white_balance: [1.0, 1.0, 1.0],
         },
     }
 }
@@ -472,9 +472,9 @@ pub(crate) fn sponza_trees_level() -> LevelData {
             zfar: 100.0,
         },
         environment: Environment {
-            sun_dir: [-0.5, -0.55, -0.35],
+            sun_dir: [-0.3, -0.9, -0.2],
             sun_intensity: 100000.0,
-            sky_tint: [0.6, 0.7, 0.9],
+            sky_white_balance: [1.0, 1.0, 1.0],
         },
     }
 }
@@ -535,9 +535,11 @@ pub(crate) fn sponza_hero_level() -> LevelData {
             zfar: 100.0,
         },
         environment: Environment {
-            sun_dir: [-0.3, -0.9, -0.2],
+            sun_dir: [-0.5, -0.55, -0.35],
             sun_intensity: 100000.0,
-            sky_tint: [0.6, 0.7, 0.9],
+            // Warm the sky radiance so the GI/IBL ambient isn't blue (a high clear sky is physically
+            // blue; the reference banner is lit by a warm HDR sky). Boost R, trim B → neutral stone.
+            sky_white_balance: [1.2, 1.05, 0.8],
         },
     }
 }

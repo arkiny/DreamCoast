@@ -104,7 +104,7 @@ impl IblSystem {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 32, // sun float4 + face + flip_y + pad
+            push_constant_size: 48, // sun float4 + face + flip_y + sky_gain + pad + wb float4
             bindless: true,         // for the root-constants param (push constants)
             uniform_buffer: false,
             depth_test: false,
@@ -340,6 +340,7 @@ impl IblSystem {
         flip_y: u32,
         vulkan: bool,
         sky_gain: f32,
+        sky_wb: [f32; 3],
     ) -> anyhow::Result<()> {
         let res = self.resources(ground_vbuf, ground_ibuf, ground_count);
         let init_cmd = device.create_command_buffer()?;
@@ -361,6 +362,7 @@ impl IblSystem {
                 flip_y,
                 vulkan,
                 sky_gain,
+                sky_wb,
             );
         }
         init_cmd.end()?;
@@ -391,6 +393,7 @@ impl IblSystem {
         flip_y: u32,
         vulkan: bool,
         sky_gain: f32,
+        sky_wb: [f32; 3],
     ) {
         let sun_changed = (sun_dir, sun_intensity) != self.last_sun;
         if !(realtime_env || !self.env_captured || sun_changed) {
@@ -424,6 +427,7 @@ impl IblSystem {
             flip_y,
             vulkan,
             sky_gain,
+            sky_wb,
         );
         self.last_written = write;
         self.env_parity += 1;
@@ -466,6 +470,7 @@ fn record_environment_capture(
     flip_y: u32,
     vulkan: bool,
     sky_gain: f32,
+    sky_wb: [f32; 3],
 ) {
     let env_index = write.env.bindless_index();
     let env_mips = write.env.mip_levels();
@@ -491,7 +496,14 @@ fn record_environment_capture(
             cmd.begin_rendering_cube_face(&write.env, face, mip, Some(ClearColor::BLACK));
             cmd.set_viewport_scissor_extent(Extent2D::new(size, size));
             cmd.bind_graphics_pipeline(ibl.sky_pipeline);
-            cmd.push_constants(&sky_push(sun_dir, sun_intensity, face, flip_y, sky_gain));
+            cmd.push_constants(&sky_push(
+                sun_dir,
+                sun_intensity,
+                face,
+                flip_y,
+                sky_gain,
+                sky_wb,
+            ));
             cmd.draw(3, 1);
             cmd.end_rendering();
         }

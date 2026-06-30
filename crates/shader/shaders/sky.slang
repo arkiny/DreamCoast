@@ -19,6 +19,11 @@ struct PushConstants
     uint flip_y;    // 0 = D3D12 (Y up), 1 = Vulkan (Y down)
     float sky_gain; // inscatter→radiance gain (sun:sky ratio knob; legacy 6.0)
     uint pad;
+    // Sky white balance: a per-channel gain on the sky radiance (xyz; w unused). The captured
+    // env cube feeds the visible sky + the irradiance/prefilter cubes (so the IBL diffuse/specular
+    // ambient and, via IBL, the SW-RT GI ambient), so this neutralises/warms the whole sky-sourced
+    // ambient in one place while leaving the DIRECT sun untinted. `(1,1,1)` = neutral, a no-op.
+    float4 wb;
 };
 
 [[vk::push_constant]]
@@ -161,5 +166,7 @@ float4 fsMain(VSOutput input) : SV_Target
 {
     float3 dir = cube_direction(pc.face, input.uv);
     float3 col = procedural_sky(dir, normalize(pc.sun.xyz), pc.sun.w, pc.sky_gain);
+    // White balance the sky radiance (neutral (1,1,1) = exact no-op → byte-identical capture).
+    col *= pc.wb.rgb;
     return float4(col, 1.0);
 }
