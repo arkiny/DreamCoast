@@ -189,6 +189,10 @@ pub(crate) fn ensure_level_files(dir: &Path) -> anyhow::Result<Vec<String>> {
         ("gallery.level", gallery_level as fn() -> LevelData),
         ("lanterns.level", lanterns_level as fn() -> LevelData),
         ("sponza.level", sponza_level as fn() -> LevelData),
+        (
+            "sponza_intel.level",
+            sponza_intel_level as fn() -> LevelData,
+        ),
     ] {
         let path = dir.join(name);
         if !path.exists() {
@@ -358,5 +362,55 @@ pub(crate) fn sponza_level() -> LevelData {
             zfar: 100.0,
         },
         environment: Environment::default(),
+    }
+}
+
+/// Intel "New Sponza" (the high-quality benchmark building) overlaid with its **curtains**
+/// pack — a multi-element scene: two co-authored glTFs from the modular New Sponza set placed
+/// at their shared native coordinates (identity transform), so the drapes hang in the arcades
+/// of the main building. Both import through Stage B (so the building's `dirt_decal` is
+/// classified and handled by the deferred decal pass, and the curtains add as extra entities).
+/// Assets live in the gitignored `assets/IntelSponza/`; loading errors cleanly if absent.
+pub(crate) fn sponza_intel_level() -> LevelData {
+    use dreamcoast_asset::level::{Camera, Environment, Light};
+    let identity = trs(0.0, 0.0, 0.0, 1.0);
+    LevelData {
+        entities: vec![
+            LevelEntity {
+                asset: "assets/IntelSponza/main_sponza/NewSponza_Main_glTF_003.gltf".into(),
+                transform: identity,
+                material_override: None,
+            },
+            LevelEntity {
+                // The curtains/drapes pack — authored in the same world space as the main
+                // building, so an identity transform overlays them in the arcades.
+                asset: "assets/IntelSponza/pkg_a_curtains/NewSponza_Curtains_glTF.gltf".into(),
+                transform: identity,
+                material_override: None,
+            },
+        ],
+        // A single lux-unit directional sun (≈68° toward (0.3, 0.9, 0.2)) clearing the nave
+        // walls, unified with the `environment.sun_dir` below so direct + sky/IBL/GI agree.
+        // One sun keeps a clean daytime read (no Khronos-scale point lights); exposes under
+        // the default EV100 camera (use `EV100=11` to brighten the interior as in the captures).
+        lights: vec![Light {
+            kind: LightKind::Directional,
+            vec: [-0.3, -0.9, -0.2],
+            color: [1.0, 0.96, 0.9],
+            intensity: 100000.0,
+        }],
+        // The validated indoor "lion view": down the long nave axis (X) at human height.
+        camera: Camera {
+            position: [-14.0, 2.0, 0.0],
+            target: [14.0, 2.0, 0.0],
+            fov_y_deg: 60.0,
+            znear: 0.05,
+            zfar: 100.0,
+        },
+        environment: Environment {
+            sun_dir: [-0.3, -0.9, -0.2],
+            sun_intensity: 100000.0,
+            sky_tint: [0.6, 0.7, 0.9],
+        },
     }
 }
