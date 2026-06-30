@@ -109,7 +109,7 @@ impl RtSystem {
             Some(device.create_compute_pipeline(&ComputePipelineDesc {
                 compute_bytes: rt_path_cs,
                 compute_entry: "csMain",
-                push_constant_size: 128, // inv_view_proj + cam_pos + sun + 2x uint4
+                push_constant_size: 144, // inv_view_proj + cam_pos + sun + 2x uint4 + sky float4
                 bindless: true,
                 uniform_buffer: false,
                 threads_per_group: [8, 8, 1],
@@ -182,7 +182,7 @@ impl RtSystem {
                 metal_intersection_entry: Some(
                     "irconverter.wrapper.intersection.function.triangle",
                 ),
-                push_constant_size: 128, // matches rt_path / rt_pipeline PushConstants
+                push_constant_size: 144, // matches rt_path / rt_pipeline PushConstants
                 // Payload = float3 x4 (48) + uint x3 (12) + float x2 cone state (8) = 68,
                 // rounded up to a multiple of 8. Must be >= the shader payload or D3D12
                 // CreateStateObject rejects the SHADER_CONFIG with E_INVALIDARG.
@@ -463,6 +463,8 @@ impl RtSystem {
         ch: u32,
         flip_y: u32,
         spp: u32,
+        sky_gain: f32,
+        sky_wb: [f32; 3],
     ) {
         let rt_pipe = self.path_pipeline.as_ref().expect("rt path pipeline");
         // M5: when enabled, drive the same path tracer through the RT pipeline + SBT
@@ -514,6 +516,8 @@ impl RtSystem {
                     ch,
                     flip,
                     spp,
+                    sky_gain,
+                    sky_wb,
                 );
                 if let Some(rt_pt) = rt_pt {
                     // Full RT pipeline path (raygen/miss/hit + SBT).

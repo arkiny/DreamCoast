@@ -4062,6 +4062,8 @@ impl App {
                     ch,
                     self.flip_y,
                     self.path_spp,
+                    self.sky_gain,
+                    self.sky_wb,
                 );
             } else if self.rt.has_trace() {
                 self.rt.record_trace(
