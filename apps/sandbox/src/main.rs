@@ -1322,6 +1322,7 @@ impl App {
                     .unwrap_or(crate::compose::DEFAULT_MIN_MESH_RADIUS);
                 let mut mesh_index: HashMap<u32, usize> = HashMap::new();
                 let mut culled = 0u32;
+                let mut negated = 0u32;
                 for d in world.draw_list() {
                     let cpu = mesh_registry.cpu(d.mesh);
                     let (mn, mx) = dreamcoast_asset::sdf::mesh_local_aabb_padded(&cpu.vertices);
@@ -1337,9 +1338,22 @@ impl App {
                         let mdim = dreamcoast_asset::sdf::mesh_sdf_dim(mn, mx);
                         let mvtx = dreamcoast_asset::sdf::encode_vertices_fused(&cpu.vertices);
                         let midx = dreamcoast_asset::sdf::encode_indices(&cpu.indices);
-                        let (vol, _) = dreamcoast_asset::cook::load_or_bake_mesh_sdf(
+                        let (mut vol, _) = dreamcoast_asset::cook::load_or_bake_mesh_sdf(
                             &mvtx, &midx, mdim, mn, mx, &cache_dir,
                         );
+                        // A per-mesh DF that is *mostly* negative has globally-inverted normals
+                        // (it reads open space as "inside"): negate it so the sign is correct.
+                        // This removes the compose poisoning *and* the spurious floor-occlusion
+                        // blotches those meshes cause via AO/GI. A correct solid is mostly
+                        // positive outside and a correct thin sheet ~50 %, so the 60 % threshold
+                        // only flips clearly-inverted meshes.
+                        let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count();
+                        if neg * 5 > vol.voxels.len() * 3 {
+                            for v in &mut vol.voxels {
+                                *v = -*v;
+                            }
+                            negated += 1;
+                        }
                         mesh_sdfs.push(vol);
                         let i = mesh_sdfs.len() - 1;
                         mesh_index.insert(d.mesh.0, i);
@@ -1351,24 +1365,14 @@ impl App {
                         &mesh_sdfs[mi],
                     ));
                 }
-                // Diagnostic: a per-mesh DF that is *mostly negative* has inverted/inconsistent
-                // normals (its sign convention reads open space as "inside") and poisons the
-                // compose `min` — the cause of the degenerate clay trace. Count them.
-                let inverted = mesh_sdfs
-                    .iter()
-                    .filter(|v| {
-                        let neg = v.voxels.iter().filter(|&&d| d < 0.0).count();
-                        neg * 2 > v.voxels.len()
-                    })
-                    .count();
                 info!(
                     "per-mesh DF: {} unique meshes, {} instances ({} culled < {:.2} m radius, \
-                     {} mostly-negative/inverted)",
+                     {} inverted-meshes negated)",
                     mesh_sdfs.len(),
                     compose_objects.len(),
                     culled,
                     min_radius,
-                    inverted
+                    negated
                 );
             }
             let sdf_bytes = if !use_permesh {
