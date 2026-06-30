@@ -1350,12 +1350,24 @@ impl App {
                         &mesh_sdfs[mi],
                     ));
                 }
+                // Diagnostic: a per-mesh DF that is *mostly negative* has inverted/inconsistent
+                // normals (its sign convention reads open space as "inside") and poisons the
+                // compose `min` — the cause of the degenerate clay trace. Count them.
+                let inverted = mesh_sdfs
+                    .iter()
+                    .filter(|v| {
+                        let neg = v.voxels.iter().filter(|&&d| d < 0.0).count();
+                        neg * 2 > v.voxels.len()
+                    })
+                    .count();
                 info!(
-                    "per-mesh DF: {} unique meshes, {} instances ({} culled < {:.2} m radius)",
+                    "per-mesh DF: {} unique meshes, {} instances ({} culled < {:.2} m radius, \
+                     {} mostly-negative/inverted)",
                     mesh_sdfs.len(),
                     compose_objects.len(),
                     culled,
-                    min_radius
+                    min_radius,
+                    inverted
                 );
             }
             let sdf_bytes = if !use_permesh {
