@@ -197,6 +197,7 @@ pub(crate) fn ensure_level_files(dir: &Path) -> anyhow::Result<Vec<String>> {
             "sponza_trees.level",
             sponza_trees_level as fn() -> LevelData,
         ),
+        ("sponza_hero.level", sponza_hero_level as fn() -> LevelData),
     ] {
         let path = dir.join(name);
         if !path.exists() {
@@ -466,6 +467,66 @@ pub(crate) fn sponza_trees_level() -> LevelData {
         camera: Camera {
             position: [7.0, 2.2, 0.0],
             target: [-15.84, 2.27, 0.0],
+            fov_y_deg: 60.0,
+            znear: 0.05,
+            zfar: 100.0,
+        },
+        environment: Environment {
+            sun_dir: [-0.3, -0.9, -0.2],
+            sun_intensity: 100000.0,
+            sky_tint: [0.6, 0.7, 0.9],
+        },
+    }
+}
+
+/// Intel "New Sponza" **hero shot** — the full modular set (main building, curtains, cypress tree,
+/// ivy growth), all at identity in the shared New Sponza world space. This is the README banner
+/// scene (`docs/media/sponza.png`): the cypress stands in the nave, the ivy (a 4.9 M-tri
+/// modelled-leaf pack, `alphaMode=OPAQUE` so it needs no alpha test — the leaves are real geometry)
+/// climbs the far arcade toward the lion, and the coloured drapes line the colonnade. Heavy (the ivy
+/// `.bin` is ~270 MB); the first load cooks its SDF/albedo. Assets live in the gitignored `assets/`.
+pub(crate) fn sponza_hero_level() -> LevelData {
+    use dreamcoast_asset::level::{Camera, Environment, Light};
+    let identity = trs(0.0, 0.0, 0.0, 1.0);
+    LevelData {
+        entities: vec![
+            LevelEntity {
+                asset: "assets/IntelSponza/main_sponza/NewSponza_Main_glTF_003.gltf".into(),
+                transform: identity,
+                material_override: None,
+            },
+            LevelEntity {
+                asset: "assets/IntelSponza/pkg_a_curtains/NewSponza_Curtains_glTF.gltf".into(),
+                transform: identity,
+                material_override: None,
+            },
+            LevelEntity {
+                asset: "assets/IntelSponza/pkg_c_trees/NewSponza_CypressTree_glTF.gltf".into(),
+                transform: identity,
+                material_override: None,
+            },
+            LevelEntity {
+                // The ivy growth pack — modelled leaf geometry (OPAQUE, no alpha mask), authored
+                // climbing the arcade at the lion end (X≈-7, Y≈4–18) in the shared world space.
+                asset: "assets/IntelSponza/pkg_b_ivy/NewSponza_IvyGrowth_glTF.gltf".into(),
+                transform: identity,
+                material_override: None,
+            },
+        ],
+        lights: vec![Light {
+            kind: LightKind::Directional,
+            vec: [-0.3, -0.9, -0.2],
+            color: [1.0, 0.96, 0.9],
+            intensity: 100000.0,
+        }],
+        // Hero framing: the reverse colonnade — stand near the lion end and look back up the nave
+        // toward the bright entrance, so the ivy drapes over the foreground arch (top centre), the
+        // cypress stands mid-nave, and the coloured drapes line the receding colonnade symmetrically.
+        // Render the banner with `EV100=12` (richer than the default interior exposure):
+        //   EV100=12 LEVEL=sponza_hero ./target/release/sandbox --backend metal --screenshot-clean hero.png
+        camera: Camera {
+            position: [-10.5, 3.7, 0.0],
+            target: [9.0, 4.2, 0.0],
             fov_y_deg: 60.0,
             znear: 0.05,
             zfar: 100.0,
