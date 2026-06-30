@@ -1212,31 +1212,32 @@ impl CommandBuffer {
         target: &RenderTarget,
         color_clear: Option<ClearColor>,
         depth: Option<&DepthBuffer>,
+        depth_clear: bool,
     ) {
         match (self, target, depth) {
             #[cfg(windows)]
             (Self::Vulkan(c), RenderTarget::Vulkan(t), None) => {
-                c.begin_rendering_target(t, color_clear, None)
+                c.begin_rendering_target(t, color_clear, None, depth_clear)
             }
             #[cfg(windows)]
             (Self::Vulkan(c), RenderTarget::Vulkan(t), Some(DepthBuffer::Vulkan(d))) => {
-                c.begin_rendering_target(t, color_clear, Some(d))
+                c.begin_rendering_target(t, color_clear, Some(d), depth_clear)
             }
             #[cfg(windows)]
             (Self::D3d12(c), RenderTarget::D3d12(t), None) => {
-                c.begin_rendering_target(t, color_clear, None)
+                c.begin_rendering_target(t, color_clear, None, depth_clear)
             }
             #[cfg(windows)]
             (Self::D3d12(c), RenderTarget::D3d12(t), Some(DepthBuffer::D3d12(d))) => {
-                c.begin_rendering_target(t, color_clear, Some(d))
+                c.begin_rendering_target(t, color_clear, Some(d), depth_clear)
             }
             #[cfg(target_os = "macos")]
             (Self::Metal(c), RenderTarget::Metal(t), None) => {
-                c.begin_rendering_target(t, color_clear, None)
+                c.begin_rendering_target(t, color_clear, None, depth_clear)
             }
             #[cfg(target_os = "macos")]
             (Self::Metal(c), RenderTarget::Metal(t), Some(DepthBuffer::Metal(d))) => {
-                c.begin_rendering_target(t, color_clear, Some(d))
+                c.begin_rendering_target(t, color_clear, Some(d), depth_clear)
             }
             #[cfg(windows)]
             _ => unreachable!("{MIXED}"),
@@ -1251,6 +1252,7 @@ impl CommandBuffer {
         &self,
         targets: &[(&RenderTarget, Option<ClearColor>)],
         depth: Option<&DepthBuffer>,
+        depth_clear: bool,
     ) {
         match self {
             #[cfg(windows)]
@@ -1263,8 +1265,10 @@ impl CommandBuffer {
                     })
                     .collect();
                 match depth {
-                    None => c.begin_rendering_targets(&vk_targets, None),
-                    Some(DepthBuffer::Vulkan(d)) => c.begin_rendering_targets(&vk_targets, Some(d)),
+                    None => c.begin_rendering_targets(&vk_targets, None, depth_clear),
+                    Some(DepthBuffer::Vulkan(d)) => {
+                        c.begin_rendering_targets(&vk_targets, Some(d), depth_clear)
+                    }
                     _ => unreachable!("{MIXED}"),
                 }
             }
@@ -1278,8 +1282,10 @@ impl CommandBuffer {
                     })
                     .collect();
                 match depth {
-                    None => c.begin_rendering_targets(&dx_targets, None),
-                    Some(DepthBuffer::D3d12(d)) => c.begin_rendering_targets(&dx_targets, Some(d)),
+                    None => c.begin_rendering_targets(&dx_targets, None, depth_clear),
+                    Some(DepthBuffer::D3d12(d)) => {
+                        c.begin_rendering_targets(&dx_targets, Some(d), depth_clear)
+                    }
                     _ => unreachable!("{MIXED}"),
                 }
             }
@@ -1292,8 +1298,10 @@ impl CommandBuffer {
                     })
                     .collect();
                 match depth {
-                    None => c.begin_rendering_targets(&mtl_targets, None),
-                    Some(DepthBuffer::Metal(d)) => c.begin_rendering_targets(&mtl_targets, Some(d)),
+                    None => c.begin_rendering_targets(&mtl_targets, None, depth_clear),
+                    Some(DepthBuffer::Metal(d)) => {
+                        c.begin_rendering_targets(&mtl_targets, Some(d), depth_clear)
+                    }
                 }
             }
         }

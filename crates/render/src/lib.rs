@@ -558,6 +558,18 @@ impl<'a> RenderGraph<'a> {
             !c.is_empty() && self.resources[c[0].0.0].backbuffer
         });
 
+        // Per depth resource, the first scheduled pass that attaches it: that pass CLEARS
+        // the depth, every later pass attaching the same depth LOADS it (preserving the
+        // earlier writes). Without this a later pass (the deferred decal pass) would clear
+        // the G-buffer depth the SW-RT passes still sample (AO / GI / reflections). Computed
+        // here (sequential) so the parallel per-pass recording stays a pure read.
+        let mut depth_first_writer: HashMap<ResourceId, usize> = HashMap::new();
+        for &i in &compiled.schedule {
+            if let Some(d) = self.passes[i].depth {
+                depth_first_writer.entry(d).or_insert(i);
+            }
+        }
+
         if let Some(jobs) = jobs.filter(|_| !profile) {
             // M4 B4 — parallel recording: each scheduled pass builds its own bucket on
             // a worker, then we concatenate the buckets in schedule order. GPU ordering
@@ -568,18 +580,25 @@ impl<'a> RenderGraph<'a> {
             let mut pass_jobs: Vec<PassJob> = compiled
                 .schedule
                 .iter()
-                .map(|&i| PassJob {
-                    pass: slots[i]
+                .map(|&i| {
+                    let pass = slots[i]
                         .take()
-                        .expect("each pass is scheduled at most once"),
-                    resources: &self.resources,
-                    pool: pool_ref,
-                    color_locs: &color_locs,
-                    depth_slots: &depth_slots,
-                    alias_barrier: &alias_barrier,
-                    is_first_backbuffer: first_backbuffer == Some(i),
-                    bucket: CommandList::new(),
-                    result: Ok(()),
+                        .expect("each pass is scheduled at most once");
+                    let depth_clear = pass
+                        .depth
+                        .is_none_or(|d| depth_first_writer.get(&d) == Some(&i));
+                    PassJob {
+                        pass,
+                        resources: &self.resources,
+                        pool: pool_ref,
+                        color_locs: &color_locs,
+                        depth_slots: &depth_slots,
+                        alias_barrier: &alias_barrier,
+                        is_first_backbuffer: first_backbuffer == Some(i),
+                        depth_clear,
+                        bucket: CommandList::new(),
+                        result: Ok(()),
+                    }
                 })
                 .collect();
             // The closure captures nothing external (all context is in `job`), so it is
@@ -593,6 +612,7 @@ impl<'a> RenderGraph<'a> {
                     job.depth_slots,
                     job.alias_barrier,
                     job.is_first_backbuffer,
+                    job.depth_clear,
                     &job.bucket,
                 );
             });
@@ -609,6 +629,9 @@ impl<'a> RenderGraph<'a> {
                     list.write_timestamp(p.heap, idx);
                     p.names.push(self.passes[pass_idx].name.clone());
                 }
+                let depth_clear = self.passes[pass_idx]
+                    .depth
+                    .is_none_or(|d| depth_first_writer.get(&d) == Some(&pass_idx));
                 record_pass(
                     &mut self.passes[pass_idx],
                     &self.resources,
@@ -617,6 +640,7 @@ impl<'a> RenderGraph<'a> {
                     &depth_slots,
                     &alias_barrier,
                     first_backbuffer == Some(pass_idx),
+                    depth_clear,
                     list,
                 )?;
             }
@@ -767,6 +791,8 @@ fn record_pass(
     depth_slots: &HashMap<ResourceId, usize>,
     alias_barrier: &HashMap<ResourceId, bool>,
     is_first_backbuffer: bool,
+    // Whether this pass is the first to attach its depth (clear) vs a later user (load).
+    depth_clear: bool,
     bucket: &CommandList,
 ) -> Result<(), EngineError> {
     // Name this pass's region for GPU captures (RenderDoc/PIX/NSight); the barriers +
@@ -877,7 +903,7 @@ fn record_pass(
                 .iter()
                 .map(|&(id, clear)| (pool.color_target(&color_locs[&id]), clear))
                 .collect();
-            bucket.begin_rendering_targets(&targets, depth_ref);
+            bucket.begin_rendering_targets(&targets, depth_ref, depth_clear);
             bucket.set_viewport_scissor_extent(extent);
         }
         extent
@@ -910,6 +936,7 @@ struct PassJob<'a, 'r> {
     depth_slots: &'r HashMap<ResourceId, usize>,
     alias_barrier: &'r HashMap<ResourceId, bool>,
     is_first_backbuffer: bool,
+    depth_clear: bool,
     bucket: CommandList,
     result: Result<(), EngineError>,
 }
