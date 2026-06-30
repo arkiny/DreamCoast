@@ -76,7 +76,7 @@ pub(crate) struct GdfSystem {
     scene_albedo: Option<[Volume; 3]>,
     scene_tri_albedo: Option<StorageBuffer>,
     albedo_bake_pipeline: Option<ComputePipeline>,
-    /// Stage C8b: Lumen-style mesh-card surface cache. `cards` holds the per-object AABB-face
+    /// Stage C8b: mesh-card surface cache. `cards` holds the per-object AABB-face
     /// card records; `cache_pos` (hit pos + valid) and `cache_albedo` are the captured-once
     /// geometry atlases (flat storage buffers, one float4 / texel). C8b2 adds the re-lit
     /// radiance ping-pong; C8b3 looks it up at GI / reflection hits.
@@ -1252,7 +1252,7 @@ impl GdfSystem {
         let tracep = self.trace_pipeline.as_ref().expect("gdf trace pipeline");
         let out = graph.create_storage_image("scene_gdf_out", HDR_FORMAT, extent);
         let gdf_ext = graph.import_external("scene_gdf");
-        // UE-style clay viz: the scene's HDR sun (~1e5) over-exposes the flat clay through the
+        // Clay GDF viz: the scene's HDR sun (~1e5) over-exposes the flat clay through the
         // shared tonemap; a gain brings it to a readable mid-grey. `GDF_VIEW_GAIN` env tunes it.
         let view_gain = std::env::var("GDF_VIEW_GAIN")
             .ok()
@@ -1304,7 +1304,7 @@ impl GdfSystem {
                     ch,
                     flip_y,
                     sampled,
-                    2, // mode bit1: UE-style clay viz (read the GDF shape, not a fake color)
+                    2, // mode bit1: clay GDF viz (read the GDF shape, not a fake color)
                     clip.0,
                     clip.1,
                     aabb_min,

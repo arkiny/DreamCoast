@@ -34,7 +34,7 @@ struct GdfPush
     uint height;
     uint flip_y;            // bit0: 1 = Vulkan (clip-space Y down)
     uint gdf_sampled;       // volumes[] (SRV) index of the merged GDF
-    uint mode;              // bit0: 1 = analytic reference field; bit1: 1 = UE-style clay viz
+    uint mode;              // bit0: 1 = analytic reference field; bit1: 1 = clay GDF viz
     uint clip_desc;         // Stage B: clipmap descriptor storage-buffer index
     uint clip_count;        // Stage B: clipmap level count (1 = single volume = legacy)
     // The GDF world extent (the volume's AABB) + ground plane height in .w. B4 passes
@@ -224,18 +224,18 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         float ao = calc_ao(hit_p, n);
         if ((pc.mode & 2u) != 0u)
         {
-            // UE-style "Visualize Global Distance Field" (DistanceFieldVisualization.usf):
-            // a single neutral *clay* albedo so the image reads the GDF's resolved SHAPE and
-            // gradient normal — not a fake surface color. UE shades N·L (directional) + a sky
-            // fill, NO hard shadow — so the clay reads smoothly. We map an ambient-lifted N·L
-            // into the scene's exposure (× sun_i, like the lit path) so it survives the shared
-            // tonemap without crushing to black/white. AO adds contact depth. Toggling the GDF
-            // source (fused vs per-mesh composite) under this view shows what each resolves.
+            // Clay GDF visualization: a single neutral *clay* albedo so the image reads the
+            // GDF's resolved SHAPE and gradient normal — not a fake surface color. N·L
+            // (directional) + a sky fill, NO hard shadow, so the clay reads smoothly. We map an
+            // ambient-lifted N·L into the scene's exposure (× sun_i, like the lit path) so it
+            // survives the shared tonemap without crushing to black/white. AO adds contact
+            // depth. Toggling the GDF source (fused vs per-mesh composite) shows what each
+            // resolves.
             const float3 clay = float3(0.6, 0.6, 0.62);
             // Shade at the SAME magnitude as the real direct term (× sun_i × 1/π) so it lands
             // mid-grey under the scene's shared tonemap exposure — not blown white. No hard
-            // self-shadow (UE's viz doesn't shadow); a sun_i-scaled hemispheric ambient lifts
-            // shaded faces to dark-grey instead of black. AO adds contact depth.
+            // self-shadow; a sun_i-scaled hemispheric ambient lifts shaded faces to dark-grey
+            // instead of black. AO adds contact depth.
             const float INV_PI = 0.31830989;
             float3 direct = clay * sun_i * ndl * INV_PI;
             float3 ambient =

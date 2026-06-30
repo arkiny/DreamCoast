@@ -1312,9 +1312,9 @@ impl App {
             if use_permesh {
                 use std::collections::HashMap;
                 let cache_dir = app::cooked_cache_dir();
-                // G1 (gdf-ue-alignment.md): UE `MinMeshSDFRadius` — cull tiny drawables from the
-                // composite (they barely move low-frequency GI/AO but each is a full per-mesh
-                // bake). `P11_GDF_MIN_RADIUS` (m); 0 disables.
+                // G1 (gdf-reference-alignment.md): small-mesh radius cull — drop tiny drawables
+                // from the composite (they barely move low-frequency GI/AO but each is a full
+                // per-mesh bake). `P11_GDF_MIN_RADIUS` (m); 0 disables.
                 let min_radius = std::env::var("P11_GDF_MIN_RADIUS")
                     .ok()
                     .and_then(|v| v.trim().parse::<f32>().ok())

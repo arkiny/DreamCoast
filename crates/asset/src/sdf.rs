@@ -709,8 +709,8 @@ pub fn bake_albedo_from_fused(
 // instances / levels / scenes (see `cook::load_or_bake_mesh_sdf`). The runtime composites
 // these into the camera clipmap; this module is just the bake + grid sizing.
 
-/// Target voxel edge (metres) for a per-mesh SDF — UE's "Distance Field Resolution Scale"
-/// analogue. The voxel count scales with mesh extent, clamped to [`MESH_SDF_MIN_DIM`,
+/// Target voxel edge (metres) for a per-mesh SDF — a per-mesh "resolution scale".
+/// The voxel count scales with mesh extent, clamped to [`MESH_SDF_MIN_DIM`,
 /// `MESH_SDF_MAX_DIM`]: 0.05 m gives fine local detail; tiny meshes clamp up, large flat
 /// ones clamp down (a big wall at the cap is still fine — it has no thin features).
 pub const MESH_SDF_TARGET_VOXEL: f32 = 0.05;
