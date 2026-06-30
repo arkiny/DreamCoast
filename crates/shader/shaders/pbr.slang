@@ -36,6 +36,7 @@ struct PushConstants
     uint flip_y; // 0 = D3D12 (Y up), 1 = Vulkan (Y down)
     uint shadow_index; // bindless index of the directional shadow map
     uint gdf_ao_index; // Stage-C2 GDF AO image (0xFFFFFFFF = absent)
+    uint ssao_index; // screen-space near-field AO image (0xFFFFFFFF = absent → 1.0, no-op)
     uint gdf_gi_index; // Stage-C3 GDF indirect-irradiance image (0xFFFFFFFF = absent)
     uint reflect_index; // Stage-C7c hybrid SW-RT reflection image (0xFFFFFFFF = legacy IBL prefilter cube)
     uint two_sided; // 1 = orient the G-buffer normal toward the viewer (two-sided surfaces)
@@ -394,6 +395,10 @@ float4 fsMain(VSOutput input) : SV_Target
     float gdf_ao = 1.0;
     if (pc.gdf_ao_index != NO_TEXTURE)
         gdf_ao = g.textures[pc.gdf_ao_index].Sample(g.samp, input.uv).r;
+    // Screen-space near-field AO composes with the GDF far-field AO (the way UE layers
+    // GTAO × DFAO). Absent (0xFFFFFFFF) -> 1.0, an exact no-op (byte-identical baseline).
+    if (pc.ssao_index != NO_TEXTURE)
+        gdf_ao *= g.textures[pc.ssao_index].Sample(g.samp, input.uv).r;
 
     // Stage C7c: the hybrid SW-RT reflection (composited in a prior compute pass) replaces
     // the IBL prefilter-cube specular when bound; absent (0xFFFFFFFF) -> legacy IBL path.

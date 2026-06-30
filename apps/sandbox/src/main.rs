@@ -37,6 +37,7 @@ mod deferred;
 mod fuse;
 mod gdf;
 mod gi;
+mod gtao;
 mod ibl;
 mod level;
 mod mesh;
@@ -434,6 +435,7 @@ struct App {
     deferred: DeferredRenderer,
     gdf: GdfSystem,
     gi: GiSystem,
+    gtao: gtao::GtaoSystem,
     reflect: ReflectSystem,
     particles: ParticleSystem,
     cull: CullSystem,
@@ -590,6 +592,10 @@ struct App {
     /// C2: GDF AO multiplied into the deferred ambient term (the first GDF feature in
     /// the real render path; C1's `scene_gdf` is a standalone trace viz).
     gdf_ao: bool,
+    /// Screen-space near-field AO (HBAO-lite), composed with the GDF AO. `SSAO` env / tier.
+    ssao: bool,
+    /// SSAO tuning: world radius (m), intensity, contact bias (m), contrast power.
+    ssao_params: [f32; 4],
     /// C3: GDF 1-bounce diffuse GI added to the deferred ambient term.
     gdf_gi: bool,
     /// UE GI-fidelity: world irradiance volume (DDGI-lite radiance cache). When on, the GI pass
@@ -799,6 +805,8 @@ impl App {
         let mut gdf = GdfSystem::new(&device, backend, compute_supported)?;
         // Stage C GDF-lighting consumers (C2 AO, C3 GI, C4 denoise). See `gi.rs`.
         let gi = GiSystem::new(&device, backend, compute_supported)?;
+        // Screen-space near-field AO (composed with the GDF AO). See `gtao.rs`.
+        let gtao = gtao::GtaoSystem::new(&device, backend, compute_supported)?;
         // Stage C reflection track (C5 SSR; C6/C7 later). See `reflect.rs`.
         let reflect = ReflectSystem::new(&device, backend, compute_supported)?;
         // QHD/UHD track: temporal upsampler. See `taau.rs`.
@@ -1538,6 +1546,23 @@ impl App {
         let gdf_ao = gi.has_ao()
             && gdf.has_scene_sdf()
             && quality::env_bool("P11_GDF_AO", !gallery_scene && qp.gdf_ao);
+        // Screen-space near-field AO (HBAO-lite), composed with the GDF AO for crevice/contact
+        // definition the coarse GDF can't resolve. Gallery off (byte-identical anchor); content on
+        // by default (cheap, big quality win). `SSAO` overrides; `SSAO_RADIUS/INTENSITY/BIAS/POWER`
+        // tune. World radius 0.5 m (contact scale), intensity 1.5, bias 2 cm, power 1.5 (contrast).
+        let ssao = compute_supported && quality::env_bool("SSAO", !gallery_scene);
+        let env_f32 = |name: &str, default: f32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(default)
+        };
+        let ssao_params = [
+            env_f32("SSAO_RADIUS", 0.5),
+            env_f32("SSAO_INTENSITY", 2.0),
+            env_f32("SSAO_BIAS", 0.02),
+            env_f32("SSAO_POWER", 1.5),
+        ];
         // Deprecate the legacy captured-cube IBL: by default the deferred ambient is the
         // SW-RT hybrid reflection (specular) + GDF GI (diffuse scene bounce) + sky irradiance.
         // `P11_LEGACY_IBL` restores the captured-cube path (prefilter-cube specular + scene
@@ -1846,6 +1871,7 @@ impl App {
             deferred,
             gdf,
             gi,
+            gtao,
             reflect,
             particles,
             cull,
@@ -1977,6 +2003,8 @@ impl App {
             gdf_trace,
             scene_gdf,
             gdf_ao,
+            ssao,
+            ssao_params,
             gdf_gi,
             gi_volume,
             gi_spp,
@@ -3591,6 +3619,28 @@ impl App {
             )),
             _ => None,
         };
+        // Screen-space near-field AO (HBAO-lite), composed with the GDF AO in the lighting pass.
+        // proj_scale = 0.5/tan(fovY/2) with the fixed 60° vertical FOV (perspective_rh above).
+        let ssao_out = if self.ssao {
+            self.gtao.record(
+                &mut graph,
+                g_depth,
+                g_normal,
+                extent,
+                inv_view_proj,
+                [eye.x, eye.y, eye.z],
+                cw,
+                ch,
+                self.flip_y,
+                self.ssao_params[0],
+                self.ssao_params[1],
+                self.ssao_params[2],
+                0.5 / (30f32.to_radians().tan()),
+                self.ssao_params[3],
+            )
+        } else {
+            None
+        };
         // Stage C3: 1-bounce diffuse GI added to the ambient term, optionally denoised (C4).
         let gdf_gi_out = match (self.gdf_gi, scene_gdf_vol, scene_gdf_ext) {
             (true, Some(vol), Some(ext)) => {
@@ -3892,6 +3942,7 @@ impl App {
             gbuf,
             shadow_map,
             gdf_ao_out,
+            ssao_out,
             gdf_gi_out,
             swrt_reflect_out,
             globals_offset,

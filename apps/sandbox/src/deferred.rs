@@ -321,7 +321,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 44, // G-buffer indices + flip_y + shadow + gdf_ao + gdf_gi + reflect + two_sided + exposure_buf
+            push_constant_size: 48, // G-buffer indices + flip_y + shadow + gdf_ao + ssao + gdf_gi + reflect + two_sided + exposure_buf
             bindless: true,
             uniform_buffer: true,
             depth_test: false,
@@ -796,6 +796,7 @@ impl DeferredRenderer {
         gbuf: GBufferTargets,
         shadow_map: ResourceId,
         gdf_ao: Option<ResourceId>,
+        ssao: Option<ResourceId>,
         gdf_gi: Option<ResourceId>,
         reflect: Option<ResourceId>,
         globals_offset: u64,
@@ -812,6 +813,9 @@ impl DeferredRenderer {
         ];
         if let Some(ao) = gdf_ao {
             reads.push(ao);
+        }
+        if let Some(s) = ssao {
+            reads.push(s);
         }
         if let Some(gi) = gdf_gi {
             reads.push(gi);
@@ -835,6 +839,7 @@ impl DeferredRenderer {
                 ];
                 let shadow_index = ctx.sampled_index(shadow_map);
                 let ao_index = gdf_ao.map(|ao| ctx.sampled_index(ao)).unwrap_or(u32::MAX);
+                let ssao_index = ssao.map(|s| ctx.sampled_index(s)).unwrap_or(u32::MAX);
                 let gi_index = gdf_gi.map(|gi| ctx.sampled_index(gi)).unwrap_or(u32::MAX);
                 let reflect_index = reflect.map(|r| ctx.sampled_index(r)).unwrap_or(u32::MAX);
                 let cmd = ctx.cmd();
@@ -845,6 +850,7 @@ impl DeferredRenderer {
                     flip_y,
                     shadow_index,
                     ao_index,
+                    ssao_index,
                     gi_index,
                     reflect_index,
                     two_sided as u32,
@@ -976,31 +982,33 @@ fn gbuffer_push(
     pc
 }
 
-/// Pack the lighting push block: 4 G-buffer indices + flip_y + shadow_index +
-/// gdf_ao_index + gdf_gi_index + reflect_index (36 bytes). The GDF / reflect indices are
-/// `u32::MAX` when the C2 AO / C3 GI / C7c hybrid-reflection images are absent.
+/// Pack the lighting push block: 4 G-buffer indices + flip_y + shadow_index + gdf_ao_index +
+/// ssao_index + gdf_gi_index + reflect_index + two_sided + exposure_buf_index (48 bytes). The
+/// GDF / SSAO / reflect indices are `u32::MAX` when those images are absent (then a no-op).
 #[allow(clippy::too_many_arguments)]
 fn pbr_push(
     indices: [u32; 4],
     flip_y: u32,
     shadow_index: u32,
     gdf_ao_index: u32,
+    ssao_index: u32,
     gdf_gi_index: u32,
     reflect_index: u32,
     two_sided: u32,
     exposure_buf_index: u32,
-) -> [u8; 44] {
-    let mut pc = [0u8; 44];
+) -> [u8; 48] {
+    let mut pc = [0u8; 48];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
     pc[16..20].copy_from_slice(&flip_y.to_le_bytes());
     pc[20..24].copy_from_slice(&shadow_index.to_le_bytes());
     pc[24..28].copy_from_slice(&gdf_ao_index.to_le_bytes());
-    pc[28..32].copy_from_slice(&gdf_gi_index.to_le_bytes());
-    pc[32..36].copy_from_slice(&reflect_index.to_le_bytes());
-    pc[36..40].copy_from_slice(&two_sided.to_le_bytes());
-    pc[40..44].copy_from_slice(&exposure_buf_index.to_le_bytes());
+    pc[28..32].copy_from_slice(&ssao_index.to_le_bytes());
+    pc[32..36].copy_from_slice(&gdf_gi_index.to_le_bytes());
+    pc[36..40].copy_from_slice(&reflect_index.to_le_bytes());
+    pc[40..44].copy_from_slice(&two_sided.to_le_bytes());
+    pc[44..48].copy_from_slice(&exposure_buf_index.to_le_bytes());
     pc
 }
 

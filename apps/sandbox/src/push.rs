@@ -105,6 +105,54 @@ pub(crate) fn sky_push(
     pc
 }
 
+/// Pack the screen-space AO (gtao.slang) push block (144 bytes): inv_view_proj + camera_pos +
+/// the sampled/storage indices + dims + the two param vectors. `dir_index`/`in_index` are only
+/// read by the blur entry; the AO entry ignores them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gtao_push(
+    inv_view_proj: &[f32; 16],
+    camera_pos: [f32; 3],
+    depth_index: u32,
+    normal_index: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    dir_index: u32,
+    in_index: u32,
+    radius: f32,
+    intensity: f32,
+    bias: f32,
+    proj_scale: f32,
+    aspect: f32,
+    power: f32,
+    blur_sigma: f32,
+) -> [u8; 144] {
+    let mut pc = [0u8; 144];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&camera_pos[0].to_le_bytes());
+    pc[68..72].copy_from_slice(&camera_pos[1].to_le_bytes());
+    pc[72..76].copy_from_slice(&camera_pos[2].to_le_bytes());
+    pc[80..84].copy_from_slice(&depth_index.to_le_bytes());
+    pc[84..88].copy_from_slice(&normal_index.to_le_bytes());
+    pc[88..92].copy_from_slice(&out_index.to_le_bytes());
+    pc[92..96].copy_from_slice(&width.to_le_bytes());
+    pc[96..100].copy_from_slice(&height.to_le_bytes());
+    pc[100..104].copy_from_slice(&flip_y.to_le_bytes());
+    pc[104..108].copy_from_slice(&dir_index.to_le_bytes());
+    pc[108..112].copy_from_slice(&in_index.to_le_bytes());
+    pc[112..116].copy_from_slice(&radius.to_le_bytes());
+    pc[116..120].copy_from_slice(&intensity.to_le_bytes());
+    pc[120..124].copy_from_slice(&bias.to_le_bytes());
+    pc[124..128].copy_from_slice(&proj_scale.to_le_bytes());
+    pc[128..132].copy_from_slice(&aspect.to_le_bytes());
+    pc[132..136].copy_from_slice(&power.to_le_bytes());
+    pc[136..140].copy_from_slice(&blur_sigma.to_le_bytes());
+    pc
+}
+
 /// Pack the irradiance push block: face + flip_y + env_index + pad (16 bytes).
 pub(crate) fn cube_gen_push(face: u32, flip_y: u32, env_index: u32, roughness: f32) -> [u8; 16] {
     let mut pc = [0u8; 16];

@@ -565,6 +565,19 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gdf_ao_cs",
     },
+    // Screen-space (HBAO-lite) near-field AO, composed with the GDF AO; + its bilateral blur.
+    Job {
+        src: "gtao.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gtao_cs",
+    },
+    Job {
+        src: "gtao.slang",
+        entry: "csBlur",
+        stage: "compute",
+        key: "gtao_blur_cs",
+    },
     // Phase 11 Stage C (C3): stochastic 1-bounce diffuse GI against the GDF.
     Job {
         src: "gdf_gi.slang",
