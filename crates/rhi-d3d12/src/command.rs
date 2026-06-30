@@ -200,6 +200,7 @@ impl D3d12CommandBuffer {
         target: &D3d12RenderTarget,
         color_clear: Option<ClearColor>,
         depth: Option<&D3d12DepthBuffer>,
+        depth_clear: bool,
     ) {
         let rtv = target.rtv_handle();
         unsafe {
@@ -208,8 +209,12 @@ impl D3d12CommandBuffer {
                     let dsv = d.dsv();
                     self.list
                         .OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
-                    self.list
-                        .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+                    // Only the first writer clears; a later user preserves the existing depth
+                    // (D3D12 keeps depth in the texture — no load/store op needed).
+                    if depth_clear {
+                        self.list
+                            .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+                    }
                 }
                 None => self.list.OMSetRenderTargets(1, Some(&rtv), false, None),
             }
@@ -227,6 +232,7 @@ impl D3d12CommandBuffer {
         &self,
         targets: &[(&D3d12RenderTarget, Option<ClearColor>)],
         depth: Option<&D3d12DepthBuffer>,
+        depth_clear: bool,
     ) {
         let rtvs: Vec<_> = targets.iter().map(|(t, _)| t.rtv_handle()).collect();
         unsafe {
@@ -239,8 +245,11 @@ impl D3d12CommandBuffer {
                         false,
                         Some(&dsv),
                     );
-                    self.list
-                        .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+                    // Only the first writer clears; a later user preserves the existing depth.
+                    if depth_clear {
+                        self.list
+                            .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+                    }
                 }
                 None => self.list.OMSetRenderTargets(
                     rtvs.len() as u32,

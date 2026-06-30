@@ -316,13 +316,18 @@ impl MetalCommandBuffer {
 
     // ---- Offscreen render targets / MRT / shadow / cubemaps (M4) -----------
 
-    /// Begin rendering into one offscreen color target (+ optional depth). Depth is
-    /// cleared and discarded (`DontCare`) — only the shadow pass stores depth.
+    /// Begin rendering into one offscreen color target (+ optional depth). `depth_clear`
+    /// clears the depth (first writer) else loads it. Depth is always **stored**: Metal
+    /// tile memory discards a `DontCare` depth, so the G-buffer depth the deferred SW-RT
+    /// passes sample (GDF AO / GI / reflections, which reconstruct from it) must be kept;
+    /// storing is safe under transient aliasing (the store lands at pass-end in memory the
+    /// plan has already consumed or has yet to rewrite, never a live resource).
     pub fn begin_rendering_target(
         &self,
         target: &MetalRenderTarget,
         color_clear: Option<ClearColor>,
         depth: Option<&MetalDepthBuffer>,
+        depth_clear: bool,
     ) {
         let pass = MTLRenderPassDescriptor::new();
         let attach = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
@@ -332,18 +337,22 @@ impl MetalCommandBuffer {
             config_depth(
                 &pass.depthAttachment(),
                 &d.texture,
-                MTLStoreAction::DontCare,
+                depth_clear,
+                MTLStoreAction::Store,
             );
         }
         self.start_encoder(&pass);
     }
 
     /// Begin rendering into N offscreen color targets (MRT, e.g. the 4-attachment
-    /// G-buffer) + optional depth. Each target clears if `Some`, else loads.
+    /// G-buffer) + optional depth. Each target clears if `Some`, else loads; `depth_clear`
+    /// likewise clears (first writer) vs loads the depth, which is **stored** (see
+    /// [`Self::begin_rendering_target`]).
     pub fn begin_rendering_targets(
         &self,
         targets: &[(&MetalRenderTarget, Option<ClearColor>)],
         depth: Option<&MetalDepthBuffer>,
+        depth_clear: bool,
     ) {
         let pass = MTLRenderPassDescriptor::new();
         let attachments = pass.colorAttachments();
@@ -356,7 +365,8 @@ impl MetalCommandBuffer {
             config_depth(
                 &pass.depthAttachment(),
                 &d.texture,
-                MTLStoreAction::DontCare,
+                depth_clear,
+                MTLStoreAction::Store,
             );
         }
         self.start_encoder(&pass);
@@ -374,6 +384,7 @@ impl MetalCommandBuffer {
         config_depth(
             &pass.depthAttachment(),
             &depth.texture,
+            true, // shadow map: clear then store for the lighting pass to sample
             MTLStoreAction::Store,
         );
         self.start_encoder(&pass);
@@ -436,6 +447,7 @@ impl MetalCommandBuffer {
         config_depth(
             &pass.depthAttachment(),
             &depth.texture,
+            true, // cube-face capture: clear depth; not sampled afterwards
             MTLStoreAction::DontCare,
         );
         self.start_encoder(&pass);
@@ -886,10 +898,18 @@ fn config_color(attach: &MTLRenderPassColorAttachmentDescriptor, clear: Option<C
 fn config_depth(
     da: &MTLRenderPassDepthAttachmentDescriptor,
     texture: &Retained<ProtocolObject<dyn MTLTexture>>,
+    clear: bool,
     store: MTLStoreAction,
 ) {
     da.setTexture(Some(texture));
-    da.setLoadAction(MTLLoadAction::Clear);
+    // `clear` clears to far (the first writer of this depth); otherwise LOAD preserves an
+    // existing depth so a later pass (the decal pass) tests against — and the deferred SW-RT
+    // passes sample — the real G-buffer depth, not a freshly-cleared one.
+    da.setLoadAction(if clear {
+        MTLLoadAction::Clear
+    } else {
+        MTLLoadAction::Load
+    });
     da.setClearDepth(1.0);
     da.setStoreAction(store);
 }
