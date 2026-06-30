@@ -124,7 +124,16 @@ pub(crate) fn compose_sdf_level(
                                 level_min[1] + ext[1] * (y as f32 + 0.5) * inv_dim,
                                 level_min[2] + ext[2] * (z as f32 + 0.5) * inv_dim,
                             ];
+                            // Compose by the NEAREST surface (smallest |distance|) and take its
+                            // sign — NOT `min` of the signed fields. A plain signed `min` lets a
+                            // mesh with inverted/inconsistent normals (its DF reads open space as
+                            // "inside", i.e. large-negative) drag every overlapping voxel
+                            // negative, poisoning the whole field (the degenerate clay trace).
+                            // Nearest-surface-wins is the correct union for well-formed SDFs and
+                            // robust to a far bad mesh: only the closest correctly-oriented
+                            // surface sets the sign. `empty` (open space) is the initial nearest.
                             let mut best = empty;
+                            let mut best_abs = empty;
                             for o in objects {
                                 if p[0] < o.wmin[0]
                                     || p[0] > o.wmax[0]
@@ -137,7 +146,8 @@ pub(crate) fn compose_sdf_level(
                                 }
                                 let lp = o.inv_world.transform_point3(Vec3::new(p[0], p[1], p[2]));
                                 let d = mesh_sdfs[o.mesh].sample([lp.x, lp.y, lp.z]) * o.scale;
-                                if d < best {
+                                if d.abs() < best_abs {
+                                    best_abs = d.abs();
                                     best = d;
                                 }
                             }
