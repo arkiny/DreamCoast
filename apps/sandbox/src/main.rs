@@ -32,6 +32,7 @@ use tracing::info;
 mod app;
 mod camera;
 mod clipmap;
+mod compose;
 mod cull;
 mod deferred;
 mod fuse;
@@ -1293,16 +1294,80 @@ impl App {
                 .max(1);
             let clip = clipmap::plan_levels(amin, amax, clip_center, sdf_dim, 0.1, clip_max_levels);
             info!("GDF clipmap: {} level(s)", clip.level_count());
-            let (sdf_vol, sdf_outcome) = dreamcoast_asset::cook::load_or_bake_scene_sdf(
-                &fused_v,
-                &fused_i,
-                sdf_dim,
-                amin,
-                amax,
-                &app::cooked_cache_dir(),
-            );
-            info!("scene SDF {sdf_dim}^3 ({sdf_outcome:?})");
-            let sdf_bytes = sdf_vol.to_le_bytes();
+            // Stage S1 (per-mesh-distance-fields.md): opt-in (`P11_PERMESH_GDF`) — composite
+            // per-mesh DFs (baked once per unique mesh, cached/instanced) into each clip level
+            // instead of re-baking the fused triangle soup. Default OFF: on a *non-instanced*
+            // scene (Intel Sponza = 448 unique meshes) per-mesh DFs are 448× the voxel work of
+            // one fused bake, so the first cook is slower — the win is on instanced content (a
+            // unique asset bakes once, every placement reuses it) and per-mesh thin-feature
+            // resolution (S2 color). The gallery always keeps the fused bake (byte-identical
+            // anchor). `scene_diag` is the "open space" distance for voxels no object covers.
+            let use_permesh = !gallery_scene && std::env::var_os("P11_PERMESH_GDF").is_some();
+            let scene_diag = {
+                let d = [amax[0] - amin[0], amax[1] - amin[1], amax[2] - amin[2]];
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+            };
+            let mut mesh_sdfs: Vec<dreamcoast_asset::sdf::SdfVolume> = Vec::new();
+            let mut compose_objects: Vec<crate::compose::ComposeObject> = Vec::new();
+            if use_permesh {
+                use std::collections::HashMap;
+                let cache_dir = app::cooked_cache_dir();
+                let mut mesh_index: HashMap<u32, usize> = HashMap::new();
+                for d in world.draw_list() {
+                    let mi = if let Some(&i) = mesh_index.get(&d.mesh.0) {
+                        i
+                    } else {
+                        let cpu = mesh_registry.cpu(d.mesh);
+                        let (mn, mx) = dreamcoast_asset::sdf::mesh_local_aabb_padded(&cpu.vertices);
+                        let mdim = dreamcoast_asset::sdf::mesh_sdf_dim(mn, mx);
+                        let mvtx = dreamcoast_asset::sdf::encode_vertices_fused(&cpu.vertices);
+                        let midx = dreamcoast_asset::sdf::encode_indices(&cpu.indices);
+                        let (vol, _) = dreamcoast_asset::cook::load_or_bake_mesh_sdf(
+                            &mvtx, &midx, mdim, mn, mx, &cache_dir,
+                        );
+                        mesh_sdfs.push(vol);
+                        let i = mesh_sdfs.len() - 1;
+                        mesh_index.insert(d.mesh.0, i);
+                        i
+                    };
+                    compose_objects.push(crate::compose::ComposeObject::new(
+                        d.world,
+                        mi,
+                        &mesh_sdfs[mi],
+                    ));
+                }
+                info!(
+                    "per-mesh DF: {} unique meshes, {} instances",
+                    mesh_sdfs.len(),
+                    compose_objects.len()
+                );
+            }
+            let sdf_bytes = if !use_permesh {
+                let (sdf_vol, sdf_outcome) = dreamcoast_asset::cook::load_or_bake_scene_sdf(
+                    &fused_v,
+                    &fused_i,
+                    sdf_dim,
+                    amin,
+                    amax,
+                    &app::cooked_cache_dir(),
+                );
+                info!("scene SDF {sdf_dim}^3 ({sdf_outcome:?})");
+                sdf_vol.to_le_bytes()
+            } else {
+                let vol = crate::compose::compose_sdf_level(
+                    &compose_objects,
+                    &mesh_sdfs,
+                    amin,
+                    amax,
+                    sdf_dim,
+                    scene_diag,
+                );
+                info!(
+                    "scene SDF {sdf_dim}^3 (composed from {} per-mesh DFs)",
+                    mesh_sdfs.len()
+                );
+                vol.to_le_bytes()
+            };
             // C8a per-voxel albedo volumes: cooked the same way (CPU bake, cached),
             // uploaded so the one-time GPU albedo bake is skipped too.
             let (albedo_vol, alb_outcome) = dreamcoast_asset::cook::load_or_bake_scene_albedo(
@@ -1343,15 +1408,31 @@ impl App {
                 let mut sdf_store: Vec<Vec<u8>> = Vec::new();
                 let mut alb_store: Vec<[Vec<u8>; 3]> = Vec::new();
                 for (lmin, lmax) in finer {
-                    let (v, _) = dreamcoast_asset::cook::load_or_bake_scene_sdf(
-                        &fused_v,
-                        &fused_i,
-                        sdf_dim,
-                        *lmin,
-                        *lmax,
-                        &app::cooked_cache_dir(),
-                    );
-                    sdf_store.push(v.to_le_bytes());
+                    // S1: finer levels compose from per-mesh DFs when opt-in, else the fused
+                    // bake (this loop only runs for content — the gallery is single-level).
+                    let sdf_le = if use_permesh {
+                        crate::compose::compose_sdf_level(
+                            &compose_objects,
+                            &mesh_sdfs,
+                            *lmin,
+                            *lmax,
+                            sdf_dim,
+                            scene_diag,
+                        )
+                        .to_le_bytes()
+                    } else {
+                        dreamcoast_asset::cook::load_or_bake_scene_sdf(
+                            &fused_v,
+                            &fused_i,
+                            sdf_dim,
+                            *lmin,
+                            *lmax,
+                            &app::cooked_cache_dir(),
+                        )
+                        .0
+                        .to_le_bytes()
+                    };
+                    sdf_store.push(sdf_le);
                     let (av, _) = dreamcoast_asset::cook::load_or_bake_scene_albedo(
                         &fused_v,
                         &fused_i,
