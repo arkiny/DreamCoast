@@ -172,6 +172,30 @@ float3 apply_normal_map(float3 n, float3 world_pos, float2 uv, float3 tangent_no
     return normalize(mul(tangent_normal, tbn));
 }
 
+// PCG integer hash -> a well-distributed uint from a uint seed (Jarzynski & Olano 2020).
+// Pure integer ops, so it is bit-identical on SPIR-V and DXIL (the cross-backend gate).
+uint pcg_hash(uint v)
+{
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// Hashed/stochastic-alpha threshold in [0,1) keyed to a WORLD-SPACE point. World position is
+// identical on every backend (no screen-space SV_Position Y-flip ambiguity), so the dither is
+// DX≡VK-deterministic. Quantizing to ~0.25 mm decorrelates neighbouring pixels (spatial blue
+// noise) AND makes the camera's sub-pixel TAA jitter resample a different threshold each frame,
+// so the temporal accumulator resolves the binary keep/discard into smooth fractional coverage
+// — soft, translucent foliage edges in a deferred pipeline with no sorting (Wyman & McGuire
+// 2017, "Hashed Alpha Testing", resolved by TAA rather than MSAA).
+float hashed_alpha_threshold(float3 world_pos)
+{
+    int3 q = int3(floor(world_pos * 4096.0)); // 1/4096 m ≈ 0.244 mm cells
+    uint3 u = uint3(q);                        // two's-complement reinterpret (backend-stable)
+    uint h = pcg_hash(u.x ^ pcg_hash(u.y ^ pcg_hash(u.z)));
+    return float(h & 0xFFFFFFu) * (1.0 / float(0x1000000)); // [0,1)
+}
+
 [shader("fragment")]
 GBufferOut fsMain(VSOutput input)
 {
@@ -183,16 +207,22 @@ GBufferOut fsMain(VSOutput input)
     // upscaler can reconstruct full-res texture detail (otherwise the low-res derivatives pick
     // blurry mips and the result stays soft). 0 on the native path = byte-identical to Sample().
     float mip_bias = pc.mr_factor.z;
-    // Masked (alphaMode MASK) materials: discard fragments whose base-color alpha is below the
-    // cutoff (mr_factor.w). `cutoff <= 0` = opaque -> the branch never runs and only `.rgb` is used,
-    // so opaque/untextured draws (the whole gallery) are byte-identical to the pre-mask path.
+    // Alpha-test cutoff (mr_factor.w) routes three ways by SIGN (one push field, no layout change):
+    //   cutoff == 0 : opaque   -> the branch never runs, only `.rgb` is used (whole gallery is
+    //                             byte-identical to the pre-mask path).
+    //   cutoff  > 0 : MASK / foliage cutout -> hard discard below the threshold (crisp edges).
+    //   cutoff  < 0 : foliage HASHED alpha  -> stochastic discard against a world-space hash so
+    //                             TAA resolves the leaf edge into a soft translucent silhouette.
     float cutoff = pc.mr_factor.w;
     float3 albedo = pc.base_color_factor.rgb;
     if (pc.tex.x != NO_TEXTURE)
     {
         float4 bc = g.textures[pc.tex.x].SampleBias(g.samp_wrap, input.uv, mip_bias);
         albedo *= bc.rgb;
-        if (cutoff > 0.0 && bc.a * pc.base_color_factor.a < cutoff)
+        float a = bc.a * pc.base_color_factor.a;
+        if (cutoff > 0.0 && a < cutoff)
+            discard;
+        else if (cutoff < 0.0 && a < hashed_alpha_threshold(input.world_pos))
             discard;
     }
 
