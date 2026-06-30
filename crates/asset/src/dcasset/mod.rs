@@ -39,9 +39,10 @@ use dreamcoast_core::EngineError;
 /// Container magic. The trailing NUL keeps it a fixed 8 bytes and ASCII-greppable.
 pub const MAGIC: [u8; 8] = *b"DCASSET\0";
 
-/// Format version. **Bump on any layout change** — the loader treats a mismatch as
-/// a cache miss and re-cooks, so an old `.dcasset` is never misread as a new one.
-pub const VERSION: u32 = 1;
+/// Format version. **Bump on any layout OR cook-policy change** — the loader treats a
+/// mismatch as a cache miss and re-cooks, so an old `.dcasset` is never misread as a new
+/// one. v2: data textures (metallic-roughness) now cook to BC7 instead of staying RGBA8.
+pub const VERSION: u32 = 2;
 
 // Chunk type tags (directory `type` field). Stable across versions; new payloads
 // get new tags. Unknown tags are skipped by the readers (forward compatibility).
