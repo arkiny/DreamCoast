@@ -403,7 +403,7 @@ pub(crate) fn sponza_intel_level() -> LevelData {
         // lion-head relief (centre ~(-15.84, 2.27, 0.79)) so the columns recede to it as the
         // vanishing point — the corridor is visible and the lion anchors the far end.
         camera: Camera {
-            position: [0.0, 2.2, 0.79],
+            position: [7.0, 2.2, 0.79],
             target: [-15.84, 2.27, 0.79],
             fov_y_deg: 60.0,
             znear: 0.05,
