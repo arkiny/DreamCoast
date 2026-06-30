@@ -168,6 +168,9 @@ pub(crate) struct SceneObject {
 struct LevelLighting {
     sun_dir: [f32; 3],
     sun_intensity: f32,
+    /// The directional (sun) light's RGB color — drives the analytic sun tint so a level can author
+    /// a warm sun (e.g. `[1.0, 0.96, 0.9]`). White `[1,1,1]` if the level has no directional light.
+    sun_color: [f32; 3],
     point_pos: [[f32; 4]; 4],
     point_color: [[f32; 4]; 4],
     point_count: i32,
@@ -184,6 +187,7 @@ fn level_lighting(level: &dreamcoast_asset::LevelData) -> LevelLighting {
     let env = level.environment;
     let mut sun_dir = toward_sun(env.sun_dir);
     let mut sun_intensity = env.sun_intensity;
+    let mut sun_color = [1.0f32, 1.0, 1.0];
     let mut point_pos = [[0.0f32; 4]; 4];
     let mut point_color = [[0.0f32; 4]; 4];
     let mut count = 0usize;
@@ -192,6 +196,7 @@ fn level_lighting(level: &dreamcoast_asset::LevelData) -> LevelLighting {
             LightKind::Directional => {
                 sun_dir = toward_sun(l.vec);
                 sun_intensity = l.intensity;
+                sun_color = l.color;
             }
             LightKind::Point if count < 4 => {
                 point_pos[count] = [l.vec[0], l.vec[1], l.vec[2], 0.0];
@@ -204,6 +209,7 @@ fn level_lighting(level: &dreamcoast_asset::LevelData) -> LevelLighting {
     LevelLighting {
         sun_dir,
         sun_intensity,
+        sun_color,
         point_pos,
         point_color,
         point_count: count as i32,
@@ -529,6 +535,9 @@ struct App {
     // UI-controlled lighting / feature state.
     sun_dir: [f32; 3],
     sun_intensity: f32,
+    /// Analytic sun RGB tint (the level's directional-light color, or white). Multiplies the direct
+    /// sun in the lighting pass so a warm authored sun reads warm. `SUN_COLOR` env / level override.
+    sun_color: [f32; 3],
     ambient: f32,
     exposure: f32,
     /// Atmosphere inscatter→radiance gain — the sun:sky illuminance ratio knob fed to the env
@@ -1446,6 +1455,14 @@ impl App {
             .or_else(|| level_lighting_override.as_ref().map(|ll| ll.sun_intensity))
             .unwrap_or(if gallery_scene { 3.0 } else { 100_000.0 })
             .max(0.0);
+        // Analytic sun tint. Resolved like the direction: `SUN_COLOR="r,g,b"` env wins, else the
+        // loaded level's directional-light color (so a level can author a warm sun — New Sponza's is
+        // [1.0, 0.96, 0.9]), else white. White keeps the gallery/code-default scenes byte-identical;
+        // a warm sun also takes some of the blue out of the daylight read (the sky ambient is blue).
+        let sun_color = parse_vec3_env("SUN_COLOR")
+            .map(|v| [v.x, v.y, v.z])
+            .or_else(|| level_lighting_override.as_ref().map(|ll| ll.sun_color))
+            .unwrap_or([1.0, 1.0, 1.0]);
         // Sun:sky ratio fed to the env capture (see the `sky_gain` field). Kept at 6.0 by default:
         // measurement showed that lowering it for "physical sun dominance" darkens open-roof
         // interiors (Sponza's atrium legitimately receives strong skylight), regressing exactly the
@@ -1886,6 +1903,7 @@ impl App {
             gdf_trace_analytic,
             sun_dir,
             sun_intensity,
+            sun_color,
             ambient,
             // Camera exposure (pre-filmic, applied as `(ambient+lo)·exposure`). Gallery keeps the
             // legacy 0.6 (anchor). Content derives it from a physical-camera **EV100** so the lux
@@ -3229,7 +3247,12 @@ impl App {
         let globals = Globals {
             camera_pos: [eye.x, eye.y, eye.z, 0.0],
             sun_direction: normalize3(sun_dir),
-            sun_color: [1.0, 1.0, 1.0, sun_intensity],
+            sun_color: [
+                self.sun_color[0],
+                self.sun_color[1],
+                self.sun_color[2],
+                sun_intensity,
+            ],
             ambient: [self.ambient, self.ambient, self.ambient, self.exposure],
             counts: [
                 if self.point_lights_on { point_count } else { 0 },
