@@ -136,6 +136,20 @@
 > 옅었음 — DEBUG_VIEW=9 기준 darkened<200 픽셀 1.4%→31.9%). 모두 **push-constant**라 백엔드 동일값 =
 > DX≡VK-safe. 이걸 정식 파라미터로 끌어올리는 게 후속 작업.
 
+### (0) 스크린스페이스 AO (GTAO/HBAO) — ✅ 구현 (`503f3c9`)
+> 표면이 "플랫"하던 원인: occlusion이 **coarse 48³ GDF AO(원거리)뿐**, 미세 크레비스/접촉/주름엔 AO가
+> 전무(베이크드 머티리얼 AO=1.0). UE가 DFAO와 **레이어링하는 스크린스페이스 AO**가 빠져 있었음.
+- `gtao.slang csMain`: HBAO-lite obscurance — G-buffer depth로 월드포지션 복원(gdf_ao.slang과 동일),
+  월드 노멀 읽고 6 dirs×4 steps×2 sides를 **depth-scaled 스크린 디스크**(월드 반경→proj_scale로 스크린
+  투영, 스케일 일관)에서 horizon obscurance 적분, range falloff(헤일로 방지). 픽셀 회전은 **순수 정수
+  PCG 해시**(스크린/Y-flip/프레임 항 없음 → SPIR-V≡DXIL 비트동일). `csBlur` bilateral 엔트리 포함(후속
+  디노이즈용; 현재 48탭이라 블러 없이도 깨끗).
+- `pbr.slang`: `ambient *= ssao`를 `gdf_ao`와 함께(부재 인덱스 0xFFFFFFFF→1.0 정확 no-op). 라이팅 푸시
+  44→48 B. `gtao.rs` 시스템 + `record` 패스(gi.rs record_ao 미러).
+- 노브: `SSAO`(콘텐츠 기본 on, 갤러리 off=앵커), `SSAO_RADIUS`(0.5 m) `SSAO_INTENSITY`(2.0)
+  `SSAO_BIAS`(2 cm) `SSAO_POWER`(1.5). 검증(Metal): 크레비스/커튼주름/접촉/폴리지 자기차폐 음영, 갤러리
+  바이트 동일, DX≡VK 설계상 안전(정수 해시). **후속**: csBlur 디노이즈 연결 + RenderQuality 티어 노브화.
+
 ### (1) 런타임/티어 노브로 승격
 - `QualityPreset`에 `ao_strength`/`ao_reach`/`ao_floor` 추가, `gi.rs`의 `.unwrap_or(<하드코딩>)`을
   `.unwrap_or(preset.ao_*)`로 교체(개별 env 항상 우선 — 기존 seam 유지). Low/Med/High별 강도 매핑.
