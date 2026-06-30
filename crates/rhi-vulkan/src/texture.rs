@@ -62,15 +62,8 @@ impl VulkanTexture {
                 .create_image(&image_ci, None)
                 .map_err(vk_err)?;
             let req = device.device.get_image_memory_requirements(image);
-            let mem_type = device
-                .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-            let alloc = vk::MemoryAllocateInfo::default()
-                .allocation_size(req.size)
-                .memory_type_index(mem_type);
-            let memory = device
-                .device
-                .allocate_memory(&alloc, None)
-                .map_err(vk_err)?;
+            // VRAM-aware allocation: device-local first, host-visible spill on exhaustion.
+            let memory = device.allocate_resource_memory(req.size, req.memory_type_bits)?;
             device
                 .device
                 .bind_image_memory(image, memory, 0)
@@ -202,15 +195,8 @@ impl VulkanTexture {
                 .create_image(&image_ci, None)
                 .map_err(vk_err)?;
             let req = device.device.get_image_memory_requirements(image);
-            let mem_type = device
-                .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-            let alloc = vk::MemoryAllocateInfo::default()
-                .allocation_size(req.size)
-                .memory_type_index(mem_type);
-            let memory = device
-                .device
-                .allocate_memory(&alloc, None)
-                .map_err(vk_err)?;
+            // VRAM-aware allocation: device-local first, host-visible spill on exhaustion.
+            let memory = device.allocate_resource_memory(req.size, req.memory_type_bits)?;
             device
                 .device
                 .bind_image_memory(image, memory, 0)

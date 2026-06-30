@@ -379,6 +379,57 @@ impl DeviceShared {
         Err(EngineError::Rhi("no suitable memory type".into()))
     }
 
+    /// Allocate device memory for a resource's requirements (`size` + `type_bits` from a
+    /// `get_*_memory_requirements` call), preferring DEVICE_LOCAL VRAM. On VRAM exhaustion
+    /// it spills to a host-visible heap *when the resource permits it* — mirroring D3D12's
+    /// WDDM oversubscription so the scene loads (slower, over PCIe) instead of aborting.
+    ///
+    /// OPTIMAL-tiling images usually permit *only* device-local memory (their `type_bits`
+    /// excludes host-visible types), so the spill is impossible for them and a true OOM
+    /// still errors — but now with an actionable message instead of a bare result code.
+    pub(crate) fn allocate_resource_memory(
+        &self,
+        size: u64,
+        type_bits: u32,
+    ) -> Result<vk::DeviceMemory, EngineError> {
+        // Preferred: device-local VRAM.
+        if let Ok(mt) = self.find_memory_type(type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+            match self.raw_allocate(size, mt) {
+                Ok(m) => return Ok(m),
+                // VRAM exhausted — fall through to the host-visible spill below.
+                Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+                | Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY) => {}
+                Err(e) => return Err(crate::vk_err(e)),
+            }
+        }
+        // Spill: any host-visible heap this resource permits (system RAM, non-device-local).
+        if let Ok(mt) = self.find_memory_type(type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE)
+            && let Ok(m) = self.raw_allocate(size, mt)
+        {
+            // One line per spilling allocation would spam; the host-visible heap is large, so
+            // a single notice is enough to explain the perf cliff. `eprintln!` keeps the RHI
+            // crate logging-dependency-free (matches the asset crate's cook warnings).
+            eprintln!(
+                "rhi-vulkan: device-local VRAM exhausted — spilled {size} B to host-visible \
+                 memory (slow PCIe path; enable P12_TEX_COMPRESS or reduce the scene)"
+            );
+            return Ok(m);
+        }
+        Err(EngineError::Rhi(format!(
+            "vulkan: out of device memory allocating {size} B (no host-visible fallback for this \
+             resource — enable P12_TEX_COMPRESS or reduce the scene)"
+        )))
+    }
+
+    /// Raw `vkAllocateMemory` for `size` bytes of memory type `mem_type` (no fallback);
+    /// the caller maps the error. Used by [`Self::allocate_resource_memory`].
+    fn raw_allocate(&self, size: u64, mem_type: u32) -> Result<vk::DeviceMemory, vk::Result> {
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(size)
+            .memory_type_index(mem_type);
+        unsafe { self.device.allocate_memory(&alloc, None) }
+    }
+
     /// Register a sampled image view in the bindless table, returning its index.
     pub(crate) fn register_sampled_image(&self, view: vk::ImageView) -> u32 {
         let index = self.bindless_next.fetch_add(1, Ordering::Relaxed);
