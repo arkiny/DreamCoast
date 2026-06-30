@@ -15,6 +15,8 @@
 //! the rasterizer / HW path tracer / GPU bake all share — one layout, no second
 //! source.
 
+use crate::MeshVertex;
+
 /// A baked signed-distance volume: `dim³` R32F voxels over `[aabb_min, aabb_max]`.
 pub struct SdfVolume {
     pub dim: u32,
@@ -656,6 +658,93 @@ pub fn bake_albedo_from_fused(
     AlbedoVolumes { dim, channels }
 }
 
+// --- Per-mesh distance fields (per-mesh-distance-fields.md, Stage S0) ---------------
+//
+// A mesh's SDF is baked over its **own padded local AABB** at a resolution scaled to the
+// mesh size, so thin geometry (e.g. curtain cloth) is resolved at its own scale — unlike
+// the whole-scene fused field, where a 36 m bound coarsens it away. It reuses the same
+// deterministic grid-accelerated `bake_sdf_from_fused`, so the result is bit-identical and
+// backend-independent, and is content-hash cached per *unique* mesh — shared across all
+// instances / levels / scenes (see `cook::load_or_bake_mesh_sdf`). The runtime composites
+// these into the camera clipmap; this module is just the bake + grid sizing.
+
+/// Target voxel edge (metres) for a per-mesh SDF — UE's "Distance Field Resolution Scale"
+/// analogue. The voxel count scales with mesh extent, clamped to [`MESH_SDF_MIN_DIM`,
+/// `MESH_SDF_MAX_DIM`]: 0.05 m gives fine local detail; tiny meshes clamp up, large flat
+/// ones clamp down (a big wall at the cap is still fine — it has no thin features).
+pub const MESH_SDF_TARGET_VOXEL: f32 = 0.05;
+/// Minimum per-mesh grid edge (small meshes still get a usable field).
+pub const MESH_SDF_MIN_DIM: u32 = 8;
+/// Maximum per-mesh grid edge (memory/bake cap, matches UE's 128³ mesh-DF ceiling).
+pub const MESH_SDF_MAX_DIM: u32 = 128;
+
+/// Cubic voxel-grid edge for a mesh of the given **padded** local extent: the longest
+/// axis / the target voxel size, clamped. Cubic `dim` keeps the `idx = x + dim*(y +
+/// dim*z)` layout the volume upload + `.dcasset` use; a non-cubic AABB just yields
+/// anisotropic voxels (the thin axis ends up over-resolved, which is what we want).
+pub fn mesh_sdf_dim(aabb_min: [f32; 3], aabb_max: [f32; 3]) -> u32 {
+    let longest = (0..3)
+        .map(|a| aabb_max[a] - aabb_min[a])
+        .fold(0.0f32, f32::max);
+    ((longest / MESH_SDF_TARGET_VOXEL).ceil() as u32).clamp(MESH_SDF_MIN_DIM, MESH_SDF_MAX_DIM)
+}
+
+/// A mesh's local AABB, padded 10 % per axis (≥0.05 m) so the zero-isosurface isn't
+/// clipped at the volume edge — identical padding to the scene fuse (`fuse.rs`). An empty
+/// mesh yields a zero AABB.
+pub fn mesh_local_aabb_padded(vertices: &[MeshVertex]) -> ([f32; 3], [f32; 3]) {
+    if vertices.is_empty() {
+        return ([0.0; 3], [0.0; 3]);
+    }
+    let mut mn = [f32::MAX; 3];
+    let mut mx = [f32::MIN; 3];
+    for v in vertices {
+        for a in 0..3 {
+            mn[a] = mn[a].min(v.pos[a]);
+            mx[a] = mx[a].max(v.pos[a]);
+        }
+    }
+    for a in 0..3 {
+        let pad = ((mx[a] - mn[a]) * 0.1).max(0.05);
+        mn[a] -= pad;
+        mx[a] += pad;
+    }
+    (mn, mx)
+}
+
+/// Encode mesh vertices into the fused 32-byte records (`pos`@0, `normal`@12, `uv`@24)
+/// the SDF/albedo bakes read, so a single mesh bakes through the same path as the fused
+/// scene (and the bytes are the content-hash cache key).
+pub fn encode_vertices_fused(vertices: &[MeshVertex]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vertices.len() * VTX_STRIDE);
+    for v in vertices {
+        for f in v.pos.iter().chain(&v.normal).chain(&v.uv) {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Encode u32 indices little-endian (the index-buffer layout the bakes read).
+pub fn encode_indices(indices: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(indices.len() * 4);
+    for &i in indices {
+        out.extend_from_slice(&i.to_le_bytes());
+    }
+    out
+}
+
+/// Bake a mesh's local-space SDF: pick the size-scaled cubic grid over the mesh's padded
+/// local AABB, then run the shared deterministic bake. The returned volume's
+/// `aabb_min/max` are the padded local bounds the runtime composites with.
+pub fn bake_mesh_sdf(vertices: &[MeshVertex], indices: &[u32]) -> SdfVolume {
+    let (mn, mx) = mesh_local_aabb_padded(vertices);
+    let dim = mesh_sdf_dim(mn, mx);
+    let vtx = encode_vertices_fused(vertices);
+    let idx = encode_indices(indices);
+    bake_sdf_from_fused(&vtx, &idx, dim, mn, mx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,6 +778,80 @@ mod tests {
     #[inline]
     fn at(vol: &SdfVolume, x: u32, y: u32, z: u32) -> f32 {
         vol.voxels[(x + vol.dim * (y + vol.dim * z)) as usize] as _
+    }
+
+    fn vert(pos: [f32; 3], normal: [f32; 3]) -> MeshVertex {
+        MeshVertex {
+            pos,
+            normal,
+            uv: [0.0, 0.0],
+        }
+    }
+
+    #[test]
+    fn mesh_sdf_dim_scales_and_clamps() {
+        // Tiny mesh clamps to the floor; huge mesh clamps to the ceiling; a mid mesh is
+        // longest_axis / target_voxel.
+        assert_eq!(mesh_sdf_dim([0.0; 3], [0.01, 0.01, 0.01]), MESH_SDF_MIN_DIM);
+        assert_eq!(mesh_sdf_dim([0.0; 3], [100.0, 1.0, 1.0]), MESH_SDF_MAX_DIM);
+        // 2 m longest / 0.05 = 40 voxels.
+        assert_eq!(mesh_sdf_dim([0.0; 3], [2.0, 0.5, 0.1]), 40);
+    }
+
+    #[test]
+    fn mesh_local_aabb_pads_thin_axis() {
+        // A flat 2x2 quad in XY (zero Z extent) pads the thin axis by the 0.05 m floor.
+        let verts = [
+            vert([-1.0, -1.0, 0.0], [0.0, 0.0, 1.0]),
+            vert([1.0, -1.0, 0.0], [0.0, 0.0, 1.0]),
+            vert([1.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            vert([-1.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+        ];
+        let (mn, mx) = mesh_local_aabb_padded(&verts);
+        assert!(
+            (mn[2] + 0.05).abs() < 1e-6 && (mx[2] - 0.05).abs() < 1e-6,
+            "thin Z padded ±0.05"
+        );
+        // Wide axes padded 10 %: 2 m → ±0.2.
+        assert!((mn[0] + 1.2).abs() < 1e-5 && (mx[0] - 1.2).abs() < 1e-5);
+    }
+
+    /// THE point of per-mesh DF: a thin sheet (a curtain proxy) resolves a clean signed
+    /// zero-crossing in its OWN local field — the whole-scene fused field at 48³/36 m
+    /// cannot. We bake a flat quad and check the SDF flips sign across the thin axis with
+    /// a near-zero magnitude at the sheet (so a marching ray registers a hit on it).
+    #[test]
+    fn mesh_sdf_resolves_thin_sheet() {
+        let verts = [
+            vert([-1.0, -1.0, 0.0], [0.0, 0.0, 1.0]),
+            vert([1.0, -1.0, 0.0], [0.0, 0.0, 1.0]),
+            vert([1.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            vert([-1.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+        ];
+        let indices = [0u32, 1, 2, 0, 2, 3];
+        let vol = bake_mesh_sdf(&verts, &indices);
+        // Centre column in XY; the sheet sits at world z = 0, between two adjacent Z
+        // voxels. Find the sign flip and confirm the straddling values are small.
+        let c = vol.dim / 2;
+        let mut flipped = false;
+        for z in 0..vol.dim - 1 {
+            let below = at(&vol, c, c, z);
+            let above = at(&vol, c, c, z + 1);
+            if below < 0.0 && above > 0.0 {
+                flipped = true;
+                // Both straddling voxels are within ~one voxel of the sheet (z extent is
+                // 0.1 m over `dim` voxels), i.e. the thin sheet is finely resolved.
+                let vox = 0.1 / vol.dim as f32;
+                assert!(
+                    below.abs() < 2.0 * vox && above.abs() < 2.0 * vox,
+                    "straddling SDF should be sub-voxel: {below} {above} (vox {vox})"
+                );
+            }
+        }
+        assert!(
+            flipped,
+            "thin sheet must produce a signed zero-crossing in its local DF"
+        );
     }
 
     #[test]
