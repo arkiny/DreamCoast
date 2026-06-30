@@ -193,6 +193,10 @@ pub(crate) fn ensure_level_files(dir: &Path) -> anyhow::Result<Vec<String>> {
             "sponza_intel.level",
             sponza_intel_level as fn() -> LevelData,
         ),
+        (
+            "sponza_trees.level",
+            sponza_trees_level as fn() -> LevelData,
+        ),
     ] {
         let path = dir.join(name);
         if !path.exists() {
@@ -403,6 +407,62 @@ pub(crate) fn sponza_intel_level() -> LevelData {
         // lion-head relief end. Z = 0 is the corridor centre (the column rows sit at Z ~ ±3.1),
         // so the columns recede symmetrically and the lion anchors the far end; the lion itself
         // is at Z 0.79, barely off-centre over the ~23 m depth.
+        camera: Camera {
+            position: [7.0, 2.2, 0.0],
+            target: [-15.84, 2.27, 0.0],
+            fov_y_deg: 60.0,
+            znear: 0.05,
+            zfar: 100.0,
+        },
+        environment: Environment {
+            sun_dir: [-0.3, -0.9, -0.2],
+            sun_intensity: 100000.0,
+            sky_tint: [0.6, 0.7, 0.9],
+        },
+    }
+}
+
+/// Intel "New Sponza" main building + curtains **+ the cypress tree pack** — a foliage scene.
+/// Kept separate from [`sponza_intel_level`] (which stays the decal/AO verification scene) so
+/// the alpha-tested foliage path has a dedicated level without perturbing that baseline. The
+/// tree's `LeafSpring` material is the engine's first real `alphaMode=BLEND` foliage: its leaf
+/// shape lives in the base-color alpha, rendered as an alpha-tested cutout (see
+/// `classify_material` / the foliage cutoff). All three packs are co-authored in the same New
+/// Sponza world space, so identity transforms place the tree (authored at the origin, ~14.8 m
+/// tall) standing in the nave. Assets live in the gitignored `assets/IntelSponza/`.
+pub(crate) fn sponza_trees_level() -> LevelData {
+    use dreamcoast_asset::level::{Camera, Environment, Light};
+    let identity = trs(0.0, 0.0, 0.0, 1.0);
+    LevelData {
+        entities: vec![
+            LevelEntity {
+                asset: "assets/IntelSponza/main_sponza/NewSponza_Main_glTF_003.gltf".into(),
+                transform: identity,
+                material_override: None,
+            },
+            LevelEntity {
+                asset: "assets/IntelSponza/pkg_a_curtains/NewSponza_Curtains_glTF.gltf".into(),
+                transform: identity,
+                material_override: None,
+            },
+            LevelEntity {
+                // The cypress tree pack — authored at the origin in the shared New Sponza space,
+                // so identity stands it in the nave centre (X≈Z≈0, base at Y≈0). Its `LeafSpring`
+                // leaves are alpha-tested cutouts (base-color alpha = leaf shape).
+                asset: "assets/IntelSponza/pkg_c_trees/NewSponza_CypressTree_glTF.gltf".into(),
+                transform: identity,
+                material_override: None,
+            },
+        ],
+        lights: vec![Light {
+            kind: LightKind::Directional,
+            vec: [-0.3, -0.9, -0.2],
+            color: [1.0, 0.96, 0.9],
+            intensity: 100000.0,
+        }],
+        // Down the colonnade centred on the cypress: the same nave view as `sponza_intel`, but
+        // here the tree stands ~7 m ahead at the corridor centre (X≈Z≈0) so its trunk, canopy
+        // and leaf litter fill the frame, read against the lit arcade and the bright far doorway.
         camera: Camera {
             position: [7.0, 2.2, 0.0],
             target: [-15.84, 2.27, 0.0],
