@@ -1267,8 +1267,9 @@ impl App {
             let amin = fused.aabb_min;
             let amax = fused.aabb_max;
             let tri_count = fused.tri_count;
-            // Per-drawable world AABBs (for the surface-cache mesh cards).
+            // Per-drawable world AABBs + representative albedo (for the surface-cache cards).
             let obj_aabb = fused.drawable_aabb;
+            let obj_albedo = fused.drawable_albedo;
             // Phase 12 M2: cook the scene SDF (deterministic CPU bake, cached as a
             // `.dcasset` keyed on the fused geometry + grid) and upload it, replacing
             // the one-time GPU bake. A fresh cache loads directly; a miss bakes + saves.
@@ -1508,8 +1509,16 @@ impl App {
             // it; cards are draw-list-driven.
             let build_cache = std::env::var_os("P11_LEGACY_IBL").is_none();
             if build_cache {
-                let cards = fuse::build_surface_cards(&obj_aabb);
+                let (cards, card_albedo) = fuse::build_surface_cards(&obj_aabb, &obj_albedo);
                 let num_cards = (cards.len() / 64) as u32;
+                // C: content stamps the drawable's true albedo onto its cards (fine color);
+                // the gallery keeps the legacy voxel-volume albedo (byte-identical anchor).
+                // `P11_CARD_ALBEDO=0` forces the legacy path (A/B isolation of the cache color).
+                let card_albedo = if gallery_scene || !quality::env_bool("P11_CARD_ALBEDO", true) {
+                    None
+                } else {
+                    Some(card_albedo.as_slice())
+                };
                 // QHD/UHD track: the surface-cache atlas tile is runtime-tunable (`P11_CACHE_TILE`)
                 // so content can trade cache cost + atlas memory for reflection-cache sharpness.
                 // Default 32 = unchanged (byte-identical). Measured: tile 16 cuts the relight only
@@ -1520,7 +1529,7 @@ impl App {
                     .and_then(|v| v.trim().parse::<u32>().ok())
                     .unwrap_or(32)
                     .clamp(4, 64);
-                gdf.build_surface_cache(&device, &cards, num_cards, cache_tile)?;
+                gdf.build_surface_cache(&device, &cards, num_cards, cache_tile, card_albedo)?;
             }
         }
 

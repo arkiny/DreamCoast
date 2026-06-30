@@ -81,6 +81,11 @@ pub(crate) struct GdfSystem {
     /// geometry atlases (flat storage buffers, one float4 / texel). C8b2 adds the re-lit
     /// radiance ping-pong; C8b3 looks it up at GI / reflection hits.
     cards: Option<StorageBuffer>,
+    /// C: per-card source albedo (the drawable's representative color, 12 B/card). The
+    /// capture stamps it onto the card so the GI/reflection cache carries the real surface
+    /// color instead of the blurred per-voxel albedo volume. `None` ⇒ legacy volume path
+    /// (gallery — keeps the byte-identical anchor).
+    card_src_albedo: Option<StorageBuffer>,
     cache_pos: Option<StorageBuffer>,
     cache_albedo: Option<StorageBuffer>,
     num_cards: u32,
@@ -402,6 +407,7 @@ impl GdfSystem {
             scene_albedo_cooked: false,
             scene_albedo: None,
             scene_tri_albedo: None,
+            card_src_albedo: None,
             albedo_bake_pipeline,
             cards: None,
             cache_pos: None,
@@ -746,6 +752,7 @@ impl GdfSystem {
         cards: &[u8],
         num_cards: u32,
         tile: u32,
+        card_albedo: Option<&[u8]>,
     ) -> anyhow::Result<()> {
         if self.cache_capture_pipeline.is_none() || num_cards == 0 {
             return Ok(());
@@ -759,6 +766,19 @@ impl GdfSystem {
             },
             cards,
         )?);
+        // C: the per-card source-albedo buffer (content only); the capture reads it instead
+        // of the per-voxel albedo volume. Absent ⇒ the legacy volume path (gallery anchor).
+        self.card_src_albedo = match card_albedo {
+            Some(bytes) if !bytes.is_empty() => Some(device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: bytes.len() as u64,
+                    stride: 4,
+                    indirect: false,
+                },
+                bytes,
+            )?),
+            _ => None,
+        };
         let texels = (num_cards * self.card_tile * self.card_tile) as u64;
         let make = || -> anyhow::Result<Option<StorageBuffer>> {
             Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
@@ -1111,6 +1131,12 @@ impl GdfSystem {
             .as_ref()
             .expect("cache albedo")
             .storage_index();
+        // C: per-card source-albedo buffer index (content), else sentinel ⇒ legacy volume.
+        let card_albedo_index = self
+            .card_src_albedo
+            .as_ref()
+            .map(|b| b.storage_index())
+            .unwrap_or(u32::MAX);
         let albedo = albedo_ext.and(self.scene_albedo.as_ref());
         let num_cards = self.num_cards;
         let num_texels = num_cards * self.card_tile * self.card_tile;
@@ -1170,6 +1196,7 @@ impl GdfSystem {
                     aabb_min,
                     aabb_max,
                     diag,
+                    card_albedo_index,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())
