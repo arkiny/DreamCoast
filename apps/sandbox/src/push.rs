@@ -1515,8 +1515,10 @@ pub(crate) fn rt_path_push(
     height: u32,
     flip_y: u32,
     spp: u32,
-) -> [u8; 128] {
-    let mut pc = [0u8; 128];
+    sky_gain: f32,
+    sky_wb: [f32; 3],
+) -> [u8; 144] {
+    let mut pc = [0u8; 144];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1538,6 +1540,12 @@ pub(crate) fn rt_path_push(
     pc[116..120].copy_from_slice(&height.to_le_bytes());
     pc[120..124].copy_from_slice(&flip_y.to_le_bytes());
     pc[124..128].copy_from_slice(&spp.to_le_bytes());
+    // float4 sky: x = sky_gain (sun:sky ratio), yzw = sky white balance. Threaded from the
+    // host so the path tracer's miss shader matches the env-capture's procedural sky exactly.
+    pc[128..132].copy_from_slice(&sky_gain.to_le_bytes());
+    pc[132..136].copy_from_slice(&sky_wb[0].to_le_bytes());
+    pc[136..140].copy_from_slice(&sky_wb[1].to_le_bytes());
+    pc[140..144].copy_from_slice(&sky_wb[2].to_le_bytes());
     pc
 }
 

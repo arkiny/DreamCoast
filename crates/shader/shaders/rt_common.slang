@@ -5,6 +5,7 @@
 // inline-vs-pipeline parity tests depend on it).
 
 #include "bindless.slang"
+#include "sky_common.slang"
 
 static const float PI = 3.14159265358979;
 static const float INV_PI = 0.31830988618379;
@@ -33,6 +34,7 @@ struct PushConstants
     uint height;
     uint flip_y;            // bit0: 1 = Vulkan (Y down); bit1: 1 = Cornell box mode
     uint spp;               // samples per dispatch
+    float4 sky;             // x = sky_gain (sun:sky ratio), yzw = sky white balance (per-channel)
 };
 
 [[vk::push_constant]]
@@ -67,24 +69,16 @@ float rnd(inout uint s)
     return float(pcg(s) & 0xFFFFFFu) / float(0x1000000);
 }
 
-// Gradient sky + HDR sun disk. `with_sun` adds the bright sun disk; it is only
-// enabled for primary (camera) rays. Diffuse/indirect rays use `with_sun = false`
-// because the sun's contribution is added analytically as a direct light (the
-// shadow-ray / NEE term) — sampling the disk again would double-count the sun.
+// Procedural sky (miss shader). Evaluates the SAME physically-based atmosphere as the
+// rasterizer's env-cube capture (`sky_common.slang`), so the parity residual measures
+// shading/GI error rather than a sky-model mismatch. `with_sun` adds the bright sun disk;
+// it is only enabled for primary (camera) rays. Diffuse/indirect rays use `with_sun = false`
+// because the sun's contribution is added analytically as a direct light (the shadow-ray /
+// NEE term) — sampling the disk again would double-count the sun. `sky_gain` + white balance
+// come from the push (threaded from the host, matching the env capture's values).
 float3 sky(float3 dir, float3 sun_dir, float sun_i, bool with_sun)
 {
-    float up = dir.y;
-    float3 zenith = float3(0.04, 0.16, 0.55);
-    float3 horizon = float3(0.50, 0.66, 0.92);
-    float3 ground = float3(0.16, 0.15, 0.14);
-    float3 col = up >= 0.0 ? lerp(horizon, zenith, pow(saturate(up), 0.45))
-                           : lerp(horizon, ground, saturate(-up * 6.0));
-    if (with_sun)
-    {
-        float c = saturate(dot(dir, sun_dir));
-        col += sun_i * (pow(c, 4000.0) * 6.0 + pow(c, 32.0) * 0.4);
-    }
-    return col;
+    return procedural_sky(dir, sun_dir, sun_i, pc.sky.x, with_sun) * pc.sky.yzw;
 }
 
 // Orthonormal basis around a unit normal.
