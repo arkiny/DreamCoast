@@ -472,7 +472,7 @@ pub(crate) fn sponza_trees_level() -> LevelData {
             zfar: 100.0,
         },
         environment: Environment {
-            sun_dir: [-0.3, -0.9, -0.2],
+            sun_dir: [-0.5, -0.55, -0.35],
             sun_intensity: 100000.0,
             sky_tint: [0.6, 0.7, 0.9],
         },
@@ -515,15 +515,18 @@ pub(crate) fn sponza_hero_level() -> LevelData {
         ],
         lights: vec![Light {
             kind: LightKind::Directional,
-            vec: [-0.3, -0.9, -0.2],
+            vec: [-0.5, -0.55, -0.35],
             color: [1.0, 0.96, 0.9],
             intensity: 100000.0,
         }],
         // Hero framing: the reverse colonnade — stand near the lion end and look back up the nave
         // toward the bright entrance, so the ivy drapes over the foreground arch (top centre), the
         // cypress stands mid-nave, and the coloured drapes line the receding colonnade symmetrically.
-        // Render the banner with `EV100=12` (richer than the default interior exposure):
-        //   EV100=12 LEVEL=sponza_hero ./target/release/sandbox --backend metal --screenshot-clean hero.png
+        // The sun is lowered (vs the high midday `sponza_intel` sun) to warm the procedural-sky IBL
+        // ambient — a high sun makes a blue Rayleigh zenith that washes the shaded interior cold.
+        // Banner render (richer exposure + lighter AO so the dense canopy isn't crushed dark):
+        //   EV100=12 AO_STRENGTH=1.0 AO_FLOOR=0.6 LEVEL=sponza_hero \
+        //     ./target/release/sandbox --backend metal --screenshot-clean hero.png
         camera: Camera {
             position: [-10.5, 3.7, 0.0],
             target: [9.0, 4.2, 0.0],
