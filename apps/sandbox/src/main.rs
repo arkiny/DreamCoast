@@ -1312,13 +1312,27 @@ impl App {
             if use_permesh {
                 use std::collections::HashMap;
                 let cache_dir = app::cooked_cache_dir();
+                // G1 (gdf-ue-alignment.md): UE `MinMeshSDFRadius` — cull tiny drawables from the
+                // composite (they barely move low-frequency GI/AO but each is a full per-mesh
+                // bake). `P11_GDF_MIN_RADIUS` (m); 0 disables.
+                let min_radius = std::env::var("P11_GDF_MIN_RADIUS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .unwrap_or(crate::compose::DEFAULT_MIN_MESH_RADIUS);
                 let mut mesh_index: HashMap<u32, usize> = HashMap::new();
+                let mut culled = 0u32;
                 for d in world.draw_list() {
+                    let cpu = mesh_registry.cpu(d.mesh);
+                    let (mn, mx) = dreamcoast_asset::sdf::mesh_local_aabb_padded(&cpu.vertices);
+                    if min_radius > 0.0
+                        && crate::compose::mesh_world_radius(d.world, mn, mx) < min_radius
+                    {
+                        culled += 1;
+                        continue;
+                    }
                     let mi = if let Some(&i) = mesh_index.get(&d.mesh.0) {
                         i
                     } else {
-                        let cpu = mesh_registry.cpu(d.mesh);
-                        let (mn, mx) = dreamcoast_asset::sdf::mesh_local_aabb_padded(&cpu.vertices);
                         let mdim = dreamcoast_asset::sdf::mesh_sdf_dim(mn, mx);
                         let mvtx = dreamcoast_asset::sdf::encode_vertices_fused(&cpu.vertices);
                         let midx = dreamcoast_asset::sdf::encode_indices(&cpu.indices);
@@ -1337,9 +1351,11 @@ impl App {
                     ));
                 }
                 info!(
-                    "per-mesh DF: {} unique meshes, {} instances",
+                    "per-mesh DF: {} unique meshes, {} instances ({} culled < {:.2} m radius)",
                     mesh_sdfs.len(),
-                    compose_objects.len()
+                    compose_objects.len(),
+                    culled,
+                    min_radius
                 );
             }
             let sdf_bytes = if !use_permesh {

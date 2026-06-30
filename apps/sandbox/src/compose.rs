@@ -20,6 +20,23 @@
 use dreamcoast_asset::sdf::SdfVolume;
 use dreamcoast_core::glam::{Mat4, Vec3};
 
+/// UE `MinMeshSDFRadius` analogue: the smallest drawable (world bounding-sphere radius) that
+/// contributes to the GDF composite. Tiny props (bolts, small detail) barely occlude/bounce
+/// the low-frequency GI/AO the distance field feeds, yet each is a full per-mesh DF bake +
+/// composite — so on a non-instanced scene they dominate the cost for ~no quality. Culling
+/// them concentrates the field on the large occluders (walls, columns, curtains). Knob:
+/// `P11_GDF_MIN_RADIUS` (metres); `0` disables the cull.
+pub(crate) const DEFAULT_MIN_MESH_RADIUS: f32 = 0.2;
+
+/// World bounding-sphere radius of a mesh whose padded local AABB is `(mn, mx)` placed by
+/// `world` (translation + uniform scale): half the local diagonal times the world scale.
+pub(crate) fn mesh_world_radius(world: Mat4, mn: [f32; 3], mx: [f32; 3]) -> f32 {
+    let scale = world.x_axis.truncate().length();
+    let half =
+        0.5 * ((mx[0] - mn[0]).powi(2) + (mx[1] - mn[1]).powi(2) + (mx[2] - mn[2]).powi(2)).sqrt();
+    half * scale
+}
+
 /// One instance to composite: the inverse world transform (world→local), the uniform world
 /// scale (local distance → world distance), its world-space AABB (the padded per-mesh DF
 /// bounds, transformed — for the broad-phase cull), and the index of its per-mesh DF.
