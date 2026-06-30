@@ -515,15 +515,17 @@ pub(crate) fn sponza_hero_level() -> LevelData {
         ],
         lights: vec![Light {
             kind: LightKind::Directional,
-            vec: [-0.5, -0.55, -0.35],
+            // HIGH sun (same as `sponza_intel`): the ~12 m nave walls block a low sun entirely (the
+            // wall shadow swallows the whole nave — no direct light, no sunlit color-bleed GI off the
+            // drapes). A high sun clears the walls and lands a direct beam on the floor. Warmth is
+            // handled by `sky_white_balance` below, NOT by lowering the sun, so the beam survives.
+            vec: [-0.3, -0.9, -0.2],
             color: [1.0, 0.96, 0.9],
             intensity: 100000.0,
         }],
         // Hero framing: the reverse colonnade — stand near the lion end and look back up the nave
         // toward the bright entrance, so the ivy drapes over the foreground arch (top centre), the
         // cypress stands mid-nave, and the coloured drapes line the receding colonnade symmetrically.
-        // The sun is lowered (vs the high midday `sponza_intel` sun) to warm the procedural-sky IBL
-        // ambient — a high sun makes a blue Rayleigh zenith that washes the shaded interior cold.
         // Banner render (richer exposure + lighter AO so the dense canopy isn't crushed dark):
         //   EV100=12 AO_STRENGTH=1.0 AO_FLOOR=0.6 LEVEL=sponza_hero \
         //     ./target/release/sandbox --backend metal --screenshot-clean hero.png
@@ -535,10 +537,11 @@ pub(crate) fn sponza_hero_level() -> LevelData {
             zfar: 100.0,
         },
         environment: Environment {
-            sun_dir: [-0.5, -0.55, -0.35],
+            sun_dir: [-0.3, -0.9, -0.2],
             sun_intensity: 100000.0,
-            // Warm the sky radiance so the GI/IBL ambient isn't blue (a high clear sky is physically
-            // blue; the reference banner is lit by a warm HDR sky). Boost R, trim B → neutral stone.
+            // Warm the sky RADIANCE (ambient only — the direct sun is untinted) so the GI/IBL ambient
+            // isn't blue: a high clear sky is physically blue (Rayleigh); this neutralises that hue
+            // without sacrificing the direct beam. Boost R, trim B → neutral stone.
             sky_white_balance: [1.2, 1.05, 0.8],
         },
     }
