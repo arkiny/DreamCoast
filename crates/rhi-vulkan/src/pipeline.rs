@@ -282,6 +282,7 @@ unsafe fn build(
             BlendMode::DecalAlbedo => (0..desc.color_formats.len())
                 .map(|i| {
                     if i == 0 {
+                        // RT0 albedo: alpha-blend RGB (A = baked AO preserved).
                         vk::PipelineColorBlendAttachmentState::default()
                             .color_write_mask(
                                 vk::ColorComponentFlags::R
@@ -295,7 +296,20 @@ unsafe fn build(
                             .src_alpha_blend_factor(vk::BlendFactor::ONE)
                             .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                             .alpha_blend_op(vk::BlendOp::ADD)
+                    } else if i == 2 {
+                        // RT2 material: alpha-blend roughness into G only (R metallic + B AO
+                        // stay the surface's). (A4)
+                        vk::PipelineColorBlendAttachmentState::default()
+                            .color_write_mask(vk::ColorComponentFlags::G)
+                            .blend_enable(true)
+                            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                            .color_blend_op(vk::BlendOp::ADD)
+                            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                            .alpha_blend_op(vk::BlendOp::ADD)
                     } else {
+                        // RT1 normal, RT3 world-pos: untouched.
                         vk::PipelineColorBlendAttachmentState::default()
                             .color_write_mask(vk::ColorComponentFlags::empty())
                             .blend_enable(false)

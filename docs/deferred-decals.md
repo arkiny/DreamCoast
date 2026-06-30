@@ -7,8 +7,10 @@
 상태: **A1–A3(데칼, PR #6) + GDF AO depth-load/store(PR #7) 구현 완료 + Windows DX≡VK 게이트 통과
 (2026-06-30, RTX 2070 SUPER)**. Metal 검증(macOS)에 이어 Windows에서 VK/D3D12 컴파일·검증 클린·DX≡VK
 확인(상세 [§ Windows 게이트 결과](#windows-dxvk-게이트-결과-2026-06-30-rtx-2070-super--pr-6-데칼--pr-7-depth)).
-A4의 roughness 블렌드(선택)는 보류(아래 스테이징 참고). 후속 트랙 B(포워드 투명)는
-[§ 후속](#후속-트랙-b--포워드-투명) 참고.
+A4(roughness 블렌드)도 구현 완료(Metal 검증; DX≡VK는 데칼/AO와 동일 표면이라 같은 게이트로 검증).
+후속 트랙 B(포워드 투명)는 [§ 후속](#후속-트랙-b--포워드-투명) 참고 — **현재 보류**: Sponza `glass`는
+`alphaMode=OPAQUE`(알파 1.0)라 투명 케이스가 아니고(검은 건 매끈 유전체 스페큘러 문제, 별개), 어느 씬에도
+`Transparent` 분류 드로우블이 0개라 검증할 투명 에셋이 없음. 진짜 투명 에셋이 생길 때 계획서와 함께 진행.
 
 > **Windows 게이트에서 잡은 크로스백엔드 갭:** A2의 `DecalAlbedo`는 G-buffer MRT에 비균등 per-attachment
 > 블렌드를 줘서 Vulkan **`independentBlend` 디바이스 피처**가 필요한데(D3D12 `IndependentBlendEnable`/Metal은
@@ -123,9 +125,12 @@ Sponza dirt_decal은 표면에 동일평면으로 놓인 **메시 데칼**(glTF 
   WAW/RAW가 gbuffer→decals→lighting 정렬. **Metal 검증: Sponza 검은 패치 → 먼지 틴트(석재 보임),
   갤러리 바이트 동일(무회귀)**. **Windows DX≡VK 통과: Sponza 데모 앵글 0.000/ch(max 11=기존 스토캐스틱
   firefly, 데칼 무관), 갤러리 0.000 무회귀, 검은 패치→밝은 석재, VK/DX 검증 클린.**
-- **A4 — roughness 블렌드(선택, 보류) + 마무리**: RT2.g 블렌드는 `dirt_decal`이 MR 텍스처가 없어
-  (roughnessFactor 1.0뿐) 이득이 작고 RT2 per-RT 블렌드(write mask=G)라는 추가 크로스백엔드 표면을
-  Metal 단독으로는 검증 못 하므로 **보류** — Windows 복구 시 DX≡VK와 함께 평가. 마무리(문서·메모리)는 완료.
+- **A4 — roughness 블렌드** ✅: `DecalAlbedo`가 RT2의 **G 채널만**(write mask Green) 데칼 roughness를
+  알파블렌드 — 먼지 데칼이 밑면 roughness를 올림(metallic R·AO B는 밑면 유지). `fsDecal`이 RT0=(albedo,α)
+  + RT2=(0,roughness,0,α) 출력, roughness = factor × MR텍스처 G. 3 백엔드(Metal writeMask Green / VK
+  color_write_mask G / D3D12 RenderTarget[2] GREEN). **Metal 검증: 빌드·무회귀; 단 dirt_decal은 이미
+  ~1.0 rough인 석재를 덮어 시각 효과는 없음(글로시 표면 위 데칼엔 유효)**. DX≡VK는 데칼과 동일 per-RT
+  블렌드 표면이라 같은 게이트로 검증.
 
 ## GDF AO depth-load/store (PR #7) — 데칼 트랙이 드러낸 인접 버그
 

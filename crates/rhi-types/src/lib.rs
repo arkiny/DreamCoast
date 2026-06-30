@@ -277,12 +277,13 @@ pub enum BlendMode {
     /// Standard src-alpha / one-minus-src-alpha blending on every attachment (UI).
     AlphaBlend,
     /// Deferred surface-decal preset for the deferred **G-buffer** MRT layout
-    /// (`RT0` albedo+AO, `RT1` normal, `RT2` material, `RT3` world-pos): attachment **0**
-    /// alpha-blends its RGB into the albedo with a write mask of **RGB only** (so the
-    /// baked AO in `RT0.a` is preserved), and every attachment **≥ 1** is write-masked
-    /// **off** — the decal leaves normal / metallic / roughness / world-pos untouched, so
-    /// the underlying surface keeps its own lighting inputs. This is what stops a decal
-    /// from overwriting the surface as opaque metal (the Intel Sponza `dirt_decal` fix).
+    /// (`RT0` albedo+AO, `RT1` normal, `RT2` material[r metallic, g roughness, b AO],
+    /// `RT3` world-pos): attachment **0** alpha-blends its RGB into the albedo with a write
+    /// mask of **RGB only** (so the baked AO in `RT0.a` is preserved), attachment **2**
+    /// alpha-blends the decal roughness into **G only** (a dusty decal raises the covered
+    /// surface's roughness; metallic `r` + AO `b` stay the surface's — A4), and `RT1`/`RT3`
+    /// are write-masked **off**. So the decal only tints albedo and nudges roughness; it
+    /// never overwrites metallic / normal / world-pos (the Intel Sponza `dirt_decal` fix).
     /// Only meaningful for a pipeline rendering the G-buffer MRT set.
     DecalAlbedo,
 }

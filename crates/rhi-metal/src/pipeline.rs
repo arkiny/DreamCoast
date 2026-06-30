@@ -55,6 +55,7 @@ pub(crate) fn build(
             // the G-buffer (normal / metallic / roughness / world-pos) untouched.
             BlendMode::DecalAlbedo => {
                 if i == 0 {
+                    // RT0 albedo: alpha-blend RGB, write RGB (A = baked AO preserved).
                     attach.setBlendingEnabled(true);
                     attach.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
                     attach.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
@@ -62,7 +63,16 @@ pub(crate) fn build(
                     attach.setWriteMask(
                         MTLColorWriteMask::Red | MTLColorWriteMask::Green | MTLColorWriteMask::Blue,
                     );
+                } else if i == 2 {
+                    // RT2 material: alpha-blend the decal roughness into G only (write mask Green);
+                    // metallic (R) and AO (B) stay the underlying surface's. (A4)
+                    attach.setBlendingEnabled(true);
+                    attach.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+                    attach.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+                    attach.setRgbBlendOperation(MTLBlendOperation::Add);
+                    attach.setWriteMask(MTLColorWriteMask::Green);
                 } else {
+                    // RT1 normal, RT3 world-pos: untouched.
                     attach.setWriteMask(MTLColorWriteMask::empty());
                 }
             }
