@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use dreamcoast_core::EngineError;
 
-use crate::{MeshData, dcasset, load_gltf};
+use crate::{GltfScene, MeshData, dcasset, load_gltf, load_gltf_scene};
 
 /// Which path [`load_cooked`] took, for the caller to log (startup speedup is
 /// observable as the second run reporting `CacheHit` instead of `Cooked`).
@@ -121,6 +121,76 @@ pub fn load_cooked(
         ));
     }
     Ok((mesh, LoadOutcome::Cooked))
+}
+
+/// Load a glTF **scene** (multi-mesh/multi-material) as a cooked, block-compressed
+/// `.dcasset`, cooking + caching on a miss. This is the level / glTF-import path
+/// (`load_cooked` handles the single-mesh gallery model). On a hit the glTF parse,
+/// image decode, AND BCn encode are all skipped — only the cached scene is read.
+///
+/// `tier` block-compresses the texture table per slot usage (gallery anchor passes
+/// `Off`). Animated/skinned scenes are compressed in memory but **not cached** (the
+/// static scene chunk can't represent skins/morph), so they re-cook each load.
+pub fn load_or_cook_gltf_scene(
+    source: &Path,
+    cache_key: &str,
+    cache_dir: &Path,
+    tier: TexCompress,
+) -> Result<(GltfScene, LoadOutcome), EngineError> {
+    let cache_file = cache_path(cache_dir, cache_key);
+
+    // Shipped path: no source to validate against — trust the cache if present.
+    let Ok(src_bytes) = std::fs::read(source) else {
+        if let Ok(bytes) = std::fs::read(&cache_file)
+            && let Ok((_, scene)) = dcasset::read_scene(&bytes)
+        {
+            return Ok((scene, LoadOutcome::CacheHitNoSource));
+        }
+        return Err(EngineError::Asset(format!(
+            "no source glTF and no cached scene for {}",
+            source.display()
+        )));
+    };
+
+    // Key folds the source bytes + the compression tier (changing either re-cooks).
+    let key = dcasset::hash_update(dcasset::source_hash(&src_bytes), &[tier.tag()]);
+
+    // Hit: a cached scene whose key matches the live source → decode it, no glTF parse.
+    if let Ok(bytes) = std::fs::read(&cache_file)
+        && let Ok(header) = dcasset::read_header(&bytes)
+        && header.version == dcasset::VERSION
+        && header.source_hash == key
+        && header.cook_params_hash == dcasset::cook_params_hash()
+        && let Ok((_, scene)) = dcasset::read_scene(&bytes)
+    {
+        return Ok((scene, LoadOutcome::CacheHit));
+    }
+
+    // Miss: import the glTF, block-compress the texture table, cache when static.
+    let mut scene = load_gltf_scene(source)?;
+    texture::compress_scene_textures(&mut scene, tier);
+    if is_static_scene(&scene) {
+        let cooked = dcasset::write_scene(&scene, key);
+        if let Err(e) = write_atomic(&cache_file, &cooked) {
+            tracing_warn(&format!(
+                "failed to write cooked scene {}: {e}",
+                cache_file.display()
+            ));
+        }
+    }
+    Ok((scene, LoadOutcome::Cooked))
+}
+
+/// Whether a scene has no skin / morph / animation side data — only static scenes are
+/// cacheable (the glTF-scene chunk stores geometry + materials + textures, not rigs).
+fn is_static_scene(scene: &GltfScene) -> bool {
+    scene.animations.is_empty()
+        && scene.skins.is_empty()
+        && scene
+            .meshes
+            .iter()
+            .flatten()
+            .all(|p| p.joints.is_none() && p.weights.is_none() && p.morph_targets.is_empty())
 }
 
 /// Write `bytes` to `path`, creating the parent dir. Writes to a temp sibling then

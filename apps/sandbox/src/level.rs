@@ -11,9 +11,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use dreamcoast_asset::cook::{TexCompress, load_or_cook_level};
+use dreamcoast_asset::cook::{TexCompress, load_or_cook_gltf_scene, load_or_cook_level};
 use dreamcoast_asset::level::{Entity as LevelEntity, LightKind, MaterialOverride};
-use dreamcoast_asset::{GltfScene, LevelData, load_gltf_scene, unit_cube, uv_sphere};
+use dreamcoast_asset::{GltfScene, LevelData, unit_cube, uv_sphere};
 use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_scene::{LocalTransform, MeshInstance, Name, Parent, World, instantiate_gltf};
 use rhi::{Device, Texture};
@@ -161,9 +161,16 @@ pub(crate) fn build_level(
         let place = Mat4::from_translation(origin) * Mat4::from_cols_array(&ent.transform);
         if is_gltf(&ent.asset) {
             if !gltf_cache.contains_key(&ent.asset) {
-                let gscene = load_gltf_scene(&ent.asset)?;
-                let handles =
-                    upload_gltf_scene(device, &gscene, meshes, materials, textures, compress)?;
+                // Load the asset through its cooked, block-compressed `.dcasset` (cache-keyed
+                // on the source glTF + compression tier). A hit skips glTF parse + image
+                // decode + BCn encode entirely; the level just links to the cooked scene.
+                let (gscene, _) = load_or_cook_gltf_scene(
+                    Path::new(&ent.asset),
+                    &ent.asset,
+                    &crate::app::cooked_cache_dir(),
+                    compress,
+                )?;
+                let handles = upload_gltf_scene(device, &gscene, meshes, materials, textures)?;
                 gltf_cache.insert(ent.asset.clone(), (gscene, handles));
             }
             let (gscene, handles) = &gltf_cache[&ent.asset];

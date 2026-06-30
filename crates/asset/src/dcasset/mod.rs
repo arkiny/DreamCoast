@@ -24,10 +24,12 @@
 //! invalidation-key hashing); the per-payload chunk codecs live in [`mesh`]
 //! (mesh + textures), [`volume`] (SDF + albedo), and [`level`] (scene/level).
 
+mod gltf;
 mod level;
 mod mesh;
 mod volume;
 
+pub use gltf::{read_scene, write_scene};
 pub use level::{read_level, write_level};
 pub use mesh::{read, write};
 pub use volume::{read_albedo, read_sdf, write_albedo, write_sdf};
@@ -51,6 +53,9 @@ pub(crate) const CHUNK_SDF: u32 = 3;
 pub(crate) const CHUNK_ALBEDO: u32 = 4;
 /// Level / scene chunk: entities + lights + camera + environment (item 2).
 pub(crate) const CHUNK_LEVEL: u32 = 5;
+/// Cooked glTF scene chunk: node hierarchy + per-primitive geometry + materials +
+/// the block-compressed texture table (static scenes; see [`gltf`]).
+pub(crate) const CHUNK_GLTF_SCENE: u32 = 6;
 
 /// Header byte size: magic(8) + version(4) + flags(4) + source_hash(8) +
 /// cook_params_hash(8) + chunk_count(4).

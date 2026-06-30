@@ -3,7 +3,7 @@
 use rhi_types::Format;
 
 use crate::bc::{self, BcFormat};
-use crate::{ImageData, Material, TexData};
+use crate::{GltfScene, ImageData, Material, TexData};
 
 /// Texture-compression tier for the cook. Picks the colour codec; `Off` keeps
 /// textures uncompressed (render byte-identical). The trade is size vs quality —
@@ -90,6 +90,46 @@ pub fn compress_image_for_slot(
     let has_alpha = im.rgba8.chunks_exact(4).any(|p| p[3] != 255);
     let fmt = slot_format(slot, tier, has_alpha)?;
     Some(compress_image(im, fmt, srgb))
+}
+
+/// Block-compress a glTF scene's shared texture table in place, per slot usage. Each
+/// image is compressed according to the **first material slot that references it** (its
+/// `TexSlot` + colour space) — in practice an image serves one role, so this matches the
+/// per-(image, slot) policy the runtime upload would otherwise apply, while letting the
+/// cook bake it once into the cached scene. Data textures + `tier == Off` stay `Rgba8`.
+pub(crate) fn compress_scene_textures(scene: &mut GltfScene, tier: TexCompress) {
+    if !tier.enabled() {
+        return;
+    }
+    // Resolve each image's (slot kind, srgb) from the first material slot referencing it.
+    let mut usage: Vec<Option<(TexSlot, bool)>> = vec![None; scene.images.len()];
+    for m in &scene.materials {
+        for (img, kind, srgb) in [
+            (m.base_color, TexSlot::Colour, true),
+            (m.emissive, TexSlot::Colour, true),
+            (m.normal, TexSlot::Normal, false),
+            (m.metallic_roughness, TexSlot::Data, false),
+        ] {
+            if let Some(i) = img
+                && usage.get(i).is_some_and(Option::is_none)
+            {
+                usage[i] = Some((kind, srgb));
+            }
+        }
+    }
+    for (i, tex) in scene.images.iter_mut().enumerate() {
+        let Some((kind, srgb)) = usage[i] else {
+            continue; // unreferenced image — leave as-is
+        };
+        // `match` borrows `tex` only for the call; the owned result is assigned after.
+        let cooked = match tex {
+            TexData::Rgba8(im) => compress_image_for_slot(im, kind, srgb, tier),
+            TexData::Bc { .. } => None,
+        };
+        if let Some(bc) = cooked {
+            *tex = bc;
+        }
+    }
 }
 
 /// Compress a material slot in place per the policy (no-op for `Data` / `tier == Off`,

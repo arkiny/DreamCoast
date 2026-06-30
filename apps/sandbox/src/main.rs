@@ -948,10 +948,17 @@ impl App {
                 content_compress,
             )?;
         } else if let Some(path) = &scene_gltf_path {
-            // Stage B: import the whole node hierarchy + every primitive/material/image.
-            let gscene = dreamcoast_asset::load_gltf_scene(path)?;
+            // Stage B: import the whole node hierarchy + every primitive/material/image,
+            // through the cooked, block-compressed `.dcasset` (a hit skips glTF parse +
+            // decode + BCn encode). `content_compress` sets the tier.
+            let (gscene, outcome) = dreamcoast_asset::cook::load_or_cook_gltf_scene(
+                std::path::Path::new(path),
+                path,
+                &app::cooked_cache_dir(),
+                content_compress,
+            )?;
             info!(
-                "glTF scene '{path}': {} nodes, {} primitives, {} materials, {} images",
+                "glTF scene '{path}' ({outcome:?}): {} nodes, {} primitives, {} materials, {} images",
                 gscene.nodes.len(),
                 gscene.primitive_count(),
                 gscene.materials.len(),
@@ -963,7 +970,6 @@ impl App {
                 &mut mesh_registry,
                 &mut material_registry,
                 &mut textures,
-                content_compress,
             )?;
             let (imported, node_map) =
                 dreamcoast_scene::instantiate_gltf_mapped(&mut world, &gscene, &prim_handles);
