@@ -1,4 +1,4 @@
-# Per-mesh distance fields — 베이크 구조 전환 (UE Mesh DF / Lumen 정렬)
+# Per-mesh distance fields — 베이크 구조 전환 (per-mesh DF + 카드 색 정렬)
 
 > 상위: [scalable-gi.md](scalable-gi.md) (Phase 10 GI 트랙). 이 문서는 그 트랙의 **베이크 아키텍처를
 > "씬 전체 fused 재베이크" → "per-mesh DF + 인스턴스 공유 + 클립맵 합성"** 으로 바꾸는 권위 계획이다.
@@ -6,7 +6,7 @@
 > [lumen-parity-swrt.md](lumen-parity-swrt.md), [foliage.md](foliage.md)(커튼 색 번짐 부재).
 > **상태: 계획(미구현) — 리뷰 후 스테이지별 커밋.**
 
-## 동기 / 배경 (2026-06-30, 측정·UE 확인으로 확정)
+## 동기 / 배경 (2026-06-30, 측정·레퍼런스 확인으로 확정)
 
 두 가지 문제가 **하나의 근본 원인**을 공유한다는 것이 이번 세션에서 확정됐다:
 
@@ -31,12 +31,12 @@
 - **베이크**: 인스턴스/레벨이 바뀔 때마다 fused 삼각형 수프를 클립맵 레벨마다 통째로 재베이크.
   유니크 메시가 적어도(Sponza 기둥/아치는 인스턴스) 매번 전체를 다시 굽는다.
 
-### UE/Lumen은 어떻게 하나 (2026-06-30 공식 문서·Narkowicz "Journey to Lumen" 확인)
-- **Mesh Distance Field**: **메시(에셋) 단위**로 오프라인 1회 베이크 → 메시당 dense 볼륨 텍스처(최대
-  128³, 8 MB; Distance Field Resolution Scale로 메시 크기에 비례). **인스턴스가 공유.** 런타임의
-  **Global Distance Field는 per-object 필드를 카메라 중심 클립맵으로 합성**하되, 새로 보이거나 바뀐
+### 레퍼런스는 어떻게 하나 (2026-06-30 소스 대조)
+- **Mesh distance field**: **메시(에셋) 단위**로 오프라인 1회 베이크 → 메시당 dense 볼륨 텍스처(최대
+  128³, 8 MB; 거리장 해상도 스케일로 메시 크기에 비례). **인스턴스가 공유.** 런타임의
+  **글로벌 distance field는 per-object 필드를 카메라 중심 클립맵으로 합성**하되, 새로 보이거나 바뀐
   영역만 갱신. → 씬 전체 재베이크가 없다.
-- **Lumen surface cache 카드**: 메시당 오프라인 생성(~12), 캡처 = **실제 메시를 카드 시점에서
+- **mesh-card surface cache**: 메시당 오프라인 생성(~12 카드), 캡처 = **실제 메시를 카드 시점에서
   래스터화** → per-texel 진짜 머티리얼 albedo. 카드는 **opacity 저장 → 구멍**(체인링크 펜스/천/잎).
   색을 coarse voxel이 아니라 **메시 표면**에서 얻기 때문에 얇은 천이 살아난다.
 
@@ -50,7 +50,7 @@
 - `MeshRegistry`는 이미 [`MeshCpu{vertices,indices}`](../apps/sandbox/src/registry.rs)를 `MeshHandle`
   별로 보관(fuse의 단일 지오 소스). 여기에 **메시별 로컬-공간 SDF**를 추가한다.
 - 베이크: 메시의 **로컬 AABB**에 `bake_sdf_from_fused`(Stage A 그리드 가속, 결정론)로 굽되, 해상도는
-  **메시 크기 비례**(UE Distance Field Resolution Scale 모사): `dim ≈ clamp(round(longest_extent /
+  **메시 크기 비례**(거리장 해상도 스케일 모사): `dim ≈ clamp(round(longest_extent /
   target_voxel), MIN_DIM, MAX_DIM)`, 비입방 메시는 축별 dim(셀 ~입방 유지). 기본 `target_voxel`은
   메시-국소이므로 **세밀**(예 ≈ 메시 최장축/64, MAX_DIM=128). 커튼은 자기 스케일에서 완전 해상.
 - 캐시 키 = **(로컬 vtx, 로컬 idx, dim)** — **월드 AABB 없음** → 동일 메시는 인스턴스/레벨/씬에 무관히
@@ -58,7 +58,7 @@
 - 결정론·DX≡VK: min-거리 연산이라 순서 무관 비트 동일(기존 `grid_matches_brute` 패턴 재사용).
 
 ### B. 런타임 합성 (Global DF 클립맵, **거리만**) — SDF 트레이스 경로 셰이더 불변
-- 정적 레벨은 **로드 시 1회**, per-mesh DF들을 **기존 클립맵 볼륨으로 합성**한다(UE Global DF의 정적
+- 정적 레벨은 **로드 시 1회**, per-mesh DF들을 **기존 클립맵 볼륨으로 합성**한다(글로벌 DF 합성의 정적
   특수화). 클립맵 voxel `p`마다: 근방 오브젝트들에 대해 `min_i sdf_i(inv_xf_i · p)`(오브젝트 로컬로
   역변환 후 자기 DF 트라이리니어 샘플). **균등/유니폼 스케일만**(노멀 보존) 우선 지원.
 - 가속: 오브젝트 월드 AABB 그리드(Stage A 그리드 재사용)로 voxel당 근방 오브젝트만 → O(clip_voxels ×
@@ -81,8 +81,8 @@
   로컬 좌표 → **그 메시의 파인 local albedo 볼륨 트라이리니어 샘플**. hit당 변환 1 + 샘플 1(바운드).
 - **한계(정직)**: 트레이스가 coarse라 hit 위치 자체가 ±voxel 오차. 커튼처럼 **열린 아케이드에 매달린**
   지오는 최근접=커튼이라 색이 제대로 산다(측정으로 확인). 벽에 바짝 붙은 얇은 면은 coarse 트레이스가
-  커튼/벽을 못 가르므로 여전히 한계 → **per-object DF 직접 march**가 필요(S4, Lumen mesh-DF trace).
-- **C2(후속, Lumen 정렬, S4)**: 트레이스도 per-object 파인 DF로(thin-against-thick 해결) + surface
+  커튼/벽을 못 가르므로 여전히 한계 → **per-object DF 직접 march**가 필요(S4, per-object mesh-DF trace).
+- **C2(후속, 카드 정렬, S4)**: 트레이스도 per-object 파인 DF로(thin-against-thick 해결) + surface
   cache 카드 **메시 래스터 캡처 + opacity**(천/잎/펜스 일반화), voxel albedo 볼륨 제거.
 
 ## 스테이지 (각 = 독립 커밋, 게이트 아래)
@@ -98,7 +98,7 @@
   (bleed.py) 전/후 수치 보고(빨강 옆 바닥 R−B 상승). DX≡VK 재검증(셰이더 변경). 베이크 시간 전/후 보고.
 - **S3 — fused 경로 교체**: 기본을 per-mesh+합성으로, 구 fused 삼각형 베이크 제거(또는 폴백 플래그).
   finer 클립맵 중심을 씬 중심 → **카메라/관심영역**으로(빈-레벨 낭비 제거, [main.rs:1281] 수정).
-- **S4(후속, 분리 가능)** — C2 카드 래스터 캡처 + opacity (Lumen 정렬). 동적/스트리밍은 범위 외.
+- **S4(후속, 분리 가능)** — C2 카드 래스터 캡처 + opacity (카드 색 정렬). 동적/스트리밍은 범위 외.
 
 ## 파일 (생성 / 수정)
 - **신규**: 본 문서, `apps/sandbox/src/compose.rs`(합성기), 메시별 DF 베이크/캐시 헬퍼.

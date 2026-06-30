@@ -20,7 +20,7 @@
 use dreamcoast_asset::sdf::SdfVolume;
 use dreamcoast_core::glam::{Mat4, Vec3};
 
-/// UE `MinMeshSDFRadius` analogue: the smallest drawable (world bounding-sphere radius) that
+/// Small-mesh radius cull: the smallest drawable (world bounding-sphere radius) that
 /// contributes to the GDF composite. Tiny props (bolts, small detail) barely occlude/bounce
 /// the low-frequency GI/AO the distance field feeds, yet each is a full per-mesh DF bake +
 /// composite — so on a non-instanced scene they dominate the cost for ~no quality. Culling
