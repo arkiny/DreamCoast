@@ -590,8 +590,23 @@ fn blend_state(mode: BlendMode) -> D3D12_BLEND_DESC {
             LogicOp: D3D12_LOGIC_OP_NOOP,
             RenderTargetWriteMask: 0,
         };
+        // RT2 material: alpha-blend the decal roughness into G only (R metallic + B AO stay the
+        // surface's). (A4)
+        let rt2 = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            LogicOpEnable: false.into(),
+            SrcBlend: D3D12_BLEND_SRC_ALPHA,
+            DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_GREEN.0 as u8,
+        };
         let mut render_target = [masked; 8];
         render_target[0] = rt0;
+        render_target[2] = rt2;
         return D3D12_BLEND_DESC {
             AlphaToCoverageEnable: false.into(),
             IndependentBlendEnable: true.into(),

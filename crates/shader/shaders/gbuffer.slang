@@ -229,8 +229,18 @@ GBufferOut fsMain(VSOutput input)
 // underlying normal / metallic / roughness / world-pos intact. That is what stops the Intel
 // Sponza `dirt_decal` (BLEND, no MR texture → metallicFactor 1.0) from painting the stone as
 // opaque black metal — the stone keeps its own metalness/normal and only its colour is dusted.
+// Decal G-buffer outputs: RT0 albedo (rgb tint, a = blend alpha) + RT2 material (g = roughness,
+// a = blend alpha). The `DecalAlbedo` blend alpha-blends RT0.rgb and RT2.g and masks everything
+// else (RT0.a AO, RT2.r metallic + RT2.b AO, RT1 normal, RT3 world-pos), so the decal only tints
+// the albedo and nudges the roughness — the surface keeps its own metalness/normal/AO/position.
+struct DecalOut
+{
+    float4 albedo : SV_Target0;
+    float4 material : SV_Target2;
+};
+
 [shader("fragment")]
-float4 fsDecal(VSOutput input) : SV_Target0
+DecalOut fsDecal(VSOutput input)
 {
     float mip_bias = pc.mr_factor.z;
     float3 albedo = pc.base_color_factor.rgb;
@@ -241,5 +251,14 @@ float4 fsDecal(VSOutput input) : SV_Target0
         albedo *= bc.rgb;
         alpha *= bc.a;
     }
-    return float4(albedo, alpha);
+    // Roughness = factor × metallic-roughness texture's G (glTF packs roughness there). Dusty
+    // decals are rough, so this raises the covered surface's roughness (A4). Written to RT2.g only.
+    float roughness = pc.mr_factor.y;
+    if (pc.tex.y != NO_TEXTURE)
+        roughness *= g.textures[pc.tex.y].SampleBias(g.samp_wrap, input.uv, mip_bias).g;
+
+    DecalOut o;
+    o.albedo = float4(albedo, alpha);
+    o.material = float4(0.0, saturate(roughness), 0.0, alpha);
+    return o;
 }
