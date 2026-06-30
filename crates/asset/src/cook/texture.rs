@@ -48,14 +48,13 @@ pub enum TexSlot {
 
 /// Per-slot texture-compression policy. **Perceptual colour** (base colour,
 /// emissive) compresses per the `tier` (BC1/BC3 for `Fast`, BC7 for `High`);
-/// **normals** to BC5 (near-lossless). **Data textures** — metallic-roughness and
-/// anything carrying linear/vector data — are left uncompressed, because block
-/// compression corrupts non-perceptual values.
+/// **normals** to BC5; **data textures** (metallic-roughness) to BC7 — both
+/// near-lossless, so linear/packed values survive at 4:1.
 pub(crate) fn compress_material(material: &mut Material, tier: TexCompress) {
     compress_slot(&mut material.base_color, TexSlot::Colour, true, tier);
     compress_slot(&mut material.emissive, TexSlot::Colour, true, tier);
     compress_slot(&mut material.normal, TexSlot::Normal, false, tier);
-    // metallic_roughness: data texture — intentionally left uncompressed.
+    compress_slot(&mut material.metallic_roughness, TexSlot::Data, false, tier);
 }
 
 /// The block format the policy assigns to `slot` at `tier`, or `None` to keep it
@@ -68,7 +67,11 @@ pub fn slot_format(slot: TexSlot, tier: TexCompress, has_alpha: bool) -> Option<
         return None;
     }
     match slot {
-        TexSlot::Data => None,
+        // Data textures (metallic-roughness, occlusion) → BC7. BC1's heavy colour
+        // quantization would corrupt linear values, but BC7 is near-lossless at the same
+        // 4:1 and — unlike BC5 (2-channel) — preserves all four channels, so glTF's
+        // packed G=roughness/B=metallic layout survives with no swizzle or shader change.
+        TexSlot::Data => Some(BcFormat::Bc7),
         TexSlot::Normal => Some(BcFormat::Bc5),
         TexSlot::Colour => Some(match tier {
             TexCompress::High => BcFormat::Bc7,
@@ -222,8 +225,14 @@ mod tests {
             })
         ));
         assert!(
-            matches!(m.metallic_roughness, Some(TexData::Rgba8(_))),
-            "metallic-roughness is a data texture and must stay uncompressed"
+            matches!(
+                m.metallic_roughness,
+                Some(TexData::Bc {
+                    format: BcFormat::Bc7,
+                    ..
+                })
+            ),
+            "metallic-roughness (data) compresses to near-lossless BC7"
         );
     }
 
