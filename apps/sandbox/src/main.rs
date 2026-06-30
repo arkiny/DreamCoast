@@ -603,6 +603,12 @@ struct App {
     /// samples a multibounce-propagating world volume instead of a single-bounce ray march — the
     /// real fix for deep-interior darkness. Content-only (`P_GI_VOLUME`); gallery forced off.
     gi_volume: bool,
+    /// UE-style indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
+    /// directional sky-visibility): neutral leak fraction (`P_SKYVIS_TINT`) + min-occlusion floor
+    /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
+    /// no-op sentinel image so it stays byte-identical.
+    skyvis_tint: f32,
+    skyvis_min_occ: f32,
     /// C3 hemisphere rays per pixel.
     gi_spp: u32,
     /// Stage D2: surface-cache amortized-relight period (round-robin card budget; 1 = legacy
@@ -1713,6 +1719,20 @@ impl App {
         // the legacy march); `P_GI_VOLUME=0` forces the march back.
         let gi_volume =
             quality::env_bool("P_GI_VOLUME", !gallery_scene) && gdf_gi && gi.has_gi_volume();
+        // UE-style indoor skylight occlusion knobs (only effective on the volume GI path, content):
+        // `P_SKYVIS_TINT` = neutral OcclusionTint leak as a fraction of the occluded skylight
+        // luminance (the occluded floor keeps brightness but loses the blue cast); `P_SKYVIS_MIN_OCC`
+        // = min sky-visibility floor (=1.0 disables the occlusion entirely → SH-L1 baseline).
+        let skyvis_tint = std::env::var("P_SKYVIS_TINT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+        let skyvis_min_occ = std::env::var("P_SKYVIS_MIN_OCC")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
         // Stage D3: gallery forced to the legacy 8 (byte-identical anchor); content takes the tier.
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
@@ -2129,6 +2149,8 @@ impl App {
             ssao_params,
             gdf_gi,
             gi_volume,
+            skyvis_tint,
+            skyvis_min_occ,
             gi_spp,
             cache_relight_period,
             cache_feedback,
@@ -3764,6 +3786,9 @@ impl App {
             None
         };
         // Stage C3: 1-bounce diffuse GI added to the ambient term, optionally denoised (C4).
+        // Indoor skylight-occlusion image (directional sky-visibility), produced on the volume GI
+        // path and consumed by the lighting (occludes the IBL diffuse skylight). `None` otherwise.
+        let mut gi_skyvis_out: Option<ResourceId> = None;
         let gdf_gi_out = match (self.gdf_gi, scene_gdf_vol, scene_gdf_ext) {
             (true, Some(vol), Some(ext)) => {
                 // Stage D1: trace at half res (1/4 the rays) when enabled, then joint-bilateral
@@ -3798,11 +3823,11 @@ impl App {
                             0.1,
                         )
                         .zip(self.gi.gi_volume_sampled())
-                        .map(|(vext, idx)| (idx, vext))
+                        .map(|(vext, (rad_base, skyvis_base))| (rad_base, skyvis_base, vext))
                 } else {
                     None
                 };
-                let traced = self.gi.record_gi(
+                let (traced, skyvis) = self.gi.record_gi(
                     &mut graph,
                     vol,
                     ext,
@@ -3828,6 +3853,7 @@ impl App {
                     self.gdf_cone_k,
                     gi_volume_arg,
                 );
+                gi_skyvis_out = skyvis;
                 let raw = if half_gi {
                     self.gi.record_upsample(
                         &mut graph,
@@ -4067,6 +4093,9 @@ impl App {
             ssao_out,
             gdf_gi_out,
             swrt_reflect_out,
+            gi_skyvis_out,
+            self.skyvis_tint,
+            self.skyvis_min_occ,
             globals_offset,
             self.flip_y,
             // Two-sided shading for imported scenes (single-sided walls seen from inside);

@@ -21,8 +21,17 @@ use crate::push::{
     gi_volume_push,
 };
 
-/// World-space GI irradiance-volume (DDGI-lite radiance cache) probe-grid resolution.
+/// World-space directional-irradiance volume (radiance-cache) probe-grid resolution.
 const GI_VOL_DIM: u32 = 32;
+
+/// SH band-0/1 coefficient count per probe channel-set: 4 coeffs × RGB = 12 R32F volumes per
+/// ping-pong slot (slot index = channel*4 + coeff). Allocated contiguously so the shaders take
+/// only the base bindless index. See `gi_volume.slang`.
+const GI_VOL_SH: usize = 12;
+
+/// Scalar sky-visibility SH band-0/1 coefficient count per ping-pong slot (4 R32F volumes,
+/// contiguous; base index only). UE-style indoor skylight occlusion. See `gi_volume.slang`.
+const GI_SKYVIS_SH: usize = 4;
 
 pub(crate) struct GiSystem {
     ao_pipeline: Option<ComputePipeline>, // C2 GDF ambient occlusion
@@ -40,10 +49,14 @@ pub(crate) struct GiSystem {
     gi_denoise_frame: u32,
     /// Lighting/quality key; a change (sun, spp, …) resets the accumulation.
     gi_denoise_key: Option<u64>,
-    /// UE GI-fidelity track: world-space irradiance volume (DDGI-lite radiance cache). Update
-    /// pipeline + 6 R32F volumes (ping-pong [read|write] x RGB; reuses the albedo 3-volume pattern).
+    /// GI-fidelity track: world-space directional-irradiance volume (radiance cache). Update
+    /// pipeline + 24 R32F volumes (ping-pong [read|write] × 12 SH coefficients). Allocated
+    /// contiguously per slot so only the base bindless index is passed to the shaders.
     gi_vol_pipeline: Option<ComputePipeline>,
-    gi_vol: [[Option<Volume>; 3]; 2],
+    gi_vol: [[Option<Volume>; GI_VOL_SH]; 2],
+    /// UE-style indoor skylight occlusion: directional sky-visibility SH (4 scalar coeffs/slot,
+    /// ping-pong = 8 volumes), filled in the same `gi_volume` pass. Contiguous per slot (base only).
+    gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2],
     gi_vol_frame: u32,
 }
 
@@ -116,9 +129,13 @@ impl GiSystem {
             "gi_volume",
             160,
         )?;
-        // 6 R32F volumes: ping-pong [read|write] x RGB. Empty (zero) at start = no fill until the
-        // update converges; the lighting falls back gracefully (e = 0).
-        let mut gi_vol: [[Option<Volume>; 3]; 2] = [[None, None, None], [None, None, None]];
+        // 24 R32F volumes: ping-pong [read|write] × 12 SH coefficients. Empty (zero) at start = no
+        // fill until the update converges; the lighting falls back gracefully (e = 0). Allocated
+        // back-to-back so each slot's 12 volumes are contiguous in the bindless sampled AND storage
+        // tables (`create_volume` bumps both index counters by one) — the shaders address them as
+        // `base + channel*4 + coeff`, so only the base index is pushed.
+        let mut gi_vol: [[Option<Volume>; GI_VOL_SH]; 2] = Default::default();
+        let mut gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2] = Default::default();
         if gi_vol_pipeline.is_some() {
             let vd = VolumeDesc {
                 width: GI_VOL_DIM,
@@ -131,6 +148,26 @@ impl GiSystem {
                     *ch = Some(device.create_volume(&vd)?);
                 }
             }
+            for set in gi_skyvis.iter_mut() {
+                for ch in set.iter_mut() {
+                    *ch = Some(device.create_volume(&vd)?);
+                }
+            }
+            // The base-index addressing is only valid if each slot's volumes are contiguous in both
+            // the sampled and storage bindless tables; assert it so a future interleaving allocation
+            // can't silently break it.
+            let check = |sets: &[&[Option<Volume>]]| {
+                for set in sets {
+                    let base_s = set[0].as_ref().unwrap().sampled_index();
+                    let base_u = set[0].as_ref().unwrap().storage_index();
+                    for (i, ch) in set.iter().enumerate() {
+                        let v = ch.as_ref().unwrap();
+                        debug_assert_eq!(v.sampled_index(), base_s + i as u32);
+                        debug_assert_eq!(v.storage_index(), base_u + i as u32);
+                    }
+                }
+            };
+            check(&[&gi_vol[0], &gi_vol[1], &gi_skyvis[0], &gi_skyvis[1]]);
         }
         Ok(Self {
             ao_pipeline,
@@ -145,6 +182,7 @@ impl GiSystem {
             gi_denoise_key: None,
             gi_vol_pipeline,
             gi_vol,
+            gi_skyvis,
             gi_vol_frame: 0,
         })
     }
@@ -153,16 +191,15 @@ impl GiSystem {
         self.gi_vol_pipeline.is_some()
     }
 
-    /// The sampled-volume indices (R,G,B) of the volume the GI pass should READ this frame — the
-    /// one the update pass wrote (write slot = frame % 2). `None` if the volume isn't built.
-    pub(crate) fn gi_volume_sampled(&self) -> Option<[u32; 3]> {
+    /// The sampled base indices the GI pass should READ this frame — the slot the update pass wrote
+    /// (write slot = frame % 2). Returns `(radiance_base, skyvis_base)`; each set is contiguous from
+    /// its base. `None` if the volume isn't built.
+    pub(crate) fn gi_volume_sampled(&self) -> Option<(u32, u32)> {
         let w = (self.gi_vol_frame % 2) as usize;
-        let s = &self.gi_vol[w];
-        Some([
-            s[0].as_ref()?.sampled_index(),
-            s[1].as_ref()?.sampled_index(),
-            s[2].as_ref()?.sampled_index(),
-        ])
+        Some((
+            self.gi_vol[w][0].as_ref()?.sampled_index(),
+            self.gi_skyvis[w][0].as_ref()?.sampled_index(),
+        ))
     }
 
     /// Advance the volume ping-pong (end-of-frame, after submit), like the denoiser counter.
@@ -197,16 +234,14 @@ impl GiSystem {
         let write = (self.gi_vol_frame % 2) as usize;
         let rv = &self.gi_vol[read];
         let wv = &self.gi_vol[write];
-        let read_idx = [
-            rv[0].as_ref()?.sampled_index(),
-            rv[1].as_ref()?.sampled_index(),
-            rv[2].as_ref()?.sampled_index(),
-        ];
-        let write_idx = [
-            wv[0].as_ref()?.storage_index(),
-            wv[1].as_ref()?.storage_index(),
-            wv[2].as_ref()?.storage_index(),
-        ];
+        let sv_r = &self.gi_skyvis[read];
+        let sv_w = &self.gi_skyvis[write];
+        // Contiguous bases: the previous slot's sampled base (multibounce + EMA read) and this
+        // slot's storage base (write). The SH volumes follow each base in order.
+        let read_base = rv[0].as_ref()?.sampled_index();
+        let write_base = wv[0].as_ref()?.storage_index();
+        let skyvis_read_base = sv_r[0].as_ref()?.sampled_index();
+        let skyvis_write_base = sv_w[0].as_ref()?.storage_index();
         let diag = Self::diag(aabb_min, aabb_max);
         let reset = u32::from(self.gi_vol_frame == 0);
         let vol_ext = graph.import_external("gi_volume_w");
@@ -229,6 +264,9 @@ impl GiSystem {
                 for ch in rv.iter().flatten() {
                     cmd.volume_to_sampled(ch);
                 }
+                for ch in sv_r.iter().flatten() {
+                    cmd.volume_to_sampled(ch);
+                }
                 let albedo_idx = if let Some((vols, _)) = albedo {
                     for v in vols.iter() {
                         cmd.volume_to_sampled(v);
@@ -244,6 +282,9 @@ impl GiSystem {
                 for ch in wv.iter().flatten() {
                     cmd.volume_to_storage(ch);
                 }
+                for ch in sv_w.iter().flatten() {
+                    cmd.volume_to_storage(ch);
+                }
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&gi_volume_push(
                     aabb_min,
@@ -254,9 +295,9 @@ impl GiSystem {
                     sun_intensity,
                     [GI_VOL_DIM, GI_VOL_DIM, GI_VOL_DIM],
                     frame,
-                    read_idx,
+                    [read_base, skyvis_read_base, 0], // x = radiance SH base, y = sky-vis SH base
                     reset,
-                    write_idx,
+                    [write_base, skyvis_write_base, 0], // x = radiance SH base, y = sky-vis SH base
                     albedo_idx,
                     clip.0,
                     clip.1,
@@ -271,6 +312,9 @@ impl GiSystem {
                 cmd.dispatch(g, g, g);
                 // Transition the just-written volumes back to sampled so the GI pass can read them.
                 for ch in wv.iter().flatten() {
+                    cmd.volume_to_sampled(ch);
+                }
+                for ch in sv_w.iter().flatten() {
                     cmd.volume_to_sampled(ch);
                 }
                 Ok(())
@@ -436,12 +480,19 @@ impl GiSystem {
         clip_vols: &'a [&'a Volume],
         max_steps: u32,
         cone_k: f32,
-        // UE GI-fidelity: when present, the GI pass SAMPLES this world irradiance volume (R/G/B
-        // sampled indices + the update pass's write graph handle) instead of marching rays.
-        gi_volume: Option<([u32; 3], ResourceId)>,
-    ) -> ResourceId {
+        // GI-fidelity: when present, the GI pass SAMPLES this directional-irradiance volume
+        // `(radiance_SH_base, skyvis_SH_base, update-pass write handle)` and reconstructs E(n) +
+        // the sky-visibility instead of marching rays.
+        gi_volume: Option<(u32, u32, ResourceId)>,
+        // Returns `(gi_image, skyvis_image)`; the sky-vis image (indoor skylight occlusion) is only
+        // produced on the volume path (None on the ray-march/gallery path).
+    ) -> (ResourceId, Option<ResourceId>) {
         let gip = self.gi_pipeline.as_ref().expect("gdf gi pipeline");
         let out = graph.create_storage_image("gdf_gi_out", HDR_FORMAT, extent);
+        // Sky-visibility output: produced only on the volume path. NOT denoised (the volume field is
+        // already smooth/stable) — the lighting samples it directly at this (possibly half) res.
+        let skyvis_out =
+            gi_volume.map(|_| graph.create_storage_image("gi_skyvis", HDR_FORMAT, extent));
         let sampled = scene_gdf.sampled_index();
         let diag = Self::diag(aabb_min, aabb_max);
         let bias = diag * 0.004;
@@ -455,21 +506,32 @@ impl GiSystem {
         if let Some((_, ext)) = cache {
             reads.push(ext);
         }
-        if let Some((_, ext)) = gi_volume {
+        if let Some((_, _, ext)) = gi_volume {
             reads.push(ext); // barrier the GI sample after the volume update
         }
-        let vol_rgb = gi_volume.map(|(idx, _)| idx).unwrap_or([u32::MAX; 3]);
+        // vol_r = radiance SH base, vol_g = sky-vis SH base; vol_b (sky-vis output storage index) is
+        // resolved inside the closure (it's a graph resource).
+        let (vol_r, vol_g) = gi_volume
+            .map(|(rb, sb, _)| (rb, sb))
+            .unwrap_or((u32::MAX, u32::MAX));
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
+        let mut storage_writes = vec![out];
+        if let Some(sv) = skyvis_out {
+            storage_writes.push(sv);
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "gdf_gi",
-                storage_writes: vec![out],
+                storage_writes,
                 reads,
             },
             move |ctx| {
                 let depth_index = ctx.sampled_index(depth);
                 let normal_index = ctx.sampled_index(normal);
                 let out_index = ctx.storage_index(out);
+                let vol_b = skyvis_out
+                    .map(|sv| ctx.storage_index(sv))
+                    .unwrap_or(u32::MAX);
                 let cmd = ctx.cmd();
                 cmd.volume_to_sampled(scene_gdf);
                 for v in clip_vols {
@@ -517,13 +579,14 @@ impl GiSystem {
                     crate::GROUND_ALBEDO, // analytic ground material (floor bounce hits)
                     max_steps,            // D3: bounce-ray march step cap
                     cone_k,               // P3: cone-trace LOD slope (0 = legacy)
-                    vol_rgb,              // GI-fidelity: irradiance-volume sampled indices (or MAX)
+                    // vol_r = radiance SH base, vol_g = sky-vis SH base, vol_b = sky-vis out image.
+                    [vol_r, vol_g, vol_b],
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
             },
         );
-        out
+        (out, skyvis_out)
     }
 
     /// Stage D1: joint-bilateral upsample of the half-res GI to full resolution. The C3 trace

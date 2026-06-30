@@ -1,17 +1,37 @@
-// World-space irradiance volume (DDGI-lite radiance cache). One thread per volume probe
-// (voxel). Each probe casts `spp` uniform-sphere rays into the scene GDF; at a hit it shades
-// the surface with direct sun (soft-shadowed) + a sky fill + the PREVIOUS frame's volume
-// sampled at the hit (= multibounce), on a miss it adds the sky. The mean incoming radiance is
-// EMA-accumulated into the write volume. Because each probe samples the volume itself, bright
-// regions (a sunlit atrium) propagate into dark ones (an enclosed nave) over frames — the
-// infinite-bounce fill a single-bounce trace can't reach (UE Lumen radiance cache / DDGI).
+// World-space directional irradiance volume (radiance-cache probes). One thread per volume
+// probe (voxel). Each probe casts `spp` uniform-sphere rays into the scene GDF; at a hit it
+// shades the surface with direct sun (soft-shadowed) + a sky fill + the PREVIOUS frame's
+// volume sampled at the hit (= multibounce), on a miss it adds the sky. Instead of one scalar
+// average per probe, the incoming radiance L(dir) is projected onto a band-0+1 spherical-
+// harmonic basis (4 coefficients per colour channel) and EMA-accumulated per coefficient.
+// Because each probe samples the volume itself, bright regions (a sunlit atrium) propagate
+// into dark ones (an enclosed nave) over frames — the infinite-bounce fill a single-bounce
+// trace can't reach.
 //
-// RGB is three R32F volumes (reusing the albedo-volume pattern), ping-pong read/write.
+// Storing direction (not just the omnidirectional mean) is what lets a coloured surface bleed
+// onto its neighbours: a receiver reconstructs the cosine-weighted hemispherical average in
+// ITS normal direction, so a floor next to a red curtain weights the up/curtain hemisphere and
+// keeps the colour the full-sphere average washed out to ~0.
+//
+// Layout: 12 R32F volumes per ping-pong slot — slot index = channel*4 + coeff (R coeffs 0..3,
+// G coeffs 4..7, B coeffs 8..11). The 12 are allocated contiguously, so only the base bindless
+// index is passed (read_rgb.x = sampled base of the previous slot, write_rgb.x = storage base
+// of this slot); read_rgb.w = reset.
+//
+// Sky-visibility (UE-style indoor skylight occlusion): the probe also projects a SCALAR directional
+// sky-visibility onto band-0/1 SH (4 R32F volumes/slot) — 1 on a sky-escape, 0 on a geometry hit. A
+// receiver reconstructs the cosine-weighted hemispherical sky visibility V(n); the lighting occludes
+// the IBL DIFFUSE skylight by it (with a tint/min-occlusion leak), so an enclosed interior isn't
+// flooded by the full (blue) diffuse skylight. bases: read_rgb.y = sampled, write_rgb.y = storage.
 
 #include "bindless.slang"
 #include "clipmap.slang"
 
 static const float GV_PI = 3.14159265359;
+
+// Real SH band-0/1 basis normalisation: Y0 = sqrt(1/4pi), Y1 = sqrt(3/4pi)*{y,z,x}.
+static const float SH_C0 = 0.2820947918; // sqrt(1/(4*pi))
+static const float SH_C1 = 0.4886025119; // sqrt(3/(4*pi))
 
 struct GiVolumePush
 {
@@ -19,8 +39,10 @@ struct GiVolumePush
     float4 aabb_max;     // xyz volume/world max, w = sample distance clamp
     float4 sun;          // xyz direction toward the sun, w = intensity
     uint4 dims;          // x,y,z = probe grid resolution, w = frame (RNG)
-    uint4 read_rgb;      // sampled volumes[] indices of the previous-frame irradiance (R,G,B); w = reset
-    uint4 write_rgb;     // storage_volumes[] indices to write this frame (R,G,B); w unused
+    uint4 read_rgb;      // x = sampled base of the previous radiance SH volumes; y = sampled base of
+                         // the previous sky-vis SH volumes (0xFFFFFFFF = sky-vis off); w = reset
+    uint4 write_rgb;     // x = storage base of the radiance SH volumes; y = storage base of the
+                         // sky-vis SH volumes written this frame
     uint4 albedo_rgb;    // sampled volumes[] indices of the per-voxel albedo (R,G,B); x=0xFFFFFFFF = constant
     uint4 clip;          // x = clipmap descriptor index, y = level count
     float4 params;       // x = spp, y = ray max dist, z = sky fill, w = EMA alpha
@@ -67,23 +89,52 @@ float gv_shadow(float3 o, float3 d)
     return saturate(res);
 }
 
-// Simple gradient sky (the volume's miss radiance; the env cube isn't sampleable here).
-float3 gv_sky(float3 d)
+// Trilinear sample of the 12 SH coefficient volumes (base index `base`) at world position p,
+// filling c[coeff].rgb. Out of the volume AABB -> all zero. coeff `k` channel `ch` lives in
+// volume `base + ch*4 + k`.
+void read_coeffs(uint base, float3 p, out float3 c[4])
 {
-    float up = saturate(d.y * 0.5 + 0.5);
-    return lerp(float3(0.45, 0.5, 0.6), float3(0.18, 0.34, 0.7), up) * pc.params.z;
-}
-
-// Trilinear sample of the ping-pong RGB read volume at world position p.
-float3 read_volume(float3 p)
-{
+    [unroll]
+    for (int k = 0; k < 4; k++)
+        c[k] = float3(0.0, 0.0, 0.0);
     float3 uvw = (p - pc.aabb_min.xyz) / (pc.aabb_max.xyz - pc.aabb_min.xyz);
     if (any(uvw < 0.0) || any(uvw > 1.0))
-        return float3(0.0, 0.0, 0.0);
+        return;
     uvw = saturate(uvw);
-    return float3(g.volumes[pc.read_rgb.x].SampleLevel(g.samp, uvw, 0.0).x,
-                  g.volumes[pc.read_rgb.y].SampleLevel(g.samp, uvw, 0.0).x,
-                  g.volumes[pc.read_rgb.z].SampleLevel(g.samp, uvw, 0.0).x);
+    [unroll]
+    for (int ch = 0; ch < 3; ch++)
+    {
+        [unroll]
+        for (int k = 0; k < 4; k++)
+            c[k][ch] = g.volumes[base + uint(ch * 4 + k)].SampleLevel(g.samp, uvw, 0.0).x;
+    }
+}
+
+// Trilinear sample of the 4 SCALAR sky-visibility SH coefficient volumes (base index `base`).
+void read_coeffs_scalar(uint base, float3 p, out float c[4])
+{
+    [unroll]
+    for (int k = 0; k < 4; k++)
+        c[k] = 0.0;
+    float3 uvw = (p - pc.aabb_min.xyz) / (pc.aabb_max.xyz - pc.aabb_min.xyz);
+    if (any(uvw < 0.0) || any(uvw > 1.0))
+        return;
+    uvw = saturate(uvw);
+    [unroll]
+    for (int k = 0; k < 4; k++)
+        c[k] = g.volumes[base + uint(k)].SampleLevel(g.samp, uvw, 0.0).x;
+}
+
+// Cosine-weighted hemispherical average radiance in direction n, reconstructed from the SH
+// radiance coefficients (the clamped-cosine convolution: A0/PI = 1, A1/PI = 2/3). For an
+// isotropic field (only the band-0 coeff) this returns exactly the omnidirectional mean, so it
+// is a strict directional generalisation of the old scalar probe. Clamped >= 0 (band-1 SH can
+// ring negative).
+float3 eval_irradiance(float3 c[4], float3 n)
+{
+    float3 e = c[0] * SH_C0
+               + (2.0 / 3.0) * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]);
+    return max(e, float3(0.0, 0.0, 0.0));
 }
 
 // Uniform sphere direction.
@@ -111,8 +162,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 sun_dir = normalize(pc.sun.xyz);
     float bias = pc.ground.w;
     float maxt = pc.params.y;
+    uint read_base = pc.read_rgb.x;
 
-    float3 sum = float3(0.0, 0.0, 0.0);
+    // SH band-0/1 accumulators (4 coeffs x RGB) + scalar sky-visibility (4 coeffs).
+    float3 sh0 = float3(0.0, 0.0, 0.0);
+    float3 sh1 = float3(0.0, 0.0, 0.0);
+    float3 sh2 = float3(0.0, 0.0, 0.0);
+    float3 sh3 = float3(0.0, 0.0, 0.0);
+    float sv0 = 0.0, sv1 = 0.0, sv2 = 0.0, sv3 = 0.0;
     for (uint s = 0; s < spp; s++)
     {
         float3 dir = uniform_sphere(seed);
@@ -133,6 +190,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             if (t > maxt)
                 break;
         }
+        // Incoming radiance L(dir) arriving at the probe along this ray.
+        float3 radiance;
         if (hit)
         {
             float3 hn = scene_normal(hp);
@@ -141,30 +200,81 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp);
             float3 alb = is_ground ? pc.ground.xyz : albedo_at(hp);
             float sky_fill = pc.params.z * (0.5 + 0.5 * hn.y);
-            // Outgoing radiance toward the probe (Lambertian). The DIRECT sun + sky fill are
-            // irradiance, so they get the albedo/PI BRDF. The multibounce `indirect` is the stored
-            // average incoming RADIANCE (the volume holds E/PI); converting it to irradiance (×PI)
-            // before the albedo/PI BRDF cancels the PI, so it re-enters as albedo·indirect. Folding
-            // it under the same 1/PI (the old code) made every bounce PI× too weak — interiors that
-            // rely on multibounce (deep nave) came out ~10× too dark per the extra 1/PI each hop.
-            float3 indirect = read_volume(hp);
-            sum += alb * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / GV_PI) + alb * indirect;
+            // Multibounce: the hit surface re-emits its own indirect irradiance, read
+            // DIRECTIONALLY from the previous-frame SH volume in the hit's normal direction.
+            // The DIRECT sun + sky fill are irradiance, so they get the albedo/PI BRDF; the
+            // stored irradiance (E) re-enters as albedo*indirect (the ×PI to irradiance cancels
+            // the BRDF 1/PI), matching the old scalar probe's energy.
+            float3 cprev[4];
+            read_coeffs(read_base, hp, cprev);
+            float3 indirect = eval_irradiance(cprev, hn);
+            radiance = alb * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / GV_PI) + alb * indirect;
         }
         else
         {
-            sum += gv_sky(dir);
+            // Sky-escape contributes 0 to the stored indirect, matching the per-pixel march
+            // (`gdf_gi.slang trace_bounce`): the deferred IBL diffuse already supplies the
+            // (AO-occluded) sky, so adding the sky here too would double-count it AND flood the
+            // directional irradiance with blue — drowning the coloured scene bounce (e.g. a red
+            // curtain) the volume exists to propagate. The volume now carries ONLY scene radiance
+            // (single-source sky = IBL). The hemispheric `sky_fill` at HITS stays: that is the sky
+            // bouncing off a surface, a legitimate indirect term the march also keeps.
+            radiance = float3(0.0, 0.0, 0.0);
         }
+        // Project L(dir) onto the band-0/1 SH basis.
+        sh0 += radiance * SH_C0;
+        sh1 += radiance * (SH_C1 * dir.y);
+        sh2 += radiance * (SH_C1 * dir.z);
+        sh3 += radiance * (SH_C1 * dir.x);
+        // Sky-visibility: 1 if this ray escaped to sky, 0 if it hit geometry — projected the same
+        // way so a receiver reconstructs the cosine-weighted hemispherical sky visibility V(n).
+        float vis = hit ? 0.0 : 1.0;
+        sv0 += vis * SH_C0;
+        sv1 += vis * (SH_C1 * dir.y);
+        sv2 += vis * (SH_C1 * dir.z);
+        sv3 += vis * (SH_C1 * dir.x);
     }
-    float3 e = sum / float(spp);
+    // Monte-Carlo estimator for uniform-sphere sampling (pdf = 1/4pi): coeff = (4pi/N) * sum.
+    float kw = (4.0 * GV_PI) / float(spp);
+    float3 c[4] = { sh0 * kw, sh1 * kw, sh2 * kw, sh3 * kw };
+    float sv[4] = { sv0 * kw, sv1 * kw, sv2 * kw, sv3 * kw };
 
-    // EMA with the previous frame (reset on the first frame / re-alloc).
+    // EMA with the previous frame (per coefficient; reset on the first frame / re-alloc).
     if (pc.read_rgb.w == 0u)
     {
-        float3 prev = read_volume(probe);
-        e = lerp(prev, e, pc.params.w);
+        float3 prev[4];
+        read_coeffs(read_base, probe, prev);
+        [unroll]
+        for (int i = 0; i < 4; i++)
+            c[i] = lerp(prev[i], c[i], pc.params.w);
+        if (pc.read_rgb.y != 0xFFFFFFFFu)
+        {
+            float svprev[4];
+            read_coeffs_scalar(pc.read_rgb.y, probe, svprev);
+            [unroll]
+            for (int i = 0; i < 4; i++)
+                sv[i] = lerp(svprev[i], sv[i], pc.params.w);
+        }
     }
-    e = make_finite(e);
-    g.storage_volumes[pc.write_rgb.x][tid] = e.x;
-    g.storage_volumes[pc.write_rgb.y][tid] = e.y;
-    g.storage_volumes[pc.write_rgb.z][tid] = e.z;
+    [unroll]
+    for (int i = 0; i < 4; i++)
+        c[i] = make_finite(c[i]);
+
+    uint write_base = pc.write_rgb.x;
+    [unroll]
+    for (int ch = 0; ch < 3; ch++)
+    {
+        [unroll]
+        for (int k = 0; k < 4; k++)
+            g.storage_volumes[write_base + uint(ch * 4 + k)][tid] = c[k][ch];
+    }
+
+    // Sky-visibility SH (4 scalar volumes), when bound.
+    if (pc.write_rgb.y != 0xFFFFFFFFu)
+    {
+        uint sv_base = pc.write_rgb.y;
+        [unroll]
+        for (int k = 0; k < 4; k++)
+            g.storage_volumes[sv_base + uint(k)][tid] = make_finite(float3(sv[k], 0.0, 0.0)).x;
+    }
 }
