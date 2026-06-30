@@ -36,6 +36,47 @@ impl SdfVolume {
         }
         out
     }
+
+    /// Trilinear sample at a point in the volume's own world space (`[aabb_min, aabb_max]`),
+    /// matching the GPU `SampleLevel` convention: voxel centers at `(i+0.5)/dim`, clamp-to-
+    /// edge outside the center grid. Used by the per-mesh→clipmap compositor
+    /// (per-mesh-distance-fields.md, S1) to read a mesh's local DF at a world voxel mapped
+    /// into the mesh's local frame. The caller decides containment; this never returns NaN.
+    pub fn sample(&self, p: [f32; 3]) -> f32 {
+        let dim = self.dim as f32;
+        let mut g = [0.0f32; 3]; // continuous voxel-center coords
+        for a in 0..3 {
+            let ext = self.aabb_max[a] - self.aabb_min[a];
+            let t = if ext > 0.0 {
+                (p[a] - self.aabb_min[a]) / ext
+            } else {
+                0.5
+            };
+            // map normalized [0,1] to voxel-center index space [-0.5 .. dim-0.5], then clamp
+            // so edge samples replicate (GPU clamp addressing).
+            g[a] = (t * dim - 0.5).clamp(0.0, dim - 1.0);
+        }
+        let i0 = [g[0] as u32, g[1] as u32, g[2] as u32];
+        let i1 = [
+            (i0[0] + 1).min(self.dim - 1),
+            (i0[1] + 1).min(self.dim - 1),
+            (i0[2] + 1).min(self.dim - 1),
+        ];
+        let f = [
+            g[0] - i0[0] as f32,
+            g[1] - i0[1] as f32,
+            g[2] - i0[2] as f32,
+        ];
+        let at = |x: u32, y: u32, z: u32| -> f32 {
+            self.voxels[(x + self.dim * (y + self.dim * z)) as usize]
+        };
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let c00 = lerp(at(i0[0], i0[1], i0[2]), at(i1[0], i0[1], i0[2]), f[0]);
+        let c10 = lerp(at(i0[0], i1[1], i0[2]), at(i1[0], i1[1], i0[2]), f[0]);
+        let c01 = lerp(at(i0[0], i0[1], i1[2]), at(i1[0], i0[1], i1[2]), f[0]);
+        let c11 = lerp(at(i0[0], i1[1], i1[2]), at(i1[0], i1[1], i1[2]), f[0]);
+        lerp(lerp(c00, c10, f[1]), lerp(c01, c11, f[1]), f[2])
+    }
 }
 
 /// Vertex stride of the fused buffer (pos[3] + normal[3] + uv[2], all f32).
@@ -675,8 +716,10 @@ pub fn bake_albedo_from_fused(
 pub const MESH_SDF_TARGET_VOXEL: f32 = 0.05;
 /// Minimum per-mesh grid edge (small meshes still get a usable field).
 pub const MESH_SDF_MIN_DIM: u32 = 8;
-/// Maximum per-mesh grid edge (memory/bake cap, matches UE's 128³ mesh-DF ceiling).
-pub const MESH_SDF_MAX_DIM: u32 = 128;
+/// Maximum per-mesh grid edge. Capped low (`dim³` cost, and there are *many* unique meshes
+/// in a non-instanced scene): a thin sheet's thin axis is already resolved by its *tight*
+/// padded AABB even at this dim, so a higher cap only burns bake time for no color gain.
+pub const MESH_SDF_MAX_DIM: u32 = 48;
 
 /// Cubic voxel-grid edge for a mesh of the given **padded** local extent: the longest
 /// axis / the target voxel size, clamped. Cubic `dim` keeps the `idx = x + dim*(y +
