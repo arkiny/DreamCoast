@@ -69,6 +69,20 @@ cook으로 느림).
 - `FOLIAGE_HASHED`(sandbox env, 기본 off) — 소프트 엣지 opt-in. `P_TAAU_FORCE`와 페어링.
 - 추후 `RenderQuality` 티어 연동(Low에서 해시드 off 등) 가능 — 모두 폴리지 일반(씬별 패치 없음).
 
+## Ivy + 히어로 씬 (`sponza_hero`)
+New Sponza **ivy growth** 팩(`pkg_b_ivy`) 추가. **사이프러스와 다름**: `IvyLeaf` 머티리얼은
+`alphaMode=OPAQUE` + **4.9 M-tri 모델링된 잎 지오메트리**(잎 실루엣이 실제 메시, UV가 아틀라스의 잎
+영역만 샘플 — baseColor는 RGB, 알파 없음). 따라서 **알파테스트 불필요** = 일반 OPAQUE glTF로 그대로
+들어오고 폴리지 컷아웃이 안 건드림(정상). 라이아나/잎 in-place 저작(X≈-7, Y≈4–18, 사자 끝 아케이드를
+타고 오름). 무거움(`.bin` ~270 MB, 첫 로드 SDF/albedo cook). `assets/`는 gitignore — ivy는
+`~/assets/pkg_b_ivy`에서 심링크.
+
+`sponza_hero` 레벨 = main + 커튼 + 사이프러스 + ivy(전부 identity). **README 배너**
+(`docs/media/sponza.png`) 교체용 히어로: 역방향 콜로네이드(사자 끝→입구 방향, ivy가 전경 아치를 덮고
+사이프러스가 신랑 중앙, 색 커튼이 양옆)를 레벨 카메라에 베이크. 재현:
+`EV100=12 LEVEL=sponza_hero … --screenshot-clean hero.png` (2560×1440 렌더 → 1920×1080 다운스케일).
+커밋 `895b4e0`.
+
 ## 후속
 - 진짜 유리/투명(트랙 B 포워드 OIT)은 별개 — `Transparent` 중 폴리지가 아닌 자산이 생기면 분류를
   세분화(현재는 모든 비-데칼 BLEND를 컷아웃/해시드로 처리, 딥퍼드에서 안전한 일반 폴백).
