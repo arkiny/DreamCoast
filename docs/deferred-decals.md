@@ -4,9 +4,11 @@
 [phase-11-asset-pipeline.md](phase-11-asset-pipeline.md)(glTF 머티리얼 임포트),
 [sponza-perf.md](sponza-perf.md)(Sponza 컨텍스트).
 
-상태: **A1–A3 구현 완료 + Windows DX≡VK 게이트 통과 (2026-06-30, RTX 2070 SUPER)**. Metal 검증(macOS)에
-이어 Windows에서 VK/D3D12 컴파일·검증 클린·DX≡VK 확인. A4의 roughness 블렌드(선택)는 보류(아래 스테이징
-참고). 후속 트랙 B(포워드 투명)는 [§ 후속](#후속-트랙-b--포워드-투명) 참고.
+상태: **A1–A3(데칼, PR #6) + GDF AO depth-load/store(PR #7) 구현 완료 + Windows DX≡VK 게이트 통과
+(2026-06-30, RTX 2070 SUPER)**. Metal 검증(macOS)에 이어 Windows에서 VK/D3D12 컴파일·검증 클린·DX≡VK
+확인(상세 [§ Windows 게이트 결과](#windows-dxvk-게이트-결과-2026-06-30-rtx-2070-super--pr-6-데칼--pr-7-depth)).
+A4의 roughness 블렌드(선택)는 보류(아래 스테이징 참고). 후속 트랙 B(포워드 투명)는
+[§ 후속](#후속-트랙-b--포워드-투명) 참고.
 
 > **Windows 게이트에서 잡은 크로스백엔드 갭:** A2의 `DecalAlbedo`는 G-buffer MRT에 비균등 per-attachment
 > 블렌드를 줘서 Vulkan **`independentBlend` 디바이스 피처**가 필요한데(D3D12 `IndependentBlendEnable`/Metal은
@@ -124,6 +126,42 @@ Sponza dirt_decal은 표면에 동일평면으로 놓인 **메시 데칼**(glTF 
 - **A4 — roughness 블렌드(선택, 보류) + 마무리**: RT2.g 블렌드는 `dirt_decal`이 MR 텍스처가 없어
   (roughnessFactor 1.0뿐) 이득이 작고 RT2 per-RT 블렌드(write mask=G)라는 추가 크로스백엔드 표면을
   Metal 단독으로는 검증 못 하므로 **보류** — Windows 복구 시 DX≡VK와 함께 평가. 마무리(문서·메모리)는 완료.
+
+## GDF AO depth-load/store (PR #7) — 데칼 트랙이 드러낸 인접 버그
+
+데칼 패스가 G-buffer **depth**를 `loadAction=Clear`(양 백엔드 하드코딩)로 지우고, 오프스크린 MRT 패스가
+depth를 store 안 하면서(Metal `DontCare`), depth로 월드좌표를 복원하는 **모든 deferred SW-RT 패스(GDF
+AO·GI·reflect·SSR)** 가 깨졌다(Metal 깜빡임 / DX·VK는 blank-but-stable). 수정 = **그래프 단위 per-pass
+depth load/store**: depth를 처음 붙이는 패스만 CLEAR, 이후(데칼)는 LOAD로 보존, STORE해서 샘플 가능하게.
+영향: `crates/render/src/lib.rs`(`depth_first_writer` → `depth_clear` 전달), `crates/rhi`(IR/파사드
+`depth_clear`), `rhi-vulkan`/`rhi-d3d12 command.rs`(begin_rendering_targets depth load_op clear↔load +
+STORE). AO 튜닝(머지 부수): strength 1.5 / reach 0.5 / floor 0.4 (`AO_STRENGTH`/`AO_REACH`/`AO_FLOOR`
+env, push-constant라 백엔드 동일).
+
+## Windows DX≡VK 게이트 결과 (2026-06-30, RTX 2070 SUPER) — PR #6 데칼 + PR #7 depth
+
+Metal 구현·검증 후 Windows에서 VK/D3D12 컴파일·검증·DX≡VK 확인. `LEVEL=sponza_intel`(Intel Sponza
+main + 커튼), 카메라 `CAM_EYE="7,2.2,0" CAM_TARGET="-15.84,2.27,0"`, `EV100=11`.
+
+| 항목 | 결과 |
+|---|---|
+| VK+D3D12 빌드 · `clippy --all-targets -D warnings` · `rhi-types` 테스트 | ✅ (단, clippy가 stale 테스트 1건 적발 — 아래) |
+| 깜빡임 (`CAPTURE_SEQ=4 P11_LEGACY_IBL=1`) | **DX·VK 4프레임 비트 동일** = 깜빡임 없음 ✅ |
+| GDF AO 가시성 (`DEBUG_VIEW=9`) | mean 222.9 / min 198 = 콜로네이드 음영 보임(**blank 아님**) ✅ |
+| **GDF AO 단독 DX≡VK** (PR #7 출력 격리) | **0.001/ch** (max 25) ✅ |
+| 갤러리 무회귀 DX≡VK | **0.001/ch** (max 5) ✅ |
+| full Sponza DX≡VK (데칼+AO+GI) | 0.003/ch (legacy-IBL 0.004) — **기존 씬 복잡도 갭** |
+| VK 검증 / D3D12 디버그 레이어 | 무에러(surface-cache/NV 제외) ✅ |
+
+**full Sponza 0.003~0.004 해석:** 변경분 자체는 파리티 클린(AO 단독 0.001, 갤러리 0.001, 이전 main-only
+Sponza+데칼 0.000). full 씬의 0.003~0.004는 sponza_intel(155노드+커튼+IBL 큐브 캡처)의 **기존 cross-backend
+복잡도 갭**(montage diff ×8 = 새까맘 = sub-LSB가 전 지오메트리 엣지에 분산, 데칼/먼지 영역 집중 아님; 메모리
+문서값 "demo 0.004 pre-existing"과 일치). sponza_intel 레벨이 PR 이후 추가돼 동일 씬 PR-이전 베이스라인은
+없으므로 격리 측정으로 갈음. **PR #6/#7이 도입한 DX≡VK 발산은 없음.**
+
+**게이트가 잡은 빌드 버그(수정·푸시 `257cafb`):** PR #6이 `GltfMaterial`에 `alpha_mode`/`kind`를 추가했으나
+`crates/scene` 유닛테스트 픽스처가 옛 필드로 생성 → `cargo build`는 테스트 타깃 미컴파일로 통과, **`clippy
+--all-targets`만 적발**(macOS가 못 잡는, Windows 게이트의 전형). Opaque/Opaque로 수정.
 
 ## 스케일링 / 품질 노브 (한 곳)
 - 데칼은 **정확성**(기본 on). 토글/캡은 `quality.rs` 한 곳: `decals_on`, `max_decals`(드로우 캡), 추후
