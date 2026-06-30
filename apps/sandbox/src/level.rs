@@ -400,11 +400,12 @@ pub(crate) fn sponza_intel_level() -> LevelData {
             intensity: 100000.0,
         }],
         // Down the colonnade toward the lion: stand back in the +X nave and look -X at the
-        // lion-head relief (centre ~(-15.84, 2.27, 0.79)) so the columns recede to it as the
-        // vanishing point — the corridor is visible and the lion anchors the far end.
+        // lion-head relief end. Z = 0 is the corridor centre (the column rows sit at Z ~ ±3.1),
+        // so the columns recede symmetrically and the lion anchors the far end; the lion itself
+        // is at Z 0.79, barely off-centre over the ~23 m depth.
         camera: Camera {
-            position: [7.0, 2.2, 0.79],
-            target: [-15.84, 2.27, 0.79],
+            position: [7.0, 2.2, 0.0],
+            target: [-15.84, 2.27, 0.0],
             fov_y_deg: 60.0,
             znear: 0.05,
             zfar: 100.0,
