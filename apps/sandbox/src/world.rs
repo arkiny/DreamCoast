@@ -114,6 +114,7 @@ impl Streaming {
             &mut materials,
             &mut textures,
             Vec3::from(*origin),
+            crate::level::content_tex_compress(),
         )?;
         propagate_transforms(&mut world);
         self.loaded.push(LoadedChunk {

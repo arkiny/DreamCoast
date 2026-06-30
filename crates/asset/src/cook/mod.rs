@@ -19,7 +19,7 @@ mod texture;
 
 pub use level::load_or_cook_level;
 pub use scene::{load_or_bake_scene_albedo, load_or_bake_scene_sdf};
-pub use texture::TexCompress;
+pub use texture::{TexCompress, TexSlot, compress_image_for_slot, slot_format};
 
 use std::path::{Path, PathBuf};
 
