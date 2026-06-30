@@ -229,6 +229,7 @@ impl VulkanCommandBuffer {
         target: &VulkanRenderTarget,
         color_clear: Option<ClearColor>,
         depth: Option<&VulkanDepthBuffer>,
+        depth_clear: bool,
     ) {
         let (load_op, clear_value) = match color_clear {
             Some(c) => (
@@ -261,8 +262,14 @@ impl VulkanCommandBuffer {
             depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(d.view())
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                // First writer CLEARs; a later user LOADs (preserves) the depth. STORE so the
+                // deferred SW-RT passes (GDF AO / GI / reflections) sample the real depth.
+                .load_op(if depth_clear {
+                    vk::AttachmentLoadOp::CLEAR
+                } else {
+                    vk::AttachmentLoadOp::LOAD
+                })
+                .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue {
                         depth: 1.0,
@@ -287,6 +294,7 @@ impl VulkanCommandBuffer {
         &self,
         targets: &[(&VulkanRenderTarget, Option<ClearColor>)],
         depth: Option<&VulkanDepthBuffer>,
+        depth_clear: bool,
     ) {
         let extent = targets[0].0.extent();
         let color_attachments: Vec<vk::RenderingAttachmentInfo> = targets
@@ -324,8 +332,14 @@ impl VulkanCommandBuffer {
             depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(d.view())
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                // First writer CLEARs; a later user LOADs (preserves) the depth. STORE so the
+                // deferred SW-RT passes (GDF AO / GI / reflections) sample the real depth.
+                .load_op(if depth_clear {
+                    vk::AttachmentLoadOp::CLEAR
+                } else {
+                    vk::AttachmentLoadOp::LOAD
+                })
+                .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue {
                         depth: 1.0,

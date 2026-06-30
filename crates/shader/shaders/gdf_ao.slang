@@ -31,7 +31,7 @@ struct AoPush
     uint pad0;
     float4 aabb_min;        // xyz GDF world min, w = ground plane Y
     float4 aabb_max;        // xyz GDF world max, w = sample distance clamp
-    float4 params;          // x = AO reach (world units), y = strength, z = bias, w unused
+    float4 params;          // x = AO reach (world units), y = strength, z = bias, w = AO floor
     uint4 clip;             // Stage B clipmap: x = descriptor index, y = level count
 };
 
@@ -78,7 +78,12 @@ float calc_ao(float3 p, float3 n)
     // asymptotes toward — but never reaches — zero, so a visible concave corner (which still sees
     // most of the sky) keeps a soft AO instead of crushing to pure black. The linear form clamped
     // to 0 in corners and, with weak indirect fill, burned the recesses black.
-    return exp(-pc.params.y * max(occ, 0.0));
+    float ao = exp(-pc.params.y * max(occ, 0.0));
+    // Remap to [floor, 1]: even a fully-occluded contact (a column meeting the floor) keeps at
+    // least `floor` of the ambient, so deep contacts read as soft shade rather than near-black —
+    // the single-bounce GDF GI under-fills those recesses, and a metric reach makes the contact
+    // band wide, so without a floor the column bases crush. `AO_FLOOR` tunes it (0 = no floor).
+    return pc.params.w + (1.0 - pc.params.w) * ao;
 }
 
 [shader("compute")]

@@ -596,7 +596,7 @@ fn generate_brdf_lut(
 ) -> anyhow::Result<()> {
     cmd.begin()?;
     cmd.rt_to_render_target(brdf_lut);
-    cmd.begin_rendering_target(brdf_lut, Some(ClearColor::BLACK), None);
+    cmd.begin_rendering_target(brdf_lut, Some(ClearColor::BLACK), None, true);
     cmd.set_viewport_scissor_extent(Extent2D::new(BRDF_SIZE, BRDF_SIZE));
     cmd.bind_graphics_pipeline(brdf_pipeline);
     let mut push = [0u8; 16];
