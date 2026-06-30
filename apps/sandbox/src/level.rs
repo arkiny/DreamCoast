@@ -399,11 +399,11 @@ pub(crate) fn sponza_intel_level() -> LevelData {
             color: [1.0, 0.96, 0.9],
             intensity: 100000.0,
         }],
-        // Facing the iconic lion-head relief on the nave's -X end wall (its world AABB centre
-        // is ~(-15.84, 2.27, 0.79)): stand in the nave and look down -X at the lion.
+        // Standing in front of the door at the nave's -X end (by the lion relief) looking down
+        // the long +X corridor: the colonnade recedes and a far door anchors the vanishing point.
         camera: Camera {
-            position: [-6.0, 2.3, 0.79],
-            target: [-15.84, 2.27, 0.79],
+            position: [-14.0, 2.0, 0.0],
+            target: [12.0, 2.7, 0.0],
             fov_y_deg: 60.0,
             znear: 0.05,
             zfar: 100.0,
