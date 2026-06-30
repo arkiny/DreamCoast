@@ -347,16 +347,21 @@ impl GiSystem {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or((diag * 0.07).min(0.5));
         let bias = (diag * 0.004).min(0.02);
+        // Strength `2.0`: `1.5` (set when the depth fix first made AO reliable) read too faint in the
+        // interiors, so it is nudged up for a more present contact shade — still well below the `3.0`
+        // that over-darkened the scene. (AO is slated for a `RenderQuality`/UI parameterization; this
+        // is just a better default in the meantime.) `AO_STRENGTH` overrides.
         let strength = std::env::var("AO_STRENGTH")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(1.5);
+            .unwrap_or(2.0);
         // AO floor: deep contacts keep at least this fraction of the ambient (gdf_ao.slang remaps
-        // to [floor, 1]) so column bases / recesses read as soft shade, not near-black.
+        // to [floor, 1]) so column bases / recesses read as soft shade, not near-black. Lowered
+        // `0.4 -> 0.3` so the deepest contacts can read a touch darker without crushing to black.
         let floor = std::env::var("AO_FLOOR")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.4);
+            .unwrap_or(0.3);
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "gdf_ao",
