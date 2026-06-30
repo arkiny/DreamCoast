@@ -399,10 +399,11 @@ pub(crate) fn sponza_intel_level() -> LevelData {
             color: [1.0, 0.96, 0.9],
             intensity: 100000.0,
         }],
-        // The validated indoor "lion view": down the long nave axis (X) at human height.
+        // Facing the iconic lion-head relief on the nave's -X end wall (its world AABB centre
+        // is ~(-15.84, 2.27, 0.79)): stand in the nave and look down -X at the lion.
         camera: Camera {
-            position: [-14.0, 2.0, 0.0],
-            target: [14.0, 2.0, 0.0],
+            position: [-6.0, 2.3, 0.79],
+            target: [-15.84, 2.27, 0.79],
             fov_y_deg: 60.0,
             znear: 0.05,
             zfar: 100.0,
