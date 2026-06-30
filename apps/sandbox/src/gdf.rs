@@ -1252,6 +1252,13 @@ impl GdfSystem {
         let tracep = self.trace_pipeline.as_ref().expect("gdf trace pipeline");
         let out = graph.create_storage_image("scene_gdf_out", HDR_FORMAT, extent);
         let gdf_ext = graph.import_external("scene_gdf");
+        // UE-style clay viz: the scene's HDR sun (~1e5) over-exposes the flat clay through the
+        // shared tonemap; a gain brings it to a readable mid-grey. `GDF_VIEW_GAIN` env tunes it.
+        let view_gain = std::env::var("GDF_VIEW_GAIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.05);
+        let sun_intensity = sun_intensity * view_gain;
         let aabb_min = self.scene_aabb_min;
         let aabb_max = self.scene_aabb_max;
         if build {
@@ -1297,7 +1304,7 @@ impl GdfSystem {
                     ch,
                     flip_y,
                     sampled,
-                    0, // mode 0: sample the baked GDF (no analytic reference)
+                    2, // mode bit1: UE-style clay viz (read the GDF shape, not a fake color)
                     clip.0,
                     clip.1,
                     aabb_min,
