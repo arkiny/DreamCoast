@@ -18,8 +18,14 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
     gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_gi_upsample_push, gdf_temporal_push,
-    gi_volume_push,
+    gi_volume_push, screen_probe_integrate_push, screen_probe_trace_push,
 };
+
+/// Screen-space radiance probe density: one probe per `SP_DOWNSAMPLE`x`SP_DOWNSAMPLE` screen
+/// tile (reference uses ~16). Tunable later via a `RenderQuality` tier.
+const SP_DOWNSAMPLE: u32 = 16;
+/// Octahedral radiance-tile resolution per probe (texels per side). Reference starts 8.
+const SP_OCT_RES: u32 = 8;
 
 /// World-space directional-irradiance volume (radiance-cache) probe-grid resolution.
 const GI_VOL_DIM: u32 = 32;
@@ -54,6 +60,11 @@ pub(crate) struct GiSystem {
     /// contiguously per slot so only the base bindless index is passed to the shaders.
     gi_vol_pipeline: Option<ComputePipeline>,
     gi_vol: [[Option<Volume>; GI_VOL_SH]; 2],
+    /// Screen-space radiance probes (P1+): per-tile probe trace into an octahedral radiance
+    /// atlas, then a per-pixel gather of that atlas into indirect irradiance. Replaces the
+    /// world-volume / ray-march GI consumption on content scenes (opt-in `SCREEN_PROBE`).
+    sp_trace_pipeline: Option<ComputePipeline>,
+    sp_integrate_pipeline: Option<ComputePipeline>,
     /// UE-style indoor skylight occlusion: directional sky-visibility SH (4 scalar coeffs/slot,
     /// ping-pong = 8 volumes), filled in the same `gi_volume` pass. Contiguous per slot (base only).
     gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2],
@@ -129,6 +140,20 @@ impl GiSystem {
             "gi_volume",
             160,
         )?;
+        let sp_trace_pipeline = compute(
+            dreamcoast_shader::screen_probe_trace_cs_spirv,
+            dreamcoast_shader::screen_probe_trace_cs_dxil,
+            dreamcoast_shader::screen_probe_trace_cs_metallib,
+            "screen_probe_trace",
+            224,
+        )?;
+        let sp_integrate_pipeline = compute(
+            dreamcoast_shader::screen_probe_integrate_cs_spirv,
+            dreamcoast_shader::screen_probe_integrate_cs_dxil,
+            dreamcoast_shader::screen_probe_integrate_cs_metallib,
+            "screen_probe_integrate",
+            128,
+        )?;
         // 24 R32F volumes: ping-pong [read|write] × 12 SH coefficients. Empty (zero) at start = no
         // fill until the update converges; the lighting falls back gracefully (e = 0). Allocated
         // back-to-back so each slot's 12 volumes are contiguous in the bindless sampled AND storage
@@ -184,6 +209,8 @@ impl GiSystem {
             gi_vol,
             gi_skyvis,
             gi_vol_frame: 0,
+            sp_trace_pipeline,
+            sp_integrate_pipeline,
         })
     }
 
@@ -331,6 +358,9 @@ impl GiSystem {
     }
     pub(crate) fn has_upsample(&self) -> bool {
         self.upsample_pipeline.is_some()
+    }
+    pub(crate) fn has_screen_probe(&self) -> bool {
+        self.sp_trace_pipeline.is_some() && self.sp_integrate_pipeline.is_some()
     }
     pub(crate) fn has_denoise(&self) -> bool {
         self.temporal_pipeline.is_some() && self.atrous_pipeline.is_some()
@@ -587,6 +617,167 @@ impl GiSystem {
             },
         );
         (out, skyvis_out)
+    }
+
+    /// Screen-space radiance probes (P1 trace + P3 integrate). A probe is placed on the
+    /// representative G-buffer surface of every `SP_DOWNSAMPLE` screen tile; the trace pass
+    /// fills each probe's octahedral radiance tile (atlas) by marching the shared bounce tracer
+    /// into the scene GDF; the integrate pass gathers the surrounding probes per pixel into
+    /// indirect irradiance E (the lighting multiplies by albedo). Returns the full-res E image
+    /// (a drop-in for `record_gi`'s output). Same GDF / albedo / cache / clip inputs as
+    /// `record_gi`. `None` without the pipelines.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_screen_probe<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        scene_gdf: &'a Volume,
+        scene_gdf_ext: ResourceId,
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        depth: ResourceId,
+        normal: ResourceId,
+        extent: Extent2D,
+        inv_view_proj: [f32; 16],
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        cw: u32,
+        ch: u32,
+        flip_y: u32,
+        frame: u32,
+        albedo: Option<(&'a [Volume; 3], ResourceId)>,
+        cache: Option<([u32; 5], ResourceId)>,
+        clamp_max: f32,
+        clip: (u32, u32),
+        clip_vols: &'a [&'a Volume],
+        max_steps: u32,
+        cone_k: f32,
+    ) -> ResourceId {
+        let trace = self.sp_trace_pipeline.as_ref().expect("sp trace pipeline");
+        let integrate = self
+            .sp_integrate_pipeline
+            .as_ref()
+            .expect("sp integrate pipeline");
+        let diag = Self::diag(aabb_min, aabb_max);
+        let bias = diag * 0.004;
+
+        let probes_x = cw.div_ceil(SP_DOWNSAMPLE);
+        let probes_y = ch.div_ceil(SP_DOWNSAMPLE);
+        let atlas_w = probes_x * SP_OCT_RES;
+        let atlas_h = probes_y * SP_OCT_RES;
+        let atlas = graph.create_storage_image(
+            "sp_radiance_atlas",
+            HDR_FORMAT,
+            Extent2D::new(atlas_w, atlas_h),
+        );
+        let out = graph.create_storage_image("sp_gi_out", HDR_FORMAT, extent);
+
+        let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
+        let cache4 = [cache_idx[0], cache_idx[1], cache_idx[2], cache_idx[3]];
+        let cache_tile = cache_idx[4];
+
+        // --- P1: trace every probe's octahedral radiance tile into the atlas. ---
+        let mut trace_reads = vec![depth, normal, scene_gdf_ext];
+        if let Some((_, ext)) = albedo {
+            trace_reads.push(ext);
+        }
+        if let Some((_, ext)) = cache {
+            trace_reads.push(ext);
+        }
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "screen_probe_trace",
+                storage_writes: vec![atlas],
+                reads: trace_reads,
+            },
+            move |ctx| {
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let atlas_index = ctx.storage_index(atlas);
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(scene_gdf);
+                for v in clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
+                if let Some((vols, _)) = albedo {
+                    for v in vols.iter() {
+                        cmd.volume_to_sampled(v);
+                    }
+                }
+                cmd.bind_compute_pipeline(trace);
+                cmd.push_constants_compute(&screen_probe_trace_push(
+                    &inv_view_proj,
+                    sun_dir,
+                    sun_intensity,
+                    aabb_min,
+                    0.0, // world ground plane y = 0
+                    aabb_max,
+                    diag, // sample distance clamp
+                    diag, // ray max distance
+                    bias,
+                    0.25, // sky fill radiance at the bounce hit
+                    0.7,  // constant hit-albedo fallback (sentinel albedo)
+                    crate::GROUND_ALBEDO,
+                    cone_k,
+                    cache4,
+                    depth_index,
+                    normal_index,
+                    atlas_index,
+                    cache_tile,
+                    cw,
+                    ch,
+                    probes_x,
+                    probes_y,
+                    SP_DOWNSAMPLE,
+                    SP_OCT_RES,
+                    flip_y,
+                    frame,
+                    max_steps,
+                    clip.0,
+                    clip.1,
+                    clamp_max,
+                ));
+                cmd.dispatch(atlas_w.div_ceil(8), atlas_h.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+
+        // --- P3: gather the probe atlas per pixel into indirect irradiance. ---
+        let pos_sigma = diag * 0.01;
+        let normal_power = 8.0_f32;
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "screen_probe_integrate",
+                storage_writes: vec![out],
+                reads: vec![atlas, depth, normal],
+            },
+            move |ctx| {
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let atlas_index = ctx.sampled_index(atlas);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(integrate);
+                cmd.push_constants_compute(&screen_probe_integrate_push(
+                    &inv_view_proj,
+                    depth_index,
+                    normal_index,
+                    atlas_index,
+                    out_index,
+                    cw,
+                    ch,
+                    probes_x,
+                    probes_y,
+                    SP_DOWNSAMPLE,
+                    SP_OCT_RES,
+                    flip_y,
+                    pos_sigma,
+                    normal_power,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
     }
 
     /// Stage D1: joint-bilateral upsample of the half-res GI to full resolution. The C3 trace

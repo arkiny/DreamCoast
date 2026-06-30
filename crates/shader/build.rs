@@ -592,6 +592,20 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gi_volume_cs",
     },
+    // Screen-space radiance probes: per-tile probe trace into the octahedral atlas (P1).
+    Job {
+        src: "screen_probe_trace.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "screen_probe_trace_cs",
+    },
+    // Screen-space radiance probes: per-pixel gather of the probe atlas -> indirect irradiance.
+    Job {
+        src: "screen_probe_integrate.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "screen_probe_integrate_cs",
+    },
     // Physical-camera auto-exposure: luminance histogram (pass 1) → adapted exposure (pass 2).
     Job {
         src: "auto_exposure.slang",
