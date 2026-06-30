@@ -340,15 +340,23 @@ impl GiSystem {
         // now that it applies correctly every frame, 3.0 over-darkened the interior, so it is dialled
         // back to a subtle, natural contact occlusion. `AO_STRENGTH` / `AO_REACH` tune it.
         let diag = Self::diag(aabb_min, aabb_max);
+        // Reach capped at 0.5 m: a contact-scale band so the occlusion hugs the contact line
+        // (a column meeting the floor) instead of smearing ~1 m up the column.
         let reach = std::env::var("AO_REACH")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or((diag * 0.07).min(1.0));
+            .unwrap_or((diag * 0.07).min(0.5));
         let bias = (diag * 0.004).min(0.02);
         let strength = std::env::var("AO_STRENGTH")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(1.5);
+        // AO floor: deep contacts keep at least this fraction of the ambient (gdf_ao.slang remaps
+        // to [floor, 1]) so column bases / recesses read as soft shade, not near-black.
+        let floor = std::env::var("AO_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.4);
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "gdf_ao",
@@ -381,6 +389,7 @@ impl GiSystem {
                     reach,
                     strength,
                     bias,
+                    floor,
                     clip.0,
                     clip.1,
                 ));

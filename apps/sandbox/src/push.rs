@@ -686,6 +686,7 @@ pub(crate) fn gdf_ao_push(
     reach: f32,
     strength: f32,
     bias: f32,
+    floor: f32,
     clip_desc: u32,
     clip_count: u32,
 ) -> [u8; 160] {
@@ -712,6 +713,7 @@ pub(crate) fn gdf_ao_push(
     pc[128..132].copy_from_slice(&reach.to_le_bytes());
     pc[132..136].copy_from_slice(&strength.to_le_bytes());
     pc[136..140].copy_from_slice(&bias.to_le_bytes());
+    pc[140..144].copy_from_slice(&floor.to_le_bytes()); // params.w = AO floor (min AO value)
     // Stage B clipmap descriptor (uint4 clip at offset 144): x = index, y = level count.
     pc[144..148].copy_from_slice(&clip_desc.to_le_bytes());
     pc[148..152].copy_from_slice(&clip_count.to_le_bytes());
