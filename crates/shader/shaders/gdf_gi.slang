@@ -56,10 +56,16 @@ struct GiPush
     // .w sits at +12 on all three backends; max_steps then gets its own clean 16-byte row.
     float4 ground_albedo;
     uint max_steps;         // Stage D3: bounce-ray march step cap (64 = legacy / gallery)
-    uint vol_r;             // GI irradiance-volume R sampled index (0xFFFFFFFF = off -> trace rays)
-    uint vol_g;             // green
-    uint vol_b;             // blue (4 contiguous uints w/ max_steps -> Metal-safe row, no float3 pad)
+    uint vol_r;             // directional-irradiance volume: sampled BASE index of the 12 SH
+                            // coefficient volumes (0xFFFFFFFF = off -> trace rays)
+    uint vol_g;             // sky-visibility: sampled BASE index of the 4 scalar SH volumes
+                            // (0xFFFFFFFF = sky-vis off). Reuses vol_r's freed slot.
+    uint vol_b;             // sky-visibility OUTPUT storage-image index (0xFFFFFFFF = don't write).
 };
+
+// Real SH band-0/1 basis normalisation (matches gi_volume.slang).
+static const float SH_C0 = 0.2820947918; // sqrt(1/(4*pi))
+static const float SH_C1 = 0.4886025119; // sqrt(3/(4*pi))
 
 [[vk::push_constant]]
 ConstantBuffer<GiPush> pc : register(b0, space0);
@@ -227,10 +233,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float2 uv = (float2(tid.xy) + 0.5) / float2(pc.width, pc.height);
     float depth = g.textures[pc.depth_index].SampleLevel(g.samp, uv, 0.0).r;
 
-    // Far plane (no geometry): no indirect bounce.
+    // Far plane (no geometry): no indirect bounce. Sky-vis = 1 (the skybox isn't IBL-lit, but keep
+    // the image defined so the lighting never reads stale storage).
     if (depth >= 1.0)
     {
         g.storage_images[pc.out_index][tid.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        if (pc.vol_b != 0xFFFFFFFFu)
+            g.storage_images[pc.vol_b][tid.xy] = float4(1.0, 0.0, 0.0, 1.0);
         return;
     }
 
@@ -239,10 +248,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float4 hpos = mul(pc.inv_view_proj, float4(ndc, depth, 1.0));
     float3 world_pos = hpos.xyz / hpos.w;
 
-    // GI irradiance-volume mode (DDGI-lite radiance cache): instead of marching per-pixel rays,
-    // sample the world-space irradiance volume (updated in gi_volume.slang with multibounce). This
-    // is the indirect E the lighting multiplies by albedo; it fills enclosed interiors a single
-    // bounce can't reach. Feeds the existing temporal+a-trous denoiser unchanged.
+    float3 n = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, uv, 0.0).xyz);
+
+    // Directional-irradiance volume mode (radiance cache): instead of marching per-pixel rays,
+    // sample the world-space SH volume (updated in gi_volume.slang with multibounce) and
+    // reconstruct the cosine-weighted hemispherical average radiance in THIS pixel's normal
+    // direction. That directionality is what lets a coloured surface bleed onto a neighbour the
+    // old omnidirectional average washed out. The result is the indirect E the lighting
+    // multiplies by albedo; it fills enclosed interiors a single bounce can't reach. Feeds the
+    // existing temporal + a-trous denoiser unchanged.
     if (pc.vol_r != 0xFFFFFFFFu)
     {
         float3 uvw = (world_pos - GDF_MIN) / (GDF_MAX - GDF_MIN);
@@ -250,15 +264,49 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         if (all(uvw >= 0.0) && all(uvw <= 1.0))
         {
             uvw = saturate(uvw);
-            e = float3(g.volumes[pc.vol_r].SampleLevel(g.samp, uvw, 0.0).x,
-                       g.volumes[pc.vol_g].SampleLevel(g.samp, uvw, 0.0).x,
-                       g.volumes[pc.vol_b].SampleLevel(g.samp, uvw, 0.0).x);
+            // The 12 SH coefficient volumes are contiguous from vol_r: coeff k, channel ch lives
+            // in volume vol_r + ch*4 + k. Reconstruct E(n) with the clamped-cosine convolution
+            // (A0/PI = 1, A1/PI = 2/3); clamp >= 0 (band-1 SH can ring negative).
+            float3 c[4];
+            [unroll]
+            for (int k = 0; k < 4; k++)
+                c[k] = float3(0.0, 0.0, 0.0);
+            [unroll]
+            for (int ch = 0; ch < 3; ch++)
+            {
+                [unroll]
+                for (int k = 0; k < 4; k++)
+                    c[k][ch] =
+                        g.volumes[pc.vol_r + uint(ch * 4 + k)].SampleLevel(g.samp, uvw, 0.0).x;
+            }
+            e = c[0] * SH_C0
+                + (2.0 / 3.0) * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]);
+            e = max(e, float3(0.0, 0.0, 0.0));
         }
         g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
+
+        // Sky-visibility (UE-style indoor skylight occlusion): reconstruct the cosine-weighted
+        // hemispherical sky visibility V(n) from the 4 scalar SH volumes (contiguous from vol_g) and
+        // write it for the lighting to occlude the IBL diffuse skylight. Open surfaces -> ~1 (full
+        // skylight); enclosed interiors -> ~0 (the diffuse skylight is occluded, so the coloured
+        // scene bounce shows instead of flat blue sky).
+        if (pc.vol_g != 0xFFFFFFFFu && pc.vol_b != 0xFFFFFFFFu)
+        {
+            float v = 1.0;
+            if (all(uvw >= 0.0) && all(uvw <= 1.0))
+            {
+                float sc[4];
+                [unroll]
+                for (int k = 0; k < 4; k++)
+                    sc[k] = g.volumes[pc.vol_g + uint(k)].SampleLevel(g.samp, uvw, 0.0).x;
+                v = sc[0] * SH_C0
+                    + (2.0 / 3.0) * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2] + SH_C1 * n.x * sc[3]);
+                v = saturate(v);
+            }
+            g.storage_images[pc.vol_b][tid.xy] = float4(v, 0.0, 0.0, 1.0);
+        }
         return;
     }
-
-    float3 n = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, uv, 0.0).xyz);
 
     uint spp = max(pc.spp, 1u);
     uint seed = (tid.x * 1973u + tid.y * 9277u + pc.frame * 26699u) | 1u;
