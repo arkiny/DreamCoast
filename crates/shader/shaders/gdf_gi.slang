@@ -60,6 +60,16 @@ struct GiPush
     uint vol_g;             // sky-visibility: sampled BASE index of the 4 scalar SH volumes
                             // (0xFFFFFFFF = sky-vis off). Reuses vol_r's freed slot.
     uint vol_b;             // sky-visibility OUTPUT storage-image index (0xFFFFFFFF = don't write).
+    // F3 (HW-RT high-fidelity path, first increment): 0 = off (SW sphere-march, the scalable
+    // default — bytecode-inert here so the OFF path is byte-identical to the pre-F3 shader);
+    // 1 = cast the same cosine-hemisphere GI rays against the scene TLAS with an inline RayQuery
+    // and return a hardware-traced VISIBILITY term instead of the SW march. Opt-in High tier
+    // (`P_HWRT_GI=1`); requires the BLAS/TLAS built by rt.rs (gallery scene). This first increment
+    // returns occlusion only (hit LIGHTING from the surface cache is the next increment).
+    uint hwrt;
+    uint pad_hwrt0;         // 16-byte row padding (keeps the block a multiple of 16 across backends)
+    uint pad_hwrt1;
+    uint pad_hwrt2;
 };
 
 // Real SH band-0/1 basis normalisation (matches gi_volume.slang).
@@ -185,6 +195,41 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     uint spp = max(pc.spp, 1u);
     uint seed = (tid.x * 1973u + tid.y * 9277u + pc.frame * 26699u) | 1u;
     float3 origin = world_pos + n * pc.params.y;
+
+    // F3 first increment — HARDWARE-RAYTRACED gather (High tier, opt-in `P_HWRT_GI=1`). Cast the
+    // same cosine-hemisphere GI rays against the scene TLAS (built by rt.rs, shared bindless
+    // `g.tlas` binding) with an inline RayQuery — the same trace primitive the ground-truth path
+    // tracer uses — and accumulate a hardware-traced VISIBILITY term (1 = ray escaped / sky seen,
+    // 0 = occluded by geometry). This proves the TLAS is reusable from the real-time GI seam and
+    // runs on Metal's inline-RT path. PARTIAL: it returns occlusion only; reading the hit's
+    // surface-cache lighting (so the HW path matches the SW march's bounce radiance) is the next
+    // increment. Written as `e = sky_term * V` so the output stays in the same "indirect E" units
+    // the lighting multiplies by albedo. `hwrt == 0` (default) skips this entirely -> SW march.
+    if (pc.hwrt != 0u)
+    {
+        float vis = 0.0;
+        for (uint s = 0; s < spp; s++)
+        {
+            float3 dir = bounce_cosine_hemisphere(n, seed);
+            RayDesc ray;
+            ray.Origin = origin;
+            ray.Direction = dir;
+            ray.TMin = 0.0;
+            ray.TMax = pc.params.x; // bounce reach = scene diagonal (same as the SW ray_max)
+            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+            q.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, ray);
+            q.Proceed();
+            // Escaped (no hit within reach) => this direction sees the sky => visible.
+            if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+                vis += 1.0;
+        }
+        vis /= float(spp);
+        // Same sky-fill scale the SW escape uses, so the magnitude is comparable to the march path.
+        float3 e = float3(pc.params.z, pc.params.z, pc.params.z) * vis;
+        g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
+        return;
+    }
+
     BounceScene bs = gi_bounce_scene();
 
     float3 sum = float3(0.0, 0.0, 0.0);

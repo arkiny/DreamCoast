@@ -822,8 +822,11 @@ pub(crate) fn gdf_gi_push(
     max_steps: u32,
     cone_k: f32,
     vol_rgb: [u32; 3],
-) -> [u8; 240] {
-    let mut pc = [0u8; 240];
+    // F3 (HW-RT high-fidelity path): 0 = off (SW sphere-march, default & byte-identical anchor);
+    // 1 = hardware-traced visibility gather against the scene TLAS. Opt-in High tier.
+    hwrt: u32,
+) -> [u8; 256] {
+    let mut pc = [0u8; 256];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -884,6 +887,9 @@ pub(crate) fn gdf_gi_push(
     pc[228..232].copy_from_slice(&vol_rgb[0].to_le_bytes());
     pc[232..236].copy_from_slice(&vol_rgb[1].to_le_bytes());
     pc[236..240].copy_from_slice(&vol_rgb[2].to_le_bytes());
+    // F3: HW-RT gather toggle on its own 16-byte row (offset 240..244; 244..256 = padding).
+    // 0 (default) leaves the shader on the SW sphere-march path -> gallery byte-identical.
+    pc[240..244].copy_from_slice(&hwrt.to_le_bytes());
     pc
 }
 
