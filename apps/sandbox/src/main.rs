@@ -3765,7 +3765,17 @@ impl App {
         };
         // Stage D3: period-aware temporal alpha keeps the visible cards converged within the
         // screenshot warmup as the period rises; gallery (feedback off) keeps the legacy 0.35.
-        let relight_alpha = if self.cache_feedback {
+        // The surface-cache VIEW uses a much SLOWER alpha: the multibounce gather is stochastic
+        // (random rays per frame), so a fast EMA leaves per-frame noise that reads as flicker
+        // ("new colours every frame"); a slow alpha temporally averages the gather over ~20 frames,
+        // so the (static-camera) view converges to a stable image. `P_SC_VIZ_ALPHA` overrides.
+        let relight_alpha = if self.sc_viz {
+            std::env::var("P_SC_VIZ_ALPHA")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.05)
+                .clamp(0.005, 1.0)
+        } else if self.cache_feedback {
             (0.35 * (self.cache_relight_period as f32 / 8.0)).clamp(0.35, 0.8)
         } else {
             0.35
