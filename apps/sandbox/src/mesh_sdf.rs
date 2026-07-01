@@ -13,13 +13,8 @@
 //!   shader turns a world point into a short candidate list with one grid lookup.
 //!
 //! Both are built on the CPU (deterministic, backend-independent) and uploaded as bindless
-//! storage buffers. Content-scene only — the gallery keeps the dense single-level field (the
-//! byte-identical anchor).
-//!
-//! Staged ahead of its consumer: this CPU builder + its unit tests land first, then the P1 GPU
-//! wiring (`gdf.rs` descriptor upload) + P2 direct-sample shader call `build` and read its
-//! fields. `allow(dead_code)` covers the gap until that wiring lands.
-#![allow(dead_code)]
+//! storage buffers (`gdf.rs::install_mesh_sdf`). Content-scene only — the gallery keeps the
+//! dense single-level field (the byte-identical anchor).
 
 use dreamcoast_asset::sdf_atlas::SdfAtlas;
 use dreamcoast_core::glam::Mat4;
@@ -27,9 +22,9 @@ use dreamcoast_core::glam::Mat4;
 use crate::compose::ComposeObject;
 
 /// Bytes per instance record (7 × float4). Matches `MeshSdfInstance` in `mesh_sdf_sample.slang`.
-pub(crate) const INSTANCE_STRIDE: u64 = 112;
+pub(crate) const INSTANCE_STRIDE: u32 = 112;
 /// Bytes per cell record (`uint2` = offset, count).
-pub(crate) const CELL_STRIDE: u64 = 8;
+pub(crate) const CELL_STRIDE: u32 = 8;
 
 /// The packed direct-sample data ready to upload as bindless storage buffers.
 pub(crate) struct MeshSdfBuild {
