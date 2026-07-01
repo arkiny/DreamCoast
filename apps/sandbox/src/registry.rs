@@ -18,7 +18,7 @@ use dreamcoast_core::glam::{Mat4, Quat, Vec3};
 use dreamcoast_scene::{MaterialHandle, MeshHandle, World};
 use rhi::{Buffer, Device, Format, Texture};
 
-use crate::mesh::{upload_geometry, upload_image_rgba8, upload_mesh};
+use crate::mesh::{upload_geometry, upload_mesh, upload_texture};
 use crate::{NO_TEXTURE, SceneObject};
 
 /// An uploaded mesh: vertex/index buffers + their counts.
@@ -212,8 +212,10 @@ pub(crate) fn upload_gltf_scene(
     materials: &mut MaterialRegistry,
     textures: &mut Vec<Texture>,
 ) -> anyhow::Result<PrimitiveHandles> {
-    // Dedup images by (glTF image index, sRGB) so a shared texture uploads once. The
-    // same image is rarely used across colour spaces, so keying on both is safe.
+    // The scene's texture table is already cooked (block-compressed where eligible) by
+    // `cook::load_or_cook_gltf_scene`, so upload just pushes each `TexData` to the GPU —
+    // no per-slot compression here. Dedup by (image index, sRGB) so a shared texture
+    // uploads once; `srgb` only selects the RGBA8 format (BC data carries its own).
     let mut image_cache: HashMap<(usize, bool), u32> = HashMap::new();
     let mut resolve =
         |textures: &mut Vec<Texture>, slot: Option<usize>, srgb: bool| -> anyhow::Result<u32> {
@@ -228,7 +230,7 @@ pub(crate) fn upload_gltf_scene(
             } else {
                 Format::Rgba8Unorm
             };
-            let bindless = upload_image_rgba8(device, textures, &scene.images[idx], format)?;
+            let bindless = upload_texture(device, textures, &scene.images[idx], format)?;
             image_cache.insert((idx, srgb), bindless);
             Ok(bindless)
         };

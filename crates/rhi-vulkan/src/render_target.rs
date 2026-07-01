@@ -62,15 +62,8 @@ impl VulkanRenderTarget {
         unsafe {
             let (image, extent) = create_image(&device, desc, false)?;
             let req = device.device.get_image_memory_requirements(image);
-            let mem_type = device
-                .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-            let alloc = vk::MemoryAllocateInfo::default()
-                .allocation_size(req.size)
-                .memory_type_index(mem_type);
-            let memory = device
-                .device
-                .allocate_memory(&alloc, None)
-                .map_err(vk_err)?;
+            // VRAM-aware allocation: device-local first, host-visible spill on exhaustion.
+            let memory = device.allocate_resource_memory(req.size, req.memory_type_bits)?;
             device
                 .device
                 .bind_image_memory(image, memory, 0)
@@ -265,15 +258,9 @@ impl VulkanTransientHeap {
             )?;
             let req = device.device.get_image_memory_requirements(sample.0);
             device.device.destroy_image(sample.0, None);
-            let mem_type = device
-                .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-            let alloc = vk::MemoryAllocateInfo::default()
-                .allocation_size(size.max(1))
-                .memory_type_index(mem_type);
-            let memory = device
-                .device
-                .allocate_memory(&alloc, None)
-                .map_err(vk_err)?;
+            // VRAM-aware allocation for the whole transient heap: device-local first,
+            // host-visible spill on exhaustion. (`req` only supplies the type mask here.)
+            let memory = device.allocate_resource_memory(size.max(1), req.memory_type_bits)?;
             Ok(Self {
                 mem: Arc::new(HeapMemory { device, memory }),
             })

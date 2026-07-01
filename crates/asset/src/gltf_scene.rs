@@ -13,7 +13,7 @@ use std::path::Path;
 
 use dreamcoast_core::EngineError;
 
-use crate::{ImageData, MeshVertex, image_to_rgba8};
+use crate::{MeshVertex, TexData, image_to_rgba8};
 
 /// One node in the glTF hierarchy. `children`/`mesh`/`skin` are indices into
 /// [`GltfScene::nodes`] / [`GltfScene::meshes`] / [`GltfScene::skins`]. Transform is
@@ -190,7 +190,10 @@ pub struct GltfScene {
     /// Indexed by glTF mesh index; each entry is that mesh's primitives.
     pub meshes: Vec<Vec<GltfPrimitive>>,
     pub materials: Vec<GltfMaterial>,
-    pub images: Vec<ImageData>,
+    /// Shared, deduplicated textures referenced by material slots (by index). Raw imports
+    /// are `Rgba8`; the cook (`load_or_cook_gltf_scene`) block-compresses each per its slot
+    /// usage, so a cached scene carries GPU-ready `Bc` data (no decode/encode at load).
+    pub images: Vec<TexData>,
     /// Animation clips (node TRS tracks); empty for a static scene.
     pub animations: Vec<GltfAnimation>,
     /// Skins (joint sets + inverse-bind matrices); empty for an unskinned scene.
@@ -209,7 +212,12 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<GltfScene, EngineError>
     let (doc, buffers, images_raw) =
         gltf::import(path).map_err(|e| EngineError::Asset(format!("gltf import: {e}")))?;
 
-    let images: Vec<ImageData> = images_raw.iter().map(image_to_rgba8).collect();
+    // Raw import: each decoded image as an uncompressed `Rgba8` texture. The cook
+    // block-compresses them per slot usage (see `cook::load_or_cook_gltf_scene`).
+    let images: Vec<TexData> = images_raw
+        .iter()
+        .map(|d| TexData::Rgba8(image_to_rgba8(d)))
+        .collect();
 
     let materials: Vec<GltfMaterial> = doc
         .materials()
