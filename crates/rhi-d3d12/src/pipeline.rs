@@ -374,6 +374,29 @@ pub(crate) fn bindless_ranges() -> [D3D12_DESCRIPTOR_RANGE; 7] {
     ]
 }
 
+/// A D3D12 root signature is capped at **64 DWORDs** total. Inline 32-bit root
+/// constants cost `push_size / 4` DWORDs; the bindless descriptor table costs 1 and
+/// the optional globals CBV costs 2. When the push block alone would leave no room
+/// for those (e.g. a 256-byte / 64-DWORD block + the 1-DWORD table = 65 > 64), the
+/// block is spilled into a **root CBV** at `b0` — 2 DWORDs regardless of size,
+/// uploaded per-dispatch from a ring — instead of inline root constants. This is the
+/// same "large per-pass constants live in a bound constant buffer" split reference
+/// engines use. The DXIL binds `b0` as a cbuffer either way (Slang maps the push
+/// constant to `register(b0, space0)`), so the shader bytecode is byte-identical and
+/// the delivered bytes — hence the rendered output — are unchanged.
+const ROOT_SIG_MAX_DWORDS: u32 = 64;
+
+/// Whether `desc`'s push block must spill to a root CBV to fit the 64-DWORD budget.
+/// Only meaningful for bindless pipelines (the non-bindless path has no root params).
+pub(crate) fn compute_push_via_cbv(desc: &ComputePipelineDesc) -> bool {
+    if !desc.bindless {
+        return false;
+    }
+    let table = 1; // param[0]: bindless descriptor table
+    let globals_cbv = if desc.uniform_buffer { 2 } else { 0 }; // param[2]: root CBV (b1)
+    table + desc.push_constant_size / 4 + globals_cbv > ROOT_SIG_MAX_DWORDS
+}
+
 /// A compute pipeline: its (bindless) root signature and compute PSO.
 pub struct D3d12ComputePipeline {
     #[allow(dead_code)]
@@ -382,6 +405,9 @@ pub struct D3d12ComputePipeline {
     pso: ID3D12PipelineState,
     bindless: bool,
     uniform_buffer: bool,
+    /// `true` ⇒ push constants bind as a root CBV (param 1) fed from the command
+    /// buffer's upload ring, not inline 32-bit constants. See [`compute_push_via_cbv`].
+    push_via_cbv: bool,
 }
 
 impl D3d12ComputePipeline {
@@ -406,6 +432,7 @@ impl D3d12ComputePipeline {
                 pso,
                 bindless: desc.bindless,
                 uniform_buffer: desc.uniform_buffer,
+                push_via_cbv: compute_push_via_cbv(desc),
             })
         }
     }
@@ -424,6 +451,12 @@ impl D3d12ComputePipeline {
 
     pub(crate) fn uses_uniform(&self) -> bool {
         self.uniform_buffer
+    }
+
+    /// Whether push constants must be uploaded through the root-CBV ring (param 1)
+    /// rather than set as inline 32-bit root constants. See [`compute_push_via_cbv`].
+    pub(crate) fn push_via_cbv(&self) -> bool {
+        self.push_via_cbv
     }
 }
 
@@ -445,10 +478,39 @@ fn create_compute_root_signature(
             );
         }
         let ranges = bindless_ranges();
-        // params[0] = bindless table, params[1] = 32-bit root constants (b0), and the
-        // optional params[2] = root CBV (b1) for the per-frame globals — the same layout
-        // as the graphics root signature, so a compute pass can opt into the globals UBO
+        // params[0] = bindless table, params[1] = the push block at b0, and the optional
+        // params[2] = root CBV (b1) for the per-frame globals — the same layout as the
+        // graphics root signature, so a compute pass can opt into the globals UBO
         // (Stage C7 reflection reprojection) via `uniform_buffer`.
+        //
+        // params[1] is inline 32-bit root constants when the block fits the 64-DWORD root
+        // budget, else a root CBV (b0) that the command buffer feeds from its upload ring
+        // — see `compute_push_via_cbv`. Both bind the same `b0` cbuffer the DXIL declares,
+        // so the shader is unaffected; only the delivery mechanism (and DWORD cost) differs.
+        let push_param = if compute_push_via_cbv(desc) {
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            }
+        } else {
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                        Num32BitValues: desc.push_constant_size / 4,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            }
+        };
         let mut params = vec![
             D3D12_ROOT_PARAMETER {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
@@ -460,17 +522,7 @@ fn create_compute_root_signature(
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
-            D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    Constants: D3D12_ROOT_CONSTANTS {
-                        ShaderRegister: 0,
-                        RegisterSpace: 0,
-                        Num32BitValues: desc.push_constant_size / 4,
-                    },
-                },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            },
+            push_param,
         ];
         if desc.uniform_buffer {
             params.push(D3D12_ROOT_PARAMETER {
