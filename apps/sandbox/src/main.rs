@@ -766,8 +766,8 @@ struct App {
     taa_mip_bias: f32,
     // Profiler UI state.
     profiler_on: bool,
-    slot_pass_names: Vec<Vec<String>>,
-    gpu_timings: Vec<(String, f32)>,
+    slot_pass_names: Vec<Vec<&'static str>>,
+    gpu_timings: Vec<(&'static str, f32)>,
 
     // Loop bookkeeping.
     fif: usize,
@@ -2200,7 +2200,7 @@ impl App {
             // (byte-identical native).
             .clamp(0.3333, 1.0);
         let profiler_on = std::env::var("PROFILE_GPU").is_ok();
-        let slot_pass_names: Vec<Vec<String>> = vec![Vec::new(); FRAMES_IN_FLIGHT];
+        let slot_pass_names: Vec<Vec<&'static str>> = vec![Vec::new(); FRAMES_IN_FLIGHT];
         let render_finished = build_render_finished(&device, swapchain.image_count())?;
 
         // Image-based lighting (see `ibl.rs`): the procedural-sky / capture /
@@ -3683,9 +3683,9 @@ impl App {
             self.gpu_timings = self.slot_pass_names[fif]
                 .iter()
                 .enumerate()
-                .map(|(i, name)| {
+                .map(|(i, &name)| {
                     let dt = ticks[i + 1].saturating_sub(ticks[i]);
-                    (name.clone(), dt as f32 * period_ns * 1e-6)
+                    (name, dt as f32 * period_ns * 1e-6)
                 })
                 .collect();
             // Headless dump (screenshot mode has no UI): log per-pass GPU ms so PROFILE_GPU
