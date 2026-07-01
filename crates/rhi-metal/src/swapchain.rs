@@ -13,7 +13,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSSize;
 use objc2_metal::{MTLPixelFormat, MTLTexture};
 use objc2_quartz_core::CAMetalDrawable;
-use rhi_types::{Extent2D, Format, SwapchainDesc};
+use rhi_types::{Extent2D, Format, PresentMode, SwapchainDesc};
 
 use crate::device::DeviceShared;
 use crate::sync::MetalSemaphore;
@@ -103,6 +103,11 @@ fn configure_layer(shared: &DeviceShared, desc: &SwapchainDesc) {
     // Allow blitting the drawable into a readback buffer (screenshots). Drawables
     // are framebuffer-only by default, which forbids using them as a copy source.
     layer.setFramebufferOnly(false);
+    // VSync: `displaySyncEnabled=true` paces `nextDrawable` to the display refresh
+    // (the Metal equivalent of FIFO); `Immediate` turns it off so the frame runs
+    // uncapped (benchmarking the true CPU+GPU frame time — `NO_VSYNC`). Mailbox maps
+    // to synced here (Metal has no separate low-latency-synced mode we model).
+    layer.setDisplaySyncEnabled(desc.present_mode != PresentMode::Immediate);
     layer.setDrawableSize(NSSize::new(
         desc.extent.width as f64,
         desc.extent.height as f64,
