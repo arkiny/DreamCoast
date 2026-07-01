@@ -1,6 +1,6 @@
 # GI 디버그 뷰 표현 규칙 (distance-field/probe cache 위 GI 시각화)
 
-상위: [gi-radiance-cache.md](gi-radiance-cache.md), [lumen-parity-swrt.md](lumen-parity-swrt.md).
+상위: [gi-radiance-cache.md](gi-radiance-cache.md), [swrt-gi-perf-track.md](swrt-gi-perf-track.md).
 목적: 카메라를 GDF 안으로 날려 hit마다 GI 상태(월드 radiance cache의 indirect irradiance)를 칠하는
 플라이 가능한 디버그 뷰의 **표현(presentation)** 규칙을, 레퍼런스 렌더러가 distance-field/surface-cache/
 world-probe 위에서 쓰는 유용한 관례에 맞춘다. 아래는 레퍼런스 소스에서 확인한 내용만 일반화해 기술한다.

@@ -1,6 +1,6 @@
 # GI 월드 irradiance 볼륨 (DDGI-lite radiance cache) — 권위 계획
 
-상위: [lumen-parity-swrt.md](lumen-parity-swrt.md). UE Lumen GI fidelity 조사(메모리 unreal-engine-reference)
+상위: [swrt-gi-perf-track.md](swrt-gi-perf-track.md). 레퍼런스 엔진 SW GI 충실도 조사
 결과, 우리 1-bounce GDF GI는 깊은 실내(Sponza nave)에 **GI가 도달하지 못해** 어둡다(멀티바운스 부재). UE는
 **월드 radiance cache + radiosity 멀티바운스**로 채운다. 이 트랙은 그 핵심을 **월드 공간 irradiance 볼륨
 (DDGI-lite)** 으로 도입 — 밝은 atrium의 빛이 프레임 누적으로 nave까지 전파(멀티바운스)되어 실내를 채운다.
