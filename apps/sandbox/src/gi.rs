@@ -130,7 +130,7 @@ impl GiSystem {
             dreamcoast_shader::gdf_gi_cs_dxil,
             dreamcoast_shader::gdf_gi_cs_metallib,
             "gdf_gi",
-            240,
+            256, // F4: +16B row for the importance-gather mix (`gi_importance`); 0.0 = legacy anchor.
         )?;
         let upsample_pipeline = compute(
             dreamcoast_shader::gdf_gi_upsample_cs_spirv,
@@ -782,6 +782,12 @@ impl GiSystem {
         clip_vols: &'a [&'a Volume],
         max_steps: u32,
         cone_k: f32,
+        // F4 (importance-sampled final gather, first increment): fraction [0,1] of the `spp` gather
+        // rays drawn from a sun-steered irradiance lobe (MIS mixture with the cosine lobe) instead
+        // of plain cosine. Lowers variance at a fixed spp (unbiased). `0.0` = the legacy cosine
+        // gather (byte-identical anchor; forced for the gallery at the call site). Ignored on the
+        // volume-sampling path (that reconstructs E from the SH field, it doesn't march rays).
+        gi_importance: f32,
         // GI-fidelity: when present, the GI pass SAMPLES this directional-irradiance volume
         // `(radiance_SH_base, skyvis_SH_base, update-pass write handle)` and reconstructs E(n) +
         // the sky-visibility instead of marching rays.
@@ -883,6 +889,9 @@ impl GiSystem {
                     cone_k,               // P3: cone-trace LOD slope (0 = legacy)
                     // vol_r = radiance SH base, vol_g = sky-vis SH base, vol_b = sky-vis out image.
                     [vol_r, vol_g, vol_b],
+                    // F4: importance-sampling mix (0.0 = legacy cosine gather = gallery anchor). No
+                    // effect on the volume-sampling branch, which reads the SH field, not rays.
+                    gi_importance,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

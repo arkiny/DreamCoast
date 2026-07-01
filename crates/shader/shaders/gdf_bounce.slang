@@ -62,6 +62,97 @@ float3 bounce_cosine_hemisphere(float3 n, inout uint rng)
     return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
 }
 
+// --- F4 first increment: importance-sampled final gather ---------------------------------
+//
+// The cosine-hemisphere estimator (above) samples the BRDF cosine only; every direction is
+// weighted equally by the integrand's *geometric* term but blind to WHERE the incoming
+// radiance actually comes from. For a 1-bounce diffuse gather the single strongest source of
+// incoming radiance is the sun-lit hemisphere, so at a fixed sample count the cosine estimator
+// wastes many rays on directions that return ~0 (into shadow / away from lit geometry) — that
+// is the visible variance.
+//
+// The reference (production real-time GI) fixes this with an importance-sampled final gather:
+// draw ray directions from a pdf that ALSO peaks where the incoming irradiance is expected to
+// be large, then divide each sample by its pdf so the estimator stays unbiased (it converges to
+// the *same* mean as cosine, just with lower variance for the same spp). We build the pdf as a
+// two-lobe mixture and combine the lobes with the balance heuristic (multiple importance
+// sampling), which is provably never worse than either lobe alone:
+//
+//   lobe A — cosine hemisphere about the surface normal `n`  (pdf_A = cos/pi)   [the BRDF]
+//   lobe B — power-cosine lobe steered toward the sun direction `s`             [the irradiance
+//            estimate: the sun hemisphere is where a 1-bounce gather finds lit surfaces / sky]
+//
+// `mix` in [0,1] is the fraction of samples drawn from lobe B (0 => pure cosine = the legacy
+// estimator, exactly). The per-sample weight is  f_cos(dir) / pdf_mix(dir)  where
+// pdf_mix = (1-mix)*pdf_A + mix*pdf_B and f_cos = cos(n,dir)/pi is the Lambertian BRDF*cosine
+// the cosine pdf normally cancels. This is the standard balance-heuristic MIS weight, evaluated
+// once per sample regardless of which lobe drew it.
+
+// Power-cosine ("Phong") sample about axis `w`, exponent `k` (k=1 => cosine). Returns the
+// direction; also outputs cos(w,dir) so the caller can evaluate the pdf without a redundant dot.
+float3 bounce_powercos(float3 w, float k, inout uint rng, out float cw)
+{
+    float u1 = bounce_rnd(rng);
+    float u2 = bounce_rnd(rng);
+    cw = pow(u1, 1.0 / (k + 1.0)); // cos(theta) from the power-cosine cdf
+    float sw = sqrt(max(0.0, 1.0 - cw * cw));
+    float phi = 2.0 * BOUNCE_PI * u2;
+    float3 t, b;
+    bounce_onb(w, t, b);
+    return normalize(t * (sw * cos(phi)) + b * (sw * sin(phi)) + w * cw);
+}
+
+// pdf of the power-cosine lobe (axis `w`, exponent `k`) for a direction with cos(w,dir)=cw.
+// pdf = (k+1)/(2*pi) * cos^k. cw<=0 (below the lobe hemisphere) => 0.
+float bounce_powercos_pdf(float cw, float k)
+{
+    if (cw <= 0.0)
+        return 0.0;
+    return (k + 1.0) * (1.0 / (2.0 * BOUNCE_PI)) * pow(cw, k);
+}
+
+// Draw one importance-sampled gather direction from the two-lobe mixture and return the
+// balance-heuristic MIS weight  w = f_cos / pdf_mix  the caller multiplies the traced radiance
+// by. `sun_dir` need not be normalized. `sun_k` is the sun-lobe exponent (higher = tighter cone
+// around the sun; a diffuse gather wants a broad lobe, ~4). `mix`=0 reproduces the cosine
+// estimator EXACTLY (weight collapses to 1, same rng draw order) so the OFF path is inert.
+float3 bounce_importance_dir(float3 n, float3 sun_dir, float sun_k, float mix, inout uint rng,
+                             out float weight)
+{
+    float3 s = normalize(sun_dir);
+    // Steer the sun lobe by the surface hemisphere: reflect the sun axis up if it points into the
+    // surface so the lobe still lands in the visible hemisphere (a below-horizon sun contributes
+    // no direct-lit bounce anyway; keeping the axis in-hemisphere avoids an all-zero lobe).
+    float3 axis = dot(s, n) > 0.0 ? s : normalize(s - 2.0 * dot(s, n) * n);
+
+    float3 dir;
+    // Pick the lobe by one extra uniform draw so each lobe gets `mix`/`1-mix` of the samples; the
+    // returned direction is scored against BOTH lobe pdfs (MIS), so the choice only affects which
+    // region we sample densely, never the (unbiased) estimator.
+    float pick = bounce_rnd(rng);
+    if (pick < mix)
+    {
+        float cw;
+        dir = bounce_powercos(axis, sun_k, rng, cw);
+    }
+    else
+    {
+        dir = bounce_cosine_hemisphere(n, rng);
+    }
+
+    // Evaluate the mixture pdf for `dir` under both lobes.
+    float cos_n = max(dot(n, dir), 0.0);
+    float pdf_cos = cos_n * (1.0 / BOUNCE_PI); // cosine-hemisphere pdf
+    float cos_s = dot(axis, dir);
+    float pdf_sun = bounce_powercos_pdf(cos_s, sun_k);
+    float pdf_mix = (1.0 - mix) * pdf_cos + mix * pdf_sun;
+
+    // f_cos is the Lambertian BRDF*cosine the estimator integrates (cos/pi). Weight = f/pdf.
+    float f_cos = cos_n * (1.0 / BOUNCE_PI);
+    weight = (pdf_mix > 1e-8) ? (f_cos / pdf_mix) : 0.0;
+    return dir;
+}
+
 // --- GDF field via the clipmap (single level => identical to the legacy single volume +
 // ground union). ---
 ClipMap bs_clip(BounceScene bs)

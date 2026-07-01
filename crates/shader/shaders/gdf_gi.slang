@@ -60,6 +60,17 @@ struct GiPush
     uint vol_g;             // sky-visibility: sampled BASE index of the 4 scalar SH volumes
                             // (0xFFFFFFFF = sky-vis off). Reuses vol_r's freed slot.
     uint vol_b;             // sky-visibility OUTPUT storage-image index (0xFFFFFFFF = don't write).
+    // F4 (importance-sampled final gather, first increment): fraction of the `spp` gather rays
+    // drawn from the sun-steered irradiance lobe instead of the plain cosine hemisphere (a
+    // balance-heuristic MIS mixture, evaluated in gdf_bounce.slang -> `bounce_importance_dir`).
+    // The estimator stays unbiased (each sample is divided by its mixture pdf), so this only
+    // lowers variance at a fixed spp — it converges to the SAME mean as cosine. `0.0` (default)
+    // reproduces the legacy cosine gather EXACTLY (same rng draw order, weight == 1), so the OFF
+    // path is byte-identical to the pre-F4 shader (the gallery anchor). On its own 16-byte row.
+    float gi_importance;
+    uint pad_imp0;
+    uint pad_imp1;
+    uint pad_imp2;
 };
 
 // Real SH band-0/1 basis normalisation (matches gi_volume.slang).
@@ -187,21 +198,40 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 origin = world_pos + n * pc.params.y;
     BounceScene bs = gi_bounce_scene();
 
+    // F4: importance-sampled final gather. `gi_importance == 0` => the legacy cosine estimator,
+    // EXACTLY (`bounce_importance_dir` with mix=0 draws the same cosine direction from the same
+    // rng and returns weight==1, so this branch is bit-identical to the pre-F4 loop = the gallery
+    // anchor). `gi_importance > 0` mixes in a sun-steered irradiance lobe and divides each sample
+    // by its mixture pdf (`w`), concentrating rays where the 1-bounce integrand is large for lower
+    // variance at the SAME spp — an unbiased estimator (same mean, less noise). Broad sun lobe
+    // (exponent 4) since the diffuse gather integrates a wide hemisphere, not a mirror direction.
+    const float GI_SUN_LOBE_K = 4.0;
     float3 sum = float3(0.0, 0.0, 0.0);
     for (uint s = 0; s < spp; s++)
     {
-        float3 dir = bounce_cosine_hemisphere(n, seed);
+        float w;
+        float3 dir;
+        if (pc.gi_importance > 0.0)
+        {
+            dir = bounce_importance_dir(n, bs.sun_dir, GI_SUN_LOBE_K, pc.gi_importance, seed, w);
+        }
+        else
+        {
+            dir = bounce_cosine_hemisphere(n, seed);
+            w = 1.0; // cosine estimator: the cos/pi pdf cancels the BRDF*cosine => unit weight.
+        }
         // Firefly clamp per sample (before averaging): one ray hitting a bright spot can't
         // blow out the mean. Hue-preserving; `clamp_max = 1e30` disables it.
         float esc;
-        float3 b = bs_trace_bounce(bs, origin, dir, esc);
+        float3 b = bs_trace_bounce(bs, origin, dir, esc) * w;
         float m = max(b.r, max(b.g, b.b));
         if (m > pc.clamp_max)
             b *= pc.clamp_max / m;
         sum += b;
     }
-    // Cosine-weighted estimator: mean incoming radiance = indirect irradiance E. The
-    // lighting pass multiplies by the surface albedo (× 1-metallic) to get L_o.
+    // Importance-sampled estimator: mean of (radiance * f/pdf) = indirect irradiance E. With the
+    // cosine pdf (weight 1) this is the same cosine-weighted mean as before. The lighting pass
+    // multiplies by the surface albedo (× 1-metallic) to get L_o.
     float3 e = sum / float(spp);
 
     g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);

@@ -651,6 +651,9 @@ struct App {
     /// GI temporal denoiser history-clamp (gdf_temporal params.w): 0 off (content; fixes shimmer),
     /// 1 hard (gallery legacy byte-identical), >1.5 variance γ.
     gi_temporal_clamp: f32,
+    /// F4: importance-sampled final-gather mix [0,1] for `gdf_gi` (fraction of rays steered to the
+    /// sun-lit irradiance lobe; MIS with cosine). 0.0 = legacy cosine gather (gallery byte-identical).
+    gi_importance: f32,
     /// C4: spatio-temporal denoise of the noisy C3 GI.
     gi_denoise: bool,
     /// Previous frame's view-projection (world -> clip) for C4 temporal reprojection.
@@ -1983,6 +1986,14 @@ impl App {
                 qp.gi_temporal_clamp
             })
             .clamp(0.0, 16.0);
+        // F4 (importance-sampled final gather): fraction of the gdf_gi gather rays steered toward the
+        // sun-lit incoming-irradiance lobe (MIS with cosine). Gallery forced to 0.0 (legacy cosine
+        // gather = byte-identical anchor); content takes the tier value. `P_GI_IMPORTANCE` overrides.
+        let gi_importance = std::env::var("P_GI_IMPORTANCE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(if gallery_scene { 0.0 } else { qp.gi_importance })
+            .clamp(0.0, 1.0);
         // Stage D3: half-res reflection trace + bilateral upsample (reuses the GI upsample).
         // Gallery forced off (full-res = byte-identical anchor); content takes the tier value.
         let reflect_half_res = gi.has_upsample()
@@ -2271,6 +2282,7 @@ impl App {
             reflect_history_clamp,
             reflect_clamp_gamma,
             gi_temporal_clamp,
+            gi_importance,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
             prev_view_proj_taau: Mat4::IDENTITY.to_cols_array(),
@@ -4067,6 +4079,8 @@ impl App {
                     &scene_clip_vols,
                     self.gi_max_steps,
                     self.gdf_cone_k,
+                    // F4: importance-sampled gather mix (0.0 on the gallery = legacy cosine anchor).
+                    self.gi_importance,
                     gi_volume_arg,
                 );
                 gi_skyvis_out = skyvis;

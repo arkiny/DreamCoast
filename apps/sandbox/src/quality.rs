@@ -163,6 +163,17 @@ pub struct QualityPreset {
     /// hard 3x3 min/max (legacy; forced for the gallery byte-identical anchor). `> 1.5` = variance clamp
     /// with gamma = this value (a wide outlier reject that still converges). Content defaults off.
     pub gi_temporal_clamp: f32,
+    /// F4 (hierarchical radiance cache + importance final gather, first increment): fraction [0,1]
+    /// of the `gdf_gi` gather rays drawn from a sun-steered incoming-irradiance lobe (MIS mixture
+    /// with the plain cosine lobe) instead of pure cosine hemisphere (`gdf_bounce.slang` ->
+    /// `bounce_importance_dir`). The estimator stays unbiased (each sample is divided by its
+    /// mixture pdf) so this only trades the same spp for lower variance — a 1-bounce diffuse gather
+    /// finds most of its incoming radiance in the sun-lit hemisphere, so steering a share of the
+    /// rays there cuts the per-frame noise the cosine gather leaves. `0.0` = the legacy cosine
+    /// gather (byte-identical; forced for the gallery anchor at the call site). `P_GI_IMPORTANCE`
+    /// override. Higher = more rays on the sun lobe (diminishing once the lobe dominates); ~0.5 is a
+    /// balanced default. See `docs/gi-fidelity-phases.md` (F4).
+    pub gi_importance: f32,
 }
 
 /// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
@@ -192,6 +203,9 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             reflect_history_clamp: 1, // hard (cheapest) — kills rotation smear
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
+            // Low tier runs the fewest gather rays (spp 2), so the variance win matters most — steer
+            // half of them to the sun-lit hemisphere.
+            gi_importance: 0.5,
             // Low-end / high-res performance mode: render at 2/3 of the output extent and let the
             // TAAU jitter reconstruction (B-track) upscale it. 2/3 (not 1/2) keeps detailed scenes
             // legible — at 1/2 the internal resolution undersamples texture/geometry detail enough
@@ -227,6 +241,10 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             reflect_history_clamp: 1, // hard (matches the WIP default) — kills rotation smear
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
+            // Med (content default) runs spp 1 — the noisiest tier — so importance sampling is the
+            // main variance lever here. 0.5 balances the cosine + sun lobes (MIS never worse than
+            // either alone). The gallery is forced to 0.0 at the call site (byte-identical anchor).
+            gi_importance: 0.5,
         },
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
@@ -253,6 +271,9 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             reflect_history_clamp: 2, // variance (gentler on sharp mirrors) — quality tier
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
+            // High tier already runs spp 16 (lower base variance), but importance sampling still
+            // converges faster; keep it on at the same 0.5 mix so the tier is consistent.
+            gi_importance: 0.5,
         },
     }
 }

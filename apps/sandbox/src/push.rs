@@ -822,8 +822,11 @@ pub(crate) fn gdf_gi_push(
     max_steps: u32,
     cone_k: f32,
     vol_rgb: [u32; 3],
-) -> [u8; 240] {
-    let mut pc = [0u8; 240];
+    // F4 (importance-sampled final gather): fraction of the gather rays drawn from the sun-steered
+    // irradiance lobe (MIS with the cosine lobe). 0.0 = legacy cosine gather (byte-identical anchor).
+    gi_importance: f32,
+) -> [u8; 256] {
+    let mut pc = [0u8; 256];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -884,6 +887,9 @@ pub(crate) fn gdf_gi_push(
     pc[228..232].copy_from_slice(&vol_rgb[0].to_le_bytes());
     pc[232..236].copy_from_slice(&vol_rgb[1].to_le_bytes());
     pc[236..240].copy_from_slice(&vol_rgb[2].to_le_bytes());
+    // F4 importance-sampling mix on its own 16-byte row (offset 240..244; 244..256 = padding).
+    // 0.0 (default / gallery) keeps the shader on the legacy cosine gather -> byte-identical.
+    pc[240..244].copy_from_slice(&gi_importance.to_le_bytes());
     pc
 }
 
