@@ -122,8 +122,10 @@ pub struct QualityPreset {
     pub gdf_ao: bool,
     /// Near-field screen-space AO (HBAO-lite), a SECOND independent AO pass composed with `gdf_ao`
     /// (`SSAO`). On for content on most tiers; the Apple platform tier turns it OFF (gdf_ao already
-    /// supplies contact AO, and this reclaims a full ~13 ms pass on the M3). Gallery forces it via
-    /// `!gallery_scene` at the call site regardless of the tier, so the anchor is unaffected.
+    /// supplies contact AO, and this reclaims a full ~13 ms pass on the M3). The gallery anchor
+    /// resolves its `ssao` against [`gallery_preset`] (which pins it OFF), not the active tier, so
+    /// the byte-identical gallery never runs this pass — the lock is now structural (a single
+    /// preset table), not a per-call-site `!gallery_scene` force.
     pub ssao: bool,
     /// Firefly clamp on the reflection/GI radiance (`P11_FIREFLY_CLAMP`).
     pub firefly_clamp: bool,
@@ -457,5 +459,484 @@ pub fn env_bool(name: &str, tier_default: bool) -> bool {
             !(v == "0" || v == "false" || v == "off")
         }
         Err(_) => tier_default,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scalability groups (organizing layer)
+// ---------------------------------------------------------------------------
+//
+// A reference real-time engine expresses scalability as a small set of quality *groups* — global
+// illumination, reflection, shadow, etc. — each carried at a level 0..=3, and a quality "tier" is
+// just an assignment of a level to every group (its ini `sg.<Group>Quality` cvars). Our knob set is
+// finer-grained (~27 fields in [`QualityPreset`]), so this module keeps that precise table as the
+// single source of truth and layers the group concept ON TOP as an ADDITIVE, self-describing map.
+//
+// IMPORTANT — this layer is DESCRIPTIVE, not authoritative. [`groups`] REFLECTS the levels that
+// [`preset`] already encodes; it does NOT feed back into [`preset`] or change any resolved value
+// (the byte-identical gallery/Med anchors must hold). A group level is a coarse label ("this tier
+// runs GI at level 2"), useful for UI, per-platform reasoning, and a per-group env override a
+// caller MAY consult — but the fine-grained `P_*`/`P11_*`/`SHADOW_*`/`RENDER_SCALE` env knobs remain
+// the precise controls and WIN over any group level. Wiring group-level -> a concrete knob table
+// would change resolved values (it can't reproduce the 27-field presets losslessly from six 0..=3
+// integers), so we deliberately keep it a documented mapping rather than a behavioral input.
+
+/// A reference-engine-style scalability GROUP: a named bucket of related quality knobs carried at a
+/// level `0..=3`. A [`RenderQuality`] tier is an assignment of a level to every group (see
+/// [`groups`]). This is an organizing/UI layer over the precise [`QualityPreset`] table — the fine
+/// `P_*`/`P11_*` env knobs remain the exact controls and win over group levels.
+///
+// `dead_code`: this is an additive organizing/API layer for the scalability system. Its consumers
+// (the `main.rs` resolver + the test-scene Scalability UI panel) are owned by other agents and land
+// separately, so nothing in the binary references it yet — the unit tests below exercise the whole
+// surface. The allow keeps `clippy -D warnings` green without a placeholder call site; remove it
+// once `main.rs`/the UI panel consult the groups layer.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScalabilityGroup {
+    /// Internal render resolution + TAAU upscale (`render_scale`). Env override: `SG_RESOLUTION`.
+    Resolution,
+    /// Diffuse global illumination: samples, trace-resolution divisor, à-trous, half-res
+    /// (`gi_spp`/`gi_res_div`/`gi_atrous_steps`/`gi_half_res`/`gi_max_steps`). Env: `SG_GI`.
+    GlobalIllumination,
+    /// Screen-mirror + GGX reflection: trace-resolution divisor, march cap, roughness cutoff,
+    /// half-res, history clamp (`reflect_*`, `ssr_stochastic`). Env: `SG_REFLECTION`.
+    Reflection,
+    /// Ambient occlusion: GDF contact AO, screen-space HBAO-lite, AO trace divisor
+    /// (`gdf_ao`/`ssao`/`ao_res_div`). Env: `SG_AO`.
+    AmbientOcclusion,
+    /// Shadow filtering: PCSS-lite softness + tap count (`shadow_softness`/`shadow_taps`).
+    /// Env: `SG_SHADOW`.
+    Shadow,
+    /// GI surface (mesh-card) cache: multibounce lookup + amortized relight period/spp
+    /// (`surface_cache`/`cache_relight_period`/`cache_relight_spp`). Env: `SG_SURFACE_CACHE`.
+    SurfaceCache,
+}
+
+#[allow(dead_code)] // additive API layer; consumed by tests + the (separately-landing) resolver/UI.
+impl ScalabilityGroup {
+    /// Every group, in a fixed order. The length of [`groups`]'s return value.
+    pub const ALL: [ScalabilityGroup; 6] = [
+        ScalabilityGroup::Resolution,
+        ScalabilityGroup::GlobalIllumination,
+        ScalabilityGroup::Reflection,
+        ScalabilityGroup::AmbientOcclusion,
+        ScalabilityGroup::Shadow,
+        ScalabilityGroup::SurfaceCache,
+    ];
+
+    /// The per-group env-override name a caller MAY consult (`SG_GI`, `SG_REFLECTION`, `SG_AO`,
+    /// `SG_SHADOW`, `SG_RESOLUTION`, `SG_SURFACE_CACHE`). This names the coarse group lever; the
+    /// fine-grained `P_*`/`P11_*`/`SHADOW_*` env knobs remain the precise controls and win over it.
+    pub fn env_name(self) -> &'static str {
+        match self {
+            ScalabilityGroup::Resolution => "SG_RESOLUTION",
+            ScalabilityGroup::GlobalIllumination => "SG_GI",
+            ScalabilityGroup::Reflection => "SG_REFLECTION",
+            ScalabilityGroup::AmbientOcclusion => "SG_AO",
+            ScalabilityGroup::Shadow => "SG_SHADOW",
+            ScalabilityGroup::SurfaceCache => "SG_SURFACE_CACHE",
+        }
+    }
+
+    /// A stable short label for logs/UI (`resolution`, `gi`, `reflection`, ...).
+    pub fn label(self) -> &'static str {
+        match self {
+            ScalabilityGroup::Resolution => "resolution",
+            ScalabilityGroup::GlobalIllumination => "gi",
+            ScalabilityGroup::Reflection => "reflection",
+            ScalabilityGroup::AmbientOcclusion => "ao",
+            ScalabilityGroup::Shadow => "shadow",
+            ScalabilityGroup::SurfaceCache => "surface_cache",
+        }
+    }
+
+    /// The per-group env override, parsed + clamped to `0..=3`, or `None` when unset / unparseable.
+    /// This is an OPTIONAL coarse lever a caller may consult; unset (the default) means "use the
+    /// tier's [`groups`] level". Returning the level does NOT reach into [`preset`] — a caller that
+    /// honors it would map the level to knobs itself; the fine `P_*` env knobs still win. Kept here
+    /// so the group env names live in one place (single source of truth).
+    pub fn env_level(self) -> Option<u8> {
+        std::env::var(self.env_name())
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .map(|lvl| lvl.min(3))
+    }
+}
+
+/// The tier -> per-group level table (levels `0..=3`), the group-layer VIEW of [`preset`].
+///
+/// Returns a level for EVERY [`ScalabilityGroup`] (exhaustive, order = [`ScalabilityGroup::ALL`]),
+/// so the system is self-describing and per-platform extensible: a new platform tier declares its
+/// coarse profile as six integers here alongside its precise [`QualityPreset`]. The levels are a
+/// DESCRIPTIVE summary of what [`preset(tier)`](preset) already encodes — changing them does not
+/// change any resolved render value (the fine knobs are the source of truth). Level scale (looser
+/// = more expensive): `0` cheapest / `3` reference ceiling.
+///
+/// How each tier's levels reflect its preset:
+/// - **Low**: 2/3 internal res (Resolution 0), spp2 + third-res GI (GI 1), half-res reflection with
+///   a short 64-step march (Reflection 0), GDF AO off / SSAO on (AO 1), hard shadows / 8 taps
+///   (Shadow 0), no surface cache / long relight period (SurfaceCache 0).
+/// - **Med** (the byte-identical no-reg baseline): native res (Resolution 2), spp1 third-res GI
+///   (GI 1), half-res 96-step reflection (Reflection 1), GDF AO + SSAO both on (AO 2), hard shadows
+///   / 16 taps (Shadow 1), no surface cache / period-40 relight (SurfaceCache 1).
+/// - **High**: native res (Resolution 2), spp16 + full-res GI (GI 3), full-res 96-step reflection
+///   with a variance history clamp (Reflection 3), GDF AO + SSAO both on (AO 2), aesthetic soft
+///   shadows / 16 taps (Shadow 3), multibounce surface cache with every-frame relight
+///   (SurfaceCache 3).
+/// - **Apple** (platform tier, Med-derived, cost knobs pushed for the fanless iGPU): 0.67 internal
+///   res (Resolution 1), spp1 quarter-res single-à-trous GI (GI 0), 1/6-res 56-step reflection
+///   (Reflection 0), GDF AO on / SSAO off / half-res AO (AO 1), hard shadows / 16 taps (Shadow 1),
+///   no surface cache / period-64 relight (SurfaceCache 0).
+#[allow(dead_code)] // additive API layer; consumed by tests + the (separately-landing) resolver/UI.
+pub fn groups(q: RenderQuality) -> [(ScalabilityGroup, u8); 6] {
+    use ScalabilityGroup::*;
+    match q {
+        RenderQuality::Low => [
+            (Resolution, 0),
+            (GlobalIllumination, 1),
+            (Reflection, 0),
+            (AmbientOcclusion, 1),
+            (Shadow, 0),
+            (SurfaceCache, 0),
+        ],
+        RenderQuality::Med => [
+            (Resolution, 2),
+            (GlobalIllumination, 1),
+            (Reflection, 1),
+            (AmbientOcclusion, 2),
+            (Shadow, 1),
+            (SurfaceCache, 1),
+        ],
+        RenderQuality::High => [
+            (Resolution, 2),
+            (GlobalIllumination, 3),
+            (Reflection, 3),
+            (AmbientOcclusion, 2),
+            (Shadow, 3),
+            (SurfaceCache, 3),
+        ],
+        RenderQuality::Apple => [
+            (Resolution, 1),
+            (GlobalIllumination, 0),
+            (Reflection, 0),
+            (AmbientOcclusion, 1),
+            (Shadow, 1),
+            (SurfaceCache, 0),
+        ],
+    }
+}
+
+/// The group level a tier carries for one group (convenience lookup over [`groups`]). Panics never:
+/// [`groups`] is exhaustive over [`ScalabilityGroup`], so the group is always present.
+#[allow(dead_code)] // additive API layer; consumed by tests + the (separately-landing) resolver/UI.
+pub fn group_level(q: RenderQuality, group: ScalabilityGroup) -> u8 {
+    groups(q)
+        .into_iter()
+        .find_map(|(g, lvl)| (g == group).then_some(lvl))
+        .expect("groups() is exhaustive over ScalabilityGroup")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every [`RenderQuality`] tier, for exhaustive per-tier assertions. Kept in one place so a new
+    /// tier variant forces an obvious edit here (and the compiler flags the missing match arm in
+    /// `preset`/`groups`).
+    const TIERS: [RenderQuality; 4] = [
+        RenderQuality::Low,
+        RenderQuality::Med,
+        RenderQuality::High,
+        RenderQuality::Apple,
+    ];
+
+    /// Assert that a preset's every field sits inside the range its consumer clamps it to in
+    /// `main.rs` (the `env_override.unwrap_or(base.x).clamp(..)` sites). This is the validated-range
+    /// table from the design doc, checked structurally so a future preset edit that lands an
+    /// out-of-range default is caught here rather than silently clamped at runtime.
+    fn assert_preset_in_range(label: &str, p: &QualityPreset) {
+        // Trace-resolution divisors: clamp(1, 16) at the res-div consumer sites.
+        assert!(
+            (1..=16).contains(&p.gi_res_div),
+            "{label}: gi_res_div {} out of 1..=16",
+            p.gi_res_div
+        );
+        assert!(
+            (1..=16).contains(&p.reflect_res_div),
+            "{label}: reflect_res_div {} out of 1..=16",
+            p.reflect_res_div
+        );
+        assert!(
+            (1..=16).contains(&p.ao_res_div),
+            "{label}: ao_res_div {} out of 1..=16",
+            p.ao_res_div
+        );
+        // à-trous iterations: clamp(1, 5).
+        assert!(
+            (1..=5).contains(&p.gi_atrous_steps),
+            "{label}: gi_atrous_steps {} out of 1..=5",
+            p.gi_atrous_steps
+        );
+        // Surface-cache relight period: .max(1) — must be >= 1 (0 = divide-by-zero round-robin).
+        assert!(
+            p.cache_relight_period >= 1,
+            "{label}: cache_relight_period {} must be >= 1",
+            p.cache_relight_period
+        );
+        // Sample counts: clamp(1, 256).
+        assert!(
+            (1..=256).contains(&p.gi_spp),
+            "{label}: gi_spp {} out of 1..=256",
+            p.gi_spp
+        );
+        assert!(
+            (1..=256).contains(&p.gi_max_steps),
+            "{label}: gi_max_steps {} out of 1..=256",
+            p.gi_max_steps
+        );
+        assert!(
+            (1..=256).contains(&p.reflect_max_steps),
+            "{label}: reflect_max_steps {} out of 1..=256",
+            p.reflect_max_steps
+        );
+        // Cache relight gather spp: a positive per-texel ray count.
+        assert!(
+            p.cache_relight_spp >= 1,
+            "{label}: cache_relight_spp {} must be >= 1",
+            p.cache_relight_spp
+        );
+        // Internal render scale: clamp(0.3333, 1.0) at the render-scale consumer site.
+        assert!(
+            (0.3333..=1.0).contains(&p.render_scale),
+            "{label}: render_scale {} out of 0.3333..=1.0",
+            p.render_scale
+        );
+        // Reflection history-clamp MODE: .min(2) => 0/1/2.
+        assert!(
+            p.reflect_history_clamp <= 2,
+            "{label}: reflect_history_clamp {} out of 0..=2",
+            p.reflect_history_clamp
+        );
+        // Soft-PCF tap count: clamp(1, 16) (POISSON16 array bound in the shader).
+        assert!(
+            (1..=16).contains(&p.shadow_taps),
+            "{label}: shadow_taps {} out of 1..=16",
+            p.shadow_taps
+        );
+        // Reflection roughness cutoff: a 0..=1 fraction.
+        assert!(
+            (0.0..=1.0).contains(&p.reflect_max_roughness),
+            "{label}: reflect_max_roughness {} out of 0..=1",
+            p.reflect_max_roughness
+        );
+        // Cone-trace LOD slope: clamp(0.0, 1.0).
+        assert!(
+            (0.0..=1.0).contains(&p.gdf_cone_k),
+            "{label}: gdf_cone_k {} out of 0..=1",
+            p.gdf_cone_k
+        );
+        // Shadow softness (penumbra scale): non-negative; clamped at the consumer only for < 0.
+        assert!(
+            p.shadow_softness >= 0.0,
+            "{label}: shadow_softness {} must be >= 0",
+            p.shadow_softness
+        );
+        // Reflection variance-clamp tightness: clamp(0.0, 8.0).
+        assert!(
+            (0.0..=8.0).contains(&p.reflect_clamp_gamma),
+            "{label}: reflect_clamp_gamma {} out of 0..=8",
+            p.reflect_clamp_gamma
+        );
+        // GI temporal-clamp mode/gamma: clamp(0.0, 16.0).
+        assert!(
+            (0.0..=16.0).contains(&p.gi_temporal_clamp),
+            "{label}: gi_temporal_clamp {} out of 0..=16",
+            p.gi_temporal_clamp
+        );
+    }
+
+    /// Every tier's `preset()` resolves within the validated ranges its consumers clamp to.
+    #[test]
+    fn preset_fields_in_range() {
+        for tier in TIERS {
+            assert_preset_in_range(tier.label(), &preset(tier));
+        }
+    }
+
+    /// The gallery preset — which the gallery scene resolves against instead of the active tier —
+    /// is also a valid, in-range configuration.
+    #[test]
+    fn gallery_preset_in_range() {
+        assert_preset_in_range("gallery", &gallery_preset());
+    }
+
+    /// GUARDRAIL: [`gallery_preset`] equals the byte-identical legacy anchor values, field by field.
+    /// The gallery is the path-tracer parity + regression anchor (`af70c1a5…`); this test locks its
+    /// resolved config so a future `preset`/tier edit can't silently drift the anchor. If a value
+    /// here must change, the gallery sha changes too — that is the whole point of the lock.
+    #[test]
+    fn gallery_preset_locks_legacy_anchor() {
+        let g = gallery_preset();
+        assert_eq!(g.gi_spp, 8, "gallery gi_spp (PT-parity sample count)");
+        assert_eq!(
+            g.gi_max_steps, 64,
+            "gallery gi_max_steps (full bounce march)"
+        );
+        assert_eq!(g.reflect_max_steps, 96, "gallery reflect_max_steps");
+        assert!(g.gi_denoise, "gallery gi_denoise");
+        assert!(g.reflect_cache, "gallery reflect_cache");
+        assert!(!g.surface_cache, "gallery surface_cache");
+        assert!(
+            !g.ssr_stochastic,
+            "gallery ssr_stochastic (full-res mirror)"
+        );
+        assert_eq!(
+            g.reflect_max_roughness, 0.5,
+            "gallery reflect_max_roughness"
+        );
+        assert!(!g.gdf_ao, "gallery gdf_ao (no GDF AO)");
+        assert!(!g.ssao, "gallery ssao (no screen-space AO)");
+        assert!(g.firefly_clamp, "gallery firefly_clamp");
+        assert_eq!(g.shadow_softness, 0.0, "gallery shadow_softness (hard PCF)");
+        assert_eq!(g.shadow_taps, 16, "gallery shadow_taps");
+        assert_eq!(
+            g.cache_relight_period, 1,
+            "gallery cache_relight_period (every-frame relight)"
+        );
+        assert!(!g.gi_half_res, "gallery gi_half_res (full-res trace)");
+        assert_eq!(g.cache_relight_spp, 8, "gallery cache_relight_spp");
+        assert!(!g.reflect_half_res, "gallery reflect_half_res (full-res)");
+        assert_eq!(g.render_scale, 1.0, "gallery render_scale (native)");
+        assert_eq!(g.gdf_cone_k, 0.0, "gallery gdf_cone_k (linear march)");
+        assert_eq!(g.gi_res_div, 2, "gallery gi_res_div (legacy value)");
+        assert_eq!(
+            g.reflect_res_div, 2,
+            "gallery reflect_res_div (legacy value)"
+        );
+        assert_eq!(g.ao_res_div, 1, "gallery ao_res_div (legacy value)");
+        assert_eq!(g.gi_atrous_steps, 2, "gallery gi_atrous_steps");
+        assert_eq!(
+            g.reflect_history_clamp, 0,
+            "gallery reflect_history_clamp (off)"
+        );
+        assert_eq!(g.reflect_clamp_gamma, 1.25, "gallery reflect_clamp_gamma");
+        assert_eq!(
+            g.gi_temporal_clamp, 1.0,
+            "gallery gi_temporal_clamp (hard 3x3)"
+        );
+    }
+
+    /// `Med` reproduces the pre-tier hardcoded defaults (the no-regression baseline) for the fields
+    /// the design doc calls out. A drift here is a byte-identical-anchor risk for content Med.
+    #[test]
+    fn med_matches_legacy_defaults() {
+        let m = preset(RenderQuality::Med);
+        assert_eq!(m.gi_spp, 1, "Med gi_spp");
+        assert_eq!(m.render_scale, 1.0, "Med render_scale (native)");
+        assert_eq!(m.reflect_max_roughness, 0.5, "Med reflect_max_roughness");
+        assert_eq!(m.reflect_max_steps, 96, "Med reflect_max_steps");
+        assert!(m.gdf_ao, "Med gdf_ao");
+        assert!(m.ssao, "Med ssao (legacy content default)");
+    }
+
+    /// `env_bool` parsing: `0`/`false`/`off` (case/space-insensitive) => false; any other set value
+    /// => true; unset => the tier default (either polarity).
+    #[test]
+    fn env_bool_parses() {
+        // A test-local env name so this can't collide with a real feature flag.
+        let name = "DC_TEST_ENV_BOOL_PARSE";
+        // Unset => default is returned verbatim (both polarities).
+        // SAFETY: single-threaded test on a test-local env name; set/remove are balanced here.
+        unsafe { std::env::remove_var(name) };
+        assert!(env_bool(name, true), "unset => default true");
+        assert!(!env_bool(name, false), "unset => default false");
+
+        for falsy in ["0", "false", "off", "OFF", "  false  ", "False"] {
+            // SAFETY: single-threaded test, restored via remove_var before the next case.
+            unsafe { std::env::set_var(name, falsy) };
+            assert!(
+                !env_bool(name, true),
+                "{falsy:?} => false (overrides default)"
+            );
+        }
+        for truthy in ["1", "true", "on", "yes", "anything"] {
+            unsafe { std::env::set_var(name, truthy) };
+            assert!(
+                env_bool(name, false),
+                "{truthy:?} => true (overrides default)"
+            );
+        }
+        unsafe { std::env::remove_var(name) };
+    }
+
+    /// `groups(tier)` returns a level for EVERY [`ScalabilityGroup`] (exhaustive), each within the
+    /// `0..=3` range, for every tier. Guards the self-describing invariant that a tier's group
+    /// profile covers the whole group set.
+    #[test]
+    fn groups_cover_every_group() {
+        for tier in TIERS {
+            let g = groups(tier);
+            assert_eq!(
+                g.len(),
+                ScalabilityGroup::ALL.len(),
+                "{}: groups() must have one entry per ScalabilityGroup",
+                tier.label()
+            );
+            for group in ScalabilityGroup::ALL {
+                let present = g.iter().any(|(gg, _)| *gg == group);
+                assert!(
+                    present,
+                    "{}: groups() missing {}",
+                    tier.label(),
+                    group.label()
+                );
+            }
+            for (group, level) in g {
+                assert!(
+                    level <= 3,
+                    "{}: {} level {} out of 0..=3",
+                    tier.label(),
+                    group.label(),
+                    level
+                );
+                // The convenience lookup agrees with the table.
+                assert_eq!(
+                    group_level(tier, group),
+                    level,
+                    "{}: group_level disagrees with groups() for {}",
+                    tier.label(),
+                    group.label()
+                );
+            }
+        }
+    }
+
+    /// Each group's env-override name is the documented `SG_*` string, and `env_level` clamps a set
+    /// value to `0..=3` / returns `None` when unset. Confirms the coarse group lever a caller may
+    /// consult is wired to the right env names.
+    #[test]
+    fn group_env_levels_parse_and_clamp() {
+        assert_eq!(ScalabilityGroup::Resolution.env_name(), "SG_RESOLUTION");
+        assert_eq!(ScalabilityGroup::GlobalIllumination.env_name(), "SG_GI");
+        assert_eq!(ScalabilityGroup::Reflection.env_name(), "SG_REFLECTION");
+        assert_eq!(ScalabilityGroup::AmbientOcclusion.env_name(), "SG_AO");
+        assert_eq!(ScalabilityGroup::Shadow.env_name(), "SG_SHADOW");
+        assert_eq!(
+            ScalabilityGroup::SurfaceCache.env_name(),
+            "SG_SURFACE_CACHE"
+        );
+
+        // SAFETY: single-threaded test; each set is followed by a read then a balanced remove.
+        let g = ScalabilityGroup::GlobalIllumination;
+        unsafe { std::env::remove_var(g.env_name()) };
+        assert_eq!(g.env_level(), None, "unset SG_GI => None");
+        unsafe { std::env::set_var(g.env_name(), "2") };
+        assert_eq!(g.env_level(), Some(2), "SG_GI=2 => Some(2)");
+        unsafe { std::env::set_var(g.env_name(), "9") };
+        assert_eq!(g.env_level(), Some(3), "SG_GI=9 => clamped to Some(3)");
+        unsafe { std::env::set_var(g.env_name(), "not-a-number") };
+        assert_eq!(g.env_level(), None, "SG_GI=garbage => None");
+        unsafe { std::env::remove_var(g.env_name()) };
     }
 }
