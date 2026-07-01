@@ -114,12 +114,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 
     BounceScene bs = probe_bounce_scene();
     float3 origin = world_pos + normal * pc.params.y;
-    float3 radiance = bs_trace_bounce(bs, origin, dir);
+    float escaped;
+    float3 radiance = bs_trace_bounce(bs, origin, dir, escaped);
 
     // Firefly clamp (hue-preserving): one bright sample can't dominate the gather.
     float m = max(radiance.r, max(radiance.g, radiance.b));
     if (m > pc.clamp_max)
         radiance *= pc.clamp_max / m;
 
-    g.storage_images[pc.atlas_index][tid.xy] = float4(radiance, 1.0);
+    // Alpha = per-ray sky visibility (1 = reached sky, 0 = hit geometry). The integrate pass
+    // builds the per-pixel hemispherical sky-vis V(n) from these for indoor skylight occlusion.
+    g.storage_images[pc.atlas_index][tid.xy] = float4(radiance, escaped);
 }

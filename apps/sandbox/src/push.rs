@@ -1669,6 +1669,7 @@ pub(crate) fn screen_probe_integrate_push(
     downsample: u32,
     oct_res: u32,
     flip_y: u32,
+    skyvis_index: u32,
     pos_sigma: f32,
     normal_power: f32,
 ) -> [u8; 128] {
@@ -1689,7 +1690,7 @@ pub(crate) fn screen_probe_integrate_push(
     putu(&mut pc, 96, downsample);
     putu(&mut pc, 100, oct_res);
     putu(&mut pc, 104, flip_y);
-    putu(&mut pc, 108, 0);
+    putu(&mut pc, 108, skyvis_index);
     putf(&mut pc, 112, pos_sigma);
     putf(&mut pc, 116, normal_power);
     pc

@@ -62,10 +62,46 @@ is the P1 correctness bar.
   that scene) chiefly by a cool cast — the shipped indoor sky-vis occlusion (de-blue) is
   not yet wired into the screen-probe path (a P3 item).
 
+## P3 — indoor skylight occlusion (sky-vis) from the probe trace
+
+The gather now reconstructs indoor skylight occlusion directly from the probes instead of
+the separate SH-volume path — more principled, since the probes already trace the exact
+visibility. The shared tracer `bs_trace_bounce` reports `escaped` (1 = the ray reached the
+sky, 0 = it hit geometry); the trace pass stores it in the atlas **alpha**. The integrate
+pass reconstructs the cosine-weighted hemispherical sky visibility `V(n) = Σ vis·cos / Σ cos`
+per probe, blends it with the same probe weights as E, and writes a full-res sky-vis image.
+That image feeds the existing lighting occlusion (the shipped `P_SKYVIS_TINT` /
+`P_SKYVIS_MIN_OCC` neutral-leak) exactly like the volume path's output, so open surfaces
+keep full skylight and enclosed interiors de-blue to the colored scene bounce.
+
+The per-pixel probe gather itself (bilinear × plane × normal weights, cosine octahedral
+integration) is the P3 consumption; it landed with P1 as the vertical slice that made the
+technique measurable, and is refined here with the sky-vis term.
+
+### Verification (Metal; Windows DX≡VK pending — frozen)
+
+| Capture (gallery, vs `P8_PATHTRACE` ground truth) | avg abs diff / ch |
+|---|---|
+| GI baseline (per-pixel ray march) | 6.162 |
+| Screen-probe GI, P1 (no sky-vis) | 6.228 |
+| Screen-probe GI, P3 (sky-vis active) | **5.984** |
+
+Reconstructing the indoor occlusion from the probes brings the gallery **below the
+ray-march baseline** against the path tracer — the traced sky visibility occludes the IBL
+diffuse in recesses exactly where the path tracer does.
+
+- **Gallery byte-identical** anchor (no env): `dba9ff7c…` unchanged (the `escaped` out-param
+  added to `bs_trace_bounce` is behaviour-preserving on the per-pixel path).
+- **Determinism**: two `SCREEN_PROBE=1` gallery runs byte-identical (`aa30b9f6…`).
+- `sponza_intel` (`EV100=11`): the stone de-blues from the P1 cool cast to a warm/neutral
+  indoor look with the curtains popping — matching the shipped volume-path aesthetic, now
+  driven by traced per-probe visibility.
+
 ## Next
 
-- **P3**: reintroduce the indoor skylight-occlusion (sky-vis) on the probe path so the
-  stone de-blues to match the shipped look; refine the gather (probe-irradiance
-  pre-integration to drop the per-pixel tap count; better disocclusion handling).
 - **P2**: importance sampling (BRDF + prior radiance) + screen-space spatial/temporal probe
-  filtering with octahedral borders.
+  filtering with octahedral borders (noise / firefly suppression).
+- Gather efficiency: probe-irradiance pre-integration to drop the per-pixel tap count
+  (currently oct_res² × up-to-4 probes); better disocclusion handling.
+- **P4**: world radiance-cache clipmap fallback for off-screen / far-field / infinite bounce.
+- **P5**: tile classification, ray budget, half/quarter-res, temporal amortization.

@@ -3805,8 +3805,9 @@ impl App {
                 // Screen-space radiance probes (P1+): per-tile probe trace into an octahedral
                 // atlas + a per-pixel gather replace the GI consumption (world-volume sample /
                 // ray march). Full-res output; denoise (temporal + à-trous) for stability like the
-                // ray-march path. Indoor skylight occlusion (sky-vis) is reintroduced in P3.
-                let traced = self.gi.record_screen_probe(
+                // ray-march path. The gather also builds the indoor skylight occlusion (sky-vis)
+                // from the probes' per-ray sky visibility, fed to lighting like the volume path.
+                let (traced, sp_skyvis) = self.gi.record_screen_probe(
                     &mut graph,
                     vol,
                     ext,
@@ -3830,7 +3831,7 @@ impl App {
                     self.gi_max_steps,
                     self.gdf_cone_k,
                 );
-                gi_skyvis_out = None;
+                gi_skyvis_out = Some(sp_skyvis);
                 let out = if gi_denoise_active {
                     self.gi.record_denoise(
                         &mut graph,

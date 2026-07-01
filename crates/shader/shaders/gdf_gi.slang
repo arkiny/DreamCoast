@@ -193,7 +193,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         float3 dir = bounce_cosine_hemisphere(n, seed);
         // Firefly clamp per sample (before averaging): one ray hitting a bright spot can't
         // blow out the mean. Hue-preserving; `clamp_max = 1e30` disables it.
-        float3 b = bs_trace_bounce(bs, origin, dir);
+        float esc;
+        float3 b = bs_trace_bounce(bs, origin, dir, esc);
         float m = max(b.r, max(b.g, b.b));
         if (m > pc.clamp_max)
             b *= pc.clamp_max / m;

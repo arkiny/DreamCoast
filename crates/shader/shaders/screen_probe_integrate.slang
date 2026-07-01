@@ -30,7 +30,7 @@ struct ProbeIntegratePush
     uint downsample;        // screen pixels per probe tile
     uint oct_res;           // octahedral tile resolution
     uint flip_y;            // bit0: 1 = Vulkan (clip-space Y down)
-    uint pad0;
+    uint skyvis_index;      // storage-image index for indoor sky-visibility (0xFFFFFFFF = off)
     float pos_sigma;        // surface-plane proximity weight scale (world units)
     float normal_power;     // normal-agreement weight exponent
     float pad1;
@@ -63,11 +63,15 @@ bool probe_surface(uint2 probe, out float3 world_pos, out float3 normal)
     return reconstruct(px, world_pos, normal);
 }
 
-// Integrate one probe's octahedral radiance tile over the cosine hemisphere about `n`.
-float3 integrate_probe(uint2 probe, float3 n)
+// Integrate one probe's octahedral tile over the cosine hemisphere about `n`. Returns the
+// indirect irradiance E and (via `vis`) the cosine-weighted hemispherical sky visibility
+// V(n) in [0,1] (1 = fully sky-exposed, 0 = enclosed) reconstructed from the atlas alpha.
+float3 integrate_probe(uint2 probe, float3 n, out float vis)
 {
     uint2 base = probe * pc.oct_res;
     float3 e = float3(0.0, 0.0, 0.0);
+    float vis_num = 0.0;
+    float cos_sum = 0.0;
     for (uint oy = 0u; oy < pc.oct_res; oy++)
     {
         for (uint ox = 0u; ox < pc.oct_res; ox++)
@@ -77,10 +81,13 @@ float3 integrate_probe(uint2 probe, float3 n)
             float c = max(dot(dir, n), 0.0);
             if (c <= 0.0)
                 continue;
-            float3 L = g.textures[pc.atlas_index].Load(int3(int(base.x + ox), int(base.y + oy), 0)).rgb;
-            e += L * c;
+            float4 s = g.textures[pc.atlas_index].Load(int3(int(base.x + ox), int(base.y + oy), 0));
+            e += s.rgb * c;
+            vis_num += s.a * c; // alpha = per-ray sky visibility
+            cos_sum += c;
         }
     }
+    vis = cos_sum > 0.0 ? vis_num / cos_sum : 1.0;
     // (1/pi) * sum(L * cos * dOmega), dOmega = 4*pi / oct_res^2  ->  4/oct_res^2.
     return e * (4.0 / float(pc.oct_res * pc.oct_res));
 }
@@ -96,6 +103,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     if (!reconstruct(tid.xy, world_pos, normal))
     {
         g.storage_images[pc.out_index][tid.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        // Sky / far plane: fully sky-visible (defined output so lighting never reads stale).
+        if (pc.skyvis_index != 0xFFFFFFFFu)
+            g.storage_images[pc.skyvis_index][tid.xy] = float4(1.0, 0.0, 0.0, 1.0);
         return;
     }
 
@@ -106,6 +116,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     int2 base = int2(base_f);
 
     float3 accum = float3(0.0, 0.0, 0.0);
+    float vis_accum = 0.0;
     float wsum = 0.0;
     for (int j = 0; j < 2; j++)
     {
@@ -132,11 +143,24 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             if (w < 1e-5)
                 continue;
 
-            accum += w * integrate_probe(probe, normal);
+            float v_probe;
+            accum += w * integrate_probe(probe, normal, v_probe);
+            vis_accum += w * v_probe;
             wsum += w;
         }
     }
 
-    float3 e = wsum > 0.0 ? accum / wsum : float3(0.0, 0.0, 0.0);
+    float inv_w = wsum > 0.0 ? 1.0 / wsum : 0.0;
+    float3 e = accum * inv_w;
     g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
+
+    // Indoor skylight occlusion: cosine-weighted hemispherical sky visibility V(n). Open
+    // surfaces -> ~1 (full skylight); enclosed interiors -> ~0 (the diffuse skylight is
+    // occluded, so the colored scene bounce shows instead of flat blue sky). No probe coverage
+    // (wsum == 0) -> fully sky-visible (matches the volume path's graceful fallback).
+    if (pc.skyvis_index != 0xFFFFFFFFu)
+    {
+        float v = wsum > 0.0 ? saturate(vis_accum * inv_w) : 1.0;
+        g.storage_images[pc.skyvis_index][tid.xy] = float4(v, 0.0, 0.0, 1.0);
+    }
 }
