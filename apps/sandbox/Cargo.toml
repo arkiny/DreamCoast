@@ -18,6 +18,10 @@ rhi.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 image.workspace = true
+# Data-driven scalability tier tables (apps/sandbox/config/scalability.ron): parsed at
+# startup with an embedded (include_str!) fallback. Same RON stack the .level loader uses.
+serde.workspace = true
+ron.workspace = true
 
 # Debug-only: in-app RenderDoc frame-capture trigger (RDOC_CAPTURE=1, run under
 # `renderdoccmd capture`). Loads the injected RenderDoc module at runtime; a no-op
