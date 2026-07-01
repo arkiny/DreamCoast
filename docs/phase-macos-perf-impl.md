@@ -138,7 +138,14 @@ non-Apple tier keeps 2; **Apple tier = 4 (quarter-res)**. `P_REFLECT_RES_DIV` ov
 | M0 Med native | 165 | 6 | 77.8 |
 | M1 Apple (rs0.67, half reflect) | 70 | 14 | 30.8 |
 | **+ quarter-res reflect (rs0.67)** | **48.3** | **21** | **8.25** |
-| + quarter-res reflect + rs0.5 | 29.8 | 34 | ~4.6 |
+| **+ half-res AO (rs0.67)** | **38.8** | **26** | gdf_ao 12.1→3.56 |
+| + quarter reflect + half AO + rs0.5 | ~27 | ~37 | — |
+
+**Half-res AO (`ao_res_div`, Apple=2):** trace `gdf_ao` at 1/div + the same bilateral upsample.
+Non-Apple tiers = 1 (full-res, byte-identical); the gallery never runs gdf_ao so the anchor is
+unaffected. Measured: gdf_ao 12.1→3.56ms; **half-vs-full AO on Sponza is byte-identical** (AO is a
+low-frequency contact term the guided upsample reconstructs within 8-bit precision) — a free win.
+`P_AO_RES_DIV` override. Med Sponza `1ee08a3a` byte-identical (div=1 no-op), gallery `af70c1a5`.
 
 **Gates PASS:** gallery anchor `af70c1a5` byte-identical + deterministic (gallery forces reflect
 full-res); **Med Sponza `1ee08a3a` byte-identical → `div=2` is a proven no-op**; clippy -D clean.
