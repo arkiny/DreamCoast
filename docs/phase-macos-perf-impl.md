@@ -139,7 +139,17 @@ non-Apple tier keeps 2; **Apple tier = 4 (quarter-res)**. `P_REFLECT_RES_DIV` ov
 | M1 Apple (rs0.67, half reflect) | 70 | 14 | 30.8 |
 | **+ quarter-res reflect (rs0.67)** | **48.3** | **21** | **8.25** |
 | **+ half-res AO (rs0.67)** | **38.8** | **26** | gdf_ao 12.1→3.56 |
-| + quarter reflect + half AO + rs0.5 | ~27 | ~37 | — |
+| **+ SSR-stochastic + reflect 1/6 + AO 1/4** | **32.9** | **30** | gdf_reflect →~4, ssr →0.8 |
+| + all + rs0.5 | ~23 | ~43 | — |
+
+**Apple-tier further tuning (all byte-identical on the Sponza benchmark, sha `546cb91759…`):**
+`ssr_stochastic=true` (half-res GGX + ratio-estimator denoise, ~1/3 the full-mirror cost),
+`reflect_res_div 4→6` (gdf_reflect scales with trace res only; roughness-gated so free on rough
+content — smooth mirrors read softer, `P_REFLECT_RES_DIV=4` to restore), `ao_res_div 2→4` (AO is
+very low-frequency; a standard downsample). 39.9→32.9ms (26→30fps). Gallery `af70c1a5` + Med Sponza
+`1ee08a3a` unchanged (Apple-only), deterministic, clippy -D clean. Moving-camera notes: the cache
+relight period stays 64 (128 gives ~2s relight lag for only −1.8ms — rejected as too aggressive for
+a quality default); stochastic SSR is temporally denoised under motion.
 
 **Half-res AO (`ao_res_div`, Apple=2):** trace `gdf_ao` at 1/div + the same bilateral upsample.
 Non-Apple tiers = 1 (full-res, byte-identical); the gallery never runs gdf_ao so the anchor is

@@ -356,7 +356,9 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_denoise: true,
             reflect_cache: true,
             surface_cache: false,
-            ssr_stochastic: false,
+            // Half-res stochastic SSR (GGX-jittered + ratio-estimator denoise): ~1/3 the cost of the
+            // full-res mirror path; byte-identical on the Sponza benchmark, denoised under motion.
+            ssr_stochastic: true,
             reflect_max_roughness: 0.4,
             gdf_ao: true, // contact AO retained — it is the AO source once ssao is off
             ssao: false,  // OFF on Apple: gdf_ao covers contact AO; reclaims the ~13 ms 2nd AO pass
@@ -370,8 +372,14 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             render_scale: 0.67,
             gdf_cone_k: 0.06,
             gi_res_div: 4,
-            reflect_res_div: 4, // quarter-res reflection (M3-C): the one lever that cuts gdf_reflect
-            ao_res_div: 2,      // half-res AO: gdf_ao is the top pass after quarter-res reflection
+            // 1/6-res reflection: gdf_reflect scales only with trace resolution (measured), and the
+            // reflection is roughness-gated (>0.4 → GDF fallback) + temporally accumulated, so on
+            // rough-dominant content this is byte-identical (Sponza max Δ18 on <0.01% px). Smooth
+            // mirrors read softer than div=4 — override `P_REFLECT_RES_DIV=4` for mirror-heavy content.
+            reflect_res_div: 6,
+            // 1/4-res AO: AO is a very low-frequency contact term the guided upsample reconstructs
+            // within 8-bit precision (byte-identical on Sponza); a standard AO downsample.
+            ao_res_div: 4,
             reflect_history_clamp: 1, // hard (matches Med) — kills rotation smear
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
