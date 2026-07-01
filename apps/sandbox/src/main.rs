@@ -1534,6 +1534,26 @@ impl App {
                     .collect();
                 gdf.set_clip_levels(&device, &level_data)?;
             }
+            // P1 (per-mesh-sdf-direct-sample-plan.md): pack every unique mesh's field into one
+            // atlas volume + build the instance table / cell grid, then switch the SW-RT field
+            // source to direct per-mesh sampling. Opt-in (`P11_DIRECT_SDF=1`) until P3 promotes
+            // it to the content default; the dense compose above still runs so the two paths can
+            // be A/B'd on the same scene. Content-only (gallery keeps the dense anchor).
+            if use_permesh && quality::env_bool("P11_DIRECT_SDF", false) {
+                let atlas = dreamcoast_asset::sdf_atlas::SdfAtlas::pack(&mesh_sdfs);
+                let res = crate::mesh_sdf::grid_res_for(compose_objects.len());
+                let build = crate::mesh_sdf::build(&compose_objects, &atlas, amin, amax, res);
+                info!(
+                    "per-mesh SDF direct sample: atlas {}x{}x{} ({:.1} MB), {} instances, {}^3 cell grid",
+                    atlas.dim[0],
+                    atlas.dim[1],
+                    atlas.dim[2],
+                    (atlas.voxels.len() * 4) as f32 / 1.0e6,
+                    build.instance_count,
+                    res,
+                );
+                gdf.install_mesh_sdf(&device, &atlas.to_le_bytes(), atlas.dim, &build)?;
+            }
             // Phase 12 item 3: optional GPU→CPU volume-readback round-trip check. Reads
             // the just-uploaded scene SDF back and confirms it equals the bytes we
             // uploaded — validating `Device::read_volume` on the live backend.
