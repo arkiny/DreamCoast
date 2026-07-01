@@ -71,6 +71,14 @@ use rt::*;
 use smoketest::*;
 
 const FRAMES_IN_FLIGHT: usize = 2;
+// CPU/GPU-bound diagnosis (`PROFILE_CPU`): microseconds spent in the per-frame fence wait (blocking
+// on the fif's previous GPU submission) and the whole-frame CPU wall time. wait≈0 ⇒ CPU-bound (the
+// GPU already finished, the CPU is the long pole); wait large ⇒ GPU-bound. Logged in screenshot mode.
+static LAST_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_FRAME_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// CPU record time: frame entry → just before `present` (excludes the display-paced present block),
+// so it isolates the real CPU work (graph build + command recording + submit) from vsync pacing.
+static LAST_CPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 // Swapchain / backbuffer. UNORM, not sRGB: GPU capture & overlay layers
 // (RenderDoc, OBS, …) force VK_IMAGE_USAGE_STORAGE onto swapchain images, which an
 // sRGB surface format can never support — an sRGB backbuffer makes RenderDoc
@@ -245,7 +253,13 @@ fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
     SwapchainDesc {
         extent,
         format: COLOR_FORMAT,
-        present_mode: PresentMode::Fifo,
+        // `NO_VSYNC=1` runs the presentation uncapped (no display-refresh pacing) so the true
+        // CPU+GPU frame time can be benchmarked past the 60Hz vsync ceiling. Default = Fifo (vsync).
+        present_mode: if std::env::var_os("NO_VSYNC").is_some() {
+            PresentMode::Immediate
+        } else {
+            PresentMode::Fifo
+        },
         image_count: 3,
     }
 }
@@ -641,6 +655,8 @@ struct App {
     /// macOS/M3 perf: GDF AO trace divisor (1 = full-res, 2 = half). Traced at 1/div + bilateral
     /// upsample; the Apple tier uses 2 (gdf_ao is the top pass after quarter-res reflection). `P_AO_RES_DIV`.
     ao_res_div: u32,
+    /// macOS/M3 perf: à-trous GI-denoise iteration count (2 = legacy, Apple = 1). `P_GI_ATROUS_STEPS`.
+    gi_atrous_steps: u32,
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
     /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
     gi_half_res: bool,
@@ -1797,7 +1813,17 @@ impl App {
         // override always wins over the tier.
         let device_info = device.device_info();
         let quality = quality::RenderQuality::from_env_for_device(&device_info);
-        let qp = quality::preset(quality);
+        // Scalability resolution base (single source of truth): the gallery is the byte-identical
+        // path-tracer anchor, so its knobs resolve against a fixed legacy preset rather than the
+        // active tier — structurally, so a new tier knob can't break the anchor by forgetting a
+        // per-site `if gallery_scene { .. }` force. Content scenes resolve against the tier preset.
+        // Each knob below is `env_override.unwrap_or(base.<knob>).clamp(..)`; the UI live-swap uses
+        // the same `base` (see the RenderQuality combo) so the two paths can never drift.
+        let base = if gallery_scene {
+            quality::gallery_preset()
+        } else {
+            quality::preset(quality)
+        };
         info!(
             "RenderQuality tier: {} (RENDER_QUALITY; GPU \"{}\")",
             quality.label(),
@@ -1842,16 +1868,15 @@ impl App {
         // Stage C2: GDF contact AO into the deferred ambient term. Gallery forced off (byte-
         // identical anchor); content takes the tier (Med now on — the contact-scale reach fix
         // makes AO add depth, not crush the interior). `P11_GDF_AO` overrides either way.
-        let gdf_ao = gi.has_ao()
-            && gdf.has_scene_sdf()
-            && quality::env_bool("P11_GDF_AO", !gallery_scene && qp.gdf_ao);
+        let gdf_ao =
+            gi.has_ao() && gdf.has_scene_sdf() && quality::env_bool("P11_GDF_AO", base.gdf_ao);
         // Screen-space near-field AO (HBAO-lite), composed with the GDF AO for crevice/contact
         // definition the coarse GDF can't resolve. Gallery off (byte-identical anchor); content
         // takes the tier default (`qp.ssao` — on for Med/High/Low, OFF for the Apple tier where
         // gdf_ao already covers contact AO and this reclaims the ~13 ms 2nd AO pass). `SSAO`
         // overrides either way; `SSAO_RADIUS/INTENSITY/BIAS/POWER` tune. World radius 0.5 m (contact
         // scale), intensity 1.5, bias 2 cm, power 1.5 (contrast).
-        let ssao = compute_supported && quality::env_bool("SSAO", !gallery_scene && qp.ssao);
+        let ssao = compute_supported && quality::env_bool("SSAO", base.ssao);
         let env_f32 = |name: &str, default: f32| {
             std::env::var(name)
                 .ok()
@@ -1919,14 +1944,14 @@ impl App {
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(if gallery_scene { 8 } else { qp.gi_spp })
+            .unwrap_or(base.gi_spp)
             .clamp(1, 256);
         // Stage D3: C3 bounce-ray march step cap. Gallery forced to the legacy 64 (byte-identical);
         // content takes the tier value. `P11_GI_MAX_STEPS` overrides.
         let gi_max_steps = std::env::var("P11_GI_MAX_STEPS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(if gallery_scene { 64 } else { qp.gi_max_steps })
+            .unwrap_or(base.gi_max_steps)
             .clamp(1, 256);
         // Stage D2: surface-cache amortized-relight period. The gallery is the byte-identical
         // regression anchor, so it is forced to 1 (every-frame relight = legacy) just like the
@@ -1935,11 +1960,7 @@ impl App {
         let cache_relight_period = std::env::var("P11_CACHE_RELIGHT_PERIOD")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(if gallery_scene {
-                1
-            } else {
-                qp.cache_relight_period
-            })
+            .unwrap_or(base.cache_relight_period)
             .max(1);
         // Stage D2b: camera-visibility feedback drives the relight budget (off-screen cards relit
         // far less). Pure perf optimization — invariant for the on-screen image — so default on for
@@ -1964,24 +1985,20 @@ impl App {
         let cache_relight_spp = std::env::var("P11_CACHE_RELIGHT_SPP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(if gallery_scene {
-                8
-            } else {
-                qp.cache_relight_spp
-            })
+            .unwrap_or(base.cache_relight_spp)
             .max(1);
         // Stage D1: half-res GI trace + bilateral upsample. Gallery stays full-res (the
         // byte-identical anchor); content scenes take the tier default. `P11_GI_HALF_RES`
         // overrides. Needs the upsample pipeline (capability-gated).
-        let gi_half_res = gi.has_upsample()
-            && quality::env_bool("P11_GI_HALF_RES", !gallery_scene && qp.gi_half_res);
+        let gi_half_res =
+            gi.has_upsample() && quality::env_bool("P11_GI_HALF_RES", base.gi_half_res);
         // P1 (SW-RT GI 레퍼런스급): GI trace-resolution divisor used when `gi_half_res` is on (2 = legacy
         // half, 4 = quarter = sparser screen-space probes). Only affects content (the gallery traces
         // full-res). `P_GI_RES_DIV` overrides the tier.
         let gi_res_div = std::env::var("P_GI_RES_DIV")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(qp.gi_res_div)
+            .unwrap_or(base.gi_res_div)
             .clamp(1, 16);
         // macOS/M3 perf (M3-C): reflection trace-resolution divisor used when `reflect_half_res` is on
         // (2 = legacy half = the old `div_ceil(2)`, 4 = quarter). Only affects content (the gallery
@@ -1989,7 +2006,7 @@ impl App {
         let reflect_res_div = std::env::var("P_REFLECT_RES_DIV")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(qp.reflect_res_div)
+            .unwrap_or(base.reflect_res_div)
             .clamp(1, 16);
         // macOS/M3 perf: GDF AO trace-resolution divisor (1 = full-res = byte-identical; 2 = half).
         // Traced at 1/div then joint-bilateral upsampled; the gallery never runs gdf_ao so the anchor
@@ -1997,8 +2014,16 @@ impl App {
         let ao_res_div = std::env::var("P_AO_RES_DIV")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(qp.ao_res_div)
+            .unwrap_or(base.ao_res_div)
             .clamp(1, 16);
+        // macOS/M3 perf: à-trous spatial GI-denoise iteration count (2 = legacy byte-identical; the
+        // Apple tier uses 1). The gallery forces the legacy 2 (it runs GI denoise, so the count would
+        // otherwise shift the byte-identical anchor). `P_GI_ATROUS_STEPS` overrides the tier.
+        let gi_atrous_steps = std::env::var("P_GI_ATROUS_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.gi_atrous_steps)
+            .clamp(1, 5);
         // Screen-space radiance probe GI (P1+): opt-in. Replaces the GI consumption (world-volume
         // sample / per-pixel ray march) with per-tile screen probes + a per-pixel gather. Default
         // OFF, so the gallery anchor (no env) stays byte-identical; an explicit `SCREEN_PROBE=1`
@@ -2016,7 +2041,7 @@ impl App {
         // earlier, above `cache_feedback`) selects the high-res surface-cache source.
         let wrc_viz = gi.has_wrc_view() && (std::env::var_os("P_WRC_VIZ").is_some() || sc_viz);
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
-        let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", qp.gi_denoise);
+        let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", base.gi_denoise);
         // C5 screen-space reflections (viz toggle).
         let gdf_ssr = reflect.has_ssr() && std::env::var_os("P11_SSR").is_some();
         // C6 GDF reflections (off-screen fallback viz toggle).
@@ -2045,7 +2070,7 @@ impl App {
         // C8b3 surface-cache consumers (multibounce radiance lookup in GI / reflections).
         let surface_cache = gdf.has_surface_cache()
             && gdf.has_cache_lighting()
-            && quality::env_bool("P11_SURFACE_CACHE", qp.surface_cache);
+            && quality::env_bool("P11_SURFACE_CACHE", base.surface_cache);
         // C8g: use the surface cache as the GDF REFLECTION hit radiance by default (accurate lit
         // colour for reflected objects — fixes the grazing avocado smear; ground hits have no
         // cards and fall back to the per-ray re-light). Cheap (only the per-frame cache-light pass
@@ -2054,37 +2079,29 @@ impl App {
         let reflect_cache = swrt_reflect
             && gdf.has_surface_cache()
             && gdf.has_cache_lighting()
-            && quality::env_bool("P11_REFLECT_CACHE", qp.reflect_cache);
+            && quality::env_bool("P11_REFLECT_CACHE", base.reflect_cache);
         // Firefly clamp on by default (P11_FIREFLY_CLAMP=0 to disable / compare).
-        let firefly_clamp = quality::env_bool("P11_FIREFLY_CLAMP", qp.firefly_clamp);
+        let firefly_clamp = quality::env_bool("P11_FIREFLY_CLAMP", base.firefly_clamp);
         // C8d: roughness above which screen-mirror SSR stops contributing (GDF takes over). Gallery
         // forced to the legacy 0.5 (byte-identical anchor; a no-op under Med where qp is already 0.5)
         // so the Apple tier's lower 0.4 cutoff never shifts the gallery's reflections.
         let reflect_max_roughness = std::env::var("P11_REFLECT_MAX_ROUGHNESS")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(if gallery_scene {
-                0.5
-            } else {
-                qp.reflect_max_roughness
-            });
+            .unwrap_or(base.reflect_max_roughness);
         // Stage D3: reflection-ray march step cap. Gallery forced to the legacy 96 (byte-identical);
         // content takes the tier value. `P11_REFLECT_MAX_STEPS` overrides.
         let reflect_max_steps = std::env::var("P11_REFLECT_MAX_STEPS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(if gallery_scene {
-                96
-            } else {
-                qp.reflect_max_steps
-            })
+            .unwrap_or(base.reflect_max_steps)
             .clamp(1, 256);
         // P3 (SW-RT GI 레퍼런스급 SW-RT): cone-trace LOD march slope. Gallery forced to 0 (legacy linear
         // march = byte-identical anchor); content takes the tier value. `P_CONE_K` overrides.
         let gdf_cone_k = std::env::var("P_CONE_K")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(if gallery_scene { 0.0 } else { qp.gdf_cone_k })
+            .unwrap_or(base.gdf_cone_k)
             .clamp(0.0, 1.0);
         // Reflection history clamp permutation (0 off / 1 hard / 2 variance). Gallery forced to 0
         // (byte-identical legacy resolve = regression anchor); content takes the tier. `P_REFL_CLAMP`
@@ -2092,37 +2109,26 @@ impl App {
         let reflect_history_clamp = std::env::var("P_REFL_CLAMP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(if gallery_scene {
-                0
-            } else {
-                qp.reflect_history_clamp
-            })
+            .unwrap_or(base.reflect_history_clamp)
             .min(2);
         let reflect_clamp_gamma = std::env::var("P_REFL_CLAMP_GAMMA")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(qp.reflect_clamp_gamma)
+            .unwrap_or(base.reflect_clamp_gamma)
             .clamp(0.0, 8.0);
         // GI temporal history clamp: gallery forced to 1.0 (hard 3x3 = legacy byte-identical anchor);
         // content takes the tier (0.0 = off = the static-shimmer fix). `P_GI_TEMPORAL_CLAMP` override.
         let gi_temporal_clamp = std::env::var("P_GI_TEMPORAL_CLAMP")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(if gallery_scene {
-                1.0
-            } else {
-                qp.gi_temporal_clamp
-            })
+            .unwrap_or(base.gi_temporal_clamp)
             .clamp(0.0, 16.0);
         // Stage D3: half-res reflection trace + bilateral upsample (reuses the GI upsample).
         // Gallery forced off (full-res = byte-identical anchor); content takes the tier value.
-        let reflect_half_res = gi.has_upsample()
-            && quality::env_bool(
-                "P11_REFLECT_HALF_RES",
-                !gallery_scene && qp.reflect_half_res,
-            );
+        let reflect_half_res =
+            gi.has_upsample() && quality::env_bool("P11_REFLECT_HALF_RES", base.reflect_half_res);
         // C8d: default to the full-res mirror SSR; opt into the stochastic glossy path to compare.
-        let ssr_stochastic = quality::env_bool("P11_SSR_STOCHASTIC", qp.ssr_stochastic);
+        let ssr_stochastic = quality::env_bool("P11_SSR_STOCHASTIC", base.ssr_stochastic);
         // Diagnostic single-object orbit: frame one scene object tightly so it can be
         // inspected from every side. `DIAG_OBJ=<index>` selects it (2 = copper sphere,
         // 3 = red cube); `DIAG_COPPER=1` / `DIAG_CUBE=1` are shortcuts. `DIAG_ANGLE=<deg>`
@@ -2187,7 +2193,7 @@ impl App {
         let render_scale = std::env::var("RENDER_SCALE")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(if gallery_scene { 1.0 } else { qp.render_scale })
+            .unwrap_or(base.render_scale)
             // Floor at 1/3 (DLSS "ultra performance" territory): below that even a temporal
             // reconstruction can't hold up. The TAAU jitter reconstruction (B-track) makes the
             // 0.4–0.6 range viable, which is what QHD/UHD high-fps needs; 1.0 stays the default
@@ -2348,13 +2354,13 @@ impl App {
             shadow_softness: std::env::var("SHADOW_SOFTNESS")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(qp.shadow_softness),
+                .unwrap_or(base.shadow_softness),
             // Soft-shadow tap count (RenderQuality knob, written to globals.shadow.w). Only the
             // soft path reads it; the shader clamps to [1, 16] (POISSON16). `SHADOW_TAPS` overrides.
             shadow_taps: std::env::var("SHADOW_TAPS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(qp.shadow_taps)
+                .unwrap_or(base.shadow_taps)
                 .clamp(1, 16),
             quality,
             override_material: false,
@@ -2399,6 +2405,7 @@ impl App {
             reflect_half_res,
             reflect_res_div,
             ao_res_div,
+            gi_atrous_steps,
             gi_half_res,
             gi_res_div,
             screen_probe,
@@ -2675,6 +2682,7 @@ impl App {
     /// (screenshot mode done); `true` to continue (including the skip-this-frame
     /// cases — zero-size window, failed acquire).
     fn frame(&mut self) -> anyhow::Result<bool> {
+        let _t_cpu = Instant::now(); // CPU record timer (stored right before present)
         // Apply a pending level hot-swap requested from the UI last frame.
         if let Some(idx) = self.pending_level.take() {
             self.load_level(idx)?;
@@ -2721,12 +2729,16 @@ impl App {
         let image_index = if self.rhi_thread.is_some() {
             0
         } else {
+            let _t_wait = Instant::now();
             self.in_flight[fif].wait()?;
             // Acquire the drawable up front: its *actual* pixel size is the single
             // source of truth for this whole frame (ImGui display size, camera aspect,
             // render extent, viewport). A failed acquire skips here, BEFORE the ImGui
-            // frame is started, so NewFrame/Render stay balanced.
-            match self
+            // frame is started, so NewFrame/Render stay balanced. NOTE: `nextDrawable`
+            // blocks here until the compositor releases a drawable — the 60Hz frame pace
+            // in windowed mode — so fold it into the "wait" so `cpu-record` isolates the
+            // true compute (record minus fence-wait minus this acquire-pacing block).
+            let img = match self
                 .swapchain()
                 .acquire_next_image(&self.image_available[fif])?
             {
@@ -2735,7 +2747,12 @@ impl App {
                     self.needs_recreate = true;
                     return Ok(true);
                 }
-            }
+            };
+            LAST_WAIT_US.store(
+                _t_wait.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            img
         };
         // The swapchain (display) extent presents the final image; the *render* extent is where
         // the scene passes run. They are equal by default (byte-identical), but `RENDER_RES`
@@ -2807,6 +2824,7 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32();
         self.last = now;
+        LAST_FRAME_US.store((dt * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
 
         // --- Fixed-timestep simulation (M2) ---------------------------------------
         // The sim advances in whole `FIXED_DT` steps so motion is framerate-
@@ -3171,13 +3189,22 @@ impl App {
                 gdf_ao,
                 gdf_gi,
                 gi_spp,
+                gi_max_steps,
                 cache_relight_period,
+                cache_relight_spp,
                 gi_half_res,
                 gi_res_div,
                 reflect_history_clamp,
                 reflect_clamp_gamma,
                 gi_temporal_clamp,
                 gi_denoise,
+                reflect_max_steps,
+                reflect_res_div,
+                reflect_half_res,
+                ao_res_div,
+                gi_atrous_steps,
+                gdf_cone_k,
+                render_scale,
                 gdf_ssr,
                 gdf_reflect,
                 gdf_hybrid,
@@ -3267,45 +3294,37 @@ impl App {
                             quality::RenderQuality::Apple,
                         ][tier_idx];
                         *quality = nq;
-                        let p = quality::preset(nq);
-                        // Re-derive each knob from the preset, preserving the same capability gates
-                        // used at construction so a tier can't enable a feature the device lacks.
-                        *gi_spp = p.gi_spp.clamp(1, 256);
-                        // Gallery stays the byte-identical anchor (period 1); content amortizes.
-                        *cache_relight_period = if *is_gallery {
-                            1
+                        // Re-derive each knob from the SAME base the construction path uses: the
+                        // gallery resolves against the fixed legacy `gallery_preset()`, content
+                        // against the tier — so the gallery-lock is structural (no scattered
+                        // `if *is_gallery` here) and the two resolution paths can never drift.
+                        // Capability gates stay so a tier can't enable a feature the device lacks.
+                        let base = if *is_gallery {
+                            quality::gallery_preset()
                         } else {
-                            p.cache_relight_period.max(1)
+                            quality::preset(nq)
                         };
-                        // Half-res GI: content-only (gallery full-res = byte-identical anchor).
-                        *gi_half_res = gi.has_upsample() && !*is_gallery && p.gi_half_res;
-                        *gi_res_div = p.gi_res_div.clamp(1, 16); // P1: GI trace divisor
-                        // Reflection history clamp: content takes the tier, gallery forced off (anchor).
-                        *reflect_history_clamp = if *is_gallery {
-                            0
-                        } else {
-                            p.reflect_history_clamp.min(2)
-                        };
-                        *reflect_clamp_gamma = p.reflect_clamp_gamma;
-                        // GI temporal clamp: gallery forced hard (1.0 legacy); content takes tier.
-                        *gi_temporal_clamp = if *is_gallery {
-                            1.0
-                        } else {
-                            p.gi_temporal_clamp
-                        };
-                        *gi_denoise = gi.has_denoise() && p.gi_denoise;
+                        *gi_spp = base.gi_spp.clamp(1, 256);
+                        *cache_relight_period = base.cache_relight_period.max(1);
+                        *gi_half_res = gi.has_upsample() && base.gi_half_res;
+                        *gi_res_div = base.gi_res_div.clamp(1, 16);
+                        *reflect_history_clamp = base.reflect_history_clamp.min(2);
+                        *reflect_clamp_gamma = base.reflect_clamp_gamma;
+                        *gi_temporal_clamp = base.gi_temporal_clamp;
+                        *gi_denoise = gi.has_denoise() && base.gi_denoise;
                         *reflect_cache = *swrt_reflect
                             && gdf.has_surface_cache()
                             && gdf.has_cache_lighting()
-                            && p.reflect_cache;
-                        *surface_cache =
-                            gdf.has_surface_cache() && gdf.has_cache_lighting() && p.surface_cache;
-                        *ssr_stochastic = p.ssr_stochastic;
-                        *reflect_max_roughness = p.reflect_max_roughness;
-                        *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && !*is_gallery && p.gdf_ao;
-                        *firefly_clamp = p.firefly_clamp;
-                        *shadow_softness = p.shadow_softness;
-                        *shadow_taps = p.shadow_taps.clamp(1, 16);
+                            && base.reflect_cache;
+                        *surface_cache = gdf.has_surface_cache()
+                            && gdf.has_cache_lighting()
+                            && base.surface_cache;
+                        *ssr_stochastic = base.ssr_stochastic;
+                        *reflect_max_roughness = base.reflect_max_roughness;
+                        *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && base.gdf_ao;
+                        *firefly_clamp = base.firefly_clamp;
+                        *shadow_softness = base.shadow_softness;
+                        *shadow_taps = base.shadow_taps.clamp(1, 16);
                     }
                     ui.text(format!(
                         "validation: {}",
@@ -3318,6 +3337,126 @@ impl App {
                     // flat wall of toggles. Core groups default open.
                     use imgui::TreeNodeFlags;
                     let open = TreeNodeFlags::DEFAULT_OPEN;
+
+                    // Live scalability panel (docs/scalability-system.md): the individual knobs the
+                    // RenderQuality tier resolves, exposed as live sliders/toggles. The render graph
+                    // rebuilds every frame, so a change here takes effect immediately — no restart.
+                    // The gallery scene is the byte-identical path-tracer-parity anchor, so its
+                    // controls are disabled here (the headless screenshot path has no UI at all and
+                    // is unaffected regardless; this is purely to stop an interactive session from
+                    // perturbing the anchor image by hand).
+                    if ui.collapsing_header("Scalability", open) {
+                        if *is_gallery {
+                            ui.text_disabled(
+                                "gallery scene: scalability knobs locked (byte-identical anchor)",
+                            );
+                        }
+                        // Coarse scalability-group profile of the active tier (read-only): the six
+                        // 0-3 group levels this tier corresponds to (quality::ScalabilityGroup). A
+                        // glance-level summary; the fine sliders below are the precise controls.
+                        ui.text(format!("tier '{}' group levels:", quality.label()));
+                        for (g, lvl) in quality::groups(*quality) {
+                            ui.same_line();
+                            ui.text_disabled(format!("{}={}", g.label(), lvl));
+                        }
+                        ui.disabled(*is_gallery, || {
+                            ui.slider("Render scale", 0.33, 1.0, render_scale);
+                            *render_scale = render_scale.clamp(0.3333, 1.0);
+                            if ui.slider("GI res divisor", 1u32, 8, gi_res_div) {
+                                *gi_res_div = (*gi_res_div).clamp(1, 8);
+                            }
+                            if ui.slider("Reflect res divisor", 1u32, 8, reflect_res_div) {
+                                *reflect_res_div = (*reflect_res_div).clamp(1, 8);
+                            }
+                            if ui.slider("AO res divisor", 1u32, 4, ao_res_div) {
+                                *ao_res_div = (*ao_res_div).clamp(1, 4);
+                            }
+                            if ui.slider("GI a-trous steps", 1u32, 5, gi_atrous_steps) {
+                                *gi_atrous_steps = (*gi_atrous_steps).clamp(1, 5);
+                            }
+                            if ui.slider("GI samples/px", 1u32, 32, gi_spp) {
+                                *gi_spp = (*gi_spp).clamp(1, 256);
+                            }
+                            if ui.slider("GI max march steps", 8u32, 128, gi_max_steps) {
+                                *gi_max_steps = (*gi_max_steps).clamp(1, 256);
+                            }
+                            if ui.slider("Reflect max march steps", 8u32, 256, reflect_max_steps) {
+                                *reflect_max_steps = (*reflect_max_steps).clamp(1, 256);
+                            }
+                            if ui.slider("Cache relight period", 1u32, 256, cache_relight_period) {
+                                *cache_relight_period = (*cache_relight_period).max(1);
+                            }
+                            ui.slider("Reflect max roughness", 0.0, 1.0, reflect_max_roughness);
+                            ui.slider("GDF cone-trace slope", 0.0, 0.2, gdf_cone_k);
+                            *gdf_cone_k = gdf_cone_k.clamp(0.0, 1.0);
+                            ui.slider("Shadow softness (0=hard)", 0.0, 0.1, shadow_softness);
+                            if ui.slider("Shadow taps", 1u32, 16, shadow_taps) {
+                                *shadow_taps = (*shadow_taps).clamp(1, 16);
+                            }
+
+                            ui.checkbox("Stochastic SSR", ssr_stochastic);
+                            if ui.checkbox("GI half-res trace", gi_half_res) {
+                                *gi_half_res = gi.has_upsample() && *gi_half_res;
+                            }
+                            if ui.checkbox("Reflect half-res trace", reflect_half_res) {
+                                *reflect_half_res = gi.has_upsample() && *reflect_half_res;
+                            }
+                            if ui.checkbox("GDF ambient occlusion", gdf_ao) {
+                                *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && *gdf_ao;
+                            }
+                            ui.checkbox("Firefly clamp", firefly_clamp);
+                            if ui.checkbox("GI denoise", gi_denoise) {
+                                *gi_denoise = gi.has_denoise() && *gi_denoise;
+                            }
+
+                            let mut clamp_idx = (*reflect_history_clamp).min(2) as usize;
+                            if ui.combo_simple_string(
+                                "Reflect history clamp",
+                                &mut clamp_idx,
+                                &["off", "hard", "variance"],
+                            ) {
+                                *reflect_history_clamp = clamp_idx as u32;
+                            }
+
+                            if ui.button("Reset to tier default") {
+                                let base = if *is_gallery {
+                                    quality::gallery_preset()
+                                } else {
+                                    quality::preset(*quality)
+                                };
+                                *render_scale = base.render_scale.clamp(0.3333, 1.0);
+                                *gi_res_div = base.gi_res_div.clamp(1, 16);
+                                *reflect_res_div = base.reflect_res_div.clamp(1, 16);
+                                *ao_res_div = base.ao_res_div.clamp(1, 16);
+                                *gi_atrous_steps = base.gi_atrous_steps.clamp(1, 5);
+                                *gi_spp = base.gi_spp.clamp(1, 256);
+                                *gi_max_steps = base.gi_max_steps.clamp(1, 256);
+                                *reflect_max_steps = base.reflect_max_steps.clamp(1, 256);
+                                *cache_relight_period = base.cache_relight_period.max(1);
+                                *cache_relight_spp = base.cache_relight_spp.max(1);
+                                *reflect_max_roughness = base.reflect_max_roughness;
+                                *gdf_cone_k = base.gdf_cone_k.clamp(0.0, 1.0);
+                                *shadow_softness = base.shadow_softness;
+                                *shadow_taps = base.shadow_taps.clamp(1, 16);
+                                *ssr_stochastic = base.ssr_stochastic;
+                                *gi_half_res = gi.has_upsample() && base.gi_half_res;
+                                *reflect_half_res = gi.has_upsample() && base.reflect_half_res;
+                                *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && base.gdf_ao;
+                                *firefly_clamp = base.firefly_clamp;
+                                *gi_denoise = gi.has_denoise() && base.gi_denoise;
+                                *reflect_history_clamp = base.reflect_history_clamp.min(2);
+                                *reflect_clamp_gamma = base.reflect_clamp_gamma;
+                                *gi_temporal_clamp = base.gi_temporal_clamp;
+                                *reflect_cache = *swrt_reflect
+                                    && gdf.has_surface_cache()
+                                    && gdf.has_cache_lighting()
+                                    && base.reflect_cache;
+                                *surface_cache = gdf.has_surface_cache()
+                                    && gdf.has_cache_lighting()
+                                    && base.surface_cache;
+                            }
+                        });
+                    }
 
                     if ui.collapsing_header("Lighting", open) {
                         ui.combo_simple_string("Debug view", debug_view, &DEBUG_VIEWS);
@@ -3559,7 +3698,19 @@ impl App {
                     .map(|(n, ms)| format!("  {n:<20} {ms:.4} ms"))
                     .collect::<Vec<_>>()
                     .join("\n");
-                tracing::info!("GPU profile (total {total:.4} ms):\n{rows}");
+                let frame_ms =
+                    LAST_FRAME_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+                let wait_ms =
+                    LAST_WAIT_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+                // frame = full wall time; wait = fence stall on the GPU; cpu ≈ frame − wait is the
+                // CPU record/build long pole. wait≈0 with cpu>gpu ⇒ CPU-bound (the real bottleneck).
+                let cpu_ms = LAST_CPU_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+                // record = CPU time between fence-wait-end and present (pure graph build + encode +
+                // submit, no present pacing). This is the real CPU long pole on a CPU-bound frame.
+                tracing::info!(
+                    "GPU profile (total {total:.4} ms):\n{rows}\n  --- frame {frame_ms:.3} ms | fence-wait {wait_ms:.3} ms | cpu-record {:.3} ms | gpu-passes {total:.3} ms",
+                    (cpu_ms - wait_ms).max(0.0)
+                );
             }
         }
 
@@ -4172,6 +4323,7 @@ impl App {
                         ch,
                         temporal_flip,
                         self.gi_temporal_clamp,
+                        self.gi_atrous_steps,
                     )
                 } else {
                     traced
@@ -4279,6 +4431,7 @@ impl App {
                         ch,
                         temporal_flip,
                         self.gi_temporal_clamp,
+                        self.gi_atrous_steps,
                     )
                 } else {
                     raw
@@ -5391,6 +5544,10 @@ impl App {
                 );
             }
 
+            LAST_CPU_US.store(
+                _t_cpu.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let signal = &self.render_finished[image_index as usize];
             if self.queue().present(
                 self.swapchain.as_ref().expect("inline swapchain"),

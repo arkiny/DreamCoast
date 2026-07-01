@@ -1346,6 +1346,9 @@ impl GiSystem {
         // shimmer the hard clamp caused on the noisy spp1 GI), ~1.0 = hard 3x3 min/max (legacy,
         // gallery byte-identical anchor), > 1.5 = variance clamp with gamma = this value.
         temporal_clamp: f32,
+        // Number of edge-aware à-trous iterations (macOS/M3 perf): 2 = legacy (steps 1,2); 1 = a single
+        // wide blur (Apple tier — the sparse GI is temporally denoised + upsampled). Clamped to [1,5].
+        atrous_steps: u32,
     ) -> ResourceId {
         let tempp = self.temporal_pipeline.as_ref().expect("temporal pipeline");
         let atrousp = self.atrous_pipeline.as_ref().expect("atrous pipeline");
@@ -1406,16 +1409,22 @@ impl GiSystem {
             },
         );
 
-        // Two à-trous iterations (step 1 then 2): a wide edge-aware blur at low cost.
+        // Edge-aware à-trous iterations (dilation 1, 2, 4, … per step): a wide blur at low cost. The
+        // count is tier-driven (`atrous_steps`, clamped [1,5]) — 2 legacy, 1 on the Apple perf tier.
         let pos_sigma = diag * 0.03;
         let normal_power = 32.0_f32;
         let mut cur = temporal_out;
-        for (i, step) in [1u32, 2u32].into_iter().enumerate() {
-            let out = graph.create_storage_image(
-                if i == 0 { "gi_atrous0" } else { "gi_atrous1" },
-                HDR_FORMAT,
-                extent,
-            );
+        let steps = atrous_steps.clamp(1, 5);
+        const ATROUS_NAMES: [&str; 5] = [
+            "gi_atrous0",
+            "gi_atrous1",
+            "gi_atrous2",
+            "gi_atrous3",
+            "gi_atrous4",
+        ];
+        for i in 0..steps {
+            let step = 1u32 << i; // 1, 2, 4, … (à-trous hole dilation)
+            let out = graph.create_storage_image(ATROUS_NAMES[i as usize], HDR_FORMAT, extent);
             let src = cur;
             graph.add_compute_pass(
                 ComputePassInfo {

@@ -16,6 +16,48 @@
 >
 > 선행 컨텍스트: `docs/ROADMAP.md`(Stage D), `docs/shadow-reflection-quality.md`(소프트섀도우=옵트인 티어),
 > `docs/reflection-sdf-resolution.md`(SDF 해상도=잔차 레버 아님, 종료). 원칙: `CLAUDE.md` 5원칙.
+> **후속 하드닝(단일-소스 리졸버 + 갤러리-락 + 스케일러빌리티 그룹): `docs/scalability-system.md` 참조.**
+
+## 스케일러빌리티 그룹 + 갤러리-락 (하드닝, ✅ 추가)
+
+> 세부 설계는 [`docs/scalability-system.md`](scalability-system.md). 여기선 티어 문서에 걸리는 핵심만.
+
+**단일-소스 리졸버 + 구조적 갤러리-락 (✅).** 모든 스케일러빌리티 노브는 하나의 베이스 프리셋에 대해
+`base = if gallery { gallery_preset() } else { preset(tier) }`로 해상되고, 소비처에서
+`env_override.unwrap_or(base.x).clamp(..)` **한 곳**에서 오버라이드+클램프한다. 갤러리(바이트 동일 PT 앵커
+`af70c1a5…`)는 활성 티어가 아니라 고정 [`gallery_preset()`](../apps/sandbox/src/quality.rs)에 대해 해상하므로,
+새로 추가한 티어 노브가 per-site `if gallery_scene { .. }` 강제를 빠뜨려 앵커를 **조용히 드리프트**시키는 일이
+구조적으로 불가능하다(`render_scale`·`reflect_max_roughness`를 깼던 그 버그). `gallery_preset_locks_legacy_anchor`
+유닛 테스트가 그 앵커 값을 필드별로 잠근다 — 값이 바뀌면 갤러리 sha도 바뀐다(그게 락의 목적).
+
+**스케일러빌리티 그룹 (조직화 레이어, ✅ 추가).** 레퍼런스 실시간 엔진처럼(제품/소스명 없이) 티어를 여섯 개
+명명된 GROUP에 레벨 `0..=3`을 배정한 것으로 표현하는 **추가·자기기술 레이어**([`quality.rs`](../apps/sandbox/src/quality.rs)):
+- **`ScalabilityGroup`** enum: `Resolution`(render_scale/TAAU), `GlobalIllumination`(gi_spp/res_div/
+  atrous/half_res/max_steps), `Reflection`(reflect_res_div/max_steps/roughness/half_res/history_clamp/ssr),
+  `AmbientOcclusion`(gdf_ao/ssao/ao_res_div), `Shadow`(softness/taps), `SurfaceCache`(surface_cache/
+  relight period/spp).
+- **`groups(tier) -> [(ScalabilityGroup, u8); 6]`**: 모든 그룹에 레벨을 반환(exhaustive) → 시스템이
+  자기기술적이고 플랫폼별 확장 가능(새 플랫폼 티어 = 여섯 정수 + 정밀 `QualityPreset`). `group_level(tier, group)`
+  편의 조회, `ScalabilityGroup::ALL` 정준 순서.
+- **그룹별 env 오버라이드** `SG_GI`/`SG_REFLECTION`/`SG_AO`/`SG_SHADOW`/`SG_RESOLUTION`/`SG_SURFACE_CACHE`
+  (`env_name()`/`env_level()`, `0..=3` 파싱·클램프) — 호출부가 참고할 수 있는 coarse 레버.
+- **정직한 경계 — 서술적이지 권위적이지 않다.** `groups()`는 `preset()`이 이미 인코딩한 레벨을 **반영**할
+  뿐, `preset()`으로 되먹이거나 해상된 값을 바꾸지 않는다(바이트 동일 앵커 무영향). 여섯 `0..=3` 정수로
+  ~27필드 프리셋을 무손실 복원할 수 없으므로 — 바이트 동일 게이트가 최우선이라는 설계 제약에 따라 — 위험한
+  behavioral 입력 대신 문서화된 매핑으로 유지한다. 정밀 `P_*`/`P11_*` env 노브가 정확한 컨트롤이며 그룹 레벨을
+  이긴다.
+
+| 그룹 | 노브 | Low | Med | High | Apple |
+|---|---|---|---|---|---|
+| Resolution | render_scale/TAAU | 0 | 2 | 2 | 1 |
+| GlobalIllumination | gi_spp/res_div/atrous/half_res | 1 | 1 | 3 | 0 |
+| Reflection | reflect_res_div/max_steps/roughness/half_res | 0 | 1 | 3 | 0 |
+| AmbientOcclusion | gdf_ao/ssao/ao_res_div | 1 | 2 | 2 | 1 |
+| Shadow | softness/taps | 0 | 1 | 3 | 1 |
+| SurfaceCache | surface_cache/relight period·spp | 0 | 1 | 3 | 0 |
+
+> 레벨 스케일: `0` 최저비용 / `3` 레퍼런스 상한. 이 표는 `preset()` 값을 **서술**한 것이며 렌더 값을 바꾸지
+> 않는다(`groups_cover_every_group` 테스트가 전 그룹 커버·`0..=3` 불변식을 지킨다).
 
 ## 검증된 기준선 (cold-start, 2026-06-27)
 
