@@ -97,6 +97,40 @@ gallery scene). This is the "robust test-scene scalability" deliverable.
   every `ScalabilityGroup` (exhaustive) within `0..=3`, `group_level` agrees with the table, and the
   `SG_*` env names / clamping are correct.
 
+### 5. Data-driven tier tables — ✅ ADDED (this change)
+The per-tier `QualityPreset` values and per-tier group levels are now **DATA, not code**, so a tier
+can be tuned or a platform tier added **without recompiling** — the reference-engine
+scalability-config-file model. The tables live in
+[`apps/sandbox/config/scalability.ron`](../apps/sandbox/config/scalability.ron) (RON, the same
+serde/`ron` stack the `.level` loader uses).
+
+- **Single source with a zero-risk fallback.** The file is embedded into the binary at compile time
+  via `include_str!` (`EMBEDDED_CONFIG` in `quality.rs`), so the binary always ships a complete,
+  valid table and works even with no on-disk file. At startup [`load_config`](../apps/sandbox/src/quality.rs)
+  resolves the on-disk file against that embedded default, searching (highest precedence first):
+  `SCALABILITY_CONFIG=<path>` (explicit), then the committed
+  `apps/sandbox/config/scalability.ron`, then the runtime-editable `assets/config/scalability.ron`.
+  The first that **exists** is read; if it **parses** it wins; on a parse (or read) **error** a
+  `tracing::warn!` is logged and the loader falls back to the embedded default. The config is parsed
+  once behind a `OnceLock` (static tables), and `preset()`/`groups()` keep the same public signatures
+  — they now read the loaded snapshot instead of a hard-coded `match`. A partial on-disk override that
+  omits a tier falls back to that tier's embedded entry, so both functions stay total.
+- **Gallery-lock stays structural AND compiled-in.** [`gallery_preset()`](../apps/sandbox/src/quality.rs)
+  is deliberately **NOT** data-driven — it remains hard-coded Rust, so a stray edit to the RON file
+  can never silently move the byte-identical path-tracer anchor (`af70c1a5…`). Only the tier presets
+  (`preset()`) and `groups()` are data-sourced. The `gallery_preset_locks_legacy_anchor` guardrail
+  test is unchanged.
+- **Env precedence unchanged.** The fine `P_*`/`P11_*`/`SHADOW_*`/`RENDER_SCALE`/`SG_*` env knobs
+  still win over the (now data-sourced) base preset at each consumer site
+  (`env_override.unwrap_or(base.knob).clamp(..)`). No resolution-site semantics in `main.rs` changed;
+  `quality.rs` keeps the same public API.
+- **Tests.** `embedded_config_parses_and_covers_every_tier` (the embedded RON parses and has exactly
+  one entry per tier — the invariant the fallback relies on, caught at `cargo test` before shipping);
+  `data_driven_presets_match_snapshot` / `data_driven_groups_match_snapshot` (the data reproduces the
+  historical hard-coded tables exactly); `on_disk_override_parses_or_falls_back` (a well-formed
+  override applies its edit; a malformed document is a parse error so the loader falls back). The
+  §4 range/`groups`/Med-legacy tests continue to pass unchanged against the data-sourced tables.
+
 ## Gates (every step)
 `gallery af70c1a5` + `Med sponza 1ee08a3a` byte-identical + determinism + `clippy -D` + Intel
 Sponza ≥60fps (cool). The refactor is behavior-preserving by construction: `resolve()` must emit the

@@ -30,7 +30,7 @@ pub const TAA_MIP_BIAS: f32 = -1.0;
 /// Render quality tier. `Med` is the explicit default (`RENDER_QUALITY=med`) and matches the legacy
 /// behavior byte-for-byte. `Apple` is a platform-default tier auto-selected on Apple GPUs (never via
 /// an explicit `RENDER_QUALITY` value) — see [`RenderQuality::from_env_for_device`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum RenderQuality {
     /// Low-end fallback: heavy reflection/GI features off, fewer samples, cheaper SSR.
     Low,
@@ -103,8 +103,11 @@ impl RenderQuality {
     }
 }
 
-/// Per-tier default values for the quality knobs. The ONE place the tier→knob mapping lives;
-/// every field is overridable by its individual env var at the consumer site.
+/// Per-tier default values for the quality knobs. The tier→knob table now lives in the
+/// data-driven config (`apps/sandbox/config/scalability.ron`, embedded + on-disk-overridable);
+/// this struct is the deserialized shape and every field is overridable by its individual env
+/// var at the consumer site. (The gallery anchor stays hard-coded in [`gallery_preset`].)
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct QualityPreset {
     /// C3 hemisphere rays per pixel (`P11_GI_SPP`).
     pub gi_spp: u32,
@@ -232,177 +235,146 @@ pub struct QualityPreset {
     pub gi_temporal_clamp: f32,
 }
 
-/// The tier→knob table. Med must equal the legacy hardcoded defaults (no-regression).
-pub fn preset(q: RenderQuality) -> QualityPreset {
-    match q {
-        // Low-end fallback: reflection hit cache off, cheap stochastic half-res SSR, half the
-        // GI samples, lower reflection roughness cutoff (GDF takes over sooner). Hard shadows.
-        RenderQuality::Low => QualityPreset {
-            gi_spp: 2,
-            gi_max_steps: 24,
-            reflect_max_steps: 64,
-            gi_denoise: true,
-            reflect_cache: false,
-            surface_cache: false,
-            ssr_stochastic: true,
-            reflect_max_roughness: 0.3,
-            gdf_ao: false,
-            ssao: true, // content default (gallery forces via !gallery_scene at the call site)
-            firefly_clamp: true,
-            shadow_softness: 0.0,
-            shadow_taps: 8,
-            cache_relight_period: 48,
-            gi_half_res: true,
-            cache_relight_spp: 2,
-            reflect_half_res: true,
-            gdf_cone_k: 0.05,
-            gi_res_div: 3,
-            reflect_res_div: 2,       // legacy half-res reflection
-            ao_res_div: 1,            // full-res AO
-            gi_atrous_steps: 2,       // two à-trous iterations
-            reflect_history_clamp: 1, // hard (cheapest) — kills rotation smear
-            reflect_clamp_gamma: 1.25,
-            gi_temporal_clamp: 0.0,
-            // Low-end / high-res performance mode: render at 2/3 of the output extent and let the
-            // TAAU jitter reconstruction (B-track) upscale it. 2/3 (not 1/2) keeps detailed scenes
-            // legible — at 1/2 the internal resolution undersamples texture/geometry detail enough
-            // that even the temporal reconstruction reads as soft (poor visibility). Measured
-            // (Sponza, output 2052x1133): internal 0.6667 = d3d12 14.5ms / vk 18.5ms (async vk
-            // ~9.9ms); the reconstruction needs the jitter, on by default in this path.
-            render_scale: 0.6667,
-        },
-        // Default — identical to the pre-tier behavior. Do not change without re-baselining no-reg.
-        RenderQuality::Med => QualityPreset {
-            gi_spp: 1,
-            gi_max_steps: 24,
-            reflect_max_steps: 96,
-            gi_denoise: true,
-            reflect_cache: true,
-            surface_cache: false,
-            ssr_stochastic: false,
-            reflect_max_roughness: 0.5,
-            gdf_ao: true, // PBR contact AO (fixed contact-scale reach) — depth for content
-            ssao: true,   // content default (= the legacy !gallery_scene default; no-reg)
-            firefly_clamp: true,
-            shadow_softness: 0.0,
-            shadow_taps: 16,
-            // Stage D2b/D3: visibility feedback (off-screen cards relit 8x less) + period-aware EMA
-            // alpha let the period reach 레퍼런스 엔진's 32 range; gather spp 2 (denoised) + half-res GI/reflect
-            // bring the GDF SW-RT stack into the 60fps frame budget on both backends.
-            cache_relight_period: 40,
-            gi_half_res: true,
-            cache_relight_spp: 1,
-            reflect_half_res: true,
-            render_scale: 1.0,
-            gdf_cone_k: 0.02,
-            gi_res_div: 3,
-            reflect_res_div: 2,       // legacy half-res reflection (no-reg)
-            ao_res_div: 1,            // full-res AO (no-reg)
-            gi_atrous_steps: 2,       // two à-trous iterations (no-reg)
-            reflect_history_clamp: 1, // hard (matches the WIP default) — kills rotation smear
-            reflect_clamp_gamma: 1.25,
-            gi_temporal_clamp: 0.0,
-        },
-        // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
-        // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
-        RenderQuality::High => QualityPreset {
-            gi_spp: 16,
-            gi_max_steps: 64,
-            reflect_max_steps: 96,
-            gi_denoise: true,
-            reflect_cache: true,
-            surface_cache: true,
-            ssr_stochastic: false,
-            reflect_max_roughness: 0.6,
-            gdf_ao: true,
-            ssao: true, // content default (gallery forces via !gallery_scene at the call site)
-            firefly_clamp: true,
-            shadow_softness: 0.03,
-            shadow_taps: 16,
-            cache_relight_period: 1,
-            gi_half_res: false,
-            cache_relight_spp: 8,
-            reflect_half_res: false,
-            render_scale: 1.0,
-            gdf_cone_k: 0.0,
-            gi_res_div: 2,
-            reflect_res_div: 2, // legacy half-res reflection (quality tier keeps it sharp)
-            ao_res_div: 1,      // full-res AO (quality tier)
-            gi_atrous_steps: 2, // two à-trous iterations (quality tier)
-            reflect_history_clamp: 2, // variance (gentler on sharp mirrors) — quality tier
-            reflect_clamp_gamma: 1.25,
-            gi_temporal_clamp: 0.0,
-        },
-        // Apple-platform default (macOS perf, axis A). Derived from `Med` — same feature SET and the
-        // same denoise/clamp behaviour, so the look matches Med — with the cost knobs pushed for the
-        // weak unified iGPU + TBDR of Apple Silicon. Auto-selected only on an Apple GPU with
-        // `RENDER_QUALITY` unset; every value here is a tier DEFAULT that its own env var overrides.
-        //
-        // The M0 baseline (Sponza Med, native 1440p on M3) is ~165 ms; the SW-RT reflection+AO stack
-        // is ~82% of it, and `render_scale=1.0` (native QHD on an iGPU) is the single biggest lever.
-        // Starting points (the lead measures the real ms; these are picked, not measured here):
-        //   * render_scale 0.67 — ~0.44x internal pixels vs native; every per-pixel SW-RT pass
-        //     (gdf_reflect/gdf_ao/ssao/ssr/temporal) scales ~with it. The 2/3 (not 1/2) point keeps
-        //     detailed geometry legible under TAAU (see the Low-tier note). This is THE big win.
-        //   * ssao OFF — gdf_ao already supplies contact AO; the near-field HBAO-lite pass is a
-        //     second, independent ~13 ms AO pass whose contribution largely overlaps gdf_ao's on
-        //     content. Dropping it reclaims that pass outright. (gdf_ao stays on — the depth cue.)
-        //   * reflect_max_steps 96 -> 56 — gdf_reflect dominates the frame; the reflection is
-        //     temporally accumulated + half-res, so a shorter GGX march holds up. Mid of the 48-64
-        //     band: low enough to pay off, high enough that distant rays don't obviously leak sky.
-        //   * gdf_cone_k 0.06 — widen the cone-trace step with distance across GI/reflection/cache
-        //     marches (grazing rays stop crawling); denoised/EMA signals tolerate it. Above Med's
-        //     0.02, near Low's 0.05.
-        //   * gi_res_div 4 — quarter-res GI trace (vs Med's third-res). The div-4 parity risk noted
-        //     for Med is a DX=VK concern; macOS is Metal-only, so we can take the cheaper trace here.
-        //   * reflect_max_roughness 0.4 — fade screen-mirror SSR to the cheap GDF fallback sooner
-        //     (rougher surfaces don't need the sharp SSR march). Below Med's 0.5, above Low's 0.3.
-        //   * cache_relight_period 64 — relight fewer surface-cache cards per frame (vs Med's 40).
-        //     The cache persists radiance + EMA-denoises, so a longer period trades moving-camera
-        //     convergence lag for a cheaper `sdf_cache_light`. Aggressive but reversible.
-        // Everything else tracks Med (feature set, GI half-res, spp, shadows, temporal clamps).
-        RenderQuality::Apple => QualityPreset {
-            gi_spp: 1,
-            gi_max_steps: 24,
-            reflect_max_steps: 56,
-            gi_denoise: true,
-            reflect_cache: true,
-            surface_cache: false,
-            // Half-res stochastic SSR (GGX-jittered + ratio-estimator denoise): ~1/3 the cost of the
-            // full-res mirror path; byte-identical on the Sponza benchmark, denoised under motion.
-            ssr_stochastic: true,
-            reflect_max_roughness: 0.4,
-            gdf_ao: true, // contact AO retained — it is the AO source once ssao is off
-            ssao: false,  // OFF on Apple: gdf_ao covers contact AO; reclaims the ~13 ms 2nd AO pass
-            firefly_clamp: true,
-            shadow_softness: 0.0,
-            shadow_taps: 16,
-            // Moderate cache amortization (was 128): the surface-cache relight is nearly free on a
-            // dense scene (Intel Sponza ~0.02ms — short SW-RT rays), so a shorter period buys crisper
-            // moving-camera GI at negligible cost. UE ships up to 128 at its low tier; 64 is a balance.
-            cache_relight_period: 64,
-            gi_half_res: true,
-            cache_relight_spp: 1,
-            reflect_half_res: true,
-            render_scale: 0.67, // UE "Quality" upscale band; ~72fps on Intel Sponza after the IBL fix
-            gdf_cone_k: 0.06,
-            gi_res_div: 4,
-            // 1/6-res reflection: the reflection resolve (reflect_temporal) also runs at this res, so
-            // div=4 measured ~1.17× frame cost — too much fanless-M3 thermal margin for the mirror
-            // sharpness (Intel Sponza is rough-dominant, so 1/6 reads fine). `P_REFLECT_RES_DIV=4`
-            // for mirror-heavy content when cool.
-            reflect_res_div: 6,
-            // Half-res AO (was 1/4): a standard AO downsample; sharper contact than 1/4 at trivial cost.
-            ao_res_div: 2,
-            // Single à-trous (the second full-res pass measured ~1.36× frame cost on Intel Sponza —
-            // too much thermal margin on the fanless M3 for the GI-cleanliness gain). The sparse GI is
-            // temporally EMA-denoised + upsampled; `P_GI_ATROUS_STEPS=2` for cleaner GI when cool.
-            gi_atrous_steps: 1,
-            reflect_history_clamp: 1, // hard (matches Med) — kills rotation smear
-            reflect_clamp_gamma: 1.25,
-            gi_temporal_clamp: 0.0,
-        },
+// ---------------------------------------------------------------------------
+// Data-driven tier tables (single source: apps/sandbox/config/scalability.ron)
+// ---------------------------------------------------------------------------
+//
+// The per-tier `QualityPreset` values and per-tier group levels are DATA, not code: they live
+// in a RON config so a tier can be tuned or added without recompiling (the reference-engine
+// scalability-config-file model). The file is embedded at compile time via `include_str!` as
+// the built-in default, so the binary always works even with no on-disk file; an on-disk copy
+// overrides it at startup (parse error => a warning + the embedded fallback). The gallery
+// anchor ([`gallery_preset`]) is deliberately NOT data-driven — it stays compiled in, so a stray
+// file edit can never silently move the byte-identical path-tracer anchor.
+
+/// The embedded default config — the built-in copy of the tier tables. The binary always has
+/// this, so a missing/corrupt on-disk file degrades to the shipped defaults, never to nothing.
+const EMBEDDED_CONFIG: &str = include_str!("../config/scalability.ron");
+
+/// One tier's data-driven entry: its full [`QualityPreset`] plus its six scalability-group
+/// levels. `tier` keys the entry to a [`RenderQuality`]; the file lists one entry per tier.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+struct TierConfig {
+    tier: RenderQuality,
+    preset: QualityPreset,
+    groups: GroupLevels,
+}
+
+/// The six scalability-group levels for a tier (0..=3), a coarse VIEW of the preset (see the
+/// group layer below). Named fields keep the RON self-describing and order-independent.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+struct GroupLevels {
+    resolution: u8,
+    global_illumination: u8,
+    reflection: u8,
+    ambient_occlusion: u8,
+    shadow: u8,
+    surface_cache: u8,
+}
+
+impl GroupLevels {
+    /// The `(group, level)` pairs in [`ScalabilityGroup::ALL`] order — the shape [`groups`] returns.
+    fn as_pairs(&self) -> [(ScalabilityGroup, u8); 6] {
+        use ScalabilityGroup::*;
+        [
+            (Resolution, self.resolution),
+            (GlobalIllumination, self.global_illumination),
+            (Reflection, self.reflection),
+            (AmbientOcclusion, self.ambient_occlusion),
+            (Shadow, self.shadow),
+            (SurfaceCache, self.surface_cache),
+        ]
     }
+}
+
+/// The parsed scalability config: the list of per-tier entries. One entry per [`RenderQuality`].
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct ScalabilityConfig {
+    tiers: Vec<TierConfig>,
+}
+
+impl ScalabilityConfig {
+    /// Parse a RON document into a config.
+    fn parse(text: &str) -> Result<Self, ron::error::SpannedError> {
+        ron::from_str(text)
+    }
+
+    /// The entry for a tier, or `None` when the config omits it (a partial on-disk override).
+    fn tier(&self, q: RenderQuality) -> Option<&TierConfig> {
+        self.tiers.iter().find(|t| t.tier == q)
+    }
+}
+
+/// Load the active config, resolving the on-disk override against the embedded default.
+///
+/// Search order for the on-disk file: `SCALABILITY_CONFIG=<path>` (explicit), else the committed
+/// `apps/sandbox/config/scalability.ron`, else the runtime-editable `assets/config/scalability.ron`.
+/// The first that EXISTS is read; if it parses, it wins; if it fails to parse, a warning is logged
+/// and we fall back to the embedded default. When no on-disk file exists, the embedded default is
+/// used silently. The embedded default is `include_str!`d, so it is guaranteed to parse (a bad
+/// commit would be caught by the `embedded_config_parses` unit test).
+fn load_config() -> ScalabilityConfig {
+    let embedded = ScalabilityConfig::parse(EMBEDDED_CONFIG)
+        .expect("embedded scalability.ron must parse (locked by unit test)");
+    // Candidate on-disk paths, highest precedence first. Only the first that exists is consulted.
+    let candidates: [Option<std::path::PathBuf>; 3] = [
+        std::env::var_os("SCALABILITY_CONFIG").map(std::path::PathBuf::from),
+        Some(std::path::PathBuf::from(
+            "apps/sandbox/config/scalability.ron",
+        )),
+        Some(std::path::PathBuf::from("assets/config/scalability.ron")),
+    ];
+    for path in candidates.into_iter().flatten() {
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match ScalabilityConfig::parse(&text) {
+                Ok(cfg) => {
+                    tracing::info!("scalability config: loaded {}", path.display());
+                    return cfg;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "scalability config: {} failed to parse ({e}); using embedded default",
+                        path.display()
+                    );
+                    return embedded;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "scalability config: {} unreadable ({e}); using embedded default",
+                    path.display()
+                );
+                return embedded;
+            }
+        }
+    }
+    embedded
+}
+
+/// Process-wide cache of the loaded config (parsed once at first use). The tier tables are static
+/// data, so a single load is correct; the resolver + UI both read this one snapshot.
+fn config() -> &'static ScalabilityConfig {
+    static CONFIG: std::sync::OnceLock<ScalabilityConfig> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(load_config)
+}
+
+/// The tier→knob table, sourced from the data-driven config. Med must equal the legacy hardcoded
+/// defaults (no-regression), which the RON reproduces exactly. A tier missing from an on-disk
+/// override falls back to the embedded default for that tier, so `preset()` is always total.
+pub fn preset(q: RenderQuality) -> QualityPreset {
+    let cfg = config();
+    if let Some(t) = cfg.tier(q) {
+        return t.preset;
+    }
+    // The active on-disk config omits this tier: fall back to the embedded default's entry (which,
+    // being `include_str!`d, always contains every tier). This keeps a partial override safe.
+    ScalabilityConfig::parse(EMBEDDED_CONFIG)
+        .ok()
+        .and_then(|e| e.tier(q).map(|t| t.preset))
+        .expect("embedded scalability.ron covers every tier (locked by unit test)")
 }
 
 /// The gallery's byte-identical legacy configuration, as a preset. The gallery is the path-tracer
@@ -588,43 +560,17 @@ impl ScalabilityGroup {
 ///   res (Resolution 1), spp1 quarter-res single-à-trous GI (GI 0), 1/6-res 56-step reflection
 ///   (Reflection 0), GDF AO on / SSAO off / half-res AO (AO 1), hard shadows / 16 taps (Shadow 1),
 ///   no surface cache / period-64 relight (SurfaceCache 0).
-#[allow(dead_code)] // additive API layer; consumed by tests + the (separately-landing) resolver/UI.
 pub fn groups(q: RenderQuality) -> [(ScalabilityGroup, u8); 6] {
-    use ScalabilityGroup::*;
-    match q {
-        RenderQuality::Low => [
-            (Resolution, 0),
-            (GlobalIllumination, 1),
-            (Reflection, 0),
-            (AmbientOcclusion, 1),
-            (Shadow, 0),
-            (SurfaceCache, 0),
-        ],
-        RenderQuality::Med => [
-            (Resolution, 2),
-            (GlobalIllumination, 1),
-            (Reflection, 1),
-            (AmbientOcclusion, 2),
-            (Shadow, 1),
-            (SurfaceCache, 1),
-        ],
-        RenderQuality::High => [
-            (Resolution, 2),
-            (GlobalIllumination, 3),
-            (Reflection, 3),
-            (AmbientOcclusion, 2),
-            (Shadow, 3),
-            (SurfaceCache, 3),
-        ],
-        RenderQuality::Apple => [
-            (Resolution, 1),
-            (GlobalIllumination, 0),
-            (Reflection, 0),
-            (AmbientOcclusion, 1),
-            (Shadow, 1),
-            (SurfaceCache, 0),
-        ],
+    let cfg = config();
+    if let Some(t) = cfg.tier(q) {
+        return t.groups.as_pairs();
     }
+    // Partial on-disk override that omits this tier: fall back to the embedded default's levels
+    // (which always cover every tier), matching `preset`'s same-tier fallback.
+    ScalabilityConfig::parse(EMBEDDED_CONFIG)
+        .ok()
+        .and_then(|e| e.tier(q).map(|t| t.groups.as_pairs()))
+        .expect("embedded scalability.ron covers every tier (locked by unit test)")
 }
 
 /// The group level a tier carries for one group (convenience lookup over [`groups`]). Panics never:
@@ -838,6 +784,151 @@ mod tests {
         assert_eq!(m.reflect_max_steps, 96, "Med reflect_max_steps");
         assert!(m.gdf_ao, "Med gdf_ao");
         assert!(m.ssao, "Med ssao (legacy content default)");
+    }
+
+    /// The embedded (`include_str!`) config parses and covers every tier. This is the invariant the
+    /// data-driven fallback relies on: the binary always has a complete, valid table, so a missing
+    /// or corrupt on-disk file degrades to the shipped defaults, never to nothing. A malformed edit
+    /// to `config/scalability.ron` is caught here at `cargo test`, before it can ship.
+    #[test]
+    fn embedded_config_parses_and_covers_every_tier() {
+        let cfg =
+            ScalabilityConfig::parse(EMBEDDED_CONFIG).expect("embedded scalability.ron must parse");
+        for tier in TIERS {
+            assert!(
+                cfg.tier(tier).is_some(),
+                "embedded config missing tier {}",
+                tier.label()
+            );
+        }
+        // One entry per tier (no duplicates / strays that would shadow a lookup).
+        assert_eq!(
+            cfg.tiers.len(),
+            TIERS.len(),
+            "embedded config must have exactly one entry per tier"
+        );
+    }
+
+    /// The data-driven presets reproduce the historical hard-coded tables EXACTLY. Spot-checks the
+    /// fields most likely to drift on a hand edit of the RON, per tier — the range/`groups`/Med tests
+    /// cover the rest structurally. If the RON and this snapshot disagree, one of them is wrong.
+    #[test]
+    fn data_driven_presets_match_snapshot() {
+        let low = preset(RenderQuality::Low);
+        assert_eq!(low.gi_spp, 2, "Low gi_spp");
+        assert_eq!(low.render_scale, 0.6667, "Low render_scale");
+        assert!(!low.reflect_cache, "Low reflect_cache off");
+        assert!(low.ssr_stochastic, "Low ssr_stochastic");
+        assert_eq!(low.gi_res_div, 3, "Low gi_res_div");
+
+        let high = preset(RenderQuality::High);
+        assert_eq!(high.gi_spp, 16, "High gi_spp");
+        assert!(high.surface_cache, "High surface_cache on");
+        assert_eq!(high.shadow_softness, 0.03, "High shadow_softness");
+        assert_eq!(high.reflect_history_clamp, 2, "High reflect_history_clamp");
+        assert_eq!(high.gi_res_div, 2, "High gi_res_div");
+
+        let apple = preset(RenderQuality::Apple);
+        assert_eq!(apple.render_scale, 0.67, "Apple render_scale");
+        assert!(!apple.ssao, "Apple ssao off");
+        assert_eq!(apple.reflect_res_div, 6, "Apple reflect_res_div");
+        assert_eq!(apple.ao_res_div, 2, "Apple ao_res_div");
+        assert_eq!(apple.gi_atrous_steps, 1, "Apple gi_atrous_steps");
+        assert_eq!(apple.gi_res_div, 4, "Apple gi_res_div");
+    }
+
+    /// The data-driven group levels reproduce the historical hard-coded `groups()` table exactly.
+    #[test]
+    fn data_driven_groups_match_snapshot() {
+        use ScalabilityGroup::*;
+        let expect = |q, want: [(ScalabilityGroup, u8); 6]| {
+            assert_eq!(groups(q), want, "{} group levels", q.label());
+        };
+        expect(
+            RenderQuality::Low,
+            [
+                (Resolution, 0),
+                (GlobalIllumination, 1),
+                (Reflection, 0),
+                (AmbientOcclusion, 1),
+                (Shadow, 0),
+                (SurfaceCache, 0),
+            ],
+        );
+        expect(
+            RenderQuality::Med,
+            [
+                (Resolution, 2),
+                (GlobalIllumination, 1),
+                (Reflection, 1),
+                (AmbientOcclusion, 2),
+                (Shadow, 1),
+                (SurfaceCache, 1),
+            ],
+        );
+        expect(
+            RenderQuality::High,
+            [
+                (Resolution, 2),
+                (GlobalIllumination, 3),
+                (Reflection, 3),
+                (AmbientOcclusion, 2),
+                (Shadow, 3),
+                (SurfaceCache, 3),
+            ],
+        );
+        expect(
+            RenderQuality::Apple,
+            [
+                (Resolution, 1),
+                (GlobalIllumination, 0),
+                (Reflection, 0),
+                (AmbientOcclusion, 1),
+                (Shadow, 1),
+                (SurfaceCache, 0),
+            ],
+        );
+    }
+
+    /// An on-disk override that parses is applied (a valid tweak wins), and one that FAILS to parse
+    /// falls back to the embedded default without panicking. Exercises the loader's parse/fallback
+    /// contract directly (`load_config`'s file path is env/CWD-dependent, so this drives the
+    /// parse+select core via `ScalabilityConfig::parse` on temp-file contents).
+    #[test]
+    fn on_disk_override_parses_or_falls_back() {
+        // A well-formed single-tier override changes only that tier when merged over the embedded
+        // base — here we assert the parsed override carries the edited value.
+        let good = r#"(tiers: [(
+            tier: Med,
+            preset: (
+                gi_spp: 4, gi_denoise: true, reflect_cache: true, surface_cache: false,
+                ssr_stochastic: false, reflect_max_roughness: 0.5, gdf_ao: true, ssao: true,
+                firefly_clamp: true, shadow_softness: 0.0, shadow_taps: 16, cache_relight_period: 40,
+                gi_half_res: true, cache_relight_spp: 1, gi_max_steps: 24, reflect_max_steps: 96,
+                reflect_half_res: true, render_scale: 1.0, gdf_cone_k: 0.02, gi_res_div: 3,
+                reflect_res_div: 2, ao_res_div: 1, gi_atrous_steps: 2, reflect_history_clamp: 1,
+                reflect_clamp_gamma: 1.25, gi_temporal_clamp: 0.0,
+            ),
+            groups: (resolution: 2, global_illumination: 1, reflection: 1, ambient_occlusion: 2,
+                     shadow: 1, surface_cache: 1),
+        )])"#;
+        let parsed = ScalabilityConfig::parse(good).expect("good override parses");
+        assert_eq!(
+            parsed.tier(RenderQuality::Med).map(|t| t.preset.gi_spp),
+            Some(4),
+            "override applies its edited gi_spp"
+        );
+
+        // A malformed document must be a parse error (the loader logs + falls back to embedded).
+        assert!(
+            ScalabilityConfig::parse("(tiers: [ this is not ron").is_err(),
+            "malformed RON must fail to parse (so the loader falls back to embedded)"
+        );
+        // The fallback target — the embedded default — is always valid and total.
+        assert!(
+            ScalabilityConfig::parse(EMBEDDED_CONFIG).is_ok(),
+            "embedded default (the fallback) must always parse"
+        );
     }
 
     /// `env_bool` parsing: `0`/`false`/`off` (case/space-insensitive) => false; any other set value

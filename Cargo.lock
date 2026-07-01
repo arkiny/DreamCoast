@@ -1383,6 +1383,8 @@ dependencies = [
  "image",
  "renderdoc",
  "rhi",
+ "ron",
+ "serde",
  "tracing",
 ]
 
