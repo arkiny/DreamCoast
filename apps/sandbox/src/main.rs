@@ -641,6 +641,8 @@ struct App {
     /// macOS/M3 perf: GDF AO trace divisor (1 = full-res, 2 = half). Traced at 1/div + bilateral
     /// upsample; the Apple tier uses 2 (gdf_ao is the top pass after quarter-res reflection). `P_AO_RES_DIV`.
     ao_res_div: u32,
+    /// macOS/M3 perf: à-trous GI-denoise iteration count (2 = legacy, Apple = 1). `P_GI_ATROUS_STEPS`.
+    gi_atrous_steps: u32,
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
     /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
     gi_half_res: bool,
@@ -1999,6 +2001,14 @@ impl App {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(qp.ao_res_div)
             .clamp(1, 16);
+        // macOS/M3 perf: à-trous spatial GI-denoise iteration count (2 = legacy byte-identical; the
+        // Apple tier uses 1). The gallery forces the legacy 2 (it runs GI denoise, so the count would
+        // otherwise shift the byte-identical anchor). `P_GI_ATROUS_STEPS` overrides the tier.
+        let gi_atrous_steps = std::env::var("P_GI_ATROUS_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(if gallery_scene { 2 } else { qp.gi_atrous_steps })
+            .clamp(1, 5);
         // Screen-space radiance probe GI (P1+): opt-in. Replaces the GI consumption (world-volume
         // sample / per-pixel ray march) with per-tile screen probes + a per-pixel gather. Default
         // OFF, so the gallery anchor (no env) stays byte-identical; an explicit `SCREEN_PROBE=1`
@@ -2399,6 +2409,7 @@ impl App {
             reflect_half_res,
             reflect_res_div,
             ao_res_div,
+            gi_atrous_steps,
             gi_half_res,
             gi_res_div,
             screen_probe,
@@ -4172,6 +4183,7 @@ impl App {
                         ch,
                         temporal_flip,
                         self.gi_temporal_clamp,
+                        self.gi_atrous_steps,
                     )
                 } else {
                     traced
@@ -4279,6 +4291,7 @@ impl App {
                         ch,
                         temporal_flip,
                         self.gi_temporal_clamp,
+                        self.gi_atrous_steps,
                     )
                 } else {
                     raw

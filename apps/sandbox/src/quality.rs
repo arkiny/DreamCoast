@@ -205,6 +205,13 @@ pub struct QualityPreset {
     /// upsample. The gallery never runs `gdf_ao` (`!gallery_scene`), so the anchor is unaffected
     /// regardless. `P_AO_RES_DIV` override. See `docs/phase-macos-perf-impl.md`.
     pub ao_res_div: u32,
+    /// macOS/M3 perf: number of edge-aware à-trous spatial GI-denoise iterations after the temporal
+    /// pass. `2` (legacy: steps 1,2) everywhere except the Apple tier, which uses `1` — the GI is
+    /// traced sparse (`gi_res_div=4`) + temporally EMA-denoised + upsampled, so one wide à-trous
+    /// cleans the low-frequency residual (UE reduces/disables Lumen spatial filters at its low tier).
+    /// Each iteration is a full-res compute pass (~2.2ms @ rs0.67), so dropping one is a direct save.
+    /// `P_GI_ATROUS_STEPS` override. Non-Apple stays 2 (byte-identical). See `docs/phase-macos-perf-autonomous.md`.
+    pub gi_atrous_steps: u32,
     /// Reflection temporal-resolve history neighbourhood clamp (`reflect_temporal.slang`): removes the
     /// view-dependent specular smear when the camera rotates (stale reprojected history dragged across
     /// chrome). A scalability permutation: `0` = off (byte-identical legacy resolve; forced for the
@@ -250,6 +257,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_res_div: 3,
             reflect_res_div: 2,       // legacy half-res reflection
             ao_res_div: 1,            // full-res AO
+            gi_atrous_steps: 2,       // two à-trous iterations
             reflect_history_clamp: 1, // hard (cheapest) — kills rotation smear
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
@@ -288,6 +296,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_res_div: 3,
             reflect_res_div: 2,       // legacy half-res reflection (no-reg)
             ao_res_div: 1,            // full-res AO (no-reg)
+            gi_atrous_steps: 2,       // two à-trous iterations (no-reg)
             reflect_history_clamp: 1, // hard (matches the WIP default) — kills rotation smear
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
@@ -317,6 +326,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gi_res_div: 2,
             reflect_res_div: 2, // legacy half-res reflection (quality tier keeps it sharp)
             ao_res_div: 1,      // full-res AO (quality tier)
+            gi_atrous_steps: 2, // two à-trous iterations (quality tier)
             reflect_history_clamp: 2, // variance (gentler on sharp mirrors) — quality tier
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
@@ -365,7 +375,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 16,
-            cache_relight_period: 64,
+            cache_relight_period: 128,
             gi_half_res: true,
             cache_relight_spp: 1,
             reflect_half_res: true,
@@ -380,6 +390,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             // 1/4-res AO: AO is a very low-frequency contact term the guided upsample reconstructs
             // within 8-bit precision (byte-identical on Sponza); a standard AO downsample.
             ao_res_div: 4,
+            gi_atrous_steps: 1, // single à-trous: sparse GI is temporally denoised + upsampled
             reflect_history_clamp: 1, // hard (matches Med) — kills rotation smear
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
