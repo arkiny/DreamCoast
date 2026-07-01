@@ -158,9 +158,19 @@ base_hash + rerun-if-changed 통합.
 - **결정론**: run-to-run 바이트 동일 확인.
 - **DX≡VK**: Windows 동결 → **보류**(플랜 하드룰대로 Metal 검증 + 명시).
 
-**미결정 (사용자 확인) — 기본값 승격 여부.** 하이브리드라 direct-sample은 **순수 가산**(dense 위에
-209MB atlas). CLAUDE.md 룰3 "heavy=opt-in"에 따라 현재 **`P11_DIRECT_SDF` 옵트인(기본 off)** 유지.
-콘텐츠 기본 승격하려면 선결: (a) atlas 메모리 절감(스파스 브릭/가변타일 다운샘플) + (b) DX≡VK 검증.
+### P3 — 콘텐츠 기본 승격 ✅ (커밋 `a7896b8`)
+`P11_DIRECT_SDF` 콘텐츠 **기본 on**(fused→per-mesh 승격 `c34b0e5` 패턴). `=0` 이 dense-only 폴백
+(하이브리드 coarse 필드이기도 함) + WARN. 갤러리 앵커 `af70c1a5…` 재확인 동일.
+
+### P4.5 — 아틀라스 메모리 절감 ✅ (커밋 `9738c4c`)
+아틀라스는 dense `dim³` 타일이라 큰 메시가 크기를 지배(그 여분 해상도는 저주파 → coarse dense가 커버;
+얇은 피처는 타이트 AABB가 해결, cube dim 아님). `P11_ATLAS_MAX_DIM`(기본 **32**) 초과 타일을 결정론적
+트라이리니어로 다운샘플 후 팩. **sponza_intel 209.6MB→71.0MB (3×)**, 얇은지오 리파인 유지(뷰티 픽셀
+dense대비 24% 변화, native 31%; capped↔native 12%), 다운샘플 아티팩트 없음, 앵커 불변. `pack()`은
+정확재현 테스트용 네이티브 유지, `pack_capped(max_dim)`가 절감 경로.
+
+**남은 후속(옵트인/후속 세션):** DX≡VK 검증(Windows 동결 해제 시), per-mesh albedo 아틀라스(현재 albedo
+dense), 스파스 브릭으로 추가 절감, 셀그리드 프레임당 재빌드(현재 정적).
 
 ## 배경 (이번 세션 산출물, main에 머지됨)
 GI-on-distance-field 비주얼라이저(`P_WRC_VIZ` 월드-캐시 소스 / `P_SC_VIZ` 서페이스-캐시 고해상 소스),
