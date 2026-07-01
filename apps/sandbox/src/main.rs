@@ -1324,15 +1324,24 @@ impl App {
                 .max(1);
             let clip = clipmap::plan_levels(amin, amax, clip_center, sdf_dim, 0.1, clip_max_levels);
             info!("GDF clipmap: {} level(s)", clip.level_count());
-            // Stage S1 (per-mesh-distance-fields.md): opt-in (`P11_PERMESH_GDF`) — composite
-            // per-mesh DFs (baked once per unique mesh, cached/instanced) into each clip level
-            // instead of re-baking the fused triangle soup. Default OFF: on a *non-instanced*
-            // scene (Intel Sponza = 448 unique meshes) per-mesh DFs are 448× the voxel work of
-            // one fused bake, so the first cook is slower — the win is on instanced content (a
-            // unique asset bakes once, every placement reuses it) and per-mesh thin-feature
-            // resolution (S2 color). The gallery always keeps the fused bake (byte-identical
-            // anchor). `scene_diag` is the "open space" distance for voxels no object covers.
-            let use_permesh = !gallery_scene && std::env::var_os("P11_PERMESH_GDF").is_some();
+            // Stage S1 (per-mesh-distance-fields.md): composite per-mesh DFs (baked once per unique
+            // mesh at ~5 cm target voxels, cached/instanced) into each clip level instead of the
+            // fused whole-scene triangle-soup bake. Per-mesh is now the **DEFAULT for content**: the
+            // fused bake is DEPRECATED — its coarse whole-scene voxels (~0.76 m on a 37 m scene) lose
+            // thin features (reliefs, thin walls, tracery), so DF-based passes (GI/AO/reflection +
+            // the debug view) march straight through them. The gallery keeps the fused bake (it is
+            // the byte-identical anchor and a simple scene where per-mesh buys nothing). The first
+            // cook of a non-instanced scene (Intel Sponza ~426 unique meshes) is slower but cached;
+            // the win compounds on instanced content (a unique asset bakes once, reused per
+            // placement). `P11_PERMESH_GDF=0` forces the deprecated fused path (fallback / A-B).
+            // `scene_diag` is the "open space" distance for voxels no object covers.
+            let use_permesh = !gallery_scene && quality::env_bool("P11_PERMESH_GDF", true);
+            if !use_permesh && !gallery_scene {
+                tracing::warn!(
+                    "GDF: using the DEPRECATED fused whole-scene distance field (P11_PERMESH_GDF=0). \
+                     Thin features (reliefs, thin walls) are lost below the coarse voxel size."
+                );
+            }
             let scene_diag = {
                 let d = [amax[0] - amin[0], amax[1] - amin[1], amax[2] - amin[2]];
                 (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
