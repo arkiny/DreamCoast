@@ -184,6 +184,18 @@ pub struct QualityPreset {
     /// Only active where `gi_half_res` is (content; the gallery traces full-res = byte-identical).
     /// `P_GI_RES_DIV` override. See `docs/swrt-gi-perf-track.md`.
     pub gi_res_div: u32,
+    /// macOS/M3 perf (M3-C): GGX reflection trace-resolution divisor when `reflect_half_res` is on —
+    /// trace `gdf_reflect` at `1/div` of the render extent per axis, then the same joint-bilateral
+    /// upsample the GI uses. `gdf_reflect.slang` samples the G-buffer by normalized UV, so any div
+    /// traces correctly with no shader change. `2` = the legacy half-res (byte-identical with the old
+    /// `hcw/hch` = `div_ceil(2)`; every non-Apple tier keeps it). `4` = quarter-res — the ONE
+    /// quality-preserving lever on `gdf_reflect`, which the M3 sweep proved responds to trace
+    /// resolution and nothing else (steps/roughness had ~0 effect; full-res = 120ms, half = 31ms). The
+    /// reflection is temporally accumulated + low-frequency, so the coarser trace holds up for content.
+    /// Only active where `reflect_half_res` is (content; the gallery traces full-res = byte-identical).
+    /// `P_REFLECT_RES_DIV` override. See `docs/phase-macos-perf-impl.md`. Metal-measured here; the
+    /// cross-backend parity of div>2 is a Windows follow-up (cf. the `gi_res_div=4` DX=VK note above).
+    pub reflect_res_div: u32,
     /// Reflection temporal-resolve history neighbourhood clamp (`reflect_temporal.slang`): removes the
     /// view-dependent specular smear when the camera rotates (stale reprojected history dragged across
     /// chrome). A scalability permutation: `0` = off (byte-identical legacy resolve; forced for the
@@ -227,6 +239,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             reflect_half_res: true,
             gdf_cone_k: 0.05,
             gi_res_div: 3,
+            reflect_res_div: 2, // legacy half-res reflection
             reflect_history_clamp: 1, // hard (cheapest) — kills rotation smear
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
@@ -263,6 +276,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             render_scale: 1.0,
             gdf_cone_k: 0.02,
             gi_res_div: 3,
+            reflect_res_div: 2, // legacy half-res reflection (no-reg)
             reflect_history_clamp: 1, // hard (matches the WIP default) — kills rotation smear
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
@@ -290,6 +304,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             render_scale: 1.0,
             gdf_cone_k: 0.0,
             gi_res_div: 2,
+            reflect_res_div: 2, // legacy half-res reflection (quality tier keeps it sharp)
             reflect_history_clamp: 2, // variance (gentler on sharp mirrors) — quality tier
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
@@ -343,6 +358,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             render_scale: 0.67,
             gdf_cone_k: 0.06,
             gi_res_div: 4,
+            reflect_res_div: 4, // quarter-res reflection (M3-C): the one lever that cuts gdf_reflect
             reflect_history_clamp: 1, // hard (matches Med) — kills rotation smear
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
