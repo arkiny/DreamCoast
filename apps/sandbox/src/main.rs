@@ -556,7 +556,7 @@ struct App {
     /// fixed EV100). Opt-in (`AUTO_EXPOSURE`); off → the lighting uses the static `exposure` and is
     /// byte-identical (the gallery anchor never auto-exposes).
     auto_exposure: bool,
-    /// UE-style multi-bounce energy compensation strength for the GDF GI (0 = off = gallery anchor;
+    /// 레퍼런스식 multi-bounce energy compensation strength for the GDF GI (0 = off = gallery anchor;
     /// ~0.6 content). Written to `globals.probe_box_max.w`; see pbr.slang. `P_GI_MULTIBOUNCE`.
     gi_multibounce: f32,
     point_lights_on: bool,
@@ -600,11 +600,11 @@ struct App {
     ssao_params: [f32; 4],
     /// C3: GDF 1-bounce diffuse GI added to the deferred ambient term.
     gdf_gi: bool,
-    /// UE GI-fidelity: world irradiance volume (DDGI-lite radiance cache). When on, the GI pass
+    /// 레퍼런스 엔진 GI-fidelity: world irradiance volume (DDGI-lite radiance cache). When on, the GI pass
     /// samples a multibounce-propagating world volume instead of a single-bounce ray march — the
     /// real fix for deep-interior darkness. Content-only (`P_GI_VOLUME`); gallery forced off.
     gi_volume: bool,
-    /// UE-style indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
+    /// 레퍼런스식 indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
     /// directional sky-visibility): neutral leak fraction (`P_SKYVIS_TINT`) + min-occlusion floor
     /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
     /// no-op sentinel image so it stays byte-identical.
@@ -624,7 +624,7 @@ struct App {
     gi_max_steps: u32,
     /// Stage D3: GGX reflection-ray march step cap (gallery forced to legacy 96).
     reflect_max_steps: u32,
-    /// P3 (Lumen-parity): cone-trace LOD march slope for the SW-RT march loops (gallery forced 0 =
+    /// P3 (SW-RT GI 레퍼런스급): cone-trace LOD march slope for the SW-RT march loops (gallery forced 0 =
     /// legacy linear march = byte-identical). Content takes the tier value.
     gdf_cone_k: f32,
     /// Stage D3: trace the GGX reflection at half resolution + bilateral upsample (gallery off).
@@ -632,7 +632,7 @@ struct App {
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
     /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
     gi_half_res: bool,
-    /// P1 (Lumen-parity): GI trace divisor when `gi_half_res` is on (2 = half, 4 = quarter probes).
+    /// P1 (SW-RT GI 레퍼런스급): GI trace divisor when `gi_half_res` is on (2 = half, 4 = quarter probes).
     gi_res_div: u32,
     /// Screen-space radiance probe GI: replace the world-volume / ray-march GI consumption with
     /// per-tile screen probes traced into an octahedral atlas + a per-pixel gather. Content-only
@@ -1784,15 +1784,15 @@ impl App {
         let gdf_gi = gi.has_gi()
             && gdf.has_scene_sdf()
             && (!legacy_ibl || std::env::var_os("P11_GDF_GI").is_some());
-        // UE GI-fidelity: the world irradiance volume (DDGI-lite) = our world-space RADIANCE CACHE,
-        // the same idea Lumen uses. It replaces the per-pixel 1-spp GI march with a smooth, stable
+        // 레퍼런스 엔진 GI-fidelity: the world irradiance volume (DDGI-lite) = our world-space RADIANCE CACHE,
+        // the same idea 레퍼런스 SW-RT GI uses. It replaces the per-pixel 1-spp GI march with a smooth, stable
         // volume sample — so high-variance lighting (e.g. point lights) doesn't produce the firefly
         // speckle a single-bounce stochastic march leaves behind (which the temporal denoiser can't
         // fully clear). Default ON for content, never the gallery (the byte-identical anchor stays on
         // the legacy march); `P_GI_VOLUME=0` forces the march back.
         let gi_volume =
             quality::env_bool("P_GI_VOLUME", !gallery_scene) && gdf_gi && gi.has_gi_volume();
-        // UE-style indoor skylight occlusion knobs (only effective on the volume GI path, content):
+        // 레퍼런스식 indoor skylight occlusion knobs (only effective on the volume GI path, content):
         // `P_SKYVIS_TINT` = neutral OcclusionTint leak as a fraction of the occluded skylight
         // luminance (the occluded floor keeps brightness but loses the blue cast); `P_SKYVIS_MIN_OCC`
         // = min sky-visibility floor (=1.0 disables the occlusion entirely → SH-L1 baseline).
@@ -1866,7 +1866,7 @@ impl App {
         // overrides. Needs the upsample pipeline (capability-gated).
         let gi_half_res = gi.has_upsample()
             && quality::env_bool("P11_GI_HALF_RES", !gallery_scene && qp.gi_half_res);
-        // P1 (Lumen-parity): GI trace-resolution divisor used when `gi_half_res` is on (2 = legacy
+        // P1 (SW-RT GI 레퍼런스급): GI trace-resolution divisor used when `gi_half_res` is on (2 = legacy
         // half, 4 = quarter = sparser screen-space probes). Only affects content (the gallery traces
         // full-res). `P_GI_RES_DIV` overrides the tier.
         let gi_res_div = std::env::var("P_GI_RES_DIV")
@@ -1948,7 +1948,7 @@ impl App {
                 qp.reflect_max_steps
             })
             .clamp(1, 256);
-        // P3 (Lumen-parity SW-RT): cone-trace LOD march slope. Gallery forced to 0 (legacy linear
+        // P3 (SW-RT GI 레퍼런스급 SW-RT): cone-trace LOD march slope. Gallery forced to 0 (legacy linear
         // march = byte-identical anchor); content takes the tier value. `P_CONE_K` overrides.
         let gdf_cone_k = std::env::var("P_CONE_K")
             .ok()
@@ -3693,8 +3693,8 @@ impl App {
         //      negative offset pulls them back to the full-res mip the upscaler reconstructs to.
         //   2. taa_mip_bias (~-1, Stage 8): the PRIMARY distant-sharpness lever. With sub-pixel
         //      jitter the temporal accumulation super-samples, so we can bias toward sharper mips and
-        //      let TAA resolve the aliasing — this is UE/DLSS's primary approach to distant-texture
-        //      sharpness (UE also uses hardware anisotropic filtering, but that's the grazing-surface
+        //      let TAA resolve the aliasing — this is 레퍼런스 엔진/DLSS's primary approach to distant-texture
+        //      sharpness (레퍼런스 엔진 also uses hardware anisotropic filtering, but that's the grazing-surface
         //      lever — see Stage 9 / P_ANISO — not the distance one). Applies even at native (term 1
         //      = 0) under forced TAA. Only added with jitter (no jitter => no supersampling to hide it).
         // Gallery (TAA off => taau_active false) keeps bias 0 => SampleBias(.,0)==Sample() => byte
@@ -4017,7 +4017,7 @@ impl App {
                 let div = if half_gi { self.gi_res_div.max(1) } else { 1 };
                 let (gw, gh) = (cw.div_ceil(div), ch.div_ceil(div));
                 let gi_extent = Extent2D::new(gw, gh);
-                // UE GI-fidelity: update + bind the world irradiance volume (DDGI-lite). The update
+                // 레퍼런스 엔진 GI-fidelity: update + bind the world irradiance volume (DDGI-lite). The update
                 // propagates last frame's volume into hits (multibounce), so deep interiors fill in
                 // over frames. When bound, the GI pass samples the volume instead of marching.
                 let gi_volume_arg = if self.gi_volume {
@@ -4326,7 +4326,7 @@ impl App {
                 } else {
                     refl_traced
                 };
-                // C8j: temporally resolve the stochastic GGX GDF reflection (UE-style; the rough
+                // C8j: temporally resolve the stochastic GGX GDF reflection (레퍼런스식; the rough
                 // lobe is sampled by real rays + denoised, so it's correctly blurred without an
                 // image-space prefilter that over-brightens rough metals).
                 let gdf_resolved = self.reflect.record_reflect_temporal(
@@ -5180,7 +5180,7 @@ impl App {
         if scene_cache_lit_ext.is_some() {
             self.gdf.advance_cache();
         }
-        // UE GI-fidelity: advance the world irradiance volume ping-pong (next frame reads this).
+        // 레퍼런스 엔진 GI-fidelity: advance the world irradiance volume ping-pong (next frame reads this).
         if self.gi_volume {
             self.gi.advance_gi_volume();
         }

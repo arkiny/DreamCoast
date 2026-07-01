@@ -1,6 +1,6 @@
 // Phase 11 Stage C8b1 — mesh-card surface-cache capture (compute).
 //
-// Lumen-style surface cache: each scene object is parameterized by 6 axis-aligned
+// 레퍼런스식 surface cache: each scene object is parameterized by 6 axis-aligned
 // "cards" (oriented quads on its world AABB faces). This pass captures, once, the
 // surface geometry seen by each card texel — for texel (u,v) of a card it starts on the
 // card plane and sphere-traces the scene GDF *inward* (along -card.normal) to the first

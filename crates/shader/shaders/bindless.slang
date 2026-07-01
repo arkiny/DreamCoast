@@ -93,7 +93,7 @@ float3 linear_to_srgb(float3 c)
     return lerp(lo, hi, step(float3(0.0031308), c));
 }
 
-// NaN/Inf guard (UE Lumen `MakeFinite`): an IEEE float is non-finite iff its exponent
+// NaN/Inf guard (레퍼런스 엔진 SW GI `MakeFinite`): an IEEE float is non-finite iff its exponent
 // field is all ones. Zero out non-finite components so one bad sample can't poison a
 // temporal-accumulation buffer — an EMA blend would otherwise spread the NaN every frame
 // (the "black creeps in from frame 2" failure). The asuint bit test survives the optimizer

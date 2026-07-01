@@ -603,7 +603,7 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gdf_gi_cs",
     },
-    // UE GI-fidelity track: world-space irradiance volume (DDGI-lite radiance cache) update.
+    // 레퍼런스 엔진 GI-fidelity track: world-space irradiance volume (DDGI-lite radiance cache) update.
     Job {
         src: "gi_volume.slang",
         entry: "csMain",

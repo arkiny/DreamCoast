@@ -8,7 +8,7 @@
 //   • YCoCg variance clipping (Karis 2014 / Salvi 2016): clip the reprojected history to the
 //     current neighborhood's statistical color box [μ ± γσ] in YCoCg (ray-AABB clip toward the
 //     mean) — the primary anti-ghost, and it also stabilizes (trusted history => no jitter).
-//   • Closest-depth dilation (Playdead/UE): reproject using the NEAREST depth in the 3x3 so
+//   • Closest-depth dilation (Playdead/레퍼런스 엔진): reproject using the NEAREST depth in the 3x3 so
 //     silhouettes fetch the foreground's history (kills edge ghosting on moving edges).
 //   • Luminance-weighted feedback (Lottes): bias toward more history where luma is stable
 //     (hides jitter) and toward the current sample where it changes fast (drops ghosts).

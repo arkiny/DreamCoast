@@ -13,8 +13,8 @@ Phase 10에서 만든 GDF(global distance field) 기반 SW-RT GI/AO/반사는 **
 막힌다(아래).
 
 ### 이번 세션에서 확정된 결정 (2026-06-27)
-- **Surface cache 단일화 (Lumen式).** surface cache(메시 카드)를 **GI·반사 공통 radiance 소스**로
-  쓰고, **per-voxel albedo 볼륨 베이크(C8a)를 제거**한다. 진짜 Lumen은 surface cache가 radiance
+- **Surface cache 단일화 (레퍼런스식).** surface cache(메시 카드)를 **GI·반사 공통 radiance 소스**로
+  쓰고, **per-voxel albedo 볼륨 베이크(C8a)를 제거**한다. 진짜 레퍼런스 SW-RT GI은 surface cache가 radiance
   소스이고 per-voxel albedo 볼륨은 없다. 우리 albedo 볼륨은 소형 갤러리용 단축 경로였다.
   - 현재(확인됨, [gdf_gi.slang](../crates/shader/shaders/gdf_gi.slang) `trace_bounce`): **반사**는
     surface cache 기본(reflect_cache), **GI**는 기본이 `albedo_at()`(per-voxel albedo 볼륨 재조명);
@@ -135,7 +135,7 @@ Phase 10에서 만든 GDF(global distance field) 기반 SW-RT GI/AO/반사는 **
 | C 아틀라스 | `5995649` | `fuse::build_surface_cards` 일반화 + MAX_CARDS 예산 |
 | D-build | `9ce08b8` | 콘텐츠 씬 GDF/클립맵 빌드(Sponza 4레벨), analytic ground 비활성 |
 | D-lighting | `4171839` | 콘텐츠 GDF ambient 배선 |
-| **NaN fix** | `46f396d` | UE `MakeFinite` + safe_normalize — temporal 누적 NaN 오염 차단 |
+| **NaN fix** | `46f396d` | 레퍼런스 엔진 `MakeFinite` + safe_normalize — temporal 누적 NaN 오염 차단 |
 | **GDF 디폴트** | `e5f54df` | **콘텐츠 씬 GDF ambient 디폴트**(P11_LEGACY_IBL=escape) |
 
 **검증 결과:**
@@ -148,13 +148,13 @@ Phase 10에서 만든 GDF(global distance field) 기반 SW-RT GI/AO/반사는 **
 
 **★ 핵심 교훈(NaN 오염)**: "Sponza GDF가 검다"는 GI 부족이 아니라 **temporal 누적 버퍼 NaN 오염**이었음
 (첫 프레임 정상→이후 검은색 번짐). 원인=빈 영역 SDF 그래디언트 `normalize(0)`→NaN→서피스캐시/GI
-디노이저/반사 누적의 EMA로 매 프레임 확산. UE5 Lumen `MakeFinite` 패턴(누적 경계 sanitize)+
+디노이저/반사 누적의 EMA로 매 프레임 확산. 레퍼런스 엔진 SW GI `MakeFinite` 패턴(누적 경계 sanitize)+
 safe_normalize로 해결. 유한값엔 무영향=갤러리 바이트 동일.
 
 **미결(측정 주도 후속):**
 - **서피스 캐시 단일화(albedo 볼륨 제거)**: 계획의 GI=캐시-radiance-소스 단일화는 미적용(현 GI=
   per-voxel albedo 볼륨 경로, 콘텐츠는 클립맵 레벨당 albedo 볼륨). 갤러리 재baseline 동반→별도 측정 주도.
-- **콘텐츠 라이팅 추가 품질**(UE Lumen 정렬): 멀티바운스 강화·스카이 이라디언스·노출 미세조정.
+- **콘텐츠 라이팅 추가 품질**(레퍼런스 엔진 SW GI 정렬): 멀티바운스 강화·스카이 이라디언스·노출 미세조정.
 
 ## 향후 정합성 — 카메라 이동 GDF 스트리밍 (대형 월드)
 

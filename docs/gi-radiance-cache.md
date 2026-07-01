@@ -1,7 +1,7 @@
 # GI 월드 irradiance 볼륨 (DDGI-lite radiance cache) — 권위 계획
 
 상위: [swrt-gi-perf-track.md](swrt-gi-perf-track.md). 레퍼런스 엔진 SW GI 충실도 조사
-결과, 우리 1-bounce GDF GI는 깊은 실내(Sponza nave)에 **GI가 도달하지 못해** 어둡다(멀티바운스 부재). UE는
+결과, 우리 1-bounce GDF GI는 깊은 실내(Sponza nave)에 **GI가 도달하지 못해** 어둡다(멀티바운스 부재). 레퍼런스 엔진는
 **월드 radiance cache + radiosity 멀티바운스**로 채운다. 이 트랙은 그 핵심을 **월드 공간 irradiance 볼륨
 (DDGI-lite)** 으로 도입 — 밝은 atrium의 빛이 프레임 누적으로 nave까지 전파(멀티바운스)되어 실내를 채운다.
 
@@ -59,9 +59,9 @@
     **=1.0이면 완전 off**=SH-L1 베이스라인 바이트 동일).
   - **측정(sponza_intel, Metal, EV100=11)**: 바닥 디블루 — 우측 빨강 커튼 바닥 R−B **−38→+7.9(warm!)**,
     중앙 바닥 R−B **−70→+5.9(중립)**; 바닥 영역 평균 dRGB **[−6,−35,−59]**(파랑 제거, 빨강 보존). 석재가
-    중립이 되어 컬러 커튼이 도드라짐(UE 실내 룩). **갤러리 바이트 동일**(SHA 불변)·**결정론적**·off-스위치가
+    중립이 되어 컬러 커튼이 도드라짐(레퍼런스 엔진 실내 룩). **갤러리 바이트 동일**(SHA 불변)·**결정론적**·off-스위치가
     베이스라인 바이트 동일. **DX≡VK 보류**(Windows 동결; pbr 푸시 후행 스칼라 = 레이아웃 안전).
-- 차후: 차폐분을 평면 틴트 대신 radiance-cache 바운스로 채우기(완전 Lumen형), 클립맵(대형 월드), 상각 update,
+- 차후: 차폐분을 평면 틴트 대신 radiance-cache 바운스로 채우기(완전 레퍼런스 SW-RT GI형), 클립맵(대형 월드), 상각 update,
   ImGui 토글, RenderQuality 티어 편입.
 
 ## 하지 말 것

@@ -5,7 +5,7 @@
 // rasterizer's shading/GI/reflection approximation — not a sky-model mismatch.
 //
 // Physically-based atmosphere — single-scattering ray-march (Rayleigh + Mie + ozone)
-// in the spirit of Bruneton 2008 / Hillaire 2020 (UE5 Sky Atmosphere). Earth
+// in the spirit of Bruneton 2008 / Hillaire 2020 (레퍼런스 엔진 Sky Atmosphere). Earth
 // parameters; the view ray is integrated through the atmosphere with a per-sample
 // sun-transmittance march, so the sky is physically derived from sun elevation: blue
 // zenith, brighter/whiter horizon, reddening as the sun nears the horizon.
