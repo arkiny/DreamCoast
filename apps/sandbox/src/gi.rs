@@ -675,10 +675,24 @@ impl GiSystem {
         let diag = Self::diag(aabb_min, aabb_max);
         let bias = diag * 0.004;
 
-        let probes_x = cw.div_ceil(SP_DOWNSAMPLE);
-        let probes_y = ch.div_ceil(SP_DOWNSAMPLE);
-        let atlas_w = probes_x * SP_OCT_RES;
-        let atlas_h = probes_y * SP_OCT_RES;
+        // Probe density + octahedral resolution are the two scalability knobs (a future
+        // RenderQuality tier). `P_SP_DOWNSAMPLE` (screen px / probe) and `P_SP_OCT` (octahedral
+        // texels / side) override the defaults for A/B tuning.
+        let ds = std::env::var("P_SP_DOWNSAMPLE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(SP_DOWNSAMPLE)
+            .clamp(4, 64);
+        let oct = std::env::var("P_SP_OCT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(SP_OCT_RES)
+            .clamp(4, 32);
+
+        let probes_x = cw.div_ceil(ds);
+        let probes_y = ch.div_ceil(ds);
+        let atlas_w = probes_x * oct;
+        let atlas_h = probes_y * oct;
         let atlas = graph.create_storage_image(
             "sp_radiance_atlas",
             HDR_FORMAT,
@@ -743,8 +757,8 @@ impl GiSystem {
                     ch,
                     probes_x,
                     probes_y,
-                    SP_DOWNSAMPLE,
-                    SP_OCT_RES,
+                    ds,
+                    oct,
                     flip_y,
                     frame,
                     max_steps,
@@ -793,8 +807,8 @@ impl GiSystem {
                             ch,
                             probes_x,
                             probes_y,
-                            SP_DOWNSAMPLE,
-                            SP_OCT_RES,
+                            ds,
+                            oct,
                             flip_y,
                             filter_half_kernel,
                             pos_sigma,
@@ -834,8 +848,8 @@ impl GiSystem {
                     ch,
                     probes_x,
                     probes_y,
-                    SP_DOWNSAMPLE,
-                    SP_OCT_RES,
+                    ds,
+                    oct,
                     flip_y,
                     skyvis_index,
                     pos_sigma,

@@ -120,3 +120,29 @@ Verify (Metal): gallery path-tracer parity 5.988/ch with the filter vs 5.984 wit
 bilateral filter preserves the mean, so it is parity-neutral on the already-smooth gallery
 (no bias) and reduces probe-grid blockiness on complex scenes / sparser probes. Gallery
 byte-identical (no env). Deterministic (sponza filter-on `30f70511…`).
+
+## P2b — resolution / density scalability knobs + the measured accuracy finding
+
+The probe trace is **deterministic and noise-free** (fixed octahedral directions, no
+Monte-Carlo sampling), so P2's classic role — denoising stochastic traces — does not apply.
+The only accuracy lever the probes expose is **angular resolution** (octahedral texels) and
+**spatial density** (probes per screen). Both are now env-tunable quality knobs (a future
+`RenderQuality` tier): `P_SP_OCT` (default 8) and `P_SP_DOWNSAMPLE` (default 16).
+
+Measured on the gallery vs the path tracer:
+
+| knob | value → avg abs diff / ch |
+|---|---|
+| octahedral res `P_SP_OCT` | 8 → 5.988 · 12 → 5.997 · 16 → 5.988 |
+| probe density `P_SP_DOWNSAMPLE` | 8 → 5.984 · 16 → 5.988 · 32 → 5.996 |
+
+**Neither knob moves parity meaningfully** — the diffuse GI gather is already at its accuracy
+floor; the residual is dominated by non-diffuse-GI approximations (GGX / the mirror spheres /
+GDF voxelization), not the probe angular resolution or density. So the default 8² / 16 px is a
+well-chosen cost/quality point, and heavier angular supersampling (temporal jitter +
+accumulation) would **not** improve measured accuracy on these scenes — it is a stability /
+sparse-probe feature that belongs with **P5** temporal amortization (when probes drop to
+half/quarter-res and actually need the extra effective samples). Landing it now would add cost
+for no parity gain, which the build-to-quality metric (path-tracer parity) argues against.
+
+Gallery byte-identical (no env, `dba9ff7c…`); deterministic (no RNG added).
