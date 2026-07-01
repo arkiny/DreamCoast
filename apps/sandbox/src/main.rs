@@ -1548,7 +1548,17 @@ impl App {
                 );
             }
             if direct_sdf {
-                let atlas = dreamcoast_asset::sdf_atlas::SdfAtlas::pack(&mesh_sdfs);
+                // Atlas memory cap: tiles are dense `dim³`, so downsampling the largest meshes
+                // (whose extra resolution is low-frequency, covered by the coarse dense field)
+                // trims the atlas a lot while thin features — resolved by their tight AABB, not
+                // the cube dim — survive. `P11_ATLAS_MAX_DIM` tunes it (native = 48).
+                let atlas_cap = std::env::var("P11_ATLAS_MAX_DIM")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .map(|d| d.clamp(dreamcoast_asset::sdf::MESH_SDF_MIN_DIM, 48))
+                    .unwrap_or(32);
+                let atlas =
+                    dreamcoast_asset::sdf_atlas::SdfAtlas::pack_capped(&mesh_sdfs, atlas_cap);
                 let res = crate::mesh_sdf::grid_res_for(compose_objects.len());
                 let build = crate::mesh_sdf::build(&compose_objects, &atlas, amin, amax, res);
                 info!(
