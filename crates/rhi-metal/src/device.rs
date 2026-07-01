@@ -586,9 +586,11 @@ impl MetalDevice {
         ))
     }
 
-    /// Create a timestamp query heap (Phase 9 profiling — stub on Metal).
+    /// Create a timestamp query heap (Phase 9 profiling). Backed by an
+    /// `MTLCounterSampleBuffer`; degrades to zero ticks on hardware lacking a
+    /// timestamp counter set.
     pub fn create_query_heap(&self, count: u32) -> Result<crate::query::MetalQueryHeap> {
-        crate::query::MetalQueryHeap::new(count)
+        crate::query::MetalQueryHeap::new(&self.shared, count)
     }
 
     /// A command buffer that records onto the dedicated compute queue (M5 async
