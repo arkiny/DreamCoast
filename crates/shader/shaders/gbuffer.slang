@@ -251,6 +251,34 @@ GBufferOut fsMain(VSOutput input)
     return o;
 }
 
+// Depth pre-pass fragment shader (pipeline rebaseline PR-1). The pre-pass rasterizes opaque
+// geometry depth-only, *before* the G-buffer fill, so the base pass can run with an EQUAL depth
+// test + depth-write off and shade each pixel exactly once (Early-Z overdraw elimination). It
+// shares the G-buffer vertex shaders (`vsMain` / `vsMainSkinned` / `vsMainMorphed`) UNCHANGED, so
+// the clip-space position it writes is computed by the identical instruction sequence with the
+// identical `mvp` push — the depths therefore match bit-exactly and the base pass's EQUAL test
+// passes on every fragment (no z-fighting). This fragment writes no color; it only performs the
+// same alpha-test discard the G-buffer does so cutout/foliage holes are punched into the pre-pass
+// depth too (otherwise the base pass would try to shade holes that fail the EQUAL test). It uses
+// the |cutoff| HARD test in both the >0 (masked) and <0 (hashed) modes: the pre-pass must write a
+// deterministic, TAA-independent depth (a stochastic hashed discard here would fight the base
+// pass's own hashed discard and re-introduce z-fighting on leaf edges), so it treats hashed
+// foliage as a crisp cutout for the purpose of establishing depth — identical to how the shadow
+// pass resolves the same ambiguity.
+[shader("fragment")]
+void fsDepth(VSOutput input)
+{
+    float mip_bias = pc.mr_factor.z;
+    float cutoff = abs(pc.mr_factor.w);
+    if (cutoff > 0.0 && pc.tex.x != NO_TEXTURE)
+    {
+        float a = g.textures[pc.tex.x].SampleBias(g.samp_wrap, input.uv, mip_bias).a
+                * pc.base_color_factor.a;
+        if (a < cutoff)
+            discard;
+    }
+}
+
 // Deferred surface-decal fragment shader (decals A3). A decal is a mesh laid coplanar on
 // an already-shaded opaque surface; it must TINT the surface's albedo, not replace it with
 // its own (diffuse-less) lighting inputs. So it writes ONLY RT0 = float4(albedo, alpha):
