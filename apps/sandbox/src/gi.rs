@@ -183,7 +183,7 @@ impl GiSystem {
             dreamcoast_shader::screen_probe_trace_cs_dxil,
             dreamcoast_shader::screen_probe_trace_cs_metallib,
             "screen_probe_trace",
-            224,
+            240, // ProbeTracePush = 240B (wrc_atlas/grid/oct/pad0 row @224); matches screen_probe_trace_push.
         )?;
         let sp_integrate_pipeline = compute(
             dreamcoast_shader::screen_probe_integrate_cs_spirv,

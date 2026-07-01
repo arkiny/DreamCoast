@@ -786,11 +786,12 @@ pub(crate) fn gdf_ao_push(
     pc
 }
 
-/// Pack the Phase 11 Stage C3 GDF-GI push block (224 bytes): inv_view_proj (64) +
+/// Pack the Phase 11 Stage C3 GDF-GI push block (256 bytes): inv_view_proj (64) +
 /// sun dir+intensity (16) + (depth, normal, gdf_sampled, out) (16) + (width, height,
-/// flip_y, spp) (16) + (frame, pad×3) (16) + aabb_min.xyz/ground_y (16) +
+/// flip_y, spp) (16) + (frame, albedo_rgb) (16) + aabb_min.xyz/ground_y (16) +
 /// aabb_max.xyz/dist_clamp (16) + (ray_max_dist, bias, sky_term, hit_albedo) (16) +
-/// (cache uint4 + tile, clamp_max, pad×2) (16) + ground_albedo.xyz/pad (16).
+/// (cache uint4 + tile, clamp_max, clip_desc, clip_count) (16) + ground_albedo.xyz/cone_k (16) +
+/// (max_steps, vol_rgb) (16) + F3 (hwrt, pad×3) (16).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gdf_gi_push(
     inv_view_proj: &[f32; 16],
@@ -1582,7 +1583,7 @@ pub(crate) fn post_compute_push(
     pc
 }
 
-/// Pack the screen-probe TRACE push block (224 bytes): inv_view_proj (64) + sun (16) +
+/// Pack the screen-probe TRACE push block (240 bytes): inv_view_proj (64) + sun (16) +
 /// aabb_min/+ground_y (16) + aabb_max/+sample_clamp (16) + params (16) + ground_albedo/+cone_k
 /// (16) + cache uint4 (16) + 14 scalar indices/dims (4 rows of 16) + clamp_max. All scalars are
 /// grouped after the vec4 block (Metal-safe: no float3+trailing-scalar mis-packing).

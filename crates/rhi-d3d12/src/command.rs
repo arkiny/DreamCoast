@@ -6,7 +6,7 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use dreamcoast_core::EngineError;
-use rhi_types::{ClearColor, Extent2D, Rect2D};
+use rhi_types::{BufferDesc, BufferUsage, ClearColor, Extent2D, Rect2D};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::{
@@ -38,6 +38,17 @@ use crate::pipeline::{D3d12ComputePipeline, D3d12GraphicsPipeline};
 use crate::render_target::D3d12RenderTarget;
 use crate::swapchain::D3d12Swapchain;
 
+/// UPLOAD-heap ring feeding root-CBV push constants for compute pipelines whose
+/// block overflows the 64-DWORD root budget (see `pipeline::compute_push_via_cbv`).
+/// 64 KiB = 256 aligned 256-byte slots, far more large-push dispatches than a frame
+/// records. Owned per command buffer and rewound in `begin()`: safe because the
+/// owning buffer's prior GPU work has completed (its in-flight fence is waited before
+/// re-record), so last frame's slots are no longer read.
+const PUSH_CBV_RING_SIZE: u64 = 64 * 1024;
+/// D3D12 requires root-CBV addresses to be 256-byte aligned
+/// (`D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT`); each ring slot honours it.
+const CBV_ALIGN: u64 = 256;
+
 /// A primary command list (+ its allocator), reset and re-recorded each frame.
 pub struct D3d12CommandBuffer {
     device: Rc<DeviceShared>,
@@ -45,6 +56,12 @@ pub struct D3d12CommandBuffer {
     list: ID3D12GraphicsCommandList,
     // GPU VA of the per-frame globals slice for the next PBR pipeline bind.
     globals_va: Cell<u64>,
+    // Upload ring + bump offset for root-CBV push constants (large compute blocks).
+    push_ring: D3d12Buffer,
+    push_ring_offset: Cell<u64>,
+    // Whether the currently-bound compute pipeline feeds push constants via the ring
+    // (root CBV) vs inline 32-bit root constants. Set by `bind_compute_pipeline`.
+    push_via_cbv: Cell<bool>,
 }
 
 impl D3d12CommandBuffer {
@@ -72,11 +89,21 @@ impl D3d12CommandBuffer {
                 .map_err(d3d_err)?;
             // Created open; close so `begin` can reset it uniformly.
             list.Close().map_err(d3d_err)?;
+            let push_ring = D3d12Buffer::new(
+                device.clone(),
+                &BufferDesc {
+                    size: PUSH_CBV_RING_SIZE,
+                    usage: BufferUsage::Uniform,
+                },
+            )?;
             Ok(Self {
                 device,
                 allocator,
                 list,
                 globals_va: Cell::new(0),
+                push_ring,
+                push_ring_offset: Cell::new(0),
+                push_via_cbv: Cell::new(false),
             })
         }
     }
@@ -89,6 +116,9 @@ impl D3d12CommandBuffer {
         unsafe {
             self.allocator.Reset().map_err(d3d_err)?;
             self.list.Reset(&self.allocator, None).map_err(d3d_err)?;
+            // Rewind the push-CBV ring: this buffer's previous GPU submission has
+            // completed (in-flight fence waited before re-record), so its slots are free.
+            self.push_ring_offset.set(0);
             Ok(())
         }
     }
@@ -684,6 +714,9 @@ impl D3d12CommandBuffer {
             }
             self.list.SetPipelineState(pipeline.pso());
         }
+        // Route the next `push_constants_compute` to the ring (root CBV) or inline
+        // 32-bit constants, matching how this pipeline's root signature was built.
+        self.push_via_cbv.set(pipeline.push_via_cbv());
     }
 
     /// Dispatch the bound compute pipeline over `(x, y, z)` thread groups.
@@ -691,16 +724,41 @@ impl D3d12CommandBuffer {
         unsafe { self.list.Dispatch(x, y, z) };
     }
 
-    /// Upload root (push) constants for the bound compute pipeline (param 1).
+    /// Upload root (push) constants for the bound compute pipeline (param 1). Small
+    /// blocks go inline (32-bit root constants); blocks that overflow the 64-DWORD root
+    /// budget are copied into the per-frame upload ring and bound as a root CBV — the
+    /// same bytes reach `b0` either way, so the shader output is identical.
     pub fn push_constants_compute(&self, data: &[u8]) {
-        unsafe {
-            self.list.SetComputeRoot32BitConstants(
-                1,
-                (data.len() / 4) as u32,
-                data.as_ptr() as *const c_void,
-                0,
-            );
+        if self.push_via_cbv.get() {
+            let va = self.upload_push_cbv(data);
+            unsafe { self.list.SetComputeRootConstantBufferView(1, va) };
+        } else {
+            unsafe {
+                self.list.SetComputeRoot32BitConstants(
+                    1,
+                    (data.len() / 4) as u32,
+                    data.as_ptr() as *const c_void,
+                    0,
+                );
+            }
         }
+    }
+
+    /// Copy `data` into the next 256-aligned slot of the push-CBV ring and return its
+    /// GPU virtual address (a valid root-CBV target). Wraps to the start if the frame's
+    /// large-push dispatches would exceed the ring — the ring is sized so this never
+    /// happens in practice, and a wrap only reuses slots already consumed this frame.
+    fn upload_push_cbv(&self, data: &[u8]) -> u64 {
+        let aligned = (data.len() as u64).div_ceil(CBV_ALIGN) * CBV_ALIGN;
+        let mut off = self.push_ring_offset.get();
+        if off + aligned > PUSH_CBV_RING_SIZE {
+            off = 0;
+        }
+        self.push_ring
+            .write_at(off, data)
+            .expect("push-CBV ring write within bounds");
+        self.push_ring_offset.set(off + aligned);
+        self.push_ring.gpu_va() + off
     }
 
     /// Bind a ray-tracing state object + its global root signature, the shared
