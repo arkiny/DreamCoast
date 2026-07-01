@@ -85,6 +85,73 @@ M3 (C-axis: cut gdf_reflect 30 ms + gdf_ao 11.6 ms) **and** render_scale 0.5 **a
 tile-shading that unlocks the real memoryless win. 60fps@QHD-native output with the full SW-RT
 stack may require accepting render_scale 0.5 as the Apple default. Decision needed.
 
+## DEEPER ANALYSIS (measured knob sweeps, Apple tier, Sponza/M3, 2026-07-01)
+
+Serialized `PROFILE_GPU` sweeps to find what actually moves the needle:
+
+| Config | total ms | gdf_reflect | note |
+|--------|---------:|------------:|------|
+| Apple baseline (rs0.67, reflect half-res) | ~69 | ~31 | |
+| + render_scale 0.5 | **~42** | 17 | render_scale is THE lever |
+| + render_scale 0.45 | ~37 | 14 | |
+| reflect_max_steps 56→32 | ~69 | ~31 | **no effect — not step-bound** |
+| reflect_max_steps 56→16 | ~65 | ~27 | barely |
+| reflect_max_roughness 0.4→0.15 | ~69 | ~31 | **no effect — pass runs regardless** |
+| gi_res_div 4→6 | ~43 | — | no effect (GI trace already 0.16ms) |
+| gdf_ao OFF | ~57 | 31 | saves ~12ms but loses ALL AO (ssao already off on Apple) |
+| **reflect_half_res=0 (full-res)** | **~158** | **120** | reflection already half-res saving ~4× |
+| **P11_LEGACY_IBL (drop SW-RT ambient), rs0.67** | **~18** | — | 55fps |
+| **P11_LEGACY_IBL + rs0.5** | **~12.4** | — | **80fps** |
+| P11_LEGACY_IBL + rs0.5 + gdf_ao off | ~5.4 | — | |
+
+**Conclusions (measured, not modeled):**
+1. **`gdf_reflect` (~40% of frame) responds to NOTHING but resolution** — not march steps, not the
+   roughness gate, not the enable flag (it's capability-forced on). It is a per-pixel SW-RT GGX
+   reflection, already half-res (full-res = 120ms). The only quality-preserving lever left is a
+   **quarter-res reflection trace + bilateral upsample** (a new `reflect_res_div`, mirroring the
+   existing `gi_res_div` path) — the reflection is temporally accumulated + low-frequency, so it
+   should tolerate it. Estimated ~half of gdf_reflect (~8ms @ rs0.5). This is the one real
+   algorithmic M3-C task worth doing.
+2. **The entire 60fps overage IS the SW-RT reflect+GI+AO stack.** `P11_LEGACY_IBL` (the cheap
+   captured-cube ambient) hits 60fps trivially (12–18ms). So 60fps @ Sponza on M3 is a
+   **quality-vs-framerate** decision, not a tuning problem.
+3. **60fps with full SW-RT GI is NOT reachable by knobs alone.** Floor with everything aggressive
+   (rs0.45 + quarter-res reflect + cheaper AO) is ~27–30ms ≈ **33–37 fps**. Reaching 16.6ms
+   requires falling back to the cheap IBL ambient (dropping the engine's signature SW-RT GI) or a
+   much lower internal resolution.
+
+**Recommendation (aligns with the build-to-quality directive — don't drop correct GI for fps):**
+Ship the Apple tier at render_scale 0.5 + a new quarter-res reflection path (M3-C) → target the
+best achievable **with** SW-RT GI (~30–37 fps), and expose an optional lower "performance"
+sub-tier that switches to `LEGACY_IBL` for users who need 60fps at the ambient-quality cost.
+Do **not** claim 60fps+SW-RT — the measurement says it isn't there.
+
+## M3-C RESULT — quarter-res reflection (`reflect_res_div`), VERIFIED (2026-07-01)
+
+New `reflect_res_div` knob (mirrors `gi_res_div`): trace `gdf_reflect` at `1/div` + the existing
+bilateral upsample. `div=2` reproduces the legacy half-res byte-for-byte (`cw.div_ceil(2)`); every
+non-Apple tier keeps 2; **Apple tier = 4 (quarter-res)**. `P_REFLECT_RES_DIV` override.
+
+**Perf ladder (Apple tier, Sponza/M3):**
+| Stage | total ms | fps | gdf_reflect |
+|-------|---------:|----:|------------:|
+| M0 Med native | 165 | 6 | 77.8 |
+| M1 Apple (rs0.67, half reflect) | 70 | 14 | 30.8 |
+| **+ quarter-res reflect (rs0.67)** | **48.3** | **21** | **8.25** |
+| + quarter-res reflect + rs0.5 | 29.8 | 34 | ~4.6 |
+
+**Gates PASS:** gallery anchor `af70c1a5` byte-identical + deterministic (gallery forces reflect
+full-res); **Med Sponza `1ee08a3a` byte-identical → `div=2` is a proven no-op**; clippy -D clean.
+**Quality:** on Sponza (rough-dominant) div=1/2/4 are byte-identical — reflection is roughness-gated
+(`reflect_max_roughness=0.4`) so quarter-res is free there. On a smooth mirror (gallery copper
+sphere) div=4-vs-full = mean 0.092/ch (max 124), ~2× the half-res error but temporally stable.
+So quarter-res is a defensible low-power-tier default (rough content free, smooth mirrors softer),
+opt-in and env-overridable. Cross-backend (DX≡VK) parity of div>2 is a Windows follow-up.
+
+**60fps status:** best-with-SW-RT is now ~30ms @ rs0.5 (~34 fps). Reaching 16.6ms still needs
+render_scale ≲0.45 + cheaper AO (gdf_ao is now the top pass) or the `LEGACY_IBL` performance
+sub-tier — the quality-vs-fps decision stands.
+
 ## Stages, owners, gates
 
 Order is by ROI and file-conflict avoidance. **All GPU measurement is serialized on this one

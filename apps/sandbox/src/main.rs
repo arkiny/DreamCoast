@@ -635,6 +635,9 @@ struct App {
     gdf_cone_k: f32,
     /// Stage D3: trace the GGX reflection at half resolution + bilateral upsample (gallery off).
     reflect_half_res: bool,
+    /// macOS/M3 perf (M3-C): reflection trace divisor when `reflect_half_res` is on (2 = legacy half,
+    /// 4 = quarter). The one lever that cuts `gdf_reflect` (measured resolution-only). `P_REFLECT_RES_DIV`.
+    reflect_res_div: u32,
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
     /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
     gi_half_res: bool,
@@ -1977,6 +1980,14 @@ impl App {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(qp.gi_res_div)
             .clamp(1, 16);
+        // macOS/M3 perf (M3-C): reflection trace-resolution divisor used when `reflect_half_res` is on
+        // (2 = legacy half = the old `div_ceil(2)`, 4 = quarter). Only affects content (the gallery
+        // traces full-res = byte-identical). `P_REFLECT_RES_DIV` overrides the tier.
+        let reflect_res_div = std::env::var("P_REFLECT_RES_DIV")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(qp.reflect_res_div)
+            .clamp(1, 16);
         // Screen-space radiance probe GI (P1+): opt-in. Replaces the GI consumption (world-volume
         // sample / per-pixel ray march) with per-tile screen probes + a per-pixel gather. Default
         // OFF, so the gallery anchor (no env) stays byte-identical; an explicit `SCREEN_PROBE=1`
@@ -2371,6 +2382,7 @@ impl App {
             reflect_max_steps,
             gdf_cone_k,
             reflect_half_res,
+            reflect_res_div,
             gi_half_res,
             gi_res_div,
             screen_probe,
@@ -4382,11 +4394,15 @@ impl App {
                         )
                         .0
                 };
-                // Stage D3: trace the reflection at half res (1/4 the rays) + bilateral upsample
-                // to full res before the temporal resolve. gdf_reflect.slang samples the G-buffer
-                // by normalized UV, so a half extent + half dims trace correctly (no shader change).
+                // Stage D3 / M3-C: trace the reflection at 1/div res + bilateral upsample to full res
+                // before the temporal resolve. gdf_reflect.slang samples the G-buffer by normalized UV,
+                // so any coarser extent + dims trace correctly (no shader change). `div = 2` reproduces
+                // the legacy half-res exactly (`cw.div_ceil(2)` == the old `hcw/hch`); the Apple tier
+                // uses `div = 4` (quarter-res) — the measured single lever on gdf_reflect. Gallery keeps
+                // `reflect_half_res` off ⇒ div collapses to 1 (full-res, byte-identical anchor).
                 let refl_half = self.reflect_half_res;
-                let (rw, rh) = if refl_half { (hcw, hch) } else { (cw, ch) };
+                let rdiv = if refl_half { self.reflect_res_div.max(1) } else { 1 };
+                let (rw, rh) = (cw.div_ceil(rdiv), ch.div_ceil(rdiv));
                 let refl_extent = if refl_half {
                     Extent2D::new(rw, rh)
                 } else {
