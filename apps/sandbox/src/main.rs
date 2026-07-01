@@ -1592,7 +1592,28 @@ impl App {
             // it; cards are draw-list-driven.
             let build_cache = std::env::var_os("P11_LEGACY_IBL").is_none();
             if build_cache {
-                let (cards, card_albedo) = fuse::build_surface_cards(&obj_aabb, &obj_albedo);
+                // F1 (surface-cache virtualization): rank drawables for card residency from a
+                // static reference camera resolved once here, matching the per-frame camera's
+                // eye/focus precedence (`CAM_EYE`/`CAM_TARGET` → authored level view → orbit
+                // framing). Within-budget scenes (the gallery) keep every drawable regardless of
+                // this pose, so the anchor stays byte-identical; over-budget scenes select the
+                // camera-relevant subset deterministically and mark the rest coarse fallback.
+                let (ref_focus, ref_eye) =
+                    match (parse_vec3_env("CAM_EYE"), parse_vec3_env("CAM_TARGET")) {
+                        (Some(e), Some(t)) => (t, e),
+                        (Some(e), None) => (scene_center, e),
+                        _ => match level_view {
+                            Some((e, t)) => (t, e),
+                            None => (
+                                scene_center,
+                                scene_center
+                                    + Vec3::new(scene_radius * 1.6, scene_radius * 0.55, 0.0),
+                            ),
+                        },
+                    };
+                let card_cam = fuse::CardCamera::from_look(ref_eye, ref_focus);
+                let (cards, card_albedo, _residency) =
+                    fuse::build_surface_cards(&obj_aabb, &obj_albedo, &card_cam);
                 let num_cards = (cards.len() / 64) as u32;
                 // C: content stamps the drawable's true albedo onto its cards (fine color);
                 // the gallery keeps the legacy voxel-volume albedo (byte-identical anchor).
