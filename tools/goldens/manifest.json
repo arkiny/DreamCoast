@@ -16,7 +16,7 @@
         "LEVEL": "sponza_intel",
         "WARMUP_FRAMES": "64"
       },
-      "sha256": "0e5d94e61f23056758272e344f0373ec51995ac1cf100d27856d500b63cfbc74"
+      "sha256": "d372ba8cec5e103c7171231a3aca07ab798c04be0b0360cdd5bbeb052c7c240b"
     },
     "sponza_sc_viz": {
       "desc": "content: surface-cache viz (P_SC_VIZ)",
@@ -28,7 +28,7 @@
         "P_SC_VIZ": "1",
         "WARMUP_FRAMES": "64"
       },
-      "sha256": "f61c2d303879c76d134f2c1085922d24027ad13cf83bf5fabb828508e0ee0274"
+      "sha256": "e29b14bc1739de801e88b7ea3f5035b789a4cfa5974cf7ba3398ba28ac89b537"
     }
   }
 }
