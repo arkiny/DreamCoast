@@ -600,6 +600,12 @@ struct App {
     ssao_params: [f32; 4],
     /// C3: GDF 1-bounce diffuse GI added to the deferred ambient term.
     gdf_gi: bool,
+    /// F3 (HW-RT high-fidelity path, first increment): route the GI gather rays through the scene
+    /// TLAS via an inline RayQuery (hardware ray tracing) instead of the SW sphere-march. High-tier
+    /// opt-in (`P_HWRT_GI=1`); default off keeps the scalable SW path (gallery byte-identical). This
+    /// first increment returns a hardware-traced VISIBILITY term only (hit lighting is a later
+    /// increment) and requires the BLAS/TLAS built by `rt.rs` (currently the gallery scene only).
+    hwrt_gi: bool,
     /// 레퍼런스 엔진 GI-fidelity: world irradiance volume (DDGI-lite radiance cache). When on, the GI pass
     /// samples a multibounce-propagating world volume instead of a single-bounce ray march — the
     /// real fix for deep-interior darkness. Content-only (`P_GI_VOLUME`); gallery forced off.
@@ -1805,6 +1811,15 @@ impl App {
         let gdf_gi = gi.has_gi()
             && gdf.has_scene_sdf()
             && (!legacy_ibl || std::env::var_os("P11_GDF_GI").is_some());
+        // F3 (HW-RT high-fidelity path, first increment): opt-in `P_HWRT_GI=1`. Requires an RT
+        // device AND a built scene TLAS (rt.rs builds BLAS/TLAS only for the gallery scene today —
+        // the glTF/level path skips it because its per-primitive vertex/index storage buffers would
+        // overflow the 64-slot bindless storage table). Gated here so a content scene without a TLAS
+        // silently stays on the SW march instead of tracing an empty/stale acceleration structure.
+        let hwrt_gi = std::env::var_os("P_HWRT_GI").is_some()
+            && device.has_raytracing()
+            && rt.has_scene()
+            && gdf_gi;
         // 레퍼런스 엔진 GI-fidelity: the world irradiance volume (DDGI-lite) = our world-space RADIANCE CACHE,
         // the same idea 레퍼런스 SW-RT GI uses. It replaces the per-pixel 1-spp GI march with a smooth, stable
         // volume sample — so high-variance lighting (e.g. point lights) doesn't produce the firefly
@@ -2272,6 +2287,7 @@ impl App {
             ssao,
             ssao_params,
             gdf_gi,
+            hwrt_gi,
             gi_volume,
             skyvis_tint,
             skyvis_min_occ,
@@ -4089,6 +4105,9 @@ impl App {
                     self.gi_max_steps,
                     self.gdf_cone_k,
                     gi_volume_arg,
+                    // F3: HW-RT gather only on the ray-march path (the volume path samples the field,
+                    // not rays). Default off (`P_HWRT_GI` unset) -> SW march -> gallery byte-identical.
+                    self.hwrt_gi && gi_volume_arg.is_none(),
                 );
                 gi_skyvis_out = skyvis;
                 let raw = if half_gi {

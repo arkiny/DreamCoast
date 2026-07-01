@@ -130,7 +130,7 @@ impl GiSystem {
             dreamcoast_shader::gdf_gi_cs_dxil,
             dreamcoast_shader::gdf_gi_cs_metallib,
             "gdf_gi",
-            240,
+            256, // F3: +16B row for the HW-RT gather toggle (`hwrt`); default 0 = SW march.
         )?;
         let upsample_pipeline = compute(
             dreamcoast_shader::gdf_gi_upsample_cs_spirv,
@@ -786,6 +786,12 @@ impl GiSystem {
         // `(radiance_SH_base, skyvis_SH_base, update-pass write handle)` and reconstructs E(n) +
         // the sky-visibility instead of marching rays.
         gi_volume: Option<(u32, u32, ResourceId)>,
+        // F3 (HW-RT high-fidelity path, first increment): when true (High tier, `P_HWRT_GI=1`) the
+        // GI gather rays trace the scene TLAS with an inline RayQuery and return a hardware-traced
+        // visibility term instead of the SW sphere-march. Requires the BLAS/TLAS built by `rt.rs`
+        // (currently the gallery scene only). Ignored on the volume path (that samples the field).
+        // Default false keeps the SW march -> gallery byte-identical.
+        hwrt: bool,
         // Returns `(gi_image, skyvis_image)`; the sky-vis image (indoor skylight occlusion) is only
         // produced on the volume path (None on the ray-march/gallery path).
     ) -> (ResourceId, Option<ResourceId>) {
@@ -883,6 +889,7 @@ impl GiSystem {
                     cone_k,               // P3: cone-trace LOD slope (0 = legacy)
                     // vol_r = radiance SH base, vol_g = sky-vis SH base, vol_b = sky-vis out image.
                     [vol_r, vol_g, vol_b],
+                    u32::from(hwrt), // F3: HW-RT gather toggle (0 = SW march, default & anchor)
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
