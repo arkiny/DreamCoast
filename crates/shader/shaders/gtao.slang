@@ -2,7 +2,7 @@
 // GDF AO (gdf_ao.slang) misses. It reconstructs each pixel's world position + normal from
 // the G-buffer depth, samples neighbours in a depth-scaled screen-space disk, and accumulates
 // horizon obscurance. The result composes with the GDF AO in the lighting pass (near-field ×
-// far-field, the way UE layers GTAO × DFAO), restoring the crevice/contact definition that
+// far-field, the way 레퍼런스 엔진 layers GTAO × DFAO), restoring the crevice/contact definition that
 // makes surfaces read as solid rather than flat.
 //
 // Determinism (the DX≡VK gate): the per-pixel sampling rotation is a PURE INTEGER hash of the

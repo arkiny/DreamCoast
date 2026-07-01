@@ -788,6 +788,28 @@ pub fn bake_mesh_sdf(vertices: &[MeshVertex], indices: &[u32]) -> SdfVolume {
     bake_sdf_from_fused(&vtx, &idx, dim, mn, mx)
 }
 
+/// Bake a mesh's local-space **albedo** volumes (gi-fidelity-phases.md, F5 S1) over the
+/// *exact same* grid as [`bake_mesh_sdf`] — the size-scaled cubic `dim` on the mesh's padded
+/// local AABB — so the albedo tile aligns 1:1 with the SDF tile in the atlas and a single
+/// tile UVW mapping addresses both. `tri_albedo_bytes` is the per-triangle linear albedo
+/// (12 B / triangle, same order as `indices`), mirroring the dense `bake_albedo_from_fused`
+/// but bounded to this one mesh's frame so a hit reads the mesh's own colour at its own
+/// resolution instead of the coarse whole-scene albedo grid (which blurs across meshes).
+///
+/// `dim`/`aabb` match `bake_mesh_sdf` by construction (both call `mesh_sdf_dim` /
+/// `mesh_local_aabb_padded`), so the SDF atlas's `tile_uvw` is the albedo atlas's too.
+pub fn bake_mesh_albedo(
+    vertices: &[MeshVertex],
+    indices: &[u32],
+    tri_albedo_bytes: &[u8],
+) -> AlbedoVolumes {
+    let (mn, mx) = mesh_local_aabb_padded(vertices);
+    let dim = mesh_sdf_dim(mn, mx);
+    let vtx = encode_vertices_fused(vertices);
+    let idx = encode_indices(indices);
+    bake_albedo_from_fused(&vtx, &idx, tri_albedo_bytes, dim, mn, mx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

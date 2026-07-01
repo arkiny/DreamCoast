@@ -9,7 +9,7 @@
 // silhouettes / depth discontinuities — the classic guided upsample used for half-res
 // effects in commercial engines.
 //   Ref: J. Kopf, M. Cohen, D. Lischinski, M. Uyttendaele, "Joint Bilateral Upsampling",
-//        ACM SIGGRAPH 2007. (UE5 Lumen screen-probe / Frostbite half-res GI integrate the
+//        ACM SIGGRAPH 2007. (레퍼런스 엔진 SW GI screen-probe / 다른 레퍼런스 엔진 half-res GI integrate the
 //        same depth/normal-aware upscale.)
 //
 // The half-res GI was traced from the SAME full-res depth at each half texel's center, so a

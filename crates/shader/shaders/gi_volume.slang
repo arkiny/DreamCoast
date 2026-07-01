@@ -18,7 +18,7 @@
 // index is passed (read_rgb.x = sampled base of the previous slot, write_rgb.x = storage base
 // of this slot); read_rgb.w = reset.
 //
-// Sky-visibility (UE-style indoor skylight occlusion): the probe also projects a SCALAR directional
+// Sky-visibility (레퍼런스식 indoor skylight occlusion): the probe also projects a SCALAR directional
 // sky-visibility onto band-0/1 SH (4 R32F volumes/slot) — 1 on a sky-escape, 0 on a geometry hit. A
 // receiver reconstructs the cosine-weighted hemispherical sky visibility V(n); the lighting occludes
 // the IBL DIFFUSE skylight by it (with a tint/min-occlusion leak), so an enclosed interior isn't

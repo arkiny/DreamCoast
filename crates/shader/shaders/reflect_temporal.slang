@@ -1,6 +1,6 @@
 // Phase 11 Stage C8j — stochastic GDF reflection temporal resolve.
 //
-// `gdf_reflect.slang` now casts one GGX-importance-sampled ray per pixel per frame (UE Lumen's
+// `gdf_reflect.slang` now casts one GGX-importance-sampled ray per pixel per frame (레퍼런스 엔진 SW GI's
 // approach to rough reflections — sample the real lobe, then denoise — instead of an image-space
 // prefilter that can't average in the off-screen sky a rough lobe sees). This pass accumulates
 // those noisy single-ray samples over frames: reproject the surface into the previous frame, read
@@ -8,7 +8,7 @@
 // On the static screenshot the warm-up converges to the lobe average (a muted glossy reflection
 // like the path tracer); on a moving camera the reprojection keeps it stable (SSR-history style).
 //
-// Radiance is accumulated in a tonemap-weighted space (Karis / UE `RGBToDenoiserSpace`) so a
+// Radiance is accumulated in a tonemap-weighted space (Karis / 레퍼런스 엔진 `RGBToDenoiserSpace`) so a
 // bright sample can't dominate the average — the principled version of a per-tap clamp.
 
 #include "bindless.slang"
@@ -99,7 +99,7 @@ void fetch_refl_history(float2 puv, float3 world_pos, out float3 out_rgb, out fl
         out_len = len_sum / wsum;
     }
 }
-// Tonemap-weighted space for stable HDR averaging (UE RGBToDenoiserSpace).
+// Tonemap-weighted space for stable HDR averaging (레퍼런스 엔진 RGBToDenoiserSpace).
 float3 to_tm(float3 v) { return v / (1.0 + dot(v, float3(0.2126, 0.7152, 0.0722)) * pc.params.w); }
 float3 from_tm(float3 v)
 {
@@ -132,7 +132,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 world_pos = reconstruct(uv, depth);
     // Spatial reconstruction: average the current single-ray GGX samples over a roughness-scaled,
     // depth-weighted neighbourhood (each neighbour pixel traced a DIFFERENT GGX ray) to cut the
-    // per-pixel variance before temporal accumulation — UE resolves spatially + temporally. Sharp
+    // per-pixel variance before temporal accumulation — 레퍼런스 엔진 resolves spatially + temporally. Sharp
     // surfaces (chrome) use radius 0 (no blur).
     //
     // The SAME neighbourhood also builds the statistics for a TAA-style neighbourhood clamp of the
@@ -141,7 +141,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // direction's radiance (dark off-screen sky / shadowed geometry) across the chrome as a black
     // smear (the "no history" trails). Clamping the history into the current frame's local reflection
     // range kills that lag while keeping the static accumulation (history already in range -> a
-    // no-op, so the converged screenshot/parity baseline is preserved). UE Lumen / Frostbite
+    // no-op, so the converged screenshot/parity baseline is preserved). 레퍼런스 엔진 SW GI / 다른 레퍼런스 엔진
     // reflections clamp the same way.
     //
     // Two permutations (`pc.clamp_mode`), so the strength scales with the RenderQuality tier:

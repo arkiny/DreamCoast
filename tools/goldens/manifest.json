@@ -1,0 +1,34 @@
+{
+  "backend_note": "SHAs authored on the maintainer's box; exact match is the strict gate, pixel tolerance is the portable fallback.",
+  "configs": {
+    "gallery": {
+      "desc": "gallery anchor (default scene, byte-identity invariant)",
+      "env": {},
+      "sha256": "af70c1a5c8db49661d2c7926140c1309c28fda04c82cc1ab8aa6638d588b2b74"
+    },
+    "sponza_gdf_ao": {
+      "desc": "content: distance-field AO (DEBUG_VIEW=9)",
+      "env": {
+        "CAM_EYE": "-14,2,0",
+        "CAM_TARGET": "14,2,0",
+        "DEBUG_VIEW": "9",
+        "EV100": "11",
+        "LEVEL": "sponza_intel",
+        "WARMUP_FRAMES": "64"
+      },
+      "sha256": "0e5d94e61f23056758272e344f0373ec51995ac1cf100d27856d500b63cfbc74"
+    },
+    "sponza_sc_viz": {
+      "desc": "content: surface-cache viz (P_SC_VIZ)",
+      "env": {
+        "CAM_EYE": "-14,2,0",
+        "CAM_TARGET": "14,2,0",
+        "EV100": "11",
+        "LEVEL": "sponza_intel",
+        "P_SC_VIZ": "1",
+        "WARMUP_FRAMES": "64"
+      },
+      "sha256": "f61c2d303879c76d134f2c1085922d24027ad13cf83bf5fabb828508e0ee0274"
+    }
+  }
+}

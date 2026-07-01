@@ -5,7 +5,7 @@
 //   * C5 screen-space reflections (`ssr.slang`) — accurate where the reflected surface is on
 //     screen; rgb = reflected color, a = confidence. (Largely sky/off-screen here -> GDF fills.)
 //   * C6/C8j GDF reflections (`gdf_reflect.slang` + `reflect_temporal.slang`) — the reliable
-//     source: a GGX-importance-sampled, sphere-traced, temporally-resolved reflection (UE Lumen
+//     source: a GGX-importance-sampled, sphere-traced, temporally-resolved reflection (레퍼런스 엔진 SW GI
 //     style — the rough lobe is sampled by real rays, so it is already correctly blurred; no
 //     image-space prefilter needed). Mirror for near-zero roughness (the chrome).
 //

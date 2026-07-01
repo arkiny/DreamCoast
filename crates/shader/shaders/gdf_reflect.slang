@@ -60,7 +60,7 @@ ConstantBuffer<ReflectPush> pc : register(b0, space0);
 #define GDF_MAX (pc.aabb_max.xyz)
 #define GROUND_Y (pc.aabb_min.w)
 
-// C8j — GGX importance sampling for a stochastic reflection ray (UE Lumen casts ONE GGX ray /
+// C8j — GGX importance sampling for a stochastic reflection ray (레퍼런스 엔진 SW GI casts ONE GGX ray /
 // pixel into the real lobe directions, then denoises; an image-space prefilter of a single mirror
 // ray can't average in the off-screen sky a rough lobe sees, so a rough metal's reflection of the
 // bright ground reads too bright). One jittered ray/frame; the temporal resolve accumulates them.

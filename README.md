@@ -34,7 +34,7 @@ and D3D12 (≤ 0.001 avg/channel, verified on an RTX 2070 SUPER); Metal is at ne
   one deterministic `.dcasset`; a self-made ECS + glTF hierarchy import, RON levels, and
   camera-driven chunk streaming. Convention: **1 unit = 1 metre**.
 - **Multithreaded frame** — a from-scratch work-stealing **job system**, a fixed-timestep
-  sim loop, a parallel ECS schedule, and a UE-style **render-graph ↔ RHI thread split** with
+  sim loop, a parallel ECS schedule, and a 레퍼런스식 **render-graph ↔ RHI thread split** with
   1-frame overlap + parallel pass recording (`P15_RHI_THREAD` / `P15_PARALLEL_RECORD`).
 - **glTF animation** — node TRS clips (all 3 interpolation modes), **GPU vertex skinning**
   (vertex-pulling, Metal+VK+D3D12) + skinned shadows, and morph targets — driven from the
