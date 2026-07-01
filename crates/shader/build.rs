@@ -620,6 +620,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "wrc_update_cs",
     },
+    // Screen-space radiance probes (P5): per-probe radiance -> irradiance pre-integration.
+    Job {
+        src: "screen_probe_irradiance.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "screen_probe_irradiance_cs",
+    },
     // Physical-camera auto-exposure: luminance histogram (pass 1) → adapted exposure (pass 2).
     Job {
         src: "auto_exposure.slang",

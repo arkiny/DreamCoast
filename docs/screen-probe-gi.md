@@ -180,3 +180,22 @@ OFF so it never regresses the screen-probe default), with the honest finding rec
 a false quality claim. The multi-bounce-at-hits integration is the real untapped value and is
 noted for a future pass (it needs a hit-side irradiance lookup + reconciliation with the surface
 cache). Gallery anchor `dba9ff7c…`; screen-probe default unchanged at 5.988.
+
+## P5 — per-probe irradiance pre-integration (the dominant cost cut)
+
+`screen_probe_irradiance.slang`: convert each probe's octahedral RADIANCE tile into an
+octahedral IRRADIANCE tile ONCE (each output texel = the cosine-weighted hemispherical
+integral of the probe's radiance about that direction, rgb; sky visibility about it, alpha),
+via a groupshared threadgroup-per-tile reduction. The per-pixel gather then becomes a cheap
+directional LOOKUP — bilinearly sample each of the 4 neighbor probes' irradiance tile in the
+pixel normal direction — instead of a full hemisphere integral per pixel. That collapses the
+integrate from ~oct²-tap-per-pixel (256 at 8²) to ~4-probe × 4-tap. `screen_probe_integrate`
+gains `mode` (0 = direct integral, 1 = lookup); `P_SP_IRRADIANCE=0` restores the direct path.
+This is the reference's default gather; the research doc `docs/screen-probe-optimization.md`
+independently ranked it the biggest win.
+
+Verify (Metal): quality-neutral — gallery vs PT 5.994 (pre-integrated) vs 5.988 (direct
+integral); the two paths differ by only 0.015/ch avg (max 5), pure octahedral-interpolation
+error. Gallery byte-identical (no env, `dba9ff7c…`). Deterministic (`e9e982e8…`). Per-pass GPU
+ms pending the Metal timestamp timers (being wired up) — the win is structural (256→~16
+taps/pixel on the dominant per-pixel pass) and matches the reference default.
