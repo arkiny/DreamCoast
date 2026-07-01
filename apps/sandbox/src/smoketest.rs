@@ -11,8 +11,8 @@ use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
 use rhi::{
-    BackendKind, BlendMode, BufferDesc, BufferUsage, ClearColor, Device, Extent2D, Format,
-    GraphicsPipelineDesc, PrimitiveTopology, Swapchain, Texture, VertexLayout,
+    BackendKind, BlendMode, BufferDesc, BufferUsage, ClearColor, DepthCompare, Device, Extent2D,
+    Format, GraphicsPipelineDesc, PrimitiveTopology, Swapchain, Texture, VertexLayout,
 };
 use tracing::info;
 
@@ -144,6 +144,7 @@ pub(crate) fn run_triangle_test(
         uniform_buffer: false,
         depth_test: false,
         depth_write: false,
+        depth_compare: DepthCompare::Less,
         depth_format: None,
     })?;
 
@@ -294,6 +295,7 @@ pub(crate) fn run_mesh_test(
         uniform_buffer: false,
         depth_test: true,
         depth_write: true,
+        depth_compare: DepthCompare::Less,
         depth_format: Some(DEPTH_FORMAT),
     })?;
 

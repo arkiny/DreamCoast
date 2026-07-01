@@ -10,8 +10,9 @@ use dreamcoast_core::EngineError;
 use dreamcoast_platform::Input;
 use imgui::{Context, DrawCmd, DrawData, DrawIdx, DrawVert};
 use rhi::{
-    BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, Device, Format, GraphicsPipeline,
-    GraphicsPipelineDesc, PrimitiveTopology, Recorder, Rect2D, Texture, TextureDesc, VertexLayout,
+    BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, DepthCompare, Device, Format,
+    GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, Recorder, Rect2D, Texture,
+    TextureDesc, VertexLayout,
 };
 
 /// Per-frame-in-flight dynamic geometry buffers (grown as needed).
@@ -91,6 +92,7 @@ impl Gui {
             uniform_buffer: false,
             depth_test: false,
             depth_write: false,
+            depth_compare: DepthCompare::Less,
             depth_format: None,
         })?;
 

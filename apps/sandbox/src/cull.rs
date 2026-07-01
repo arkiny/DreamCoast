@@ -9,9 +9,9 @@
 
 use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourceId};
 use rhi::{
-    BackendKind, BlendMode, Buffer, ComputePipeline, ComputePipelineDesc, Device, Extent2D, Format,
-    GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, StorageBuffer, StorageBufferDesc,
-    VertexLayout,
+    BackendKind, BlendMode, Buffer, ComputePipeline, ComputePipelineDesc, DepthCompare, Device,
+    Extent2D, Format, GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, StorageBuffer,
+    StorageBufferDesc, VertexLayout,
 };
 
 use crate::app::{load_compute_shader, load_shader_pair};
@@ -118,6 +118,7 @@ impl CullSystem {
                 uniform_buffer: false,
                 depth_test: true,
                 depth_write: true,
+                depth_compare: DepthCompare::Less,
                 depth_format: Some(DEPTH_FORMAT),
             })?)
         } else {
