@@ -27,7 +27,9 @@
 /// so the byte-identical anchor is preserved.
 pub const TAA_MIP_BIAS: f32 = -1.0;
 
-/// Render quality tier. `Med` is the default (unset env) and matches the legacy behavior.
+/// Render quality tier. `Med` is the explicit default (`RENDER_QUALITY=med`) and matches the legacy
+/// behavior byte-for-byte. `Apple` is a platform-default tier auto-selected on Apple GPUs (never via
+/// an explicit `RENDER_QUALITY` value) — see [`RenderQuality::from_env_for_device`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderQuality {
     /// Low-end fallback: heavy reflection/GI features off, fewer samples, cheaper SSR.
@@ -36,30 +38,59 @@ pub enum RenderQuality {
     Med,
     /// Quality: opt-in surface cache / GDF AO, doubled GI samples, aesthetic soft shadows.
     High,
+    /// Apple-platform default (macOS perf, axis A): a Med-derived tier tuned for the weak unified
+    /// iGPU + TBDR of Apple Silicon. Auto-selected only when `RENDER_QUALITY` is UNSET and an Apple
+    /// GPU is detected; an explicit `RENDER_QUALITY=med|low|high` always wins over it. Drops the
+    /// internal render resolution, turns off the redundant second AO pass, and shortens the SW-RT
+    /// reflection/GI marches — all as *tier defaults*, so every `RENDER_SCALE`/`SSAO`/`P11_*`
+    /// override still wins at the consumer site. Never affects the gallery anchor (forced legacy at
+    /// the call site) or the VK/D3D12 backends (they never report an Apple GPU).
+    Apple,
 }
 
 impl RenderQuality {
-    /// Resolve the active tier from `RENDER_QUALITY` (unset / unrecognized => platform default).
-    pub fn from_env() -> Self {
+    /// Resolve the active tier, consulting the GPU identity for the platform default. An explicit
+    /// `RENDER_QUALITY=low|med|high` still wins (returned verbatim); only the UNSET path consults
+    /// the device, and only an Apple GPU changes the result (to the aggressive [`Apple`] tier).
+    /// Non-Apple / unknown falls back to the honest `Med`. This is the sole entry point that can
+    /// return [`RenderQuality::Apple`] — the tier can never be forced via an env string.
+    ///
+    /// [`Apple`]: RenderQuality::Apple
+    pub fn from_env_for_device(info: &rhi::DeviceInfo) -> Self {
+        Self::from_explicit_env().unwrap_or_else(|| Self::device_default(info))
+    }
+
+    /// The explicit `RENDER_QUALITY` selection, or `None` when unset / unrecognized (=> a
+    /// platform-default path should decide). `Apple` is intentionally NOT reachable here.
+    fn from_explicit_env() -> Option<Self> {
         match std::env::var("RENDER_QUALITY")
             .ok()
             .as_deref()
             .map(|s| s.trim().to_ascii_lowercase())
             .as_deref()
         {
-            Some("low") => RenderQuality::Low,
-            Some("med") | Some("medium") => RenderQuality::Med,
-            Some("high") => RenderQuality::High,
-            _ => Self::platform_default(),
+            Some("low") => Some(RenderQuality::Low),
+            Some("med") | Some("medium") => Some(RenderQuality::Med),
+            Some("high") => Some(RenderQuality::High),
+            _ => None,
         }
     }
 
-    /// The default tier when `RENDER_QUALITY` is unset. `Med` everywhere today (= the legacy
-    /// no-reg baseline). This is the seam where future per-platform / per-GPU selection plugs in:
-    /// a low-end mobile/iGPU would map to `Low`, a high-end desktop GPU to `High`. Kept honest —
-    /// without a GPU perf-tier lookup we don't fake detection, so it returns `Med` for now.
-    pub fn platform_default() -> RenderQuality {
-        RenderQuality::Med
+    /// The default tier for a given GPU when `RENDER_QUALITY` is unset. Apple GPUs (detected by the
+    /// vendor name substring, `hasUnifiedMemory` as a secondary hint) map to the aggressive [`Apple`]
+    /// tier; every other / unknown GPU keeps the honest `Med` fallback (matches VK/D3D12, which never
+    /// report an Apple adapter — so this is a no-op for those backends).
+    ///
+    /// [`Apple`]: RenderQuality::Apple
+    fn device_default(info: &rhi::DeviceInfo) -> RenderQuality {
+        // Primary signal: the adapter name contains "Apple". Secondary: a unified-memory low-power
+        // GPU is an integrated part that also wants the aggressive tier (defends against a driver
+        // formatting change that drops "Apple" from the name).
+        if info.is_apple_gpu() || (info.unified_memory && info.low_power) {
+            RenderQuality::Apple
+        } else {
+            RenderQuality::Med
+        }
     }
 
     pub fn label(self) -> &'static str {
@@ -67,6 +98,7 @@ impl RenderQuality {
             RenderQuality::Low => "low",
             RenderQuality::Med => "med",
             RenderQuality::High => "high",
+            RenderQuality::Apple => "apple",
         }
     }
 }
@@ -88,6 +120,11 @@ pub struct QualityPreset {
     pub reflect_max_roughness: f32,
     /// C2 GDF ambient occlusion (`P11_GDF_AO`).
     pub gdf_ao: bool,
+    /// Near-field screen-space AO (HBAO-lite), a SECOND independent AO pass composed with `gdf_ao`
+    /// (`SSAO`). On for content on most tiers; the Apple platform tier turns it OFF (gdf_ao already
+    /// supplies contact AO, and this reclaims a full ~13 ms pass on the M3). Gallery forces it via
+    /// `!gallery_scene` at the call site regardless of the tier, so the anchor is unaffected.
+    pub ssao: bool,
     /// Firefly clamp on the reflection/GI radiance (`P11_FIREFLY_CLAMP`).
     pub firefly_clamp: bool,
     /// PCSS-lite penumbra scale; 0 = hard 3x3 PCF (`SHADOW_SOFTNESS`).
@@ -180,6 +217,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             ssr_stochastic: true,
             reflect_max_roughness: 0.3,
             gdf_ao: false,
+            ssao: true, // content default (gallery forces via !gallery_scene at the call site)
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 8,
@@ -211,6 +249,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             ssr_stochastic: false,
             reflect_max_roughness: 0.5,
             gdf_ao: true, // PBR contact AO (fixed contact-scale reach) — depth for content
+            ssao: true,   // content default (= the legacy !gallery_scene default; no-reg)
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 16,
@@ -240,6 +279,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             ssr_stochastic: false,
             reflect_max_roughness: 0.6,
             gdf_ao: true,
+            ssao: true, // content default (gallery forces via !gallery_scene at the call site)
             firefly_clamp: true,
             shadow_softness: 0.03,
             shadow_taps: 16,
@@ -251,6 +291,59 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             gdf_cone_k: 0.0,
             gi_res_div: 2,
             reflect_history_clamp: 2, // variance (gentler on sharp mirrors) — quality tier
+            reflect_clamp_gamma: 1.25,
+            gi_temporal_clamp: 0.0,
+        },
+        // Apple-platform default (macOS perf, axis A). Derived from `Med` — same feature SET and the
+        // same denoise/clamp behaviour, so the look matches Med — with the cost knobs pushed for the
+        // weak unified iGPU + TBDR of Apple Silicon. Auto-selected only on an Apple GPU with
+        // `RENDER_QUALITY` unset; every value here is a tier DEFAULT that its own env var overrides.
+        //
+        // The M0 baseline (Sponza Med, native 1440p on M3) is ~165 ms; the SW-RT reflection+AO stack
+        // is ~82% of it, and `render_scale=1.0` (native QHD on an iGPU) is the single biggest lever.
+        // Starting points (the lead measures the real ms; these are picked, not measured here):
+        //   * render_scale 0.67 — ~0.44x internal pixels vs native; every per-pixel SW-RT pass
+        //     (gdf_reflect/gdf_ao/ssao/ssr/temporal) scales ~with it. The 2/3 (not 1/2) point keeps
+        //     detailed geometry legible under TAAU (see the Low-tier note). This is THE big win.
+        //   * ssao OFF — gdf_ao already supplies contact AO; the near-field HBAO-lite pass is a
+        //     second, independent ~13 ms AO pass whose contribution largely overlaps gdf_ao's on
+        //     content. Dropping it reclaims that pass outright. (gdf_ao stays on — the depth cue.)
+        //   * reflect_max_steps 96 -> 56 — gdf_reflect dominates the frame; the reflection is
+        //     temporally accumulated + half-res, so a shorter GGX march holds up. Mid of the 48-64
+        //     band: low enough to pay off, high enough that distant rays don't obviously leak sky.
+        //   * gdf_cone_k 0.06 — widen the cone-trace step with distance across GI/reflection/cache
+        //     marches (grazing rays stop crawling); denoised/EMA signals tolerate it. Above Med's
+        //     0.02, near Low's 0.05.
+        //   * gi_res_div 4 — quarter-res GI trace (vs Med's third-res). The div-4 parity risk noted
+        //     for Med is a DX=VK concern; macOS is Metal-only, so we can take the cheaper trace here.
+        //   * reflect_max_roughness 0.4 — fade screen-mirror SSR to the cheap GDF fallback sooner
+        //     (rougher surfaces don't need the sharp SSR march). Below Med's 0.5, above Low's 0.3.
+        //   * cache_relight_period 64 — relight fewer surface-cache cards per frame (vs Med's 40).
+        //     The cache persists radiance + EMA-denoises, so a longer period trades moving-camera
+        //     convergence lag for a cheaper `sdf_cache_light`. Aggressive but reversible.
+        // Everything else tracks Med (feature set, GI half-res, spp, shadows, temporal clamps).
+        RenderQuality::Apple => QualityPreset {
+            gi_spp: 1,
+            gi_max_steps: 24,
+            reflect_max_steps: 56,
+            gi_denoise: true,
+            reflect_cache: true,
+            surface_cache: false,
+            ssr_stochastic: false,
+            reflect_max_roughness: 0.4,
+            gdf_ao: true, // contact AO retained — it is the AO source once ssao is off
+            ssao: false,  // OFF on Apple: gdf_ao covers contact AO; reclaims the ~13 ms 2nd AO pass
+            firefly_clamp: true,
+            shadow_softness: 0.0,
+            shadow_taps: 16,
+            cache_relight_period: 64,
+            gi_half_res: true,
+            cache_relight_spp: 1,
+            reflect_half_res: true,
+            render_scale: 0.67,
+            gdf_cone_k: 0.06,
+            gi_res_div: 4,
+            reflect_history_clamp: 1, // hard (matches Med) — kills rotation smear
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
         },

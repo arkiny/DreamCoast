@@ -530,6 +530,22 @@ impl Device {
         }
     }
 
+    /// Backend-agnostic GPU identity (adapter name + cheap capability flags), for platform-default
+    /// quality-tier selection (macOS perf, axis A). Read-only + additive — surfacing it changes no
+    /// backend's rendering behavior. On Metal it reflects the live `MTLDevice`
+    /// (`name`/`hasUnifiedMemory`/`isLowPower`); on Vulkan/D3D12 it reports a stable non-Apple marker
+    /// (those adapters are never Apple GPUs in this engine, so the tier only needs that distinction).
+    pub fn device_info(&self) -> DeviceInfo {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => d.device_info(),
+            #[cfg(windows)]
+            Self::D3d12(d) => d.device_info(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => d.device_info(),
+        }
+    }
+
     /// Whether hardware ray tracing is available (Vulkan KHR ray-tracing
     /// extensions / D3D12 DXR Tier >= 1.1) (Phase 8). Always false on Metal for
     /// now (Phase 8 deferred).
