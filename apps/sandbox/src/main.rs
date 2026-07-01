@@ -3189,13 +3189,22 @@ impl App {
                 gdf_ao,
                 gdf_gi,
                 gi_spp,
+                gi_max_steps,
                 cache_relight_period,
+                cache_relight_spp,
                 gi_half_res,
                 gi_res_div,
                 reflect_history_clamp,
                 reflect_clamp_gamma,
                 gi_temporal_clamp,
                 gi_denoise,
+                reflect_max_steps,
+                reflect_res_div,
+                reflect_half_res,
+                ao_res_div,
+                gi_atrous_steps,
+                gdf_cone_k,
+                render_scale,
                 gdf_ssr,
                 gdf_reflect,
                 gdf_hybrid,
@@ -3328,6 +3337,118 @@ impl App {
                     // flat wall of toggles. Core groups default open.
                     use imgui::TreeNodeFlags;
                     let open = TreeNodeFlags::DEFAULT_OPEN;
+
+                    // Live scalability panel (docs/scalability-system.md): the individual knobs the
+                    // RenderQuality tier resolves, exposed as live sliders/toggles. The render graph
+                    // rebuilds every frame, so a change here takes effect immediately — no restart.
+                    // The gallery scene is the byte-identical path-tracer-parity anchor, so its
+                    // controls are disabled here (the headless screenshot path has no UI at all and
+                    // is unaffected regardless; this is purely to stop an interactive session from
+                    // perturbing the anchor image by hand).
+                    if ui.collapsing_header("Scalability", open) {
+                        if *is_gallery {
+                            ui.text_disabled(
+                                "gallery scene: scalability knobs locked (byte-identical anchor)",
+                            );
+                        }
+                        ui.disabled(*is_gallery, || {
+                            ui.slider("Render scale", 0.33, 1.0, render_scale);
+                            *render_scale = render_scale.clamp(0.3333, 1.0);
+                            if ui.slider("GI res divisor", 1u32, 8, gi_res_div) {
+                                *gi_res_div = (*gi_res_div).clamp(1, 8);
+                            }
+                            if ui.slider("Reflect res divisor", 1u32, 8, reflect_res_div) {
+                                *reflect_res_div = (*reflect_res_div).clamp(1, 8);
+                            }
+                            if ui.slider("AO res divisor", 1u32, 4, ao_res_div) {
+                                *ao_res_div = (*ao_res_div).clamp(1, 4);
+                            }
+                            if ui.slider("GI a-trous steps", 1u32, 5, gi_atrous_steps) {
+                                *gi_atrous_steps = (*gi_atrous_steps).clamp(1, 5);
+                            }
+                            if ui.slider("GI samples/px", 1u32, 32, gi_spp) {
+                                *gi_spp = (*gi_spp).clamp(1, 256);
+                            }
+                            if ui.slider("GI max march steps", 8u32, 128, gi_max_steps) {
+                                *gi_max_steps = (*gi_max_steps).clamp(1, 256);
+                            }
+                            if ui.slider("Reflect max march steps", 8u32, 256, reflect_max_steps) {
+                                *reflect_max_steps = (*reflect_max_steps).clamp(1, 256);
+                            }
+                            if ui.slider("Cache relight period", 1u32, 256, cache_relight_period) {
+                                *cache_relight_period = (*cache_relight_period).max(1);
+                            }
+                            ui.slider("Reflect max roughness", 0.0, 1.0, reflect_max_roughness);
+                            ui.slider("GDF cone-trace slope", 0.0, 0.2, gdf_cone_k);
+                            *gdf_cone_k = gdf_cone_k.clamp(0.0, 1.0);
+                            ui.slider("Shadow softness (0=hard)", 0.0, 0.1, shadow_softness);
+                            if ui.slider("Shadow taps", 1u32, 16, shadow_taps) {
+                                *shadow_taps = (*shadow_taps).clamp(1, 16);
+                            }
+
+                            ui.checkbox("Stochastic SSR", ssr_stochastic);
+                            if ui.checkbox("GI half-res trace", gi_half_res) {
+                                *gi_half_res = gi.has_upsample() && *gi_half_res;
+                            }
+                            if ui.checkbox("Reflect half-res trace", reflect_half_res) {
+                                *reflect_half_res = gi.has_upsample() && *reflect_half_res;
+                            }
+                            if ui.checkbox("GDF ambient occlusion", gdf_ao) {
+                                *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && *gdf_ao;
+                            }
+                            ui.checkbox("Firefly clamp", firefly_clamp);
+                            if ui.checkbox("GI denoise", gi_denoise) {
+                                *gi_denoise = gi.has_denoise() && *gi_denoise;
+                            }
+
+                            let mut clamp_idx = (*reflect_history_clamp).min(2) as usize;
+                            if ui.combo_simple_string(
+                                "Reflect history clamp",
+                                &mut clamp_idx,
+                                &["off", "hard", "variance"],
+                            ) {
+                                *reflect_history_clamp = clamp_idx as u32;
+                            }
+
+                            if ui.button("Reset to tier default") {
+                                let base = if *is_gallery {
+                                    quality::gallery_preset()
+                                } else {
+                                    quality::preset(*quality)
+                                };
+                                *render_scale = base.render_scale.clamp(0.3333, 1.0);
+                                *gi_res_div = base.gi_res_div.clamp(1, 16);
+                                *reflect_res_div = base.reflect_res_div.clamp(1, 16);
+                                *ao_res_div = base.ao_res_div.clamp(1, 16);
+                                *gi_atrous_steps = base.gi_atrous_steps.clamp(1, 5);
+                                *gi_spp = base.gi_spp.clamp(1, 256);
+                                *gi_max_steps = base.gi_max_steps.clamp(1, 256);
+                                *reflect_max_steps = base.reflect_max_steps.clamp(1, 256);
+                                *cache_relight_period = base.cache_relight_period.max(1);
+                                *cache_relight_spp = base.cache_relight_spp.max(1);
+                                *reflect_max_roughness = base.reflect_max_roughness;
+                                *gdf_cone_k = base.gdf_cone_k.clamp(0.0, 1.0);
+                                *shadow_softness = base.shadow_softness;
+                                *shadow_taps = base.shadow_taps.clamp(1, 16);
+                                *ssr_stochastic = base.ssr_stochastic;
+                                *gi_half_res = gi.has_upsample() && base.gi_half_res;
+                                *reflect_half_res = gi.has_upsample() && base.reflect_half_res;
+                                *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && base.gdf_ao;
+                                *firefly_clamp = base.firefly_clamp;
+                                *gi_denoise = gi.has_denoise() && base.gi_denoise;
+                                *reflect_history_clamp = base.reflect_history_clamp.min(2);
+                                *reflect_clamp_gamma = base.reflect_clamp_gamma;
+                                *gi_temporal_clamp = base.gi_temporal_clamp;
+                                *reflect_cache = *swrt_reflect
+                                    && gdf.has_surface_cache()
+                                    && gdf.has_cache_lighting()
+                                    && base.reflect_cache;
+                                *surface_cache = gdf.has_surface_cache()
+                                    && gdf.has_cache_lighting()
+                                    && base.surface_cache;
+                            }
+                        });
+                    }
 
                     if ui.collapsing_header("Lighting", open) {
                         ui.combo_simple_string("Debug view", debug_view, &DEBUG_VIEWS);
