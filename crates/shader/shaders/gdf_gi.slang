@@ -196,15 +196,18 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     uint seed = (tid.x * 1973u + tid.y * 9277u + pc.frame * 26699u) | 1u;
     float3 origin = world_pos + n * pc.params.y;
 
-    // F3 first increment — HARDWARE-RAYTRACED gather (High tier, opt-in `P_HWRT_GI=1`). Cast the
-    // same cosine-hemisphere GI rays against the scene TLAS (built by rt.rs, shared bindless
-    // `g.tlas` binding) with an inline RayQuery — the same trace primitive the ground-truth path
-    // tracer uses — and accumulate a hardware-traced VISIBILITY term (1 = ray escaped / sky seen,
-    // 0 = occluded by geometry). This proves the TLAS is reusable from the real-time GI seam and
-    // runs on Metal's inline-RT path. PARTIAL: it returns occlusion only; reading the hit's
-    // surface-cache lighting (so the HW path matches the SW march's bounce radiance) is the next
-    // increment. Written as `e = sky_term * V` so the output stays in the same "indirect E" units
-    // the lighting multiplies by albedo. `hwrt == 0` (default) skips this entirely -> SW march.
+    // F3 — HARDWARE-RAYTRACED gather (High tier). Compiled in ONLY by the `gdf_gi_hwrt` permutation
+    // (`HWRT_GI` define, see build.rs `defines_for`); the default `gdf_gi` variant strips this whole
+    // block so it references no acceleration structure — Slang then omits the `g.tlas` binding,
+    // keeping the scalable SW-default GI independent of RT capability and free of the RT path's
+    // register pressure. The host loads this variant only when HW-RT GI is opted in (`P_HWRT_GI=1`)
+    // AND the device is RT-capable AND a scene TLAS exists. Cast the same cosine-hemisphere GI rays
+    // against the scene TLAS with an inline RayQuery (the ground-truth path tracer's trace
+    // primitive) and accumulate a hardware-traced VISIBILITY term (1 = ray escaped / sky seen). It
+    // is bound as `gi_pipeline` only when `pc.hwrt != 0`, so the runtime guard is redundant with the
+    // compile-time gate but kept as a belt-and-braces no-op. PARTIAL: occlusion only; reading the
+    // hit's surface-cache lighting is the next increment.
+#ifdef HWRT_GI
     if (pc.hwrt != 0u)
     {
         float vis = 0.0;
@@ -229,6 +232,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
         return;
     }
+#endif
 
     BounceScene bs = gi_bounce_scene();
 
