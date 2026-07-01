@@ -42,6 +42,7 @@ mod gtao;
 mod ibl;
 mod level;
 mod mesh;
+mod mesh_sdf;
 mod morph;
 mod particle;
 mod push;
