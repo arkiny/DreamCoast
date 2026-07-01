@@ -234,6 +234,184 @@ impl SdfAtlas {
     }
 }
 
+// --- F2 S1: sparse-brick occupancy analysis (gi-fidelity-phases.md, F2) ---------------
+//
+// A dense `dim³` tile spends most of its voxels on far-from-surface distance, which is pure
+// low-frequency filler: the coarse whole-scene field already carries long-range distance, and
+// the sampler only needs the per-mesh field *near the surface* to pull the iso-surface onto the
+// mesh's thin geometry. So a mesh's field can be split into small **bricks** and only the bricks
+// the surface passes through need be stored; the rest are an "empty" marker that falls back to
+// the coarse field. This module is the CPU **analysis + measurement** for that split — it
+// classifies bricks and reports the projected memory win, so S2 (the GPU brick atlas +
+// indirection volume) can be built against a measured, unit-tested data structure. No GPU wiring
+// here; the pack contract above is untouched.
+
+/// Brick edge (voxels). A mesh field is split into `ceil(dim / BRICK_DIM)³` bricks. 8 keeps
+/// bricks small enough that empty ones are a real saving, while large enough that the
+/// per-brick indirection overhead (S2) stays modest.
+pub const BRICK_DIM: u32 = 8;
+
+/// Per-brick occupancy classification of one mesh field: which bricks the surface passes
+/// through (within a distance band) versus empty. Deterministic — a pure function of the field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrickOccupancy {
+    /// The mesh's `SdfVolume::dim`.
+    pub dim: u32,
+    /// Brick-grid resolution per axis = `dim.div_ceil(BRICK_DIM)` (same on all axes since the
+    /// field is cubic).
+    pub bricks_per_axis: u32,
+    /// One flag per brick, `bidx = bx + bricks_per_axis*(by + bricks_per_axis*bz)`: `true` if the
+    /// brick is occupied (holds a voxel with `|distance| < band`), `false` if empty.
+    pub occupied: Vec<bool>,
+}
+
+impl BrickOccupancy {
+    /// Total brick count (`bricks_per_axis³`).
+    pub fn brick_count(&self) -> u32 {
+        self.bricks_per_axis * self.bricks_per_axis * self.bricks_per_axis
+    }
+
+    /// How many bricks are occupied.
+    pub fn occupied_count(&self) -> u32 {
+        self.occupied.iter().filter(|&&b| b).count() as u32
+    }
+}
+
+/// A per-mesh band width (world distance units) below which a voxel counts as "near the
+/// surface", derived from the mesh's own voxel size: `band = margin * voxel_edge`, where
+/// `voxel_edge` is the largest per-axis voxel spacing (`extent / dim`). Measuring in voxels
+/// makes the band mesh-relative — a coarse mesh gets a proportionally wider band — so a brick
+/// straddling the surface is classified occupied regardless of the mesh's scale. `margin`
+/// controls how many voxels of shell around the zero-isosurface are kept resident; a band of a
+/// few voxels captures the trilinear neighbourhood the sampler actually reads.
+pub fn brick_band_for(vol: &SdfVolume, margin: f32) -> f32 {
+    let dim = vol.dim.max(1) as f32;
+    let voxel_edge = (0..3)
+        .map(|a| (vol.aabb_max[a] - vol.aabb_min[a]).abs() / dim)
+        .fold(0.0f32, f32::max);
+    margin * voxel_edge.max(f32::MIN_POSITIVE)
+}
+
+/// Classify each `BRICK_DIM³` brick of `vol` as occupied (`|distance| < band` for some voxel it
+/// covers) or empty. `band` is a world-space distance (see [`brick_band_for`]). Deterministic:
+/// a pure scan of the voxels, so the same field always yields the same flags.
+///
+/// A brick covers voxels `[bx*BRICK_DIM .. min((bx+1)*BRICK_DIM, dim))` per axis (the last brick
+/// along each axis is partial when `dim` is not a multiple of `BRICK_DIM`). Any covered voxel
+/// within the band marks the whole brick occupied — conservative, so the surface is never
+/// dropped from residency.
+pub fn classify_bricks(vol: &SdfVolume, band: f32) -> BrickOccupancy {
+    let dim = vol.dim;
+    let bpa = dim.div_ceil(BRICK_DIM).max(1);
+    let mut occupied = vec![false; (bpa * bpa * bpa) as usize];
+    let at = |x: u32, y: u32, z: u32| vol.voxels[(x + dim * (y + dim * z)) as usize];
+    for bz in 0..bpa {
+        for by in 0..bpa {
+            for bx in 0..bpa {
+                let mut hit = false;
+                let z0 = bz * BRICK_DIM;
+                let z1 = ((bz + 1) * BRICK_DIM).min(dim);
+                let y0 = by * BRICK_DIM;
+                let y1 = ((by + 1) * BRICK_DIM).min(dim);
+                let x0 = bx * BRICK_DIM;
+                let x1 = ((bx + 1) * BRICK_DIM).min(dim);
+                'scan: for z in z0..z1 {
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            if at(x, y, z).abs() < band {
+                                hit = true;
+                                break 'scan;
+                            }
+                        }
+                    }
+                }
+                occupied[(bx + bpa * (by + bpa * bz)) as usize] = hit;
+            }
+        }
+    }
+    BrickOccupancy {
+        dim,
+        bricks_per_axis: bpa,
+        occupied,
+    }
+}
+
+/// The measured sparse-brick win for a set of meshes, versus the current dense atlas.
+///
+/// All byte figures count only the f32 distance payload of the *tiles* (the gutter/shelf waste
+/// of a concrete atlas pack is not modelled here — this is an apples-to-apples payload
+/// comparison of dense vs. brick storage, the quantity S2 actually trades). "Sparse" adds a
+/// 1-voxel gutter *per brick* (so a brick tap clamps to its own edge, exactly as the dense
+/// tiles do today), which is the real cost the S2 brick atlas will pay.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrickAnalysis {
+    /// Number of meshes analysed.
+    pub mesh_count: usize,
+    /// Sum over meshes of `bricks_per_axis³`.
+    pub total_bricks: u64,
+    /// Sum over meshes of occupied bricks.
+    pub occupied_bricks: u64,
+    /// `occupied_bricks / total_bricks` (0 when there are no bricks).
+    pub occupied_fraction: f32,
+    /// Dense payload: sum of `dim³` voxels × 4 bytes (the tile payload the current atlas stores).
+    pub dense_bytes: u64,
+    /// Sparse payload: sum over occupied bricks of `(BRICK_DIM + 2)³` voxels × 4 bytes (each
+    /// brick padded by a 1-voxel gutter, matching the atlas's clamp-to-edge tap convention).
+    pub sparse_bytes: u64,
+}
+
+impl BrickAnalysis {
+    /// `sparse_bytes / dense_bytes` (1.0 when dense is empty) — the memory fraction the brick
+    /// scheme projects. Lower is better; a value above 1 means the per-brick gutter overhead
+    /// outweighs the emptiness (only for meshes that are almost entirely surface).
+    pub fn memory_ratio(&self) -> f32 {
+        if self.dense_bytes == 0 {
+            1.0
+        } else {
+            self.sparse_bytes as f32 / self.dense_bytes as f32
+        }
+    }
+}
+
+/// Analyse the sparse-brick occupancy over `meshes`, deriving each mesh's band from its own
+/// voxel size (`margin` voxels of shell; see [`brick_band_for`]). Returns the aggregate
+/// occupied-brick fraction and the projected dense-vs-sparse payload bytes. Deterministic.
+///
+/// This is the F2 measurement primitive: it quantifies "how much of the dense tile is actually
+/// near the surface" for a real mesh set, so the S2 brick atlas can be justified and sized
+/// before any GPU code is written.
+pub fn analyze_bricks(meshes: &[SdfVolume], margin: f32) -> BrickAnalysis {
+    let gutter_side = (BRICK_DIM + 2 * GUTTER) as u64;
+    let brick_payload = gutter_side * gutter_side * gutter_side * 4;
+
+    let mut total_bricks = 0u64;
+    let mut occupied_bricks = 0u64;
+    let mut dense_bytes = 0u64;
+    let mut sparse_bytes = 0u64;
+    for m in meshes {
+        let band = brick_band_for(m, margin);
+        let occ = classify_bricks(m, band);
+        total_bricks += occ.brick_count() as u64;
+        let occ_n = occ.occupied_count() as u64;
+        occupied_bricks += occ_n;
+        dense_bytes += (m.dim as u64).pow(3) * 4;
+        sparse_bytes += occ_n * brick_payload;
+    }
+    let occupied_fraction = if total_bricks == 0 {
+        0.0
+    } else {
+        occupied_bricks as f32 / total_bricks as f32
+    };
+    BrickAnalysis {
+        mesh_count: meshes.len(),
+        total_bricks,
+        occupied_bricks,
+        occupied_fraction,
+        dense_bytes,
+        sparse_bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +546,256 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // --- F2 S1: sparse-brick occupancy analysis ---------------------------------------
+
+    /// A `dim³` field whose voxel value is the signed distance (in AABB-normalized units) to a
+    /// planar surface at normalized `x = plane_t` — a controlled "surface" whose occupied bricks
+    /// are analytically known. Distance is `(x_center - plane_t)` scaled to the AABB extent, so
+    /// the band test behaves like a real world-space SDF over `[0,1]³`.
+    fn plane_field(dim: u32, plane_t: f32) -> SdfVolume {
+        let n = (dim * dim * dim) as usize;
+        let mut voxels = vec![0.0f32; n];
+        for z in 0..dim {
+            for y in 0..dim {
+                for x in 0..dim {
+                    let xc = (x as f32 + 0.5) / dim as f32; // voxel-center normalized x
+                    voxels[(x + dim * (y + dim * z)) as usize] = xc - plane_t;
+                }
+            }
+        }
+        SdfVolume {
+            dim,
+            aabb_min: [0.0; 3],
+            aabb_max: [1.0; 3],
+            voxels,
+        }
+    }
+
+    #[test]
+    fn classify_occupies_only_bricks_the_surface_crosses() {
+        // 16³ field → 2 bricks/axis (8-wide bricks). A plane at x=0.5 sits exactly on the brick
+        // boundary; a band of one voxel keeps it out of both x-slabs' far ends. Use a plane at
+        // x=0.30 so only the low-x brick column straddles it, with a tight band.
+        let dim = 16u32;
+        let vol = plane_field(dim, 0.30);
+        // voxel_edge = 1/16 = 0.0625; band = 1.5 voxels = 0.09375 in normalized units.
+        let band = brick_band_for(&vol, 1.5);
+        let occ = classify_bricks(&vol, band);
+        assert_eq!(occ.bricks_per_axis, 2);
+        assert_eq!(occ.brick_count(), 8);
+        // The surface at x≈0.30 lives in the low-x bricks (voxels x=0..7 span 0.03..0.47), and
+        // band 0.094 reaches those bricks only. All 4 low-x bricks (by,bz any) are occupied; the
+        // 4 high-x bricks (x=8..15 span 0.53..0.97, min |dist| = 0.53-0.30 = 0.23 > band) empty.
+        for bz in 0..2 {
+            for by in 0..2 {
+                let lo = occ.occupied[(2 * (by + 2 * bz)) as usize];
+                let hi = occ.occupied[(1 + 2 * (by + 2 * bz)) as usize];
+                assert!(lo, "low-x brick (by={by},bz={bz}) must be occupied");
+                assert!(!hi, "high-x brick (by={by},bz={bz}) must be empty");
+            }
+        }
+        assert_eq!(occ.occupied_count(), 4);
+    }
+
+    #[test]
+    fn classify_marks_all_bricks_for_a_surface_through_the_centre() {
+        // A plane at x=0.5 with a wide band (3 voxels) reaches into every x-column, so with the
+        // surface plus band spanning the middle, only the outermost bricks could be empty. Check
+        // a mid plane with a generous band occupies at least the central column and is symmetric.
+        let dim = 24u32; // 3 bricks/axis
+        let vol = plane_field(dim, 0.5);
+        let band = brick_band_for(&vol, 2.0); // ~2 voxels
+        let occ = classify_bricks(&vol, band);
+        assert_eq!(occ.bricks_per_axis, 3);
+        // The middle x-brick (bx=1, voxels x=8..15, centers 0.354..0.646) straddles x=0.5 → all
+        // 9 of its (by,bz) entries occupied; the outer x-bricks are far → empty.
+        let mut mid = 0;
+        for bz in 0..3 {
+            for by in 0..3 {
+                if occ.occupied[(1 + 3 * (by + 3 * bz)) as usize] {
+                    mid += 1;
+                }
+            }
+        }
+        assert_eq!(mid, 9, "entire central x-brick column occupied");
+    }
+
+    #[test]
+    fn classify_is_deterministic() {
+        let vol = plane_field(24, 0.42);
+        let band = brick_band_for(&vol, 1.7);
+        let a = classify_bricks(&vol, band);
+        let b = classify_bricks(&vol, band);
+        assert_eq!(a, b, "brick classification must be deterministic");
+    }
+
+    #[test]
+    fn band_scales_with_voxel_size() {
+        // Two fields, same dim but 2× AABB extent → 2× voxel edge → 2× band for the same margin.
+        let small = SdfVolume {
+            dim: 8,
+            aabb_min: [0.0; 3],
+            aabb_max: [1.0; 3],
+            voxels: vec![0.0; 512],
+        };
+        let big = SdfVolume {
+            dim: 8,
+            aabb_min: [0.0; 3],
+            aabb_max: [2.0; 3],
+            voxels: vec![0.0; 512],
+        };
+        let bs = brick_band_for(&small, 2.0);
+        let bb = brick_band_for(&big, 2.0);
+        assert!(
+            (bb - 2.0 * bs).abs() < 1e-6,
+            "band ∝ voxel edge: {bs} vs {bb}"
+        );
+        // margin 2 voxels over a 1/8 = 0.125 edge → 0.25.
+        assert!(
+            (bs - 0.25).abs() < 1e-6,
+            "small band = 2 * 0.125 = 0.25, got {bs}"
+        );
+    }
+
+    #[test]
+    fn analysis_projects_a_memory_win_for_a_mostly_empty_field() {
+        // A single plane field: most of the volume is far-from-surface, so most bricks are empty
+        // and the sparse payload is a fraction of the dense payload despite the per-brick gutter.
+        let vol = plane_field(48, 0.5); // 6 bricks/axis = 216 bricks
+        let report = analyze_bricks(std::slice::from_ref(&vol), 2.0);
+        assert_eq!(report.mesh_count, 1);
+        assert_eq!(report.total_bricks, 6 * 6 * 6);
+        // A single planar surface occupies only the x-columns it crosses → a slab of bricks, well
+        // under half the volume.
+        assert!(
+            report.occupied_fraction < 0.5,
+            "a plane should leave most bricks empty, got {}",
+            report.occupied_fraction
+        );
+        assert!(
+            report.memory_ratio() < 1.0,
+            "sparse payload must beat dense for a mostly-empty field, got {}",
+            report.memory_ratio()
+        );
+        // Dense payload is exactly dim³ * 4.
+        assert_eq!(report.dense_bytes, 48u64.pow(3) * 4);
+        // Sparse payload is occupied_bricks * (8+2)³ * 4.
+        assert_eq!(report.sparse_bytes, report.occupied_bricks * 1000 * 4);
+    }
+
+    #[test]
+    fn analysis_is_deterministic_over_a_mesh_set() {
+        let meshes = [
+            plane_field(16, 0.3),
+            plane_field(32, 0.6),
+            plane_field(48, 0.5),
+        ];
+        let a = analyze_bricks(&meshes, 1.5);
+        let b = analyze_bricks(&meshes, 1.5);
+        assert_eq!(a, b, "aggregate brick analysis must be deterministic");
+    }
+
+    #[test]
+    fn analysis_of_empty_set_is_benign() {
+        let report = analyze_bricks(&[], 2.0);
+        assert_eq!(report.mesh_count, 0);
+        assert_eq!(report.total_bricks, 0);
+        assert_eq!(report.occupied_fraction, 0.0);
+        assert_eq!(report.memory_ratio(), 1.0);
+    }
+
+    /// Measurement (ignored — prints numbers, no asset needed). Bakes a representative mix of
+    /// real per-mesh SDFs spanning the two regimes the brick win depends on — surface-dominated
+    /// shapes (thin sheet, wall) where nearly every brick touches the surface, and
+    /// volume-dominated shapes (a big sphere with a far interior, a sparse two-part assembly
+    /// with empty space in its AABB) where interior/empty bricks are droppable — through the
+    /// production `bake_mesh_sdf`, then reports the occupied-brick fraction and dense-vs-sparse
+    /// payload. Run:
+    ///   `cargo test -p dreamcoast-asset brick_analysis_report -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement: prints occupied-brick fraction + projected memory"]
+    fn brick_analysis_report() {
+        use crate::MeshVertex;
+        use crate::sdf::bake_mesh_sdf;
+
+        let quad = |sx: f32, sy: f32| -> (Vec<MeshVertex>, Vec<u32>) {
+            let mk = |x: f32, y: f32| MeshVertex {
+                pos: [x, y, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0, 0.0],
+            };
+            (
+                vec![mk(-sx, -sy), mk(sx, -sy), mk(sx, sy), mk(-sx, sy)],
+                vec![0u32, 1, 2, 0, 2, 3],
+            )
+        };
+        let sphere_at = |r: f32, c: [f32; 3]| -> (Vec<MeshVertex>, Vec<u32>) {
+            let mut s = crate::uv_sphere(32, 24);
+            for v in &mut s.vertices {
+                v.pos = [
+                    v.pos[0] * r + c[0],
+                    v.pos[1] * r + c[1],
+                    v.pos[2] * r + c[2],
+                ];
+            }
+            (s.vertices, s.indices)
+        };
+
+        // Surface-dominated: a 2×2 m thin curtain sheet.
+        let (sv, si) = quad(1.0, 1.0);
+        let sheet = bake_mesh_sdf(&sv, &si);
+
+        // Surface-dominated: a thin 3×2×0.15 m box wall.
+        let cube = crate::unit_cube();
+        let mut wv = cube.vertices.clone();
+        for v in &mut wv {
+            v.pos = [v.pos[0] * 1.5, v.pos[1] * 1.0, v.pos[2] * 0.075];
+        }
+        let wall = bake_mesh_sdf(&wv, &cube.indices);
+
+        // Volume-dominated: a big solid sphere (r=1.5 m) — the interior is far from the surface,
+        // so its inner bricks carry only large-magnitude distance (droppable).
+        let (bv, bi) = sphere_at(1.5, [0.0; 3]);
+        let big_sphere = bake_mesh_sdf(&bv, &bi);
+
+        // Sparse assembly: two small spheres at opposite corners of one AABB — the empty middle
+        // is far from either surface (the classic sparse-brick win).
+        let (mut av, ai0) = sphere_at(0.35, [-1.6, -1.6, -1.6]);
+        let (bv2, bi2) = sphere_at(0.35, [1.6, 1.6, 1.6]);
+        let off = av.len() as u32;
+        av.extend(bv2);
+        let mut asm_i = ai0;
+        asm_i.extend(bi2.iter().map(|&i| i + off));
+        let assembly = bake_mesh_sdf(&av, &asm_i);
+
+        let meshes = [sheet, wall, big_sphere, assembly];
+        for margin in [1.0f32, 2.0, 3.0] {
+            let r = analyze_bricks(&meshes, margin);
+            eprintln!(
+                "margin={margin:.0} vox | meshes={} bricks={} occupied={} \
+                 frac={:.1}% | dense={:.1} KB sparse={:.1} KB ratio={:.2}",
+                r.mesh_count,
+                r.total_bricks,
+                r.occupied_bricks,
+                r.occupied_fraction * 100.0,
+                r.dense_bytes as f64 / 1024.0,
+                r.sparse_bytes as f64 / 1024.0,
+                r.memory_ratio(),
+            );
+        }
+        for (i, m) in meshes.iter().enumerate() {
+            let band = brick_band_for(m, 2.0);
+            let occ = classify_bricks(m, band);
+            eprintln!(
+                "  mesh[{i}] dim={} bricks/axis={} occupied {}/{}",
+                m.dim,
+                occ.bricks_per_axis,
+                occ.occupied_count(),
+                occ.brick_count(),
+            );
         }
     }
 
