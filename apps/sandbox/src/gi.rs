@@ -19,7 +19,7 @@ use crate::app::load_compute_shader;
 use crate::push::{
     gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_gi_upsample_push, gdf_temporal_push,
     gi_volume_push, screen_probe_filter_push, screen_probe_integrate_push,
-    screen_probe_irradiance_push, screen_probe_trace_push, wrc_update_push,
+    screen_probe_irradiance_push, screen_probe_trace_push, wrc_update_push, wrc_view_push,
 };
 
 /// Screen-space radiance probe density: one probe per `SP_DOWNSAMPLE`x`SP_DOWNSAMPLE` screen
@@ -82,6 +82,9 @@ pub(crate) struct GiSystem {
     wrc_atlas: [Option<StorageBuffer>; 2],
     wrc_levels: u32,
     wrc_frame: u32,
+    /// GI-on-distance-field visualization: march the camera into the GDF, paint hits with the
+    /// world radiance cache's stored indirect irradiance.
+    wrc_view_pipeline: Option<ComputePipeline>,
     /// UE-style indoor skylight occlusion: directional sky-visibility SH (4 scalar coeffs/slot,
     /// ping-pong = 8 volumes), filled in the same `gi_volume` pass. Contiguous per slot (base only).
     gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2],
@@ -192,6 +195,13 @@ impl GiSystem {
             "wrc_update",
             128,
         )?;
+        let wrc_view_pipeline = compute(
+            dreamcoast_shader::wrc_view_cs_spirv,
+            dreamcoast_shader::wrc_view_cs_dxil,
+            dreamcoast_shader::wrc_view_cs_metallib,
+            "wrc_view",
+            192,
+        )?;
         // 24 R32F volumes: ping-pong [read|write] × 12 SH coefficients. Empty (zero) at start = no
         // fill until the update converges; the lighting falls back gracefully (e = 0). Allocated
         // back-to-back so each slot's 12 volumes are contiguous in the bindless sampled AND storage
@@ -255,6 +265,7 @@ impl GiSystem {
             wrc_atlas: [None, None],
             wrc_levels: 0,
             wrc_frame: 0,
+            wrc_view_pipeline,
         })
     }
 
@@ -408,6 +419,78 @@ impl GiSystem {
     }
     pub(crate) fn has_wrc(&self) -> bool {
         self.wrc_pipeline.is_some()
+    }
+    pub(crate) fn has_wrc_view(&self) -> bool {
+        self.wrc_view_pipeline.is_some() && self.wrc_pipeline.is_some()
+    }
+
+    /// GI-on-distance-field visualization: a full-screen pass that marches the camera ray into
+    /// the scene GDF and paints each hit with the world radiance cache's stored indirect
+    /// irradiance (reconstructed for the hit normal). `wrc_atlas`/`wrc_ext` are the cache the
+    /// update wrote this frame (the handle orders this pass after it). `mode` 0 = irradiance
+    /// grayscale, 1 = irradiance × clay albedo. Returns the raw-radiance image (host tonemaps).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_wrc_view<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        scene_gdf: &'a Volume,
+        extent: Extent2D,
+        cam_pos: [f32; 3],
+        inv_view_proj: [f32; 16],
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        cw: u32,
+        ch: u32,
+        flip_y: u32,
+        clip: (u32, u32),
+        clip_vols: &'a [&'a Volume],
+        wrc_atlas: u32,
+        wrc_ext: ResourceId,
+        mode: u32,
+        gain: f32,
+    ) -> ResourceId {
+        let pipe = self.wrc_view_pipeline.as_ref().expect("wrc view pipeline");
+        let diag = Self::diag(aabb_min, aabb_max);
+        let out = graph.create_storage_image("wrc_view_out", HDR_FORMAT, extent);
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "wrc_view",
+                storage_writes: vec![out],
+                reads: vec![wrc_ext],
+            },
+            move |ctx| {
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(scene_gdf);
+                for v in clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&wrc_view_push(
+                    &inv_view_proj,
+                    cam_pos,
+                    aabb_min,
+                    0.0, // world ground plane y = 0
+                    aabb_max,
+                    diag,            // GDF sample distance clamp
+                    [0.5, 0.5, 0.5], // neutral clay albedo for the lit-clay look (mode 1)
+                    gain,
+                    out_index,
+                    cw,
+                    ch,
+                    flip_y,
+                    clip.0,
+                    clip.1,
+                    wrc_atlas,
+                    WRC_GRID,
+                    WRC_OCT,
+                    mode,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
     }
 
     /// (Re)allocate the world radiance cache ping-pong atlas buffers for `levels` clipmap levels

@@ -627,6 +627,14 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "screen_probe_irradiance_cs",
     },
+    // GI-on-distance-field visualization: march the camera into the GDF, paint hits with the
+    // world radiance cache's stored indirect irradiance.
+    Job {
+        src: "wrc_view.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "wrc_view_cs",
+    },
     // Physical-camera auto-exposure: luminance histogram (pass 1) → adapted exposure (pass 2).
     Job {
         src: "auto_exposure.slang",
