@@ -3,12 +3,12 @@
 // One thread per card: test the card's bounding sphere against the camera frustum and write a
 // per-card visibility flag. `sdf_cache_light` reads it to relight on-screen cards at the base
 // budget period and off-screen cards far less often (the bulk of a dense scene's cards are
-// outside any one view). This is the camera-visibility half of UE5 Lumen's surface-cache update
-// priority — Lumen drives card updates from feedback (cards actually sampled) + staleness; here
+// outside any one view). This is the camera-visibility half of 레퍼런스 엔진 SW GI's surface-cache update
+// priority — 레퍼런스 SW-RT GI drives card updates from feedback (cards actually sampled) + staleness; here
 // the frustum test is the deterministic, backend-identical proxy for "is this card on screen",
 // and the relight period supplies the staleness term.
-//   Ref: D. Wright et al. (Epic Games), "Lumen: Real-time GI in UE5", SIGGRAPH 2022
-//        (surface-cache update budget + visibility/priority).
+//   Ref: D. Wright et al., "Real-time GI", SIGGRAPH 2022 (surface-cache update budget +
+//        visibility/priority — the reference real-time SW-RT GI system).
 //
 // The frustum planes are extracted from a Y-flip-free view-projection on the CPU, so DX and VK
 // compute the identical visible set (matching the existing GPU-cull convention). The bounding

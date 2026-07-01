@@ -127,7 +127,7 @@ pub(crate) fn fuse_scene(
     }
 }
 
-/// Build the Lumen-style surface-cache mesh cards from the per-drawable world AABBs: 6
+/// Build the 레퍼런스식 surface-cache mesh cards from the per-drawable world AABBs: 6
 /// axis-aligned cards per drawable (one per AABB face), 64 bytes each
 /// (`center.xyz/trace_depth, normal.xyz, u_axis.xyz, v_axis.xyz`). The capture pass
 /// sphere-traces the GDF inward from each card-plane texel to the surface.

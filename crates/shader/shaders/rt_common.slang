@@ -121,7 +121,7 @@ float3 sample_cone(float3 dir, float cos_max, inout uint rng)
 
 // ---- Microfacet BSDF (Cook-Torrance, GGX) -------------------------------------
 // Physically-based metallic-roughness BSDF. Unlike the rasterizer (which uses the
-// UE direct-light G approximation k=(r+1)^2/8), the path tracer uses the exact
+// 레퍼런스 엔진 direct-light G approximation k=(r+1)^2/8), the path tracer uses the exact
 // Smith-GGX masking term so it is an unbiased reference the rasterizer converges
 // toward. `alpha = roughness^2`.
 

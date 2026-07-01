@@ -121,9 +121,9 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     // Stage D2 (Sponza 60fps) — amortized relight budget. Re-lighting all `num_cards*tile^2`
     // texels every frame (the legacy path) is the dominant Sponza cost. Instead refresh only a
     // round-robin slice of cards each frame and persist the rest, since the cache is a temporally
-    // accumulated, mostly-static signal (EMA below). This is UE5 Lumen's "surface cache update
+    // accumulated, mostly-static signal (EMA below). This is 레퍼런스 엔진 SW GI's "surface cache update
     // budget": a fixed fraction of cards relit per frame, the others keep last frame's radiance.
-    //   Ref: D. Wright et al. (Epic Games), "Lumen: Real-time Global Illumination in UE5",
+    //   Ref: D. Wright et al. (레퍼런스 엔진 팀), "레퍼런스 SW-RT GI: Real-time Global Illumination in 레퍼런스 엔진",
     //        SIGGRAPH 2022 Advances in Real-Time Rendering.
     // `relight_period == 1` ⇒ every card every frame ⇒ byte-identical to the legacy path (the
     // gallery regression anchor passes period 1). `reset` always relights all cards (first frame).
@@ -131,7 +131,7 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     uint card = t / max(pc.tile * pc.tile, 1u);
     // Stage D2b: camera-visibility priority. On-screen cards relight at the base budget period;
     // off-screen cards relight HIDDEN_MULT× less often (most of a dense scene's cards are out of
-    // any one view, and they don't affect the current image — UE5 Lumen's visibility/staleness
+    // any one view, and they don't affect the current image — 레퍼런스 엔진 SW GI's visibility/staleness
     // priority). `clip.w == 0xFFFFFFFF` ⇒ no feedback ⇒ uniform period (Stage D2 behavior).
     const uint HIDDEN_MULT = 8u;
     uint period = relight_period;

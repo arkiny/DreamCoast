@@ -1,6 +1,6 @@
 // Phase 11 — stochastic SSR resolve: spatial ratio estimator + temporal (half-res).
 //
-// Frostbite-style (Stachowiak, SIGGRAPH 2015): the trace casts ONE GGX-jittered ray per
+// 레퍼런스식 (Stachowiak, SIGGRAPH 2015): the trace casts ONE GGX-jittered ray per
 // half-res pixel, storing the reflected colour (+ confidence) and the ray direction (+ the
 // GGX pdf it was sampled with). This pass resolves the noise *spatially* by reusing the
 // rays from a neighbourhood — each borrowed ray `q` is reweighted by the *ratio*

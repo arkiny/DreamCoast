@@ -159,7 +159,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         }
         g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
 
-        // Sky-visibility (UE-style indoor skylight occlusion): reconstruct the cosine-weighted
+        // Sky-visibility (레퍼런스식 indoor skylight occlusion): reconstruct the cosine-weighted
         // hemispherical sky visibility V(n) from the 4 scalar SH volumes (contiguous from vol_g) and
         // write it for the lighting to occlude the IBL diffuse skylight. Open surfaces -> ~1 (full
         // skylight); enclosed interiors -> ~0 (the diffuse skylight is occluded, so the coloured

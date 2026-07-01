@@ -266,7 +266,7 @@ per-instance 트랜스폼을 공급하는 단일 소스가 된다. 테스트는 
   로더/세이브 + 런타임 전환 → **D** 레벨 그래프(`LevelGraph`) + 카메라 기반 청크 스트리밍(엔티티
   스폰/디스폰) → **E**(선택, Phase 11 이후) 쿡된 바이너리 레벨/월드.
 - **컴패니언 트랙 — 머티리얼 애셋화**(쿡 토대는 Phase 11 완료): 메시 종속 머티리얼을 공유 가능한 1급
-  애셋으로 분리(콘텐츠-주소 텍스처 dedup, UE식 Material Instance). 런타임 키 dedup은 Stage B(다중 머티리얼
+  애셋으로 분리(콘텐츠-주소 텍스처 dedup, 레퍼런스식 Material Instance). 런타임 키 dedup은 Stage B(다중 머티리얼
   업로드), 인스턴스 오버라이드는 Stage C/E(레벨 머티리얼)에 결속. 세부: [material-assets.md](material-assets.md).
 - **완료 기준**: ECS 씬이 단일 드로우 리스트로 세 소비처(래스터/RT/컬)를 공급, glTF 계층이 올바른 상대
   트랜스폼으로 렌더, 선언적 레벨 핫스왑, 카메라 주행 시 청크 스트림 인/아웃(엔티티 디스폰, 누수 없음), 두
@@ -317,7 +317,7 @@ per-instance 트랜스폼을 공급하는 단일 소스가 된다. 테스트는 
   Metal API+GPU validation layer까지 통과. RT 텍스처 머티리얼은 hit UV 보간 + mip0 `Load`
   기반 bilinear 샘플링으로 base/mr/normal/emissive를 inline과 M7 양쪽에 적용했고, M7
   converter descriptor table도 sampled texture/cube/storage/TLAS 범위를 채우도록 갱신.
-- **Phase 10 SW-RT 패리티: Stage B(3D 볼륨/GDF) + Stage C(GDF AO·GI·SSR·GDF 반사·Lumen
+- **Phase 10 SW-RT 패리티: Stage B(3D 볼륨/GDF) + Stage C(GDF AO·GI·SSR·GDF 반사·레퍼런스 SW-RT GI
   surface cache) 모두 Metal에서 완료·검증**(M3 box). Stage C의 유일한 Metal 갭은 컴퓨트
   파이프라인의 `uniform_buffer`(SSR의 per-frame globals UBO 바인딩)였고 `rhi-metal`에만
   반영해 해결 — 공유 셰이더/`rhi-types`/렌더 그래프 무변경이라 **Vulkan/D3D12 무회귀**.
@@ -378,7 +378,7 @@ facade trait 뒤에 성숙 라이브러리 백엔드를 격리 → 차후 자체
   텔레메트리, 골든이미지 회귀 CI, 패키징/배포(P12 확장), 로컬라이제이션.
 - **권장 1차 수직 슬라이스**(플레이 가능 최소 루프): `15 잡 → 16 피직스 → 18 입력 → 19 ECS/세이브 →
   20 AA/포스트 → 17 오디오 → 25 스크립팅 → 에디터 E1–E2`. 이후 21–24(렌더)·26–30(게임플레이)·E3–E5로 확장.
-- **정직한 점검**: UE/Unity式 breadth + 독립 에디터는 **수년 규모**다. 본 계획의 가치는 완성이 아니라
+- **정직한 점검**: 레퍼런스 엔진/Unity式 breadth + 독립 에디터는 **수년 규모**다. 본 계획의 가치는 완성이 아니라
   **올바른 의존 순서 · 백엔드 추상화 seam · 언제든 수직 슬라이스로 절단 가능한 구조**를 박아두는 것.
 
 ## 의존성 위험 / 미결 사항 (세부 계획에서 해소)

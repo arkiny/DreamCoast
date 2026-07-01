@@ -898,7 +898,7 @@ Rust, so Vulkan / D3D12 are unaffected.
 ## Phase 10 Stage C — GDF GI / reflections / SSR / surface cache on Metal (done, verified this M3 box)
 
 Phase 10 Stage C (GDF ambient occlusion, stochastic 1-bounce diffuse GI, screen-space
-+ GDF reflections, the Lumen-style mesh-card surface cache, and a `RenderQuality` tier)
++ GDF reflections, the 레퍼런스식 mesh-card surface cache, and a `RenderQuality` tier)
 shipped on Vulkan / D3D12 first and landed on `main` as one large drop (origin/main
 `041caae`). On macOS it brought up cleanly on the first fetch with **one** real RHI gap.
 

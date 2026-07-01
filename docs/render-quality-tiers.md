@@ -138,7 +138,7 @@
 
 ### (0) 스크린스페이스 AO (GTAO/HBAO) — ✅ 구현 (`503f3c9`)
 > 표면이 "플랫"하던 원인: occlusion이 **coarse 48³ GDF AO(원거리)뿐**, 미세 크레비스/접촉/주름엔 AO가
-> 전무(베이크드 머티리얼 AO=1.0). UE가 DFAO와 **레이어링하는 스크린스페이스 AO**가 빠져 있었음.
+> 전무(베이크드 머티리얼 AO=1.0). 레퍼런스 엔진가 DFAO와 **레이어링하는 스크린스페이스 AO**가 빠져 있었음.
 - `gtao.slang csMain`: HBAO-lite obscurance — G-buffer depth로 월드포지션 복원(gdf_ao.slang과 동일),
   월드 노멀 읽고 6 dirs×4 steps×2 sides를 **depth-scaled 스크린 디스크**(월드 반경→proj_scale로 스크린
   투영, 스케일 일관)에서 horizon obscurance 적분, range falloff(헤일로 방지). 픽셀 회전은 **순수 정수

@@ -33,11 +33,11 @@ Sponza 실내가 검게 타던 문제. 셋 다 콘텐츠 한정(갤러리 앵커
 
 측정: 실내 전체 lit 27→44, recess 검정 해소. DX≡VK 0.005, clippy 클린.
 
-## env 큐브 clamp (의도된 설계, UE식)
+## env 큐브 clamp (의도된 설계, 레퍼런스식)
 
 env 캡처 큐브는 Rgba16Float(max ~65504). lux sun이 `sky.slang`의 baked sun 디스크를 +inf로 overflow시켜
 IBL convolution을 오염시키므로 env sky를 60000으로 clamp한다. **디스크는 반사/irradiance용이고, 실제 sun
-에너지는 analytic 디렉셔널 라이트가 운반**(UE도 동일). prefilter(저-roughness)가 디스크를 직접 샘플해도
+에너지는 analytic 디렉셔널 라이트가 운반**(레퍼런스 엔진도 동일). prefilter(저-roughness)가 디스크를 직접 샘플해도
 fp16을 안 넘기게 하는 안전장치 — fp32 env로 바꿔도 prefilter가 다시 넘치므로 clamp가 올바른 해법.
 
 ## sky:sun 비율 — 측정 기록

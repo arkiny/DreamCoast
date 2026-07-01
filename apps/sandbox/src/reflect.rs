@@ -383,7 +383,7 @@ impl ReflectSystem {
         (out, out_b)
     }
 
-    /// Stochastic SSR resolve (Frostbite ratio estimator): gather the half-res neighbour rays
+    /// Stochastic SSR resolve (다른 레퍼런스 엔진 ratio estimator): gather the half-res neighbour rays
     /// (`ssr_a` colour+conf, `ssr_b` dir+pdf), reweight each by `pdf_p(dir)/pdf_q` so the
     /// centre pixel borrows them under its own GGX lobe (roughness-adaptive, low variance per
     /// frame), then a light temporal EMA + firefly clamp. Returns the resolved half-res

@@ -42,7 +42,7 @@ const GI_VOL_DIM: u32 = 32;
 const GI_VOL_SH: usize = 12;
 
 /// Scalar sky-visibility SH band-0/1 coefficient count per ping-pong slot (4 R32F volumes,
-/// contiguous; base index only). UE-style indoor skylight occlusion. See `gi_volume.slang`.
+/// contiguous; base index only). 레퍼런스식 indoor skylight occlusion. See `gi_volume.slang`.
 const GI_SKYVIS_SH: usize = 4;
 
 pub(crate) struct GiSystem {
@@ -85,7 +85,7 @@ pub(crate) struct GiSystem {
     /// GI-on-distance-field visualization: march the camera into the GDF, paint hits with the
     /// world radiance cache's stored indirect irradiance.
     wrc_view_pipeline: Option<ComputePipeline>,
-    /// UE-style indoor skylight occlusion: directional sky-visibility SH (4 scalar coeffs/slot,
+    /// 레퍼런스식 indoor skylight occlusion: directional sky-visibility SH (4 scalar coeffs/slot,
     /// ping-pong = 8 volumes), filled in the same `gi_volume` pass. Contiguous per slot (base only).
     gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2],
     gi_vol_frame: u32,
@@ -289,7 +289,7 @@ impl GiSystem {
         self.gi_vol_frame = self.gi_vol_frame.saturating_add(1);
     }
 
-    /// UE GI-fidelity track: update the world irradiance volume (DDGI-lite). Each probe casts
+    /// 레퍼런스 엔진 GI-fidelity track: update the world irradiance volume (DDGI-lite). Each probe casts
     /// sphere rays into the scene GDF, shades hits (direct + the PREVIOUS volume = multibounce),
     /// EMA-accumulates into the write slot. Returns the write graph handle (a read dep for the GI
     /// pass that samples it). `None` without the pipeline/volumes.
