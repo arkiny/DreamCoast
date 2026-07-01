@@ -11,9 +11,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use dreamcoast_asset::cook::load_or_cook_level;
+use dreamcoast_asset::cook::{TexCompress, load_or_cook_gltf_scene, load_or_cook_level};
 use dreamcoast_asset::level::{Entity as LevelEntity, LightKind, MaterialOverride};
-use dreamcoast_asset::{GltfScene, LevelData, load_gltf_scene, unit_cube, uv_sphere};
+use dreamcoast_asset::{GltfScene, LevelData, unit_cube, uv_sphere};
 use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_scene::{LocalTransform, MeshInstance, Name, Parent, World, instantiate_gltf};
 use rhi::{Device, Texture};
@@ -26,6 +26,18 @@ use crate::registry::{
 
 /// The world-space AABB of a placed scene (metres), for framing the camera.
 pub(crate) type Bounds = (Vec3, Vec3);
+
+/// The texture-compression tier for content scenes (levels / glTF imports / worlds),
+/// resolved from `P12_TEX_COMPRESS`. Defaults to `Fast` (BC1 colour / BC5 normals,
+/// ~4× smaller, GPU-native) so large levels fit in VRAM; `0|off` disables, `high|bc7`
+/// picks BC7. The gallery anchor never calls this (it stays uncompressed = byte-identical).
+pub(crate) fn content_tex_compress() -> TexCompress {
+    match std::env::var("P12_TEX_COMPRESS").ok().as_deref() {
+        Some("0") | Some("off") => TexCompress::Off,
+        Some("high") | Some("bc7") => TexCompress::High,
+        _ => TexCompress::Fast,
+    }
+}
 
 /// Expand `[min, max]` by the 8 corners of a local AABB transformed by `place`.
 fn expand_bounds(min: &mut Vec3, max: &mut Vec3, place: Mat4, lmin: Vec3, lmax: Vec3) {
@@ -122,6 +134,7 @@ fn desc_from_override(ov: Option<MaterialOverride>) -> MaterialDesc {
 /// the registries. glTF assets are imported + normalized to unit size, then placed by
 /// the entity transform; procedural assets spawn a single entity with the override
 /// material. The same glTF file referenced by several entities is imported once.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_level(
     device: &Device,
     level: &LevelData,
@@ -132,6 +145,9 @@ pub(crate) fn build_level(
     // World-space offset applied to every entity (Stage D chunk placement; Vec3::ZERO
     // for a standalone level).
     origin: Vec3,
+    // BCn texture-compression tier for imported glTF textures (content scenes default to
+    // `Fast`; the gallery anchor keeps `Off`). Cuts texture VRAM ~4× on large levels.
+    compress: TexCompress,
 ) -> anyhow::Result<Option<Bounds>> {
     // Cache each glTF asset's import + uploaded handles so a row of the same model
     // (e.g. lanterns) uploads once.
@@ -145,7 +161,15 @@ pub(crate) fn build_level(
         let place = Mat4::from_translation(origin) * Mat4::from_cols_array(&ent.transform);
         if is_gltf(&ent.asset) {
             if !gltf_cache.contains_key(&ent.asset) {
-                let gscene = load_gltf_scene(&ent.asset)?;
+                // Load the asset through its cooked, block-compressed `.dcasset` (cache-keyed
+                // on the source glTF + compression tier). A hit skips glTF parse + image
+                // decode + BCn encode entirely; the level just links to the cooked scene.
+                let (gscene, _) = load_or_cook_gltf_scene(
+                    Path::new(&ent.asset),
+                    &ent.asset,
+                    &crate::app::cooked_cache_dir(),
+                    compress,
+                )?;
                 let handles = upload_gltf_scene(device, &gscene, meshes, materials, textures)?;
                 gltf_cache.insert(ent.asset.clone(), (gscene, handles));
             }

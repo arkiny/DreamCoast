@@ -890,6 +890,12 @@ impl App {
         // use the captured-cube IBL (forced via `legacy_ibl` below).
         let gallery_scene = !world_mode && level_select.is_none() && scene_gltf_path.is_none();
         let levels_dir = std::path::PathBuf::from("apps/sandbox/levels");
+        // Content scenes (levels / glTF imports / worlds) carry large multi-material assets —
+        // e.g. Sponza + foliage needs ~7.8 GB of uncompressed textures, right at an 8 GB card's
+        // edge (Vulkan OOMs where D3D12's VRAM oversubscription barely fits). Block-compress
+        // their textures by DEFAULT (BC1 colour / BC5 normals, ~4× smaller, GPU-native = no
+        // decompress cost). The gallery anchor stays `Off` (byte-identical regression scene).
+        let content_compress = level::content_tex_compress();
 
         // Registries own the GPU meshes + material descriptors the scene's handles
         // point at (P2). Unique geometry uploads once — the two spheres share a handle.
@@ -950,12 +956,20 @@ impl App {
                 &mut material_registry,
                 &mut textures,
                 Vec3::ZERO,
+                content_compress,
             )?;
         } else if let Some(path) = &scene_gltf_path {
-            // Stage B: import the whole node hierarchy + every primitive/material/image.
-            let gscene = dreamcoast_asset::load_gltf_scene(path)?;
+            // Stage B: import the whole node hierarchy + every primitive/material/image,
+            // through the cooked, block-compressed `.dcasset` (a hit skips glTF parse +
+            // decode + BCn encode). `content_compress` sets the tier.
+            let (gscene, outcome) = dreamcoast_asset::cook::load_or_cook_gltf_scene(
+                std::path::Path::new(path),
+                path,
+                &app::cooked_cache_dir(),
+                content_compress,
+            )?;
             info!(
-                "glTF scene '{path}': {} nodes, {} primitives, {} materials, {} images",
+                "glTF scene '{path}' ({outcome:?}): {} nodes, {} primitives, {} materials, {} images",
                 gscene.nodes.len(),
                 gscene.primitive_count(),
                 gscene.materials.len(),
@@ -2418,6 +2432,7 @@ impl App {
             &mut material_registry,
             &mut textures,
             Vec3::ZERO,
+            level::content_tex_compress(),
         )?;
         dreamcoast_scene::propagate_transforms_parallel(&mut world, dreamcoast_jobs::global());
         self.world = world;

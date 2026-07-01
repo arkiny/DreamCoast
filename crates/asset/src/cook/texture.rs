@@ -3,7 +3,7 @@
 use rhi_types::Format;
 
 use crate::bc::{self, BcFormat};
-use crate::{ImageData, Material, TexData};
+use crate::{GltfScene, ImageData, Material, TexData};
 
 /// Texture-compression tier for the cook. Picks the colour codec; `Off` keeps
 /// textures uncompressed (render byte-identical). The trade is size vs quality —
@@ -35,36 +35,113 @@ impl TexCompress {
     }
 }
 
-/// Per-slot texture-compression policy. **Perceptual colour** (base colour,
-/// emissive) compresses per the `tier` (BC1/BC3 for `Fast`, BC7 for `High`);
-/// **normals** to BC5 (near-lossless). **Data textures** — metallic-roughness and
-/// anything carrying linear/vector data — are left uncompressed, because block
-/// compression corrupts non-perceptual values.
-pub(crate) fn compress_material(material: &mut Material, tier: TexCompress) {
-    compress_colour(&mut material.base_color, true, tier);
-    compress_colour(&mut material.emissive, true, tier);
-    take_compress(&mut material.normal, BcFormat::Bc5, false);
-    // metallic_roughness: data texture — intentionally left uncompressed.
+/// The semantic role of a texture slot — drives the per-slot compression policy.
+/// **Colour** (base colour, emissive) is perceptual; **Normal** is a vector map;
+/// **Data** (metallic-roughness, occlusion, any linear/vector payload) must stay
+/// uncompressed because block compression corrupts non-perceptual values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TexSlot {
+    Colour,
+    Normal,
+    Data,
 }
 
-/// Compress a colour slot: `High` → BC7 (keeps alpha); `Fast` → BC1, or BC3 when the
-/// texture has real alpha (BC1 would drop it).
-fn compress_colour(slot: &mut Option<TexData>, srgb: bool, tier: TexCompress) {
-    if let Some(TexData::Rgba8(im)) = slot {
-        let fmt = match tier {
+/// Per-slot texture-compression policy. **Perceptual colour** (base colour,
+/// emissive) compresses per the `tier` (BC1/BC3 for `Fast`, BC7 for `High`);
+/// **normals** to BC5; **data textures** (metallic-roughness) to BC7 — both
+/// near-lossless, so linear/packed values survive at 4:1.
+pub(crate) fn compress_material(material: &mut Material, tier: TexCompress) {
+    compress_slot(&mut material.base_color, TexSlot::Colour, true, tier);
+    compress_slot(&mut material.emissive, TexSlot::Colour, true, tier);
+    compress_slot(&mut material.normal, TexSlot::Normal, false, tier);
+    compress_slot(&mut material.metallic_roughness, TexSlot::Data, false, tier);
+}
+
+/// The block format the policy assigns to `slot` at `tier`, or `None` to keep it
+/// uncompressed (Data slots, or `tier == Off`). `has_alpha` only matters for colour:
+/// `Fast` picks BC3 over BC1 when there is real alpha (BC1 would drop it). This is the
+/// single source of the per-slot format choice, shared by the Material cook and the
+/// runtime glTF/level texture upload.
+pub fn slot_format(slot: TexSlot, tier: TexCompress, has_alpha: bool) -> Option<BcFormat> {
+    if !tier.enabled() {
+        return None;
+    }
+    match slot {
+        // Data textures (metallic-roughness, occlusion) → BC7. BC1's heavy colour
+        // quantization would corrupt linear values, but BC7 is near-lossless at the same
+        // 4:1 and — unlike BC5 (2-channel) — preserves all four channels, so glTF's
+        // packed G=roughness/B=metallic layout survives with no swizzle or shader change.
+        TexSlot::Data => Some(BcFormat::Bc7),
+        TexSlot::Normal => Some(BcFormat::Bc5),
+        TexSlot::Colour => Some(match tier {
             TexCompress::High => BcFormat::Bc7,
-            _ if im.rgba8.chunks_exact(4).any(|p| p[3] != 255) => BcFormat::Bc3,
+            _ if has_alpha => BcFormat::Bc3,
             _ => BcFormat::Bc1,
-        };
-        *slot = Some(compress_image(im, fmt, srgb));
+        }),
     }
 }
 
-/// Compress one slot in place if it holds an uncompressed image (no alpha concern —
-/// for normals / non-colour data the alpha channel is unused).
-fn take_compress(slot: &mut Option<TexData>, fmt: BcFormat, srgb: bool) {
-    if let Some(TexData::Rgba8(im)) = slot {
-        *slot = Some(compress_image(im, fmt, srgb));
+/// Block-compress a single decoded image per the slot policy + tier, or return `None`
+/// to keep it uncompressed (Data slots, or `tier == Off`). Lets the runtime importer
+/// (levels / glTF scenes) compress shared images with the exact same policy as the cook.
+pub fn compress_image_for_slot(
+    im: &ImageData,
+    slot: TexSlot,
+    srgb: bool,
+    tier: TexCompress,
+) -> Option<TexData> {
+    let has_alpha = im.rgba8.chunks_exact(4).any(|p| p[3] != 255);
+    let fmt = slot_format(slot, tier, has_alpha)?;
+    Some(compress_image(im, fmt, srgb))
+}
+
+/// Block-compress a glTF scene's shared texture table in place, per slot usage. Each
+/// image is compressed according to the **first material slot that references it** (its
+/// `TexSlot` + colour space) — in practice an image serves one role, so this matches the
+/// per-(image, slot) policy the runtime upload would otherwise apply, while letting the
+/// cook bake it once into the cached scene. Data textures + `tier == Off` stay `Rgba8`.
+pub(crate) fn compress_scene_textures(scene: &mut GltfScene, tier: TexCompress) {
+    if !tier.enabled() {
+        return;
+    }
+    // Resolve each image's (slot kind, srgb) from the first material slot referencing it.
+    let mut usage: Vec<Option<(TexSlot, bool)>> = vec![None; scene.images.len()];
+    for m in &scene.materials {
+        for (img, kind, srgb) in [
+            (m.base_color, TexSlot::Colour, true),
+            (m.emissive, TexSlot::Colour, true),
+            (m.normal, TexSlot::Normal, false),
+            (m.metallic_roughness, TexSlot::Data, false),
+        ] {
+            if let Some(i) = img
+                && usage.get(i).is_some_and(Option::is_none)
+            {
+                usage[i] = Some((kind, srgb));
+            }
+        }
+    }
+    for (i, tex) in scene.images.iter_mut().enumerate() {
+        let Some((kind, srgb)) = usage[i] else {
+            continue; // unreferenced image — leave as-is
+        };
+        // `match` borrows `tex` only for the call; the owned result is assigned after.
+        let cooked = match tex {
+            TexData::Rgba8(im) => compress_image_for_slot(im, kind, srgb, tier),
+            TexData::Bc { .. } => None,
+        };
+        if let Some(bc) = cooked {
+            *tex = bc;
+        }
+    }
+}
+
+/// Compress a material slot in place per the policy (no-op for `Data` / `tier == Off`,
+/// or a slot that is already block-compressed / empty).
+fn compress_slot(slot: &mut Option<TexData>, kind: TexSlot, srgb: bool, tier: TexCompress) {
+    if let Some(TexData::Rgba8(im)) = slot
+        && let Some(bc) = compress_image_for_slot(im, kind, srgb, tier)
+    {
+        *slot = Some(bc);
     }
 }
 
@@ -148,8 +225,14 @@ mod tests {
             })
         ));
         assert!(
-            matches!(m.metallic_roughness, Some(TexData::Rgba8(_))),
-            "metallic-roughness is a data texture and must stay uncompressed"
+            matches!(
+                m.metallic_roughness,
+                Some(TexData::Bc {
+                    format: BcFormat::Bc7,
+                    ..
+                })
+            ),
+            "metallic-roughness (data) compresses to near-lossless BC7"
         );
     }
 

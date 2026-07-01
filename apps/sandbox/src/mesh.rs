@@ -164,30 +164,6 @@ pub(crate) fn upload_geometry(
     Ok((vbuf, ibuf, indices.len() as u32))
 }
 
-/// Upload a decoded RGBA8 image as a bindless sampled texture (mips generated at
-/// upload), returning its bindless index. The inner of [`upload_texture`]'s `Rgba8`
-/// arm; used directly by the glTF importer to dedup shared images.
-pub(crate) fn upload_image_rgba8(
-    device: &Device,
-    store: &mut Vec<Texture>,
-    img: &dreamcoast_asset::ImageData,
-    format: Format,
-) -> anyhow::Result<u32> {
-    let t = device.create_texture(
-        &TextureDesc {
-            width: img.width,
-            height: img.height,
-            format,
-        },
-        &img.rgba8,
-    )?;
-    let idx = t.bindless_index();
-    store.push(t);
-    Ok(idx)
-}
-
-/// Create a sampled texture from decoded image data and return its bindless index,
-/// keeping the texture alive in `store`.
 /// Upload a material texture (bindless). Uncompressed `Rgba8` uses `rgba8_format`
 /// (the slot's colour space) and generates mips at upload; pre-cooked `Bc` data
 /// (Phase 12 M3) uploads its block mips via the GPU-native path — no decompression.
