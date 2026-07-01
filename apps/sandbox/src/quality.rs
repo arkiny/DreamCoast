@@ -403,6 +403,49 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
     }
 }
 
+/// The gallery's byte-identical legacy configuration, as a preset. The gallery is the path-tracer
+/// parity + regression anchor (`af70c1a5…`), so every scalability knob that would otherwise shift
+/// its pixels is pinned here to the value it had before the tier system existed: full-res trace
+/// (no half-res / divisors), no amortization (relight period 1, gather spp 8), the high
+/// path-trace-parity sample counts (gi_spp 8, gi_max_steps 64), and the neutral march / clamp /
+/// AO settings. Consumers resolve a knob against `base = if gallery { gallery_preset() } else
+/// { preset(tier) }` (see `main.rs`), so the gallery-lock is STRUCTURAL: a newly added tier knob
+/// takes its gallery value from this one table and can no longer silently break the anchor by
+/// forgetting a per-call-site `if gallery_scene { .. }` (the bug that hit `render_scale` and
+/// `reflect_max_roughness`). Fields that no gallery pass reads (e.g. the res divisors, unused while
+/// `gi_half_res`/`reflect_half_res` are false, and `ssao`/`ao_res_div`, unused while AO is off)
+/// still carry their legacy value so the table is a complete, self-describing snapshot.
+pub fn gallery_preset() -> QualityPreset {
+    QualityPreset {
+        gi_spp: 8,        // path-trace-parity sample count (gallery is the PT reference)
+        gi_max_steps: 64, // full bounce march
+        reflect_max_steps: 96,
+        gi_denoise: true,
+        reflect_cache: true,
+        surface_cache: false,
+        ssr_stochastic: false, // full-res mirror SSR (does not affect the gallery image)
+        reflect_max_roughness: 0.5,
+        gdf_ao: false, // gallery runs no GDF AO
+        ssao: false,   // gallery runs no screen-space AO
+        firefly_clamp: true,
+        shadow_softness: 0.0,
+        shadow_taps: 16,
+        cache_relight_period: 1, // every-frame relight (no amortization)
+        gi_half_res: false,      // full-res GI trace
+        cache_relight_spp: 8,
+        reflect_half_res: false,  // full-res reflection trace
+        render_scale: 1.0,        // native (no upscale)
+        gdf_cone_k: 0.0,          // linear march (no cone LOD)
+        gi_res_div: 2,            // unused (gi_half_res=false); legacy value for completeness
+        reflect_res_div: 2,       // unused (reflect_half_res=false)
+        ao_res_div: 1,            // unused (gdf_ao=false)
+        gi_atrous_steps: 2,       // two à-trous iterations (legacy denoise)
+        reflect_history_clamp: 0, // off (legacy resolve, no neighbourhood clamp)
+        reflect_clamp_gamma: 1.25,
+        gi_temporal_clamp: 1.0, // hard 3x3 GI temporal clamp (legacy byte-identical anchor)
+    }
+}
+
 /// Resolve a boolean knob: explicit env (`0`/`false`/`off` => false, any other value => true)
 /// overrides the tier default; unset => `tier_default`. Replaces the old presence-only
 /// (`var_os(..).is_some()`) toggles so a higher tier's on-by-default can still be turned off
