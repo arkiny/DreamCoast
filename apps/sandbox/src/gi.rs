@@ -18,8 +18,8 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
     gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_gi_upsample_push, gdf_temporal_push,
-    gi_volume_push, screen_probe_filter_push, screen_probe_integrate_push, screen_probe_trace_push,
-    wrc_update_push,
+    gi_volume_push, screen_probe_filter_push, screen_probe_integrate_push,
+    screen_probe_irradiance_push, screen_probe_trace_push, wrc_update_push,
 };
 
 /// Screen-space radiance probe density: one probe per `SP_DOWNSAMPLE`x`SP_DOWNSAMPLE` screen
@@ -73,6 +73,8 @@ pub(crate) struct GiSystem {
     sp_integrate_pipeline: Option<ComputePipeline>,
     /// P2 spatial cross-probe joint-bilateral filter of the radiance atlas (optional).
     sp_filter_pipeline: Option<ComputePipeline>,
+    /// P5 per-probe radiance->irradiance pre-integration (makes the per-pixel gather a cheap lookup).
+    sp_irradiance_pipeline: Option<ComputePipeline>,
     /// P4 world radiance cache: update pipeline + ping-pong atlas buffers (octahedral radiance
     /// tiles for `levels * WRC_GRID^3` clipmap probes, 16 B/texel). Persists across frames for
     /// EMA accumulation + infinite bounce; (re)allocated when the clipmap level count changes.
@@ -176,6 +178,13 @@ impl GiSystem {
             "screen_probe_filter",
             128,
         )?;
+        let sp_irradiance_pipeline = compute(
+            dreamcoast_shader::screen_probe_irradiance_cs_spirv,
+            dreamcoast_shader::screen_probe_irradiance_cs_dxil,
+            dreamcoast_shader::screen_probe_irradiance_cs_metallib,
+            "screen_probe_irradiance",
+            32,
+        )?;
         let wrc_pipeline = compute(
             dreamcoast_shader::wrc_update_cs_spirv,
             dreamcoast_shader::wrc_update_cs_dxil,
@@ -241,6 +250,7 @@ impl GiSystem {
             sp_trace_pipeline,
             sp_integrate_pipeline,
             sp_filter_pipeline,
+            sp_irradiance_pipeline,
             wrc_pipeline,
             wrc_atlas: [None, None],
             wrc_levels: 0,
@@ -996,17 +1006,57 @@ impl GiSystem {
             _ => atlas,
         };
 
-        // --- P3: gather the (filtered) probe atlas per pixel into indirect irradiance. ---
+        // --- P5: pre-integrate each probe's octahedral RADIANCE tile into an IRRADIANCE tile
+        // ONCE, so the per-pixel gather is a cheap directional lookup (~4-probe bilinear) instead
+        // of a full hemisphere integral per pixel (~oct^2 taps). The reference's default. When
+        // enabled the integrate runs in lookup `mode = 1`; `P_SP_IRRADIANCE=0` keeps the direct
+        // per-pixel integral (`mode = 0`). ---
+        let irradiance_on = std::env::var("P_SP_IRRADIANCE")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let (integrate_atlas, integrate_mode) =
+            match (irradiance_on, self.sp_irradiance_pipeline.as_ref()) {
+                (true, Some(irr)) => {
+                    let irr_atlas = graph.create_storage_image(
+                        "sp_irradiance_atlas",
+                        HDR_FORMAT,
+                        Extent2D::new(atlas_w, atlas_h),
+                    );
+                    graph.add_compute_pass(
+                        ComputePassInfo {
+                            name: "screen_probe_irradiance",
+                            storage_writes: vec![irr_atlas],
+                            reads: vec![gather_atlas],
+                        },
+                        move |ctx| {
+                            let atlas_in = ctx.sampled_index(gather_atlas);
+                            let atlas_out = ctx.storage_index(irr_atlas);
+                            let cmd = ctx.cmd();
+                            cmd.bind_compute_pipeline(irr);
+                            cmd.push_constants_compute(&screen_probe_irradiance_push(
+                                atlas_in, atlas_out, probes_x, probes_y, oct,
+                            ));
+                            cmd.dispatch(atlas_w.div_ceil(8), atlas_h.div_ceil(8), 1);
+                            Ok(())
+                        },
+                    );
+                    (irr_atlas, 1u32)
+                }
+                _ => (gather_atlas, 0u32),
+            };
+
+        // --- P3: gather the probe atlas per pixel into indirect irradiance (lookup in mode 1). ---
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "screen_probe_integrate",
                 storage_writes: vec![out, skyvis],
-                reads: vec![gather_atlas, depth, normal],
+                reads: vec![integrate_atlas, depth, normal],
             },
             move |ctx| {
                 let depth_index = ctx.sampled_index(depth);
                 let normal_index = ctx.sampled_index(normal);
-                let atlas_index = ctx.sampled_index(gather_atlas);
+                let atlas_index = ctx.sampled_index(integrate_atlas);
                 let out_index = ctx.storage_index(out);
                 let skyvis_index = ctx.storage_index(skyvis);
                 let cmd = ctx.cmd();
@@ -1027,6 +1077,7 @@ impl GiSystem {
                     skyvis_index,
                     pos_sigma,
                     normal_power,
+                    integrate_mode,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

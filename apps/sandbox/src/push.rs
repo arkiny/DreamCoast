@@ -1745,6 +1745,7 @@ pub(crate) fn screen_probe_integrate_push(
     skyvis_index: u32,
     pos_sigma: f32,
     normal_power: f32,
+    mode: u32,
 ) -> [u8; 128] {
     let mut pc = [0u8; 128];
     let putu = |pc: &mut [u8], o: usize, v: u32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
@@ -1766,6 +1767,26 @@ pub(crate) fn screen_probe_integrate_push(
     putu(&mut pc, 108, skyvis_index);
     putf(&mut pc, 112, pos_sigma);
     putf(&mut pc, 116, normal_power);
+    putu(&mut pc, 120, mode);
+    pc
+}
+
+/// Pack the screen-probe IRRADIANCE pre-integration push block (32 bytes): atlas_in, atlas_out,
+/// probes_x, probes_y, oct + pad. See `screen_probe_irradiance.slang`.
+pub(crate) fn screen_probe_irradiance_push(
+    atlas_in: u32,
+    atlas_out: u32,
+    probes_x: u32,
+    probes_y: u32,
+    oct: u32,
+) -> [u8; 32] {
+    let mut pc = [0u8; 32];
+    let putu = |pc: &mut [u8], o: usize, v: u32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    putu(&mut pc, 0, atlas_in);
+    putu(&mut pc, 4, atlas_out);
+    putu(&mut pc, 8, probes_x);
+    putu(&mut pc, 12, probes_y);
+    putu(&mut pc, 16, oct);
     pc
 }
 

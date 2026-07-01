@@ -33,7 +33,7 @@ struct ProbeIntegratePush
     uint skyvis_index;      // storage-image index for indoor sky-visibility (0xFFFFFFFF = off)
     float pos_sigma;        // surface-plane proximity weight scale (world units)
     float normal_power;     // normal-agreement weight exponent
-    float pad1;
+    uint mode;              // 0 = integrate radiance tiles; 1 = look up pre-integrated irradiance
     float pad2;
 };
 
@@ -92,6 +92,39 @@ float3 integrate_probe(uint2 probe, float3 n, out float vis)
     return e * (4.0 / float(pc.oct_res * pc.oct_res));
 }
 
+// Cheap gather (mode 1): the atlas already holds per-probe IRRADIANCE (pre-integrated by
+// screen_probe_irradiance.slang) — rgb = indirect irradiance about the texel direction,
+// a = sky visibility. Bilinearly look it up in the pixel normal direction (a few taps).
+float3 lookup_probe(uint2 probe, float3 n, out float vis)
+{
+    uint2 base = probe * pc.oct_res;
+    float2 t = oct_dir_to_texel(n, pc.oct_res) - 0.5;
+    t = clamp(t, float2(0.0, 0.0), float2(float(pc.oct_res) - 1.0, float(pc.oct_res) - 1.0));
+    int2 t0 = int2(floor(t));
+    float2 f = t - float2(t0);
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    [unroll]
+    for (int j = 0; j < 2; j++)
+    {
+        [unroll]
+        for (int i = 0; i < 2; i++)
+        {
+            int2 tc = clamp(t0 + int2(i, j), int2(0, 0),
+                            int2(int(pc.oct_res) - 1, int(pc.oct_res) - 1));
+            float wgt = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+            int2 px = int2(base) + tc;
+            acc += g.textures[pc.atlas_index].Load(int3(px, 0)) * wgt;
+        }
+    }
+    vis = acc.a;
+    return acc.rgb;
+}
+
+float3 gather_probe(uint2 probe, float3 n, out float vis)
+{
+    return pc.mode != 0u ? lookup_probe(probe, n, vis) : integrate_probe(probe, n, vis);
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void csMain(uint3 tid: SV_DispatchThreadID)
@@ -144,7 +177,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 continue;
 
             float v_probe;
-            accum += w * integrate_probe(probe, normal, v_probe);
+            accum += w * gather_probe(probe, normal, v_probe);
             vis_accum += w * v_probe;
             wsum += w;
         }
