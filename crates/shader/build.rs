@@ -613,6 +613,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "screen_probe_filter_cs",
     },
+    // World radiance cache (P4): per-frame update of the camera-following clipmap probe atlas.
+    Job {
+        src: "wrc_update.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "wrc_update_cs",
+    },
     // Physical-camera auto-exposure: luminance histogram (pass 1) → adapted exposure (pass 2).
     Job {
         src: "auto_exposure.slang",

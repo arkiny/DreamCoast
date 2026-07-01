@@ -1605,8 +1605,11 @@ pub(crate) fn screen_probe_trace_push(
     clip_desc: u32,
     clip_count: u32,
     clamp_max: f32,
-) -> [u8; 224] {
-    let mut pc = [0u8; 224];
+    wrc_atlas: u32,
+    wrc_grid: u32,
+    wrc_oct: u32,
+) -> [u8; 240] {
+    let mut pc = [0u8; 240];
     let put3 = |pc: &mut [u8], o: usize, v: [f32; 3]| {
         for (i, x) in v.iter().enumerate() {
             pc[o + i * 4..o + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
@@ -1649,6 +1652,76 @@ pub(crate) fn screen_probe_trace_push(
     putu(&mut pc, 212, clip_desc);
     putu(&mut pc, 216, clip_count);
     putf(&mut pc, 220, clamp_max);
+    // World radiance cache fallback (0xFFFFFFFF atlas = unbound). grid/oct describe the atlas.
+    putu(&mut pc, 224, wrc_atlas);
+    putu(&mut pc, 228, wrc_grid);
+    putu(&mut pc, 232, wrc_oct);
+    putu(&mut pc, 236, 0);
+    pc
+}
+
+/// Pack the world radiance cache UPDATE push block (128 bytes): sun (16) + params (16) +
+/// ground_albedo/+cone_k (16) + cache uint4 (16) + scalars (clip_desc, clip_count, grid, oct,
+/// atlas_write, atlas_prev, cache_tile, max_steps, frame, reset, alpha, sample_clamp, ground_y +
+/// pad). See `wrc_update.slang`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrc_update_push(
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    ray_max: f32,
+    bias: f32,
+    sky_term: f32,
+    albedo_fallback: f32,
+    ground_albedo: [f32; 3],
+    cone_k: f32,
+    cache: [u32; 4],
+    clip_desc: u32,
+    clip_count: u32,
+    grid: u32,
+    oct: u32,
+    atlas_write: u32,
+    atlas_prev: u32,
+    cache_tile: u32,
+    max_steps: u32,
+    frame: u32,
+    reset: u32,
+    alpha: f32,
+    sample_clamp: f32,
+    ground_y: f32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    let put3 = |pc: &mut [u8], o: usize, v: [f32; 3]| {
+        for (i, x) in v.iter().enumerate() {
+            pc[o + i * 4..o + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+        }
+    };
+    let putu = |pc: &mut [u8], o: usize, v: u32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let putf = |pc: &mut [u8], o: usize, v: f32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let sun = normalize3(sun_dir);
+    put3(&mut pc, 0, [sun[0], sun[1], sun[2]]);
+    putf(&mut pc, 12, sun_intensity);
+    putf(&mut pc, 16, ray_max);
+    putf(&mut pc, 20, bias);
+    putf(&mut pc, 24, sky_term);
+    putf(&mut pc, 28, albedo_fallback);
+    put3(&mut pc, 32, ground_albedo);
+    putf(&mut pc, 44, cone_k);
+    for (i, v) in cache.iter().enumerate() {
+        putu(&mut pc, 48 + i * 4, *v);
+    }
+    putu(&mut pc, 64, clip_desc);
+    putu(&mut pc, 68, clip_count);
+    putu(&mut pc, 72, grid);
+    putu(&mut pc, 76, oct);
+    putu(&mut pc, 80, atlas_write);
+    putu(&mut pc, 84, atlas_prev);
+    putu(&mut pc, 88, cache_tile);
+    putu(&mut pc, 92, max_steps);
+    putu(&mut pc, 96, frame);
+    putu(&mut pc, 100, reset);
+    putf(&mut pc, 104, alpha);
+    putf(&mut pc, 108, sample_clamp);
+    putf(&mut pc, 112, ground_y);
     pc
 }
 

@@ -637,6 +637,8 @@ struct App {
     /// per-tile screen probes traced into an octahedral atlas + a per-pixel gather. Content-only
     /// (`SCREEN_PROBE`); the gallery keeps its current GI path (byte-identical anchor).
     screen_probe: bool,
+    /// P4 world radiance cache fallback for escaped screen-probe rays (`P_WRC`, on with probes).
+    wrc: bool,
     /// Reflection temporal history clamp (0 off / 1 hard / 2 variance; gallery forced 0) + variance γ.
     reflect_history_clamp: u32,
     reflect_clamp_gamma: f32,
@@ -1813,6 +1815,13 @@ impl App {
         // turns it on for any scene — including the gallery, so the technique can be measured
         // against the path-traced ground truth (the only path-traceable scene).
         let screen_probe = gi.has_screen_probe() && quality::env_bool("SCREEN_PROBE", false);
+        // P4 world radiance cache: an off-screen / far-field / infinite-bounce fallback escaped
+        // screen-probe rays sample. Opt-in (`P_WRC=1`), default OFF: measurement shows it is
+        // inert-to-slightly-negative on our architecture because the full-scene GDF clipmap
+        // already covers all on/off-screen geometry (screen-probe rays hit real geometry instead
+        // of escaping), so the cache's primary role is subsumed. Kept as correct infrastructure
+        // for the multi-bounce-at-hits refinement (docs/world-radiance-cache.md). See the finding.
+        let wrc = screen_probe && gi.has_wrc() && quality::env_bool("P_WRC", false);
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
         let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", qp.gi_denoise);
         // C5 screen-space reflections (viz toggle).
@@ -2186,6 +2195,7 @@ impl App {
             gi_half_res,
             gi_res_div,
             screen_probe,
+            wrc,
             reflect_history_clamp,
             reflect_clamp_gamma,
             gi_temporal_clamp,
@@ -3537,6 +3547,11 @@ impl App {
                 .wrapping_add(self.gi_spp as u64);
             self.gi.prepare_denoise(&self.device, cw, ch, key)?;
         }
+        // P4: (re)allocate the world radiance cache atlas for the scene's clipmap level count.
+        if self.wrc {
+            let levels = self.gdf.clip_descriptor().map(|(_, c)| c).unwrap_or(1);
+            self.gi.prepare_wrc(&self.device, levels)?;
+        }
         // C7b: (re)allocate the lit-color history buffers for the hybrid reflection path
         // (the standalone viz or the C7c lighting feedback).
         if self.gdf_hybrid || self.swrt_reflect {
@@ -3822,6 +3837,28 @@ impl App {
                 // ray march). Full-res output; denoise (temporal + à-trous) for stability like the
                 // ray-march path. The gather also builds the indoor skylight occlusion (sky-vis)
                 // from the probes' per-ray sky visibility, fed to lighting like the volume path.
+                // P4: update the world radiance cache first, so escaped probe rays sample this
+                // frame's cache (off-screen / far-field / infinite bounce). `None` when disabled.
+                let wrc_arg = if self.wrc {
+                    self.gi.record_wrc_update(
+                        &mut graph,
+                        vol,
+                        ext,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        self.sun_dir,
+                        self.sun_intensity,
+                        scene_clip,
+                        &scene_clip_vols,
+                        scene_albedo,
+                        gi_cache_arg,
+                        self.gi_max_steps,
+                        self.gdf_cone_k,
+                        0.1, // EMA alpha
+                    )
+                } else {
+                    None
+                };
                 let (traced, sp_skyvis) = self.gi.record_screen_probe(
                     &mut graph,
                     vol,
@@ -3851,6 +3888,7 @@ impl App {
                         .and_then(|v| v.parse::<u32>().ok())
                         .unwrap_or(1)
                         .min(4),
+                    wrc_arg,
                 );
                 gi_skyvis_out = Some(sp_skyvis);
                 let out = if gi_denoise_active {
@@ -4961,6 +4999,10 @@ impl App {
         // frame's view-projection for the next frame's temporal reprojection.
         if gi_denoise_active {
             self.gi.advance_denoise();
+        }
+        // P4: advance the world radiance cache ping-pong so next frame reads this frame's write.
+        if self.wrc {
+            self.gi.advance_wrc();
         }
         // C7b: advance the lit-color history ping-pong so next frame reads this frame's write.
         if self.gdf_hybrid || self.swrt_reflect {

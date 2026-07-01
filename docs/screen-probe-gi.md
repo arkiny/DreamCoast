@@ -146,3 +146,37 @@ half/quarter-res and actually need the extra effective samples). Landing it now 
 for no parity gain, which the build-to-quality metric (path-tracer parity) argues against.
 
 Gallery byte-identical (no env, `dba9ff7c…`); deterministic (no RNG added).
+
+## P4 — world radiance cache fallback (opt-in) + the subsumption finding
+
+`wrc_update.slang` + `wrc_common.slang`: a camera-following clipmap of world probes (reusing
+the GDF clipmap level AABBs for placement, `WRC_GRID`=16 probes/side, `WRC_OCT`=8 octahedral
+texels), each storing incoming radiance in a persistent ping-pong 2D atlas backed by a byte-
+address storage buffer (escapes the 3D-volume-count limit; dense/direct-indexed — sparse
+indirection is a noted refinement). Updated each frame by marching the shared bounce tracer;
+escaped update rays sample the previous atlas (infinite bounce + far-field over frames). A
+screen-probe ray that escapes the local trace reads the cache at the probe origin in the ray
+direction (`screen_probe_trace.slang`). `P_WRC=1` opt-in.
+
+**Measured finding — the cache's role is largely subsumed by our full-scene GDF.** With the
+fallback correctly landing inside the cache (sample at the on-surface origin, not the far
+point which is outside every clipmap level):
+
+| scene | WRC on vs off |
+|---|---|
+| gallery (open) vs PT | 6.005 vs **5.988** — slightly *worse* (mild overshoot on an already-floor-limited scene) |
+| sponza_intel (enclosed) | **0.000/ch** difference (few-LSB) — inert |
+
+Why: unlike a screen-space-only tracer (which cannot see off-screen and *needs* a world cache),
+our screen probes march the **full-scene GDF clipmap**, so their rays hit real on/off-screen
+geometry instead of escaping — and the few rays that do escape are sky-gap rays the cache has no
+radiance for. The reference cache's off-screen/far-field role is therefore already covered by
+the GDF. The one genuine gap is **multi-bounce** (our probes are 1-bounce; the path tracer is
+infinite), but the cache's escaped-ray hook is the wrong place for it — multi-bounce would come
+from feeding cache irradiance at **hits**, which overlaps the existing mesh-card surface cache.
+
+So P4 lands as **correct, deterministic, gallery-byte-identical, opt-in infrastructure** (default
+OFF so it never regresses the screen-probe default), with the honest finding recorded rather than
+a false quality claim. The multi-bounce-at-hits integration is the real untapped value and is
+noted for a future pass (it needs a hit-side irradiance lookup + reconciliation with the surface
+cache). Gallery anchor `dba9ff7c…`; screen-probe default unchanged at 5.988.
