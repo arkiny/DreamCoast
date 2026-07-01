@@ -112,19 +112,28 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     if (escaped > 0.5 && pc.atlas_prev != 0xFFFFFFFFu)
         radiance = wrc_sample(w, probe_center + dir * pc.params.x, dir);
 
+    // Per-direction SKY VISIBILITY: `escaped` = 1 when the ray reached the sky (the cache stores
+    // bounce-only radiance, so a consumer adds the skylight OCCLUDED by this). Accumulated in the
+    // tile alpha alongside the radiance so the world cache carries indoor sky occlusion, matching
+    // the reference (which applies the skylight weighted by how much the surface sees the sky).
+    float sky_vis = escaped;
+
     // EMA temporal accumulation. On reset (first frame) or with no prev atlas bound there is no
     // history to blend against, so the new sample is written straight through.
     float3 outv;
+    float outa;
     if (pc.reset != 0u || pc.atlas_prev == 0xFFFFFFFFu)
     {
         outv = radiance;
+        outa = sky_vis;
     }
     else
     {
-        float3 prev = wrc_load(pc.atlas_prev, tid.xy, pc.grid, pc.oct);
-        outv = lerp(prev, radiance, pc.alpha);
+        float4 prev = wrc_load4(pc.atlas_prev, tid.xy, pc.grid, pc.oct);
+        outv = lerp(prev.rgb, radiance, pc.alpha);
+        outa = lerp(prev.a, sky_vis, pc.alpha);
     }
 
     uint off = wrc_texel_offset(tid.xy, pc.grid, pc.oct);
-    g.storage_buffers[pc.atlas_write].Store4(off, asuint(float4(outv, 1.0)));
+    g.storage_buffers[pc.atlas_write].Store4(off, asuint(float4(outv, outa)));
 }

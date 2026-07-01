@@ -41,10 +41,14 @@ uint wrc_texel_offset(uint2 px, uint grid, uint oct)
     return (px.y * (grid * oct) + px.x) * 16u;
 }
 
-// Read a float4 texel from the atlas storage buffer.
+// Read a float4 texel (rgb = radiance, a = per-direction sky visibility) from the atlas buffer.
+float4 wrc_load4(uint atlas, uint2 px, uint grid, uint oct)
+{
+    return asfloat(g.storage_buffers[atlas].Load4(wrc_texel_offset(px, grid, oct)));
+}
 float3 wrc_load(uint atlas, uint2 px, uint grid, uint oct)
 {
-    return asfloat(g.storage_buffers[atlas].Load4(wrc_texel_offset(px, grid, oct))).rgb;
+    return wrc_load4(atlas, px, grid, oct).rgb;
 }
 
 // World-space center of probe (level, cell), from the clipmap level AABB.
@@ -107,4 +111,93 @@ float3 wrc_sample(Wrc w, float3 p, float3 dir)
         }
     }
     return float3(0.0, 0.0, 0.0);
+}
+
+// Reconstruct the indirect IRRADIANCE the cache holds at world point `p` for a surface with
+// normal `n`: the finest clipmap level's nearest probe, its octahedral radiance tile integrated
+// over the cosine hemisphere about `n` (same (1/pi)*sum(L*cos*dOmega), dOmega = 4*pi/oct^2
+// estimator the screen-probe gather uses). Used by the GI-on-distance-field visualization.
+// Returns 0 if the cache is unbound or `p` is outside every level.
+float3 wrc_irradiance(Wrc w, float3 p, float3 n)
+{
+    if (w.atlas == 0xFFFFFFFFu)
+        return float3(0.0, 0.0, 0.0);
+    ClipMap c;
+    c.desc = w.clip_desc;
+    c.count = w.levels;
+    for (uint i = 0u; i < w.levels; i++)
+    {
+        float3 mn = cm_min(c, i);
+        float3 mx = cm_max(c, i);
+        float3 uvw = (p - mn) / (mx - mn);
+        if (all(uvw >= 0.0) && all(uvw <= 1.0))
+        {
+            uint3 cell = uint3(clamp(int3(floor(uvw * float(w.grid))), int3(0, 0, 0),
+                                     int3(int(w.grid) - 1, int(w.grid) - 1, int(w.grid) - 1)));
+            uint2 base = wrc_tile_base(i, cell, w.grid, w.oct);
+            float3 e = float3(0.0, 0.0, 0.0);
+            for (uint oy = 0u; oy < w.oct; oy++)
+            {
+                for (uint ox = 0u; ox < w.oct; ox++)
+                {
+                    float3 dir = oct_to_dir(oct_texel_to_square(uint2(ox, oy), w.oct));
+                    float cw = max(dot(dir, n), 0.0);
+                    if (cw <= 0.0)
+                        continue;
+                    e += wrc_load(w.atlas, base + uint2(ox, oy), w.grid, w.oct) * cw;
+                }
+            }
+            return e * (4.0 / float(w.oct * w.oct));
+        }
+    }
+    return float3(0.0, 0.0, 0.0);
+}
+
+// Gather the cache at world point `p` for surface normal `n`: the bounce indirect irradiance
+// (`bounce_E`, rgb) AND the cosine-weighted hemispherical SKY VISIBILITY (`skyvis`, in [0,1],
+// from the per-direction sky visibility stored in the tile alpha). The reference applies the
+// skylight OCCLUDED by how much the surface sees the sky, rather than a flat fill — so a
+// visualization / lighting consumer can add `sky * skyvis`. `skyvis` defaults to 1 (fully open)
+// when the cache is unbound or `p` is outside every level.
+void wrc_gather(Wrc w, float3 p, float3 n, out float3 bounce_E, out float skyvis)
+{
+    bounce_E = float3(0.0, 0.0, 0.0);
+    skyvis = 1.0;
+    if (w.atlas == 0xFFFFFFFFu)
+        return;
+    ClipMap c;
+    c.desc = w.clip_desc;
+    c.count = w.levels;
+    for (uint i = 0u; i < w.levels; i++)
+    {
+        float3 mn = cm_min(c, i);
+        float3 mx = cm_max(c, i);
+        float3 uvw = (p - mn) / (mx - mn);
+        if (all(uvw >= 0.0) && all(uvw <= 1.0))
+        {
+            uint3 cell = uint3(clamp(int3(floor(uvw * float(w.grid))), int3(0, 0, 0),
+                                     int3(int(w.grid) - 1, int(w.grid) - 1, int(w.grid) - 1)));
+            uint2 base = wrc_tile_base(i, cell, w.grid, w.oct);
+            float3 e = float3(0.0, 0.0, 0.0);
+            float vis_num = 0.0;
+            float cos_sum = 0.0;
+            for (uint oy = 0u; oy < w.oct; oy++)
+            {
+                for (uint ox = 0u; ox < w.oct; ox++)
+                {
+                    float3 dir = oct_to_dir(oct_texel_to_square(uint2(ox, oy), w.oct));
+                    float cw = max(dot(dir, n), 0.0);
+                    if (cw <= 0.0)
+                        continue;
+                    float4 s = wrc_load4(w.atlas, base + uint2(ox, oy), w.grid, w.oct);
+                    e += s.rgb * cw;
+                    vis_num += s.a * cw; // a = per-direction sky visibility
+                    cos_sum += cw;
+                }
+            }
+            bounce_E = e * (4.0 / float(w.oct * w.oct));
+            skyvis = cos_sum > 0.0 ? vis_num / cos_sum : 1.0;
+            return;
+        }
+    }
 }

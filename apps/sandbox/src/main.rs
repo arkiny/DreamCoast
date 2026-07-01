@@ -639,6 +639,9 @@ struct App {
     screen_probe: bool,
     /// P4 world radiance cache fallback for escaped screen-probe rays (`P_WRC`, on with probes).
     wrc: bool,
+    /// GI-on-distance-field visualization (`P_WRC_VIZ`): march the camera into the GDF and paint
+    /// hits with the world radiance cache's stored indirect irradiance. Replaces the tonemap source.
+    wrc_viz: bool,
     /// Reflection temporal history clamp (0 off / 1 hard / 2 variance; gallery forced 0) + variance γ.
     reflect_history_clamp: u32,
     reflect_clamp_gamma: f32,
@@ -1822,6 +1825,10 @@ impl App {
         // of escaping), so the cache's primary role is subsumed. Kept as correct infrastructure
         // for the multi-bounce-at-hits refinement (docs/world-radiance-cache.md). See the finding.
         let wrc = screen_probe && gi.has_wrc() && quality::env_bool("P_WRC", false);
+        // GI-on-distance-field visualization: march the camera into the GDF, paint each hit with
+        // the world radiance cache's stored indirect irradiance. Opt-in `P_WRC_VIZ=1`; needs the
+        // scene GDF (built when GDF features are active). Runs its own cache update to populate.
+        let wrc_viz = gi.has_wrc_view() && std::env::var_os("P_WRC_VIZ").is_some();
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
         let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", qp.gi_denoise);
         // C5 screen-space reflections (viz toggle).
@@ -2196,6 +2203,7 @@ impl App {
             gi_res_div,
             screen_probe,
             wrc,
+            wrc_viz,
             reflect_history_clamp,
             reflect_clamp_gamma,
             gi_temporal_clamp,
@@ -2687,6 +2695,8 @@ impl App {
             || taau_active
             || self.gi_volume
             || self.auto_exposure
+            || self.wrc
+            || self.wrc_viz
             || (self.swrt_reflect && self.reflect.has_reflect_temporal())
         {
             // The surface cache / stochastic GGX reflection accrue a sample per frame + temporally
@@ -3548,7 +3558,7 @@ impl App {
             self.gi.prepare_denoise(&self.device, cw, ch, key)?;
         }
         // P4: (re)allocate the world radiance cache atlas for the scene's clipmap level count.
-        if self.wrc {
+        if self.wrc || self.wrc_viz {
             let levels = self.gdf.clip_descriptor().map(|(_, c)| c).unwrap_or(1);
             self.gi.prepare_wrc(&self.device, levels)?;
         }
@@ -3666,7 +3676,8 @@ impl App {
             || self.gdf_hybrid
             || self.swrt_reflect
             || self.cache_viz
-            || self.surface_cache)
+            || self.surface_cache
+            || self.wrc_viz)
             && scene_gdf_vol.is_some()
         {
             let ext = graph.import_external("scene_gdf");
@@ -4016,6 +4027,59 @@ impl App {
                 };
                 Some(out)
             }
+            _ => None,
+        };
+        // GI-on-distance-field visualization: update the world radiance cache, then march the
+        // camera into the GDF and paint each hit with the cache's stored indirect irradiance.
+        // Replaces the tonemap source (added to the `tonemap_src` chain below). `P_WRC_VIZ_MODE`
+        // 0 = irradiance grayscale, 1 = irradiance × clay; `P_WRC_VIZ_GAIN` lifts the dim indirect.
+        let wrc_view_out = match (self.wrc_viz, scene_gdf_vol, scene_gdf_ext) {
+            (true, Some(vol), Some(ext)) => self
+                .gi
+                .record_wrc_update(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    scene_clip,
+                    &scene_clip_vols,
+                    scene_albedo,
+                    gi_cache_arg,
+                    self.gi_max_steps,
+                    self.gdf_cone_k,
+                    0.1, // EMA alpha
+                )
+                .map(|(wrc_atlas, wrc_ext)| {
+                    let mode = std::env::var("P_WRC_VIZ_MODE")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(1);
+                    let gain = std::env::var("P_WRC_VIZ_GAIN")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(1.0);
+                    self.gi.record_wrc_view(
+                        &mut graph,
+                        vol,
+                        extent,
+                        eye.into(),
+                        inv_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        self.flip_y,
+                        scene_clip,
+                        &scene_clip_vols,
+                        wrc_atlas,
+                        wrc_ext,
+                        mode,
+                        gain,
+                    )
+                }),
             _ => None,
         };
         // Stage C7c: hybrid SW-RT reflection feeding the lighting specular. Built BEFORE
@@ -4740,6 +4804,7 @@ impl App {
             None
         };
         let tonemap_src = rt_out
+            .or(wrc_view_out)
             .or(sdf_out)
             .or(vol_out)
             .or(bake_out)
@@ -5001,7 +5066,7 @@ impl App {
             self.gi.advance_denoise();
         }
         // P4: advance the world radiance cache ping-pong so next frame reads this frame's write.
-        if self.wrc {
+        if self.wrc || self.wrc_viz {
             self.gi.advance_wrc();
         }
         // C7b: advance the lit-color history ping-pong so next frame reads this frame's write.

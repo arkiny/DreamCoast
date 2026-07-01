@@ -1834,6 +1834,61 @@ pub(crate) fn screen_probe_filter_push(
     pc
 }
 
+/// Pack the GI-on-distance-field VIEW push block (192 bytes): inv_view_proj (64), cam_pos (16),
+/// aabb_min/ground_y (16), aabb_max/sample_clamp (16), clay/gain (16), then scalars. See
+/// `wrc_view.slang`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrc_view_push(
+    inv_view_proj: &[f32; 16],
+    cam_pos: [f32; 3],
+    aabb_min: [f32; 3],
+    ground_y: f32,
+    aabb_max: [f32; 3],
+    sample_clamp: f32,
+    clay: [f32; 3],
+    gain: f32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    clip_desc: u32,
+    clip_count: u32,
+    wrc_atlas: u32,
+    wrc_grid: u32,
+    wrc_oct: u32,
+    mode: u32,
+) -> [u8; 192] {
+    let mut pc = [0u8; 192];
+    let put3 = |pc: &mut [u8], o: usize, v: [f32; 3]| {
+        for (i, x) in v.iter().enumerate() {
+            pc[o + i * 4..o + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+        }
+    };
+    let putu = |pc: &mut [u8], o: usize, v: u32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let putf = |pc: &mut [u8], o: usize, v: f32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    put3(&mut pc, 64, cam_pos);
+    put3(&mut pc, 80, aabb_min);
+    putf(&mut pc, 92, ground_y);
+    put3(&mut pc, 96, aabb_max);
+    putf(&mut pc, 108, sample_clamp);
+    put3(&mut pc, 112, clay);
+    putf(&mut pc, 124, gain);
+    putu(&mut pc, 128, out_index);
+    putu(&mut pc, 132, width);
+    putu(&mut pc, 136, height);
+    putu(&mut pc, 140, flip_y);
+    putu(&mut pc, 144, clip_desc);
+    putu(&mut pc, 148, clip_count);
+    putu(&mut pc, 152, wrc_atlas);
+    putu(&mut pc, 156, wrc_grid);
+    putu(&mut pc, 160, wrc_oct);
+    putu(&mut pc, 164, mode);
+    pc
+}
+
 /// Convert a column-major glam [`Mat4`] object-to-world transform into the
 /// row-major 3x4 (12-float) form acceleration-structure instances expect (Phase 8).
 pub(crate) fn mat4_to_3x4(m: Mat4) -> [f32; 12] {
