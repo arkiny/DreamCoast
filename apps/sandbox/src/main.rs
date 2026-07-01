@@ -639,9 +639,11 @@ struct App {
     screen_probe: bool,
     /// P4 world radiance cache fallback for escaped screen-probe rays (`P_WRC`, on with probes).
     wrc: bool,
-    /// GI-on-distance-field visualization (`P_WRC_VIZ`): march the camera into the GDF and paint
-    /// hits with the world radiance cache's stored indirect irradiance. Replaces the tonemap source.
+    /// GI-on-distance-field visualization: march the camera into the GDF and paint hits. Replaces
+    /// the tonemap source. `wrc_viz` = the view pass is active; `sc_viz` = shade from the high-res
+    /// surface cache (`P_SC_VIZ`) instead of the coarse world radiance cache (`P_WRC_VIZ`).
     wrc_viz: bool,
+    sc_viz: bool,
     /// Reflection temporal history clamp (0 off / 1 hard / 2 variance; gallery forced 0) + variance γ.
     reflect_history_clamp: u32,
     reflect_clamp_gamma: f32,
@@ -1834,10 +1836,16 @@ impl App {
         // of escaping), so the cache's primary role is subsumed. Kept as correct infrastructure
         // for the multi-bounce-at-hits refinement (docs/world-radiance-cache.md). See the finding.
         let wrc = screen_probe && gi.has_wrc() && quality::env_bool("P_WRC", false);
-        // GI-on-distance-field visualization: march the camera into the GDF, paint each hit with
-        // the world radiance cache's stored indirect irradiance. Opt-in `P_WRC_VIZ=1`; needs the
-        // scene GDF (built when GDF features are active). Runs its own cache update to populate.
-        let wrc_viz = gi.has_wrc_view() && std::env::var_os("P_WRC_VIZ").is_some();
+        // GI-on-distance-field visualization: march the camera into the GDF and paint each hit.
+        // `P_SC_VIZ=1` shades from the high-res SURFACE CACHE (2D mesh cards, final lit radiance —
+        // like the reference "scene" view); `P_WRC_VIZ=1` shades from the coarse world radiance
+        // cache. Either enables the view pass (opt-in); the surface-cache source additionally needs
+        // the mesh-card surface cache (built/lit via `cache_active` below).
+        let sc_viz = gi.has_wrc_view()
+            && gdf.has_surface_cache()
+            && gdf.has_cache_lighting()
+            && std::env::var_os("P_SC_VIZ").is_some();
+        let wrc_viz = gi.has_wrc_view() && (std::env::var_os("P_WRC_VIZ").is_some() || sc_viz);
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
         let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", qp.gi_denoise);
         // C5 screen-space reflections (viz toggle).
@@ -2213,6 +2221,7 @@ impl App {
             screen_probe,
             wrc,
             wrc_viz,
+            sc_viz,
             reflect_history_clamp,
             reflect_clamp_gamma,
             gi_temporal_clamp,
@@ -3728,8 +3737,9 @@ impl App {
         // C8b1: capture the mesh-card surface cache once (static geometry + albedo), reading
         // the scene GDF (+ the C8a albedo volumes for the captured color). C8b2 then re-lights
         // it every frame into a radiance atlas (multibounce gather from the previous frame).
-        let cache_active = (self.cache_viz || self.surface_cache || self.reflect_cache)
-            && self.gdf.has_surface_cache();
+        let cache_active =
+            (self.cache_viz || self.surface_cache || self.reflect_cache || self.sc_viz)
+                && self.gdf.has_surface_cache();
         let scene_cache_ext = match (cache_active, scene_gdf_ext) {
             (true, Some(gdf_ext)) => {
                 let ext = graph.import_external("scene_cache");
@@ -4087,6 +4097,16 @@ impl App {
                         wrc_ext,
                         mode,
                         gain,
+                        // Surface-cache source (P_SC_VIZ): shade from the high-res mesh cards' final
+                        // lit radiance where a card covers the hit; else fall back to the world cache.
+                        if self.sc_viz { 1 } else { 0 },
+                        if self.sc_viz {
+                            cache_read
+                                .zip(scene_cache_lit_ext)
+                                .map(|((c, p, r, n, t), ext)| ([c, p, r, n, t], ext))
+                        } else {
+                            None
+                        },
                     )
                 }),
             _ => None,

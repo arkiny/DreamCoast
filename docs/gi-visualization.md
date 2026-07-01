@@ -107,3 +107,26 @@ blobby surfaces and the world radiance cache (16³ probes/level) makes the GI bl
 reads dark where the coarse 1-bounce cache has little GI (the honest state). Gallery byte-identical
 with no env (opt-in); deterministic (the cache update has no RNG). Metal-verified; Windows DX≡VK
 pending.
+
+## Two shading sources — world radiance cache vs surface cache (`P_WRC_VIZ` / `P_SC_VIZ`)
+
+The reference "scene" visualization looks higher-resolution than a probe-grid view because it
+shades hits from the **surface cache** (2D mesh cards storing final lit radiance at per-texel
+resolution, following the geometry) rather than a coarse volumetric probe grid. Our view now
+supports both sources (the pass `source` field selects):
+
+- `P_WRC_VIZ=1` — **world radiance cache** (default source): a coarse 3D probe clipmap
+  (`WRC_GRID=16` probes × `WRC_OCT=8` octahedral per level). Low-frequency / blobby, but smooth.
+- `P_SC_VIZ=1` — **surface cache** (higher-res): sample the mesh cards' final lit radiance
+  (`CARD_TILE=32` texels/card) at the hit via `sample_surface_cache`; card-less surfaces (e.g. the
+  analytic ground) fall through to the world-cache path. Enables the mesh-card surface cache
+  (capture + per-frame re-light) via `cache_active`. Reuses the 6 spare `wrc_view_push` pads for
+  the source flag + card indices (push stays 192 B).
+
+Trade-off (measured): the surface-cache source is dramatically higher resolution (per-texel card
+detail visible) but **noisier** — it samples the high-res 2D cards from our **coarse GDF march hit
+points** (blobby, offset up to ~½ voxel, with an approximate gradient normal), so the hit
+mis-registers against the fine cards → a high-frequency checkerboard. The reference is clean
+because its mesh-SDF hits are precise. Cleaning ours up needs a finer DF hit (snap-to-surface or a
+higher-resolution field near the camera) — the same coarse-DF ceiling as the lion-relief
+see-through. Gallery byte-identical (both sources opt-in); the world-cache source is unchanged.

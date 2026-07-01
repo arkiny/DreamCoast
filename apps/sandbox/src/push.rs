@@ -1857,6 +1857,8 @@ pub(crate) fn wrc_view_push(
     wrc_grid: u32,
     wrc_oct: u32,
     mode: u32,
+    source: u32,
+    sc: [u32; 5], // surface cache: cards, cache_pos, cache_rad, num_cards, tile (0xFFFFFFFF = off)
 ) -> [u8; 192] {
     let mut pc = [0u8; 192];
     let put3 = |pc: &mut [u8], o: usize, v: [f32; 3]| {
@@ -1886,6 +1888,12 @@ pub(crate) fn wrc_view_push(
     putu(&mut pc, 156, wrc_grid);
     putu(&mut pc, 160, wrc_oct);
     putu(&mut pc, 164, mode);
+    putu(&mut pc, 168, source);
+    putu(&mut pc, 172, sc[0]); // cards
+    putu(&mut pc, 176, sc[1]); // cache_pos
+    putu(&mut pc, 180, sc[2]); // cache_rad
+    putu(&mut pc, 184, sc[3]); // num_cards
+    putu(&mut pc, 188, sc[4]); // tile
     pc
 }
 
