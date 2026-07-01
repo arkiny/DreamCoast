@@ -4,7 +4,11 @@
 > "씬 전체 fused 재베이크" → "per-mesh DF + 인스턴스 공유 + 클립맵 합성"** 으로 바꾸는 권위 계획이다.
 > 선행 측정/근거: [reflection-sdf-resolution.md](reflection-sdf-resolution.md)(해상도는 레버 아님),
 > [lumen-parity-swrt.md](lumen-parity-swrt.md), [foliage.md](foliage.md)(커튼 색 번짐 부재).
-> **상태: 계획(미구현) — 리뷰 후 스테이지별 커밋.**
+> **상태: 구현 완료 + 콘텐츠 기본값 승격.** per-mesh DF가 이제 **콘텐츠 씬의 기본 경로**이고, fused
+> 전체-씬 베이크는 **DEPRECATED**(거친 복셀 ~0.76 m @ 37 m 씬 → 얇은 부조/벽/트레이서리를 잃어 DF 기반
+> 패스가 관통). 갤러리만 fused 유지(바이트 동일 앵커·per-mesh 이득 없음). `P11_PERMESH_GDF=0`으로만 폐기된
+> fused 경로 강제(fallback/A-B; 콘텐츠에서 켜면 WARN 로그). 비-인스턴스 씬(Intel Sponza ~426 유니크 메시)은
+> 첫 쿡이 느리지만 캐시됨.
 
 ## 동기 / 배경 (2026-06-30, 측정·레퍼런스 확인으로 확정)
 
