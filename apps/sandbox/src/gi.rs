@@ -448,15 +448,25 @@ impl GiSystem {
         wrc_ext: ResourceId,
         mode: u32,
         gain: f32,
+        // Shading source: 0 = world radiance cache (coarse probes); 1 = surface cache (high-res
+        // mesh cards, final lit radiance). `surface_cache` = its `(indices, lit graph handle)`; the
+        // handle orders the view after the cache re-light. `None` => world-cache source only.
+        source: u32,
+        surface_cache: Option<([u32; 5], ResourceId)>,
     ) -> ResourceId {
         let pipe = self.wrc_view_pipeline.as_ref().expect("wrc view pipeline");
         let diag = Self::diag(aabb_min, aabb_max);
         let out = graph.create_storage_image("wrc_view_out", HDR_FORMAT, extent);
+        let sc = surface_cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
+        let mut reads = vec![wrc_ext];
+        if let Some((_, ext)) = surface_cache {
+            reads.push(ext); // order the view after this frame's surface-cache re-light
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "wrc_view",
                 storage_writes: vec![out],
-                reads: vec![wrc_ext],
+                reads,
             },
             move |ctx| {
                 let out_index = ctx.storage_index(out);
@@ -485,6 +495,8 @@ impl GiSystem {
                     WRC_GRID,
                     WRC_OCT,
                     mode,
+                    source,
+                    sc,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

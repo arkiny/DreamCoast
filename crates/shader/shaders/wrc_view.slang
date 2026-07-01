@@ -41,12 +41,13 @@ struct WrcViewPush
     uint wrc_grid;          // 156 cache probes per side per level
     uint wrc_oct;           // 160 cache octahedral texels per side
     uint mode;              // 164 0 = irradiance (grayscale), 1 = irradiance x clay albedo
-    uint pad0;              // 168
-    uint pad1;              // 172
-    uint pad2;              // 176
-    uint pad3;              // 180
-    uint pad4;              // 184
-    uint pad5;              // 188
+    uint source;            // 168 0 = world radiance cache (coarse 3D probes); 1 = surface cache
+                            //     (high-res 2D mesh cards, final lit radiance) — the higher-res view
+    uint sc_cards;          // 172 surface-cache card metadata buffer index (0xFFFFFFFF = unbound)
+    uint sc_pos;            // 176 surface-cache card world-position buffer index
+    uint sc_rad;            // 180 surface-cache lit radiance atlas index
+    uint sc_num;            // 184 number of cards
+    uint sc_tile;           // 188 card atlas tile edge
 };
 
 [[vk::push_constant]]
@@ -140,6 +141,28 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     }
 
     float3 n = bs_scene_normal(bs, p);
+
+    // --- Surface-cache source (mode 1): the higher-resolution view, matching the reference "scene"
+    // visualization. The mesh-card surface cache stores FINAL lit radiance (direct + indirect +
+    // skylight) at per-texel resolution (32^2 per card, following the geometry), far finer than the
+    // coarse world radiance-cache probe grid. Sample the lit card at the hit; where no card covers
+    // the point (e.g. the analytic ground), fall through to the world-cache path below. ---
+    if (pc.source == 1u && pc.sc_cards != 0xFFFFFFFFu)
+    {
+        bool found = false;
+        float3 sc = sample_surface_cache(p, n, pc.sc_cards, pc.sc_pos, pc.sc_rad, pc.sc_num,
+                                         pc.sc_tile, found);
+        if (found)
+        {
+            // Card radiance is already final lit (incl. skylight) at high res — display directly.
+            float3 c = sc * pc.clay.w;
+            float lum = max(dot(c, float3(0.2126, 0.7152, 0.0722)), 1e-5);
+            c *= (lum / (1.0 + lum)) / lum;
+            float form = 0.7 + 0.3 * (n.y * 0.5 + 0.5);
+            g.storage_images[pc.out_index][tid.xy] = float4(c * form, 1.0);
+            return;
+        }
+    }
 
     Wrc w;
     w.atlas = pc.wrc_atlas;
