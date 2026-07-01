@@ -40,6 +40,11 @@ pub(crate) struct FusedScene {
     /// Per-drawable world-space AABB (**unpadded**), draw-list order — the surface
     /// cache projects its mesh cards from these.
     pub(crate) drawable_aabb: Vec<([f32; 3], [f32; 3])>,
+    /// Per-drawable representative linear albedo (draw-list order), aligned with
+    /// `drawable_aabb`. Each drawable (glTF primitive) has exactly one material, so this
+    /// is the surface's true color — the mesh-card capture (C) stamps it onto the card so
+    /// the GI/reflection cache carries the real albedo instead of the blurred voxel volume.
+    pub(crate) drawable_albedo: Vec<[f32; 3]>,
 }
 
 /// Fuse `world`'s opaque draw list into one world-space triangle soup. Transforms are
@@ -60,6 +65,7 @@ pub(crate) fn fuse_scene(
     let mut amin = [f32::MAX; 3];
     let mut amax = [f32::MIN; 3];
     let mut drawable_aabb: Vec<([f32; 3], [f32; 3])> = Vec::new();
+    let mut drawable_albedo: Vec<[f32; 3]> = Vec::new();
 
     for d in world.draw_list() {
         let cpu = meshes.cpu(d.mesh);
@@ -97,6 +103,7 @@ pub(crate) fn fuse_scene(
         }
         base += cpu.vertices.len() as u32;
         drawable_aabb.push((omin, omax));
+        drawable_albedo.push(albedo);
     }
 
     // Pad the AABB by 10 % per axis so the zero-isosurface isn't clipped at the volume
@@ -116,6 +123,7 @@ pub(crate) fn fuse_scene(
         aabb_min: amin,
         aabb_max: amax,
         drawable_aabb,
+        drawable_albedo,
     }
 }
 
@@ -128,7 +136,10 @@ pub(crate) fn fuse_scene(
 /// drawables (by AABB volume — the most screen-relevant) keep cards, in their original
 /// draw-list order (so a within-budget scene like the gallery is byte-identical), and the
 /// dropped count is logged. This bounds the atlas size and the per-frame relight cost.
-pub(crate) fn build_surface_cards(drawable_aabb: &[([f32; 3], [f32; 3])]) -> Vec<u8> {
+pub(crate) fn build_surface_cards(
+    drawable_aabb: &[([f32; 3], [f32; 3])],
+    drawable_albedo: &[[f32; 3]],
+) -> (Vec<u8>, Vec<u8>) {
     let max_drawables = (MAX_CARDS / 6) as usize;
     // Pick which drawables get cards (all, unless over budget → largest-volume subset).
     let mut keep: Vec<usize> = (0..drawable_aabb.len()).collect();
@@ -152,6 +163,9 @@ pub(crate) fn build_surface_cards(drawable_aabb: &[([f32; 3], [f32; 3])]) -> Vec
     }
 
     let mut cards: Vec<u8> = Vec::with_capacity(keep.len() * 6 * 64);
+    // One linear-albedo float3 (12 B) per card, same card order — the capture stamps the
+    // drawable's true material color onto its 6 cards (C).
+    let mut card_albedo: Vec<u8> = Vec::with_capacity(keep.len() * 6 * 12);
     let push4 = |v: [f32; 3], w: f32, buf: &mut Vec<u8>| {
         for c in v {
             buf.extend_from_slice(&c.to_le_bytes());
@@ -160,6 +174,7 @@ pub(crate) fn build_surface_cards(drawable_aabb: &[([f32; 3], [f32; 3])]) -> Vec
     };
     for &i in &keep {
         let (omin, omax) = drawable_aabb[i];
+        let alb = drawable_albedo[i];
         let center = [
             (omin[0] + omax[0]) * 0.5,
             (omin[1] + omax[1]) * 0.5,
@@ -187,8 +202,11 @@ pub(crate) fn build_surface_cards(drawable_aabb: &[([f32; 3], [f32; 3])]) -> Vec
                 push4(normal, 0.0, &mut cards);
                 push4(u_axis, 0.0, &mut cards);
                 push4(v_axis, 0.0, &mut cards);
+                for c in alb {
+                    card_albedo.extend_from_slice(&c.to_le_bytes());
+                }
             }
         }
     }
-    cards
+    (cards, card_albedo)
 }

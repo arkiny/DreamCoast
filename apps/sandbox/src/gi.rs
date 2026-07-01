@@ -18,11 +18,32 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
     gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_gi_upsample_push, gdf_temporal_push,
-    gi_volume_push,
+    gi_volume_push, screen_probe_filter_push, screen_probe_integrate_push,
+    screen_probe_irradiance_push, screen_probe_trace_push, wrc_update_push,
 };
 
-/// World-space GI irradiance-volume (DDGI-lite radiance cache) probe-grid resolution.
+/// Screen-space radiance probe density: one probe per `SP_DOWNSAMPLE`x`SP_DOWNSAMPLE` screen
+/// tile (reference uses ~16). Tunable later via a `RenderQuality` tier.
+const SP_DOWNSAMPLE: u32 = 16;
+/// Octahedral radiance-tile resolution per probe (texels per side). Reference starts 8.
+const SP_OCT_RES: u32 = 8;
+
+/// World radiance cache (P4) probe grid resolution per clipmap level (probes per side).
+const WRC_GRID: u32 = 16;
+/// World radiance cache octahedral tile resolution (texels per side).
+const WRC_OCT: u32 = 8;
+
+/// World-space directional-irradiance volume (radiance-cache) probe-grid resolution.
 const GI_VOL_DIM: u32 = 32;
+
+/// SH band-0/1 coefficient count per probe channel-set: 4 coeffs × RGB = 12 R32F volumes per
+/// ping-pong slot (slot index = channel*4 + coeff). Allocated contiguously so the shaders take
+/// only the base bindless index. See `gi_volume.slang`.
+const GI_VOL_SH: usize = 12;
+
+/// Scalar sky-visibility SH band-0/1 coefficient count per ping-pong slot (4 R32F volumes,
+/// contiguous; base index only). UE-style indoor skylight occlusion. See `gi_volume.slang`.
+const GI_SKYVIS_SH: usize = 4;
 
 pub(crate) struct GiSystem {
     ao_pipeline: Option<ComputePipeline>, // C2 GDF ambient occlusion
@@ -40,10 +61,30 @@ pub(crate) struct GiSystem {
     gi_denoise_frame: u32,
     /// Lighting/quality key; a change (sun, spp, …) resets the accumulation.
     gi_denoise_key: Option<u64>,
-    /// UE GI-fidelity track: world-space irradiance volume (DDGI-lite radiance cache). Update
-    /// pipeline + 6 R32F volumes (ping-pong [read|write] x RGB; reuses the albedo 3-volume pattern).
+    /// GI-fidelity track: world-space directional-irradiance volume (radiance cache). Update
+    /// pipeline + 24 R32F volumes (ping-pong [read|write] × 12 SH coefficients). Allocated
+    /// contiguously per slot so only the base bindless index is passed to the shaders.
     gi_vol_pipeline: Option<ComputePipeline>,
-    gi_vol: [[Option<Volume>; 3]; 2],
+    gi_vol: [[Option<Volume>; GI_VOL_SH]; 2],
+    /// Screen-space radiance probes (P1+): per-tile probe trace into an octahedral radiance
+    /// atlas, then a per-pixel gather of that atlas into indirect irradiance. Replaces the
+    /// world-volume / ray-march GI consumption on content scenes (opt-in `SCREEN_PROBE`).
+    sp_trace_pipeline: Option<ComputePipeline>,
+    sp_integrate_pipeline: Option<ComputePipeline>,
+    /// P2 spatial cross-probe joint-bilateral filter of the radiance atlas (optional).
+    sp_filter_pipeline: Option<ComputePipeline>,
+    /// P5 per-probe radiance->irradiance pre-integration (makes the per-pixel gather a cheap lookup).
+    sp_irradiance_pipeline: Option<ComputePipeline>,
+    /// P4 world radiance cache: update pipeline + ping-pong atlas buffers (octahedral radiance
+    /// tiles for `levels * WRC_GRID^3` clipmap probes, 16 B/texel). Persists across frames for
+    /// EMA accumulation + infinite bounce; (re)allocated when the clipmap level count changes.
+    wrc_pipeline: Option<ComputePipeline>,
+    wrc_atlas: [Option<StorageBuffer>; 2],
+    wrc_levels: u32,
+    wrc_frame: u32,
+    /// UE-style indoor skylight occlusion: directional sky-visibility SH (4 scalar coeffs/slot,
+    /// ping-pong = 8 volumes), filled in the same `gi_volume` pass. Contiguous per slot (base only).
+    gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2],
     gi_vol_frame: u32,
 }
 
@@ -116,9 +157,48 @@ impl GiSystem {
             "gi_volume",
             160,
         )?;
-        // 6 R32F volumes: ping-pong [read|write] x RGB. Empty (zero) at start = no fill until the
-        // update converges; the lighting falls back gracefully (e = 0).
-        let mut gi_vol: [[Option<Volume>; 3]; 2] = [[None, None, None], [None, None, None]];
+        let sp_trace_pipeline = compute(
+            dreamcoast_shader::screen_probe_trace_cs_spirv,
+            dreamcoast_shader::screen_probe_trace_cs_dxil,
+            dreamcoast_shader::screen_probe_trace_cs_metallib,
+            "screen_probe_trace",
+            224,
+        )?;
+        let sp_integrate_pipeline = compute(
+            dreamcoast_shader::screen_probe_integrate_cs_spirv,
+            dreamcoast_shader::screen_probe_integrate_cs_dxil,
+            dreamcoast_shader::screen_probe_integrate_cs_metallib,
+            "screen_probe_integrate",
+            128,
+        )?;
+        let sp_filter_pipeline = compute(
+            dreamcoast_shader::screen_probe_filter_cs_spirv,
+            dreamcoast_shader::screen_probe_filter_cs_dxil,
+            dreamcoast_shader::screen_probe_filter_cs_metallib,
+            "screen_probe_filter",
+            128,
+        )?;
+        let sp_irradiance_pipeline = compute(
+            dreamcoast_shader::screen_probe_irradiance_cs_spirv,
+            dreamcoast_shader::screen_probe_irradiance_cs_dxil,
+            dreamcoast_shader::screen_probe_irradiance_cs_metallib,
+            "screen_probe_irradiance",
+            32,
+        )?;
+        let wrc_pipeline = compute(
+            dreamcoast_shader::wrc_update_cs_spirv,
+            dreamcoast_shader::wrc_update_cs_dxil,
+            dreamcoast_shader::wrc_update_cs_metallib,
+            "wrc_update",
+            128,
+        )?;
+        // 24 R32F volumes: ping-pong [read|write] × 12 SH coefficients. Empty (zero) at start = no
+        // fill until the update converges; the lighting falls back gracefully (e = 0). Allocated
+        // back-to-back so each slot's 12 volumes are contiguous in the bindless sampled AND storage
+        // tables (`create_volume` bumps both index counters by one) — the shaders address them as
+        // `base + channel*4 + coeff`, so only the base index is pushed.
+        let mut gi_vol: [[Option<Volume>; GI_VOL_SH]; 2] = Default::default();
+        let mut gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2] = Default::default();
         if gi_vol_pipeline.is_some() {
             let vd = VolumeDesc {
                 width: GI_VOL_DIM,
@@ -131,6 +211,26 @@ impl GiSystem {
                     *ch = Some(device.create_volume(&vd)?);
                 }
             }
+            for set in gi_skyvis.iter_mut() {
+                for ch in set.iter_mut() {
+                    *ch = Some(device.create_volume(&vd)?);
+                }
+            }
+            // The base-index addressing is only valid if each slot's volumes are contiguous in both
+            // the sampled and storage bindless tables; assert it so a future interleaving allocation
+            // can't silently break it.
+            let check = |sets: &[&[Option<Volume>]]| {
+                for set in sets {
+                    let base_s = set[0].as_ref().unwrap().sampled_index();
+                    let base_u = set[0].as_ref().unwrap().storage_index();
+                    for (i, ch) in set.iter().enumerate() {
+                        let v = ch.as_ref().unwrap();
+                        debug_assert_eq!(v.sampled_index(), base_s + i as u32);
+                        debug_assert_eq!(v.storage_index(), base_u + i as u32);
+                    }
+                }
+            };
+            check(&[&gi_vol[0], &gi_vol[1], &gi_skyvis[0], &gi_skyvis[1]]);
         }
         Ok(Self {
             ao_pipeline,
@@ -145,7 +245,16 @@ impl GiSystem {
             gi_denoise_key: None,
             gi_vol_pipeline,
             gi_vol,
+            gi_skyvis,
             gi_vol_frame: 0,
+            sp_trace_pipeline,
+            sp_integrate_pipeline,
+            sp_filter_pipeline,
+            sp_irradiance_pipeline,
+            wrc_pipeline,
+            wrc_atlas: [None, None],
+            wrc_levels: 0,
+            wrc_frame: 0,
         })
     }
 
@@ -153,16 +262,15 @@ impl GiSystem {
         self.gi_vol_pipeline.is_some()
     }
 
-    /// The sampled-volume indices (R,G,B) of the volume the GI pass should READ this frame — the
-    /// one the update pass wrote (write slot = frame % 2). `None` if the volume isn't built.
-    pub(crate) fn gi_volume_sampled(&self) -> Option<[u32; 3]> {
+    /// The sampled base indices the GI pass should READ this frame — the slot the update pass wrote
+    /// (write slot = frame % 2). Returns `(radiance_base, skyvis_base)`; each set is contiguous from
+    /// its base. `None` if the volume isn't built.
+    pub(crate) fn gi_volume_sampled(&self) -> Option<(u32, u32)> {
         let w = (self.gi_vol_frame % 2) as usize;
-        let s = &self.gi_vol[w];
-        Some([
-            s[0].as_ref()?.sampled_index(),
-            s[1].as_ref()?.sampled_index(),
-            s[2].as_ref()?.sampled_index(),
-        ])
+        Some((
+            self.gi_vol[w][0].as_ref()?.sampled_index(),
+            self.gi_skyvis[w][0].as_ref()?.sampled_index(),
+        ))
     }
 
     /// Advance the volume ping-pong (end-of-frame, after submit), like the denoiser counter.
@@ -197,16 +305,14 @@ impl GiSystem {
         let write = (self.gi_vol_frame % 2) as usize;
         let rv = &self.gi_vol[read];
         let wv = &self.gi_vol[write];
-        let read_idx = [
-            rv[0].as_ref()?.sampled_index(),
-            rv[1].as_ref()?.sampled_index(),
-            rv[2].as_ref()?.sampled_index(),
-        ];
-        let write_idx = [
-            wv[0].as_ref()?.storage_index(),
-            wv[1].as_ref()?.storage_index(),
-            wv[2].as_ref()?.storage_index(),
-        ];
+        let sv_r = &self.gi_skyvis[read];
+        let sv_w = &self.gi_skyvis[write];
+        // Contiguous bases: the previous slot's sampled base (multibounce + EMA read) and this
+        // slot's storage base (write). The SH volumes follow each base in order.
+        let read_base = rv[0].as_ref()?.sampled_index();
+        let write_base = wv[0].as_ref()?.storage_index();
+        let skyvis_read_base = sv_r[0].as_ref()?.sampled_index();
+        let skyvis_write_base = sv_w[0].as_ref()?.storage_index();
         let diag = Self::diag(aabb_min, aabb_max);
         let reset = u32::from(self.gi_vol_frame == 0);
         let vol_ext = graph.import_external("gi_volume_w");
@@ -229,6 +335,9 @@ impl GiSystem {
                 for ch in rv.iter().flatten() {
                     cmd.volume_to_sampled(ch);
                 }
+                for ch in sv_r.iter().flatten() {
+                    cmd.volume_to_sampled(ch);
+                }
                 let albedo_idx = if let Some((vols, _)) = albedo {
                     for v in vols.iter() {
                         cmd.volume_to_sampled(v);
@@ -244,6 +353,9 @@ impl GiSystem {
                 for ch in wv.iter().flatten() {
                     cmd.volume_to_storage(ch);
                 }
+                for ch in sv_w.iter().flatten() {
+                    cmd.volume_to_storage(ch);
+                }
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&gi_volume_push(
                     aabb_min,
@@ -254,9 +366,9 @@ impl GiSystem {
                     sun_intensity,
                     [GI_VOL_DIM, GI_VOL_DIM, GI_VOL_DIM],
                     frame,
-                    read_idx,
+                    [read_base, skyvis_read_base, 0], // x = radiance SH base, y = sky-vis SH base
                     reset,
-                    write_idx,
+                    [write_base, skyvis_write_base, 0], // x = radiance SH base, y = sky-vis SH base
                     albedo_idx,
                     clip.0,
                     clip.1,
@@ -273,6 +385,9 @@ impl GiSystem {
                 for ch in wv.iter().flatten() {
                     cmd.volume_to_sampled(ch);
                 }
+                for ch in sv_w.iter().flatten() {
+                    cmd.volume_to_sampled(ch);
+                }
                 Ok(())
             },
         );
@@ -287,6 +402,142 @@ impl GiSystem {
     }
     pub(crate) fn has_upsample(&self) -> bool {
         self.upsample_pipeline.is_some()
+    }
+    pub(crate) fn has_screen_probe(&self) -> bool {
+        self.sp_trace_pipeline.is_some() && self.sp_integrate_pipeline.is_some()
+    }
+    pub(crate) fn has_wrc(&self) -> bool {
+        self.wrc_pipeline.is_some()
+    }
+
+    /// (Re)allocate the world radiance cache ping-pong atlas buffers for `levels` clipmap levels
+    /// (each `WRC_GRID^3` probes of `WRC_OCT^2` octahedral texels, 16 B/texel). Runs before the
+    /// graph (its `wait_idle` + alloc stay off the graph borrow), like `prepare_denoise`. No-op
+    /// without the pipeline or when the level count is unchanged.
+    pub(crate) fn prepare_wrc(&mut self, device: &Device, levels: u32) -> anyhow::Result<()> {
+        if self.wrc_pipeline.is_none() || levels == 0 {
+            return Ok(());
+        }
+        if self.wrc_levels != levels {
+            device.wait_idle()?;
+            let atlas_w = WRC_GRID * WRC_OCT;
+            let atlas_h = levels * WRC_GRID * WRC_GRID * WRC_OCT;
+            let bytes = (atlas_w as u64) * (atlas_h as u64) * 16;
+            let make = || -> anyhow::Result<Option<StorageBuffer>> {
+                Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
+                    size: bytes,
+                    stride: 16,
+                    indirect: false,
+                })?))
+            };
+            self.wrc_atlas = [make()?, make()?];
+            self.wrc_levels = levels;
+            self.wrc_frame = 0;
+        }
+        Ok(())
+    }
+
+    /// Advance the world-cache ping-pong (end-of-frame, after submit).
+    pub(crate) fn advance_wrc(&mut self) {
+        self.wrc_frame = self.wrc_frame.saturating_add(1);
+    }
+
+    /// P4: update the world radiance cache. Every clipmap probe re-traces its octahedral
+    /// directions into the scene GDF (shared bounce tracer) and EMA-accumulates into the write
+    /// atlas; escaped rays sample the previous atlas (infinite bounce + far-field). Returns the
+    /// write atlas `(storage_buffers[] index, graph write handle)` for the screen probes to
+    /// sample (the handle orders their trace after this update). `None` without the cache.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_wrc_update<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        scene_gdf: &'a Volume,
+        scene_gdf_ext: ResourceId,
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        clip: (u32, u32),
+        clip_vols: &'a [&'a Volume],
+        albedo: Option<(&'a [Volume; 3], ResourceId)>,
+        cache: Option<([u32; 5], ResourceId)>,
+        max_steps: u32,
+        cone_k: f32,
+        alpha: f32,
+    ) -> Option<(u32, ResourceId)> {
+        let pipe = self.wrc_pipeline.as_ref()?;
+        let levels = clip.1.max(1);
+        let write = (self.wrc_frame % 2) as usize;
+        let prev = ((self.wrc_frame + 1) % 2) as usize;
+        let write_idx = self.wrc_atlas[write].as_ref()?.storage_index();
+        let prev_idx = if self.wrc_frame == 0 {
+            u32::MAX
+        } else {
+            self.wrc_atlas[prev].as_ref()?.storage_index()
+        };
+        let reset = u32::from(self.wrc_frame == 0);
+        let diag = Self::diag(aabb_min, aabb_max);
+        let bias = diag * 0.004;
+        let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
+        let cache4 = [cache_idx[0], cache_idx[1], cache_idx[2], cache_idx[3]];
+        let cache_tile = cache_idx[4];
+        let atlas_w = WRC_GRID * WRC_OCT;
+        let atlas_h = levels * WRC_GRID * WRC_GRID * WRC_OCT;
+        let write_ext = graph.import_external("wrc_atlas_w");
+        let mut reads = vec![scene_gdf_ext];
+        if let Some((_, ext)) = albedo {
+            reads.push(ext);
+        }
+        if let Some((_, ext)) = cache {
+            reads.push(ext);
+        }
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "wrc_update",
+                storage_writes: vec![write_ext],
+                reads,
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(scene_gdf);
+                for v in clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
+                if let Some((vols, _)) = albedo {
+                    for v in vols.iter() {
+                        cmd.volume_to_sampled(v);
+                    }
+                }
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&wrc_update_push(
+                    sun_dir,
+                    sun_intensity,
+                    diag, // ray max distance
+                    bias,
+                    0.25, // sky fill radiance at the bounce hit
+                    0.7,  // constant hit-albedo fallback
+                    crate::GROUND_ALBEDO,
+                    cone_k,
+                    cache4,
+                    clip.0,
+                    levels,
+                    WRC_GRID,
+                    WRC_OCT,
+                    write_idx,
+                    prev_idx,
+                    cache_tile,
+                    max_steps,
+                    self.wrc_frame,
+                    reset,
+                    alpha,
+                    diag, // GDF sample distance clamp
+                    0.0,  // world ground plane y = 0
+                ));
+                cmd.dispatch(atlas_w.div_ceil(8), atlas_h.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        Some((write_idx, write_ext))
     }
     pub(crate) fn has_denoise(&self) -> bool {
         self.temporal_pipeline.is_some() && self.atrous_pipeline.is_some()
@@ -436,12 +687,19 @@ impl GiSystem {
         clip_vols: &'a [&'a Volume],
         max_steps: u32,
         cone_k: f32,
-        // UE GI-fidelity: when present, the GI pass SAMPLES this world irradiance volume (R/G/B
-        // sampled indices + the update pass's write graph handle) instead of marching rays.
-        gi_volume: Option<([u32; 3], ResourceId)>,
-    ) -> ResourceId {
+        // GI-fidelity: when present, the GI pass SAMPLES this directional-irradiance volume
+        // `(radiance_SH_base, skyvis_SH_base, update-pass write handle)` and reconstructs E(n) +
+        // the sky-visibility instead of marching rays.
+        gi_volume: Option<(u32, u32, ResourceId)>,
+        // Returns `(gi_image, skyvis_image)`; the sky-vis image (indoor skylight occlusion) is only
+        // produced on the volume path (None on the ray-march/gallery path).
+    ) -> (ResourceId, Option<ResourceId>) {
         let gip = self.gi_pipeline.as_ref().expect("gdf gi pipeline");
         let out = graph.create_storage_image("gdf_gi_out", HDR_FORMAT, extent);
+        // Sky-visibility output: produced only on the volume path. NOT denoised (the volume field is
+        // already smooth/stable) — the lighting samples it directly at this (possibly half) res.
+        let skyvis_out =
+            gi_volume.map(|_| graph.create_storage_image("gi_skyvis", HDR_FORMAT, extent));
         let sampled = scene_gdf.sampled_index();
         let diag = Self::diag(aabb_min, aabb_max);
         let bias = diag * 0.004;
@@ -455,21 +713,32 @@ impl GiSystem {
         if let Some((_, ext)) = cache {
             reads.push(ext);
         }
-        if let Some((_, ext)) = gi_volume {
+        if let Some((_, _, ext)) = gi_volume {
             reads.push(ext); // barrier the GI sample after the volume update
         }
-        let vol_rgb = gi_volume.map(|(idx, _)| idx).unwrap_or([u32::MAX; 3]);
+        // vol_r = radiance SH base, vol_g = sky-vis SH base; vol_b (sky-vis output storage index) is
+        // resolved inside the closure (it's a graph resource).
+        let (vol_r, vol_g) = gi_volume
+            .map(|(rb, sb, _)| (rb, sb))
+            .unwrap_or((u32::MAX, u32::MAX));
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
+        let mut storage_writes = vec![out];
+        if let Some(sv) = skyvis_out {
+            storage_writes.push(sv);
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "gdf_gi",
-                storage_writes: vec![out],
+                storage_writes,
                 reads,
             },
             move |ctx| {
                 let depth_index = ctx.sampled_index(depth);
                 let normal_index = ctx.sampled_index(normal);
                 let out_index = ctx.storage_index(out);
+                let vol_b = skyvis_out
+                    .map(|sv| ctx.storage_index(sv))
+                    .unwrap_or(u32::MAX);
                 let cmd = ctx.cmd();
                 cmd.volume_to_sampled(scene_gdf);
                 for v in clip_vols {
@@ -517,13 +786,304 @@ impl GiSystem {
                     crate::GROUND_ALBEDO, // analytic ground material (floor bounce hits)
                     max_steps,            // D3: bounce-ray march step cap
                     cone_k,               // P3: cone-trace LOD slope (0 = legacy)
-                    vol_rgb,              // GI-fidelity: irradiance-volume sampled indices (or MAX)
+                    // vol_r = radiance SH base, vol_g = sky-vis SH base, vol_b = sky-vis out image.
+                    [vol_r, vol_g, vol_b],
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
             },
         );
-        out
+        (out, skyvis_out)
+    }
+
+    /// Screen-space radiance probes (P1 trace + P3 integrate). A probe is placed on the
+    /// representative G-buffer surface of every `SP_DOWNSAMPLE` screen tile; the trace pass
+    /// fills each probe's octahedral radiance tile (atlas) by marching the shared bounce tracer
+    /// into the scene GDF; the integrate pass gathers the surrounding probes per pixel into
+    /// indirect irradiance E (the lighting multiplies by albedo). Returns the full-res E image
+    /// (a drop-in for `record_gi`'s output). Same GDF / albedo / cache / clip inputs as
+    /// `record_gi`. `None` without the pipelines.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_screen_probe<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        scene_gdf: &'a Volume,
+        scene_gdf_ext: ResourceId,
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        depth: ResourceId,
+        normal: ResourceId,
+        extent: Extent2D,
+        inv_view_proj: [f32; 16],
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        cw: u32,
+        ch: u32,
+        flip_y: u32,
+        frame: u32,
+        albedo: Option<(&'a [Volume; 3], ResourceId)>,
+        cache: Option<([u32; 5], ResourceId)>,
+        clamp_max: f32,
+        clip: (u32, u32),
+        clip_vols: &'a [&'a Volume],
+        max_steps: u32,
+        cone_k: f32,
+        // P2: apply the spatial cross-probe joint-bilateral filter to the radiance atlas before
+        // the gather (probe-neighborhood half kernel; 0 disables). Content quality knob.
+        filter_half_kernel: u32,
+        // P4: world radiance cache sampled by escaped probe rays for off-screen / far-field /
+        // infinite bounce. `(storage_buffers[] index, graph write handle)`; the handle orders the
+        // trace after this frame's cache update. `None` = unbound (no cache fallback).
+        wrc: Option<(u32, ResourceId)>,
+        // Returns `(gi_image, skyvis_image)`; the sky-vis image (indoor skylight occlusion) is
+        // built from the probes' per-ray sky visibility, mirroring the volume GI path's output.
+    ) -> (ResourceId, ResourceId) {
+        let trace = self.sp_trace_pipeline.as_ref().expect("sp trace pipeline");
+        let integrate = self
+            .sp_integrate_pipeline
+            .as_ref()
+            .expect("sp integrate pipeline");
+        let diag = Self::diag(aabb_min, aabb_max);
+        let bias = diag * 0.004;
+
+        // Probe density + octahedral resolution are the two scalability knobs (a future
+        // RenderQuality tier). `P_SP_DOWNSAMPLE` (screen px / probe) and `P_SP_OCT` (octahedral
+        // texels / side) override the defaults for A/B tuning.
+        let ds = std::env::var("P_SP_DOWNSAMPLE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(SP_DOWNSAMPLE)
+            .clamp(4, 64);
+        let oct = std::env::var("P_SP_OCT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(SP_OCT_RES)
+            .clamp(4, 32);
+
+        let (wrc_atlas, wrc_ext) = match wrc {
+            Some((idx, ext)) => (idx, Some(ext)),
+            None => (u32::MAX, None),
+        };
+
+        let probes_x = cw.div_ceil(ds);
+        let probes_y = ch.div_ceil(ds);
+        let atlas_w = probes_x * oct;
+        let atlas_h = probes_y * oct;
+        let atlas = graph.create_storage_image(
+            "sp_radiance_atlas",
+            HDR_FORMAT,
+            Extent2D::new(atlas_w, atlas_h),
+        );
+        let out = graph.create_storage_image("sp_gi_out", HDR_FORMAT, extent);
+        let skyvis = graph.create_storage_image("sp_skyvis", HDR_FORMAT, extent);
+
+        let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
+        let cache4 = [cache_idx[0], cache_idx[1], cache_idx[2], cache_idx[3]];
+        let cache_tile = cache_idx[4];
+
+        // --- P1: trace every probe's octahedral radiance tile into the atlas. ---
+        let mut trace_reads = vec![depth, normal, scene_gdf_ext];
+        if let Some((_, ext)) = albedo {
+            trace_reads.push(ext);
+        }
+        if let Some((_, ext)) = cache {
+            trace_reads.push(ext);
+        }
+        // Order the trace after this frame's world-cache update (escaped rays sample it).
+        if let Some(ext) = wrc_ext {
+            trace_reads.push(ext);
+        }
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "screen_probe_trace",
+                storage_writes: vec![atlas],
+                reads: trace_reads,
+            },
+            move |ctx| {
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let atlas_index = ctx.storage_index(atlas);
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(scene_gdf);
+                for v in clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
+                if let Some((vols, _)) = albedo {
+                    for v in vols.iter() {
+                        cmd.volume_to_sampled(v);
+                    }
+                }
+                cmd.bind_compute_pipeline(trace);
+                cmd.push_constants_compute(&screen_probe_trace_push(
+                    &inv_view_proj,
+                    sun_dir,
+                    sun_intensity,
+                    aabb_min,
+                    0.0, // world ground plane y = 0
+                    aabb_max,
+                    diag, // sample distance clamp
+                    diag, // ray max distance
+                    bias,
+                    0.25, // sky fill radiance at the bounce hit
+                    0.7,  // constant hit-albedo fallback (sentinel albedo)
+                    crate::GROUND_ALBEDO,
+                    cone_k,
+                    cache4,
+                    depth_index,
+                    normal_index,
+                    atlas_index,
+                    cache_tile,
+                    cw,
+                    ch,
+                    probes_x,
+                    probes_y,
+                    ds,
+                    oct,
+                    flip_y,
+                    frame,
+                    max_steps,
+                    clip.0,
+                    clip.1,
+                    clamp_max,
+                    wrc_atlas,
+                    WRC_GRID,
+                    WRC_OCT,
+                ));
+                cmd.dispatch(atlas_w.div_ceil(8), atlas_h.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+
+        let pos_sigma = diag * 0.01;
+        let normal_power = 8.0_f32;
+
+        // --- P2: spatial cross-probe joint-bilateral filter of the radiance atlas. Smooths
+        // probe-to-probe variation on shared surfaces (blockiness) without blurring across
+        // silhouettes; skipped when disabled or the pipeline is absent. ---
+        let gather_atlas = match (filter_half_kernel > 0, self.sp_filter_pipeline.as_ref()) {
+            (true, Some(filter)) => {
+                let filtered = graph.create_storage_image(
+                    "sp_radiance_atlas_filtered",
+                    HDR_FORMAT,
+                    Extent2D::new(atlas_w, atlas_h),
+                );
+                graph.add_compute_pass(
+                    ComputePassInfo {
+                        name: "screen_probe_filter",
+                        storage_writes: vec![filtered],
+                        reads: vec![atlas, depth, normal],
+                    },
+                    move |ctx| {
+                        let depth_index = ctx.sampled_index(depth);
+                        let normal_index = ctx.sampled_index(normal);
+                        let atlas_in = ctx.sampled_index(atlas);
+                        let atlas_out = ctx.storage_index(filtered);
+                        let cmd = ctx.cmd();
+                        cmd.bind_compute_pipeline(filter);
+                        cmd.push_constants_compute(&screen_probe_filter_push(
+                            &inv_view_proj,
+                            depth_index,
+                            normal_index,
+                            atlas_in,
+                            atlas_out,
+                            cw,
+                            ch,
+                            probes_x,
+                            probes_y,
+                            ds,
+                            oct,
+                            flip_y,
+                            filter_half_kernel,
+                            pos_sigma,
+                            normal_power,
+                        ));
+                        cmd.dispatch(atlas_w.div_ceil(8), atlas_h.div_ceil(8), 1);
+                        Ok(())
+                    },
+                );
+                filtered
+            }
+            _ => atlas,
+        };
+
+        // --- P5: pre-integrate each probe's octahedral RADIANCE tile into an IRRADIANCE tile
+        // ONCE, so the per-pixel gather is a cheap directional lookup (~4-probe bilinear) instead
+        // of a full hemisphere integral per pixel (~oct^2 taps). The reference's default. When
+        // enabled the integrate runs in lookup `mode = 1`; `P_SP_IRRADIANCE=0` keeps the direct
+        // per-pixel integral (`mode = 0`). ---
+        let irradiance_on = std::env::var("P_SP_IRRADIANCE")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let (integrate_atlas, integrate_mode) =
+            match (irradiance_on, self.sp_irradiance_pipeline.as_ref()) {
+                (true, Some(irr)) => {
+                    let irr_atlas = graph.create_storage_image(
+                        "sp_irradiance_atlas",
+                        HDR_FORMAT,
+                        Extent2D::new(atlas_w, atlas_h),
+                    );
+                    graph.add_compute_pass(
+                        ComputePassInfo {
+                            name: "screen_probe_irradiance",
+                            storage_writes: vec![irr_atlas],
+                            reads: vec![gather_atlas],
+                        },
+                        move |ctx| {
+                            let atlas_in = ctx.sampled_index(gather_atlas);
+                            let atlas_out = ctx.storage_index(irr_atlas);
+                            let cmd = ctx.cmd();
+                            cmd.bind_compute_pipeline(irr);
+                            cmd.push_constants_compute(&screen_probe_irradiance_push(
+                                atlas_in, atlas_out, probes_x, probes_y, oct,
+                            ));
+                            cmd.dispatch(atlas_w.div_ceil(8), atlas_h.div_ceil(8), 1);
+                            Ok(())
+                        },
+                    );
+                    (irr_atlas, 1u32)
+                }
+                _ => (gather_atlas, 0u32),
+            };
+
+        // --- P3: gather the probe atlas per pixel into indirect irradiance (lookup in mode 1). ---
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "screen_probe_integrate",
+                storage_writes: vec![out, skyvis],
+                reads: vec![integrate_atlas, depth, normal],
+            },
+            move |ctx| {
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let atlas_index = ctx.sampled_index(integrate_atlas);
+                let out_index = ctx.storage_index(out);
+                let skyvis_index = ctx.storage_index(skyvis);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(integrate);
+                cmd.push_constants_compute(&screen_probe_integrate_push(
+                    &inv_view_proj,
+                    depth_index,
+                    normal_index,
+                    atlas_index,
+                    out_index,
+                    cw,
+                    ch,
+                    probes_x,
+                    probes_y,
+                    ds,
+                    oct,
+                    flip_y,
+                    skyvis_index,
+                    pos_sigma,
+                    normal_power,
+                    integrate_mode,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        (out, skyvis)
     }
 
     /// Stage D1: joint-bilateral upsample of the half-res GI to full resolution. The C3 trace

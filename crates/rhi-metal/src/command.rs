@@ -18,10 +18,11 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLEvent;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLFence, MTLIndexType, MTLLoadAction,
-    MTLOrigin, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassColorAttachmentDescriptor,
-    MTLRenderPassDepthAttachmentDescriptor, MTLRenderPassDescriptor, MTLRenderStages, MTLResource,
-    MTLResourceUsage, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLViewport,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLDevice, MTLFence,
+    MTLIndexType, MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLRenderCommandEncoder,
+    MTLRenderPassColorAttachmentDescriptor, MTLRenderPassDepthAttachmentDescriptor,
+    MTLRenderPassDescriptor, MTLRenderStages, MTLResource, MTLResourceUsage, MTLScissorRect,
+    MTLSize, MTLStoreAction, MTLTexture, MTLViewport,
 };
 use objc2_quartz_core::CAMetalDrawable;
 use rhi_types::{ClearColor, Extent2D, Rect2D};
@@ -176,10 +177,66 @@ impl MetalCommandBuffer {
         Ok(())
     }
 
-    /// Timestamp query recording (Phase 9 M1) — no-ops on the Metal stub.
+    /// Timestamp query recording (Phase 9 M1).
+    ///
+    /// `reset_queries` / `resolve_queries` are no-ops on Metal: an
+    /// `MTLCounterSampleBuffer` needs no per-frame reset (unlike a Vulkan query
+    /// pool), and it is resolved on the *host* via `resolveCounterRange` (see
+    /// [`crate::query::MetalQueryHeap::read`]), not with a GPU resolve command
+    /// (unlike D3D12's `ResolveQueryData`).
     pub fn reset_queries(&self, _heap: &crate::query::MetalQueryHeap, _first: u32, _count: u32) {}
-    pub fn write_timestamp(&self, _heap: &crate::query::MetalQueryHeap, _index: u32) {}
     pub fn resolve_queries(&self, _heap: &crate::query::MetalQueryHeap, _count: u32) {}
+
+    /// Sample a GPU timestamp into slot `index` of the heap's counter sample
+    /// buffer, at this point in the command stream.
+    ///
+    /// The render graph calls this at pass *boundaries* — between encoders, when
+    /// none is open. Apple-family GPUs support only **stage-boundary** counter
+    /// sampling (not blit/dispatch mid-encoder `sampleCountersInBuffer`), so we
+    /// open a tiny **empty compute pass** whose sample-buffer attachment records
+    /// slot `index` at its *start-of-encoder* stage boundary, then close it
+    /// immediately (no dispatch). That start boundary is the current point in the
+    /// command stream, giving the same "timestamp at a point" semantics as the
+    /// Vulkan `vkCmdWriteTimestamp` the render graph brackets passes with:
+    /// successive samples bracket the encoders (passes) recorded between them.
+    ///
+    /// We first close (and fence) any open encoder, and the new pass waits the
+    /// hazard fence, so the boundary orders after all prior encoders' work (the
+    /// empty encoder's start boundary won't fire until the GPU reaches it).
+    ///
+    /// No-op when the device lacks a timestamp counter set (heap has no sample
+    /// buffer): the profiler then reads 0 ticks, exactly as before.
+    pub fn write_timestamp(&self, heap: &crate::query::MetalQueryHeap, index: u32) {
+        let Some(sample_buffer) = heap.sample_buffer() else {
+            return;
+        };
+        self.end_any_encoder();
+
+        // Compute pass descriptor: sample the timestamp at the start-of-encoder
+        // stage boundary into slot `index`; omit the end sample (DONT_SAMPLE).
+        let desc = MTLComputePassDescriptor::new();
+        let attachments = desc.sampleBufferAttachments();
+        // SAFETY: index 0 is a valid attachment slot on the array; `index` is within
+        // the heap's `count` slots (the render graph writes indices `0..=passes`);
+        // `MTLCounterDontSample` (usize::MAX) omits the end-of-encoder sample.
+        let attach = unsafe { attachments.objectAtIndexedSubscript(0) };
+        attach.setSampleBuffer(Some(sample_buffer));
+        unsafe {
+            attach.setStartOfEncoderSampleIndex(index as usize);
+            attach.setEndOfEncoderSampleIndex(crate::query::COUNTER_DONT_SAMPLE);
+        }
+
+        let cmd = self.cmd.borrow();
+        let cmd = cmd.as_ref().expect("write_timestamp without begin");
+        let enc = cmd
+            .computeCommandEncoderWithDescriptor(&desc)
+            .expect("failed to create timestamp compute encoder");
+        if self.fence_pending.get() {
+            enc.waitForFence(&self.fence);
+        }
+        // No dispatch: the start-of-encoder stage boundary is the sample point.
+        enc.endEncoding();
+    }
 
     /// Debug-marker regions (Phase 9 M2) — no-ops on the Metal stub (Metal uses
     /// per-encoder `pushDebugGroup`, not a command-buffer-level label).

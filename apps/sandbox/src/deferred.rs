@@ -321,7 +321,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 48, // G-buffer indices + flip_y + shadow + gdf_ao + ssao + gdf_gi + reflect + two_sided + exposure_buf
+            push_constant_size: 60, // G-buffer indices + flip_y + shadow + gdf_ao + ssao + gdf_gi + reflect + two_sided + exposure_buf + skyvis(idx,tint,min_occ)
             bindless: true,
             uniform_buffer: true,
             depth_test: false,
@@ -799,6 +799,9 @@ impl DeferredRenderer {
         ssao: Option<ResourceId>,
         gdf_gi: Option<ResourceId>,
         reflect: Option<ResourceId>,
+        skyvis: Option<ResourceId>,
+        skyvis_tint: f32,
+        skyvis_min_occ: f32,
         globals_offset: u64,
         flip_y: u32,
         two_sided: bool,
@@ -823,6 +826,9 @@ impl DeferredRenderer {
         if let Some(r) = reflect {
             reads.push(r);
         }
+        if let Some(sv) = skyvis {
+            reads.push(sv);
+        }
         graph.add_pass(
             PassInfo {
                 name: "lighting",
@@ -842,6 +848,7 @@ impl DeferredRenderer {
                 let ssao_index = ssao.map(|s| ctx.sampled_index(s)).unwrap_or(u32::MAX);
                 let gi_index = gdf_gi.map(|gi| ctx.sampled_index(gi)).unwrap_or(u32::MAX);
                 let reflect_index = reflect.map(|r| ctx.sampled_index(r)).unwrap_or(u32::MAX);
+                let skyvis_index = skyvis.map(|s| ctx.sampled_index(s)).unwrap_or(u32::MAX);
                 let cmd = ctx.cmd();
                 cmd.set_globals(&self.globals_buffer, globals_offset);
                 cmd.bind_graphics_pipeline(&self.pbr_pipeline);
@@ -855,6 +862,9 @@ impl DeferredRenderer {
                     reflect_index,
                     two_sided as u32,
                     exposure_buf_index,
+                    skyvis_index,
+                    skyvis_tint,
+                    skyvis_min_occ,
                 ));
                 cmd.draw(3, 1);
                 Ok(())
@@ -983,8 +993,9 @@ fn gbuffer_push(
 }
 
 /// Pack the lighting push block: 4 G-buffer indices + flip_y + shadow_index + gdf_ao_index +
-/// ssao_index + gdf_gi_index + reflect_index + two_sided + exposure_buf_index (48 bytes). The
-/// GDF / SSAO / reflect indices are `u32::MAX` when those images are absent (then a no-op).
+/// ssao_index + gdf_gi_index + reflect_index + two_sided + exposure_buf_index + skyvis_index
+/// (52 bytes). The GDF / SSAO / reflect / skyvis indices are `u32::MAX` when those images are
+/// absent (then an exact no-op — the gallery anchor).
 #[allow(clippy::too_many_arguments)]
 fn pbr_push(
     indices: [u32; 4],
@@ -996,8 +1007,11 @@ fn pbr_push(
     reflect_index: u32,
     two_sided: u32,
     exposure_buf_index: u32,
-) -> [u8; 48] {
-    let mut pc = [0u8; 48];
+    skyvis_index: u32,
+    skyvis_tint: f32,
+    skyvis_min_occ: f32,
+) -> [u8; 60] {
+    let mut pc = [0u8; 60];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1009,6 +1023,9 @@ fn pbr_push(
     pc[36..40].copy_from_slice(&reflect_index.to_le_bytes());
     pc[40..44].copy_from_slice(&two_sided.to_le_bytes());
     pc[44..48].copy_from_slice(&exposure_buf_index.to_le_bytes());
+    pc[48..52].copy_from_slice(&skyvis_index.to_le_bytes());
+    pc[52..56].copy_from_slice(&skyvis_tint.to_le_bytes());
+    pc[56..60].copy_from_slice(&skyvis_min_occ.to_le_bytes());
     pc
 }
 

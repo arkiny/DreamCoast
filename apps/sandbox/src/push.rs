@@ -498,6 +498,7 @@ pub(crate) fn cache_capture_push(
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     dist_clamp: f32,
+    card_albedo_index: u32,
 ) -> [u8; 80] {
     let mut pc = [0u8; 80];
     let u = [
@@ -520,6 +521,9 @@ pub(crate) fn cache_capture_push(
     for (i, v) in aabb_min.iter().enumerate() {
         pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
+    // C: pack the per-card source-albedo buffer index into the unused `aabb_min.w` slot
+    // (bytes 60..64) — no layout/size change (DX≡VK-safe). 0xFFFFFFFF ⇒ legacy volume path.
+    pc[60..64].copy_from_slice(&card_albedo_index.to_le_bytes());
     for (i, v) in aabb_max.iter().enumerate() {
         pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1561,6 +1565,272 @@ pub(crate) fn post_compute_push(
     pc[4..8].copy_from_slice(&out_index.to_le_bytes());
     pc[8..12].copy_from_slice(&width.to_le_bytes());
     pc[12..16].copy_from_slice(&height.to_le_bytes());
+    pc
+}
+
+/// Pack the screen-probe TRACE push block (224 bytes): inv_view_proj (64) + sun (16) +
+/// aabb_min/+ground_y (16) + aabb_max/+sample_clamp (16) + params (16) + ground_albedo/+cone_k
+/// (16) + cache uint4 (16) + 14 scalar indices/dims (4 rows of 16) + clamp_max. All scalars are
+/// grouped after the vec4 block (Metal-safe: no float3+trailing-scalar mis-packing).
+/// See `screen_probe_trace.slang`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn screen_probe_trace_push(
+    inv_view_proj: &[f32; 16],
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    aabb_min: [f32; 3],
+    ground_y: f32,
+    aabb_max: [f32; 3],
+    sample_clamp: f32,
+    ray_max: f32,
+    bias: f32,
+    sky_term: f32,
+    albedo_fallback: f32,
+    ground_albedo: [f32; 3],
+    cone_k: f32,
+    cache: [u32; 4],
+    depth_index: u32,
+    normal_index: u32,
+    atlas_index: u32,
+    cache_tile: u32,
+    screen_w: u32,
+    screen_h: u32,
+    probes_x: u32,
+    probes_y: u32,
+    downsample: u32,
+    oct_res: u32,
+    flip_y: u32,
+    frame: u32,
+    max_steps: u32,
+    clip_desc: u32,
+    clip_count: u32,
+    clamp_max: f32,
+    wrc_atlas: u32,
+    wrc_grid: u32,
+    wrc_oct: u32,
+) -> [u8; 240] {
+    let mut pc = [0u8; 240];
+    let put3 = |pc: &mut [u8], o: usize, v: [f32; 3]| {
+        for (i, x) in v.iter().enumerate() {
+            pc[o + i * 4..o + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+        }
+    };
+    let putu = |pc: &mut [u8], o: usize, v: u32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let putf = |pc: &mut [u8], o: usize, v: f32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let sun = normalize3(sun_dir);
+    put3(&mut pc, 64, [sun[0], sun[1], sun[2]]);
+    putf(&mut pc, 76, sun_intensity);
+    put3(&mut pc, 80, aabb_min);
+    putf(&mut pc, 92, ground_y);
+    put3(&mut pc, 96, aabb_max);
+    putf(&mut pc, 108, sample_clamp);
+    putf(&mut pc, 112, ray_max);
+    putf(&mut pc, 116, bias);
+    putf(&mut pc, 120, sky_term);
+    putf(&mut pc, 124, albedo_fallback);
+    put3(&mut pc, 128, ground_albedo);
+    putf(&mut pc, 140, cone_k);
+    for (i, v) in cache.iter().enumerate() {
+        putu(&mut pc, 144 + i * 4, *v);
+    }
+    putu(&mut pc, 160, depth_index);
+    putu(&mut pc, 164, normal_index);
+    putu(&mut pc, 168, atlas_index);
+    putu(&mut pc, 172, cache_tile);
+    putu(&mut pc, 176, screen_w);
+    putu(&mut pc, 180, screen_h);
+    putu(&mut pc, 184, probes_x);
+    putu(&mut pc, 188, probes_y);
+    putu(&mut pc, 192, downsample);
+    putu(&mut pc, 196, oct_res);
+    putu(&mut pc, 200, flip_y);
+    putu(&mut pc, 204, frame);
+    putu(&mut pc, 208, max_steps);
+    putu(&mut pc, 212, clip_desc);
+    putu(&mut pc, 216, clip_count);
+    putf(&mut pc, 220, clamp_max);
+    // World radiance cache fallback (0xFFFFFFFF atlas = unbound). grid/oct describe the atlas.
+    putu(&mut pc, 224, wrc_atlas);
+    putu(&mut pc, 228, wrc_grid);
+    putu(&mut pc, 232, wrc_oct);
+    putu(&mut pc, 236, 0);
+    pc
+}
+
+/// Pack the world radiance cache UPDATE push block (128 bytes): sun (16) + params (16) +
+/// ground_albedo/+cone_k (16) + cache uint4 (16) + scalars (clip_desc, clip_count, grid, oct,
+/// atlas_write, atlas_prev, cache_tile, max_steps, frame, reset, alpha, sample_clamp, ground_y +
+/// pad). See `wrc_update.slang`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wrc_update_push(
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    ray_max: f32,
+    bias: f32,
+    sky_term: f32,
+    albedo_fallback: f32,
+    ground_albedo: [f32; 3],
+    cone_k: f32,
+    cache: [u32; 4],
+    clip_desc: u32,
+    clip_count: u32,
+    grid: u32,
+    oct: u32,
+    atlas_write: u32,
+    atlas_prev: u32,
+    cache_tile: u32,
+    max_steps: u32,
+    frame: u32,
+    reset: u32,
+    alpha: f32,
+    sample_clamp: f32,
+    ground_y: f32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    let put3 = |pc: &mut [u8], o: usize, v: [f32; 3]| {
+        for (i, x) in v.iter().enumerate() {
+            pc[o + i * 4..o + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+        }
+    };
+    let putu = |pc: &mut [u8], o: usize, v: u32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let putf = |pc: &mut [u8], o: usize, v: f32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let sun = normalize3(sun_dir);
+    put3(&mut pc, 0, [sun[0], sun[1], sun[2]]);
+    putf(&mut pc, 12, sun_intensity);
+    putf(&mut pc, 16, ray_max);
+    putf(&mut pc, 20, bias);
+    putf(&mut pc, 24, sky_term);
+    putf(&mut pc, 28, albedo_fallback);
+    put3(&mut pc, 32, ground_albedo);
+    putf(&mut pc, 44, cone_k);
+    for (i, v) in cache.iter().enumerate() {
+        putu(&mut pc, 48 + i * 4, *v);
+    }
+    putu(&mut pc, 64, clip_desc);
+    putu(&mut pc, 68, clip_count);
+    putu(&mut pc, 72, grid);
+    putu(&mut pc, 76, oct);
+    putu(&mut pc, 80, atlas_write);
+    putu(&mut pc, 84, atlas_prev);
+    putu(&mut pc, 88, cache_tile);
+    putu(&mut pc, 92, max_steps);
+    putu(&mut pc, 96, frame);
+    putu(&mut pc, 100, reset);
+    putf(&mut pc, 104, alpha);
+    putf(&mut pc, 108, sample_clamp);
+    putf(&mut pc, 112, ground_y);
+    pc
+}
+
+/// Pack the screen-probe INTEGRATE push block (128 bytes): inv_view_proj (64) + 12 scalar
+/// indices/dims (3 rows of 16) + (pos_sigma, normal_power, pad, pad) (16). See
+/// `screen_probe_integrate.slang`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn screen_probe_integrate_push(
+    inv_view_proj: &[f32; 16],
+    depth_index: u32,
+    normal_index: u32,
+    atlas_index: u32,
+    out_index: u32,
+    screen_w: u32,
+    screen_h: u32,
+    probes_x: u32,
+    probes_y: u32,
+    downsample: u32,
+    oct_res: u32,
+    flip_y: u32,
+    skyvis_index: u32,
+    pos_sigma: f32,
+    normal_power: f32,
+    mode: u32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    let putu = |pc: &mut [u8], o: usize, v: u32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let putf = |pc: &mut [u8], o: usize, v: f32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    putu(&mut pc, 64, depth_index);
+    putu(&mut pc, 68, normal_index);
+    putu(&mut pc, 72, atlas_index);
+    putu(&mut pc, 76, out_index);
+    putu(&mut pc, 80, screen_w);
+    putu(&mut pc, 84, screen_h);
+    putu(&mut pc, 88, probes_x);
+    putu(&mut pc, 92, probes_y);
+    putu(&mut pc, 96, downsample);
+    putu(&mut pc, 100, oct_res);
+    putu(&mut pc, 104, flip_y);
+    putu(&mut pc, 108, skyvis_index);
+    putf(&mut pc, 112, pos_sigma);
+    putf(&mut pc, 116, normal_power);
+    putu(&mut pc, 120, mode);
+    pc
+}
+
+/// Pack the screen-probe IRRADIANCE pre-integration push block (32 bytes): atlas_in, atlas_out,
+/// probes_x, probes_y, oct + pad. See `screen_probe_irradiance.slang`.
+pub(crate) fn screen_probe_irradiance_push(
+    atlas_in: u32,
+    atlas_out: u32,
+    probes_x: u32,
+    probes_y: u32,
+    oct: u32,
+) -> [u8; 32] {
+    let mut pc = [0u8; 32];
+    let putu = |pc: &mut [u8], o: usize, v: u32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    putu(&mut pc, 0, atlas_in);
+    putu(&mut pc, 4, atlas_out);
+    putu(&mut pc, 8, probes_x);
+    putu(&mut pc, 12, probes_y);
+    putu(&mut pc, 16, oct);
+    pc
+}
+
+/// Pack the screen-probe FILTER push block (128 bytes): inv_view_proj (64) + 12 scalar
+/// indices/dims (3 rows of 16) + (pos_sigma, normal_power, pad, pad) (16). See
+/// `screen_probe_filter.slang`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn screen_probe_filter_push(
+    inv_view_proj: &[f32; 16],
+    depth_index: u32,
+    normal_index: u32,
+    atlas_in_index: u32,
+    atlas_out_index: u32,
+    screen_w: u32,
+    screen_h: u32,
+    probes_x: u32,
+    probes_y: u32,
+    downsample: u32,
+    oct_res: u32,
+    flip_y: u32,
+    half_kernel: u32,
+    pos_sigma: f32,
+    normal_power: f32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    let putu = |pc: &mut [u8], o: usize, v: u32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let putf = |pc: &mut [u8], o: usize, v: f32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    putu(&mut pc, 64, depth_index);
+    putu(&mut pc, 68, normal_index);
+    putu(&mut pc, 72, atlas_in_index);
+    putu(&mut pc, 76, atlas_out_index);
+    putu(&mut pc, 80, screen_w);
+    putu(&mut pc, 84, screen_h);
+    putu(&mut pc, 88, probes_x);
+    putu(&mut pc, 92, probes_y);
+    putu(&mut pc, 96, downsample);
+    putu(&mut pc, 100, oct_res);
+    putu(&mut pc, 104, flip_y);
+    putu(&mut pc, 108, half_kernel);
+    putf(&mut pc, 112, pos_sigma);
+    putf(&mut pc, 116, normal_power);
     pc
 }
 

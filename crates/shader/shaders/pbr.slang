@@ -42,6 +42,10 @@ struct PushConstants
     uint two_sided; // 1 = orient the G-buffer normal toward the viewer (two-sided surfaces)
     uint exposure_buf_index; // auto-exposure: storage buffer holding the adapted exposure at offset 0
                              // (0xFFFFFFFF = use the static globals.ambient.a)
+    uint skyvis_index; // directional sky-visibility image (UE-style indoor skylight occlusion);
+                       // occludes the IBL DIFFUSE skylight. 0xFFFFFFFF = absent -> 1.0 (gallery anchor).
+    float skyvis_tint; // neutral leak as a fraction of the occluded skylight luminance.
+    float skyvis_min_occ; // min sky-visibility floor (lerp V toward 1); higher = weaker occlusion.
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -125,8 +129,22 @@ float3 fresnel_schlick_roughness(float cos_theta, float3 f0, float roughness)
 // specular lookup; the env-BRDF term (`f * brdf.x + brdf.y`) and the diffuse irradiance
 // are unchanged. The composite already sees the real neighbouring geometry, so the
 // box-proxy parallax correction is skipped on that path.
+// UE-style indoor skylight occlusion of the diffuse skylight (irradiance). `sky_vis` (V in [0,1]) is
+// the cosine-weighted hemispherical sky visibility at the receiver normal. Occluded directions are
+// replaced by a neutral OcclusionTint = a desaturated fraction of the LOCAL skylight luminance (so
+// the indoor floor keeps brightness but loses the blue cast — the coloured GI bounce then shows),
+// with a MinOcclusion floor so it never crushes to black. sky_vis = 1 -> exact no-op. The tint
+// fraction and min-occlusion floor come from the push (`P_SKYVIS_TINT` / `P_SKYVIS_MIN_OCC`).
+float3 occlude_sky_diffuse(float3 irradiance, float sky_vis)
+{
+    float vis = lerp(saturate(sky_vis), 1.0, pc.skyvis_min_occ);
+    float lum = dot(irradiance, float3(0.2126, 0.7152, 0.0722));
+    return irradiance * vis + (pc.skyvis_tint * lum) * (1.0 - vis);
+}
+
 float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float metallic,
-                   float roughness, float ao, float3 f0, float3 swrt_refl, bool has_swrt)
+                   float roughness, float ao, float3 f0, float3 swrt_refl, bool has_swrt,
+                   float sky_vis)
 {
     if (globals.ibl.y < 0)
         return globals.ambient.rgb * albedo * ao;
@@ -138,7 +156,10 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
     float3 kd = (1.0 - f) * (1.0 - metallic);
 
     float3 irradiance = g.cubes[globals.ibl.y].SampleLevel(g.samp, n, 0.0).rgb;
-    float3 diffuse = irradiance * albedo;
+    // UE-style indoor skylight occlusion: occlude the diffuse skylight (irradiance) by the scene-
+    // scale sky visibility before the albedo, so an enclosed interior isn't flooded by the full
+    // (blue) diffuse skylight (sky_vis = 1 -> exact no-op, the gallery anchor).
+    float3 diffuse = occlude_sky_diffuse(irradiance, sky_vis) * albedo;
 
     float3 refl;
     if (has_swrt)
@@ -407,8 +428,14 @@ float4 fsMain(VSOutput input) : SV_Target
     if (has_swrt)
         swrt_refl = g.textures[pc.reflect_index].Sample(g.samp, input.uv).rgb;
 
+    // UE-style indoor skylight occlusion: directional sky-visibility occludes the IBL diffuse
+    // skylight. Absent (0xFFFFFFFF) -> 1.0 (exact no-op, gallery anchor).
+    float sky_vis = 1.0;
+    if (pc.skyvis_index != NO_TEXTURE)
+        sky_vis = saturate(g.textures[pc.skyvis_index].Sample(g.samp, input.uv).r);
+
     float3 ambient = ambient_ibl(n, v, world_pos, albedo, metallic, roughness, ao, f0,
-                                 swrt_refl, has_swrt) * gdf_ao;
+                                 swrt_refl, has_swrt, sky_vis) * gdf_ao;
 
     // Stage C3: 1-bounce diffuse GI marched against the scene GDF in a prior compute
     // pass. The GI image holds the mean incoming radiance (indirect irradiance) from

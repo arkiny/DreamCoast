@@ -32,6 +32,7 @@ use tracing::info;
 mod app;
 mod camera;
 mod clipmap;
+mod compose;
 mod cull;
 mod deferred;
 mod fuse;
@@ -602,6 +603,12 @@ struct App {
     /// samples a multibounce-propagating world volume instead of a single-bounce ray march — the
     /// real fix for deep-interior darkness. Content-only (`P_GI_VOLUME`); gallery forced off.
     gi_volume: bool,
+    /// UE-style indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
+    /// directional sky-visibility): neutral leak fraction (`P_SKYVIS_TINT`) + min-occlusion floor
+    /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
+    /// no-op sentinel image so it stays byte-identical.
+    skyvis_tint: f32,
+    skyvis_min_occ: f32,
     /// C3 hemisphere rays per pixel.
     gi_spp: u32,
     /// Stage D2: surface-cache amortized-relight period (round-robin card budget; 1 = legacy
@@ -626,6 +633,12 @@ struct App {
     gi_half_res: bool,
     /// P1 (Lumen-parity): GI trace divisor when `gi_half_res` is on (2 = half, 4 = quarter probes).
     gi_res_div: u32,
+    /// Screen-space radiance probe GI: replace the world-volume / ray-march GI consumption with
+    /// per-tile screen probes traced into an octahedral atlas + a per-pixel gather. Content-only
+    /// (`SCREEN_PROBE`); the gallery keeps its current GI path (byte-identical anchor).
+    screen_probe: bool,
+    /// P4 world radiance cache fallback for escaped screen-probe rays (`P_WRC`, on with probes).
+    wrc: bool,
     /// Reflection temporal history clamp (0 off / 1 hard / 2 variance; gallery forced 0) + variance γ.
     reflect_history_clamp: u32,
     reflect_clamp_gamma: f32,
@@ -1280,8 +1293,9 @@ impl App {
             let amin = fused.aabb_min;
             let amax = fused.aabb_max;
             let tri_count = fused.tri_count;
-            // Per-drawable world AABBs (for the surface-cache mesh cards).
+            // Per-drawable world AABBs + representative albedo (for the surface-cache cards).
             let obj_aabb = fused.drawable_aabb;
+            let obj_albedo = fused.drawable_albedo;
             // Phase 12 M2: cook the scene SDF (deterministic CPU bake, cached as a
             // `.dcasset` keyed on the fused geometry + grid) and upload it, replacing
             // the one-time GPU bake. A fresh cache loads directly; a miss bakes + saves.
@@ -1307,16 +1321,112 @@ impl App {
                 .max(1);
             let clip = clipmap::plan_levels(amin, amax, clip_center, sdf_dim, 0.1, clip_max_levels);
             info!("GDF clipmap: {} level(s)", clip.level_count());
-            let (sdf_vol, sdf_outcome) = dreamcoast_asset::cook::load_or_bake_scene_sdf(
-                &fused_v,
-                &fused_i,
-                sdf_dim,
-                amin,
-                amax,
-                &app::cooked_cache_dir(),
-            );
-            info!("scene SDF {sdf_dim}^3 ({sdf_outcome:?})");
-            let sdf_bytes = sdf_vol.to_le_bytes();
+            // Stage S1 (per-mesh-distance-fields.md): opt-in (`P11_PERMESH_GDF`) — composite
+            // per-mesh DFs (baked once per unique mesh, cached/instanced) into each clip level
+            // instead of re-baking the fused triangle soup. Default OFF: on a *non-instanced*
+            // scene (Intel Sponza = 448 unique meshes) per-mesh DFs are 448× the voxel work of
+            // one fused bake, so the first cook is slower — the win is on instanced content (a
+            // unique asset bakes once, every placement reuses it) and per-mesh thin-feature
+            // resolution (S2 color). The gallery always keeps the fused bake (byte-identical
+            // anchor). `scene_diag` is the "open space" distance for voxels no object covers.
+            let use_permesh = !gallery_scene && std::env::var_os("P11_PERMESH_GDF").is_some();
+            let scene_diag = {
+                let d = [amax[0] - amin[0], amax[1] - amin[1], amax[2] - amin[2]];
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+            };
+            let mut mesh_sdfs: Vec<dreamcoast_asset::sdf::SdfVolume> = Vec::new();
+            let mut compose_objects: Vec<crate::compose::ComposeObject> = Vec::new();
+            if use_permesh {
+                use std::collections::HashMap;
+                let cache_dir = app::cooked_cache_dir();
+                // G1 (gdf-reference-alignment.md): small-mesh radius cull — drop tiny drawables
+                // from the composite (they barely move low-frequency GI/AO but each is a full
+                // per-mesh bake). `P11_GDF_MIN_RADIUS` (m); 0 disables.
+                let min_radius = std::env::var("P11_GDF_MIN_RADIUS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .unwrap_or(crate::compose::DEFAULT_MIN_MESH_RADIUS);
+                let mut mesh_index: HashMap<u32, usize> = HashMap::new();
+                let mut culled = 0u32;
+                let mut negated = 0u32;
+                for d in world.draw_list() {
+                    let cpu = mesh_registry.cpu(d.mesh);
+                    let (mn, mx) = dreamcoast_asset::sdf::mesh_local_aabb_padded(&cpu.vertices);
+                    if min_radius > 0.0
+                        && crate::compose::mesh_world_radius(d.world, mn, mx) < min_radius
+                    {
+                        culled += 1;
+                        continue;
+                    }
+                    let mi = if let Some(&i) = mesh_index.get(&d.mesh.0) {
+                        i
+                    } else {
+                        let mdim = dreamcoast_asset::sdf::mesh_sdf_dim(mn, mx);
+                        let mvtx = dreamcoast_asset::sdf::encode_vertices_fused(&cpu.vertices);
+                        let midx = dreamcoast_asset::sdf::encode_indices(&cpu.indices);
+                        let (mut vol, _) = dreamcoast_asset::cook::load_or_bake_mesh_sdf(
+                            &mvtx, &midx, mdim, mn, mx, &cache_dir,
+                        );
+                        // A per-mesh DF that is *mostly* negative has globally-inverted normals
+                        // (it reads open space as "inside"): negate it so the sign is correct.
+                        // This removes the compose poisoning *and* the spurious floor-occlusion
+                        // blotches those meshes cause via AO/GI. A correct solid is mostly
+                        // positive outside and a correct thin sheet ~50 %, so the 60 % threshold
+                        // only flips clearly-inverted meshes.
+                        let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count();
+                        if neg * 5 > vol.voxels.len() * 3 {
+                            for v in &mut vol.voxels {
+                                *v = -*v;
+                            }
+                            negated += 1;
+                        }
+                        mesh_sdfs.push(vol);
+                        let i = mesh_sdfs.len() - 1;
+                        mesh_index.insert(d.mesh.0, i);
+                        i
+                    };
+                    compose_objects.push(crate::compose::ComposeObject::new(
+                        d.world,
+                        mi,
+                        &mesh_sdfs[mi],
+                    ));
+                }
+                info!(
+                    "per-mesh DF: {} unique meshes, {} instances ({} culled < {:.2} m radius, \
+                     {} inverted-meshes negated)",
+                    mesh_sdfs.len(),
+                    compose_objects.len(),
+                    culled,
+                    min_radius,
+                    negated
+                );
+            }
+            let sdf_bytes = if !use_permesh {
+                let (sdf_vol, sdf_outcome) = dreamcoast_asset::cook::load_or_bake_scene_sdf(
+                    &fused_v,
+                    &fused_i,
+                    sdf_dim,
+                    amin,
+                    amax,
+                    &app::cooked_cache_dir(),
+                );
+                info!("scene SDF {sdf_dim}^3 ({sdf_outcome:?})");
+                sdf_vol.to_le_bytes()
+            } else {
+                let vol = crate::compose::compose_sdf_level(
+                    &compose_objects,
+                    &mesh_sdfs,
+                    amin,
+                    amax,
+                    sdf_dim,
+                    scene_diag,
+                );
+                info!(
+                    "scene SDF {sdf_dim}^3 (composed from {} per-mesh DFs)",
+                    mesh_sdfs.len()
+                );
+                vol.to_le_bytes()
+            };
             // C8a per-voxel albedo volumes: cooked the same way (CPU bake, cached),
             // uploaded so the one-time GPU albedo bake is skipped too.
             let (albedo_vol, alb_outcome) = dreamcoast_asset::cook::load_or_bake_scene_albedo(
@@ -1357,15 +1467,31 @@ impl App {
                 let mut sdf_store: Vec<Vec<u8>> = Vec::new();
                 let mut alb_store: Vec<[Vec<u8>; 3]> = Vec::new();
                 for (lmin, lmax) in finer {
-                    let (v, _) = dreamcoast_asset::cook::load_or_bake_scene_sdf(
-                        &fused_v,
-                        &fused_i,
-                        sdf_dim,
-                        *lmin,
-                        *lmax,
-                        &app::cooked_cache_dir(),
-                    );
-                    sdf_store.push(v.to_le_bytes());
+                    // S1: finer levels compose from per-mesh DFs when opt-in, else the fused
+                    // bake (this loop only runs for content — the gallery is single-level).
+                    let sdf_le = if use_permesh {
+                        crate::compose::compose_sdf_level(
+                            &compose_objects,
+                            &mesh_sdfs,
+                            *lmin,
+                            *lmax,
+                            sdf_dim,
+                            scene_diag,
+                        )
+                        .to_le_bytes()
+                    } else {
+                        dreamcoast_asset::cook::load_or_bake_scene_sdf(
+                            &fused_v,
+                            &fused_i,
+                            sdf_dim,
+                            *lmin,
+                            *lmax,
+                            &app::cooked_cache_dir(),
+                        )
+                        .0
+                        .to_le_bytes()
+                    };
+                    sdf_store.push(sdf_le);
                     let (av, _) = dreamcoast_asset::cook::load_or_bake_scene_albedo(
                         &fused_v,
                         &fused_i,
@@ -1413,8 +1539,16 @@ impl App {
             // it; cards are draw-list-driven.
             let build_cache = std::env::var_os("P11_LEGACY_IBL").is_none();
             if build_cache {
-                let cards = fuse::build_surface_cards(&obj_aabb);
+                let (cards, card_albedo) = fuse::build_surface_cards(&obj_aabb, &obj_albedo);
                 let num_cards = (cards.len() / 64) as u32;
+                // C: content stamps the drawable's true albedo onto its cards (fine color);
+                // the gallery keeps the legacy voxel-volume albedo (byte-identical anchor).
+                // `P11_CARD_ALBEDO=0` forces the legacy path (A/B isolation of the cache color).
+                let card_albedo = if gallery_scene || !quality::env_bool("P11_CARD_ALBEDO", true) {
+                    None
+                } else {
+                    Some(card_albedo.as_slice())
+                };
                 // QHD/UHD track: the surface-cache atlas tile is runtime-tunable (`P11_CACHE_TILE`)
                 // so content can trade cache cost + atlas memory for reflection-cache sharpness.
                 // Default 32 = unchanged (byte-identical). Measured: tile 16 cuts the relight only
@@ -1425,7 +1559,7 @@ impl App {
                     .and_then(|v| v.trim().parse::<u32>().ok())
                     .unwrap_or(32)
                     .clamp(4, 64);
-                gdf.build_surface_cache(&device, &cards, num_cards, cache_tile)?;
+                gdf.build_surface_cache(&device, &cards, num_cards, cache_tile, card_albedo)?;
             }
         }
 
@@ -1605,6 +1739,20 @@ impl App {
         // the legacy march); `P_GI_VOLUME=0` forces the march back.
         let gi_volume =
             quality::env_bool("P_GI_VOLUME", !gallery_scene) && gdf_gi && gi.has_gi_volume();
+        // UE-style indoor skylight occlusion knobs (only effective on the volume GI path, content):
+        // `P_SKYVIS_TINT` = neutral OcclusionTint leak as a fraction of the occluded skylight
+        // luminance (the occluded floor keeps brightness but loses the blue cast); `P_SKYVIS_MIN_OCC`
+        // = min sky-visibility floor (=1.0 disables the occlusion entirely → SH-L1 baseline).
+        let skyvis_tint = std::env::var("P_SKYVIS_TINT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+        let skyvis_min_occ = std::env::var("P_SKYVIS_MIN_OCC")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
         // Stage D3: gallery forced to the legacy 8 (byte-identical anchor); content takes the tier.
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
@@ -1661,6 +1809,19 @@ impl App {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(qp.gi_res_div)
             .clamp(1, 16);
+        // Screen-space radiance probe GI (P1+): opt-in. Replaces the GI consumption (world-volume
+        // sample / per-pixel ray march) with per-tile screen probes + a per-pixel gather. Default
+        // OFF, so the gallery anchor (no env) stays byte-identical; an explicit `SCREEN_PROBE=1`
+        // turns it on for any scene — including the gallery, so the technique can be measured
+        // against the path-traced ground truth (the only path-traceable scene).
+        let screen_probe = gi.has_screen_probe() && quality::env_bool("SCREEN_PROBE", false);
+        // P4 world radiance cache: an off-screen / far-field / infinite-bounce fallback escaped
+        // screen-probe rays sample. Opt-in (`P_WRC=1`), default OFF: measurement shows it is
+        // inert-to-slightly-negative on our architecture because the full-scene GDF clipmap
+        // already covers all on/off-screen geometry (screen-probe rays hit real geometry instead
+        // of escaping), so the cache's primary role is subsumed. Kept as correct infrastructure
+        // for the multi-bounce-at-hits refinement (docs/world-radiance-cache.md). See the finding.
+        let wrc = screen_probe && gi.has_wrc() && quality::env_bool("P_WRC", false);
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
         let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", qp.gi_denoise);
         // C5 screen-space reflections (viz toggle).
@@ -2021,6 +2182,8 @@ impl App {
             ssao_params,
             gdf_gi,
             gi_volume,
+            skyvis_tint,
+            skyvis_min_occ,
             gi_spp,
             cache_relight_period,
             cache_feedback,
@@ -2031,6 +2194,8 @@ impl App {
             reflect_half_res,
             gi_half_res,
             gi_res_div,
+            screen_probe,
+            wrc,
             reflect_history_clamp,
             reflect_clamp_gamma,
             gi_temporal_clamp,
@@ -3382,6 +3547,11 @@ impl App {
                 .wrapping_add(self.gi_spp as u64);
             self.gi.prepare_denoise(&self.device, cw, ch, key)?;
         }
+        // P4: (re)allocate the world radiance cache atlas for the scene's clipmap level count.
+        if self.wrc {
+            let levels = self.gdf.clip_descriptor().map(|(_, c)| c).unwrap_or(1);
+            self.gi.prepare_wrc(&self.device, levels)?;
+        }
         // C7b: (re)allocate the lit-color history buffers for the hybrid reflection path
         // (the standalone viz or the C7c lighting feedback).
         if self.gdf_hybrid || self.swrt_reflect {
@@ -3657,7 +3827,91 @@ impl App {
             None
         };
         // Stage C3: 1-bounce diffuse GI added to the ambient term, optionally denoised (C4).
+        // Indoor skylight-occlusion image (directional sky-visibility), produced on the volume GI
+        // path and consumed by the lighting (occludes the IBL diffuse skylight). `None` otherwise.
+        let mut gi_skyvis_out: Option<ResourceId> = None;
         let gdf_gi_out = match (self.gdf_gi, scene_gdf_vol, scene_gdf_ext) {
+            (true, Some(vol), Some(ext)) if self.screen_probe => {
+                // Screen-space radiance probes (P1+): per-tile probe trace into an octahedral
+                // atlas + a per-pixel gather replace the GI consumption (world-volume sample /
+                // ray march). Full-res output; denoise (temporal + à-trous) for stability like the
+                // ray-march path. The gather also builds the indoor skylight occlusion (sky-vis)
+                // from the probes' per-ray sky visibility, fed to lighting like the volume path.
+                // P4: update the world radiance cache first, so escaped probe rays sample this
+                // frame's cache (off-screen / far-field / infinite bounce). `None` when disabled.
+                let wrc_arg = if self.wrc {
+                    self.gi.record_wrc_update(
+                        &mut graph,
+                        vol,
+                        ext,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        self.sun_dir,
+                        self.sun_intensity,
+                        scene_clip,
+                        &scene_clip_vols,
+                        scene_albedo,
+                        gi_cache_arg,
+                        self.gi_max_steps,
+                        self.gdf_cone_k,
+                        0.1, // EMA alpha
+                    )
+                } else {
+                    None
+                };
+                let (traced, sp_skyvis) = self.gi.record_screen_probe(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    extent,
+                    inv_view_proj,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    cw,
+                    ch,
+                    self.flip_y,
+                    self.frame_no as u32,
+                    scene_albedo,
+                    gi_cache_arg,
+                    firefly_max,
+                    scene_clip,
+                    &scene_clip_vols,
+                    self.gi_max_steps,
+                    self.gdf_cone_k,
+                    // P2 spatial cross-probe filter half-kernel (1 = 3x3; `P_SP_FILTER=0` disables).
+                    std::env::var("P_SP_FILTER")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(1)
+                        .min(4),
+                    wrc_arg,
+                );
+                gi_skyvis_out = Some(sp_skyvis);
+                let out = if gi_denoise_active {
+                    self.gi.record_denoise(
+                        &mut graph,
+                        traced,
+                        g_depth,
+                        g_normal,
+                        extent,
+                        inv_view_proj,
+                        self.prev_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        temporal_flip,
+                        self.gi_temporal_clamp,
+                    )
+                } else {
+                    traced
+                };
+                Some(out)
+            }
             (true, Some(vol), Some(ext)) => {
                 // Stage D1: trace at half res (1/4 the rays) when enabled, then joint-bilateral
                 // upsample to full res before the denoiser. gdf_gi.slang samples the G-buffer by
@@ -3691,11 +3945,11 @@ impl App {
                             0.1,
                         )
                         .zip(self.gi.gi_volume_sampled())
-                        .map(|(vext, idx)| (idx, vext))
+                        .map(|(vext, (rad_base, skyvis_base))| (rad_base, skyvis_base, vext))
                 } else {
                     None
                 };
-                let traced = self.gi.record_gi(
+                let (traced, skyvis) = self.gi.record_gi(
                     &mut graph,
                     vol,
                     ext,
@@ -3721,6 +3975,7 @@ impl App {
                     self.gdf_cone_k,
                     gi_volume_arg,
                 );
+                gi_skyvis_out = skyvis;
                 let raw = if half_gi {
                     self.gi.record_upsample(
                         &mut graph,
@@ -3960,6 +4215,9 @@ impl App {
             ssao_out,
             gdf_gi_out,
             swrt_reflect_out,
+            gi_skyvis_out,
+            self.skyvis_tint,
+            self.skyvis_min_occ,
             globals_offset,
             self.flip_y,
             // Two-sided shading for imported scenes (single-sided walls seen from inside);
@@ -4741,6 +4999,10 @@ impl App {
         // frame's view-projection for the next frame's temporal reprojection.
         if gi_denoise_active {
             self.gi.advance_denoise();
+        }
+        // P4: advance the world radiance cache ping-pong so next frame reads this frame's write.
+        if self.wrc {
+            self.gi.advance_wrc();
         }
         // C7b: advance the lit-color history ping-pong so next frame reads this frame's write.
         if self.gdf_hybrid || self.swrt_reflect {

@@ -22,8 +22,7 @@
 #include "bindless.slang"
 #include "clipmap.slang"
 #include "surface_cache.slang"
-
-static const float PI = 3.14159265359;
+#include "gdf_bounce.slang"
 
 struct GiPush
 {
@@ -56,10 +55,16 @@ struct GiPush
     // .w sits at +12 on all three backends; max_steps then gets its own clean 16-byte row.
     float4 ground_albedo;
     uint max_steps;         // Stage D3: bounce-ray march step cap (64 = legacy / gallery)
-    uint vol_r;             // GI irradiance-volume R sampled index (0xFFFFFFFF = off -> trace rays)
-    uint vol_g;             // green
-    uint vol_b;             // blue (4 contiguous uints w/ max_steps -> Metal-safe row, no float3 pad)
+    uint vol_r;             // directional-irradiance volume: sampled BASE index of the 12 SH
+                            // coefficient volumes (0xFFFFFFFF = off -> trace rays)
+    uint vol_g;             // sky-visibility: sampled BASE index of the 4 scalar SH volumes
+                            // (0xFFFFFFFF = sky-vis off). Reuses vol_r's freed slot.
+    uint vol_b;             // sky-visibility OUTPUT storage-image index (0xFFFFFFFF = don't write).
 };
+
+// Real SH band-0/1 basis normalisation (matches gi_volume.slang).
+static const float SH_C0 = 0.2820947918; // sqrt(1/(4*pi))
+static const float SH_C1 = 0.4886025119; // sqrt(3/(4*pi))
 
 [[vk::push_constant]]
 ConstantBuffer<GiPush> pc : register(b0, space0);
@@ -68,153 +73,28 @@ ConstantBuffer<GiPush> pc : register(b0, space0);
 #define GDF_MAX (pc.aabb_max.xyz)
 #define GROUND_Y (pc.aabb_min.w)
 
-// --- RNG + sampling (mirrors rt_common.slang so the noise is identical across
-// backends and consistent with the path tracer). ---
-uint pcg(inout uint state)
+// Build the shared bounce-tracer scene from this pass's push constants. The march/shade/
+// shadow code lives once in `gdf_bounce.slang` (also used by the screen-space probes);
+// this is a pure mapping of `pc` fields, so the per-pixel ray-march output is unchanged.
+BounceScene gi_bounce_scene()
 {
-    state = state * 747796405u + 2891336453u;
-    uint word = ((state >> ((state >> 28) + 4u)) ^ state) * 277803737u;
-    return (word >> 22) ^ word;
-}
-float rnd(inout uint s)
-{
-    return float(pcg(s) & 0xFFFFFFu) / float(0x1000000);
-}
-void onb(float3 n, out float3 t, out float3 b)
-{
-    t = normalize(abs(n.x) > 0.9 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
-    b = cross(n, t);
-}
-float3 cosine_hemisphere(float3 n, inout uint rng)
-{
-    float u1 = rnd(rng);
-    float u2 = rnd(rng);
-    float r = sqrt(u1);
-    float phi = 2.0 * PI * u2;
-    float3 t, b;
-    onb(n, t, b);
-    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
-}
-
-// --- GDF field via the clipmap (single level ⇒ identical to the legacy single volume +
-// ground union of gdf_trace.slang). ---
-ClipMap gi_clip()
-{
-    ClipMap c;
-    c.desc = pc.clip_desc;
-    c.count = pc.clip_count;
-    return c;
-}
-
-float geo_inside(float3 p)
-{
-    return cm_geo_inside(gi_clip(), p, pc.aabb_max.w);
-}
-
-// Geometry distance for marching: outside the box, return the (clamped) box distance so
-// the empty bounding box never reads as a surface while the ray steps sensibly.
-float geo_march(float3 p)
-{
-    return cm_geo_march(gi_clip(), p, pc.aabb_max.w);
-}
-
-float scene_march(float3 p)
-{
-    return min(geo_march(p), p.y - GROUND_Y);
-}
-float scene_occ(float3 p)
-{
-    return min(geo_inside(p), p.y - GROUND_Y);
-}
-
-// C8a: the nearest-triangle albedo at a GDF hit (trilinear from the 3 R32F color volumes
-// baked in `sdf_albedo_bake.slang`), or the constant fallback when no albedo volume is
-// bound (albedo_r == 0xFFFFFFFF). The albedo grid shares the distance field's voxel grid.
-float3 albedo_at(float3 p)
-{
-    return cm_albedo(gi_clip(), p, pc.params.w);
-}
-
-float3 scene_normal(float3 p)
-{
-    const float e = 0.012;
-    float2 k = float2(1.0, -1.0);
-    float3 grad = k.xyy * scene_occ(p + k.xyy * e) + k.yyx * scene_occ(p + k.yyx * e)
-                  + k.yxy * scene_occ(p + k.yxy * e) + k.xxx * scene_occ(p + k.xxx * e);
-    return safe_normalize(grad, float3(0.0, 1.0, 0.0));
-}
-
-// Cheap penumbra shadow toward the sun for the bounce hit (fewer steps than the primary
-// trace's — indirect shadowing is low-frequency and gets denoised in C4).
-float gi_shadow(float3 origin, float3 dir)
-{
-    float res = 1.0;
-    float t = 0.02;
-    float maxt = pc.params.x;
-    for (int i = 0; i < 48; i++)
-    {
-        float h = scene_occ(origin + dir * t);
-        if (h < 0.002)
-            return 0.0;
-        res = min(res, 16.0 * h / t);
-        // P3 cone-trace LOD: widen the max step with distance (cone_k=0 => clamp(.,0.01,0.2) legacy).
-        t += clamp(h, 0.01, max(0.2, pc.ground_albedo.w * t));
-        if (t > maxt)
-            break;
-    }
-    return saturate(res);
-}
-
-// Sphere-trace a bounce ray; returns the incoming radiance along it (0 if it escapes).
-float3 trace_bounce(float3 origin, float3 dir)
-{
-    // Stage D3: content lowers the step cap (cheaper march); gallery passes 64 = legacy.
-    int max_steps = int(max(pc.max_steps, 1u));
-    const float HIT_EPS = 0.001;
-    float t = pc.params.y; // start past the surface bias
-    float maxt = pc.params.x;
-    for (int i = 0; i < max_steps; i++)
-    {
-        float3 p = origin + dir * t;
-        float d = scene_march(p);
-        if (d < HIT_EPS)
-        {
-            float3 hn = scene_normal(p);
-            // C8b3/C8g: when the surface cache is bound, the incoming radiance along this ray is
-            // the hit surface's cached (multibounce) radiance — a direct lookup, no per-ray
-            // re-light / shadow ray. On a cache MISS (e.g. the analytic ground, which has no
-            // cards) fall back to the C8a per-ray colored re-light instead of black.
-            if (pc.cache.x != 0xFFFFFFFFu)
-            {
-                bool cached = false;
-                float3 r = sample_surface_cache(p, hn, pc.cache.x, pc.cache.y, pc.cache.z,
-                                                pc.cache.w, pc.cache_tile, cached);
-                if (cached)
-                    return r;
-            }
-            float3 sun_dir = normalize(pc.sun.xyz);
-            float ndl = max(dot(hn, sun_dir), 0.0);
-            float sh = ndl > 0.0 ? gi_shadow(p + hn * 0.004, sun_dir) : 1.0;
-            // C8a colored re-light: the hit's real surface albedo (per-voxel color volume)
-            // × sun (soft-shadowed) + a small hemispheric sky fill so surfaces in full
-            // shadow still bounce a little. Colored albedo => colored indirect bleed.
-            // The analytic ground is not in the albedo volume, so albedo_at() returns the
-            // nearest object's colour for a ground hit — use the ground's own albedo
-            // ([0.8], matching deferred.rs) so floor bounce isn't tinted by nearby objects.
-            bool is_ground = (p.y - GROUND_Y) < geo_inside(p);
-            float3 hit_albedo = is_ground ? pc.ground_albedo.xyz : albedo_at(p);
-            // Lambertian: the bounce surface re-emits albedo/PI * irradiance — the same
-            // 1/PI the deferred direct term uses. Omitting it over-brightened indirect
-            // diffuse by ~PI (the GDF-GI over-lighting vs the path tracer).
-            float sky_fill = pc.params.z * (0.5 + 0.5 * hn.y);
-            return hit_albedo * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / PI);
-        }
-        // P3 cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01) legacy).
-        t += max(d, max(0.01, pc.ground_albedo.w * t));
-        if (t > maxt)
-            break;
-    }
-    return float3(0.0, 0.0, 0.0); // escaped to sky -> IBL already supplies it
+    BounceScene bs;
+    bs.clip_desc = pc.clip_desc;
+    bs.clip_count = pc.clip_count;
+    bs.sample_clamp = pc.aabb_max.w;
+    bs.ground_y = GROUND_Y;
+    bs.sun_dir = pc.sun.xyz;
+    bs.sun_i = pc.sun.w;
+    bs.ray_max = pc.params.x;
+    bs.bias = pc.params.y;
+    bs.sky_term = pc.params.z;
+    bs.albedo_fallback = pc.params.w;
+    bs.cache = pc.cache;
+    bs.cache_tile = pc.cache_tile;
+    bs.ground_albedo = pc.ground_albedo.xyz;
+    bs.cone_k = pc.ground_albedo.w;
+    bs.max_steps = pc.max_steps;
+    return bs;
 }
 
 [shader("compute")]
@@ -227,10 +107,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float2 uv = (float2(tid.xy) + 0.5) / float2(pc.width, pc.height);
     float depth = g.textures[pc.depth_index].SampleLevel(g.samp, uv, 0.0).r;
 
-    // Far plane (no geometry): no indirect bounce.
+    // Far plane (no geometry): no indirect bounce. Sky-vis = 1 (the skybox isn't IBL-lit, but keep
+    // the image defined so the lighting never reads stale storage).
     if (depth >= 1.0)
     {
         g.storage_images[pc.out_index][tid.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        if (pc.vol_b != 0xFFFFFFFFu)
+            g.storage_images[pc.vol_b][tid.xy] = float4(1.0, 0.0, 0.0, 1.0);
         return;
     }
 
@@ -239,10 +122,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float4 hpos = mul(pc.inv_view_proj, float4(ndc, depth, 1.0));
     float3 world_pos = hpos.xyz / hpos.w;
 
-    // GI irradiance-volume mode (DDGI-lite radiance cache): instead of marching per-pixel rays,
-    // sample the world-space irradiance volume (updated in gi_volume.slang with multibounce). This
-    // is the indirect E the lighting multiplies by albedo; it fills enclosed interiors a single
-    // bounce can't reach. Feeds the existing temporal+a-trous denoiser unchanged.
+    float3 n = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, uv, 0.0).xyz);
+
+    // Directional-irradiance volume mode (radiance cache): instead of marching per-pixel rays,
+    // sample the world-space SH volume (updated in gi_volume.slang with multibounce) and
+    // reconstruct the cosine-weighted hemispherical average radiance in THIS pixel's normal
+    // direction. That directionality is what lets a coloured surface bleed onto a neighbour the
+    // old omnidirectional average washed out. The result is the indirect E the lighting
+    // multiplies by albedo; it fills enclosed interiors a single bounce can't reach. Feeds the
+    // existing temporal + a-trous denoiser unchanged.
     if (pc.vol_r != 0xFFFFFFFFu)
     {
         float3 uvw = (world_pos - GDF_MIN) / (GDF_MAX - GDF_MIN);
@@ -250,27 +138,63 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         if (all(uvw >= 0.0) && all(uvw <= 1.0))
         {
             uvw = saturate(uvw);
-            e = float3(g.volumes[pc.vol_r].SampleLevel(g.samp, uvw, 0.0).x,
-                       g.volumes[pc.vol_g].SampleLevel(g.samp, uvw, 0.0).x,
-                       g.volumes[pc.vol_b].SampleLevel(g.samp, uvw, 0.0).x);
+            // The 12 SH coefficient volumes are contiguous from vol_r: coeff k, channel ch lives
+            // in volume vol_r + ch*4 + k. Reconstruct E(n) with the clamped-cosine convolution
+            // (A0/PI = 1, A1/PI = 2/3); clamp >= 0 (band-1 SH can ring negative).
+            float3 c[4];
+            [unroll]
+            for (int k = 0; k < 4; k++)
+                c[k] = float3(0.0, 0.0, 0.0);
+            [unroll]
+            for (int ch = 0; ch < 3; ch++)
+            {
+                [unroll]
+                for (int k = 0; k < 4; k++)
+                    c[k][ch] =
+                        g.volumes[pc.vol_r + uint(ch * 4 + k)].SampleLevel(g.samp, uvw, 0.0).x;
+            }
+            e = c[0] * SH_C0
+                + (2.0 / 3.0) * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]);
+            e = max(e, float3(0.0, 0.0, 0.0));
         }
         g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
+
+        // Sky-visibility (UE-style indoor skylight occlusion): reconstruct the cosine-weighted
+        // hemispherical sky visibility V(n) from the 4 scalar SH volumes (contiguous from vol_g) and
+        // write it for the lighting to occlude the IBL diffuse skylight. Open surfaces -> ~1 (full
+        // skylight); enclosed interiors -> ~0 (the diffuse skylight is occluded, so the coloured
+        // scene bounce shows instead of flat blue sky).
+        if (pc.vol_g != 0xFFFFFFFFu && pc.vol_b != 0xFFFFFFFFu)
+        {
+            float v = 1.0;
+            if (all(uvw >= 0.0) && all(uvw <= 1.0))
+            {
+                float sc[4];
+                [unroll]
+                for (int k = 0; k < 4; k++)
+                    sc[k] = g.volumes[pc.vol_g + uint(k)].SampleLevel(g.samp, uvw, 0.0).x;
+                v = sc[0] * SH_C0
+                    + (2.0 / 3.0) * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2] + SH_C1 * n.x * sc[3]);
+                v = saturate(v);
+            }
+            g.storage_images[pc.vol_b][tid.xy] = float4(v, 0.0, 0.0, 1.0);
+        }
         return;
     }
-
-    float3 n = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, uv, 0.0).xyz);
 
     uint spp = max(pc.spp, 1u);
     uint seed = (tid.x * 1973u + tid.y * 9277u + pc.frame * 26699u) | 1u;
     float3 origin = world_pos + n * pc.params.y;
+    BounceScene bs = gi_bounce_scene();
 
     float3 sum = float3(0.0, 0.0, 0.0);
     for (uint s = 0; s < spp; s++)
     {
-        float3 dir = cosine_hemisphere(n, seed);
+        float3 dir = bounce_cosine_hemisphere(n, seed);
         // Firefly clamp per sample (before averaging): one ray hitting a bright spot can't
         // blow out the mean. Hue-preserving; `clamp_max = 1e30` disables it.
-        float3 b = trace_bounce(origin, dir);
+        float esc;
+        float3 b = bs_trace_bounce(bs, origin, dir, esc);
         float m = max(b.r, max(b.g, b.b));
         if (m > pc.clamp_max)
             b *= pc.clamp_max / m;
