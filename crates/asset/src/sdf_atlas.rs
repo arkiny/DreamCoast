@@ -25,7 +25,7 @@
 //! `uvw = (origin_inner + t*d) / A = origin_inner/A + t*(d/A)` — i.e. `uvw_bias =
 //! origin_inner/A`, `uvw_scale = d/A`. [`SdfAtlas::tile_uvw`] returns that pair.
 
-use crate::sdf::SdfVolume;
+use crate::sdf::{AlbedoVolumes, SdfVolume};
 
 /// One packed tile: where a mesh's `dim³` field lives in the atlas, plus the mesh's local AABB
 /// (so the sampler can form the mesh-local normalized coordinate `t`).
@@ -228,6 +228,144 @@ impl SdfAtlas {
     pub fn to_le_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.voxels.len() * 4);
         for v in &self.voxels {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// Trilinearly resample one `src_dim³` channel to `new_dim³` over the *same* normalized
+/// `[0,1]³` box (voxel-center clamp addressing, the GPU convention). Used to match an albedo
+/// tile to the SDF tile's (possibly capped) `dim` so a single UVW mapping addresses both.
+/// Deterministic; a box downsample when `new_dim < src_dim`, identity when equal.
+fn resample_channel(src: &[f32], src_dim: u32, new_dim: u32) -> Vec<f32> {
+    let sd = src_dim.max(1);
+    let n = new_dim.max(1);
+    if sd == n {
+        return src.to_vec();
+    }
+    let sample = |t: [f32; 3]| -> f32 {
+        // Continuous voxel-center coord, clamped (matches SdfVolume::sample / the GPU sampler).
+        let mut g = [0.0f32; 3];
+        for a in 0..3 {
+            g[a] = (t[a] * sd as f32 - 0.5).clamp(0.0, sd as f32 - 1.0);
+        }
+        let i0 = [g[0] as u32, g[1] as u32, g[2] as u32];
+        let i1 = [
+            (i0[0] + 1).min(sd - 1),
+            (i0[1] + 1).min(sd - 1),
+            (i0[2] + 1).min(sd - 1),
+        ];
+        let f = [
+            g[0] - i0[0] as f32,
+            g[1] - i0[1] as f32,
+            g[2] - i0[2] as f32,
+        ];
+        let at = |x: u32, y: u32, z: u32| src[(x + sd * (y + sd * z)) as usize];
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let c00 = lerp(at(i0[0], i0[1], i0[2]), at(i1[0], i0[1], i0[2]), f[0]);
+        let c10 = lerp(at(i0[0], i1[1], i0[2]), at(i1[0], i1[1], i0[2]), f[0]);
+        let c01 = lerp(at(i0[0], i0[1], i1[2]), at(i1[0], i0[1], i1[2]), f[0]);
+        let c11 = lerp(at(i0[0], i1[1], i1[2]), at(i1[0], i1[1], i1[2]), f[0]);
+        lerp(lerp(c00, c10, f[1]), lerp(c01, c11, f[1]), f[2])
+    };
+    let inv = 1.0 / n as f32;
+    let mut out = vec![0.0f32; (n * n * n) as usize];
+    for z in 0..n {
+        for y in 0..n {
+            for x in 0..n {
+                let t = [
+                    (x as f32 + 0.5) * inv,
+                    (y as f32 + 0.5) * inv,
+                    (z as f32 + 0.5) * inv,
+                ];
+                out[(x + n * (y + n * z)) as usize] = sample(t);
+            }
+        }
+    }
+    out
+}
+
+/// A set of per-mesh **albedo** fields packed into three atlas channel volumes (R/G/B),
+/// reusing an [`SdfAtlas`]'s exact tile geometry (gi-fidelity-phases.md, F5 S2).
+///
+/// The whole point of F5 is that hit *colour* gets the same per-mesh precision the SDF already
+/// has: instead of the coarse whole-scene albedo grid (which blurs colour across neighbouring
+/// meshes), each mesh's albedo lives in a tile sampled through the *same* `tile_uvw` mapping the
+/// SDF uses — so `mesh_sdf_sample.slang` reads the hit instance's own colour at the same UVW it
+/// used for the distance. Because the tiles share origins/dims/atlas-dims with the SDF atlas,
+/// there is exactly one tile contract for both (single source).
+pub struct AlbedoAtlas {
+    /// Atlas volume dimensions (voxels) — **identical** to the paired [`SdfAtlas::dim`].
+    pub dim: [u32; 3],
+    /// Three `dim.x*dim.y*dim.z` channels (R/G/B), `idx = x + dim.x*(y + dim.y*z)`.
+    pub channels: [Vec<f32>; 3],
+}
+
+impl AlbedoAtlas {
+    /// Pack `albedos[i]` (the albedo of mesh `i`, baked over the same local grid as its SDF)
+    /// into the layout of `sdf_atlas` — same tile origins, same tile `dim`, same atlas `dim`.
+    /// Each albedo, baked at the mesh's native `dim`, is resampled to the (possibly capped) SDF
+    /// tile `dim` so the two tiles coincide voxel-for-voxel. A missing/mismatched albedo fills
+    /// its tile with `fallback` (a benign neutral) so the atlas is always well-formed.
+    /// Deterministic — a pure function of the SDF atlas + albedos.
+    pub fn pack_like(sdf_atlas: &SdfAtlas, albedos: &[AlbedoVolumes], fallback: [f32; 3]) -> Self {
+        let dim = sdf_atlas.dim;
+        let (ax, ay) = (dim[0] as usize, dim[1] as usize);
+        let n = ax * ay * dim[2] as usize;
+        let mut channels = [vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]];
+
+        for (i, tile) in sdf_atlas.tiles.iter().enumerate() {
+            let d = tile.dim;
+            // The per-channel source at the tile's dim (resampled from the albedo's native dim,
+            // exactly as the SDF tile was capped), or the neutral fallback when absent.
+            let src: [Vec<f32>; 3] = match albedos.get(i) {
+                Some(a) => [
+                    resample_channel(&a.channels[0], a.dim, d),
+                    resample_channel(&a.channels[1], a.dim, d),
+                    resample_channel(&a.channels[2], a.dim, d),
+                ],
+                None => {
+                    let m = (d * d * d) as usize;
+                    [
+                        vec![fallback[0]; m],
+                        vec![fallback[1]; m],
+                        vec![fallback[2]; m],
+                    ]
+                }
+            };
+            let di = d as i32;
+            let base = [
+                tile.origin[0] as i32 - GUTTER as i32,
+                tile.origin[1] as i32 - GUTTER as i32,
+                tile.origin[2] as i32 - GUTTER as i32,
+            ];
+            let s = (d + 2 * GUTTER) as i32;
+            for fz in 0..s {
+                let mz = (fz - GUTTER as i32).clamp(0, di - 1);
+                let az = (base[2] + fz) as usize;
+                for fy in 0..s {
+                    let my = (fy - GUTTER as i32).clamp(0, di - 1);
+                    let ay_ = (base[1] + fy) as usize;
+                    for fx in 0..s {
+                        let mx = (fx - GUTTER as i32).clamp(0, di - 1);
+                        let ax_ = (base[0] + fx) as usize;
+                        let sidx = (mx + di * (my + di * mz)) as usize;
+                        let aidx = ax_ + ax * (ay_ + ay * az);
+                        for c in 0..3 {
+                            channels[c][aidx] = src[c][sidx];
+                        }
+                    }
+                }
+            }
+        }
+        AlbedoAtlas { dim, channels }
+    }
+
+    /// Channel `c` (0=R,1=G,2=B) as little-endian f32 bytes for `Device::create_volume_init`.
+    pub fn channel_le_bytes(&self, c: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.channels[c].len() * 4);
+        for v in &self.channels[c] {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out
@@ -839,5 +977,188 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- F5 S1/S2: per-mesh albedo atlas ------------------------------------------------
+
+    /// A `dim³` albedo field whose per-channel value is a deterministic function of the voxel
+    /// index (distinct per channel), so an atlas round-trip can be checked exactly.
+    fn ramp_albedo(dim: u32, seed: f32) -> AlbedoVolumes {
+        let n = (dim * dim * dim) as usize;
+        let ch = |k: f32| {
+            (0..n)
+                .map(|i| seed + k + i as f32 * 0.003)
+                .collect::<Vec<f32>>()
+        };
+        AlbedoVolumes {
+            dim,
+            channels: [ch(0.0), ch(0.11), ch(0.29)],
+        }
+    }
+
+    /// Reference trilinear tap on one albedo channel (voxel-center clamp, GPU convention).
+    fn albedo_sample(atlas: &AlbedoAtlas, c: usize, uvw: [f32; 3]) -> f32 {
+        let a = [
+            atlas.dim[0] as f32,
+            atlas.dim[1] as f32,
+            atlas.dim[2] as f32,
+        ];
+        let mut g = [0.0f32; 3];
+        for k in 0..3 {
+            g[k] = (uvw[k] * a[k] - 0.5).clamp(0.0, a[k] - 1.0);
+        }
+        let i0 = [g[0] as u32, g[1] as u32, g[2] as u32];
+        let i1 = [
+            (i0[0] + 1).min(atlas.dim[0] - 1),
+            (i0[1] + 1).min(atlas.dim[1] - 1),
+            (i0[2] + 1).min(atlas.dim[2] - 1),
+        ];
+        let f = [
+            g[0] - i0[0] as f32,
+            g[1] - i0[1] as f32,
+            g[2] - i0[2] as f32,
+        ];
+        let (dx, dy) = (atlas.dim[0], atlas.dim[1]);
+        let at = |x: u32, y: u32, z: u32| atlas.channels[c][(x + dx * (y + dy * z)) as usize];
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let c00 = lerp(at(i0[0], i0[1], i0[2]), at(i1[0], i0[1], i0[2]), f[0]);
+        let c10 = lerp(at(i0[0], i1[1], i0[2]), at(i1[0], i1[1], i0[2]), f[0]);
+        let c01 = lerp(at(i0[0], i0[1], i1[2]), at(i1[0], i0[1], i1[2]), f[0]);
+        let c11 = lerp(at(i0[0], i1[1], i1[2]), at(i1[0], i1[1], i1[2]), f[0]);
+        lerp(lerp(c00, c10, f[1]), lerp(c01, c11, f[1]), f[2])
+    }
+
+    /// Trilinear tap on a raw `dim³` channel (the reference the resampled atlas must match).
+    fn channel_sample(ch: &[f32], dim: u32, t: [f32; 3]) -> f32 {
+        let d = dim as f32;
+        let mut g = [0.0f32; 3];
+        for k in 0..3 {
+            g[k] = (t[k] * d - 0.5).clamp(0.0, d - 1.0);
+        }
+        let i0 = [g[0] as u32, g[1] as u32, g[2] as u32];
+        let i1 = [
+            (i0[0] + 1).min(dim - 1),
+            (i0[1] + 1).min(dim - 1),
+            (i0[2] + 1).min(dim - 1),
+        ];
+        let f = [
+            g[0] - i0[0] as f32,
+            g[1] - i0[1] as f32,
+            g[2] - i0[2] as f32,
+        ];
+        let at = |x: u32, y: u32, z: u32| ch[(x + dim * (y + dim * z)) as usize];
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let c00 = lerp(at(i0[0], i0[1], i0[2]), at(i1[0], i0[1], i0[2]), f[0]);
+        let c10 = lerp(at(i0[0], i1[1], i0[2]), at(i1[0], i1[1], i0[2]), f[0]);
+        let c01 = lerp(at(i0[0], i0[1], i1[2]), at(i1[0], i0[1], i1[2]), f[0]);
+        let c11 = lerp(at(i0[0], i1[1], i1[2]), at(i1[0], i1[1], i1[2]), f[0]);
+        lerp(lerp(c00, c10, f[1]), lerp(c01, c11, f[1]), f[2])
+    }
+
+    /// The albedo atlas, sampled through the paired SDF atlas's `tile_uvw`, must reproduce each
+    /// mesh's own albedo channels — the F5 contract: **one** UVW mapping addresses both fields.
+    /// Native dims (no cap) so the round-trip is exact to trilinear tolerance.
+    #[test]
+    fn albedo_atlas_reproduces_mesh_sample_through_sdf_uvw() {
+        let dims = [8u32, 32, 48];
+        let meshes: Vec<SdfVolume> = dims
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| ramp_volume(d, [-1.0; 3], [1.0; 3], i as f32))
+            .collect();
+        let albedos: Vec<AlbedoVolumes> = dims.iter().map(|&d| ramp_albedo(d, d as f32)).collect();
+
+        let sdf_atlas = SdfAtlas::pack(&meshes);
+        let alb_atlas = AlbedoAtlas::pack_like(&sdf_atlas, &albedos, [0.5; 3]);
+        assert_eq!(alb_atlas.dim, sdf_atlas.dim, "albedo atlas shares SDF dims");
+
+        for (i, a) in albedos.iter().enumerate() {
+            let (bias, scale) = sdf_atlas.tile_uvw(i);
+            for &tx in &[0.0f32, 0.1, 0.5, 0.9, 1.0] {
+                for &ty in &[0.0f32, 0.37, 1.0] {
+                    for &tz in &[0.0f32, 0.63, 1.0] {
+                        let t = [tx, ty, tz];
+                        let uvw = [
+                            bias[0] + t[0] * scale[0],
+                            bias[1] + t[1] * scale[1],
+                            bias[2] + t[2] * scale[2],
+                        ];
+                        for c in 0..3 {
+                            let want = channel_sample(&a.channels[c], a.dim, t);
+                            let got = albedo_sample(&alb_atlas, c, uvw);
+                            assert!(
+                                (got - want).abs() < 1e-4,
+                                "mesh {i} ch{c} t={t:?}: atlas {got} vs mesh {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// When the SDF atlas is capped (large tiles downsampled), the albedo tile is resampled to
+    /// the SAME capped dim, so the two tiles stay voxel-aligned and one `tile_uvw` maps both.
+    #[test]
+    fn albedo_atlas_matches_capped_sdf_tile_dims() {
+        let big_sdf = ramp_volume(48, [-1.0; 3], [1.0; 3], 0.0);
+        let big_alb = ramp_albedo(48, 7.0);
+        let sdf_atlas = SdfAtlas::pack_capped(std::slice::from_ref(&big_sdf), 16);
+        assert_eq!(sdf_atlas.tiles[0].dim, 16, "SDF tile capped to 16");
+        let alb_atlas =
+            AlbedoAtlas::pack_like(&sdf_atlas, std::slice::from_ref(&big_alb), [0.5; 3]);
+        // A center sample must read the albedo resampled to 16³ (not the native 48³), matching
+        // the SDF's capped tile — i.e. no dim mismatch between the paired atlases.
+        let (bias, scale) = sdf_atlas.tile_uvw(0);
+        let t = [0.5f32, 0.5, 0.5];
+        let uvw = [
+            bias[0] + t[0] * scale[0],
+            bias[1] + t[1] * scale[1],
+            bias[2] + t[2] * scale[2],
+        ];
+        let capped = resample_channel(&big_alb.channels[0], big_alb.dim, 16);
+        let want = channel_sample(&capped, 16, t);
+        let got = albedo_sample(&alb_atlas, 0, uvw);
+        assert!((got - want).abs() < 1e-4, "capped albedo {got} vs {want}");
+    }
+
+    /// A missing albedo (fewer albedos than tiles) fills its tile with the neutral fallback,
+    /// so the atlas is always well-formed and the shader's fallback path is exercisable.
+    #[test]
+    fn albedo_atlas_fallback_fills_absent_tiles() {
+        let meshes = [
+            ramp_volume(8, [-1.0; 3], [1.0; 3], 0.0),
+            ramp_volume(16, [0.0; 3], [1.0; 3], 1.0),
+        ];
+        let albedos = [ramp_albedo(8, 3.0)]; // only mesh 0 has albedo
+        let sdf_atlas = SdfAtlas::pack(&meshes);
+        let fb = [0.42f32, 0.13, 0.77];
+        let alb_atlas = AlbedoAtlas::pack_like(&sdf_atlas, &albedos, fb);
+        // Mesh 1's tile center reads the fallback on every channel.
+        let (bias, scale) = sdf_atlas.tile_uvw(1);
+        let t = [0.5f32, 0.5, 0.5];
+        let uvw = [
+            bias[0] + t[0] * scale[0],
+            bias[1] + t[1] * scale[1],
+            bias[2] + t[2] * scale[2],
+        ];
+        for (c, &f) in fb.iter().enumerate() {
+            let got = albedo_sample(&alb_atlas, c, uvw);
+            assert!((got - f).abs() < 1e-5, "fallback ch{c}: {got} vs {f}");
+        }
+    }
+
+    #[test]
+    fn albedo_atlas_is_deterministic() {
+        let meshes = [
+            ramp_volume(8, [-1.0; 3], [1.0; 3], 0.0),
+            ramp_volume(16, [0.0; 3], [2.0; 3], 5.0),
+        ];
+        let albedos = [ramp_albedo(8, 1.0), ramp_albedo(16, 2.0)];
+        let sdf_atlas = SdfAtlas::pack(&meshes);
+        let a = AlbedoAtlas::pack_like(&sdf_atlas, &albedos, [0.5; 3]);
+        let b = AlbedoAtlas::pack_like(&sdf_atlas, &albedos, [0.5; 3]);
+        assert_eq!(a.dim, b.dim);
+        assert_eq!(a.channels, b.channels);
     }
 }

@@ -1356,6 +1356,11 @@ impl App {
                 (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
             };
             let mut mesh_sdfs: Vec<dreamcoast_asset::sdf::SdfVolume> = Vec::new();
+            // F5 (gi-fidelity-phases.md): one per-mesh albedo volume per unique mesh, parallel to
+            // `mesh_sdfs` (same order / dedup), baked over the SAME grid so the albedo tile aligns
+            // 1:1 with the SDF tile. Opt-in (heavy: per-mesh bake + 3 atlas volumes); off ⇒ dense.
+            let permesh_albedo = use_permesh && quality::env_bool("F5_PERMESH_ALBEDO", false);
+            let mut mesh_albedos: Vec<dreamcoast_asset::sdf::AlbedoVolumes> = Vec::new();
             let mut compose_objects: Vec<crate::compose::ComposeObject> = Vec::new();
             if use_permesh {
                 use std::collections::HashMap;
@@ -1402,6 +1407,30 @@ impl App {
                             negated += 1;
                         }
                         mesh_sdfs.push(vol);
+                        // F5: bake this unique mesh's albedo over the same grid. Albedo depends on
+                        // the drawable's material too, so — matching the mesh-only dedup here — we
+                        // key it on the mesh + this first drawable's representative material colour
+                        // (uniform per drawable in these scenes), repeated per triangle.
+                        if permesh_albedo {
+                            let alb = material_registry.get(d.material).albedo;
+                            let tri_count = cpu.indices.len() / 3;
+                            let mut tri_albedo = Vec::with_capacity(tri_count * 12);
+                            for _ in 0..tri_count {
+                                for c in alb {
+                                    tri_albedo.extend_from_slice(&c.to_le_bytes());
+                                }
+                            }
+                            let (av, _) = dreamcoast_asset::cook::load_or_bake_mesh_albedo(
+                                &mvtx,
+                                &midx,
+                                &tri_albedo,
+                                mdim,
+                                mn,
+                                mx,
+                                &cache_dir,
+                            );
+                            mesh_albedos.push(av);
+                        }
                         let i = mesh_sdfs.len() - 1;
                         mesh_index.insert(d.mesh.0, i);
                         i
@@ -1567,16 +1596,43 @@ impl App {
                     dreamcoast_asset::sdf_atlas::SdfAtlas::pack_capped(&mesh_sdfs, atlas_cap);
                 let res = crate::mesh_sdf::grid_res_for(compose_objects.len());
                 let build = crate::mesh_sdf::build(&compose_objects, &atlas, amin, amax, res);
+                // F5: pack the per-mesh albedo volumes into the SAME tile geometry as the SDF
+                // atlas (one `tile_uvw` maps both), so the shader reads hit colour at the hit
+                // instance with per-mesh precision. Opt-in (`F5_PERMESH_ALBEDO`); off ⇒ dense.
+                let albedo_atlas = if permesh_albedo && mesh_albedos.len() == mesh_sdfs.len() {
+                    Some(dreamcoast_asset::sdf_atlas::AlbedoAtlas::pack_like(
+                        &atlas,
+                        &mesh_albedos,
+                        [0.7, 0.7, 0.7],
+                    ))
+                } else {
+                    None
+                };
                 info!(
-                    "per-mesh SDF direct sample: atlas {}x{}x{} ({:.1} MB), {} instances, {}^3 cell grid",
+                    "per-mesh SDF direct sample: atlas {}x{}x{} ({:.1} MB), {} instances, {}^3 cell grid{}",
                     atlas.dim[0],
                     atlas.dim[1],
                     atlas.dim[2],
                     (atlas.voxels.len() * 4) as f32 / 1.0e6,
                     build.instance_count,
                     res,
+                    if albedo_atlas.is_some() {
+                        " + per-mesh albedo atlas (F5)"
+                    } else {
+                        ""
+                    },
                 );
-                gdf.install_mesh_sdf(&device, &atlas.to_le_bytes(), atlas.dim, &build)?;
+                let alb_ch = albedo_atlas.as_ref().map(|a| {
+                    [
+                        a.channel_le_bytes(0),
+                        a.channel_le_bytes(1),
+                        a.channel_le_bytes(2),
+                    ]
+                });
+                let alb_ref = alb_ch
+                    .as_ref()
+                    .map(|c| [c[0].as_slice(), c[1].as_slice(), c[2].as_slice()]);
+                gdf.install_mesh_sdf(&device, &atlas.to_le_bytes(), atlas.dim, &build, alb_ref)?;
             }
             // Phase 12 item 3: optional GPU→CPU volume-readback round-trip check. Reads
             // the just-uploaded scene SDF back and confirms it equals the bytes we
