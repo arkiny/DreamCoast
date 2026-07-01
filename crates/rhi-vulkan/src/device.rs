@@ -1127,6 +1127,19 @@ impl VulkanDevice {
         self.shared.has_dedicated_compute
     }
 
+    /// Backend-agnostic device identity, surfaced up through the facade for platform-default
+    /// quality-tier selection (macOS perf, axis A). Additive + read-only. A Vulkan adapter is never
+    /// an Apple GPU in this engine (Metal owns macOS), so the tier only needs a non-Apple marker
+    /// here — the detailed adapter string is already logged at selection time and is not otherwise
+    /// consumed. Reporting a stable `"Vulkan"` name keeps this change from touching device selection.
+    pub fn device_info(&self) -> rhi_types::DeviceInfo {
+        rhi_types::DeviceInfo {
+            name: "Vulkan".to_string(),
+            unified_memory: false,
+            low_power: false,
+        }
+    }
+
     /// Whether hardware ray tracing is available (acceleration-structure +
     /// ray-query + ray-tracing-pipeline extensions enabled) (Phase 8).
     pub fn has_raytracing(&self) -> bool {
