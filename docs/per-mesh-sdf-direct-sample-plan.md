@@ -1,5 +1,9 @@
 # 다음 세션 프롬프트 — per-mesh SDF **직접 샘플** (dense 48³ 합성 폐기, 정밀 히트)
 
+> **상태: 실행 완료(역사 문서).** 이 계획은 `P11_DIRECT_SDF`(variable-tile SDF 아틀라스 + cell
+> grid + hybrid min(dense,atlas) 셰이더)로 구현됐다. 현행 내용은 코드와
+> `per-mesh-distance-fields.md`를 볼 것. 아래는 착수 당시의 작업 지시 원문.
+
 > 이 문서 = 다음 세션 콜드스타트 작업 지시. 그대로 붙여 시작할 수 있게 자기완결적으로 작성.
 
 ## 빌드 디렉티브 (최우선, 메모리 `dreamcoast-build-to-quality`)
