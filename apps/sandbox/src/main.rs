@@ -638,6 +638,9 @@ struct App {
     /// macOS/M3 perf (M3-C): reflection trace divisor when `reflect_half_res` is on (2 = legacy half,
     /// 4 = quarter). The one lever that cuts `gdf_reflect` (measured resolution-only). `P_REFLECT_RES_DIV`.
     reflect_res_div: u32,
+    /// macOS/M3 perf: GDF AO trace divisor (1 = full-res, 2 = half). Traced at 1/div + bilateral
+    /// upsample; the Apple tier uses 2 (gdf_ao is the top pass after quarter-res reflection). `P_AO_RES_DIV`.
+    ao_res_div: u32,
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
     /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
     gi_half_res: bool,
@@ -1988,6 +1991,14 @@ impl App {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(qp.reflect_res_div)
             .clamp(1, 16);
+        // macOS/M3 perf: GDF AO trace-resolution divisor (1 = full-res = byte-identical; 2 = half).
+        // Traced at 1/div then joint-bilateral upsampled; the gallery never runs gdf_ao so the anchor
+        // is unaffected. `P_AO_RES_DIV` overrides the tier.
+        let ao_res_div = std::env::var("P_AO_RES_DIV")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(qp.ao_res_div)
+            .clamp(1, 16);
         // Screen-space radiance probe GI (P1+): opt-in. Replaces the GI consumption (world-volume
         // sample / per-pixel ray march) with per-tile screen probes + a per-pixel gather. Default
         // OFF, so the gallery anchor (no env) stays byte-identical; an explicit `SCREEN_PROBE=1`
@@ -2052,7 +2063,11 @@ impl App {
         let reflect_max_roughness = std::env::var("P11_REFLECT_MAX_ROUGHNESS")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(if gallery_scene { 0.5 } else { qp.reflect_max_roughness });
+            .unwrap_or(if gallery_scene {
+                0.5
+            } else {
+                qp.reflect_max_roughness
+            });
         // Stage D3: reflection-ray march step cap. Gallery forced to the legacy 96 (byte-identical);
         // content takes the tier value. `P11_REFLECT_MAX_STEPS` overrides.
         let reflect_max_steps = std::env::var("P11_REFLECT_MAX_STEPS")
@@ -2383,6 +2398,7 @@ impl App {
             gdf_cone_k,
             reflect_half_res,
             reflect_res_div,
+            ao_res_div,
             gi_half_res,
             gi_res_div,
             screen_probe,
@@ -4005,22 +4021,53 @@ impl App {
         };
         // Stage C2: GDF ambient occlusion, multiplied into the lighting ambient term.
         let gdf_ao_out = match (self.gdf_ao, scene_gdf_vol, scene_gdf_ext) {
-            (true, Some(vol), Some(ext)) => Some(self.gi.record_ao(
-                &mut graph,
-                vol,
-                ext,
-                scene_aabb_min,
-                scene_aabb_max,
-                g_depth,
-                g_normal,
-                extent,
-                inv_view_proj,
-                cw,
-                ch,
-                self.flip_y,
-                scene_clip,
-                &scene_clip_vols,
-            )),
+            (true, Some(vol), Some(ext)) => {
+                // macOS/M3 perf: trace the AO at 1/div (Apple tier = half) + joint-bilateral upsample.
+                // gdf_ao.slang samples the G-buffer by normalized UV, so a coarser extent + dims trace
+                // correctly (no shader change); div=1 keeps the legacy full-res path byte-identical.
+                let adiv = self.ao_res_div.max(1);
+                let (aw, ah) = (cw.div_ceil(adiv), ch.div_ceil(adiv));
+                let ao_extent = if adiv > 1 {
+                    Extent2D::new(aw, ah)
+                } else {
+                    extent
+                };
+                let ao_traced = self.gi.record_ao(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    ao_extent,
+                    inv_view_proj,
+                    aw,
+                    ah,
+                    self.flip_y,
+                    scene_clip,
+                    &scene_clip_vols,
+                );
+                Some(if adiv > 1 {
+                    self.gi.record_upsample(
+                        &mut graph,
+                        ao_traced,
+                        g_depth,
+                        g_normal,
+                        extent,
+                        inv_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        aw,
+                        ah,
+                        self.flip_y,
+                    )
+                } else {
+                    ao_traced
+                })
+            }
             _ => None,
         };
         // Screen-space near-field AO (HBAO-lite), composed with the GDF AO in the lighting pass.
@@ -4401,7 +4448,11 @@ impl App {
                 // uses `div = 4` (quarter-res) — the measured single lever on gdf_reflect. Gallery keeps
                 // `reflect_half_res` off ⇒ div collapses to 1 (full-res, byte-identical anchor).
                 let refl_half = self.reflect_half_res;
-                let rdiv = if refl_half { self.reflect_res_div.max(1) } else { 1 };
+                let rdiv = if refl_half {
+                    self.reflect_res_div.max(1)
+                } else {
+                    1
+                };
                 let (rw, rh) = (cw.div_ceil(rdiv), ch.div_ceil(rdiv));
                 let refl_extent = if refl_half {
                     Extent2D::new(rw, rh)
