@@ -3351,6 +3351,14 @@ impl App {
                                 "gallery scene: scalability knobs locked (byte-identical anchor)",
                             );
                         }
+                        // Coarse scalability-group profile of the active tier (read-only): the six
+                        // 0-3 group levels this tier corresponds to (quality::ScalabilityGroup). A
+                        // glance-level summary; the fine sliders below are the precise controls.
+                        ui.text(format!("tier '{}' group levels:", quality.label()));
+                        for (g, lvl) in quality::groups(*quality) {
+                            ui.same_line();
+                            ui.text_disabled(format!("{}={}", g.label(), lvl));
+                        }
                         ui.disabled(*is_gallery, || {
                             ui.slider("Render scale", 0.33, 1.0, render_scale);
                             *render_scale = render_scale.clamp(0.3333, 1.0);
