@@ -1534,12 +1534,20 @@ impl App {
                     .collect();
                 gdf.set_clip_levels(&device, &level_data)?;
             }
-            // P1 (per-mesh-sdf-direct-sample-plan.md): pack every unique mesh's field into one
+            // P3 (per-mesh-sdf-direct-sample-plan.md): pack every unique mesh's field into one
             // atlas volume + build the instance table / cell grid, then switch the SW-RT field
-            // source to direct per-mesh sampling. Opt-in (`P11_DIRECT_SDF=1`) until P3 promotes
-            // it to the content default; the dense compose above still runs so the two paths can
-            // be A/B'd on the same scene. Content-only (gallery keeps the dense anchor).
-            if use_permesh && quality::env_bool("P11_DIRECT_SDF", false) {
+            // source to direct per-mesh sampling — the **content default** (dense loses per-mesh
+            // resolution → thin-geo penetration + surface-cache checkerboard). `P11_DIRECT_SDF=0`
+            // opts out to the dense-only composite (kept above as the hybrid's coarse field, and
+            // as the A/B fallback). Content-only; the gallery keeps the dense anchor untouched.
+            let direct_sdf = use_permesh && quality::env_bool("P11_DIRECT_SDF", true);
+            if use_permesh && !direct_sdf {
+                info!(
+                    "GDF: per-mesh SDF direct sampling DISABLED (P11_DIRECT_SDF=0) — dense \
+                     composite only (loses per-mesh resolution)"
+                );
+            }
+            if direct_sdf {
                 let atlas = dreamcoast_asset::sdf_atlas::SdfAtlas::pack(&mesh_sdfs);
                 let res = crate::mesh_sdf::grid_res_for(compose_objects.len());
                 let build = crate::mesh_sdf::build(&compose_objects, &atlas, amin, amax, res);
