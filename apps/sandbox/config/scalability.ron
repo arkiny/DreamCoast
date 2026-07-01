@@ -1,0 +1,185 @@
+// Scalability config — the data-driven tier tables (Phase 11 Stage D, data-driven layer).
+//
+// This file is the SINGLE SOURCE of the per-tier `QualityPreset` values and the per-tier
+// scalability-group levels that `apps/sandbox/src/quality.rs` used to hard-code. It is
+// embedded into the binary at compile time via `include_str!`, so the engine always works
+// even if this file is absent; an on-disk copy (this path, `assets/config/scalability.ron`,
+// or `SCALABILITY_CONFIG=<path>`) overrides the embedded copy at startup, and a parse error
+// logs a warning and falls back to the embedded default.
+//
+// NOTE — the gallery byte-identical anchor (`gallery_preset()`) is deliberately NOT here: it
+// stays compiled into Rust so a stray edit to this file can never silently move the anchor.
+//
+// Each tier lists its full `QualityPreset` field set (must reproduce the historical hard-coded
+// values EXACTLY — `Med` is the byte-identical no-regression baseline) plus its six group
+// levels (0..=3, descriptive-not-authoritative: a coarse VIEW of the preset for UI/logs).
+// Fields no gallery/tier pass reads still carry their legacy value so each entry is a complete,
+// self-describing snapshot. Group order matches `ScalabilityGroup::ALL`.
+(
+    tiers: [
+        // Low-end fallback: reflection hit cache off, cheap stochastic half-res SSR, half the
+        // GI samples, lower reflection roughness cutoff (GDF takes over sooner). Hard shadows.
+        (
+            tier: Low,
+            preset: (
+                gi_spp: 2,
+                gi_denoise: true,
+                reflect_cache: false,
+                surface_cache: false,
+                ssr_stochastic: true,
+                reflect_max_roughness: 0.3,
+                gdf_ao: false,
+                ssao: true,
+                firefly_clamp: true,
+                shadow_softness: 0.0,
+                shadow_taps: 8,
+                cache_relight_period: 48,
+                gi_half_res: true,
+                cache_relight_spp: 2,
+                gi_max_steps: 24,
+                reflect_max_steps: 64,
+                reflect_half_res: true,
+                render_scale: 0.6667,
+                gdf_cone_k: 0.05,
+                gi_res_div: 3,
+                reflect_res_div: 2,
+                ao_res_div: 1,
+                gi_atrous_steps: 2,
+                reflect_history_clamp: 1,
+                reflect_clamp_gamma: 1.25,
+                gi_temporal_clamp: 0.0,
+            ),
+            groups: (
+                resolution: 0,
+                global_illumination: 1,
+                reflection: 0,
+                ambient_occlusion: 1,
+                shadow: 0,
+                surface_cache: 0,
+            ),
+        ),
+        // Default — identical to the pre-tier behavior. Do not change without re-baselining.
+        (
+            tier: Med,
+            preset: (
+                gi_spp: 1,
+                gi_denoise: true,
+                reflect_cache: true,
+                surface_cache: false,
+                ssr_stochastic: false,
+                reflect_max_roughness: 0.5,
+                gdf_ao: true,
+                ssao: true,
+                firefly_clamp: true,
+                shadow_softness: 0.0,
+                shadow_taps: 16,
+                cache_relight_period: 40,
+                gi_half_res: true,
+                cache_relight_spp: 1,
+                gi_max_steps: 24,
+                reflect_max_steps: 96,
+                reflect_half_res: true,
+                render_scale: 1.0,
+                gdf_cone_k: 0.02,
+                gi_res_div: 3,
+                reflect_res_div: 2,
+                ao_res_div: 1,
+                gi_atrous_steps: 2,
+                reflect_history_clamp: 1,
+                reflect_clamp_gamma: 1.25,
+                gi_temporal_clamp: 0.0,
+            ),
+            groups: (
+                resolution: 2,
+                global_illumination: 1,
+                reflection: 1,
+                ambient_occlusion: 2,
+                shadow: 1,
+                surface_cache: 1,
+            ),
+        ),
+        // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
+        // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
+        (
+            tier: High,
+            preset: (
+                gi_spp: 16,
+                gi_denoise: true,
+                reflect_cache: true,
+                surface_cache: true,
+                ssr_stochastic: false,
+                reflect_max_roughness: 0.6,
+                gdf_ao: true,
+                ssao: true,
+                firefly_clamp: true,
+                shadow_softness: 0.03,
+                shadow_taps: 16,
+                cache_relight_period: 1,
+                gi_half_res: false,
+                cache_relight_spp: 8,
+                gi_max_steps: 64,
+                reflect_max_steps: 96,
+                reflect_half_res: false,
+                render_scale: 1.0,
+                gdf_cone_k: 0.0,
+                gi_res_div: 2,
+                reflect_res_div: 2,
+                ao_res_div: 1,
+                gi_atrous_steps: 2,
+                reflect_history_clamp: 2,
+                reflect_clamp_gamma: 1.25,
+                gi_temporal_clamp: 0.0,
+            ),
+            groups: (
+                resolution: 2,
+                global_illumination: 3,
+                reflection: 3,
+                ambient_occlusion: 2,
+                shadow: 3,
+                surface_cache: 3,
+            ),
+        ),
+        // Apple-platform default (macOS perf, axis A). Med-derived; cost knobs pushed for the
+        // weak unified iGPU + TBDR of Apple Silicon. Auto-selected only on an Apple GPU with
+        // `RENDER_QUALITY` unset; every value here is a tier default its own env var overrides.
+        (
+            tier: Apple,
+            preset: (
+                gi_spp: 1,
+                gi_denoise: true,
+                reflect_cache: true,
+                surface_cache: false,
+                ssr_stochastic: true,
+                reflect_max_roughness: 0.4,
+                gdf_ao: true,
+                ssao: false,
+                firefly_clamp: true,
+                shadow_softness: 0.0,
+                shadow_taps: 16,
+                cache_relight_period: 64,
+                gi_half_res: true,
+                cache_relight_spp: 1,
+                gi_max_steps: 24,
+                reflect_max_steps: 56,
+                reflect_half_res: true,
+                render_scale: 0.67,
+                gdf_cone_k: 0.06,
+                gi_res_div: 4,
+                reflect_res_div: 6,
+                ao_res_div: 2,
+                gi_atrous_steps: 1,
+                reflect_history_clamp: 1,
+                reflect_clamp_gamma: 1.25,
+                gi_temporal_clamp: 0.0,
+            ),
+            groups: (
+                resolution: 1,
+                global_illumination: 0,
+                reflection: 0,
+                ambient_occlusion: 1,
+                shadow: 1,
+                surface_cache: 0,
+            ),
+        ),
+    ],
+)
