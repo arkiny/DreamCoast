@@ -364,6 +364,13 @@ facade trait 뒤에 성숙 라이브러리 백엔드를 격리 → 차후 자체
 - **T1→T2 렌더 완성도** — **20 AA(TAA)+포스트 스택+투명/OIT [S]**(P14 모션벡터) · **21 다광원
   클러스터드+CSM+데칼+프로브 [S]** · **22 대기/볼류메트릭 [S]** · **23 월드(지형/식생/물/버추얼 텍스처)
   [S]** · **24 머티리얼 그래프+고급 셰이딩(SSS/헤어/클로스) [S]**.
+  - **⚙ 선결 — "파이프라인 정합" 트랙(PR-1..9)**: 레퍼런스 디퍼드 렌더러 대비 프레임 패스 순서를 재정합.
+    세부·근거·매핑표: [render-pipeline-reference.md](render-pipeline-reference.md). **소스레벨 재정합에서
+    확인한 구조 블로커**: (a) **depth pre-pass 부재**(G-buffer가 최초 depth writer → HZB/SSR/AO 순서 암묵
+    의존), (b) **velocity(모션벡터) 채널 부재**(TAAU가 카메라 모션만 리프로젝션 → 움직이는 오브젝트 고스팅;
+    TAA·모션블러 공통 선결), (c) **투명 패스 슬롯 부재**(particle/cull이 톤맵-후 LDR에 드로), (d) **대기/포그
+    합성 슬롯 부재**, (e) **클러스터드 라이트 리스트 부재**(다광원 확장 블로커), (f) **파편적 post 체인**
+    (블룸 데모만·DoF/그레이딩 없음). **Phase 20의 실질 선결 = PR-1(prepass)·PR-2(velocity)·PR-5(post 시퀀스).**
   - **데칼(21) — Intel Sponza `dirt_decal`로 앞당겨짐**: RenderDoc로 "검은 기둥" = BLEND 데칼이 opaque로
     석재를 덮는 것(metallic 파이프라인은 정상)으로 확정. **트랙 A = deferred(G-buffer) 데칼** 계획
     [deferred-decals.md](deferred-decals.md)(임포트 분류 → RHI per-RT 블렌드/write-mask → 데칼 패스),
