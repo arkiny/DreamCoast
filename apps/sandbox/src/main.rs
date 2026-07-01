@@ -3845,6 +3845,12 @@ impl App {
                     &scene_clip_vols,
                     self.gi_max_steps,
                     self.gdf_cone_k,
+                    // P2 spatial cross-probe filter half-kernel (1 = 3x3; `P_SP_FILTER=0` disables).
+                    std::env::var("P_SP_FILTER")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(1)
+                        .min(4),
                 );
                 gi_skyvis_out = Some(sp_skyvis);
                 let out = if gi_denoise_active {

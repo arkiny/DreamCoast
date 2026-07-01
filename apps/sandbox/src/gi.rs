@@ -18,7 +18,7 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
     gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_gi_upsample_push, gdf_temporal_push,
-    gi_volume_push, screen_probe_integrate_push, screen_probe_trace_push,
+    gi_volume_push, screen_probe_filter_push, screen_probe_integrate_push, screen_probe_trace_push,
 };
 
 /// Screen-space radiance probe density: one probe per `SP_DOWNSAMPLE`x`SP_DOWNSAMPLE` screen
@@ -65,6 +65,8 @@ pub(crate) struct GiSystem {
     /// world-volume / ray-march GI consumption on content scenes (opt-in `SCREEN_PROBE`).
     sp_trace_pipeline: Option<ComputePipeline>,
     sp_integrate_pipeline: Option<ComputePipeline>,
+    /// P2 spatial cross-probe joint-bilateral filter of the radiance atlas (optional).
+    sp_filter_pipeline: Option<ComputePipeline>,
     /// UE-style indoor skylight occlusion: directional sky-visibility SH (4 scalar coeffs/slot,
     /// ping-pong = 8 volumes), filled in the same `gi_volume` pass. Contiguous per slot (base only).
     gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2],
@@ -154,6 +156,13 @@ impl GiSystem {
             "screen_probe_integrate",
             128,
         )?;
+        let sp_filter_pipeline = compute(
+            dreamcoast_shader::screen_probe_filter_cs_spirv,
+            dreamcoast_shader::screen_probe_filter_cs_dxil,
+            dreamcoast_shader::screen_probe_filter_cs_metallib,
+            "screen_probe_filter",
+            128,
+        )?;
         // 24 R32F volumes: ping-pong [read|write] × 12 SH coefficients. Empty (zero) at start = no
         // fill until the update converges; the lighting falls back gracefully (e = 0). Allocated
         // back-to-back so each slot's 12 volumes are contiguous in the bindless sampled AND storage
@@ -211,6 +220,7 @@ impl GiSystem {
             gi_vol_frame: 0,
             sp_trace_pipeline,
             sp_integrate_pipeline,
+            sp_filter_pipeline,
         })
     }
 
@@ -651,6 +661,9 @@ impl GiSystem {
         clip_vols: &'a [&'a Volume],
         max_steps: u32,
         cone_k: f32,
+        // P2: apply the spatial cross-probe joint-bilateral filter to the radiance atlas before
+        // the gather (probe-neighborhood half kernel; 0 disables). Content quality knob.
+        filter_half_kernel: u32,
         // Returns `(gi_image, skyvis_image)`; the sky-vis image (indoor skylight occlusion) is
         // built from the probes' per-ray sky visibility, mirroring the volume GI path's output.
     ) -> (ResourceId, ResourceId) {
@@ -744,19 +757,69 @@ impl GiSystem {
             },
         );
 
-        // --- P3: gather the probe atlas per pixel into indirect irradiance. ---
         let pos_sigma = diag * 0.01;
         let normal_power = 8.0_f32;
+
+        // --- P2: spatial cross-probe joint-bilateral filter of the radiance atlas. Smooths
+        // probe-to-probe variation on shared surfaces (blockiness) without blurring across
+        // silhouettes; skipped when disabled or the pipeline is absent. ---
+        let gather_atlas = match (filter_half_kernel > 0, self.sp_filter_pipeline.as_ref()) {
+            (true, Some(filter)) => {
+                let filtered = graph.create_storage_image(
+                    "sp_radiance_atlas_filtered",
+                    HDR_FORMAT,
+                    Extent2D::new(atlas_w, atlas_h),
+                );
+                graph.add_compute_pass(
+                    ComputePassInfo {
+                        name: "screen_probe_filter",
+                        storage_writes: vec![filtered],
+                        reads: vec![atlas, depth, normal],
+                    },
+                    move |ctx| {
+                        let depth_index = ctx.sampled_index(depth);
+                        let normal_index = ctx.sampled_index(normal);
+                        let atlas_in = ctx.sampled_index(atlas);
+                        let atlas_out = ctx.storage_index(filtered);
+                        let cmd = ctx.cmd();
+                        cmd.bind_compute_pipeline(filter);
+                        cmd.push_constants_compute(&screen_probe_filter_push(
+                            &inv_view_proj,
+                            depth_index,
+                            normal_index,
+                            atlas_in,
+                            atlas_out,
+                            cw,
+                            ch,
+                            probes_x,
+                            probes_y,
+                            SP_DOWNSAMPLE,
+                            SP_OCT_RES,
+                            flip_y,
+                            filter_half_kernel,
+                            pos_sigma,
+                            normal_power,
+                        ));
+                        cmd.dispatch(atlas_w.div_ceil(8), atlas_h.div_ceil(8), 1);
+                        Ok(())
+                    },
+                );
+                filtered
+            }
+            _ => atlas,
+        };
+
+        // --- P3: gather the (filtered) probe atlas per pixel into indirect irradiance. ---
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "screen_probe_integrate",
                 storage_writes: vec![out, skyvis],
-                reads: vec![atlas, depth, normal],
+                reads: vec![gather_atlas, depth, normal],
             },
             move |ctx| {
                 let depth_index = ctx.sampled_index(depth);
                 let normal_index = ctx.sampled_index(normal);
-                let atlas_index = ctx.sampled_index(atlas);
+                let atlas_index = ctx.sampled_index(gather_atlas);
                 let out_index = ctx.storage_index(out);
                 let skyvis_index = ctx.storage_index(skyvis);
                 let cmd = ctx.cmd();

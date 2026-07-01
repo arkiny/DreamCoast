@@ -1696,6 +1696,50 @@ pub(crate) fn screen_probe_integrate_push(
     pc
 }
 
+/// Pack the screen-probe FILTER push block (128 bytes): inv_view_proj (64) + 12 scalar
+/// indices/dims (3 rows of 16) + (pos_sigma, normal_power, pad, pad) (16). See
+/// `screen_probe_filter.slang`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn screen_probe_filter_push(
+    inv_view_proj: &[f32; 16],
+    depth_index: u32,
+    normal_index: u32,
+    atlas_in_index: u32,
+    atlas_out_index: u32,
+    screen_w: u32,
+    screen_h: u32,
+    probes_x: u32,
+    probes_y: u32,
+    downsample: u32,
+    oct_res: u32,
+    flip_y: u32,
+    half_kernel: u32,
+    pos_sigma: f32,
+    normal_power: f32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    let putu = |pc: &mut [u8], o: usize, v: u32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let putf = |pc: &mut [u8], o: usize, v: f32| pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    putu(&mut pc, 64, depth_index);
+    putu(&mut pc, 68, normal_index);
+    putu(&mut pc, 72, atlas_in_index);
+    putu(&mut pc, 76, atlas_out_index);
+    putu(&mut pc, 80, screen_w);
+    putu(&mut pc, 84, screen_h);
+    putu(&mut pc, 88, probes_x);
+    putu(&mut pc, 92, probes_y);
+    putu(&mut pc, 96, downsample);
+    putu(&mut pc, 100, oct_res);
+    putu(&mut pc, 104, flip_y);
+    putu(&mut pc, 108, half_kernel);
+    putf(&mut pc, 112, pos_sigma);
+    putf(&mut pc, 116, normal_power);
+    pc
+}
+
 /// Convert a column-major glam [`Mat4`] object-to-world transform into the
 /// row-major 3x4 (12-float) form acceleration-structure instances expect (Phase 8).
 pub(crate) fn mat4_to_3x4(m: Mat4) -> [f32; 12] {

@@ -105,3 +105,18 @@ diffuse in recesses exactly where the path tracer does.
   (currently oct_res² × up-to-4 probes); better disocclusion handling.
 - **P4**: world radiance-cache clipmap fallback for off-screen / far-field / infinite bounce.
 - **P5**: tile classification, ray budget, half/quarter-res, temporal amortization.
+
+## P2a — spatial cross-probe filter
+
+`screen_probe_filter.slang`: a joint-bilateral blur of the octahedral atlas ACROSS
+neighboring probes (a 3×3 probe kernel by default). For each probe texel it blends the SAME
+octahedral direction from surrounding probes, weighted by surface-plane proximity + normal
+agreement — smoothing probe-to-probe variation on a shared surface but never blurring across
+a silhouette. Filtering matching directions across probes needs no octahedral border
+handling. Radiance (rgb) + traced sky-vis (alpha) filtered together. Runs between the trace
+and the gather; `P_SP_FILTER=0` disables (kernel size `P_SP_FILTER=N`).
+
+Verify (Metal): gallery path-tracer parity 5.988/ch with the filter vs 5.984 without — the
+bilateral filter preserves the mean, so it is parity-neutral on the already-smooth gallery
+(no bias) and reduces probe-grid blockiness on complex scenes / sparser probes. Gallery
+byte-identical (no env). Deterministic (sponza filter-on `30f70511…`).
