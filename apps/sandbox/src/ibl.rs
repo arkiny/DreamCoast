@@ -50,6 +50,11 @@ struct IblResources<'a> {
 /// scene-capture / irradiance / prefilter / BRDF pipelines, the two ping-pong
 /// environment cube sets, the capture depth buffer and the (sky-independent) BRDF
 /// LUT. Also tracks the per-frame ping-pong parity + capture-decision state.
+/// The set of inputs a sky/environment capture is a deterministic function of. When these are
+/// unchanged (and no multibounce feedback is active) the recaptured cube is bit-identical, so the
+/// capture can be skipped. (sun_dir, sun_intensity, ambient, sky_gain, sky_wb, focus).
+type CaptureInputs = ([f32; 3], f32, f32, f32, [f32; 3], [f32; 3]);
+
 pub(crate) struct IblSystem {
     sky_pipeline: GraphicsPipeline,
     capture_pipeline: GraphicsPipeline,
@@ -66,7 +71,12 @@ pub(crate) struct IblSystem {
     /// False until the first capture; the boot warm-up does not flip it, so the
     /// first loop frame always captures.
     env_captured: bool,
-    last_sun: ([f32; 3], f32),
+    /// The capture inputs from the last actual capture (sun dir, sun intensity, ambient, sky gain,
+    /// sky white-balance, probe focus). A capture is skipped when these are unchanged AND multibounce
+    /// is off: the sky-only (SW-RT default) capture re-marches to the identical cube from static
+    /// inputs, so recapturing every frame is pure CPU cost — and it is the dominant cost on a
+    /// CPU-bound frame (the per-frame env/irradiance/prefilter cube encoders). `None` until first.
+    last_inputs: Option<CaptureInputs>,
     /// Ping-pong parity for the two cube sets; advances only on an actual capture,
     /// so a skipped frame keeps sampling the last written set.
     env_parity: usize,
@@ -81,8 +91,8 @@ impl IblSystem {
         backend: BackendKind,
         queue: &Queue,
         flip_y: u32,
-        sun_dir: [f32; 3],
-        sun_intensity: f32,
+        _sun_dir: [f32; 3],
+        _sun_intensity: f32,
     ) -> anyhow::Result<Self> {
         // Sky pipeline: renders the procedural sky into each environment cube face.
         let (sky_vs, sky_fs) = load_shader_pair(
@@ -296,7 +306,7 @@ impl IblSystem {
             _brdf_lut: brdf_lut,
             brdf_index,
             env_captured: false,
-            last_sun: (sun_dir, sun_intensity),
+            last_inputs: None,
             env_parity: 0,
             last_written: 0,
         })
@@ -395,8 +405,23 @@ impl IblSystem {
         sky_gain: f32,
         sky_wb: [f32; 3],
     ) {
-        let sun_changed = (sun_dir, sun_intensity) != self.last_sun;
-        if !(realtime_env || !self.env_captured || sun_changed) {
+        // Recapture only when the sky inputs actually change (or the first frame, or multibounce is
+        // feeding the previous cube back — that path needs per-frame convergence). `realtime_env`
+        // gates whether on-demand recapture is allowed at all, but no longer forces a capture every
+        // frame: a static sky (the common case — `time_of_day` is off by default) re-marches to the
+        // identical cube, so skipping saves the per-frame env/irradiance/prefilter cube encoders,
+        // the dominant cost on a CPU-bound frame. Deterministic + bit-identical when inputs match.
+        let inputs: CaptureInputs = (
+            sun_dir,
+            sun_intensity,
+            ambient,
+            sky_gain,
+            sky_wb,
+            focus.to_array(),
+        );
+        let inputs_changed = self.last_inputs != Some(inputs);
+        let feedback = multibounce && self.env_captured; // legacy convergence path: must re-run
+        if !(!self.env_captured || (realtime_env && (inputs_changed || feedback))) {
             return;
         }
         let write = self.env_parity % 2;
@@ -432,7 +457,7 @@ impl IblSystem {
         self.last_written = write;
         self.env_parity += 1;
         self.env_captured = true;
-        self.last_sun = (sun_dir, sun_intensity);
+        self.last_inputs = Some(inputs);
     }
 
     /// The bindless indices the main lighting pass samples (env, irradiance,

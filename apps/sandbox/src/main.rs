@@ -71,6 +71,14 @@ use rt::*;
 use smoketest::*;
 
 const FRAMES_IN_FLIGHT: usize = 2;
+// CPU/GPU-bound diagnosis (`PROFILE_CPU`): microseconds spent in the per-frame fence wait (blocking
+// on the fif's previous GPU submission) and the whole-frame CPU wall time. wait≈0 ⇒ CPU-bound (the
+// GPU already finished, the CPU is the long pole); wait large ⇒ GPU-bound. Logged in screenshot mode.
+static LAST_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_FRAME_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// CPU record time: frame entry → just before `present` (excludes the display-paced present block),
+// so it isolates the real CPU work (graph build + command recording + submit) from vsync pacing.
+static LAST_CPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 // Swapchain / backbuffer. UNORM, not sRGB: GPU capture & overlay layers
 // (RenderDoc, OBS, …) force VK_IMAGE_USAGE_STORAGE onto swapchain images, which an
 // sRGB surface format can never support — an sRGB backbuffer makes RenderDoc
@@ -245,7 +253,13 @@ fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
     SwapchainDesc {
         extent,
         format: COLOR_FORMAT,
-        present_mode: PresentMode::Fifo,
+        // `NO_VSYNC=1` runs the presentation uncapped (no display-refresh pacing) so the true
+        // CPU+GPU frame time can be benchmarked past the 60Hz vsync ceiling. Default = Fifo (vsync).
+        present_mode: if std::env::var_os("NO_VSYNC").is_some() {
+            PresentMode::Immediate
+        } else {
+            PresentMode::Fifo
+        },
         image_count: 3,
     }
 }
@@ -2686,6 +2700,7 @@ impl App {
     /// (screenshot mode done); `true` to continue (including the skip-this-frame
     /// cases — zero-size window, failed acquire).
     fn frame(&mut self) -> anyhow::Result<bool> {
+        let _t_cpu = Instant::now(); // CPU record timer (stored right before present)
         // Apply a pending level hot-swap requested from the UI last frame.
         if let Some(idx) = self.pending_level.take() {
             self.load_level(idx)?;
@@ -2732,12 +2747,16 @@ impl App {
         let image_index = if self.rhi_thread.is_some() {
             0
         } else {
+            let _t_wait = Instant::now();
             self.in_flight[fif].wait()?;
             // Acquire the drawable up front: its *actual* pixel size is the single
             // source of truth for this whole frame (ImGui display size, camera aspect,
             // render extent, viewport). A failed acquire skips here, BEFORE the ImGui
-            // frame is started, so NewFrame/Render stay balanced.
-            match self
+            // frame is started, so NewFrame/Render stay balanced. NOTE: `nextDrawable`
+            // blocks here until the compositor releases a drawable — the 60Hz frame pace
+            // in windowed mode — so fold it into the "wait" so `cpu-record` isolates the
+            // true compute (record minus fence-wait minus this acquire-pacing block).
+            let img = match self
                 .swapchain()
                 .acquire_next_image(&self.image_available[fif])?
             {
@@ -2746,7 +2765,12 @@ impl App {
                     self.needs_recreate = true;
                     return Ok(true);
                 }
-            }
+            };
+            LAST_WAIT_US.store(
+                _t_wait.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            img
         };
         // The swapchain (display) extent presents the final image; the *render* extent is where
         // the scene passes run. They are equal by default (byte-identical), but `RENDER_RES`
@@ -2818,6 +2842,7 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32();
         self.last = now;
+        LAST_FRAME_US.store((dt * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
 
         // --- Fixed-timestep simulation (M2) ---------------------------------------
         // The sim advances in whole `FIXED_DT` steps so motion is framerate-
@@ -3570,7 +3595,19 @@ impl App {
                     .map(|(n, ms)| format!("  {n:<20} {ms:.4} ms"))
                     .collect::<Vec<_>>()
                     .join("\n");
-                tracing::info!("GPU profile (total {total:.4} ms):\n{rows}");
+                let frame_ms =
+                    LAST_FRAME_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+                let wait_ms =
+                    LAST_WAIT_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+                // frame = full wall time; wait = fence stall on the GPU; cpu ≈ frame − wait is the
+                // CPU record/build long pole. wait≈0 with cpu>gpu ⇒ CPU-bound (the real bottleneck).
+                let cpu_ms = LAST_CPU_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+                // record = CPU time between fence-wait-end and present (pure graph build + encode +
+                // submit, no present pacing). This is the real CPU long pole on a CPU-bound frame.
+                tracing::info!(
+                    "GPU profile (total {total:.4} ms):\n{rows}\n  --- frame {frame_ms:.3} ms | fence-wait {wait_ms:.3} ms | cpu-record {:.3} ms | gpu-passes {total:.3} ms",
+                    (cpu_ms - wait_ms).max(0.0)
+                );
             }
         }
 
@@ -5404,6 +5441,10 @@ impl App {
                 );
             }
 
+            LAST_CPU_US.store(
+                _t_cpu.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let signal = &self.render_finished[image_index as usize];
             if self.queue().present(
                 self.swapchain.as_ref().expect("inline swapchain"),
