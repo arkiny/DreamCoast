@@ -58,3 +58,6 @@ Temporary Items
 # RenderDoc source checkout used by tools/build-renderdoc-py312.ps1 to produce a
 # Python-3.12-compatible renderdoc.pyd (the official Windows module is 3.6-only).
 /tools/renderdoc-src/
+
+# Claude Code harness state (agent worktrees, session data)
+.claude/

@@ -42,15 +42,19 @@ const GI_VOL_DIM: u32 = 32;
 const GI_VOL_SH: usize = 12;
 
 /// Scalar sky-visibility SH band-0/1 coefficient count per ping-pong slot (4 R32F volumes,
-/// contiguous; base index only). UE-style indoor skylight occlusion. See `gi_volume.slang`.
+/// contiguous; base index only). 레퍼런스식 indoor skylight occlusion. See `gi_volume.slang`.
 const GI_SKYVIS_SH: usize = 4;
 
 pub(crate) struct GiSystem {
     ao_pipeline: Option<ComputePipeline>, // C2 GDF ambient occlusion
-    gi_pipeline: Option<ComputePipeline>, // C3 GDF 1-bounce diffuse GI
+    gi_pipeline: Option<ComputePipeline>, // C3 GDF 1-bounce diffuse GI (SW march — the default)
+    /// F3: the `gdf_gi_hwrt` permutation (hardware-ray-traced gather compiled in). Built only on
+    /// RT-capable devices; bound in place of `gi_pipeline` when HW-RT GI is opted in. The default
+    /// `gi_pipeline` above has no acceleration-structure reference, so the SW path is RT-independent.
+    gi_hwrt_pipeline: Option<ComputePipeline>,
     upsample_pipeline: Option<ComputePipeline>, // D1 half-res GI joint-bilateral upsample
     temporal_pipeline: Option<ComputePipeline>, // C4 temporal reprojection
-    atrous_pipeline: Option<ComputePipeline>, // C4 spatial à-trous
+    atrous_pipeline: Option<ComputePipeline>,   // C4 spatial à-trous
     /// C4 GI denoiser history: ping-pong float4/pixel storage buffers — `gi_hist`
     /// (rgb = accumulated irradiance, a = history length) + `gi_pos` (xyz = the world
     /// point the sample belongs to, w = valid), (re)allocated to the render extent.
@@ -85,7 +89,7 @@ pub(crate) struct GiSystem {
     /// GI-on-distance-field visualization: march the camera into the GDF, paint hits with the
     /// world radiance cache's stored indirect irradiance.
     wrc_view_pipeline: Option<ComputePipeline>,
-    /// UE-style indoor skylight occlusion: directional sky-visibility SH (4 scalar coeffs/slot,
+    /// 레퍼런스식 indoor skylight occlusion: directional sky-visibility SH (4 scalar coeffs/slot,
     /// ping-pong = 8 volumes), filled in the same `gi_volume` pass. Contiguous per slot (base only).
     gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2],
     gi_vol_frame: u32,
@@ -130,8 +134,22 @@ impl GiSystem {
             dreamcoast_shader::gdf_gi_cs_dxil,
             dreamcoast_shader::gdf_gi_cs_metallib,
             "gdf_gi",
-            240,
+            256, // +16B row: F3 `hwrt` @240 (SW variant ignores it); default = SW march.
         )?;
+        // F3: the HW-RT permutation, built only on RT-capable devices (its inline RayQuery /
+        // acceleration-structure use can't be created without RT support). Bound in place of
+        // `gi_pipeline` when HW-RT GI is opted in; absent ⇒ the SW default is always used.
+        let gi_hwrt_pipeline = if compute_supported && device.has_raytracing() {
+            compute(
+                dreamcoast_shader::gdf_gi_hwrt_cs_spirv,
+                dreamcoast_shader::gdf_gi_hwrt_cs_dxil,
+                dreamcoast_shader::gdf_gi_hwrt_cs_metallib,
+                "gdf_gi_hwrt",
+                256,
+            )?
+        } else {
+            None
+        };
         let upsample_pipeline = compute(
             dreamcoast_shader::gdf_gi_upsample_cs_spirv,
             dreamcoast_shader::gdf_gi_upsample_cs_dxil,
@@ -245,6 +263,7 @@ impl GiSystem {
         Ok(Self {
             ao_pipeline,
             gi_pipeline,
+            gi_hwrt_pipeline,
             upsample_pipeline,
             temporal_pipeline,
             atrous_pipeline,
@@ -289,7 +308,7 @@ impl GiSystem {
         self.gi_vol_frame = self.gi_vol_frame.saturating_add(1);
     }
 
-    /// UE GI-fidelity track: update the world irradiance volume (DDGI-lite). Each probe casts
+    /// 레퍼런스 엔진 GI-fidelity track: update the world irradiance volume (DDGI-lite). Each probe casts
     /// sphere rays into the scene GDF, shades hits (direct + the PREVIOUS volume = multibounce),
     /// EMA-accumulates into the write slot. Returns the write graph handle (a read dep for the GI
     /// pass that samples it). `None` without the pipeline/volumes.
@@ -786,10 +805,25 @@ impl GiSystem {
         // `(radiance_SH_base, skyvis_SH_base, update-pass write handle)` and reconstructs E(n) +
         // the sky-visibility instead of marching rays.
         gi_volume: Option<(u32, u32, ResourceId)>,
+        // F3 (HW-RT high-fidelity path, first increment): when true (High tier, `P_HWRT_GI=1`) the
+        // GI gather rays trace the scene TLAS with an inline RayQuery and return a hardware-traced
+        // visibility term instead of the SW sphere-march. Requires the BLAS/TLAS built by `rt.rs`
+        // (currently the gallery scene only). Ignored on the volume path (that samples the field).
+        // Default false keeps the SW march -> gallery byte-identical.
+        hwrt: bool,
         // Returns `(gi_image, skyvis_image)`; the sky-vis image (indoor skylight occlusion) is only
         // produced on the volume path (None on the ray-march/gallery path).
     ) -> (ResourceId, Option<ResourceId>) {
-        let gip = self.gi_pipeline.as_ref().expect("gdf gi pipeline");
+        // F3: bind the HW-RT permutation only when opted in AND it was built (RT-capable device);
+        // otherwise the SW-default variant (which contains no acceleration-structure reference).
+        let gip = if hwrt {
+            self.gi_hwrt_pipeline
+                .as_ref()
+                .or(self.gi_pipeline.as_ref())
+                .expect("gdf gi pipeline")
+        } else {
+            self.gi_pipeline.as_ref().expect("gdf gi pipeline")
+        };
         let out = graph.create_storage_image("gdf_gi_out", HDR_FORMAT, extent);
         // Sky-visibility output: produced only on the volume path. NOT denoised (the volume field is
         // already smooth/stable) — the lighting samples it directly at this (possibly half) res.
@@ -883,6 +917,7 @@ impl GiSystem {
                     cone_k,               // P3: cone-trace LOD slope (0 = legacy)
                     // vol_r = radiance SH base, vol_g = sky-vis SH base, vol_b = sky-vis out image.
                     [vol_r, vol_g, vol_b],
+                    u32::from(hwrt), // F3: HW-RT gather toggle (0 = SW march, default & anchor)
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

@@ -144,6 +144,53 @@ pub fn load_or_bake_scene_albedo(
     (vol, LoadOutcome::Cooked)
 }
 
+/// Load a **single mesh's** local-space albedo volumes as cooked data, baking + caching on a
+/// miss (gi-fidelity-phases.md, F5 S1 — the per-mesh companion to [`load_or_bake_mesh_sdf`]).
+/// The key is a content hash of the mesh's **local** geometry + its per-triangle albedo + grid
+/// — no world transform — so the cache is shared across every instance / level, and a colour
+/// change re-bakes. `mesh_vtx`/`mesh_idx`/`dim`/`aabb` are the **same** the paired mesh-SDF
+/// cook uses (`sdf::mesh_sdf_dim` / `mesh_local_aabb_padded`), so the albedo tile aligns 1:1
+/// with the SDF tile. Pure CPU → deterministic, VK≡DX by construction.
+pub fn load_or_bake_mesh_albedo(
+    mesh_vtx: &[u8],
+    mesh_idx: &[u8],
+    tri_albedo: &[u8],
+    dim: u32,
+    aabb_min: [f32; 3],
+    aabb_max: [f32; 3],
+    cache_dir: &Path,
+) -> (AlbedoVolumes, LoadOutcome) {
+    let mut key = dcasset::hash_begin();
+    key = dcasset::hash_update(key, mesh_vtx);
+    key = dcasset::hash_update(key, mesh_idx);
+    key = dcasset::hash_update(key, tri_albedo);
+    key = dcasset::hash_update(key, &dim.to_le_bytes());
+    for c in aabb_min.iter().chain(aabb_max.iter()) {
+        key = dcasset::hash_update(key, &c.to_le_bytes());
+    }
+    let cache_file = cache_dir.join(format!("mesh-albedo.{key:016x}.dcasset"));
+
+    if let Ok(bytes) = std::fs::read(&cache_file)
+        && let Ok(header) = dcasset::read_header(&bytes)
+        && header.version == dcasset::VERSION
+        && header.source_hash == key
+        && header.cook_params_hash == dcasset::cook_params_hash()
+        && let Ok((_, vol)) = dcasset::read_albedo(&bytes)
+        && vol.dim == dim
+    {
+        return (vol, LoadOutcome::CacheHit);
+    }
+
+    let vol = sdf::bake_albedo_from_fused(mesh_vtx, mesh_idx, tri_albedo, dim, aabb_min, aabb_max);
+    if let Err(e) = write_atomic(&cache_file, &dcasset::write_albedo(&vol, key)) {
+        tracing_warn(&format!(
+            "failed to write cooked mesh albedo {}: {e}",
+            cache_file.display()
+        ));
+    }
+    (vol, LoadOutcome::Cooked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

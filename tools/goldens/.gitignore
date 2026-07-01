@@ -1,0 +1,4 @@
+# Golden PNG blobs are NOT committed (2560x1440 captures are large and
+# regenerable). The committed regression is manifest.json (per-config SHA-256).
+# Regenerate PNGs locally with: python tools/golden-image.py --update --save-png
+*.png

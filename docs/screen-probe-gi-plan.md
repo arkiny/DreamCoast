@@ -18,10 +18,10 @@ DreamCoast — 순수 Vulkan(ash)/D3D12(windows-rs)/Metal(objc2)를 직접 깐 R
 글로벌 거리장 GDF + 클립맵). 게임용 프로덕션 코드. 검증 분담: macOS=Metal(이 머신), Windows=Vulkan/D3D12
 DX≡VK 게이트(RTX 2070 SUPER, **현재 동결**). 먼저 `DreamCoast/CLAUDE.md` 읽기. 작업 루트
 `/Users/arkiny/GitRepos`, 엔진은 `DreamCoast/`. 브랜치 `feature/per-mesh-distance-fields` 이어서.
-레퍼런스 상용 엔진 소스 `/Users/arkiny/GitRepos/UnrealEngine-1` (추측은 이 소스 대조; 산출물엔 상표명 금지).
+레퍼런스 상용 엔진 소스 `/Users/arkiny/GitRepos/레퍼런스 엔진-1` (추측은 이 소스 대조; 산출물엔 상표명 금지).
 
 ## 하드 룰
-- **상표명 금지**: 제3자 제품명·소스 식별자(Unreal/UE/Lumen/Nanite/Epic 등)를 문서/주석/커밋에 쓰지 말 것.
+- **상표명 금지**: 제3자 제품명·소스 식별자(레퍼런스 엔진/레퍼런스 엔진/레퍼런스 SW-RT GI/버추얼 지오메트리/레퍼런스 등)를 문서/주석/커밋에 쓰지 말 것.
   기법을 일반어로 기술. (메모리 `dreamcoast-no-trademark-names`)
 - **갤러리 바이트 동일**이 매 변경 1순위 무회귀 게이트(SHA-256). 신규 GI는 콘텐츠 전용 게이트.
 - **DX≡VK ≤0.001 avg/ch** (Windows 동결 시 Metal 구현·검증 + 보류 명시). 푸시 레이아웃은 후행 스칼라/스페어로
@@ -39,9 +39,9 @@ DX≡VK 게이트(RTX 2070 SUPER, **현재 동결**). 먼저 `DreamCoast/CLAUDE.
   월드-볼륨으로는 한계. 화면-공간 프로브가 정답.** (이 결론은 확정 — 다시 월드-볼륨 튜닝으로 회귀 말 것.)
 
 ## 이번 작업 = 화면-공간 라디언스 프로브 게더 (스테이지)
-레퍼런스 대조: `UnrealEngine-1/Engine/Shaders/Private/Lumen/LumenScreenProbe*.usf/.ush`
-(`LumenScreenProbeGather`, `…ImportanceSampling`, `…TileClassication`, `…Filtering`, `…Common`),
-월드 캐시 `LumenRadianceCache*` / `LumenIrradianceFieldGather.cpp`(기본값 추출처). 기본값·동작방식을
+레퍼런스 대조: `레퍼런스 SW GI 소스`
+(`레퍼런스 SW GI`, `…ImportanceSampling`, `…TileClassication`, `…Filtering`, `…Common`),
+월드 캐시 `레퍼런스 SW GI*` / `레퍼런스 SW GI 소스`(기본값 추출처). 기본값·동작방식을
 이 소스에서 뽑아 우리 GDF SW-RT 위에 구현(상표명 미표기).
 
 - **P1 — 프로브 배치 + 트레이스 + octahedral 저장.** 화면을 타일(레퍼런스 ~16×16px)로 나눠 타일당 프로브 1개를
@@ -85,8 +85,8 @@ DX≡VK 게이트(RTX 2070 SUPER, **현재 동결**). 먼저 `DreamCoast/CLAUDE.
   push,main,reflect}.rs`. `gdf_gi.slang trace_bounce`가 프로브 트레이서의 토대.
 - 문서: `docs/radiance-cache-fill.md`(월드-볼륨 한계·S0 진단), `docs/gi-radiance-cache.md`(출하된 SH-L1+차폐),
   `docs/scalable-gi.md`, `docs/gdf-reference-alignment.md`, **이 문서**.
-- 레퍼런스: `UnrealEngine-1/Engine/Shaders/Private/Lumen/LumenScreenProbe*`, `LumenRadianceCache*`,
-  `Engine/Source/Runtime/Renderer/Private/Lumen/LumenIrradianceFieldGather.cpp`(기본값).
+- 레퍼런스: `레퍼런스 SW GI 소스`, `레퍼런스 SW GI*`,
+  `Engine/Source/Runtime/Renderer/Private/레퍼런스 SW-RT GI/`레퍼런스 SW GI 소스`(기본값).
 - 메모리: `dreamcoast-build-to-quality`(디렉티브), `dreamcoast-permesh-df-plan`(GI 트랙 전체사),
   `dreamcoast-no-trademark-names`, `dreamcoast-verification-split`, `dreamcoast-metal-milestones`.
 

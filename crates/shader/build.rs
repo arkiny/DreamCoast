@@ -77,10 +77,17 @@ fn profile_for(target: &str, stage: &str) -> Option<&'static str> {
 /// buffers non-uniformly without the decoration). This is also why the key MUST hash
 /// defines even before permutations exist (M4.4): the same `rt_common.slang` produces
 /// different bytecode with vs. without this define.
-fn defines_for(target: &str) -> &'static [(&'static str, &'static str)] {
-    match target {
-        "metallib" => &[("RT_METAL_TARGET", "1")],
-        _ => &[],
+fn defines_for(target: &str, key: &str) -> &'static [(&'static str, &'static str)] {
+    // The `gdf_gi_hwrt` permutation compiles the hardware-ray-tracing gather path in (`HWRT_GI`);
+    // the default `gdf_gi` leaves it out so it references no acceleration structure — Slang then
+    // omits the TLAS binding, keeping the scalable SW-default GI independent of RT capability and
+    // free of the RT path's register pressure. HW-RT is loaded only when opted in (a High tier).
+    let hwrt = key == "gdf_gi_hwrt_cs";
+    match (target, hwrt) {
+        ("metallib", true) => &[("RT_METAL_TARGET", "1"), ("HWRT_GI", "1")],
+        ("metallib", false) => &[("RT_METAL_TARGET", "1")],
+        (_, true) => &[("HWRT_GI", "1")],
+        (_, false) => &[],
     }
 }
 
@@ -153,7 +160,7 @@ fn cell_key(
     out_dir: &Path,
 ) -> CellKey {
     let profile = profile_for(target, job.stage);
-    let defines = defines_for(target);
+    let defines = defines_for(target, job.key);
     let defines_str: String = defines.iter().map(|(k, v)| format!("{k}={v};")).collect();
     let params = format!(
         "t={target};e={};s={};p={};d={defines_str}",
@@ -596,14 +603,23 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gtao_blur_cs",
     },
-    // Phase 11 Stage C (C3): stochastic 1-bounce diffuse GI against the GDF.
+    // Phase 11 Stage C (C3): stochastic 1-bounce diffuse GI against the GDF. Default = SW march.
     Job {
         src: "gdf_gi.slang",
         entry: "csMain",
         stage: "compute",
         key: "gdf_gi_cs",
     },
-    // UE GI-fidelity track: world-space irradiance volume (DDGI-lite radiance cache) update.
+    // F3 permutation: the same shader with the hardware-ray-tracing gather compiled in (`HWRT_GI`,
+    // via `defines_for`). Loaded only when HW-RT GI is opted in (High tier); the default variant
+    // above references no acceleration structure, so the SW-default GI stays RT-independent.
+    Job {
+        src: "gdf_gi.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_gi_hwrt_cs",
+    },
+    // 레퍼런스 엔진 GI-fidelity track: world-space irradiance volume (DDGI-lite radiance cache) update.
     Job {
         src: "gi_volume.slang",
         entry: "csMain",

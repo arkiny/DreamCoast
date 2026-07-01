@@ -56,4 +56,4 @@ print([round(float(np.abs(im[i]-im[i-1]).mean()),3) for i in range(1,len(im))]) 
 - DX·VK는 정지 시 GI temporal이 0.008로 수렴(반사 증폭돼도 0.025) → 위 레퍼런스처럼 안정.
 - Metal만 GI가 1.67(200×) 미수렴 → 반사 피드백으로 18.8 증폭. **Metal-전용 백엔드 버그**(알고리즘은
   DX/VK에서 정상). 목표 = Metal을 0.008(GI-only)·0.025(기본)로 맞춤.
-- 진단·수정 가이드: 별도 프롬프트 + `docs/lumen-parity-swrt.md`("깜빡임 조사 + GI temporal clamp 수정").
+- 진단·수정 가이드: 별도 프롬프트 + `docs/swrt-gi-perf-track.md`("깜빡임 조사 + GI temporal clamp 수정").

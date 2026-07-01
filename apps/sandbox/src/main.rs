@@ -556,7 +556,7 @@ struct App {
     /// fixed EV100). Opt-in (`AUTO_EXPOSURE`); off → the lighting uses the static `exposure` and is
     /// byte-identical (the gallery anchor never auto-exposes).
     auto_exposure: bool,
-    /// UE-style multi-bounce energy compensation strength for the GDF GI (0 = off = gallery anchor;
+    /// 레퍼런스식 multi-bounce energy compensation strength for the GDF GI (0 = off = gallery anchor;
     /// ~0.6 content). Written to `globals.probe_box_max.w`; see pbr.slang. `P_GI_MULTIBOUNCE`.
     gi_multibounce: f32,
     point_lights_on: bool,
@@ -600,11 +600,17 @@ struct App {
     ssao_params: [f32; 4],
     /// C3: GDF 1-bounce diffuse GI added to the deferred ambient term.
     gdf_gi: bool,
-    /// UE GI-fidelity: world irradiance volume (DDGI-lite radiance cache). When on, the GI pass
+    /// F3 (HW-RT high-fidelity path, first increment): route the GI gather rays through the scene
+    /// TLAS via an inline RayQuery (hardware ray tracing) instead of the SW sphere-march. High-tier
+    /// opt-in (`P_HWRT_GI=1`); default off keeps the scalable SW path (gallery byte-identical). This
+    /// first increment returns a hardware-traced VISIBILITY term only (hit lighting is a later
+    /// increment) and requires the BLAS/TLAS built by `rt.rs` (currently the gallery scene only).
+    hwrt_gi: bool,
+    /// 레퍼런스 엔진 GI-fidelity: world irradiance volume (DDGI-lite radiance cache). When on, the GI pass
     /// samples a multibounce-propagating world volume instead of a single-bounce ray march — the
     /// real fix for deep-interior darkness. Content-only (`P_GI_VOLUME`); gallery forced off.
     gi_volume: bool,
-    /// UE-style indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
+    /// 레퍼런스식 indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
     /// directional sky-visibility): neutral leak fraction (`P_SKYVIS_TINT`) + min-occlusion floor
     /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
     /// no-op sentinel image so it stays byte-identical.
@@ -624,7 +630,7 @@ struct App {
     gi_max_steps: u32,
     /// Stage D3: GGX reflection-ray march step cap (gallery forced to legacy 96).
     reflect_max_steps: u32,
-    /// P3 (Lumen-parity): cone-trace LOD march slope for the SW-RT march loops (gallery forced 0 =
+    /// P3 (SW-RT GI 레퍼런스급): cone-trace LOD march slope for the SW-RT march loops (gallery forced 0 =
     /// legacy linear march = byte-identical). Content takes the tier value.
     gdf_cone_k: f32,
     /// Stage D3: trace the GGX reflection at half resolution + bilateral upsample (gallery off).
@@ -632,7 +638,7 @@ struct App {
     /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
     /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
     gi_half_res: bool,
-    /// P1 (Lumen-parity): GI trace divisor when `gi_half_res` is on (2 = half, 4 = quarter probes).
+    /// P1 (SW-RT GI 레퍼런스급): GI trace divisor when `gi_half_res` is on (2 = half, 4 = quarter probes).
     gi_res_div: u32,
     /// Screen-space radiance probe GI: replace the world-volume / ray-march GI consumption with
     /// per-tile screen probes traced into an octahedral atlas + a per-pixel gather. Content-only
@@ -1350,6 +1356,11 @@ impl App {
                 (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
             };
             let mut mesh_sdfs: Vec<dreamcoast_asset::sdf::SdfVolume> = Vec::new();
+            // F5 (gi-fidelity-phases.md): one per-mesh albedo volume per unique mesh, parallel to
+            // `mesh_sdfs` (same order / dedup), baked over the SAME grid so the albedo tile aligns
+            // 1:1 with the SDF tile. Opt-in (heavy: per-mesh bake + 3 atlas volumes); off ⇒ dense.
+            let permesh_albedo = use_permesh && quality::env_bool("F5_PERMESH_ALBEDO", false);
+            let mut mesh_albedos: Vec<dreamcoast_asset::sdf::AlbedoVolumes> = Vec::new();
             let mut compose_objects: Vec<crate::compose::ComposeObject> = Vec::new();
             if use_permesh {
                 use std::collections::HashMap;
@@ -1396,6 +1407,30 @@ impl App {
                             negated += 1;
                         }
                         mesh_sdfs.push(vol);
+                        // F5: bake this unique mesh's albedo over the same grid. Albedo depends on
+                        // the drawable's material too, so — matching the mesh-only dedup here — we
+                        // key it on the mesh + this first drawable's representative material colour
+                        // (uniform per drawable in these scenes), repeated per triangle.
+                        if permesh_albedo {
+                            let alb = material_registry.get(d.material).albedo;
+                            let tri_count = cpu.indices.len() / 3;
+                            let mut tri_albedo = Vec::with_capacity(tri_count * 12);
+                            for _ in 0..tri_count {
+                                for c in alb {
+                                    tri_albedo.extend_from_slice(&c.to_le_bytes());
+                                }
+                            }
+                            let (av, _) = dreamcoast_asset::cook::load_or_bake_mesh_albedo(
+                                &mvtx,
+                                &midx,
+                                &tri_albedo,
+                                mdim,
+                                mn,
+                                mx,
+                                &cache_dir,
+                            );
+                            mesh_albedos.push(av);
+                        }
                         let i = mesh_sdfs.len() - 1;
                         mesh_index.insert(d.mesh.0, i);
                         i
@@ -1561,16 +1596,43 @@ impl App {
                     dreamcoast_asset::sdf_atlas::SdfAtlas::pack_capped(&mesh_sdfs, atlas_cap);
                 let res = crate::mesh_sdf::grid_res_for(compose_objects.len());
                 let build = crate::mesh_sdf::build(&compose_objects, &atlas, amin, amax, res);
+                // F5: pack the per-mesh albedo volumes into the SAME tile geometry as the SDF
+                // atlas (one `tile_uvw` maps both), so the shader reads hit colour at the hit
+                // instance with per-mesh precision. Opt-in (`F5_PERMESH_ALBEDO`); off ⇒ dense.
+                let albedo_atlas = if permesh_albedo && mesh_albedos.len() == mesh_sdfs.len() {
+                    Some(dreamcoast_asset::sdf_atlas::AlbedoAtlas::pack_like(
+                        &atlas,
+                        &mesh_albedos,
+                        [0.7, 0.7, 0.7],
+                    ))
+                } else {
+                    None
+                };
                 info!(
-                    "per-mesh SDF direct sample: atlas {}x{}x{} ({:.1} MB), {} instances, {}^3 cell grid",
+                    "per-mesh SDF direct sample: atlas {}x{}x{} ({:.1} MB), {} instances, {}^3 cell grid{}",
                     atlas.dim[0],
                     atlas.dim[1],
                     atlas.dim[2],
                     (atlas.voxels.len() * 4) as f32 / 1.0e6,
                     build.instance_count,
                     res,
+                    if albedo_atlas.is_some() {
+                        " + per-mesh albedo atlas (F5)"
+                    } else {
+                        ""
+                    },
                 );
-                gdf.install_mesh_sdf(&device, &atlas.to_le_bytes(), atlas.dim, &build)?;
+                let alb_ch = albedo_atlas.as_ref().map(|a| {
+                    [
+                        a.channel_le_bytes(0),
+                        a.channel_le_bytes(1),
+                        a.channel_le_bytes(2),
+                    ]
+                });
+                let alb_ref = alb_ch
+                    .as_ref()
+                    .map(|c| [c[0].as_slice(), c[1].as_slice(), c[2].as_slice()]);
+                gdf.install_mesh_sdf(&device, &atlas.to_le_bytes(), atlas.dim, &build, alb_ref)?;
             }
             // Phase 12 item 3: optional GPU→CPU volume-readback round-trip check. Reads
             // the just-uploaded scene SDF back and confirms it equals the bytes we
@@ -1592,7 +1654,28 @@ impl App {
             // it; cards are draw-list-driven.
             let build_cache = std::env::var_os("P11_LEGACY_IBL").is_none();
             if build_cache {
-                let (cards, card_albedo) = fuse::build_surface_cards(&obj_aabb, &obj_albedo);
+                // F1 (surface-cache virtualization): rank drawables for card residency from a
+                // static reference camera resolved once here, matching the per-frame camera's
+                // eye/focus precedence (`CAM_EYE`/`CAM_TARGET` → authored level view → orbit
+                // framing). Within-budget scenes (the gallery) keep every drawable regardless of
+                // this pose, so the anchor stays byte-identical; over-budget scenes select the
+                // camera-relevant subset deterministically and mark the rest coarse fallback.
+                let (ref_focus, ref_eye) =
+                    match (parse_vec3_env("CAM_EYE"), parse_vec3_env("CAM_TARGET")) {
+                        (Some(e), Some(t)) => (t, e),
+                        (Some(e), None) => (scene_center, e),
+                        _ => match level_view {
+                            Some((e, t)) => (t, e),
+                            None => (
+                                scene_center,
+                                scene_center
+                                    + Vec3::new(scene_radius * 1.6, scene_radius * 0.55, 0.0),
+                            ),
+                        },
+                    };
+                let card_cam = fuse::CardCamera::from_look(ref_eye, ref_focus);
+                let (cards, card_albedo, _residency) =
+                    fuse::build_surface_cards(&obj_aabb, &obj_albedo, &card_cam);
                 let num_cards = (cards.len() / 64) as u32;
                 // C: content stamps the drawable's true albedo onto its cards (fine color);
                 // the gallery keeps the legacy voxel-volume albedo (byte-identical anchor).
@@ -1784,15 +1867,24 @@ impl App {
         let gdf_gi = gi.has_gi()
             && gdf.has_scene_sdf()
             && (!legacy_ibl || std::env::var_os("P11_GDF_GI").is_some());
-        // UE GI-fidelity: the world irradiance volume (DDGI-lite) = our world-space RADIANCE CACHE,
-        // the same idea Lumen uses. It replaces the per-pixel 1-spp GI march with a smooth, stable
+        // F3 (HW-RT high-fidelity path, first increment): opt-in `P_HWRT_GI=1`. Requires an RT
+        // device AND a built scene TLAS (rt.rs builds BLAS/TLAS only for the gallery scene today —
+        // the glTF/level path skips it because its per-primitive vertex/index storage buffers would
+        // overflow the 64-slot bindless storage table). Gated here so a content scene without a TLAS
+        // silently stays on the SW march instead of tracing an empty/stale acceleration structure.
+        let hwrt_gi = std::env::var_os("P_HWRT_GI").is_some()
+            && device.has_raytracing()
+            && rt.has_scene()
+            && gdf_gi;
+        // 레퍼런스 엔진 GI-fidelity: the world irradiance volume (DDGI-lite) = our world-space RADIANCE CACHE,
+        // the same idea 레퍼런스 SW-RT GI uses. It replaces the per-pixel 1-spp GI march with a smooth, stable
         // volume sample — so high-variance lighting (e.g. point lights) doesn't produce the firefly
         // speckle a single-bounce stochastic march leaves behind (which the temporal denoiser can't
         // fully clear). Default ON for content, never the gallery (the byte-identical anchor stays on
         // the legacy march); `P_GI_VOLUME=0` forces the march back.
         let gi_volume =
             quality::env_bool("P_GI_VOLUME", !gallery_scene) && gdf_gi && gi.has_gi_volume();
-        // UE-style indoor skylight occlusion knobs (only effective on the volume GI path, content):
+        // 레퍼런스식 indoor skylight occlusion knobs (only effective on the volume GI path, content):
         // `P_SKYVIS_TINT` = neutral OcclusionTint leak as a fraction of the occluded skylight
         // luminance (the occluded floor keeps brightness but loses the blue cast); `P_SKYVIS_MIN_OCC`
         // = min sky-visibility floor (=1.0 disables the occlusion entirely → SH-L1 baseline).
@@ -1866,7 +1958,7 @@ impl App {
         // overrides. Needs the upsample pipeline (capability-gated).
         let gi_half_res = gi.has_upsample()
             && quality::env_bool("P11_GI_HALF_RES", !gallery_scene && qp.gi_half_res);
-        // P1 (Lumen-parity): GI trace-resolution divisor used when `gi_half_res` is on (2 = legacy
+        // P1 (SW-RT GI 레퍼런스급): GI trace-resolution divisor used when `gi_half_res` is on (2 = legacy
         // half, 4 = quarter = sparser screen-space probes). Only affects content (the gallery traces
         // full-res). `P_GI_RES_DIV` overrides the tier.
         let gi_res_div = std::env::var("P_GI_RES_DIV")
@@ -1948,7 +2040,7 @@ impl App {
                 qp.reflect_max_steps
             })
             .clamp(1, 256);
-        // P3 (Lumen-parity SW-RT): cone-trace LOD march slope. Gallery forced to 0 (legacy linear
+        // P3 (SW-RT GI 레퍼런스급 SW-RT): cone-trace LOD march slope. Gallery forced to 0 (legacy linear
         // march = byte-identical anchor); content takes the tier value. `P_CONE_K` overrides.
         let gdf_cone_k = std::env::var("P_CONE_K")
             .ok()
@@ -2251,6 +2343,7 @@ impl App {
             ssao,
             ssao_params,
             gdf_gi,
+            hwrt_gi,
             gi_volume,
             skyvis_tint,
             skyvis_min_occ,
@@ -3693,8 +3786,8 @@ impl App {
         //      negative offset pulls them back to the full-res mip the upscaler reconstructs to.
         //   2. taa_mip_bias (~-1, Stage 8): the PRIMARY distant-sharpness lever. With sub-pixel
         //      jitter the temporal accumulation super-samples, so we can bias toward sharper mips and
-        //      let TAA resolve the aliasing — this is UE/DLSS's primary approach to distant-texture
-        //      sharpness (UE also uses hardware anisotropic filtering, but that's the grazing-surface
+        //      let TAA resolve the aliasing — this is 레퍼런스 엔진/DLSS's primary approach to distant-texture
+        //      sharpness (레퍼런스 엔진 also uses hardware anisotropic filtering, but that's the grazing-surface
         //      lever — see Stage 9 / P_ANISO — not the distance one). Applies even at native (term 1
         //      = 0) under forced TAA. Only added with jitter (no jitter => no supersampling to hide it).
         // Gallery (TAA off => taau_active false) keeps bias 0 => SampleBias(.,0)==Sample() => byte
@@ -4017,7 +4110,7 @@ impl App {
                 let div = if half_gi { self.gi_res_div.max(1) } else { 1 };
                 let (gw, gh) = (cw.div_ceil(div), ch.div_ceil(div));
                 let gi_extent = Extent2D::new(gw, gh);
-                // UE GI-fidelity: update + bind the world irradiance volume (DDGI-lite). The update
+                // 레퍼런스 엔진 GI-fidelity: update + bind the world irradiance volume (DDGI-lite). The update
                 // propagates last frame's volume into hits (multibounce), so deep interiors fill in
                 // over frames. When bound, the GI pass samples the volume instead of marching.
                 let gi_volume_arg = if self.gi_volume {
@@ -4068,6 +4161,9 @@ impl App {
                     self.gi_max_steps,
                     self.gdf_cone_k,
                     gi_volume_arg,
+                    // F3: HW-RT gather only on the ray-march path (the volume path samples the field,
+                    // not rays). Default off (`P_HWRT_GI` unset) -> SW march -> gallery byte-identical.
+                    self.hwrt_gi && gi_volume_arg.is_none(),
                 );
                 gi_skyvis_out = skyvis;
                 let raw = if half_gi {
@@ -4326,7 +4422,7 @@ impl App {
                 } else {
                     refl_traced
                 };
-                // C8j: temporally resolve the stochastic GGX GDF reflection (UE-style; the rough
+                // C8j: temporally resolve the stochastic GGX GDF reflection (레퍼런스식; the rough
                 // lobe is sampled by real rays + denoised, so it's correctly blurred without an
                 // image-space prefilter that over-brightens rough metals).
                 let gdf_resolved = self.reflect.record_reflect_temporal(
@@ -5180,7 +5276,7 @@ impl App {
         if scene_cache_lit_ext.is_some() {
             self.gdf.advance_cache();
         }
-        // UE GI-fidelity: advance the world irradiance volume ping-pong (next frame reads this).
+        // 레퍼런스 엔진 GI-fidelity: advance the world irradiance volume ping-pong (next frame reads this).
         if self.gi_volume {
             self.gi.advance_gi_volume();
         }

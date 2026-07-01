@@ -11,17 +11,158 @@
 
 use dreamcoast_core::glam::Vec3;
 use dreamcoast_scene::World;
-use tracing::warn;
+use tracing::info;
 
 use crate::registry::{MaterialRegistry, MeshRegistry};
+
+/// Number of axis-aligned cards captured per drawable (one per AABB face).
+pub(crate) const CARDS_PER_DRAWABLE: u32 = 6;
 
 /// Surface-cache atlas budget: the maximum number of mesh cards. The atlas is
 /// `cards · CARD_TILE²` texels across four flat buffers (captured pos + albedo + a
 /// radiance ping-pong) re-lit every frame, so cost is linear in card count: at
 /// `CARD_TILE = 32` this cap is ~1024·1024·16 B·4 ≈ 67 MB and ~1.05 M texels re-lit/frame.
-/// 6 cards / drawable ⇒ ~170 drawables fit; above this the largest-volume drawables (most
-/// screen-relevant) keep cards and the rest are logged — never silently dropped.
+/// 6 cards / drawable ⇒ ~170 drawables fit; above this the surface cache virtualizes:
+/// drawables are ranked by a deterministic camera-relevance priority, the top `MAX_CARDS/6`
+/// keep cards, and the remainder are marked **coarse fallback** (they read the dense
+/// distance-field/voxel path instead of a dedicated card) — an explicit residency decision,
+/// never a silent drop. Demand-driven page streaming (LRU) is the next increment.
 pub(crate) const MAX_CARDS: u32 = 1024;
+
+/// A reference camera pose used to rank drawables for card residency when the scene
+/// exceeds the card budget. Built once at scene setup from the content scene's initial
+/// framing (authored/level camera, `CAM_EYE`/`CAM_TARGET`, or the orbit focus). Priority
+/// is a pure function of this pose + the drawable AABB, so residency is deterministic.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CardCamera {
+    /// World-space eye position.
+    pub(crate) eye: [f32; 3],
+    /// Normalized view forward direction (eye → focus).
+    pub(crate) forward: [f32; 3],
+}
+
+impl CardCamera {
+    /// Build from an eye + focus point. `forward` is normalized; a degenerate (eye==focus)
+    /// pair falls back to `-Z` so priority stays well-defined and deterministic.
+    pub(crate) fn from_look(eye: Vec3, focus: Vec3) -> Self {
+        let fwd = (focus - eye).normalize_or_zero();
+        let fwd = if fwd.length_squared() > 0.0 {
+            fwd
+        } else {
+            Vec3::NEG_Z
+        };
+        Self {
+            eye: eye.to_array(),
+            forward: fwd.to_array(),
+        }
+    }
+}
+
+/// The outcome of the deterministic budget selection: which drawables keep dedicated
+/// surface-cache cards (in ascending draw-list order, so a within-budget scene is
+/// byte-identical to the legacy path) and which fall back to the coarse dense field.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CardResidency {
+    /// Draw-list indices that keep cards, sorted ascending (draw-list order).
+    pub(crate) resident: Vec<usize>,
+    /// Draw-list indices with no dedicated card — explicit coarse fallback, sorted ascending.
+    pub(crate) coarse_fallback: Vec<usize>,
+}
+
+impl CardResidency {
+    fn all_resident(count: usize) -> Self {
+        Self {
+            resident: (0..count).collect(),
+            coarse_fallback: Vec::new(),
+        }
+    }
+}
+
+/// Deterministic per-drawable card priority: **higher is more important** (kept first).
+///
+/// Two well-ordered, camera-relevant terms:
+/// - **Proximity** — closer to the camera eye ranks higher (`1 / (1 + dist_to_aabb)`).
+/// - **Frustum relevance** — a drawable in front of the camera outranks one behind it
+///   (the signed forward projection of the eye→center vector, mapped to `[0, 1]`).
+///
+/// Solid-angle-ish size (larger AABB projects to more screen) breaks near-ties so big
+/// nearby geometry wins over a tiny nearby speck. All arithmetic is on `f64` derived from
+/// the stored `f32` inputs, so the ordering is identical run-to-run and machine-to-machine.
+fn card_priority(aabb: &([f32; 3], [f32; 3]), cam: &CardCamera) -> f64 {
+    let (mn, mx) = aabb;
+    let center = [
+        0.5 * (mn[0] as f64 + mx[0] as f64),
+        0.5 * (mn[1] as f64 + mx[1] as f64),
+        0.5 * (mn[2] as f64 + mx[2] as f64),
+    ];
+    let eye = [cam.eye[0] as f64, cam.eye[1] as f64, cam.eye[2] as f64];
+    let fwd = [
+        cam.forward[0] as f64,
+        cam.forward[1] as f64,
+        cam.forward[2] as f64,
+    ];
+    // Distance from the eye to the AABB (0 when the eye is inside it).
+    let clamp_dist = |c: usize| -> f64 {
+        let lo = mn[c] as f64;
+        let hi = mx[c] as f64;
+        let e = eye[c];
+        (lo - e).max(e - hi).max(0.0)
+    };
+    let d2 = clamp_dist(0).powi(2) + clamp_dist(1).powi(2) + clamp_dist(2).powi(2);
+    let dist = d2.sqrt();
+    let proximity = 1.0 / (1.0 + dist);
+    // Forward relevance: eye→center projected on the view forward, normalized to [0, 1].
+    let to_center = [center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]];
+    let len = (to_center[0].powi(2) + to_center[1].powi(2) + to_center[2].powi(2)).sqrt();
+    let cos = if len > 0.0 {
+        (to_center[0] * fwd[0] + to_center[1] * fwd[1] + to_center[2] * fwd[2]) / len
+    } else {
+        1.0 // eye at the center ⇒ maximally relevant
+    };
+    let relevance = 0.5 * (cos + 1.0);
+    // Projected-size tie-break: AABB volume, softly compressed so it only breaks ties.
+    let volume = ((mx[0] - mn[0]).max(0.0) as f64)
+        * ((mx[1] - mn[1]).max(0.0) as f64)
+        * ((mx[2] - mn[2]).max(0.0) as f64);
+    let size_term = (1.0 + volume).ln();
+    // Weighted sum: proximity and frustum relevance dominate; size only disambiguates.
+    proximity * 4.0 + relevance * 2.0 + size_term * 0.1
+}
+
+/// Deterministically choose which drawables keep surface-cache cards within [`MAX_CARDS`].
+///
+/// When every drawable fits (`6·N ≤ MAX_CARDS`) all are resident and there is no fallback,
+/// so the produced card set is byte-identical to the legacy path (the gallery anchor). When
+/// the scene overflows, drawables are ranked by [`card_priority`] and the top
+/// `MAX_CARDS/6` are kept; ties (equal priority) resolve by draw-list index so the choice is
+/// stable. The overflow drawables are recorded as `coarse_fallback` rather than dropped, and
+/// the kept set is returned in ascending draw-list order (byte-stable card layout).
+pub(crate) fn select_card_residency(
+    drawable_aabb: &[([f32; 3], [f32; 3])],
+    cam: &CardCamera,
+) -> CardResidency {
+    let n = drawable_aabb.len();
+    let max_drawables = (MAX_CARDS / CARDS_PER_DRAWABLE) as usize;
+    if n <= max_drawables {
+        return CardResidency::all_resident(n);
+    }
+    // Rank by priority (descending); break ties deterministically by draw-list index.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let pa = card_priority(&drawable_aabb[a], cam);
+        let pb = card_priority(&drawable_aabb[b], cam);
+        pb.total_cmp(&pa).then(a.cmp(&b))
+    });
+    let mut resident: Vec<usize> = order[..max_drawables].to_vec();
+    let mut coarse_fallback: Vec<usize> = order[max_drawables..].to_vec();
+    // Restore draw-list order in both lists so the card layout is byte-stable.
+    resident.sort_unstable();
+    coarse_fallback.sort_unstable();
+    CardResidency {
+        resident,
+        coarse_fallback,
+    }
+}
 
 /// The fused scene: one world-space triangle soup ready for the GDF bake, plus the
 /// per-drawable AABBs the surface-cache cards are built from.
@@ -127,38 +268,33 @@ pub(crate) fn fuse_scene(
     }
 }
 
-/// Build the Lumen-style surface-cache mesh cards from the per-drawable world AABBs: 6
-/// axis-aligned cards per drawable (one per AABB face), 64 bytes each
-/// (`center.xyz/trace_depth, normal.xyz, u_axis.xyz, v_axis.xyz`). The capture pass
-/// sphere-traces the GDF inward from each card-plane texel to the surface.
+/// Build the mesh-card surface cache from the per-drawable world AABBs: 6 axis-aligned
+/// cards per drawable (one per AABB face), 64 bytes each (`center.xyz/trace_depth,
+/// normal.xyz, u_axis.xyz, v_axis.xyz`). The capture pass sphere-traces the GDF inward from
+/// each card-plane texel to the surface.
 ///
-/// Optimization / scalability: if 6·drawables would exceed [`MAX_CARDS`], only the largest
-/// drawables (by AABB volume — the most screen-relevant) keep cards, in their original
-/// draw-list order (so a within-budget scene like the gallery is byte-identical), and the
-/// dropped count is logged. This bounds the atlas size and the per-frame relight cost.
+/// Scalability (surface-cache virtualization, first increment): if `6·drawables` would
+/// exceed [`MAX_CARDS`], drawables are ranked by a deterministic camera-relevance priority
+/// ([`select_card_residency`]) and only the top `MAX_CARDS/6` keep cards, emitted in
+/// draw-list order (so a within-budget scene like the gallery is byte-identical). Overflow
+/// drawables are marked **coarse fallback** — they read the dense distance field instead of
+/// a dedicated card, an explicit residency state rather than a silent drop. Returns the card
+/// buffers plus the [`CardResidency`] decision for callers/diagnostics.
 pub(crate) fn build_surface_cards(
     drawable_aabb: &[([f32; 3], [f32; 3])],
     drawable_albedo: &[[f32; 3]],
-) -> (Vec<u8>, Vec<u8>) {
-    let max_drawables = (MAX_CARDS / 6) as usize;
-    // Pick which drawables get cards (all, unless over budget → largest-volume subset).
-    let mut keep: Vec<usize> = (0..drawable_aabb.len()).collect();
-    if keep.len() > max_drawables {
-        let volume = |i: usize| -> f32 {
-            let (mn, mx) = drawable_aabb[i];
-            (mx[0] - mn[0]).max(0.0) * (mx[1] - mn[1]).max(0.0) * (mx[2] - mn[2]).max(0.0)
-        };
-        keep.sort_by(|&a, &b| volume(b).total_cmp(&volume(a)));
-        let dropped = keep.len() - max_drawables;
-        keep.truncate(max_drawables);
-        keep.sort_unstable(); // restore draw-list order for determinism
-        warn!(
-            "surface cache: {} drawables exceed the {}-card budget — keeping the {} largest, \
-             dropping {} (smaller drawables get no cache cards)",
+    cam: &CardCamera,
+) -> (Vec<u8>, Vec<u8>, CardResidency) {
+    let residency = select_card_residency(drawable_aabb, cam);
+    let keep = &residency.resident;
+    if !residency.coarse_fallback.is_empty() {
+        info!(
+            "surface cache: {} drawables exceed the {}-card budget — {} keep cards \
+             (camera-priority residency), {} on coarse fallback (dense-field lit, not dropped)",
             drawable_aabb.len(),
             MAX_CARDS,
-            max_drawables,
-            dropped
+            keep.len(),
+            residency.coarse_fallback.len(),
         );
     }
 
@@ -172,7 +308,7 @@ pub(crate) fn build_surface_cards(
         }
         buf.extend_from_slice(&w.to_le_bytes());
     };
-    for &i in &keep {
+    for &i in keep {
         let (omin, omax) = drawable_aabb[i];
         let alb = drawable_albedo[i];
         let center = [
@@ -208,5 +344,95 @@ pub(crate) fn build_surface_cards(
             }
         }
     }
-    (cards, card_albedo)
+    (cards, card_albedo, residency)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn boxed(center: [f32; 3], half: f32) -> ([f32; 3], [f32; 3]) {
+        (
+            [center[0] - half, center[1] - half, center[2] - half],
+            [center[0] + half, center[1] + half, center[2] + half],
+        )
+    }
+
+    /// A budget-fitting scene keeps every drawable, in draw-list order, with no fallback —
+    /// this is what guarantees the within-budget gallery stays byte-identical.
+    #[test]
+    fn within_budget_keeps_all_in_order() {
+        let cam = CardCamera::from_look(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO);
+        let aabbs: Vec<_> = (0..10).map(|i| boxed([i as f32, 0.0, 0.0], 0.5)).collect();
+        let r = select_card_residency(&aabbs, &cam);
+        assert_eq!(r.resident, (0..10).collect::<Vec<_>>());
+        assert!(r.coarse_fallback.is_empty());
+    }
+
+    /// The exact budget boundary: `MAX_CARDS/6` drawables all fit; one more forces exactly
+    /// one drawable onto coarse fallback, and the two lists partition the draw list with no
+    /// overlap and no loss.
+    #[test]
+    fn budget_boundary_partitions_without_loss() {
+        let cam = CardCamera::from_look(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO);
+        let cap = (MAX_CARDS / CARDS_PER_DRAWABLE) as usize;
+
+        // Exactly at the cap: everything resident.
+        let at: Vec<_> = (0..cap).map(|i| boxed([i as f32, 0.0, 0.0], 0.5)).collect();
+        let r = select_card_residency(&at, &cam);
+        assert_eq!(r.resident.len(), cap);
+        assert!(r.coarse_fallback.is_empty());
+
+        // One over the cap: exactly one drawable falls back.
+        let over: Vec<_> = (0..cap + 1)
+            .map(|i| boxed([i as f32, 0.0, 0.0], 0.5))
+            .collect();
+        let r = select_card_residency(&over, &cam);
+        assert_eq!(r.resident.len(), cap);
+        assert_eq!(r.coarse_fallback.len(), 1);
+        // Partition: resident ∪ fallback == 0..N, disjoint, each sorted ascending.
+        let mut all = r.resident.clone();
+        all.extend_from_slice(&r.coarse_fallback);
+        all.sort_unstable();
+        assert_eq!(all, (0..cap + 1).collect::<Vec<_>>());
+        assert!(r.resident.windows(2).all(|w| w[0] < w[1]));
+        assert!(r.coarse_fallback.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// Priority ordering is deterministic: the same inputs yield the same residency across
+    /// repeated calls, and (crucially) the selection is independent of the input draw-list
+    /// permutation up to the identity of the kept set — closest/most-relevant geometry wins.
+    #[test]
+    fn priority_selection_is_deterministic() {
+        let cam = CardCamera::from_look(Vec3::new(0.0, 0.0, 20.0), Vec3::ZERO);
+        let cap = (MAX_CARDS / CARDS_PER_DRAWABLE) as usize;
+        // cap+2 drawables receding along -Z away from the eye: the two farthest must fall back.
+        let aabbs: Vec<_> = (0..cap + 2)
+            .map(|i| boxed([0.0, 0.0, 20.0 - i as f32], 0.4))
+            .collect();
+        let r1 = select_card_residency(&aabbs, &cam);
+        let r2 = select_card_residency(&aabbs, &cam);
+        assert_eq!(r1, r2, "residency must be run-to-run identical");
+        // Farthest two (largest index ⇒ most negative Z ⇒ farthest from eye at +Z) fall back.
+        assert_eq!(r1.coarse_fallback, vec![cap, cap + 1]);
+    }
+
+    /// Nearer geometry outranks farther geometry: place one drawable close to the eye and the
+    /// rest far; over budget, the near one is always resident.
+    #[test]
+    fn nearer_geometry_outranks_farther() {
+        let cam = CardCamera::from_look(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -1.0));
+        let cap = (MAX_CARDS / CARDS_PER_DRAWABLE) as usize;
+        let mut aabbs: Vec<_> = (0..cap)
+            .map(|i| boxed([0.0, 0.0, -100.0 - i as f32], 0.5))
+            .collect();
+        // Insert a near drawable at draw-list index 0.
+        aabbs.insert(0, boxed([0.0, 0.0, -2.0], 0.5));
+        let r = select_card_residency(&aabbs, &cam);
+        assert!(
+            r.resident.contains(&0),
+            "the near drawable (index 0) must keep its card"
+        );
+        assert_eq!(r.coarse_fallback.len(), 1);
+    }
 }

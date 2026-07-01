@@ -18,7 +18,7 @@
 /// QHD/UHD track (Stage 8): TAA-aware texture LOD bias. When sub-pixel jitter is active the
 /// temporal accumulation super-samples the image, so we can bias the G-buffer texture fetches
 /// toward *sharper* mips and let TAA resolve the extra aliasing — this is the PRIMARY lever for
-/// distant-texture sharpness (the UE/DLSS/FSR2 approach), not anisotropy. It is added on top of
+/// distant-texture sharpness (the 레퍼런스 엔진/DLSS/FSR2 approach), not anisotropy. It is added on top of
 /// the resolution term `log2(internal/output)` and applies even at native resolution under forced
 /// TAA (`P_TAAU_FORCE`). Driver-independent (a plain LOD offset on the existing trilinear sampler),
 /// so it carries no DX≡VK risk. `-1.0` ≈ one mip sharper; tuning range -0.5..-1.5 (too negative ->
@@ -98,12 +98,12 @@ pub struct QualityPreset {
     /// Stage D2 (Sponza 60fps): surface-cache amortized-relight period — relight `1/period` of the
     /// cards per frame (round-robin), the rest persist their radiance (`P11_CACHE_RELIGHT_PERIOD`).
     /// `1` = the legacy every-frame relight (byte-identical; forced for the gallery anchor at the
-    /// call site). Higher = cheaper `sdf_cache_light`, slower convergence. UE Lumen surface-cache
+    /// call site). Higher = cheaper `sdf_cache_light`, slower convergence. 레퍼런스 엔진 SW GI surface-cache
     /// update budget; see `sdf_cache_light.slang` and `docs/sponza-perf.md`.
     pub cache_relight_period: u32,
     /// Stage D1 (Sponza 60fps): trace the C3 GI at half resolution + joint-bilateral upsample
     /// (1/4 the rays) (`P11_GI_HALF_RES`). Forced off for the gallery anchor (full-res =
-    /// byte-identical) at the call site. UE5 Lumen screen-probe / Frostbite half-res GI; see
+    /// byte-identical) at the call site. 레퍼런스 엔진 SW GI screen-probe / 다른 레퍼런스 엔진 half-res GI; see
     /// `gdf_gi_upsample.slang`.
     pub gi_half_res: bool,
     /// Stage D3 (Sponza 60fps): surface-cache relight indirect-gather rays per texel
@@ -130,28 +130,28 @@ pub struct QualityPreset {
     /// identical). The seam for a future dynamic-resolution controller; default 1.0 at every tier
     /// (the scale that hits a given fps depends on the display resolution + target, not the tier).
     pub render_scale: f32,
-    /// P3 (Lumen-parity SW-RT): cone-trace LOD march slope (`P_CONE_K`). The SW-RT march loops
+    /// P3 (SW-RT GI 레퍼런스급 SW-RT): cone-trace LOD march slope (`P_CONE_K`). The SW-RT march loops
     /// (GI bounce / reflection / surface-cache gather + their soft-shadow marches) widen the step
     /// with distance: floor `max(d, cone_k·t)` and shadow ceiling `max(0.2, cone_k·t)`. Fewer steps
     /// at distance (grazing rays stop crawling). `0.0` = legacy linear march (byte-identical; forced
     /// for the gallery anchor at the call site). Higher = cheaper march, softer distant GI/reflection.
-    /// Denoised/EMA signals tolerate it; see `docs/lumen-parity-swrt.md`.
+    /// Denoised/EMA signals tolerate it; see `docs/swrt-gi-perf-track.md`.
     pub gdf_cone_k: f32,
-    /// P1 (Lumen-parity SW-RT): GI trace-resolution divisor when `gi_half_res` is on — trace the
+    /// P1 (SW-RT GI 레퍼런스급 SW-RT): GI trace-resolution divisor when `gi_half_res` is on — trace the
     /// C3 GI at `1/div` of the render extent per axis, then joint-bilateral upsample (the spatial
-    /// half of UE5 Lumen's ScreenProbeGather: sparser trace origins, guided interpolation).
+    /// half of 레퍼런스 엔진 SW GI's ScreenProbeGather: sparser trace origins, guided interpolation).
     /// `2` = the legacy half-res (Stage D1). `3` = third-res — measured sweet spot: gdf_gi ~-48% vs
     /// half with DX=VK back at the baseline ~0.006/ch. `4` = quarter-res is faster still (~-65%) but
     /// over-reaches: each divergent coarse stochastic GI ray spreads over a larger upsample footprint,
     /// raising the DX=VK gap to ~0.117/ch (a broad parity divergence, not just fireflies) — rejected.
     /// Only active where `gi_half_res` is (content; the gallery traces full-res = byte-identical).
-    /// `P_GI_RES_DIV` override. See `docs/lumen-parity-swrt.md`.
+    /// `P_GI_RES_DIV` override. See `docs/swrt-gi-perf-track.md`.
     pub gi_res_div: u32,
     /// Reflection temporal-resolve history neighbourhood clamp (`reflect_temporal.slang`): removes the
     /// view-dependent specular smear when the camera rotates (stale reprojected history dragged across
     /// chrome). A scalability permutation: `0` = off (byte-identical legacy resolve; forced for the
     /// gallery anchor), `1` = hard AABB clamp (cheapest), `2` = variance clamp (mean +- gamma*sigma,
-    /// gentler on sharp mirrors). `P_REFL_CLAMP` override. See `docs/lumen-parity-swrt.md`.
+    /// gentler on sharp mirrors). `P_REFL_CLAMP` override. See `docs/swrt-gi-perf-track.md`.
     pub reflect_history_clamp: u32,
     /// Variance-clamp tightness for `reflect_history_clamp == 2` (`P_REFL_CLAMP_GAMMA`). Lower = tighter
     /// (more lag removed, more risk of clipping valid history); ~1.0-1.5 typical. Ignored for modes 0/1.
@@ -215,7 +215,7 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             shadow_softness: 0.0,
             shadow_taps: 16,
             // Stage D2b/D3: visibility feedback (off-screen cards relit 8x less) + period-aware EMA
-            // alpha let the period reach UE's 32 range; gather spp 2 (denoised) + half-res GI/reflect
+            // alpha let the period reach 레퍼런스 엔진's 32 range; gather spp 2 (denoised) + half-res GI/reflect
             // bring the GDF SW-RT stack into the 60fps frame budget on both backends.
             cache_relight_period: 40,
             gi_half_res: true,

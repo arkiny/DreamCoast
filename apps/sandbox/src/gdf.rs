@@ -126,6 +126,12 @@ pub(crate) struct GdfSystem {
     /// atlas, so every SW-RT consumer samples the per-mesh fields directly via `clipmap.slang`
     /// with no per-consumer change. Content-scene opt-in (dense stays the gallery anchor).
     sdf_atlas: Option<Volume>,
+    /// F5 (gi-fidelity-phases.md): the per-mesh **albedo** atlas — three R/G/B channel volumes
+    /// packed with the SDF atlas's tile geometry, so a hit reads the instance's own colour at
+    /// the same tile UVW as its distance (precise per-mesh colour vs the blurred dense grid).
+    /// `None` ⇒ per-mesh albedo off (dense grid stays the colour source). Opt-in with the SDF
+    /// atlas; transitioned to sampled through `clip_level_volumes` like the SDF atlas.
+    ms_albedo_atlas: Option<[Volume; 3]>,
     ms_instances: Option<StorageBuffer>,
     ms_cells: Option<StorageBuffer>,
     ms_indices: Option<StorageBuffer>,
@@ -438,6 +444,7 @@ impl GdfSystem {
             clip_count: 0,
             clip_levels: Vec::new(),
             sdf_atlas: None,
+            ms_albedo_atlas: None,
             ms_instances: None,
             ms_cells: None,
             ms_indices: None,
@@ -660,7 +667,12 @@ impl GdfSystem {
     /// the per-mesh atlas volume, so consumers transition it through the same seam.
     pub(crate) fn clip_level_volumes(&self) -> Vec<&Volume> {
         if self.ms_active {
-            return self.sdf_atlas.as_ref().into_iter().collect();
+            let mut v: Vec<&Volume> = self.sdf_atlas.as_ref().into_iter().collect();
+            // F5: the per-mesh albedo atlas rides the same transition seam as the SDF atlas.
+            if let Some(a) = &self.ms_albedo_atlas {
+                v.extend(a.iter());
+            }
+            return v;
         }
         let mut v = Vec::new();
         for lv in &self.clip_levels {
@@ -691,12 +703,18 @@ impl GdfSystem {
     /// is the packed atlas volume (`atlas_dim`), `build` the CPU instance table + cell grid
     /// (`mesh_sdf::build`). Dense albedo (`scene_albedo`) stays the color source — only the
     /// geometry field moves to the atlas. No-op without a scene GDF (compute unsupported).
+    ///
+    /// F5: when `albedo_atlas` is `Some([r,g,b])` (three channel byte buffers over the SAME
+    /// `atlas_dim` as the SDF atlas — packed by `AlbedoAtlas::pack_like`), the per-mesh albedo
+    /// atlas is installed and the shader reads hit colour from it (per-mesh precision). `None`
+    /// keeps the dense grid as the colour source.
     pub(crate) fn install_mesh_sdf(
         &mut self,
         device: &Device,
         atlas_bytes: &[u8],
         atlas_dim: [u32; 3],
         build: &crate::mesh_sdf::MeshSdfBuild,
+        albedo_atlas: Option<[&[u8]; 3]>,
     ) -> anyhow::Result<()> {
         if self.scene_gdf.is_none() {
             return Ok(());
@@ -710,6 +728,23 @@ impl GdfSystem {
             },
             atlas_bytes,
         )?;
+        // F5: the per-mesh albedo atlas — three channel volumes sharing the SDF atlas dims.
+        let albedo_atlas = match albedo_atlas {
+            Some(ch) => {
+                let vd = VolumeDesc {
+                    width: atlas_dim[0],
+                    height: atlas_dim[1],
+                    depth: atlas_dim[2],
+                    format: Format::R32Float,
+                };
+                Some([
+                    device.create_volume_init(&vd, ch[0])?,
+                    device.create_volume_init(&vd, ch[1])?,
+                    device.create_volume_init(&vd, ch[2])?,
+                ])
+            }
+            None => None,
+        };
         let sbuf = |data: &[u8], stride: u32| -> anyhow::Result<StorageBuffer> {
             Ok(device.create_storage_buffer_init(
                 &StorageBufferDesc {
@@ -734,9 +769,10 @@ impl GdfSystem {
         //   0: float3 grid_min, uint atlas_sampled_idx
         //  16: float3 grid_max, uint res
         //  32: uint4  instance_buf, cell_buf, index_buf, instance_count
-        //  48: uint4  albedo_r, albedo_g, albedo_b, dense_sdf_idx
+        //  48: uint4  albedo_r, albedo_g, albedo_b, dense_sdf_idx  (dense fallback albedo)
         //  64: float3 scene_aabb_min, _
         //  80: float3 scene_aabb_max, _
+        //  96: uint4  alb_atlas_r, alb_atlas_g, alb_atlas_b, alb_atlas_active  (F5 per-mesh)
         // dense_sdf_idx is the coarse whole-scene field: the shader marches on it (safe
         // empty-space stepping) and takes min(dense, atlas) near surfaces for precision.
         let alb = match self.scene_albedo.as_ref() {
@@ -747,7 +783,7 @@ impl GdfSystem {
             ],
             None => [u32::MAX; 3],
         };
-        let mut h: Vec<u8> = Vec::with_capacity(96);
+        let mut h: Vec<u8> = Vec::with_capacity(112);
         let pf = |h: &mut Vec<u8>, v: f32| h.extend_from_slice(&v.to_le_bytes());
         let pu = |h: &mut Vec<u8>, v: u32| h.extend_from_slice(&v.to_le_bytes());
         for a in build.grid_min {
@@ -774,9 +810,26 @@ impl GdfSystem {
             pf(&mut h, a);
         }
         pf(&mut h, 0.0);
+        // F5 word (offset 96): per-mesh albedo atlas channel indices + active flag. When
+        // absent, `active = 0` so the shader falls back to the dense grid above.
+        match &albedo_atlas {
+            Some(v) => {
+                pu(&mut h, v[0].sampled_index());
+                pu(&mut h, v[1].sampled_index());
+                pu(&mut h, v[2].sampled_index());
+                pu(&mut h, 1);
+            }
+            None => {
+                pu(&mut h, u32::MAX);
+                pu(&mut h, u32::MAX);
+                pu(&mut h, u32::MAX);
+                pu(&mut h, 0);
+            }
+        }
         let header = sbuf(&h, 16)?;
 
         self.sdf_atlas = Some(atlas);
+        self.ms_albedo_atlas = albedo_atlas;
         self.ms_instances = Some(instances);
         self.ms_cells = Some(cells);
         self.ms_indices = Some(indices);
