@@ -57,10 +57,71 @@ pub struct SdfAtlas {
 /// adjacent tile.
 const GUTTER: u32 = 1;
 
+/// Trilinearly resample `src` to a `new_dim³` cube over the *same* AABB (a box downsample when
+/// `new_dim < src.dim`). Averaging signed distances preserves the zero-isosurface to first order,
+/// so a coarser tile still resolves a mesh's thin features (whose voxel size is set by the tight
+/// AABB, not the cube dim) while shedding over-resolution on the long axes. Deterministic.
+fn resample(src: &SdfVolume, new_dim: u32) -> SdfVolume {
+    let n = new_dim.max(1);
+    let mut voxels = vec![0.0f32; (n * n * n) as usize];
+    let ext = [
+        src.aabb_max[0] - src.aabb_min[0],
+        src.aabb_max[1] - src.aabb_min[1],
+        src.aabb_max[2] - src.aabb_min[2],
+    ];
+    let inv = 1.0 / n as f32;
+    for z in 0..n {
+        for y in 0..n {
+            for x in 0..n {
+                let p = [
+                    src.aabb_min[0] + ext[0] * (x as f32 + 0.5) * inv,
+                    src.aabb_min[1] + ext[1] * (y as f32 + 0.5) * inv,
+                    src.aabb_min[2] + ext[2] * (z as f32 + 0.5) * inv,
+                ];
+                voxels[(x + n * (y + n * z)) as usize] = src.sample(p);
+            }
+        }
+    }
+    SdfVolume {
+        dim: n,
+        aabb_min: src.aabb_min,
+        aabb_max: src.aabb_max,
+        voxels,
+    }
+}
+
 impl SdfAtlas {
-    /// Pack `meshes` into one atlas. Deterministic: the placement depends only on the meshes'
-    /// dims and their input order. An empty input yields a 1³ empty atlas.
+    /// Pack `meshes` into one atlas at their native resolution (no cap). Deterministic.
     pub fn pack(meshes: &[SdfVolume]) -> SdfAtlas {
+        Self::pack_capped(meshes, u32::MAX)
+    }
+
+    /// Pack `meshes`, first downsampling any whose `dim > max_dim` to `max_dim³` (a memory cap:
+    /// the atlas is dense `dim³` tiles, so a lower cap trims the largest meshes — whose extra
+    /// resolution is low-frequency and covered by the coarse dense field — for a large saving).
+    /// `max_dim = u32::MAX` packs at native resolution. Deterministic.
+    pub fn pack_capped(meshes: &[SdfVolume], max_dim: u32) -> SdfAtlas {
+        // Downsample over-cap tiles up front, then pack exactly (borrow the capped set).
+        let capped: Vec<SdfVolume> = meshes
+            .iter()
+            .map(|m| {
+                if m.dim > max_dim {
+                    resample(m, max_dim)
+                } else {
+                    SdfVolume {
+                        dim: m.dim,
+                        aabb_min: m.aabb_min,
+                        aabb_max: m.aabb_max,
+                        voxels: m.voxels.clone(),
+                    }
+                }
+            })
+            .collect();
+        Self::pack_native(&capped)
+    }
+
+    /// Pack `meshes` at exactly their current resolution (internal; `pack_capped` handles caps).
+    fn pack_native(meshes: &[SdfVolume]) -> SdfAtlas {
         if meshes.is_empty() {
             return SdfAtlas {
                 dim: [1, 1, 1],
@@ -220,6 +281,49 @@ mod tests {
         let c01 = lerp(at(i0[0], i0[1], i1[2]), at(i1[0], i0[1], i1[2]), f[0]);
         let c11 = lerp(at(i0[0], i1[1], i1[2]), at(i1[0], i1[1], i1[2]), f[0]);
         lerp(lerp(c00, c10, f[1]), lerp(c01, c11, f[1]), f[2])
+    }
+
+    #[test]
+    fn capped_pack_downsamples_large_tiles() {
+        // A 48³ mesh capped to 16 must occupy a 16³ tile; a 12³ mesh (< cap) is untouched.
+        let big = ramp_volume(48, [-1.0; 3], [1.0; 3], 0.0);
+        let small = ramp_volume(12, [0.0; 3], [1.0; 3], 3.0);
+        let atlas = SdfAtlas::pack_capped(&[big, small], 16);
+        assert_eq!(atlas.tiles[0].dim, 16, "large tile downsampled to the cap");
+        assert_eq!(atlas.tiles[1].dim, 12, "small tile left at native dim");
+    }
+
+    #[test]
+    fn resample_preserves_a_linear_field() {
+        // A field linear in world space resamples exactly (trilinear is exact on linear data),
+        // so the cap can't distort a smooth SDF beyond its own discretisation.
+        let dim = 32u32;
+        let (mn, mx) = ([-2.0f32; 3], [2.0f32; 3]);
+        let n = (dim * dim * dim) as usize;
+        let mut voxels = vec![0.0f32; n];
+        for z in 0..dim {
+            for y in 0..dim {
+                for x in 0..dim {
+                    // world x at this voxel center
+                    let wx = mn[0] + (mx[0] - mn[0]) * (x as f32 + 0.5) / dim as f32;
+                    voxels[(x + dim * (y + dim * z)) as usize] = wx;
+                }
+            }
+        }
+        let src = SdfVolume {
+            dim,
+            aabb_min: mn,
+            aabb_max: mx,
+            voxels,
+        };
+        let ds = resample(&src, 16);
+        // A voxel center in the coarse grid maps to the same world x → same value.
+        for i in 0..16usize {
+            // row y=z=0, so the linear index is just i
+            let wx = mn[0] + (mx[0] - mn[0]) * (i as f32 + 0.5) / 16.0;
+            let got = ds.voxels[i];
+            assert!((got - wx).abs() < 1e-3, "i={i}: {got} vs {wx}");
+        }
     }
 
     #[test]
