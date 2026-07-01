@@ -606,6 +606,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "screen_probe_integrate_cs",
     },
+    // Screen-space radiance probes: spatial cross-probe joint-bilateral filter of the atlas (P2).
+    Job {
+        src: "screen_probe_filter.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "screen_probe_filter_cs",
+    },
     // Physical-camera auto-exposure: luminance histogram (pass 1) → adapted exposure (pass 2).
     Job {
         src: "auto_exposure.slang",
