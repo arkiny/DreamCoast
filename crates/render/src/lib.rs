@@ -1265,22 +1265,30 @@ impl ResourcePool {
 
 #[cfg(test)]
 mod tests {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
 
-    /// Counts every heap allocation made through the global allocator while
-    /// [`ALLOC_COUNT_ACTIVE`] is set, so a test can measure allocations made by a
-    /// specific call without instrumenting the call itself.
+    /// Counts heap allocations made *by the current thread* while a
+    /// [`count_allocs`] window is active, so a test can measure allocations made
+    /// by a specific call without instrumenting the call itself. The counter is
+    /// thread-local on purpose: `cargo test` runs tests (and the libtest harness
+    /// itself) on concurrent threads, and a process-global counter picks up their
+    /// unrelated allocations — a flaky off-by-a-few. Both cells are
+    /// const-initialized so touching them inside `alloc` cannot itself allocate;
+    /// `try_with` guards against TLS teardown.
     struct CountingAlloc;
-    static ALLOC_COUNT_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-    static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static TL_COUNT_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static TL_ALLOC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     unsafe impl GlobalAlloc for CountingAlloc {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            if ALLOC_COUNT_ACTIVE.load(Ordering::Relaxed) != 0 {
-                ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            if TL_COUNT_ACTIVE
+                .try_with(std::cell::Cell::get)
+                .unwrap_or(false)
+            {
+                let _ = TL_ALLOC_COUNT.try_with(|c| c.set(c.get() + 1));
             }
             unsafe { System.alloc(layout) }
         }
@@ -1292,19 +1300,12 @@ mod tests {
     #[global_allocator]
     static GLOBAL: CountingAlloc = CountingAlloc;
 
-    /// Serializes the two allocation-counting tests below: `ALLOC_COUNT`/
-    /// `ALLOC_COUNT_ACTIVE` are process-global, so counting must not overlap with
-    /// another test's allocations on a concurrently-run thread (`cargo test`'s
-    /// default).
-    static COUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn count_allocs(f: impl FnOnce()) -> usize {
-        let _guard = COUNT_LOCK.lock().unwrap();
-        ALLOC_COUNT.store(0, Ordering::Relaxed);
-        ALLOC_COUNT_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        TL_ALLOC_COUNT.with(|c| c.set(0));
+        TL_COUNT_ACTIVE.with(|a| a.set(true));
         f();
-        ALLOC_COUNT_ACTIVE.fetch_sub(1, Ordering::Relaxed);
-        ALLOC_COUNT.load(Ordering::Relaxed)
+        TL_COUNT_ACTIVE.with(|a| a.set(false));
+        TL_ALLOC_COUNT.with(std::cell::Cell::get)
     }
 
     /// Builds a graph shaped like the sandbox's default deferred+SW-RT frame: a
