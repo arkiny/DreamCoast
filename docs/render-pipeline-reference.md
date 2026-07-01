@@ -122,7 +122,7 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 | 5 | GBuffer 데칼(후) | ✅ `record_decals`(A3, deferred decal) | ✅ | base pass 후·라이팅 전 — 정합. Intel Sponza `dirt_decal`에서 검증 |
 | 6 | Shadow Depth | ✅ `record_shadow`(단일 디렉셔널 shadow map, PCF/PCSS-lite) | 🟡 | 단일 맵만 — **CSM/cascade·스팟/포인트 큐브·아틀라스 없음** |
 | 7 | Diffuse Indirect + AO | ✅ GDF AO + GTAO + software-traced GI(screen-probe / ray-march) + 디노이저 | ✅ | **직접광 이전**에 배치 — 정합. 이 트랙은 오히려 레퍼런스급으로 깊다(P10/P11) |
-| 8 | Direct Lighting | 🟡 `record_lighting`(풀스크린 PBR, 단일 디렉셔널 + point) | 🟡 | **clustered/tiled 라이트 리스트 없음** — 다광원 확장 시 병목. 순서(GI 뒤)는 정합 |
+| 8 | Direct Lighting | ✅ `record_lighting`(풀스크린 PBR, 단일 디렉셔널 + **clustered froxel** point) | ✅ | **PR-6 완료:** 3D froxel(16×9×24, exponential Z) 라이트 컬링 compute + per-cluster 리스트 소비. opt-in `CLUSTERED_LIGHTS=1`, 디폴트 브루트포스=바이트 동일. 스케일 1024 라이트 ~19× (170→8.7 ms). Metal 검증; DX≡VK Windows pending. spot/area·Z-binning 스케일은 후속. 상세 [clustered-lighting.md](clustered-lighting.md) |
 | 9 | Reflections + Sky | ✅ SSR→GDF→sky 하이브리드 composite, lit-history 피드백 | 🟡 | 순서(직접광 뒤 lit-history 샘플) 정합. 단 lit-history 피드백이 flicker 유발(메모리: swrt_reflect 루프) |
 | 10 | Sky/Atmosphere | 🟡 절차 sky → env cube(`ibl.rs`), 씬 배경 합성은 IBL로 | 🟡 | 물리기반 sky/에어리얼 퍼스펙티브/time-of-day 없음; 별도 sky 합성 패스 아닌 IBL 캡처 |
 | 11 | Fog/Volumetric | **없음** | 🔴 | height fog·volumetric·light shaft·cloud 전무 |
@@ -153,8 +153,10 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
    슬롯 부재의 증상이다.
 4. **포그/대기/볼류메트릭 슬롯 부재 (#10·#11).** 불투명 완성 후·투명 전의 합성 지점이 비어 있어, sky를
    IBL 캡처로만 처리하고 aerial perspective·height fog·light shaft를 꽂을 자리가 없다.
-5. **클러스터드 라이트 리스트 부재 (#8).** 라이팅이 풀스크린 단일-패스라 다광원(point/spot/area 다수 +
-   다수 그림자)으로 확장하려면 라이트 컬링/그리드 인프라를 먼저 깔아야 한다.
+5. **클러스터드 라이트 리스트 부재 (#8).** ~~라이팅이 풀스크린 단일-패스라 다광원으로 확장하려면
+   라이트 컬링/그리드 인프라를 먼저 깔아야 한다.~~ **→ PR-6에서 해소:** 3D froxel 클러스터 컬링
+   compute + per-cluster 리스트 소비(opt-in `CLUSTERED_LIGHTS=1`, 브루트포스 바이트 동일).
+   다수 그림자(스팟/포인트)는 PR-7 그림자 아틀라스와 함께.
 6. **Post 체인이 톤맵 위주 단일 노드 (#16·#17·#18).** 블룸(데모만)·DoF·그레이딩/LUT을 꽂을 **순서 있는
    post 시퀀스**가 없다. 현재는 `hdr → (compute box-blur 데모) → taau → tonemap`으로 파편적.
 
@@ -189,9 +191,12 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
   DoF(스텁) → tonemap+grading`. 각 노드 opt-in. *unblocks:* Phase 20 포스트 스택이 자리에 꽂힘.
 
 ### 정합 P2 — 라이팅 확장 토대
-- **PR-6 · 클러스터드 라이트 컬링 인프라 [L].** 뷰 절두체를 클러스터로 나눠 라이트 리스트 빌드(compute),
-  `record_lighting`이 타일/클러스터 리스트를 소비하도록 변경(단일 디렉셔널은 특수 케이스로 유지, 바이트
-  동일). *unblocks:* Phase 21 다광원(point/spot/area)·다수 그림자. *의존:* P7 compute.
+- **PR-6 · 클러스터드 라이트 컬링 인프라 [L]. ✅ 완료** (Metal 검증, DX≡VK Windows pending). 뷰 절두체를
+  3D froxel(16×9×24, exponential Z)로 나눠 라이트 리스트 빌드(compute), `record_lighting`이 per-cluster
+  리스트를 소비(단일 디렉셔널은 특수 케이스 유지). opt-in `CLUSTERED_LIGHTS=1`, 디폴트 브루트포스 바이트
+  동일; `TEST_LIGHTS=N` 스포너로 1024 라이트 ~19× 입증. froxel↔Z-binning 설계 근거·수치
+  [clustered-lighting.md](clustered-lighting.md). *unblocks:* Phase 21 다광원(point/spot/area)·다수
+  그림자. *의존:* P7 compute.
 - **PR-7 · 그림자 아틀라스/CSM 골격 [L].** 단일 shadow map을 cascade/아틀라스로 일반화(디렉셔널 CSM +
   스팟/포인트 슬롯). *의존:* PR-6 라이트 리스트. *unblocks:* Phase 21 다수 그림자.
 

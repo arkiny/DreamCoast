@@ -321,7 +321,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 60, // G-buffer indices + flip_y + shadow + gdf_ao + ssao + gdf_gi + reflect + two_sided + exposure_buf + skyvis(idx,tint,min_occ)
+            push_constant_size: 76, // 60-byte core + clustered light bufs (grid, index, light, count)
             bindless: true,
             uniform_buffer: true,
             depth_test: false,
@@ -806,6 +806,11 @@ impl DeferredRenderer {
         flip_y: u32,
         two_sided: bool,
         exposure_buf_index: u32,
+        // Clustered light culling (PR-6). `Some((grid_ext, index_ext, grid_idx, index_idx,
+        // light_idx, light_count))` binds the froxel light list built by `ClusterSystem`; the
+        // *_ext ids order the lighting pass after the cluster-build compute pass. `None` = the
+        // brute-force globals.point_pos[] path (default, gallery byte-identical).
+        cluster: Option<(ResourceId, ResourceId, u32, u32, u32, u32)>,
     ) {
         let mut reads = vec![
             gbuf.albedo,
@@ -814,6 +819,10 @@ impl DeferredRenderer {
             gbuf.position,
             shadow_map,
         ];
+        if let Some((grid_ext, index_ext, ..)) = cluster {
+            reads.push(grid_ext);
+            reads.push(index_ext);
+        }
         if let Some(ao) = gdf_ao {
             reads.push(ao);
         }
@@ -849,6 +858,12 @@ impl DeferredRenderer {
                 let gi_index = gdf_gi.map(|gi| ctx.sampled_index(gi)).unwrap_or(u32::MAX);
                 let reflect_index = reflect.map(|r| ctx.sampled_index(r)).unwrap_or(u32::MAX);
                 let skyvis_index = skyvis.map(|s| ctx.sampled_index(s)).unwrap_or(u32::MAX);
+                // Clustered light bufs: their storage indices are stable (persistent buffers),
+                // so pass them straight through; `NO_TEXTURE` grid buf disables the path.
+                let (cl_grid, cl_index, cl_light, cl_count) = match cluster {
+                    Some((_, _, g, i, l, c)) => (g, i, l, c),
+                    None => (u32::MAX, u32::MAX, u32::MAX, 0),
+                };
                 let cmd = ctx.cmd();
                 cmd.set_globals(&self.globals_buffer, globals_offset);
                 cmd.bind_graphics_pipeline(&self.pbr_pipeline);
@@ -865,6 +880,7 @@ impl DeferredRenderer {
                     skyvis_index,
                     skyvis_tint,
                     skyvis_min_occ,
+                    [cl_grid, cl_index, cl_light, cl_count],
                 ));
                 cmd.draw(3, 1);
                 Ok(())
@@ -1010,8 +1026,11 @@ fn pbr_push(
     skyvis_index: u32,
     skyvis_tint: f32,
     skyvis_min_occ: f32,
-) -> [u8; 60] {
-    let mut pc = [0u8; 60];
+    // Clustered light bufs: [grid_buf, index_buf, light_buf, light_count]. grid_buf == u32::MAX
+    // (0xFFFFFFFF) selects the brute-force point-light loop (byte-identical anchor).
+    cluster: [u32; 4],
+) -> [u8; 76] {
+    let mut pc = [0u8; 76];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1026,6 +1045,10 @@ fn pbr_push(
     pc[48..52].copy_from_slice(&skyvis_index.to_le_bytes());
     pc[52..56].copy_from_slice(&skyvis_tint.to_le_bytes());
     pc[56..60].copy_from_slice(&skyvis_min_occ.to_le_bytes());
+    for (i, v) in cluster.iter().enumerate() {
+        let o = 60 + i * 4;
+        pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
     pc
 }
 
