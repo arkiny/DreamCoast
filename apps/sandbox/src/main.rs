@@ -3814,6 +3814,8 @@ impl App {
                         card_vis_ext,
                         relight_alpha,
                         self.gdf_cone_k,
+                        self.sky_gain,
+                        self.sky_wb,
                     );
                     self.scene_cache_reset = false;
                 }
@@ -5041,6 +5043,8 @@ impl App {
                     relight_alpha,
                     self.cache_feedback,
                     self.gdf_cone_k,
+                    self.sky_gain,
+                    self.sky_wb,
                 );
                 ccmd.end()?;
                 let cur = (self.frame_no % 2) as usize;

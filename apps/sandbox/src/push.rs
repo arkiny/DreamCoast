@@ -591,8 +591,10 @@ pub(crate) fn cache_light_push(
     relight_period: u32,
     card_vis_index: u32,
     cone_k: f32,
-) -> [u8; 144] {
-    let mut pc = [0u8; 144];
+    sky_gain: f32,
+    sky_wb: [f32; 3],
+) -> [u8; 160] {
+    let mut pc = [0u8; 160];
     let u = [
         cards_index,
         cache_pos_index,
@@ -637,6 +639,12 @@ pub(crate) fn cache_light_push(
     pc[124..128].copy_from_slice(&card_vis_index.to_le_bytes());
     // P3: cone-trace LOD slope on its own 16-byte-aligned row (offset 128). 0 = legacy linear march.
     pc[128..132].copy_from_slice(&cone_k.to_le_bytes());
+    // Sky (float4 at offset 144, after cone_k + 3 pad floats): x = gain, yzw = white balance —
+    // the same procedural-sky params the path tracer uses, for the relight's sky-on-miss.
+    pc[144..148].copy_from_slice(&sky_gain.to_le_bytes());
+    for (i, v) in sky_wb.iter().enumerate() {
+        pc[148 + i * 4..152 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
     pc
 }
 

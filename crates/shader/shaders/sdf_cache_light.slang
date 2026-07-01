@@ -11,6 +11,7 @@
 #include "bindless.slang"
 #include "clipmap.slang"
 #include "surface_cache.slang"
+#include "sky_common.slang"
 
 static const float PI = 3.14159265359;
 
@@ -31,9 +32,13 @@ struct CacheLightPush
     float4 sun;           // xyz direction toward the sun, w = intensity
     float4 aabb_min;      // xyz GDF world min, w = ground plane Y
     float4 aabb_max;      // xyz GDF world max, w = sample distance clamp
-    float4 params;        // x sky_fill, y temporal alpha, z surface bias, w ray max dist
+    float4 params;        // x (unused, was sky_fill), y temporal alpha, z surface bias, w ray max
     uint4 clip;           // Stage B clipmap: x = descriptor index, y = level count
     float cone_k;         // P3: cone-trace LOD slope (0 = legacy linear march = byte-identical)
+    float pad0;
+    float pad1;
+    float pad2;
+    float4 sky;           // x = sky gain, yzw = white balance (matches the path tracer's sky)
 };
 
 [[vk::push_constant]]
@@ -159,11 +164,14 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     float sun_i = pc.sun.w;
     float ndl = max(dot(n, sun_dir), 0.0);
     float sh = ndl > 0.0 ? sun_shadow(p + n * 0.004, sun_dir) : 1.0;
-    float sky_fill = pc.params.x * (0.5 + 0.5 * n.y);
-    float3 direct_irr = float3(sun_i * ndl * sh + sky_fill, sun_i * ndl * sh + sky_fill,
-                               sun_i * ndl * sh + sky_fill);
+    // Direct sun only (the skylight now comes from the indirect gather's sky-on-miss below, matching
+    // the reference: a per-ray OCCLUDED skylight instead of the old unoccluded `sky_fill` ambient).
+    float3 direct_irr = float3(sun_i * ndl * sh, sun_i * ndl * sh, sun_i * ndl * sh);
 
-    // Indirect gather: cosine rays into the GDF; at an object hit read last frame's cache.
+    // Indirect gather: cosine rays into the GDF; at an object hit read last frame's cache, on a MISS
+    // add the sky (same procedural model as the path tracer, sun disk omitted) so the cache seeds
+    // the skylight from the first frame — it converges from a lit state, not from black, and the
+    // occluded skylight (only rays that escape see the sky) matches the ground truth.
     float3 indirect = float3(0, 0, 0);
     uint spp = max(pc.spp, 1u);
     uint seed = (t * 9277u + pc.frame * 26699u) | 1u;
@@ -174,12 +182,14 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
         float3 dir = cosine_hemisphere(n, seed);
         float3 o = p + n * bias;
         float tt = bias;
+        bool hit = false;
         for (int i = 0; i < 48; i++)
         {
             float3 q = o + dir * tt;
             float d = geo_march(q);
             if (d < 0.0015)
             {
+                hit = true;
                 bool cache_hit;
                 indirect += sample_surface_cache(q, geo_normal(q), pc.cards_index,
                                                  pc.cache_pos_index, pc.cache_rad_read,
@@ -191,6 +201,8 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
             if (tt > maxt)
                 break;
         }
+        if (!hit)
+            indirect += procedural_sky(dir, sun_dir, sun_i, pc.sky.x, false) * pc.sky.yzw;
     }
     indirect /= float(spp);
 
