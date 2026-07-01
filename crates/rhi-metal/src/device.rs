@@ -616,6 +616,18 @@ impl MetalDevice {
         true
     }
 
+    /// Backend-agnostic device identity (name + cheap capability flags), surfaced up through the
+    /// facade so app code can pick a platform-appropriate default quality tier (macOS perf, axis
+    /// A). Read-only — reads the live `MTLDevice` attributes; changes nothing about rendering.
+    pub fn device_info(&self) -> rhi_types::DeviceInfo {
+        let d = &self.shared.device;
+        rhi_types::DeviceInfo {
+            name: d.name().to_string(),
+            unified_memory: d.hasUnifiedMemory(),
+            low_power: d.isLowPower(),
+        }
+    }
+
     /// Hardware ray tracing (Phase 8): true on Apple GPUs that support the
     /// `metal::raytracing` inline ray-query API (Apple7+ / Metal 3). The inline
     /// `RayQuery` path tracer traces the bindless `g.tlas`.
