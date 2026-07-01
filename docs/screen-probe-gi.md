@@ -196,6 +196,20 @@ independently ranked it the biggest win.
 
 Verify (Metal): quality-neutral — gallery vs PT 5.994 (pre-integrated) vs 5.988 (direct
 integral); the two paths differ by only 0.015/ch avg (max 5), pure octahedral-interpolation
-error. Gallery byte-identical (no env, `dba9ff7c…`). Deterministic (`e9e982e8…`). Per-pass GPU
-ms pending the Metal timestamp timers (being wired up) — the win is structural (256→~16
-taps/pixel on the dominant per-pixel pass) and matches the reference default.
+error. Gallery byte-identical (no env, `dba9ff7c…`). Deterministic (`e9e982e8…`).
+
+**Measured GPU cost** (gallery 2560×1440, Metal, real per-pass timers — the Metal timestamp
+backend was wired up in parallel for this, `feat(rhi-metal)`):
+
+| pass | pre-integration ON | OFF (direct integral) |
+|---|---|---|
+| trace | ~5.7 ms | ~5.7 ms |
+| filter | ~0.5 ms | ~0.5 ms |
+| irradiance | ~2.4 ms | — |
+| integrate | **~1.3 ms** | **~10.5 ms** |
+| **total screen-probe GI** | **~10.0 ms** | **~16.7 ms** |
+
+The per-pixel gather drops from 10.5 ms to 3.8 ms (integrate 1.3 + irradiance 2.4) — ~2.8×,
+and ~40% off the whole screen-probe GI cost. The **trace** (~5.7 ms) is now the dominant pass
+— the next optimization target (temporal ray-rotation / adaptive ray budget) if further cuts
+are needed; the gather is no longer the bottleneck.
