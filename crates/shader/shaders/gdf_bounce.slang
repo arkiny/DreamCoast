@@ -129,8 +129,12 @@ float bs_gi_shadow(BounceScene bs, float3 origin, float3 dir)
 }
 
 // Sphere-trace a bounce ray; returns the incoming radiance along it (0 if it escapes).
-float3 bs_trace_bounce(BounceScene bs, float3 origin, float3 dir)
+// `escaped` reports sky visibility along the ray: 1.0 if it reached the sky (no hit),
+// 0.0 if it hit geometry/ground. Used by the screen probes to build indoor skylight
+// occlusion; the per-pixel GI pass passes a throwaway and ignores it.
+float3 bs_trace_bounce(BounceScene bs, float3 origin, float3 dir, out float escaped)
 {
+    escaped = 1.0; // assume sky-visible until a hit proves otherwise
     int max_steps = int(max(bs.max_steps, 1u));
     const float HIT_EPS = 0.001;
     float t = bs.bias; // start past the surface bias
@@ -141,6 +145,7 @@ float3 bs_trace_bounce(BounceScene bs, float3 origin, float3 dir)
         float d = bs_scene_march(bs, p);
         if (d < HIT_EPS)
         {
+            escaped = 0.0;
             float3 hn = bs_scene_normal(bs, p);
             // When the surface cache is bound, the incoming radiance along this ray is the hit
             // surface's cached (multibounce) radiance — a direct lookup, no per-ray re-light. On a

@@ -651,7 +651,9 @@ impl GiSystem {
         clip_vols: &'a [&'a Volume],
         max_steps: u32,
         cone_k: f32,
-    ) -> ResourceId {
+        // Returns `(gi_image, skyvis_image)`; the sky-vis image (indoor skylight occlusion) is
+        // built from the probes' per-ray sky visibility, mirroring the volume GI path's output.
+    ) -> (ResourceId, ResourceId) {
         let trace = self.sp_trace_pipeline.as_ref().expect("sp trace pipeline");
         let integrate = self
             .sp_integrate_pipeline
@@ -670,6 +672,7 @@ impl GiSystem {
             Extent2D::new(atlas_w, atlas_h),
         );
         let out = graph.create_storage_image("sp_gi_out", HDR_FORMAT, extent);
+        let skyvis = graph.create_storage_image("sp_skyvis", HDR_FORMAT, extent);
 
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
         let cache4 = [cache_idx[0], cache_idx[1], cache_idx[2], cache_idx[3]];
@@ -747,7 +750,7 @@ impl GiSystem {
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "screen_probe_integrate",
-                storage_writes: vec![out],
+                storage_writes: vec![out, skyvis],
                 reads: vec![atlas, depth, normal],
             },
             move |ctx| {
@@ -755,6 +758,7 @@ impl GiSystem {
                 let normal_index = ctx.sampled_index(normal);
                 let atlas_index = ctx.sampled_index(atlas);
                 let out_index = ctx.storage_index(out);
+                let skyvis_index = ctx.storage_index(skyvis);
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(integrate);
                 cmd.push_constants_compute(&screen_probe_integrate_push(
@@ -770,6 +774,7 @@ impl GiSystem {
                     SP_DOWNSAMPLE,
                     SP_OCT_RES,
                     flip_y,
+                    skyvis_index,
                     pos_sigma,
                     normal_power,
                 ));
@@ -777,7 +782,7 @@ impl GiSystem {
                 Ok(())
             },
         );
-        out
+        (out, skyvis)
     }
 
     /// Stage D1: joint-bilateral upsample of the half-res GI to full resolution. The C3 trace
