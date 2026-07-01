@@ -135,7 +135,7 @@ pub struct QualityPreset {
     /// with distance: floor `max(d, cone_k·t)` and shadow ceiling `max(0.2, cone_k·t)`. Fewer steps
     /// at distance (grazing rays stop crawling). `0.0` = legacy linear march (byte-identical; forced
     /// for the gallery anchor at the call site). Higher = cheaper march, softer distant GI/reflection.
-    /// Denoised/EMA signals tolerate it; see `docs/lumen-parity-swrt.md`.
+    /// Denoised/EMA signals tolerate it; see `docs/swrt-gi-perf-track.md`.
     pub gdf_cone_k: f32,
     /// P1 (Lumen-parity SW-RT): GI trace-resolution divisor when `gi_half_res` is on — trace the
     /// C3 GI at `1/div` of the render extent per axis, then joint-bilateral upsample (the spatial
@@ -145,13 +145,13 @@ pub struct QualityPreset {
     /// over-reaches: each divergent coarse stochastic GI ray spreads over a larger upsample footprint,
     /// raising the DX=VK gap to ~0.117/ch (a broad parity divergence, not just fireflies) — rejected.
     /// Only active where `gi_half_res` is (content; the gallery traces full-res = byte-identical).
-    /// `P_GI_RES_DIV` override. See `docs/lumen-parity-swrt.md`.
+    /// `P_GI_RES_DIV` override. See `docs/swrt-gi-perf-track.md`.
     pub gi_res_div: u32,
     /// Reflection temporal-resolve history neighbourhood clamp (`reflect_temporal.slang`): removes the
     /// view-dependent specular smear when the camera rotates (stale reprojected history dragged across
     /// chrome). A scalability permutation: `0` = off (byte-identical legacy resolve; forced for the
     /// gallery anchor), `1` = hard AABB clamp (cheapest), `2` = variance clamp (mean +- gamma*sigma,
-    /// gentler on sharp mirrors). `P_REFL_CLAMP` override. See `docs/lumen-parity-swrt.md`.
+    /// gentler on sharp mirrors). `P_REFL_CLAMP` override. See `docs/swrt-gi-perf-track.md`.
     pub reflect_history_clamp: u32,
     /// Variance-clamp tightness for `reflect_history_clamp == 2` (`P_REFL_CLAMP_GAMMA`). Lower = tighter
     /// (more lag removed, more risk of clipping valid history); ~1.0-1.5 typical. Ignored for modes 0/1.
