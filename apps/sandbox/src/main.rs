@@ -1795,10 +1795,22 @@ impl App {
             .max(1);
         // Stage D2b: camera-visibility feedback drives the relight budget (off-screen cards relit
         // far less). Pure perf optimization — invariant for the on-screen image — so default on for
+        // GI-on-distance-field visualization: `P_SC_VIZ=1` shades hits from the high-res surface
+        // cache (2D mesh cards, final lit radiance — like the reference "scene" view); `P_WRC_VIZ=1`
+        // shades from the coarse world radiance cache. Defined here (before `cache_feedback`) because
+        // the surface-cache view forces the visibility gating off (below).
+        let sc_viz = gi.has_wrc_view()
+            && gdf.has_surface_cache()
+            && gdf.has_cache_lighting()
+            && std::env::var_os("P_SC_VIZ").is_some();
         // content; forced off for the gallery anchor (uniform period = byte-identical). Needs the
-        // visibility pipeline (capability-gated). `P11_CACHE_FEEDBACK` overrides.
-        let cache_feedback =
-            gdf.has_cache_visibility() && quality::env_bool("P11_CACHE_FEEDBACK", !gallery_scene);
+        // visibility pipeline (capability-gated). `P11_CACHE_FEEDBACK` overrides. The surface-cache
+        // VIEW forces it OFF: the camera-visibility priority relights "hidden" cards 8x slower, but
+        // the flyable view's DF march reaches those hidden-card surfaces and would show them stale
+        // (black). Uniform relight fills every card so the view has no dead cards.
+        let cache_feedback = gdf.has_cache_visibility()
+            && !sc_viz
+            && quality::env_bool("P11_CACHE_FEEDBACK", !gallery_scene);
         // Stage D3: relight gather rays/texel. Gallery forced to the legacy 8 (byte-identical);
         // content takes the tier value. `P11_CACHE_RELIGHT_SPP` overrides.
         let cache_relight_spp = std::env::var("P11_CACHE_RELIGHT_SPP")
@@ -1836,15 +1848,8 @@ impl App {
         // of escaping), so the cache's primary role is subsumed. Kept as correct infrastructure
         // for the multi-bounce-at-hits refinement (docs/world-radiance-cache.md). See the finding.
         let wrc = screen_probe && gi.has_wrc() && quality::env_bool("P_WRC", false);
-        // GI-on-distance-field visualization: march the camera into the GDF and paint each hit.
-        // `P_SC_VIZ=1` shades from the high-res SURFACE CACHE (2D mesh cards, final lit radiance —
-        // like the reference "scene" view); `P_WRC_VIZ=1` shades from the coarse world radiance
-        // cache. Either enables the view pass (opt-in); the surface-cache source additionally needs
-        // the mesh-card surface cache (built/lit via `cache_active` below).
-        let sc_viz = gi.has_wrc_view()
-            && gdf.has_surface_cache()
-            && gdf.has_cache_lighting()
-            && std::env::var_os("P_SC_VIZ").is_some();
+        // `wrc_viz` (the GI-on-DF view pass) is enabled by either source flag; `sc_viz` (defined
+        // earlier, above `cache_feedback`) selects the high-res surface-cache source.
         let wrc_viz = gi.has_wrc_view() && (std::env::var_os("P_WRC_VIZ").is_some() || sc_viz);
         // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
         let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", qp.gi_denoise);
@@ -2723,6 +2728,12 @@ impl App {
         } else {
             SCREENSHOT_WARMUP
         };
+        // `WARMUP_FRAMES=<n>` overrides the headless warmup — e.g. to let an amortized cache
+        // (surface-cache re-light) fully converge before the capture.
+        let warmup = std::env::var("WARMUP_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(warmup);
 
         // Decide whether this frame produces a screenshot: a scheduled capture in
         // screenshot mode (after warmup), or an F2 rising edge interactively.
