@@ -383,6 +383,15 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "gbuffer_fs",
     },
+    // Depth pre-pass fragment shader (pipeline rebaseline PR-1): depth-only + the
+    // G-buffer's alpha-test discard, sharing the G-buffer vertex shaders unchanged so
+    // the pre-pass depth is bit-identical to the base pass (EQUAL depth test premise).
+    Job {
+        src: "gbuffer.slang",
+        entry: "fsDepth",
+        stage: "fragment",
+        key: "gbuffer_depth_fs",
+    },
     // Deferred surface-decal fragment shader (decals A3): shares `vsMain`, writes only
     // RT0 = float4(albedo, alpha); the DecalAlbedo blend state alpha-blends it into the
     // G-buffer albedo and masks the other targets.
