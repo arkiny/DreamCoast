@@ -1782,12 +1782,21 @@ impl App {
         // On by default; `NO_POINT_LIGHTS=1` disables them (the path tracer has no
         // point lights, so a fair raster-vs-ground-truth comparison turns these off).
         let point_lights_on = std::env::var_os("NO_POINT_LIGHTS").is_none();
-        // RenderQuality tier (Stage D): `RENDER_QUALITY=low|med|high` (unset => Med = the legacy
-        // defaults, no-reg). `qp` is the single tier→knob table; each knob below reads its own env
-        // first and falls back to `qp.*`, so an explicit `P11_*`/`SHADOW_*` override always wins.
-        let quality = quality::RenderQuality::from_env();
+        // RenderQuality tier (Stage D): `RENDER_QUALITY=low|med|high` (unset => platform default).
+        // The platform default consults the GPU identity (macOS perf, axis A): an Apple GPU maps to
+        // the aggressive `Apple` tier, every other / unknown GPU (incl. all VK/D3D12 adapters) stays
+        // on `Med` = the legacy no-reg baseline. An explicit `RENDER_QUALITY` value always wins over
+        // the platform default. `qp` is the single tier→knob table; each knob below reads its own env
+        // first and falls back to `qp.*`, so an explicit `P11_*`/`SHADOW_*`/`RENDER_SCALE`/`SSAO`
+        // override always wins over the tier.
+        let device_info = device.device_info();
+        let quality = quality::RenderQuality::from_env_for_device(&device_info);
         let qp = quality::preset(quality);
-        info!("RenderQuality tier: {} (RENDER_QUALITY)", quality.label());
+        info!(
+            "RenderQuality tier: {} (RENDER_QUALITY; GPU \"{}\")",
+            quality.label(),
+            device_info.name
+        );
         // Phase 7: route the HDR result through a compute post-process (3x3 blur into
         // a storage image) before tonemapping. Initial state seedable via env var so
         // headless screenshots can exercise each demo (`P7_COMPUTE_POST=1`, etc.).
@@ -1831,10 +1840,12 @@ impl App {
             && gdf.has_scene_sdf()
             && quality::env_bool("P11_GDF_AO", !gallery_scene && qp.gdf_ao);
         // Screen-space near-field AO (HBAO-lite), composed with the GDF AO for crevice/contact
-        // definition the coarse GDF can't resolve. Gallery off (byte-identical anchor); content on
-        // by default (cheap, big quality win). `SSAO` overrides; `SSAO_RADIUS/INTENSITY/BIAS/POWER`
-        // tune. World radius 0.5 m (contact scale), intensity 1.5, bias 2 cm, power 1.5 (contrast).
-        let ssao = compute_supported && quality::env_bool("SSAO", !gallery_scene);
+        // definition the coarse GDF can't resolve. Gallery off (byte-identical anchor); content
+        // takes the tier default (`qp.ssao` — on for Med/High/Low, OFF for the Apple tier where
+        // gdf_ao already covers contact AO and this reclaims the ~13 ms 2nd AO pass). `SSAO`
+        // overrides either way; `SSAO_RADIUS/INTENSITY/BIAS/POWER` tune. World radius 0.5 m (contact
+        // scale), intensity 1.5, bias 2 cm, power 1.5 (contrast).
+        let ssao = compute_supported && quality::env_bool("SSAO", !gallery_scene && qp.ssao);
         let env_f32 = |name: &str, default: f32| {
             std::env::var(name)
                 .ok()
@@ -2024,11 +2035,13 @@ impl App {
             && quality::env_bool("P11_REFLECT_CACHE", qp.reflect_cache);
         // Firefly clamp on by default (P11_FIREFLY_CLAMP=0 to disable / compare).
         let firefly_clamp = quality::env_bool("P11_FIREFLY_CLAMP", qp.firefly_clamp);
-        // C8d: roughness above which screen-mirror SSR stops contributing (GDF takes over).
+        // C8d: roughness above which screen-mirror SSR stops contributing (GDF takes over). Gallery
+        // forced to the legacy 0.5 (byte-identical anchor; a no-op under Med where qp is already 0.5)
+        // so the Apple tier's lower 0.4 cutoff never shifts the gallery's reflections.
         let reflect_max_roughness = std::env::var("P11_REFLECT_MAX_ROUGHNESS")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(qp.reflect_max_roughness);
+            .unwrap_or(if gallery_scene { 0.5 } else { qp.reflect_max_roughness });
         // Stage D3: reflection-ray march step cap. Gallery forced to the legacy 96 (byte-identical);
         // content takes the tier value. `P11_REFLECT_MAX_STEPS` overrides.
         let reflect_max_steps = std::env::var("P11_REFLECT_MAX_STEPS")
@@ -2142,10 +2155,13 @@ impl App {
             Some((w, h))
         });
         // QHD/UHD track: internal render scale (production knob). `RENDER_SCALE` overrides the tier.
+        // The gallery is forced native (1.0) regardless of tier so the byte-identical anchor holds
+        // even when the platform default is the Apple tier (render_scale 0.67) — mirrors the
+        // `if gallery_scene { legacy } else { qp.* }` gate every other tier knob uses.
         let render_scale = std::env::var("RENDER_SCALE")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(qp.render_scale)
+            .unwrap_or(if gallery_scene { 1.0 } else { qp.render_scale })
             // Floor at 1/3 (DLSS "ultra performance" territory): below that even a temporal
             // reconstruction can't hold up. The TAAU jitter reconstruction (B-track) makes the
             // 0.4–0.6 range viable, which is what QHD/UHD high-fps needs; 1.0 stays the default
@@ -3203,20 +3219,24 @@ impl App {
                     // knobs below (capability-gated). A manual pick supersedes any startup env
                     // override — the env seam only seeds the initial state. The graph is rebuilt
                     // every frame, so the new tier takes effect immediately.
+                    // The `apple` platform tier is auto-selected on Apple GPUs (not via env); it is
+                    // listed here so the live tier displays correctly and a manual re-pick works.
                     let mut tier_idx = match *quality {
                         quality::RenderQuality::Low => 0usize,
                         quality::RenderQuality::Med => 1,
                         quality::RenderQuality::High => 2,
+                        quality::RenderQuality::Apple => 3,
                     };
                     if ui.combo_simple_string(
                         "RenderQuality",
                         &mut tier_idx,
-                        &["low", "med", "high"],
+                        &["low", "med", "high", "apple"],
                     ) {
                         let nq = [
                             quality::RenderQuality::Low,
                             quality::RenderQuality::Med,
                             quality::RenderQuality::High,
+                            quality::RenderQuality::Apple,
                         ][tier_idx];
                         *quality = nq;
                         let p = quality::preset(nq);

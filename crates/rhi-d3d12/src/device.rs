@@ -655,6 +655,18 @@ impl D3d12Device {
         true
     }
 
+    /// Backend-agnostic device identity, surfaced up through the facade for platform-default
+    /// quality-tier selection (macOS perf, axis A). Additive + read-only. A D3D12 adapter is never
+    /// an Apple GPU in this engine (Metal owns macOS), so the tier only needs a non-Apple marker
+    /// here. Reporting a stable `"D3D12"` name keeps this change from touching device selection.
+    pub fn device_info(&self) -> rhi_types::DeviceInfo {
+        rhi_types::DeviceInfo {
+            name: "D3D12".to_string(),
+            unified_memory: false,
+            low_power: false,
+        }
+    }
+
     /// Whether hardware ray tracing (DXR Tier >= 1.1) is available (Phase 8).
     pub fn has_raytracing(&self) -> bool {
         self.shared.has_raytracing

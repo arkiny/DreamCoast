@@ -16,6 +16,33 @@ pub enum BackendKind {
     Metal,
 }
 
+/// Backend-agnostic GPU device identity, surfaced up through the facade so app code can pick a
+/// platform-appropriate default quality tier (macOS/M3 perf, axis A). Additive + read-only: it
+/// carries no GPU handles, so exposing it does not change any backend's rendering behavior.
+///
+/// `name` is the raw adapter string (e.g. `"Apple M3"`, `"NVIDIA GeForce RTX 2070 SUPER"`).
+/// `unified_memory` / `low_power` are cheap capability flags where the backend exposes them (Metal
+/// `hasUnifiedMemory` / `isLowPower`); backends that don't expose them report `false`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DeviceInfo {
+    /// Adapter / device name string, as reported by the driver.
+    pub name: String,
+    /// Whether the GPU shares memory with the CPU (Apple Silicon / most iGPUs). `false` if unknown.
+    pub unified_memory: bool,
+    /// Whether the driver flags this as a low-power / integrated GPU. `false` if unknown.
+    pub low_power: bool,
+}
+
+impl DeviceInfo {
+    /// Heuristic: does this look like an Apple GPU? Matches the vendor name substring (`"Apple"`,
+    /// e.g. `"Apple M3"`) as the primary signal, with the unified-memory flag as a secondary hint.
+    /// Used only to select an aggressive Apple default quality tier; non-Apple / unknown stays on
+    /// the honest `Med` fallback. Case-insensitive so a driver-formatting change can't defeat it.
+    pub fn is_apple_gpu(&self) -> bool {
+        self.name.to_ascii_lowercase().contains("apple")
+    }
+}
+
 /// A 2D size in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Extent2D {
