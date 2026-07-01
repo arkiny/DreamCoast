@@ -1867,7 +1867,9 @@ impl App {
             && std::env::var_os("P11_HYBRID").is_some();
         // C7c: feed the hybrid composite into the lighting specular — the DEFAULT specular
         // now (replaces the prefilter-cube IBL); `P11_LEGACY_IBL` falls back to the cube.
-        let swrt_reflect = swrt_ok && !legacy_ibl;
+        // Skipped when a full-screen GI-on-DF view replaces the output: the reflection only feeds
+        // the scene HDR that the view discards, so it is ~21 ms of wasted work in that mode.
+        let swrt_reflect = swrt_ok && !legacy_ibl && !wrc_viz;
         // C8a colored GDF re-light (per-voxel albedo). On by default when the albedo volumes
         // exist; `P11_GDF_COLOR=0` forces the achromatic constant-albedo path (no-reg compare).
         let gdf_color = gdf.has_scene_albedo()
