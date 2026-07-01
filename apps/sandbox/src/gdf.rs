@@ -119,6 +119,18 @@ pub(crate) struct GdfSystem {
     /// camera), each its own SDF + albedo volumes over its own AABB. The coarsest level
     /// stays in `scene_gdf`/`scene_albedo` (global coverage). Empty ⇒ single-level (gallery).
     clip_levels: Vec<ClipLevel>,
+    /// P1 (per-mesh SDF direct sampling): the atlas volume holding every unique mesh's field as
+    /// a tile, the instance table / cell grid / flat index storage buffers, and the header the
+    /// shader reads (atlas index, grid params, buffer indices, dense-albedo fallback). When
+    /// `ms_active`, `clip_descriptor` reports `count == 0` and `clip_level_volumes` yields the
+    /// atlas, so every SW-RT consumer samples the per-mesh fields directly via `clipmap.slang`
+    /// with no per-consumer change. Content-scene opt-in (dense stays the gallery anchor).
+    sdf_atlas: Option<Volume>,
+    ms_instances: Option<StorageBuffer>,
+    ms_cells: Option<StorageBuffer>,
+    ms_indices: Option<StorageBuffer>,
+    ms_header: Option<StorageBuffer>,
+    ms_active: bool,
     /// Stage D: the analytic ground-plane height the SW-RT marches union with the GDF. The
     /// gallery's floor is *analytic* (y = 0, no floor geometry in the fuse); content scenes
     /// (Sponza) carry their floor as real geometry, so the analytic ground is disabled
@@ -425,6 +437,12 @@ impl GdfSystem {
             clip_desc: None,
             clip_count: 0,
             clip_levels: Vec::new(),
+            sdf_atlas: None,
+            ms_instances: None,
+            ms_cells: None,
+            ms_indices: None,
+            ms_header: None,
+            ms_active: false,
             scene_ground_y: 0.0,
         })
     }
@@ -638,8 +656,12 @@ impl GdfSystem {
 
     /// Stage B3: the finer-level SDF + albedo volumes that a consumer must transition to
     /// the sampled state before sampling the clipmap (the coarsest is handled separately).
-    /// Empty for a single-level (gallery) clipmap.
+    /// Empty for a single-level (gallery) clipmap. In direct-sample mode (P1) this is instead
+    /// the per-mesh atlas volume, so consumers transition it through the same seam.
     pub(crate) fn clip_level_volumes(&self) -> Vec<&Volume> {
+        if self.ms_active {
+            return self.sdf_atlas.as_ref().into_iter().collect();
+        }
         let mut v = Vec::new();
         for lv in &self.clip_levels {
             v.push(&lv.sdf);
@@ -651,11 +673,116 @@ impl GdfSystem {
     }
 
     /// Stage B: the clipmap descriptor `(storage-buffer index, level count)` the SW-RT
-    /// shaders sample the scene field through, or `None` until a scene GDF is built.
+    /// shaders sample the scene field through, or `None` until a scene GDF is built. In
+    /// direct-sample mode (P1) the count is `0` (the direct-sample sentinel) and the index
+    /// points at the mesh-SDF header instead of the clipmap level array; `clipmap.slang`
+    /// switches paths on the `0`.
     pub(crate) fn clip_descriptor(&self) -> Option<(u32, u32)> {
+        if self.ms_active {
+            return self.ms_header.as_ref().map(|b| (b.storage_index(), 0));
+        }
         self.clip_desc
             .as_ref()
             .map(|b| (b.storage_index(), self.clip_count))
+    }
+
+    /// P1: install the per-mesh SDF **atlas** + direct-sample acceleration buffers, switching
+    /// the SW-RT field source from the dense clipmap to direct per-mesh sampling. `atlas_bytes`
+    /// is the packed atlas volume (`atlas_dim`), `build` the CPU instance table + cell grid
+    /// (`mesh_sdf::build`). Dense albedo (`scene_albedo`) stays the color source — only the
+    /// geometry field moves to the atlas. No-op without a scene GDF (compute unsupported).
+    pub(crate) fn install_mesh_sdf(
+        &mut self,
+        device: &Device,
+        atlas_bytes: &[u8],
+        atlas_dim: [u32; 3],
+        build: &crate::mesh_sdf::MeshSdfBuild,
+    ) -> anyhow::Result<()> {
+        if self.scene_gdf.is_none() {
+            return Ok(());
+        }
+        let atlas = device.create_volume_init(
+            &VolumeDesc {
+                width: atlas_dim[0],
+                height: atlas_dim[1],
+                depth: atlas_dim[2],
+                format: Format::R32Float,
+            },
+            atlas_bytes,
+        )?;
+        let sbuf = |data: &[u8], stride: u32| -> anyhow::Result<StorageBuffer> {
+            Ok(device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: data.len() as u64,
+                    stride,
+                    indirect: false,
+                },
+                data,
+            )?)
+        };
+        let instances = sbuf(&build.instances, crate::mesh_sdf::INSTANCE_STRIDE)?;
+        let cells = sbuf(&build.cell_ranges, crate::mesh_sdf::CELL_STRIDE)?;
+        // The index array can be empty (no instances); a storage buffer needs a non-zero size.
+        let idx_bytes: &[u8] = if build.indices.is_empty() {
+            &[0u8; 4]
+        } else {
+            &build.indices
+        };
+        let indices = sbuf(idx_bytes, 4)?;
+
+        // Header — byte layout consumed by `mesh_sdf_sample.slang` via `Load4` (see there):
+        //   0: float3 grid_min, uint atlas_sampled_idx
+        //  16: float3 grid_max, uint res
+        //  32: uint4  instance_buf, cell_buf, index_buf, instance_count
+        //  48: uint4  albedo_r, albedo_g, albedo_b, dense_sdf_idx
+        //  64: float3 scene_aabb_min, _
+        //  80: float3 scene_aabb_max, _
+        // dense_sdf_idx is the coarse whole-scene field: the shader marches on it (safe
+        // empty-space stepping) and takes min(dense, atlas) near surfaces for precision.
+        let alb = match self.scene_albedo.as_ref() {
+            Some(v) => [
+                v[0].sampled_index(),
+                v[1].sampled_index(),
+                v[2].sampled_index(),
+            ],
+            None => [u32::MAX; 3],
+        };
+        let mut h: Vec<u8> = Vec::with_capacity(96);
+        let pf = |h: &mut Vec<u8>, v: f32| h.extend_from_slice(&v.to_le_bytes());
+        let pu = |h: &mut Vec<u8>, v: u32| h.extend_from_slice(&v.to_le_bytes());
+        for a in build.grid_min {
+            pf(&mut h, a);
+        }
+        pu(&mut h, atlas.sampled_index());
+        for a in build.grid_max {
+            pf(&mut h, a);
+        }
+        pu(&mut h, build.res);
+        pu(&mut h, instances.storage_index());
+        pu(&mut h, cells.storage_index());
+        pu(&mut h, indices.storage_index());
+        pu(&mut h, build.instance_count);
+        pu(&mut h, alb[0]);
+        pu(&mut h, alb[1]);
+        pu(&mut h, alb[2]);
+        pu(&mut h, self.scene_gdf.as_ref().unwrap().sampled_index());
+        for a in self.scene_aabb_min {
+            pf(&mut h, a);
+        }
+        pf(&mut h, 0.0);
+        for a in self.scene_aabb_max {
+            pf(&mut h, a);
+        }
+        pf(&mut h, 0.0);
+        let header = sbuf(&h, 16)?;
+
+        self.sdf_atlas = Some(atlas);
+        self.ms_instances = Some(instances);
+        self.ms_cells = Some(cells);
+        self.ms_indices = Some(indices);
+        self.ms_header = Some(header);
+        self.ms_active = true;
+        Ok(())
     }
 
     pub(crate) fn has_scene_sdf(&self) -> bool {

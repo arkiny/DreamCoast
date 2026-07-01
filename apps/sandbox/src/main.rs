@@ -42,6 +42,7 @@ mod gtao;
 mod ibl;
 mod level;
 mod mesh;
+mod mesh_sdf;
 mod morph;
 mod particle;
 mod push;
@@ -1532,6 +1533,44 @@ impl App {
                     })
                     .collect();
                 gdf.set_clip_levels(&device, &level_data)?;
+            }
+            // P3 (per-mesh-sdf-direct-sample-plan.md): pack every unique mesh's field into one
+            // atlas volume + build the instance table / cell grid, then switch the SW-RT field
+            // source to direct per-mesh sampling — the **content default** (dense loses per-mesh
+            // resolution → thin-geo penetration + surface-cache checkerboard). `P11_DIRECT_SDF=0`
+            // opts out to the dense-only composite (kept above as the hybrid's coarse field, and
+            // as the A/B fallback). Content-only; the gallery keeps the dense anchor untouched.
+            let direct_sdf = use_permesh && quality::env_bool("P11_DIRECT_SDF", true);
+            if use_permesh && !direct_sdf {
+                info!(
+                    "GDF: per-mesh SDF direct sampling DISABLED (P11_DIRECT_SDF=0) — dense \
+                     composite only (loses per-mesh resolution)"
+                );
+            }
+            if direct_sdf {
+                // Atlas memory cap: tiles are dense `dim³`, so downsampling the largest meshes
+                // (whose extra resolution is low-frequency, covered by the coarse dense field)
+                // trims the atlas a lot while thin features — resolved by their tight AABB, not
+                // the cube dim — survive. `P11_ATLAS_MAX_DIM` tunes it (native = 48).
+                let atlas_cap = std::env::var("P11_ATLAS_MAX_DIM")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .map(|d| d.clamp(dreamcoast_asset::sdf::MESH_SDF_MIN_DIM, 48))
+                    .unwrap_or(32);
+                let atlas =
+                    dreamcoast_asset::sdf_atlas::SdfAtlas::pack_capped(&mesh_sdfs, atlas_cap);
+                let res = crate::mesh_sdf::grid_res_for(compose_objects.len());
+                let build = crate::mesh_sdf::build(&compose_objects, &atlas, amin, amax, res);
+                info!(
+                    "per-mesh SDF direct sample: atlas {}x{}x{} ({:.1} MB), {} instances, {}^3 cell grid",
+                    atlas.dim[0],
+                    atlas.dim[1],
+                    atlas.dim[2],
+                    (atlas.voxels.len() * 4) as f32 / 1.0e6,
+                    build.instance_count,
+                    res,
+                );
+                gdf.install_mesh_sdf(&device, &atlas.to_le_bytes(), atlas.dim, &build)?;
             }
             // Phase 12 item 3: optional GPU→CPU volume-readback round-trip check. Reads
             // the just-uploaded scene SDF back and confirms it equals the bytes we
