@@ -132,11 +132,35 @@ clip.1(count)`를 넘김 → **`count==0` 센티넬 = 직접샘플 모드**, `de
 **모든 소비자 push 패커 무변경**(단일소스). 각 `record_*`의 볼륨 레이아웃 전이만 아틀라스 볼륨으로
 교체. 헤더는 `gdf.rs`가 `build_clip_descriptor`와 나란히 빌드.
 
-### P2 — 직접샘플 셰이더 (예정)
+### P2 — 직접샘플 셰이더 ✅ (완료·Metal 검증)
 `crates/shader/shaders/mesh_sdf_sample.slang`: `p`→셀 조회→후보 인스턴스별 `lp=inv_world·p`,
 `t=saturate(...)`, 아틀라스 트라이리니어·`·dist_scale`, nearest-surface-wins min. `clipmap.slang`
-`cm_geo_march/inside`가 `count==0`이면 위임, 아니면 기존 dense 클립맵. albedo는 1차엔 dense 유지
-(증상 2개는 순수 지오메트리 정밀도 문제 → SDF만으로 해결; per-mesh albedo 아틀라스는 후속).
+`cm_geo_march/inside/albedo`가 `count==0`이면 위임(단일 진입점 → 전 소비자 승계). albedo는 dense 유지.
+
+**설계 정정 — 대체가 아니라 하이브리드(coarse+atlas).** per-mesh 필드는 자기 표면 근처 거리만 알아
+sphere-march의 빈 공간 스텝에 전역 하한이 필요 → **coarse dense 48³를 유지**하고
+`min(dense, atlas)`. 빈 공간은 dense가 안전한 롱스텝을 주고, 표면 근처는 atlas 정밀거리가 등가면을
+실제 얇은 지오로 끌어당김(dense가 뭉갠 디테일 복원). **dense 해상도는 절대 안 올림 — 정밀도는 전부
+atlas에서.** 헤더 `dense_sdf_idx`가 coarse 필드를 실어 나름. (원계획의 "dense 합성 폐기"는
+하이브리드로 전환: dense는 48³ coarse로 상시 유지, 다만 다신 해상도 올릴 필요 없음.)
+
+**부수 픽스 (커밋 `57c8b0e`)**: 셰이더 쿡 캐시가 공유 include(clipmap/surface_cache/gdf_bounce/…)
+편집 시 무효화 안 됨 → stale 바이트코드 배포하던 잠복 버그. `SHARED_INCLUDES` 한 리스트로
+base_hash + rerun-if-changed 통합.
+
+### P3/P4 — 검증 결과 (Metal, RELEASE)
+- **갤러리 바이트 동일**: `--screenshot-clean` SHA `af70c1a5…` **정확히 일치** (전 셰이더 재컴파일해도
+  결정론적 slangc → 비트 동일; 콘텐츠 전용이라 앵커 무영향). #1 게이트 PASS.
+- **직접샘플 동작**: `LEVEL=sponza_intel`(426 유니크 메시 = 64슬롯 불가 케이스)에서 아틀라스
+  392×350×382 (209.6 MB) **1 볼륨 슬롯**에 팩, 크래시 없음.
+- **정밀도 효과**: dense 대비 뷰티 픽셀 31% 변화(>4), 차이가 **얇은 지오(커튼 주름·아이비 잎·기둥
+  엣지)에 집중** — 개선 시그니처(무작위 노이즈 아님). GDF AO 채널도 국소 리파인 확인.
+- **결정론**: run-to-run 바이트 동일 확인.
+- **DX≡VK**: Windows 동결 → **보류**(플랜 하드룰대로 Metal 검증 + 명시).
+
+**미결정 (사용자 확인) — 기본값 승격 여부.** 하이브리드라 direct-sample은 **순수 가산**(dense 위에
+209MB atlas). CLAUDE.md 룰3 "heavy=opt-in"에 따라 현재 **`P11_DIRECT_SDF` 옵트인(기본 off)** 유지.
+콘텐츠 기본 승격하려면 선결: (a) atlas 메모리 절감(스파스 브릭/가변타일 다운샘플) + (b) DX≡VK 검증.
 
 ## 배경 (이번 세션 산출물, main에 머지됨)
 GI-on-distance-field 비주얼라이저(`P_WRC_VIZ` 월드-캐시 소스 / `P_SC_VIZ` 서페이스-캐시 고해상 소스),
