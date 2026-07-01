@@ -734,9 +734,11 @@ impl GdfSystem {
         //   0: float3 grid_min, uint atlas_sampled_idx
         //  16: float3 grid_max, uint res
         //  32: uint4  instance_buf, cell_buf, index_buf, instance_count
-        //  48: uint4  albedo_r, albedo_g, albedo_b, _
+        //  48: uint4  albedo_r, albedo_g, albedo_b, dense_sdf_idx
         //  64: float3 scene_aabb_min, _
         //  80: float3 scene_aabb_max, _
+        // dense_sdf_idx is the coarse whole-scene field: the shader marches on it (safe
+        // empty-space stepping) and takes min(dense, atlas) near surfaces for precision.
         let alb = match self.scene_albedo.as_ref() {
             Some(v) => [
                 v[0].sampled_index(),
@@ -763,7 +765,7 @@ impl GdfSystem {
         pu(&mut h, alb[0]);
         pu(&mut h, alb[1]);
         pu(&mut h, alb[2]);
-        pu(&mut h, 0);
+        pu(&mut h, self.scene_gdf.as_ref().unwrap().sampled_index());
         for a in self.scene_aabb_min {
             pf(&mut h, a);
         }
