@@ -375,22 +375,27 @@ pub fn preset(q: RenderQuality) -> QualityPreset {
             firefly_clamp: true,
             shadow_softness: 0.0,
             shadow_taps: 16,
-            cache_relight_period: 128,
+            // Moderate cache amortization (was 128): the surface-cache relight is nearly free on a
+            // dense scene (Intel Sponza ~0.02ms — short SW-RT rays), so a shorter period buys crisper
+            // moving-camera GI at negligible cost. UE ships up to 128 at its low tier; 64 is a balance.
+            cache_relight_period: 64,
             gi_half_res: true,
             cache_relight_spp: 1,
             reflect_half_res: true,
-            render_scale: 0.67,
+            render_scale: 0.67, // UE "Quality" upscale band; ~72fps on Intel Sponza after the IBL fix
             gdf_cone_k: 0.06,
             gi_res_div: 4,
-            // 1/6-res reflection: gdf_reflect scales only with trace resolution (measured), and the
-            // reflection is roughness-gated (>0.4 → GDF fallback) + temporally accumulated, so on
-            // rough-dominant content this is byte-identical (Sponza max Δ18 on <0.01% px). Smooth
-            // mirrors read softer than div=4 — override `P_REFLECT_RES_DIV=4` for mirror-heavy content.
+            // 1/6-res reflection: the reflection resolve (reflect_temporal) also runs at this res, so
+            // div=4 measured ~1.17× frame cost — too much fanless-M3 thermal margin for the mirror
+            // sharpness (Intel Sponza is rough-dominant, so 1/6 reads fine). `P_REFLECT_RES_DIV=4`
+            // for mirror-heavy content when cool.
             reflect_res_div: 6,
-            // 1/4-res AO: AO is a very low-frequency contact term the guided upsample reconstructs
-            // within 8-bit precision (byte-identical on Sponza); a standard AO downsample.
-            ao_res_div: 4,
-            gi_atrous_steps: 1, // single à-trous: sparse GI is temporally denoised + upsampled
+            // Half-res AO (was 1/4): a standard AO downsample; sharper contact than 1/4 at trivial cost.
+            ao_res_div: 2,
+            // Single à-trous (the second full-res pass measured ~1.36× frame cost on Intel Sponza —
+            // too much thermal margin on the fanless M3 for the GI-cleanliness gain). The sparse GI is
+            // temporally EMA-denoised + upsampled; `P_GI_ATROUS_STEPS=2` for cleaner GI when cool.
+            gi_atrous_steps: 1,
             reflect_history_clamp: 1, // hard (matches Med) — kills rotation smear
             reflect_clamp_gamma: 1.25,
             gi_temporal_clamp: 0.0,
