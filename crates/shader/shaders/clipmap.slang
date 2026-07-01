@@ -13,11 +13,17 @@
 // `albedo_r == 0xFFFFFFFF` ⇒ no albedo volume on this clipmap (constant fallback).
 //
 // Requires "bindless.slang" (the `g` ParameterBlock) included first.
+//
+// Direct-sample override (per-mesh-sdf-direct-sample-plan.md): when `count == 0`, `desc` is a
+// per-mesh-SDF header, not a clipmap level array — the `cm_geo_*` / `cm_albedo` below delegate to
+// `mesh_sdf_sample.slang` (per-mesh atlas + cell grid). One switch point ⇒ every SW-RT consumer
+// inherits it. `count >= 1` is the legacy dense clipmap path (unchanged; gallery byte-identical).
+#include "mesh_sdf_sample.slang"
 
 struct ClipMap
 {
     uint desc;  // storage_buffers[] index of the descriptor (above)
-    uint count; // level count (1 = single volume = legacy)
+    uint count; // level count (1 = single volume = legacy; 0 = direct per-mesh sampling)
 };
 
 float3 cm_min(ClipMap c, uint i)
@@ -38,6 +44,8 @@ uint4 cm_idx(ClipMap c, uint i)
 // sensibly). Single level ⇒ identical to the legacy `geo_march`.
 float cm_geo_march(ClipMap c, float3 p, float clamp_d)
 {
+    if (c.count == 0u)
+        return ms_geo(c.desc, p, clamp_d);
     for (uint i = 0u; i + 1u < c.count; i++)
     {
         float3 mn = cm_min(c, i);
@@ -63,6 +71,8 @@ float cm_geo_march(ClipMap c, float3 p, float clamp_d)
 // every level. Single level ⇒ identical to the legacy `geo_inside`.
 float cm_geo_inside(ClipMap c, float3 p, float clamp_d)
 {
+    if (c.count == 0u)
+        return ms_geo(c.desc, p, clamp_d);
     for (uint i = 0u; i + 1u < c.count; i++)
     {
         float3 mn = cm_min(c, i);
@@ -86,6 +96,8 @@ float cm_geo_inside(ClipMap c, float3 p, float clamp_d)
 // identical to legacy.
 float3 cm_albedo(ClipMap c, float3 p, float constant_fallback)
 {
+    if (c.count == 0u)
+        return ms_albedo(c.desc, p, constant_fallback);
     for (uint i = 0u; i + 1u < c.count; i++)
     {
         float3 mn = cm_min(c, i);
@@ -113,3 +125,4 @@ float3 cm_albedo(ClipMap c, float3 p, float constant_fallback)
                   g.volumes[idx.z].SampleLevel(g.samp, u, 0.0).x,
                   g.volumes[idx.w].SampleLevel(g.samp, u, 0.0).x);
 }
+

@@ -19,6 +19,24 @@ use std::sync::OnceLock;
 const RT_PIPELINE_ISECT_KEY: &str = "rt_pipeline_isect";
 const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
 
+/// Shared `#include` files that are not JOBS themselves but are pulled in by shaders that are.
+/// Every one is folded into the cook cache's `base_hash` and emitted as `rerun-if-changed`, so
+/// editing any of them recompiles all dependents (they include no per-job tracking otherwise —
+/// an omitted entry silently ships stale bytecode). Keep in sync with the `#include`s under
+/// `shaders/` (a non-JOB `.slang` — or the RT-pipeline root-sig JSON — belongs here).
+const SHARED_INCLUDES: [&str; 10] = [
+    "bindless.slang",
+    "rt_common.slang",
+    "rt_pipeline_metal_rootsig.json",
+    "clipmap.slang",
+    "mesh_sdf_sample.slang",
+    "gdf_bounce.slang",
+    "octahedral.slang",
+    "sky_common.slang",
+    "surface_cache.slang",
+    "wrc_common.slang",
+];
+
 // FNV-1a 64-bit — dependency-free content hash for the shader cook cache (Phase 12
 // M4, shader-asset-cache.md §4 option A). Collision risk is irrelevant for a build
 // cache key; this keeps `crates/shader` at zero build-dependencies.
@@ -791,11 +809,13 @@ fn main() {
     for job in JOBS {
         println!("cargo:rerun-if-changed=shaders/{}", job.src);
     }
-    // Shared includes are not in JOBS but several shaders `#include` them; watch
-    // them explicitly so edits trigger a recompile of the including shaders.
-    println!("cargo:rerun-if-changed=shaders/bindless.slang");
-    println!("cargo:rerun-if-changed=shaders/rt_common.slang");
-    println!("cargo:rerun-if-changed=shaders/rt_pipeline_metal_rootsig.json");
+    // Shared includes are not in JOBS but several shaders `#include` them; watch them
+    // explicitly (and fold them into `base_hash` below) so an edit both re-runs this
+    // script and invalidates the cache of every shader that includes them. Missing one
+    // silently ships stale bytecode — the whole set must be listed.
+    for inc in SHARED_INCLUDES {
+        println!("cargo:rerun-if-changed=shaders/{inc}");
+    }
     println!("cargo:rerun-if-env-changed=DXC");
     println!("cargo:rerun-if-env-changed=METAL_SHADERCONVERTER");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
@@ -845,11 +865,7 @@ fn main() {
     let manifest_path = cache_dir.join("manifest.txt");
     let mut manifest = load_manifest(&manifest_path);
     let mut base_hash = fnv1a(&slangc_version(&slangc), FNV_OFFSET);
-    for inc in [
-        "bindless.slang",
-        "rt_common.slang",
-        "rt_pipeline_metal_rootsig.json",
-    ] {
+    for inc in SHARED_INCLUDES {
         if let Ok(bytes) = std::fs::read(shader_dir.join(inc)) {
             base_hash = fnv1a(&bytes, base_hash);
         }
