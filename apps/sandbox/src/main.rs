@@ -32,6 +32,7 @@ use tracing::info;
 mod app;
 mod camera;
 mod clipmap;
+mod cluster;
 mod compose;
 mod cull;
 mod deferred;
@@ -56,6 +57,7 @@ mod smoketest;
 mod taau;
 mod world;
 use app::*;
+use cluster::{ClusterLight, ClusterSystem};
 use cull::*;
 use deferred::*;
 use dreamcoast_scene::{LocalTransform, MeshInstance, World};
@@ -93,9 +95,24 @@ const GB_NORMAL_FMT: Format = Format::Rgba16Float;
 const GB_MATERIAL_FMT: Format = Format::Rgba8Unorm;
 const GB_POSITION_FMT: Format = Format::Rgba16Float;
 /// Per-frame globals slice size (256-byte aligned for D3D12 root CBV / Vulkan
-/// dynamic UBO offset). 512 holds the lighting globals plus the light
-/// view-projection matrix.
-const GLOBALS_SLICE: u64 = 512;
+/// dynamic UBO offset). 768 holds the lighting globals, the light view-projection
+/// matrix, and (PR-6) the clustered-lighting view-Z row + froxel params.
+const GLOBALS_SLICE: u64 = 768;
+
+/// Clustered light culling froxel grid (PR-6). Single source of truth mirrored by
+/// `CLUSTER_X/Y/Z` in `light_cluster_common.slang`. 16×9 tiles matches 16:9; 24
+/// exponential Z slices is the DOOM-2016-era default. Bump for a higher RenderQuality
+/// tier (also grows the grid/index storage buffers via `CLUSTER_COUNT`).
+const CLUSTER_X: u32 = 16;
+const CLUSTER_Y: u32 = 9;
+const CLUSTER_Z: u32 = 24;
+const CLUSTER_COUNT: u32 = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
+/// Max lights binned per cluster (mirrors `MAX_LIGHTS_PER_CLUSTER` in the shader).
+const MAX_LIGHTS_PER_CLUSTER: u32 = 128;
+/// Camera near/far — single source of truth for the scene projection AND the clustered
+/// froxel Z slicing (they must agree so cluster slices span the actual view frustum).
+const CLUSTER_Z_NEAR: f32 = 0.05;
+const CLUSTER_Z_FAR: f32 = 100.0;
 /// Directional shadow map resolution (square).
 const SHADOW_SIZE: u32 = 2048;
 /// The ground plane's linear albedo — the single source of truth shared by the
@@ -247,6 +264,11 @@ struct Globals {
     probe_box_min: [f32; 4],    // xyz reflection proxy AABB min corner
     probe_box_max: [f32; 4],    // xyz reflection proxy AABB max corner
     prev_view_proj: [f32; 16],  // world -> previous clip (Stage C7 SSR history reprojection)
+    // Clustered light culling (PR-6). `cluster_view_z_row` is row 2 of the world->view matrix
+    // (positive linear view depth = -dot(row, [world,1])); `cluster_params` = (z_near, z_far, 0, 0)
+    // for the froxel Z slicing. Unused on the brute-force path (CLUSTERED_LIGHTS off).
+    cluster_view_z_row: [f32; 4],
+    cluster_params: [f32; 4],
 }
 
 fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
@@ -455,6 +477,9 @@ struct App {
     reflect: ReflectSystem,
     particles: ParticleSystem,
     cull: CullSystem,
+    /// Clustered light culling (PR-6). `None` where compute is unavailable; the feature
+    /// stays off. Gated on `clustered_lights` (`CLUSTERED_LIGHTS=1`).
+    cluster: Option<ClusterSystem>,
     rt: RtSystem,
     ibl: IblSystem,
 
@@ -574,6 +599,13 @@ struct App {
     /// ~0.6 content). Written to `globals.probe_box_max.w`; see pbr.slang. `P_GI_MULTIBOUNCE`.
     gi_multibounce: f32,
     point_lights_on: bool,
+    /// Clustered light culling on (PR-6, `CLUSTERED_LIGHTS=1`). Off = brute-force loop.
+    clustered_lights: bool,
+    /// A/B baseline (`CLUSTERED_BRUTE=1`): upload the light buffer but loop all lights (no
+    /// froxel list) — for profiling clustered vs brute-force on the same light set.
+    clustered_brute: bool,
+    /// Deterministic test-light count (`TEST_LIGHTS=N`, PR-6 scale proof). 0 = off.
+    test_lights: u32,
     shadows_on: bool,
     shadow_bias: f32,
     // PCSS-lite penumbra scale (max soft-shadow radius in shadow-map UV); 0 = hard 3x3 PCF.
@@ -868,6 +900,11 @@ impl App {
         // against the frustum and writes an indirect draw; the draw renders only the
         // visible instances (see `cull.rs`).
         let cull = CullSystem::new(&device, backend, compute_supported, swapchain.format())?;
+
+        // Clustered light culling (PR-6): a compute pass bins the scene's point lights into a
+        // view-frustum froxel grid so the lighting pass loops only its cluster's lights. `None`
+        // where compute is unavailable; opt-in via `CLUSTERED_LIGHTS=1` (see `cluster.rs`).
+        let cluster = ClusterSystem::new(&device, backend, compute_supported)?;
 
         // Clip-space Y orientation for the full-screen passes (Vulkan = 1, D3D12 /
         // Metal = 0; both have a Y-up NDC with a top-left framebuffer origin).
@@ -1804,6 +1841,21 @@ impl App {
         // On by default; `NO_POINT_LIGHTS=1` disables them (the path tracer has no
         // point lights, so a fair raster-vs-ground-truth comparison turns these off).
         let point_lights_on = std::env::var_os("NO_POINT_LIGHTS").is_none();
+        // Clustered light culling (PR-6): opt-in seam. Default off = the brute-force point-light
+        // loop (byte-identical anchor); on routes lighting through the froxel light list. Only
+        // when the cluster compute system built (compute available).
+        let clustered_lights = std::env::var_os("CLUSTERED_LIGHTS").is_some() && cluster.is_some();
+        // A/B baseline (`CLUSTERED_BRUTE=1`): upload the same light buffer but loop ALL lights in
+        // the shader (no froxel list) so brute-force vs clustered PROFILE_GPU can be compared on the
+        // identical light set at scale. Implies the clustered light upload path (needs the buffer).
+        let clustered_brute = std::env::var_os("CLUSTERED_BRUTE").is_some() && cluster.is_some();
+        // Deterministic stress spawner (PR-6 scale proof): `TEST_LIGHTS=N` places N point lights
+        // on a fixed grid across the scene bounds (no animation, fixed layout) so brute-force vs
+        // clustered can be profiled at scale. 0 = off (level/gallery lights only).
+        let test_lights: u32 = std::env::var("TEST_LIGHTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         // RenderQuality tier (Stage D): `RENDER_QUALITY=low|med|high` (unset => platform default).
         // The platform default consults the GPU identity (macOS perf, axis A): an Apple GPU maps to
         // the aggressive `Apple` tier, every other / unknown GPU (incl. all VK/D3D12 adapters) stays
@@ -2260,6 +2312,7 @@ impl App {
             reflect,
             particles,
             cull,
+            cluster,
             rt,
             ibl,
             _textures: textures,
@@ -2344,6 +2397,9 @@ impl App {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(if gallery_scene { 0.0 } else { 0.6 }),
             point_lights_on,
+            clustered_lights,
+            clustered_brute,
+            test_lights,
             shadows_on: true,
             shadow_bias: 0.0015,
             // PCSS-lite soft shadows: an opt-in quality tier (the scalability seam).
@@ -3080,8 +3136,12 @@ impl App {
             scene = streaming.build_scene();
         }
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
-        let proj_noflip =
-            Mat4::perspective_rh(60f32.to_radians(), cw as f32 / ch as f32, 0.05, 100.0);
+        let proj_noflip = Mat4::perspective_rh(
+            60f32.to_radians(),
+            cw as f32 / ch as f32,
+            CLUSTER_Z_NEAR,
+            CLUSTER_Z_FAR,
+        );
         let mut proj = proj_noflip;
         if self.backend == BackendKind::Vulkan {
             proj.y_axis.y *= -1.0; // Vulkan clip-space Y points down
@@ -3867,6 +3927,12 @@ impl App {
             // Last frame's view-projection (updated end-of-frame) so the SSR history
             // sample reprojects the world hit point into the previous frame (Stage C7b).
             prev_view_proj: self.prev_view_proj,
+            // Clustered lighting (PR-6): row 2 of the world->view matrix so the shader can
+            // recover positive linear view depth from a G-buffer world position, plus the
+            // camera near/far for the froxel Z slicing. `view` is column-major (glam), so
+            // row 2 = the .z component of each column.
+            cluster_view_z_row: [view.x_axis.z, view.y_axis.z, view.z_axis.z, view.w_axis.z],
+            cluster_params: [CLUSTER_Z_NEAR, CLUSTER_Z_FAR, 0.0, 0.0],
         };
         let globals_offset = fif as u64 * GLOBALS_SLICE;
         // Firefly clamp ceiling (raw radiance, max component). ~8 keeps diffuse + moderate
@@ -3874,6 +3940,46 @@ impl App {
         let firefly_max = if self.firefly_clamp { 8.0f32 } else { 1e30 };
         self.deferred
             .write_globals(globals_offset, globals_bytes(&globals))?;
+
+        // Clustered light culling (PR-6): assemble this frame's point-light list and upload it
+        // to the cluster/light buffer, returning the bindless indices the build + lighting passes
+        // read. Done BEFORE the graph is built (host write + possible realloc mutate `self.cluster`;
+        // the graph then borrows it immutably for the record closures).
+        //
+        // Parity note: the scene's authored point lights get an EFFECTIVELY INFINITE radius so
+        // every cluster bins them — the shader then accumulates the SAME lights in the SAME order
+        // as the brute-force loop (which applies no distance cutoff), so the result is byte-identical
+        // for scenes with few lights. The deterministic TEST_LIGHTS stress grid gets a finite radius
+        // (that's where per-cluster culling actually pays off).
+        let cluster_indices: Option<(u32, u32, u32, u32)> = if let (true, Some(cluster_sys)) = (
+            self.clustered_lights || self.clustered_brute,
+            self.cluster.as_mut(),
+        ) {
+            let mut lights: Vec<ClusterLight> = Vec::new();
+            let n = if self.point_lights_on {
+                point_count as usize
+            } else {
+                0
+            };
+            for i in 0..n.min(4) {
+                lights.push(ClusterLight {
+                    position: [point_pos[i][0], point_pos[i][1], point_pos[i][2]],
+                    radius: CLUSTER_Z_FAR * 4.0, // "infinite": covers the whole frustum
+                    color: [point_color[i][0], point_color[i][1], point_color[i][2]],
+                    intensity: point_color[i][3],
+                });
+            }
+            if self.test_lights > 0 {
+                lights.extend(test_light_grid(
+                    self.test_lights,
+                    self.scene_center,
+                    self.scene_radius,
+                ));
+            }
+            Some(cluster_sys.upload(&self.device, fif, &lights)?)
+        } else {
+            None
+        };
 
         // Phase 8 M4: manage the path tracer's persistent accumulation buffer and
         // reset key BEFORE building the render graph — the fallible buffer
@@ -4699,6 +4805,53 @@ impl App {
             }
             _ => None,
         };
+        // Clustered light culling (PR-6): build this frame's froxel light lists, then hand the
+        // buffer ids to the lighting pass. The build pass writes the grid/index externals, so the
+        // lighting pass (which reads them) sequences after it. `None` = brute-force point loop.
+        let cluster_lighting = match (cluster_indices, self.cluster.as_ref()) {
+            (Some((grid_idx, index_idx, light_idx, light_count)), Some(cluster_sys))
+                if self.clustered_lights =>
+            {
+                let (grid_ext, index_ext) = ClusterSystem::import(&mut graph);
+                let view_z_row = [view.x_axis.z, view.y_axis.z, view.z_axis.z, view.w_axis.z];
+                cluster_sys.record_build(
+                    &mut graph,
+                    grid_ext,
+                    index_ext,
+                    fif,
+                    light_count,
+                    view_z_row,
+                    inv_view_proj,
+                    [eye.x, eye.y, eye.z],
+                    CLUSTER_Z_NEAR,
+                    CLUSTER_Z_FAR,
+                    cw,
+                    ch,
+                );
+                Some((
+                    grid_ext,
+                    index_ext,
+                    grid_idx,
+                    index_idx,
+                    light_idx,
+                    light_count,
+                ))
+            }
+            // Brute-force A/B: upload the light buffer but pass index_buf = MAX (loop all lights,
+            // no froxel list). Import a dummy external so the tuple shape holds; no build pass.
+            (Some((grid_idx, _, light_idx, light_count)), Some(_)) if self.clustered_brute => {
+                let (grid_ext, index_ext) = ClusterSystem::import(&mut graph);
+                Some((
+                    grid_ext,
+                    index_ext,
+                    grid_idx,
+                    u32::MAX,
+                    light_idx,
+                    light_count,
+                ))
+            }
+            _ => None,
+        };
         self.deferred.record_lighting(
             &mut graph,
             hdr,
@@ -4723,6 +4876,7 @@ impl App {
             } else {
                 u32::MAX
             },
+            cluster_lighting,
         );
         // Auto-exposure metering: read this frame's lit HDR, adapt the exposure for next frame.
         // After lighting (the `hdr` read orders it). `adapt` = 1-exp(-dt·speed) (eye/iris speed).
@@ -5579,6 +5733,55 @@ impl App {
 }
 
 /// View the globals struct as bytes for upload.
+/// Deterministic stress-test point lights (PR-6 `TEST_LIGHTS=N`): a fixed cubic-ish grid of
+/// `n` lights filling the scene's bounding volume, with a fixed rotating palette and a finite
+/// influence radius so per-cluster culling actually excludes most of them per cluster. No time
+/// dependence — the layout is a pure function of (n, center, radius), so runs are reproducible
+/// and A/B comparable (brute-force vs clustered) at identical light sets.
+fn test_light_grid(n: u32, center: Vec3, radius: f32) -> Vec<ClusterLight> {
+    // Cube-root grid dimensions (as close to equal as possible), filling [-1,1]^3 of the scene
+    // bounds scaled up a bit so lights sit among the geometry.
+    let side = (n as f32).cbrt().ceil() as u32;
+    let extent = radius * 1.4;
+    // Per-light influence radius: a couple of grid cells so neighbours overlap but distant
+    // clusters cull the light. Independent of n's exact value (deterministic).
+    let cell = (2.0 * extent) / side.max(1) as f32;
+    let light_radius = cell * 1.5;
+    // Fixed candela so N lights of this radius stay visible but bounded.
+    let intensity = radius * radius * 2.0;
+    let palette = [
+        [1.0, 0.4, 0.3],
+        [0.3, 0.6, 1.0],
+        [0.5, 1.0, 0.4],
+        [1.0, 0.9, 0.4],
+        [0.8, 0.4, 1.0],
+    ];
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let gx = i % side;
+        let gy = (i / side) % side;
+        let gz = i / (side * side);
+        let f = |g: u32| -> f32 {
+            if side <= 1 {
+                0.0
+            } else {
+                (g as f32 / (side - 1) as f32) * 2.0 - 1.0
+            }
+        };
+        out.push(ClusterLight {
+            position: [
+                center.x + f(gx) * extent,
+                center.y + f(gy) * extent,
+                center.z + f(gz) * extent,
+            ],
+            radius: light_radius,
+            color: palette[(i as usize) % palette.len()],
+            intensity,
+        });
+    }
+    out
+}
+
 fn globals_bytes(g: &Globals) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(

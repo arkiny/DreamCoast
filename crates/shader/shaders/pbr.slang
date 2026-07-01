@@ -18,6 +18,7 @@
 // migration (Vulkan/D3D12 parity pending the Windows box).
 
 #include "bindless.slang"
+#include "light_cluster_common.slang"
 
 static const float PI = 3.14159265359;
 
@@ -46,6 +47,13 @@ struct PushConstants
                        // occludes the IBL DIFFUSE skylight. 0xFFFFFFFF = absent -> 1.0 (gallery anchor).
     float skyvis_tint; // neutral leak as a fraction of the occluded skylight luminance.
     float skyvis_min_occ; // min sky-visibility floor (lerp V toward 1); higher = weaker occlusion.
+    // Clustered light culling (PR-6). When cluster_grid_buf != 0xFFFFFFFF the point-light
+    // loop reads only this pixel's froxel light list (storage buffers below) instead of the
+    // globals.point_pos[] brute-force array. All three 0xFFFFFFFF = brute-force (gallery anchor).
+    uint cluster_grid_buf;  // per-cluster light COUNT u32[CLUSTER_COUNT]
+    uint cluster_index_buf; // flat light-index list u32[CLUSTER_COUNT * MAX_LIGHTS_PER_CLUSTER]
+    uint cluster_light_buf; // packed Light[] (position/radius/color/intensity)
+    uint cluster_light_count; // number of lights in cluster_light_buf (dbg heatmap normalisation)
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -68,6 +76,9 @@ struct Globals
     float4 probe;         // xyz = reflection-probe capture centre, w = parallax on (1) / off (0)
     float4 probe_box_min; // xyz = reflection proxy AABB min corner (w unused)
     float4 probe_box_max; // xyz = reflection proxy AABB max corner (w unused)
+    float4x4 prev_view_proj; // world -> previous clip (SSR history reprojection; mirrors Rust)
+    float4 cluster_view_z_row; // row 2 of world->view: view_z = dot(row, float4(p,1)) (PR-6)
+    float4 cluster_params;     // x = z_near, y = z_far (clustered froxel Z slicing)
 };
 
 [[vk::push_constant]]
@@ -399,15 +410,72 @@ float4 fsMain(VSOutput input) : SV_Target
     // square `atten` converts candela → illuminance (lux) at the surface: E = I / d². (glTF
     // KHR_lights_punctual authors point/spot intensity in candela already; a light specified in
     // lumens Φ converts as I = Φ / 4π.)
-    int count = min(globals.counts.x, 4);
-    for (int i = 0; i < count; ++i)
+    //
+    // Clustered path (PR-6): when the cluster buffers are bound, iterate only this pixel's
+    // froxel light list. The list was built in ascending global-light-index order, and we
+    // read it in that same order, so with few lights (all in-cluster) the accumulation is
+    // bit-identical to the brute-force loop below. `lights_touched` feeds the debug heatmap.
+    uint lights_touched = 0;
+    if (pc.cluster_grid_buf != NO_TEXTURE)
     {
-        float3 to_light = globals.point_pos[i].xyz - world_pos;
-        float dist = length(to_light);
-        float3 l = to_light / max(dist, 1e-4);
-        float atten = 1.0 / max(dist * dist, 1e-4);
-        float3 radiance = globals.point_color[i].rgb * globals.point_color[i].a * atten;
-        lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
+        RWByteAddressBuffer lbuf = g.storage_buffers[pc.cluster_light_buf];
+        if (pc.cluster_index_buf == NO_TEXTURE)
+        {
+            // Brute-force-over-storage A/B baseline (CLUSTERED_BRUTE=1): loop ALL lights in the
+            // buffer, no froxel list. Same lights + same shader as the clustered path — only the
+            // culling differs, so the PROFILE_GPU delta isolates the culling's payoff at scale.
+            for (uint li = 0; li < pc.cluster_light_count; ++li)
+            {
+                Light L = load_light(lbuf, li);
+                float3 to_light = L.position - world_pos;
+                float dist = length(to_light);
+                float3 l = to_light / max(dist, 1e-4);
+                float atten = 1.0 / max(dist * dist, 1e-4);
+                float3 radiance = L.color * L.intensity * atten;
+                lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
+            }
+            lights_touched = pc.cluster_light_count;
+        }
+        else
+        {
+            // Positive linear view depth of this surface -> its froxel Z slice.
+            float view_z = -dot(globals.cluster_view_z_row, float4(world_pos, 1.0));
+            // Screen UV from the fullscreen fragment (input.uv is the [0,1] triangle uv;
+            // matches the cluster build's D3D-style uv->ndc — no Y flip, cancels in world).
+            float2 cuv = input.uv;
+            uint ci = cluster_index_for(cuv, view_z, globals.cluster_params.x,
+                                        globals.cluster_params.y);
+            RWByteAddressBuffer grid = g.storage_buffers[pc.cluster_grid_buf];
+            RWByteAddressBuffer index_list = g.storage_buffers[pc.cluster_index_buf];
+            uint lcount = grid.Load(ci * 4);
+            uint lbase = ci * MAX_LIGHTS_PER_CLUSTER;
+            for (uint k = 0; k < lcount; ++k)
+            {
+                uint li = index_list.Load((lbase + k) * 4);
+                Light L = load_light(lbuf, li);
+                float3 to_light = L.position - world_pos;
+                float dist = length(to_light);
+                float3 l = to_light / max(dist, 1e-4);
+                float atten = 1.0 / max(dist * dist, 1e-4);
+                float3 radiance = L.color * L.intensity * atten;
+                lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
+            }
+            lights_touched = lcount;
+        }
+    }
+    else
+    {
+        int count = min(globals.counts.x, 4);
+        for (int i = 0; i < count; ++i)
+        {
+            float3 to_light = globals.point_pos[i].xyz - world_pos;
+            float dist = length(to_light);
+            float3 l = to_light / max(dist, 1e-4);
+            float atten = 1.0 / max(dist * dist, 1e-4);
+            float3 radiance = globals.point_color[i].rgb * globals.point_color[i].a * atten;
+            lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
+        }
+        lights_touched = uint(count);
     }
 
     // Stage C2: GDF ambient occlusion, marched against the world-space scene GDF in a
@@ -470,6 +538,15 @@ float4 fsMain(VSOutput input) : SV_Target
     else if (dbg == 8) color = ambient * exposure; // IBL ambient only
     else if (dbg == 9) color = float3(gdf_ao);     // GDF AO factor
     else if (dbg == 10) color = gi * exposure;     // GDF indirect diffuse
+    else if (dbg == 11)                            // clustered light-count heatmap
+    {
+        // Per-pixel lights-touched as a blue->green->red ramp (0 = black). Normalised to a
+        // fixed 16-light budget so hot clusters (many overlapping lights) glow red.
+        float t = saturate(float(lights_touched) / 16.0);
+        color = float3(saturate(t * 2.0 - 1.0), saturate(1.0 - abs(t - 0.5) * 2.0), saturate(1.0 - t * 2.0));
+        if (lights_touched == 0)
+            color = float3(0.0);
+    }
 
     return float4(color, 1.0);
 }
