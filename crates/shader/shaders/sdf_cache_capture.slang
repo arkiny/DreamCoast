@@ -107,7 +107,18 @@ void cacheMain(uint3 tid: SV_DispatchThreadID)
             break;
     }
 
-    float3 albedo = valid > 0.5 ? albedo_at(hit_pos) : float3(0.0, 0.0, 0.0);
+    // C: stamp the card's drawable albedo (fine, true surface color) when bound; else fall
+    // back to the per-voxel albedo volume (legacy / gallery). The index is packed into the
+    // unused `aabb_min.w` slot; 0xFFFFFFFF = legacy. One float3 (12 B) per card.
+    float3 albedo = float3(0.0, 0.0, 0.0);
+    if (valid > 0.5)
+    {
+        uint card_albedo_index = asuint(pc.aabb_min.w);
+        if (card_albedo_index != 0xFFFFFFFFu)
+            albedo = asfloat(g.storage_buffers[card_albedo_index].Load3(card * 12u));
+        else
+            albedo = albedo_at(hit_pos);
+    }
     g.storage_buffers[pc.cache_pos_index].Store4(t * 16u, asuint(float4(hit_pos, valid)));
     g.storage_buffers[pc.cache_alb_index].Store4(t * 16u, asuint(float4(albedo, 0.0)));
 }

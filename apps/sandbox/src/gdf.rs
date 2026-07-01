@@ -76,11 +76,16 @@ pub(crate) struct GdfSystem {
     scene_albedo: Option<[Volume; 3]>,
     scene_tri_albedo: Option<StorageBuffer>,
     albedo_bake_pipeline: Option<ComputePipeline>,
-    /// Stage C8b: Lumen-style mesh-card surface cache. `cards` holds the per-object AABB-face
+    /// Stage C8b: mesh-card surface cache. `cards` holds the per-object AABB-face
     /// card records; `cache_pos` (hit pos + valid) and `cache_albedo` are the captured-once
     /// geometry atlases (flat storage buffers, one float4 / texel). C8b2 adds the re-lit
     /// radiance ping-pong; C8b3 looks it up at GI / reflection hits.
     cards: Option<StorageBuffer>,
+    /// C: per-card source albedo (the drawable's representative color, 12 B/card). The
+    /// capture stamps it onto the card so the GI/reflection cache carries the real surface
+    /// color instead of the blurred per-voxel albedo volume. `None` ⇒ legacy volume path
+    /// (gallery — keeps the byte-identical anchor).
+    card_src_albedo: Option<StorageBuffer>,
     cache_pos: Option<StorageBuffer>,
     cache_albedo: Option<StorageBuffer>,
     num_cards: u32,
@@ -402,6 +407,7 @@ impl GdfSystem {
             scene_albedo_cooked: false,
             scene_albedo: None,
             scene_tri_albedo: None,
+            card_src_albedo: None,
             albedo_bake_pipeline,
             cards: None,
             cache_pos: None,
@@ -746,6 +752,7 @@ impl GdfSystem {
         cards: &[u8],
         num_cards: u32,
         tile: u32,
+        card_albedo: Option<&[u8]>,
     ) -> anyhow::Result<()> {
         if self.cache_capture_pipeline.is_none() || num_cards == 0 {
             return Ok(());
@@ -759,6 +766,19 @@ impl GdfSystem {
             },
             cards,
         )?);
+        // C: the per-card source-albedo buffer (content only); the capture reads it instead
+        // of the per-voxel albedo volume. Absent ⇒ the legacy volume path (gallery anchor).
+        self.card_src_albedo = match card_albedo {
+            Some(bytes) if !bytes.is_empty() => Some(device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: bytes.len() as u64,
+                    stride: 4,
+                    indirect: false,
+                },
+                bytes,
+            )?),
+            _ => None,
+        };
         let texels = (num_cards * self.card_tile * self.card_tile) as u64;
         let make = || -> anyhow::Result<Option<StorageBuffer>> {
             Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
@@ -1111,6 +1131,12 @@ impl GdfSystem {
             .as_ref()
             .expect("cache albedo")
             .storage_index();
+        // C: per-card source-albedo buffer index (content), else sentinel ⇒ legacy volume.
+        let card_albedo_index = self
+            .card_src_albedo
+            .as_ref()
+            .map(|b| b.storage_index())
+            .unwrap_or(u32::MAX);
         let albedo = albedo_ext.and(self.scene_albedo.as_ref());
         let num_cards = self.num_cards;
         let num_texels = num_cards * self.card_tile * self.card_tile;
@@ -1170,6 +1196,7 @@ impl GdfSystem {
                     aabb_min,
                     aabb_max,
                     diag,
+                    card_albedo_index,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())
@@ -1252,6 +1279,13 @@ impl GdfSystem {
         let tracep = self.trace_pipeline.as_ref().expect("gdf trace pipeline");
         let out = graph.create_storage_image("scene_gdf_out", HDR_FORMAT, extent);
         let gdf_ext = graph.import_external("scene_gdf");
+        // Clay GDF viz: the scene's HDR sun (~1e5) over-exposes the flat clay through the
+        // shared tonemap; a gain brings it to a readable mid-grey. `GDF_VIEW_GAIN` env tunes it.
+        let view_gain = std::env::var("GDF_VIEW_GAIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(0.05);
+        let sun_intensity = sun_intensity * view_gain;
         let aabb_min = self.scene_aabb_min;
         let aabb_max = self.scene_aabb_max;
         if build {
@@ -1297,7 +1331,7 @@ impl GdfSystem {
                     ch,
                     flip_y,
                     sampled,
-                    0, // mode 0: sample the baked GDF (no analytic reference)
+                    2, // mode bit1: clay GDF viz (read the GDF shape, not a fake color)
                     clip.0,
                     clip.1,
                     aabb_min,
