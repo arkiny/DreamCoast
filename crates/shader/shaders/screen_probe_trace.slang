@@ -18,6 +18,7 @@
 #include "surface_cache.slang"
 #include "gdf_bounce.slang"
 #include "octahedral.slang"
+#include "wrc_common.slang"
 
 struct ProbeTracePush
 {
@@ -44,6 +45,10 @@ struct ProbeTracePush
     uint clip_desc;         // clipmap descriptor storage-buffer index
     uint clip_count;        // clipmap level count
     float clamp_max;        // firefly clamp: max bounce-sample radiance component (1e30 = off)
+    uint wrc_atlas;         // world radiance cache atlas (sampled); 0xFFFFFFFF = unbound
+    uint wrc_grid;          // world cache probes per side per level
+    uint wrc_oct;           // world cache octahedral texels per side
+    uint pad0;
 };
 
 [[vk::push_constant]]
@@ -116,6 +121,24 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 origin = world_pos + normal * pc.params.y;
     float escaped;
     float3 radiance = bs_trace_bounce(bs, origin, dir, escaped);
+
+    // Off-screen / far-field / infinite-bounce fallback: a ray that escaped the local trace
+    // (would otherwise contribute 0) reads the world radiance cache at the PROBE ORIGIN in the
+    // ray direction. The cache probe nearest this on-surface origin already integrated that
+    // direction over the whole scene with multi-bounce (its EMA self-sampling), so it supplies
+    // the far-field / multi-bounce radiance the single escaped ray missed. Sampling at the origin
+    // (inside the scene) — not the far point (outside every clipmap level) — is what makes the
+    // fallback land inside the cache. Unbound (0xFFFFFFFF) => no cache => unchanged.
+    if (escaped > 0.5 && pc.wrc_atlas != 0xFFFFFFFFu)
+    {
+        Wrc w;
+        w.atlas = pc.wrc_atlas;
+        w.clip_desc = pc.clip_desc;
+        w.levels = pc.clip_count;
+        w.grid = pc.wrc_grid;
+        w.oct = pc.wrc_oct;
+        radiance = wrc_sample(w, origin, dir);
+    }
 
     // Firefly clamp (hue-preserving): one bright sample can't dominate the gather.
     float m = max(radiance.r, max(radiance.g, radiance.b));

@@ -19,6 +19,7 @@ use crate::app::load_compute_shader;
 use crate::push::{
     gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_gi_upsample_push, gdf_temporal_push,
     gi_volume_push, screen_probe_filter_push, screen_probe_integrate_push, screen_probe_trace_push,
+    wrc_update_push,
 };
 
 /// Screen-space radiance probe density: one probe per `SP_DOWNSAMPLE`x`SP_DOWNSAMPLE` screen
@@ -26,6 +27,11 @@ use crate::push::{
 const SP_DOWNSAMPLE: u32 = 16;
 /// Octahedral radiance-tile resolution per probe (texels per side). Reference starts 8.
 const SP_OCT_RES: u32 = 8;
+
+/// World radiance cache (P4) probe grid resolution per clipmap level (probes per side).
+const WRC_GRID: u32 = 16;
+/// World radiance cache octahedral tile resolution (texels per side).
+const WRC_OCT: u32 = 8;
 
 /// World-space directional-irradiance volume (radiance-cache) probe-grid resolution.
 const GI_VOL_DIM: u32 = 32;
@@ -67,6 +73,13 @@ pub(crate) struct GiSystem {
     sp_integrate_pipeline: Option<ComputePipeline>,
     /// P2 spatial cross-probe joint-bilateral filter of the radiance atlas (optional).
     sp_filter_pipeline: Option<ComputePipeline>,
+    /// P4 world radiance cache: update pipeline + ping-pong atlas buffers (octahedral radiance
+    /// tiles for `levels * WRC_GRID^3` clipmap probes, 16 B/texel). Persists across frames for
+    /// EMA accumulation + infinite bounce; (re)allocated when the clipmap level count changes.
+    wrc_pipeline: Option<ComputePipeline>,
+    wrc_atlas: [Option<StorageBuffer>; 2],
+    wrc_levels: u32,
+    wrc_frame: u32,
     /// UE-style indoor skylight occlusion: directional sky-visibility SH (4 scalar coeffs/slot,
     /// ping-pong = 8 volumes), filled in the same `gi_volume` pass. Contiguous per slot (base only).
     gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2],
@@ -163,6 +176,13 @@ impl GiSystem {
             "screen_probe_filter",
             128,
         )?;
+        let wrc_pipeline = compute(
+            dreamcoast_shader::wrc_update_cs_spirv,
+            dreamcoast_shader::wrc_update_cs_dxil,
+            dreamcoast_shader::wrc_update_cs_metallib,
+            "wrc_update",
+            128,
+        )?;
         // 24 R32F volumes: ping-pong [read|write] × 12 SH coefficients. Empty (zero) at start = no
         // fill until the update converges; the lighting falls back gracefully (e = 0). Allocated
         // back-to-back so each slot's 12 volumes are contiguous in the bindless sampled AND storage
@@ -221,6 +241,10 @@ impl GiSystem {
             sp_trace_pipeline,
             sp_integrate_pipeline,
             sp_filter_pipeline,
+            wrc_pipeline,
+            wrc_atlas: [None, None],
+            wrc_levels: 0,
+            wrc_frame: 0,
         })
     }
 
@@ -371,6 +395,139 @@ impl GiSystem {
     }
     pub(crate) fn has_screen_probe(&self) -> bool {
         self.sp_trace_pipeline.is_some() && self.sp_integrate_pipeline.is_some()
+    }
+    pub(crate) fn has_wrc(&self) -> bool {
+        self.wrc_pipeline.is_some()
+    }
+
+    /// (Re)allocate the world radiance cache ping-pong atlas buffers for `levels` clipmap levels
+    /// (each `WRC_GRID^3` probes of `WRC_OCT^2` octahedral texels, 16 B/texel). Runs before the
+    /// graph (its `wait_idle` + alloc stay off the graph borrow), like `prepare_denoise`. No-op
+    /// without the pipeline or when the level count is unchanged.
+    pub(crate) fn prepare_wrc(&mut self, device: &Device, levels: u32) -> anyhow::Result<()> {
+        if self.wrc_pipeline.is_none() || levels == 0 {
+            return Ok(());
+        }
+        if self.wrc_levels != levels {
+            device.wait_idle()?;
+            let atlas_w = WRC_GRID * WRC_OCT;
+            let atlas_h = levels * WRC_GRID * WRC_GRID * WRC_OCT;
+            let bytes = (atlas_w as u64) * (atlas_h as u64) * 16;
+            let make = || -> anyhow::Result<Option<StorageBuffer>> {
+                Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
+                    size: bytes,
+                    stride: 16,
+                    indirect: false,
+                })?))
+            };
+            self.wrc_atlas = [make()?, make()?];
+            self.wrc_levels = levels;
+            self.wrc_frame = 0;
+        }
+        Ok(())
+    }
+
+    /// Advance the world-cache ping-pong (end-of-frame, after submit).
+    pub(crate) fn advance_wrc(&mut self) {
+        self.wrc_frame = self.wrc_frame.saturating_add(1);
+    }
+
+    /// P4: update the world radiance cache. Every clipmap probe re-traces its octahedral
+    /// directions into the scene GDF (shared bounce tracer) and EMA-accumulates into the write
+    /// atlas; escaped rays sample the previous atlas (infinite bounce + far-field). Returns the
+    /// write atlas `(storage_buffers[] index, graph write handle)` for the screen probes to
+    /// sample (the handle orders their trace after this update). `None` without the cache.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_wrc_update<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        scene_gdf: &'a Volume,
+        scene_gdf_ext: ResourceId,
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        clip: (u32, u32),
+        clip_vols: &'a [&'a Volume],
+        albedo: Option<(&'a [Volume; 3], ResourceId)>,
+        cache: Option<([u32; 5], ResourceId)>,
+        max_steps: u32,
+        cone_k: f32,
+        alpha: f32,
+    ) -> Option<(u32, ResourceId)> {
+        let pipe = self.wrc_pipeline.as_ref()?;
+        let levels = clip.1.max(1);
+        let write = (self.wrc_frame % 2) as usize;
+        let prev = ((self.wrc_frame + 1) % 2) as usize;
+        let write_idx = self.wrc_atlas[write].as_ref()?.storage_index();
+        let prev_idx = if self.wrc_frame == 0 {
+            u32::MAX
+        } else {
+            self.wrc_atlas[prev].as_ref()?.storage_index()
+        };
+        let reset = u32::from(self.wrc_frame == 0);
+        let diag = Self::diag(aabb_min, aabb_max);
+        let bias = diag * 0.004;
+        let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
+        let cache4 = [cache_idx[0], cache_idx[1], cache_idx[2], cache_idx[3]];
+        let cache_tile = cache_idx[4];
+        let atlas_w = WRC_GRID * WRC_OCT;
+        let atlas_h = levels * WRC_GRID * WRC_GRID * WRC_OCT;
+        let write_ext = graph.import_external("wrc_atlas_w");
+        let mut reads = vec![scene_gdf_ext];
+        if let Some((_, ext)) = albedo {
+            reads.push(ext);
+        }
+        if let Some((_, ext)) = cache {
+            reads.push(ext);
+        }
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "wrc_update",
+                storage_writes: vec![write_ext],
+                reads,
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(scene_gdf);
+                for v in clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
+                if let Some((vols, _)) = albedo {
+                    for v in vols.iter() {
+                        cmd.volume_to_sampled(v);
+                    }
+                }
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&wrc_update_push(
+                    sun_dir,
+                    sun_intensity,
+                    diag, // ray max distance
+                    bias,
+                    0.25, // sky fill radiance at the bounce hit
+                    0.7,  // constant hit-albedo fallback
+                    crate::GROUND_ALBEDO,
+                    cone_k,
+                    cache4,
+                    clip.0,
+                    levels,
+                    WRC_GRID,
+                    WRC_OCT,
+                    write_idx,
+                    prev_idx,
+                    cache_tile,
+                    max_steps,
+                    self.wrc_frame,
+                    reset,
+                    alpha,
+                    diag, // GDF sample distance clamp
+                    0.0,  // world ground plane y = 0
+                ));
+                cmd.dispatch(atlas_w.div_ceil(8), atlas_h.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        Some((write_idx, write_ext))
     }
     pub(crate) fn has_denoise(&self) -> bool {
         self.temporal_pipeline.is_some() && self.atrous_pipeline.is_some()
@@ -664,6 +821,10 @@ impl GiSystem {
         // P2: apply the spatial cross-probe joint-bilateral filter to the radiance atlas before
         // the gather (probe-neighborhood half kernel; 0 disables). Content quality knob.
         filter_half_kernel: u32,
+        // P4: world radiance cache sampled by escaped probe rays for off-screen / far-field /
+        // infinite bounce. `(storage_buffers[] index, graph write handle)`; the handle orders the
+        // trace after this frame's cache update. `None` = unbound (no cache fallback).
+        wrc: Option<(u32, ResourceId)>,
         // Returns `(gi_image, skyvis_image)`; the sky-vis image (indoor skylight occlusion) is
         // built from the probes' per-ray sky visibility, mirroring the volume GI path's output.
     ) -> (ResourceId, ResourceId) {
@@ -689,6 +850,11 @@ impl GiSystem {
             .unwrap_or(SP_OCT_RES)
             .clamp(4, 32);
 
+        let (wrc_atlas, wrc_ext) = match wrc {
+            Some((idx, ext)) => (idx, Some(ext)),
+            None => (u32::MAX, None),
+        };
+
         let probes_x = cw.div_ceil(ds);
         let probes_y = ch.div_ceil(ds);
         let atlas_w = probes_x * oct;
@@ -711,6 +877,10 @@ impl GiSystem {
             trace_reads.push(ext);
         }
         if let Some((_, ext)) = cache {
+            trace_reads.push(ext);
+        }
+        // Order the trace after this frame's world-cache update (escaped rays sample it).
+        if let Some(ext) = wrc_ext {
             trace_reads.push(ext);
         }
         graph.add_compute_pass(
@@ -765,6 +935,9 @@ impl GiSystem {
                     clip.0,
                     clip.1,
                     clamp_max,
+                    wrc_atlas,
+                    WRC_GRID,
+                    WRC_OCT,
                 ));
                 cmd.dispatch(atlas_w.div_ceil(8), atlas_h.div_ceil(8), 1);
                 Ok(())
