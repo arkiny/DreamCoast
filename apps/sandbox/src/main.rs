@@ -2044,9 +2044,17 @@ impl App {
         // latency, hidden by the cache's existing amortization + EMA). Opt-in (`P_ASYNC_CACHE`);
         // needs a dedicated compute queue + the cache-lighting pipeline. Particles fall back to the
         // graph sim when this is on (the two would contend for the single compute submission).
+        // Default-ON for D3D12 content: overlapping the view-independent `sdf_cache_light` on the
+        // compute queue is a measured ~1.2ms win on D3D12 (17.6 -> 16.4ms, Sponza 1080p/0.667 Med
+        // = the 60fps line) and image-identical (1-frame-latency relight, hidden by the cache EMA).
+        // Vulkan defaults OFF: measured a net loss there (the GDF compute is already saturated, so
+        // the overlap only contends). The gallery defaults OFF (fixed byte-identical anchor). All
+        // three are `P_ASYNC_CACHE`-overridable. In headless screenshot mode a dedicated compute
+        // queue also needs `ASYNC_COMPUTE=1` (see `async_compute_supported`).
+        let async_default = backend == BackendKind::D3d12 && !gallery_scene;
         let async_cache_on = async_compute_supported
             && gdf.has_cache_lighting()
-            && std::env::var_os("P_ASYNC_CACHE").is_some();
+            && quality::env_bool("P_ASYNC_CACHE", async_default);
         gdf.set_cache_async(async_cache_on);
         let gpu_cull = compute_supported && std::env::var_os("P7_CULL").is_some();
         // HZB occlusion culling (PR-8) is layered on the GPU frustum cull; it requires
