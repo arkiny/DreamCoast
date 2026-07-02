@@ -10,8 +10,9 @@
 use dreamcoast_core::glam::Vec3;
 use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourceId};
 use rhi::{
-    BackendKind, BlendMode, ComputePipeline, ComputePipelineDesc, Device, Format, GraphicsPipeline,
-    GraphicsPipelineDesc, PrimitiveTopology, StorageBuffer, StorageBufferDesc, VertexLayout,
+    BackendKind, BlendMode, ComputePipeline, ComputePipelineDesc, DepthCompare, Device, Format,
+    GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, StorageBuffer, StorageBufferDesc,
+    VertexLayout,
 };
 
 use crate::PARTICLE_COUNT;
@@ -77,6 +78,7 @@ impl ParticleSystem {
                 uniform_buffer: false,
                 depth_test: false,
                 depth_write: false,
+                depth_compare: DepthCompare::Less,
                 depth_format: None,
             })?)
         } else {

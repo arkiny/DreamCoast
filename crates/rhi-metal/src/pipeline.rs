@@ -15,7 +15,7 @@ use objc2_metal::{
     MTLDepthStencilDescriptor, MTLDevice, MTLFunction, MTLLibrary, MTLRenderPipelineDescriptor,
     MTLSize, MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
 };
-use rhi_types::{BlendMode, ComputePipelineDesc, GraphicsPipelineDesc, VertexLayout};
+use rhi_types::{BlendMode, ComputePipelineDesc, DepthCompare, GraphicsPipelineDesc, VertexLayout};
 
 use crate::resources::{MetalComputePipeline, MetalGraphicsPipeline, VERTEX_BUFFER_INDEX};
 use crate::{Result, pixel_format, rhi_err};
@@ -93,11 +93,15 @@ pub(crate) fn build(
 
     // Depth test/write is render *state* (an `MTLDepthStencilState`), separate from
     // the pipeline's depth attachment format; build one for depth-testing passes so
-    // `bind_graphics_pipeline` can set it. `LessEqual` + write-on matches the Vulkan
-    // / D3D12 depth setup.
+    // `bind_graphics_pipeline` can set it. The default `Less` maps to `LessEqual` here
+    // — the pre-existing mapping kept so every current pipeline stays byte-identical —
+    // and `Equal` maps to `Equal` for the depth-pre-pass base pass (matches VK/DX EQUAL).
     let depth_stencil = if desc.depth_test {
         let dsd = MTLDepthStencilDescriptor::new();
-        dsd.setDepthCompareFunction(MTLCompareFunction::LessEqual);
+        dsd.setDepthCompareFunction(match desc.depth_compare {
+            DepthCompare::Less => MTLCompareFunction::LessEqual,
+            DepthCompare::Equal => MTLCompareFunction::Equal,
+        });
         dsd.setDepthWriteEnabled(desc.depth_write);
         Some(
             device
