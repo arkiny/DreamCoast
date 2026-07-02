@@ -45,7 +45,7 @@ impl TaauSystem {
             Some(device.create_compute_pipeline(&ComputePipelineDesc {
                 compute_bytes: cs,
                 compute_entry: "csMain",
-                push_constant_size: 224,
+                push_constant_size: 240,
                 bindless: true,
                 uniform_buffer: false,
                 threads_per_group: [8, 8, 1],
@@ -174,6 +174,7 @@ impl TaauSystem {
         scene_diag: f32,
         jitter_uv: [f32; 2],
         force_reset: bool,
+        velocity: Option<ResourceId>,
     ) -> ResourceId {
         let pipe = self.pipeline.as_ref().expect("taau pipeline");
         let frame = self.frame;
@@ -193,15 +194,20 @@ impl TaauSystem {
         // it need not run longer. gamma = variance-box half-width (γσ), ~1 = standard.
         let max_hist = 32.0_f32;
         let gamma = 1.0_f32;
+        let mut reads = vec![hdr, depth];
+        if let Some(v) = velocity {
+            reads.push(v);
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "taau",
                 storage_writes: vec![out, hist_w_ext, pos_w_ext],
-                reads: vec![hdr, depth],
+                reads,
             },
             move |ctx| {
                 let hdr_index = ctx.sampled_index(hdr);
                 let depth_index = ctx.sampled_index(depth);
+                let velocity_index = velocity.map(|v| ctx.sampled_index(v)).unwrap_or(u32::MAX);
                 let out_index = ctx.storage_index(out);
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(pipe);
@@ -225,6 +231,7 @@ impl TaauSystem {
                     max_hist,
                     gamma,
                     jitter_uv,
+                    velocity_index,
                 ));
                 cmd.dispatch(ow.div_ceil(8), oh.div_ceil(8), 1);
                 Ok(())

@@ -38,6 +38,11 @@ pub(crate) struct SkinnedMesh {
     /// Per-fif palette storage buffers + their bindless indices; written each frame.
     palette_bufs: Vec<StorageBuffer>,
     palette_idx: Vec<u32>,
+    /// The palette bindless index written LAST frame (the previous joint pose) — the velocity
+    /// pass reads it to reconstruct each skinned vertex's previous-frame position. Seeded to the
+    /// current (so the first velocity frame is zero motion, not garbage). Updated in
+    /// `update_palettes` after this frame's write.
+    prev_palette_idx: u32,
     /// Reused per-frame palette byte scratch (`joint_count × 64`).
     palette_scratch: Vec<u8>,
     // Keep the static buffers resident.
@@ -143,6 +148,7 @@ pub(crate) fn build_skinned_meshes(
                 joint_count,
                 joint_entities: joint_entities.clone(),
                 inverse_bind: inverse_bind.clone(),
+                prev_palette_idx: palette_idx[0],
                 palette_bufs,
                 palette_idx,
                 palette_scratch: Vec::with_capacity(palette_size),
@@ -162,7 +168,13 @@ pub(crate) fn update_palettes(
     world: &World,
     fif: usize,
 ) -> anyhow::Result<()> {
+    let prev_fif = (fif + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
     for sk in skinned.iter_mut() {
+        // The OTHER ring slot still holds last frame's joint pose (this frame overwrites `fif`);
+        // record its bindless index as the previous pose so the velocity pass reads the prior joint
+        // transforms. This is the animation system's single prev-pose source for skinned draws
+        // (double-buffered ring: `prev_fif` is exactly one frame back).
+        sk.prev_palette_idx = sk.palette_idx[prev_fif];
         sk.palette_scratch.clear();
         for (&je, ib) in sk.joint_entities.iter().zip(&sk.inverse_bind) {
             let joint_world = world
@@ -182,8 +194,13 @@ pub(crate) fn update_palettes(
 /// Tag each skinned drawable with this frame's skin indices + reset its model matrix
 /// to the identity (skinned vertices are already in world space). The drawable keeps
 /// its bind-pose mesh; the G-buffer pass draws it with the skinned pipeline.
-pub(crate) fn patch_scene(skinned: &[SkinnedMesh], scene: &mut [crate::SceneObject], fif: usize) {
-    for obj in scene.iter_mut() {
+pub(crate) fn patch_scene(
+    skinned: &[SkinnedMesh],
+    scene: &mut [crate::SceneObject],
+    prev: &mut [crate::velocity::PrevPose],
+    fif: usize,
+) {
+    for (i, obj) in scene.iter_mut().enumerate() {
         if let Some(sk) = skinned.iter().find(|s| Rc::ptr_eq(&obj.mesh, &s.base_mesh)) {
             obj.skin = Some([
                 sk.joints_idx,
@@ -192,6 +209,12 @@ pub(crate) fn patch_scene(skinned: &[SkinnedMesh], scene: &mut [crate::SceneObje
                 sk.joint_count,
             ]);
             obj.transform = Mat4::IDENTITY;
+            // Prev pose = the previous-frame palette (skinned vertices are world-space, so the
+            // prev model transform is identity — the palette carries the motion).
+            if let Some(p) = prev.get_mut(i) {
+                p.transform = Mat4::IDENTITY;
+                p.skin_palette = sk.prev_palette_idx;
+            }
         }
     }
 }
