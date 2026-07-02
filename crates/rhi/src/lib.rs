@@ -206,6 +206,22 @@ impl StorageBuffer {
             Self::Metal(b) => b.write(data),
         }
     }
+
+    /// Host-read the buffer's contents into `dst` (diagnostics only, e.g. the HZB cull
+    /// stats). Requires a host-visible storage buffer (`create_storage_buffer_host`) and
+    /// that the GPU writes it have completed (the caller syncs). On unified-memory Metal
+    /// the `Shared` buffer is a direct CPU pointer; on VK/D3D12 the host-coherent /
+    /// L0 heap is likewise mapped.
+    pub fn read_into(&self, dst: &mut [u8]) -> Result<()> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(b) => b.read_into(dst),
+            #[cfg(windows)]
+            Self::D3d12(b) => b.read_into(dst),
+            #[cfg(target_os = "macos")]
+            Self::Metal(b) => b.read_into(dst),
+        }
+    }
 }
 
 impl RenderTarget {
