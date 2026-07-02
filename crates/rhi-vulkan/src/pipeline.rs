@@ -349,7 +349,10 @@ unsafe fn build(
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(desc.depth_test)
             .depth_write_enable(desc.depth_write)
-            .depth_compare_op(vk::CompareOp::LESS);
+            .depth_compare_op(match desc.depth_compare {
+                rhi_types::DepthCompare::Less => vk::CompareOp::LESS,
+                rhi_types::DepthCompare::Equal => vk::CompareOp::EQUAL,
+            });
 
         let color_formats: Vec<vk::Format> = desc
             .color_formats

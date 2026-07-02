@@ -315,6 +315,24 @@ pub enum BlendMode {
     DecalAlbedo,
 }
 
+/// Depth-comparison function for a depth-testing pipeline. Kept separate from
+/// `depth_test`/`depth_write` so a pass can pick how it compares against the bound
+/// depth (the load behaviour is a graph attachment property; this is pipeline state).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DepthCompare {
+    /// Standard closer-passes test (Vulkan/D3D12 `LESS`; Metal `LessEqual` — the
+    /// pre-existing per-backend mapping, kept so every current pipeline stays
+    /// byte-identical). This is the default for all opaque geometry.
+    #[default]
+    Less,
+    /// `EQUAL` on every backend: the depth-pre-pass base-pass mode — the G-buffer
+    /// fill only shades fragments whose depth equals the pre-pass depth already in
+    /// the buffer (Early-Z overdraw elimination). Requires the pre-pass and base
+    /// pass to compute clip-space position with the identical instruction sequence
+    /// (same `mvp`, same shader math) so the depths match bit-exactly.
+    Equal,
+}
+
 /// Graphics pipeline parameters.
 #[derive(Clone, Copy, Debug)]
 pub struct GraphicsPipelineDesc<'a> {
@@ -348,6 +366,10 @@ pub struct GraphicsPipelineDesc<'a> {
     /// `depth_test: true, depth_write: false` so it is occluded by closer geometry but does
     /// not perturb the opaque depth buffer that downstream passes read.
     pub depth_write: bool,
+    /// Depth-comparison function (only consulted when `depth_test`). `Less` (default)
+    /// keeps every existing pipeline unchanged; `Equal` is the depth-pre-pass base-pass
+    /// mode (shade only fragments matching the pre-pass depth).
+    pub depth_compare: DepthCompare,
     /// Depth attachment format the pipeline renders against (`None` = no depth).
     pub depth_format: Option<Format>,
 }

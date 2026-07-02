@@ -115,7 +115,7 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 | # | 레퍼런스 스테이지 | DreamCoast 현황 | 판정 | 비고 (근거) |
 |---|---|---|---|---|
 | V | 씬 가시성/컬링 | GPU frustum 컬링(P7 `cull.rs`), HZB occlusion 없음 | 🟡 | 컬링은 있으나 occlusion/HZB 부재; 라이트 컬링(클러스터) 없음(단일 디렉셔널) |
-| 1 | Depth Pre-pass | **없음** — G-buffer가 첫 depth writer | 🔴 | `record_gbuffer`가 depth를 처음 생성. 화면공간 패스(SSR/AO)가 G-buffer depth에 직접 의존 → prepass 없이 순서 강제됨. GDF AO flicker 근원도 depth 라이프타임(메모리 참조) |
+| 1 | Depth Pre-pass | ✅ opt-in `DEPTH_PREPASS=1` (`record_prepass`, PR-1) — depth-only pre-pass가 G-buffer 앞에 depth 생성, G-buffer는 `Equal`+write-off | ✅ | [depth-prepass.md](depth-prepass.md). pre-pass가 `g_depth`의 producer → 화면공간 패스(SSR/AO/GI)가 완성 depth를 명시 소비. VS 단일 소스 재사용으로 position invariance 비트 단위 성립 → OFF/ON 캡처 sha256 동일(Metal 검증). 디폴트 off = 바이트 동일. DX≡VK Windows 후속 |
 | 2 | DBuffer 데칼(전) | **없음** | 🔴 | 데칼은 base pass **후** 경로만 존재(아래 #5) |
 | 3 | Base Pass(G-buffer) | ✅ 4 MRT(albedo+AO / world normal / material / **world position**) | 🟡 | 존재·견고하나 **velocity(모션벡터) 채널 없음**, world-position을 명시 저장(레퍼런스는 depth에서 재구성) |
 | 4 | Custom Depth/Stencil | **없음** | 🔴 | 아웃라인/마스크 파이프라인 부재 |
@@ -142,9 +142,11 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 | — | View Family | 🟡 단일 뷰 | 🟡 | 스플릿/스테레오/씬캡처 다중 뷰 없음 |
 
 ### 2.1 순서/구조 상이가 **미래 기능을 막는** 지점 (핵심)
-1. **Depth pre-pass 부재 (#1).** G-buffer가 최초 depth writer라 SSR/AO/GI가 완성 depth를 전제하는 순서를
-   *암묵적으로만* 만족한다. Early-Z 오버드로 제거, HZB occlusion 컬링, hi-Z 기반 SSR 트레이스, 정확한
-   화면공간 트레이싱 모두 prepass depth를 요구한다. 부재가 GDF AO depth-lifetime 버그의 배경이기도 했다.
+1. ~~**Depth pre-pass 부재 (#1).**~~ **PR-1로 해결(opt-in `DEPTH_PREPASS=1`).** depth-only pre-pass가
+   G-buffer 앞에 depth를 만들고 base pass는 `Equal`+write-off로 Early-Z 오버드로를 제거한다. 화면공간
+   패스(SSR/AO/GI)가 pre-pass가 만든 완성 depth를 명시적으로 소비한다. VS 단일 소스 재사용으로 position
+   invariance가 비트 단위 성립 → OFF/ON 바이트 동일(Metal). 상세 [depth-prepass.md](depth-prepass.md).
+   이제 HZB occlusion 컬링·hi-Z SSR·GDF AO depth-lifetime 근본 정리의 토대가 마련됐다.
 2. **Velocity / 모션벡터 부재 (#3·#13·#14).** G-buffer에 velocity 채널이 없어 TAAU가 **카메라 모션만**
    리프로젝션한다 → 움직이는 오브젝트(스키닝/스핀/파티클)에서 고스팅. **모션블러(13)와 velocity-aware
    TAA(14)의 공통 선결조건**이며, Phase 20 TAA/포스트의 실질 블로커.

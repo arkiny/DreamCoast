@@ -4,18 +4,18 @@ use std::ffi::c_void;
 use std::rc::Rc;
 
 use dreamcoast_core::EngineError;
-use rhi_types::{BlendMode, GraphicsPipelineDesc, PrimitiveTopology, VertexLayout};
+use rhi_types::{BlendMode, DepthCompare, GraphicsPipelineDesc, PrimitiveTopology, VertexLayout};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::{
     D3D_ROOT_SIGNATURE_VERSION_1, D3D12_BLEND_DESC, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE,
     D3D12_BLEND_OP_ADD, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_ZERO, D3D12_COLOR_WRITE_ENABLE_ALL,
     D3D12_COLOR_WRITE_ENABLE_BLUE, D3D12_COLOR_WRITE_ENABLE_GREEN, D3D12_COLOR_WRITE_ENABLE_RED,
-    D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_LESS, D3D12_COMPARISON_FUNC_NEVER,
-    D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
-    D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_WRITE_MASK_ALL,
-    D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_DESCRIPTOR_RANGE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-    D3D12_DESCRIPTOR_RANGE_TYPE_UAV, D3D12_FILL_MODE_SOLID, D3D12_FILTER_ANISOTROPIC,
-    D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_EQUAL, D3D12_COMPARISON_FUNC_LESS,
+    D3D12_COMPARISON_FUNC_NEVER, D3D12_COMPUTE_PIPELINE_STATE_DESC,
+    D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF, D3D12_CULL_MODE_NONE, D3D12_DEPTH_STENCIL_DESC,
+    D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_DESCRIPTOR_RANGE,
+    D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, D3D12_FILL_MODE_SOLID,
+    D3D12_FILTER_ANISOTROPIC, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, D3D12_INPUT_ELEMENT_DESC, D3D12_INPUT_LAYOUT_DESC,
     D3D12_LOGIC_OP_NOOP, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC,
     D3D12_RENDER_TARGET_BLEND_DESC, D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR,
@@ -116,7 +116,11 @@ impl D3d12GraphicsPipeline {
                 PS: shader_bytecode(desc.fragment_bytes),
                 RasterizerState: rasterizer_default(),
                 BlendState: blend_state(desc.blend),
-                DepthStencilState: depth_state(desc.depth_test, desc.depth_write),
+                DepthStencilState: depth_state(
+                    desc.depth_test,
+                    desc.depth_write,
+                    desc.depth_compare,
+                ),
                 SampleMask: u32::MAX,
                 InputLayout: input_layout,
                 PrimitiveTopologyType: topology,
@@ -690,7 +694,7 @@ fn blend_state(mode: BlendMode) -> D3D12_BLEND_DESC {
     }
 }
 
-fn depth_state(test: bool, write: bool) -> D3D12_DEPTH_STENCIL_DESC {
+fn depth_state(test: bool, write: bool, compare: DepthCompare) -> D3D12_DEPTH_STENCIL_DESC {
     D3D12_DEPTH_STENCIL_DESC {
         DepthEnable: test.into(),
         DepthWriteMask: if write {
@@ -699,7 +703,10 @@ fn depth_state(test: bool, write: bool) -> D3D12_DEPTH_STENCIL_DESC {
             D3D12_DEPTH_WRITE_MASK_ZERO
         },
         DepthFunc: if test {
-            D3D12_COMPARISON_FUNC_LESS
+            match compare {
+                DepthCompare::Less => D3D12_COMPARISON_FUNC_LESS,
+                DepthCompare::Equal => D3D12_COMPARISON_FUNC_EQUAL,
+            }
         } else {
             D3D12_COMPARISON_FUNC_ALWAYS
         },

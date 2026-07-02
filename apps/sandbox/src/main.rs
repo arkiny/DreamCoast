@@ -623,6 +623,11 @@ struct App {
     post_mode: usize,
     aliasing: bool,
     compute_post: bool,
+    /// Depth pre-pass active (pipeline rebaseline PR-1, opt-in `DEPTH_PREPASS=1`): render an
+    /// opaque depth-only pass before the G-buffer so the base pass runs EQUAL-test + write-off
+    /// (Early-Z overdraw elimination) and the screen-space passes sample a completed depth.
+    /// Off by default = the pre-pass-less path (byte-identical golden anchor).
+    depth_prepass: bool,
     particles_on: bool,
     async_compute_on: bool,
     gpu_cull: bool,
@@ -1885,6 +1890,9 @@ impl App {
         // a storage image) before tonemapping. Initial state seedable via env var so
         // headless screenshots can exercise each demo (`P7_COMPUTE_POST=1`, etc.).
         let compute_post = compute_supported && std::env::var_os("P7_COMPUTE_POST").is_some();
+        // Pipeline rebaseline PR-1: opt-in depth pre-pass (`DEPTH_PREPASS=1`). Off by default so
+        // the frame graph is identical to the pre-pass-less path (byte-identical golden anchor).
+        let depth_prepass = std::env::var_os("DEPTH_PREPASS").is_some();
         let particles_on = compute_supported && std::env::var_os("P7_PARTICLES").is_some();
         // Run the particle sim on the async-compute queue (overlapping graphics) when
         // a dedicated compute queue exists. Off / unsupported -> the sim runs as a
@@ -2429,6 +2437,7 @@ impl App {
             post_mode: 0,
             aliasing: true,
             compute_post,
+            depth_prepass,
             particles_on,
             async_compute_on,
             gpu_cull,
@@ -4108,6 +4117,27 @@ impl App {
         } else {
             0.0
         };
+        // Depth pre-pass (pipeline rebaseline PR-1, opt-in `DEPTH_PREPASS=1`): render an opaque
+        // depth-only pass into `g_depth` BEFORE the G-buffer so the base pass runs EQUAL-test +
+        // write-off (Early-Z overdraw elimination) and the screen-space passes (AO/GI/SSR) sample
+        // a completed depth whose producer is now explicitly the pre-pass (the render graph orders
+        // pre-pass → G-buffer via the shared `g_depth` write, and the AO/GI/SSR reads of `g_depth`
+        // chain after it). Off by default = no pre-pass pass at all (byte-identical golden anchor).
+        if self.depth_prepass {
+            self.deferred.record_prepass(
+                &mut graph,
+                g_depth,
+                &scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                mip_bias,
+            );
+        }
         self.deferred.record_gbuffer(
             &mut graph,
             gbuf,
@@ -4121,6 +4151,7 @@ impl App {
             self.metallic_override,
             self.roughness_override,
             mip_bias,
+            self.depth_prepass,
         );
         // Deferred surface-decal pass (decals A3): tint the G-buffer albedo for `kind == Decal`
         // drawables after the opaque fill, before lighting. No-op (no pass) when the scene has
