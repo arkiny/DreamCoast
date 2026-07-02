@@ -36,6 +36,8 @@ struct TaauPush
     uint reset;              // 1 = ignore history
     float4 params;           // x = reject distance, y = max history, z = variance gamma, w unused
     float4 jitter;           // xy = current frame's jitter in UV (add to the stable UV to sample)
+    uint velocity_index;     // sampled: RG16Float per-pixel motion vector, or 0xFFFFFFFF = absent
+    uint pad0, pad1, pad2;   // 16-byte align the tail
 };
 
 [[vk::push_constant]]
@@ -125,6 +127,59 @@ float3 reconstruct(float2 cuv, float depth, float sy)
     return h.xyz / h.w;
 }
 
+// Velocity-aware reprojection (pipeline re-baseline PR-2). When a per-pixel motion-vector
+// target is bound, reproject each pixel by ITS OWN screen motion instead of the camera-only
+// world-space reprojection — this is what removes ghosting on moving objects (spin / skinning
+// / morph), whose surface points move on screen independently of the camera.
+//   • The stored value is `cur_ndc - prev_ndc` (raw NDC delta, jitter-free, Y-flip cancels in
+//     the difference). Previous UV = current UV − motion, converting the NDC delta to UV:
+//     Δuv = (Δndc.x, Δndc.y·sy) · 0.5 (the same sy the reconstruct/reproject use).
+//   • 3×3 DILATION (canonical, Playdead/FSR2): fetch the LONGEST velocity in the 3×3
+//     neighborhood, so silhouette pixels adopt the foreground's motion and their history is
+//     pulled from the moving object, not the static background behind the edge (kills the
+//     smear at the trailing edge of a moving object).
+// `uv` is the STABLE output-grid coordinate (the history grid); `cuv` = uv + jitter is where the
+// current geometry sits in the jittered internal frame (where the velocity was rasterized). The
+// velocity target is UNJITTERED, so we sample the motion at `cuv` (the surface point) but apply it
+// on the stable grid: prev_uv = uv − motion. Mixing the two (reprojecting the jittered `cuv`) leaves
+// the sub-pixel jitter in the reprojection and destabilizes the history — sampling the motion at the
+// geometry while reprojecting the stable grid keeps both the motion accurate and the history aligned.
+bool velocity_reproject(float2 uv, float2 cuv, float sy, out float2 prev_uv)
+{
+    prev_uv = uv;
+    if (pc.velocity_index == 0xFFFFFFFFu)
+        return false;
+    float2 its = 1.0 / float2(pc.in_width, pc.in_height);
+    float2 best = float2(0.0, 0.0);
+    float best_len = -1.0;
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            float2 suv = cuv + float2(dx, dy) * its;
+            float2 v = g.textures[pc.velocity_index].SampleLevel(g.samp, suv, 0.0).xy;
+            float l = dot(v, v);
+            if (l > best_len)
+            {
+                best_len = l;
+                best = v;
+            }
+        }
+    }
+    // Static-pixel fall-through: an exactly-zero motion (RG16 stores 0 exactly for static geometry)
+    // hands back to the camera-only world-space reprojection — that path is the byte-identical anchor
+    // for a static scene, so a genuinely static frame stays bit-stable rather than diverging by a
+    // sub-pixel numerical path. A tiny epsilon (well below one texel) keeps every actually-moving
+    // pixel — even slow interior motion — on the velocity path so the anti-ghosting is preserved.
+    if (best_len <= 1e-12)
+        return false;
+    // NDC delta -> UV delta (y carries the Y-flip sign so a Vulkan-flipped clip still maps to
+    // the same on-screen direction as D3D12 — DX≡VK).
+    float2 duv = float2(best.x, best.y * sy) * 0.5;
+    prev_uv = uv - duv;
+    return true;
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void csMain(uint3 tid: SV_DispatchThreadID)
@@ -183,15 +238,31 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float hist_len = 0.0;
     if (pc.reset == 0u)
     {
-        float4 pclip = mul(pc.prev_view_proj, float4(world_reproj, 1.0));
-        if (pclip.w > 0.0)
+        // When the PR-2 motion-vector target is bound, prefer per-pixel velocity reprojection
+        // (removes moving-object ghosting). When it is ABSENT (the default), run the original
+        // camera-only world-space reprojection block VERBATIM so its codegen — and therefore the
+        // accumulated history — is bit-identical to the pre-PR-2 pipeline (content-scene byte
+        // parity; the velocity path is a strict opt-in addition, never a rewrite of the default).
+        float2 vuv;
+        if (pc.velocity_index != 0xFFFFFFFFu && velocity_reproject(uv, cuv, sy, vuv))
         {
-            float3 pndc = pclip.xyz / pclip.w;
-            float2 puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
-            if (all(puv >= 0.0) && all(puv <= 1.0) && pndc.z >= 0.0 && pndc.z <= 1.0)
+            if (all(vuv >= 0.0) && all(vuv <= 1.0))
             {
-                // Sub-pixel-accurate (bilinear) history reprojection — see fetch_history_bilinear.
-                fetch_history_bilinear(puv, world_pos, hist_rgb, hist_len);
+                fetch_history_bilinear(vuv, world_pos, hist_rgb, hist_len);
+            }
+        }
+        else
+        {
+            float4 pclip = mul(pc.prev_view_proj, float4(world_reproj, 1.0));
+            if (pclip.w > 0.0)
+            {
+                float3 pndc = pclip.xyz / pclip.w;
+                float2 puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
+                if (all(puv >= 0.0) && all(puv <= 1.0) && pndc.z >= 0.0 && pndc.z <= 1.0)
+                {
+                    // Sub-pixel-accurate (bilinear) history reprojection — see fetch_history_bilinear.
+                    fetch_history_bilinear(puv, world_pos, hist_rgb, hist_len);
+                }
             }
         }
     }

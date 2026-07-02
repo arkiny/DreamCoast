@@ -14,15 +14,15 @@ use dreamcoast_core::glam::Mat4;
 use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourceId};
 use rhi::{
     BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, ComputePipeline,
-    ComputePipelineDesc, Format, GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology,
-    StorageBuffer, StorageBufferDesc, VertexLayout,
+    ComputePipelineDesc, DepthCompare, Format, GraphicsPipeline, GraphicsPipelineDesc,
+    PrimitiveTopology, StorageBuffer, StorageBufferDesc, VertexLayout,
 };
 
 use crate::app::{load_compute_shader, load_shader_pair};
-use crate::push::{post_compute_push, post_push};
+use crate::push::post_push;
 use crate::{
     DEPTH_FORMAT, FRAMES_IN_FLIGHT, GB_ALBEDO_FMT, GB_MATERIAL_FMT, GB_NORMAL_FMT, GB_POSITION_FMT,
-    GLOBALS_SLICE, GROUND_ALBEDO, HDR_FORMAT, NO_TEXTURE, SceneObject,
+    GLOBALS_SLICE, GROUND_ALBEDO, HDR_FORMAT, MAX_VIEWS, NO_TEXTURE, SceneObject,
 };
 
 /// The render graph's G-buffer targets: four MRTs (+ depth) written by the fill pass
@@ -53,9 +53,24 @@ pub(crate) struct DeferredRenderer {
     gbuffer_decal_pipeline: GraphicsPipeline,
     /// Depth-only shadow fill for GPU-morphed casters (so the shadow follows the morph).
     shadow_morphed_pipeline: GraphicsPipeline,
+    /// Depth pre-pass fill (pipeline rebaseline PR-1, opt-in `DEPTH_PREPASS=1`): three
+    /// depth-only pipelines (static / skinned / morphed) that reuse the *G-buffer* vertex
+    /// shaders (`vsMain` / `vsMainSkinned` / `vsMainMorphed`) with the depth-only `fsDepth`
+    /// fragment, so the pre-pass clip-space position is computed by the identical instruction
+    /// sequence as the base pass — the depths match bit-exactly (EQUAL-test premise).
+    prepass_pipeline: GraphicsPipeline,
+    prepass_skinned_pipeline: GraphicsPipeline,
+    prepass_morphed_pipeline: GraphicsPipeline,
+    /// EQUAL-depth-test + depth-write-off variants of the three G-buffer fills, used when the
+    /// depth pre-pass is active: the pre-pass has already established depth, so the base pass
+    /// only shades fragments whose depth equals it (Early-Z overdraw elimination) and does not
+    /// re-write depth. Same shaders / formats as the default `Less` fills — only the depth state
+    /// differs — so switching does not change shading (the EQUAL byte-identical goal).
+    gbuffer_equal_pipeline: GraphicsPipeline,
+    gbuffer_equal_skinned_pipeline: GraphicsPipeline,
+    gbuffer_equal_morphed_pipeline: GraphicsPipeline,
     pbr_pipeline: GraphicsPipeline,
     post_pipeline: GraphicsPipeline,
-    post_compute_pipeline: ComputePipeline,
     /// Physical-camera auto-exposure: the histogram + resolve compute pipelines, a 256-bin
     /// luminance histogram buffer, and the persistent 1-element exposure buffer (adapted value
     /// read by the lighting pass when auto on).
@@ -103,6 +118,7 @@ impl DeferredRenderer {
             uniform_buffer: false,
             depth_test: true,
             depth_write: true,
+            depth_compare: DepthCompare::Less,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -137,6 +153,7 @@ impl DeferredRenderer {
             uniform_buffer: false,
             depth_test: true,
             depth_write: true,
+            depth_compare: DepthCompare::Less,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -171,6 +188,7 @@ impl DeferredRenderer {
             uniform_buffer: false,
             depth_test: true,
             depth_write: true,
+            depth_compare: DepthCompare::Less,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -209,6 +227,7 @@ impl DeferredRenderer {
             uniform_buffer: false,
             depth_test: true,
             depth_write: false,
+            depth_compare: DepthCompare::Less,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -240,6 +259,7 @@ impl DeferredRenderer {
             uniform_buffer: false,
             depth_test: true,
             depth_write: true,
+            depth_compare: DepthCompare::Less,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -269,6 +289,7 @@ impl DeferredRenderer {
             uniform_buffer: false,
             depth_test: true,
             depth_write: true,
+            depth_compare: DepthCompare::Less,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -298,8 +319,139 @@ impl DeferredRenderer {
             uniform_buffer: false,
             depth_test: true,
             depth_write: true,
+            depth_compare: DepthCompare::Less,
             depth_format: Some(DEPTH_FORMAT),
         })?;
+
+        // Depth pre-pass fill (pipeline rebaseline PR-1). Depth-only pipelines that reuse the
+        // G-buffer *vertex* shaders unchanged (so the clip position is bit-identical to the base
+        // pass) with the `fsDepth` fragment (depth + the same alpha-test discard). One per deform
+        // path (static / skinned / morphed). `Mesh` layout + 208-byte push match the G-buffer
+        // fills (the VS reads pos+normal+uv and the full push). `Less` + write-on establishes the
+        // scene depth. Built unconditionally (cheap pipeline objects); only recorded when the
+        // `DEPTH_PREPASS` seam is on, so the default path is byte-identical.
+        type ShaderFn = fn() -> Option<&'static [u8]>;
+        let make_prepass = |vs_spirv: ShaderFn,
+                            vs_dxil: ShaderFn,
+                            vs_metallib: ShaderFn,
+                            entry: &'static str,
+                            label: &'static str|
+         -> anyhow::Result<GraphicsPipeline> {
+            let (vs, fs) = load_shader_pair(
+                backend,
+                vs_spirv,
+                dreamcoast_shader::gbuffer_depth_fs_spirv,
+                vs_dxil,
+                dreamcoast_shader::gbuffer_depth_fs_dxil,
+                vs_metallib,
+                dreamcoast_shader::gbuffer_depth_fs_metallib,
+                label,
+            )?;
+            Ok(device.create_graphics_pipeline(&GraphicsPipelineDesc {
+                vertex_bytes: vs,
+                fragment_bytes: fs,
+                vertex_entry: entry,
+                fragment_entry: "fsDepth",
+                color_formats: &[], // depth-only
+                topology: PrimitiveTopology::TriangleList,
+                vertex_layout: VertexLayout::Mesh,
+                blend: BlendMode::Opaque,
+                push_constant_size: 208,
+                bindless: true,
+                uniform_buffer: false,
+                depth_test: true,
+                depth_write: true,
+                depth_compare: DepthCompare::Less,
+                depth_format: Some(DEPTH_FORMAT),
+            })?)
+        };
+        let prepass_pipeline = make_prepass(
+            dreamcoast_shader::gbuffer_vs_spirv,
+            dreamcoast_shader::gbuffer_vs_dxil,
+            dreamcoast_shader::gbuffer_vs_metallib,
+            "vsMain",
+            "prepass",
+        )?;
+        let prepass_skinned_pipeline = make_prepass(
+            dreamcoast_shader::gbuffer_skinned_vs_spirv,
+            dreamcoast_shader::gbuffer_skinned_vs_dxil,
+            dreamcoast_shader::gbuffer_skinned_vs_metallib,
+            "vsMainSkinned",
+            "prepass_skinned",
+        )?;
+        let prepass_morphed_pipeline = make_prepass(
+            dreamcoast_shader::gbuffer_morphed_vs_spirv,
+            dreamcoast_shader::gbuffer_morphed_vs_dxil,
+            dreamcoast_shader::gbuffer_morphed_vs_metallib,
+            "vsMainMorphed",
+            "prepass_morphed",
+        )?;
+
+        // EQUAL-depth-test + depth-write-off variants of the three G-buffer fills (used when the
+        // pre-pass is active). Identical shaders / MRT formats / push size to the default `Less`
+        // fills — only the depth state differs — so the shading is unchanged; the EQUAL test just
+        // rejects the overdrawn fragments the pre-pass already resolved. `depth_write: false`
+        // keeps the pre-pass depth (downstream screen-space passes sample it).
+        let make_gbuffer_equal = |vs_spirv: ShaderFn,
+                                  vs_dxil: ShaderFn,
+                                  vs_metallib: ShaderFn,
+                                  entry: &'static str,
+                                  label: &'static str|
+         -> anyhow::Result<GraphicsPipeline> {
+            let (vs, fs) = load_shader_pair(
+                backend,
+                vs_spirv,
+                dreamcoast_shader::gbuffer_fs_spirv,
+                vs_dxil,
+                dreamcoast_shader::gbuffer_fs_dxil,
+                vs_metallib,
+                dreamcoast_shader::gbuffer_fs_metallib,
+                label,
+            )?;
+            Ok(device.create_graphics_pipeline(&GraphicsPipelineDesc {
+                vertex_bytes: vs,
+                fragment_bytes: fs,
+                vertex_entry: entry,
+                fragment_entry: "fsMain",
+                color_formats: &[
+                    GB_ALBEDO_FMT,
+                    GB_NORMAL_FMT,
+                    GB_MATERIAL_FMT,
+                    GB_POSITION_FMT,
+                ],
+                topology: PrimitiveTopology::TriangleList,
+                vertex_layout: VertexLayout::Mesh,
+                blend: BlendMode::Opaque,
+                push_constant_size: 208,
+                bindless: true,
+                uniform_buffer: false,
+                depth_test: true,
+                depth_write: false,
+                depth_compare: DepthCompare::Equal,
+                depth_format: Some(DEPTH_FORMAT),
+            })?)
+        };
+        let gbuffer_equal_pipeline = make_gbuffer_equal(
+            dreamcoast_shader::gbuffer_vs_spirv,
+            dreamcoast_shader::gbuffer_vs_dxil,
+            dreamcoast_shader::gbuffer_vs_metallib,
+            "vsMain",
+            "gbuffer_equal",
+        )?;
+        let gbuffer_equal_skinned_pipeline = make_gbuffer_equal(
+            dreamcoast_shader::gbuffer_skinned_vs_spirv,
+            dreamcoast_shader::gbuffer_skinned_vs_dxil,
+            dreamcoast_shader::gbuffer_skinned_vs_metallib,
+            "vsMainSkinned",
+            "gbuffer_equal_skinned",
+        )?;
+        let gbuffer_equal_morphed_pipeline = make_gbuffer_equal(
+            dreamcoast_shader::gbuffer_morphed_vs_spirv,
+            dreamcoast_shader::gbuffer_morphed_vs_dxil,
+            dreamcoast_shader::gbuffer_morphed_vs_metallib,
+            "vsMainMorphed",
+            "gbuffer_equal_morphed",
+        )?;
 
         // Deferred lighting pipeline: full-screen, reads G-buffer + globals -> HDR.
         let (pbr_vs, pbr_fs) = load_shader_pair(
@@ -321,11 +473,12 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 60, // G-buffer indices + flip_y + shadow + gdf_ao + ssao + gdf_gi + reflect + two_sided + exposure_buf + skyvis(idx,tint,min_occ)
+            push_constant_size: 76, // 60-byte core + clustered light bufs (grid, index, light, count)
             bindless: true,
             uniform_buffer: true,
             depth_test: false,
             depth_write: false,
+            depth_compare: DepthCompare::Less,
             depth_format: None,
         })?;
 
@@ -349,30 +502,15 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 32, // hdr_index + mode + flip_y + exposure + sharpen + inv_w/h
+            // hdr_index + mode + flip_y + exposure + sharpen + inv_w/h + PR-5 bloom
+            // composite slot + ASC-CDL grading (see push::post_push).
+            push_constant_size: 96,
             bindless: true,
             uniform_buffer: false,
             depth_test: false,
             depth_write: false,
+            depth_compare: DepthCompare::Less,
             depth_format: None,
-        })?;
-
-        // Compute post-process pipeline (Phase 7): blurs the HDR target into a
-        // storage image between the lighting and tonemap passes.
-        let post_compute_cs = load_compute_shader(
-            backend,
-            dreamcoast_shader::post_compute_cs_spirv,
-            dreamcoast_shader::post_compute_cs_dxil,
-            dreamcoast_shader::post_compute_cs_metallib,
-            "post_compute",
-        )?;
-        let post_compute_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
-            compute_bytes: post_compute_cs,
-            compute_entry: "csMain",
-            push_constant_size: 16, // hdr_index + out_index + width + height
-            bindless: true,
-            uniform_buffer: false,
-            threads_per_group: [8, 8, 1],
         })?;
 
         // Physical-camera auto-exposure: a luminance-histogram metering (csHistogram → csResolve)
@@ -435,9 +573,12 @@ impl DeferredRenderer {
             Err(_) => (None, None, None, None),
         };
 
-        // Per-frame globals uniform buffer (one 256-byte slice per frame-in-flight).
+        // Per-frame globals uniform buffer. PR-9 view family: `FRAMES_IN_FLIGHT * MAX_VIEWS`
+        // slices so each view in a frame gets its own camera-matrix slice (offset
+        // `(fif * MAX_VIEWS + view) * GLOBALS_SLICE`). The default single-view path only touches
+        // slice 0 of each frame, so the extra tail is unused (and zero-cost) when off.
         let globals_buffer = device.create_buffer(&BufferDesc {
-            size: GLOBALS_SLICE * FRAMES_IN_FLIGHT as u64,
+            size: GLOBALS_SLICE * FRAMES_IN_FLIGHT as u64 * MAX_VIEWS,
             usage: BufferUsage::Uniform,
         })?;
         device.set_globals_buffer(&globals_buffer, GLOBALS_SLICE);
@@ -450,9 +591,14 @@ impl DeferredRenderer {
             gbuffer_morphed_pipeline,
             gbuffer_decal_pipeline,
             shadow_morphed_pipeline,
+            prepass_pipeline,
+            prepass_skinned_pipeline,
+            prepass_morphed_pipeline,
+            gbuffer_equal_pipeline,
+            gbuffer_equal_skinned_pipeline,
+            gbuffer_equal_morphed_pipeline,
             pbr_pipeline,
             post_pipeline,
-            post_compute_pipeline,
             ae_histogram_pipeline,
             ae_resolve_pipeline,
             ae_hist_buf,
@@ -604,6 +750,169 @@ impl DeferredRenderer {
         );
     }
 
+    /// Depth pre-pass (pipeline rebaseline PR-1, opt-in `DEPTH_PREPASS=1`): rasterize the same
+    /// opaque scene the G-buffer fill draws (skipping decals) plus the ground, DEPTH-ONLY, into
+    /// `targets.depth` **before** the G-buffer pass. This establishes the scene depth so the base
+    /// pass can run EQUAL-test + depth-write-off and shade every pixel exactly once (Early-Z
+    /// overdraw elimination), and gives the screen-space passes (AO/GI/SSR/reflect) a completed
+    /// depth to sample without an ordering race. The pipelines reuse the *G-buffer vertex shaders
+    /// unchanged*, so the clip position — and therefore the depth — is bit-identical to the base
+    /// pass. The pass clears the depth (it is the first depth writer this frame); the later
+    /// G-buffer pass then LOADS it (the render graph's per-depth first-writer clear/load rule).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_prepass<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        depth: ResourceId,
+        scene: &'a [SceneObject],
+        ground_vbuf: &'a Buffer,
+        ground_ibuf: &'a Buffer,
+        ground_count: u32,
+        view_proj: Mat4,
+        override_material: bool,
+        metallic_override: f32,
+        roughness_override: f32,
+        mip_bias: f32,
+    ) {
+        graph.add_pass(
+            PassInfo {
+                name: "prepass",
+                colors: vec![], // depth-only
+                depth: Some(depth),
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.bind_graphics_pipeline(&self.prepass_pipeline);
+                for obj in scene {
+                    // Skip decals exactly like the G-buffer pass: decals do not write opaque
+                    // depth (they tint the albedo in the later decal pass). Keeps the pre-pass
+                    // depth identical to what the base pass expects.
+                    if obj.kind == dreamcoast_asset::MaterialKind::Decal {
+                        continue;
+                    }
+                    let obj_mvp = (view_proj * obj.transform).to_cols_array();
+                    // The alpha-test discard needs the base-color texture + cutoff; the mvp +
+                    // model + skin/morph indices must match the base pass exactly (same push),
+                    // so the shared VS produces the same clip position. Material factors that do
+                    // not affect position (metallic/roughness) are the base pass's; here they are
+                    // fed the override too so the push is identical to the G-buffer draw.
+                    let (m, rgh, mr_tex) = if override_material {
+                        (metallic_override, roughness_override, NO_TEXTURE)
+                    } else {
+                        (obj.metallic, obj.roughness, obj.tex[1])
+                    };
+                    if obj.skin.is_some() {
+                        cmd.bind_graphics_pipeline(&self.prepass_skinned_pipeline);
+                    } else if obj.morph.is_some() {
+                        cmd.bind_graphics_pipeline(&self.prepass_morphed_pipeline);
+                    }
+                    cmd.push_constants(&gbuffer_push(
+                        obj_mvp,
+                        obj.base_color,
+                        m,
+                        rgh,
+                        mip_bias,
+                        obj.alpha_cutoff,
+                        [obj.tex[0], mr_tex, obj.tex[2], obj.tex[3]],
+                        obj.transform.to_cols_array(),
+                        obj.skin.unwrap_or([0; 4]),
+                        obj.morph.unwrap_or([0; 4]),
+                    ));
+                    cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
+                    cmd.bind_index_buffer(&obj.mesh.ibuf, true);
+                    cmd.draw_indexed(obj.mesh.index_count, 0, 0);
+                    if obj.skin.is_some() || obj.morph.is_some() {
+                        cmd.bind_graphics_pipeline(&self.prepass_pipeline); // restore
+                    }
+                }
+                // Ground plane — identical push to the G-buffer ground draw so its depth matches.
+                cmd.push_constants(&gbuffer_push(
+                    view_proj.to_cols_array(),
+                    [GROUND_ALBEDO[0], GROUND_ALBEDO[1], GROUND_ALBEDO[2], 1.0],
+                    0.0,
+                    0.9,
+                    0.0,
+                    0.0,
+                    [NO_TEXTURE; 4],
+                    Mat4::IDENTITY.to_cols_array(),
+                    [0; 4],
+                    [0; 4],
+                ));
+                cmd.bind_vertex_buffer(ground_vbuf, 32);
+                cmd.bind_index_buffer(ground_ibuf, true);
+                cmd.draw_indexed(ground_count, 0, 0);
+                Ok(())
+            },
+        );
+    }
+
+    /// CSM / shadow-atlas fill (PR-7): rasterize the shadow casters once per cascade slot into
+    /// its atlas tile. One depth pass clears the whole atlas, then each slot restricts the
+    /// viewport + scissor to its tile (`set_viewport_scissor_rect`) and draws the casters with
+    /// that cascade's view-projection. Slots share the same caster loop as `record_shadow` (the
+    /// static / skinned / morph pipeline select + masked alpha-test discard), so a caster's
+    /// cascade shadow matches its lit-mesh cutout exactly. The atlas texture is the same
+    /// resource the lighting pass samples, so the sampling side needs no per-slot wiring — only
+    /// the cascade view-projection array in globals. Future spot / point slots reuse this loop.
+    pub(crate) fn record_shadow_atlas<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        shadow_atlas: ResourceId,
+        scene: &'a [SceneObject],
+        slots: &'a [crate::csm::ShadowSlot],
+    ) {
+        graph.add_pass(
+            PassInfo {
+                name: "shadow_atlas",
+                colors: vec![],
+                depth: Some(shadow_atlas),
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                for slot in slots {
+                    // Only cascade slots carry the directional caster set this PR; spot /
+                    // point slots get their own caster loops when those light types land
+                    // (the slot table + per-slot view-projections already accommodate them).
+                    if slot.kind != crate::csm::SlotKind::Cascade {
+                        continue;
+                    }
+                    // Restrict rasterization to this cascade's atlas tile. The depth clear
+                    // covered the whole atlas (first depth writer); the scissor keeps each
+                    // cascade's draws inside its own tile so they don't bleed across slots.
+                    cmd.set_viewport_scissor_rect(slot.rect);
+                    cmd.bind_graphics_pipeline(&self.shadow_pipeline);
+                    for obj in scene {
+                        if !obj.casts_shadow {
+                            continue;
+                        }
+                        let lmvp = (slot.view_proj * obj.transform).to_cols_array();
+                        if obj.skin.is_some() {
+                            cmd.bind_graphics_pipeline(&self.shadow_skinned_pipeline);
+                        } else if obj.morph.is_some() {
+                            cmd.bind_graphics_pipeline(&self.shadow_morphed_pipeline);
+                        }
+                        cmd.push_constants(&shadow_push(
+                            lmvp,
+                            obj.tex[0],
+                            obj.alpha_cutoff,
+                            obj.skin.unwrap_or([0; 4]),
+                            obj.morph.unwrap_or([0; 4]),
+                        ));
+                        cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
+                        cmd.bind_index_buffer(&obj.mesh.ibuf, true);
+                        cmd.draw_indexed(obj.mesh.index_count, 0, 0);
+                        if obj.skin.is_some() || obj.morph.is_some() {
+                            cmd.bind_graphics_pipeline(&self.shadow_pipeline); // restore
+                        }
+                    }
+                }
+                Ok(())
+            },
+        );
+    }
+
     /// G-buffer fill: rasterize each scene object (with its PBR material) plus the
     /// ground into the four MRTs (+ depth). The UI material override replaces
     /// metallic/roughness and drops the m/r texture so the factors apply directly.
@@ -622,7 +931,25 @@ impl DeferredRenderer {
         metallic_override: f32,
         roughness_override: f32,
         mip_bias: f32,
+        // Depth pre-pass active (`DEPTH_PREPASS=1`): the pre-pass already wrote depth, so use the
+        // EQUAL-test + depth-write-off G-buffer pipelines (Early-Z overdraw elimination). `false`
+        // = the default `Less` + write-on fills (byte-identical to the pre-pass-less path).
+        prepass: bool,
     ) {
+        // Select the base-pass pipeline set: EQUAL-test (pre-pass on) vs the default `Less` fills.
+        let (pipe_static, pipe_skinned, pipe_morphed) = if prepass {
+            (
+                &self.gbuffer_equal_pipeline,
+                &self.gbuffer_equal_skinned_pipeline,
+                &self.gbuffer_equal_morphed_pipeline,
+            )
+        } else {
+            (
+                &self.gbuffer_pipeline,
+                &self.gbuffer_skinned_pipeline,
+                &self.gbuffer_morphed_pipeline,
+            )
+        };
         let sky = ClearColor {
             r: ambient,
             g: ambient,
@@ -649,7 +976,7 @@ impl DeferredRenderer {
             },
             move |ctx| {
                 let cmd = ctx.cmd();
-                cmd.bind_graphics_pipeline(&self.gbuffer_pipeline);
+                cmd.bind_graphics_pipeline(pipe_static);
                 for obj in scene {
                     // Decals are not opaque surfaces: they tint the G-buffer albedo in the
                     // later `record_decals` pass instead of writing their own (diffuse-less)
@@ -670,9 +997,9 @@ impl DeferredRenderer {
                     // objects keep the already-bound pipeline (gallery byte-identical). A
                     // drawable is at most one of skinned / morphed.
                     if obj.skin.is_some() {
-                        cmd.bind_graphics_pipeline(&self.gbuffer_skinned_pipeline);
+                        cmd.bind_graphics_pipeline(pipe_skinned);
                     } else if obj.morph.is_some() {
-                        cmd.bind_graphics_pipeline(&self.gbuffer_morphed_pipeline);
+                        cmd.bind_graphics_pipeline(pipe_morphed);
                     }
                     cmd.push_constants(&gbuffer_push(
                         obj_mvp,
@@ -690,7 +1017,7 @@ impl DeferredRenderer {
                     cmd.bind_index_buffer(&obj.mesh.ibuf, true);
                     cmd.draw_indexed(obj.mesh.index_count, 0, 0);
                     if obj.skin.is_some() || obj.morph.is_some() {
-                        cmd.bind_graphics_pipeline(&self.gbuffer_pipeline); // restore
+                        cmd.bind_graphics_pipeline(pipe_static); // restore
                     }
                 }
                 // Ground plane (plain matte material, no textures). Albedo from the shared
@@ -806,6 +1133,11 @@ impl DeferredRenderer {
         flip_y: u32,
         two_sided: bool,
         exposure_buf_index: u32,
+        // Clustered light culling (PR-6). `Some((grid_ext, index_ext, grid_idx, index_idx,
+        // light_idx, light_count))` binds the froxel light list built by `ClusterSystem`; the
+        // *_ext ids order the lighting pass after the cluster-build compute pass. `None` = the
+        // brute-force globals.point_pos[] path (default, gallery byte-identical).
+        cluster: Option<(ResourceId, ResourceId, u32, u32, u32, u32)>,
     ) {
         let mut reads = vec![
             gbuf.albedo,
@@ -814,6 +1146,10 @@ impl DeferredRenderer {
             gbuf.position,
             shadow_map,
         ];
+        if let Some((grid_ext, index_ext, ..)) = cluster {
+            reads.push(grid_ext);
+            reads.push(index_ext);
+        }
         if let Some(ao) = gdf_ao {
             reads.push(ao);
         }
@@ -849,6 +1185,12 @@ impl DeferredRenderer {
                 let gi_index = gdf_gi.map(|gi| ctx.sampled_index(gi)).unwrap_or(u32::MAX);
                 let reflect_index = reflect.map(|r| ctx.sampled_index(r)).unwrap_or(u32::MAX);
                 let skyvis_index = skyvis.map(|s| ctx.sampled_index(s)).unwrap_or(u32::MAX);
+                // Clustered light bufs: their storage indices are stable (persistent buffers),
+                // so pass them straight through; `NO_TEXTURE` grid buf disables the path.
+                let (cl_grid, cl_index, cl_light, cl_count) = match cluster {
+                    Some((_, _, g, i, l, c)) => (g, i, l, c),
+                    None => (u32::MAX, u32::MAX, u32::MAX, 0),
+                };
                 let cmd = ctx.cmd();
                 cmd.set_globals(&self.globals_buffer, globals_offset);
                 cmd.bind_graphics_pipeline(&self.pbr_pipeline);
@@ -865,6 +1207,7 @@ impl DeferredRenderer {
                     skyvis_index,
                     skyvis_tint,
                     skyvis_min_occ,
+                    [cl_grid, cl_index, cl_light, cl_count],
                 ));
                 cmd.draw(3, 1);
                 Ok(())
@@ -874,36 +1217,15 @@ impl DeferredRenderer {
 
     /// Phase 7 compute post: blur `hdr` into the `hdr_post` storage image (the tonemap
     /// pass then samples `hdr_post` instead of the raw `hdr`).
-    pub(crate) fn record_compute_post<'a>(
-        &'a self,
-        graph: &mut RenderGraph<'a>,
-        hdr: ResourceId,
-        hdr_post: ResourceId,
-        cw: u32,
-        ch: u32,
-    ) {
-        graph.add_compute_pass(
-            ComputePassInfo {
-                name: "post_compute",
-                storage_writes: vec![hdr_post],
-                reads: vec![hdr],
-            },
-            move |ctx| {
-                let in_index = ctx.sampled_index(hdr);
-                let out_index = ctx.storage_index(hdr_post);
-                let cmd = ctx.cmd();
-                cmd.bind_compute_pipeline(&self.post_compute_pipeline);
-                cmd.push_constants_compute(&post_compute_push(in_index, out_index, cw, ch));
-                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                Ok(())
-            },
-        );
-    }
-
-    /// Tonemap `src` (the chosen HDR-ish image: rasterized HDR / compute-post / path
+    /// Tonemap `src` (the chosen HDR-ish image: rasterized HDR / post-chain / path
     /// trace / SW-RT) to the backbuffer, encoding sRGB in-shader. `exposure` is 1.0
     /// for the rasterized path (exposure already baked into lighting) and the camera
     /// exposure for the raw-radiance RT/SW-RT sources.
+    ///
+    /// PR-5: the final post node also composites bloom (`bloom` = the pyramid mip0
+    /// resource, `None` = off) and applies the ASC-CDL color grade (`grade_on == 0` or
+    /// `CDL_NEUTRAL` = identity). The bloom resource, when present, is added to the pass
+    /// `reads` so the graph sequences the bloom chain before tonemap.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_tonemap<'a>(
         &'a self,
@@ -916,20 +1238,96 @@ impl DeferredRenderer {
         sharpen: f32,
         inv_w: f32,
         inv_h: f32,
+        bloom: Option<ResourceId>,
+        bloom_intensity: f32,
+        grade_on: u32,
+        cdl_slope: [f32; 3],
+        cdl_offset: [f32; 3],
+        cdl_power: [f32; 3],
     ) {
+        let mut reads = vec![src];
+        if let Some(b) = bloom {
+            reads.push(b);
+        }
         graph.add_pass(
             PassInfo {
                 name: "tonemap",
                 colors: vec![(backbuffer, Some(ClearColor::BLACK))],
+                depth: None,
+                reads,
+            },
+            move |ctx| {
+                let hdr_index = ctx.sampled_index(src);
+                let bloom_index = bloom.map(|b| ctx.sampled_index(b)).unwrap_or(u32::MAX);
+                let cmd = ctx.cmd();
+                cmd.bind_graphics_pipeline(&self.post_pipeline);
+                cmd.push_constants(&post_push(
+                    hdr_index,
+                    post_mode,
+                    flip_y,
+                    exposure,
+                    sharpen,
+                    inv_w,
+                    inv_h,
+                    bloom_index,
+                    bloom_intensity,
+                    grade_on,
+                    cdl_slope,
+                    cdl_offset,
+                    cdl_power,
+                ));
+                cmd.draw(3, 1);
+                Ok(())
+            },
+        );
+    }
+
+    /// PR-9 view family: composite a secondary view's HDR as a picture-in-picture inset. Tonemaps
+    /// `src` into `viewport` (a sub-rect of the backbuffer), LOADING (not clearing) the backbuffer
+    /// so the already-composited primary view is preserved everywhere outside the inset. The
+    /// full-screen triangle is scaled into the rect by the viewport transform (the graph sets the
+    /// full-backbuffer viewport before this closure; we override it here). Bloom/grading are
+    /// disabled (the inset is a plain ACES+sRGB encode). See `docs/view-family.md`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_tonemap_inset<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        backbuffer: ResourceId,
+        src: ResourceId,
+        post_mode: u32,
+        flip_y: u32,
+        exposure: f32,
+        viewport: rhi::Rect2D,
+    ) {
+        graph.add_pass(
+            PassInfo {
+                name: "view_inset",
+                // `None` clear = load the backbuffer (preserve the primary-view composite).
+                colors: vec![(backbuffer, None)],
                 depth: None,
                 reads: vec![src],
             },
             move |ctx| {
                 let hdr_index = ctx.sampled_index(src);
                 let cmd = ctx.cmd();
+                // Restrict the draw to the inset rect (both viewport + scissor).
+                cmd.set_viewport_scissor_rect(viewport);
                 cmd.bind_graphics_pipeline(&self.post_pipeline);
+                let (s, o, p) = crate::push::CDL_NEUTRAL;
                 cmd.push_constants(&post_push(
-                    hdr_index, post_mode, flip_y, exposure, sharpen, inv_w, inv_h,
+                    hdr_index,
+                    post_mode,
+                    flip_y,
+                    exposure,
+                    0.0, // no sharpen
+                    0.0,
+                    0.0,
+                    u32::MAX, // no bloom
+                    0.0,
+                    0, // grading off
+                    s,
+                    o,
+                    p,
                 ));
                 cmd.draw(3, 1);
                 Ok(())
@@ -1010,8 +1408,11 @@ fn pbr_push(
     skyvis_index: u32,
     skyvis_tint: f32,
     skyvis_min_occ: f32,
-) -> [u8; 60] {
-    let mut pc = [0u8; 60];
+    // Clustered light bufs: [grid_buf, index_buf, light_buf, light_count]. grid_buf == u32::MAX
+    // (0xFFFFFFFF) selects the brute-force point-light loop (byte-identical anchor).
+    cluster: [u32; 4],
+) -> [u8; 76] {
+    let mut pc = [0u8; 76];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1026,6 +1427,10 @@ fn pbr_push(
     pc[48..52].copy_from_slice(&skyvis_index.to_le_bytes());
     pc[52..56].copy_from_slice(&skyvis_tint.to_le_bytes());
     pc[56..60].copy_from_slice(&skyvis_min_occ.to_le_bytes());
+    for (i, v) in cluster.iter().enumerate() {
+        let o = 60 + i * 4;
+        pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
     pc
 }
 

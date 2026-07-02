@@ -504,6 +504,29 @@ impl D3d12CommandBuffer {
         }
     }
 
+    /// Set the viewport + scissor to an arbitrary sub-rect of the bound target
+    /// (shadow-atlas tiling: each cascade / light slot renders into its own tile).
+    pub fn set_viewport_scissor_rect(&self, rect: Rect2D) {
+        let viewport = D3D12_VIEWPORT {
+            TopLeftX: rect.x as f32,
+            TopLeftY: rect.y as f32,
+            Width: rect.width as f32,
+            Height: rect.height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let scissor = RECT {
+            left: rect.x,
+            top: rect.y,
+            right: rect.x + rect.width as i32,
+            bottom: rect.y + rect.height as i32,
+        };
+        unsafe {
+            self.list.RSSetViewports(&[viewport]);
+            self.list.RSSetScissorRects(&[scissor]);
+        }
+    }
+
     /// Copy a rendered swapchain image into a host-readable readback buffer (for
     /// screenshots). The image must be in `PRESENT` (the state the render graph
     /// leaves it in); it is restored to that state afterward. The buffer receives

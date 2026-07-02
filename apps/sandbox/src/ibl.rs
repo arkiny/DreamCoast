@@ -14,8 +14,8 @@
 use dreamcoast_core::glam::{Mat4, Vec3};
 use rhi::{
     BackendKind, BlendMode, Buffer, ClearColor, CommandBuffer, Cubemap, CubemapDesc, DepthBuffer,
-    Device, Extent2D, Fence, Format, GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology,
-    Queue, RenderTarget, RenderTargetDesc, VertexLayout,
+    DepthCompare, Device, Extent2D, Fence, Format, GraphicsPipeline, GraphicsPipelineDesc,
+    PrimitiveTopology, Queue, RenderTarget, RenderTargetDesc, VertexLayout,
 };
 
 use crate::app::load_shader_pair;
@@ -119,6 +119,7 @@ impl IblSystem {
             uniform_buffer: false,
             depth_test: false,
             depth_write: false,
+            depth_compare: DepthCompare::Less,
             depth_format: None,
         })?;
 
@@ -148,6 +149,7 @@ impl IblSystem {
             uniform_buffer: false,
             depth_test: true, // occlusion when capturing the scene into the cube
             depth_write: true,
+            depth_compare: DepthCompare::Less,
             depth_format: Some(DEPTH_FORMAT),
         })?;
 
@@ -176,6 +178,7 @@ impl IblSystem {
             uniform_buffer: false,
             depth_test: false,
             depth_write: false,
+            depth_compare: DepthCompare::Less,
             depth_format: None,
         })?;
 
@@ -204,6 +207,7 @@ impl IblSystem {
             uniform_buffer: false,
             depth_test: false,
             depth_write: false,
+            depth_compare: DepthCompare::Less,
             depth_format: None,
         })?;
 
@@ -232,6 +236,7 @@ impl IblSystem {
             uniform_buffer: false,
             depth_test: false,
             depth_write: false,
+            depth_compare: DepthCompare::Less,
             depth_format: None,
         })?;
 

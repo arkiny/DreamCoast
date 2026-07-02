@@ -9,9 +9,9 @@
 
 use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourceId};
 use rhi::{
-    BackendKind, BlendMode, Buffer, ComputePipeline, ComputePipelineDesc, Device, Extent2D, Format,
-    GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, StorageBuffer, StorageBufferDesc,
-    VertexLayout,
+    BackendKind, BlendMode, Buffer, ComputePipeline, ComputePipelineDesc, DepthCompare, Device,
+    Extent2D, Format, GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, StorageBuffer,
+    StorageBufferDesc, VertexLayout,
 };
 
 use crate::app::{load_compute_shader, load_shader_pair};
@@ -118,6 +118,7 @@ impl CullSystem {
                 uniform_buffer: false,
                 depth_test: true,
                 depth_write: true,
+                depth_compare: DepthCompare::Less,
                 depth_format: Some(DEPTH_FORMAT),
             })?)
         } else {
@@ -142,6 +143,62 @@ impl CullSystem {
             graph.import_external("cull_args"),
             graph.import_external("cull_visible"),
         )
+    }
+
+    /// The indirect-args + visible-list buffers, for the HZB cull path (PR-8), which
+    /// runs its own occlusion-aware cull compute over the same buffers so the indirect
+    /// draw is unchanged.
+    pub(crate) fn buffers(&self) -> (&StorageBuffer, &StorageBuffer) {
+        (&self.args, &self.visible)
+    }
+
+    /// Cube index count written into the indirect draw args header.
+    pub(crate) fn index_count(&self) -> u32 {
+        self.cube_index_count
+    }
+
+    /// Record the reset pass only (clear the indirect args header). The HZB path
+    /// substitutes its own occlusion-aware cull for `record_cull`'s frustum cull but
+    /// still needs the header reset first.
+    pub(crate) fn record_reset<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        args_ext: ResourceId,
+        visible_ext: ResourceId,
+        planes: [[f32; 4]; 6],
+        grid: &CullGrid,
+    ) {
+        let reset = &self.reset_pipeline;
+        let args = &self.args;
+        let visible = &self.visible;
+        let icount = self.cube_index_count;
+        let (spacing, radius, height) = (grid.spacing, grid.cube_radius, grid.height);
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "cull_reset",
+                storage_writes: vec![args_ext, visible_ext],
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.storage_buffer_to_storage(args); // INDIRECT (prev frame) -> UAV
+                cmd.bind_compute_pipeline(reset);
+                cmd.push_constants_compute(&cull_push(
+                    &planes,
+                    args.storage_index(),
+                    visible.storage_index(),
+                    GRID_COUNT,
+                    GRID_DIM,
+                    spacing,
+                    radius,
+                    height,
+                    icount,
+                ));
+                cmd.dispatch(1, 1, 1);
+                cmd.storage_buffer_barrier(args); // order reset before cull
+                Ok(())
+            },
+        );
     }
 
     /// Add the reset + cull compute passes (clear the indirect args, then frustum-cull
@@ -219,7 +276,12 @@ impl CullSystem {
     }
 
     /// Add the indirect, instanced draw of the visible cube grid over `backbuffer`
-    /// (its own depth buffer, sized `extent`).
+    /// (its own depth attachment orders cube-vs-cube). `scene_depth` = the scene's
+    /// depth buffer, sampled in the fragment shader as a manual depth test (PR-8):
+    /// a grid cube behind a wall renders nothing, which is exactly the set the HZB
+    /// occlusion cull removes — so culling on/off is image-identical by construction.
+    /// `render_extent` (the scene/depth resolution) maps display pixels to depth
+    /// texels (1:1 at native; smaller under the TAAU upscale path).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_draw<'a>(
         &'a self,
@@ -231,6 +293,8 @@ impl CullSystem {
         view_proj: [f32; 16],
         sun_dir: [f32; 3],
         grid: &CullGrid,
+        scene_depth: ResourceId,
+        render_extent: Extent2D,
     ) {
         let cull_depth = graph.create_depth("cull_depth", extent);
         let draw = self
@@ -242,14 +306,19 @@ impl CullSystem {
         let vbuf = &self.cube_vbuf;
         let ibuf = &self.cube_ibuf;
         let (spacing, scale, height) = (grid.spacing, grid.cube_scale, grid.height);
+        let depth_scale = [
+            render_extent.width as f32 / extent.width as f32,
+            render_extent.height as f32 / extent.height as f32,
+        ];
         graph.add_pass(
             PassInfo {
                 name: "cull_draw",
                 colors: vec![(backbuffer, None)],
                 depth: Some(cull_depth),
-                reads: vec![args_ext, visible_ext],
+                reads: vec![args_ext, visible_ext, scene_depth],
             },
             move |ctx| {
+                let depth_index = ctx.sampled_index(scene_depth);
                 let cmd = ctx.cmd();
                 cmd.bind_graphics_pipeline(draw);
                 cmd.push_constants(&cull_draw_push(
@@ -260,6 +329,8 @@ impl CullSystem {
                     spacing,
                     scale,
                     height,
+                    depth_index,
+                    depth_scale,
                 ));
                 cmd.bind_vertex_buffer(vbuf, 32);
                 cmd.bind_index_buffer(ibuf, true);

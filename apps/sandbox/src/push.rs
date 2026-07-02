@@ -181,8 +181,20 @@ pub(crate) fn prefilter_push(
     pc
 }
 
-/// Pack the tonemap push block (32 bytes): hdr_index + mode + flip_y + exposure (16) +
-/// sharpen + inv_w + inv_h + pad (16, the QHD/UHD post-upscale sharpen).
+/// Neutral (identity) ASC-CDL color grade: slope 1, offset 0, power 1. Passing this
+/// with `grade_on = 0` (or these exact values) is a byte-identical no-op — the anchor.
+pub(crate) const CDL_NEUTRAL: ([f32; 3], [f32; 3], [f32; 3]) =
+    ([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+
+/// Pack the tonemap push block (96 bytes): hdr_index + mode + flip_y + exposure (16) +
+/// sharpen + inv_w + inv_h + bloom_index (16) + bloom_intensity + grade_on + pad + pad
+/// (16) + cdl_slope float4 (16) + cdl_offset float4 (16) + cdl_power float4 (16).
+///
+/// PR-5 added the bloom composite slot + the ASC-CDL color-grading hook. `bloom_index ==
+/// u32::MAX` skips the bloom add; `grade_on == 0` skips grading. Each CDL vector is a
+/// full float4 row (never float3 + trailing scalar) to match the HLSL/SPIR-V vs. MSL
+/// push-constant packing. Neutral params (`CDL_NEUTRAL`) + `grade_on = 0` + no bloom =
+/// the byte-identical anchor.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn post_push(
     hdr_index: u32,
@@ -192,8 +204,14 @@ pub(crate) fn post_push(
     sharpen: f32,
     inv_w: f32,
     inv_h: f32,
-) -> [u8; 32] {
-    let mut pc = [0u8; 32];
+    bloom_index: u32,
+    bloom_intensity: f32,
+    grade_on: u32,
+    cdl_slope: [f32; 3],
+    cdl_offset: [f32; 3],
+    cdl_power: [f32; 3],
+) -> [u8; 96] {
+    let mut pc = [0u8; 96];
     pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
     pc[4..8].copy_from_slice(&mode.to_le_bytes());
     pc[8..12].copy_from_slice(&flip_y.to_le_bytes());
@@ -201,6 +219,100 @@ pub(crate) fn post_push(
     pc[16..20].copy_from_slice(&sharpen.to_le_bytes());
     pc[20..24].copy_from_slice(&inv_w.to_le_bytes());
     pc[24..28].copy_from_slice(&inv_h.to_le_bytes());
+    pc[28..32].copy_from_slice(&bloom_index.to_le_bytes());
+    pc[32..36].copy_from_slice(&bloom_intensity.to_le_bytes());
+    pc[36..40].copy_from_slice(&grade_on.to_le_bytes());
+    // pc[40..48]: pad0/pad1 to the float4 boundary.
+    for (i, v) in cdl_slope.iter().enumerate() {
+        pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in cdl_offset.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in cdl_power.iter().enumerate() {
+        pc[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc
+}
+
+/// Pack the PR-4 atmosphere/height-fog push block (80 bytes): 4 uints (hdr_index,
+/// position_index, out_index [unused by the graphics entry], flip_y [unused]) + three
+/// float4 rows (camera_pos.xyz + density.w, sun_dir.xyz + sun_intensity.w, sky_wb.xyz +
+/// inscatter_gain.w) + a final float4 (height_falloff.x + exposure.y + unused zw). Every
+/// row is a full float4 (never a bare float3 followed by a scalar) to dodge the HLSL/
+/// SPIR-V vs. MSL push-constant packing divergence documented on `gdf_gi_push`'s
+/// `ground_albedo`. `exposure` is the same scalar `record_lighting` bakes into `hdr`
+/// (`globals.ambient.a` / the auto-exposure buffer) — `procedural_sky` returns raw
+/// unexposed radiance (like the sky-background miss path in `pbr.slang`), so the
+/// inscatter color must be exposed the same way before blending, or a physically-scaled
+/// sun (tens of thousands of lux) blows the composite out to white.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn atmosphere_push(
+    hdr_index: u32,
+    position_index: u32,
+    camera_pos: [f32; 3],
+    density: f32,
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    sky_wb: [f32; 3],
+    inscatter_gain: f32,
+    height_falloff: f32,
+    exposure: f32,
+) -> [u8; 80] {
+    let mut pc = [0u8; 80];
+    pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&position_index.to_le_bytes());
+    // pc[8..12] = out_index (unused by the graphics entry), pc[12..16] = flip_y (unused).
+    for (i, v) in camera_pos.iter().enumerate() {
+        pc[16 + i * 4..20 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[28..32].copy_from_slice(&density.to_le_bytes());
+    let sun = normalize3(sun_dir);
+    for (i, v) in sun.iter().take(3).enumerate() {
+        pc[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[44..48].copy_from_slice(&sun_intensity.to_le_bytes());
+    for (i, v) in sky_wb.iter().enumerate() {
+        pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[60..64].copy_from_slice(&inscatter_gain.to_le_bytes());
+    pc[64..68].copy_from_slice(&height_falloff.to_le_bytes());
+    pc[68..72].copy_from_slice(&exposure.to_le_bytes());
+    pc
+}
+
+/// Pack the forward translucency push block (176 bytes, PR-3). Layout: mvp(64), model(64),
+/// base_color(16), material(16 = metallic, roughness, base_color tex-index bits, flip_y
+/// bits), misc(16 = shadow_index then 3 reserved). `base_tex`/`flip_y`/`shadow_index` are
+/// `u32` values stored in the float slots (`material.zw` / `misc.x`) that the shader reads
+/// with `asuint` — the reinterpret keeps the block a single 16-byte-aligned float4 grid
+/// across all three backends' cbuffer packing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn translucent_push(
+    mvp: &[f32; 16],
+    model: &[f32; 16],
+    base_color: [f32; 4],
+    metallic: f32,
+    roughness: f32,
+    base_tex: u32,
+    flip_y: u32,
+    shadow_index: u32,
+) -> [u8; 176] {
+    let mut pc = [0u8; 176];
+    for (i, v) in mvp.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in model.iter().enumerate() {
+        pc[64 + i * 4..64 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in base_color.iter().enumerate() {
+        pc[128 + i * 4..128 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[144..148].copy_from_slice(&metallic.to_le_bytes());
+    pc[148..152].copy_from_slice(&roughness.to_le_bytes());
+    pc[152..156].copy_from_slice(&base_tex.to_le_bytes());
+    pc[156..160].copy_from_slice(&flip_y.to_le_bytes());
+    pc[160..164].copy_from_slice(&shadow_index.to_le_bytes());
     pc
 }
 
@@ -298,7 +410,84 @@ pub(crate) fn cull_push(
     pc
 }
 
-/// Pack the cull-draw push block (112 bytes): view_proj + sun_dir + grid params.
+/// Pack the HZB build push block (32 bytes): source/dest bindless indices + level
+/// dims + reduction tap counts (see `hzb_build.slang`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hzb_build_push(
+    src_index: u32,
+    dst_index: u32,
+    dst_w: u32,
+    dst_h: u32,
+    src_w: u32,
+    src_h: u32,
+    tap_x: u32,
+    tap_y: u32,
+) -> [u8; 32] {
+    let mut pc = [0u8; 32];
+    for (i, v) in [
+        src_index, dst_index, dst_w, dst_h, src_w, src_h, tap_x, tap_y,
+    ]
+    .iter()
+    .enumerate()
+    {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc
+}
+
+/// Pack the HZB-aware cull push block (224 bytes): the identical 128-byte frustum
+/// block (see `cull_push`) followed by the occlusion block — unjittered no-Y-flip
+/// view_proj + HZB metadata (see `csCullHzb` in `cull.slang`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cull_hzb_push(
+    planes: &[[f32; 4]; 6],
+    args_index: u32,
+    visible_index: u32,
+    count: u32,
+    grid_dim: u32,
+    spacing: f32,
+    cube_radius: f32,
+    y_height: f32,
+    index_count: u32,
+    view_proj: &[f32; 16],
+    hzb_base: u32,
+    hzb_levels: u32,
+    hzb_w: u32,
+    hzb_h: u32,
+    enabled: bool,
+    stats_index: u32,
+) -> [u8; 224] {
+    let mut pc = [0u8; 224];
+    // Bytes 0..128: identical frustum block.
+    let head = cull_push(
+        planes,
+        args_index,
+        visible_index,
+        count,
+        grid_dim,
+        spacing,
+        cube_radius,
+        y_height,
+        index_count,
+    );
+    pc[..128].copy_from_slice(&head);
+    // Bytes 128..192: view_proj (column-major, matches vp[4] float4 columns).
+    for (i, v) in view_proj.iter().enumerate() {
+        let o = 128 + i * 4;
+        pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // Bytes 192..: HZB metadata.
+    pc[192..196].copy_from_slice(&hzb_base.to_le_bytes());
+    pc[196..200].copy_from_slice(&hzb_levels.to_le_bytes());
+    pc[200..204].copy_from_slice(&hzb_w.to_le_bytes());
+    pc[204..208].copy_from_slice(&hzb_h.to_le_bytes());
+    pc[208..212].copy_from_slice(&(enabled as u32).to_le_bytes());
+    pc[212..216].copy_from_slice(&stats_index.to_le_bytes());
+    pc
+}
+
+/// Pack the cull-draw push block (112 bytes): view_proj + sun_dir + grid params +
+/// the scene-depth manual test (index + display→render pixel scale; see cull_draw.slang).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cull_draw_push(
     view_proj: &[f32; 16],
@@ -308,6 +497,8 @@ pub(crate) fn cull_draw_push(
     spacing: f32,
     cube_scale: f32,
     y_height: f32,
+    depth_index: u32,
+    depth_scale: [f32; 2],
 ) -> [u8; 112] {
     let mut pc = [0u8; 112];
     for (i, v) in view_proj.iter().enumerate() {
@@ -321,6 +512,9 @@ pub(crate) fn cull_draw_push(
     pc[88..92].copy_from_slice(&spacing.to_le_bytes());
     pc[92..96].copy_from_slice(&cube_scale.to_le_bytes());
     pc[96..100].copy_from_slice(&y_height.to_le_bytes());
+    pc[100..104].copy_from_slice(&depth_index.to_le_bytes());
+    pc[104..108].copy_from_slice(&depth_scale[0].to_le_bytes());
+    pc[108..112].copy_from_slice(&depth_scale[1].to_le_bytes());
     pc
 }
 
@@ -1106,8 +1300,9 @@ pub(crate) fn taau_push(
     max_hist: f32,
     variance_gamma: f32,
     jitter_uv: [f32; 2],
-) -> [u8; 224] {
-    let mut pc = [0u8; 224];
+    velocity_index: u32,
+) -> [u8; 240] {
+    let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1138,6 +1333,9 @@ pub(crate) fn taau_push(
     // float4 jitter (xy = current jitter in UV) at the next 16-byte row.
     pc[208..212].copy_from_slice(&jitter_uv[0].to_le_bytes());
     pc[212..216].copy_from_slice(&jitter_uv[1].to_le_bytes());
+    // velocity target index (PR-2) at the next 16-byte row; 0xFFFFFFFF = absent (camera-only
+    // reprojection, byte-identical to the pre-velocity path).
+    pc[224..228].copy_from_slice(&velocity_index.to_le_bytes());
     pc
 }
 
@@ -1565,21 +1763,6 @@ pub(crate) fn rt_path_push(
     pc[132..136].copy_from_slice(&sky_wb[0].to_le_bytes());
     pc[136..140].copy_from_slice(&sky_wb[1].to_le_bytes());
     pc[140..144].copy_from_slice(&sky_wb[2].to_le_bytes());
-    pc
-}
-
-/// Pack the compute-post push block: hdr_index + out_index + width + height.
-pub(crate) fn post_compute_push(
-    hdr_index: u32,
-    out_index: u32,
-    width: u32,
-    height: u32,
-) -> [u8; 16] {
-    let mut pc = [0u8; 16];
-    pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
-    pc[4..8].copy_from_slice(&out_index.to_le_bytes());
-    pc[8..12].copy_from_slice(&width.to_le_bytes());
-    pc[12..16].copy_from_slice(&height.to_le_bytes());
     pc
 }
 

@@ -364,7 +364,15 @@ facade trait 뒤에 성숙 라이브러리 백엔드를 격리 → 차후 자체
 - **T1→T2 렌더 완성도** — **20 AA(TAA)+포스트 스택+투명/OIT [S]**(P14 모션벡터) · **21 다광원
   클러스터드+CSM+데칼+프로브 [S]** · **22 대기/볼류메트릭 [S]** · **23 월드(지형/식생/물/버추얼 텍스처)
   [S]** · **24 머티리얼 그래프+고급 셰이딩(SSS/헤어/클로스) [S]**.
-  - **⚙ 선결 — "파이프라인 정합" 트랙(PR-1..9)**: 레퍼런스 디퍼드 렌더러 대비 프레임 패스 순서를 재정합.
+  - **⚙ 선결 — "파이프라인 정합" 트랙(PR-1..9) ✅ 완료**: 레퍼런스 디퍼드 렌더러 대비 프레임 패스 순서를 재정합.
+    PR-1 depth pre-pass(`DEPTH_PREPASS`) · PR-2 velocity+velocity-aware TAAU(`P_VELOCITY`) · PR-3 포워드
+    투명 슬롯(`P_TRANSLUCENT_TEST`) · PR-4 대기/포그 슬롯(`P_HEIGHT_FOG`) · PR-5 순서화 post 체인
+    (`P_BLOOM`/`P_MOTION_BLUR`/`P_DOF`/`P_GRADE`) · PR-6 클러스터드 라이트 컬링(`CLUSTERED_LIGHTS`,
+    1024라이트 ~19×) · PR-7 그림자 아틀라스+디렉셔널 CSM(`CSM=<N>`) · PR-8 HZB occlusion(`HZB_CULL`) ·
+    PR-9 view family(`P_SECOND_VIEW`) 전부 opt-in seam, 디폴트 바이트 동일(골든 러너 ALL PASS), Metal 검증
+    (DX≡VK Windows 후속). 각 항목 세부 문서: `depth-prepass.md`/`velocity-motion-vectors.md`/
+    `translucency-pass.md`/`atmosphere-fog-slot.md`/`post-process-chain.md`/`clustered-lighting.md`/
+    `shadow-atlas-csm.md`/`hzb-occlusion-culling.md`/`view-family.md`.
     세부·근거·매핑표: [render-pipeline-reference.md](render-pipeline-reference.md). **소스레벨 재정합에서
     확인한 구조 블로커**: (a) **depth pre-pass 부재**(G-buffer가 최초 depth writer → HZB/SSR/AO 순서 암묵
     의존), (b) **velocity(모션벡터) 채널 부재**(TAAU가 카메라 모션만 리프로젝션 → 움직이는 오브젝트 고스팅;

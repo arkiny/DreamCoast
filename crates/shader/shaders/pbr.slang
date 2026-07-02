@@ -18,8 +18,15 @@
 // migration (Vulkan/D3D12 parity pending the Windows box).
 
 #include "bindless.slang"
+#include "light_cluster_common.slang"
 
 static const float PI = 3.14159265359;
+
+// Cook-Torrance BRDF helpers (distribution/geometry/fresnel/shade) live in a shared
+// header so the forward translucency pass (`translucent.slang`) shades with the exact
+// same math — single source, no drift. Textual include after `PI` is defined, so the
+// generated code is unchanged from the previous inline definitions (byte-identical anchor).
+#include "pbr_brdf.slang"
 
 struct VSOutput
 {
@@ -46,6 +53,13 @@ struct PushConstants
                        // occludes the IBL DIFFUSE skylight. 0xFFFFFFFF = absent -> 1.0 (gallery anchor).
     float skyvis_tint; // neutral leak as a fraction of the occluded skylight luminance.
     float skyvis_min_occ; // min sky-visibility floor (lerp V toward 1); higher = weaker occlusion.
+    // Clustered light culling (PR-6). When cluster_grid_buf != 0xFFFFFFFF the point-light
+    // loop reads only this pixel's froxel light list (storage buffers below) instead of the
+    // globals.point_pos[] brute-force array. All three 0xFFFFFFFF = brute-force (gallery anchor).
+    uint cluster_grid_buf;  // per-cluster light COUNT u32[CLUSTER_COUNT]
+    uint cluster_index_buf; // flat light-index list u32[CLUSTER_COUNT * MAX_LIGHTS_PER_CLUSTER]
+    uint cluster_light_buf; // packed Light[] (position/radius/color/intensity)
+    uint cluster_light_count; // number of lights in cluster_light_buf (dbg heatmap normalisation)
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -68,6 +82,16 @@ struct Globals
     float4 probe;         // xyz = reflection-probe capture centre, w = parallax on (1) / off (0)
     float4 probe_box_min; // xyz = reflection proxy AABB min corner (w unused)
     float4 probe_box_max; // xyz = reflection proxy AABB max corner (w unused)
+    float4x4 prev_view_proj; // world -> previous clip (SSR history reprojection; mirrors Rust)
+    float4 cluster_view_z_row; // row 2 of world->view: view_z = dot(row, float4(p,1)) (PR-6)
+    float4 cluster_params;     // x = z_near, y = z_far (clustered froxel Z slicing)
+    // --- PR-7 shadow atlas / CSM. All zero on the legacy single-map path (csm_params.x == 0),
+    // where sun_shadow() takes the `light_view_proj` branch → byte-identical anchor.
+    int4 csm_params;         // x = cascade count (0 = off), y = debug viz, z = tile texels, w = atlas texels
+    float4 csm_split;        // per-cascade view-space far distance (up to 4)
+    float4 csm_opts;         // x = cross-cascade blend fraction (of the cascade depth range)
+    float4x4 csm_view_proj[4]; // per-cascade world -> atlas-tile light clip
+    float4 csm_atlas_uv[4];    // per-cascade atlas UV sub-rect: xy offset, zw scale
 };
 
 [[vk::push_constant]]
@@ -86,39 +110,6 @@ VSOutput vsMain(uint id: SV_VertexID)
     o.uv = uv;
     o.pos = float4(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * s, 0.0, 1.0);
     return o;
-}
-
-float distribution_ggx(float n_dot_h, float roughness)
-{
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
-    return a2 / max(PI * d * d, 1e-7);
-}
-
-float geometry_schlick_ggx(float n_dot_v, float roughness)
-{
-    float r = roughness + 1.0;
-    float k = (r * r) / 8.0;
-    return n_dot_v / (n_dot_v * (1.0 - k) + k);
-}
-
-float geometry_smith(float n_dot_v, float n_dot_l, float roughness)
-{
-    return geometry_schlick_ggx(n_dot_v, roughness)
-         * geometry_schlick_ggx(n_dot_l, roughness);
-}
-
-float3 fresnel_schlick(float cos_theta, float3 f0)
-{
-    return f0 + (1.0 - f0) * pow(saturate(1.0 - cos_theta), 5.0);
-}
-
-// Fresnel with a roughness term, for the IBL ambient.
-float3 fresnel_schlick_roughness(float cos_theta, float3 f0, float roughness)
-{
-    float3 fr = max(float3(1.0 - roughness), f0);
-    return f0 + (fr - f0) * pow(saturate(1.0 - cos_theta), 5.0);
 }
 
 // Image-based ambient: diffuse from the irradiance cube + specular from the
@@ -234,32 +225,17 @@ float shadow_tap(float2 uv, float current)
 // then a rotated Poisson PCF filters it (soft contact-hard, wide far from the caster).
 // `light_size` (globals.shadow.z) <= 0 falls back to the cheap 3x3 PCF (hard shadows).
 // `pix` = screen pixel coord, for the per-pixel rotation that hides banding.
-float sun_shadow(float3 world_pos, float2 pix)
+// PCF / PCSS-lite filter over a shadow-atlas UV. `uv` is the receiver's position in the
+// (sub-)tile it must stay within; `uv_min`/`uv_max` clamp the tap disk to that tile so a
+// blocker search can't bleed across atlas slots (identity [0,1] for the single map). `texel`
+// is one shadow-map texel in atlas UV. Shared by the single-map and CSM paths so both keep the
+// same quality (this is the extracted body of the legacy sun_shadow filter — behavior
+// preserved for the single map: uv_min=0, uv_max=1, texel=globals.shadow.y).
+float shadow_filter(float2 uv, float current, float2 pix, float texel,
+                    float2 uv_min, float2 uv_max)
 {
-    if (globals.counts.w == 0)
-        return 1.0;
-
-    float4 lc = mul(globals.light_view_proj, float4(world_pos, 1.0));
-    float3 proj = lc.xyz / lc.w; // ortho: w = 1
-    float2 uv;
-    uv.x = proj.x * 0.5 + 0.5;
-    // Map clip Y to texture V. Vulkan rasterizes the shadow map with +Y down,
-    // D3D12 with +Y up, so the sign of the V flip depends on the backend.
-    uv.y = pc.flip_y != 0 ? (proj.y * 0.5 + 0.5) : (proj.y * -0.5 + 0.5);
-
-    // Outside the light frustum (or beyond its far plane): treat as lit.
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || proj.z > 1.0)
-        return 1.0;
-
-    float bias = globals.shadow.x;
-    float texel = globals.shadow.y;
-    float current = proj.z - bias;
-    // Penumbra factor: shadow-map UV of penumbra per unit normalized depth gap. Folds
-    // the sun's angular size + the ortho depth-range/width on the CPU so it matches the
-    // path tracer's sun disk. 0 = hard 3x3 PCF.
     float penumbra_factor = globals.shadow.z;
 
-    // Per-pixel rotation of the Poisson disk (interleaved gradient noise).
     float ign = frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))));
     float ca = cos(ign * 6.2831853);
     float sa = sin(ign * 6.2831853);
@@ -271,12 +247,10 @@ float sun_shadow(float3 world_pos, float2 pix)
         float sum = 0.0;
         for (int x = -1; x <= 1; ++x)
             for (int y = -1; y <= 1; ++y)
-                sum += shadow_tap(uv + float2(x, y) * texel, current);
+                sum += shadow_tap(clamp(uv + float2(x, y) * texel, uv_min, uv_max), current);
         return sum / 9.0;
     }
 
-    // Soft-shadow tap count from the RenderQuality tier (globals.shadow.w). 0 / out-of-range
-    // falls back to the array bound, so an unset slot reproduces the legacy 16-tap behavior.
     int taps = int(globals.shadow.w);
     if (taps < 1 || taps > SHADOW_MAX_SAMPLES)
         taps = SHADOW_MAX_SAMPLES;
@@ -287,7 +261,7 @@ float sun_shadow(float3 world_pos, float2 pix)
     for (int i = 0; i < taps; ++i)
     {
         float2 o = mul(rot, POISSON16[i]) * SHADOW_SEARCH_UV;
-        float d = g.textures[pc.shadow_index].Sample(g.samp, uv + o).r;
+        float d = g.textures[pc.shadow_index].Sample(g.samp, clamp(uv + o, uv_min, uv_max)).r;
         if (d < current)
         {
             blocker_sum += d;
@@ -306,27 +280,121 @@ float sun_shadow(float3 world_pos, float2 pix)
     for (int i = 0; i < taps; ++i)
     {
         float2 o = mul(rot, POISSON16[i]) * radius;
-        sum += shadow_tap(uv + o, current);
+        sum += shadow_tap(clamp(uv + o, uv_min, uv_max), current);
     }
     return sum / float(taps);
 }
 
-// One light's contribution. `radiance` already folds color * intensity * atten.
-float3 shade(float3 n, float3 v, float3 l, float3 radiance, float3 albedo,
-             float metallic, float roughness, float3 f0)
+// `shade()` (one light's Cook-Torrance contribution) now lives in the shared
+// `pbr_brdf.slang` header included above — same math, shared with the translucency pass.
+
+// Project `world_pos` by a cascade / light view-projection into shadow-atlas UV + depth.
+// Returns false when outside the light frustum (or past its far plane) so the caller treats
+// the pixel as lit. `atlas_uv` = xy offset, zw scale of the tile within the atlas.
+bool project_to_atlas(float4x4 vp, float4 atlas_uv, float3 world_pos, out float2 uv, out float depth)
 {
-    float3 h = normalize(v + l);
-    float n_dot_v = max(dot(n, v), 1e-4);
-    float n_dot_l = max(dot(n, l), 0.0);
-    float n_dot_h = max(dot(n, h), 0.0);
+    float4 lc = mul(vp, float4(world_pos, 1.0));
+    float3 proj = lc.xyz / lc.w; // ortho: w = 1
+    float2 tuv;
+    tuv.x = proj.x * 0.5 + 0.5;
+    // Backend V flip (Vulkan rasterizes +Y down, D3D12 +Y up) — same convention as the map.
+    tuv.y = pc.flip_y != 0 ? (proj.y * 0.5 + 0.5) : (proj.y * -0.5 + 0.5);
+    depth = proj.z;
+    // Map the [0,1] tile UV into the atlas sub-rect.
+    uv = atlas_uv.xy + tuv * atlas_uv.zw;
+    return !(tuv.x < 0.0 || tuv.x > 1.0 || tuv.y < 0.0 || tuv.y > 1.0 || proj.z > 1.0);
+}
 
-    float ndf = distribution_ggx(n_dot_h, roughness);
-    float geo = geometry_smith(n_dot_v, n_dot_l, roughness);
-    float3 fr = fresnel_schlick(max(dot(h, v), 0.0), f0);
+// CSM cascade select: the tightest cascade whose split-far covers the view-space depth. A small
+// blend band near each boundary cross-fades to the next cascade so the resolution step isn't a
+// hard seam. `view_depth` = distance from the camera along the view direction. Returns the
+// sun-visibility [0,1]; also writes the chosen cascade index (for the debug overlay).
+float csm_shadow(float3 world_pos, float2 pix, float view_depth, out int cascade_out)
+{
+    int n = globals.csm_params.x;
+    float atlas = float(max(globals.csm_params.w, 1));
+    float texel = 1.0 / atlas; // one atlas texel in atlas UV
 
-    float3 specular = (ndf * geo * fr) / max(4.0 * n_dot_v * n_dot_l, 1e-4);
-    float3 kd = (1.0 - fr) * (1.0 - metallic);
-    return (kd * albedo / PI + specular) * radiance * n_dot_l;
+    // Cascade select by CONTAINMENT (not just the depth split): iterate tightest → widest and
+    // pick the first cascade whose frustum actually covers this world point. The split ordering
+    // makes near cascades the tightest, so this yields the highest-resolution cascade available
+    // for the pixel. Radial view-depth alone can route a point to a cascade whose sphere doesn't
+    // contain it (perspective vs radial + the sphere overshoots the slice) → the depth-only
+    // select leaves it wrongly lit; containment fixes that.
+    int ci = -1;
+    float2 uv = float2(0.0);
+    float depth = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        float2 tuv;
+        float td;
+        if (project_to_atlas(globals.csm_view_proj[i], globals.csm_atlas_uv[i], world_pos, tuv, td))
+        {
+            ci = i;
+            uv = tuv;
+            depth = td;
+            break;
+        }
+    }
+    cascade_out = ci;
+    if (ci < 0)
+        return 1.0; // outside every cascade (beyond the far cascade) -> lit
+    float4 rect = globals.csm_atlas_uv[ci];
+    float2 uv_min = rect.xy + texel;               // inset one texel so clamp never samples a neighbor
+    float2 uv_max = rect.xy + rect.zw - texel;
+    float current = depth - globals.shadow.x;
+    float vis = shadow_filter(uv, current, pix, texel, uv_min, uv_max);
+
+    // Cross-cascade blend: within the last `csm_opts.x` fraction of this cascade's view-depth
+    // coverage, fade to the next (wider) cascade so the resolution step at the split boundary
+    // isn't a hard seam. Blend fraction is CPU-owned (CsmConfig::blend_frac, single source).
+    if (ci + 1 < n)
+    {
+        float near_split = (ci == 0) ? 0.0 : globals.csm_split[ci - 1];
+        float far_split = globals.csm_split[ci];
+        float band = (far_split - near_split) * globals.csm_opts.x;
+        float t = saturate((view_depth - (far_split - band)) / max(band, 1e-4));
+        if (t > 0.0)
+        {
+            float2 uv2;
+            float depth2;
+            if (project_to_atlas(globals.csm_view_proj[ci + 1], globals.csm_atlas_uv[ci + 1],
+                                 world_pos, uv2, depth2))
+            {
+                float4 rect2 = globals.csm_atlas_uv[ci + 1];
+                float2 uv2_min = rect2.xy + texel;
+                float2 uv2_max = rect2.xy + rect2.zw - texel;
+                float cur2 = depth2 - globals.shadow.x;
+                float vis2 = shadow_filter(uv2, cur2, pix, texel, uv2_min, uv2_max);
+                vis = lerp(vis, vis2, t);
+            }
+        }
+    }
+    return vis;
+}
+
+// Fraction of the directional sun reaching `world_pos` (1 = fully lit, 0 = fully shadowed).
+// `view_depth` = camera-space distance (for the CSM cascade select). The CSM path is taken when
+// the seam is on (csm_params.x > 0); otherwise the legacy single-map path runs unchanged.
+float sun_shadow(float3 world_pos, float2 pix, float view_depth, out int cascade_out)
+{
+    cascade_out = -1;
+    if (globals.counts.w == 0)
+        return 1.0;
+
+    if (globals.csm_params.x > 0)
+        return csm_shadow(world_pos, pix, view_depth, cascade_out);
+
+    // Legacy single directional map (byte-identical anchor): identity atlas rect, texel =
+    // globals.shadow.y, clamp bounds [0,1] (no-op) → the extracted filter reproduces the
+    // original 3x3 / PCSS-lite behavior exactly.
+    float2 uv;
+    float depth;
+    float4 full = float4(0.0, 0.0, 1.0, 1.0);
+    if (!project_to_atlas(globals.light_view_proj, full, world_pos, uv, depth))
+        return 1.0;
+    float current = depth - globals.shadow.x;
+    return shadow_filter(uv, current, pix, globals.shadow.y, float2(0.0), float2(1.0));
 }
 
 // Camera exposure applied to the whole (ambient + direct) sum. Auto-exposure stores the adapted
@@ -386,12 +454,18 @@ float4 fsMain(VSOutput input) : SV_Target
 
     float3 lo = float3(0.0);
 
-    // Directional sun (attenuated by the shadow map).
+    // View-space distance for the CSM cascade select. Radial distance from the eye — a stable,
+    // view-direction-agnostic proxy for the perspective depth the CPU split scheme tiled (the
+    // single-map path ignores it). `cascade_idx` is the chosen cascade for the debug overlay.
+    float view_depth = length(globals.camera_pos.xyz - world_pos);
+    int cascade_idx = -1;
+
+    // Directional sun (attenuated by the shadow map / cascade atlas).
     {
         float3 l = normalize(globals.sun_direction.xyz);
         float3 radiance = globals.sun_color.rgb * globals.sun_color.a;
         lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0)
-            * sun_shadow(world_pos, input.pos.xy);
+            * sun_shadow(world_pos, input.pos.xy, view_depth, cascade_idx);
     }
 
     // Point lights. point_color.a is the luminous intensity in CANDELA (lm/sr) — the same
@@ -399,15 +473,72 @@ float4 fsMain(VSOutput input) : SV_Target
     // square `atten` converts candela → illuminance (lux) at the surface: E = I / d². (glTF
     // KHR_lights_punctual authors point/spot intensity in candela already; a light specified in
     // lumens Φ converts as I = Φ / 4π.)
-    int count = min(globals.counts.x, 4);
-    for (int i = 0; i < count; ++i)
+    //
+    // Clustered path (PR-6): when the cluster buffers are bound, iterate only this pixel's
+    // froxel light list. The list was built in ascending global-light-index order, and we
+    // read it in that same order, so with few lights (all in-cluster) the accumulation is
+    // bit-identical to the brute-force loop below. `lights_touched` feeds the debug heatmap.
+    uint lights_touched = 0;
+    if (pc.cluster_grid_buf != NO_TEXTURE)
     {
-        float3 to_light = globals.point_pos[i].xyz - world_pos;
-        float dist = length(to_light);
-        float3 l = to_light / max(dist, 1e-4);
-        float atten = 1.0 / max(dist * dist, 1e-4);
-        float3 radiance = globals.point_color[i].rgb * globals.point_color[i].a * atten;
-        lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
+        RWByteAddressBuffer lbuf = g.storage_buffers[pc.cluster_light_buf];
+        if (pc.cluster_index_buf == NO_TEXTURE)
+        {
+            // Brute-force-over-storage A/B baseline (CLUSTERED_BRUTE=1): loop ALL lights in the
+            // buffer, no froxel list. Same lights + same shader as the clustered path — only the
+            // culling differs, so the PROFILE_GPU delta isolates the culling's payoff at scale.
+            for (uint li = 0; li < pc.cluster_light_count; ++li)
+            {
+                Light L = load_light(lbuf, li);
+                float3 to_light = L.position - world_pos;
+                float dist = length(to_light);
+                float3 l = to_light / max(dist, 1e-4);
+                float atten = 1.0 / max(dist * dist, 1e-4);
+                float3 radiance = L.color * L.intensity * atten;
+                lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
+            }
+            lights_touched = pc.cluster_light_count;
+        }
+        else
+        {
+            // Positive linear view depth of this surface -> its froxel Z slice.
+            float view_z = -dot(globals.cluster_view_z_row, float4(world_pos, 1.0));
+            // Screen UV from the fullscreen fragment (input.uv is the [0,1] triangle uv;
+            // matches the cluster build's D3D-style uv->ndc — no Y flip, cancels in world).
+            float2 cuv = input.uv;
+            uint ci = cluster_index_for(cuv, view_z, globals.cluster_params.x,
+                                        globals.cluster_params.y);
+            RWByteAddressBuffer grid = g.storage_buffers[pc.cluster_grid_buf];
+            RWByteAddressBuffer index_list = g.storage_buffers[pc.cluster_index_buf];
+            uint lcount = grid.Load(ci * 4);
+            uint lbase = ci * MAX_LIGHTS_PER_CLUSTER;
+            for (uint k = 0; k < lcount; ++k)
+            {
+                uint li = index_list.Load((lbase + k) * 4);
+                Light L = load_light(lbuf, li);
+                float3 to_light = L.position - world_pos;
+                float dist = length(to_light);
+                float3 l = to_light / max(dist, 1e-4);
+                float atten = 1.0 / max(dist * dist, 1e-4);
+                float3 radiance = L.color * L.intensity * atten;
+                lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
+            }
+            lights_touched = lcount;
+        }
+    }
+    else
+    {
+        int count = min(globals.counts.x, 4);
+        for (int i = 0; i < count; ++i)
+        {
+            float3 to_light = globals.point_pos[i].xyz - world_pos;
+            float dist = length(to_light);
+            float3 l = to_light / max(dist, 1e-4);
+            float atten = 1.0 / max(dist * dist, 1e-4);
+            float3 radiance = globals.point_color[i].rgb * globals.point_color[i].a * atten;
+            lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
+        }
+        lights_touched = uint(count);
     }
 
     // Stage C2: GDF ambient occlusion, marched against the world-space scene GDF in a
@@ -470,6 +601,28 @@ float4 fsMain(VSOutput input) : SV_Target
     else if (dbg == 8) color = ambient * exposure; // IBL ambient only
     else if (dbg == 9) color = float3(gdf_ao);     // GDF AO factor
     else if (dbg == 10) color = gi * exposure;     // GDF indirect diffuse
+    else if (dbg == 11)                            // clustered light-count heatmap
+    {
+        // Per-pixel lights-touched as a blue->green->red ramp (0 = black). Normalised to a
+        // fixed 16-light budget so hot clusters (many overlapping lights) glow red.
+        float t = saturate(float(lights_touched) / 16.0);
+        color = float3(saturate(t * 2.0 - 1.0), saturate(1.0 - abs(t - 0.5) * 2.0), saturate(1.0 - t * 2.0));
+        if (lights_touched == 0)
+            color = float3(0.0);
+    }
+
+    // PR-7 CSM cascade-index overlay (csm_params.y): tint the lit color by which cascade
+    // shades each pixel so the split boundaries are inspectable. Only active with CSM on.
+    if (globals.csm_params.y != 0 && globals.csm_params.x > 0 && cascade_idx >= 0)
+    {
+        // 4 distinct hues for cascades 0..3 (near→far): red, green, blue, yellow.
+        float3 tints[4] = {
+            float3(1.0, 0.3, 0.3), float3(0.3, 1.0, 0.3),
+            float3(0.3, 0.5, 1.0), float3(1.0, 1.0, 0.3),
+        };
+        float3 tint = tints[clamp(cascade_idx, 0, 3)];
+        color = lerp(color, color * tint * 1.5 + tint * 0.15, 0.5);
+    }
 
     return float4(color, 1.0);
 }
