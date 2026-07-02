@@ -19,8 +19,8 @@
 use dreamcoast_core::glam::Mat4;
 use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourceId};
 use rhi::{
-    BackendKind, BlendMode, ClearColor, ComputePipeline, ComputePipelineDesc, Device, Extent2D,
-    GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, VertexLayout,
+    BackendKind, BlendMode, ClearColor, ComputePipeline, ComputePipelineDesc, DepthCompare, Device,
+    Extent2D, GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, VertexLayout,
 };
 
 use crate::app::{load_compute_shader, load_shader_pair};
@@ -73,6 +73,7 @@ impl VelocitySystem {
                 uniform_buffer: false,
                 depth_test: true,
                 depth_write: false, // depth already written by the G-buffer fill; test-only (no perturb)
+                depth_compare: DepthCompare::Less,
                 depth_format: Some(DEPTH_FORMAT),
             })?)
         };
