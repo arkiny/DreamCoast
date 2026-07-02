@@ -138,6 +138,7 @@ pub trait Recorder {
     fn storage_buffer_to_storage(&self, buffer: &StorageBuffer);
     fn draw_indexed_indirect(&self, buffer: &StorageBuffer, offset: u64, draw_count: u32);
     fn set_scissor(&self, rect: Rect2D);
+    fn set_viewport_scissor_rect(&self, rect: Rect2D);
     fn bind_vertex_buffer(&self, buffer: &Buffer, stride: u32);
     fn bind_index_buffer(&self, buffer: &Buffer, wide: bool);
     fn push_constants(&self, data: &[u8]);
@@ -305,6 +306,9 @@ impl Recorder for CommandBuffer {
     fn set_scissor(&self, rect: Rect2D) {
         CommandBuffer::set_scissor(self, rect)
     }
+    fn set_viewport_scissor_rect(&self, rect: Rect2D) {
+        CommandBuffer::set_viewport_scissor_rect(self, rect)
+    }
     fn bind_vertex_buffer(&self, buffer: &Buffer, stride: u32) {
         CommandBuffer::bind_vertex_buffer(self, buffer, stride)
     }
@@ -403,6 +407,9 @@ pub enum RhiCommand {
     SetViewportScissor,
     SetViewportScissorExtent {
         extent: Extent2D,
+    },
+    SetViewportScissorRect {
+        rect: Rect2D,
     },
     RtToRenderTarget {
         target: ResPtr<RenderTarget>,
@@ -746,6 +753,7 @@ impl CommandList {
                 RhiCommand::SetViewportScissorExtent { extent } => {
                     cmd.set_viewport_scissor_extent(extent)
                 }
+                RhiCommand::SetViewportScissorRect { rect } => cmd.set_viewport_scissor_rect(rect),
                 RhiCommand::RtToRenderTarget { target } => {
                     cmd.rt_to_render_target(unsafe { target.get() })
                 }
@@ -1175,6 +1183,12 @@ impl Recorder for CommandList {
             .borrow_mut()
             .cmds
             .push(RhiCommand::SetScissor { rect });
+    }
+    fn set_viewport_scissor_rect(&self, rect: Rect2D) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::SetViewportScissorRect { rect });
     }
     fn bind_vertex_buffer(&self, buffer: &Buffer, stride: u32) {
         self.inner
