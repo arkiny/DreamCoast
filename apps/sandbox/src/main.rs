@@ -54,6 +54,7 @@ mod rt;
 mod skin;
 mod smoketest;
 mod taau;
+mod velocity;
 mod world;
 use app::*;
 use cull::*;
@@ -126,7 +127,7 @@ const BRDF_SIZE: u32 = 256;
 const NO_TEXTURE: u32 = u32::MAX;
 const MODEL_PATH: &str = "assets/model.glb";
 
-const DEBUG_VIEWS: [&str; 11] = [
+const DEBUG_VIEWS: [&str; 12] = [
     "Lit",
     "Albedo",
     "Normal",
@@ -138,7 +139,11 @@ const DEBUG_VIEWS: [&str; 11] = [
     "IBL",
     "GDF AO",
     "GDF GI",
+    "Velocity", // 11 — motion vectors (needs P_VELOCITY=1)
 ];
+/// DEBUG_VIEW=11 velocity viz amplification: a small NDC motion (a few 1e-3) is scaled into a
+/// visible colour range. Tuned so a spinning object's edge motion is clearly readable.
+const VELOCITY_VIZ_SCALE: f32 = 40.0;
 const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 
 /// One materialized drawable in the sample scene: a shared GPU mesh + world
@@ -764,6 +769,17 @@ struct App {
     /// distant-texture sharpness lever). Resolved once from `quality::TAA_MIP_BIAS` with a
     /// `TAA_MIP_BIAS` env override for sweeps. See `quality.rs` for the rationale.
     taa_mip_bias: f32,
+    /// Velocity (motion-vector) G-buffer channel (pipeline re-baseline PR-2). Owns the opaque
+    /// velocity pass + the DEBUG_VIEW=11 viz. `velocity_on` gates the whole feature (`P_VELOCITY=1`);
+    /// default off = no velocity target, camera-only TAAU reprojection, byte-identical.
+    velocity: velocity::VelocitySystem,
+    velocity_on: bool,
+    /// Single prev-pose source (PR-2): each drawable's PREVIOUS-frame unjittered world transform,
+    /// keyed by the frame's stable draw-list index (deterministic insertion order). The velocity
+    /// pass reads it to compute per-object screen motion for static / Spin / node-animated draws
+    /// (skinning / morph add their prev palette / weights on top). Rebuilt after each frame from the
+    /// current transforms.
+    prev_transforms: Vec<Mat4>,
     // Profiler UI state.
     profiler_on: bool,
     slot_pass_names: Vec<Vec<&'static str>>,
@@ -858,6 +874,8 @@ impl App {
         let reflect = ReflectSystem::new(&device, backend, compute_supported)?;
         // QHD/UHD track: temporal upsampler. See `taau.rs`.
         let taau = taau::TaauSystem::new(&device, backend, compute_supported)?;
+        // Velocity (motion-vector) channel (pipeline re-baseline PR-2). See `velocity.rs`.
+        let velocity = velocity::VelocitySystem::new(&device, backend)?;
 
         // GPU particle system (Phase 7): a persistent ping-pong buffer pair advanced
         // by a compute pass and drawn as instanced billboards (see `particle.rs`).
@@ -2450,6 +2468,9 @@ impl App {
                 .ok()
                 .and_then(|s| s.trim().parse::<f32>().ok())
                 .unwrap_or(quality::TAA_MIP_BIAS),
+            velocity,
+            velocity_on: quality::env_bool("P_VELOCITY", false),
+            prev_transforms: Vec::new(),
             profiler_on,
             slot_pass_names,
             gpu_timings: Vec::new(),
@@ -2980,6 +3001,29 @@ impl App {
             build_scene(&self.world, &self.mesh_registry, &self.material_registry)
         };
 
+        // Velocity (PR-2) single prev-pose source: seed each drawable's previous transform from
+        // last frame's stored transforms (same stable draw-list order). A newly-appeared drawable
+        // (or first frame) has no history → default (identity + current), i.e. zero object motion.
+        // Skinning / morph overwrite their entries with the prev palette / weights below. Built
+        // only when velocity is on (else an empty vec — no per-frame cost on the default path).
+        let mut prev_scene: Vec<velocity::PrevPose> = if self.velocity_on {
+            scene
+                .iter()
+                .enumerate()
+                .map(|(i, obj)| velocity::PrevPose {
+                    transform: self
+                        .prev_transforms
+                        .get(i)
+                        .copied()
+                        .unwrap_or(obj.transform),
+                    skin_palette: 0,
+                    morph_weights: 0,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Animation Stage B: CPU-skin the skinned primitives and swap each skinned
         // drawable to this frame-in-flight's vertex buffer. Inline path only — the
         // per-frame vertex write relies on this slot's fence having been waited at
@@ -2987,14 +3031,14 @@ impl App {
         // not supported in B.1).
         if !self.skinned.is_empty() && self.rhi_thread.is_none() {
             skin::update_palettes(&mut self.skinned, &self.world, fif)?;
-            skin::patch_scene(&self.skinned, &mut scene, fif);
+            skin::patch_scene(&self.skinned, &mut scene, &mut prev_scene, fif);
         }
         // Animation Stage C: blend morph targets (GPU = write the per-frame weights
         // buffer; CPU = re-blend the vertex ring) + patch this frame's drawables. Inline
         // path only (the per-frame storage/vertex write relies on the frame-start fence).
         if !self.morphed.is_empty() && self.rhi_thread.is_none() {
             morph::apply_morph(&mut self.morphed, &self.world, fif)?;
-            morph::patch_scene(&self.morphed, &mut scene, fif);
+            morph::patch_scene(&self.morphed, &mut scene, &mut prev_scene, fif);
         }
 
         // Orbiting camera framing the whole sample scene — or, in single-object
@@ -4021,6 +4065,29 @@ impl App {
         // no decals, so the gallery / non-decal scenes stay byte-identical.
         self.deferred
             .record_decals(&mut graph, gbuf, &scene, view_proj, mip_bias);
+        // Velocity (motion-vector) channel (pipeline re-baseline PR-2, opt-in `P_VELOCITY=1`): a
+        // separate opaque pass into an RG16Float target holding per-pixel screen motion. Uses the
+        // UNJITTERED current + previous camera matrices (`view_proj_stable` / `prev_view_proj_taau`)
+        // so no TAA jitter leaks into the motion; per-object prev pose from `prev_scene`. Consumed by
+        // the velocity-aware TAAU reprojection + the DEBUG_VIEW=11 viz. Off = no target, no pass.
+        let velocity_target = if self.velocity_on {
+            let vt = graph.create_color("velocity", velocity::VELOCITY_FMT, extent);
+            self.velocity.record(
+                &mut graph,
+                vt,
+                g_depth,
+                &scene,
+                &prev_scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj_stable,
+                Mat4::from_cols_array(&self.prev_view_proj_taau),
+            );
+            Some(vt)
+        } else {
+            None
+        };
         // Stage C2/C3 (GDF-lighting consumers, see `gi.rs`) share the world scene GDF:
         // import its handle once + record the one-time fused-scene bake (the volume is
         // owned by `GdfSystem`), then AO + GI read it. Recorded before lighting so the
@@ -5228,11 +5295,23 @@ impl App {
                 self.scene_radius * 2.0,
                 taau_jitter_uv,
                 false,
+                velocity_target,
             ))
         } else {
             None
         };
-        let tonemap_src = rt_out
+        // DEBUG_VIEW=11: colour-code the velocity target (needs `P_VELOCITY=1`). Takes precedence
+        // over the lit/TAAU output so the motion vectors are visualized directly.
+        let velocity_view_out = if self.debug_view == 11 {
+            velocity_target.map(|vt| {
+                self.velocity
+                    .record_viz(&mut graph, vt, extent, cw, ch, VELOCITY_VIZ_SCALE)
+            })
+        } else {
+            None
+        };
+        let tonemap_src = velocity_view_out
+            .or(rt_out)
             .or(wrc_view_out)
             .or(sdf_out)
             .or(vol_out)
@@ -5526,6 +5605,15 @@ impl App {
         }
         self.prev_view_proj = view_proj.to_cols_array();
         self.prev_view_proj_taau = view_proj_stable.to_cols_array();
+        // Velocity (PR-2): stash this frame's per-object world transforms as next frame's prev pose
+        // (single source; stable draw-list order). Only when velocity is on (else no cost / no state
+        // churn). Uses the pre-skin transform for static/Spin draws; skinned draws carry identity
+        // here and their motion comes from the palette history instead.
+        if self.velocity_on {
+            self.prev_transforms.clear();
+            self.prev_transforms
+                .extend(scene.iter().map(|o| o.transform));
+        }
 
         // Inline present + capture readback. Threaded: the RHI thread did both (its
         // capture readback waits the same frame fence → byte-identical + deterministic).

@@ -117,7 +117,7 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 | V | 씬 가시성/컬링 | GPU frustum 컬링(P7 `cull.rs`), HZB occlusion 없음 | 🟡 | 컬링은 있으나 occlusion/HZB 부재; 라이트 컬링(클러스터) 없음(단일 디렉셔널) |
 | 1 | Depth Pre-pass | **없음** — G-buffer가 첫 depth writer | 🔴 | `record_gbuffer`가 depth를 처음 생성. 화면공간 패스(SSR/AO)가 G-buffer depth에 직접 의존 → prepass 없이 순서 강제됨. GDF AO flicker 근원도 depth 라이프타임(메모리 참조) |
 | 2 | DBuffer 데칼(전) | **없음** | 🔴 | 데칼은 base pass **후** 경로만 존재(아래 #5) |
-| 3 | Base Pass(G-buffer) | ✅ 4 MRT(albedo+AO / world normal / material / **world position**) | 🟡 | 존재·견고하나 **velocity(모션벡터) 채널 없음**, world-position을 명시 저장(레퍼런스는 depth에서 재구성) |
+| 3 | Base Pass(G-buffer) | ✅ 4 MRT + **velocity RT(RG16F, PR-2, opt-in `P_VELOCITY=1`)** | 🟡 | velocity 채널 도입(전용 RT + 별도 불투명 패스, unjittered `clip−prevClip`, 스태틱·Spin·스키닝·모프 prev-pose 단일 소스 — [velocity-motion-vectors.md](velocity-motion-vectors.md)); world-position 명시 저장은 여전(레퍼런스는 depth에서 재구성) |
 | 4 | Custom Depth/Stencil | **없음** | 🔴 | 아웃라인/마스크 파이프라인 부재 |
 | 5 | GBuffer 데칼(후) | ✅ `record_decals`(A3, deferred decal) | ✅ | base pass 후·라이팅 전 — 정합. Intel Sponza `dirt_decal`에서 검증 |
 | 6 | Shadow Depth | ✅ `record_shadow`(단일 디렉셔널 shadow map, PCF/PCSS-lite) | 🟡 | 단일 맵만 — **CSM/cascade·스팟/포인트 큐브·아틀라스 없음** |
@@ -127,8 +127,8 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 | 10 | Sky/Atmosphere | 🟡 절차 sky → env cube(`ibl.rs`), 씬 배경 합성은 IBL로 | 🟡 | 물리기반 sky/에어리얼 퍼스펙티브/time-of-day 없음; 별도 sky 합성 패스 아닌 IBL 캡처 |
 | 11 | Fog/Volumetric | **없음** | 🔴 | height fog·volumetric·light shaft·cloud 전무 |
 | 12 | Translucency | **없음**(불투명만) | 🔴 | 정렬 투명/OIT/굴절 없음 — foliage는 alpha-cutout(불투명 경로)로 우회 |
-| 13 | Motion Blur | **없음** | 🔴 | velocity 부재로 불가 |
-| 14 | Temporal AA/Upscale | 🟡 `taau.rs`(TAAU: jitter + 리프로젝션 누적, 톤맵 **전** linear-HDR) | 🟡 | 위치(톤맵 전)·jitter는 정합. **그러나 카메라 모션만 리프로젝션**(prev view-proj + world-pos), **per-object velocity 없음** → 움직이는 오브젝트에서 고스팅/스미어 |
+| 13 | Motion Blur | **없음** (선결이던 velocity는 PR-2로 확보) | 🔴 | velocity RT가 생겨 이제 구현 가능 — PR-5 post 시퀀스의 스텁 슬롯에 삽입 예정 |
+| 14 | Temporal AA/Upscale | ✅ `taau.rs`(TAAU: jitter + 리프로젝션 누적, 톤맵 **전** linear-HDR) + **velocity-aware 리프로젝션(PR-2)** | 🟡 | 위치(톤맵 전)·jitter 정합. `P_VELOCITY=1`이면 3×3 dilated per-pixel velocity로 리프로젝션(움직이는 오브젝트 고스팅 감소, 검증 수치는 [velocity-motion-vectors.md](velocity-motion-vectors.md)); off면 종전 카메라-온리(바이트 동일) |
 | 15 | Auto Exposure | ✅ `record_auto_exposure`(히스토그램/평균, 적응) | ✅ | 톤맵 전 배치 정합(opt-in) |
 | 16 | Bloom | 🟡 P5 데모 블룸 체인 존재하나 현 프레임 경로엔 미배선 | 🟡 | `record_compute_post`는 3×3 박스 블러(데모)이며 블룸 아님. 실 블룸은 tonemap에 미통합 |
 | 17 | Depth of Field | **없음** | 🔴 | — |
@@ -145,9 +145,9 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 1. **Depth pre-pass 부재 (#1).** G-buffer가 최초 depth writer라 SSR/AO/GI가 완성 depth를 전제하는 순서를
    *암묵적으로만* 만족한다. Early-Z 오버드로 제거, HZB occlusion 컬링, hi-Z 기반 SSR 트레이스, 정확한
    화면공간 트레이싱 모두 prepass depth를 요구한다. 부재가 GDF AO depth-lifetime 버그의 배경이기도 했다.
-2. **Velocity / 모션벡터 부재 (#3·#13·#14).** G-buffer에 velocity 채널이 없어 TAAU가 **카메라 모션만**
-   리프로젝션한다 → 움직이는 오브젝트(스키닝/스핀/파티클)에서 고스팅. **모션블러(13)와 velocity-aware
-   TAA(14)의 공통 선결조건**이며, Phase 20 TAA/포스트의 실질 블로커.
+2. **~~Velocity / 모션벡터 부재 (#3·#13·#14)~~ — PR-2로 해소.** velocity RT(RG16F, opt-in
+   `P_VELOCITY=1`) + velocity-aware TAAU 리프로젝션이 들어가 움직이는 오브젝트(스키닝/스핀/모프)의
+   고스팅이 감소. 모션블러(13)의 선결도 확보 — [velocity-motion-vectors.md](velocity-motion-vectors.md).
 3. **투명 패스 부재 (#12).** 디퍼드 라이팅 뒤·post 앞의 정렬 투명 슬롯 자체가 없어 유리/굴절/파티클
    HDR 합성/포그 상호작용을 넣을 자리가 없다. 현재 particle/cull이 **톤맵 후 LDR**에 그려지는 것도 이
    슬롯 부재의 증상이다.
@@ -172,10 +172,11 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
   *왜 먼저:* 아래 velocity·HZB·SSR 정확도의 공통 토대. *unblocks:* HZB occlusion 컬링, hi-Z SSR,
   화면공간 트레이싱 정확도, GDF AO depth-lifetime 근본 정리. *리스크:* 양 백엔드 depth load/store +
   골든이미지 anchor 바이트 동일 유지(기존 depth graph-driven load/store 재사용).
-- **PR-2 · Velocity(모션벡터) G-buffer 채널 [M].** base pass에서 `clip - prevClip` 모션벡터를 MRT(또는
-  전용 RT)로 출력(스태틱·스키닝·모프·스핀 모두 prev-transform 전달). *왜 여기:* TAA·모션블러의 단일
-  선결. *unblocks:* velocity-aware TAAU(고스팅 제거), 모션블러, 반사/GI 리프로젝션 정확도.
-  *단일 소스:* prev-transform을 애니메이션 시스템(P13/P15 spin)에서 한 곳으로 공급.
+- **PR-2 · Velocity(모션벡터) G-buffer 채널 [M] — ✅ DONE.** 전용 RG16F RT + 별도 불투명 velocity
+  패스로 `clip − prevClip`(unjittered NDC) 출력 — 스태틱·Spin·스키닝(prev 팔레트)·모프(prev 웨이트)
+  전부 prev-pose 단일 소스에서 공급. velocity-aware TAAU(3×3 dilated) 배선까지 포함, opt-in
+  `P_VELOCITY=1`(off = 골든 앵커 바이트 동일) + `DEBUG_VIEW=11` 시각화. 설계·검증 수치:
+  [velocity-motion-vectors.md](velocity-motion-vectors.md). DX≡VK parity pending Windows.
 
 ### 정합 P1 — 합성 슬롯 열기
 - **PR-3 · 투명 패스 슬롯 [M].** 디퍼드 라이팅+반사 뒤, post 앞에 **정렬 불투명-후 투명 패스**를 그래프에

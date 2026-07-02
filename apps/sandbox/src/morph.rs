@@ -60,6 +60,10 @@ struct GpuMorphMesh {
     /// Per-fif weights storage buffers + their bindless indices; written each frame.
     weight_bufs: Vec<StorageBuffer>,
     weight_idx: Vec<u32>,
+    /// The weights bindless index written LAST frame (the previous blendshape state) — the
+    /// velocity pass reads it to reconstruct each vertex's previous-frame position. Updated in
+    /// `apply_morph`. Single prev-pose source for morphed draws.
+    prev_weight_idx: u32,
     /// Reused per-frame weights byte scratch (16-byte-aligned buffer size).
     weight_scratch: Vec<u8>,
     // Keep the static delta buffer resident.
@@ -191,6 +195,7 @@ fn build_gpu_mesh(
         target_count: target_count as u32,
         vertex_count: vertex_count as u32,
         node,
+        prev_weight_idx: weight_idx[0],
         weight_bufs,
         weight_idx,
         weight_scratch: vec![0u8; weight_size],
@@ -238,7 +243,11 @@ fn build_cpu_mesh(
 /// weights buffer (cheap, no per-vertex work); CPU primitives blend into the ring. Call
 /// after the animation advances and after this slot's fence has been waited.
 pub(crate) fn apply_morph(set: &mut MorphSet, world: &World, fif: usize) -> anyhow::Result<()> {
+    let prev_fif = (fif + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
     for m in set.gpu.iter_mut() {
+        // The OTHER ring slot holds last frame's weights (double-buffered); record its index as the
+        // previous state before this frame overwrites `fif`.
+        m.prev_weight_idx = m.weight_idx[prev_fif];
         m.weight_scratch.iter_mut().for_each(|b| *b = 0);
         if let Some(w) = world.get::<MorphWeights>(m.node) {
             for (t, &wv) in w.0.iter().take(m.target_count as usize).enumerate() {
@@ -298,8 +307,13 @@ fn blend_cpu(m: &mut CpuMorphMesh, world: &World, fif: usize) -> anyhow::Result<
 /// indices (the g-buffer/shadow pass draws them with the morph pipeline + the bind-pose
 /// buffer); CPU primitives swap to this frame's ring buffer. Run on the freshly built
 /// scene list each frame, after [`apply_morph`].
-pub(crate) fn patch_scene(set: &MorphSet, scene: &mut [crate::SceneObject], fif: usize) {
-    for obj in scene.iter_mut() {
+pub(crate) fn patch_scene(
+    set: &MorphSet,
+    scene: &mut [crate::SceneObject],
+    prev: &mut [crate::velocity::PrevPose],
+    fif: usize,
+) {
+    for (i, obj) in scene.iter_mut().enumerate() {
         if let Some(m) = set.gpu.iter().find(|m| Rc::ptr_eq(&obj.mesh, &m.base_mesh)) {
             obj.morph = Some([
                 m.deltas_idx,
@@ -307,6 +321,11 @@ pub(crate) fn patch_scene(set: &MorphSet, scene: &mut [crate::SceneObject], fif:
                 m.target_count,
                 m.vertex_count,
             ]);
+            // Prev pose keeps the node transform (morphed vertices are local space); the previous
+            // blendshape weights carry the deform motion.
+            if let Some(p) = prev.get_mut(i) {
+                p.morph_weights = m.prev_weight_idx;
+            }
         } else if let Some(m) = set.cpu.iter().find(|m| Rc::ptr_eq(&obj.mesh, &m.base_mesh)) {
             obj.mesh = m.ring[fif].clone();
         }
