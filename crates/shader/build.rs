@@ -443,6 +443,18 @@ const JOBS: &[Job] = &[
         key: "post_fs",
     },
     Job {
+        src: "atmosphere.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "atmosphere_vs",
+    },
+    Job {
+        src: "atmosphere.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "atmosphere_fs",
+    },
+    Job {
         src: "blur.slang",
         entry: "vsMain",
         stage: "vertex",
