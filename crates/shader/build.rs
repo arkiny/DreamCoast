@@ -24,7 +24,7 @@ const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
 /// editing any of them recompiles all dependents (they include no per-job tracking otherwise —
 /// an omitted entry silently ships stale bytecode). Keep in sync with the `#include`s under
 /// `shaders/` (a non-JOB `.slang` — or the RT-pipeline root-sig JSON — belongs here).
-const SHARED_INCLUDES: [&str; 11] = [
+const SHARED_INCLUDES: [&str; 12] = [
     "bindless.slang",
     "rt_common.slang",
     "rt_pipeline_metal_rootsig.json",
@@ -36,6 +36,7 @@ const SHARED_INCLUDES: [&str; 11] = [
     "surface_cache.slang",
     "wrc_common.slang",
     "light_cluster_common.slang",
+    "pbr_brdf.slang",
 ];
 
 // FNV-1a 64-bit — dependency-free content hash for the shader cook cache (Phase 12
@@ -497,6 +498,18 @@ const JOBS: &[Job] = &[
         entry: "fsMain",
         stage: "fragment",
         key: "atmosphere_fs",
+    },
+    Job {
+        src: "translucent.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "translucent_vs",
+    },
+    Job {
+        src: "translucent.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "translucent_fs",
     },
     Job {
         src: "blur.slang",

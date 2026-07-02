@@ -250,6 +250,41 @@ pub(crate) fn atmosphere_push(
     pc
 }
 
+/// Pack the forward translucency push block (176 bytes, PR-3). Layout: mvp(64), model(64),
+/// base_color(16), material(16 = metallic, roughness, base_color tex-index bits, flip_y
+/// bits), misc(16 = shadow_index then 3 reserved). `base_tex`/`flip_y`/`shadow_index` are
+/// `u32` values stored in the float slots (`material.zw` / `misc.x`) that the shader reads
+/// with `asuint` — the reinterpret keeps the block a single 16-byte-aligned float4 grid
+/// across all three backends' cbuffer packing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn translucent_push(
+    mvp: &[f32; 16],
+    model: &[f32; 16],
+    base_color: [f32; 4],
+    metallic: f32,
+    roughness: f32,
+    base_tex: u32,
+    flip_y: u32,
+    shadow_index: u32,
+) -> [u8; 176] {
+    let mut pc = [0u8; 176];
+    for (i, v) in mvp.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in model.iter().enumerate() {
+        pc[64 + i * 4..64 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in base_color.iter().enumerate() {
+        pc[128 + i * 4..128 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[144..148].copy_from_slice(&metallic.to_le_bytes());
+    pc[148..152].copy_from_slice(&roughness.to_le_bytes());
+    pc[152..156].copy_from_slice(&base_tex.to_le_bytes());
+    pc[156..160].copy_from_slice(&flip_y.to_le_bytes());
+    pc[160..164].copy_from_slice(&shadow_index.to_le_bytes());
+    pc
+}
+
 /// Pack the particle-sim push block: buffer_index + count + dt + time + init.
 pub(crate) fn particle_sim_push(
     read_index: u32,

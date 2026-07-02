@@ -56,6 +56,7 @@ mod rt;
 mod skin;
 mod smoketest;
 mod taau;
+mod translucent;
 mod velocity;
 mod world;
 use app::*;
@@ -483,6 +484,13 @@ struct App {
     /// PR-4 (render-pipeline re-baseline track): the sky/atmosphere composite slot
     /// (today: opt-in analytic height fog, `P_HEIGHT_FOG`). See `atmosphere.rs`.
     atmosphere: atmosphere::AtmosphereSystem,
+    /// PR-3 (render-pipeline re-baseline track): the forward translucency slot (sorted
+    /// alpha-blend after opaque lighting + fog, before post). See `translucent.rs`.
+    translucency: translucent::TranslucencySystem,
+    /// Translucent drawables sorted + drawn by the translucency pass. Empty by default
+    /// (the slot then adds no pass → byte-identical). `P_TRANSLUCENT_TEST=1` seeds demo
+    /// glass panes; glTF `Transparent` (BLEND) materials also route here.
+    translucents: Vec<translucent::TranslucentObject>,
     reflect: ReflectSystem,
     particles: ParticleSystem,
     cull: CullSystem,
@@ -930,6 +938,11 @@ impl App {
         // PR-4 (render-pipeline re-baseline track): the sky/atmosphere composite slot
         // (opt-in height fog today). See `atmosphere.rs`.
         let atmosphere = atmosphere::AtmosphereSystem::new(&device, backend, HDR_FORMAT)?;
+        // PR-3 (render-pipeline re-baseline track): the forward translucency slot. Built
+        // unconditionally (the shader is exercised by every backend's build); the pass is
+        // only recorded when there are translucent objects. See `translucent.rs`.
+        let translucency =
+            translucent::TranslucencySystem::new(&device, backend, HDR_FORMAT, DEPTH_FORMAT)?;
         // Stage C reflection track (C5 SSR; C6/C7 later). See `reflect.rs`.
         let reflect = ReflectSystem::new(&device, backend, compute_supported)?;
         // QHD/UHD track: temporal upsampler. See `taau.rs`.
@@ -939,13 +952,16 @@ impl App {
 
         // GPU particle system (Phase 7): a persistent ping-pong buffer pair advanced
         // by a compute pass and drawn as instanced billboards (see `particle.rs`).
-        let particles =
-            ParticleSystem::new(&device, backend, compute_supported, swapchain.format())?;
+        // PR-3 side-effect: the draw now composites in the HDR translucency slot (before
+        // tonemap), not over the tonemapped LDR — so it's built with HDR_FORMAT. Default-off
+        // (`P7_PARTICLES`), so the default gallery/anchor output is unchanged.
+        let particles = ParticleSystem::new(&device, backend, compute_supported, HDR_FORMAT)?;
 
         // GPU frustum culling (Phase 7): a compute pass tests a cube instance grid
         // against the frustum and writes an indirect draw; the draw renders only the
-        // visible instances (see `cull.rs`).
-        let cull = CullSystem::new(&device, backend, compute_supported, swapchain.format())?;
+        // visible instances (see `cull.rs`). PR-3 side-effect: draws into the HDR slot
+        // (before tonemap), so built with HDR_FORMAT. Default-off (`P7_CULL`).
+        let cull = CullSystem::new(&device, backend, compute_supported, HDR_FORMAT)?;
 
         // Clustered light culling (PR-6): a compute pass bins the scene's point lights into a
         // view-frustum froxel grid so the lighting pass loops only its cluster's lights. `None`
@@ -2371,6 +2387,31 @@ impl App {
         let swap_format_cached = swapchain.format();
         let readback_layout_cached = device.swapchain_readback_layout(&swapchain);
 
+        // PR-3: seed the translucency slot. `P_TRANSLUCENT_TEST=1` spawns two overlapping
+        // tinted glass panes in the gallery (there is no translucent sample asset yet), to
+        // verify sorted alpha compositing / depth-test occlusion / fog interaction. Empty by
+        // default → the pass adds no work → byte-identical anchor.
+        //
+        let mut translucents: Vec<translucent::TranslucentObject> = Vec::new();
+        if gallery_scene && quality::env_bool("P_TRANSLUCENT_TEST", false) {
+            translucents =
+                translucent::translucent_test_planes(&device, scene_radius, scene_center)?;
+            info!(
+                "P_TRANSLUCENT_TEST: spawned {} translucent glass pane(s)",
+                translucents.len()
+            );
+        }
+        // glTF `Transparent` (BLEND, non-decal) routing skeleton. The census below is where
+        // production BLEND drawables would be lifted OUT of the opaque G-buffer list and turned
+        // into `TranslucentObject`s for this slot — `translucent::TranslucentObject::from_scene`
+        // does the conversion (mesh/transform/material → forward material). It is intentionally
+        // NOT wired to run by default: doing so must also SUPPRESS the object's opaque G-buffer
+        // draw (else it renders twice), and — critically — the foliage path depends on
+        // `Transparent` drawables staying in the opaque G-buffer with a positive `alpha_cutoff`
+        // (crisp cutout / hashed soft edges). So enabling gltf routing is deferred to the Phase
+        // 20 work that also adds the G-buffer suppression; foliage behaviour is unchanged here.
+        // See `docs/translucency-pass.md` (§ glTF routing).
+
         Ok(Self {
             window,
             _instance: instance,
@@ -2385,6 +2426,8 @@ impl App {
             gi,
             gtao,
             atmosphere,
+            translucency,
+            translucents,
             reflect,
             particles,
             cull,
@@ -5094,6 +5137,26 @@ impl App {
             None
         };
 
+        // PR-3 (render-pipeline re-baseline track, `docs/render-pipeline-reference.md` §1.7
+        // #12 / §3): the forward translucency slot. Draws sorted alpha-blended translucent
+        // geometry over the finished opaque+fog HDR (blend in place), depth-testing against the
+        // opaque `g_depth` (occluded behind solid geometry) with depth-write off (overlapping
+        // panes all blend). Sits AFTER fog and BEFORE TAAU/tonemap — reference ordering. Adds
+        // no pass when `translucents` is empty (zero cost, byte-identical anchor).
+        let translucency_target = fog_out.unwrap_or(fog_src);
+        self.translucency.record(
+            &mut graph,
+            translucency_target,
+            g_depth,
+            &self.translucents,
+            view_proj,
+            eye,
+            self.deferred.globals_buffer(),
+            globals_offset,
+            self.flip_y,
+            shadow_map,
+        );
+
         // Phase 7 GPU particles: a compute pass advances the persistent particle
         // buffer; an external graph resource sequences it before the draw pass.
         let particles_ext = if self.particles_on {
@@ -5141,6 +5204,36 @@ impl App {
                 visible_ext,
                 frustum_planes(cull_view_proj),
                 &grid,
+            );
+        }
+
+        // PR-3 side-effect: the Phase-7 particle + GPU-culling draws move into the HDR
+        // translucency slot (alpha-blend over `translucency_target`, BEFORE tonemap), instead
+        // of drawing over the tonemapped LDR backbuffer. Both are default-off demo features
+        // (`P7_PARTICLES` / `P7_CULL`), so the default gallery/anchor output is unchanged; this
+        // only fixes the HDR-composite ordering the reference pipeline expects (§2.1-3, #21).
+        // Declared after the sim/cull compute passes so the WAR/WAW deps order them correctly;
+        // the graph schedules by resource dependency, not declaration order.
+        if let Some((args_ext, visible_ext)) = cull_res {
+            self.cull.record_draw(
+                &mut graph,
+                translucency_target,
+                extent,
+                args_ext,
+                visible_ext,
+                view_proj.to_cols_array(),
+                self.sun_dir,
+                &grid,
+            );
+        }
+        if let Some(particles_ext) = particles_ext {
+            self.particles.record_draw(
+                &mut graph,
+                translucency_target,
+                particles_ext,
+                view_proj.to_cols_array(),
+                cam_right,
+                cam_up,
             );
         }
 
@@ -5633,35 +5726,6 @@ impl App {
             inv_w,
             inv_h,
         );
-
-        // Phase 7 GPU-culling draw: indirect, instanced render of the visible cube
-        // grid over the tonemapped image, with its own depth buffer.
-        if let Some((args_ext, visible_ext)) = cull_res {
-            self.cull.record_draw(
-                &mut graph,
-                backbuffer,
-                swap_extent,
-                args_ext,
-                visible_ext,
-                view_proj.to_cols_array(),
-                self.sun_dir,
-                &grid,
-            );
-        }
-
-        // Phase 7 particle draw: instanced billboards composited over the tonemapped
-        // image (alpha blend), reading the compute-updated buffer in the vertex stage.
-        // Declared after tonemap so the WAW on the backbuffer orders it last.
-        if let Some(particles_ext) = particles_ext {
-            self.particles.record_draw(
-                &mut graph,
-                backbuffer,
-                particles_ext,
-                view_proj.to_cols_array(),
-                cam_right,
-                cam_up,
-            );
-        }
 
         if include_ui {
             graph.add_pass(
