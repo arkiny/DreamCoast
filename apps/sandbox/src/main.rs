@@ -5395,6 +5395,7 @@ impl App {
                 // documented simplification; the fog is a slow-varying ambient term so a
                 // one-frame-stale exposure has no visible impact.
                 self.exposure,
+                self.flip_y,
             );
             Some(hdr_fog)
         } else {
