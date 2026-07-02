@@ -124,8 +124,8 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 | 7 | Diffuse Indirect + AO | ✅ GDF AO + GTAO + software-traced GI(screen-probe / ray-march) + 디노이저 | ✅ | **직접광 이전**에 배치 — 정합. 이 트랙은 오히려 레퍼런스급으로 깊다(P10/P11) |
 | 8 | Direct Lighting | ✅ `record_lighting`(풀스크린 PBR, 단일 디렉셔널 + **clustered froxel** point) | ✅ | **PR-6 완료:** 3D froxel(16×9×24, exponential Z) 라이트 컬링 compute + per-cluster 리스트 소비. opt-in `CLUSTERED_LIGHTS=1`, 디폴트 브루트포스=바이트 동일. 스케일 1024 라이트 ~19× (170→8.7 ms). Metal 검증; DX≡VK Windows pending. spot/area·Z-binning 스케일은 후속. 상세 [clustered-lighting.md](clustered-lighting.md) |
 | 9 | Reflections + Sky | ✅ SSR→GDF→sky 하이브리드 composite, lit-history 피드백 | 🟡 | 순서(직접광 뒤 lit-history 샘플) 정합. 단 lit-history 피드백이 flicker 유발(메모리: swrt_reflect 루프) |
-| 10 | Sky/Atmosphere | 🟡 절차 sky → env cube(`ibl.rs`), 씬 배경 합성은 IBL로 | 🟡 | 물리기반 sky/에어리얼 퍼스펙티브/time-of-day 없음; 별도 sky 합성 패스 아닌 IBL 캡처 |
-| 11 | Fog/Volumetric | **없음** | 🔴 | height fog·volumetric·light shaft·cloud 전무 |
+| 10 | Sky/Atmosphere | 🟡 절차 sky → env cube(`ibl.rs`) + **PR-4 대기 합성 슬롯**(`atmosphere.rs`/`atmosphere.slang`, 항상 배선) | 🟡 | 씬 배경 자체는 여전히 IBL 캡처(별도 sky 패스 아님); 다만 불투명 완성 후·투명 전 합성 지점은 PR-4로 정식 확보됨(§3 PR-4). 물리기반 에어리얼 퍼스펙티브/time-of-day는 후속 |
+| 11 | Fog/Volumetric | 🟡 **PR-4**: opt-in analytic height fog(`P_HEIGHT_FOG=1`) | 🟡 | 지수 높이 포그(closed-form 적분, Quilez 2010) 구현 — `docs/atmosphere-fog-slot.md`. volumetric/light shaft/cloud은 여전히 부재(같은 슬롯에 후속 삽입 가능) |
 | 12 | Translucency | **없음**(불투명만) | 🔴 | 정렬 투명/OIT/굴절 없음 — foliage는 alpha-cutout(불투명 경로)로 우회 |
 | 13 | Motion Blur | **없음** | 🔴 | velocity 부재로 불가 |
 | 14 | Temporal AA/Upscale | 🟡 `taau.rs`(TAAU: jitter + 리프로젝션 누적, 톤맵 **전** linear-HDR) | 🟡 | 위치(톤맵 전)·jitter는 정합. **그러나 카메라 모션만 리프로젝션**(prev view-proj + world-pos), **per-object velocity 없음** → 움직이는 오브젝트에서 고스팅/스미어 |

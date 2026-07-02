@@ -204,6 +204,52 @@ pub(crate) fn post_push(
     pc
 }
 
+/// Pack the PR-4 atmosphere/height-fog push block (80 bytes): 4 uints (hdr_index,
+/// position_index, out_index [unused by the graphics entry], flip_y [unused]) + three
+/// float4 rows (camera_pos.xyz + density.w, sun_dir.xyz + sun_intensity.w, sky_wb.xyz +
+/// inscatter_gain.w) + a final float4 (height_falloff.x + exposure.y + unused zw). Every
+/// row is a full float4 (never a bare float3 followed by a scalar) to dodge the HLSL/
+/// SPIR-V vs. MSL push-constant packing divergence documented on `gdf_gi_push`'s
+/// `ground_albedo`. `exposure` is the same scalar `record_lighting` bakes into `hdr`
+/// (`globals.ambient.a` / the auto-exposure buffer) — `procedural_sky` returns raw
+/// unexposed radiance (like the sky-background miss path in `pbr.slang`), so the
+/// inscatter color must be exposed the same way before blending, or a physically-scaled
+/// sun (tens of thousands of lux) blows the composite out to white.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn atmosphere_push(
+    hdr_index: u32,
+    position_index: u32,
+    camera_pos: [f32; 3],
+    density: f32,
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    sky_wb: [f32; 3],
+    inscatter_gain: f32,
+    height_falloff: f32,
+    exposure: f32,
+) -> [u8; 80] {
+    let mut pc = [0u8; 80];
+    pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&position_index.to_le_bytes());
+    // pc[8..12] = out_index (unused by the graphics entry), pc[12..16] = flip_y (unused).
+    for (i, v) in camera_pos.iter().enumerate() {
+        pc[16 + i * 4..20 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[28..32].copy_from_slice(&density.to_le_bytes());
+    let sun = normalize3(sun_dir);
+    for (i, v) in sun.iter().take(3).enumerate() {
+        pc[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[44..48].copy_from_slice(&sun_intensity.to_le_bytes());
+    for (i, v) in sky_wb.iter().enumerate() {
+        pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[60..64].copy_from_slice(&inscatter_gain.to_le_bytes());
+    pc[64..68].copy_from_slice(&height_falloff.to_le_bytes());
+    pc[68..72].copy_from_slice(&exposure.to_le_bytes());
+    pc
+}
+
 /// Pack the particle-sim push block: buffer_index + count + dt + time + init.
 pub(crate) fn particle_sim_push(
     read_index: u32,
