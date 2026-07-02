@@ -1838,6 +1838,19 @@ impl CommandBuffer {
         }
     }
 
+    /// Set viewport + scissor to an arbitrary sub-rect of the bound target — the
+    /// shadow-atlas tiling primitive (each cascade / light slot renders into its tile).
+    pub fn set_viewport_scissor_rect(&self, rect: Rect2D) {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(c) => c.set_viewport_scissor_rect(rect),
+            #[cfg(windows)]
+            Self::D3d12(c) => c.set_viewport_scissor_rect(rect),
+            #[cfg(target_os = "macos")]
+            Self::Metal(c) => c.set_viewport_scissor_rect(rect),
+        }
+    }
+
     pub fn bind_vertex_buffer(&self, buffer: &Buffer, stride: u32) {
         match (self, buffer) {
             #[cfg(windows)]

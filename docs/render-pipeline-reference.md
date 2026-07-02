@@ -120,7 +120,7 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 | 3 | Base Pass(G-buffer) | ✅ 4 MRT + **velocity RT(RG16F, PR-2, opt-in `P_VELOCITY=1`)** | 🟡 | velocity 채널 도입(전용 RT + 별도 불투명 패스, unjittered `clip−prevClip`, 스태틱·Spin·스키닝·모프 prev-pose 단일 소스 — [velocity-motion-vectors.md](velocity-motion-vectors.md)); world-position 명시 저장은 여전(레퍼런스는 depth에서 재구성) |
 | 4 | Custom Depth/Stencil | **없음** | 🔴 | 아웃라인/마스크 파이프라인 부재 |
 | 5 | GBuffer 데칼(후) | ✅ `record_decals`(A3, deferred decal) | ✅ | base pass 후·라이팅 전 — 정합. Intel Sponza `dirt_decal`에서 검증 |
-| 6 | Shadow Depth | ✅ `record_shadow`(단일 디렉셔널 shadow map, PCF/PCSS-lite) | 🟡 | 단일 맵만 — **CSM/cascade·스팟/포인트 큐브·아틀라스 없음** |
+| 6 | Shadow Depth | ✅ `record_shadow`(단일 맵, PCF/PCSS-lite) + **PR-7 `record_shadow_atlas`: 그림자 아틀라스 + 디렉셔널 CSM(opt-in `CSM=<N>`)** | 🟡 | CSM/아틀라스 골격 완료([shadow-atlas-csm.md](shadow-atlas-csm.md)): practical split(log/uniform λ=0.75) + stable sphere-fit/texel-snap + cascade blend + `CSM_DEBUG` 뷰. 슬롯 테이블(kind/view-proj/UV rect)은 스팟/포인트 확장형 — **캐스터 루프만 Phase 21**. 디폴트 off = 단일 맵 바이트 동일 |
 | 7 | Diffuse Indirect + AO | ✅ GDF AO + GTAO + software-traced GI(screen-probe / ray-march) + 디노이저 | ✅ | **직접광 이전**에 배치 — 정합. 이 트랙은 오히려 레퍼런스급으로 깊다(P10/P11) |
 | 8 | Direct Lighting | ✅ `record_lighting`(풀스크린 PBR, 단일 디렉셔널 + **clustered froxel** point) | ✅ | **PR-6 완료:** 3D froxel(16×9×24, exponential Z) 라이트 컬링 compute + per-cluster 리스트 소비. opt-in `CLUSTERED_LIGHTS=1`, 디폴트 브루트포스=바이트 동일. 스케일 1024 라이트 ~19× (170→8.7 ms). Metal 검증; DX≡VK Windows pending. spot/area·Z-binning 스케일은 후속. 상세 [clustered-lighting.md](clustered-lighting.md) |
 | 9 | Reflections + Sky | ✅ SSR→GDF→sky 하이브리드 composite, lit-history 피드백 | 🟡 | 순서(직접광 뒤 lit-history 샘플) 정합. 단 lit-history 피드백이 flicker 유발(메모리: swrt_reflect 루프) |
@@ -207,6 +207,7 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
   그림자. *의존:* P7 compute.
 - **PR-7 · 그림자 아틀라스/CSM 골격 [L].** 단일 shadow map을 cascade/아틀라스로 일반화(디렉셔널 CSM +
   스팟/포인트 슬롯). *의존:* PR-6 라이트 리스트. *unblocks:* Phase 21 다수 그림자.
+  **구현됨** — [shadow-atlas-csm.md](shadow-atlas-csm.md) (opt-in `CSM=<N>`, 디폴트 off 앵커 바이트 동일).
 
 ### 정합 P3 — 가시성/멀티뷰 (후속)
 - **PR-8 · HZB Occlusion 컬링 [M].** ✅ **DONE** ([hzb-occlusion-culling.md](hzb-occlusion-culling.md),
