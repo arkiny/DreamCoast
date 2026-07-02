@@ -566,6 +566,30 @@ const JOBS: &[Job] = &[
         key: "light_cluster_build_cs",
     },
     Job {
+        src: "cull.slang",
+        entry: "csCullHzb",
+        stage: "compute",
+        key: "cull_hzb_cs",
+    },
+    Job {
+        src: "cull.slang",
+        entry: "csClearStats",
+        stage: "compute",
+        key: "cull_stats_clear_cs",
+    },
+    Job {
+        src: "hzb_build.slang",
+        entry: "csCopy",
+        stage: "compute",
+        key: "hzb_copy_cs",
+    },
+    Job {
+        src: "hzb_build.slang",
+        entry: "csReduce",
+        stage: "compute",
+        key: "hzb_reduce_cs",
+    },
+    Job {
         src: "cull_draw.slang",
         entry: "vsMain",
         stage: "vertex",

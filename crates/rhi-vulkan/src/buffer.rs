@@ -318,6 +318,21 @@ impl VulkanStorageBuffer {
         Ok(())
     }
 
+    /// Host-read the buffer into `dst` (HZB cull stats). Valid only for the host-visible
+    /// `new_host` variant (persistently mapped HOST_COHERENT memory); the caller syncs
+    /// the GPU writes first. (DX/VK parity pending Windows verification.)
+    pub fn read_into(&self, dst: &mut [u8]) -> Result<(), EngineError> {
+        if self.mapped.is_null() {
+            return Err(EngineError::Rhi(
+                "host-read of a DEVICE_LOCAL Vulkan storage buffer (use create_storage_buffer_host)"
+                    .into(),
+            ));
+        }
+        let n = (dst.len() as u64).min(self.size) as usize;
+        unsafe { std::ptr::copy_nonoverlapping(self.mapped as *const u8, dst.as_mut_ptr(), n) };
+        Ok(())
+    }
+
     pub(crate) fn raw(&self) -> vk::Buffer {
         self.buffer
     }
