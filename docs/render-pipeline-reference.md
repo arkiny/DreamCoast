@@ -114,7 +114,7 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 
 | # | 레퍼런스 스테이지 | DreamCoast 현황 | 판정 | 비고 (근거) |
 |---|---|---|---|---|
-| V | 씬 가시성/컬링 | GPU frustum 컬링(P7 `cull.rs`), HZB occlusion 없음 | 🟡 | 컬링은 있으나 occlusion/HZB 부재; 라이트 컬링(클러스터) 없음(단일 디렉셔널) |
+| V | 씬 가시성/컬링 | GPU frustum 컬링(P7 `cull.rs`) + **HZB occlusion 컬링(PR-8, `HZB_CULL=1`)** — prev-frame Hi-Z 피라미드(`hzb.rs`/`hzb_build.slang`) + 4탭 보수 테스트(`csCullHzb`), 통계 리드백 | 🟡 | PR-8 완료([hzb-occlusion-culling.md](hzb-occlusion-culling.md)): 가림-양성 케이스 98/256 컬 + OFF≡ON 바이트 동일(보수성). 현재 대상은 P7 컬 그리드(메인 씬 GPU-driven화는 Phase 23); 라이트 컬링(클러스터)은 여전히 없음(단일 디렉셔널) |
 | 1 | Depth Pre-pass | **없음** — G-buffer가 첫 depth writer | 🔴 | `record_gbuffer`가 depth를 처음 생성. 화면공간 패스(SSR/AO)가 G-buffer depth에 직접 의존 → prepass 없이 순서 강제됨. GDF AO flicker 근원도 depth 라이프타임(메모리 참조) |
 | 2 | DBuffer 데칼(전) | **없음** | 🔴 | 데칼은 base pass **후** 경로만 존재(아래 #5) |
 | 3 | Base Pass(G-buffer) | ✅ 4 MRT(albedo+AO / world normal / material / **world position**) | 🟡 | 존재·견고하나 **velocity(모션벡터) 채널 없음**, world-position을 명시 저장(레퍼런스는 depth에서 재구성) |
@@ -196,8 +196,10 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
   스팟/포인트 슬롯). *의존:* PR-6 라이트 리스트. *unblocks:* Phase 21 다수 그림자.
 
 ### 정합 P3 — 가시성/멀티뷰 (후속)
-- **PR-8 · HZB Occlusion 컬링 [M].** PR-1 prepass depth로 Hi-Z 피라미드 빌드 → GPU occlusion 컬링.
-  *의존:* PR-1. *unblocks:* 대규모 씬(월드 렌더링 Phase 23) 스케일.
+- **PR-8 · HZB Occlusion 컬링 [M].** ✅ **DONE** ([hzb-occlusion-culling.md](hzb-occlusion-culling.md),
+  `HZB_CULL=1`): prev-frame HZB(리프로젝션 없음, 보수적 4탭) — prev-frame 방식이라 PR-1과 독립
+  (G-buffer depth 소스; PR-1 머지 시 read 1줄 교체). *unblocks:* 대규모 씬(월드 렌더링 Phase 23)
+  스케일 — 메인 씬 GPU-driven화 시 two-phase로 확장.
 - **PR-9 · View Family(다중 뷰) [M].** 공용 리소스로 N뷰 렌더(씬 캡처/스플릿/스테레오). *unblocks:*
   실시간 env 캡처·에디터 다중 뷰포트.
 
