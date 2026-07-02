@@ -105,10 +105,12 @@ render dependency graph(RDG) 위에 선언되고**, 패스는 리소스 read/wri
 
 현 프레임 흐름(코드 기준): `apps/sandbox/src/main.rs`의 프레임 루프가
 **shadow depth → G-buffer(4 MRT) → deferred decals(A3) → GDF/SW-RT compute(AO / screen-probe 또는
-ray-march GI / SSR+반사 composite) → PBR deferred lighting → (auto-exposure) → (compute post box-blur) →
-TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
+ray-march GI / SSR+반사 composite) → PBR deferred lighting → (auto-exposure meter) → (atmosphere/fog
+슬롯, PR-4) → [PR-5 post] motion-blur → TAAU(내부해상도 업스케일) → bloom → DoF(스텁) →
+tonemap+grading → (particle/cull draw/ImGui)`.
 근거 코드: `deferred.rs`(`record_shadow`/`record_gbuffer`/`record_decals`/`record_lighting`/
-`record_tonemap`), `gi.rs`·`reflect.rs`·`gdf.rs`·`gtao.rs`·`taau.rs`, `ibl.rs`.
+`record_tonemap`), `postfx.rs`(motion-blur/bloom/DoF), `gi.rs`·`reflect.rs`·`gdf.rs`·`gtao.rs`·
+`taau.rs`·`atmosphere.rs`, `ibl.rs`.
 
 범례: ✅ 존재·정합 · 🟡 존재하나 구조/순서 상이 · 🔴 부재.
 
@@ -127,12 +129,12 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 | 10 | Sky/Atmosphere | 🟡 절차 sky → env cube(`ibl.rs`) + **PR-4 대기 합성 슬롯**(`atmosphere.rs`/`atmosphere.slang`, 항상 배선) | 🟡 | 씬 배경 자체는 여전히 IBL 캡처(별도 sky 패스 아님); 다만 불투명 완성 후·투명 전 합성 지점은 PR-4로 정식 확보됨(§3 PR-4). 물리기반 에어리얼 퍼스펙티브/time-of-day는 후속 |
 | 11 | Fog/Volumetric | 🟡 **PR-4**: opt-in analytic height fog(`P_HEIGHT_FOG=1`) | 🟡 | 지수 높이 포그(closed-form 적분, Quilez 2010) 구현 — `docs/atmosphere-fog-slot.md`. volumetric/light shaft/cloud은 여전히 부재(같은 슬롯에 후속 삽입 가능) |
 | 12 | Translucency | 🟡 **PR-3**: opt-in 정렬 포워드 투명 슬롯 | 🟡 | 디퍼드 라이팅+반사+포그 뒤·post 앞에 삽입. back-to-front CPU 정렬(거리→인덱스 tie-break, 결정론적), depth-test on/write off, G-buffer 미기록, 알파 블렌드. 포워드 PBR(디렉셔널+IBL)은 디퍼드와 **공유 BRDF 헤더**(`pbr_brdf.slang`) 재사용. 투명 0개면 미스케줄(바이트 동일). 테스트: `P_TRANSLUCENT_TEST=1`(갤러리 유리 평면 2장). OIT/굴절/투명 velocity는 Phase 20 — [translucency-pass.md](translucency-pass.md). DX≡VK Windows pending |
-| 13 | Motion Blur | **없음** (선결이던 velocity는 PR-2로 확보) | 🔴 | velocity RT가 생겨 이제 구현 가능 — PR-5 post 시퀀스의 스텁 슬롯에 삽입 예정 |
+| 13 | Motion Blur | ✅ **PR-5**: opt-in per-pixel velocity-along 블러(`P_MOTION_BLUR=1`, 전제 `P_VELOCITY=1`) — `postfx::MotionBlurSystem`/`motion_blur.slang` | ✅ | TAA **앞** linear-HDR 배치 정합. PR-2 velocity 소비, off/velocity-없음 = 패스 없음(바이트 동일). tile-max/neighbor-max dilation은 후속(Phase 20). [post-process-chain.md](post-process-chain.md) |
 | 14 | Temporal AA/Upscale | ✅ `taau.rs`(TAAU: jitter + 리프로젝션 누적, 톤맵 **전** linear-HDR) + **velocity-aware 리프로젝션(PR-2)** | 🟡 | 위치(톤맵 전)·jitter 정합. `P_VELOCITY=1`이면 3×3 dilated per-pixel velocity로 리프로젝션(움직이는 오브젝트 고스팅 감소, 검증 수치는 [velocity-motion-vectors.md](velocity-motion-vectors.md)); off면 종전 카메라-온리(바이트 동일) |
 | 15 | Auto Exposure | ✅ `record_auto_exposure`(히스토그램/평균, 적응) | ✅ | 톤맵 전 배치 정합(opt-in) |
-| 16 | Bloom | 🟡 P5 데모 블룸 체인 존재하나 현 프레임 경로엔 미배선 | 🟡 | `record_compute_post`는 3×3 박스 블러(데모)이며 블룸 아님. 실 블룸은 tonemap에 미통합 |
-| 17 | Depth of Field | **없음** | 🔴 | — |
-| 18 | Tonemap + Grading | 🟡 `record_tonemap`(ACES + sRGB 인코드) | 🟡 | 톤맵은 있으나 **컬러 그레이딩/LUT 없음**, 노출은 라이팅 패스에서 선적용 |
+| 16 | Bloom | ✅ **PR-5**: opt-in progressive dual-filter 블룸(`P_BLOOM=1`) — `postfx::BloomSystem`/`bloom.slang`(Karis 13-tap ↓ + 3×3 tent ↑), tonemap 입력에 additive 합성 | ✅ | linear-HDR bright-pass → 다운/업샘플 피라미드 정합. 파라미터 단일 소스 `BloomParams`. 데모(`blur.slang`/`post_compute.slang`)는 제거. off = 바이트 동일. [post-process-chain.md](post-process-chain.md) |
+| 17 | Depth of Field | 🟡 **PR-5** 스텁 노드(`P_DOF=1`, passthrough) — `postfx::DofSystem`/`dof.slang` | 🟡 | 순서·시임만 확보(자리 박음). CoC+보케 실구현은 Phase 20(문서에 확장 지점 명시). off = 패스 없음(바이트 동일) |
+| 18 | Tonemap + Grading | ✅ **PR-5**: `record_tonemap`(ACES + sRGB) + **ASC-CDL 컬러 그레이딩 훅**(`P_GRADE=1`, `out=(slope·in+offset)^power`) + 블룸 additive 합성 | ✅ | 그레이딩은 노출 후·커브 전 linear-HDR. 중립(slope1/offset0/power1) = 바이트 동일. per-ch `P_CDL_SLOPE/OFFSET/POWER`. [post-process-chain.md](post-process-chain.md) |
 | 19 | FXAA/SMAA | 🟡 `record_fxaa`(TAA 미사용·비jitter 시 FXAA pre-pass) | 🟡 | 존재하나 TAA **pre-pass**로 배치(레퍼런스는 톤맵 후 대체 AA). 역할 상이 |
 | 20 | Primary/Secondary Upscale | 🟡 TAAU가 내부→출력 업스케일 겸함 + 톤맵 샤픈 | 🟡 | 전용 스페이셜 업스케일 단계 없음(TAAU에 융합) |
 | 21 | Editor/Debug Overlay | ✅ ImGui 오버레이 + 디버그 뷰(`DEBUG_VIEW`) | ✅ | ImGui는 톤맵 후 draw(정합). **PR-3에서 particle/cull draw를 HDR 투명 슬롯(톤맵 전)으로 이동** — 종전 톤맵-후 LDR 드로 문제 해소(§2.1-3). 둘 다 디폴트-off(`P7_PARTICLES`/`P7_CULL`)라 디폴트 출력 불변 |
@@ -161,8 +163,11 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
    라이트 컬링/그리드 인프라를 먼저 깔아야 한다.~~ **→ PR-6에서 해소:** 3D froxel 클러스터 컬링
    compute + per-cluster 리스트 소비(opt-in `CLUSTERED_LIGHTS=1`, 브루트포스 바이트 동일).
    다수 그림자(스팟/포인트)는 PR-7 그림자 아틀라스와 함께.
-6. **Post 체인이 톤맵 위주 단일 노드 (#16·#17·#18).** 블룸(데모만)·DoF·그레이딩/LUT을 꽂을 **순서 있는
-   post 시퀀스**가 없다. 현재는 `hdr → (compute box-blur 데모) → taau → tonemap`으로 파편적.
+6. **~~Post 체인이 톤맵 위주 단일 노드 (#16·#17·#18)~~ — PR-5로 해소.** 파편적 경로(`hdr →
+   (compute box-blur 데모) → taau → tonemap`)를 **순서 있는 post 노드 시퀀스**로 정리:
+   motion-blur(#13) → TAA/upscale(#14) → exposure(#15) → bloom(#16) → DoF 스텁(#17) →
+   tonemap+grading(#18). 각 노드 opt-in, off = 바이트 동일. 데모(`blur.slang`/
+   `post_compute.slang`) 제거. 상세 [post-process-chain.md](post-process-chain.md).
 
 ---
 
@@ -194,9 +199,13 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
   상세 [translucency-pass.md](translucency-pass.md).
 - **PR-4 · 대기/포그 합성 슬롯 [S].** 불투명 완성 후·투명 전에 **sky+fog 합성 지점**을 그래프에 확보
   (지금은 no-op 통과, Phase 22에서 채움). *왜 지금:* 순서 자리를 박아두면 Phase 22가 재배선 없이 삽입.
-- **PR-5 · Post-process 시퀀스 정식화 [M].** 파편적 `compute_post(box-blur 데모)`를 제거하고, 순서 있는
-  post 노드 시퀀스로 정리: `motion-blur(스텁) → TAA/upscale → exposure(기존) → bloom(P5 체인 재배선) →
-  DoF(스텁) → tonemap+grading`. 각 노드 opt-in. *unblocks:* Phase 20 포스트 스택이 자리에 꽂힘.
+- **PR-5 · Post-process 시퀀스 정식화 [M]. ✅ 완료** (Metal 검증, DX≡VK Windows pending). 파편적
+  `compute_post(box-blur 데모)` + `blur.slang` 데모를 제거하고 순서 있는 post 노드 시퀀스로 정리:
+  `motion-blur(P_MOTION_BLUR, velocity 소비) → TAA/upscale(기존) → exposure(기존) →
+  bloom(P_BLOOM, Karis 13-tap↓ + 3×3 tent↑ dual-filter) → DoF(P_DOF 스텁) →
+  tonemap+grading(ASC-CDL P_GRADE)`. 각 노드 opt-in, off = 골든 앵커 바이트 동일; 그레이딩 중립도
+  바이트 동일. `postfx.rs` + `bloom.slang`/`motion_blur.slang`/`dof.slang`. 상세·검증 수치
+  [post-process-chain.md](post-process-chain.md). *unblocks:* Phase 20 포스트 스택이 자리에 꽂힘.
 
 ### 정합 P2 — 라이팅 확장 토대
 - **PR-6 · 클러스터드 라이트 컬링 인프라 [L]. ✅ 완료** (Metal 검증, DX≡VK Windows pending). 뷰 절두체를

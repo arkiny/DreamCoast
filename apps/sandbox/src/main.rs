@@ -49,6 +49,7 @@ mod mesh;
 mod mesh_sdf;
 mod morph;
 mod particle;
+mod postfx;
 mod push;
 mod quality;
 mod reflect;
@@ -169,6 +170,13 @@ const DEBUG_VIEWS: [&str; 12] = [
 /// DEBUG_VIEW=11 velocity viz amplification: a small NDC motion (a few 1e-3) is scaled into a
 /// visible colour range. Tuned so a spinning object's edge motion is clearly readable.
 const VELOCITY_VIZ_SCALE: f32 = 40.0;
+/// PR-5 motion-blur tunables (single source; ready to become a RenderQuality tier).
+/// `SAMPLES` taps along the velocity vector; `INTENSITY` scales one frame of on-screen
+/// travel (1 = full shutter-open exposure); `MAX_UV` caps the per-pixel streak length in
+/// UV so a very fast object can't smear across the whole frame.
+const MOTION_BLUR_SAMPLES: u32 = 8;
+const MOTION_BLUR_INTENSITY: f32 = 1.0;
+const MOTION_BLUR_MAX_UV: f32 = 0.05;
 const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 
 /// One materialized drawable in the sample scene: a shared GPU mesh + world
@@ -504,6 +512,12 @@ struct App {
     /// (the slot then adds no pass → byte-identical). `P_TRANSLUCENT_TEST=1` seeds demo
     /// glass panes; glTF `Transparent` (BLEND) materials also route here.
     translucents: Vec<translucent::TranslucentObject>,
+    /// PR-5 (render-pipeline re-baseline track): the ordered post-process nodes —
+    /// motion blur (`P_MOTION_BLUR`), bloom (`P_BLOOM`), and the DoF stub. See
+    /// `postfx.rs` / `docs/post-process-chain.md`.
+    bloom: postfx::BloomSystem,
+    motion_blur: postfx::MotionBlurSystem,
+    dof: postfx::DofSystem,
     reflect: ReflectSystem,
     particles: ParticleSystem,
     cull: CullSystem,
@@ -661,7 +675,19 @@ struct App {
     debug_view: usize,
     post_mode: usize,
     aliasing: bool,
-    compute_post: bool,
+    /// PR-5 post nodes (opt-in). `bloom_on` = `P_BLOOM`; `motion_blur_on` = `P_MOTION_BLUR`
+    /// (requires `velocity_on`); `dof_on` = `P_DOF` (stub passthrough). `grade_on` +
+    /// `cdl_*` = the ASC-CDL color grade (`P_GRADE`, neutral = byte-identical).
+    bloom_on: bool,
+    motion_blur_on: bool,
+    dof_on: bool,
+    grade_on: bool,
+    cdl_slope: [f32; 3],
+    cdl_offset: [f32; 3],
+    cdl_power: [f32; 3],
+    /// One-time "P_MOTION_BLUR without P_VELOCITY" warning latch (interior-mutable so it
+    /// fires through the graph's `&self` borrow).
+    motion_blur_warned: std::cell::Cell<bool>,
     /// Depth pre-pass active (pipeline rebaseline PR-1, opt-in `DEPTH_PREPASS=1`): render an
     /// opaque depth-only pass before the G-buffer so the base pass runs EQUAL-test + write-off
     /// (Early-Z overdraw elimination) and the screen-space passes sample a completed depth.
@@ -969,6 +995,11 @@ impl App {
         // only recorded when there are translucent objects. See `translucent.rs`.
         let translucency =
             translucent::TranslucencySystem::new(&device, backend, HDR_FORMAT, DEPTH_FORMAT)?;
+        // PR-5 post nodes (pipelines always built so all three backends compile the
+        // shaders; the passes are only recorded when the feature flags are on).
+        let bloom = postfx::BloomSystem::new(&device, backend, HDR_FORMAT)?;
+        let motion_blur = postfx::MotionBlurSystem::new(&device, backend, HDR_FORMAT)?;
+        let dof = postfx::DofSystem::new(&device, backend, HDR_FORMAT)?;
         // Stage C reflection track (C5 SSR; C6/C7 later). See `reflect.rs`.
         let reflect = ReflectSystem::new(&device, backend, compute_supported)?;
         // QHD/UHD track: temporal upsampler. See `taau.rs`.
@@ -1978,10 +2009,6 @@ impl App {
             quality.label(),
             device_info.name
         );
-        // Phase 7: route the HDR result through a compute post-process (3x3 blur into
-        // a storage image) before tonemapping. Initial state seedable via env var so
-        // headless screenshots can exercise each demo (`P7_COMPUTE_POST=1`, etc.).
-        let compute_post = compute_supported && std::env::var_os("P7_COMPUTE_POST").is_some();
         // Pipeline rebaseline PR-1: opt-in depth pre-pass (`DEPTH_PREPASS=1`). Off by default so
         // the frame graph is identical to the pre-pass-less path (byte-identical golden anchor).
         let depth_prepass = std::env::var_os("DEPTH_PREPASS").is_some();
@@ -2131,6 +2158,37 @@ impl App {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(sky_gain);
+        // PR-5 (render-pipeline re-baseline track): the ordered post-process nodes. Each is
+        // opt-in; off = no pass recorded = byte-identical anchor. `P_BLOOM=1` enables the
+        // dual-filter bloom, `P_MOTION_BLUR=1` the velocity-along motion blur (requires
+        // `P_VELOCITY=1`), `P_DOF=1` the DoF stub (passthrough placeholder). See `postfx.rs`.
+        let bloom_on = quality::env_bool("P_BLOOM", false);
+        let motion_blur_on = quality::env_bool("P_MOTION_BLUR", false);
+        let dof_on = quality::env_bool("P_DOF", false);
+        // Color grading (ASC CDL: out = (slope*in + offset)^power). `P_GRADE=1` turns on the
+        // hook; the per-channel slope/offset/power come from `P_CDL_SLOPE`/`P_CDL_OFFSET`/
+        // `P_CDL_POWER` ("r,g,b"), defaulting to the neutral identity. Neutral = byte-identical.
+        let grade_on = quality::env_bool("P_GRADE", false);
+        let parse_rgb = |name: &str, default: [f32; 3]| -> [f32; 3] {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| {
+                    let parts: Vec<f32> =
+                        v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                    if parts.len() == 3 {
+                        Some([parts[0], parts[1], parts[2]])
+                    } else if parts.len() == 1 {
+                        Some([parts[0], parts[0], parts[0]])
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(default)
+        };
+        let (cdl_slope, cdl_offset, cdl_power) = push::CDL_NEUTRAL;
+        let cdl_slope = parse_rgb("P_CDL_SLOPE", cdl_slope);
+        let cdl_offset = parse_rgb("P_CDL_OFFSET", cdl_offset);
+        let cdl_power = parse_rgb("P_CDL_POWER", cdl_power);
         // Stage D3: gallery forced to the legacy 8 (byte-identical anchor); content takes the tier.
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
@@ -2476,6 +2534,9 @@ impl App {
             atmosphere,
             translucency,
             translucents,
+            bloom,
+            motion_blur,
+            dof,
             reflect,
             particles,
             cull,
@@ -2600,7 +2661,14 @@ impl App {
                 .unwrap_or(0),
             post_mode: 0,
             aliasing: true,
-            compute_post,
+            bloom_on,
+            motion_blur_on,
+            dof_on,
+            grade_on,
+            cdl_slope,
+            cdl_offset,
+            cdl_power,
+            motion_blur_warned: std::cell::Cell::new(false),
             depth_prepass,
             particles_on,
             async_compute_on,
@@ -3444,7 +3512,10 @@ impl App {
                 legacy_ibl,
                 post_mode,
                 aliasing,
-                compute_post,
+                bloom_on,
+                motion_blur_on,
+                dof_on,
+                grade_on,
                 particles_on,
                 async_compute_on,
                 gpu_cull,
@@ -3767,10 +3838,14 @@ impl App {
                         }
                         ui.combo_simple_string("Post effect", post_mode, &POST_EFFECTS);
                         ui.checkbox("Transient aliasing", aliasing);
+                        // PR-5 ordered post nodes.
+                        ui.checkbox("Bloom (P_BLOOM)", bloom_on);
+                        ui.checkbox("Motion blur (P_MOTION_BLUR)", motion_blur_on);
+                        ui.checkbox("DoF stub (P_DOF)", dof_on);
+                        ui.checkbox("Color grade (P_GRADE)", grade_on);
                     }
 
                     if ui.collapsing_header("Compute / GPGPU (Phase 7)", TreeNodeFlags::empty()) {
-                        ui.checkbox("Compute post (blur)", compute_post);
                         ui.checkbox("GPU particles", particles_on);
                         if async_compute_supported {
                             ui.checkbox("  - async compute queue", async_compute_on);
@@ -4358,13 +4433,6 @@ impl App {
             graph.create_depth("shadow_map", Extent2D::new(SHADOW_SIZE, SHADOW_SIZE))
         };
         let hdr = graph.create_color("hdr", HDR_FORMAT, extent);
-        // Phase 7: compute post writes the blurred HDR into a storage image that the
-        // tonemap pass samples instead of the raw `hdr` target.
-        let hdr_post = if self.compute_post {
-            Some(graph.create_storage_image("hdr_post", HDR_FORMAT, extent))
-        } else {
-            None
-        };
         let gbuf = GBufferTargets {
             albedo: g_albedo,
             normal: g_normal,
@@ -5246,19 +5314,14 @@ impl App {
                 },
             );
         }
-        if let Some(hdr_post) = hdr_post {
-            self.deferred
-                .record_compute_post(&mut graph, hdr, hdr_post, cw, ch);
-        }
-
         // PR-4 (render-pipeline re-baseline track, `docs/render-pipeline-reference.md` §3):
         // the sky/atmosphere composite slot. Sits right after the opaque scene color is
-        // final (lighting + reflections + the optional compute-post blur all done) and
-        // before TAAU/tonemap — matching the reference pipeline's "opaque complete -> sky/
-        // fog -> translucency -> post" ordering (§1.6). The slot is unconditional in the
-        // graph's *shape*; only the pass itself is opt-in (`P_HEIGHT_FOG=1`), so leaving it
-        // off costs nothing and the gallery/regression anchors stay byte-identical.
-        let fog_src = hdr_post.unwrap_or(hdr);
+        // final (lighting + reflections all done) and before the post chain — matching the
+        // reference pipeline's "opaque complete -> sky/fog -> translucency -> post" ordering
+        // (§1.6). The slot is unconditional in the graph's *shape*; only the pass itself is
+        // opt-in (`P_HEIGHT_FOG=1`), so leaving it off costs nothing and the gallery/
+        // regression anchors stay byte-identical.
+        let fog_src = hdr;
         let fog_out = if self.height_fog {
             let hdr_fog = graph.create_color("hdr_fog", HDR_FORMAT, extent);
             self.atmosphere.record_fog(
@@ -5289,7 +5352,7 @@ impl App {
         // #12 / §3): the forward translucency slot. Draws sorted alpha-blended translucent
         // geometry over the finished opaque+fog HDR (blend in place), depth-testing against the
         // opaque `g_depth` (occluded behind solid geometry) with depth-write off (overlapping
-        // panes all blend). Sits AFTER fog and BEFORE TAAU/tonemap — reference ordering. Adds
+        // panes all blend). Sits AFTER fog and BEFORE the post chain — reference ordering. Adds
         // no pass when `translucents` is empty (zero cost, byte-identical anchor).
         let translucency_target = fog_out.unwrap_or(fog_src);
         self.translucency.record(
@@ -5304,6 +5367,46 @@ impl App {
             self.flip_y,
             shadow_map,
         );
+
+        // PR-5 (render-pipeline re-baseline track): the ordered post-process chain begins
+        // here, on the finished scene HDR (lighting + reflections + the atmosphere/fog
+        // slot + translucency). Reference ordering (§1.8): motion-blur -> TAA/upscale ->
+        // auto-exposure -> bloom -> DoF -> tonemap+grading. Each node is opt-in and off =
+        // no pass recorded (byte-identical anchor).
+        //
+        // Node #13 Motion blur: a velocity-along per-pixel blur, BEFORE TAA so the temporal
+        // resolve stabilizes the streaks. Requires the PR-2 velocity target; if
+        // `P_MOTION_BLUR=1` is set without `P_VELOCITY=1` there is no velocity to consume,
+        // so it is skipped with a one-time log (documented degrade, not a hard error).
+        let opaque_hdr = translucency_target;
+        let post_hdr = if self.motion_blur_on {
+            match velocity_target {
+                Some(vt) => {
+                    let mb_out = graph.create_color("motion_blur", HDR_FORMAT, extent);
+                    self.motion_blur.record(
+                        &mut graph,
+                        opaque_hdr,
+                        mb_out,
+                        vt,
+                        self.flip_y,
+                        MOTION_BLUR_SAMPLES,
+                        MOTION_BLUR_INTENSITY,
+                        MOTION_BLUR_MAX_UV,
+                    );
+                    mb_out
+                }
+                None => {
+                    if !self.motion_blur_warned.replace(true) {
+                        tracing::warn!(
+                            "P_MOTION_BLUR=1 ignored: no velocity target (set P_VELOCITY=1)"
+                        );
+                    }
+                    opaque_hdr
+                }
+            }
+        } else {
+            opaque_hdr
+        };
 
         // Phase 7 GPU particles: a compute pass advances the persistent particle
         // buffer; an external graph resource sequences it before the draw pass.
@@ -5824,11 +5927,13 @@ impl App {
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active, else
         // the SW-RT SDF trace, else the Stage-B volume slice, else the Stage-C1 scene
         // GDF, else the Stage-C5 SSR / C6 GDF-reflection viz, else the C8b1 cache atlas,
-        // else compute-post, else HDR.
+        // else the main lit path (TAAU → bloom/DoF/grading tail), else HDR.
         // QHD/UHD TAAU: reconstruct the full-res (output) HDR from the jittered internal-res lit
         // image + history, before tonemap. Only the main lit path (not the debug/RT viz outputs).
         let taau_out = if taau_active {
-            let main_lit = fog_out.unwrap_or(fog_src);
+            // Post-chain input: opaque HDR after the fog slot + the (optional) motion-blur
+            // node — motion blur runs BEFORE TAA so the temporal resolve stabilizes streaks.
+            let main_lit = post_hdr;
             // Decima FXAA→TAA: spatially anti-alias the jittered internal frame first so its edges
             // don't flicker frame to frame, then temporally upsample. Stabilizes the jitter.
             let taau_in = if self.taau.has_fxaa() && !taau_jitter_active {
@@ -5866,6 +5971,50 @@ impl App {
         } else {
             None
         };
+        // PR-5 main-lit post tail: the DoF stub (node #17) then the bloom composite (node
+        // #16). These run only on the main lit path (the TAAU result, or the pre-TAAU post
+        // HDR at native res) — never on the RT/debug viz outputs, which take precedence in
+        // the `.or()` chain below. Both are opt-in / no-op when off (byte-identical anchor).
+        // The main-lit target lives at the output extent when TAAU upscaled, else the render
+        // extent.
+        let main_lit_extent = if taau_out.is_some() {
+            swap_extent
+        } else {
+            extent
+        };
+        let mut main_lit = taau_out.unwrap_or(post_hdr);
+        // Node #17 DoF (stub passthrough). Reserves the slot; off = no pass (anchor).
+        if self.dof_on {
+            let dof_out = graph.create_color("dof", HDR_FORMAT, main_lit_extent);
+            self.dof.record(&mut graph, main_lit, dof_out, self.flip_y);
+            main_lit = dof_out;
+        }
+        // Node #16 Bloom: build the pyramid from the main-lit HDR; the mip0 result is added
+        // at the tonemap input. The pyramid extent tracks the main-lit target's extent.
+        let bloom_mip0 = if self.bloom_on {
+            Some(
+                self.bloom
+                    .record(&mut graph, main_lit, main_lit_extent, self.flip_y),
+            )
+        } else {
+            None
+        };
+        // Whether the main lit path (not an RT/debug viz) is the tonemap source — bloom +
+        // grading apply only then, so the viz captures stay unaffected.
+        let show_main_lit = velocity_view_out
+            .or(rt_out)
+            .or(wrc_view_out)
+            .or(sdf_out)
+            .or(vol_out)
+            .or(bake_out)
+            .or(gdf_out)
+            .or(gdf_trace_out)
+            .or(scene_gdf_out)
+            .or(ssr_out)
+            .or(reflect_out)
+            .or(hybrid_out)
+            .or(cache_out)
+            .is_none();
         let tonemap_src = velocity_view_out
             .or(rt_out)
             .or(wrc_view_out)
@@ -5879,10 +6028,7 @@ impl App {
             .or(reflect_out)
             .or(hybrid_out)
             .or(cache_out)
-            .or(taau_out)
-            .or(fog_out)
-            .or(hdr_post)
-            .unwrap_or(hdr);
+            .unwrap_or(main_lit);
         // The rasterized HDR already bakes exposure into the lighting pass; the
         // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
         // exposure here before the filmic curve (else the bright sky + sun blow out).
@@ -5905,6 +6051,16 @@ impl App {
         } else {
             (0.0, 0.0, 0.0)
         };
+        // PR-5 bloom composite + ASC-CDL color grade — applied at the tonemap only on the
+        // main lit path (`show_main_lit`); the RT/debug viz get the no-op form (bloom off,
+        // grading off) so those captures are unchanged.
+        let bloom = if show_main_lit { bloom_mip0 } else { None };
+        let (grade_on, cdl_slope, cdl_offset, cdl_power) = if show_main_lit && self.grade_on {
+            (1u32, self.cdl_slope, self.cdl_offset, self.cdl_power)
+        } else {
+            let (s, o, p) = push::CDL_NEUTRAL;
+            (0u32, s, o, p)
+        };
         self.deferred.record_tonemap(
             &mut graph,
             backbuffer,
@@ -5915,6 +6071,12 @@ impl App {
             sharpen,
             inv_w,
             inv_h,
+            bloom,
+            postfx::BloomParams::INTENSITY,
+            grade_on,
+            cdl_slope,
+            cdl_offset,
+            cdl_power,
         );
 
         if include_ui {

@@ -19,7 +19,7 @@ use rhi::{
 };
 
 use crate::app::{load_compute_shader, load_shader_pair};
-use crate::push::{post_compute_push, post_push};
+use crate::push::post_push;
 use crate::{
     DEPTH_FORMAT, FRAMES_IN_FLIGHT, GB_ALBEDO_FMT, GB_MATERIAL_FMT, GB_NORMAL_FMT, GB_POSITION_FMT,
     GLOBALS_SLICE, GROUND_ALBEDO, HDR_FORMAT, NO_TEXTURE, SceneObject,
@@ -71,7 +71,6 @@ pub(crate) struct DeferredRenderer {
     gbuffer_equal_morphed_pipeline: GraphicsPipeline,
     pbr_pipeline: GraphicsPipeline,
     post_pipeline: GraphicsPipeline,
-    post_compute_pipeline: ComputePipeline,
     /// Physical-camera auto-exposure: the histogram + resolve compute pipelines, a 256-bin
     /// luminance histogram buffer, and the persistent 1-element exposure buffer (adapted value
     /// read by the lighting pass when auto on).
@@ -503,31 +502,15 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 32, // hdr_index + mode + flip_y + exposure + sharpen + inv_w/h
+            // hdr_index + mode + flip_y + exposure + sharpen + inv_w/h + PR-5 bloom
+            // composite slot + ASC-CDL grading (see push::post_push).
+            push_constant_size: 96,
             bindless: true,
             uniform_buffer: false,
             depth_test: false,
             depth_write: false,
             depth_compare: DepthCompare::Less,
             depth_format: None,
-        })?;
-
-        // Compute post-process pipeline (Phase 7): blurs the HDR target into a
-        // storage image between the lighting and tonemap passes.
-        let post_compute_cs = load_compute_shader(
-            backend,
-            dreamcoast_shader::post_compute_cs_spirv,
-            dreamcoast_shader::post_compute_cs_dxil,
-            dreamcoast_shader::post_compute_cs_metallib,
-            "post_compute",
-        )?;
-        let post_compute_pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
-            compute_bytes: post_compute_cs,
-            compute_entry: "csMain",
-            push_constant_size: 16, // hdr_index + out_index + width + height
-            bindless: true,
-            uniform_buffer: false,
-            threads_per_group: [8, 8, 1],
         })?;
 
         // Physical-camera auto-exposure: a luminance-histogram metering (csHistogram → csResolve)
@@ -613,7 +596,6 @@ impl DeferredRenderer {
             gbuffer_equal_morphed_pipeline,
             pbr_pipeline,
             post_pipeline,
-            post_compute_pipeline,
             ae_histogram_pipeline,
             ae_resolve_pipeline,
             ae_hist_buf,
@@ -1232,36 +1214,15 @@ impl DeferredRenderer {
 
     /// Phase 7 compute post: blur `hdr` into the `hdr_post` storage image (the tonemap
     /// pass then samples `hdr_post` instead of the raw `hdr`).
-    pub(crate) fn record_compute_post<'a>(
-        &'a self,
-        graph: &mut RenderGraph<'a>,
-        hdr: ResourceId,
-        hdr_post: ResourceId,
-        cw: u32,
-        ch: u32,
-    ) {
-        graph.add_compute_pass(
-            ComputePassInfo {
-                name: "post_compute",
-                storage_writes: vec![hdr_post],
-                reads: vec![hdr],
-            },
-            move |ctx| {
-                let in_index = ctx.sampled_index(hdr);
-                let out_index = ctx.storage_index(hdr_post);
-                let cmd = ctx.cmd();
-                cmd.bind_compute_pipeline(&self.post_compute_pipeline);
-                cmd.push_constants_compute(&post_compute_push(in_index, out_index, cw, ch));
-                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
-                Ok(())
-            },
-        );
-    }
-
-    /// Tonemap `src` (the chosen HDR-ish image: rasterized HDR / compute-post / path
+    /// Tonemap `src` (the chosen HDR-ish image: rasterized HDR / post-chain / path
     /// trace / SW-RT) to the backbuffer, encoding sRGB in-shader. `exposure` is 1.0
     /// for the rasterized path (exposure already baked into lighting) and the camera
     /// exposure for the raw-radiance RT/SW-RT sources.
+    ///
+    /// PR-5: the final post node also composites bloom (`bloom` = the pyramid mip0
+    /// resource, `None` = off) and applies the ASC-CDL color grade (`grade_on == 0` or
+    /// `CDL_NEUTRAL` = identity). The bloom resource, when present, is added to the pass
+    /// `reads` so the graph sequences the bloom chain before tonemap.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_tonemap<'a>(
         &'a self,
@@ -1274,20 +1235,43 @@ impl DeferredRenderer {
         sharpen: f32,
         inv_w: f32,
         inv_h: f32,
+        bloom: Option<ResourceId>,
+        bloom_intensity: f32,
+        grade_on: u32,
+        cdl_slope: [f32; 3],
+        cdl_offset: [f32; 3],
+        cdl_power: [f32; 3],
     ) {
+        let mut reads = vec![src];
+        if let Some(b) = bloom {
+            reads.push(b);
+        }
         graph.add_pass(
             PassInfo {
                 name: "tonemap",
                 colors: vec![(backbuffer, Some(ClearColor::BLACK))],
                 depth: None,
-                reads: vec![src],
+                reads,
             },
             move |ctx| {
                 let hdr_index = ctx.sampled_index(src);
+                let bloom_index = bloom.map(|b| ctx.sampled_index(b)).unwrap_or(u32::MAX);
                 let cmd = ctx.cmd();
                 cmd.bind_graphics_pipeline(&self.post_pipeline);
                 cmd.push_constants(&post_push(
-                    hdr_index, post_mode, flip_y, exposure, sharpen, inv_w, inv_h,
+                    hdr_index,
+                    post_mode,
+                    flip_y,
+                    exposure,
+                    sharpen,
+                    inv_w,
+                    inv_h,
+                    bloom_index,
+                    bloom_intensity,
+                    grade_on,
+                    cdl_slope,
+                    cdl_offset,
+                    cdl_power,
                 ));
                 cmd.draw(3, 1);
                 Ok(())

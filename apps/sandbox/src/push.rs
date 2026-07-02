@@ -181,8 +181,20 @@ pub(crate) fn prefilter_push(
     pc
 }
 
-/// Pack the tonemap push block (32 bytes): hdr_index + mode + flip_y + exposure (16) +
-/// sharpen + inv_w + inv_h + pad (16, the QHD/UHD post-upscale sharpen).
+/// Neutral (identity) ASC-CDL color grade: slope 1, offset 0, power 1. Passing this
+/// with `grade_on = 0` (or these exact values) is a byte-identical no-op — the anchor.
+pub(crate) const CDL_NEUTRAL: ([f32; 3], [f32; 3], [f32; 3]) =
+    ([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+
+/// Pack the tonemap push block (96 bytes): hdr_index + mode + flip_y + exposure (16) +
+/// sharpen + inv_w + inv_h + bloom_index (16) + bloom_intensity + grade_on + pad + pad
+/// (16) + cdl_slope float4 (16) + cdl_offset float4 (16) + cdl_power float4 (16).
+///
+/// PR-5 added the bloom composite slot + the ASC-CDL color-grading hook. `bloom_index ==
+/// u32::MAX` skips the bloom add; `grade_on == 0` skips grading. Each CDL vector is a
+/// full float4 row (never float3 + trailing scalar) to match the HLSL/SPIR-V vs. MSL
+/// push-constant packing. Neutral params (`CDL_NEUTRAL`) + `grade_on = 0` + no bloom =
+/// the byte-identical anchor.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn post_push(
     hdr_index: u32,
@@ -192,8 +204,14 @@ pub(crate) fn post_push(
     sharpen: f32,
     inv_w: f32,
     inv_h: f32,
-) -> [u8; 32] {
-    let mut pc = [0u8; 32];
+    bloom_index: u32,
+    bloom_intensity: f32,
+    grade_on: u32,
+    cdl_slope: [f32; 3],
+    cdl_offset: [f32; 3],
+    cdl_power: [f32; 3],
+) -> [u8; 96] {
+    let mut pc = [0u8; 96];
     pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
     pc[4..8].copy_from_slice(&mode.to_le_bytes());
     pc[8..12].copy_from_slice(&flip_y.to_le_bytes());
@@ -201,6 +219,19 @@ pub(crate) fn post_push(
     pc[16..20].copy_from_slice(&sharpen.to_le_bytes());
     pc[20..24].copy_from_slice(&inv_w.to_le_bytes());
     pc[24..28].copy_from_slice(&inv_h.to_le_bytes());
+    pc[28..32].copy_from_slice(&bloom_index.to_le_bytes());
+    pc[32..36].copy_from_slice(&bloom_intensity.to_le_bytes());
+    pc[36..40].copy_from_slice(&grade_on.to_le_bytes());
+    // pc[40..48]: pad0/pad1 to the float4 boundary.
+    for (i, v) in cdl_slope.iter().enumerate() {
+        pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in cdl_offset.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in cdl_power.iter().enumerate() {
+        pc[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
     pc
 }
 
@@ -1732,21 +1763,6 @@ pub(crate) fn rt_path_push(
     pc[132..136].copy_from_slice(&sky_wb[0].to_le_bytes());
     pc[136..140].copy_from_slice(&sky_wb[1].to_le_bytes());
     pc[140..144].copy_from_slice(&sky_wb[2].to_le_bytes());
-    pc
-}
-
-/// Pack the compute-post push block: hdr_index + out_index + width + height.
-pub(crate) fn post_compute_push(
-    hdr_index: u32,
-    out_index: u32,
-    width: u32,
-    height: u32,
-) -> [u8; 16] {
-    let mut pc = [0u8; 16];
-    pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
-    pc[4..8].copy_from_slice(&out_index.to_le_bytes());
-    pc[8..12].copy_from_slice(&width.to_le_bytes());
-    pc[12..16].copy_from_slice(&height.to_le_bytes());
     pc
 }
 
