@@ -604,6 +604,72 @@ impl DeferredRenderer {
         );
     }
 
+    /// CSM / shadow-atlas fill (PR-7): rasterize the shadow casters once per cascade slot into
+    /// its atlas tile. One depth pass clears the whole atlas, then each slot restricts the
+    /// viewport + scissor to its tile (`set_viewport_scissor_rect`) and draws the casters with
+    /// that cascade's view-projection. Slots share the same caster loop as `record_shadow` (the
+    /// static / skinned / morph pipeline select + masked alpha-test discard), so a caster's
+    /// cascade shadow matches its lit-mesh cutout exactly. The atlas texture is the same
+    /// resource the lighting pass samples, so the sampling side needs no per-slot wiring — only
+    /// the cascade view-projection array in globals. Future spot / point slots reuse this loop.
+    pub(crate) fn record_shadow_atlas<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        shadow_atlas: ResourceId,
+        scene: &'a [SceneObject],
+        slots: &'a [crate::csm::ShadowSlot],
+    ) {
+        graph.add_pass(
+            PassInfo {
+                name: "shadow_atlas",
+                colors: vec![],
+                depth: Some(shadow_atlas),
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                for slot in slots {
+                    // Only cascade slots carry the directional caster set this PR; spot /
+                    // point slots get their own caster loops when those light types land
+                    // (the slot table + per-slot view-projections already accommodate them).
+                    if slot.kind != crate::csm::SlotKind::Cascade {
+                        continue;
+                    }
+                    // Restrict rasterization to this cascade's atlas tile. The depth clear
+                    // covered the whole atlas (first depth writer); the scissor keeps each
+                    // cascade's draws inside its own tile so they don't bleed across slots.
+                    cmd.set_viewport_scissor_rect(slot.rect);
+                    cmd.bind_graphics_pipeline(&self.shadow_pipeline);
+                    for obj in scene {
+                        if !obj.casts_shadow {
+                            continue;
+                        }
+                        let lmvp = (slot.view_proj * obj.transform).to_cols_array();
+                        if obj.skin.is_some() {
+                            cmd.bind_graphics_pipeline(&self.shadow_skinned_pipeline);
+                        } else if obj.morph.is_some() {
+                            cmd.bind_graphics_pipeline(&self.shadow_morphed_pipeline);
+                        }
+                        cmd.push_constants(&shadow_push(
+                            lmvp,
+                            obj.tex[0],
+                            obj.alpha_cutoff,
+                            obj.skin.unwrap_or([0; 4]),
+                            obj.morph.unwrap_or([0; 4]),
+                        ));
+                        cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
+                        cmd.bind_index_buffer(&obj.mesh.ibuf, true);
+                        cmd.draw_indexed(obj.mesh.index_count, 0, 0);
+                        if obj.skin.is_some() || obj.morph.is_some() {
+                            cmd.bind_graphics_pipeline(&self.shadow_pipeline); // restore
+                        }
+                    }
+                }
+                Ok(())
+            },
+        );
+    }
+
     /// G-buffer fill: rasterize each scene object (with its PBR material) plus the
     /// ground into the four MRTs (+ depth). The UI material override replaces
     /// metallic/roughness and drops the m/r texture so the factors apply directly.
