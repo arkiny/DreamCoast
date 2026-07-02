@@ -62,6 +62,11 @@ pub struct D3d12CommandBuffer {
     // Whether the currently-bound compute pipeline feeds push constants via the ring
     // (root CBV) vs inline 32-bit root constants. Set by `bind_compute_pipeline`.
     push_via_cbv: Cell<bool>,
+    // Whether the (single, always-`srv_heap`) shader-visible descriptor heap has been
+    // bound since the last `begin`. `SetDescriptorHeaps` can force a pipeline flush on
+    // some drivers, so we set it once per recording (on the first bindless bind) instead
+    // of on every pipeline bind. `list.Reset` in `begin` clears bound heaps → reset here.
+    heaps_bound: Cell<bool>,
 }
 
 impl D3d12CommandBuffer {
@@ -104,6 +109,7 @@ impl D3d12CommandBuffer {
                 push_ring,
                 push_ring_offset: Cell::new(0),
                 push_via_cbv: Cell::new(false),
+                heaps_bound: Cell::new(false),
             })
         }
     }
@@ -119,6 +125,8 @@ impl D3d12CommandBuffer {
             // Rewind the push-CBV ring: this buffer's previous GPU submission has
             // completed (in-flight fence waited before re-record), so its slots are free.
             self.push_ring_offset.set(0);
+            // `Reset` clears the bound descriptor heaps; the next bindless bind re-binds.
+            self.heaps_bound.set(false);
             Ok(())
         }
     }
@@ -591,12 +599,23 @@ impl D3d12CommandBuffer {
         self.globals_va.set(va);
     }
 
+    /// Bind the shared shader-visible descriptor heap once per recording. It is always
+    /// the same `srv_heap`, and redundant `SetDescriptorHeaps` calls can stall on some
+    /// drivers, so subsequent bindless binds this frame skip it.
+    fn ensure_descriptor_heaps(&self) {
+        if self.heaps_bound.get() {
+            return;
+        }
+        let heaps = [Some(self.device.srv_heap.clone())];
+        unsafe { self.list.SetDescriptorHeaps(&heaps) };
+        self.heaps_bound.set(true);
+    }
+
     pub fn bind_graphics_pipeline(&self, pipeline: &D3d12GraphicsPipeline) {
+        if pipeline.is_bindless() {
+            self.ensure_descriptor_heaps();
+        }
         unsafe {
-            if pipeline.is_bindless() {
-                let heaps = [Some(self.device.srv_heap.clone())];
-                self.list.SetDescriptorHeaps(&heaps);
-            }
             self.list
                 .SetGraphicsRootSignature(pipeline.root_signature());
             if pipeline.is_bindless() {
@@ -719,11 +738,10 @@ impl D3d12CommandBuffer {
 
     /// Bind a compute pipeline (root signature + bindless table + PSO).
     pub fn bind_compute_pipeline(&self, pipeline: &D3d12ComputePipeline) {
+        if pipeline.is_bindless() {
+            self.ensure_descriptor_heaps();
+        }
         unsafe {
-            if pipeline.is_bindless() {
-                let heaps = [Some(self.device.srv_heap.clone())];
-                self.list.SetDescriptorHeaps(&heaps);
-            }
             self.list.SetComputeRootSignature(pipeline.root_signature());
             if pipeline.is_bindless() {
                 self.list
@@ -788,9 +806,8 @@ impl D3d12CommandBuffer {
     /// bindless heap/table, and the state object (Phase 8 M5). The RT pipeline
     /// binds through the compute root-signature slots (`DispatchRays` reads them).
     pub fn bind_raytracing_pipeline(&self, pipeline: &crate::rt_pipeline::D3d12RaytracingPipeline) {
+        self.ensure_descriptor_heaps();
         unsafe {
-            let heaps = [Some(self.device.srv_heap.clone())];
-            self.list.SetDescriptorHeaps(&heaps);
             self.list.SetComputeRootSignature(pipeline.root_signature());
             self.list
                 .SetComputeRootDescriptorTable(0, self.device.srv_gpu_start());
