@@ -27,7 +27,8 @@ struct ReflectPush
     float4 sun;             // xyz direction toward the sun, w = intensity
     uint depth_index;       // sampled G-buffer depth
     uint normal_index;      // sampled G-buffer world normal
-    uint gdf_sampled;       // volumes[] (SRV) index of the scene GDF
+    uint skip_packed;       // A3 adaptive skip, byte-packed: read | write<<8 | K<<16 | frame<<24
+                            //   (was gdf_sampled — unused; clip_desc drives sampling). 0xFF = disabled.
     uint out_index;         // storage image (reflection color)
     uint width;
     uint height;
@@ -52,6 +53,21 @@ struct ReflectPush
     // failure + wrong reflections). A float4's .w sits at +12 on all three backends.
     float4 ground_albedo;
 };
+
+// A3 adaptive temporal skip: reuse the previous frame's traced reflection radiance for a pixel whose
+// surface point is unchanged (world-pos gate) instead of re-marching. The ping-pong storage-buffer
+// indices + stagger period + frame are byte-packed into `skip_packed` (keeps the push at 240 B to
+// avoid a D3D12 root-CBV spill). read/write == 0xFF ⇒ disabled (gallery / viz / lighting-in-flux).
+struct SkipCfg { uint read; uint write; uint k; uint frame; };
+SkipCfg unpack_skip()
+{
+    SkipCfg s;
+    s.read = pc.skip_packed & 0xFFu;
+    s.write = (pc.skip_packed >> 8) & 0xFFu;
+    s.k = (pc.skip_packed >> 16) & 0xFFu;
+    s.frame = (pc.skip_packed >> 24) & 0xFFu;
+    return s;
+}
 
 [[vk::push_constant]]
 ConstantBuffer<ReflectPush> pc : register(b0, space0);
@@ -190,6 +206,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float depth = g.textures[pc.depth_index].SampleLevel(g.samp, uv, 0.0).r;
     float3 sun_dir = normalize(pc.sun.xyz);
     float sun_i = pc.sun.w;
+    uint lin = tid.y * pc.width + tid.x;
+    SkipCfg sk = unpack_skip();
+    bool skip_write = (sk.write != 0xFFu); // A3: persist this pixel's (pos, radiance)
 
     // Background: reflect nothing — show the sky along the view ray (so the viz reads as
     // the scene; C7 only consumes this for shaded pixels anyway).
@@ -199,12 +218,47 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     {
         float4 far = mul(pc.inv_view_proj, float4(ndc, 1.0, 1.0));
         float3 vdir = normalize(far.xyz / far.w - pc.cam_pos.xyz);
+        // Background: no surface — invalidate this pixel's skip slot so it isn't reused next frame.
+        if (skip_write)
+            g.storage_buffers[sk.write].Store4(lin * 32u, asuint(float4(0.0, 0.0, 0.0, 0.0)));
         g.storage_images[pc.out_index][tid.xy] = float4(sky(vdir, sun_dir, sun_i, true), 1.0);
         return;
     }
 
     float4 hpos = mul(pc.inv_view_proj, float4(ndc, depth, 1.0));
     float3 p = hpos.xyz / hpos.w;
+
+    // A3 adaptive temporal skip: if this pixel's surface point is unchanged from last frame (the
+    // world-pos gate) and we aren't on the staggered re-trace floor, reuse last frame's traced
+    // reflection radiance instead of re-marching. The host only enables the READ (skip.x != sentinel)
+    // once the lighting + surface cache are stable, so a reused value equals the value a fresh trace
+    // would produce (image-identical); camera motion moves the surface point > reject → re-trace;
+    // the 1/K staggered floor re-traces a rotating subset so nothing goes stale under un-modeled change.
+    if (sk.read != 0xFFu)
+    {
+        // Staggered re-trace floor — WAVE-COHERENT: force whole 8x8 dispatch tiles (not scattered
+        // pixels) so a re-trace frame doesn't put one marching thread in every wave (which would make
+        // the reused threads pay the full march via SIMD divergence). 1/K tiles re-march per frame.
+        uint tiles_x = (pc.width + 7u) / 8u;
+        uint tile_id = (tid.y / 8u) * tiles_x + (tid.x / 8u);
+        bool force = (sk.k != 0u) && (((tile_id + sk.frame) % sk.k) == 0u);
+        if (!force)
+        {
+            float reject = 0.02 * length(GDF_MAX - GDF_MIN);
+            float4 ppos = asfloat(g.storage_buffers[sk.read].Load4(lin * 32u));
+            if (ppos.w > 0.5 && distance(p, ppos.xyz) < reject)
+            {
+                float3 prad = asfloat(g.storage_buffers[sk.read].Load4(lin * 32u + 16u)).rgb;
+                if (skip_write)
+                {
+                    g.storage_buffers[sk.write].Store4(lin * 32u, asuint(float4(p, 1.0)));
+                    g.storage_buffers[sk.write].Store4(lin * 32u + 16u, asuint(float4(prad, 0.0)));
+                }
+                g.storage_images[pc.out_index][tid.xy] = float4(prad, 1.0);
+                return;
+            }
+        }
+    }
     float3 n = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, uv, 0.0).xyz);
     float3 v = normalize(pc.cam_pos.xyz - p);
     // C8j: GGX-importance-sample the reflection direction by roughness (one jittered ray/frame;
@@ -292,5 +346,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         color = sky(dir, sun_dir, sun_i, false); // specular miss -> sky w/o sun (direct light owns the glint)
     }
 
+    // A3: persist this freshly-traced (surface point, radiance) for next frame's reuse gate.
+    if (skip_write)
+    {
+        g.storage_buffers[sk.write].Store4(lin * 32u, asuint(float4(p, 1.0)));
+        g.storage_buffers[sk.write].Store4(lin * 32u + 16u, asuint(float4(color, 0.0)));
+    }
     g.storage_images[pc.out_index][tid.xy] = float4(color, 1.0);
 }
