@@ -94,15 +94,16 @@ impl ClusterSystem {
     }
 
     fn alloc_lights(device: &Device, capacity: usize) -> anyhow::Result<StorageBuffer> {
-        let bytes = vec![0u8; capacity * 32];
-        Ok(device.create_storage_buffer_init(
-            &StorageBufferDesc {
-                size: bytes.len() as u64,
-                stride: 32,
-                indirect: false,
-            },
-            &bytes,
-        )?)
+        // Host-visible: `upload` host-writes this buffer every frame via `StorageBuffer::write`,
+        // which the D3D12/VK RHI forbids on a device-local (`_init`) buffer. Mirrors the GPU-skin
+        // joint-palette pattern (`skin.rs`). Seed with zeros; the first frame's upload overwrites it.
+        let buf = device.create_storage_buffer_host(&StorageBufferDesc {
+            size: (capacity * 32) as u64,
+            stride: 32,
+            indirect: false,
+        })?;
+        buf.write(&vec![0u8; capacity * 32])?;
+        Ok(buf)
     }
 
     /// Host-write this frame's lights into the fif's light buffer (reallocating if the light
