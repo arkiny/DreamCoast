@@ -85,6 +85,7 @@ impl AtmosphereSystem {
         sky_wb: [f32; 3],
         inscatter_gain: f32,
         exposure: f32,
+        flip_y: u32,
     ) {
         graph.add_pass(
             PassInfo {
@@ -109,6 +110,7 @@ impl AtmosphereSystem {
                     inscatter_gain,
                     height_falloff,
                     exposure,
+                    flip_y,
                 ));
                 cmd.draw(3, 1);
                 Ok(())

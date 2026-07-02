@@ -258,11 +258,15 @@ pub(crate) fn atmosphere_push(
     inscatter_gain: f32,
     height_falloff: f32,
     exposure: f32,
+    flip_y: u32,
 ) -> [u8; 80] {
     let mut pc = [0u8; 80];
     pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
     pc[4..8].copy_from_slice(&position_index.to_le_bytes());
-    // pc[8..12] = out_index (unused by the graphics entry), pc[12..16] = flip_y (unused).
+    // pc[8..12] = out_index (unused by the graphics entry). pc[12..16] = flip_y drives the
+    // full-screen VS clip-space Y orientation (1 = Vulkan) — same as `tonemap_push`; without it
+    // the Vulkan fog composite renders vertically flipped (a DX≡VK parity break).
+    pc[12..16].copy_from_slice(&flip_y.to_le_bytes());
     for (i, v) in camera_pos.iter().enumerate() {
         pc[16 + i * 4..20 + i * 4].copy_from_slice(&v.to_le_bytes());
     }

@@ -60,7 +60,7 @@ struct PushConstants
     uint hdr_index;      // sampled index: the finished opaque HDR scene color (post-lighting/reflect)
     uint position_index; // sampled index: G-buffer world-position MRT (xyz = world pos, w = geometry flag)
     uint out_index;      // unused by the graphics entry (kept for layout symmetry with compute passes)
-    uint flip_y;         // 0 = D3D12 (Y up), 1 = Vulkan (Y down) — unused (fsMain has no ray reconstruction)
+    uint flip_y;         // 0 = D3D12 (Y up), 1 = Vulkan (Y down) — selects the full-screen VS clip-space Y flip
     float4 camera_pos_density; // xyz = camera world position (ray origin); w = `a` density at height 0
     float4 sun_dir_intensity;  // xyz = normalized direction TOWARD the sun; w = sun intensity (procedural_sky)
     float4 sky_wb_gain;        // xyz = sky white-balance gain (matches sky.slang's `wb`); w = inscatter gain
