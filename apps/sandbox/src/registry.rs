@@ -27,6 +27,10 @@ pub(crate) struct GpuMesh {
     pub(crate) ibuf: Buffer,
     pub(crate) index_count: u32,
     pub(crate) vertex_count: u32,
+    /// Local-space AABB (min, max) over the mesh vertices, computed once at upload. Frustum
+    /// culling transforms these 8 corners by the instance transform to get a world AABB (cheap
+    /// per frame vs re-scanning vertices). Empty mesh ⇒ a degenerate zero AABB (never culled).
+    pub(crate) local_aabb: [[f32; 3]; 2],
 }
 
 /// The CPU-side geometry kept alongside each [`GpuMesh`] so the scalable-GI fuse
@@ -87,11 +91,26 @@ impl MeshRegistry {
         indices: Vec<u32>,
     ) -> MeshHandle {
         let handle = MeshHandle(self.meshes.len() as u32);
+        let mut mn = [f32::INFINITY; 3];
+        let mut mx = [f32::NEG_INFINITY; 3];
+        for v in &vertices {
+            for i in 0..3 {
+                mn[i] = mn[i].min(v.pos[i]);
+                mx[i] = mx[i].max(v.pos[i]);
+            }
+        }
+        // Degenerate (empty mesh) ⇒ min > max ⇒ the frustum test treats it as always-visible.
+        let local_aabb = if vertices.is_empty() {
+            [[0.0; 3], [0.0; 3]]
+        } else {
+            [mn, mx]
+        };
         self.meshes.push(Rc::new(GpuMesh {
             vbuf,
             ibuf,
             index_count,
             vertex_count: vertices.len() as u32,
+            local_aabb,
         }));
         self.cpu.push(MeshCpu { vertices, indices });
         handle
@@ -180,9 +199,26 @@ pub(crate) fn build_scene(
         .into_iter()
         .map(|d| {
             let mat = materials.get(d.material);
+            let mesh = meshes.get(d.mesh);
+            // World AABB = the 8 local-AABB corners transformed by the instance matrix, reduced to
+            // min/max. Cheap (8 points) and conservative — a frustum-vs-AABB test on it never culls a
+            // visible object (only fully-outside ones), so culling stays image-identical.
+            let [lmn, lmx] = mesh.local_aabb;
+            let mut wmn = dreamcoast_core::glam::Vec3::splat(f32::INFINITY);
+            let mut wmx = dreamcoast_core::glam::Vec3::splat(f32::NEG_INFINITY);
+            for cx in [lmn[0], lmx[0]] {
+                for cy in [lmn[1], lmx[1]] {
+                    for cz in [lmn[2], lmx[2]] {
+                        let w = d.world.transform_point3(dreamcoast_core::glam::vec3(cx, cy, cz));
+                        wmn = wmn.min(w);
+                        wmx = wmx.max(w);
+                    }
+                }
+            }
             SceneObject {
-                mesh: meshes.get(d.mesh),
+                mesh,
                 transform: d.world,
+                world_aabb: [wmn, wmx],
                 base_color: mat.base_color,
                 metallic: mat.metallic,
                 roughness: mat.roughness,

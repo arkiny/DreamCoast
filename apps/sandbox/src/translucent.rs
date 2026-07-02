@@ -226,6 +226,8 @@ pub(crate) fn translucent_test_planes(
         ibuf,
         index_count,
         vertex_count: quad.len() as u32,
+        // Translucent test pane — rendered via the translucent pass, not the opaque cull; never cull.
+        local_aabb: [[-1.0e9; 3], [1.0e9; 3]],
     });
 
     let s = scene_radius * 0.55; // pane half-size

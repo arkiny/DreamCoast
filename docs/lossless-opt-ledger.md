@@ -151,7 +151,29 @@ frustum cull; camera-frustum + HZB occlusion cull attacks the gbuffer/prepass sh
   shadow cache OFF too) — a content parity bug in the sponza_intel scene, unrelated to this track,
   worth a separate look before trusting IntelSponza DX≡VK gates.
 
+### A5 — CPU frustum cull of the opaque G-buffer/pre-pass draws (cull-lod S1) — ✅ LANDED
+
+- **What:** per-mesh local AABB cached at upload (`GpuMesh.local_aabb`, registry.rs), per-object world
+  AABB (8-corner transform) in `build_scene` (`SceneObject.world_aabb`), and a host-side conservative
+  AABB-vs-frustum filter (`aabb_in_frustum`, Gribb-Hartmann planes from the unjittered no-flip
+  `cull_view_proj`) that builds the visible subset for `record_gbuffer` + `record_prepass`. Shadow
+  (whole-scene light frustum) and view-independent GDF passes keep the full scene. `SCENE_CULL=0`
+  disables; gallery-gated off.
+- **Image-identical:** a fully-outside-the-frustum object is clipped anyway, and the conservative
+  positive-vertex test never culls a visible one. IntelSponza cull ON vs OFF: **VK 0.000/ch
+  (byte-identical), DX 0.006** (DX run-to-run noise; VK proves the visible set is identical). Sponza
+  vs A3 golden 0.000, gallery anchor 0.000. clippy clean, 123 tests pass.
+- **Perf (IntelSponza, measured):** `gbuffer` **DX 14.2→8.5ms, VK 14.0→8.2ms** (~40%); total
+  **DX 42.8→37.3 / VK 43.0→37.7ms** (23→27fps). The default camera has a good fraction of the 155
+  nodes off-screen. Sponza unaffected (camera sees ~everything → cull is a no-op there).
+- **Next for IntelSponza 60fps:** (a) **HZB occlusion cull** (S3 — indoor scene has lots of occluded
+  geometry behind walls; reuse HzbSystem) on top of frustum, (b) **discrete mesh LOD** (S4), (c) the
+  **shadow cache** (14ms, still the #1 pass — see A4; needs the app-owned persistent-depth approach,
+  NOT the graph transient pool which is confirmed broken). CSM-static-mesh caching is the longer-term
+  generalization (shadow-cache-design.md S2, user-flagged).
+
 ## STATUS: Sponza 1080p/0.667 med — **≥60fps on DX (74) and VK (69)**, image-identical (≤0.051/ch)
+## IntelSponza 1080p/0.667 med — 42.8→**37.3ms (27fps)** via A5 frustum cull; shadow 14ms + HZB/LOD remain
 
 IntelSponza (43ms) NOT yet at 60fps — it is GEOMETRY-bound (gbuffer 14 + shadow 14), a different
 problem from the GI-lossless track. Two vetted designs ready: **docs/shadow-cache-design.md** (shadow
