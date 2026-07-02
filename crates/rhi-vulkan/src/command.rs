@@ -439,6 +439,35 @@ impl VulkanCommandBuffer {
         }
     }
 
+    /// Set the viewport + scissor to an arbitrary sub-rect of the bound target
+    /// (shadow-atlas tiling: each cascade / light slot renders into its own tile).
+    pub fn set_viewport_scissor_rect(&self, rect: Rect2D) {
+        let viewport = vk::Viewport {
+            x: rect.x as f32,
+            y: rect.y as f32,
+            width: rect.width as f32,
+            height: rect.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D {
+                x: rect.x,
+                y: rect.y,
+            },
+            extent: vk::Extent2D {
+                width: rect.width,
+                height: rect.height,
+            },
+        };
+        unsafe {
+            self.device
+                .device
+                .cmd_set_viewport(self.cmd, 0, &[viewport]);
+            self.device.device.cmd_set_scissor(self.cmd, 0, &[scissor]);
+        }
+    }
+
     /// Transition an offscreen target into `COLOR_ATTACHMENT_OPTIMAL` for writing.
     pub fn rt_to_render_target(&self, target: &VulkanRenderTarget) {
         let old = target.layout();
