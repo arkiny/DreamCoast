@@ -61,6 +61,7 @@ mod smoketest;
 mod taau;
 mod translucent;
 mod velocity;
+mod view;
 mod world;
 use app::*;
 use cluster::{ClusterLight, ClusterSystem};
@@ -108,6 +109,14 @@ const GB_POSITION_FMT: Format = Format::Rgba16Float;
 /// that fits both blocks; the OFF paths leave their fields zeroed so the shader takes the
 /// legacy branches and the gallery anchor stays byte-identical.
 const GLOBALS_SLICE: u64 = 1280;
+
+/// View-family capacity (render-pipeline re-baseline PR-9, `docs/view-family.md`). The globals
+/// UBO is sub-allocated as `FRAMES_IN_FLIGHT * MAX_VIEWS` slices so each view in a frame gets its
+/// own camera-matrix slice — the per-view offset is `(fif * MAX_VIEWS + view_index) * GLOBALS_SLICE`.
+/// `MAX_VIEWS = 2` covers the current primary + secondary (PiP) proof; bump it (and nothing else)
+/// to allow more simultaneous views (split-screen / stereo / scene-capture probes). The default
+/// single-view path only ever touches slice 0 of each frame, so the anchor stays byte-identical.
+const MAX_VIEWS: u64 = 2;
 
 /// Clustered light culling froxel grid (PR-6). Single source of truth mirrored by
 /// `CLUSTER_X/Y/Z` in `light_cluster_common.slang`. 16×9 tiles matches 16:9; 24
@@ -741,6 +750,12 @@ struct App {
     /// reflections, before TAAU/tonemap. Off by default (byte-identical gallery anchor —
     /// the slot itself is always present in the graph wiring, but unscheduled when off).
     height_fog: bool,
+    /// PR-9 (render-pipeline re-baseline track): opt-in second view (`P_SECOND_VIEW=1`). Renders a
+    /// second `view::SceneView` (an overhead camera) in the SAME frame against the SHARED scene
+    /// resources (shadow/CSM/IBL/GDF/cluster run once) and composites it as a picture-in-picture
+    /// inset into the backbuffer. Off by default → single view, byte-identical anchor. See
+    /// `docs/view-family.md`.
+    second_view: bool,
     /// Height-fog density at world height 0 (`a` in `d(y) = a·exp(-b·y)`, 1/world-unit).
     /// `P_FOG_DENSITY` overrides; scaled by `scene_radius` at the call site so the default
     /// reads sensibly across scene scales (unit-cube gallery vs. the larger Sponza level).
@@ -2137,6 +2152,9 @@ impl App {
         // untouched — the atmosphere slot exists in the graph wiring unconditionally, but the
         // pass itself is only added when this is true (see the `run()` call site).
         let height_fog = quality::env_bool("P_HEIGHT_FOG", false);
+        // PR-9 view family: opt-in second (overhead) view composited as a PiP inset. Off by
+        // default = single view = byte-identical anchor.
+        let second_view = quality::env_bool("P_SECOND_VIEW", false);
         // Density/falloff default to a gentle, scene-scale-relative haze: `1/scene_radius` puts
         // the characteristic falloff height and the "full extinction" distance both on the order
         // of the scene's own size, so the same defaults look sensible on the unit-radius gallery
@@ -2695,6 +2713,7 @@ impl App {
             skyvis_tint,
             skyvis_min_occ,
             height_fog,
+            second_view,
             fog_density,
             fog_height_falloff,
             fog_inscatter_gain,
@@ -3467,6 +3486,35 @@ impl App {
         let cam_up = inv_view.y_axis.truncate();
         // For reconstructing background view rays (skybox) in the lighting pass.
         let inv_view_proj = view_proj.inverse().to_cols_array();
+
+        // PR-9 view family: the PRIMARY view descriptor. It captures the same view-dependent
+        // camera math the passes below consume (the passes still read the individual locals for
+        // the byte-identical baseline; the descriptor is the structural single-source that the
+        // second view mirrors). `full()` = the complete feature set = the legacy single-view path.
+        // Jitter/stable/prev matrices are folded in so `primary_view` documents the whole
+        // per-view temporal state in one place.
+        let mut primary_view = view::SceneView::build(
+            0,
+            eye,
+            focus,
+            cw as f32 / ch as f32,
+            60f32.to_radians(),
+            CLUSTER_Z_NEAR,
+            CLUSTER_Z_FAR,
+            self.backend,
+            (fif as u64 * MAX_VIEWS) * GLOBALS_SLICE,
+            self.prev_view_proj,
+            view::SceneViewFeatures::full(),
+        );
+        // Fold this frame's jittered view-projection + jitter UV into the descriptor (the primary
+        // view is the one that carries TAAU sub-pixel jitter; the secondary view has none).
+        primary_view.view_proj = view_proj;
+        primary_view.jitter_uv = taau_jitter_uv;
+        debug_assert_eq!(
+            primary_view.globals_offset,
+            (fif as u64 * MAX_VIEWS) * GLOBALS_SLICE
+        );
+        debug_assert!(primary_view.features.taau && primary_view.features.post);
 
         // Skip the whole ImGui frame (NewFrame/Render must stay balanced) when
         // capturing a clean screenshot.
@@ -4293,7 +4341,12 @@ impl App {
                 uv
             },
         };
-        let globals_offset = fif as u64 * GLOBALS_SLICE;
+        // PR-9 view family: the primary view is slice 0 of this frame's view block
+        // (`(fif * MAX_VIEWS + view_index) * GLOBALS_SLICE`). The content written at that offset is
+        // unchanged from the pre-PR-9 layout, and every consumer reads the same offset, so the
+        // anchor stays byte-identical; the wider stride just reserves room for the second view's
+        // camera slice.
+        let globals_offset = (fif as u64 * MAX_VIEWS) * GLOBALS_SLICE;
         // Firefly clamp ceiling (raw radiance, max component). ~8 keeps diffuse + moderate
         // gloss but caps blown-out specular spikes; 1e30 = effectively off (byte-identical).
         let firefly_max = if self.firefly_clamp { 8.0f32 } else { 1e30 };
@@ -6078,6 +6131,149 @@ impl App {
             cdl_offset,
             cdl_power,
         );
+
+        // PR-9 View Family (`docs/view-family.md`): render a SECOND view in the same frame against
+        // the SHARED scene resources, composited as a picture-in-picture inset. The view-INDEPENDENT
+        // passes above (shadow/CSM atlas, IBL capture, GDF/surface cache, clustered-light upload)
+        // already ran ONCE this frame; only the view-DEPENDENT chain (G-buffer → lighting → tonemap)
+        // re-runs here, parameterized by the second `SceneView`. The secondary view uses the
+        // simplified feature set (no TAAU/velocity/post/screen-space-GI — see `SceneViewFeatures`),
+        // so its temporal state can never collide with the primary view's. Off by default = no extra
+        // passes = byte-identical anchor.
+        if self.second_view {
+            // Overhead ("god's-eye") camera: straight down onto the scene centre. A genuinely
+            // different pose from the primary orbit view so the inset is visibly a distinct view.
+            let sv_center = if self.is_gallery {
+                Vec3::new(0.0, self.model_radius * 0.5, 0.0)
+            } else {
+                self.scene_center
+            };
+            let sv_eye = sv_center + Vec3::new(0.0, self.scene_radius * 3.0, 0.001);
+            let second = view::SceneView::build(
+                1,
+                sv_eye,
+                sv_center,
+                1.0, // square inset
+                60f32.to_radians(),
+                CLUSTER_Z_NEAR,
+                CLUSTER_Z_FAR,
+                self.backend,
+                (fif as u64 * MAX_VIEWS + 1) * GLOBALS_SLICE,
+                Mat4::IDENTITY.to_cols_array(),
+                view::SceneViewFeatures::secondary(),
+            );
+
+            tracing::debug!(
+                "view family: rendering view #{} (eye {:?} -> focus {:?}) against shared scene resources",
+                second.index,
+                second.eye,
+                second.focus
+            );
+            // The second view's globals slice: reuse the shared lighting/shadow/IBL fields from the
+            // primary `globals` (single source of truth — sun, shadow atlas, IBL indices, CSM are
+            // all view-independent) and override only the camera-dependent fields.
+            let mut sv_globals = globals;
+            sv_globals.camera_pos = [second.eye.x, second.eye.y, second.eye.z, 0.0];
+            sv_globals.inv_view_proj = second.inv_view_proj;
+            sv_globals.prev_view_proj = second.prev_view_proj;
+            sv_globals.cluster_view_z_row = second.cluster_view_z_row();
+            // Secondary view lights brute-force (cluster froxels were built for the primary
+            // frustum); the froxel path is a primary-view optimization, not a correctness input.
+            self.deferred
+                .write_globals(second.globals_offset, globals_bytes(&sv_globals))?;
+
+            // The inset renders at a modest square resolution; the composite scales it into the
+            // top-right backbuffer quadrant via a viewport rect.
+            let inset = (sw.min(sh) / 3).max(64);
+            let sv_extent = Extent2D::new(inset, inset);
+            let sv_albedo = graph.create_color("sv_g_albedo", GB_ALBEDO_FMT, sv_extent);
+            let sv_normal = graph.create_color("sv_g_normal", GB_NORMAL_FMT, sv_extent);
+            let sv_material = graph.create_color("sv_g_material", GB_MATERIAL_FMT, sv_extent);
+            let sv_position = graph.create_color("sv_g_position", GB_POSITION_FMT, sv_extent);
+            let sv_depth = graph.create_depth("sv_g_depth", sv_extent);
+            let sv_hdr = graph.create_color("sv_hdr", HDR_FORMAT, sv_extent);
+            let sv_gbuf = GBufferTargets {
+                albedo: sv_albedo,
+                normal: sv_normal,
+                material: sv_material,
+                position: sv_position,
+                depth: sv_depth,
+            };
+
+            // View-dependent chain for the second view, driven by THIS VIEW'S feature set (not a
+            // scattered `if second_view` — the descriptor decides). No TAAU → no jitter → no mip
+            // bias; the raster uses this view's stable (unjittered) view-projection.
+            let f = second.features;
+            // No TAAU → render on this view's stable (unjittered) grid, no upscale mip bias.
+            let sv_view_proj = if f.taau {
+                second.view_proj
+            } else {
+                second.view_proj_stable
+            };
+            let sv_mip_bias = if f.taau { self.taa_mip_bias } else { 0.0 };
+            // The secondary feature set clears `velocity`/`post`; those passes are skipped by
+            // construction. Consumed here so the descriptor — not a scattered flag — is the gate.
+            let _ = (f.velocity, f.post, second.jitter_uv);
+            self.deferred.record_gbuffer(
+                &mut graph,
+                sv_gbuf,
+                &scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                sv_view_proj,
+                self.ambient,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                sv_mip_bias,
+                false, // no depth pre-pass
+            );
+            // Lighting: shares the ONCE-rendered shadow atlas + IBL; screen-space GI/AO/reflection
+            // inputs are gated on THIS VIEW'S `screen_space_gi` feature (off for the secondary view →
+            // IBL+direct only), brute-force point lights (cluster = None). A future view that opts
+            // into `screen_space_gi` would produce + thread its own AO/GI targets here.
+            debug_assert!(
+                !f.screen_space_gi,
+                "secondary view has no screen-space GI targets"
+            );
+            self.deferred.record_lighting(
+                &mut graph,
+                sv_hdr,
+                sv_gbuf,
+                shadow_map,
+                None,
+                None,
+                None,
+                None,
+                None,
+                self.skyvis_tint,
+                self.skyvis_min_occ,
+                second.globals_offset,
+                self.flip_y,
+                !self.is_gallery,
+                u32::MAX, // static exposure (auto-exposure meter is a primary-view resource)
+                None,
+            );
+            // Composite the second view as a PiP inset. A tonemap pass that LOADS (does not clear)
+            // the backbuffer and restricts its draw to the top-right inset viewport rect, so the
+            // full-screen triangle only fills that quadrant over the already-composited main view.
+            let vp = rhi::Rect2D {
+                x: (sw.saturating_sub(inset + inset / 12)) as i32,
+                y: (inset / 12) as i32,
+                width: inset,
+                height: inset,
+            };
+            self.deferred.record_tonemap_inset(
+                &mut graph,
+                backbuffer,
+                sv_hdr,
+                self.post_mode as u32,
+                self.flip_y,
+                1.0,
+                vp,
+            );
+        }
 
         if include_ui {
             graph.add_pass(
