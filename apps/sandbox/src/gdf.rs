@@ -105,6 +105,11 @@ pub(crate) struct GdfSystem {
     /// relight budget, + the compute pipeline that fills it. `None` until the cache is built.
     card_vis: Option<StorageBuffer>,
     cache_vis_pipeline: Option<ComputePipeline>,
+    /// A2-fix (Lumen-aligned): host-visible 1-uint buffers (ping-pong by `cache_frame % 2`) that the
+    /// relight `InterlockedMax`es with `asuint(max EMA delta)`. The host reads the slot's value from
+    /// 2 frames ago (fence-complete) to freeze the relight ONLY on MEASURED convergence — never a
+    /// frame-count guess, which locked an unconverged cache on slow-multibounce scenes (IntelSponza).
+    cache_conv: [Option<StorageBuffer>; 2],
     /// QHD/UHD track: surface-cache atlas tile edge (texels/card side), runtime so content can use
     /// a smaller tile (cheaper, resolution-INDEPENDENT relight) while the gallery keeps `CARD_TILE`
     /// (byte-identical). Set in `build_surface_cache`; all cache shaders take it as a push param.
@@ -438,6 +443,7 @@ impl GdfSystem {
             cache_async: false,
             cache_light_pipeline,
             card_vis: None,
+            cache_conv: [None, None],
             cache_vis_pipeline,
             card_tile: CARD_TILE,
             clip_desc: None,
@@ -976,6 +982,16 @@ impl GdfSystem {
             stride: 4,
             indirect: false,
         })?);
+        // A2-fix: two host-visible convergence probes (ping-pong), each [sum_fp:u32, count:u32].
+        for c in self.cache_conv.iter_mut() {
+            let b = device.create_storage_buffer_host(&StorageBufferDesc {
+                size: 8,
+                stride: 4,
+                indirect: false,
+            })?;
+            b.write(&[0u8; 8])?;
+            *c = Some(b);
+        }
         self.num_cards = num_cards;
         self.cache_frame = 0;
         Ok(())
@@ -983,6 +999,29 @@ impl GdfSystem {
 
     /// Stage D2b: the per-card visibility buffer's bindless storage index (for the relight pass),
     /// or `None` when the cache / visibility pipeline isn't built.
+    /// A2-fix: probe THIS frame's convergence slot. Returns `(bindless index to hand the relight,
+    /// max EMA delta measured 2 frames ago)`. Reads the value the same-parity slot got 2 frames back
+    /// (fence-complete, race-free) then clears it to 0 so this frame's relight starts a fresh
+    /// `InterlockedMax`. A frozen (skipped) relight leaves it 0 ⇒ a converged cache keeps reading 0.
+    pub(crate) fn cache_conv_probe(&self) -> Option<(u32, f32)> {
+        let slot = (self.cache_frame % 2) as usize;
+        let buf = self.cache_conv[slot].as_ref()?;
+        let mut bytes = [0u8; 8];
+        let delta = if buf.read_into(&mut bytes).is_ok() {
+            let sum = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32 / 1e4;
+            let count = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            if count > 0 {
+                sum / count as f32 // mean per-channel EMA step (radiance units)
+            } else {
+                f32::INFINITY // no relit texels measured ⇒ not converged
+            }
+        } else {
+            f32::INFINITY // read failed ⇒ treat as not converged (never freeze on a read error)
+        };
+        let _ = buf.write(&[0u8; 8]);
+        Some((buf.storage_index(), delta))
+    }
+
     pub(crate) fn card_vis_index(&self) -> Option<u32> {
         Some(self.card_vis.as_ref()?.storage_index())
     }
@@ -1078,6 +1117,7 @@ impl GdfSystem {
         card_vis_ext: Option<ResourceId>,
         alpha: f32,
         cone_k: f32,
+        conv_idx: u32,
         sky_gain: f32,
         sky_wb: [f32; 3],
     ) {
@@ -1170,6 +1210,7 @@ impl GdfSystem {
                     relight_period.max(1),
                     card_vis_index,
                     cone_k,
+                    conv_idx,
                     sky_gain,
                     sky_wb,
                 ));
@@ -1201,6 +1242,7 @@ impl GdfSystem {
         alpha: f32,
         feedback: bool,
         cone_k: f32,
+        conv_idx: u32,
         sky_gain: f32,
         sky_wb: [f32; 3],
     ) {
@@ -1288,6 +1330,7 @@ impl GdfSystem {
             relight_period.max(1),
             card_vis_index,
             cone_k,
+            conv_idx,
             sky_gain,
             sky_wb,
         ));

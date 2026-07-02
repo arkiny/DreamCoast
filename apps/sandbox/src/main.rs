@@ -874,15 +874,27 @@ struct App {
     /// Lossless cache/GI dirty-skip (docs/lossless-opt-ledger.md A2): the view-independent
     /// surface-cache relight (and world-irradiance volume) is a temporally-accumulated EMA that
     /// reaches a fixpoint once the lighting (sun/sky) + geometry stop changing. `cache_epoch` is a
-    /// hash of that invariant state; when it holds steady for `cache_settle_frames`, the EMA has
-    /// converged, so re-lighting produces the SAME value it already holds — we freeze the relight
-    /// (skip the dispatch, don't advance the ping-pong) and consumers keep reading the converged
-    /// radiance. Image-identical (a converged EMA == its fixpoint); any epoch change re-arms it.
+    /// hash of that invariant state; a change re-arms convergence. The freeze then arms on MEASURED
+    /// convergence (the relight's max EMA step below `cache_conv_eps` for `cache_conv_k` frames — see
+    /// the GPU `InterlockedMax` probe), NOT a frame count: multibounce converges at scene-dependent
+    /// rates, so a fixed count locked an unconverged cache on IntelSponza. Once converged, re-lighting
+    /// produces the SAME value it holds — we freeze the relight (skip the dispatch, don't advance the
+    /// ping-pong) and consumers keep reading it. Image-identical (a converged EMA == its fixpoint).
     /// Camera motion does NOT bump the epoch (the cache is view-independent), so this wins even
     /// while the camera moves — only sun/sky/geometry changes cost a re-converge. Gallery-gated.
     cache_epoch: u64,
     cache_stable_frames: u32,
-    cache_settle_frames: u32,
+    /// A2-fix: consecutive frames the MEASURED cache EMA step stayed below `cache_conv_eps`. The
+    /// relight/reflect-reuse freeze arms only when this reaches `cache_conv_k` — real convergence,
+    /// not a frame-count guess (which locked an unconverged multibounce cache on IntelSponza).
+    cache_conv_stable: u32,
+    cache_conv_eps: f32,
+    cache_conv_k: u32,
+    /// A2-fix: the freeze LATCH. Armed once `cache_conv_stable` reaches `cache_conv_k` (measured
+    /// convergence); held until the epoch (sun/sky/geometry) changes. A latch is required because a
+    /// frozen relight stops measuring — without it the missing measurement would immediately
+    /// un-freeze, oscillating. Epoch change clears it so a lighting change re-converges.
+    cache_frozen: bool,
     cache_dirty_skip: bool,
     /// Cached shadow map (docs/shadow-cache-cold-start.md S1). The legacy directional shadow map is
     /// camera-independent (`light_view_proj` reads only sun + scene bounds), so when the sun and
@@ -2833,14 +2845,20 @@ impl App {
             scene_cache_reset: true,
             cache_epoch: 0,
             cache_stable_frames: 0,
-            // Frames of lighting stability before the cache/GI EMA is treated as converged and the
-            // relight freezes. Sized above the EMA settle time (alpha≈0.35 ⇒ <0.5% residual in
-            // ~13 frames, +multibounce propagation) with margin. `P_CACHE_SETTLE` overrides; the
-            // measure harness warms 60 frames so the freeze is active in the measured tail.
-            cache_settle_frames: std::env::var("P_CACHE_SETTLE")
+            cache_conv_stable: 0,
+            // A2-fix: the max per-channel EMA radiance step (in the scene's radiance units) under
+            // which the cache is treated as converged. Tuned so a genuinely-settled cache passes and
+            // a still-propagating multibounce (IntelSponza's coloured drapes) does not. `P_CACHE_CONV_EPS`.
+            cache_conv_eps: std::env::var("P_CACHE_CONV_EPS")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.02),
+            // A2-fix: consecutive below-eps frames required before freezing (debounce). `P_CACHE_CONV_K`.
+            cache_conv_k: std::env::var("P_CACHE_CONV_K")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(45),
+                .unwrap_or(6),
+            cache_frozen: false,
             // Default-on for content; gallery byte-anchor keeps every-frame relight. `P_CACHE_DIRTY_SKIP=0`
             // forces the legacy always-relight path (perf A/B + the fast-motion worst case).
             cache_dirty_skip: !gallery_scene && quality::env_bool("P_CACHE_DIRTY_SKIP", true),
@@ -4895,11 +4913,17 @@ impl App {
         // This frame's reset flag, captured for the async relight (recorded in the submit section);
         // the in-graph (sync) path consumes it inline below.
         let cache_reset_this_frame = self.scene_cache_reset;
-        // Lossless dirty-skip: derive the cache lighting/scene epoch from everything the relight
-        // result depends on (sun, sky, gather params) — but NOT the camera (the cache is
-        // view-independent). When this epoch holds steady past `cache_settle_frames`, the relight
-        // EMA has converged to a fixpoint, so freezing it (skip below) is image-identical.
-        let cache_settled = {
+        // A2-fix: derive the cache lighting/scene epoch from everything the relight depends on (sun,
+        // sky, gather params) — but NOT the camera (the cache is view-independent). An epoch change
+        // re-arms convergence. The FREEZE itself gates on MEASURED convergence (the relight's max EMA
+        // step below `cache_conv_eps`), not a frame count: multibounce colour propagation converges at
+        // scene-dependent rates, so a fixed frame count locked an unconverged cache on IntelSponza's
+        // coloured drapes. Lumen never freezes on a frame count either — it budgets updates by
+        // priority; this is the measured-convergence analogue that stays image-identical on any scene.
+        // Probe the previous (fence-complete) relight's max EMA step + get this frame's write index.
+        let (cache_conv_idx, cache_conv_delta) =
+            self.gdf.cache_conv_probe().unwrap_or((u32::MAX, f32::INFINITY));
+        let cache_converged = {
             let mut epoch = 0xcbf29ce484222325u64;
             let mut mix = |v: u32| {
                 epoch = epoch.wrapping_mul(0x100_0000_01b3).wrapping_add(v as u64);
@@ -4919,16 +4943,36 @@ impl App {
             if epoch == self.cache_epoch {
                 self.cache_stable_frames = self.cache_stable_frames.saturating_add(1);
             } else {
+                // Lighting/geometry changed => re-converge from scratch (release the freeze latch).
                 self.cache_epoch = epoch;
                 self.cache_stable_frames = 0;
+                self.cache_conv_stable = 0;
+                self.cache_frozen = false;
             }
-            // Converged only once the cache is captured, past the first-frame reset, and the epoch
-            // has been stable long enough for the EMA (and the multibounce propagation) to settle.
-            self.cache_dirty_skip
-                && self.scene_cache_captured
-                && !cache_reset_this_frame
-                && self.cache_stable_frames >= self.cache_settle_frames
+            // Arm the freeze latch on MEASURED convergence: while not yet frozen, require the epoch
+            // stable (so the probe reflects the current lighting) AND the mean EMA step below eps for
+            // `cache_conv_k` consecutive frames. Once latched it holds (a frozen relight stops
+            // measuring, so re-evaluating would oscillate) until the epoch changes above.
+            if !self.cache_frozen {
+                if self.cache_stable_frames >= 2 && cache_conv_delta < self.cache_conv_eps {
+                    self.cache_conv_stable = self.cache_conv_stable.saturating_add(1);
+                } else {
+                    self.cache_conv_stable = 0;
+                }
+                if self.scene_cache_captured
+                    && !cache_reset_this_frame
+                    && self.cache_conv_stable >= self.cache_conv_k
+                {
+                    self.cache_frozen = true;
+                }
+            }
+            self.cache_frozen && !cache_reset_this_frame
         };
+        // A2 freeze: skip the relight only when dirty-skip is enabled AND the cache is measured-converged.
+        let cache_settled = self.cache_dirty_skip && cache_converged;
+        // Hand the relight its convergence probe index so it measures the EMA step — but only when we
+        // actually relight (not frozen); a frozen frame leaves the cleared slot at 0 (stays converged).
+        let relight_conv_idx = if cache_settled { u32::MAX } else { cache_conv_idx };
         // C8b2: re-light the cache (direct sun + sky + multibounce gather from last frame). Async:
         // the relight runs on the compute queue (submit section) and consumers read the previous
         // frame's radiance — the graph handle is only a placeholder for the consumer reads (the
@@ -4960,6 +5004,7 @@ impl App {
                         card_vis_ext,
                         relight_alpha,
                         self.gdf_cone_k,
+                        relight_conv_idx,
                         self.sky_gain,
                         self.sky_wb,
                     );
@@ -5469,9 +5514,10 @@ impl App {
                         // the lighting + surface cache are stable, so a reused pixel equals a fresh
                         // trace (image-identical). Camera motion is handled per-pixel by the world-pos
                         // gate in-shader. Sentinels when the feature/buffers are off.
-                        let stable = self.scene_cache_captured
-                            && !cache_reset_this_frame
-                            && self.cache_stable_frames >= self.cache_settle_frames;
+                        // A2-fix: enable reflect REUSE on the same MEASURED cache convergence the
+                        // relight freeze uses (was a frame-count guess that reused stale reflections
+                        // before IntelSponza's cache/GI had converged).
+                        let stable = cache_converged;
                         match (self.reflect_skip, self.reflect.reflect_skip_indices()) {
                             (true, Some((r, w))) => [
                                 if stable { r } else { u32::MAX },
@@ -6659,6 +6705,7 @@ impl App {
                     relight_alpha,
                     self.cache_feedback,
                     self.gdf_cone_k,
+                    relight_conv_idx,
                     self.sky_gain,
                     self.sky_wb,
                 );
