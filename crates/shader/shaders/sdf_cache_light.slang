@@ -35,7 +35,9 @@ struct CacheLightPush
     float4 params;        // x (unused, was sky_fill), y temporal alpha, z surface bias, w ray max
     uint4 clip;           // Stage B clipmap: x = descriptor index, y = level count
     float cone_k;         // P3: cone-trace LOD slope (0 = legacy linear march = byte-identical)
-    float pad0;
+    uint conv_buf;        // A2-fix: host-visible buffer[0] gets InterlockedMax(asuint(max EMA delta))
+                          // so the host can freeze the relight ONLY on MEASURED convergence (Lumen
+                          // uses a priority budget, never a frame-count freeze). 0xFFFFFFFF = disabled.
     float pad1;
     float pad2;
     float4 sky;           // x = sky gain, yzw = white balance (matches the path tracer's sky)
@@ -217,6 +219,18 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     {
         float3 prev = make_finite(asfloat(g.storage_buffers[pc.cache_rad_read].Load3(t * 16u)));
         radiance = lerp(prev, radiance, pc.params.y);
+        // A2-fix convergence probe: the MEAN per-channel EMA step over the relit texels (buffer[0] =
+        // sum in 1e4 fixed-point, buffer[1] = count). Mean, not max — a single stochastic-gather
+        // outlier keeps a max pinned high forever, so max never reports convergence; the mean tracks
+        // the whole cache settling. InterlockedAdd is order-independent (=> DX≡VK). The host divides
+        // sum/count to get the mean radiance step and freezes only once it falls below its epsilon.
+        if (pc.conv_buf != 0xFFFFFFFFu)
+        {
+            float3 dv = abs(radiance - prev);
+            float d = max(dv.x, max(dv.y, dv.z));
+            g.storage_buffers[pc.conv_buf].InterlockedAdd(0u, uint(min(d, 1e5) * 1e4));
+            g.storage_buffers[pc.conv_buf].InterlockedAdd(4u, 1u);
+        }
     }
     // Sanitize before storing: a NaN here would spread through the cache's gather + EMA
     // every frame (the "black creeps in" failure on complex scenes).
