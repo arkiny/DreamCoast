@@ -238,15 +238,18 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float hist_len = 0.0;
     if (pc.reset == 0u)
     {
-        // Prefer per-pixel velocity reprojection when the motion-vector target is bound
-        // (removes moving-object ghosting); otherwise fall back to the camera-only world-space
-        // reprojection (correct for static geometry + camera motion). Both land on the same
-        // stable output grid the history lives on.
-        float2 puv;
-        bool have_uv = false;
-        if (velocity_reproject(uv, cuv, sy, puv))
+        // When the PR-2 motion-vector target is bound, prefer per-pixel velocity reprojection
+        // (removes moving-object ghosting). When it is ABSENT (the default), run the original
+        // camera-only world-space reprojection block VERBATIM so its codegen — and therefore the
+        // accumulated history — is bit-identical to the pre-PR-2 pipeline (content-scene byte
+        // parity; the velocity path is a strict opt-in addition, never a rewrite of the default).
+        float2 vuv;
+        if (pc.velocity_index != 0xFFFFFFFFu && velocity_reproject(uv, cuv, sy, vuv))
         {
-            have_uv = all(puv >= 0.0) && all(puv <= 1.0);
+            if (all(vuv >= 0.0) && all(vuv <= 1.0))
+            {
+                fetch_history_bilinear(vuv, world_pos, hist_rgb, hist_len);
+            }
         }
         else
         {
@@ -254,14 +257,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             if (pclip.w > 0.0)
             {
                 float3 pndc = pclip.xyz / pclip.w;
-                puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
-                have_uv = all(puv >= 0.0) && all(puv <= 1.0) && pndc.z >= 0.0 && pndc.z <= 1.0;
+                float2 puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
+                if (all(puv >= 0.0) && all(puv <= 1.0) && pndc.z >= 0.0 && pndc.z <= 1.0)
+                {
+                    // Sub-pixel-accurate (bilinear) history reprojection — see fetch_history_bilinear.
+                    fetch_history_bilinear(puv, world_pos, hist_rgb, hist_len);
+                }
             }
-        }
-        if (have_uv)
-        {
-            // Sub-pixel-accurate (bilinear) history reprojection — see fetch_history_bilinear.
-            fetch_history_bilinear(puv, world_pos, hist_rgb, hist_len);
         }
     }
 
