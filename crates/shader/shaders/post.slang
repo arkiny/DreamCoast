@@ -30,7 +30,23 @@ struct PushConstants
     float sharpen;  // QHD/UHD: unsharp amount to recover crispness after upscale (0 = off)
     float inv_w;    // 1 / output width  (sharpen tap spacing)
     float inv_h;    // 1 / output height
-    float pad;
+    // PR-5 bloom composite: the bloom pyramid mip0 (u32 max = no bloom) added onto the
+    // HDR at `bloom_intensity` before the filmic curve. Off = byte-identical anchor.
+    uint bloom_index;
+    float bloom_intensity;
+    // PR-5 color grading (ASC CDL: out = (slope*in + offset)^power) applied in linear
+    // HDR after exposure/bloom, before the tonemap curve. Neutral = slope 1, offset 0,
+    // power 1 -> exact identity. `grade_on` gates it so the neutral case is not even
+    // evaluated (a pure no-op, no pow() rounding) -> byte-identical anchor.
+    uint grade_on;    // 0 = grading disabled (identity), 1 = apply CDL
+    uint pad0;
+    uint pad1;
+    // Each CDL vector is a full float4 row (never float3 + trailing scalar) to dodge the
+    // HLSL/SPIR-V vs. MSL push-constant packing divergence (a scalar after a float3
+    // packs at +12 on HLSL/SPIR-V but pads to +16 on MSL).
+    float4 cdl_slope;  // gain  (per-channel multiplier; neutral 1,1,1)
+    float4 cdl_offset; // lift  (per-channel additive;   neutral 0,0,0)
+    float4 cdl_power;  // gamma (per-channel exponent;   neutral 1,1,1)
 };
 
 [[vk::push_constant]]
@@ -70,10 +86,26 @@ float4 fsMain(VSOutput input) : SV_Target
         float3 blur = (n + s + e + w) * 0.25;
         hdr = max(hdr + pc.sharpen * (hdr - blur), 0.0);
     }
+    // PR-5 bloom composite: add the bloom pyramid's mip0 (already the accumulated,
+    // tent-upsampled bright energy in linear HDR) scaled by `bloom_intensity`. Done in
+    // linear HDR before exposure/curve. `bloom_index == 0xFFFFFFFF` -> skipped (anchor).
+    if (pc.bloom_index != 0xFFFFFFFFu)
+    {
+        float3 bloom = g.textures[pc.bloom_index].Sample(g.samp, input.uv).rgb;
+        hdr += bloom * pc.bloom_intensity;
+    }
     // Camera exposure before the filmic curve. The rasterized HDR already bakes
     // exposure into the lighting pass (so it passes 1.0 here); the path-traced
     // output carries raw scene radiance and is exposed at this stage instead.
-    float3 color = aces(hdr * pc.exposure);
+    float3 exposed = hdr * pc.exposure;
+    // PR-5 color grading (ASC CDL) in linear HDR, before the tonemap curve. Neutral
+    // params or `grade_on == 0` leave `exposed` untouched (byte-identical).
+    if (pc.grade_on != 0u)
+    {
+        float3 graded = pc.cdl_slope.rgb * exposed + pc.cdl_offset.rgb;
+        exposed = pow(max(graded, 0.0), pc.cdl_power.rgb);
+    }
+    float3 color = aces(exposed);
 
     if (pc.mode == 1)
     {
