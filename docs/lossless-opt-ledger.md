@@ -126,7 +126,38 @@ here). NEXT phase = real-scene frustum/occlusion culling + distance LOD (design 
 shadow frustum covers the whole scene, so shadow-map cost needs LOD / cascade-culling, not just camera
 frustum cull; camera-frustum + HZB occlusion cull attacks the gbuffer/prepass share.
 
+### A4 — Cached shadow map (dirty-skip) — ⚠️ REVERTED (design sound, transient-pool impl broken)
+
+- **What:** mirror A2 for the `shadow` pass — the legacy directional shadow map is camera-independent
+  (`light_view_proj` reads only sun/scene_center/scene_radius), so skip the re-raster when sun+geometry
+  are stable and re-sample last frame's depth. Design in **docs/shadow-cache-design.md**.
+- **Perf: CONFIRMED huge** — skipping the pass took IntelSponza `shadow` **14.1ms → 0** (DX 42.8→28.9,
+  VK 43.0→29.3), and it correctly survives camera motion (camera-independent map). This validates the
+  lever: **shadow caching is THE IntelSponza shadow win.**
+- **BUT image WRONG:** the design assumed "skip the writer ⇒ the transient depth pool slot keeps last
+  frame's depth." **Empirically false** — Sponza shadow-cache-ON vs golden = **1.726/ch** (shadows
+  gone → scene too bright); IntelSponza ON-vs-OFF = 0.133/ch (run-to-run noise is only 0.002). When no
+  pass writes the transient depth, the graph clears/reuses the slot (there is no `import_depth` for an
+  app-owned persistent depth attachment; `import_external` is barrier-tracking only). Gallery anchor
+  stayed 0.000 (cache off there). **Reverted** (`git checkout main.rs`).
+- **Correct fix (bounded follow-up, NOT landed):** an explicit **persistent app-owned shadow depth
+  texture** — render the transient map as today then **copy** it into the persistent texture; lighting
+  samples the persistent copy; skip BOTH the raster and the copy when static (the copy retains last
+  frame's depth). Copy cost ~0.5ms when rendering, 0 when frozen — still ~14ms net win. Needs a depth
+  texture-to-texture copy in the RHI (verify it exists on both backends first). Alternative: add
+  graph support for an imported persistent depth attachment (bigger).
+- **Do NOT** retry the transient-pool trick — it's confirmed broken.
+- **Side note:** IntelSponza has a **pre-existing DX≡VK divergence of ~0.94/ch** (present with the
+  shadow cache OFF too) — a content parity bug in the sponza_intel scene, unrelated to this track,
+  worth a separate look before trusting IntelSponza DX≡VK gates.
+
 ## STATUS: Sponza 1080p/0.667 med — **≥60fps on DX (74) and VK (69)**, image-identical (≤0.051/ch)
+
+IntelSponza (43ms) NOT yet at 60fps — it is GEOMETRY-bound (gbuffer 14 + shadow 14), a different
+problem from the GI-lossless track. Two vetted designs ready: **docs/shadow-cache-design.md** (shadow
+14ms→0, needs the persistent-texture fix above) + **docs/virtual-geometry-feasibility.md** /
+**docs/cull-lod-design.md** (gbuffer via per-mesh frustum+HZB cull + discrete LOD — Option A, NOT full
+Nanite, which is unjustified here). Both are implement-ready; neither landed yet.
 
 Remaining track work: (1) IntelSponza to 60fps (docs/cull-lod-design.md — culling/LOD/streaming;
 culling is NOT the Sponza lever but IS the IntelSponza-scale lever), (2) frustum+occlusion culling +
