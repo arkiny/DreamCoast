@@ -105,58 +105,69 @@ render dependency graph(RDG) 위에 선언되고**, 패스는 리소스 read/wri
 
 현 프레임 흐름(코드 기준): `apps/sandbox/src/main.rs`의 프레임 루프가
 **shadow depth → G-buffer(4 MRT) → deferred decals(A3) → GDF/SW-RT compute(AO / screen-probe 또는
-ray-march GI / SSR+반사 composite) → PBR deferred lighting → (auto-exposure) → (compute post box-blur) →
-TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
+ray-march GI / SSR+반사 composite) → PBR deferred lighting → (auto-exposure meter) → (atmosphere/fog
+슬롯, PR-4) → [PR-5 post] motion-blur → TAAU(내부해상도 업스케일) → bloom → DoF(스텁) →
+tonemap+grading → (particle/cull draw/ImGui)`.
 근거 코드: `deferred.rs`(`record_shadow`/`record_gbuffer`/`record_decals`/`record_lighting`/
-`record_tonemap`), `gi.rs`·`reflect.rs`·`gdf.rs`·`gtao.rs`·`taau.rs`, `ibl.rs`.
+`record_tonemap`), `postfx.rs`(motion-blur/bloom/DoF), `gi.rs`·`reflect.rs`·`gdf.rs`·`gtao.rs`·
+`taau.rs`·`atmosphere.rs`, `ibl.rs`.
 
 범례: ✅ 존재·정합 · 🟡 존재하나 구조/순서 상이 · 🔴 부재.
 
 | # | 레퍼런스 스테이지 | DreamCoast 현황 | 판정 | 비고 (근거) |
 |---|---|---|---|---|
-| V | 씬 가시성/컬링 | GPU frustum 컬링(P7 `cull.rs`), HZB occlusion 없음 | 🟡 | 컬링은 있으나 occlusion/HZB 부재; 라이트 컬링(클러스터) 없음(단일 디렉셔널) |
-| 1 | Depth Pre-pass | **없음** — G-buffer가 첫 depth writer | 🔴 | `record_gbuffer`가 depth를 처음 생성. 화면공간 패스(SSR/AO)가 G-buffer depth에 직접 의존 → prepass 없이 순서 강제됨. GDF AO flicker 근원도 depth 라이프타임(메모리 참조) |
+| V | 씬 가시성/컬링 | GPU frustum 컬링(P7 `cull.rs`) + **HZB occlusion 컬링(PR-8, `HZB_CULL=1`)** — prev-frame Hi-Z 피라미드(`hzb.rs`/`hzb_build.slang`) + 4탭 보수 테스트(`csCullHzb`), 통계 리드백 | 🟡 | PR-8 완료([hzb-occlusion-culling.md](hzb-occlusion-culling.md)): 가림-양성 케이스 98/256 컬 + OFF≡ON 바이트 동일(보수성). 현재 대상은 P7 컬 그리드(메인 씬 GPU-driven화는 Phase 23); 라이트 컬링은 클러스터드(PR-6) 참조 |
+| 1 | Depth Pre-pass | ✅ opt-in `DEPTH_PREPASS=1` (`record_prepass`, PR-1) — depth-only pre-pass가 G-buffer 앞에 depth 생성, G-buffer는 `Equal`+write-off | ✅ | [depth-prepass.md](depth-prepass.md). pre-pass가 `g_depth`의 producer → 화면공간 패스(SSR/AO/GI)가 완성 depth를 명시 소비. VS 단일 소스 재사용으로 position invariance 비트 단위 성립 → OFF/ON 캡처 sha256 동일(Metal 검증). 디폴트 off = 바이트 동일. DX≡VK Windows 후속 |
 | 2 | DBuffer 데칼(전) | **없음** | 🔴 | 데칼은 base pass **후** 경로만 존재(아래 #5) |
-| 3 | Base Pass(G-buffer) | ✅ 4 MRT(albedo+AO / world normal / material / **world position**) | 🟡 | 존재·견고하나 **velocity(모션벡터) 채널 없음**, world-position을 명시 저장(레퍼런스는 depth에서 재구성) |
+| 3 | Base Pass(G-buffer) | ✅ 4 MRT + **velocity RT(RG16F, PR-2, opt-in `P_VELOCITY=1`)** | 🟡 | velocity 채널 도입(전용 RT + 별도 불투명 패스, unjittered `clip−prevClip`, 스태틱·Spin·스키닝·모프 prev-pose 단일 소스 — [velocity-motion-vectors.md](velocity-motion-vectors.md)); world-position 명시 저장은 여전(레퍼런스는 depth에서 재구성) |
 | 4 | Custom Depth/Stencil | **없음** | 🔴 | 아웃라인/마스크 파이프라인 부재 |
 | 5 | GBuffer 데칼(후) | ✅ `record_decals`(A3, deferred decal) | ✅ | base pass 후·라이팅 전 — 정합. Intel Sponza `dirt_decal`에서 검증 |
-| 6 | Shadow Depth | ✅ `record_shadow`(단일 디렉셔널 shadow map, PCF/PCSS-lite) | 🟡 | 단일 맵만 — **CSM/cascade·스팟/포인트 큐브·아틀라스 없음** |
+| 6 | Shadow Depth | ✅ `record_shadow`(단일 맵, PCF/PCSS-lite) + **PR-7 `record_shadow_atlas`: 그림자 아틀라스 + 디렉셔널 CSM(opt-in `CSM=<N>`)** | 🟡 | CSM/아틀라스 골격 완료([shadow-atlas-csm.md](shadow-atlas-csm.md)): practical split(log/uniform λ=0.75) + stable sphere-fit/texel-snap + cascade blend + `CSM_DEBUG` 뷰. 슬롯 테이블(kind/view-proj/UV rect)은 스팟/포인트 확장형 — **캐스터 루프만 Phase 21**. 디폴트 off = 단일 맵 바이트 동일 |
 | 7 | Diffuse Indirect + AO | ✅ GDF AO + GTAO + software-traced GI(screen-probe / ray-march) + 디노이저 | ✅ | **직접광 이전**에 배치 — 정합. 이 트랙은 오히려 레퍼런스급으로 깊다(P10/P11) |
-| 8 | Direct Lighting | 🟡 `record_lighting`(풀스크린 PBR, 단일 디렉셔널 + point) | 🟡 | **clustered/tiled 라이트 리스트 없음** — 다광원 확장 시 병목. 순서(GI 뒤)는 정합 |
+| 8 | Direct Lighting | ✅ `record_lighting`(풀스크린 PBR, 단일 디렉셔널 + **clustered froxel** point) | ✅ | **PR-6 완료:** 3D froxel(16×9×24, exponential Z) 라이트 컬링 compute + per-cluster 리스트 소비. opt-in `CLUSTERED_LIGHTS=1`, 디폴트 브루트포스=바이트 동일. 스케일 1024 라이트 ~19× (170→8.7 ms). Metal 검증; DX≡VK Windows pending. spot/area·Z-binning 스케일은 후속. 상세 [clustered-lighting.md](clustered-lighting.md) |
 | 9 | Reflections + Sky | ✅ SSR→GDF→sky 하이브리드 composite, lit-history 피드백 | 🟡 | 순서(직접광 뒤 lit-history 샘플) 정합. 단 lit-history 피드백이 flicker 유발(메모리: swrt_reflect 루프) |
-| 10 | Sky/Atmosphere | 🟡 절차 sky → env cube(`ibl.rs`), 씬 배경 합성은 IBL로 | 🟡 | 물리기반 sky/에어리얼 퍼스펙티브/time-of-day 없음; 별도 sky 합성 패스 아닌 IBL 캡처 |
-| 11 | Fog/Volumetric | **없음** | 🔴 | height fog·volumetric·light shaft·cloud 전무 |
-| 12 | Translucency | **없음**(불투명만) | 🔴 | 정렬 투명/OIT/굴절 없음 — foliage는 alpha-cutout(불투명 경로)로 우회 |
-| 13 | Motion Blur | **없음** | 🔴 | velocity 부재로 불가 |
-| 14 | Temporal AA/Upscale | 🟡 `taau.rs`(TAAU: jitter + 리프로젝션 누적, 톤맵 **전** linear-HDR) | 🟡 | 위치(톤맵 전)·jitter는 정합. **그러나 카메라 모션만 리프로젝션**(prev view-proj + world-pos), **per-object velocity 없음** → 움직이는 오브젝트에서 고스팅/스미어 |
+| 10 | Sky/Atmosphere | 🟡 절차 sky → env cube(`ibl.rs`) + **PR-4 대기 합성 슬롯**(`atmosphere.rs`/`atmosphere.slang`, 항상 배선) | 🟡 | 씬 배경 자체는 여전히 IBL 캡처(별도 sky 패스 아님); 다만 불투명 완성 후·투명 전 합성 지점은 PR-4로 정식 확보됨(§3 PR-4). 물리기반 에어리얼 퍼스펙티브/time-of-day는 후속 |
+| 11 | Fog/Volumetric | 🟡 **PR-4**: opt-in analytic height fog(`P_HEIGHT_FOG=1`) | 🟡 | 지수 높이 포그(closed-form 적분, Quilez 2010) 구현 — `docs/atmosphere-fog-slot.md`. volumetric/light shaft/cloud은 여전히 부재(같은 슬롯에 후속 삽입 가능) |
+| 12 | Translucency | 🟡 **PR-3**: opt-in 정렬 포워드 투명 슬롯 | 🟡 | 디퍼드 라이팅+반사+포그 뒤·post 앞에 삽입. back-to-front CPU 정렬(거리→인덱스 tie-break, 결정론적), depth-test on/write off, G-buffer 미기록, 알파 블렌드. 포워드 PBR(디렉셔널+IBL)은 디퍼드와 **공유 BRDF 헤더**(`pbr_brdf.slang`) 재사용. 투명 0개면 미스케줄(바이트 동일). 테스트: `P_TRANSLUCENT_TEST=1`(갤러리 유리 평면 2장). OIT/굴절/투명 velocity는 Phase 20 — [translucency-pass.md](translucency-pass.md). DX≡VK Windows pending |
+| 13 | Motion Blur | ✅ **PR-5**: opt-in per-pixel velocity-along 블러(`P_MOTION_BLUR=1`, 전제 `P_VELOCITY=1`) — `postfx::MotionBlurSystem`/`motion_blur.slang` | ✅ | TAA **앞** linear-HDR 배치 정합. PR-2 velocity 소비, off/velocity-없음 = 패스 없음(바이트 동일). tile-max/neighbor-max dilation은 후속(Phase 20). [post-process-chain.md](post-process-chain.md) |
+| 14 | Temporal AA/Upscale | ✅ `taau.rs`(TAAU: jitter + 리프로젝션 누적, 톤맵 **전** linear-HDR) + **velocity-aware 리프로젝션(PR-2)** | 🟡 | 위치(톤맵 전)·jitter 정합. `P_VELOCITY=1`이면 3×3 dilated per-pixel velocity로 리프로젝션(움직이는 오브젝트 고스팅 감소, 검증 수치는 [velocity-motion-vectors.md](velocity-motion-vectors.md)); off면 종전 카메라-온리(바이트 동일) |
 | 15 | Auto Exposure | ✅ `record_auto_exposure`(히스토그램/평균, 적응) | ✅ | 톤맵 전 배치 정합(opt-in) |
-| 16 | Bloom | 🟡 P5 데모 블룸 체인 존재하나 현 프레임 경로엔 미배선 | 🟡 | `record_compute_post`는 3×3 박스 블러(데모)이며 블룸 아님. 실 블룸은 tonemap에 미통합 |
-| 17 | Depth of Field | **없음** | 🔴 | — |
-| 18 | Tonemap + Grading | 🟡 `record_tonemap`(ACES + sRGB 인코드) | 🟡 | 톤맵은 있으나 **컬러 그레이딩/LUT 없음**, 노출은 라이팅 패스에서 선적용 |
+| 16 | Bloom | ✅ **PR-5**: opt-in progressive dual-filter 블룸(`P_BLOOM=1`) — `postfx::BloomSystem`/`bloom.slang`(Karis 13-tap ↓ + 3×3 tent ↑), tonemap 입력에 additive 합성 | ✅ | linear-HDR bright-pass → 다운/업샘플 피라미드 정합. 파라미터 단일 소스 `BloomParams`. 데모(`blur.slang`/`post_compute.slang`)는 제거. off = 바이트 동일. [post-process-chain.md](post-process-chain.md) |
+| 17 | Depth of Field | 🟡 **PR-5** 스텁 노드(`P_DOF=1`, passthrough) — `postfx::DofSystem`/`dof.slang` | 🟡 | 순서·시임만 확보(자리 박음). CoC+보케 실구현은 Phase 20(문서에 확장 지점 명시). off = 패스 없음(바이트 동일) |
+| 18 | Tonemap + Grading | ✅ **PR-5**: `record_tonemap`(ACES + sRGB) + **ASC-CDL 컬러 그레이딩 훅**(`P_GRADE=1`, `out=(slope·in+offset)^power`) + 블룸 additive 합성 | ✅ | 그레이딩은 노출 후·커브 전 linear-HDR. 중립(slope1/offset0/power1) = 바이트 동일. per-ch `P_CDL_SLOPE/OFFSET/POWER`. [post-process-chain.md](post-process-chain.md) |
 | 19 | FXAA/SMAA | 🟡 `record_fxaa`(TAA 미사용·비jitter 시 FXAA pre-pass) | 🟡 | 존재하나 TAA **pre-pass**로 배치(레퍼런스는 톤맵 후 대체 AA). 역할 상이 |
 | 20 | Primary/Secondary Upscale | 🟡 TAAU가 내부→출력 업스케일 겸함 + 톤맵 샤픈 | 🟡 | 전용 스페이셜 업스케일 단계 없음(TAAU에 융합) |
-| 21 | Editor/Debug Overlay | ✅ ImGui 오버레이 + 디버그 뷰(`DEBUG_VIEW`) + particle/cull draw | 🟡 | 톤맵 후 draw. 단 particle/cull이 **톤맵 후 LDR**에 그려짐(HDR 합성 아님) |
+| 21 | Editor/Debug Overlay | ✅ ImGui 오버레이 + 디버그 뷰(`DEBUG_VIEW`) | ✅ | ImGui는 톤맵 후 draw(정합). **PR-3에서 particle/cull draw를 HDR 투명 슬롯(톤맵 전)으로 이동** — 종전 톤맵-후 LDR 드로 문제 해소(§2.1-3). 둘 다 디폴트-off(`P7_PARTICLES`/`P7_CULL`)라 디폴트 출력 불변 |
 | — | Render Graph | ✅ `crates/render`(트랜지언트 aliasing, read/write 선언) | ✅ | 레퍼런스 RDG와 동일 철학 |
 | — | Async Compute | ✅ P7 async(메모리: async-compute.md) | 🟡 | 인프라는 있으나 현 프레임 패스 오버랩은 제한적 |
 | — | Scalability 티어 | ✅ `RenderQuality{low/med/high}` | ✅ | cvar 그룹 대응 |
-| — | View Family | 🟡 단일 뷰 | 🟡 | 스플릿/스테레오/씬캡처 다중 뷰 없음 |
+| — | View Family | ✅ **PR-9**: `SceneView` 디스크립터로 뷰-종속 상태 분리 + `P_SECOND_VIEW=1` PiP 증명 | 🟡 | PR-9 완료([view-family.md](view-family.md)): 뷰-독립(shadow/CSM/IBL/GDF/cluster = 프레임당 1회) ↔ 뷰-종속(gbuffer/AO/GI/lighting/투명/post = 뷰마다) 코드 분리 + globals UBO per-view 슬라이스(`MAX_VIEWS`) + per-view feature 플래그(`SceneViewFeatures`, secondary는 TAAU/velocity/post/screen-GI off → temporal 상태 뷰-수 안전). opt-in `P_SECOND_VIEW=1`(상공 뷰를 인셋 합성), 디폴트 단일 뷰 = 앵커 바이트 동일. 완전 파라미터화·뷰별 히스토리 링·스테레오 인스턴싱은 후속 |
 
 ### 2.1 순서/구조 상이가 **미래 기능을 막는** 지점 (핵심)
-1. **Depth pre-pass 부재 (#1).** G-buffer가 최초 depth writer라 SSR/AO/GI가 완성 depth를 전제하는 순서를
-   *암묵적으로만* 만족한다. Early-Z 오버드로 제거, HZB occlusion 컬링, hi-Z 기반 SSR 트레이스, 정확한
-   화면공간 트레이싱 모두 prepass depth를 요구한다. 부재가 GDF AO depth-lifetime 버그의 배경이기도 했다.
-2. **Velocity / 모션벡터 부재 (#3·#13·#14).** G-buffer에 velocity 채널이 없어 TAAU가 **카메라 모션만**
-   리프로젝션한다 → 움직이는 오브젝트(스키닝/스핀/파티클)에서 고스팅. **모션블러(13)와 velocity-aware
-   TAA(14)의 공통 선결조건**이며, Phase 20 TAA/포스트의 실질 블로커.
-3. **투명 패스 부재 (#12).** 디퍼드 라이팅 뒤·post 앞의 정렬 투명 슬롯 자체가 없어 유리/굴절/파티클
-   HDR 합성/포그 상호작용을 넣을 자리가 없다. 현재 particle/cull이 **톤맵 후 LDR**에 그려지는 것도 이
-   슬롯 부재의 증상이다.
+1. ~~**Depth pre-pass 부재 (#1).**~~ **PR-1로 해결(opt-in `DEPTH_PREPASS=1`).** depth-only pre-pass가
+   G-buffer 앞에 depth를 만들고 base pass는 `Equal`+write-off로 Early-Z 오버드로를 제거한다. 화면공간
+   패스(SSR/AO/GI)가 pre-pass가 만든 완성 depth를 명시적으로 소비한다. VS 단일 소스 재사용으로 position
+   invariance가 비트 단위 성립 → OFF/ON 바이트 동일(Metal). 상세 [depth-prepass.md](depth-prepass.md).
+   이제 HZB occlusion 컬링·hi-Z SSR·GDF AO depth-lifetime 근본 정리의 토대가 마련됐다.
+2. **~~Velocity / 모션벡터 부재 (#3·#13·#14)~~ — PR-2로 해소.** velocity RT(RG16F, opt-in
+   `P_VELOCITY=1`) + velocity-aware TAAU 리프로젝션이 들어가 움직이는 오브젝트(스키닝/스핀/모프)의
+   고스팅이 감소. 모션블러(13)의 선결도 확보 — [velocity-motion-vectors.md](velocity-motion-vectors.md).
+3. **~~투명 패스 부재 (#12)~~ — PR-3로 해소.** 디퍼드 라이팅+반사+포그 뒤·post 앞에 정렬 포워드 투명
+   슬롯을 삽입(depth-test on/write off, G-buffer 미기록, back-to-front CPU 정렬 알파 블렌드; 포워드
+   PBR은 디퍼드와 공유 BRDF 헤더 재사용). 투명 0개면 미스케줄(바이트 동일). **부수효과 정리:** 종전
+   **톤맵 후 LDR**에 그려지던 particle/cull draw를 이 HDR 슬롯(톤맵 전)으로 이동(둘 다 디폴트-off →
+   디폴트 출력 불변). OIT/굴절/투명 velocity는 Phase 20 — [translucency-pass.md](translucency-pass.md).
 4. **포그/대기/볼류메트릭 슬롯 부재 (#10·#11).** 불투명 완성 후·투명 전의 합성 지점이 비어 있어, sky를
    IBL 캡처로만 처리하고 aerial perspective·height fog·light shaft를 꽂을 자리가 없다.
-5. **클러스터드 라이트 리스트 부재 (#8).** 라이팅이 풀스크린 단일-패스라 다광원(point/spot/area 다수 +
-   다수 그림자)으로 확장하려면 라이트 컬링/그리드 인프라를 먼저 깔아야 한다.
-6. **Post 체인이 톤맵 위주 단일 노드 (#16·#17·#18).** 블룸(데모만)·DoF·그레이딩/LUT을 꽂을 **순서 있는
-   post 시퀀스**가 없다. 현재는 `hdr → (compute box-blur 데모) → taau → tonemap`으로 파편적.
+5. **클러스터드 라이트 리스트 부재 (#8).** ~~라이팅이 풀스크린 단일-패스라 다광원으로 확장하려면
+   라이트 컬링/그리드 인프라를 먼저 깔아야 한다.~~ **→ PR-6에서 해소:** 3D froxel 클러스터 컬링
+   compute + per-cluster 리스트 소비(opt-in `CLUSTERED_LIGHTS=1`, 브루트포스 바이트 동일).
+   다수 그림자(스팟/포인트)는 PR-7 그림자 아틀라스와 함께.
+6. **~~Post 체인이 톤맵 위주 단일 노드 (#16·#17·#18)~~ — PR-5로 해소.** 파편적 경로(`hdr →
+   (compute box-blur 데모) → taau → tonemap`)를 **순서 있는 post 노드 시퀀스**로 정리:
+   motion-blur(#13) → TAA/upscale(#14) → exposure(#15) → bloom(#16) → DoF 스텁(#17) →
+   tonemap+grading(#18). 각 노드 opt-in, off = 바이트 동일. 데모(`blur.slang`/
+   `post_compute.slang`) 제거. 상세 [post-process-chain.md](post-process-chain.md).
 
 ---
 
@@ -172,34 +183,56 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
   *왜 먼저:* 아래 velocity·HZB·SSR 정확도의 공통 토대. *unblocks:* HZB occlusion 컬링, hi-Z SSR,
   화면공간 트레이싱 정확도, GDF AO depth-lifetime 근본 정리. *리스크:* 양 백엔드 depth load/store +
   골든이미지 anchor 바이트 동일 유지(기존 depth graph-driven load/store 재사용).
-- **PR-2 · Velocity(모션벡터) G-buffer 채널 [M].** base pass에서 `clip - prevClip` 모션벡터를 MRT(또는
-  전용 RT)로 출력(스태틱·스키닝·모프·스핀 모두 prev-transform 전달). *왜 여기:* TAA·모션블러의 단일
-  선결. *unblocks:* velocity-aware TAAU(고스팅 제거), 모션블러, 반사/GI 리프로젝션 정확도.
-  *단일 소스:* prev-transform을 애니메이션 시스템(P13/P15 spin)에서 한 곳으로 공급.
+- **PR-2 · Velocity(모션벡터) G-buffer 채널 [M] — ✅ DONE.** 전용 RG16F RT + 별도 불투명 velocity
+  패스로 `clip − prevClip`(unjittered NDC) 출력 — 스태틱·Spin·스키닝(prev 팔레트)·모프(prev 웨이트)
+  전부 prev-pose 단일 소스에서 공급. velocity-aware TAAU(3×3 dilated) 배선까지 포함, opt-in
+  `P_VELOCITY=1`(off = 골든 앵커 바이트 동일) + `DEBUG_VIEW=11` 시각화. 설계·검증 수치:
+  [velocity-motion-vectors.md](velocity-motion-vectors.md). DX≡VK parity pending Windows.
 
 ### 정합 P1 — 합성 슬롯 열기
-- **PR-3 · 투명 패스 슬롯 [M].** 디퍼드 라이팅+반사 뒤, post 앞에 **정렬 불투명-후 투명 패스**를 그래프에
-  삽입(깊이 테스트, G-buffer 미기록). 우선 단순 정렬 알파 블렌드; OIT/굴절은 Phase 20. *unblocks:*
-  유리/파티클 HDR 합성·포그 상호작용. **부수효과:** particle/cull draw를 이 슬롯(HDR)으로 이동 →
-  톤맵-후 LDR 드로 제거.
+- **PR-3 · 투명 패스 슬롯 [M]. ✅ 완료** (Metal 검증, DX≡VK Windows pending). 디퍼드 라이팅+반사+포그
+  뒤·post 앞에 정렬 포워드 투명 패스 삽입(depth-test on/write off, G-buffer 미기록, back-to-front
+  CPU 정렬 알파 블렌드; 포워드 PBR 라이팅은 디퍼드와 **공유 BRDF 헤더** `pbr_brdf.slang` 재사용).
+  투명 0개면 미스케줄 → 갤러리 앵커 `af70c1a5…` 바이트 동일. opt-in `P_TRANSLUCENT_TEST=1`(테스트
+  유리 평면). **부수효과 정리:** particle/cull draw를 이 HDR 슬롯(톤맵 전)으로 이동 → 톤맵-후 LDR
+  드로 제거(둘 다 디폴트-off라 디폴트 출력 불변). OIT/굴절/투명 velocity는 Phase 20.
+  상세 [translucency-pass.md](translucency-pass.md).
 - **PR-4 · 대기/포그 합성 슬롯 [S].** 불투명 완성 후·투명 전에 **sky+fog 합성 지점**을 그래프에 확보
   (지금은 no-op 통과, Phase 22에서 채움). *왜 지금:* 순서 자리를 박아두면 Phase 22가 재배선 없이 삽입.
-- **PR-5 · Post-process 시퀀스 정식화 [M].** 파편적 `compute_post(box-blur 데모)`를 제거하고, 순서 있는
-  post 노드 시퀀스로 정리: `motion-blur(스텁) → TAA/upscale → exposure(기존) → bloom(P5 체인 재배선) →
-  DoF(스텁) → tonemap+grading`. 각 노드 opt-in. *unblocks:* Phase 20 포스트 스택이 자리에 꽂힘.
+- **PR-5 · Post-process 시퀀스 정식화 [M]. ✅ 완료** (Metal 검증, DX≡VK Windows pending). 파편적
+  `compute_post(box-blur 데모)` + `blur.slang` 데모를 제거하고 순서 있는 post 노드 시퀀스로 정리:
+  `motion-blur(P_MOTION_BLUR, velocity 소비) → TAA/upscale(기존) → exposure(기존) →
+  bloom(P_BLOOM, Karis 13-tap↓ + 3×3 tent↑ dual-filter) → DoF(P_DOF 스텁) →
+  tonemap+grading(ASC-CDL P_GRADE)`. 각 노드 opt-in, off = 골든 앵커 바이트 동일; 그레이딩 중립도
+  바이트 동일. `postfx.rs` + `bloom.slang`/`motion_blur.slang`/`dof.slang`. 상세·검증 수치
+  [post-process-chain.md](post-process-chain.md). *unblocks:* Phase 20 포스트 스택이 자리에 꽂힘.
 
 ### 정합 P2 — 라이팅 확장 토대
-- **PR-6 · 클러스터드 라이트 컬링 인프라 [L].** 뷰 절두체를 클러스터로 나눠 라이트 리스트 빌드(compute),
-  `record_lighting`이 타일/클러스터 리스트를 소비하도록 변경(단일 디렉셔널은 특수 케이스로 유지, 바이트
-  동일). *unblocks:* Phase 21 다광원(point/spot/area)·다수 그림자. *의존:* P7 compute.
+- **PR-6 · 클러스터드 라이트 컬링 인프라 [L]. ✅ 완료** (Metal 검증, DX≡VK Windows pending). 뷰 절두체를
+  3D froxel(16×9×24, exponential Z)로 나눠 라이트 리스트 빌드(compute), `record_lighting`이 per-cluster
+  리스트를 소비(단일 디렉셔널은 특수 케이스 유지). opt-in `CLUSTERED_LIGHTS=1`, 디폴트 브루트포스 바이트
+  동일; `TEST_LIGHTS=N` 스포너로 1024 라이트 ~19× 입증. froxel↔Z-binning 설계 근거·수치
+  [clustered-lighting.md](clustered-lighting.md). *unblocks:* Phase 21 다광원(point/spot/area)·다수
+  그림자. *의존:* P7 compute.
 - **PR-7 · 그림자 아틀라스/CSM 골격 [L].** 단일 shadow map을 cascade/아틀라스로 일반화(디렉셔널 CSM +
   스팟/포인트 슬롯). *의존:* PR-6 라이트 리스트. *unblocks:* Phase 21 다수 그림자.
+  **구현됨** — [shadow-atlas-csm.md](shadow-atlas-csm.md) (opt-in `CSM=<N>`, 디폴트 off 앵커 바이트 동일).
 
 ### 정합 P3 — 가시성/멀티뷰 (후속)
-- **PR-8 · HZB Occlusion 컬링 [M].** PR-1 prepass depth로 Hi-Z 피라미드 빌드 → GPU occlusion 컬링.
-  *의존:* PR-1. *unblocks:* 대규모 씬(월드 렌더링 Phase 23) 스케일.
-- **PR-9 · View Family(다중 뷰) [M].** 공용 리소스로 N뷰 렌더(씬 캡처/스플릿/스테레오). *unblocks:*
-  실시간 env 캡처·에디터 다중 뷰포트.
+- **PR-8 · HZB Occlusion 컬링 [M].** ✅ **DONE** ([hzb-occlusion-culling.md](hzb-occlusion-culling.md),
+  `HZB_CULL=1`): prev-frame HZB(리프로젝션 없음, 보수적 4탭) — prev-frame 방식이라 PR-1과 독립
+  (G-buffer depth 소스; PR-1 머지 시 read 1줄 교체). *unblocks:* 대규모 씬(월드 렌더링 Phase 23)
+  스케일 — 메인 씬 GPU-driven화 시 two-phase로 확장.
+- **PR-9 · View Family(다중 뷰) [M]. ✅ 완료** (Metal 검증, DX≡VK Windows pending). 프레임 루프의
+  뷰-종속 상태(camera/view_proj/jitter/globals 슬라이스/뷰별 트랜지언트 타깃)를 `view::SceneView`
+  디스크립터로 분리하고, 공용 씬 리소스(shadow/CSM/IBL/GDF/cluster = 프레임당 1회)로 N뷰를 렌더하는
+  구조를 세움. globals UBO를 per-view 슬라이스로 확장(`(fif*MAX_VIEWS+view)*GLOBALS_SLICE`), per-view
+  기능 플래그(`SceneViewFeatures`: taau/velocity/post/screen_space_gi)로 secondary 뷰의 단순화(=temporal
+  상태 뷰-수 안전)를 **구조로** 표현. 증명 데모 opt-in `P_SECOND_VIEW=1`: 메인 오빗 뷰 + 상공 오버헤드
+  뷰를 같은 프레임에 렌더해 백버퍼 우상단 PiP 인셋으로 합성(`record_tonemap_inset` + 뷰포트 rect).
+  디폴트 단일 뷰 = 골든 앵커 `af70c1a5…` 바이트 동일. 완전 파라미터화·뷰별 히스토리 링·스테레오
+  single-pass 인스턴싱은 후속. 상세·검증 수치 [view-family.md](view-family.md). *unblocks:* 실시간 env
+  캡처·에디터 다중 뷰포트.
 
 ### 권장 착수 순서
 `PR-1(prepass) → PR-2(velocity) → PR-5(post 시퀀스) → PR-3(투명 슬롯) → PR-4(대기 슬롯) →

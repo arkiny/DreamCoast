@@ -24,7 +24,7 @@ const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
 /// editing any of them recompiles all dependents (they include no per-job tracking otherwise —
 /// an omitted entry silently ships stale bytecode). Keep in sync with the `#include`s under
 /// `shaders/` (a non-JOB `.slang` — or the RT-pipeline root-sig JSON — belongs here).
-const SHARED_INCLUDES: [&str; 10] = [
+const SHARED_INCLUDES: [&str; 12] = [
     "bindless.slang",
     "rt_common.slang",
     "rt_pipeline_metal_rootsig.json",
@@ -35,6 +35,8 @@ const SHARED_INCLUDES: [&str; 10] = [
     "sky_common.slang",
     "surface_cache.slang",
     "wrc_common.slang",
+    "light_cluster_common.slang",
+    "pbr_brdf.slang",
 ];
 
 // FNV-1a 64-bit — dependency-free content hash for the shader cook cache (Phase 12
@@ -383,6 +385,15 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "gbuffer_fs",
     },
+    // Depth pre-pass fragment shader (pipeline rebaseline PR-1): depth-only + the
+    // G-buffer's alpha-test discard, sharing the G-buffer vertex shaders unchanged so
+    // the pre-pass depth is bit-identical to the base pass (EQUAL depth test premise).
+    Job {
+        src: "gbuffer.slang",
+        entry: "fsDepth",
+        stage: "fragment",
+        key: "gbuffer_depth_fs",
+    },
     // Deferred surface-decal fragment shader (decals A3): shares `vsMain`, writes only
     // RT0 = float4(albedo, alpha); the DecalAlbedo blend state alpha-blends it into the
     // G-buffer albedo and masks the other targets.
@@ -391,6 +402,40 @@ const JOBS: &[Job] = &[
         entry: "fsDecal",
         stage: "fragment",
         key: "gbuffer_decal_fs",
+    },
+    // Velocity (motion-vector) G-buffer channel (pipeline re-baseline PR-2, opt-in
+    // `P_VELOCITY=1`): a separate opaque pass into an RG16Float target. Static + skinned +
+    // morphed vertex variants (prev-transform single source) share the one motion fragment;
+    // `csViz` colour-codes the target for DEBUG_VIEW=11.
+    Job {
+        src: "velocity.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "velocity_vs",
+    },
+    Job {
+        src: "velocity.slang",
+        entry: "vsMainSkinned",
+        stage: "vertex",
+        key: "velocity_skinned_vs",
+    },
+    Job {
+        src: "velocity.slang",
+        entry: "vsMainMorphed",
+        stage: "vertex",
+        key: "velocity_morphed_vs",
+    },
+    Job {
+        src: "velocity.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "velocity_fs",
+    },
+    Job {
+        src: "velocity.slang",
+        entry: "csViz",
+        stage: "compute",
+        key: "velocity_viz_cs",
     },
     Job {
         src: "shadow.slang",
@@ -443,22 +488,81 @@ const JOBS: &[Job] = &[
         key: "post_fs",
     },
     Job {
-        src: "blur.slang",
+        src: "atmosphere.slang",
         entry: "vsMain",
         stage: "vertex",
-        key: "blur_vs",
+        key: "atmosphere_vs",
     },
     Job {
-        src: "blur.slang",
+        src: "atmosphere.slang",
         entry: "fsMain",
         stage: "fragment",
-        key: "blur_fs",
+        key: "atmosphere_fs",
+    },
+    // PR-5 post-process nodes (docs/post-process-chain.md). The Phase-5 `blur.slang`
+    // demo (separable Gaussian) and the Phase-7 `post_compute.slang` 3x3 box-blur demo
+    // were removed here: neither was a real effect (blur.slang had no consumer;
+    // post_compute was a compute-graph demo, not bloom). They are superseded by the
+    // ordered post sequence below.
+    Job {
+        src: "translucent.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "translucent_vs",
     },
     Job {
-        src: "post_compute.slang",
-        entry: "csMain",
-        stage: "compute",
-        key: "post_compute_cs",
+        src: "translucent.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "translucent_fs",
+    },
+    Job {
+        src: "bloom.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "bloom_vs",
+    },
+    Job {
+        src: "bloom.slang",
+        entry: "fsPrefilter",
+        stage: "fragment",
+        key: "bloom_prefilter_fs",
+    },
+    Job {
+        src: "bloom.slang",
+        entry: "fsDownsample",
+        stage: "fragment",
+        key: "bloom_downsample_fs",
+    },
+    Job {
+        src: "bloom.slang",
+        entry: "fsUpsample",
+        stage: "fragment",
+        key: "bloom_upsample_fs",
+    },
+    Job {
+        src: "motion_blur.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "motion_blur_vs",
+    },
+    Job {
+        src: "motion_blur.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "motion_blur_fs",
+    },
+    Job {
+        src: "dof.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "dof_vs",
+    },
+    Job {
+        src: "dof.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "dof_fs",
     },
     Job {
         src: "particle_sim.slang",
@@ -489,6 +593,36 @@ const JOBS: &[Job] = &[
         entry: "csCull",
         stage: "compute",
         key: "cull_cs",
+    },
+    Job {
+        src: "light_cluster.slang",
+        entry: "csBuildClusters",
+        stage: "compute",
+        key: "light_cluster_build_cs",
+    },
+    Job {
+        src: "cull.slang",
+        entry: "csCullHzb",
+        stage: "compute",
+        key: "cull_hzb_cs",
+    },
+    Job {
+        src: "cull.slang",
+        entry: "csClearStats",
+        stage: "compute",
+        key: "cull_stats_clear_cs",
+    },
+    Job {
+        src: "hzb_build.slang",
+        entry: "csCopy",
+        stage: "compute",
+        key: "hzb_copy_cs",
+    },
+    Job {
+        src: "hzb_build.slang",
+        entry: "csReduce",
+        stage: "compute",
+        key: "hzb_reduce_cs",
     },
     Job {
         src: "cull_draw.slang",

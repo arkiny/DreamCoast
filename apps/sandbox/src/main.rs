@@ -30,21 +30,26 @@ use rhi::{
 use tracing::info;
 
 mod app;
+mod atmosphere;
 mod camera;
 mod clipmap;
+mod cluster;
 mod compose;
+mod csm;
 mod cull;
 mod deferred;
 mod fuse;
 mod gdf;
 mod gi;
 mod gtao;
+mod hzb;
 mod ibl;
 mod level;
 mod mesh;
 mod mesh_sdf;
 mod morph;
 mod particle;
+mod postfx;
 mod push;
 mod quality;
 mod reflect;
@@ -54,13 +59,18 @@ mod rt;
 mod skin;
 mod smoketest;
 mod taau;
+mod translucent;
+mod velocity;
+mod view;
 mod world;
 use app::*;
+use cluster::{ClusterLight, ClusterSystem};
 use cull::*;
 use deferred::*;
 use dreamcoast_scene::{LocalTransform, MeshInstance, World};
 use gdf::*;
 use gi::*;
+use hzb::*;
 use ibl::*;
 use mesh::*;
 use particle::*;
@@ -93,9 +103,35 @@ const GB_NORMAL_FMT: Format = Format::Rgba16Float;
 const GB_MATERIAL_FMT: Format = Format::Rgba8Unorm;
 const GB_POSITION_FMT: Format = Format::Rgba16Float;
 /// Per-frame globals slice size (256-byte aligned for D3D12 root CBV / Vulkan
-/// dynamic UBO offset). 512 holds the lighting globals plus the light
-/// view-projection matrix.
-const GLOBALS_SLICE: u64 = 512;
+/// dynamic UBO offset). Holds the lighting globals, the light view-projection matrix,
+/// the (PR-6) clustered-lighting view-Z row + froxel params, and the (PR-7) CSM cascade
+/// block (up to 4 cascade view-projections + splits/tiles). 1280 = next 256-aligned size
+/// that fits both blocks; the OFF paths leave their fields zeroed so the shader takes the
+/// legacy branches and the gallery anchor stays byte-identical.
+const GLOBALS_SLICE: u64 = 1280;
+
+/// View-family capacity (render-pipeline re-baseline PR-9, `docs/view-family.md`). The globals
+/// UBO is sub-allocated as `FRAMES_IN_FLIGHT * MAX_VIEWS` slices so each view in a frame gets its
+/// own camera-matrix slice — the per-view offset is `(fif * MAX_VIEWS + view_index) * GLOBALS_SLICE`.
+/// `MAX_VIEWS = 2` covers the current primary + secondary (PiP) proof; bump it (and nothing else)
+/// to allow more simultaneous views (split-screen / stereo / scene-capture probes). The default
+/// single-view path only ever touches slice 0 of each frame, so the anchor stays byte-identical.
+const MAX_VIEWS: u64 = 2;
+
+/// Clustered light culling froxel grid (PR-6). Single source of truth mirrored by
+/// `CLUSTER_X/Y/Z` in `light_cluster_common.slang`. 16×9 tiles matches 16:9; 24
+/// exponential Z slices is the DOOM-2016-era default. Bump for a higher RenderQuality
+/// tier (also grows the grid/index storage buffers via `CLUSTER_COUNT`).
+const CLUSTER_X: u32 = 16;
+const CLUSTER_Y: u32 = 9;
+const CLUSTER_Z: u32 = 24;
+const CLUSTER_COUNT: u32 = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
+/// Max lights binned per cluster (mirrors `MAX_LIGHTS_PER_CLUSTER` in the shader).
+const MAX_LIGHTS_PER_CLUSTER: u32 = 128;
+/// Camera near/far — single source of truth for the scene projection AND the clustered
+/// froxel Z slicing (they must agree so cluster slices span the actual view frustum).
+const CLUSTER_Z_NEAR: f32 = 0.05;
+const CLUSTER_Z_FAR: f32 = 100.0;
 /// Directional shadow map resolution (square).
 const SHADOW_SIZE: u32 = 2048;
 /// The ground plane's linear albedo — the single source of truth shared by the
@@ -126,7 +162,7 @@ const BRDF_SIZE: u32 = 256;
 const NO_TEXTURE: u32 = u32::MAX;
 const MODEL_PATH: &str = "assets/model.glb";
 
-const DEBUG_VIEWS: [&str; 11] = [
+const DEBUG_VIEWS: [&str; 12] = [
     "Lit",
     "Albedo",
     "Normal",
@@ -138,7 +174,18 @@ const DEBUG_VIEWS: [&str; 11] = [
     "IBL",
     "GDF AO",
     "GDF GI",
+    "Velocity", // 11 — motion vectors (needs P_VELOCITY=1)
 ];
+/// DEBUG_VIEW=11 velocity viz amplification: a small NDC motion (a few 1e-3) is scaled into a
+/// visible colour range. Tuned so a spinning object's edge motion is clearly readable.
+const VELOCITY_VIZ_SCALE: f32 = 40.0;
+/// PR-5 motion-blur tunables (single source; ready to become a RenderQuality tier).
+/// `SAMPLES` taps along the velocity vector; `INTENSITY` scales one frame of on-screen
+/// travel (1 = full shutter-open exposure); `MAX_UV` caps the per-pixel streak length in
+/// UV so a very fast object can't smear across the whole frame.
+const MOTION_BLUR_SAMPLES: u32 = 8;
+const MOTION_BLUR_INTENSITY: f32 = 1.0;
+const MOTION_BLUR_MAX_UV: f32 = 0.05;
 const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 
 /// One materialized drawable in the sample scene: a shared GPU mesh + world
@@ -247,6 +294,18 @@ struct Globals {
     probe_box_min: [f32; 4],    // xyz reflection proxy AABB min corner
     probe_box_max: [f32; 4],    // xyz reflection proxy AABB max corner
     prev_view_proj: [f32; 16],  // world -> previous clip (Stage C7 SSR history reprojection)
+    // Clustered light culling (PR-6). `cluster_view_z_row` is row 2 of the world->view matrix
+    // (positive linear view depth = -dot(row, [world,1])); `cluster_params` = (z_near, z_far, 0, 0)
+    // for the froxel Z slicing. Unused on the brute-force path (CLUSTERED_LIGHTS off).
+    cluster_view_z_row: [f32; 4],
+    cluster_params: [f32; 4],
+    // --- PR-7 shadow atlas / CSM. All zero on the legacy single-map path (csm_params.x == 0),
+    // which makes the shader take the `light_view_proj` branch → byte-identical anchor.
+    csm_params: [i32; 4], // x cascade count (0 = off), y debug-cascade viz, z tile texels, w atlas texels
+    csm_split: [f32; 4],  // per-cascade view-space far distance (up to MAX_CASCADES)
+    csm_opts: [f32; 4],   // x cross-cascade blend fraction (of the cascade depth range)
+    csm_view_proj: [[f32; 16]; 4], // per-cascade world -> atlas-tile light clip
+    csm_atlas_uv: [[f32; 4]; 4], // per-cascade atlas UV sub-rect: xy offset, zw scale
 }
 
 fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
@@ -452,9 +511,31 @@ struct App {
     gdf: GdfSystem,
     gi: GiSystem,
     gtao: gtao::GtaoSystem,
+    /// PR-4 (render-pipeline re-baseline track): the sky/atmosphere composite slot
+    /// (today: opt-in analytic height fog, `P_HEIGHT_FOG`). See `atmosphere.rs`.
+    atmosphere: atmosphere::AtmosphereSystem,
+    /// PR-3 (render-pipeline re-baseline track): the forward translucency slot (sorted
+    /// alpha-blend after opaque lighting + fog, before post). See `translucent.rs`.
+    translucency: translucent::TranslucencySystem,
+    /// Translucent drawables sorted + drawn by the translucency pass. Empty by default
+    /// (the slot then adds no pass → byte-identical). `P_TRANSLUCENT_TEST=1` seeds demo
+    /// glass panes; glTF `Transparent` (BLEND) materials also route here.
+    translucents: Vec<translucent::TranslucentObject>,
+    /// PR-5 (render-pipeline re-baseline track): the ordered post-process nodes —
+    /// motion blur (`P_MOTION_BLUR`), bloom (`P_BLOOM`), and the DoF stub. See
+    /// `postfx.rs` / `docs/post-process-chain.md`.
+    bloom: postfx::BloomSystem,
+    motion_blur: postfx::MotionBlurSystem,
+    dof: postfx::DofSystem,
     reflect: ReflectSystem,
     particles: ParticleSystem,
     cull: CullSystem,
+    /// Clustered light culling (PR-6). `None` where compute is unavailable; the feature
+    /// stays off. Gated on `clustered_lights` (`CLUSTERED_LIGHTS=1`).
+    cluster: Option<ClusterSystem>,
+    /// HZB occlusion culling (PR-8), `None` when compute is unavailable. Layered on
+    /// top of `cull`'s frustum test behind `HZB_CULL=1`.
+    hzb: Option<HzbSystem>,
     rt: RtSystem,
     ibl: IblSystem,
 
@@ -574,6 +655,13 @@ struct App {
     /// ~0.6 content). Written to `globals.probe_box_max.w`; see pbr.slang. `P_GI_MULTIBOUNCE`.
     gi_multibounce: f32,
     point_lights_on: bool,
+    /// Clustered light culling on (PR-6, `CLUSTERED_LIGHTS=1`). Off = brute-force loop.
+    clustered_lights: bool,
+    /// A/B baseline (`CLUSTERED_BRUTE=1`): upload the light buffer but loop all lights (no
+    /// froxel list) — for profiling clustered vs brute-force on the same light set.
+    clustered_brute: bool,
+    /// Deterministic test-light count (`TEST_LIGHTS=N`, PR-6 scale proof). 0 = off.
+    test_lights: u32,
     shadows_on: bool,
     shadow_bias: f32,
     // PCSS-lite penumbra scale (max soft-shadow radius in shadow-map UV); 0 = hard 3x3 PCF.
@@ -581,6 +669,12 @@ struct App {
     /// Soft-shadow blocker/PCF tap count, written to `globals.shadow.w` (RenderQuality knob).
     /// Only the soft path (softness > 0) reads it; the shader clamps to [1, 16].
     shadow_taps: u32,
+    /// PR-7 shadow atlas / CSM config (opt-in `CSM=1` / `CSM=<N>`). `enabled == false` is the
+    /// legacy single directional map — byte-identical anchor.
+    csm: csm::CsmConfig,
+    /// Cascade-index debug overlay: 1 tints each cascade's coverage by index so the split
+    /// boundaries are visible. Written to `globals.csm_params.y`. Off = 0.
+    csm_debug: bool,
     /// Active RenderQuality tier (Stage D). The single selector that seeded the knob defaults
     /// below; shown in the UI. Individual env vars still override per knob.
     quality: quality::RenderQuality,
@@ -590,10 +684,31 @@ struct App {
     debug_view: usize,
     post_mode: usize,
     aliasing: bool,
-    compute_post: bool,
+    /// PR-5 post nodes (opt-in). `bloom_on` = `P_BLOOM`; `motion_blur_on` = `P_MOTION_BLUR`
+    /// (requires `velocity_on`); `dof_on` = `P_DOF` (stub passthrough). `grade_on` +
+    /// `cdl_*` = the ASC-CDL color grade (`P_GRADE`, neutral = byte-identical).
+    bloom_on: bool,
+    motion_blur_on: bool,
+    dof_on: bool,
+    grade_on: bool,
+    cdl_slope: [f32; 3],
+    cdl_offset: [f32; 3],
+    cdl_power: [f32; 3],
+    /// One-time "P_MOTION_BLUR without P_VELOCITY" warning latch (interior-mutable so it
+    /// fires through the graph's `&self` borrow).
+    motion_blur_warned: std::cell::Cell<bool>,
+    /// Depth pre-pass active (pipeline rebaseline PR-1, opt-in `DEPTH_PREPASS=1`): render an
+    /// opaque depth-only pass before the G-buffer so the base pass runs EQUAL-test + write-off
+    /// (Early-Z overdraw elimination) and the screen-space passes sample a completed depth.
+    /// Off by default = the pre-pass-less path (byte-identical golden anchor).
+    depth_prepass: bool,
     particles_on: bool,
     async_compute_on: bool,
     gpu_cull: bool,
+    /// HZB occlusion culling on top of GPU frustum culling (PR-8, `HZB_CULL=1`; needs
+    /// `P7_CULL=1`). Runtime stats of the last cull are read back into `hzb_stats`.
+    hzb_cull: bool,
+    hzb_stats: std::cell::Cell<(u32, u32)>, // (survived, culled_by_occlusion) last frame
     path_trace: bool,
     rt_debug: bool,
     cornell: bool,
@@ -630,6 +745,28 @@ struct App {
     /// no-op sentinel image so it stays byte-identical.
     skyvis_tint: f32,
     skyvis_min_occ: f32,
+    /// PR-4 (render-pipeline re-baseline track): opt-in analytic exponential height fog
+    /// (`P_HEIGHT_FOG=1`), composited in the atmosphere slot after opaque lighting +
+    /// reflections, before TAAU/tonemap. Off by default (byte-identical gallery anchor —
+    /// the slot itself is always present in the graph wiring, but unscheduled when off).
+    height_fog: bool,
+    /// PR-9 (render-pipeline re-baseline track): opt-in second view (`P_SECOND_VIEW=1`). Renders a
+    /// second `view::SceneView` (an overhead camera) in the SAME frame against the SHARED scene
+    /// resources (shadow/CSM/IBL/GDF/cluster run once) and composites it as a picture-in-picture
+    /// inset into the backbuffer. Off by default → single view, byte-identical anchor. See
+    /// `docs/view-family.md`.
+    second_view: bool,
+    /// Height-fog density at world height 0 (`a` in `d(y) = a·exp(-b·y)`, 1/world-unit).
+    /// `P_FOG_DENSITY` overrides; scaled by `scene_radius` at the call site so the default
+    /// reads sensibly across scene scales (unit-cube gallery vs. the larger Sponza level).
+    fog_density: f32,
+    /// Height-fog falloff rate `b` (1/world-unit; larger = fog thins out faster with height).
+    /// `P_FOG_HEIGHT_FALLOFF` overrides; also scaled by `scene_radius`.
+    fog_height_falloff: f32,
+    /// Height-fog inscatter→radiance gain fed to the shared `procedural_sky` (mirrors
+    /// `sky_gain`'s role for the env-cube capture — same single-source atmosphere model,
+    /// not a duplicated constant). `P_FOG_INSCATTER_GAIN` overrides; defaults to `sky_gain`.
+    fog_inscatter_gain: f32,
     /// C3 hemisphere rays per pixel.
     gi_spp: u32,
     /// Stage D2: surface-cache amortized-relight period (round-robin card budget; 1 = legacy
@@ -764,6 +901,17 @@ struct App {
     /// distant-texture sharpness lever). Resolved once from `quality::TAA_MIP_BIAS` with a
     /// `TAA_MIP_BIAS` env override for sweeps. See `quality.rs` for the rationale.
     taa_mip_bias: f32,
+    /// Velocity (motion-vector) G-buffer channel (pipeline re-baseline PR-2). Owns the opaque
+    /// velocity pass + the DEBUG_VIEW=11 viz. `velocity_on` gates the whole feature (`P_VELOCITY=1`);
+    /// default off = no velocity target, camera-only TAAU reprojection, byte-identical.
+    velocity: velocity::VelocitySystem,
+    velocity_on: bool,
+    /// Single prev-pose source (PR-2): each drawable's PREVIOUS-frame unjittered world transform,
+    /// keyed by the frame's stable draw-list index (deterministic insertion order). The velocity
+    /// pass reads it to compute per-object screen motion for static / Spin / node-animated draws
+    /// (skinning / morph add their prev palette / weights on top). Rebuilt after each frame from the
+    /// current transforms.
+    prev_transforms: Vec<Mat4>,
     // Profiler UI state.
     profiler_on: bool,
     slot_pass_names: Vec<Vec<&'static str>>,
@@ -854,20 +1002,52 @@ impl App {
         let gi = GiSystem::new(&device, backend, compute_supported)?;
         // Screen-space near-field AO (composed with the GDF AO). See `gtao.rs`.
         let gtao = gtao::GtaoSystem::new(&device, backend, compute_supported)?;
+        // PR-4 (render-pipeline re-baseline track): the sky/atmosphere composite slot
+        // (opt-in height fog today). See `atmosphere.rs`.
+        let atmosphere = atmosphere::AtmosphereSystem::new(&device, backend, HDR_FORMAT)?;
+        // PR-3 (render-pipeline re-baseline track): the forward translucency slot. Built
+        // unconditionally (the shader is exercised by every backend's build); the pass is
+        // only recorded when there are translucent objects. See `translucent.rs`.
+        let translucency =
+            translucent::TranslucencySystem::new(&device, backend, HDR_FORMAT, DEPTH_FORMAT)?;
+        // PR-5 post nodes (pipelines always built so all three backends compile the
+        // shaders; the passes are only recorded when the feature flags are on).
+        let bloom = postfx::BloomSystem::new(&device, backend, HDR_FORMAT)?;
+        let motion_blur = postfx::MotionBlurSystem::new(&device, backend, HDR_FORMAT)?;
+        let dof = postfx::DofSystem::new(&device, backend, HDR_FORMAT)?;
         // Stage C reflection track (C5 SSR; C6/C7 later). See `reflect.rs`.
         let reflect = ReflectSystem::new(&device, backend, compute_supported)?;
         // QHD/UHD track: temporal upsampler. See `taau.rs`.
         let taau = taau::TaauSystem::new(&device, backend, compute_supported)?;
+        // Velocity (motion-vector) channel (pipeline re-baseline PR-2). See `velocity.rs`.
+        let velocity = velocity::VelocitySystem::new(&device, backend)?;
 
         // GPU particle system (Phase 7): a persistent ping-pong buffer pair advanced
         // by a compute pass and drawn as instanced billboards (see `particle.rs`).
-        let particles =
-            ParticleSystem::new(&device, backend, compute_supported, swapchain.format())?;
+        // PR-3 side-effect: the draw now composites in the HDR translucency slot (before
+        // tonemap), not over the tonemapped LDR — so it's built with HDR_FORMAT. Default-off
+        // (`P7_PARTICLES`), so the default gallery/anchor output is unchanged.
+        let particles = ParticleSystem::new(&device, backend, compute_supported, HDR_FORMAT)?;
 
         // GPU frustum culling (Phase 7): a compute pass tests a cube instance grid
         // against the frustum and writes an indirect draw; the draw renders only the
-        // visible instances (see `cull.rs`).
-        let cull = CullSystem::new(&device, backend, compute_supported, swapchain.format())?;
+        // visible instances (see `cull.rs`). PR-3 side-effect: draws into the HDR slot
+        // (before tonemap), so built with HDR_FORMAT. Default-off (`P7_CULL`).
+        let cull = CullSystem::new(&device, backend, compute_supported, HDR_FORMAT)?;
+
+        // Clustered light culling (PR-6): a compute pass bins the scene's point lights into a
+        // view-frustum froxel grid so the lighting pass loops only its cluster's lights. `None`
+        // where compute is unavailable; opt-in via `CLUSTERED_LIGHTS=1` (see `cluster.rs`).
+        let cluster = ClusterSystem::new(&device, backend, compute_supported)?;
+
+        // HZB occlusion culling (PR-8): a max-reduced Hi-Z pyramid built from the scene
+        // depth feeds an occlusion-aware variant of the cull compute. Compute-only; the
+        // pyramid is sized to the render extent and resized in-frame if it changes.
+        let hzb = if compute_supported {
+            Some(HzbSystem::new(&device, backend, swapchain.extent_2d())?)
+        } else {
+            None
+        };
 
         // Clip-space Y orientation for the full-screen passes (Vulkan = 1, D3D12 /
         // Metal = 0; both have a Y-up NDC with a top-left framebuffer origin).
@@ -1804,6 +1984,21 @@ impl App {
         // On by default; `NO_POINT_LIGHTS=1` disables them (the path tracer has no
         // point lights, so a fair raster-vs-ground-truth comparison turns these off).
         let point_lights_on = std::env::var_os("NO_POINT_LIGHTS").is_none();
+        // Clustered light culling (PR-6): opt-in seam. Default off = the brute-force point-light
+        // loop (byte-identical anchor); on routes lighting through the froxel light list. Only
+        // when the cluster compute system built (compute available).
+        let clustered_lights = std::env::var_os("CLUSTERED_LIGHTS").is_some() && cluster.is_some();
+        // A/B baseline (`CLUSTERED_BRUTE=1`): upload the same light buffer but loop ALL lights in
+        // the shader (no froxel list) so brute-force vs clustered PROFILE_GPU can be compared on the
+        // identical light set at scale. Implies the clustered light upload path (needs the buffer).
+        let clustered_brute = std::env::var_os("CLUSTERED_BRUTE").is_some() && cluster.is_some();
+        // Deterministic stress spawner (PR-6 scale proof): `TEST_LIGHTS=N` places N point lights
+        // on a fixed grid across the scene bounds (no animation, fixed layout) so brute-force vs
+        // clustered can be profiled at scale. 0 = off (level/gallery lights only).
+        let test_lights: u32 = std::env::var("TEST_LIGHTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         // RenderQuality tier (Stage D): `RENDER_QUALITY=low|med|high` (unset => platform default).
         // The platform default consults the GPU identity (macOS perf, axis A): an Apple GPU maps to
         // the aggressive `Apple` tier, every other / unknown GPU (incl. all VK/D3D12 adapters) stays
@@ -1829,10 +2024,9 @@ impl App {
             quality.label(),
             device_info.name
         );
-        // Phase 7: route the HDR result through a compute post-process (3x3 blur into
-        // a storage image) before tonemapping. Initial state seedable via env var so
-        // headless screenshots can exercise each demo (`P7_COMPUTE_POST=1`, etc.).
-        let compute_post = compute_supported && std::env::var_os("P7_COMPUTE_POST").is_some();
+        // Pipeline rebaseline PR-1: opt-in depth pre-pass (`DEPTH_PREPASS=1`). Off by default so
+        // the frame graph is identical to the pre-pass-less path (byte-identical golden anchor).
+        let depth_prepass = std::env::var_os("DEPTH_PREPASS").is_some();
         let particles_on = compute_supported && std::env::var_os("P7_PARTICLES").is_some();
         // Run the particle sim on the async-compute queue (overlapping graphics) when
         // a dedicated compute queue exists. Off / unsupported -> the sim runs as a
@@ -1851,6 +2045,19 @@ impl App {
             && std::env::var_os("P_ASYNC_CACHE").is_some();
         gdf.set_cache_async(async_cache_on);
         let gpu_cull = compute_supported && std::env::var_os("P7_CULL").is_some();
+        // HZB occlusion culling (PR-8) is layered on the GPU frustum cull; it requires
+        // P7_CULL (the cull grid it operates on). If HZB_CULL is set without P7_CULL,
+        // log and ignore — the base cull path stays byte-identical (default OFF).
+        let hzb_cull = {
+            let want = std::env::var_os("HZB_CULL").is_some();
+            if want && !gpu_cull {
+                eprintln!(
+                    "[hzb] HZB_CULL=1 ignored: requires P7_CULL=1 (the GPU cull grid it culls). \
+                     Set both to enable occlusion culling."
+                );
+            }
+            want && gpu_cull && hzb.is_some()
+        };
         // Hardware ray tracing (DXR / VK_KHR) path tracer — the explicit `--raytracing` option
         // (or the legacy `P8_PATHTRACE` env). Separate from the SW-RT RenderQuality tiers, which
         // all use the GDF software path; this swaps the whole render for the HW-RT ground truth.
@@ -1940,6 +2147,66 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        // PR-4 (render-pipeline re-baseline track): opt-in analytic height fog. Off by default
+        // (`P_HEIGHT_FOG=1` to enable) so the byte-identical gallery/regression anchors are
+        // untouched — the atmosphere slot exists in the graph wiring unconditionally, but the
+        // pass itself is only added when this is true (see the `run()` call site).
+        let height_fog = quality::env_bool("P_HEIGHT_FOG", false);
+        // PR-9 view family: opt-in second (overhead) view composited as a PiP inset. Off by
+        // default = single view = byte-identical anchor.
+        let second_view = quality::env_bool("P_SECOND_VIEW", false);
+        // Density/falloff default to a gentle, scene-scale-relative haze: `1/scene_radius` puts
+        // the characteristic falloff height and the "full extinction" distance both on the order
+        // of the scene's own size, so the same defaults look sensible on the unit-radius gallery
+        // and a much larger Sponza level alike. `P_FOG_DENSITY`/`P_FOG_HEIGHT_FALLOFF` override.
+        let fog_density = std::env::var("P_FOG_DENSITY")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.15 / scene_radius.max(1e-3))
+            .max(0.0);
+        let fog_height_falloff = std::env::var("P_FOG_HEIGHT_FALLOFF")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.0 / scene_radius.max(1e-3))
+            .max(0.0);
+        // Inscatter gain defaults to the same sun:sky ratio the env-cube capture uses
+        // (`sky_gain`) — single source, not a duplicated constant. `P_FOG_INSCATTER_GAIN`
+        // overrides independently (e.g. to desaturate/dim the fog relative to the sky).
+        let fog_inscatter_gain = std::env::var("P_FOG_INSCATTER_GAIN")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(sky_gain);
+        // PR-5 (render-pipeline re-baseline track): the ordered post-process nodes. Each is
+        // opt-in; off = no pass recorded = byte-identical anchor. `P_BLOOM=1` enables the
+        // dual-filter bloom, `P_MOTION_BLUR=1` the velocity-along motion blur (requires
+        // `P_VELOCITY=1`), `P_DOF=1` the DoF stub (passthrough placeholder). See `postfx.rs`.
+        let bloom_on = quality::env_bool("P_BLOOM", false);
+        let motion_blur_on = quality::env_bool("P_MOTION_BLUR", false);
+        let dof_on = quality::env_bool("P_DOF", false);
+        // Color grading (ASC CDL: out = (slope*in + offset)^power). `P_GRADE=1` turns on the
+        // hook; the per-channel slope/offset/power come from `P_CDL_SLOPE`/`P_CDL_OFFSET`/
+        // `P_CDL_POWER` ("r,g,b"), defaulting to the neutral identity. Neutral = byte-identical.
+        let grade_on = quality::env_bool("P_GRADE", false);
+        let parse_rgb = |name: &str, default: [f32; 3]| -> [f32; 3] {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| {
+                    let parts: Vec<f32> =
+                        v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                    if parts.len() == 3 {
+                        Some([parts[0], parts[1], parts[2]])
+                    } else if parts.len() == 1 {
+                        Some([parts[0], parts[0], parts[0]])
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(default)
+        };
+        let (cdl_slope, cdl_offset, cdl_power) = push::CDL_NEUTRAL;
+        let cdl_slope = parse_rgb("P_CDL_SLOPE", cdl_slope);
+        let cdl_offset = parse_rgb("P_CDL_OFFSET", cdl_offset);
+        let cdl_power = parse_rgb("P_CDL_POWER", cdl_power);
         // Stage D3: gallery forced to the legacy 8 (byte-identical anchor); content takes the tier.
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
@@ -2244,6 +2511,31 @@ impl App {
         let swap_format_cached = swapchain.format();
         let readback_layout_cached = device.swapchain_readback_layout(&swapchain);
 
+        // PR-3: seed the translucency slot. `P_TRANSLUCENT_TEST=1` spawns two overlapping
+        // tinted glass panes in the gallery (there is no translucent sample asset yet), to
+        // verify sorted alpha compositing / depth-test occlusion / fog interaction. Empty by
+        // default → the pass adds no work → byte-identical anchor.
+        //
+        let mut translucents: Vec<translucent::TranslucentObject> = Vec::new();
+        if gallery_scene && quality::env_bool("P_TRANSLUCENT_TEST", false) {
+            translucents =
+                translucent::translucent_test_planes(&device, scene_radius, scene_center)?;
+            info!(
+                "P_TRANSLUCENT_TEST: spawned {} translucent glass pane(s)",
+                translucents.len()
+            );
+        }
+        // glTF `Transparent` (BLEND, non-decal) routing skeleton. The census below is where
+        // production BLEND drawables would be lifted OUT of the opaque G-buffer list and turned
+        // into `TranslucentObject`s for this slot — `translucent::TranslucentObject::from_scene`
+        // does the conversion (mesh/transform/material → forward material). It is intentionally
+        // NOT wired to run by default: doing so must also SUPPRESS the object's opaque G-buffer
+        // draw (else it renders twice), and — critically — the foliage path depends on
+        // `Transparent` drawables staying in the opaque G-buffer with a positive `alpha_cutoff`
+        // (crisp cutout / hashed soft edges). So enabling gltf routing is deferred to the Phase
+        // 20 work that also adds the G-buffer suppression; foliage behaviour is unchanged here.
+        // See `docs/translucency-pass.md` (§ glTF routing).
+
         Ok(Self {
             window,
             _instance: instance,
@@ -2257,9 +2549,17 @@ impl App {
             gdf,
             gi,
             gtao,
+            atmosphere,
+            translucency,
+            translucents,
+            bloom,
+            motion_blur,
+            dof,
             reflect,
             particles,
             cull,
+            cluster,
+            hzb,
             rt,
             ibl,
             _textures: textures,
@@ -2344,6 +2644,9 @@ impl App {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(if gallery_scene { 0.0 } else { 0.6 }),
             point_lights_on,
+            clustered_lights,
+            clustered_brute,
+            test_lights,
             shadows_on: true,
             shadow_bias: 0.0015,
             // PCSS-lite soft shadows: an opt-in quality tier (the scalability seam).
@@ -2362,6 +2665,10 @@ impl App {
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(base.shadow_taps)
                 .clamp(1, 16),
+            // PR-7 CSM/atlas: opt-in via `CSM` (default off = legacy single map = anchor).
+            csm: csm::CsmConfig::from_env(),
+            // `CSM_DEBUG=1` overlays the per-cascade index color so splits are inspectable.
+            csm_debug: std::env::var("CSM_DEBUG").is_ok_and(|v| v != "0"),
             quality,
             override_material: false,
             metallic_override: 1.0,
@@ -2372,10 +2679,20 @@ impl App {
                 .unwrap_or(0),
             post_mode: 0,
             aliasing: true,
-            compute_post,
+            bloom_on,
+            motion_blur_on,
+            dof_on,
+            grade_on,
+            cdl_slope,
+            cdl_offset,
+            cdl_power,
+            motion_blur_warned: std::cell::Cell::new(false),
+            depth_prepass,
             particles_on,
             async_compute_on,
             gpu_cull,
+            hzb_cull,
+            hzb_stats: std::cell::Cell::new((0, 0)),
             path_trace,
             rt_debug,
             cornell,
@@ -2395,6 +2712,11 @@ impl App {
             gi_volume,
             skyvis_tint,
             skyvis_min_occ,
+            height_fog,
+            second_view,
+            fog_density,
+            fog_height_falloff,
+            fog_inscatter_gain,
             gi_spp,
             cache_relight_period,
             cache_feedback,
@@ -2450,6 +2772,9 @@ impl App {
                 .ok()
                 .and_then(|s| s.trim().parse::<f32>().ok())
                 .unwrap_or(quality::TAA_MIP_BIAS),
+            velocity,
+            velocity_on: quality::env_bool("P_VELOCITY", false),
+            prev_transforms: Vec::new(),
             profiler_on,
             slot_pass_names,
             gpu_timings: Vec::new(),
@@ -2770,6 +3095,15 @@ impl App {
                 ((sh as f32 * self.render_scale).round() as u32).max(64),
             ),
         };
+        // HZB (PR-8): the Hi-Z pyramid must match the scene-depth (render) extent. Rebuild
+        // it here if the render extent changed (RENDER_RES / render_scale / window resize).
+        // `device` and `hzb` are disjoint fields, so borrow them independently.
+        if self.hzb_cull {
+            let App { device, hzb, .. } = self;
+            if let Some(hzb) = hzb {
+                hzb.resize(device, Extent2D::new(cw, ch))?;
+            }
+        }
         // QHD/UHD track: TAAU is active when the scene renders below the output resolution (upscale)
         // and isn't a path-trace/debug capture. It jitters the camera + reconstructs full-res from
         // history. When render == output (default), it's inactive (byte-identical).
@@ -2980,6 +3314,29 @@ impl App {
             build_scene(&self.world, &self.mesh_registry, &self.material_registry)
         };
 
+        // Velocity (PR-2) single prev-pose source: seed each drawable's previous transform from
+        // last frame's stored transforms (same stable draw-list order). A newly-appeared drawable
+        // (or first frame) has no history → default (identity + current), i.e. zero object motion.
+        // Skinning / morph overwrite their entries with the prev palette / weights below. Built
+        // only when velocity is on (else an empty vec — no per-frame cost on the default path).
+        let mut prev_scene: Vec<velocity::PrevPose> = if self.velocity_on {
+            scene
+                .iter()
+                .enumerate()
+                .map(|(i, obj)| velocity::PrevPose {
+                    transform: self
+                        .prev_transforms
+                        .get(i)
+                        .copied()
+                        .unwrap_or(obj.transform),
+                    skin_palette: 0,
+                    morph_weights: 0,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Animation Stage B: CPU-skin the skinned primitives and swap each skinned
         // drawable to this frame-in-flight's vertex buffer. Inline path only — the
         // per-frame vertex write relies on this slot's fence having been waited at
@@ -2987,14 +3344,14 @@ impl App {
         // not supported in B.1).
         if !self.skinned.is_empty() && self.rhi_thread.is_none() {
             skin::update_palettes(&mut self.skinned, &self.world, fif)?;
-            skin::patch_scene(&self.skinned, &mut scene, fif);
+            skin::patch_scene(&self.skinned, &mut scene, &mut prev_scene, fif);
         }
         // Animation Stage C: blend morph targets (GPU = write the per-frame weights
         // buffer; CPU = re-blend the vertex ring) + patch this frame's drawables. Inline
         // path only (the per-frame storage/vertex write relies on the frame-start fence).
         if !self.morphed.is_empty() && self.rhi_thread.is_none() {
             morph::apply_morph(&mut self.morphed, &self.world, fif)?;
-            morph::patch_scene(&self.morphed, &mut scene, fif);
+            morph::patch_scene(&self.morphed, &mut scene, &mut prev_scene, fif);
         }
 
         // Orbiting camera framing the whole sample scene — or, in single-object
@@ -3080,8 +3437,12 @@ impl App {
             scene = streaming.build_scene();
         }
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
-        let proj_noflip =
-            Mat4::perspective_rh(60f32.to_radians(), cw as f32 / ch as f32, 0.05, 100.0);
+        let proj_noflip = Mat4::perspective_rh(
+            60f32.to_radians(),
+            cw as f32 / ch as f32,
+            CLUSTER_Z_NEAR,
+            CLUSTER_Z_FAR,
+        );
         let mut proj = proj_noflip;
         if self.backend == BackendKind::Vulkan {
             proj.y_axis.y *= -1.0; // Vulkan clip-space Y points down
@@ -3125,6 +3486,35 @@ impl App {
         let cam_up = inv_view.y_axis.truncate();
         // For reconstructing background view rays (skybox) in the lighting pass.
         let inv_view_proj = view_proj.inverse().to_cols_array();
+
+        // PR-9 view family: the PRIMARY view descriptor. It captures the same view-dependent
+        // camera math the passes below consume (the passes still read the individual locals for
+        // the byte-identical baseline; the descriptor is the structural single-source that the
+        // second view mirrors). `full()` = the complete feature set = the legacy single-view path.
+        // Jitter/stable/prev matrices are folded in so `primary_view` documents the whole
+        // per-view temporal state in one place.
+        let mut primary_view = view::SceneView::build(
+            0,
+            eye,
+            focus,
+            cw as f32 / ch as f32,
+            60f32.to_radians(),
+            CLUSTER_Z_NEAR,
+            CLUSTER_Z_FAR,
+            self.backend,
+            (fif as u64 * MAX_VIEWS) * GLOBALS_SLICE,
+            self.prev_view_proj,
+            view::SceneViewFeatures::full(),
+        );
+        // Fold this frame's jittered view-projection + jitter UV into the descriptor (the primary
+        // view is the one that carries TAAU sub-pixel jitter; the secondary view has none).
+        primary_view.view_proj = view_proj;
+        primary_view.jitter_uv = taau_jitter_uv;
+        debug_assert_eq!(
+            primary_view.globals_offset,
+            (fif as u64 * MAX_VIEWS) * GLOBALS_SLICE
+        );
+        debug_assert!(primary_view.features.taau && primary_view.features.post);
 
         // Skip the whole ImGui frame (NewFrame/Render must stay balanced) when
         // capturing a clean screenshot.
@@ -3170,10 +3560,15 @@ impl App {
                 legacy_ibl,
                 post_mode,
                 aliasing,
-                compute_post,
+                bloom_on,
+                motion_blur_on,
+                dof_on,
+                grade_on,
                 particles_on,
                 async_compute_on,
                 gpu_cull,
+                hzb_cull,
+                hzb_stats,
                 path_trace,
                 rt_debug,
                 cornell,
@@ -3491,10 +3886,14 @@ impl App {
                         }
                         ui.combo_simple_string("Post effect", post_mode, &POST_EFFECTS);
                         ui.checkbox("Transient aliasing", aliasing);
+                        // PR-5 ordered post nodes.
+                        ui.checkbox("Bloom (P_BLOOM)", bloom_on);
+                        ui.checkbox("Motion blur (P_MOTION_BLUR)", motion_blur_on);
+                        ui.checkbox("DoF stub (P_DOF)", dof_on);
+                        ui.checkbox("Color grade (P_GRADE)", grade_on);
                     }
 
                     if ui.collapsing_header("Compute / GPGPU (Phase 7)", TreeNodeFlags::empty()) {
-                        ui.checkbox("Compute post (blur)", compute_post);
                         ui.checkbox("GPU particles", particles_on);
                         if async_compute_supported {
                             ui.checkbox("  - async compute queue", async_compute_on);
@@ -3502,6 +3901,16 @@ impl App {
                             ui.text_disabled("  - async compute (no dedicated queue)");
                         }
                         ui.checkbox("GPU culling (indirect)", gpu_cull);
+                        if *gpu_cull {
+                            ui.checkbox("  - HZB occlusion cull", hzb_cull);
+                            if *hzb_cull {
+                                let (survived, culled) = hzb_stats.get();
+                                ui.text(format!(
+                                    "    {} total / {} vis / {} occluded",
+                                    GRID_COUNT, survived, culled
+                                ));
+                            }
+                        }
                     }
 
                     if rt.has_path() && rt.has_scene() {
@@ -3823,6 +4232,27 @@ impl App {
         };
         let light_vp = light_view_proj(sun_dir, shadow_center, self.scene_radius);
 
+        // PR-7 CSM: fit N cascades to the view frustum when the seam is on (single source of
+        // all shadow matrices/splits). The perspective params match the scene camera above
+        // (fov 60deg, near 0.05, far 100.0) so the cascades tile the depth range the view
+        // samples. Empty on the legacy path (byte-identical anchor).
+        let csm_slots = if self.csm.enabled {
+            csm::compute_cascades(
+                &self.csm,
+                &csm::ViewCamera {
+                    eye,
+                    target: focus,
+                    fov_y_rad: 60f32.to_radians(),
+                    aspect: cw as f32 / ch as f32,
+                    near: 0.05,
+                    far: 100.0,
+                },
+                sun_dir,
+            )
+        } else {
+            Vec::new()
+        };
+
         // Write this frame's globals slice.
         let globals = Globals {
             camera_pos: [eye.x, eye.y, eye.z, 0.0],
@@ -3867,13 +4297,101 @@ impl App {
             // Last frame's view-projection (updated end-of-frame) so the SSR history
             // sample reprojects the world hit point into the previous frame (Stage C7b).
             prev_view_proj: self.prev_view_proj,
+            // Clustered lighting (PR-6): row 2 of the world->view matrix so the shader can
+            // recover positive linear view depth from a G-buffer world position, plus the
+            // camera near/far for the froxel Z slicing. `view` is column-major (glam), so
+            // row 2 = the .z component of each column.
+            cluster_view_z_row: [view.x_axis.z, view.y_axis.z, view.z_axis.z, view.w_axis.z],
+            cluster_params: [CLUSTER_Z_NEAR, CLUSTER_Z_FAR, 0.0, 0.0],
+            // PR-7 CSM: filled from the fitted cascade slots when the seam is on; zero here =
+            // the legacy single-map path (the shader branches on csm_params.x == 0 → anchor).
+            csm_params: {
+                let atlas = self.csm.atlas_size as i32;
+                let tile = self.csm.tile_size() as i32;
+                [csm_slots.len() as i32, self.csm_debug as i32, tile, atlas]
+            },
+            csm_split: {
+                let mut s = [0.0f32; 4];
+                for (i, slot) in csm_slots.iter().take(4).enumerate() {
+                    s[i] = slot.split_far;
+                }
+                s
+            },
+            csm_opts: [self.csm.blend_frac, 0.0, 0.0, 0.0],
+            csm_view_proj: {
+                let mut m = [[0.0f32; 16]; 4];
+                for (i, slot) in csm_slots.iter().take(4).enumerate() {
+                    m[i] = slot.view_proj.to_cols_array();
+                }
+                m
+            },
+            csm_atlas_uv: {
+                // Per-cascade atlas UV sub-rect (xy offset, zw scale). The sampler maps the
+                // cascade clip → [0,1] tile UV → this sub-rect in the shared atlas texture.
+                let atlas = self.csm.atlas_size.max(1) as f32;
+                let mut uv = [[0.0f32; 4]; 4];
+                for (i, slot) in csm_slots.iter().take(4).enumerate() {
+                    uv[i] = [
+                        slot.rect.x as f32 / atlas,
+                        slot.rect.y as f32 / atlas,
+                        slot.rect.width as f32 / atlas,
+                        slot.rect.height as f32 / atlas,
+                    ];
+                }
+                uv
+            },
         };
-        let globals_offset = fif as u64 * GLOBALS_SLICE;
+        // PR-9 view family: the primary view is slice 0 of this frame's view block
+        // (`(fif * MAX_VIEWS + view_index) * GLOBALS_SLICE`). The content written at that offset is
+        // unchanged from the pre-PR-9 layout, and every consumer reads the same offset, so the
+        // anchor stays byte-identical; the wider stride just reserves room for the second view's
+        // camera slice.
+        let globals_offset = (fif as u64 * MAX_VIEWS) * GLOBALS_SLICE;
         // Firefly clamp ceiling (raw radiance, max component). ~8 keeps diffuse + moderate
         // gloss but caps blown-out specular spikes; 1e30 = effectively off (byte-identical).
         let firefly_max = if self.firefly_clamp { 8.0f32 } else { 1e30 };
         self.deferred
             .write_globals(globals_offset, globals_bytes(&globals))?;
+
+        // Clustered light culling (PR-6): assemble this frame's point-light list and upload it
+        // to the cluster/light buffer, returning the bindless indices the build + lighting passes
+        // read. Done BEFORE the graph is built (host write + possible realloc mutate `self.cluster`;
+        // the graph then borrows it immutably for the record closures).
+        //
+        // Parity note: the scene's authored point lights get an EFFECTIVELY INFINITE radius so
+        // every cluster bins them — the shader then accumulates the SAME lights in the SAME order
+        // as the brute-force loop (which applies no distance cutoff), so the result is byte-identical
+        // for scenes with few lights. The deterministic TEST_LIGHTS stress grid gets a finite radius
+        // (that's where per-cluster culling actually pays off).
+        let cluster_indices: Option<(u32, u32, u32, u32)> = if let (true, Some(cluster_sys)) = (
+            self.clustered_lights || self.clustered_brute,
+            self.cluster.as_mut(),
+        ) {
+            let mut lights: Vec<ClusterLight> = Vec::new();
+            let n = if self.point_lights_on {
+                point_count as usize
+            } else {
+                0
+            };
+            for i in 0..n.min(4) {
+                lights.push(ClusterLight {
+                    position: [point_pos[i][0], point_pos[i][1], point_pos[i][2]],
+                    radius: CLUSTER_Z_FAR * 4.0, // "infinite": covers the whole frustum
+                    color: [point_color[i][0], point_color[i][1], point_color[i][2]],
+                    intensity: point_color[i][3],
+                });
+            }
+            if self.test_lights > 0 {
+                lights.extend(test_light_grid(
+                    self.test_lights,
+                    self.scene_center,
+                    self.scene_radius,
+                ));
+            }
+            Some(cluster_sys.upload(&self.device, fif, &lights)?)
+        } else {
+            None
+        };
 
         // Phase 8 M4: manage the path tracer's persistent accumulation buffer and
         // reset key BEFORE building the render graph — the fallible buffer
@@ -3958,15 +4476,16 @@ impl App {
         let g_material = graph.create_color("g_material", GB_MATERIAL_FMT, extent);
         let g_position = graph.create_color("g_position", GB_POSITION_FMT, extent);
         let g_depth = graph.create_depth("g_depth", extent);
-        let shadow_map = graph.create_depth("shadow_map", Extent2D::new(SHADOW_SIZE, SHADOW_SIZE));
-        let hdr = graph.create_color("hdr", HDR_FORMAT, extent);
-        // Phase 7: compute post writes the blurred HDR into a storage image that the
-        // tonemap pass samples instead of the raw `hdr` target.
-        let hdr_post = if self.compute_post {
-            Some(graph.create_storage_image("hdr_post", HDR_FORMAT, extent))
+        // Shadow depth target. Legacy path: a single SHADOW_SIZE square map. CSM path: the
+        // atlas texture (CSM_ATLAS square, tiled into per-cascade slots). Same resource id
+        // feeds the lighting pass either way, so the sampling side re-wire is zero.
+        let shadow_map = if self.csm.enabled {
+            let s = self.csm.atlas_size;
+            graph.create_depth("shadow_atlas", Extent2D::new(s, s))
         } else {
-            None
+            graph.create_depth("shadow_map", Extent2D::new(SHADOW_SIZE, SHADOW_SIZE))
         };
+        let hdr = graph.create_color("hdr", HDR_FORMAT, extent);
         let gbuf = GBufferTargets {
             albedo: g_albedo,
             normal: g_normal,
@@ -3976,9 +4495,15 @@ impl App {
         };
 
         // Deferred backbone (see `deferred.rs`): shadow -> gbuffer -> lighting (HDR),
-        // then the optional compute-post blur.
-        self.deferred
-            .record_shadow(&mut graph, shadow_map, &scene, light_vp);
+        // then the optional compute-post blur. CSM path fills the atlas (one tile per
+        // cascade via per-tile viewports); the legacy path fills the single directional map.
+        if self.csm.enabled {
+            self.deferred
+                .record_shadow_atlas(&mut graph, shadow_map, &scene, &csm_slots);
+        } else {
+            self.deferred
+                .record_shadow(&mut graph, shadow_map, &scene, light_vp);
+        }
         // TAA-aware texture LOD bias for the G-buffer texture fetches (Stage 7 + Stage 8). Two terms:
         //   1. log2(internal/output): the DLSS/FSR2 resolution term — at a reduced internal
         //      resolution the screen-space derivatives are ~2x larger and fetch blurry mips, so this
@@ -4002,6 +4527,27 @@ impl App {
         } else {
             0.0
         };
+        // Depth pre-pass (pipeline rebaseline PR-1, opt-in `DEPTH_PREPASS=1`): render an opaque
+        // depth-only pass into `g_depth` BEFORE the G-buffer so the base pass runs EQUAL-test +
+        // write-off (Early-Z overdraw elimination) and the screen-space passes (AO/GI/SSR) sample
+        // a completed depth whose producer is now explicitly the pre-pass (the render graph orders
+        // pre-pass → G-buffer via the shared `g_depth` write, and the AO/GI/SSR reads of `g_depth`
+        // chain after it). Off by default = no pre-pass pass at all (byte-identical golden anchor).
+        if self.depth_prepass {
+            self.deferred.record_prepass(
+                &mut graph,
+                g_depth,
+                &scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                mip_bias,
+            );
+        }
         self.deferred.record_gbuffer(
             &mut graph,
             gbuf,
@@ -4015,12 +4561,36 @@ impl App {
             self.metallic_override,
             self.roughness_override,
             mip_bias,
+            self.depth_prepass,
         );
         // Deferred surface-decal pass (decals A3): tint the G-buffer albedo for `kind == Decal`
         // drawables after the opaque fill, before lighting. No-op (no pass) when the scene has
         // no decals, so the gallery / non-decal scenes stay byte-identical.
         self.deferred
             .record_decals(&mut graph, gbuf, &scene, view_proj, mip_bias);
+        // Velocity (motion-vector) channel (pipeline re-baseline PR-2, opt-in `P_VELOCITY=1`): a
+        // separate opaque pass into an RG16Float target holding per-pixel screen motion. Uses the
+        // UNJITTERED current + previous camera matrices (`view_proj_stable` / `prev_view_proj_taau`)
+        // so no TAA jitter leaks into the motion; per-object prev pose from `prev_scene`. Consumed by
+        // the velocity-aware TAAU reprojection + the DEBUG_VIEW=11 viz. Off = no target, no pass.
+        let velocity_target = if self.velocity_on {
+            let vt = graph.create_color("velocity", velocity::VELOCITY_FMT, extent);
+            self.velocity.record(
+                &mut graph,
+                vt,
+                g_depth,
+                &scene,
+                &prev_scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj_stable,
+                Mat4::from_cols_array(&self.prev_view_proj_taau),
+            );
+            Some(vt)
+        } else {
+            None
+        };
         // Stage C2/C3 (GDF-lighting consumers, see `gi.rs`) share the world scene GDF:
         // import its handle once + record the one-time fused-scene bake (the volume is
         // owned by `GdfSystem`), then AO + GI read it. Recorded before lighting so the
@@ -4699,6 +5269,53 @@ impl App {
             }
             _ => None,
         };
+        // Clustered light culling (PR-6): build this frame's froxel light lists, then hand the
+        // buffer ids to the lighting pass. The build pass writes the grid/index externals, so the
+        // lighting pass (which reads them) sequences after it. `None` = brute-force point loop.
+        let cluster_lighting = match (cluster_indices, self.cluster.as_ref()) {
+            (Some((grid_idx, index_idx, light_idx, light_count)), Some(cluster_sys))
+                if self.clustered_lights =>
+            {
+                let (grid_ext, index_ext) = ClusterSystem::import(&mut graph);
+                let view_z_row = [view.x_axis.z, view.y_axis.z, view.z_axis.z, view.w_axis.z];
+                cluster_sys.record_build(
+                    &mut graph,
+                    grid_ext,
+                    index_ext,
+                    fif,
+                    light_count,
+                    view_z_row,
+                    inv_view_proj,
+                    [eye.x, eye.y, eye.z],
+                    CLUSTER_Z_NEAR,
+                    CLUSTER_Z_FAR,
+                    cw,
+                    ch,
+                );
+                Some((
+                    grid_ext,
+                    index_ext,
+                    grid_idx,
+                    index_idx,
+                    light_idx,
+                    light_count,
+                ))
+            }
+            // Brute-force A/B: upload the light buffer but pass index_buf = MAX (loop all lights,
+            // no froxel list). Import a dummy external so the tuple shape holds; no build pass.
+            (Some((grid_idx, _, light_idx, light_count)), Some(_)) if self.clustered_brute => {
+                let (grid_ext, index_ext) = ClusterSystem::import(&mut graph);
+                Some((
+                    grid_ext,
+                    index_ext,
+                    grid_idx,
+                    u32::MAX,
+                    light_idx,
+                    light_count,
+                ))
+            }
+            _ => None,
+        };
         self.deferred.record_lighting(
             &mut graph,
             hdr,
@@ -4723,6 +5340,7 @@ impl App {
             } else {
                 u32::MAX
             },
+            cluster_lighting,
         );
         // Auto-exposure metering: read this frame's lit HDR, adapt the exposure for next frame.
         // After lighting (the `hdr` read orders it). `adapt` = 1-exp(-dt·speed) (eye/iris speed).
@@ -4749,10 +5367,99 @@ impl App {
                 },
             );
         }
-        if let Some(hdr_post) = hdr_post {
-            self.deferred
-                .record_compute_post(&mut graph, hdr, hdr_post, cw, ch);
-        }
+        // PR-4 (render-pipeline re-baseline track, `docs/render-pipeline-reference.md` §3):
+        // the sky/atmosphere composite slot. Sits right after the opaque scene color is
+        // final (lighting + reflections all done) and before the post chain — matching the
+        // reference pipeline's "opaque complete -> sky/fog -> translucency -> post" ordering
+        // (§1.6). The slot is unconditional in the graph's *shape*; only the pass itself is
+        // opt-in (`P_HEIGHT_FOG=1`), so leaving it off costs nothing and the gallery/
+        // regression anchors stay byte-identical.
+        let fog_src = hdr;
+        let fog_out = if self.height_fog {
+            let hdr_fog = graph.create_color("hdr_fog", HDR_FORMAT, extent);
+            self.atmosphere.record_fog(
+                &mut graph,
+                fog_src,
+                hdr_fog,
+                g_position,
+                [eye.x, eye.y, eye.z],
+                self.fog_density,
+                self.fog_height_falloff,
+                sun_dir,
+                sun_intensity,
+                self.sky_wb,
+                self.fog_inscatter_gain,
+                // `procedural_sky` returns raw (unexposed) radiance; `hdr` is already exposed
+                // (baked in by `record_lighting`), so the inscatter needs the same treatment.
+                // Uses the static EV100 exposure (not the auto-exposure adapted value) — a
+                // documented simplification; the fog is a slow-varying ambient term so a
+                // one-frame-stale exposure has no visible impact.
+                self.exposure,
+            );
+            Some(hdr_fog)
+        } else {
+            None
+        };
+
+        // PR-3 (render-pipeline re-baseline track, `docs/render-pipeline-reference.md` §1.7
+        // #12 / §3): the forward translucency slot. Draws sorted alpha-blended translucent
+        // geometry over the finished opaque+fog HDR (blend in place), depth-testing against the
+        // opaque `g_depth` (occluded behind solid geometry) with depth-write off (overlapping
+        // panes all blend). Sits AFTER fog and BEFORE the post chain — reference ordering. Adds
+        // no pass when `translucents` is empty (zero cost, byte-identical anchor).
+        let translucency_target = fog_out.unwrap_or(fog_src);
+        self.translucency.record(
+            &mut graph,
+            translucency_target,
+            g_depth,
+            &self.translucents,
+            view_proj,
+            eye,
+            self.deferred.globals_buffer(),
+            globals_offset,
+            self.flip_y,
+            shadow_map,
+        );
+
+        // PR-5 (render-pipeline re-baseline track): the ordered post-process chain begins
+        // here, on the finished scene HDR (lighting + reflections + the atmosphere/fog
+        // slot + translucency). Reference ordering (§1.8): motion-blur -> TAA/upscale ->
+        // auto-exposure -> bloom -> DoF -> tonemap+grading. Each node is opt-in and off =
+        // no pass recorded (byte-identical anchor).
+        //
+        // Node #13 Motion blur: a velocity-along per-pixel blur, BEFORE TAA so the temporal
+        // resolve stabilizes the streaks. Requires the PR-2 velocity target; if
+        // `P_MOTION_BLUR=1` is set without `P_VELOCITY=1` there is no velocity to consume,
+        // so it is skipped with a one-time log (documented degrade, not a hard error).
+        let opaque_hdr = translucency_target;
+        let post_hdr = if self.motion_blur_on {
+            match velocity_target {
+                Some(vt) => {
+                    let mb_out = graph.create_color("motion_blur", HDR_FORMAT, extent);
+                    self.motion_blur.record(
+                        &mut graph,
+                        opaque_hdr,
+                        mb_out,
+                        vt,
+                        self.flip_y,
+                        MOTION_BLUR_SAMPLES,
+                        MOTION_BLUR_INTENSITY,
+                        MOTION_BLUR_MAX_UV,
+                    );
+                    mb_out
+                }
+                None => {
+                    if !self.motion_blur_warned.replace(true) {
+                        tracing::warn!(
+                            "P_MOTION_BLUR=1 ignored: no velocity target (set P_VELOCITY=1)"
+                        );
+                    }
+                    opaque_hdr
+                }
+            }
+        } else {
+            opaque_hdr
+        };
 
         // Phase 7 GPU particles: a compute pass advances the persistent particle
         // buffer; an external graph resource sequences it before the draw pass.
@@ -4794,13 +5501,85 @@ impl App {
         } else {
             None
         };
+        // HZB occlusion culling (PR-8): when enabled, the frustum-only `record_cull` is
+        // replaced by reset + an occlusion-aware cull that also tests each instance's
+        // screen AABB against LAST frame's Hi-Z pyramid, and a build pass regenerates
+        // the pyramid from THIS frame's scene depth (for next frame). The build declares
+        // the HZB external as a WRITE and the cull as a READ, so the graph's WAR edge
+        // runs cull (last frame's data) before build (overwrite) — the canonical
+        // prev-frame-HZB scheme (conservative; no reprojection). Off => the original
+        // frustum-only path (byte-identical).
+        let hzb_active = self.hzb_cull && self.hzb.is_some();
         if let Some((args_ext, visible_ext)) = cull_res {
-            self.cull.record_cull(
+            if hzb_active {
+                let hzb = self.hzb.as_ref().unwrap();
+                let hzb_ext = HzbSystem::import(&mut graph);
+                self.cull.record_reset(
+                    &mut graph,
+                    args_ext,
+                    visible_ext,
+                    frustum_planes(cull_view_proj),
+                    &grid,
+                );
+                let (args_buf, visible_buf) = self.cull.buffers();
+                // Occlusion test disabled on the first frame (no pyramid yet), and only
+                // when the pyramid's bindless slots are consecutive (the shader indexes
+                // hzb_base + mip). Either way the frustum cull still runs.
+                let occlude = self.frame_no >= 1 && hzb.slots_are_consecutive();
+                hzb.record_cull(
+                    &mut graph,
+                    args_buf,
+                    visible_buf,
+                    args_ext,
+                    visible_ext,
+                    hzb_ext,
+                    frustum_planes(cull_view_proj),
+                    cull_view_proj.to_cols_array(),
+                    &grid,
+                    self.cull.index_count(),
+                    occlude,
+                );
+                hzb.record_build(&mut graph, g_depth, hzb_ext, extent);
+            } else {
+                self.cull.record_cull(
+                    &mut graph,
+                    args_ext,
+                    visible_ext,
+                    frustum_planes(cull_view_proj),
+                    &grid,
+                );
+            }
+        }
+
+        // PR-3 side-effect: the Phase-7 particle + GPU-culling draws move into the HDR
+        // translucency slot (alpha-blend over `translucency_target`, BEFORE tonemap), instead
+        // of drawing over the tonemapped LDR backbuffer. Both are default-off demo features
+        // (`P7_PARTICLES` / `P7_CULL`), so the default gallery/anchor output is unchanged; this
+        // only fixes the HDR-composite ordering the reference pipeline expects (§2.1-3, #21).
+        // Declared after the sim/cull compute passes so the WAR/WAW deps order them correctly;
+        // the graph schedules by resource dependency, not declaration order.
+        if let Some((args_ext, visible_ext)) = cull_res {
+            self.cull.record_draw(
                 &mut graph,
+                translucency_target,
+                extent,
                 args_ext,
                 visible_ext,
-                frustum_planes(cull_view_proj),
+                view_proj.to_cols_array(),
+                self.sun_dir,
                 &grid,
+                g_depth,
+                extent,
+            );
+        }
+        if let Some(particles_ext) = particles_ext {
+            self.particles.record_draw(
+                &mut graph,
+                translucency_target,
+                particles_ext,
+                view_proj.to_cols_array(),
+                cam_right,
+                cam_up,
             );
         }
 
@@ -5201,11 +5980,13 @@ impl App {
         // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active, else
         // the SW-RT SDF trace, else the Stage-B volume slice, else the Stage-C1 scene
         // GDF, else the Stage-C5 SSR / C6 GDF-reflection viz, else the C8b1 cache atlas,
-        // else compute-post, else HDR.
+        // else the main lit path (TAAU → bloom/DoF/grading tail), else HDR.
         // QHD/UHD TAAU: reconstruct the full-res (output) HDR from the jittered internal-res lit
         // image + history, before tonemap. Only the main lit path (not the debug/RT viz outputs).
         let taau_out = if taau_active {
-            let main_lit = hdr_post.unwrap_or(hdr);
+            // Post-chain input: opaque HDR after the fog slot + the (optional) motion-blur
+            // node — motion blur runs BEFORE TAA so the temporal resolve stabilizes streaks.
+            let main_lit = post_hdr;
             // Decima FXAA→TAA: spatially anti-alias the jittered internal frame first so its edges
             // don't flicker frame to frame, then temporally upsample. Stabilizes the jitter.
             let taau_in = if self.taau.has_fxaa() && !taau_jitter_active {
@@ -5228,11 +6009,53 @@ impl App {
                 self.scene_radius * 2.0,
                 taau_jitter_uv,
                 false,
+                velocity_target,
             ))
         } else {
             None
         };
-        let tonemap_src = rt_out
+        // DEBUG_VIEW=11: colour-code the velocity target (needs `P_VELOCITY=1`). Takes precedence
+        // over the lit/TAAU output so the motion vectors are visualized directly.
+        let velocity_view_out = if self.debug_view == 11 {
+            velocity_target.map(|vt| {
+                self.velocity
+                    .record_viz(&mut graph, vt, extent, cw, ch, VELOCITY_VIZ_SCALE)
+            })
+        } else {
+            None
+        };
+        // PR-5 main-lit post tail: the DoF stub (node #17) then the bloom composite (node
+        // #16). These run only on the main lit path (the TAAU result, or the pre-TAAU post
+        // HDR at native res) — never on the RT/debug viz outputs, which take precedence in
+        // the `.or()` chain below. Both are opt-in / no-op when off (byte-identical anchor).
+        // The main-lit target lives at the output extent when TAAU upscaled, else the render
+        // extent.
+        let main_lit_extent = if taau_out.is_some() {
+            swap_extent
+        } else {
+            extent
+        };
+        let mut main_lit = taau_out.unwrap_or(post_hdr);
+        // Node #17 DoF (stub passthrough). Reserves the slot; off = no pass (anchor).
+        if self.dof_on {
+            let dof_out = graph.create_color("dof", HDR_FORMAT, main_lit_extent);
+            self.dof.record(&mut graph, main_lit, dof_out, self.flip_y);
+            main_lit = dof_out;
+        }
+        // Node #16 Bloom: build the pyramid from the main-lit HDR; the mip0 result is added
+        // at the tonemap input. The pyramid extent tracks the main-lit target's extent.
+        let bloom_mip0 = if self.bloom_on {
+            Some(
+                self.bloom
+                    .record(&mut graph, main_lit, main_lit_extent, self.flip_y),
+            )
+        } else {
+            None
+        };
+        // Whether the main lit path (not an RT/debug viz) is the tonemap source — bloom +
+        // grading apply only then, so the viz captures stay unaffected.
+        let show_main_lit = velocity_view_out
+            .or(rt_out)
             .or(wrc_view_out)
             .or(sdf_out)
             .or(vol_out)
@@ -5244,9 +6067,21 @@ impl App {
             .or(reflect_out)
             .or(hybrid_out)
             .or(cache_out)
-            .or(taau_out)
-            .or(hdr_post)
-            .unwrap_or(hdr);
+            .is_none();
+        let tonemap_src = velocity_view_out
+            .or(rt_out)
+            .or(wrc_view_out)
+            .or(sdf_out)
+            .or(vol_out)
+            .or(bake_out)
+            .or(gdf_out)
+            .or(gdf_trace_out)
+            .or(scene_gdf_out)
+            .or(ssr_out)
+            .or(reflect_out)
+            .or(hybrid_out)
+            .or(cache_out)
+            .unwrap_or(main_lit);
         // The rasterized HDR already bakes exposure into the lighting pass; the
         // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
         // exposure here before the filmic curve (else the bright sky + sun blow out).
@@ -5269,6 +6104,16 @@ impl App {
         } else {
             (0.0, 0.0, 0.0)
         };
+        // PR-5 bloom composite + ASC-CDL color grade — applied at the tonemap only on the
+        // main lit path (`show_main_lit`); the RT/debug viz get the no-op form (bloom off,
+        // grading off) so those captures are unchanged.
+        let bloom = if show_main_lit { bloom_mip0 } else { None };
+        let (grade_on, cdl_slope, cdl_offset, cdl_power) = if show_main_lit && self.grade_on {
+            (1u32, self.cdl_slope, self.cdl_offset, self.cdl_power)
+        } else {
+            let (s, o, p) = push::CDL_NEUTRAL;
+            (0u32, s, o, p)
+        };
         self.deferred.record_tonemap(
             &mut graph,
             backbuffer,
@@ -5279,34 +6124,154 @@ impl App {
             sharpen,
             inv_w,
             inv_h,
+            bloom,
+            postfx::BloomParams::INTENSITY,
+            grade_on,
+            cdl_slope,
+            cdl_offset,
+            cdl_power,
         );
 
-        // Phase 7 GPU-culling draw: indirect, instanced render of the visible cube
-        // grid over the tonemapped image, with its own depth buffer.
-        if let Some((args_ext, visible_ext)) = cull_res {
-            self.cull.record_draw(
-                &mut graph,
-                backbuffer,
-                swap_extent,
-                args_ext,
-                visible_ext,
-                view_proj.to_cols_array(),
-                self.sun_dir,
-                &grid,
+        // PR-9 View Family (`docs/view-family.md`): render a SECOND view in the same frame against
+        // the SHARED scene resources, composited as a picture-in-picture inset. The view-INDEPENDENT
+        // passes above (shadow/CSM atlas, IBL capture, GDF/surface cache, clustered-light upload)
+        // already ran ONCE this frame; only the view-DEPENDENT chain (G-buffer → lighting → tonemap)
+        // re-runs here, parameterized by the second `SceneView`. The secondary view uses the
+        // simplified feature set (no TAAU/velocity/post/screen-space-GI — see `SceneViewFeatures`),
+        // so its temporal state can never collide with the primary view's. Off by default = no extra
+        // passes = byte-identical anchor.
+        if self.second_view {
+            // Overhead ("god's-eye") camera: straight down onto the scene centre. A genuinely
+            // different pose from the primary orbit view so the inset is visibly a distinct view.
+            let sv_center = if self.is_gallery {
+                Vec3::new(0.0, self.model_radius * 0.5, 0.0)
+            } else {
+                self.scene_center
+            };
+            let sv_eye = sv_center + Vec3::new(0.0, self.scene_radius * 3.0, 0.001);
+            let second = view::SceneView::build(
+                1,
+                sv_eye,
+                sv_center,
+                1.0, // square inset
+                60f32.to_radians(),
+                CLUSTER_Z_NEAR,
+                CLUSTER_Z_FAR,
+                self.backend,
+                (fif as u64 * MAX_VIEWS + 1) * GLOBALS_SLICE,
+                Mat4::IDENTITY.to_cols_array(),
+                view::SceneViewFeatures::secondary(),
             );
-        }
 
-        // Phase 7 particle draw: instanced billboards composited over the tonemapped
-        // image (alpha blend), reading the compute-updated buffer in the vertex stage.
-        // Declared after tonemap so the WAW on the backbuffer orders it last.
-        if let Some(particles_ext) = particles_ext {
-            self.particles.record_draw(
+            tracing::debug!(
+                "view family: rendering view #{} (eye {:?} -> focus {:?}) against shared scene resources",
+                second.index,
+                second.eye,
+                second.focus
+            );
+            // The second view's globals slice: reuse the shared lighting/shadow/IBL fields from the
+            // primary `globals` (single source of truth — sun, shadow atlas, IBL indices, CSM are
+            // all view-independent) and override only the camera-dependent fields.
+            let mut sv_globals = globals;
+            sv_globals.camera_pos = [second.eye.x, second.eye.y, second.eye.z, 0.0];
+            sv_globals.inv_view_proj = second.inv_view_proj;
+            sv_globals.prev_view_proj = second.prev_view_proj;
+            sv_globals.cluster_view_z_row = second.cluster_view_z_row();
+            // Secondary view lights brute-force (cluster froxels were built for the primary
+            // frustum); the froxel path is a primary-view optimization, not a correctness input.
+            self.deferred
+                .write_globals(second.globals_offset, globals_bytes(&sv_globals))?;
+
+            // The inset renders at a modest square resolution; the composite scales it into the
+            // top-right backbuffer quadrant via a viewport rect.
+            let inset = (sw.min(sh) / 3).max(64);
+            let sv_extent = Extent2D::new(inset, inset);
+            let sv_albedo = graph.create_color("sv_g_albedo", GB_ALBEDO_FMT, sv_extent);
+            let sv_normal = graph.create_color("sv_g_normal", GB_NORMAL_FMT, sv_extent);
+            let sv_material = graph.create_color("sv_g_material", GB_MATERIAL_FMT, sv_extent);
+            let sv_position = graph.create_color("sv_g_position", GB_POSITION_FMT, sv_extent);
+            let sv_depth = graph.create_depth("sv_g_depth", sv_extent);
+            let sv_hdr = graph.create_color("sv_hdr", HDR_FORMAT, sv_extent);
+            let sv_gbuf = GBufferTargets {
+                albedo: sv_albedo,
+                normal: sv_normal,
+                material: sv_material,
+                position: sv_position,
+                depth: sv_depth,
+            };
+
+            // View-dependent chain for the second view, driven by THIS VIEW'S feature set (not a
+            // scattered `if second_view` — the descriptor decides). No TAAU → no jitter → no mip
+            // bias; the raster uses this view's stable (unjittered) view-projection.
+            let f = second.features;
+            // No TAAU → render on this view's stable (unjittered) grid, no upscale mip bias.
+            let sv_view_proj = if f.taau {
+                second.view_proj
+            } else {
+                second.view_proj_stable
+            };
+            let sv_mip_bias = if f.taau { self.taa_mip_bias } else { 0.0 };
+            // The secondary feature set clears `velocity`/`post`; those passes are skipped by
+            // construction. Consumed here so the descriptor — not a scattered flag — is the gate.
+            let _ = (f.velocity, f.post, second.jitter_uv);
+            self.deferred.record_gbuffer(
+                &mut graph,
+                sv_gbuf,
+                &scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                sv_view_proj,
+                self.ambient,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                sv_mip_bias,
+                false, // no depth pre-pass
+            );
+            // Lighting: shares the ONCE-rendered shadow atlas + IBL; screen-space GI/AO/reflection
+            // inputs are gated on THIS VIEW'S `screen_space_gi` feature (off for the secondary view →
+            // IBL+direct only), brute-force point lights (cluster = None). A future view that opts
+            // into `screen_space_gi` would produce + thread its own AO/GI targets here.
+            debug_assert!(
+                !f.screen_space_gi,
+                "secondary view has no screen-space GI targets"
+            );
+            self.deferred.record_lighting(
+                &mut graph,
+                sv_hdr,
+                sv_gbuf,
+                shadow_map,
+                None,
+                None,
+                None,
+                None,
+                None,
+                self.skyvis_tint,
+                self.skyvis_min_occ,
+                second.globals_offset,
+                self.flip_y,
+                !self.is_gallery,
+                u32::MAX, // static exposure (auto-exposure meter is a primary-view resource)
+                None,
+            );
+            // Composite the second view as a PiP inset. A tonemap pass that LOADS (does not clear)
+            // the backbuffer and restricts its draw to the top-right inset viewport rect, so the
+            // full-screen triangle only fills that quadrant over the already-composited main view.
+            let vp = rhi::Rect2D {
+                x: (sw.saturating_sub(inset + inset / 12)) as i32,
+                y: (inset / 12) as i32,
+                width: inset,
+                height: inset,
+            };
+            self.deferred.record_tonemap_inset(
                 &mut graph,
                 backbuffer,
-                particles_ext,
-                view_proj.to_cols_array(),
-                cam_right,
-                cam_up,
+                sv_hdr,
+                self.post_mode as u32,
+                self.flip_y,
+                1.0,
+                vp,
             );
         }
 
@@ -5526,6 +6491,15 @@ impl App {
         }
         self.prev_view_proj = view_proj.to_cols_array();
         self.prev_view_proj_taau = view_proj_stable.to_cols_array();
+        // Velocity (PR-2): stash this frame's per-object world transforms as next frame's prev pose
+        // (single source; stable draw-list order). Only when velocity is on (else no cost / no state
+        // churn). Uses the pre-skin transform for static/Spin draws; skinned draws carry identity
+        // here and their motion comes from the palette history instead.
+        if self.velocity_on {
+            self.prev_transforms.clear();
+            self.prev_transforms
+                .extend(scene.iter().map(|o| o.transform));
+        }
 
         // Inline present + capture readback. Threaded: the RHI thread did both (its
         // capture readback waits the same frame fence → byte-identical + deterministic).
@@ -5560,6 +6534,25 @@ impl App {
         self.fif = (self.fif + 1) % FRAMES_IN_FLIGHT;
         self.frame_no += 1;
 
+        // HZB cull stats (PR-8): read back the (survived, occlusion-culled) counters and
+        // log them periodically (and on the last screenshot frame). Frames-in-flight give
+        // this a small latency; it is a diagnostic, so a recent frame's numbers are fine.
+        if self.hzb_cull
+            && let Some(hzb) = self.hzb.as_ref()
+        {
+            let (survived, culled) = hzb.read_stats();
+            self.hzb_stats.set((survived, culled));
+            // Log periodically, and every frame once past the warmup in screenshot mode
+            // (so a capture run always prints the final numbers).
+            if self.frame_no.is_multiple_of(60) || (self.screenshot_mode && self.frame_no >= warmup)
+            {
+                println!(
+                    "[hzb] instances: {} total, {} survived, {} occlusion-culled",
+                    GRID_COUNT, survived, culled
+                );
+            }
+        }
+
         // Bridge the D3D12 debug layer into the log (it otherwise only reaches OutputDebugString).
         // Catches validation/threading violations — e.g. the Phase 15 M4 B3 RHI submit thread's
         // cross-thread queue submit / present. No-op on Vulkan (already bridged) / Metal.
@@ -5579,6 +6572,55 @@ impl App {
 }
 
 /// View the globals struct as bytes for upload.
+/// Deterministic stress-test point lights (PR-6 `TEST_LIGHTS=N`): a fixed cubic-ish grid of
+/// `n` lights filling the scene's bounding volume, with a fixed rotating palette and a finite
+/// influence radius so per-cluster culling actually excludes most of them per cluster. No time
+/// dependence — the layout is a pure function of (n, center, radius), so runs are reproducible
+/// and A/B comparable (brute-force vs clustered) at identical light sets.
+fn test_light_grid(n: u32, center: Vec3, radius: f32) -> Vec<ClusterLight> {
+    // Cube-root grid dimensions (as close to equal as possible), filling [-1,1]^3 of the scene
+    // bounds scaled up a bit so lights sit among the geometry.
+    let side = (n as f32).cbrt().ceil() as u32;
+    let extent = radius * 1.4;
+    // Per-light influence radius: a couple of grid cells so neighbours overlap but distant
+    // clusters cull the light. Independent of n's exact value (deterministic).
+    let cell = (2.0 * extent) / side.max(1) as f32;
+    let light_radius = cell * 1.5;
+    // Fixed candela so N lights of this radius stay visible but bounded.
+    let intensity = radius * radius * 2.0;
+    let palette = [
+        [1.0, 0.4, 0.3],
+        [0.3, 0.6, 1.0],
+        [0.5, 1.0, 0.4],
+        [1.0, 0.9, 0.4],
+        [0.8, 0.4, 1.0],
+    ];
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let gx = i % side;
+        let gy = (i / side) % side;
+        let gz = i / (side * side);
+        let f = |g: u32| -> f32 {
+            if side <= 1 {
+                0.0
+            } else {
+                (g as f32 / (side - 1) as f32) * 2.0 - 1.0
+            }
+        };
+        out.push(ClusterLight {
+            position: [
+                center.x + f(gx) * extent,
+                center.y + f(gy) * extent,
+                center.z + f(gz) * extent,
+            ],
+            radius: light_radius,
+            color: palette[(i as usize) % palette.len()],
+            intensity,
+        });
+    }
+    out
+}
+
 fn globals_bytes(g: &Globals) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(
