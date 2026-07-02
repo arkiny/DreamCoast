@@ -498,23 +498,58 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "atmosphere_fs",
     },
+    // PR-5 post-process nodes (docs/post-process-chain.md). The Phase-5 `blur.slang`
+    // demo (separable Gaussian) and the Phase-7 `post_compute.slang` 3x3 box-blur demo
+    // were removed here: neither was a real effect (blur.slang had no consumer;
+    // post_compute was a compute-graph demo, not bloom). They are superseded by the
+    // ordered post sequence below.
     Job {
-        src: "blur.slang",
+        src: "bloom.slang",
         entry: "vsMain",
         stage: "vertex",
-        key: "blur_vs",
+        key: "bloom_vs",
     },
     Job {
-        src: "blur.slang",
+        src: "bloom.slang",
+        entry: "fsPrefilter",
+        stage: "fragment",
+        key: "bloom_prefilter_fs",
+    },
+    Job {
+        src: "bloom.slang",
+        entry: "fsDownsample",
+        stage: "fragment",
+        key: "bloom_downsample_fs",
+    },
+    Job {
+        src: "bloom.slang",
+        entry: "fsUpsample",
+        stage: "fragment",
+        key: "bloom_upsample_fs",
+    },
+    Job {
+        src: "motion_blur.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "motion_blur_vs",
+    },
+    Job {
+        src: "motion_blur.slang",
         entry: "fsMain",
         stage: "fragment",
-        key: "blur_fs",
+        key: "motion_blur_fs",
     },
     Job {
-        src: "post_compute.slang",
-        entry: "csMain",
-        stage: "compute",
-        key: "post_compute_cs",
+        src: "dof.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "dof_vs",
+    },
+    Job {
+        src: "dof.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "dof_fs",
     },
     Job {
         src: "particle_sim.slang",
