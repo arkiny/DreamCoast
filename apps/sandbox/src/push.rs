@@ -1152,8 +1152,9 @@ pub(crate) fn taau_push(
     max_hist: f32,
     variance_gamma: f32,
     jitter_uv: [f32; 2],
-) -> [u8; 224] {
-    let mut pc = [0u8; 224];
+    velocity_index: u32,
+) -> [u8; 240] {
+    let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1184,6 +1185,9 @@ pub(crate) fn taau_push(
     // float4 jitter (xy = current jitter in UV) at the next 16-byte row.
     pc[208..212].copy_from_slice(&jitter_uv[0].to_le_bytes());
     pc[212..216].copy_from_slice(&jitter_uv[1].to_le_bytes());
+    // velocity target index (PR-2) at the next 16-byte row; 0xFFFFFFFF = absent (camera-only
+    // reprojection, byte-identical to the pre-velocity path).
+    pc[224..228].copy_from_slice(&velocity_index.to_le_bytes());
     pc
 }
 

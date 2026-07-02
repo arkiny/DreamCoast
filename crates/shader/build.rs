@@ -402,6 +402,40 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "gbuffer_decal_fs",
     },
+    // Velocity (motion-vector) G-buffer channel (pipeline re-baseline PR-2, opt-in
+    // `P_VELOCITY=1`): a separate opaque pass into an RG16Float target. Static + skinned +
+    // morphed vertex variants (prev-transform single source) share the one motion fragment;
+    // `csViz` colour-codes the target for DEBUG_VIEW=11.
+    Job {
+        src: "velocity.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "velocity_vs",
+    },
+    Job {
+        src: "velocity.slang",
+        entry: "vsMainSkinned",
+        stage: "vertex",
+        key: "velocity_skinned_vs",
+    },
+    Job {
+        src: "velocity.slang",
+        entry: "vsMainMorphed",
+        stage: "vertex",
+        key: "velocity_morphed_vs",
+    },
+    Job {
+        src: "velocity.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "velocity_fs",
+    },
+    Job {
+        src: "velocity.slang",
+        entry: "csViz",
+        stage: "compute",
+        key: "velocity_viz_cs",
+    },
     Job {
         src: "shadow.slang",
         entry: "vsMain",
