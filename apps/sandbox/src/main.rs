@@ -33,6 +33,7 @@ mod app;
 mod camera;
 mod clipmap;
 mod compose;
+mod csm;
 mod cull;
 mod deferred;
 mod fuse;
@@ -95,7 +96,11 @@ const GB_POSITION_FMT: Format = Format::Rgba16Float;
 /// Per-frame globals slice size (256-byte aligned for D3D12 root CBV / Vulkan
 /// dynamic UBO offset). 512 holds the lighting globals plus the light
 /// view-projection matrix.
-const GLOBALS_SLICE: u64 = 512;
+// One frame's globals slice. Bumped to 1024 (256-aligned for the D3D12 root CBV) to fit the
+// CSM cascade block (PR-7): up to 4 cascade view-projections + splits/tiles. The OFF path
+// leaves the new fields zeroed, so the shader takes the legacy single-map branch and the
+// gallery anchor is byte-identical.
+const GLOBALS_SLICE: u64 = 1024;
 /// Directional shadow map resolution (square).
 const SHADOW_SIZE: u32 = 2048;
 /// The ground plane's linear albedo — the single source of truth shared by the
@@ -247,6 +252,13 @@ struct Globals {
     probe_box_min: [f32; 4],    // xyz reflection proxy AABB min corner
     probe_box_max: [f32; 4],    // xyz reflection proxy AABB max corner
     prev_view_proj: [f32; 16],  // world -> previous clip (Stage C7 SSR history reprojection)
+    // --- PR-7 shadow atlas / CSM. All zero on the legacy single-map path (csm_params.x == 0),
+    // which makes the shader take the `light_view_proj` branch → byte-identical anchor.
+    csm_params: [i32; 4], // x cascade count (0 = off), y debug-cascade viz, z tile texels, w atlas texels
+    csm_split: [f32; 4],  // per-cascade view-space far distance (up to MAX_CASCADES)
+    csm_opts: [f32; 4],   // x cross-cascade blend fraction (of the cascade depth range)
+    csm_view_proj: [[f32; 16]; 4], // per-cascade world -> atlas-tile light clip
+    csm_atlas_uv: [[f32; 4]; 4], // per-cascade atlas UV sub-rect: xy offset, zw scale
 }
 
 fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
@@ -581,6 +593,12 @@ struct App {
     /// Soft-shadow blocker/PCF tap count, written to `globals.shadow.w` (RenderQuality knob).
     /// Only the soft path (softness > 0) reads it; the shader clamps to [1, 16].
     shadow_taps: u32,
+    /// PR-7 shadow atlas / CSM config (opt-in `CSM=1` / `CSM=<N>`). `enabled == false` is the
+    /// legacy single directional map — byte-identical anchor.
+    csm: csm::CsmConfig,
+    /// Cascade-index debug overlay: 1 tints each cascade's coverage by index so the split
+    /// boundaries are visible. Written to `globals.csm_params.y`. Off = 0.
+    csm_debug: bool,
     /// Active RenderQuality tier (Stage D). The single selector that seeded the knob defaults
     /// below; shown in the UI. Individual env vars still override per knob.
     quality: quality::RenderQuality,
@@ -2362,6 +2380,10 @@ impl App {
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(base.shadow_taps)
                 .clamp(1, 16),
+            // PR-7 CSM/atlas: opt-in via `CSM` (default off = legacy single map = anchor).
+            csm: csm::CsmConfig::from_env(),
+            // `CSM_DEBUG=1` overlays the per-cascade index color so splits are inspectable.
+            csm_debug: std::env::var("CSM_DEBUG").is_ok_and(|v| v != "0"),
             quality,
             override_material: false,
             metallic_override: 1.0,
@@ -3823,6 +3845,27 @@ impl App {
         };
         let light_vp = light_view_proj(sun_dir, shadow_center, self.scene_radius);
 
+        // PR-7 CSM: fit N cascades to the view frustum when the seam is on (single source of
+        // all shadow matrices/splits). The perspective params match the scene camera above
+        // (fov 60deg, near 0.05, far 100.0) so the cascades tile the depth range the view
+        // samples. Empty on the legacy path (byte-identical anchor).
+        let csm_slots = if self.csm.enabled {
+            csm::compute_cascades(
+                &self.csm,
+                &csm::ViewCamera {
+                    eye,
+                    target: focus,
+                    fov_y_rad: 60f32.to_radians(),
+                    aspect: cw as f32 / ch as f32,
+                    near: 0.05,
+                    far: 100.0,
+                },
+                sun_dir,
+            )
+        } else {
+            Vec::new()
+        };
+
         // Write this frame's globals slice.
         let globals = Globals {
             camera_pos: [eye.x, eye.y, eye.z, 0.0],
@@ -3867,6 +3910,43 @@ impl App {
             // Last frame's view-projection (updated end-of-frame) so the SSR history
             // sample reprojects the world hit point into the previous frame (Stage C7b).
             prev_view_proj: self.prev_view_proj,
+            // PR-7 CSM: filled from the fitted cascade slots when the seam is on; zero here =
+            // the legacy single-map path (the shader branches on csm_params.x == 0 → anchor).
+            csm_params: {
+                let atlas = self.csm.atlas_size as i32;
+                let tile = self.csm.tile_size() as i32;
+                [csm_slots.len() as i32, self.csm_debug as i32, tile, atlas]
+            },
+            csm_split: {
+                let mut s = [0.0f32; 4];
+                for (i, slot) in csm_slots.iter().take(4).enumerate() {
+                    s[i] = slot.split_far;
+                }
+                s
+            },
+            csm_opts: [self.csm.blend_frac, 0.0, 0.0, 0.0],
+            csm_view_proj: {
+                let mut m = [[0.0f32; 16]; 4];
+                for (i, slot) in csm_slots.iter().take(4).enumerate() {
+                    m[i] = slot.view_proj.to_cols_array();
+                }
+                m
+            },
+            csm_atlas_uv: {
+                // Per-cascade atlas UV sub-rect (xy offset, zw scale). The sampler maps the
+                // cascade clip → [0,1] tile UV → this sub-rect in the shared atlas texture.
+                let atlas = self.csm.atlas_size.max(1) as f32;
+                let mut uv = [[0.0f32; 4]; 4];
+                for (i, slot) in csm_slots.iter().take(4).enumerate() {
+                    uv[i] = [
+                        slot.rect.x as f32 / atlas,
+                        slot.rect.y as f32 / atlas,
+                        slot.rect.width as f32 / atlas,
+                        slot.rect.height as f32 / atlas,
+                    ];
+                }
+                uv
+            },
         };
         let globals_offset = fif as u64 * GLOBALS_SLICE;
         // Firefly clamp ceiling (raw radiance, max component). ~8 keeps diffuse + moderate
@@ -3958,7 +4038,15 @@ impl App {
         let g_material = graph.create_color("g_material", GB_MATERIAL_FMT, extent);
         let g_position = graph.create_color("g_position", GB_POSITION_FMT, extent);
         let g_depth = graph.create_depth("g_depth", extent);
-        let shadow_map = graph.create_depth("shadow_map", Extent2D::new(SHADOW_SIZE, SHADOW_SIZE));
+        // Shadow depth target. Legacy path: a single SHADOW_SIZE square map. CSM path: the
+        // atlas texture (CSM_ATLAS square, tiled into per-cascade slots). Same resource id
+        // feeds the lighting pass either way, so the sampling side re-wire is zero.
+        let shadow_map = if self.csm.enabled {
+            let s = self.csm.atlas_size;
+            graph.create_depth("shadow_atlas", Extent2D::new(s, s))
+        } else {
+            graph.create_depth("shadow_map", Extent2D::new(SHADOW_SIZE, SHADOW_SIZE))
+        };
         let hdr = graph.create_color("hdr", HDR_FORMAT, extent);
         // Phase 7: compute post writes the blurred HDR into a storage image that the
         // tonemap pass samples instead of the raw `hdr` target.
@@ -3976,9 +4064,15 @@ impl App {
         };
 
         // Deferred backbone (see `deferred.rs`): shadow -> gbuffer -> lighting (HDR),
-        // then the optional compute-post blur.
-        self.deferred
-            .record_shadow(&mut graph, shadow_map, &scene, light_vp);
+        // then the optional compute-post blur. CSM path fills the atlas (one tile per
+        // cascade via per-tile viewports); the legacy path fills the single directional map.
+        if self.csm.enabled {
+            self.deferred
+                .record_shadow_atlas(&mut graph, shadow_map, &scene, &csm_slots);
+        } else {
+            self.deferred
+                .record_shadow(&mut graph, shadow_map, &scene, light_vp);
+        }
         // TAA-aware texture LOD bias for the G-buffer texture fetches (Stage 7 + Stage 8). Two terms:
         //   1. log2(internal/output): the DLSS/FSR2 resolution term — at a reduced internal
         //      resolution the screen-space derivatives are ~2x larger and fetch blurry mips, so this
