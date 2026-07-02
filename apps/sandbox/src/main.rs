@@ -191,10 +191,14 @@ const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 /// One materialized drawable in the sample scene: a shared GPU mesh + world
 /// transform + resolved PBR material. Produced from the ECS draw list by
 /// [`registry::build_scene`]; consumed by the rasterizer, RT, and GDF passes.
+#[derive(Clone)]
 pub(crate) struct SceneObject {
     /// Shared uploaded geometry (vertex/index buffers + counts).
     pub(crate) mesh: std::rc::Rc<GpuMesh>,
     pub(crate) transform: Mat4,
+    /// World-space AABB (min, max) for frustum culling — the mesh local AABB transformed by
+    /// `transform` (computed in `build_scene`). Tested against the camera frustum planes.
+    pub(crate) world_aabb: [Vec3; 2],
     pub(crate) base_color: [f32; 4],
     pub(crate) metallic: f32,
     pub(crate) roughness: f32,
@@ -885,6 +889,11 @@ struct App {
     /// `reflect_skip_stagger` re-traces 1/K pixels each frame so nothing goes stale. Gallery-gated.
     reflect_skip: bool,
     reflect_skip_stagger: u32,
+    /// CPU frustum culling of the real scene's opaque G-buffer + pre-pass draws (docs/cull-lod-design.md
+    /// S1). Filters `scene[]` by the camera frustum before those passes — image-identical (a fully
+    /// outside-the-frustum object is clipped anyway; the AABB test never culls a visible one). Does NOT
+    /// cull the shadow pass (whole-scene light frustum) or the view-independent GDF passes. Gallery-off.
+    scene_cull: bool,
     /// Set whenever a frozen (settled) frame skips the ASYNC relight submit. The async path chains a
     /// binary semaphore frame-to-frame (`cache_done`); a gap consumes it, so the first relight after
     /// a freeze must use the no-wait (frame-0-style) submit to avoid waiting on a stale semaphore.
@@ -2822,6 +2831,7 @@ impl App {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(8),
+            scene_cull: !gallery_scene && quality::env_bool("SCENE_CULL", true),
             async_cache_gap: false,
             path_trace_pipeline,
             realtime_env: true,
@@ -4544,6 +4554,23 @@ impl App {
         // (empty for the single-level gallery). Bound before the graph so it outlives the
         // pass closures that borrow it.
         let scene_clip_vols = self.gdf.clip_level_volumes();
+        // S1 CPU frustum cull: the opaque G-buffer + pre-pass draws only need objects inside the
+        // camera frustum (culled ones are clipped anyway ⇒ image-identical). The cull matrix is the
+        // unjittered no-flip `cull_view_proj` (DX≡VK-stable). Shadow + view-independent GDF passes keep
+        // the full `scene`. Declared before the graph so it outlives the pass closures; zero-copy off.
+        let culled_scene: Option<Vec<SceneObject>> = if self.scene_cull {
+            let planes = frustum_planes(cull_view_proj);
+            Some(
+                scene
+                    .iter()
+                    .filter(|o| aabb_in_frustum(&planes, o.world_aabb[0], o.world_aabb[1]))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let opaque_scene: &[SceneObject] = culled_scene.as_deref().unwrap_or(&scene);
         let mut graph = RenderGraph::new();
         // The backbuffer is the actual swapchain image (display extent); tonemap samples the
         // render-extent HDR by UV, so a render≠display extent just means a downscale at present.
@@ -4614,7 +4641,7 @@ impl App {
             self.deferred.record_prepass(
                 &mut graph,
                 g_depth,
-                &scene,
+                opaque_scene,
                 &self.ground_vbuf,
                 &self.ground_ibuf,
                 self.ground_count,
@@ -4628,7 +4655,7 @@ impl App {
         self.deferred.record_gbuffer(
             &mut graph,
             gbuf,
-            &scene,
+            opaque_scene,
             &self.ground_vbuf,
             &self.ground_ibuf,
             self.ground_count,
@@ -6809,6 +6836,24 @@ fn parse_vec3_env(name: &str) -> Option<Vec3> {
     let v = std::env::var(name).ok()?;
     let n: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
     (n.len() == 3).then(|| Vec3::new(n[0], n[1], n[2]))
+}
+
+/// Conservative AABB-vs-frustum test (Gribb-Hartmann planes from `frustum_planes`, inside ⇒
+/// `n·p + d ≥ 0`). Returns `false` only when the AABB is fully outside one plane (safe to cull);
+/// never culls a visible object, so frustum culling on this stays image-identical.
+fn aabb_in_frustum(planes: &[[f32; 4]; 6], mn: Vec3, mx: Vec3) -> bool {
+    for pl in planes {
+        // The AABB corner farthest along the plane normal (+n); if even it is outside, all are.
+        let pv = Vec3::new(
+            if pl[0] >= 0.0 { mx.x } else { mn.x },
+            if pl[1] >= 0.0 { mx.y } else { mn.y },
+            if pl[2] >= 0.0 { mx.z } else { mn.z },
+        );
+        if pl[0] * pv.x + pl[1] * pv.y + pl[2] * pv.z + pl[3] < 0.0 {
+            return false;
+        }
+    }
+    true
 }
 
 fn light_view_proj(sun_dir: [f32; 3], center: Vec3, radius: f32) -> Mat4 {

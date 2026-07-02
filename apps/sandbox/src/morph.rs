@@ -227,6 +227,8 @@ fn build_cpu_mesh(
             ibuf,
             index_count,
             vertex_count: prim.vertices.len() as u32,
+            // Morph targets deform on the GPU (bounds vary per frame); never frustum-cull them.
+            local_aabb: [[-1.0e9; 3], [1.0e9; 3]],
         }));
     }
     Ok(CpuMorphMesh {
