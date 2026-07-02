@@ -371,6 +371,27 @@ impl MetalCommandBuffer {
         }
     }
 
+    /// Set the viewport + scissor to an arbitrary sub-rect of the bound target
+    /// (shadow-atlas tiling: each cascade / light slot renders into its own tile).
+    pub fn set_viewport_scissor_rect(&self, rect: Rect2D) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            enc.setViewport(MTLViewport {
+                originX: rect.x as f64,
+                originY: rect.y as f64,
+                width: rect.width as f64,
+                height: rect.height as f64,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+            enc.setScissorRect(MTLScissorRect {
+                x: rect.x as usize,
+                y: rect.y as usize,
+                width: rect.width as usize,
+                height: rect.height as usize,
+            });
+        }
+    }
+
     // ---- Offscreen render targets / MRT / shadow / cubemaps (M4) -----------
 
     /// Begin rendering into one offscreen color target (+ optional depth). `depth_clear`
