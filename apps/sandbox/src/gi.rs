@@ -322,6 +322,7 @@ impl GiSystem {
         aabb_max: [f32; 3],
         sun_dir: [f32; 3],
         sun_intensity: f32,
+        sky_gain: f32,
         clip: (u32, u32),
         clip_vols: &'a [&'a Volume],
         albedo: Option<(&'a [Volume; 3], ResourceId)>,
@@ -403,9 +404,9 @@ impl GiSystem {
                     clip.0,
                     clip.1,
                     spp as f32,
-                    diag,  // ray max distance = scene diagonal
-                    0.4,   // sky fill radiance
-                    alpha, // EMA alpha
+                    diag,     // ray max distance = scene diagonal
+                    sky_gain, // sky gain -> procedural_sky fill at bounce hits (was flat 0.4)
+                    alpha,    // EMA alpha
                     ground_albedo,
                     diag * 0.01, // surface bias
                 ));
