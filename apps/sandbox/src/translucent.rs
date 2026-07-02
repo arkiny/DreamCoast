@@ -129,7 +129,10 @@ impl TranslucencySystem {
         globals_buffer: &'a Buffer,
         globals_offset: u64,
         flip_y: u32,
-        shadow_map: ResourceId,
+        // Shadow source, mirroring `record_lighting`: `shadow_map` = in-graph transient depth,
+        // `shadow_override` = app-owned persistent depth's bindless index (cached-shadow path).
+        shadow_map: Option<ResourceId>,
+        shadow_override: Option<u32>,
     ) {
         if objects.is_empty() {
             return;
@@ -152,10 +155,13 @@ impl TranslucencySystem {
                 // `None` clear = LOAD the finished opaque/fog HDR (blend over it).
                 colors: vec![(hdr, None)],
                 depth: Some(depth), // depth-test only (pipeline has depth-write off)
-                reads: vec![shadow_map],
+                reads: shadow_map.into_iter().collect(),
             },
             move |ctx| {
-                let shadow_index = ctx.sampled_index(shadow_map);
+                let shadow_index = match shadow_override {
+                    Some(idx) => idx,
+                    None => ctx.sampled_index(shadow_map.expect("shadow_map or shadow_override")),
+                };
                 let cmd = ctx.cmd();
                 cmd.set_globals(globals_buffer, globals_offset);
                 cmd.bind_graphics_pipeline(pipeline);

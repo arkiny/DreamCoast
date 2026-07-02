@@ -23,9 +23,9 @@ use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
 use dreamcoast_render::{GraphProfiler, PassInfo, RenderGraph, ResourceId, ResourcePool};
 use rhi::{
-    BackendKind, Buffer, BufferDesc, BufferUsage, CommandBuffer, CommandList, ComputeQueue, Device,
-    Extent2D, Fence, Format, Instance, InstanceDesc, PresentMode, QueryHeap, Queue, ReadbackLayout,
-    Recorder, Semaphore, Swapchain, SwapchainDesc, Texture,
+    BackendKind, Buffer, BufferDesc, BufferUsage, CommandBuffer, CommandList, ComputeQueue,
+    DepthBuffer, Device, Extent2D, Fence, Format, Instance, InstanceDesc, PresentMode, QueryHeap,
+    Queue, ReadbackLayout, Recorder, Semaphore, Swapchain, SwapchainDesc, Texture,
 };
 use tracing::info;
 
@@ -884,6 +884,20 @@ struct App {
     cache_stable_frames: u32,
     cache_settle_frames: u32,
     cache_dirty_skip: bool,
+    /// Cached shadow map (docs/shadow-cache-cold-start.md S1). The legacy directional shadow map is
+    /// camera-independent (`light_view_proj` reads only sun + scene bounds), so when the sun and
+    /// geometry are unchanged its re-raster reproduces a bit-identical depth. We render it into an
+    /// **app-owned persistent** depth (one per frame-in-flight, so a moving sun's every-frame write
+    /// never races the previous frame's read) OUTSIDE the render graph, then freeze — skip the
+    /// re-render once `shadow_epoch` (sun + scene bounds, NOT the camera) has held steady past
+    /// `shadow_settle_frames` — and the lighting pass re-samples the persistent depth by bindless
+    /// index. Survives arbitrary camera motion (the VSM benefit); invalidates on sun/geometry
+    /// change. Gallery-gated off (byte-identical anchor); CSM keeps the in-graph transient.
+    shadow_depth: Vec<DepthBuffer>,
+    shadow_epoch: u64,
+    shadow_stable_frames: u32,
+    shadow_settle_frames: u32,
+    shadow_dirty_skip: bool,
     /// A3 adaptive temporal reflect skip: reuse gdf_reflect's converged radiance for pixels whose
     /// surface is unchanged (host enables the reuse only once lighting + surface cache are stable).
     /// `reflect_skip_stagger` re-traces 1/K pixels each frame so nothing goes stale. Gallery-gated.
@@ -2485,6 +2499,10 @@ impl App {
         // (scheduled passes + 1) boundaries with headroom (Phase 9 M1).
         const MAX_QUERIES: u32 = 32;
         let mut query_heaps = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        // Cached-shadow (S1) persistent depth: one app-owned SHADOW_SIZE depth per frame-in-flight
+        // (sampleable), rendered OUTSIDE the graph like the IBL env capture. Per-FIF so a moving
+        // sun's write on frame N doesn't clobber the depth frame N-1's lighting is still sampling.
+        let mut shadow_depth = Vec::with_capacity(FRAMES_IN_FLIGHT);
         for _ in 0..FRAMES_IN_FLIGHT {
             command_buffers.push(device.create_command_buffer()?);
             image_available.push(device.create_semaphore()?);
@@ -2493,6 +2511,9 @@ impl App {
             compute_done.push(device.create_semaphore()?);
             cache_compute_fence.push(device.create_fence(true)?);
             query_heaps.push(device.create_query_heap(MAX_QUERIES)?);
+            let sd = device.create_depth_buffer(Extent2D::new(SHADOW_SIZE, SHADOW_SIZE))?;
+            sd.set_name("shadow_cache_depth");
+            shadow_depth.push(sd);
         }
         // QHD/UHD track: parse the offscreen render-extent override (`RENDER_RES=WxH`).
         let render_res = std::env::var("RENDER_RES").ok().and_then(|s| {
@@ -2823,6 +2844,21 @@ impl App {
             // Default-on for content; gallery byte-anchor keeps every-frame relight. `P_CACHE_DIRTY_SKIP=0`
             // forces the legacy always-relight path (perf A/B + the fast-motion worst case).
             cache_dirty_skip: !gallery_scene && quality::env_bool("P_CACHE_DIRTY_SKIP", true),
+            shadow_depth,
+            shadow_epoch: 0,
+            shadow_stable_frames: 0,
+            // The cached legacy map is EXACT the first frame after any change (no EMA to converge,
+            // unlike the surface cache) — a small settle only guards ordering. It is floored to
+            // FRAMES_IN_FLIGHT at the skip site so every per-FIF persistent depth is primed before
+            // any freeze. `P_SHADOW_SETTLE` overrides.
+            shadow_settle_frames: std::env::var("P_SHADOW_SETTLE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(FRAMES_IN_FLIGHT as u32),
+            // Default-on for content; gallery keeps the every-frame in-graph raster (byte-identical
+            // anchor). `P_SHADOW_DIRTY_SKIP=0` forces the legacy always-render path (perf A/B + the
+            // image-identical gate).
+            shadow_dirty_skip: !gallery_scene && quality::env_bool("P_SHADOW_DIRTY_SKIP", true),
             reflect_skip: !gallery_scene && quality::env_bool("P_REFLECT_SKIP", true),
             // Staggered re-trace floor: 1/K pixels re-march each frame even when "converged", so any
             // un-modeled change (future dynamic content) can't stay stale longer than K frames. K=0
@@ -4308,6 +4344,61 @@ impl App {
         };
         let light_vp = light_view_proj(sun_dir, shadow_center, self.scene_radius);
 
+        // --- Cached shadow map (docs/shadow-cache-cold-start.md S1) -----------------------------
+        // The legacy directional map is camera-independent, so render it into an app-owned
+        // persistent depth (per-FIF) OUTSIDE the render graph — mirroring the IBL env capture — and
+        // freeze the re-render while the sun + geometry are unchanged; the lighting pass then
+        // re-samples the persistent depth by bindless index (survives arbitrary camera motion).
+        // CSM (camera-fit cascades) and the gallery keep the in-graph transient path.
+        let use_shadow_cache = !self.csm.enabled && self.shadow_dirty_skip;
+        let mut shadow_cache_index: Option<u32> = None;
+        if use_shadow_cache {
+            // Epoch = everything the legacy map depends on, NOT the camera. Hash `sun_dir`
+            // bit-identically to the A2 surface-cache epoch (same FNV mix) so both caches
+            // invalidate on the same frame a sun change lands.
+            let mut epoch = 0xcbf29ce484222325u64;
+            let mut mix = |v: u32| {
+                epoch = epoch.wrapping_mul(0x100_0000_01b3).wrapping_add(v as u64);
+            };
+            for b in sun_dir.iter() {
+                mix(b.to_bits());
+            }
+            for c in [
+                shadow_center.x,
+                shadow_center.y,
+                shadow_center.z,
+                self.scene_radius,
+            ] {
+                mix(c.to_bits());
+            }
+            mix(self.shadows_on as u32);
+            if epoch == self.shadow_epoch {
+                self.shadow_stable_frames = self.shadow_stable_frames.saturating_add(1);
+            } else {
+                self.shadow_epoch = epoch;
+                self.shadow_stable_frames = 0;
+            }
+            // A skinned / morph caster's depth changes every frame → that scene never freezes
+            // (correct by construction; it re-renders each frame). Fully static scenes freeze once
+            // every per-FIF depth is primed (settle floored to FRAMES_IN_FLIGHT below).
+            let has_dynamic_caster = scene
+                .iter()
+                .any(|o| o.casts_shadow && (o.skin.is_some() || o.morph.is_some()));
+            let settle = self.shadow_settle_frames.max(FRAMES_IN_FLIGHT as u32);
+            let settled = !has_dynamic_caster && self.shadow_stable_frames >= settle;
+            let depth = &self.shadow_depth[fif];
+            if !settled {
+                // Re-raster the caster set from the sun's POV into the app-owned depth; the depth
+                // persists, so a later settled frame re-samples this exact map bit-for-bit.
+                self.deferred
+                    .record_shadow_direct(capture_rec, depth, &scene, light_vp);
+            }
+            // Make the persistent depth shader-readable for this frame's lighting pass; on a skipped
+            // frame it already holds last frame's depth (no writer ⇒ unchanged).
+            capture_rec.depth_to_sampled(depth);
+            shadow_cache_index = Some(depth.bindless_index());
+        }
+
         // PR-7 CSM: fit N cascades to the view frustum when the seam is on (single source of
         // all shadow matrices/splits). The perspective params match the scene camera above
         // (fov 60deg, near 0.05, far 100.0) so the cascades tile the depth range the view
@@ -4583,11 +4674,15 @@ impl App {
         // Shadow depth target. Legacy path: a single SHADOW_SIZE square map. CSM path: the
         // atlas texture (CSM_ATLAS square, tiled into per-cascade slots). Same resource id
         // feeds the lighting pass either way, so the sampling side re-wire is zero.
-        let shadow_map = if self.csm.enabled {
+        let shadow_map: Option<ResourceId> = if use_shadow_cache {
+            // Cached path: the map is an app-owned persistent depth rendered out-of-graph above,
+            // so there is no in-graph shadow resource this frame.
+            None
+        } else if self.csm.enabled {
             let s = self.csm.atlas_size;
-            graph.create_depth("shadow_atlas", Extent2D::new(s, s))
+            Some(graph.create_depth("shadow_atlas", Extent2D::new(s, s)))
         } else {
-            graph.create_depth("shadow_map", Extent2D::new(SHADOW_SIZE, SHADOW_SIZE))
+            Some(graph.create_depth("shadow_map", Extent2D::new(SHADOW_SIZE, SHADOW_SIZE)))
         };
         let hdr = graph.create_color("hdr", HDR_FORMAT, extent);
         let gbuf = GBufferTargets {
@@ -4601,12 +4696,22 @@ impl App {
         // Deferred backbone (see `deferred.rs`): shadow -> gbuffer -> lighting (HDR),
         // then the optional compute-post blur. CSM path fills the atlas (one tile per
         // cascade via per-tile viewports); the legacy path fills the single directional map.
-        if self.csm.enabled {
-            self.deferred
-                .record_shadow_atlas(&mut graph, shadow_map, &scene, &csm_slots);
+        if use_shadow_cache {
+            // Rendered out-of-graph into the app-owned persistent depth above (nothing here).
+        } else if self.csm.enabled {
+            self.deferred.record_shadow_atlas(
+                &mut graph,
+                shadow_map.expect("csm atlas resource"),
+                &scene,
+                &csm_slots,
+            );
         } else {
-            self.deferred
-                .record_shadow(&mut graph, shadow_map, &scene, light_vp);
+            self.deferred.record_shadow(
+                &mut graph,
+                shadow_map.expect("legacy shadow resource"),
+                &scene,
+                light_vp,
+            );
         }
         // TAA-aware texture LOD bias for the G-buffer texture fetches (Stage 7 + Stage 8). Two terms:
         //   1. log2(internal/output): the DLSS/FSR2 resolution term — at a reduced internal
@@ -5486,6 +5591,7 @@ impl App {
             hdr,
             gbuf,
             shadow_map,
+            shadow_cache_index,
             gdf_ao_out,
             ssao_out,
             gdf_gi_out,
@@ -5585,6 +5691,7 @@ impl App {
             globals_offset,
             self.flip_y,
             shadow_map,
+            shadow_cache_index,
         );
 
         // PR-5 (render-pipeline re-baseline track): the ordered post-process chain begins
@@ -6410,6 +6517,7 @@ impl App {
                 sv_hdr,
                 sv_gbuf,
                 shadow_map,
+                shadow_cache_index,
                 None,
                 None,
                 None,
