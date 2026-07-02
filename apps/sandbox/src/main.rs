@@ -739,6 +739,11 @@ struct App {
     /// samples a multibounce-propagating world volume instead of a single-bounce ray march — the
     /// real fix for deep-interior darkness. Content-only (`P_GI_VOLUME`); gallery forced off.
     gi_volume: bool,
+    /// Amortize the view-independent DDGI volume update over N frames (`P_GI_VOLUME_PERIOD`): update
+    /// 1 frame in N, the rest bind the persistent last-updated volume (the multibounce EMA carries
+    /// it). `1` = every frame (byte-identical default). Higher = cheaper `gi_volume` (the VK
+    /// view-independent floor), slower GI convergence — fine for a mostly-static world.
+    gi_volume_period: u64,
     /// 레퍼런스식 indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
     /// directional sky-visibility): neutral leak fraction (`P_SKYVIS_TINT`) + min-occlusion floor
     /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
@@ -2722,6 +2727,11 @@ impl App {
             gdf_gi,
             hwrt_gi,
             gi_volume,
+            gi_volume_period: std::env::var("P_GI_VOLUME_PERIOD")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1)
+                .max(1),
             skyvis_tint,
             skyvis_min_occ,
             height_fog,
@@ -4926,7 +4936,13 @@ impl App {
                 // 레퍼런스 엔진 GI-fidelity: update + bind the world irradiance volume (DDGI-lite). The update
                 // propagates last frame's volume into hits (multibounce), so deep interiors fill in
                 // over frames. When bound, the GI pass samples the volume instead of marching.
-                let gi_volume_arg = if self.gi_volume {
+                let gi_volume_arg = if self.gi_volume && self.frame_no % self.gi_volume_period != 0 {
+                    // Amortized skip: bind the persistent last-updated DDGI volume (the multibounce
+                    // EMA carries it); import_external orders the GI sample after it with no write.
+                    self.gi.gi_volume_sampled().map(|(rad_base, skyvis_base)| {
+                        (rad_base, skyvis_base, graph.import_external("gi_volume_w"))
+                    })
+                } else if self.gi_volume {
                     self.gi
                         .record_gi_volume(
                             &mut graph,
@@ -6496,7 +6512,9 @@ impl App {
             self.gdf.advance_cache();
         }
         // 레퍼런스 엔진 GI-fidelity: advance the world irradiance volume ping-pong (next frame reads this).
-        if self.gi_volume {
+        // Only on frames we actually updated the volume (amortization: skipped frames keep reading
+        // the same last-written slot, so the ping-pong must not advance past it).
+        if self.gi_volume && self.frame_no % self.gi_volume_period == 0 {
             self.gi.advance_gi_volume();
         }
         // QHD/UHD TAAU: advance the history ping-pong (next frame reprojects this frame's).
