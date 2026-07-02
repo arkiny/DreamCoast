@@ -880,6 +880,11 @@ struct App {
     cache_stable_frames: u32,
     cache_settle_frames: u32,
     cache_dirty_skip: bool,
+    /// A3 adaptive temporal reflect skip: reuse gdf_reflect's converged radiance for pixels whose
+    /// surface is unchanged (host enables the reuse only once lighting + surface cache are stable).
+    /// `reflect_skip_stagger` re-traces 1/K pixels each frame so nothing goes stale. Gallery-gated.
+    reflect_skip: bool,
+    reflect_skip_stagger: u32,
     /// Set whenever a frozen (settled) frame skips the ASYNC relight submit. The async path chains a
     /// binary semaphore frame-to-frame (`cache_done`); a gap consumes it, so the first relight after
     /// a freeze must use the no-wait (frame-0-style) submit to avoid waiting on a stale semaphore.
@@ -2809,6 +2814,14 @@ impl App {
             // Default-on for content; gallery byte-anchor keeps every-frame relight. `P_CACHE_DIRTY_SKIP=0`
             // forces the legacy always-relight path (perf A/B + the fast-motion worst case).
             cache_dirty_skip: !gallery_scene && quality::env_bool("P_CACHE_DIRTY_SKIP", true),
+            reflect_skip: !gallery_scene && quality::env_bool("P_REFLECT_SKIP", true),
+            // Staggered re-trace floor: 1/K pixels re-march each frame even when "converged", so any
+            // un-modeled change (future dynamic content) can't stay stale longer than K frames. K=0
+            // disables the floor (max skip). `P_REFLECT_SKIP_STAGGER` overrides.
+            reflect_skip_stagger: std::env::var("P_REFLECT_SKIP_STAGGER")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(8),
             async_cache_gap: false,
             path_trace_pipeline,
             realtime_env: true,
@@ -4509,6 +4522,17 @@ impl App {
         if self.swrt_reflect && self.reflect.has_reflect_temporal() {
             self.reflect.prepare_reflect_accum(&self.device, cw, ch)?;
         }
+        // A3: (re)allocate the adaptive-skip ping-pong at the gdf_reflect TRACE extent (half-res when
+        // reflect_half_res). Divisor mirrors the record path (rdiv=1 when full-res).
+        if self.swrt_reflect && self.reflect_skip && self.reflect.has_gdf_reflect() {
+            let rdiv = if self.reflect_half_res {
+                self.reflect_res_div.max(1)
+            } else {
+                1
+            };
+            self.reflect
+                .prepare_reflect_skip(&self.device, cw.div_ceil(rdiv), ch.div_ceil(rdiv))?;
+        }
         // QHD/UHD TAAU: (re)allocate the full-res (output) history.
         if taau_active {
             self.taau.prepare(&self.device, sw, sh, 0)?;
@@ -5308,6 +5332,24 @@ impl App {
                     &scene_clip_vols,
                     self.reflect_max_steps,
                     self.gdf_cone_k,
+                    {
+                        // A3: prime the skip buffer every frame (write); enable REUSE (read) only once
+                        // the lighting + surface cache are stable, so a reused pixel equals a fresh
+                        // trace (image-identical). Camera motion is handled per-pixel by the world-pos
+                        // gate in-shader. Sentinels when the feature/buffers are off.
+                        let stable = self.scene_cache_captured
+                            && !cache_reset_this_frame
+                            && self.cache_stable_frames >= self.cache_settle_frames;
+                        match (self.reflect_skip, self.reflect.reflect_skip_indices()) {
+                            (true, Some((r, w))) => [
+                                if stable { r } else { u32::MAX },
+                                w,
+                                self.reflect_skip_stagger,
+                                self.frame_no as u32,
+                            ],
+                            _ => [u32::MAX; 4],
+                        }
+                    },
                 );
                 let gdf_refl = if refl_half {
                     self.gi.record_upsample(
@@ -5932,6 +5974,7 @@ impl App {
                 &scene_clip_vols,
                 self.reflect_max_steps,
                 self.gdf_cone_k,
+                [u32::MAX; 4], // viz path: no adaptive skip
             )),
             _ => None,
         };
@@ -6016,6 +6059,7 @@ impl App {
                     &scene_clip_vols,
                     self.reflect_max_steps,
                     self.gdf_cone_k,
+                    [u32::MAX; 4], // standalone viz: no adaptive skip
                 );
                 // Standalone viz: no temporal resolve buffers here, so feed the GDF reflection
                 // straight into the composite (the resolve runs only in the lighting-fed path).
@@ -6581,6 +6625,10 @@ impl App {
         // C8j: advance the stochastic GDF-reflection temporal accumulation ping-pong.
         if self.swrt_reflect && self.reflect.has_reflect_temporal() {
             self.reflect.advance_reflect_accum();
+        }
+        // A3: advance the adaptive-skip ping-pong (next frame's reuse reads this frame's write).
+        if self.swrt_reflect && self.reflect_skip && self.reflect.has_reflect_skip() {
+            self.reflect.advance_reflect_skip();
         }
         // C8b2: advance the surface-cache radiance ping-pong (next frame reads this frame's).
         // Frozen (settled) frames skipped the relight, so DON'T advance — keep consumers pinned to

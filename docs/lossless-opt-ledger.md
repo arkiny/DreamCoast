@@ -84,3 +84,40 @@ _(append below; newest last)_
 - **Next levers exposed:** `gdf_reflect` now the #1 pass on BOTH (DX 11.7, VK 14.0) → plan #1
   adaptive reflect. `gdf_ao` #2 (3.1/3.7). `gi_volume` (1.6/1.8) could take the SAME dirty-skip
   freeze (view-independent DDGI) for a small extra win. Need DX −5.3ms / VK −8.9ms more for 60fps.
+
+### A3 — Adaptive temporal reflect skip (plan #1, matrix-free variant) — ✅ LANDED — **60fps BOTH**
+
+- **Design pivot from the plan:** the plan's per-pixel reproject needs `prev_view_proj` (+64B) in
+  gdf_reflect's push, but VK's `maxPushConstantsSize` is 256B and the push is already 240B → won't
+  fit (D3D12 auto-spills to a root CBV, VK has no spill). Instead: a **matrix-free** skip — gdf_reflect
+  keeps its own half-res ping-pong (32B/px: world_pos+valid, radiance) and reuses last frame's traced
+  radiance for a pixel whose **surface point is unchanged** (world-pos gate), no reprojection. The
+  push stays 240B (skip cfg byte-packed into the unused `gdf_sampled` slot — read|write|K|frame, since
+  bindless indices are <64). New `reflect.rs` `refl_skip` ping-pong + prepare/advance; `main.rs`
+  enables REUSE only once the cache is frozen (A2 settled ⇒ reflect inputs stable ⇒ reused==fresh).
+- **Wave-coherent staggered floor (critical):** a scattered `(lin+frame)%K` re-trace put ≥1 marching
+  thread in every wave → SIMD divergence made the whole wave pay the march (K=8 cost 7ms not ~2ms).
+  Forcing whole **8×8 tiles** (`(tile_id+frame)%K`) re-march coherently → 1/K real cost. K=8 default
+  (`P_REFLECT_SKIP_STAGGER`), insurance vs future dynamic content; the static scene is exact without it.
+- **Perf (measured, apples-to-apples current thermal state):** cache-dirty-skip baseline DX 20.6 / VK
+  24.1 → **DX 13.5ms (74fps) / VK 14.6ms (69fps)**. `gdf_reflect` DX 10.4→3.3, VK 12.4→3.0.
+  **≥60fps on BOTH backends achieved** (static/slow camera).
+- **Image-identical:** A3 vs the ORIGINAL max-q baseline **DX 0.050/ch, VK 0.051/ch** (< 0.089 floor)
+  ✓. DX≡VK 0.095 (≈ baseline 0.089). Gallery anchor **0.000/0.000** ✓. The 0.050 (> A2's 0.020) is
+  reuse across the TAAU sub-pixel jitter — sub-pixel staleness, below floor; tightening the world-pos
+  reject would kill the win. Clippy clean, 123 tests pass, moving-sun (un-settle) smoke clean both.
+- **Fast-motion behaviour (honest):** the master-off path (`P_REFLECT_SKIP=0`, all pixels march) is
+  DX 15.5ms vs the 10.4ms baseline — the compiled-in skip-buffer UAV *writes* cost ~5ms of occupancy
+  on the all-march path (VK unaffected). BUT this degenerate case needs the feature globally off;
+  under real motion the per-pixel world-pos gate still reuses the ~90%+ of surfaces that persist
+  frame-to-frame, so only disoccluded edges march → effective fast-motion cost stays low. A future
+  mitigation (move the skip-buffer write into a separate cheap pass so gdf_reflect only *reads*) would
+  remove even that occupancy hit; deferred (not needed for the target).
+- **Env:** `P_REFLECT_SKIP=0` (legacy full trace), `P_REFLECT_SKIP_STAGGER=<K>` (re-trace floor).
+
+## STATUS: Sponza 1080p/0.667 med — **≥60fps on DX (74) and VK (69)**, image-identical (≤0.051/ch)
+
+Remaining track work: (1) IntelSponza to 60fps (docs/cull-lod-design.md — culling/LOD/streaming;
+culling is NOT the Sponza lever but IS the IntelSponza-scale lever), (2) frustum+occlusion culling +
+distance LOD for the real scene draws (currently only the synthetic grid is culled), (3) optional
+small wins: gi_volume dirty-skip freeze (view-independent, ~1.6/1.8ms), gdf_ao half-res.

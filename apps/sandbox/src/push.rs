@@ -1546,6 +1546,11 @@ pub(crate) fn gdf_reflect_push(
     ground_albedo: [f32; 3],
     max_steps: u32,
     cone_k: f32,
+    // Adaptive temporal skip (docs/lossless-opt-ledger.md A3): (skip_read, skip_write, k_stagger,
+    // real_frame). skip_read/write = 0xFFFFFFFF sentinel disables reuse/write (gallery + viz paths).
+    // Byte-packed into the unused `gdf_sampled` slot to keep the block at 240 B — growing it to 256 B
+    // would push it over the D3D12 64-DWORD root budget (CBV spill = ~4ms on the reflect pass).
+    skip: [u32; 4],
 ) -> [u8; 240] {
     let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -1561,7 +1566,14 @@ pub(crate) fn gdf_reflect_push(
     pc[92..96].copy_from_slice(&sun_intensity.to_le_bytes());
     pc[96..100].copy_from_slice(&depth_index.to_le_bytes());
     pc[100..104].copy_from_slice(&normal_index.to_le_bytes());
-    pc[104..108].copy_from_slice(&gdf_sampled.to_le_bytes());
+    // A3 skip, byte-packed (reuses the unused `gdf_sampled` slot; `gdf_sampled` is ignored by the
+    // shader). Bindless indices are < 64 (STORAGE_BUFFER_COUNT), so read/write fit in a byte with
+    // 0xFF as the "disabled" sentinel; K < 256; frame is taken mod 256 (the stagger rotates 1/K).
+    let _ = gdf_sampled;
+    let pack = |v: u32| if v == u32::MAX { 0xFFu32 } else { v & 0xFF };
+    let skip_packed =
+        pack(skip[0]) | (pack(skip[1]) << 8) | ((skip[2] & 0xFF) << 16) | ((skip[3] & 0xFF) << 24);
+    pc[104..108].copy_from_slice(&skip_packed.to_le_bytes());
     pc[108..112].copy_from_slice(&out_index.to_le_bytes());
     pc[112..116].copy_from_slice(&width.to_le_bytes());
     pc[116..120].copy_from_slice(&height.to_le_bytes());

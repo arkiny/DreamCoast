@@ -32,6 +32,14 @@ pub(crate) struct ReflectSystem {
     refl_pos: [Option<StorageBuffer>; 2],
     refl_accum_extent: (u32, u32),
     refl_accum_frame: u32,
+    /// A3 adaptive temporal skip (docs/lossless-opt-ledger.md): a half-res ping-pong (32 B/px —
+    /// float4 world_pos+valid, float4 traced radiance) at the gdf_reflect trace extent. gdf_reflect
+    /// reuses last frame's radiance for a pixel whose surface point is unchanged (world-pos gate),
+    /// skipping the sphere-march. Separate from `refl_accum` (which is full-res, tonemap-space, and
+    /// owned by reflect_temporal) because the trace runs half-res.
+    refl_skip: [Option<StorageBuffer>; 2],
+    refl_skip_extent: (u32, u32),
+    refl_skip_frame: u32,
     /// C7b lit-color history: ping-pong byte-address storage buffers (float4/pixel, rgb =
     /// raw radiance, a = 1), (re)allocated to the render extent. The SSR reads the previous
     /// frame's buffer (reprojected); the copy pass writes this frame's.
@@ -138,6 +146,9 @@ impl ReflectSystem {
             refl_pos: [None, None],
             refl_accum_extent: (0, 0),
             refl_accum_frame: 0,
+            refl_skip: [None, None],
+            refl_skip_extent: (0, 0),
+            refl_skip_frame: 0,
             lit_hist: [None, None],
             lit_hist_extent: (0, 0),
             lit_hist_frame: 0,
@@ -219,6 +230,52 @@ impl ReflectSystem {
 
     pub(crate) fn advance_reflect_accum(&mut self) {
         self.refl_accum_frame = self.refl_accum_frame.saturating_add(1);
+    }
+
+    pub(crate) fn has_reflect_skip(&self) -> bool {
+        self.refl_skip[0].is_some()
+    }
+
+    /// A3: (re)allocate the half-res adaptive-skip ping-pong at the gdf_reflect trace extent
+    /// (`rw`×`rh`). No-op without the GDF reflect pipeline. Resets the ping-pong on a resize.
+    pub(crate) fn prepare_reflect_skip(
+        &mut self,
+        device: &Device,
+        rw: u32,
+        rh: u32,
+    ) -> anyhow::Result<()> {
+        if self.reflect_pipeline.is_none() {
+            return Ok(());
+        }
+        if self.refl_skip_extent != (rw, rh) {
+            device.wait_idle()?;
+            let make = || -> anyhow::Result<Option<StorageBuffer>> {
+                Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
+                    size: (rw as u64) * (rh as u64) * 32,
+                    stride: 32,
+                    indirect: false,
+                })?))
+            };
+            self.refl_skip = [make()?, make()?];
+            self.refl_skip_extent = (rw, rh);
+            self.refl_skip_frame = 0;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn advance_reflect_skip(&mut self) {
+        self.refl_skip_frame = self.refl_skip_frame.saturating_add(1);
+    }
+
+    /// A3: the (read, write) storage indices for this frame's skip ping-pong, or `None` when the
+    /// buffers don't exist. `read` is last frame's write (the reuse source); `write` is this frame's.
+    pub(crate) fn reflect_skip_indices(&self) -> Option<(u32, u32)> {
+        let read = ((self.refl_skip_frame + 1) % 2) as usize;
+        let write = (self.refl_skip_frame % 2) as usize;
+        Some((
+            self.refl_skip[read].as_ref()?.storage_index(),
+            self.refl_skip[write].as_ref()?.storage_index(),
+        ))
     }
 
     pub(crate) fn has_ssr(&self) -> bool {
@@ -645,6 +702,9 @@ impl ReflectSystem {
         clip_vols: &'a [&'a Volume],
         max_steps: u32,
         cone_k: f32,
+        // A3 adaptive temporal skip: (read_idx, write_idx, K stagger, real frame). read == u32::MAX
+        // disables reuse; write == u32::MAX disables the persist. Both sentinel = legacy full trace.
+        skip: [u32; 4],
     ) -> ResourceId {
         let pipe = self
             .reflect_pipeline
@@ -671,10 +731,16 @@ impl ReflectSystem {
             reads.push(ext);
         }
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
+        // A3: order this frame's skip-buffer writes (imported external; read is last frame's slot,
+        // covered by the frame fence, so it isn't graph-tracked — same pattern as refl_accum).
+        let mut writes = vec![out];
+        if skip[1] != u32::MAX {
+            writes.push(graph.import_external("refl_skip_w"));
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "gdf_reflect",
-                storage_writes: vec![out],
+                storage_writes: writes,
                 reads,
             },
             move |ctx| {
@@ -729,6 +795,7 @@ impl ReflectSystem {
                     crate::GROUND_ALBEDO, // analytic ground material (floor reflection hits)
                     max_steps,            // D3: reflection-ray march step cap
                     cone_k,               // P3: cone-trace LOD slope (0 = legacy)
+                    skip,                 // A3: adaptive temporal skip (read, write, K, frame)
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
