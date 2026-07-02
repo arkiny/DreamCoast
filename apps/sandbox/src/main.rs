@@ -39,6 +39,7 @@ mod fuse;
 mod gdf;
 mod gi;
 mod gtao;
+mod hzb;
 mod ibl;
 mod level;
 mod mesh;
@@ -61,6 +62,7 @@ use deferred::*;
 use dreamcoast_scene::{LocalTransform, MeshInstance, World};
 use gdf::*;
 use gi::*;
+use hzb::*;
 use ibl::*;
 use mesh::*;
 use particle::*;
@@ -455,6 +457,9 @@ struct App {
     reflect: ReflectSystem,
     particles: ParticleSystem,
     cull: CullSystem,
+    /// HZB occlusion culling (PR-8), `None` when compute is unavailable. Layered on
+    /// top of `cull`'s frustum test behind `HZB_CULL=1`.
+    hzb: Option<HzbSystem>,
     rt: RtSystem,
     ibl: IblSystem,
 
@@ -594,6 +599,10 @@ struct App {
     particles_on: bool,
     async_compute_on: bool,
     gpu_cull: bool,
+    /// HZB occlusion culling on top of GPU frustum culling (PR-8, `HZB_CULL=1`; needs
+    /// `P7_CULL=1`). Runtime stats of the last cull are read back into `hzb_stats`.
+    hzb_cull: bool,
+    hzb_stats: std::cell::Cell<(u32, u32)>, // (survived, culled_by_occlusion) last frame
     path_trace: bool,
     rt_debug: bool,
     cornell: bool,
@@ -868,6 +877,15 @@ impl App {
         // against the frustum and writes an indirect draw; the draw renders only the
         // visible instances (see `cull.rs`).
         let cull = CullSystem::new(&device, backend, compute_supported, swapchain.format())?;
+
+        // HZB occlusion culling (PR-8): a max-reduced Hi-Z pyramid built from the scene
+        // depth feeds an occlusion-aware variant of the cull compute. Compute-only; the
+        // pyramid is sized to the render extent and resized in-frame if it changes.
+        let hzb = if compute_supported {
+            Some(HzbSystem::new(&device, backend, swapchain.extent_2d())?)
+        } else {
+            None
+        };
 
         // Clip-space Y orientation for the full-screen passes (Vulkan = 1, D3D12 /
         // Metal = 0; both have a Y-up NDC with a top-left framebuffer origin).
@@ -1851,6 +1869,19 @@ impl App {
             && std::env::var_os("P_ASYNC_CACHE").is_some();
         gdf.set_cache_async(async_cache_on);
         let gpu_cull = compute_supported && std::env::var_os("P7_CULL").is_some();
+        // HZB occlusion culling (PR-8) is layered on the GPU frustum cull; it requires
+        // P7_CULL (the cull grid it operates on). If HZB_CULL is set without P7_CULL,
+        // log and ignore — the base cull path stays byte-identical (default OFF).
+        let hzb_cull = {
+            let want = std::env::var_os("HZB_CULL").is_some();
+            if want && !gpu_cull {
+                eprintln!(
+                    "[hzb] HZB_CULL=1 ignored: requires P7_CULL=1 (the GPU cull grid it culls). \
+                     Set both to enable occlusion culling."
+                );
+            }
+            want && gpu_cull && hzb.is_some()
+        };
         // Hardware ray tracing (DXR / VK_KHR) path tracer — the explicit `--raytracing` option
         // (or the legacy `P8_PATHTRACE` env). Separate from the SW-RT RenderQuality tiers, which
         // all use the GDF software path; this swaps the whole render for the HW-RT ground truth.
@@ -2260,6 +2291,7 @@ impl App {
             reflect,
             particles,
             cull,
+            hzb,
             rt,
             ibl,
             _textures: textures,
@@ -2376,6 +2408,8 @@ impl App {
             particles_on,
             async_compute_on,
             gpu_cull,
+            hzb_cull,
+            hzb_stats: std::cell::Cell::new((0, 0)),
             path_trace,
             rt_debug,
             cornell,
@@ -2770,6 +2804,15 @@ impl App {
                 ((sh as f32 * self.render_scale).round() as u32).max(64),
             ),
         };
+        // HZB (PR-8): the Hi-Z pyramid must match the scene-depth (render) extent. Rebuild
+        // it here if the render extent changed (RENDER_RES / render_scale / window resize).
+        // `device` and `hzb` are disjoint fields, so borrow them independently.
+        if self.hzb_cull {
+            let App { device, hzb, .. } = self;
+            if let Some(hzb) = hzb {
+                hzb.resize(device, Extent2D::new(cw, ch))?;
+            }
+        }
         // QHD/UHD track: TAAU is active when the scene renders below the output resolution (upscale)
         // and isn't a path-trace/debug capture. It jitters the camera + reconstructs full-res from
         // history. When render == output (default), it's inactive (byte-identical).
@@ -3174,6 +3217,8 @@ impl App {
                 particles_on,
                 async_compute_on,
                 gpu_cull,
+                hzb_cull,
+                hzb_stats,
                 path_trace,
                 rt_debug,
                 cornell,
@@ -3502,6 +3547,16 @@ impl App {
                             ui.text_disabled("  - async compute (no dedicated queue)");
                         }
                         ui.checkbox("GPU culling (indirect)", gpu_cull);
+                        if *gpu_cull {
+                            ui.checkbox("  - HZB occlusion cull", hzb_cull);
+                            if *hzb_cull {
+                                let (survived, culled) = hzb_stats.get();
+                                ui.text(format!(
+                                    "    {} total / {} vis / {} occluded",
+                                    GRID_COUNT, survived, culled
+                                ));
+                            }
+                        }
                     }
 
                     if rt.has_path() && rt.has_scene() {
@@ -4794,14 +4849,54 @@ impl App {
         } else {
             None
         };
+        // HZB occlusion culling (PR-8): when enabled, the frustum-only `record_cull` is
+        // replaced by reset + an occlusion-aware cull that also tests each instance's
+        // screen AABB against LAST frame's Hi-Z pyramid, and a build pass regenerates
+        // the pyramid from THIS frame's scene depth (for next frame). The build declares
+        // the HZB external as a WRITE and the cull as a READ, so the graph's WAR edge
+        // runs cull (last frame's data) before build (overwrite) — the canonical
+        // prev-frame-HZB scheme (conservative; no reprojection). Off => the original
+        // frustum-only path (byte-identical).
+        let hzb_active = self.hzb_cull && self.hzb.is_some();
         if let Some((args_ext, visible_ext)) = cull_res {
-            self.cull.record_cull(
-                &mut graph,
-                args_ext,
-                visible_ext,
-                frustum_planes(cull_view_proj),
-                &grid,
-            );
+            if hzb_active {
+                let hzb = self.hzb.as_ref().unwrap();
+                let hzb_ext = HzbSystem::import(&mut graph);
+                self.cull.record_reset(
+                    &mut graph,
+                    args_ext,
+                    visible_ext,
+                    frustum_planes(cull_view_proj),
+                    &grid,
+                );
+                let (args_buf, visible_buf) = self.cull.buffers();
+                // Occlusion test disabled on the first frame (no pyramid yet), and only
+                // when the pyramid's bindless slots are consecutive (the shader indexes
+                // hzb_base + mip). Either way the frustum cull still runs.
+                let occlude = self.frame_no >= 1 && hzb.slots_are_consecutive();
+                hzb.record_cull(
+                    &mut graph,
+                    args_buf,
+                    visible_buf,
+                    args_ext,
+                    visible_ext,
+                    hzb_ext,
+                    frustum_planes(cull_view_proj),
+                    cull_view_proj.to_cols_array(),
+                    &grid,
+                    self.cull.index_count(),
+                    occlude,
+                );
+                hzb.record_build(&mut graph, g_depth, hzb_ext, extent);
+            } else {
+                self.cull.record_cull(
+                    &mut graph,
+                    args_ext,
+                    visible_ext,
+                    frustum_planes(cull_view_proj),
+                    &grid,
+                );
+            }
         }
 
         // Phase 8 ray tracing: M4 inline path tracer (default) or the M3 trace viz
@@ -5282,7 +5377,11 @@ impl App {
         );
 
         // Phase 7 GPU-culling draw: indirect, instanced render of the visible cube
-        // grid over the tonemapped image, with its own depth buffer.
+        // grid over the tonemapped image (own depth for cube-vs-cube). The fragment
+        // stage samples the scene depth as a manual depth test (PR-8), so a
+        // world-occluded cube renders nothing — which makes the HZB occlusion cull
+        // image-neutral by construction: it only removes draws that were already
+        // invisible.
         if let Some((args_ext, visible_ext)) = cull_res {
             self.cull.record_draw(
                 &mut graph,
@@ -5293,6 +5392,8 @@ impl App {
                 view_proj.to_cols_array(),
                 self.sun_dir,
                 &grid,
+                g_depth,
+                extent,
             );
         }
 
@@ -5559,6 +5660,25 @@ impl App {
         }
         self.fif = (self.fif + 1) % FRAMES_IN_FLIGHT;
         self.frame_no += 1;
+
+        // HZB cull stats (PR-8): read back the (survived, occlusion-culled) counters and
+        // log them periodically (and on the last screenshot frame). Frames-in-flight give
+        // this a small latency; it is a diagnostic, so a recent frame's numbers are fine.
+        if self.hzb_cull
+            && let Some(hzb) = self.hzb.as_ref()
+        {
+            let (survived, culled) = hzb.read_stats();
+            self.hzb_stats.set((survived, culled));
+            // Log periodically, and every frame once past the warmup in screenshot mode
+            // (so a capture run always prints the final numbers).
+            if self.frame_no.is_multiple_of(60) || (self.screenshot_mode && self.frame_no >= warmup)
+            {
+                println!(
+                    "[hzb] instances: {} total, {} survived, {} occlusion-culled",
+                    GRID_COUNT, survived, culled
+                );
+            }
+        }
 
         // Bridge the D3D12 debug layer into the log (it otherwise only reaches OutputDebugString).
         // Catches validation/threading violations — e.g. the Phase 15 M4 B3 RHI submit thread's

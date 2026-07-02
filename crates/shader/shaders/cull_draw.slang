@@ -13,9 +13,9 @@ struct PushConstants
     float spacing;
     float cube_scale;
     float y_height;
-    uint pad0;
-    uint pad1;
-    uint pad2;
+    uint depth_index;    // bindless sampled index of the scene depth (0xffffffff = off)
+    float depth_scale_x; // render extent / display extent (maps SV_Position -> depth texel)
+    float depth_scale_y;
 };
 
 [[vk::push_constant]]
@@ -61,6 +61,21 @@ VSOutput vsMain(VSInput input, uint iid: SV_InstanceID)
 [shader("fragment")]
 float4 fsMain(VSOutput input) : SV_Target
 {
+    // Manual scene-depth test (PR-8): the grid draws over the tonemapped backbuffer
+    // (its own depth attachment orders cube-vs-cube only), so a cube behind a wall
+    // used to punch through. Sampling the scene depth here and discarding fragments
+    // behind it makes the grid world-correct — and makes HZB occlusion culling
+    // image-neutral by construction: a culled instance is one whose every fragment
+    // this test would discard anyway (cull z_near > hzb max >= per-pixel depth).
+    // `depth_scale` maps display pixels to render-extent texels (1.0 at native; the
+    // TAAU upscale path renders the scene smaller than the display).
+    if (pc.depth_index != 0xffffffffu)
+    {
+        int2 dp = int2(input.pos.xy * float2(pc.depth_scale_x, pc.depth_scale_y));
+        float scene_z = g.textures[pc.depth_index].Load(int3(dp, 0)).r;
+        if (input.pos.z > scene_z)
+            discard;
+    }
     float3 n = normalize(input.normal);
     float ndl = saturate(dot(n, normalize(pc.sun_dir.xyz)));
     float3 color = input.tint * (0.25 + 0.75 * ndl);
