@@ -380,6 +380,22 @@ impl D3d12StorageBuffer {
         Ok(())
     }
 
+    /// Host-read the buffer into `dst` (HZB cull stats). Valid only for the host-visible
+    /// `new_host` variant. The L0 heap is write-combined, so CPU reads are slow — this is
+    /// a diagnostic-only path (tiny buffer, off by default). Caller syncs GPU writes
+    /// first. (DX/VK parity pending Windows verification.)
+    pub fn read_into(&self, dst: &mut [u8]) -> Result<(), EngineError> {
+        if self.mapped.is_null() {
+            return Err(EngineError::Rhi(
+                "host-read of a DEFAULT-heap D3D12 storage buffer (use create_storage_buffer_host)"
+                    .into(),
+            ));
+        }
+        let n = (dst.len() as u64).min(self.size) as usize;
+        unsafe { std::ptr::copy_nonoverlapping(self.mapped as *const u8, dst.as_mut_ptr(), n) };
+        Ok(())
+    }
+
     pub(crate) fn resource(&self) -> &ID3D12Resource {
         &self.resource
     }

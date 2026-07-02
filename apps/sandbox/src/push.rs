@@ -379,7 +379,84 @@ pub(crate) fn cull_push(
     pc
 }
 
-/// Pack the cull-draw push block (112 bytes): view_proj + sun_dir + grid params.
+/// Pack the HZB build push block (32 bytes): source/dest bindless indices + level
+/// dims + reduction tap counts (see `hzb_build.slang`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hzb_build_push(
+    src_index: u32,
+    dst_index: u32,
+    dst_w: u32,
+    dst_h: u32,
+    src_w: u32,
+    src_h: u32,
+    tap_x: u32,
+    tap_y: u32,
+) -> [u8; 32] {
+    let mut pc = [0u8; 32];
+    for (i, v) in [
+        src_index, dst_index, dst_w, dst_h, src_w, src_h, tap_x, tap_y,
+    ]
+    .iter()
+    .enumerate()
+    {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc
+}
+
+/// Pack the HZB-aware cull push block (224 bytes): the identical 128-byte frustum
+/// block (see `cull_push`) followed by the occlusion block — unjittered no-Y-flip
+/// view_proj + HZB metadata (see `csCullHzb` in `cull.slang`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cull_hzb_push(
+    planes: &[[f32; 4]; 6],
+    args_index: u32,
+    visible_index: u32,
+    count: u32,
+    grid_dim: u32,
+    spacing: f32,
+    cube_radius: f32,
+    y_height: f32,
+    index_count: u32,
+    view_proj: &[f32; 16],
+    hzb_base: u32,
+    hzb_levels: u32,
+    hzb_w: u32,
+    hzb_h: u32,
+    enabled: bool,
+    stats_index: u32,
+) -> [u8; 224] {
+    let mut pc = [0u8; 224];
+    // Bytes 0..128: identical frustum block.
+    let head = cull_push(
+        planes,
+        args_index,
+        visible_index,
+        count,
+        grid_dim,
+        spacing,
+        cube_radius,
+        y_height,
+        index_count,
+    );
+    pc[..128].copy_from_slice(&head);
+    // Bytes 128..192: view_proj (column-major, matches vp[4] float4 columns).
+    for (i, v) in view_proj.iter().enumerate() {
+        let o = 128 + i * 4;
+        pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // Bytes 192..: HZB metadata.
+    pc[192..196].copy_from_slice(&hzb_base.to_le_bytes());
+    pc[196..200].copy_from_slice(&hzb_levels.to_le_bytes());
+    pc[200..204].copy_from_slice(&hzb_w.to_le_bytes());
+    pc[204..208].copy_from_slice(&hzb_h.to_le_bytes());
+    pc[208..212].copy_from_slice(&(enabled as u32).to_le_bytes());
+    pc[212..216].copy_from_slice(&stats_index.to_le_bytes());
+    pc
+}
+
+/// Pack the cull-draw push block (112 bytes): view_proj + sun_dir + grid params +
+/// the scene-depth manual test (index + display→render pixel scale; see cull_draw.slang).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cull_draw_push(
     view_proj: &[f32; 16],
@@ -389,6 +466,8 @@ pub(crate) fn cull_draw_push(
     spacing: f32,
     cube_scale: f32,
     y_height: f32,
+    depth_index: u32,
+    depth_scale: [f32; 2],
 ) -> [u8; 112] {
     let mut pc = [0u8; 112];
     for (i, v) in view_proj.iter().enumerate() {
@@ -402,6 +481,9 @@ pub(crate) fn cull_draw_push(
     pc[88..92].copy_from_slice(&spacing.to_le_bytes());
     pc[92..96].copy_from_slice(&cube_scale.to_le_bytes());
     pc[96..100].copy_from_slice(&y_height.to_le_bytes());
+    pc[100..104].copy_from_slice(&depth_index.to_le_bytes());
+    pc[104..108].copy_from_slice(&depth_scale[0].to_le_bytes());
+    pc[108..112].copy_from_slice(&depth_scale[1].to_le_bytes());
     pc
 }
 

@@ -116,6 +116,21 @@ impl MetalStorageBuffer {
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
         Ok(())
     }
+
+    /// Host-read the buffer's contents into `dst` (HZB cull stats readback). Only valid
+    /// for a host-visible (`StorageModeShared`) buffer; the caller must have synced the
+    /// GPU writes first. Bounds-checked against the allocated length.
+    pub fn read_into(&self, dst: &mut [u8]) -> crate::Result<()> {
+        if dst.len() > self.buffer.length() {
+            return Err(crate::rhi_err("storage buffer read out of bounds"));
+        }
+        let src = self.buffer.contents().as_ptr() as *const u8;
+        if src.is_null() {
+            return Err(crate::rhi_err("storage buffer is not host-visible"));
+        }
+        unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) };
+        Ok(())
+    }
 }
 
 /// A sampled 2D texture registered in the bindless argument buffer. The `MTLTexture`
