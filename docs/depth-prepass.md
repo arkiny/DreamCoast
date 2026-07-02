@@ -80,7 +80,13 @@ depth-only `fsDepth`로 교체한다. 즉 클립 위치는 base pass와 *같은 
   `af70c1a5c8db49661d2c7926140c1309c28fda04c82cc1ab8aa6638d588b2b74` — 기존 앵커와 **바이트 동일**.
 - **`DEPTH_PREPASS=1` 골든**: 같은 캡처가 **역시 바이트 동일** (동일 sha256). Equal-test가
   셰이딩을 바꾸지 않음을 증명 — position invariance가 비트 단위로 성립.
-- **sponza_intel sanity**: OFF/ON 캡처 시각적 동일(수치는 커밋/보고 참조).
+- **sponza_intel sanity** (lion-view, EV100=11, WARMUP_FRAMES=64, release): OFF/ON 캡처
+  **sha256 동일(바이트 동일)**, `rt-compare.py` avg 0.000/ch (max 0) — 콘텐츠 씬에서도 Equal-test
+  invariance가 비트 단위로 성립.
+- **GPU 시간 (sponza, PROFILE_GPU)**: gbuffer 패스 자체는 ~7.3ms → ~6.0ms로 감소(Early-Z 오버드로
+  제거)하나 prepass가 ~4.4–5.4ms를 추가해 이 씬에선 순비용 양수. 예상된 트레이드오프 — prepass의
+  가치는 구조(HZB/hi-Z SSR/velocity의 토대)이며, depth-only 래스터가 vertex-bound라 비싼 점은
+  후속 최적화 후보(prepass 전용 위치-전용 버텍스 스트림 등).
 - clippy `-D warnings` 클린, `cargo fmt` 적용.
 
 DX≡VK parity는 Windows 후속 검증(이 머신은 Metal 전용).
