@@ -22,7 +22,7 @@ use crate::app::{load_compute_shader, load_shader_pair};
 use crate::push::post_push;
 use crate::{
     DEPTH_FORMAT, FRAMES_IN_FLIGHT, GB_ALBEDO_FMT, GB_MATERIAL_FMT, GB_NORMAL_FMT, GB_POSITION_FMT,
-    GLOBALS_SLICE, GROUND_ALBEDO, HDR_FORMAT, NO_TEXTURE, SceneObject,
+    GLOBALS_SLICE, GROUND_ALBEDO, HDR_FORMAT, MAX_VIEWS, NO_TEXTURE, SceneObject,
 };
 
 /// The render graph's G-buffer targets: four MRTs (+ depth) written by the fill pass
@@ -573,9 +573,12 @@ impl DeferredRenderer {
             Err(_) => (None, None, None, None),
         };
 
-        // Per-frame globals uniform buffer (one 256-byte slice per frame-in-flight).
+        // Per-frame globals uniform buffer. PR-9 view family: `FRAMES_IN_FLIGHT * MAX_VIEWS`
+        // slices so each view in a frame gets its own camera-matrix slice (offset
+        // `(fif * MAX_VIEWS + view) * GLOBALS_SLICE`). The default single-view path only touches
+        // slice 0 of each frame, so the extra tail is unused (and zero-cost) when off.
         let globals_buffer = device.create_buffer(&BufferDesc {
-            size: GLOBALS_SLICE * FRAMES_IN_FLIGHT as u64,
+            size: GLOBALS_SLICE * FRAMES_IN_FLIGHT as u64 * MAX_VIEWS,
             usage: BufferUsage::Uniform,
         })?;
         device.set_globals_buffer(&globals_buffer, GLOBALS_SLICE);
@@ -1272,6 +1275,59 @@ impl DeferredRenderer {
                     cdl_slope,
                     cdl_offset,
                     cdl_power,
+                ));
+                cmd.draw(3, 1);
+                Ok(())
+            },
+        );
+    }
+
+    /// PR-9 view family: composite a secondary view's HDR as a picture-in-picture inset. Tonemaps
+    /// `src` into `viewport` (a sub-rect of the backbuffer), LOADING (not clearing) the backbuffer
+    /// so the already-composited primary view is preserved everywhere outside the inset. The
+    /// full-screen triangle is scaled into the rect by the viewport transform (the graph sets the
+    /// full-backbuffer viewport before this closure; we override it here). Bloom/grading are
+    /// disabled (the inset is a plain ACES+sRGB encode). See `docs/view-family.md`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_tonemap_inset<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        backbuffer: ResourceId,
+        src: ResourceId,
+        post_mode: u32,
+        flip_y: u32,
+        exposure: f32,
+        viewport: rhi::Rect2D,
+    ) {
+        graph.add_pass(
+            PassInfo {
+                name: "view_inset",
+                // `None` clear = load the backbuffer (preserve the primary-view composite).
+                colors: vec![(backbuffer, None)],
+                depth: None,
+                reads: vec![src],
+            },
+            move |ctx| {
+                let hdr_index = ctx.sampled_index(src);
+                let cmd = ctx.cmd();
+                // Restrict the draw to the inset rect (both viewport + scissor).
+                cmd.set_viewport_scissor_rect(viewport);
+                cmd.bind_graphics_pipeline(&self.post_pipeline);
+                let (s, o, p) = crate::push::CDL_NEUTRAL;
+                cmd.push_constants(&post_push(
+                    hdr_index,
+                    post_mode,
+                    flip_y,
+                    exposure,
+                    0.0, // no sharpen
+                    0.0,
+                    0.0,
+                    u32::MAX, // no bloom
+                    0.0,
+                    0, // grading off
+                    s,
+                    o,
+                    p,
                 ));
                 cmd.draw(3, 1);
                 Ok(())
