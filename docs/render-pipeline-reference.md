@@ -126,7 +126,7 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 | 9 | Reflections + Sky | ✅ SSR→GDF→sky 하이브리드 composite, lit-history 피드백 | 🟡 | 순서(직접광 뒤 lit-history 샘플) 정합. 단 lit-history 피드백이 flicker 유발(메모리: swrt_reflect 루프) |
 | 10 | Sky/Atmosphere | 🟡 절차 sky → env cube(`ibl.rs`) + **PR-4 대기 합성 슬롯**(`atmosphere.rs`/`atmosphere.slang`, 항상 배선) | 🟡 | 씬 배경 자체는 여전히 IBL 캡처(별도 sky 패스 아님); 다만 불투명 완성 후·투명 전 합성 지점은 PR-4로 정식 확보됨(§3 PR-4). 물리기반 에어리얼 퍼스펙티브/time-of-day는 후속 |
 | 11 | Fog/Volumetric | 🟡 **PR-4**: opt-in analytic height fog(`P_HEIGHT_FOG=1`) | 🟡 | 지수 높이 포그(closed-form 적분, Quilez 2010) 구현 — `docs/atmosphere-fog-slot.md`. volumetric/light shaft/cloud은 여전히 부재(같은 슬롯에 후속 삽입 가능) |
-| 12 | Translucency | **없음**(불투명만) | 🔴 | 정렬 투명/OIT/굴절 없음 — foliage는 alpha-cutout(불투명 경로)로 우회 |
+| 12 | Translucency | 🟡 **PR-3**: opt-in 정렬 포워드 투명 슬롯 | 🟡 | 디퍼드 라이팅+반사+포그 뒤·post 앞에 삽입. back-to-front CPU 정렬(거리→인덱스 tie-break, 결정론적), depth-test on/write off, G-buffer 미기록, 알파 블렌드. 포워드 PBR(디렉셔널+IBL)은 디퍼드와 **공유 BRDF 헤더**(`pbr_brdf.slang`) 재사용. 투명 0개면 미스케줄(바이트 동일). 테스트: `P_TRANSLUCENT_TEST=1`(갤러리 유리 평면 2장). OIT/굴절/투명 velocity는 Phase 20 — [translucency-pass.md](translucency-pass.md). DX≡VK Windows pending |
 | 13 | Motion Blur | **없음** (선결이던 velocity는 PR-2로 확보) | 🔴 | velocity RT가 생겨 이제 구현 가능 — PR-5 post 시퀀스의 스텁 슬롯에 삽입 예정 |
 | 14 | Temporal AA/Upscale | ✅ `taau.rs`(TAAU: jitter + 리프로젝션 누적, 톤맵 **전** linear-HDR) + **velocity-aware 리프로젝션(PR-2)** | 🟡 | 위치(톤맵 전)·jitter 정합. `P_VELOCITY=1`이면 3×3 dilated per-pixel velocity로 리프로젝션(움직이는 오브젝트 고스팅 감소, 검증 수치는 [velocity-motion-vectors.md](velocity-motion-vectors.md)); off면 종전 카메라-온리(바이트 동일) |
 | 15 | Auto Exposure | ✅ `record_auto_exposure`(히스토그램/평균, 적응) | ✅ | 톤맵 전 배치 정합(opt-in) |
@@ -135,7 +135,7 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 | 18 | Tonemap + Grading | 🟡 `record_tonemap`(ACES + sRGB 인코드) | 🟡 | 톤맵은 있으나 **컬러 그레이딩/LUT 없음**, 노출은 라이팅 패스에서 선적용 |
 | 19 | FXAA/SMAA | 🟡 `record_fxaa`(TAA 미사용·비jitter 시 FXAA pre-pass) | 🟡 | 존재하나 TAA **pre-pass**로 배치(레퍼런스는 톤맵 후 대체 AA). 역할 상이 |
 | 20 | Primary/Secondary Upscale | 🟡 TAAU가 내부→출력 업스케일 겸함 + 톤맵 샤픈 | 🟡 | 전용 스페이셜 업스케일 단계 없음(TAAU에 융합) |
-| 21 | Editor/Debug Overlay | ✅ ImGui 오버레이 + 디버그 뷰(`DEBUG_VIEW`) + particle/cull draw | 🟡 | 톤맵 후 draw. 단 particle/cull이 **톤맵 후 LDR**에 그려짐(HDR 합성 아님) |
+| 21 | Editor/Debug Overlay | ✅ ImGui 오버레이 + 디버그 뷰(`DEBUG_VIEW`) | ✅ | ImGui는 톤맵 후 draw(정합). **PR-3에서 particle/cull draw를 HDR 투명 슬롯(톤맵 전)으로 이동** — 종전 톤맵-후 LDR 드로 문제 해소(§2.1-3). 둘 다 디폴트-off(`P7_PARTICLES`/`P7_CULL`)라 디폴트 출력 불변 |
 | — | Render Graph | ✅ `crates/render`(트랜지언트 aliasing, read/write 선언) | ✅ | 레퍼런스 RDG와 동일 철학 |
 | — | Async Compute | ✅ P7 async(메모리: async-compute.md) | 🟡 | 인프라는 있으나 현 프레임 패스 오버랩은 제한적 |
 | — | Scalability 티어 | ✅ `RenderQuality{low/med/high}` | ✅ | cvar 그룹 대응 |
@@ -150,9 +150,11 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
 2. **~~Velocity / 모션벡터 부재 (#3·#13·#14)~~ — PR-2로 해소.** velocity RT(RG16F, opt-in
    `P_VELOCITY=1`) + velocity-aware TAAU 리프로젝션이 들어가 움직이는 오브젝트(스키닝/스핀/모프)의
    고스팅이 감소. 모션블러(13)의 선결도 확보 — [velocity-motion-vectors.md](velocity-motion-vectors.md).
-3. **투명 패스 부재 (#12).** 디퍼드 라이팅 뒤·post 앞의 정렬 투명 슬롯 자체가 없어 유리/굴절/파티클
-   HDR 합성/포그 상호작용을 넣을 자리가 없다. 현재 particle/cull이 **톤맵 후 LDR**에 그려지는 것도 이
-   슬롯 부재의 증상이다.
+3. **~~투명 패스 부재 (#12)~~ — PR-3로 해소.** 디퍼드 라이팅+반사+포그 뒤·post 앞에 정렬 포워드 투명
+   슬롯을 삽입(depth-test on/write off, G-buffer 미기록, back-to-front CPU 정렬 알파 블렌드; 포워드
+   PBR은 디퍼드와 공유 BRDF 헤더 재사용). 투명 0개면 미스케줄(바이트 동일). **부수효과 정리:** 종전
+   **톤맵 후 LDR**에 그려지던 particle/cull draw를 이 HDR 슬롯(톤맵 전)으로 이동(둘 다 디폴트-off →
+   디폴트 출력 불변). OIT/굴절/투명 velocity는 Phase 20 — [translucency-pass.md](translucency-pass.md).
 4. **포그/대기/볼류메트릭 슬롯 부재 (#10·#11).** 불투명 완성 후·투명 전의 합성 지점이 비어 있어, sky를
    IBL 캡처로만 처리하고 aerial perspective·height fog·light shaft를 꽂을 자리가 없다.
 5. **클러스터드 라이트 리스트 부재 (#8).** ~~라이팅이 풀스크린 단일-패스라 다광원으로 확장하려면
@@ -183,10 +185,13 @@ TAAU(내부해상도 업스케일) → tonemap → (particle/cull draw/ImGui)`.
   [velocity-motion-vectors.md](velocity-motion-vectors.md). DX≡VK parity pending Windows.
 
 ### 정합 P1 — 합성 슬롯 열기
-- **PR-3 · 투명 패스 슬롯 [M].** 디퍼드 라이팅+반사 뒤, post 앞에 **정렬 불투명-후 투명 패스**를 그래프에
-  삽입(깊이 테스트, G-buffer 미기록). 우선 단순 정렬 알파 블렌드; OIT/굴절은 Phase 20. *unblocks:*
-  유리/파티클 HDR 합성·포그 상호작용. **부수효과:** particle/cull draw를 이 슬롯(HDR)으로 이동 →
-  톤맵-후 LDR 드로 제거.
+- **PR-3 · 투명 패스 슬롯 [M]. ✅ 완료** (Metal 검증, DX≡VK Windows pending). 디퍼드 라이팅+반사+포그
+  뒤·post 앞에 정렬 포워드 투명 패스 삽입(depth-test on/write off, G-buffer 미기록, back-to-front
+  CPU 정렬 알파 블렌드; 포워드 PBR 라이팅은 디퍼드와 **공유 BRDF 헤더** `pbr_brdf.slang` 재사용).
+  투명 0개면 미스케줄 → 갤러리 앵커 `af70c1a5…` 바이트 동일. opt-in `P_TRANSLUCENT_TEST=1`(테스트
+  유리 평면). **부수효과 정리:** particle/cull draw를 이 HDR 슬롯(톤맵 전)으로 이동 → 톤맵-후 LDR
+  드로 제거(둘 다 디폴트-off라 디폴트 출력 불변). OIT/굴절/투명 velocity는 Phase 20.
+  상세 [translucency-pass.md](translucency-pass.md).
 - **PR-4 · 대기/포그 합성 슬롯 [S].** 불투명 완성 후·투명 전에 **sky+fog 합성 지점**을 그래프에 확보
   (지금은 no-op 통과, Phase 22에서 채움). *왜 지금:* 순서 자리를 박아두면 Phase 22가 재배선 없이 삽입.
 - **PR-5 · Post-process 시퀀스 정식화 [M].** 파편적 `compute_post(box-blur 데모)`를 제거하고, 순서 있는
