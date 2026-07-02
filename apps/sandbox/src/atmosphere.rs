@@ -16,7 +16,9 @@
 //! else in `main.rs`, so there is no duplicated ambient/sky constant.
 
 use dreamcoast_render::{PassInfo, RenderGraph, ResourceId};
-use rhi::{BackendKind, BlendMode, Device, Format, GraphicsPipeline, GraphicsPipelineDesc};
+use rhi::{
+    BackendKind, BlendMode, DepthCompare, Device, Format, GraphicsPipeline, GraphicsPipelineDesc,
+};
 
 use crate::app::load_shader_pair;
 use crate::push::atmosphere_push;
@@ -56,6 +58,7 @@ impl AtmosphereSystem {
             uniform_buffer: false,
             depth_test: false,
             depth_write: false,
+            depth_compare: DepthCompare::Less,
             depth_format: None,
         })?;
         Ok(Self { pipeline })
