@@ -172,8 +172,44 @@ frustum cull; camera-frustum + HZB occlusion cull attacks the gbuffer/prepass sh
   NOT the graph transient pool which is confirmed broken). CSM-static-mesh caching is the longer-term
   generalization (shadow-cache-design.md S2, user-flagged).
 
+### A6 — Cached shadow map, app-owned persistent depth (shadow-cache-cold-start.md S1) — ✅ LANDED (Metal)
+
+- **What:** the correct fix for A4. The legacy directional map is camera-independent
+  (`light_view_proj` reads only sun + scene bounds), so render it into an **app-owned persistent**
+  `DepthBuffer` (one **per frame-in-flight**, sampleable) **OUTSIDE** the render graph — the exact
+  `ibl.rs` env-capture pattern (`Deferred::record_shadow_direct` on a raw `Recorder`:
+  `depth_to_render_target` → `begin_rendering_depth_only` → same caster loop as `record_shadow` →
+  `end_rendering` → `depth_to_sampled`) — then **freeze**: skip the re-render once a `shadow_epoch`
+  (FNV over `sun_dir`⊕`shadow_center`⊕`scene_radius`⊕`shadows_on`, hashed bit-identically to the A2
+  epoch, **NOT the camera**) has held steady ≥ `FRAMES_IN_FLIGHT` (primes every per-FIF depth). The
+  lighting (+ translucency) pass samples the persistent depth by **bindless index** instead of the
+  graph resource (`record_lighting`/`record_shadow` shadow arg → `Option<ResourceId>` +
+  `shadow_override: Option<u32>`). Never freezes with a skinned/morph caster (`has_dynamic_caster`
+  ⇒ re-renders every frame, correct by construction). Env `P_SHADOW_DIRTY_SKIP` (default on, off for
+  gallery), `P_SHADOW_SETTLE`. RHI needed **zero** new primitives — `begin_rendering_depth_only` +
+  `create_depth_buffer` + `depth_to_sampled` already existed on all three backends (Metal verified).
+- **Why it works where A4 didn't:** A4 skipped the in-graph transient depth's *writer* and assumed the
+  pool slot persisted — false (the graph clears/reuses an unwritten depth, and the pool is per-FIF).
+  A6 owns the depth explicitly, so a skipped frame re-samples the exact texels the re-raster would
+  produce; the pool is never touched.
+- **Image-identical (Metal, this box):** **Sponza cache ON vs `P_SHADOW_DIRTY_SKIP=0`, same fixed
+  camera = 0.000/ch byte-identical (max 0)**; a **second, offset camera** (static sun) also **0.000**
+  — the headline camera-independence property. Gallery byte-anchor vs pre-change main **0.000**.
+  IntelSponza ON vs OFF **0.456/ch** < the measured **run-to-run noise floor 0.708/ch** (ON vs ON) ⇒
+  image-identical within temporal (TAA/reflect) jitter; mean brightness ON 250.58 ≈ OFF 250.67 (no
+  A4 "shadows-gone → too bright"). Moving sun (`TIME_OF_DAY=1`) runs clean (no deadlock/validation,
+  non-black). clippy `-D warnings` clean, all tests pass.
+- **Perf (IntelSponza, Metal M3, med/0.667/TAAU):** the graph `shadow` pass is **present OFF (14ms) →
+  absent ON** (skipped once frozen). **GPU fence-wait 78.8 → 64.4ms (−14.4ms)** — the ~14.1ms shadow
+  cost the design predicted; frame wall-time 82.9 → 66.8ms. (Per-pass GPU *timestamps* are
+  uncalibrated on this Metal box — garbage ms values — so fence-wait/frame wall-time are the reliable
+  signals; DX/VK timestamp perf pending a Windows re-verify.)
+- **Next:** DX≡VK re-verify on the Windows RTX 2070 (expect the ledger's 14→0 confirmed there). Then
+  **S2 world-stable CSM cascade cache** (shadow-cache-design.md) for the camera-fit path, and the
+  IntelSponza HZB-cull / LOD track for the remaining geometry floor.
+
 ## STATUS: Sponza 1080p/0.667 med — **≥60fps on DX (74) and VK (69)**, image-identical (≤0.051/ch)
-## IntelSponza 1080p/0.667 med — 42.8→**37.3ms (27fps)** via A5 frustum cull; shadow 14ms + HZB/LOD remain
+## IntelSponza — A5 frustum cull (gbuffer 14→8.5) + **A6 shadow cache (shadow 14→0, GPU −14.4ms on Metal)**; HZB/LOD remain for 60fps
 
 IntelSponza (43ms) NOT yet at 60fps — it is GEOMETRY-bound (gbuffer 14 + shadow 14), a different
 problem from the GI-lossless track. Two vetted designs ready: **docs/shadow-cache-design.md** (shadow

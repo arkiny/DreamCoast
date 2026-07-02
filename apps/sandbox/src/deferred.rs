@@ -14,15 +14,16 @@ use dreamcoast_core::glam::Mat4;
 use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourceId};
 use rhi::{
     BackendKind, BlendMode, Buffer, BufferDesc, BufferUsage, ClearColor, ComputePipeline,
-    ComputePipelineDesc, DepthCompare, Format, GraphicsPipeline, GraphicsPipelineDesc,
-    PrimitiveTopology, StorageBuffer, StorageBufferDesc, VertexLayout,
+    ComputePipelineDesc, DepthBuffer, DepthCompare, Extent2D, Format, GraphicsPipeline,
+    GraphicsPipelineDesc, PrimitiveTopology, Recorder, StorageBuffer, StorageBufferDesc,
+    VertexLayout,
 };
 
 use crate::app::{load_compute_shader, load_shader_pair};
 use crate::push::post_push;
 use crate::{
     DEPTH_FORMAT, FRAMES_IN_FLIGHT, GB_ALBEDO_FMT, GB_MATERIAL_FMT, GB_NORMAL_FMT, GB_POSITION_FMT,
-    GLOBALS_SLICE, GROUND_ALBEDO, HDR_FORMAT, MAX_VIEWS, NO_TEXTURE, SceneObject,
+    GLOBALS_SLICE, GROUND_ALBEDO, HDR_FORMAT, MAX_VIEWS, NO_TEXTURE, SHADOW_SIZE, SceneObject,
 };
 
 /// The render graph's G-buffer targets: four MRTs (+ depth) written by the fill pass
@@ -750,6 +751,55 @@ impl DeferredRenderer {
         );
     }
 
+    /// Cached-shadow (docs/shadow-cache-cold-start.md S1): rasterize the legacy directional
+    /// shadow map DEPTH-ONLY into an **app-owned persistent** `DepthBuffer`, OUTSIDE the render
+    /// graph, on a raw `Recorder` — exactly the pattern `ibl.rs` uses to capture the env cube into
+    /// app-owned targets. The legacy map is camera-independent (`light_view_proj` reads only the
+    /// sun + scene bounds), so its depth persists across frames and a settled frame can SKIP this
+    /// call and re-sample last frame's map by bindless index (the in-graph transient pool does NOT
+    /// persist depth — see ledger A4). The caster loop is identical to `record_shadow` (static /
+    /// skinned / morph pipeline select + masked alpha-test discard) so the cached depth is
+    /// bit-identical to the in-graph raster. The depth-only begin clears + stores the depth; the
+    /// caller transitions it to sampled afterwards.
+    pub(crate) fn record_shadow_direct(
+        &self,
+        cmd: &dyn Recorder,
+        depth: &DepthBuffer,
+        scene: &[SceneObject],
+        light_vp: Mat4,
+    ) {
+        cmd.depth_to_render_target(depth);
+        cmd.begin_rendering_depth_only(depth);
+        // Out-of-graph: no graph pass to set the viewport, so pin it to the shadow map extent.
+        cmd.set_viewport_scissor_extent(Extent2D::new(SHADOW_SIZE, SHADOW_SIZE));
+        cmd.bind_graphics_pipeline(&self.shadow_pipeline);
+        for obj in scene {
+            if !obj.casts_shadow {
+                continue;
+            }
+            let lmvp = (light_vp * obj.transform).to_cols_array();
+            if obj.skin.is_some() {
+                cmd.bind_graphics_pipeline(&self.shadow_skinned_pipeline);
+            } else if obj.morph.is_some() {
+                cmd.bind_graphics_pipeline(&self.shadow_morphed_pipeline);
+            }
+            cmd.push_constants(&shadow_push(
+                lmvp,
+                obj.tex[0],
+                obj.alpha_cutoff,
+                obj.skin.unwrap_or([0; 4]),
+                obj.morph.unwrap_or([0; 4]),
+            ));
+            cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
+            cmd.bind_index_buffer(&obj.mesh.ibuf, true);
+            cmd.draw_indexed(obj.mesh.index_count, 0, 0);
+            if obj.skin.is_some() || obj.morph.is_some() {
+                cmd.bind_graphics_pipeline(&self.shadow_pipeline); // restore
+            }
+        }
+        cmd.end_rendering();
+    }
+
     /// Depth pre-pass (pipeline rebaseline PR-1, opt-in `DEPTH_PREPASS=1`): rasterize the same
     /// opaque scene the G-buffer fill draws (skipping decals) plus the ground, DEPTH-ONLY, into
     /// `targets.depth` **before** the G-buffer pass. This establishes the scene depth so the base
@@ -1121,7 +1171,12 @@ impl DeferredRenderer {
         graph: &mut RenderGraph<'a>,
         hdr: ResourceId,
         gbuf: GBufferTargets,
-        shadow_map: ResourceId,
+        // Shadow map source. `shadow_map` = the in-graph transient depth (CSM atlas / gallery /
+        // cache-disabled legacy). `shadow_override` = an app-owned persistent depth's bindless
+        // sampled index (the cached-shadow path, docs/shadow-cache-cold-start.md S1) — when set,
+        // the graph resource is not read; the lighting shader samples the persistent depth directly.
+        shadow_map: Option<ResourceId>,
+        shadow_override: Option<u32>,
         gdf_ao: Option<ResourceId>,
         ssao: Option<ResourceId>,
         gdf_gi: Option<ResourceId>,
@@ -1139,13 +1194,10 @@ impl DeferredRenderer {
         // brute-force globals.point_pos[] path (default, gallery byte-identical).
         cluster: Option<(ResourceId, ResourceId, u32, u32, u32, u32)>,
     ) {
-        let mut reads = vec![
-            gbuf.albedo,
-            gbuf.normal,
-            gbuf.material,
-            gbuf.position,
-            shadow_map,
-        ];
+        let mut reads = vec![gbuf.albedo, gbuf.normal, gbuf.material, gbuf.position];
+        if let Some(sm) = shadow_map {
+            reads.push(sm);
+        }
         if let Some((grid_ext, index_ext, ..)) = cluster {
             reads.push(grid_ext);
             reads.push(index_ext);
@@ -1179,7 +1231,12 @@ impl DeferredRenderer {
                     ctx.sampled_index(gbuf.material),
                     ctx.sampled_index(gbuf.position),
                 ];
-                let shadow_index = ctx.sampled_index(shadow_map);
+                // Cached-shadow path: sample the app-owned persistent depth by its bindless index;
+                // otherwise the in-graph transient depth's per-frame bindless slot.
+                let shadow_index = match shadow_override {
+                    Some(idx) => idx,
+                    None => ctx.sampled_index(shadow_map.expect("shadow_map or shadow_override")),
+                };
                 let ao_index = gdf_ao.map(|ao| ctx.sampled_index(ao)).unwrap_or(u32::MAX);
                 let ssao_index = ssao.map(|s| ctx.sampled_index(s)).unwrap_or(u32::MAX);
                 let gi_index = gdf_gi.map(|gi| ctx.sampled_index(gi)).unwrap_or(u32::MAX);
