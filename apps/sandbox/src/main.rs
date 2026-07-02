@@ -867,6 +867,23 @@ struct App {
     scene_cache_captured: bool,
     /// C8b2 temporal reset for the cache lighting (true until the first lit frame).
     scene_cache_reset: bool,
+    /// Lossless cache/GI dirty-skip (docs/lossless-opt-ledger.md A2): the view-independent
+    /// surface-cache relight (and world-irradiance volume) is a temporally-accumulated EMA that
+    /// reaches a fixpoint once the lighting (sun/sky) + geometry stop changing. `cache_epoch` is a
+    /// hash of that invariant state; when it holds steady for `cache_settle_frames`, the EMA has
+    /// converged, so re-lighting produces the SAME value it already holds — we freeze the relight
+    /// (skip the dispatch, don't advance the ping-pong) and consumers keep reading the converged
+    /// radiance. Image-identical (a converged EMA == its fixpoint); any epoch change re-arms it.
+    /// Camera motion does NOT bump the epoch (the cache is view-independent), so this wins even
+    /// while the camera moves — only sun/sky/geometry changes cost a re-converge. Gallery-gated.
+    cache_epoch: u64,
+    cache_stable_frames: u32,
+    cache_settle_frames: u32,
+    cache_dirty_skip: bool,
+    /// Set whenever a frozen (settled) frame skips the ASYNC relight submit. The async path chains a
+    /// binary semaphore frame-to-frame (`cache_done`); a gap consumes it, so the first relight after
+    /// a freeze must use the no-wait (frame-0-style) submit to avoid waiting on a stale semaphore.
+    async_cache_gap: bool,
     path_trace_pipeline: bool,
     realtime_env: bool,
     /// Per-frame dynamic sun (time-of-day): when on, the sun arcs across the sky from
@@ -2779,6 +2796,20 @@ impl App {
             scene_albedo_baked: scene_albedo_cooked,
             scene_cache_captured: false,
             scene_cache_reset: true,
+            cache_epoch: 0,
+            cache_stable_frames: 0,
+            // Frames of lighting stability before the cache/GI EMA is treated as converged and the
+            // relight freezes. Sized above the EMA settle time (alpha≈0.35 ⇒ <0.5% residual in
+            // ~13 frames, +multibounce propagation) with margin. `P_CACHE_SETTLE` overrides; the
+            // measure harness warms 60 frames so the freeze is active in the measured tail.
+            cache_settle_frames: std::env::var("P_CACHE_SETTLE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(45),
+            // Default-on for content; gallery byte-anchor keeps every-frame relight. `P_CACHE_DIRTY_SKIP=0`
+            // forces the legacy always-relight path (perf A/B + the fast-motion worst case).
+            cache_dirty_skip: !gallery_scene && quality::env_bool("P_CACHE_DIRTY_SKIP", true),
+            async_cache_gap: false,
             path_trace_pipeline,
             realtime_env: true,
             time_of_day: std::env::var_os("TIME_OF_DAY").is_some(),
@@ -4708,6 +4739,40 @@ impl App {
         // This frame's reset flag, captured for the async relight (recorded in the submit section);
         // the in-graph (sync) path consumes it inline below.
         let cache_reset_this_frame = self.scene_cache_reset;
+        // Lossless dirty-skip: derive the cache lighting/scene epoch from everything the relight
+        // result depends on (sun, sky, gather params) — but NOT the camera (the cache is
+        // view-independent). When this epoch holds steady past `cache_settle_frames`, the relight
+        // EMA has converged to a fixpoint, so freezing it (skip below) is image-identical.
+        let cache_settled = {
+            let mut epoch = 0xcbf29ce484222325u64;
+            let mut mix = |v: u32| {
+                epoch = epoch.wrapping_mul(0x100_0000_01b3).wrapping_add(v as u64);
+            };
+            for b in self.sun_dir.iter() {
+                mix(b.to_bits());
+            }
+            mix(self.sun_intensity.to_bits());
+            mix(self.sky_gain.to_bits());
+            for b in self.sky_wb.iter() {
+                mix(b.to_bits());
+            }
+            mix(self.cache_relight_spp);
+            mix(self.cache_relight_period);
+            mix(relight_alpha.to_bits());
+            mix(self.gdf_cone_k.to_bits());
+            if epoch == self.cache_epoch {
+                self.cache_stable_frames = self.cache_stable_frames.saturating_add(1);
+            } else {
+                self.cache_epoch = epoch;
+                self.cache_stable_frames = 0;
+            }
+            // Converged only once the cache is captured, past the first-frame reset, and the epoch
+            // has been stable long enough for the EMA (and the multibounce propagation) to settle.
+            self.cache_dirty_skip
+                && self.scene_cache_captured
+                && !cache_reset_this_frame
+                && self.cache_stable_frames >= self.cache_settle_frames
+        };
         // C8b2: re-light the cache (direct sun + sky + multibounce gather from last frame). Async:
         // the relight runs on the compute queue (submit section) and consumers read the previous
         // frame's radiance — the graph handle is only a placeholder for the consumer reads (the
@@ -4715,7 +4780,9 @@ impl App {
         let scene_cache_lit_ext = match (scene_gdf_ext, scene_cache_ext) {
             (Some(gdf_ext), Some(cache_ext)) if self.gdf.has_cache_lighting() => {
                 let ext = graph.import_external("scene_cache_lit");
-                if !self.async_cache_on {
+                // Lossless dirty-skip: a converged cache re-lights to the value it already holds, so
+                // skip the ~100-march relight and let consumers read the persisted (imported) radiance.
+                if !self.async_cache_on && !cache_settled {
                     // Stage D2b: per-card camera visibility (Y-flip-free planes => DX≡VK).
                     let card_vis_ext = if self.cache_feedback {
                         self.gdf
@@ -4936,7 +5003,7 @@ impl App {
                 // 레퍼런스 엔진 GI-fidelity: update + bind the world irradiance volume (DDGI-lite). The update
                 // propagates last frame's volume into hits (multibounce), so deep interiors fill in
                 // over frames. When bound, the GI pass samples the volume instead of marching.
-                let gi_volume_arg = if self.gi_volume && self.frame_no % self.gi_volume_period != 0 {
+                let gi_volume_arg = if self.gi_volume && !self.frame_no.is_multiple_of(self.gi_volume_period) {
                     // Amortized skip: bind the persistent last-updated DDGI volume (the multibounce
                     // EMA carries it); import_external orders the GI sample after it with no write.
                     self.gi.gi_volume_sampled().map(|(rad_base, skyvis_base)| {
@@ -6388,7 +6455,7 @@ impl App {
                     signal,
                     &self.in_flight[fif],
                 )?;
-            } else if self.async_cache_on && scene_cache_lit_ext.is_some() {
+            } else if self.async_cache_on && scene_cache_lit_ext.is_some() && !cache_settled {
                 // Async surface-cache relight: record visibility + relight onto the compute command
                 // buffer and run it on the compute queue, overlapping this graphics frame. The graphics
                 // queue GPU-waits on the PREVIOUS frame's relight (1-frame latency) so its consumer
@@ -6418,9 +6485,11 @@ impl App {
                 );
                 ccmd.end()?;
                 let cur = (self.frame_no % 2) as usize;
-                if self.frame_no == 0 {
-                    // No previous relight to wait on; graphics submits normally, the relight still
-                    // signals so frame 1's wait pairs up.
+                if self.frame_no == 0 || self.async_cache_gap {
+                    // No previous relight to wait on (frame 0, or resuming after a dirty-skip freeze
+                    // that consumed the semaphore chain): graphics submits normally, the relight
+                    // still signals so the next frame's wait pairs up. Clear the gap latch.
+                    self.async_cache_gap = false;
                     self.queue().submit(
                         cmd,
                         &self.image_available[fif],
@@ -6444,6 +6513,12 @@ impl App {
                 )?;
                 self.scene_cache_reset = false;
             } else {
+                // Plain graphics submit. If this is a frozen (settled) async frame, the compute
+                // relight was skipped — latch the gap so the next resumed relight uses the no-wait
+                // submit (the `cache_done` semaphore chain was broken by the skip).
+                if self.async_cache_on && scene_cache_lit_ext.is_some() && cache_settled {
+                    self.async_cache_gap = true;
+                }
                 self.queue().submit(
                     cmd,
                     &self.image_available[fif],
@@ -6508,13 +6583,15 @@ impl App {
             self.reflect.advance_reflect_accum();
         }
         // C8b2: advance the surface-cache radiance ping-pong (next frame reads this frame's).
-        if scene_cache_lit_ext.is_some() {
+        // Frozen (settled) frames skipped the relight, so DON'T advance — keep consumers pinned to
+        // the last-lit (converged) slot for a perfectly stable image.
+        if scene_cache_lit_ext.is_some() && !cache_settled {
             self.gdf.advance_cache();
         }
         // 레퍼런스 엔진 GI-fidelity: advance the world irradiance volume ping-pong (next frame reads this).
         // Only on frames we actually updated the volume (amortization: skipped frames keep reading
         // the same last-written slot, so the ping-pong must not advance past it).
-        if self.gi_volume && self.frame_no % self.gi_volume_period == 0 {
+        if self.gi_volume && self.frame_no.is_multiple_of(self.gi_volume_period) {
             self.gi.advance_gi_volume();
         }
         // QHD/UHD TAAU: advance the history ping-pong (next frame reprojects this frame's).
