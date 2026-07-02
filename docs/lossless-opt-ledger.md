@@ -115,6 +115,17 @@ _(append below; newest last)_
   remove even that occupancy hit; deferred (not needed for the target).
 - **Env:** `P_REFLECT_SKIP=0` (legacy full trace), `P_REFLECT_SKIP_STAGGER=<K>` (re-trace floor).
 
+### IntelSponza baseline (2026-07-03, A2+A3 active) — geometry-bound, needs culling/LOD
+
+`LEVEL=sponza_intel` 1080p/0.667 med: **DX 43.1ms (23fps), VK 43.0ms (23fps)**. Top pass on BOTH is
+**`shadow` 14.1ms** (not the GDF stack — A2/A3 already cut gdf_reflect to ~4.4ms here). Geometry passes
+(shadow + gbuffer + prepass) dominate ~25-30ms of the 43ms; DX≈VK because the bottleneck is raster
+geometry (where the backends match), not GDF compute (where VK lags). **Confirms docs/cull-lod-design.md:
+culling + LOD is the IntelSponza lever** (the GI lossless track that won Sponza does NOT move the needle
+here). NEXT phase = real-scene frustum/occlusion culling + distance LOD (design S0→S6). The directional
+shadow frustum covers the whole scene, so shadow-map cost needs LOD / cascade-culling, not just camera
+frustum cull; camera-frustum + HZB occlusion cull attacks the gbuffer/prepass share.
+
 ## STATUS: Sponza 1080p/0.667 med — **≥60fps on DX (74) and VK (69)**, image-identical (≤0.051/ch)
 
 Remaining track work: (1) IntelSponza to 60fps (docs/cull-lod-design.md — culling/LOD/streaming;
