@@ -26,6 +26,7 @@
 
 #include "bindless.slang"
 #include "clipmap.slang"
+#include "sky_common.slang"
 
 static const float GV_PI = 3.14159265359;
 
@@ -199,7 +200,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float sh = ndl > 0.0 ? gv_shadow(hp + hn * 0.02, sun_dir) : 1.0;
             bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp);
             float3 alb = is_ground ? pc.ground.xyz : albedo_at(hp);
-            float sky_fill = pc.params.z * (0.5 + 0.5 * hn.y);
+            // Sky fill at the bounce hit: the ACTUAL procedural-sky radiance in the hit's
+            // upper hemisphere (single source of truth with the IBL capture / path tracer /
+            // sdf_cache_light), NOT a flat pre-photometric constant. `pc.params.z` now carries
+            // the sky gain (was the old flat fill value); sun intensity is `pc.sun.w`. This is
+            // the fix for interiors reading near-black: the old constant was ~5 orders of
+            // magnitude below the lux-scaled sun, so occluded/bounce-lit geometry lost all fill.
+            float3 sky_fill = procedural_sky(hn, sun_dir, pc.sun.w, pc.params.z, false)
+                              * (0.5 + 0.5 * hn.y);
             // Multibounce: the hit surface re-emits its own indirect irradiance, read
             // DIRECTIONALLY from the previous-frame SH volume in the hit's normal direction.
             // The DIRECT sun + sky fill are irradiance, so they get the albedo/PI BRDF; the

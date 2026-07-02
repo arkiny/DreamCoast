@@ -1975,9 +1975,13 @@ impl App {
             .map(|v| [v.x, v.y, v.z])
             .or(level_sky_wb)
             .unwrap_or([1.0, 1.0, 1.0]);
-        // Physical-camera auto-exposure (see the field). Opt-in, never the gallery (fixed-exposure
-        // anchor), and only when the metering pipeline built.
-        let auto_exposure = std::env::var_os("AUTO_EXPOSURE").is_some()
+        // Physical-camera auto-exposure (see the field). DEFAULT-ON for content scenes: a level
+        // authors its lighting on its own scale (e.g. sponza.level's sun ~4, not lux), so a single
+        // fixed EV100 default cannot expose every level correctly — an interior authored below the
+        // lux scale reads near-black under the sunny-16 default. Metering to the scene's own
+        // luminance is the production-standard, single-source fix that generalises to any level.
+        // Never the gallery (fixed-exposure byte-identical anchor); `AUTO_EXPOSURE=0` opts out.
+        let auto_exposure = quality::env_bool("AUTO_EXPOSURE", !gallery_scene)
             && !gallery_scene
             && deferred.exposure_buf_index().is_some();
         let ambient = 0.04f32;
@@ -4924,6 +4928,7 @@ impl App {
                             scene_aabb_max,
                             self.sun_dir,
                             self.sun_intensity,
+                            self.sky_gain,
                             scene_clip,
                             &scene_clip_vols,
                             scene_albedo,
