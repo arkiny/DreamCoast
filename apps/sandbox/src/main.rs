@@ -30,6 +30,7 @@ use rhi::{
 use tracing::info;
 
 mod app;
+mod atmosphere;
 mod camera;
 mod clipmap;
 mod cluster;
@@ -474,6 +475,9 @@ struct App {
     gdf: GdfSystem,
     gi: GiSystem,
     gtao: gtao::GtaoSystem,
+    /// PR-4 (render-pipeline re-baseline track): the sky/atmosphere composite slot
+    /// (today: opt-in analytic height fog, `P_HEIGHT_FOG`). See `atmosphere.rs`.
+    atmosphere: atmosphere::AtmosphereSystem,
     reflect: ReflectSystem,
     particles: ParticleSystem,
     cull: CullSystem,
@@ -667,6 +671,22 @@ struct App {
     /// no-op sentinel image so it stays byte-identical.
     skyvis_tint: f32,
     skyvis_min_occ: f32,
+    /// PR-4 (render-pipeline re-baseline track): opt-in analytic exponential height fog
+    /// (`P_HEIGHT_FOG=1`), composited in the atmosphere slot after opaque lighting +
+    /// reflections, before TAAU/tonemap. Off by default (byte-identical gallery anchor —
+    /// the slot itself is always present in the graph wiring, but unscheduled when off).
+    height_fog: bool,
+    /// Height-fog density at world height 0 (`a` in `d(y) = a·exp(-b·y)`, 1/world-unit).
+    /// `P_FOG_DENSITY` overrides; scaled by `scene_radius` at the call site so the default
+    /// reads sensibly across scene scales (unit-cube gallery vs. the larger Sponza level).
+    fog_density: f32,
+    /// Height-fog falloff rate `b` (1/world-unit; larger = fog thins out faster with height).
+    /// `P_FOG_HEIGHT_FALLOFF` overrides; also scaled by `scene_radius`.
+    fog_height_falloff: f32,
+    /// Height-fog inscatter→radiance gain fed to the shared `procedural_sky` (mirrors
+    /// `sky_gain`'s role for the env-cube capture — same single-source atmosphere model,
+    /// not a duplicated constant). `P_FOG_INSCATTER_GAIN` overrides; defaults to `sky_gain`.
+    fog_inscatter_gain: f32,
     /// C3 hemisphere rays per pixel.
     gi_spp: u32,
     /// Stage D2: surface-cache amortized-relight period (round-robin card budget; 1 = legacy
@@ -891,6 +911,9 @@ impl App {
         let gi = GiSystem::new(&device, backend, compute_supported)?;
         // Screen-space near-field AO (composed with the GDF AO). See `gtao.rs`.
         let gtao = gtao::GtaoSystem::new(&device, backend, compute_supported)?;
+        // PR-4 (render-pipeline re-baseline track): the sky/atmosphere composite slot
+        // (opt-in height fog today). See `atmosphere.rs`.
+        let atmosphere = atmosphere::AtmosphereSystem::new(&device, backend, HDR_FORMAT)?;
         // Stage C reflection track (C5 SSR; C6/C7 later). See `reflect.rs`.
         let reflect = ReflectSystem::new(&device, backend, compute_supported)?;
         // QHD/UHD track: temporal upsampler. See `taau.rs`.
@@ -2000,6 +2023,32 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        // PR-4 (render-pipeline re-baseline track): opt-in analytic height fog. Off by default
+        // (`P_HEIGHT_FOG=1` to enable) so the byte-identical gallery/regression anchors are
+        // untouched — the atmosphere slot exists in the graph wiring unconditionally, but the
+        // pass itself is only added when this is true (see the `run()` call site).
+        let height_fog = quality::env_bool("P_HEIGHT_FOG", false);
+        // Density/falloff default to a gentle, scene-scale-relative haze: `1/scene_radius` puts
+        // the characteristic falloff height and the "full extinction" distance both on the order
+        // of the scene's own size, so the same defaults look sensible on the unit-radius gallery
+        // and a much larger Sponza level alike. `P_FOG_DENSITY`/`P_FOG_HEIGHT_FALLOFF` override.
+        let fog_density = std::env::var("P_FOG_DENSITY")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.15 / scene_radius.max(1e-3))
+            .max(0.0);
+        let fog_height_falloff = std::env::var("P_FOG_HEIGHT_FALLOFF")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.0 / scene_radius.max(1e-3))
+            .max(0.0);
+        // Inscatter gain defaults to the same sun:sky ratio the env-cube capture uses
+        // (`sky_gain`) — single source, not a duplicated constant. `P_FOG_INSCATTER_GAIN`
+        // overrides independently (e.g. to desaturate/dim the fog relative to the sky).
+        let fog_inscatter_gain = std::env::var("P_FOG_INSCATTER_GAIN")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(sky_gain);
         // Stage D3: gallery forced to the legacy 8 (byte-identical anchor); content takes the tier.
         let gi_spp = std::env::var("P11_GI_SPP")
             .ok()
@@ -2317,6 +2366,7 @@ impl App {
             gdf,
             gi,
             gtao,
+            atmosphere,
             reflect,
             particles,
             cull,
@@ -2460,6 +2510,10 @@ impl App {
             gi_volume,
             skyvis_tint,
             skyvis_min_occ,
+            height_fog,
+            fog_density,
+            fog_height_falloff,
+            fog_inscatter_gain,
             gi_spp,
             cache_relight_period,
             cache_feedback,
@@ -4939,6 +4993,40 @@ impl App {
                 .record_compute_post(&mut graph, hdr, hdr_post, cw, ch);
         }
 
+        // PR-4 (render-pipeline re-baseline track, `docs/render-pipeline-reference.md` §3):
+        // the sky/atmosphere composite slot. Sits right after the opaque scene color is
+        // final (lighting + reflections + the optional compute-post blur all done) and
+        // before TAAU/tonemap — matching the reference pipeline's "opaque complete -> sky/
+        // fog -> translucency -> post" ordering (§1.6). The slot is unconditional in the
+        // graph's *shape*; only the pass itself is opt-in (`P_HEIGHT_FOG=1`), so leaving it
+        // off costs nothing and the gallery/regression anchors stay byte-identical.
+        let fog_src = hdr_post.unwrap_or(hdr);
+        let fog_out = if self.height_fog {
+            let hdr_fog = graph.create_color("hdr_fog", HDR_FORMAT, extent);
+            self.atmosphere.record_fog(
+                &mut graph,
+                fog_src,
+                hdr_fog,
+                g_position,
+                [eye.x, eye.y, eye.z],
+                self.fog_density,
+                self.fog_height_falloff,
+                sun_dir,
+                sun_intensity,
+                self.sky_wb,
+                self.fog_inscatter_gain,
+                // `procedural_sky` returns raw (unexposed) radiance; `hdr` is already exposed
+                // (baked in by `record_lighting`), so the inscatter needs the same treatment.
+                // Uses the static EV100 exposure (not the auto-exposure adapted value) — a
+                // documented simplification; the fog is a slow-varying ambient term so a
+                // one-frame-stale exposure has no visible impact.
+                self.exposure,
+            );
+            Some(hdr_fog)
+        } else {
+            None
+        };
+
         // Phase 7 GPU particles: a compute pass advances the persistent particle
         // buffer; an external graph resource sequences it before the draw pass.
         let particles_ext = if self.particles_on {
@@ -5390,7 +5478,7 @@ impl App {
         // QHD/UHD TAAU: reconstruct the full-res (output) HDR from the jittered internal-res lit
         // image + history, before tonemap. Only the main lit path (not the debug/RT viz outputs).
         let taau_out = if taau_active {
-            let main_lit = hdr_post.unwrap_or(hdr);
+            let main_lit = fog_out.unwrap_or(fog_src);
             // Decima FXAA→TAA: spatially anti-alias the jittered internal frame first so its edges
             // don't flicker frame to frame, then temporally upsample. Stabilizes the jitter.
             let taau_in = if self.taau.has_fxaa() && !taau_jitter_active {
@@ -5430,6 +5518,7 @@ impl App {
             .or(hybrid_out)
             .or(cache_out)
             .or(taau_out)
+            .or(fog_out)
             .or(hdr_post)
             .unwrap_or(hdr);
         // The rasterized HDR already bakes exposure into the lighting pass; the
