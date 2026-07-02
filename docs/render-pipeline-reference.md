@@ -141,7 +141,7 @@ tonemap+grading → (particle/cull draw/ImGui)`.
 | — | Render Graph | ✅ `crates/render`(트랜지언트 aliasing, read/write 선언) | ✅ | 레퍼런스 RDG와 동일 철학 |
 | — | Async Compute | ✅ P7 async(메모리: async-compute.md) | 🟡 | 인프라는 있으나 현 프레임 패스 오버랩은 제한적 |
 | — | Scalability 티어 | ✅ `RenderQuality{low/med/high}` | ✅ | cvar 그룹 대응 |
-| — | View Family | 🟡 단일 뷰 | 🟡 | 스플릿/스테레오/씬캡처 다중 뷰 없음 |
+| — | View Family | ✅ **PR-9**: `SceneView` 디스크립터로 뷰-종속 상태 분리 + `P_SECOND_VIEW=1` PiP 증명 | 🟡 | PR-9 완료([view-family.md](view-family.md)): 뷰-독립(shadow/CSM/IBL/GDF/cluster = 프레임당 1회) ↔ 뷰-종속(gbuffer/AO/GI/lighting/투명/post = 뷰마다) 코드 분리 + globals UBO per-view 슬라이스(`MAX_VIEWS`) + per-view feature 플래그(`SceneViewFeatures`, secondary는 TAAU/velocity/post/screen-GI off → temporal 상태 뷰-수 안전). opt-in `P_SECOND_VIEW=1`(상공 뷰를 인셋 합성), 디폴트 단일 뷰 = 앵커 바이트 동일. 완전 파라미터화·뷰별 히스토리 링·스테레오 인스턴싱은 후속 |
 
 ### 2.1 순서/구조 상이가 **미래 기능을 막는** 지점 (핵심)
 1. ~~**Depth pre-pass 부재 (#1).**~~ **PR-1로 해결(opt-in `DEPTH_PREPASS=1`).** depth-only pre-pass가
@@ -223,8 +223,16 @@ tonemap+grading → (particle/cull draw/ImGui)`.
   `HZB_CULL=1`): prev-frame HZB(리프로젝션 없음, 보수적 4탭) — prev-frame 방식이라 PR-1과 독립
   (G-buffer depth 소스; PR-1 머지 시 read 1줄 교체). *unblocks:* 대규모 씬(월드 렌더링 Phase 23)
   스케일 — 메인 씬 GPU-driven화 시 two-phase로 확장.
-- **PR-9 · View Family(다중 뷰) [M].** 공용 리소스로 N뷰 렌더(씬 캡처/스플릿/스테레오). *unblocks:*
-  실시간 env 캡처·에디터 다중 뷰포트.
+- **PR-9 · View Family(다중 뷰) [M]. ✅ 완료** (Metal 검증, DX≡VK Windows pending). 프레임 루프의
+  뷰-종속 상태(camera/view_proj/jitter/globals 슬라이스/뷰별 트랜지언트 타깃)를 `view::SceneView`
+  디스크립터로 분리하고, 공용 씬 리소스(shadow/CSM/IBL/GDF/cluster = 프레임당 1회)로 N뷰를 렌더하는
+  구조를 세움. globals UBO를 per-view 슬라이스로 확장(`(fif*MAX_VIEWS+view)*GLOBALS_SLICE`), per-view
+  기능 플래그(`SceneViewFeatures`: taau/velocity/post/screen_space_gi)로 secondary 뷰의 단순화(=temporal
+  상태 뷰-수 안전)를 **구조로** 표현. 증명 데모 opt-in `P_SECOND_VIEW=1`: 메인 오빗 뷰 + 상공 오버헤드
+  뷰를 같은 프레임에 렌더해 백버퍼 우상단 PiP 인셋으로 합성(`record_tonemap_inset` + 뷰포트 rect).
+  디폴트 단일 뷰 = 골든 앵커 `af70c1a5…` 바이트 동일. 완전 파라미터화·뷰별 히스토리 링·스테레오
+  single-pass 인스턴싱은 후속. 상세·검증 수치 [view-family.md](view-family.md). *unblocks:* 실시간 env
+  캡처·에디터 다중 뷰포트.
 
 ### 권장 착수 순서
 `PR-1(prepass) → PR-2(velocity) → PR-5(post 시퀀스) → PR-3(투명 슬롯) → PR-4(대기 슬롯) →
