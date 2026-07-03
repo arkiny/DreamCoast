@@ -309,6 +309,23 @@ pub struct MetalGraphicsPipeline {
     pub(crate) depth_stencil: Option<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
 }
 
+/// A compiled mesh-shader pipeline (`MTLRenderPipelineState` built from object/mesh/fragment
+/// functions) plus the per-stage threadgroup sizes MSL needs at draw time (Phase 14). Bound
+/// with `bind_mesh_pipeline`, drawn with `draw_mesh_tasks`.
+pub struct MetalMeshPipeline {
+    pub(crate) state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    /// Object (task) stage threadgroup size; `(1,1,1)` for a mesh-only pipeline.
+    pub(crate) object_threads: MTLSize,
+    /// Mesh stage threadgroup size (the shader's `[numthreads]`).
+    pub(crate) mesh_threads: MTLSize,
+    /// Whether to bind the bindless argument buffer to the object/mesh stages.
+    pub(crate) bindless: bool,
+    /// Whether the pipeline binds the per-frame globals UBO.
+    pub(crate) uses_globals: bool,
+    /// Depth-stencil state (compare + write) when depth testing; bound with the pipeline.
+    pub(crate) depth_stencil: Option<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
+}
+
 /// A compiled compute pipeline (`MTLComputePipelineState`) plus the threadgroup
 /// size from the shader's `[numthreads]` (MSL kernels don't bake it in, unlike
 /// SPIR-V/DXIL), and whether it binds the device's bindless argument buffer. (M5)

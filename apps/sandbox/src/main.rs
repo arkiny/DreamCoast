@@ -61,6 +61,7 @@ mod smoketest;
 mod taau;
 mod translucent;
 mod velocity;
+mod vgeo;
 mod view;
 mod world;
 use app::*;
@@ -477,6 +478,41 @@ fn run() -> anyhow::Result<()> {
         );
     }
 
+    // Phase 14 (virtual geometry) M0 capability smokes. `--atomic64-test` is headless
+    // (compute + CPU readback); `--mesh-shader-test` draws one mesh-shader triangle.
+    if atomic64_test_enabled() {
+        return run_atomic64_test(backend, &device);
+    }
+    if mesh_shader_test_enabled() {
+        return run_mesh_shader_test(backend, &mut window, &device, &mut swapchain);
+    }
+    // Phase 14 M1e: load the COOKED LOD DAG and render the meshlet debug view (per-cluster colour).
+    if vgeo_test_enabled() {
+        return run_vgeo_test(
+            backend,
+            &mut window,
+            &device,
+            &mut swapchain,
+            &model_path,
+            &model_ref,
+            &cache_dir,
+            compress_tex,
+        );
+    }
+    // Phase 14 M2: render the cooked clusters on the GPU via a mesh shader.
+    if vgeo_mesh_test_enabled() {
+        return run_vgeo_mesh(
+            backend,
+            &mut window,
+            &device,
+            &mut swapchain,
+            &model_path,
+            &model_ref,
+            &cache_dir,
+            compress_tex,
+        );
+    }
+
     let mut app = App::new(
         window,
         instance,
@@ -512,6 +548,12 @@ struct App {
 
     // Feature bundles (see the per-module docs).
     deferred: DeferredRenderer,
+    /// Phase 14 renderer integration: virtual geometry as the G-buffer producer (opt-in `P14_VGEO`,
+    /// single-model scope). `None` = the default mesh fill (gallery byte-identical).
+    vgeo: Option<vgeo::VgeoSystem>,
+    /// `P14_VGEO` mode: 0 off, 1 = vgeo producer, 2 = mesh reference (groundless single model) for
+    /// the parity diff.
+    vgeo_mode: u32,
     gdf: GdfSystem,
     gi: GiSystem,
     gtao: gtao::GtaoSystem,
@@ -1051,6 +1093,12 @@ impl App {
         captures: Vec<Capture>,
         validation_on: bool,
     ) -> anyhow::Result<Self> {
+        // `P14_VGEO=1` routes every eligible opaque object through virtual geometry (the `VgeoSystem`
+        // is built below from the mesh registry). 0 = off (default renderer, gallery byte-identical).
+        let vgeo_mode: u32 = std::env::var("P14_VGEO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let queue = device.queue();
         // Phase-7 compute (post blur / GPU particles / GPU culling) is implemented
         // on all three backends (Metal compute landed in M5).
@@ -2635,6 +2683,29 @@ impl App {
         // 20 work that also adds the G-buffer suppression; foliage behaviour is unchanged here.
         // See `docs/translucency-pass.md` (§ glTF routing).
 
+        // Phase 14 renderer integration: when P14_VGEO is on, build a virtual-geometry cluster page
+        // per registered mesh (built from the registry's CPU geometry, matching the uploaded mesh
+        // exactly). Every eligible opaque object then renders as virtual geometry, overlaid on the
+        // mesh-rastered remainder. Any failure logs and falls back to the mesh fill (mode stays set,
+        // but the frame guards on `vgeo.is_some()`).
+        let vgeo = if vgeo_mode > 0 {
+            let (ww, wh) = window.size();
+            match vgeo::VgeoSystem::new(
+                &device,
+                backend,
+                &mesh_registry,
+                Extent2D::new(ww.max(1), wh.max(1)),
+            ) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    info!("P14_VGEO disabled ({e}); using the mesh G-buffer fill");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             window,
             _instance: instance,
@@ -2645,6 +2716,8 @@ impl App {
             backend,
             gui,
             deferred,
+            vgeo,
+            vgeo_mode,
             gdf,
             gi,
             gtao,
@@ -4703,6 +4776,41 @@ impl App {
             None
         };
         let opaque_scene: &[SceneObject] = culled_scene.as_deref().unwrap_or(&scene);
+
+        // Phase 14 renderer integration (P14_VGEO=1): route each opaque object to virtual geometry
+        // when its mesh has a cluster page; the rest are mesh-rastered. Computed (+ the visibility
+        // buffer resized, + the per-object scratch pool prepared) BEFORE the graph so all of it
+        // outlives `graph.execute`. Off / no page → the normal mesh fill (gallery byte-identical).
+        if let Some(v) = self.vgeo.as_mut() {
+            v.resize(&self.device, extent)?;
+        }
+        // `(page index, material, world transform)` per vgeo object + the mesh-rastered remainder.
+        let mut vgeo_draws: Vec<(usize, vgeo::VgeoMaterial, Mat4)> = Vec::new();
+        let mut vgeo_others: Vec<SceneObject> = Vec::new();
+        if self.vgeo_mode == 1
+            && let Some(v) = self.vgeo.as_ref()
+        {
+            for o in opaque_scene {
+                match (o.kind, v.page_for(&o.mesh)) {
+                    (dreamcoast_asset::MaterialKind::Opaque, Some(page)) => vgeo_draws.push((
+                        page,
+                        vgeo::VgeoMaterial {
+                            base_color: o.base_color,
+                            metallic: o.metallic,
+                            roughness: o.roughness,
+                            tex: o.tex,
+                            alpha_cutoff: o.alpha_cutoff,
+                        },
+                        o.transform,
+                    )),
+                    _ => vgeo_others.push(o.clone()),
+                }
+            }
+        }
+        if let Some(v) = self.vgeo.as_mut() {
+            v.prepare(&self.device, self.fif, vgeo_draws.len())?;
+        }
+
         let mut graph = RenderGraph::new();
         // The backbuffer is the actual swapchain image (display extent); tonemap samples the
         // render-extent HDR by UV, so a render≠display extent just means a downscale at present.
@@ -4798,21 +4906,63 @@ impl App {
                 mip_bias,
             );
         }
-        self.deferred.record_gbuffer(
-            &mut graph,
-            gbuf,
-            opaque_scene,
-            &self.ground_vbuf,
-            &self.ground_ibuf,
-            self.ground_count,
-            view_proj,
-            self.ambient,
-            self.override_material,
-            self.metallic_override,
-            self.roughness_override,
-            mip_bias,
-            self.depth_prepass,
-        );
+        // Phase 14 renderer integration: under P14_VGEO=1 every opaque object with a cluster page is
+        // produced by virtual geometry. The mesh fill rasters the remainder + ground first (clears),
+        // then each vgeo object is resolved on top (LOAD + Less depth test → depth-composited).
+        if !vgeo_draws.is_empty() {
+            self.deferred.record_gbuffer(
+                &mut graph,
+                gbuf,
+                &vgeo_others,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj,
+                self.ambient,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                mip_bias,
+                self.depth_prepass,
+                true,
+            );
+            let v = self.vgeo.as_ref().unwrap();
+            let visbuf_ext = vgeo::VgeoSystem::import_visbuf(&mut graph);
+            for (slot, (page, material, transform)) in vgeo_draws.iter().enumerate() {
+                v.record_object(
+                    &mut graph,
+                    gbuf,
+                    self.fif,
+                    slot,
+                    *page,
+                    visbuf_ext,
+                    view_proj,
+                    cull_view_proj,
+                    eye,
+                    *transform,
+                    *material,
+                    extent,
+                );
+            }
+        } else {
+            // Default / fallback: the whole scene with the ground (unchanged, gallery byte-identical).
+            self.deferred.record_gbuffer(
+                &mut graph,
+                gbuf,
+                opaque_scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj,
+                self.ambient,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                mip_bias,
+                self.depth_prepass,
+                true,
+            );
+        }
         // Deferred surface-decal pass (decals A3): tint the G-buffer albedo for `kind == Decal`
         // drawables after the opaque fill, before lighting. No-op (no pass) when the scene has
         // no decals, so the gallery / non-decal scenes stay byte-identical.
@@ -6581,6 +6731,7 @@ impl App {
                 self.roughness_override,
                 sv_mip_bias,
                 false, // no depth pre-pass
+                true,  // draw the ground (unchanged)
             );
             // Lighting: shares the ONCE-rendered shadow atlas + IBL; screen-space GI/AO/reflection
             // inputs are gated on THIS VIEW'S `screen_space_gi` feature (off for the secondary view →

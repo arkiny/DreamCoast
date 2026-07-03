@@ -1140,6 +1140,25 @@ impl VulkanDevice {
         }
     }
 
+    /// Compile a mesh-shader pipeline (Phase 14). Windows-box follow-up: requires
+    /// `VK_EXT_mesh_shader` enabled at device creation. Gated off via [`Self::capabilities`]
+    /// until then, so this is never reached (Metal is the verified path; DX≡VK follow-up).
+    pub fn create_mesh_pipeline(
+        &self,
+        _desc: &rhi_types::MeshPipelineDesc,
+    ) -> Result<crate::VulkanMeshPipeline, EngineError> {
+        unimplemented!("Vulkan mesh-shader pipeline pending (Phase 14 Windows follow-up)")
+    }
+
+    /// Optional GPU capabilities (Phase 14 virtual geometry). NOTE: reports all-`false`
+    /// until the Windows-box follow-up enables the corresponding device features at creation
+    /// (`VK_EXT_mesh_shader`, `shaderBufferInt64Atomics`) and probes them here. The vgeo
+    /// smokes gate on this, so they fail clearly on Vulkan until then (Metal is verified on
+    /// the macOS box; DX≡VK is the tracked follow-up).
+    pub fn capabilities(&self) -> rhi_types::DeviceCapabilities {
+        rhi_types::DeviceCapabilities::default()
+    }
+
     /// Whether hardware ray tracing is available (acceleration-structure +
     /// ray-query + ray-tracing-pipeline extensions enabled) (Phase 8).
     pub fn has_raytracing(&self) -> bool {
