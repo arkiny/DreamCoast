@@ -117,7 +117,12 @@ void csRaster(uint gid: SV_GroupID, uint lane: SV_GroupThreadID)
                 continue;
             float d = saturate(w0 * sp[0].z + w1 * sp[1].z + w2 * sp[2].z);
             // Nearest (small depth) → largest key, so a single atomicMax keeps the front-most.
-            uint depth_key = (uint)((1.0 - d) * 4294967040.0);
+            // Reinterpret the float bits (monotonic for d >= 0) instead of scaling by 2^32 in float:
+            // the float32 multiply would collapse the depth to ~24 bits and re-quantize an
+            // already-float depth, spuriously TYING distinct near-coplanar surfaces (grazing arch
+            // soffit vs the wall behind) that the HW depth test resolves — the source of the
+            // dither/streaks. `0xFFFFFFFF - asuint(d)` preserves the full float32 ordering exactly.
+            uint depth_key = 0xFFFFFFFFu - asuint(d);
             uint64_t packed = ((uint64_t)depth_key << 32) | (uint64_t)payload;
             atomicMaxU64(g.storage_buffers[pc.vis_buf], (uint)y * pc.width + (uint)x, packed);
         }

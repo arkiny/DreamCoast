@@ -101,9 +101,11 @@ float4 fragMain(VertexOut i, PrimOut prim): SV_Target
         return float4(0.0, 0.0, 0.0, 1.0);
     uint px = y * pc.width + x;
     // Window-space depth (perspective-correct z, [0,1]) — the same NDC depth the SW raster
-    // interpolates, so nearest-wins is identical across HW/SW.
+    // interpolates, so nearest-wins is identical across HW/SW. Bit-reinterpret (monotonic for
+    // d >= 0), NOT a float 2^32 scale, so the key keeps full float32 precision and matches the SW
+    // path exactly — else near-coplanar surfaces tie and dither (see vgeo_swraster.slang).
     float d = saturate(i.pos.z);
-    uint depth_key = (uint)((1.0 - d) * 4294967040.0);
+    uint depth_key = 0xFFFFFFFFu - asuint(d);
     uint64_t packed = ((uint64_t)depth_key << 32) | (uint64_t)prim.payload;
     atomicMaxU64(g.storage_buffers[pc.vis_buf], px, packed);
     return float4(0.0, 0.0, 0.0, 1.0);
