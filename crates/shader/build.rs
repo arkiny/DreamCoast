@@ -1004,6 +1004,20 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "vgeo_resolve_fs",
     },
+    // Phase 14 renderer integration: visibility buffer → real Phase-6 G-buffer MRT (+ SV_Depth),
+    // so the deferred lighting pipeline consumes virtual geometry unchanged (drop-in producer).
+    Job {
+        src: "vgeo_gbuffer.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "vgeo_gbuffer_vs",
+    },
+    Job {
+        src: "vgeo_gbuffer.slang",
+        entry: "fsGBuffer",
+        stage: "fragment",
+        key: "vgeo_gbuffer_fs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.
