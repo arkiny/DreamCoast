@@ -875,8 +875,8 @@ struct App {
     /// surface-cache relight (and world-irradiance volume) is a temporally-accumulated EMA that
     /// reaches a fixpoint once the lighting (sun/sky) + geometry stop changing. `cache_epoch` is a
     /// hash of that invariant state; a change re-arms convergence. The freeze then arms on MEASURED
-    /// convergence (the relight's max EMA step below `cache_conv_eps` for `cache_conv_k` frames — see
-    /// the GPU `InterlockedMax` probe), NOT a frame count: multibounce converges at scene-dependent
+    /// convergence (the relight's mean EMA step below `cache_conv_eps` for `cache_conv_k` frames — see
+    /// the GPU `InterlockedAdd` probe), NOT a frame count: multibounce converges at scene-dependent
     /// rates, so a fixed count locked an unconverged cache on IntelSponza. Once converged, re-lighting
     /// produces the SAME value it holds — we freeze the relight (skip the dispatch, don't advance the
     /// ping-pong) and consumers keep reading it. Image-identical (a converged EMA == its fixpoint).
@@ -4649,8 +4649,11 @@ impl App {
             } else {
                 1
             };
-            self.reflect
-                .prepare_reflect_skip(&self.device, cw.div_ceil(rdiv), ch.div_ceil(rdiv))?;
+            self.reflect.prepare_reflect_skip(
+                &self.device,
+                cw.div_ceil(rdiv),
+                ch.div_ceil(rdiv),
+            )?;
         }
         // QHD/UHD TAAU: (re)allocate the full-res (output) history.
         if taau_active {
@@ -4915,14 +4918,16 @@ impl App {
         let cache_reset_this_frame = self.scene_cache_reset;
         // A2-fix: derive the cache lighting/scene epoch from everything the relight depends on (sun,
         // sky, gather params) — but NOT the camera (the cache is view-independent). An epoch change
-        // re-arms convergence. The FREEZE itself gates on MEASURED convergence (the relight's max EMA
+        // re-arms convergence. The FREEZE itself gates on MEASURED convergence (the relight's mean EMA
         // step below `cache_conv_eps`), not a frame count: multibounce colour propagation converges at
         // scene-dependent rates, so a fixed frame count locked an unconverged cache on IntelSponza's
-        // coloured drapes. Lumen never freezes on a frame count either — it budgets updates by
-        // priority; this is the measured-convergence analogue that stays image-identical on any scene.
-        // Probe the previous (fence-complete) relight's max EMA step + get this frame's write index.
-        let (cache_conv_idx, cache_conv_delta) =
-            self.gdf.cache_conv_probe().unwrap_or((u32::MAX, f32::INFINITY));
+        // coloured drapes. A general engine budgets relight updates by priority rather than a frame-count
+        // freeze; this is the measured-convergence analogue that stays image-identical on any scene.
+        // Probe the previous (fence-complete) relight's mean EMA step + get this frame's write index.
+        let (cache_conv_idx, cache_conv_delta) = self
+            .gdf
+            .cache_conv_probe()
+            .unwrap_or((u32::MAX, f32::INFINITY));
         let cache_converged = {
             let mut epoch = 0xcbf29ce484222325u64;
             let mut mix = |v: u32| {
@@ -4972,7 +4977,11 @@ impl App {
         let cache_settled = self.cache_dirty_skip && cache_converged;
         // Hand the relight its convergence probe index so it measures the EMA step — but only when we
         // actually relight (not frozen); a frozen frame leaves the cleared slot at 0 (stays converged).
-        let relight_conv_idx = if cache_settled { u32::MAX } else { cache_conv_idx };
+        let relight_conv_idx = if cache_settled {
+            u32::MAX
+        } else {
+            cache_conv_idx
+        };
         // C8b2: re-light the cache (direct sun + sky + multibounce gather from last frame). Async:
         // the relight runs on the compute queue (submit section) and consumers read the previous
         // frame's radiance — the graph handle is only a placeholder for the consumer reads (the
@@ -5204,36 +5213,37 @@ impl App {
                 // 레퍼런스 엔진 GI-fidelity: update + bind the world irradiance volume (DDGI-lite). The update
                 // propagates last frame's volume into hits (multibounce), so deep interiors fill in
                 // over frames. When bound, the GI pass samples the volume instead of marching.
-                let gi_volume_arg = if self.gi_volume && !self.frame_no.is_multiple_of(self.gi_volume_period) {
-                    // Amortized skip: bind the persistent last-updated DDGI volume (the multibounce
-                    // EMA carries it); import_external orders the GI sample after it with no write.
-                    self.gi.gi_volume_sampled().map(|(rad_base, skyvis_base)| {
-                        (rad_base, skyvis_base, graph.import_external("gi_volume_w"))
-                    })
-                } else if self.gi_volume {
-                    self.gi
-                        .record_gi_volume(
-                            &mut graph,
-                            vol,
-                            ext,
-                            scene_aabb_min,
-                            scene_aabb_max,
-                            self.sun_dir,
-                            self.sun_intensity,
-                            self.sky_gain,
-                            scene_clip,
-                            &scene_clip_vols,
-                            scene_albedo,
-                            crate::GROUND_ALBEDO,
-                            self.frame_no as u32,
-                            self.gi_spp,
-                            0.1,
-                        )
-                        .zip(self.gi.gi_volume_sampled())
-                        .map(|(vext, (rad_base, skyvis_base))| (rad_base, skyvis_base, vext))
-                } else {
-                    None
-                };
+                let gi_volume_arg =
+                    if self.gi_volume && !self.frame_no.is_multiple_of(self.gi_volume_period) {
+                        // Amortized skip: bind the persistent last-updated DDGI volume (the multibounce
+                        // EMA carries it); import_external orders the GI sample after it with no write.
+                        self.gi.gi_volume_sampled().map(|(rad_base, skyvis_base)| {
+                            (rad_base, skyvis_base, graph.import_external("gi_volume_w"))
+                        })
+                    } else if self.gi_volume {
+                        self.gi
+                            .record_gi_volume(
+                                &mut graph,
+                                vol,
+                                ext,
+                                scene_aabb_min,
+                                scene_aabb_max,
+                                self.sun_dir,
+                                self.sun_intensity,
+                                self.sky_gain,
+                                scene_clip,
+                                &scene_clip_vols,
+                                scene_albedo,
+                                crate::GROUND_ALBEDO,
+                                self.frame_no as u32,
+                                self.gi_spp,
+                                0.1,
+                            )
+                            .zip(self.gi.gi_volume_sampled())
+                            .map(|(vext, (rad_base, skyvis_base))| (rad_base, skyvis_base, vext))
+                    } else {
+                        None
+                    };
                 let (traced, skyvis) = self.gi.record_gi(
                     &mut graph,
                     vol,
