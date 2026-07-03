@@ -273,6 +273,29 @@ impl<'a> RenderGraph<'a> {
         });
     }
 
+    /// Add a graphics pass that ALSO writes external storage buffers via UAV (Phase 14 Track B:
+    /// the HW mesh-vis pass rasterizes into the shared R64 visibility buffer from its fragment
+    /// stage while rendering to a scratch color attachment). Identical to [`Self::add_pass`] plus
+    /// `storage_writes`, which the scheduler uses for WAW/RAW ordering against the other visibility
+    /// writers/readers; the actual UAV barrier for an *external* buffer is emitted by the closure
+    /// (or a following barrier pass), since the graph doesn't own external resources.
+    pub fn add_pass_with_storage_writes(
+        &mut self,
+        info: PassInfo,
+        storage_writes: Vec<ResourceId>,
+        record: impl FnMut(&mut PassContext) -> Result<(), EngineError> + 'a,
+    ) {
+        self.passes.push(PassNode {
+            name: info.name,
+            kind: PassKind::Graphics,
+            colors: info.colors,
+            depth: info.depth,
+            reads: info.reads,
+            storage_writes,
+            record: Box::new(record),
+        });
+    }
+
     /// Add a compute pass. It writes `storage_writes` (storage images / external
     /// storage buffers via UAV) and reads `reads` (sampled textures + external
     /// storage buffers). No attachments; the record closure binds a compute

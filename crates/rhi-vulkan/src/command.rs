@@ -945,14 +945,19 @@ impl VulkanCommandBuffer {
     /// UAV barrier on a storage buffer: order a compute write before any later
     /// shader read (compute / vertex / fragment).
     pub fn storage_buffer_barrier(&self, buffer: &VulkanStorageBuffer) {
+        // src covers COMPUTE/RT *and* the graphics stages: the Phase 14 Track B HW mesh-vis pass
+        // writes the shared visibility buffer from its FRAGMENT stage (mesh + fragment atomicMax),
+        // so ordering that write before a later reader needs FRAGMENT (and VERTEX, for the
+        // particle/cull vertex-pull producers) in the source scope too. D3D12/Metal UAV barriers
+        // are stage-agnostic; only Vulkan needs the explicit stages. Widening src is conservative —
+        // it only adds a dependency on stages that don't touch this buffer for compute producers.
+        let gfx = vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER;
         self.buffer_memory_barrier(
             buffer.raw(),
             vk::AccessFlags::SHADER_WRITE,
             vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            self.storage_stages(),
-            self.storage_stages()
-                | vk::PipelineStageFlags::VERTEX_SHADER
-                | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            self.storage_stages() | gfx,
+            self.storage_stages() | gfx,
         );
     }
 

@@ -19,9 +19,9 @@ use std::rc::Rc;
 use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourceId};
 use rhi::{
-    BackendKind, ComputePipeline, ComputePipelineDesc, DepthCompare, Device, Extent2D,
-    GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, StorageBuffer, StorageBufferDesc,
-    VertexLayout,
+    BackendKind, ClearColor, ComputePipeline, ComputePipelineDesc, DepthCompare, Device, Extent2D,
+    GraphicsPipeline, GraphicsPipelineDesc, MeshPipeline, MeshPipelineDesc, PrimitiveTopology,
+    StorageBuffer, StorageBufferDesc, VertexLayout,
 };
 
 use crate::deferred::GBufferTargets;
@@ -58,14 +58,37 @@ pub(crate) struct VgeoSystem {
     /// (each clears → rasters → resolves), so one buffer suffices; inter-object occlusion is
     /// resolved by the G-buffer depth test in the resolve, not the visibility buffer.
     visbuf: Vec<StorageBuffer>,
-    /// Per-FIF growable pool of per-object scratch: `(visible list, indirect-append counter)`.
-    pool: Vec<Vec<(StorageBuffer, StorageBuffer)>>,
+    /// Per-FIF growable pool of per-object scratch (visible lists + indirect-append counters).
+    pool: Vec<Vec<ObjScratch>>,
     extent: Extent2D,
     cut_pipeline: ComputePipeline,
     clear_pipeline: ComputePipeline,
     raster_pipeline: ComputePipeline,
     resolve_pipeline: GraphicsPipeline,
     tau: f32,
+    /// M5b HW/SW binning (opt-in `P14_VGEO_BIN=1`, needs mesh shaders): the binning cut splits each
+    /// object's clusters into an HW (mesh-shader) sub-list and a SW (compute-raster) sub-list by
+    /// projected screen size; both rasterize the SAME visibility buffer. `None` = SW-only (the cut
+    /// selects one list, all rasterized in compute). Required for large-triangle (Sponza-class)
+    /// clusters whose single triangle covers too many pixels for the per-thread SW rasterizer.
+    bin: Option<BinPipelines>,
+    bin_px: f32,
+}
+
+/// The extra pipelines the HW/SW binning path needs (only built when `P14_VGEO_BIN` + mesh shaders).
+struct BinPipelines {
+    cut_bin: ComputePipeline,
+    hwvis: MeshPipeline,
+}
+
+/// Per-object per-frame scratch. `hw_list`/`hw_args` are the whole cut (SW-only) or the HW sub-list
+/// (binning); `sw_*` are the SW sub-list, allocated only when binning. Host-visible so `prepare`
+/// resets them each frame (a DEFAULT-heap host write is illegal on D3D12).
+struct ObjScratch {
+    hw_list: StorageBuffer,
+    hw_args: StorageBuffer,
+    sw_list: Option<StorageBuffer>,
+    sw_args: Option<StorageBuffer>,
 }
 
 fn vis_bytes(extent: Extent2D) -> u64 {
@@ -228,6 +251,74 @@ impl VgeoSystem {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8.0);
+        let bin_px: f32 = std::env::var("VGEO_BINPX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16.0);
+
+        // M5b HW/SW binning (opt-in). Needs mesh shaders for the HW path; if requested on an adapter
+        // without them, warn and stay SW-only rather than failing the whole vgeo path.
+        let bin_requested = std::env::var("P14_VGEO_BIN").ok().as_deref() == Some("1");
+        let bin = if bin_requested {
+            if !device.capabilities().mesh_shader {
+                tracing::warn!(
+                    "P14_VGEO_BIN: {backend:?} lacks mesh shaders — staying SW-only (large-triangle \
+                     clusters may be dropped)"
+                );
+                None
+            } else {
+                let cut_bin = compute(
+                    dreamcoast_shader::vgeo_cut_bin_cs_spirv,
+                    dreamcoast_shader::vgeo_cut_bin_cs_dxil,
+                    dreamcoast_shader::vgeo_cut_bin_cs_metallib,
+                    "csCutBin",
+                    224,
+                    [64, 1, 1],
+                )?;
+                let (hms, hfs) = match backend {
+                    BackendKind::Vulkan => (
+                        dreamcoast_shader::vgeo_hwvis_ms_spirv(),
+                        dreamcoast_shader::vgeo_hwvis_fs_spirv(),
+                    ),
+                    BackendKind::D3d12 => (
+                        dreamcoast_shader::vgeo_hwvis_ms_dxil(),
+                        dreamcoast_shader::vgeo_hwvis_fs_dxil(),
+                    ),
+                    BackendKind::Metal => (
+                        dreamcoast_shader::vgeo_hwvis_ms_metallib(),
+                        dreamcoast_shader::vgeo_hwvis_fs_metallib(),
+                    ),
+                };
+                let hwvis = device.create_mesh_pipeline(&MeshPipelineDesc {
+                    object_bytes: None,
+                    object_entry: "",
+                    mesh_bytes: hms
+                        .ok_or_else(|| anyhow::anyhow!("vgeo_hwvis mesh shader unavailable"))?,
+                    mesh_entry: "meshMain",
+                    fragment_bytes: hfs
+                        .ok_or_else(|| anyhow::anyhow!("vgeo_hwvis fragment shader unavailable"))?,
+                    fragment_entry: "fragMain",
+                    // Throwaway color target (the fragment's atomicMax writes the visibility buffer;
+                    // its colour output is unused). Matches the scratch target `record_object` makes.
+                    color_formats: &[crate::GB_ALBEDO_FMT],
+                    depth_format: None,
+                    push_constant_size: 96, // mat4 mvp (64) + 8 u32 slots (32)
+                    bindless: true,
+                    uniform_buffer: false,
+                    object_threads: [1, 1, 1],
+                    mesh_threads: [128, 1, 1],
+                    depth_test: false,
+                    depth_write: false,
+                    depth_compare: DepthCompare::Less,
+                })?;
+                tracing::info!(
+                    "P14_VGEO_BIN: HW/SW binning enabled (split at {bin_px}px diameter)"
+                );
+                Some(BinPipelines { cut_bin, hwvis })
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             pages,
@@ -241,6 +332,8 @@ impl VgeoSystem {
             raster_pipeline,
             resolve_pipeline,
             tau,
+            bin,
+            bin_px,
         })
     }
 
@@ -334,27 +427,45 @@ impl VgeoSystem {
         fif: usize,
         count: usize,
     ) -> anyhow::Result<()> {
+        let binning = self.bin.is_some();
+        let list_bytes = (self.max_clusters.max(1) as u64) * 4;
+        // Host-visible (not DEFAULT-heap `_init`): host-`write`-reset every frame below, which a
+        // DEFAULT-heap D3D12 buffer rejects. CUSTOM-L0 / HOST_COHERENT is CPU-writable AND a UAV, so
+        // the cut compute writes it on the GPU too.
+        let host = |bytes: u64, indirect: bool| -> anyhow::Result<StorageBuffer> {
+            Ok(device.create_storage_buffer_host(&StorageBufferDesc {
+                size: bytes,
+                stride: 4,
+                indirect,
+            })?)
+        };
         let slots = &mut self.pool[fif];
         while slots.len() < count {
-            // Host-visible (not DEFAULT-heap `_init`): these are host-`write`-reset every frame
-            // below, which a DEFAULT-heap D3D12 buffer rejects (only Metal's unified memory allowed
-            // it). CUSTOM-L0 / HOST_COHERENT is CPU-writable AND a UAV, so the cut compute writes it
-            // on the GPU too. Seeded by the reset loop below (created empty here).
-            let vislist = device.create_storage_buffer_host(&StorageBufferDesc {
-                size: (self.max_clusters.max(1) as u64) * 4,
-                stride: 4,
-                indirect: false,
-            })?;
-            let args = device.create_storage_buffer_host(&StorageBufferDesc {
-                size: 12,
-                stride: 4,
-                indirect: false,
-            })?;
-            slots.push((vislist, args));
+            let (sw_list, sw_args) = if binning {
+                (Some(host(list_bytes, false)?), Some(host(12, false)?))
+            } else {
+                (None, None)
+            };
+            slots.push(ObjScratch {
+                hw_list: host(list_bytes, false)?,
+                // `hw_args` feeds `draw_mesh_tasks_indirect` in binning mode → needs INDIRECT usage.
+                hw_args: host(12, binning)?,
+                sw_list,
+                sw_args,
+            });
         }
-        for (vislist, args) in slots.iter().take(count) {
-            args.write(&0u32.to_le_bytes())?;
-            vislist.write(&vec![0xFFu8; self.max_clusters.max(1) as usize * 4])?;
+        // Reset each in-use slot: append counters to `{0,1,1}` (the indirect grid — `csCut`/`csCutBin`
+        // bump `.x` to the count; the mesh/SW draw reads `{count,1,1}`), lists to the `0xFFFFFFFF`
+        // sentinel (the fixed-count SW raster dispatch skips slots the cut didn't fill).
+        let args0: Vec<u8> = [0u32, 1, 1].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let sentinel = vec![0xFFu8; list_bytes as usize];
+        for s in slots.iter().take(count) {
+            s.hw_args.write(&args0)?;
+            s.hw_list.write(&sentinel)?;
+            if let (Some(sw_list), Some(sw_args)) = (&s.sw_list, &s.sw_args) {
+                sw_args.write(&args0)?;
+                sw_list.write(&sentinel)?;
+            }
         }
         Ok(())
     }
@@ -365,10 +476,15 @@ impl VgeoSystem {
         graph.import_external("vgeo_visbuf")
     }
 
-    /// Record one object's virtual-geometry G-buffer contribution (cut → clear → SW raster →
-    /// resolve overlay). `slot` indexes this frame's scratch pool; `visbuf_ext` is the shared handle
-    /// from [`Self::import_visbuf`]. The mesh fill must run first (it clears the G-buffer + depth);
-    /// the resolve LOADs them and Less-tests the model's `SV_Depth`, compositing with the rest.
+    /// Record one object's virtual-geometry G-buffer contribution (cut → raster → resolve overlay).
+    /// `slot` indexes this frame's scratch pool; `visbuf_ext` is the shared handle from
+    /// [`Self::import_visbuf`]. The mesh fill must run first (it clears the G-buffer + depth); the
+    /// resolve LOADs them and Less-tests the model's `SV_Depth`, compositing with the rest.
+    ///
+    /// SW-only (`P14_VGEO_BIN` off): `csCut` → clear + `csRaster` the whole cut. Binning
+    /// (`P14_VGEO_BIN=1` + mesh shaders): `csCutBin` splits the cut into a SW sub-list (compute
+    /// raster) and an HW sub-list (mesh shader, `vgeo_hwvis`); both write the SAME visibility buffer
+    /// so the boundary is seamless — the fix for large-triangle (Sponza-class) clusters.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_object<'a>(
         &'a self,
@@ -379,6 +495,7 @@ impl VgeoSystem {
         page_idx: usize,
         visbuf_ext: ResourceId,
         cull_view_proj: Mat4,
+        view_proj: Mat4,
         eye: Vec3,
         model: Mat4,
         material: VgeoMaterial,
@@ -386,10 +503,12 @@ impl VgeoSystem {
     ) {
         let page = &self.pages[page_idx];
         let visbuf = &self.visbuf[fif];
-        let (vislist, args) = &self.pool[fif][slot];
+        let s = &self.pool[fif][slot];
+        let (hw_list, hw_args) = (&s.hw_list, &s.hw_args);
         let (w, h) = (extent.width, extent.height);
         let total = page.total_clusters;
         let tau = self.tau;
+        let bin_px = self.bin_px;
         let (vtx_i, remap_i, tri_i, rec_i) = (
             page.vtx.storage_index(),
             page.remap.storage_index(),
@@ -397,11 +516,13 @@ impl VgeoSystem {
             page.rec.storage_index(),
         );
 
-        let vislist_ext = graph.import_external("vgeo_vislist");
-        let args_ext = graph.import_external("vgeo_args");
+        let hw_list_ext = graph.import_external("vgeo_vislist");
+        let hw_args_ext = graph.import_external("vgeo_args");
 
         // ── LOD cut (world-space): WORLD frustum planes + cam; the shader transforms each cluster's
-        // local bounds by `model` (handles non-uniform node scale that a local-space test skews). ──
+        // local bounds by `model` (handles non-uniform node scale that a local-space test skews).
+        // Binning (`csCutBin`) additionally classifies each selected cluster by projected screen
+        // size into the HW (`hw_list`) or SW (`sw_list`) sub-list. ──
         let planes = crate::push::frustum_planes(cull_view_proj);
         let cam = eye;
         let max_scale = model
@@ -412,11 +533,37 @@ impl VgeoSystem {
             .max(model.z_axis.truncate().length());
         let model_arr = model.to_cols_array();
         let proj_factor = 0.5 * h as f32 / (30f32.to_radians()).tan();
-        let cut = &self.cut_pipeline;
+        // The SW list rasterized in compute (SW-only: the whole cut = hw_list; binning: the SW
+        // sub-list); its ordering handle.
+        let (sw_list, sw_args) = match (&s.sw_list, &s.sw_args) {
+            (Some(l), Some(a)) => (l, a),
+            _ => (hw_list, hw_args),
+        };
+        let sw_list_ext = if self.bin.is_some() {
+            graph.import_external("vgeo_sw_list")
+        } else {
+            hw_list_ext
+        };
+        let sw_args_ext = if self.bin.is_some() {
+            graph.import_external("vgeo_sw_args")
+        } else {
+            hw_args_ext
+        };
+        let cut = self
+            .bin
+            .as_ref()
+            .map(|b| &b.cut_bin)
+            .unwrap_or(&self.cut_pipeline);
+        let bin = self.bin.is_some();
+        let mut cut_writes = vec![hw_list_ext, hw_args_ext];
+        if bin {
+            cut_writes.push(sw_list_ext);
+            cut_writes.push(sw_args_ext);
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "vgeo_cut",
-                storage_writes: vec![vislist_ext, args_ext],
+                storage_writes: cut_writes,
                 reads: vec![],
             },
             move |ctx| {
@@ -431,34 +578,51 @@ impl VgeoSystem {
                 cpc[104..108].copy_from_slice(&cam.z.to_le_bytes());
                 cpc[108..112].copy_from_slice(&proj_factor.to_le_bytes());
                 cpc[112..116].copy_from_slice(&tau.to_le_bytes());
-                for (i, word) in [total, rec_i, vislist.storage_index(), args.storage_index()]
-                    .iter()
-                    .enumerate()
+                for (i, word) in [
+                    total,
+                    rec_i,
+                    hw_list.storage_index(),
+                    hw_args.storage_index(),
+                ]
+                .iter()
+                .enumerate()
                 {
                     cpc[116 + i * 4..120 + i * 4].copy_from_slice(&word.to_le_bytes());
+                }
+                if bin {
+                    cpc[132..136].copy_from_slice(&sw_list.storage_index().to_le_bytes());
+                    cpc[136..140].copy_from_slice(&sw_args.storage_index().to_le_bytes());
+                    cpc[140..144].copy_from_slice(&bin_px.to_le_bytes());
                 }
                 for (i, v) in model_arr.iter().enumerate() {
                     cpc[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
                 }
                 cpc[208..212].copy_from_slice(&max_scale.to_le_bytes());
                 let cmd = ctx.cmd();
+                // `hw_args` feeds the HW mesh draw's indirect grid (binning): reset last frame's
+                // INDIRECT_ARGUMENT state back to storage before the cut UAV-writes the count.
+                if bin {
+                    cmd.storage_buffer_to_storage(hw_args);
+                }
                 cmd.bind_compute_pipeline(cut);
                 cmd.push_constants_compute(&cpc);
                 cmd.dispatch(total.div_ceil(64), 1, 1);
-                cmd.storage_buffer_barrier(vislist);
+                cmd.storage_buffer_barrier(hw_list);
+                if bin {
+                    cmd.storage_buffer_barrier(sw_list);
+                    // The count feeds `draw_mesh_tasks_indirect`.
+                    cmd.storage_buffer_to_indirect(hw_args);
+                }
                 Ok(())
             },
         );
 
-        // ── Clear the R64 visibility buffer, then SW-raster the cut into it ──
+        // ── Clear the R64 visibility buffer, then SW-raster the SW cut into it ──
         // Use the FLIP-FREE `cull_view_proj` (not `view_proj`): the SW raster and the resolve both
         // do MANUAL `(0.5 - ndc.y*0.5)` NDC→pixel mapping (the D3D/Metal window convention). On
         // Vulkan `view_proj` carries the clip-space Y-flip that fixes the *hardware* pipeline, which
         // would vertically flip this manual mapping — the visbuf rows would then mismatch the
-        // resolve's `SV_Position` reads, writing the object's G-buffer (with depth) at the wrong
-        // rows and corrupting the mesh objects there. `cull_view_proj = proj_noflip * view` is
-        // identical DX≡VK (and equals `view_proj` on D3D12/Metal when unjittered), so both backends
-        // land the visibility raster at the same screen pixels the deferred lighting samples.
+        // resolve's `SV_Position` reads. `cull_view_proj = proj_noflip * view` is identical DX≡VK.
         let mvp = (cull_view_proj * model).to_cols_array();
         let clear = &self.clear_pipeline;
         let raster = &self.raster_pipeline;
@@ -466,7 +630,7 @@ impl VgeoSystem {
             ComputePassInfo {
                 name: "vgeo_raster",
                 storage_writes: vec![visbuf_ext],
-                reads: vec![args_ext, vislist_ext],
+                reads: vec![sw_args_ext, sw_list_ext],
             },
             move |ctx| {
                 let mut spc = [0u8; 96];
@@ -479,7 +643,7 @@ impl VgeoSystem {
                     tri_i,
                     rec_i,
                     visbuf.storage_index(),
-                    vislist.storage_index(),
+                    sw_list.storage_index(),
                     w,
                     h,
                 ]
@@ -501,6 +665,74 @@ impl VgeoSystem {
                 Ok(())
             },
         );
+
+        // ── HW mesh-vis (binning only): rasterize the HW sub-list into the SAME visibility buffer
+        // via the hardware mesh pipeline + fragment atomicMax. It renders to a throwaway color
+        // target (colour unused) and uses the Y-flipped `view_proj` — the HW rasterizer + fragment
+        // `SV_Position` land the exact screen pixels the flip-free SW raster wrote, so HW and SW
+        // agree per pixel (DX≡VK). A trailing barrier pass orders its fragment writes before the
+        // resolve reads (`storage_buffer_barrier` covers the FRAGMENT stage). ──
+        if let Some(binp) = self.bin.as_ref() {
+            let hwvis = &binp.hwvis;
+            let hmvp = (view_proj * model).to_cols_array();
+            let scratch = graph.create_color("vgeo_hwvis_scratch", crate::GB_ALBEDO_FMT, extent);
+            graph.add_pass_with_storage_writes(
+                PassInfo {
+                    name: "vgeo_hwvis",
+                    colors: vec![(
+                        scratch,
+                        Some(ClearColor {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                    )],
+                    depth: None,
+                    reads: vec![hw_list_ext, hw_args_ext],
+                },
+                vec![visbuf_ext],
+                move |ctx| {
+                    let mut hpc = [0u8; 96];
+                    for (i, v) in hmvp.iter().enumerate() {
+                        hpc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    for (i, word) in [
+                        vtx_i,
+                        remap_i,
+                        tri_i,
+                        rec_i,
+                        hw_list.storage_index(),
+                        visbuf.storage_index(),
+                        w,
+                        h,
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        hpc[64 + i * 4..68 + i * 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                    let cmd = ctx.cmd();
+                    cmd.bind_mesh_pipeline(hwvis);
+                    cmd.push_constants_mesh(&hpc);
+                    cmd.draw_mesh_tasks_indirect(hw_args, 0);
+                    Ok(())
+                },
+            );
+            // Order the HW-vis fragment atomicMax writes before the resolve's fragment reads. A
+            // graphics pass can't issue a UAV barrier mid-render-pass, so a tiny compute pass does.
+            graph.add_compute_pass(
+                ComputePassInfo {
+                    name: "vgeo_hwvis_barrier",
+                    storage_writes: vec![visbuf_ext],
+                    reads: vec![],
+                },
+                move |ctx| {
+                    ctx.cmd().storage_buffer_barrier(visbuf);
+                    Ok(())
+                },
+            );
+        }
 
         // ── Resolve: visibility buffer → the four G-buffer MRTs (+ depth), OVERLAY ──
         let resolve = &self.resolve_pipeline;

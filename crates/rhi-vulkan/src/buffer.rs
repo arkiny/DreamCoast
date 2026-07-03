@@ -205,9 +205,15 @@ impl VulkanStorageBuffer {
         desc: &StorageBufferDesc,
     ) -> Result<Self, EngineError> {
         unsafe {
-            let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            let mut usage = vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
                 | vk::BufferUsageFlags::TRANSFER_SRC;
+            // Host-visible indirect-args buffer (Phase 14 Track B binning: the HW mesh-vis draw's
+            // grid is read from a host-reset + GPU-appended `hw_args`). `draw_mesh_tasks_indirect`
+            // requires the INDIRECT_BUFFER usage.
+            if desc.indirect {
+                usage |= vk::BufferUsageFlags::INDIRECT_BUFFER;
+            }
             let ci = vk::BufferCreateInfo::default()
                 .size(desc.size)
                 .usage(usage)
