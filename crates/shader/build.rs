@@ -54,22 +54,37 @@ fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
     h
 }
 
-/// HLSL shader profile for a (target, stage), or `None` for the Metal target (which
+/// HLSL shader profile for a (target, stage, key), or `None` for the Metal target (which
 /// derives everything from the stage). **Single source of truth** shared by both the
 /// cache key and the slangc `-profile` arg below, so the key can never drift from what
 /// is actually compiled. Ray-tracing stages need a DXIL *library* (`lib_6_5`); inline
 /// `RayQuery` requires >= 6.5. SPIR-V uses `sm_6_5` for every stage (RT comes from the
-/// stage capability).
-fn profile_for(target: &str, stage: &str) -> Option<&'static str> {
+/// stage capability). A few DXIL entry points need `sm_6_6` — see `dxil_needs_sm66`.
+fn profile_for(target: &str, stage: &str, key: &str) -> Option<&'static str> {
     match target {
         "spirv" => Some("sm_6_5"),
         "dxil" => Some(if is_rt_stage(stage) {
             "lib_6_5"
+        } else if dxil_needs_sm66(key) {
+            "sm_6_6"
         } else {
             "sm_6_5"
         }),
         _ => None,
     }
+}
+
+/// DXIL entry points that require **Shader Model 6.6**. Slang internally auto-upgrades the
+/// profile when it sees an SM6.6-only op (it warns E41012), but that upgrade does NOT reach
+/// the shader-model DXC targets, so a 64-bit buffer atomic (`InterlockedMax64` — the
+/// visibility-buffer primitive of Phase 14 virtual geometry) lowers to `dx.op.atomicBinOp.i64`
+/// and DXC rejects it with "64-bit atomic operations should only be used in Shader Model 6.6+".
+/// Setting the profile to `sm_6_6` here fixes it. This is **per-entry**, not per-file:
+/// `vgeo_swraster`'s `csClear` uses no atomic and stays on 6.5 (only `csRaster` needs 6.6).
+/// Keep in sync with any shader that gains a 64-bit atomic or another SM6.6-only op. SPIR-V
+/// needs no analogue — Slang infers the `Int64Atomics` capability from the op directly.
+fn dxil_needs_sm66(key: &str) -> bool {
+    matches!(key, "vgeo_atomic_cs" | "vgeo_swraster_cs")
 }
 
 /// Preprocessor `-D` defines for a target. **Single source of truth** for both the
@@ -161,7 +176,7 @@ fn cell_key(
     cache_dir: &Path,
     out_dir: &Path,
 ) -> CellKey {
-    let profile = profile_for(target, job.stage);
+    let profile = profile_for(target, job.stage, job.key);
     let defines = defines_for(target, job.key);
     let defines_str: String = defines.iter().map(|(k, v)| format!("{k}={v};")).collect();
     let params = format!(
