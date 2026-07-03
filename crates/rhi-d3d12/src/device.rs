@@ -1,6 +1,6 @@
 //! Logical device, command queue, and resource creation.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use dreamcoast_core::EngineError;
@@ -100,7 +100,14 @@ pub(crate) struct DeviceShared {
     srv_next: Cell<u32>,
     cube_next: Cell<u32>,
     storage_image_next: Cell<u32>,
+    // High-water mark for the bindless storage-buffer table + a free-list of slots returned by
+    // dropped buffers. `register_storage_buffer` reuses a freed slot before bumping the mark, so a
+    // long run creating + destroying storage buffers (resize, subsystem teardown) no longer walks
+    // the table monotonically into the reserved TLAS/volume regions. Reclaim is safe: a buffer only
+    // Drops after the frames referencing it retire (the handoff contract), so the reused slot is
+    // idle. Single-threaded (`Rc`), hence `RefCell` not a lock.
     storage_buffer_next: Cell<u32>,
+    storage_buffer_free: RefCell<Vec<u32>>,
     volume_next: Cell<u32>,
     storage_volume_next: Cell<u32>,
     // Command signature for indexed indirect draws (`ExecuteIndirect`, Phase 7).
@@ -323,6 +330,7 @@ impl DeviceShared {
                 cube_next: Cell::new(0),
                 storage_image_next: Cell::new(0),
                 storage_buffer_next: Cell::new(0),
+                storage_buffer_free: RefCell::new(Vec::new()),
                 volume_next: Cell::new(0),
                 storage_volume_next: Cell::new(0),
                 indirect_draw_signature,
@@ -560,8 +568,21 @@ impl DeviceShared {
         resource: &ID3D12Resource,
         size_bytes: u64,
     ) -> u32 {
-        let index = self.storage_buffer_next.get();
-        self.storage_buffer_next.set(index + 1);
+        // Reuse a freed slot before bumping the high-water mark (see the field docs).
+        let index = self
+            .storage_buffer_free
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| {
+                let i = self.storage_buffer_next.get();
+                self.storage_buffer_next.set(i + 1);
+                i
+            });
+        assert!(
+            index < STORAGE_BUFFER_COUNT,
+            "bindless storage-buffer table overflow (> {STORAGE_BUFFER_COUNT}); raise \
+             STORAGE_BUFFER_COUNT across bindless.slang + all three backends"
+        );
         let handle = self.cpu_handle(STORAGE_BUFFER_BASE + index);
         let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
@@ -581,6 +602,13 @@ impl DeviceShared {
                 .CreateUnorderedAccessView(resource, None, Some(&uav), handle);
         }
         index
+    }
+
+    /// Return a storage-buffer slot to the free-list (called from `D3d12StorageBuffer::drop`).
+    /// The stale UAV at `index` is left in place — no shader indexes a freed slot, and the next
+    /// reuse overwrites it.
+    pub(crate) fn free_storage_buffer(&self, index: u32) {
+        self.storage_buffer_free.borrow_mut().push(index);
     }
 
     /// Record + submit a one-time command list and wait for completion.

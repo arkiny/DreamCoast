@@ -340,6 +340,9 @@ impl VulkanStorageBuffer {
 
 impl Drop for VulkanStorageBuffer {
     fn drop(&mut self) {
+        // Return the bindless slot before destroying the buffer (safe: the handoff contract
+        // defers this Drop until the referencing frames retire, so the slot is idle).
+        self.device.free_storage_buffer(self.index);
         unsafe {
             self.device.device.destroy_buffer(self.buffer, None);
             self.device.device.free_memory(self.memory, None);
