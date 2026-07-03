@@ -164,6 +164,22 @@ pub(crate) fn build_mesh(
         )
         .map_err(|e| rhi_err(format!("newRenderPipelineState (mesh) failed: {e}")))?;
 
+    let depth_stencil = if desc.depth_test {
+        let dsd = MTLDepthStencilDescriptor::new();
+        dsd.setDepthCompareFunction(match desc.depth_compare {
+            DepthCompare::Less => MTLCompareFunction::LessEqual,
+            DepthCompare::Equal => MTLCompareFunction::Equal,
+        });
+        dsd.setDepthWriteEnabled(desc.depth_write);
+        Some(
+            device
+                .newDepthStencilStateWithDescriptor(&dsd)
+                .ok_or_else(|| rhi_err("newDepthStencilState (mesh) failed"))?,
+        )
+    } else {
+        None
+    };
+
     let size = |t: [u32; 3]| MTLSize {
         width: t[0].max(1) as usize,
         height: t[1].max(1) as usize,
@@ -175,6 +191,7 @@ pub(crate) fn build_mesh(
         mesh_threads: size(desc.mesh_threads),
         bindless: desc.bindless,
         uses_globals: desc.uniform_buffer,
+        depth_stencil,
     })
 }
 

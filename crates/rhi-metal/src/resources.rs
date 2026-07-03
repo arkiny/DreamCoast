@@ -322,6 +322,8 @@ pub struct MetalMeshPipeline {
     pub(crate) bindless: bool,
     /// Whether the pipeline binds the per-frame globals UBO.
     pub(crate) uses_globals: bool,
+    /// Depth-stencil state (compare + write) when depth testing; bound with the pipeline.
+    pub(crate) depth_stencil: Option<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
 }
 
 /// A compiled compute pipeline (`MTLComputePipelineState`) plus the threadgroup

@@ -1681,6 +1681,18 @@ impl CommandBuffer {
         }
     }
 
+    /// Upload push/root constants for the bound **mesh** pipeline (object/mesh + fragment stages).
+    pub fn push_constants_mesh(&self, data: &[u8]) {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(c) => c.push_constants_mesh(data),
+            #[cfg(windows)]
+            Self::D3d12(c) => c.push_constants_mesh(data),
+            #[cfg(target_os = "macos")]
+            Self::Metal(c) => c.push_constants_mesh(data),
+        }
+    }
+
     /// Dispatch the bound compute pipeline over `(x, y, z)` workgroups.
     pub fn dispatch(&self, x: u32, y: u32, z: u32) {
         match self {

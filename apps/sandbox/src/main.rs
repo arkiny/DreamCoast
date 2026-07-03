@@ -498,6 +498,19 @@ fn run() -> anyhow::Result<()> {
             compress_tex,
         );
     }
+    // Phase 14 M2: render the cooked clusters on the GPU via a mesh shader.
+    if vgeo_mesh_test_enabled() {
+        return run_vgeo_mesh(
+            backend,
+            &mut window,
+            &device,
+            &mut swapchain,
+            &model_path,
+            &model_ref,
+            &cache_dir,
+            compress_tex,
+        );
+    }
 
     let mut app = App::new(
         window,

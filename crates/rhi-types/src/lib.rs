@@ -455,6 +455,12 @@ pub struct MeshPipelineDesc<'a> {
     pub object_threads: [u32; 3],
     /// Mesh stage `[numthreads]`.
     pub mesh_threads: [u32; 3],
+    /// Enable depth testing (compare per `depth_compare`). Mirrors [`GraphicsPipelineDesc`].
+    pub depth_test: bool,
+    /// Enable depth writes (normally equal to `depth_test`).
+    pub depth_write: bool,
+    /// Depth-comparison function (only consulted when `depth_test`).
+    pub depth_compare: DepthCompare,
 }
 
 /// A hardware ray-tracing pipeline (Phase 8 M5): one raygen, one miss, and one

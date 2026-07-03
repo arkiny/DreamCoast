@@ -643,6 +643,9 @@ pub(crate) fn run_mesh_shader_test(
         uniform_buffer: false,
         object_threads: [1, 1, 1],
         mesh_threads: [3, 1, 1],
+        depth_test: false,
+        depth_write: false,
+        depth_compare: DepthCompare::Less,
     })?;
 
     let queue = device.queue();
@@ -825,6 +828,283 @@ pub(crate) fn run_vgeo_test(
         &debug_mesh,
         radius.max(1e-3),
     )
+}
+
+/// Whether `--vgeo-mesh` was passed: render the cooked clusters on the GPU via a mesh shader
+/// (Phase 14 M2). One mesh threadgroup per cluster reads its geometry from bindless storage
+/// buffers. `VGEO_LOD=n` picks the LOD; `VGEO_MATERIAL=1` swaps per-cluster colour for a texture.
+pub(crate) fn vgeo_mesh_test_enabled() -> bool {
+    std::env::args().skip(1).any(|a| a == "--vgeo-mesh")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_vgeo_mesh(
+    backend: BackendKind,
+    window: &mut Window,
+    device: &Device,
+    swapchain: &mut Swapchain,
+    source: &std::path::Path,
+    cache_key: &str,
+    cache_dir: &std::path::Path,
+    tex: dreamcoast_asset::cook::TexCompress,
+) -> anyhow::Result<()> {
+    use dreamcoast_asset::vgeo;
+
+    if !device.capabilities().mesh_shader {
+        return Err(anyhow!(
+            "--vgeo-mesh: {backend:?} adapter lacks mesh shaders (DeviceCapabilities::mesh_shader = false)"
+        ));
+    }
+    let (ms, fs) = match backend {
+        BackendKind::Vulkan => (
+            dreamcoast_shader::vgeo_cluster_ms_spirv(),
+            dreamcoast_shader::vgeo_cluster_fs_spirv(),
+        ),
+        BackendKind::D3d12 => (
+            dreamcoast_shader::vgeo_cluster_ms_dxil(),
+            dreamcoast_shader::vgeo_cluster_fs_dxil(),
+        ),
+        BackendKind::Metal => (
+            dreamcoast_shader::vgeo_cluster_ms_metallib(),
+            dreamcoast_shader::vgeo_cluster_fs_metallib(),
+        ),
+    };
+    let ms = ms.ok_or_else(|| anyhow!("vgeo_cluster mesh shader unavailable for {backend:?}"))?;
+    let fs =
+        fs.ok_or_else(|| anyhow!("vgeo_cluster fragment shader unavailable for {backend:?}"))?;
+
+    // Cooked clusters; recenter on the origin (raw coords) and derive the framing radius.
+    let mut dag = dreamcoast_asset::cook::load_cooked_clusters(source, cache_key, cache_dir, tex)?;
+    let mut center = Vec3::ZERO;
+    for v in &dag.vertices {
+        center += Vec3::from(v.pos);
+    }
+    center /= dag.vertices.len().max(1) as f32;
+    let mut radius = 0.0f32;
+    for v in &mut dag.vertices {
+        let p = Vec3::from(v.pos) - center;
+        v.pos = p.to_array();
+        radius = radius.max(p.length());
+    }
+    let radius = radius.max(1e-3);
+    let levels = vgeo::lod_levels(&dag);
+    let want: u32 = std::env::var("VGEO_LOD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let lod = want.min(*levels.last().unwrap_or(&0));
+
+    // Upload the geometry into bindless storage buffers. The mesh shader indexes these by the
+    // slots we stash in the push constant.
+    let sb = |device: &Device, bytes: &[u8], stride: u32| -> anyhow::Result<_> {
+        Ok(device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: bytes.len().max(1) as u64,
+                stride,
+                indirect: false,
+            },
+            bytes,
+        )?)
+    };
+    let mut vtx = Vec::with_capacity(dag.vertices.len() * 32);
+    for v in &dag.vertices {
+        for f in v.pos.iter().chain(&v.normal) {
+            vtx.extend_from_slice(&f.to_le_bytes());
+        }
+        for f in v.uv {
+            vtx.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    let mut remap = Vec::with_capacity(dag.cluster_vertices.len() * 4);
+    for &i in &dag.cluster_vertices {
+        remap.extend_from_slice(&i.to_le_bytes());
+    }
+    let mut tri = Vec::with_capacity(dag.cluster_triangles.len() * 4);
+    for &b in &dag.cluster_triangles {
+        tri.extend_from_slice(&(b as u32).to_le_bytes());
+    }
+    let mut rec = Vec::new();
+    let mut cluster_count = 0u32;
+    for c in dag.clusters.iter().filter(|c| c.lod_level == lod) {
+        for field in [
+            c.vertex_offset,
+            c.vertex_count,
+            c.triangle_offset,
+            c.triangle_count,
+        ] {
+            rec.extend_from_slice(&field.to_le_bytes());
+        }
+        cluster_count += 1;
+    }
+    let vtx_buf = sb(device, &vtx, 32)?;
+    let remap_buf = sb(device, &remap, 4)?;
+    let tri_buf = sb(device, &tri, 4)?;
+    let rec_buf = sb(device, &rec, 16)?;
+
+    // A checker texture for material mode (the cooked cluster page carries no material).
+    let checker = make_checker_texture(device)?;
+    let tex_index = checker.bindless_index();
+    let mode: u32 = if std::env::var("VGEO_MATERIAL").ok().as_deref() == Some("1") {
+        1
+    } else {
+        0
+    };
+    info!(
+        "vgeo-mesh: LOD {lod}, {cluster_count} clusters via mesh shader, mode {}",
+        if mode == 1 {
+            "material"
+        } else {
+            "cluster-colour"
+        }
+    );
+
+    let pipeline = device.create_mesh_pipeline(&MeshPipelineDesc {
+        object_bytes: None,
+        object_entry: "",
+        mesh_bytes: ms,
+        mesh_entry: "meshMain",
+        fragment_bytes: fs,
+        fragment_entry: "fragMain",
+        color_formats: &[COLOR_FORMAT],
+        depth_format: Some(DEPTH_FORMAT),
+        push_constant_size: 96,
+        bindless: true,
+        uniform_buffer: false,
+        object_threads: [1, 1, 1],
+        mesh_threads: [128, 1, 1],
+        depth_test: true,
+        depth_write: true,
+        depth_compare: DepthCompare::Less,
+    })?;
+
+    let (mut w, mut h) = window.size();
+    let mut depth = device.create_depth_buffer(Extent2D::new(w.max(1), h.max(1)))?;
+    let queue = device.queue();
+    let cmd = device.create_command_buffer()?;
+    let image_available = device.create_semaphore()?;
+    let render_finished = device.create_semaphore()?;
+    let fence = device.create_fence(true)?;
+
+    let captures = screenshot_captures();
+    const CAPTURE_FRAME: u64 = 3;
+    let max_frames = clear_test_max_frames();
+    info!("running vgeo-mesh loop (press ESC or close the window to exit)");
+    let mut frames = 0u64;
+    let mut last = Instant::now();
+    let mut angle = 0.6f32;
+    let _ = window.take_resized();
+    while !window.should_close() {
+        if let Some(max) = max_frames
+            && frames >= max
+        {
+            break;
+        }
+        window.pump_events();
+        (w, h) = window.size();
+        if w == 0 || h == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            continue;
+        }
+        if window.take_resized() {
+            device.wait_idle()?;
+            swapchain.recreate(&swapchain_desc(Extent2D::new(w, h)))?;
+            depth = device.create_depth_buffer(Extent2D::new(w, h))?;
+        }
+        let now = Instant::now();
+        let dt = (now - last).as_secs_f32();
+        last = now;
+        angle += dt * 0.5;
+
+        fence.wait()?;
+        let image_index = match swapchain.acquire_next_image(&image_available)? {
+            Some(i) => i,
+            None => {
+                swapchain.recreate(&swapchain_desc(Extent2D::new(w, h)))?;
+                depth = device.create_depth_buffer(Extent2D::new(w, h))?;
+                continue;
+            }
+        };
+        fence.reset()?;
+
+        let focus = Vec3::new(0.0, 0.0, 0.0);
+        let dist = radius * 3.0;
+        let eye = focus + Vec3::new(angle.cos() * dist, radius * 0.6, angle.sin() * dist);
+        let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
+        let mut proj = Mat4::perspective_rh(60f32.to_radians(), w as f32 / h as f32, 0.05, 100.0);
+        if backend == BackendKind::Vulkan {
+            proj.y_axis.y *= -1.0;
+        }
+        let mvp = (proj * view).to_cols_array();
+
+        // Push constant: mat4 mvp (64) + 8 u32 slots/flags (32) = 96.
+        let mut pc = [0u8; 96];
+        for (i, v) in mvp.iter().enumerate() {
+            pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let words = [
+            vtx_buf.storage_index(),
+            remap_buf.storage_index(),
+            tri_buf.storage_index(),
+            rec_buf.storage_index(),
+            0, // base_cluster
+            mode,
+            tex_index,
+            0, // pad
+        ];
+        for (i, word) in words.iter().enumerate() {
+            pc[64 + i * 4..68 + i * 4].copy_from_slice(&word.to_le_bytes());
+        }
+
+        let color = ClearColor {
+            r: 0.08,
+            g: 0.09,
+            b: 0.12,
+            a: 1.0,
+        };
+        cmd.begin()?;
+        cmd.transition_to_render_target(swapchain, image_index);
+        cmd.begin_rendering(swapchain, image_index, Some(color), Some(&depth));
+        cmd.set_viewport_scissor(swapchain);
+        cmd.bind_mesh_pipeline(&pipeline);
+        cmd.push_constants_mesh(&pc);
+        cmd.draw_mesh_tasks(cluster_count, 1, 1);
+        cmd.end_rendering();
+
+        let capture = (!captures.is_empty() && frames == CAPTURE_FRAME).then(|| &captures[0]);
+        let readback = if capture.is_some() {
+            let layout = device.swapchain_readback_layout(swapchain);
+            let buf = device.create_buffer(&BufferDesc {
+                size: layout.size,
+                usage: BufferUsage::Readback,
+            })?;
+            cmd.copy_swapchain_to_buffer(swapchain, image_index, &buf);
+            Some((buf, layout))
+        } else {
+            None
+        };
+
+        cmd.transition_to_present(swapchain, image_index);
+        cmd.end()?;
+        queue.submit(&cmd, &image_available, &render_finished, &fence)?;
+
+        if let (Some(cap), Some((buf, layout))) = (capture, readback.as_ref()) {
+            fence.wait()?;
+            let mut bytes = vec![0u8; layout.size as usize];
+            buf.read_into(&mut bytes)?;
+            save_screenshot(&cap.path, &bytes, layout)?;
+            info!("saved vgeo-mesh screenshot {}", cap.path);
+        }
+
+        queue.present(swapchain, image_index, &render_finished)?;
+        frames += 1;
+        if capture.is_some() {
+            break;
+        }
+    }
+    device.wait_idle()?;
+    let _ = (&vtx_buf, &remap_buf, &tri_buf, &rec_buf, &checker); // keep resident for the loop
+    info!("vgeo-mesh exited after {frames} frame(s)");
+    Ok(())
 }
 
 /// HSV → RGB (`h`,`s`,`v` in `[0,1]`). Used to spread cluster ids across distinct hues.

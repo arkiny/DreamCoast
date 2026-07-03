@@ -907,21 +907,104 @@ impl MetalCommandBuffer {
         }
     }
 
-    /// Bind a mesh-shader pipeline (Phase 14): set its render pipeline state and stash the
-    /// object/mesh threadgroup sizes for `draw_mesh_tasks`. The M0 smoke pipeline is
-    /// self-contained (a hardcoded triangle, no bindless/globals); the object/mesh-stage
-    /// argument-buffer + globals binding (`setObjectBuffer`/`setMeshBuffer`) lands in M2 where
-    /// a cluster mesh pipeline actually consumes it and the path becomes testable.
+    /// Bind a mesh-shader pipeline (Phase 14): set its render pipeline state + depth-stencil,
+    /// stash the object/mesh threadgroup sizes for `draw_mesh_tasks`, and — for a bindless /
+    /// globals pipeline (the cluster render, M2) — bind the argument buffer + globals to the
+    /// object/mesh (and fragment) stages and make the referenced resources resident. Mirrors
+    /// `bind_graphics_pipeline`, but through `setObjectBuffer`/`setMeshBuffer`.
     pub fn bind_mesh_pipeline(&self, pipeline: &crate::resources::MetalMeshPipeline) {
-        if pipeline.bindless || pipeline.uses_globals {
-            unimplemented!(
-                "mesh pipeline bindless/globals binding lands in Phase 14 M2 (not needed by the M0 smoke)"
-            );
-        }
         if let Some(enc) = self.encoder.borrow().as_ref() {
             enc.setRenderPipelineState(&pipeline.state);
+            if let Some(ds) = pipeline.depth_stencil.as_ref() {
+                enc.setDepthStencilState(Some(ds));
+            }
             self.mesh_object_threads.set(pipeline.object_threads);
             self.mesh_threads.set(pipeline.mesh_threads);
+
+            if pipeline.uses_globals
+                && let Some(globals) = self.shared.globals_buffer()
+            {
+                let offset = self.globals_offset.get() as usize;
+                unsafe {
+                    enc.setObjectBuffer_offset_atIndex(
+                        Some(&globals),
+                        offset,
+                        GLOBALS_BUFFER_INDEX,
+                    );
+                    enc.setMeshBuffer_offset_atIndex(Some(&globals), offset, GLOBALS_BUFFER_INDEX);
+                    enc.setFragmentBuffer_offset_atIndex(
+                        Some(&globals),
+                        offset,
+                        GLOBALS_BUFFER_INDEX,
+                    );
+                }
+            }
+            if pipeline.bindless {
+                let bindless_index = if pipeline.uses_globals {
+                    BINDLESS_BUFFER_INDEX_WITH_GLOBALS
+                } else {
+                    BINDLESS_BUFFER_INDEX
+                };
+                unsafe {
+                    enc.setObjectBuffer_offset_atIndex(
+                        Some(&self.shared.arg_buffer),
+                        0,
+                        bindless_index,
+                    );
+                    enc.setMeshBuffer_offset_atIndex(
+                        Some(&self.shared.arg_buffer),
+                        0,
+                        bindless_index,
+                    );
+                    enc.setFragmentBuffer_offset_atIndex(
+                        Some(&self.shared.arg_buffer),
+                        0,
+                        bindless_index,
+                    );
+                }
+                // Resources reached through the argument buffer must be made resident. The mesh
+                // path reads geometry in the mesh/object stages and (material mode) textures in
+                // the fragment stage.
+                let mesh_stages = MTLRenderStages::Object | MTLRenderStages::Mesh;
+                for tex in self.shared.resident_textures().iter() {
+                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**tex);
+                    enc.useResource_usage_stages(
+                        res,
+                        MTLResourceUsage::Read,
+                        mesh_stages | MTLRenderStages::Fragment,
+                    );
+                }
+                for buf in self.shared.storage_buffers().iter() {
+                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
+                    enc.useResource_usage_stages(
+                        res,
+                        MTLResourceUsage::Read | MTLResourceUsage::Write,
+                        mesh_stages | MTLRenderStages::Fragment,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Upload push constants for the bound **mesh** pipeline: to the object/mesh stages (which
+    /// read cluster indices) and the fragment stage (material mode), at [`PUSH_CONSTANT_INDEX`].
+    pub fn push_constants_mesh(&self, data: &[u8]) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            let mut buf = [0u8; 256];
+            let len = data.len();
+            assert!(
+                len <= buf.len(),
+                "mesh push constant block too large for Metal"
+            );
+            buf[..len].copy_from_slice(data);
+            let padded = (len + 15) & !15;
+            let ptr = NonNull::new(buf.as_ptr() as *mut std::ffi::c_void)
+                .expect("push_constants_mesh data pointer is null");
+            unsafe {
+                enc.setObjectBytes_length_atIndex(ptr, padded, PUSH_CONSTANT_INDEX);
+                enc.setMeshBytes_length_atIndex(ptr, padded, PUSH_CONSTANT_INDEX);
+                enc.setFragmentBytes_length_atIndex(ptr, padded, PUSH_CONSTANT_INDEX);
+            }
         }
     }
 
