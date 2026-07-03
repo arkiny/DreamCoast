@@ -671,7 +671,7 @@ impl MetalCommandBuffer {
                 }
                 // Storage buffers the vertex stage pulls from (particle / cull draw
                 // read `g.storage_buffers[i]` in `vsMain`); compute wrote them.
-                for buf in self.shared.storage_buffers().iter() {
+                for buf in self.shared.storage_buffers().iter().flatten() {
                     let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
                     enc.useResource_usage_stages(
                         res,
@@ -750,7 +750,7 @@ impl MetalCommandBuffer {
                 let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**tex);
                 enc.useResource_usage(res, MTLResourceUsage::Read | MTLResourceUsage::Write);
             }
-            for buf in self.shared.storage_buffers().iter() {
+            for buf in self.shared.storage_buffers().iter().flatten() {
                 let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
                 enc.useResource_usage(res, MTLResourceUsage::Read | MTLResourceUsage::Write);
             }
@@ -980,7 +980,7 @@ impl MetalCommandBuffer {
                         mesh_stages | MTLRenderStages::Fragment,
                     );
                 }
-                for buf in self.shared.storage_buffers().iter() {
+                for buf in self.shared.storage_buffers().iter().flatten() {
                     let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
                     enc.useResource_usage_stages(
                         res,

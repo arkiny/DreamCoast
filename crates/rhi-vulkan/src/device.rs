@@ -1,7 +1,7 @@
 //! Logical device, queue, command pool, and resource creation.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use dreamcoast_core::EngineError;
@@ -63,7 +63,14 @@ pub(crate) struct DeviceShared {
     bindless_next: AtomicU32,
     cube_next: AtomicU32,
     storage_image_next: AtomicU32,
+    // High-water mark for the bindless storage-buffer table, plus a free-list of slots
+    // returned by dropped buffers. `register_storage_buffer` reuses a freed slot before
+    // bumping the mark, so a long run that creates + destroys storage buffers (resize,
+    // subsystem teardown) no longer walks the table monotonically to overflow. Reclaim is
+    // safe because a buffer only Drops after the frames that referenced it have retired
+    // (the handoff contract), so no in-flight command reads a reused slot's stale descriptor.
     storage_buffer_next: AtomicU32,
+    storage_buffer_free: Mutex<Vec<u32>>,
     volume_next: AtomicU32,
     storage_volume_next: AtomicU32,
     // Per-frame globals (set 1): one UNIFORM_BUFFER_DYNAMIC binding, written once
@@ -379,6 +386,7 @@ impl DeviceShared {
                 cube_next: AtomicU32::new(0),
                 storage_image_next: AtomicU32::new(0),
                 storage_buffer_next: AtomicU32::new(0),
+                storage_buffer_free: Mutex::new(Vec::new()),
                 volume_next: AtomicU32::new(0),
                 storage_volume_next: AtomicU32::new(0),
                 globals_pool,
@@ -546,7 +554,18 @@ impl DeviceShared {
     /// Register a storage-buffer (UAV) in the bindless table (binding 4),
     /// returning its index in the separate 0-based storage-buffer space.
     pub(crate) fn register_storage_buffer(&self, buffer: vk::Buffer, range: u64) -> u32 {
-        let index = self.storage_buffer_next.fetch_add(1, Ordering::Relaxed);
+        // Reuse a freed slot before bumping the high-water mark (see the field docs).
+        let index = self
+            .storage_buffer_free
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| self.storage_buffer_next.fetch_add(1, Ordering::Relaxed));
+        assert!(
+            index < STORAGE_BUFFER_COUNT,
+            "bindless storage-buffer table overflow (> {STORAGE_BUFFER_COUNT}); raise \
+             STORAGE_BUFFER_COUNT across bindless.slang + all three backends"
+        );
         let info = [vk::DescriptorBufferInfo::default()
             .buffer(buffer)
             .offset(0)
@@ -559,6 +578,13 @@ impl DeviceShared {
             .buffer_info(&info);
         unsafe { self.device.update_descriptor_sets(&[write], &[]) };
         index
+    }
+
+    /// Return a storage-buffer slot to the free-list (called from `VulkanStorageBuffer::drop`).
+    /// The stale descriptor at `index` is left in place — no shader indexes a freed slot, and the
+    /// next `register_storage_buffer` that reuses the slot overwrites it.
+    pub(crate) fn free_storage_buffer(&self, index: u32) {
+        self.storage_buffer_free.lock().unwrap().push(index);
     }
 
     /// Register a sampled 3D volume view in the bindless table (binding 6),

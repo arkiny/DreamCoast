@@ -331,17 +331,21 @@ impl MetalRaytracingPipeline {
 
         {
             let storage_buffers = shared.storage_buffers();
-            for (i, buffer) in storage_buffers
+            // Enumerate over the slot vector directly so `i` is the true slot index (freed slots
+            // are `None` and skipped — their RT descriptor entry stays zeroed).
+            for (i, slot) in storage_buffers
                 .iter()
                 .take(STORAGE_BUFFER_COUNT as usize)
                 .enumerate()
             {
-                unsafe {
-                    *ptr.add(RT_STORAGE_BUFFER_BASE + i) = IrDescriptorTableEntry {
-                        gpu_va: buffer.gpuAddress(),
-                        metadata: buffer.length() as u64,
-                        ..Default::default()
-                    };
+                if let Some(buffer) = slot {
+                    unsafe {
+                        *ptr.add(RT_STORAGE_BUFFER_BASE + i) = IrDescriptorTableEntry {
+                            gpu_va: buffer.gpuAddress(),
+                            metadata: buffer.length() as u64,
+                            ..Default::default()
+                        };
+                    }
                 }
             }
         }
@@ -450,7 +454,7 @@ impl MetalRaytracingPipeline {
             let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**tex);
             enc.useResource_usage(res, MTLResourceUsage::Read | MTLResourceUsage::Write);
         }
-        for buf in shared.storage_buffers().iter() {
+        for buf in shared.storage_buffers().iter().flatten() {
             let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
             enc.useResource_usage(res, MTLResourceUsage::Read | MTLResourceUsage::Write);
         }
