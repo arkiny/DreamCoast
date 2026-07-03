@@ -1,19 +1,23 @@
-//! Phase 14 renderer integration (I2) — virtual geometry as a deferred G-buffer producer.
+//! Phase 14 renderer integration — virtual geometry as a deferred G-buffer producer.
 //!
-//! `VgeoSystem` owns the cooked cluster pages of a single model plus the per-frame scratch (the R64
-//! visibility buffer, the cut's visible-cluster list, the indirect-args), and records the compute +
-//! resolve passes that write the REAL Phase-6 G-buffer — so the existing deferred lighting consumes
-//! virtual geometry unchanged (see `docs/phase-14-vgeo-integration.md`). SW-only for this first step
-//! (the M5b HW/SW binning path is a graph follow-up); opt-in behind `P14_VGEO`, so the default
+//! `VgeoSystem` holds a cluster page **per mesh** (built from the registry's CPU geometry with
+//! `build_lod_dag`, so a page matches its uploaded mesh exactly — no cook round-trip, no
+//! renormalization) plus shared per-frame scratch, and records the compute + resolve passes that
+//! write the REAL Phase-6 G-buffer. Every eligible opaque object is routed through virtual geometry
+//! and overlaid on the mesh-rastered remainder (depth-composited), so a whole multi-object scene can
+//! render as virtual geometry — the per-static-mesh-asset direction (see
+//! `docs/phase-14-vgeo-integration.md`). SW-only for now; opt-in behind `P14_VGEO`, so the default
 //! renderer is untouched (gallery byte-identical).
 //!
-//! The cooked clusters are in raw model space; this normalizes them with the SAME arithmetic as
-//! `normalize_on_ground` (recenter + base at y=0 + unit radius) so they land in the mesh's
-//! normalized space, and the object's `transform` is then the single model matrix — matching the
-//! mesh G-buffer fill exactly for the parity gate.
+//! One material per page (the mesh's) — matching a single-material mesh; a many-material model is
+//! split into per-mesh assets upstream (the scene-cook direction) rather than baking per-cluster
+//! materials into one page.
+
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use dreamcoast_core::glam::{Mat4, Vec3};
-use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph};
+use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph, ResourceId};
 use rhi::{
     BackendKind, ComputePipeline, ComputePipelineDesc, DepthCompare, Device, Extent2D,
     GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, StorageBuffer, StorageBufferDesc,
@@ -21,7 +25,8 @@ use rhi::{
 };
 
 use crate::deferred::GBufferTargets;
-use crate::{COLOR_FORMAT, DEPTH_FORMAT, FRAMES_IN_FLIGHT};
+use crate::registry::{GpuMesh, MeshRegistry};
+use crate::{DEPTH_FORMAT, FRAMES_IN_FLIGHT};
 
 /// Single-object material for the resolve (mirrors the fields `gbuffer_push` feeds the mesh fill).
 #[derive(Clone, Copy)]
@@ -34,25 +39,32 @@ pub(crate) struct VgeoMaterial {
     pub(crate) alpha_cutoff: f32,
 }
 
-pub(crate) struct VgeoSystem {
-    // Immutable cluster geometry (shared across frames), all in the bindless storage table.
+/// One mesh's immutable cluster geometry in the bindless storage table.
+struct ClusterPage {
     vtx: StorageBuffer,
     remap: StorageBuffer,
     tri: StorageBuffer,
     rec: StorageBuffer,
     total_clusters: u32,
-    // Per-frame-in-flight scratch: R64 visibility buffer (sized to the render extent), the cut's
-    // visible-cluster list, and the indirect-args header. Host-reset each frame after the fence.
+}
+
+pub(crate) struct VgeoSystem {
+    pages: Vec<ClusterPage>,
+    /// `Rc<GpuMesh>` pointer → page index, so a scene object routes to its mesh's page.
+    mesh_to_page: HashMap<usize, usize>,
+    /// Max clusters over all pages (sizes the per-object visible-list slots).
+    max_clusters: u32,
+    /// Per-FIF shared R64 visibility buffer (sized to the render extent). Objects serialize on it
+    /// (each clears → rasters → resolves), so one buffer suffices; inter-object occlusion is
+    /// resolved by the G-buffer depth test in the resolve, not the visibility buffer.
     visbuf: Vec<StorageBuffer>,
-    vislist: Vec<StorageBuffer>,
-    args: Vec<StorageBuffer>,
+    /// Per-FIF growable pool of per-object scratch: `(visible list, indirect-append counter)`.
+    pool: Vec<Vec<(StorageBuffer, StorageBuffer)>>,
     extent: Extent2D,
-    // Pipelines: LOD cut (SW-only), visibility-buffer clear + SW raster, and the G-buffer resolve.
     cut_pipeline: ComputePipeline,
     clear_pipeline: ComputePipeline,
     raster_pipeline: ComputePipeline,
     resolve_pipeline: GraphicsPipeline,
-    /// LOD cut pixel-error threshold (`VGEO_TAU`).
     tau: f32,
 }
 
@@ -61,58 +73,20 @@ fn vis_bytes(extent: Extent2D) -> u64 {
 }
 
 impl VgeoSystem {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         device: &Device,
         backend: BackendKind,
-        source: &std::path::Path,
-        cache_key: &str,
-        cache_dir: &std::path::Path,
-        tex: dreamcoast_asset::cook::TexCompress,
+        registry: &MeshRegistry,
         extent: Extent2D,
     ) -> anyhow::Result<Self> {
+        use dreamcoast_scene::MeshHandle;
+
         if !device.capabilities().mesh_shader {
             anyhow::bail!(
                 "P14_VGEO: {backend:?} lacks the capabilities for virtual geometry (mesh_shader=false)"
             );
         }
-        let mut dag =
-            dreamcoast_asset::cook::load_cooked_clusters(source, cache_key, cache_dir, tex)?;
 
-        // Normalize the cluster data into the mesh's canonical space (identical arithmetic to
-        // `normalize_on_ground`): recenter the footprint on the origin, rest the base on y=0, and
-        // scale the bounding-sphere radius to 1. The cluster geometry is the same source as the
-        // normalized mesh, so this reproduces the mesh's transform exactly — the object's world
-        // transform is then the single model matrix (parity with the mesh G-buffer fill).
-        let mut min = [f32::MAX; 3];
-        let mut max = [f32::MIN; 3];
-        for v in &dag.vertices {
-            for i in 0..3 {
-                min[i] = min[i].min(v.pos[i]);
-                max[i] = max[i].max(v.pos[i]);
-            }
-        }
-        let c = Vec3::new((min[0] + max[0]) * 0.5, min[1], (min[2] + max[2]) * 0.5);
-        let (sx, sy, sz) = (max[0] - min[0], max[1] - min[1], max[2] - min[2]);
-        let s = 1.0 / (0.5 * (sx * sx + sy * sy + sz * sz).sqrt()).max(1e-6);
-        for v in &mut dag.vertices {
-            let p = (Vec3::from(v.pos) - c) * s;
-            v.pos = p.to_array();
-        }
-        for cl in &mut dag.clusters {
-            cl.self_center = ((Vec3::from(cl.self_center) - c) * s).to_array();
-            cl.self_radius *= s;
-            cl.self_error *= s;
-            cl.parent_center = ((Vec3::from(cl.parent_center) - c) * s).to_array();
-            cl.parent_radius *= s;
-            if cl.parent_error < 3.0e38 {
-                cl.parent_error *= s;
-            }
-            cl.bounds_center = ((Vec3::from(cl.bounds_center) - c) * s).to_array();
-            cl.bounds_radius *= s;
-        }
-
-        // Upload the (immutable) cluster geometry into bindless storage buffers.
         let sb = |bytes: &[u8], stride: u32| -> anyhow::Result<StorageBuffer> {
             Ok(device.create_storage_buffer_init(
                 &StorageBufferDesc {
@@ -123,73 +97,46 @@ impl VgeoSystem {
                 bytes,
             )?)
         };
-        let mut vtx = Vec::with_capacity(dag.vertices.len() * 32);
-        for v in &dag.vertices {
-            for f in v.pos.iter().chain(&v.normal) {
-                vtx.extend_from_slice(&f.to_le_bytes());
-            }
-            for f in v.uv {
-                vtx.extend_from_slice(&f.to_le_bytes());
-            }
-        }
-        let mut remap = Vec::with_capacity(dag.cluster_vertices.len() * 4);
-        for &i in &dag.cluster_vertices {
-            remap.extend_from_slice(&i.to_le_bytes());
-        }
-        let mut tri = Vec::with_capacity(dag.cluster_triangles.len() * 4);
-        for &b in &dag.cluster_triangles {
-            tri.extend_from_slice(&(b as u32).to_le_bytes());
-        }
-        // Per-cluster GpuCluster records (96 B), all clusters — same layout as the viewer/shaders.
-        let mut rec = Vec::with_capacity(dag.clusters.len() * 96);
-        let put = |rec: &mut Vec<u8>, f: f32| rec.extend_from_slice(&f.to_le_bytes());
-        let put3 = |rec: &mut Vec<u8>, v: [f32; 3]| {
-            for f in v {
-                rec.extend_from_slice(&f.to_le_bytes());
-            }
-        };
-        for cl in &dag.clusters {
-            for field in [
-                cl.vertex_offset,
-                cl.vertex_count,
-                cl.triangle_offset,
-                cl.triangle_count,
-            ] {
-                rec.extend_from_slice(&field.to_le_bytes());
-            }
-            put(&mut rec, cl.self_error);
-            put3(&mut rec, cl.self_center);
-            put(&mut rec, cl.self_radius);
-            put(&mut rec, cl.parent_error);
-            put3(&mut rec, cl.parent_center);
-            put(&mut rec, cl.parent_radius);
-            put3(&mut rec, cl.bounds_center);
-            put(&mut rec, cl.bounds_radius);
-            put3(&mut rec, cl.cone_axis);
-            put(&mut rec, cl.cone_cutoff);
-            rec.extend_from_slice(&[0u8; 8]); // 88..96 pad
-        }
-        let total_clusters = dag.clusters.len() as u32;
-        let vtx = sb(&vtx, 32)?;
-        let remap = sb(&remap, 4)?;
-        let tri = sb(&tri, 4)?;
-        let rec = sb(&rec, 96)?;
 
-        // Per-FIF scratch rings.
+        // Build a cluster page per mesh from its CPU geometry (build_lod_dag = what the cook runs).
+        let mut pages: Vec<ClusterPage> = Vec::new();
+        let mut mesh_to_page: HashMap<usize, usize> = HashMap::new();
+        let mut max_clusters = 0u32;
+        for i in 0..registry.len() {
+            let handle = MeshHandle(i);
+            let cpu = registry.cpu(handle);
+            if cpu.indices.len() < 3 {
+                continue;
+            }
+            let dag = dreamcoast_asset::vgeo::build_lod_dag(&cpu.vertices, &cpu.indices, 0);
+            if dag.clusters.is_empty() {
+                continue;
+            }
+            let page = Self::upload_page(&sb, &dag)?;
+            max_clusters = max_clusters.max(page.total_clusters);
+            let idx = pages.len();
+            pages.push(page);
+            mesh_to_page.insert(Rc::as_ptr(&registry.get(handle)) as usize, idx);
+        }
+        if pages.is_empty() {
+            anyhow::bail!("P14_VGEO: no mesh produced clusters");
+        }
+        tracing::info!(
+            "P14_VGEO: built {} cluster page(s) (max {} clusters)",
+            pages.len(),
+            max_clusters
+        );
+
         let mut visbuf = Vec::with_capacity(FRAMES_IN_FLIGHT);
-        let mut vislist = Vec::with_capacity(FRAMES_IN_FLIGHT);
-        let mut args = Vec::with_capacity(FRAMES_IN_FLIGHT);
         for _ in 0..FRAMES_IN_FLIGHT {
             visbuf.push(device.create_storage_buffer(&StorageBufferDesc {
                 size: vis_bytes(extent),
                 stride: 8,
                 indirect: false,
             })?);
-            vislist.push(sb(&vec![0u8; total_clusters.max(1) as usize * 4], 4)?);
-            args.push(sb(&[0u8; 12], 4)?);
         }
+        let pool = (0..FRAMES_IN_FLIGHT).map(|_| Vec::new()).collect();
 
-        // Pipelines.
         let compute = |spirv: fn() -> Option<&'static [u8]>,
                        dxil: fn() -> Option<&'static [u8]>,
                        metal: fn() -> Option<&'static [u8]>,
@@ -272,7 +219,6 @@ impl VgeoSystem {
             depth_compare: DepthCompare::Less,
             depth_format: Some(DEPTH_FORMAT),
         })?;
-        let _ = COLOR_FORMAT;
 
         let tau: f32 = std::env::var("VGEO_TAU")
             .ok()
@@ -280,14 +226,11 @@ impl VgeoSystem {
             .unwrap_or(8.0);
 
         Ok(Self {
-            vtx,
-            remap,
-            tri,
-            rec,
-            total_clusters,
+            pages,
+            mesh_to_page,
+            max_clusters,
             visbuf,
-            vislist,
-            args,
+            pool,
             extent,
             cut_pipeline,
             clear_pipeline,
@@ -295,6 +238,70 @@ impl VgeoSystem {
             resolve_pipeline,
             tau,
         })
+    }
+
+    /// Serialize a cluster DAG into bindless storage buffers (same layout as the shaders expect).
+    fn upload_page(
+        sb: &impl Fn(&[u8], u32) -> anyhow::Result<StorageBuffer>,
+        dag: &dreamcoast_asset::vgeo::MeshClusters,
+    ) -> anyhow::Result<ClusterPage> {
+        let mut vtx = Vec::with_capacity(dag.vertices.len() * 32);
+        for v in &dag.vertices {
+            for f in v.pos.iter().chain(&v.normal) {
+                vtx.extend_from_slice(&f.to_le_bytes());
+            }
+            for f in v.uv {
+                vtx.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        let mut remap = Vec::with_capacity(dag.cluster_vertices.len() * 4);
+        for &i in &dag.cluster_vertices {
+            remap.extend_from_slice(&i.to_le_bytes());
+        }
+        let mut tri = Vec::with_capacity(dag.cluster_triangles.len() * 4);
+        for &b in &dag.cluster_triangles {
+            tri.extend_from_slice(&(b as u32).to_le_bytes());
+        }
+        let mut rec = Vec::with_capacity(dag.clusters.len() * 96);
+        let put = |rec: &mut Vec<u8>, f: f32| rec.extend_from_slice(&f.to_le_bytes());
+        let put3 = |rec: &mut Vec<u8>, v: [f32; 3]| {
+            for f in v {
+                rec.extend_from_slice(&f.to_le_bytes());
+            }
+        };
+        for cl in &dag.clusters {
+            for field in [
+                cl.vertex_offset,
+                cl.vertex_count,
+                cl.triangle_offset,
+                cl.triangle_count,
+            ] {
+                rec.extend_from_slice(&field.to_le_bytes());
+            }
+            put(&mut rec, cl.self_error);
+            put3(&mut rec, cl.self_center);
+            put(&mut rec, cl.self_radius);
+            put(&mut rec, cl.parent_error);
+            put3(&mut rec, cl.parent_center);
+            put(&mut rec, cl.parent_radius);
+            put3(&mut rec, cl.bounds_center);
+            put(&mut rec, cl.bounds_radius);
+            put3(&mut rec, cl.cone_axis);
+            put(&mut rec, cl.cone_cutoff);
+            rec.extend_from_slice(&[0u8; 8]); // 88..96 pad
+        }
+        Ok(ClusterPage {
+            vtx: sb(&vtx, 32)?,
+            remap: sb(&remap, 4)?,
+            tri: sb(&tri, 4)?,
+            rec: sb(&rec, 96)?,
+            total_clusters: dag.clusters.len() as u32,
+        })
+    }
+
+    /// The page index for a scene object's mesh, or `None` (→ rasterize it via the mesh fill).
+    pub(crate) fn page_for(&self, mesh: &Rc<GpuMesh>) -> Option<usize> {
+        self.mesh_to_page.get(&(Rc::as_ptr(mesh) as usize)).copied()
     }
 
     /// Recreate the per-FIF visibility buffers when the render extent changes.
@@ -313,49 +320,86 @@ impl VgeoSystem {
         Ok(())
     }
 
-    /// Record the SW-only virtual-geometry G-buffer producer for `fif`: reset args → LOD cut →
-    /// clear visbuf → SW raster (indirect) → resolve into the four G-buffer MRTs (+ depth). Replaces
-    /// `DeferredRenderer::record_gbuffer` under `P14_VGEO=1`.
+    /// Grow this FIF's scratch pool to `count` object slots and host-reset the ones in use: each
+    /// object gets a zeroed append counter + a sentinel-cleared (`0xFFFFFFFF`) visible list, so the
+    /// fixed-count raster dispatch skips the slots the cut didn't fill (the graph IR recorder has no
+    /// indirect compute dispatch). Safe: this FIF's fence was waited at frame start.
+    pub(crate) fn prepare(
+        &mut self,
+        device: &Device,
+        fif: usize,
+        count: usize,
+    ) -> anyhow::Result<()> {
+        let slots = &mut self.pool[fif];
+        while slots.len() < count {
+            let vislist = device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: (self.max_clusters.max(1) as u64) * 4,
+                    stride: 4,
+                    indirect: false,
+                },
+                &vec![0xFFu8; self.max_clusters.max(1) as usize * 4],
+            )?;
+            let args = device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: 12,
+                    stride: 4,
+                    indirect: false,
+                },
+                &[0u8; 12],
+            )?;
+            slots.push((vislist, args));
+        }
+        for (vislist, args) in slots.iter().take(count) {
+            args.write(&0u32.to_le_bytes())?;
+            vislist.write(&vec![0xFFu8; self.max_clusters.max(1) as usize * 4])?;
+        }
+        Ok(())
+    }
+
+    /// The shared visibility buffer's ordering handle (imported once per frame so every object's
+    /// passes serialize on it).
+    pub(crate) fn import_visbuf(graph: &mut RenderGraph) -> ResourceId {
+        graph.import_external("vgeo_visbuf")
+    }
+
+    /// Record one object's virtual-geometry G-buffer contribution (cut → clear → SW raster →
+    /// resolve overlay). `slot` indexes this frame's scratch pool; `visbuf_ext` is the shared handle
+    /// from [`Self::import_visbuf`]. The mesh fill must run first (it clears the G-buffer + depth);
+    /// the resolve LOADs them and Less-tests the model's `SV_Depth`, compositing with the rest.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn record_gbuffer<'a>(
+    pub(crate) fn record_object<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
         gbuf: GBufferTargets,
         fif: usize,
+        slot: usize,
+        page_idx: usize,
+        visbuf_ext: ResourceId,
         view_proj: Mat4,
         cull_view_proj: Mat4,
         eye: Vec3,
         model: Mat4,
         material: VgeoMaterial,
         extent: Extent2D,
-    ) -> anyhow::Result<()> {
+    ) {
+        let page = &self.pages[page_idx];
         let visbuf = &self.visbuf[fif];
-        let vislist = &self.vislist[fif];
-        let args = &self.args[fif];
-        // Fresh append counter + sentinel-cleared visible list each frame (this FIF's fence was
-        // waited at frame start, so the host writes can't race in-flight GPU work). The list is
-        // cleared to 0xFFFFFFFF so the fixed-count raster dispatch (no indirect compute in the graph
-        // IR) skips the slots the cut didn't fill — see `vgeo_swraster.slang` csRaster.
-        args.write(&0u32.to_le_bytes())?;
-        vislist.write(&vec![0xFFu8; self.total_clusters.max(1) as usize * 4])?;
-
+        let (vislist, args) = &self.pool[fif][slot];
         let (w, h) = (extent.width, extent.height);
-        let total = self.total_clusters;
+        let total = page.total_clusters;
         let tau = self.tau;
         let (vtx_i, remap_i, tri_i, rec_i) = (
-            self.vtx.storage_index(),
-            self.remap.storage_index(),
-            self.tri.storage_index(),
-            self.rec.storage_index(),
+            page.vtx.storage_index(),
+            page.remap.storage_index(),
+            page.tri.storage_index(),
+            page.rec.storage_index(),
         );
 
         let vislist_ext = graph.import_external("vgeo_vislist");
         let args_ext = graph.import_external("vgeo_args");
-        let visbuf_ext = graph.import_external("vgeo_visbuf");
 
         // ── LOD cut (model-space): planes from cull_view_proj*model, cam = inverse(model)*eye ──
-        // The cluster spheres stay in model space; screen error's err/dist ratio is scale-invariant,
-        // so this handles the object transform (incl. uniform scale) exactly.
         let planes = crate::push::frustum_planes(cull_view_proj * model);
         let cam = model.inverse().transform_point3(eye);
         let proj_factor = 0.5 * h as f32 / (30f32.to_radians()).tan();
@@ -393,7 +437,7 @@ impl VgeoSystem {
             },
         );
 
-        // ── Clear the R64 visibility buffer, then SW-raster the cut into it (indirect/cluster) ──
+        // ── Clear the R64 visibility buffer, then SW-raster the cut into it ──
         let mvp = (view_proj * model).to_cols_array();
         let clear = &self.clear_pipeline;
         let raster = &self.raster_pipeline;
@@ -438,10 +482,6 @@ impl VgeoSystem {
         );
 
         // ── Resolve: visibility buffer → the four G-buffer MRTs (+ depth), OVERLAY ──
-        // The mesh fill runs first (draws the other opaque objects + ground, clearing the G-buffer +
-        // depth), so this LOADs every target and overlays the model where covered: `fsGBuffer`
-        // discards empty pixels (the cleared/other-object values survive) and emits SV_Depth, and the
-        // Less depth test against the loaded depth resolves the model vs the mesh-rastered objects.
         let resolve = &self.resolve_pipeline;
         let model_arr = model.to_cols_array();
         graph.add_pass(
@@ -501,6 +541,5 @@ impl VgeoSystem {
                 Ok(())
             },
         );
-        Ok(())
     }
 }
