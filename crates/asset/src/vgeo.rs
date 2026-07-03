@@ -3,15 +3,18 @@
 //! A mesh is split into **clusters** (meshlets, ~128 triangles) that reference a shared
 //! vertex pool through a compact local window — the meshopt-style `(vertex window, u8 triangle
 //! indices)` layout the GPU mesh-shader path consumes. Each cluster carries the culling bounds
-//! (bounding sphere + normal cone) the runtime needs. This M1a step produces a single LOD
-//! (the finest); the LOD DAG (group → simplify → parent error bounds) lands in M1c and bumps
-//! the serialization version.
+//! (bounding sphere + normal cone) the runtime needs.
 //!
-//! We build our own clusterizer (referencing meshoptimizer's approach, no FFI): a greedy
-//! sweep fills a cluster until it would exceed the vertex/triangle caps, then starts a new one.
-//! Order-based greedy is spatially naive but produces valid, deterministic clusters; a
-//! shared-edge locality pass is a later refinement (it only changes cluster *shape*, not the
-//! format or the runtime contract).
+//! [`build_clusters`] produces the finest LOD; [`build_lod_dag`] builds the full **LOD DAG** —
+//! recursively group clusters, merge + simplify each group (locking its boundary so seams stay
+//! crack-free, via [`crate::simplify`]), and re-clusterize into a coarser level, recording the
+//! monotone `self_error`/`parent_error` bounds the runtime projects for continuous LOD.
+//!
+//! We build our own clusterizer + grouping (referencing meshoptimizer / METIS, no FFI): a greedy
+//! sweep fills a cluster to the vertex/triangle caps; a greedy shared-edge partitioner forms
+//! groups. Order-based greedy is spatially naive but valid and deterministic; a shared-edge
+//! locality pass on the clusterizer is a later refinement (it only changes cluster *shape*, not
+//! the format or the runtime contract).
 
 use dreamcoast_core::glam::Vec3;
 
@@ -50,6 +53,30 @@ pub struct Cluster {
     pub cone_cutoff: f32,
     /// Material id (carried through from the source mesh; one material per mesh in M1).
     pub material: u32,
+
+    // ── LOD DAG (Phase 14 M1d) ──────────────────────────────────────────────────────────
+    // Two error/sphere pairs drive crack-free continuous LOD. `self_*` is the error incurred to
+    // create THIS cluster's LOD (0 at the finest); `parent_*` is the error of coarsening one
+    // level further. Both are GROUP-UNIFORM (every cluster simplified together shares them), so a
+    // group makes one cut decision → no cracks. Monotone: `parent_error >= self_error`. Runtime
+    // cut (M3): draw when `project(parent_*) > τ && project(self_*) <= τ`.
+    /// LOD level (0 = finest / full detail).
+    pub lod_level: u32,
+    /// Group id at this cluster's LOD (clusters simplified together share it).
+    pub group: u32,
+    /// Error introduced to build this cluster's LOD (world-space; 0 at the finest LOD).
+    pub self_error: f32,
+    /// Bounding-sphere center the `self_error` projects against (the group's merged sphere).
+    pub self_center: [f32; 3],
+    /// Bounding-sphere radius for the `self_error` projection.
+    pub self_radius: f32,
+    /// Error of coarsening one level past this cluster (monotone ≥ `self_error`; `f32::MAX` at
+    /// the root, i.e. "always fine enough to stop here").
+    pub parent_error: f32,
+    /// Bounding-sphere center the `parent_error` projects against (the parent group's sphere).
+    pub parent_center: [f32; 3],
+    /// Bounding-sphere radius for the `parent_error` projection.
+    pub parent_radius: f32,
 }
 
 /// A mesh's clusterized geometry — the per-mesh **cluster page stream** serialized to
@@ -70,48 +97,67 @@ pub struct MeshClusters {
     pub clusters: Vec<Cluster>,
 }
 
-/// Build a mesh's finest-LOD clusters (Phase 14 M1a). `indices` is the triangle list into
-/// `vertices`; `material` is stamped on every cluster. Deterministic: the greedy sweep visits
-/// triangles in input order, so the same mesh always produces the same clusters (cook-cache
-/// friendly, cross-platform byte-identical).
-pub fn build_clusters(vertices: &[MeshVertex], indices: &[u32], material: u32) -> MeshClusters {
-    let mut out = MeshClusters {
-        vertices: vertices.to_vec(),
-        ..Default::default()
-    };
+/// A group id meaning "not yet grouped for coarsening" (set by the DAG build once a cluster is
+/// assigned to a group).
+pub const UNGROUPED: u32 = u32::MAX;
+
+/// Greedy meshlet sweep over `indices` (into `vertices`), producing a self-contained chunk of
+/// clusters (`cluster_vertices`, `cluster_triangles`, `clusters`) with offsets relative to the
+/// returned arrays — the caller rebases them when appending to a [`MeshClusters`]. LOD metadata:
+/// `lod_level` / `self_error`; `self_sphere` is the group-uniform LOD sphere for coarse levels,
+/// or `None` at LOD0 (each cluster uses its own bounds, since `self_error` is 0 there). `group`
+/// and the `parent_*` fields default to "ungrouped / root" and are filled in by the DAG build.
+/// Deterministic (input triangle order).
+#[allow(clippy::type_complexity)]
+fn clusterize(
+    vertices: &[MeshVertex],
+    indices: &[u32],
+    material: u32,
+    lod_level: u32,
+    self_error: f32,
+    self_sphere: Option<(Vec3, f32)>,
+) -> (Vec<u32>, Vec<u8>, Vec<Cluster>) {
+    let mut cv: Vec<u32> = Vec::new();
+    let mut ct: Vec<u8> = Vec::new();
+    let mut clusters: Vec<Cluster> = Vec::new();
     let tri_count = indices.len() / 3;
 
-    // Current cluster accumulation state.
     let mut window: Vec<u32> = Vec::with_capacity(MAX_CLUSTER_VERTICES);
-    // Map source vertex index -> local window slot, for the current cluster only.
     let mut local_of: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
     let mut tris: Vec<[u8; 3]> = Vec::with_capacity(MAX_CLUSTER_TRIANGLES);
 
-    let flush = |out: &mut MeshClusters,
-                 window: &mut Vec<u32>,
-                 local_of: &mut std::collections::HashMap<u32, u8>,
-                 tris: &mut Vec<[u8; 3]>| {
+    let mut flush = |window: &mut Vec<u32>,
+                     local_of: &mut std::collections::HashMap<u32, u8>,
+                     tris: &mut Vec<[u8; 3]>| {
         if tris.is_empty() {
             return;
         }
         let (center, radius) = bounding_sphere(vertices, window);
         let (axis, cutoff) = normal_cone(vertices, window, tris);
-        let cluster = Cluster {
-            vertex_offset: out.cluster_vertices.len() as u32,
+        let (sc, sr) = self_sphere.unwrap_or((center, radius));
+        clusters.push(Cluster {
+            vertex_offset: cv.len() as u32,
             vertex_count: window.len() as u32,
-            triangle_offset: out.cluster_triangles.len() as u32,
+            triangle_offset: ct.len() as u32,
             triangle_count: tris.len() as u32,
             bounds_center: center.to_array(),
             bounds_radius: radius,
             cone_axis: axis.to_array(),
             cone_cutoff: cutoff,
             material,
-        };
-        out.cluster_vertices.extend_from_slice(window);
+            lod_level,
+            group: UNGROUPED,
+            self_error,
+            self_center: sc.to_array(),
+            self_radius: sr,
+            parent_error: f32::MAX,
+            parent_center: [0.0; 3],
+            parent_radius: 0.0,
+        });
+        cv.extend_from_slice(window);
         for t in tris.iter() {
-            out.cluster_triangles.extend_from_slice(t);
+            ct.extend_from_slice(t);
         }
-        out.clusters.push(cluster);
         window.clear();
         local_of.clear();
         tris.clear();
@@ -119,14 +165,12 @@ pub fn build_clusters(vertices: &[MeshVertex], indices: &[u32], material: u32) -
 
     for t in 0..tri_count {
         let tri = [indices[t * 3], indices[t * 3 + 1], indices[t * 3 + 2]];
-        // How many NEW unique vertices would this triangle add to the current window?
         let new_verts = tri.iter().filter(|v| !local_of.contains_key(v)).count();
         let would_overflow = window.len() + new_verts > MAX_CLUSTER_VERTICES
             || tris.len() + 1 > MAX_CLUSTER_TRIANGLES;
         if would_overflow {
-            flush(&mut out, &mut window, &mut local_of, &mut tris);
+            flush(&mut window, &mut local_of, &mut tris);
         }
-        // Add the triangle's vertices to the window and record the local u8 triple.
         let mut local = [0u8; 3];
         for (i, &v) in tri.iter().enumerate() {
             let slot = *local_of.entry(v).or_insert_with(|| {
@@ -138,8 +182,41 @@ pub fn build_clusters(vertices: &[MeshVertex], indices: &[u32], material: u32) -
         }
         tris.push(local);
     }
-    flush(&mut out, &mut window, &mut local_of, &mut tris);
-    out
+    flush(&mut window, &mut local_of, &mut tris);
+    (cv, ct, clusters)
+}
+
+/// Append a [`clusterize`] chunk to `mc`, rebasing its vertex/triangle offsets. Returns the
+/// range of appended cluster indices.
+fn append_chunk(
+    mc: &mut MeshClusters,
+    chunk: (Vec<u32>, Vec<u8>, Vec<Cluster>),
+) -> std::ops::Range<usize> {
+    let (cv, ct, clusters) = chunk;
+    let vbase = mc.cluster_vertices.len() as u32;
+    let tbase = mc.cluster_triangles.len() as u32;
+    let start = mc.clusters.len();
+    for mut c in clusters {
+        c.vertex_offset += vbase;
+        c.triangle_offset += tbase;
+        mc.clusters.push(c);
+    }
+    mc.cluster_vertices.extend_from_slice(&cv);
+    mc.cluster_triangles.extend_from_slice(&ct);
+    start..mc.clusters.len()
+}
+
+/// Build a mesh's finest-LOD clusters (Phase 14 M1a). One LOD (level 0, `self_error` 0). For
+/// the full LOD DAG use [`build_lod_dag`]. Deterministic: the greedy sweep visits triangles in
+/// input order, so the same mesh always produces the same clusters (cook-cache friendly).
+pub fn build_clusters(vertices: &[MeshVertex], indices: &[u32], material: u32) -> MeshClusters {
+    let mut mc = MeshClusters {
+        vertices: vertices.to_vec(),
+        ..Default::default()
+    };
+    let chunk = clusterize(&mc.vertices, indices, material, 0, 0.0, None);
+    append_chunk(&mut mc, chunk);
+    mc
 }
 
 /// Loose bounding sphere for a cluster's vertex window: centroid + max radius. Cheap and
@@ -190,6 +267,216 @@ fn normal_cone(vertices: &[MeshVertex], window: &[u32], tris: &[[u8; 3]]) -> (Ve
     } else {
         (axis, cutoff)
     }
+}
+
+/// Target clusters per group when grouping for LOD simplification (~8-32; the plan's midpoint).
+/// A group's triangles are merged and simplified together, so bigger groups amortize the locked
+/// boundary but coarsen granularity.
+pub const TARGET_GROUP_SIZE: usize = 16;
+
+/// An undirected edge as a sorted global-vertex pair (source-mesh indices).
+type Edge = (u32, u32);
+
+fn edge(a: u32, b: u32) -> Edge {
+    if a < b { (a, b) } else { (b, a) }
+}
+
+/// Map each cluster's local triangle vertices back to source-mesh (global) vertex indices, so
+/// two clusters that meet share the *same* edge key even though their `u8` local indices differ.
+fn cluster_global_edges(mc: &MeshClusters, ci: usize) -> Vec<Edge> {
+    let c = &mc.clusters[ci];
+    let vbase = c.vertex_offset as usize;
+    let tbase = c.triangle_offset as usize;
+    let g = |local: u8| mc.cluster_vertices[vbase + local as usize];
+    let mut seen = std::collections::HashSet::new();
+    let mut edges = Vec::new();
+    for t in 0..c.triangle_count as usize {
+        let tri = [
+            mc.cluster_triangles[tbase + t * 3],
+            mc.cluster_triangles[tbase + t * 3 + 1],
+            mc.cluster_triangles[tbase + t * 3 + 2],
+        ];
+        for k in 0..3 {
+            let e = edge(g(tri[k]), g(tri[(k + 1) % 3]));
+            if seen.insert(e) {
+                edges.push(e);
+            }
+        }
+    }
+    edges
+}
+
+/// Shared-edge adjacency among a **subset** of clusters (a single LOD level), keyed by cluster
+/// index: `adj[i][j]` = the number of edges clusters `i` and `j` share. Only edges between two
+/// subset clusters count, so grouping stays within a level.
+fn adjacency_subset(
+    mc: &MeshClusters,
+    subset: &[usize],
+) -> std::collections::HashMap<usize, std::collections::HashMap<usize, u32>> {
+    let mut edge_clusters: std::collections::HashMap<Edge, Vec<usize>> =
+        std::collections::HashMap::new();
+    for &ci in subset {
+        for e in cluster_global_edges(mc, ci) {
+            edge_clusters.entry(e).or_default().push(ci);
+        }
+    }
+    let mut adj: std::collections::HashMap<usize, std::collections::HashMap<usize, u32>> =
+        subset.iter().map(|&c| (c, Default::default())).collect();
+    for cls in edge_clusters.values() {
+        for i in 0..cls.len() {
+            for j in i + 1..cls.len() {
+                *adj.get_mut(&cls[i]).unwrap().entry(cls[j]).or_insert(0) += 1;
+                *adj.get_mut(&cls[j]).unwrap().entry(cls[i]).or_insert(0) += 1;
+            }
+        }
+    }
+    adj
+}
+
+/// Partition a subset of clusters (one LOD level) into groups of up to `target` by greedy
+/// region growing: seed the lowest unassigned cluster, then repeatedly annex the unassigned
+/// cluster sharing the most edges with the current group (ties → lowest index) until full or
+/// nothing is adjacent. Our own partitioner (referencing METIS's shared-boundary objective, no
+/// FFI). Deterministic. Returns groups as cluster-index lists.
+pub fn group_subset(mc: &MeshClusters, subset: &[usize], target: usize) -> Vec<Vec<usize>> {
+    let adj = adjacency_subset(mc, subset);
+    let mut order: Vec<usize> = subset.to_vec();
+    order.sort_unstable();
+    let mut assigned: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut groups = Vec::new();
+
+    for &seed in &order {
+        if assigned.contains(&seed) {
+            continue;
+        }
+        assigned.insert(seed);
+        let mut group = vec![seed];
+        while group.len() < target {
+            let mut weight: std::collections::HashMap<usize, u32> =
+                std::collections::HashMap::new();
+            for &c in &group {
+                for (&nb, &w) in &adj[&c] {
+                    if !assigned.contains(&nb) {
+                        *weight.entry(nb).or_insert(0) += w;
+                    }
+                }
+            }
+            let best = weight
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+            match best {
+                Some((c, _)) => {
+                    assigned.insert(c);
+                    group.push(c);
+                }
+                None => break,
+            }
+        }
+        groups.push(group);
+    }
+    groups
+}
+
+/// The group's triangle soup as global (`mc.vertices`) indices — concatenating every cluster's
+/// triangles, remapped from `u8` local windows. The unit the simplifier coarsens.
+fn group_global_indices(mc: &MeshClusters, group: &[usize]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for &ci in group {
+        let c = &mc.clusters[ci];
+        let vbase = c.vertex_offset as usize;
+        let tbase = c.triangle_offset as usize;
+        for k in 0..c.triangle_count as usize * 3 {
+            out.push(mc.cluster_vertices[vbase + mc.cluster_triangles[tbase + k] as usize]);
+        }
+    }
+    out
+}
+
+/// Bounding sphere (centroid + max radius) of every vertex referenced by a group's clusters.
+fn group_bounds(mc: &MeshClusters, group: &[usize]) -> (Vec3, f32) {
+    let mut verts: Vec<u32> = Vec::new();
+    for &ci in group {
+        let c = &mc.clusters[ci];
+        let vbase = c.vertex_offset as usize;
+        for i in 0..c.vertex_count as usize {
+            verts.push(mc.cluster_vertices[vbase + i]);
+        }
+    }
+    bounding_sphere(&mc.vertices, &verts)
+}
+
+/// Build the full LOD DAG for a mesh (Phase 14 M1d): the finest clusters (LOD 0) plus
+/// recursively coarser levels. Each level groups the current clusters, merges + simplifies each
+/// group (locking its boundary so shared seams stay crack-free), and re-clusterizes the result
+/// as the parent level. Records the monotone `self_error` / `parent_error` bounds the runtime
+/// projects for continuous LOD. Recurses until a level stops shrinking or reaches one cluster.
+/// Deterministic; single material (Phase 14 M1). Uses [`crate::simplify`].
+pub fn build_lod_dag(vertices: &[MeshVertex], indices: &[u32], material: u32) -> MeshClusters {
+    let mut mc = MeshClusters {
+        vertices: vertices.to_vec(),
+        ..Default::default()
+    };
+    let chunk = clusterize(&mc.vertices, indices, material, 0, 0.0, None);
+    let mut current: Vec<usize> = append_chunk(&mut mc, chunk).collect();
+
+    // Positions for the simplifier (shared across levels; vertices never change).
+    let positions: Vec<Vec3> = mc.vertices.iter().map(|v| Vec3::from(v.pos)).collect();
+
+    let mut lod_level = 1u32;
+    let mut next_group_id = 0u32;
+    while current.len() > 1 {
+        let groups = group_subset(&mc, &current, TARGET_GROUP_SIZE);
+        let mut next: Vec<usize> = Vec::new();
+
+        for group in &groups {
+            let group_tris = group_global_indices(&mc, group);
+            let tri_n = group_tris.len() / 3;
+            let locked = crate::simplify::open_boundary_vertices(&group_tris);
+            let target = (tri_n / 2).max(1);
+            let (simplified, err) =
+                crate::simplify::simplify_subset(&positions, &group_tris, target, &locked);
+
+            // Monotone group error: the worst child's error plus this level's simplification.
+            let child_max = group
+                .iter()
+                .map(|&c| mc.clusters[c].self_error)
+                .fold(0.0f32, f32::max);
+            let group_error = child_max + err as f32;
+            let (gc, gr) = group_bounds(&mc, group);
+            let gid = next_group_id;
+            next_group_id += 1;
+
+            // Link the children into this group (their coarsening bound).
+            for &c in group {
+                mc.clusters[c].group = gid;
+                mc.clusters[c].parent_error = group_error;
+                mc.clusters[c].parent_center = gc.to_array();
+                mc.clusters[c].parent_radius = gr;
+            }
+
+            // No reduction (e.g. everything on a locked boundary) → the group can't coarsen; its
+            // clusters stay terminal (parent bound above still applies). Don't emit a parent LOD.
+            if simplified.len() / 3 >= tri_n {
+                continue;
+            }
+            let chunk = clusterize(
+                &mc.vertices,
+                &simplified,
+                material,
+                lod_level,
+                group_error,
+                Some((gc, gr)),
+            );
+            next.extend(append_chunk(&mut mc, chunk));
+        }
+
+        if next.is_empty() {
+            break; // no group coarsened → the current level is the root set
+        }
+        current = next;
+        lod_level += 1;
+    }
+    mc
 }
 
 #[cfg(test)]
@@ -246,6 +533,107 @@ mod tests {
             idx.len() / 3,
             "all triangles clustered"
         );
+    }
+
+    #[test]
+    fn grouping_covers_all_clusters_and_bounds_size() {
+        let (verts, idx) = grid_mesh(40);
+        let mc = build_clusters(&verts, &idx, 0);
+        assert!(
+            mc.clusters.len() > 20,
+            "need enough clusters to form groups"
+        );
+
+        let all: Vec<usize> = (0..mc.clusters.len()).collect();
+        let groups = group_subset(&mc, &all, TARGET_GROUP_SIZE);
+        // Every cluster is in exactly one group.
+        let mut seen = vec![false; mc.clusters.len()];
+        let mut total = 0;
+        for g in &groups {
+            assert!(!g.is_empty());
+            assert!(g.len() <= TARGET_GROUP_SIZE, "group exceeds target size");
+            for &c in g {
+                assert!(!seen[c], "cluster {c} in two groups");
+                seen[c] = true;
+                total += 1;
+            }
+        }
+        assert_eq!(total, mc.clusters.len(), "all clusters grouped");
+        assert!(seen.iter().all(|&s| s), "no cluster left ungrouped");
+
+        // Determinism: same input → same partition.
+        assert_eq!(groups, group_subset(&mc, &all, TARGET_GROUP_SIZE));
+    }
+
+    #[test]
+    fn adjacency_is_symmetric() {
+        let (verts, idx) = grid_mesh(24);
+        let mc = build_clusters(&verts, &idx, 0);
+        let all: Vec<usize> = (0..mc.clusters.len()).collect();
+        let adj = adjacency_subset(&mc, &all);
+        for (&i, nbrs) in &adj {
+            for (&j, &w) in nbrs {
+                assert_eq!(adj[&j].get(&i), Some(&w), "adjacency asymmetric");
+            }
+        }
+    }
+
+    /// A grid displaced by a smooth height field — non-planar, so simplification incurs real
+    /// (nonzero) QEM error, unlike the flat `grid_mesh`.
+    fn bumpy_grid(n: u32) -> (Vec<MeshVertex>, Vec<u32>) {
+        let (mut verts, idx) = grid_mesh(n);
+        for v in &mut verts {
+            let (x, y) = (v.pos[0], v.pos[1]);
+            v.pos[2] = (x * 0.4).sin() * 1.5 + (y * 0.3).cos() * 1.2;
+        }
+        (verts, idx)
+    }
+
+    #[test]
+    fn lod_dag_builds_monotone_shrinking_levels() {
+        // A denser bumpy grid so several LOD levels form and carry real error.
+        let (verts, idx) = bumpy_grid(48);
+        let mc = build_lod_dag(&verts, &idx, 5);
+
+        let max_lod = mc.clusters.iter().map(|c| c.lod_level).max().unwrap();
+        assert!(
+            max_lod >= 1,
+            "expected at least one coarser LOD, got {max_lod}"
+        );
+
+        // Per-level triangle totals must strictly shrink as LOD coarsens.
+        let mut per_level = vec![0u32; max_lod as usize + 1];
+        for c in &mc.clusters {
+            per_level[c.lod_level as usize] += c.triangle_count;
+        }
+        for l in 1..=max_lod as usize {
+            assert!(
+                per_level[l] < per_level[l - 1],
+                "LOD {l} ({}) not coarser than LOD {} ({})",
+                per_level[l],
+                l - 1,
+                per_level[l - 1]
+            );
+        }
+
+        // Monotone error bounds: parent_error >= self_error on every cluster; coarser LODs have
+        // larger self_error than the finest (which is 0).
+        for c in &mc.clusters {
+            assert!(c.parent_error >= c.self_error, "parent_error < self_error");
+            if c.lod_level == 0 {
+                assert_eq!(c.self_error, 0.0, "LOD0 self_error must be 0");
+            }
+        }
+        assert!(
+            mc.clusters
+                .iter()
+                .any(|c| c.lod_level > 0 && c.self_error > 0.0),
+            "coarser LODs should carry a nonzero error"
+        );
+
+        // Determinism.
+        let mc2 = build_lod_dag(&verts, &idx, 5);
+        assert_eq!(mc, mc2);
     }
 
     #[test]
