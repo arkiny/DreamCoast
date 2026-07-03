@@ -135,12 +135,21 @@ and the small-triangle objects (plants, props) render correctly, but the large-t
 screen bounding box, so a wall triangle covering a large screen area loops over millions of pixels →
 the compute dispatch effectively hangs / is dropped. This is precisely the case **M5b binning** exists
 for (large clusters → the HW mesh path, only micro-triangles → SW). The integration is SW-only today,
-so **I4 (binning in the graph) is required for Sponza-class scenes.** I4's obstacle: a graph render
-pass (the HW mesh-vis pass) must declare a UAV storage-write (the visibility buffer) for ordering —
-`PassInfo` has no `storage_writes` today — and needs a colour attachment; add both, then reuse
-`csCutBin` + `vgeo_hwvis.slang` (already built) to split each object's clusters HW/SW into the shared
-visibility buffer before the resolve. Small/medium-triangle meshes (gallery, Lantern) are fully
-correct on the SW-only path.
+so **I4 is required for Sponza-class scenes.** Two obstacles, in order of depth:
+1. **The render-graph IR `Recorder` (`crates/rhi/command_list.rs`) has no mesh-shader support** — only
+   `draw` / `dispatch` / `draw_indexed_indirect`, no `bind_mesh_pipeline` / `draw_mesh_tasks[_indirect]`
+   (the self-contained viewer drove the HW path on the raw command buffer, outside the graph). So HW
+   binning in the *graph-based* renderer first needs mesh commands added to the IR `Recorder` +
+   `CommandList` + all three backends' translation. **This is the real blocker**, a moderate RHI change.
+2. Then the HW mesh-vis pass needs a UAV storage-write declaration (add
+   `RenderGraph::add_pass_with_storage_writes` — `PassNode.storage_writes` already exists + `writes()`
+   already chains it, so this is a few lines) + a scratch colour attachment; reuse the already-built
+   `csCutBin` + `vgeo_hwvis.slang` to split each object HW/SW into the shared visibility buffer.
+
+**Alternative to HW binning:** a tiled / threadgroup-cooperative SW rasterizer (bin triangles to screen
+tiles, rasterize per-tile) stays in compute (no IR change) and also fixes large triangles. Either is a
+substantial distinct effort. Small/medium-triangle meshes (gallery, Lantern) are fully correct on the
+current SW-only path.
 
 ## Deferred / out of scope (see `dreamcoast-vgeo-followups`)
 
