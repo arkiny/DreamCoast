@@ -42,16 +42,29 @@ pub(crate) struct VgeoMaterial {
     pub(crate) alpha_cutoff: f32,
 }
 
-/// One mesh's immutable cluster geometry in the bindless storage table.
-struct ClusterPage {
+/// All meshes' cluster geometry consolidated into FOUR bindless storage buffers (not four *per
+/// mesh*). Every page's vertex pool / remap / triangle / record arrays are concatenated with each
+/// page's base offset baked into the indices at upload, so the whole scene uses a fixed 4 slots
+/// regardless of mesh count — the fix for Sponza-class scenes (103–405 meshes would otherwise need
+/// 400–1600 storage-buffer slots and overflow the bindless table).
+struct GlobalGeom {
     vtx: StorageBuffer,
     remap: StorageBuffer,
     tri: StorageBuffer,
     rec: StorageBuffer,
+}
+
+/// One mesh's cluster range inside the consolidated [`GlobalGeom`]: its clusters occupy the global
+/// record slots `rec_base .. rec_base + total_clusters`, and each record's `vertex_offset`/
+/// `tri_offset` already point into the global remap/triangle arrays (baked at upload).
+struct ClusterPage {
+    rec_base: u32,
     total_clusters: u32,
 }
 
 pub(crate) struct VgeoSystem {
+    /// All meshes' cluster geometry in 4 shared buffers (see [`GlobalGeom`]).
+    geom: GlobalGeom,
     pages: Vec<ClusterPage>,
     /// `Rc<GpuMesh>` pointer → page index, so a scene object routes to its mesh's page.
     mesh_to_page: HashMap<usize, usize>,
@@ -128,7 +141,12 @@ impl VgeoSystem {
             )?)
         };
 
-        // Build a cluster page per mesh from its CPU geometry (build_lod_dag = what the cook runs).
+        // Build a cluster page per mesh from its CPU geometry (build_lod_dag = what the cook runs),
+        // appending each into the CONSOLIDATED global arrays with its base offsets baked in. This
+        // keeps the whole scene at 4 storage-buffer slots (not 4 × mesh count) so Sponza-class
+        // scenes (100s of meshes) don't overflow the bindless table.
+        let (mut gvtx, mut gremap, mut gtri, mut grec) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut pages: Vec<ClusterPage> = Vec::new();
         let mut mesh_to_page: HashMap<usize, usize> = HashMap::new();
         let mut max_clusters = 0u32;
@@ -142,7 +160,7 @@ impl VgeoSystem {
             if dag.clusters.is_empty() {
                 continue;
             }
-            let page = Self::upload_page(&sb, &dag)?;
+            let page = Self::append_page(&mut gvtx, &mut gremap, &mut gtri, &mut grec, &dag);
             max_clusters = max_clusters.max(page.total_clusters);
             let idx = pages.len();
             pages.push(page);
@@ -151,9 +169,17 @@ impl VgeoSystem {
         if pages.is_empty() {
             anyhow::bail!("P14_VGEO: no mesh produced clusters");
         }
+        let geom = GlobalGeom {
+            vtx: sb(&gvtx, 32)?,
+            remap: sb(&gremap, 4)?,
+            tri: sb(&gtri, 4)?,
+            rec: sb(&grec, 96)?,
+        };
         tracing::info!(
-            "P14_VGEO: built {} cluster page(s) (max {} clusters)",
+            "P14_VGEO: {} cluster page(s), {} total clusters (consolidated into 4 buffers, max {} \
+             clusters/page)",
             pages.len(),
+            grec.len() / 96,
             max_clusters
         );
 
@@ -324,6 +350,7 @@ impl VgeoSystem {
         };
 
         Ok(Self {
+            geom,
             pages,
             mesh_to_page,
             max_clusters,
@@ -340,29 +367,39 @@ impl VgeoSystem {
         })
     }
 
-    /// Serialize a cluster DAG into bindless storage buffers (same layout as the shaders expect).
-    fn upload_page(
-        sb: &impl Fn(&[u8], u32) -> anyhow::Result<StorageBuffer>,
+    /// Append a cluster DAG into the consolidated global arrays, baking this page's base offsets
+    /// into the indices so the records point into the shared buffers directly:
+    ///   * `remap` values (indices into the vertex pool) += the page's global vertex base,
+    ///   * each record's `vertex_offset` (into remap) += the global remap base,
+    ///   * each record's `tri_offset` (into triangles) += the global triangle base.
+    ///
+    /// The triangle values are LOCAL per-cluster indices (into the cluster's emitted vertices), so
+    /// they need no offset. Returns the page's global record range.
+    fn append_page(
+        gvtx: &mut Vec<u8>,
+        gremap: &mut Vec<u8>,
+        gtri: &mut Vec<u8>,
+        grec: &mut Vec<u8>,
         dag: &dreamcoast_asset::vgeo::MeshClusters,
-    ) -> anyhow::Result<ClusterPage> {
-        let mut vtx = Vec::with_capacity(dag.vertices.len() * 32);
+    ) -> ClusterPage {
+        let vtx_base = (gvtx.len() / 32) as u32;
+        let remap_base = (gremap.len() / 4) as u32;
+        let tri_base = (gtri.len() / 4) as u32;
+        let rec_base = (grec.len() / 96) as u32;
         for v in &dag.vertices {
             for f in v.pos.iter().chain(&v.normal) {
-                vtx.extend_from_slice(&f.to_le_bytes());
+                gvtx.extend_from_slice(&f.to_le_bytes());
             }
             for f in v.uv {
-                vtx.extend_from_slice(&f.to_le_bytes());
+                gvtx.extend_from_slice(&f.to_le_bytes());
             }
         }
-        let mut remap = Vec::with_capacity(dag.cluster_vertices.len() * 4);
         for &i in &dag.cluster_vertices {
-            remap.extend_from_slice(&i.to_le_bytes());
+            gremap.extend_from_slice(&(i + vtx_base).to_le_bytes());
         }
-        let mut tri = Vec::with_capacity(dag.cluster_triangles.len() * 4);
         for &b in &dag.cluster_triangles {
-            tri.extend_from_slice(&(b as u32).to_le_bytes());
+            gtri.extend_from_slice(&(b as u32).to_le_bytes());
         }
-        let mut rec = Vec::with_capacity(dag.clusters.len() * 96);
         let put = |rec: &mut Vec<u8>, f: f32| rec.extend_from_slice(&f.to_le_bytes());
         let put3 = |rec: &mut Vec<u8>, v: [f32; 3]| {
             for f in v {
@@ -371,32 +408,29 @@ impl VgeoSystem {
         };
         for cl in &dag.clusters {
             for field in [
-                cl.vertex_offset,
+                cl.vertex_offset + remap_base,
                 cl.vertex_count,
-                cl.triangle_offset,
+                cl.triangle_offset + tri_base,
                 cl.triangle_count,
             ] {
-                rec.extend_from_slice(&field.to_le_bytes());
+                grec.extend_from_slice(&field.to_le_bytes());
             }
-            put(&mut rec, cl.self_error);
-            put3(&mut rec, cl.self_center);
-            put(&mut rec, cl.self_radius);
-            put(&mut rec, cl.parent_error);
-            put3(&mut rec, cl.parent_center);
-            put(&mut rec, cl.parent_radius);
-            put3(&mut rec, cl.bounds_center);
-            put(&mut rec, cl.bounds_radius);
-            put3(&mut rec, cl.cone_axis);
-            put(&mut rec, cl.cone_cutoff);
-            rec.extend_from_slice(&[0u8; 8]); // 88..96 pad
+            put(grec, cl.self_error);
+            put3(grec, cl.self_center);
+            put(grec, cl.self_radius);
+            put(grec, cl.parent_error);
+            put3(grec, cl.parent_center);
+            put(grec, cl.parent_radius);
+            put3(grec, cl.bounds_center);
+            put(grec, cl.bounds_radius);
+            put3(grec, cl.cone_axis);
+            put(grec, cl.cone_cutoff);
+            grec.extend_from_slice(&[0u8; 8]); // 88..96 pad
         }
-        Ok(ClusterPage {
-            vtx: sb(&vtx, 32)?,
-            remap: sb(&remap, 4)?,
-            tri: sb(&tri, 4)?,
-            rec: sb(&rec, 96)?,
+        ClusterPage {
+            rec_base,
             total_clusters: dag.clusters.len() as u32,
-        })
+        }
     }
 
     /// The page index for a scene object's mesh, or `None` (→ rasterize it via the mesh fill).
@@ -510,13 +544,18 @@ impl VgeoSystem {
         let (hw_list, hw_args) = (&s.hw_list, &s.hw_args);
         let (w, h) = (extent.width, extent.height);
         let total = page.total_clusters;
+        // Global cluster index of this page's first cluster: the cut adds it to the local index so
+        // the shared record buffer is addressed correctly; the visible list then carries GLOBAL
+        // cluster indices, which the raster / mesh / resolve read against the shared buffers.
+        let rec_base = page.rec_base;
         let tau = self.tau;
         let bin_px = self.bin_px;
+        // Consolidated geometry: the same 4 shared buffers for every object (offsets baked in).
         let (vtx_i, remap_i, tri_i, rec_i) = (
-            page.vtx.storage_index(),
-            page.remap.storage_index(),
-            page.tri.storage_index(),
-            page.rec.storage_index(),
+            self.geom.vtx.storage_index(),
+            self.geom.remap.storage_index(),
+            self.geom.tri.storage_index(),
+            self.geom.rec.storage_index(),
         );
 
         let hw_list_ext = graph.import_external("vgeo_vislist");
@@ -601,6 +640,7 @@ impl VgeoSystem {
                     cpc[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
                 }
                 cpc[208..212].copy_from_slice(&max_scale.to_le_bytes());
+                cpc[212..216].copy_from_slice(&rec_base.to_le_bytes());
                 let cmd = ctx.cmd();
                 // `hw_args` feeds the HW mesh draw's indirect grid (binning): reset last frame's
                 // INDIRECT_ARGUMENT state back to storage before the cut UAV-writes the count.

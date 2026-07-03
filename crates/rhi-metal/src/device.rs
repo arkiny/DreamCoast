@@ -52,7 +52,7 @@ pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
 /// in rhi-vulkan / rhi-d3d12 and `Bindless.storage_buffers[N]`; storage buffer `i`
 /// lives at handle slot `STORAGE_BUFFER_BASE + i` (M5). Raised 64→128 for Phase 14 virtual
 /// geometry (the GI-heavy default scene already fills all 64 slots — see the rhi-vulkan note).
-pub(crate) const STORAGE_BUFFER_COUNT: u32 = 128;
+pub(crate) const STORAGE_BUFFER_COUNT: u32 = 2048;
 
 /// First argument-buffer slot of the storage-image region. Mirrors the
 /// `Bindless { textures[1024], samp, cubes[64], storage_images[64],

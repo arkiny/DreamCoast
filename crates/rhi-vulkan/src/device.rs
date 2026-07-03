@@ -35,7 +35,7 @@ pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
 /// virtual geometry: the GI-heavy default scene already fills all 64 slots, leaving no room
 /// for vgeo's cluster-page / visibility / cut buffers. Must match `Bindless.storage_buffers[N]`
 /// in bindless.slang and the same constant in rhi-d3d12 / rhi-metal.
-pub(crate) const STORAGE_BUFFER_COUNT: u32 = 128;
+pub(crate) const STORAGE_BUFFER_COUNT: u32 = 2048;
 /// Size of the bindless sampled 3D-volume table (binding 6). Trilinear-sampled
 /// distance fields; separate 0-based index space (Phase 11 Stage B).
 pub(crate) const VOLUME_COUNT: u32 = 64;
