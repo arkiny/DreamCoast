@@ -104,6 +104,29 @@ one material for the whole cluster set (single-mesh/single-material object).
   inside the graph — resolve into a scratch/one of the MRTs as a dummy, or a depth-only mesh pass),
   then **M4b HZB** 2-pass occlusion from the real depth.
 
+## Multi-mesh + world-space cut (LANDED)
+
+- **Multi-mesh (commit `6d265b2`):** a cluster page per registered mesh (from the registry's CPU
+  geometry via `build_lod_dag`), routed by `Rc<GpuMesh>` identity; every eligible opaque object
+  renders as virtual geometry, overlaid on the mesh remainder. Whole gallery via vgeo = 0.19% vs
+  all-mesh.
+- **World-space cut:** the LOD cut transforms each cluster's local bounds by the object's `model`
+  matrix (a `model` mat4 + `max_scale` added to the cut push; the recentered viewer passes
+  `identity`/`1` → unchanged) so the frustum/cone/error work under **non-uniform node scale** (which
+  Sponza has); a local-space sphere test would skew. Backward-compatible, gallery + viewer
+  unregressed.
+
+## Known limitation — disconnected-component LOD (M1 builder)
+
+On multi-component meshes (e.g. the Khronos Lantern's post+**base** in one primitive), a small
+disconnected component can vanish under vgeo at **every** τ: the M1 `build_lod_dag` simplifier
+collapses the component but under-records its LOD error (a disconnected island has no boundary edges
+constraining the QEM collapse), so the cut's `parent_error` for its finest clusters stays below τ and
+no LOD level is ever selected for it. The runtime integration is correct (the whole page uploads);
+this is an **M1 asset-pipeline robustness gap** (the M1 gate was a single-component torus). Fix =
+account for removed/collapsed geometry in the LOD error, especially per connected component, in
+`crates/asset/src/{vgeo.rs,simplify.rs}`. Single-component meshes (the gallery) are unaffected.
+
 ## Deferred / out of scope (see `dreamcoast-vgeo-followups`)
 
 - **Multi-material / scene-cook:** per-cluster material id + a material table so Sponza-class scenes

@@ -164,7 +164,7 @@ impl VgeoSystem {
             dreamcoast_shader::vgeo_cut_cs_dxil,
             dreamcoast_shader::vgeo_cut_cs_metallib,
             "csCut",
-            144,
+            224,
             [64, 1, 1],
         )?;
         let clear_pipeline = compute(
@@ -399,9 +399,17 @@ impl VgeoSystem {
         let vislist_ext = graph.import_external("vgeo_vislist");
         let args_ext = graph.import_external("vgeo_args");
 
-        // ── LOD cut (model-space): planes from cull_view_proj*model, cam = inverse(model)*eye ──
-        let planes = crate::push::frustum_planes(cull_view_proj * model);
-        let cam = model.inverse().transform_point3(eye);
+        // ── LOD cut (world-space): WORLD frustum planes + cam; the shader transforms each cluster's
+        // local bounds by `model` (handles non-uniform node scale that a local-space test skews). ──
+        let planes = crate::push::frustum_planes(cull_view_proj);
+        let cam = eye;
+        let max_scale = model
+            .x_axis
+            .truncate()
+            .length()
+            .max(model.y_axis.truncate().length())
+            .max(model.z_axis.truncate().length());
+        let model_arr = model.to_cols_array();
         let proj_factor = 0.5 * h as f32 / (30f32.to_radians()).tan();
         let cut = &self.cut_pipeline;
         graph.add_compute_pass(
@@ -411,7 +419,7 @@ impl VgeoSystem {
                 reads: vec![],
             },
             move |ctx| {
-                let mut cpc = [0u8; 144];
+                let mut cpc = [0u8; 224];
                 for (i, plane) in planes.iter().enumerate() {
                     for (j, f) in plane.iter().enumerate() {
                         cpc[i * 16 + j * 4..i * 16 + j * 4 + 4].copy_from_slice(&f.to_le_bytes());
@@ -428,6 +436,10 @@ impl VgeoSystem {
                 {
                     cpc[116 + i * 4..120 + i * 4].copy_from_slice(&word.to_le_bytes());
                 }
+                for (i, v) in model_arr.iter().enumerate() {
+                    cpc[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
+                }
+                cpc[208..212].copy_from_slice(&max_scale.to_le_bytes());
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(cut);
                 cmd.push_constants_compute(&cpc);
