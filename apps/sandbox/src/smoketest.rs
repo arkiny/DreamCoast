@@ -977,6 +977,9 @@ pub(crate) fn run_vgeo_mesh(
     // (compute-raster) list by projected screen size; both write the SAME R64 visibility buffer.
     // `VGEO_BINPX` is the split threshold (projected bounds diameter in px, below → SW).
     let bin = std::env::var("VGEO_BIN").ok().as_deref() == Some("1");
+    // M6 (VGEO_RESOLVE=1): resolve the visibility buffer to shaded attributes (the deferred
+    // G-buffer stage) instead of the raw cluster-id visualization. Needs a populated visbuf (sw/bin).
+    let resolve = std::env::var("VGEO_RESOLVE").ok().as_deref() == Some("1");
     let sw = std::env::var("VGEO_SW").ok().as_deref() == Some("1");
     let cut = sw || bin || std::env::var("VGEO_CUT").ok().as_deref() == Some("1");
     let tau: f32 = std::env::var("VGEO_TAU")
@@ -1185,6 +1188,45 @@ pub(crate) fn run_vgeo_mesh(
             depth_test: false,
             depth_write: false,
             depth_compare: DepthCompare::Less,
+        })?)
+    } else {
+        None
+    };
+
+    // M6: the material-resolve pipeline (full-screen). Reads the visibility buffer, reconstructs
+    // analytic-barycentric attributes, and shades like the M2 direct render (the deferred G-buffer
+    // stage in the self-contained viewer). Opt-in via VGEO_RESOLVE=1, needs a populated visbuf.
+    let resolve_pipeline = if resolve && (sw || bin) {
+        let (rvs, rfs) = match backend {
+            BackendKind::Vulkan => (
+                dreamcoast_shader::vgeo_resolve_vs_spirv(),
+                dreamcoast_shader::vgeo_resolve_fs_spirv(),
+            ),
+            BackendKind::D3d12 => (
+                dreamcoast_shader::vgeo_resolve_vs_dxil(),
+                dreamcoast_shader::vgeo_resolve_fs_dxil(),
+            ),
+            BackendKind::Metal => (
+                dreamcoast_shader::vgeo_resolve_vs_metallib(),
+                dreamcoast_shader::vgeo_resolve_fs_metallib(),
+            ),
+        };
+        Some(device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            vertex_bytes: rvs.ok_or_else(|| anyhow!("vgeo_resolve vs unavailable"))?,
+            fragment_bytes: rfs.ok_or_else(|| anyhow!("vgeo_resolve fs unavailable"))?,
+            vertex_entry: "vsMain",
+            fragment_entry: "fragMain",
+            color_formats: &[COLOR_FORMAT],
+            topology: PrimitiveTopology::TriangleList,
+            vertex_layout: VertexLayout::None,
+            blend: BlendMode::Opaque,
+            push_constant_size: 112,
+            bindless: true,
+            uniform_buffer: false,
+            depth_test: false,
+            depth_write: false,
+            depth_compare: DepthCompare::Less,
+            depth_format: None,
         })?)
     } else {
         None
@@ -1422,7 +1464,31 @@ pub(crate) fn run_vgeo_mesh(
             if sw || bin { None } else { Some(&depth) },
         );
         cmd.set_viewport_scissor(swapchain);
-        if sw || bin {
+        if let Some(rp) = resolve_pipeline.as_ref() {
+            // M6: resolve the visibility buffer → attributes → shaded surface. Push (112 B):
+            // mvp (64) + geometry slots + visbuf + size + mode/tex.
+            let mut rpc = [0u8; 112];
+            for (i, v) in mvp.iter().enumerate() {
+                rpc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            let words = [
+                vtx_buf.storage_index(),
+                remap_buf.storage_index(),
+                tri_buf.storage_index(),
+                rec_buf.storage_index(),
+                visbuf.storage_index(),
+                w,
+                h,
+                mode,
+                tex_index,
+            ];
+            for (i, word) in words.iter().enumerate() {
+                rpc[64 + i * 4..68 + i * 4].copy_from_slice(&word.to_le_bytes());
+            }
+            cmd.bind_graphics_pipeline(rp);
+            cmd.push_constants(&rpc);
+            cmd.draw(3, 1);
+        } else if sw || bin {
             // Full-screen visualization of the visibility buffer (cluster id → colour).
             let mut vpc = [0u8; 16];
             vpc[0..4].copy_from_slice(&visbuf.storage_index().to_le_bytes());
@@ -1510,6 +1576,7 @@ pub(crate) fn run_vgeo_mesh(
         &sw_raster_pipeline,
         &vis_pipeline,
         &hwvis_pipeline,
+        &resolve_pipeline,
     );
     info!("vgeo-mesh exited after {frames} frame(s)");
     Ok(())
