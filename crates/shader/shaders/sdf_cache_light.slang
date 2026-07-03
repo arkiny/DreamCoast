@@ -35,9 +35,10 @@ struct CacheLightPush
     float4 params;        // x (unused, was sky_fill), y temporal alpha, z surface bias, w ray max
     uint4 clip;           // Stage B clipmap: x = descriptor index, y = level count
     float cone_k;         // P3: cone-trace LOD slope (0 = legacy linear march = byte-identical)
-    uint conv_buf;        // A2-fix: host-visible buffer[0] gets InterlockedMax(asuint(max EMA delta))
-                          // so the host can freeze the relight ONLY on MEASURED convergence (Lumen
-                          // uses a priority budget, never a frame-count freeze). 0xFFFFFFFF = disabled.
+    uint conv_buf;        // A2-fix: relight InterlockedAdds the per-channel EMA step into this host-
+                          // visible buffer ([0]=sum_fp, [4]=count); the host divides to the MEAN step and
+                          // freezes the relight ONLY on MEASURED convergence (a general engine budgets by
+                          // priority rather than a frame-count freeze). 0xFFFFFFFF = disabled.
     float pad1;
     float pad2;
     float4 sky;           // x = sky gain, yzw = white balance (matches the path tracer's sky)

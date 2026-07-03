@@ -1477,8 +1477,10 @@ pub(crate) fn ssr_resolve_push(
     alpha: f32,
     clamp_max: f32,
     kernel_radius: f32,
-) -> [u8; 224] {
-    let mut pc = [0u8; 224];
+    clamp_mode: u32,
+    clamp_gamma: f32,
+) -> [u8; 240] {
+    let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1511,6 +1513,10 @@ pub(crate) fn ssr_resolve_push(
     pc[212..216].copy_from_slice(&alpha.to_le_bytes());
     pc[216..220].copy_from_slice(&clamp_max.to_le_bytes());
     pc[220..224].copy_from_slice(&kernel_radius.to_le_bytes());
+    // History neighbourhood clamp (mode 0 = off = byte-identical). float4 `params` occupies 208..224,
+    // so the two scalars land in the next 16-byte register (224..232; 232..240 is tail padding).
+    pc[224..228].copy_from_slice(&clamp_mode.to_le_bytes());
+    pc[228..232].copy_from_slice(&clamp_gamma.to_le_bytes());
     pc
 }
 
