@@ -971,7 +971,10 @@ pub(crate) fn run_vgeo_mesh(
 
     // M3 cut mode (VGEO_CUT=1): a compute pass selects the view-dependent cut into `vis_buf` and
     // writes the mesh-draw threadgroup count into `args_buf` for the indirect draw.
-    let cut = std::env::var("VGEO_CUT").ok().as_deref() == Some("1");
+    // M5 software-raster mode (VGEO_SW=1): rasterize the cut's clusters into an R64 visibility
+    // buffer via atomicMax, then visualize it. SW implies the cut (it needs the visible list).
+    let sw = std::env::var("VGEO_SW").ok().as_deref() == Some("1");
+    let cut = sw || std::env::var("VGEO_CUT").ok().as_deref() == Some("1");
     let tau: f32 = std::env::var("VGEO_TAU")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1041,6 +1044,92 @@ pub(crate) fn run_vgeo_mesh(
 
     let (mut w, mut h) = window.size();
     let mut depth = device.create_depth_buffer(Extent2D::new(w.max(1), h.max(1)))?;
+
+    // M5 software-raster resources: an R64 visibility buffer (one u64/pixel), the clear + raster
+    // compute pipelines, and the full-screen visualization pipeline. `visbuf` is recreated on
+    // resize (its size tracks the render extent).
+    let vis_bytes = |w: u32, h: u32| (w.max(1) as u64) * (h.max(1) as u64) * 8;
+    let mut visbuf = device.create_storage_buffer(&StorageBufferDesc {
+        size: vis_bytes(w, h),
+        stride: 8,
+        indirect: false,
+    })?;
+    let (sw_clear_pipeline, sw_raster_pipeline, vis_pipeline) = if sw {
+        let cshader = |spirv: fn() -> Option<&'static [u8]>,
+                       dxil: fn() -> Option<&'static [u8]>,
+                       metal: fn() -> Option<&'static [u8]>,
+                       entry: &str,
+                       size: u32|
+         -> anyhow::Result<_> {
+            let bytes = match backend {
+                BackendKind::Vulkan => spirv(),
+                BackendKind::D3d12 => dxil(),
+                BackendKind::Metal => metal(),
+            }
+            .ok_or_else(|| anyhow!("{entry} shader unavailable for {backend:?}"))?;
+            Ok(device.create_compute_pipeline(&ComputePipelineDesc {
+                compute_bytes: bytes,
+                compute_entry: entry,
+                push_constant_size: size,
+                bindless: true,
+                uniform_buffer: false,
+                threads_per_group: if entry == "csClear" {
+                    [64, 1, 1]
+                } else {
+                    [128, 1, 1]
+                },
+            })?)
+        };
+        let clear = cshader(
+            dreamcoast_shader::vgeo_swraster_clear_cs_spirv,
+            dreamcoast_shader::vgeo_swraster_clear_cs_dxil,
+            dreamcoast_shader::vgeo_swraster_clear_cs_metallib,
+            "csClear",
+            96,
+        )?;
+        let raster = cshader(
+            dreamcoast_shader::vgeo_swraster_cs_spirv,
+            dreamcoast_shader::vgeo_swraster_cs_dxil,
+            dreamcoast_shader::vgeo_swraster_cs_metallib,
+            "csRaster",
+            96,
+        )?;
+        let (vvs, vfs) = match backend {
+            BackendKind::Vulkan => (
+                dreamcoast_shader::vgeo_visbuffer_vs_spirv(),
+                dreamcoast_shader::vgeo_visbuffer_fs_spirv(),
+            ),
+            BackendKind::D3d12 => (
+                dreamcoast_shader::vgeo_visbuffer_vs_dxil(),
+                dreamcoast_shader::vgeo_visbuffer_fs_dxil(),
+            ),
+            BackendKind::Metal => (
+                dreamcoast_shader::vgeo_visbuffer_vs_metallib(),
+                dreamcoast_shader::vgeo_visbuffer_fs_metallib(),
+            ),
+        };
+        let vis = device.create_graphics_pipeline(&GraphicsPipelineDesc {
+            vertex_bytes: vvs.ok_or_else(|| anyhow!("vgeo_visbuffer vs unavailable"))?,
+            fragment_bytes: vfs.ok_or_else(|| anyhow!("vgeo_visbuffer fs unavailable"))?,
+            vertex_entry: "vsMain",
+            fragment_entry: "fragMain",
+            color_formats: &[COLOR_FORMAT],
+            topology: PrimitiveTopology::TriangleList,
+            vertex_layout: VertexLayout::None,
+            blend: BlendMode::Opaque,
+            push_constant_size: 16,
+            bindless: true,
+            uniform_buffer: false,
+            depth_test: false,
+            depth_write: false,
+            depth_compare: DepthCompare::Less,
+            depth_format: None,
+        })?;
+        (Some(clear), Some(raster), Some(vis))
+    } else {
+        (None, None, None)
+    };
+
     let queue = device.queue();
     let cmd = device.create_command_buffer()?;
     let image_available = device.create_semaphore()?;
@@ -1071,6 +1160,13 @@ pub(crate) fn run_vgeo_mesh(
             device.wait_idle()?;
             swapchain.recreate(&swapchain_desc(Extent2D::new(w, h)))?;
             depth = device.create_depth_buffer(Extent2D::new(w, h))?;
+            if sw {
+                visbuf = device.create_storage_buffer(&StorageBufferDesc {
+                    size: vis_bytes(w, h),
+                    stride: 8,
+                    indirect: false,
+                })?;
+            }
         }
         let now = Instant::now();
         let dt = (now - last).as_secs_f32();
@@ -1173,6 +1269,34 @@ pub(crate) fn run_vgeo_mesh(
             cmd.dispatch(total_clusters.div_ceil(64), 1, 1);
         }
 
+        // M5: clear the R64 visibility buffer and rasterize the cut's clusters into it (compute),
+        // one threadgroup per visible cluster via the same indirect count.
+        if sw {
+            let mut spc = [0u8; 96];
+            for (i, v) in mvp.iter().enumerate() {
+                spc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            let words = [
+                vtx_buf.storage_index(),
+                remap_buf.storage_index(),
+                tri_buf.storage_index(),
+                rec_buf.storage_index(),
+                visbuf.storage_index(),
+                vis_buf.storage_index(), // the cut's visible-cluster list
+                w,
+                h,
+            ];
+            for (i, word) in words.iter().enumerate() {
+                spc[64 + i * 4..68 + i * 4].copy_from_slice(&word.to_le_bytes());
+            }
+            cmd.bind_compute_pipeline(sw_clear_pipeline.as_ref().unwrap());
+            cmd.push_constants_compute(&spc);
+            cmd.dispatch((w * h).div_ceil(64), 1, 1);
+            cmd.bind_compute_pipeline(sw_raster_pipeline.as_ref().unwrap());
+            cmd.push_constants_compute(&spc);
+            cmd.dispatch_indirect(&args_buf, 0);
+        }
+
         let color = ClearColor {
             r: 0.08,
             g: 0.09,
@@ -1180,14 +1304,30 @@ pub(crate) fn run_vgeo_mesh(
             a: 1.0,
         };
         cmd.transition_to_render_target(swapchain, image_index);
-        cmd.begin_rendering(swapchain, image_index, Some(color), Some(&depth));
+        cmd.begin_rendering(
+            swapchain,
+            image_index,
+            Some(color),
+            if sw { None } else { Some(&depth) },
+        );
         cmd.set_viewport_scissor(swapchain);
-        cmd.bind_mesh_pipeline(&pipeline);
-        cmd.push_constants_mesh(&pc);
-        if cut {
-            cmd.draw_mesh_tasks_indirect(&args_buf, 0);
+        if sw {
+            // Full-screen visualization of the visibility buffer (cluster id → colour).
+            let mut vpc = [0u8; 16];
+            vpc[0..4].copy_from_slice(&visbuf.storage_index().to_le_bytes());
+            vpc[4..8].copy_from_slice(&w.to_le_bytes());
+            vpc[8..12].copy_from_slice(&h.to_le_bytes());
+            cmd.bind_graphics_pipeline(vis_pipeline.as_ref().unwrap());
+            cmd.push_constants(&vpc);
+            cmd.draw(3, 1);
         } else {
-            cmd.draw_mesh_tasks(lod_count, 1, 1);
+            cmd.bind_mesh_pipeline(&pipeline);
+            cmd.push_constants_mesh(&pc);
+            if cut {
+                cmd.draw_mesh_tasks_indirect(&args_buf, 0);
+            } else {
+                cmd.draw_mesh_tasks(lod_count, 1, 1);
+            }
         }
         cmd.end_rendering();
 
@@ -1241,6 +1381,10 @@ pub(crate) fn run_vgeo_mesh(
         &args_buf,
         &checker,
         &cut_pipeline,
+        &visbuf,
+        &sw_clear_pipeline,
+        &sw_raster_pipeline,
+        &vis_pipeline,
     );
     info!("vgeo-mesh exited after {frames} frame(s)");
     Ok(())

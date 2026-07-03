@@ -943,6 +943,31 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "vgeo_cut_cs",
     },
+    // Phase 14 M5: software rasterizer into an R64 visibility buffer + its visualization.
+    Job {
+        src: "vgeo_swraster.slang",
+        entry: "csClear",
+        stage: "compute",
+        key: "vgeo_swraster_clear_cs",
+    },
+    Job {
+        src: "vgeo_swraster.slang",
+        entry: "csRaster",
+        stage: "compute",
+        key: "vgeo_swraster_cs",
+    },
+    Job {
+        src: "vgeo_visbuffer.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "vgeo_visbuffer_vs",
+    },
+    Job {
+        src: "vgeo_visbuffer.slang",
+        entry: "fragMain",
+        stage: "fragment",
+        key: "vgeo_visbuffer_fs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.
