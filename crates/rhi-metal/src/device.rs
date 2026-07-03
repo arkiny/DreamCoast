@@ -10,11 +10,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLAccelerationStructure, MTLBuffer, MTLCommandBuffer, MTLCommandQueue,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor,
-    MTLHeapType, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceID, MTLResourceOptions,
-    MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
-    MTLSamplerState, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
-    MTLTextureUsage,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLHazardTrackingMode, MTLHeap,
+    MTLHeapDescriptor, MTLHeapType, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceID,
+    MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter,
+    MTLSamplerMipFilter, MTLSamplerState, MTLSize, MTLStorageMode, MTLTexture,
+    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 use objc2_quartz_core::CAMetalLayer;
 use rhi_types::{
@@ -628,6 +628,19 @@ impl MetalDevice {
         }
     }
 
+    /// Optional GPU capabilities (Phase 14 virtual geometry). Probed live from the
+    /// `MTLDevice` GPU-family support. Mesh shaders land at Apple7 (Metal 3); the 64-bit
+    /// buffer `atomicMax` min/max the visibility buffer needs is an Apple8+ feature (M3 is
+    /// Apple9). Indirect compute dispatch is universally available on Metal.
+    pub fn capabilities(&self) -> rhi_types::DeviceCapabilities {
+        let d = &self.shared.device;
+        rhi_types::DeviceCapabilities {
+            mesh_shader: d.supportsFamily(MTLGPUFamily::Apple7),
+            atomic_int64: d.supportsFamily(MTLGPUFamily::Apple8),
+            dispatch_indirect: true,
+        }
+    }
+
     /// Hardware ray tracing (Phase 8): true on Apple GPUs that support the
     /// `metal::raytracing` inline ray-query API (Apple7+ / Metal 3). The inline
     /// `RayQuery` path tracer traces the bindless `g.tlas`.
@@ -691,6 +704,14 @@ impl MetalDevice {
         desc: &ComputePipelineDesc,
     ) -> Result<MetalComputePipeline> {
         crate::pipeline::build_compute(&self.shared.device, desc)
+    }
+
+    /// Compile a mesh-shader pipeline (Phase 14) from object/mesh/fragment metallib blobs.
+    pub fn create_mesh_pipeline(
+        &self,
+        desc: &rhi_types::MeshPipelineDesc,
+    ) -> Result<crate::resources::MetalMeshPipeline> {
+        crate::pipeline::build_mesh(&self.shared.device, desc)
     }
 
     pub fn create_raytracing_pipeline(

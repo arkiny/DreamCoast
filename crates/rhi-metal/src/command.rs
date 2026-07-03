@@ -59,6 +59,10 @@ pub struct MetalCommandBuffer {
     /// Threadgroup size of the bound compute pipeline, used by `dispatch` to turn
     /// threadgroup counts into `dispatchThreadgroups:threadsPerThreadgroup:`.
     pipeline_threads: Cell<MTLSize>,
+    /// Object/mesh stage threadgroup sizes of the bound mesh pipeline (Phase 14), applied by
+    /// `draw_mesh_tasks` (Metal needs them at draw time, like compute's `pipeline_threads`).
+    mesh_object_threads: Cell<MTLSize>,
+    mesh_threads: Cell<MTLSize>,
     rt_push_constants: RefCell<Vec<u8>>,
     /// Cross-encoder hazard fence. Metal only auto-tracks read-after-write hazards for
     /// resources reached *directly* by an encoder; a transient written as a render
@@ -98,6 +102,16 @@ impl MetalCommandBuffer {
                 height: 1,
                 depth: 1,
             }),
+            mesh_object_threads: Cell::new(MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            }),
+            mesh_threads: Cell::new(MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            }),
             rt_push_constants: RefCell::new(Vec::new()),
         }
     }
@@ -127,12 +141,18 @@ impl MetalCommandBuffer {
 
     /// Wait the hazard fence on a freshly opened render encoder (before any stage runs), so
     /// it sees the writes of every prior encoder in this command buffer. No-op for the first
-    /// encoder (nothing recorded the fence yet).
+    /// encoder (nothing recorded the fence yet). Includes the Object/Mesh stages so a mesh
+    /// pipeline (Phase 14) sees a preceding compute pass's writes — the LOD-cut compute feeds the
+    /// mesh draw's indirect args + visible list, which are read in the Object/Mesh stages, not
+    /// Vertex (a mesh pipeline has no vertex stage).
     fn wait_fence_render(&self, enc: &ProtocolObject<dyn MTLRenderCommandEncoder>) {
         if self.fence_pending.get() {
             enc.waitForFence_beforeStages(
                 &self.fence,
-                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+                MTLRenderStages::Vertex
+                    | MTLRenderStages::Object
+                    | MTLRenderStages::Mesh
+                    | MTLRenderStages::Fragment,
             );
         }
     }
@@ -758,6 +778,23 @@ impl MetalCommandBuffer {
         }
     }
 
+    /// Indirect compute dispatch (Phase 14): the threadgroup grid dimensions are read from
+    /// GPU memory at `buffer[offset..]` as a `MTLDispatchThreadgroupsIndirectArguments`
+    /// (three `u32`: threadgroups-per-grid x/y/z). Threadgroup size still comes from the
+    /// bound pipeline's `[numthreads]`. Lets an earlier compute pass size the dispatch (e.g.
+    /// the cluster-cull count) without a CPU round-trip.
+    pub fn dispatch_indirect(&self, buffer: &MetalStorageBuffer, offset: u64) {
+        if let Some(enc) = self.compute_encoder.borrow().as_ref() {
+            unsafe {
+                enc.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                    &buffer.buffer,
+                    offset as usize,
+                    self.pipeline_threads.get(),
+                );
+            }
+        }
+    }
+
     /// Upload compute push constants at [`PUSH_CONSTANT_INDEX`] (padded up to 16,
     /// like the graphics path).
     pub fn push_constants_compute(&self, data: &[u8]) {
@@ -871,6 +908,142 @@ impl MetalCommandBuffer {
                     0,
                     &buffer.buffer,
                     (offset + i * 20) as usize,
+                );
+            }
+        }
+    }
+
+    /// Bind a mesh-shader pipeline (Phase 14): set its render pipeline state + depth-stencil,
+    /// stash the object/mesh threadgroup sizes for `draw_mesh_tasks`, and — for a bindless /
+    /// globals pipeline (the cluster render, M2) — bind the argument buffer + globals to the
+    /// object/mesh (and fragment) stages and make the referenced resources resident. Mirrors
+    /// `bind_graphics_pipeline`, but through `setObjectBuffer`/`setMeshBuffer`.
+    pub fn bind_mesh_pipeline(&self, pipeline: &crate::resources::MetalMeshPipeline) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            enc.setRenderPipelineState(&pipeline.state);
+            if let Some(ds) = pipeline.depth_stencil.as_ref() {
+                enc.setDepthStencilState(Some(ds));
+            }
+            self.mesh_object_threads.set(pipeline.object_threads);
+            self.mesh_threads.set(pipeline.mesh_threads);
+
+            if pipeline.uses_globals
+                && let Some(globals) = self.shared.globals_buffer()
+            {
+                let offset = self.globals_offset.get() as usize;
+                unsafe {
+                    enc.setObjectBuffer_offset_atIndex(
+                        Some(&globals),
+                        offset,
+                        GLOBALS_BUFFER_INDEX,
+                    );
+                    enc.setMeshBuffer_offset_atIndex(Some(&globals), offset, GLOBALS_BUFFER_INDEX);
+                    enc.setFragmentBuffer_offset_atIndex(
+                        Some(&globals),
+                        offset,
+                        GLOBALS_BUFFER_INDEX,
+                    );
+                }
+            }
+            if pipeline.bindless {
+                let bindless_index = if pipeline.uses_globals {
+                    BINDLESS_BUFFER_INDEX_WITH_GLOBALS
+                } else {
+                    BINDLESS_BUFFER_INDEX
+                };
+                unsafe {
+                    enc.setObjectBuffer_offset_atIndex(
+                        Some(&self.shared.arg_buffer),
+                        0,
+                        bindless_index,
+                    );
+                    enc.setMeshBuffer_offset_atIndex(
+                        Some(&self.shared.arg_buffer),
+                        0,
+                        bindless_index,
+                    );
+                    enc.setFragmentBuffer_offset_atIndex(
+                        Some(&self.shared.arg_buffer),
+                        0,
+                        bindless_index,
+                    );
+                }
+                // Resources reached through the argument buffer must be made resident. The mesh
+                // path reads geometry in the mesh/object stages and (material mode) textures in
+                // the fragment stage.
+                let mesh_stages = MTLRenderStages::Object | MTLRenderStages::Mesh;
+                for tex in self.shared.resident_textures().iter() {
+                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**tex);
+                    enc.useResource_usage_stages(
+                        res,
+                        MTLResourceUsage::Read,
+                        mesh_stages | MTLRenderStages::Fragment,
+                    );
+                }
+                for buf in self.shared.storage_buffers().iter() {
+                    let res: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buf);
+                    enc.useResource_usage_stages(
+                        res,
+                        MTLResourceUsage::Read | MTLResourceUsage::Write,
+                        mesh_stages | MTLRenderStages::Fragment,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Upload push constants for the bound **mesh** pipeline: to the object/mesh stages (which
+    /// read cluster indices) and the fragment stage (material mode), at [`PUSH_CONSTANT_INDEX`].
+    pub fn push_constants_mesh(&self, data: &[u8]) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            let mut buf = [0u8; 256];
+            let len = data.len();
+            assert!(
+                len <= buf.len(),
+                "mesh push constant block too large for Metal"
+            );
+            buf[..len].copy_from_slice(data);
+            let padded = (len + 15) & !15;
+            let ptr = NonNull::new(buf.as_ptr() as *mut std::ffi::c_void)
+                .expect("push_constants_mesh data pointer is null");
+            unsafe {
+                enc.setObjectBytes_length_atIndex(ptr, padded, PUSH_CONSTANT_INDEX);
+                enc.setMeshBytes_length_atIndex(ptr, padded, PUSH_CONSTANT_INDEX);
+                enc.setFragmentBytes_length_atIndex(ptr, padded, PUSH_CONSTANT_INDEX);
+            }
+        }
+    }
+
+    /// Draw `x * y * z` mesh threadgroups of the bound mesh pipeline (Phase 14). The object
+    /// (task) and mesh threadgroup SIZES come from the bound pipeline (stashed at bind time);
+    /// with no object stage the object threadgroup is `(1,1,1)`.
+    pub fn draw_mesh_tasks(&self, x: u32, y: u32, z: u32) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            let groups = MTLSize {
+                width: x as usize,
+                height: y as usize,
+                depth: z as usize,
+            };
+            enc.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                groups,
+                self.mesh_object_threads.get(),
+                self.mesh_threads.get(),
+            );
+        }
+    }
+
+    /// Indirect mesh draw (Phase 14 M3): the object/mesh threadgroup GRID is read from
+    /// `buffer[offset..]` as a `MTLDrawMeshThreadgroupsIndirectArguments` (three `u32`
+    /// threadgroups-per-grid) — e.g. the LOD-cut compute writes the selected-cluster count there.
+    /// Threadgroup sizes come from the bound pipeline.
+    pub fn draw_mesh_tasks_indirect(&self, buffer: &MetalStorageBuffer, offset: u64) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            unsafe {
+                enc.drawMeshThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                    &buffer.buffer,
+                    offset as usize,
+                    self.mesh_object_threads.get(),
+                    self.mesh_threads.get(),
                 );
             }
         }

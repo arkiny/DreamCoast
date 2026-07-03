@@ -15,6 +15,8 @@ pub mod level_graph;
 pub mod primitives;
 pub mod sdf;
 pub mod sdf_atlas;
+pub mod simplify;
+pub mod vgeo;
 
 pub use gltf_scene::{
     AlphaMode, ChannelData, GltfAnimation, GltfChannel, GltfMaterial, GltfNode, GltfPrimitive,
@@ -27,7 +29,7 @@ pub use primitives::{cornell_box, unit_cube, uv_sphere};
 
 /// A mesh vertex (matches `rhi::VertexLayout::Mesh`: 32-byte stride).
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeshVertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],

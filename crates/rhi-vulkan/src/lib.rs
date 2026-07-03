@@ -42,7 +42,7 @@ pub use cubemap::VulkanCubemap;
 pub use depth::VulkanDepthBuffer;
 pub use device::{VulkanComputeQueue, VulkanDevice, VulkanQueue};
 pub use instance::VulkanInstance;
-pub use pipeline::{VulkanComputePipeline, VulkanGraphicsPipeline};
+pub use pipeline::{VulkanComputePipeline, VulkanGraphicsPipeline, VulkanMeshPipeline};
 pub use query::VulkanQueryHeap;
 pub use render_target::{VulkanRenderTarget, VulkanTransientHeap};
 pub use rt_pipeline::VulkanRaytracingPipeline;

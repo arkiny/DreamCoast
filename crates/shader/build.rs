@@ -899,6 +899,125 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "lit_history_cs",
     },
+    // Phase 14 (virtual geometry) M0 capability smokes. `vgeo_atomic` proves the
+    // cross-backend 64-bit `atomicMax` path (the visibility-buffer primitive);
+    // `vgeo_meshlet` proves the mesh-shader pipeline. Both are opt-in (`--atomic64-test`
+    // / `--mesh-shader-test`) and referenced by no default render pass, so the gallery
+    // anchor stays byte-identical.
+    Job {
+        src: "vgeo_atomic.slang",
+        entry: "csAtomicMax",
+        stage: "compute",
+        key: "vgeo_atomic_cs",
+    },
+    Job {
+        src: "vgeo_meshlet.slang",
+        entry: "meshMain",
+        stage: "mesh",
+        key: "vgeo_meshlet_ms",
+    },
+    Job {
+        src: "vgeo_meshlet.slang",
+        entry: "fragMain",
+        stage: "fragment",
+        key: "vgeo_meshlet_fs",
+    },
+    // Phase 14 M2: resident cluster render via a mesh shader (reads cluster geometry from
+    // bindless storage buffers). Opt-in (`--vgeo-mesh`); no default pass references it.
+    Job {
+        src: "vgeo_cluster.slang",
+        entry: "meshMain",
+        stage: "mesh",
+        key: "vgeo_cluster_ms",
+    },
+    Job {
+        src: "vgeo_cluster.slang",
+        entry: "fragMain",
+        stage: "fragment",
+        key: "vgeo_cluster_fs",
+    },
+    // Phase 14 M3: view-dependent LOD DAG cut selection (compute → visible list + indirect args).
+    Job {
+        src: "vgeo_cut.slang",
+        entry: "csCut",
+        stage: "compute",
+        key: "vgeo_cut_cs",
+    },
+    // Phase 14 M5b: HW/SW binning cut — splits the cut into a HW (mesh-shader) list and a SW
+    // (compute-raster) list by projected screen size, each with its own indirect args.
+    Job {
+        src: "vgeo_cut.slang",
+        entry: "csCutBin",
+        stage: "compute",
+        key: "vgeo_cut_bin_cs",
+    },
+    // Phase 14 M5b: HW-path mesh shader writing into the same R64 visibility buffer as the SW
+    // rasterizer (per-primitive triId + fragment atomicMax → seamless HW/SW boundary).
+    Job {
+        src: "vgeo_hwvis.slang",
+        entry: "meshMain",
+        stage: "mesh",
+        key: "vgeo_hwvis_ms",
+    },
+    Job {
+        src: "vgeo_hwvis.slang",
+        entry: "fragMain",
+        stage: "fragment",
+        key: "vgeo_hwvis_fs",
+    },
+    // Phase 14 M5: software rasterizer into an R64 visibility buffer + its visualization.
+    Job {
+        src: "vgeo_swraster.slang",
+        entry: "csClear",
+        stage: "compute",
+        key: "vgeo_swraster_clear_cs",
+    },
+    Job {
+        src: "vgeo_swraster.slang",
+        entry: "csRaster",
+        stage: "compute",
+        key: "vgeo_swraster_cs",
+    },
+    Job {
+        src: "vgeo_visbuffer.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "vgeo_visbuffer_vs",
+    },
+    Job {
+        src: "vgeo_visbuffer.slang",
+        entry: "fragMain",
+        stage: "fragment",
+        key: "vgeo_visbuffer_fs",
+    },
+    // Phase 14 M6: material resolve — visibility buffer → analytic-barycentric attributes → shaded
+    // surface (the deferred G-buffer stage; here shaded to match the M2 direct render for the gate).
+    Job {
+        src: "vgeo_resolve.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "vgeo_resolve_vs",
+    },
+    Job {
+        src: "vgeo_resolve.slang",
+        entry: "fragMain",
+        stage: "fragment",
+        key: "vgeo_resolve_fs",
+    },
+    // Phase 14 renderer integration: visibility buffer → real Phase-6 G-buffer MRT (+ SV_Depth),
+    // so the deferred lighting pipeline consumes virtual geometry unchanged (drop-in producer).
+    Job {
+        src: "vgeo_gbuffer.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "vgeo_gbuffer_vs",
+    },
+    Job {
+        src: "vgeo_gbuffer.slang",
+        entry: "fsGBuffer",
+        stage: "fragment",
+        key: "vgeo_gbuffer_fs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.

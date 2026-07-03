@@ -985,6 +985,10 @@ impl DeferredRenderer {
         // EQUAL-test + depth-write-off G-buffer pipelines (Early-Z overdraw elimination). `false`
         // = the default `Less` + write-on fills (byte-identical to the pre-pass-less path).
         prepass: bool,
+        // Draw the matte ground plane into the G-buffer. `true` on every normal path (gallery
+        // byte-identical); `false` only for the P14_VGEO parity reference (a groundless single
+        // model, matching the vgeo producer which draws no ground).
+        draw_ground: bool,
     ) {
         // Select the base-pass pipeline set: EQUAL-test (pre-pass on) vs the default `Less` fills.
         let (pipe_static, pipe_skinned, pipe_morphed) = if prepass {
@@ -1072,21 +1076,23 @@ impl DeferredRenderer {
                 }
                 // Ground plane (plain matte material, no textures). Albedo from the shared
                 // GROUND_ALBEDO single source (also fed to the GI / reflection re-light passes).
-                cmd.push_constants(&gbuffer_push(
-                    view_proj.to_cols_array(),
-                    [GROUND_ALBEDO[0], GROUND_ALBEDO[1], GROUND_ALBEDO[2], 1.0],
-                    0.0,
-                    0.9,
-                    0.0, // ground is untextured -> bias irrelevant
-                    0.0, // opaque -> no alpha test
-                    [NO_TEXTURE; 4],
-                    Mat4::IDENTITY.to_cols_array(),
-                    [0; 4], // not skinned
-                    [0; 4], // not morphed
-                ));
-                cmd.bind_vertex_buffer(ground_vbuf, 32);
-                cmd.bind_index_buffer(ground_ibuf, true);
-                cmd.draw_indexed(ground_count, 0, 0);
+                if draw_ground {
+                    cmd.push_constants(&gbuffer_push(
+                        view_proj.to_cols_array(),
+                        [GROUND_ALBEDO[0], GROUND_ALBEDO[1], GROUND_ALBEDO[2], 1.0],
+                        0.0,
+                        0.9,
+                        0.0, // ground is untextured -> bias irrelevant
+                        0.0, // opaque -> no alpha test
+                        [NO_TEXTURE; 4],
+                        Mat4::IDENTITY.to_cols_array(),
+                        [0; 4], // not skinned
+                        [0; 4], // not morphed
+                    ));
+                    cmd.bind_vertex_buffer(ground_vbuf, 32);
+                    cmd.bind_index_buffer(ground_ibuf, true);
+                    cmd.draw_indexed(ground_count, 0, 0);
+                }
                 Ok(())
             },
         );

@@ -12,12 +12,18 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCompareFunction,
-    MTLDepthStencilDescriptor, MTLDevice, MTLFunction, MTLLibrary, MTLRenderPipelineDescriptor,
-    MTLSize, MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
+    MTLDepthStencilDescriptor, MTLDevice, MTLFunction, MTLLibrary, MTLMeshRenderPipelineDescriptor,
+    MTLPipelineOption, MTLRenderPipelineDescriptor, MTLSize, MTLVertexDescriptor, MTLVertexFormat,
+    MTLVertexStepFunction,
 };
-use rhi_types::{BlendMode, ComputePipelineDesc, DepthCompare, GraphicsPipelineDesc, VertexLayout};
+use rhi_types::{
+    BlendMode, ComputePipelineDesc, DepthCompare, GraphicsPipelineDesc, MeshPipelineDesc,
+    VertexLayout,
+};
 
-use crate::resources::{MetalComputePipeline, MetalGraphicsPipeline, VERTEX_BUFFER_INDEX};
+use crate::resources::{
+    MetalComputePipeline, MetalGraphicsPipeline, MetalMeshPipeline, VERTEX_BUFFER_INDEX,
+};
 use crate::{Result, pixel_format, rhi_err};
 
 /// Compile a graphics pipeline from per-stage metallib blobs + render state.
@@ -114,6 +120,75 @@ pub(crate) fn build(
 
     Ok(MetalGraphicsPipeline {
         state,
+        bindless: desc.bindless,
+        uses_globals: desc.uniform_buffer,
+        depth_stencil,
+    })
+}
+
+/// Compile a mesh-shader pipeline (Phase 14) from object/mesh/fragment metallib blobs. The
+/// legacy `MTLRenderPipelineDescriptor` mesh path (`setObjectFunction`/`setMeshFunction`,
+/// macOS 13+) produces a normal `MTLRenderPipelineState` — bound like a graphics pipeline,
+/// drawn with `drawMeshThreadgroups`. M0 uses mesh+fragment only (no object stage), opaque,
+/// no depth.
+pub(crate) fn build_mesh(
+    device: &ProtocolObject<dyn MTLDevice>,
+    desc: &MeshPipelineDesc,
+) -> Result<MetalMeshPipeline> {
+    let pd = MTLMeshRenderPipelineDescriptor::new();
+    if let Some(object_bytes) = desc.object_bytes {
+        let object = load_function(device, object_bytes, desc.object_entry)?;
+        unsafe { pd.setObjectFunction(Some(&object)) };
+    }
+    let mesh = load_function(device, desc.mesh_bytes, desc.mesh_entry)?;
+    let fragment = load_function(device, desc.fragment_bytes, desc.fragment_entry)?;
+    unsafe {
+        pd.setMeshFunction(Some(&mesh));
+        pd.setFragmentFunction(Some(&fragment));
+    }
+
+    let attachments = pd.colorAttachments();
+    for (i, format) in desc.color_formats.iter().enumerate() {
+        let attach = unsafe { attachments.objectAtIndexedSubscript(i) };
+        attach.setPixelFormat(pixel_format(*format));
+    }
+    if let Some(depth) = desc.depth_format {
+        pd.setDepthAttachmentPixelFormat(pixel_format(depth));
+    }
+
+    let state = device
+        .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
+            &pd,
+            MTLPipelineOption::None,
+            None,
+        )
+        .map_err(|e| rhi_err(format!("newRenderPipelineState (mesh) failed: {e}")))?;
+
+    let depth_stencil = if desc.depth_test {
+        let dsd = MTLDepthStencilDescriptor::new();
+        dsd.setDepthCompareFunction(match desc.depth_compare {
+            DepthCompare::Less => MTLCompareFunction::LessEqual,
+            DepthCompare::Equal => MTLCompareFunction::Equal,
+        });
+        dsd.setDepthWriteEnabled(desc.depth_write);
+        Some(
+            device
+                .newDepthStencilStateWithDescriptor(&dsd)
+                .ok_or_else(|| rhi_err("newDepthStencilState (mesh) failed"))?,
+        )
+    } else {
+        None
+    };
+
+    let size = |t: [u32; 3]| MTLSize {
+        width: t[0].max(1) as usize,
+        height: t[1].max(1) as usize,
+        depth: t[2].max(1) as usize,
+    };
+    Ok(MetalMeshPipeline {
+        state,
+        object_threads: size(desc.object_threads),
+        mesh_threads: size(desc.mesh_threads),
         bindless: desc.bindless,
         uses_globals: desc.uniform_buffer,
         depth_stencil,

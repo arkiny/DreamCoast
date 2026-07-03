@@ -25,7 +25,8 @@ pub use device::{MetalComputeQueue, MetalDevice, MetalInstance, MetalQueue};
 pub use query::MetalQueryHeap;
 pub use resources::{
     MetalBuffer, MetalComputePipeline, MetalCubemap, MetalDepthBuffer, MetalGraphicsPipeline,
-    MetalRenderTarget, MetalStorageBuffer, MetalTexture, MetalTransientHeap, MetalVolume,
+    MetalMeshPipeline, MetalRenderTarget, MetalStorageBuffer, MetalTexture, MetalTransientHeap,
+    MetalVolume,
 };
 pub use rt_pipeline::MetalRaytracingPipeline;
 pub use swapchain::MetalSwapchain;
