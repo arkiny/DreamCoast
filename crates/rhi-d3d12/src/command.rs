@@ -917,15 +917,21 @@ impl D3d12CommandBuffer {
         }
     }
 
-    /// Indirect compute dispatch (Phase 14): reads a `D3D12_DISPATCH_ARGUMENTS` (three `u32`)
-    /// from `buffer` at `offset` via `ExecuteIndirect`. Requires a DISPATCH command signature
-    /// on the device — wired in the Windows-box follow-up alongside enabling the SM6.6 64-bit
-    /// atomics / mesh-shader tiers. Until then [`Device::capabilities`] reports all-false, so
-    /// the vgeo smokes never reach this on D3D12.
-    pub fn dispatch_indirect(&self, _buffer: &D3d12StorageBuffer, _offset: u64) {
-        unimplemented!(
-            "D3D12 dispatch_indirect: DISPATCH command signature pending (Phase 14 Windows follow-up)"
-        );
+    /// Indirect compute dispatch (Phase 14): reads a `D3D12_DISPATCH_ARGUMENTS` (three `u32`
+    /// groupCount, matching `VkDispatchIndirectCommand`) from `buffer` at `offset` via a single
+    /// `ExecuteIndirect` over the device's DISPATCH command signature. The buffer must be in the
+    /// `INDIRECT_ARGUMENT` state (see [`Self::storage_buffer_to_indirect`]).
+    pub fn dispatch_indirect(&self, buffer: &D3d12StorageBuffer, offset: u64) {
+        unsafe {
+            self.list.ExecuteIndirect(
+                &self.device.indirect_dispatch_signature,
+                1,
+                buffer.resource(),
+                offset,
+                None,
+                0,
+            );
+        }
     }
 
     /// Bind a mesh-shader pipeline (Phase 14). Windows-box follow-up (SM6.5 mesh PSO); gated

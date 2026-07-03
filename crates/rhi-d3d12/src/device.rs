@@ -11,13 +11,15 @@ use rhi_types::{
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_BUFFER_UAV, D3D12_BUFFER_UAV_FLAG_RAW, D3D12_COMMAND_LIST_TYPE_COMPUTE,
-    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE,
-    D3D12_COMMAND_SIGNATURE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
+    D3D_SHADER_MODEL_6_6, D3D12_BUFFER_UAV, D3D12_BUFFER_UAV_FLAG_RAW,
+    D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
+    D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_COMMAND_SIGNATURE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
     D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, D3D12_DESCRIPTOR_HEAP_DESC,
     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-    D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_DATA_D3D12_OPTIONS5, D3D12_FENCE_FLAG_NONE,
-    D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_INDIRECT_ARGUMENT_DESC,
+    D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_D3D12_OPTIONS11, D3D12_FEATURE_DATA_D3D12_OPTIONS5,
+    D3D12_FEATURE_DATA_D3D12_OPTIONS11, D3D12_FEATURE_DATA_SHADER_MODEL,
+    D3D12_FEATURE_SHADER_MODEL, D3D12_FENCE_FLAG_NONE, D3D12_GPU_DESCRIPTOR_HANDLE,
+    D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
     D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     D3D12_RAYTRACING_TIER_1_1, D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
     D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE, D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -56,8 +58,12 @@ pub(crate) const CUBE_COUNT: u32 = 64;
 /// right after the cubes. Separate 0-based index space (`u0, space0`).
 pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
 /// Size of the bindless storage-buffer UAV table (Phase 7), after the storage
-/// images. Separate 0-based index space (`u0, space1`).
-pub(crate) const STORAGE_BUFFER_COUNT: u32 = 64;
+/// images. Separate 0-based index space (`u0, space1`). Raised 64→128 for Phase 14 virtual
+/// geometry: the GI-heavy default scene already fills all 64 slots, leaving no room for vgeo's
+/// cluster-page / visibility / cut buffers. Downstream heap offsets (`TLAS_SLOT`, `VOLUME_BASE`,
+/// …) and the root-signature ranges derive from this, so the whole layout shifts consistently;
+/// must match `Bindless.storage_buffers[N]` in bindless.slang and rhi-vulkan / rhi-metal.
+pub(crate) const STORAGE_BUFFER_COUNT: u32 = 128;
 /// Heap offset where the storage-image UAV region begins.
 pub(crate) const STORAGE_IMAGE_BASE: u32 = BINDLESS_COUNT + CUBE_COUNT;
 /// Heap offset where the storage-buffer UAV region begins.
@@ -97,6 +103,10 @@ pub(crate) struct DeviceShared {
     storage_volume_next: Cell<u32>,
     // Command signature for indexed indirect draws (`ExecuteIndirect`, Phase 7).
     pub indirect_draw_signature: ID3D12CommandSignature,
+    // Command signature for indirect compute dispatch (`ExecuteIndirect` over a
+    // `D3D12_DISPATCH_ARGUMENTS`, Phase 14). 12-byte stride matches `VkDispatchIndirectCommand`
+    // so one compute shader fills args for both APIs.
+    pub indirect_dispatch_signature: ID3D12CommandSignature,
     // Async compute (Phase 7): a COMPUTE-type queue overlapping the DIRECT queue,
     // and a fence the compute queue signals / the graphics queue waits on (GPU
     // cross-queue sync). `async_value` holds the last value signaled.
@@ -109,6 +119,11 @@ pub(crate) struct DeviceShared {
     idle_value: Cell<u64>,
     // Hardware ray tracing (Phase 8): true when DXR Tier >= 1.1 is supported.
     has_raytracing: bool,
+    // 64-bit buffer atomics (Phase 14 virtual geometry): true when the device supports
+    // Shader Model 6.6 AND `AtomicInt64OnDescriptorHeapResourceSupported` (OPTIONS11). The
+    // SW-raster visibility buffer is a bindless (descriptor-heap-indexed) `RWByteAddressBuffer`
+    // doing `InterlockedMax64`, so descriptor-heap atomics are exactly the required cap.
+    has_atomic_int64: bool,
 }
 
 impl DeviceShared {
@@ -140,6 +155,35 @@ impl DeviceShared {
                     )
                     .is_ok()
                 && options5.RaytracingTier.0 >= D3D12_RAYTRACING_TIER_1_1.0;
+
+            // 64-bit buffer atomics (Phase 14 virtual geometry). The visibility buffer is a
+            // bindless `RWByteAddressBuffer` doing `InterlockedMax64`, which needs Shader Model 6.6
+            // and — because it is reached through the shader-visible descriptor heap —
+            // `AtomicInt64OnDescriptorHeapResourceSupported` (OPTIONS11). Probe both; report the
+            // capability so the vgeo path gates cleanly on adapters that lack it.
+            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            };
+            let sm_ok = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    &mut sm as *mut _ as *mut core::ffi::c_void,
+                    std::mem::size_of::<D3D12_FEATURE_DATA_SHADER_MODEL>() as u32,
+                )
+                .is_ok()
+                && sm.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+            let mut options11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+            let atomic64_heap = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS11,
+                    &mut options11 as *mut _ as *mut core::ffi::c_void,
+                    std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS11>() as u32,
+                )
+                .is_ok()
+                && options11
+                    .AtomicInt64OnDescriptorHeapResourceSupported
+                    .as_bool();
+            let has_atomic_int64 = sm_ok && atomic64_heap;
 
             let queue_desc = D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -199,6 +243,26 @@ impl DeviceShared {
                 .map_err(d3d_err)?;
             let indirect_draw_signature = indirect_draw_signature
                 .ok_or_else(|| EngineError::Rhi("command signature null".into()))?;
+
+            // Indirect-dispatch signature: one DISPATCH argument, 12-byte stride (matches
+            // VkDispatchIndirectCommand's three u32 groupCount so one compute shader fills both
+            // APIs). No root arguments referenced, so no root signature (like the draw one).
+            let dispatch_arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                ..Default::default()
+            };
+            let dispatch_sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: 12,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &dispatch_arg,
+                NodeMask: 0,
+            };
+            let mut indirect_dispatch_signature: Option<ID3D12CommandSignature> = None;
+            device
+                .CreateCommandSignature(&dispatch_sig_desc, None, &mut indirect_dispatch_signature)
+                .map_err(d3d_err)?;
+            let indirect_dispatch_signature = indirect_dispatch_signature
+                .ok_or_else(|| EngineError::Rhi("dispatch command signature null".into()))?;
             tracing::debug!("D3D12 device + queue ready");
 
             Ok(Self {
@@ -215,6 +279,7 @@ impl DeviceShared {
                 volume_next: Cell::new(0),
                 storage_volume_next: Cell::new(0),
                 indirect_draw_signature,
+                indirect_dispatch_signature,
                 compute_queue,
                 async_fence,
                 async_value: Cell::new(0),
@@ -222,6 +287,7 @@ impl DeviceShared {
                 idle_event,
                 idle_value: Cell::new(0),
                 has_raytracing,
+                has_atomic_int64,
             })
         }
     }
@@ -678,12 +744,17 @@ impl D3d12Device {
     }
 
     /// Optional GPU capabilities (Phase 14 virtual geometry). NOTE: reports all-`false`
-    /// until the Windows-box follow-up probes the corresponding D3D12 feature-support flags
-    /// (`D3D12_FEATURE_D3D12_OPTIONS7` mesh-shader tier, `OPTIONS9` 64-bit atomics) and the
-    /// mesh/indirect paths are exercised there. The vgeo smokes gate on this and fail clearly
-    /// on D3D12 until then (Metal is verified on the macOS box; DX≡VK is the tracked follow-up).
+    /// `atomic_int64` reflects the probed SM6.6 + `AtomicInt64OnDescriptorHeapResourceSupported`
+    /// (OPTIONS11) support (the SW-raster visibility-buffer path). `dispatch_indirect` is always
+    /// available (the DISPATCH command signature is created at device init). `mesh_shader` stays
+    /// `false` until the mesh-shader PSO seam is implemented (Track B); the SW-only vgeo path
+    /// needs only `atomic_int64`.
     pub fn capabilities(&self) -> rhi_types::DeviceCapabilities {
-        rhi_types::DeviceCapabilities::default()
+        rhi_types::DeviceCapabilities {
+            mesh_shader: false,
+            atomic_int64: self.shared.has_atomic_int64,
+            dispatch_indirect: true,
+        }
     }
 
     /// Whether hardware ray tracing (DXR Tier >= 1.1) is available (Phase 8).

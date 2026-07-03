@@ -31,8 +31,11 @@ pub(crate) const CUBE_COUNT: u32 = 64;
 /// these; its index space is separate and 0-based (Phase 7).
 pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
 /// Size of the bindless storage-buffer (UAV) table (binding 4). Compute/vertex
-/// read-write these; separate 0-based index space (Phase 7).
-pub(crate) const STORAGE_BUFFER_COUNT: u32 = 64;
+/// read-write these; separate 0-based index space (Phase 7). Raised 64→128 for Phase 14
+/// virtual geometry: the GI-heavy default scene already fills all 64 slots, leaving no room
+/// for vgeo's cluster-page / visibility / cut buffers. Must match `Bindless.storage_buffers[N]`
+/// in bindless.slang and the same constant in rhi-d3d12 / rhi-metal.
+pub(crate) const STORAGE_BUFFER_COUNT: u32 = 128;
 /// Size of the bindless sampled 3D-volume table (binding 6). Trilinear-sampled
 /// distance fields; separate 0-based index space (Phase 11 Stage B).
 pub(crate) const VOLUME_COUNT: u32 = 64;
@@ -79,6 +82,11 @@ pub(crate) struct DeviceShared {
     pub compute_queue: vk::Queue,
     pub compute_command_pool: vk::CommandPool,
     pub has_dedicated_compute: bool,
+    // 64-bit buffer atomics (Phase 14 virtual geometry): true when `shaderInt64` +
+    // `shaderBufferInt64Atomics` are supported and enabled at device creation. The SW
+    // rasterizer's visibility buffer records `(depth<<32)|payload` with a single
+    // `OpAtomicUMax` on a u64 storage buffer, which needs both features.
+    pub has_atomic_int64: bool,
     // Hardware ray tracing (Phase 8): true when the acceleration-structure +
     // ray-query + ray-tracing-pipeline extensions are enabled.
     pub has_raytracing: bool,
@@ -169,6 +177,18 @@ impl DeviceShared {
             let phys_limits = raw_inst
                 .get_physical_device_properties(instance.physical_device)
                 .limits;
+
+            // 64-bit buffer atomics (Phase 14 virtual geometry). `shaderBufferInt64Atomics` is
+            // Vulkan-1.2 core (promoted from `VK_KHR_shader_atomic_int64`); the visibility-buffer
+            // `OpAtomicUMax` on a u64 also needs the base `shaderInt64` feature for the Int64 type.
+            // Probe both via a `Features2` chain and only enable when supported, so devices without
+            // it still create a valid logical device (the vgeo path then gates off via capabilities).
+            let mut probe_vk12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut probe_features2 =
+                vk::PhysicalDeviceFeatures2::default().push_next(&mut probe_vk12);
+            raw_inst.get_physical_device_features2(instance.physical_device, &mut probe_features2);
+            let has_atomic_int64 =
+                phys_features.shader_int64 != 0 && probe_vk12.shader_buffer_int64_atomics != 0;
             let max_anisotropy = if aniso_req > 1.0 && phys_features.sampler_anisotropy != 0 {
                 aniso_req.min(phys_limits.max_sampler_anisotropy)
             } else {
@@ -194,7 +214,9 @@ impl DeviceShared {
                 .descriptor_binding_sampled_image_update_after_bind(true)
                 .descriptor_binding_storage_image_update_after_bind(true)
                 .descriptor_binding_storage_buffer_update_after_bind(true)
-                .buffer_device_address(has_raytracing);
+                .buffer_device_address(has_raytracing)
+                // Phase 14: 64-bit buffer atomics for the SW-raster visibility buffer.
+                .shader_buffer_int64_atomics(has_atomic_int64);
             // SV_VertexID full-screen-triangle shaders (triangle/post/blur) compile
             // to SPIR-V using the DrawParameters capability.
             let mut features11 =
@@ -215,7 +237,9 @@ impl DeviceShared {
                 // (D3D12 IndependentBlendEnable / Metal per-attachment are always available).
                 .independent_blend(true)
                 // 1b: only requested + supported when P_ANISO opts in (else false = unchanged).
-                .sampler_anisotropy(max_anisotropy > 1.0);
+                .sampler_anisotropy(max_anisotropy > 1.0)
+                // Phase 14: the Int64 type used by the visibility-buffer atomicMax / u64 store.
+                .shader_int64(has_atomic_int64);
             // RT feature structs (Phase 8) — only chained when the extensions are
             // enabled, else validation rejects the unsupported feature structs.
             let mut accel_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
@@ -333,6 +357,7 @@ impl DeviceShared {
                 compute_queue,
                 compute_command_pool,
                 has_dedicated_compute,
+                has_atomic_int64,
                 has_raytracing,
                 accel_loader,
                 rt_pipeline_loader,
@@ -1150,13 +1175,17 @@ impl VulkanDevice {
         unimplemented!("Vulkan mesh-shader pipeline pending (Phase 14 Windows follow-up)")
     }
 
-    /// Optional GPU capabilities (Phase 14 virtual geometry). NOTE: reports all-`false`
-    /// until the Windows-box follow-up enables the corresponding device features at creation
-    /// (`VK_EXT_mesh_shader`, `shaderBufferInt64Atomics`) and probes them here. The vgeo
-    /// smokes gate on this, so they fail clearly on Vulkan until then (Metal is verified on
-    /// the macOS box; DX≡VK is the tracked follow-up).
+    /// Optional GPU capabilities (Phase 14 virtual geometry). `atomic_int64` reflects the
+    /// probed + enabled `shaderInt64` + `shaderBufferInt64Atomics` features (the SW-raster
+    /// visibility-buffer path). `mesh_shader` stays `false` until the `VK_EXT_mesh_shader`
+    /// seam is implemented (Track B); the SW-only vgeo path needs only `atomic_int64`.
     pub fn capabilities(&self) -> rhi_types::DeviceCapabilities {
-        rhi_types::DeviceCapabilities::default()
+        rhi_types::DeviceCapabilities {
+            mesh_shader: false,
+            atomic_int64: self.shared.has_atomic_int64,
+            // `vkCmdDispatchIndirect` is Vulkan-1.0 core — always available.
+            dispatch_indirect: true,
+        }
     }
 
     /// Whether hardware ray tracing is available (acceleration-structure +
