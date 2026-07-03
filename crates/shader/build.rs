@@ -990,6 +990,20 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "vgeo_visbuffer_fs",
     },
+    // Phase 14 M6: material resolve — visibility buffer → analytic-barycentric attributes → shaded
+    // surface (the deferred G-buffer stage; here shaded to match the M2 direct render for the gate).
+    Job {
+        src: "vgeo_resolve.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "vgeo_resolve_vs",
+    },
+    Job {
+        src: "vgeo_resolve.slang",
+        entry: "fragMain",
+        stage: "fragment",
+        key: "vgeo_resolve_fs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.
