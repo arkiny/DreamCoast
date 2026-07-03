@@ -995,11 +995,22 @@ pub(crate) fn run_vgeo_mesh(
         .and_then(|s| s.parse().ok())
         .unwrap_or(16.0);
     // `vis_buf`/`args_buf` are the cut's list/args (M3/M5a); in binning mode they carry the HW
-    // sub-list and `sw_list`/`sw_args` carry the SW sub-list.
+    // sub-list and `sw_list`/`sw_args` carry the SW sub-list. The lists are GPU-only (written by
+    // the cut, read by the draw), so DEFAULT-heap; the *args* are host-reset every frame (the
+    // indirect count), so they must be host-visible (`create_storage_buffer_host` — a DEFAULT-heap
+    // host write is illegal on D3D12 / Vulkan; this is the Metal-ism the integrated path also
+    // fixed). The cut then GPU-writes the count and the draw reads it as an indirect argument.
+    let host_args = |device: &Device| -> anyhow::Result<StorageBuffer> {
+        Ok(device.create_storage_buffer_host(&StorageBufferDesc {
+            size: 12, // {countX, 1, 1}
+            stride: 4,
+            indirect: false,
+        })?)
+    };
     let vis_buf = sb(device, &vec![0u8; total_clusters as usize * 4], 4)?;
-    let args_buf = sb(device, &[0u8; 12], 4)?; // {countX, 1, 1}
+    let args_buf = host_args(device)?;
     let sw_list = sb(device, &vec![0u8; total_clusters as usize * 4], 4)?;
-    let sw_args = sb(device, &[0u8; 12], 4)?;
+    let sw_args = host_args(device)?;
     let cut_pipeline = if cut {
         let cs = match (bin, backend) {
             (false, BackendKind::Vulkan) => dreamcoast_shader::vgeo_cut_cs_spirv(),
@@ -1248,7 +1259,13 @@ pub(crate) fn run_vgeo_mesh(
     info!("running vgeo-mesh loop (press ESC or close the window to exit)");
     let mut frames = 0u64;
     let mut last = Instant::now();
-    let mut angle = 0.6f32;
+    // `VGEO_ANGLE=<rad>` pins the orbit azimuth (freezes the auto-rotation) so a headless
+    // capture is deterministic — used to compare DX≡VK for the mesh paths (the wall-clock `dt`
+    // rotation is otherwise non-reproducible across backends/runs). Mirrors `DIAG_ANGLE`.
+    let angle_pin: Option<f32> = std::env::var("VGEO_ANGLE")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let mut angle = angle_pin.unwrap_or(0.6f32);
     let _ = window.take_resized();
     while !window.should_close() {
         if let Some(max) = max_frames
@@ -1277,7 +1294,9 @@ pub(crate) fn run_vgeo_mesh(
         let now = Instant::now();
         let dt = (now - last).as_secs_f32();
         last = now;
-        angle += dt * 0.5;
+        if angle_pin.is_none() {
+            angle += dt * 0.5;
+        }
 
         fence.wait()?;
         let image_index = match swapchain.acquire_next_image(&image_available)? {
@@ -1300,11 +1319,19 @@ pub(crate) fn run_vgeo_mesh(
         let dist = radius * 3.0;
         let eye = focus + Vec3::new(angle.cos() * dist, radius * 0.6, angle.sin() * dist);
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
-        let mut proj = Mat4::perspective_rh(60f32.to_radians(), w as f32 / h as f32, 0.05, 100.0);
+        let proj_noflip =
+            Mat4::perspective_rh(60f32.to_radians(), w as f32 / h as f32, 0.05, 100.0);
+        let mut proj = proj_noflip;
         if backend == BackendKind::Vulkan {
             proj.y_axis.y *= -1.0;
         }
+        // Two matrices: the HW-rasterized mesh passes (cluster / hwvis) use the clip-space
+        // Y-flipped `mvp` (Vulkan's NDC convention). The SW compute rasterizer + the M6 resolve do
+        // MANUAL NDC→pixel mapping with the no-flip window convention, so they must use the
+        // flip-free `mvp_noflip` (= the same matrix the LOD cut uses) — otherwise the visibility
+        // buffer rows are flipped vs the reader on Vulkan. On D3D12 the two are identical.
         let mvp = (proj * view).to_cols_array();
+        let mvp_noflip = (proj_noflip * view).to_cols_array();
 
         // Mesh push constant: mat4 mvp (64) + 12 u32 slots/flags (48) = 112.
         let mut pc = [0u8; 112];
@@ -1391,9 +1418,24 @@ pub(crate) fn run_vgeo_mesh(
                 cpc[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
             }
             cpc[208..212].copy_from_slice(&1.0f32.to_le_bytes());
+            // The cut UAV-writes the visible list + args count; last frame left the args in the
+            // INDIRECT_ARGUMENT state, so transition them back to storage before this write (Metal
+            // auto-tracks; DX/VK need it explicit).
+            cmd.storage_buffer_to_storage(&args_buf);
+            if bin {
+                cmd.storage_buffer_to_storage(&sw_args);
+            }
             cmd.bind_compute_pipeline(cut_pipeline.as_ref().unwrap());
             cmd.push_constants_compute(&cpc);
             cmd.dispatch(total_clusters.div_ceil(64), 1, 1);
+            // Order the cut's writes before their readers: the visible list feeds the mesh/SW
+            // draws (UAV barrier), the args count feeds the indirect dispatch/draw (→ INDIRECT).
+            cmd.storage_buffer_barrier(&vis_buf);
+            cmd.storage_buffer_to_indirect(&args_buf);
+            if bin {
+                cmd.storage_buffer_barrier(&sw_list);
+                cmd.storage_buffer_to_indirect(&sw_args);
+            }
         }
 
         // M5: clear the R64 visibility buffer and rasterize the SW clusters into it (compute), one
@@ -1407,7 +1449,7 @@ pub(crate) fn run_vgeo_mesh(
                 (&vis_buf, &args_buf)
             };
             let mut spc = [0u8; 96];
-            for (i, v) in mvp.iter().enumerate() {
+            for (i, v) in mvp_noflip.iter().enumerate() {
                 spc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
             }
             let words = [
@@ -1426,9 +1468,13 @@ pub(crate) fn run_vgeo_mesh(
             cmd.bind_compute_pipeline(sw_clear_pipeline.as_ref().unwrap());
             cmd.push_constants_compute(&spc);
             cmd.dispatch((w * h).div_ceil(64), 1, 1);
+            // Order the clear before the raster's atomicMax (both write the R64 visibility buffer).
+            cmd.storage_buffer_barrier(&visbuf);
             cmd.bind_compute_pipeline(sw_raster_pipeline.as_ref().unwrap());
             cmd.push_constants_compute(&spc);
             cmd.dispatch_indirect(raster_args, 0);
+            // Order the raster's visbuf writes before the HW-vis mesh pass / visualization reads.
+            cmd.storage_buffer_barrier(&visbuf);
         }
 
         let color = ClearColor {
@@ -1467,6 +1513,14 @@ pub(crate) fn run_vgeo_mesh(
             cmd.push_constants_mesh(&hpc);
             cmd.draw_mesh_tasks_indirect(&args_buf, 0);
             cmd.end_rendering();
+            // Order the HW-vis fragment atomicMax writes before the visualization reads visbuf.
+            cmd.storage_buffer_barrier(&visbuf);
+        }
+        // The direct / cut paths attach a depth buffer; transition it out of UNDEFINED into the
+        // depth render-target layout (Metal handles this implicitly; DX/VK need it explicit —
+        // otherwise the depth test rejects every fragment and nothing renders).
+        if !(sw || bin) {
+            cmd.depth_to_render_target(&depth);
         }
         cmd.begin_rendering(
             swapchain,
@@ -1479,7 +1533,7 @@ pub(crate) fn run_vgeo_mesh(
             // M6: resolve the visibility buffer → attributes → shaded surface. Push (112 B):
             // mvp (64) + geometry slots + visbuf + size + mode/tex.
             let mut rpc = [0u8; 112];
-            for (i, v) in mvp.iter().enumerate() {
+            for (i, v) in mvp_noflip.iter().enumerate() {
                 rpc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
             }
             let words = [

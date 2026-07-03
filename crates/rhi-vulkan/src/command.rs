@@ -28,6 +28,10 @@ pub struct VulkanCommandBuffer {
     current_layout: Cell<vk::PipelineLayout>,
     // Dynamic offset into the globals buffer for the next PBR pipeline bind.
     globals_offset: Cell<u32>,
+    // Push-constant stage set of the currently bound mesh pipeline (Phase 14 Track B). The
+    // range's stages depend on whether the pipeline has a task stage, so `push_constants_mesh`
+    // must push exactly what the bound pipeline's layout declared.
+    mesh_push_stages: Cell<vk::ShaderStageFlags>,
 }
 
 impl VulkanCommandBuffer {
@@ -59,6 +63,7 @@ impl VulkanCommandBuffer {
             pool,
             current_layout: Cell::new(vk::PipelineLayout::null()),
             globals_offset: Cell::new(0),
+            mesh_push_stages: Cell::new(vk::ShaderStageFlags::empty()),
         })
     }
 
@@ -1242,6 +1247,7 @@ impl VulkanCommandBuffer {
                 pipeline.raw(),
             );
             self.current_layout.set(pipeline.layout());
+            self.mesh_push_stages.set(pipeline.push_stages());
             if pipeline.is_bindless() {
                 self.device.device.cmd_bind_descriptor_sets(
                     self.cmd,
@@ -1282,9 +1288,7 @@ impl VulkanCommandBuffer {
             self.device.device.cmd_push_constants(
                 self.cmd,
                 self.current_layout.get(),
-                vk::ShaderStageFlags::TASK_EXT
-                    | vk::ShaderStageFlags::MESH_EXT
-                    | vk::ShaderStageFlags::FRAGMENT,
+                self.mesh_push_stages.get(),
                 0,
                 data,
             );

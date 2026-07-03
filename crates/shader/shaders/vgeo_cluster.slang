@@ -78,11 +78,15 @@ void meshMain(
     // tri_count}.
     uint4 rec = g.storage_buffers[pc.rec_buf].Load4(cluster * 96);
     uint voff = rec.x;
-    uint vcount = rec.y;
+    // Clamp to the declared output maxima BEFORE `SetMeshOutputCounts`. This is required for
+    // correctness (an out-of-range count is UB) and is also the fix for an NVIDIA VK_EXT_mesh_shader
+    // codegen issue: feeding `SetMeshOutputCounts` a value straight from a `ByteAddressBuffer.Load`
+    // (with no bound the driver can prove) makes the whole mesh draw emit NOTHING on NVIDIA/Vulkan
+    // — the `min()` gives the driver the static bound it needs. DX/Metal are unaffected (identical).
+    uint vcount = min(rec.y, MAX_VERTS);
     uint toff = rec.z;
-    uint tcount = rec.w;
+    uint tcount = min(rec.w, MAX_TRIS);
     SetMeshOutputCounts(vcount, tcount);
-
     if (lane < vcount)
     {
         uint remap = g.storage_buffers[pc.remap_buf].Load((voff + lane) * 4);
