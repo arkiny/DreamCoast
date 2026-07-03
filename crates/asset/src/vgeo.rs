@@ -494,9 +494,17 @@ pub fn build_lod_dag(vertices: &[MeshVertex], indices: &[u32], material: u32) ->
                 mc.clusters[c].parent_radius = gr;
             }
 
-            // No reduction (e.g. everything on a locked boundary) → the group can't coarsen; its
-            // clusters stay terminal (parent bound above still applies). Don't emit a parent LOD.
+            // No reduction (e.g. everything on a locked boundary, or a tiny disconnected component
+            // that can't simplify) → the group can't coarsen. Its clusters are TERMINAL: there is no
+            // coarser representation, so their coarsening cost is INFINITE — set `parent_error = MAX`
+            // (overriding the finite group bound above) so the cut always keeps them once their own
+            // LOD is fine enough (`self <= tau`). A finite `parent_error` here would strand them in a
+            // LOD gap (`self <= tau` but `parent <= tau` too → never selected), which made small
+            // disconnected components — e.g. a lamp-post base — vanish at every tau.
             if simplified.len() / 3 >= tri_n {
+                for &c in group {
+                    mc.clusters[c].parent_error = f32::MAX;
+                }
                 continue;
             }
             let chunk = clusterize(
