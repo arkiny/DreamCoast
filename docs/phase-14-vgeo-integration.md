@@ -239,8 +239,19 @@ flip-free `cull_view_proj`, so both land the same screen pixels. **Verified (gal
 binning output byte-identical to SW-only on DX (0.000/ch) — HW and SW write bit-identical
 visibility — and DX≡VK 0.001/ch; gallery anchor (off) unchanged.** One benign SPIR-V validation
 warning (`VUID-…-OpVariable-08746`: a Slang per-primitive mesh→fragment decoration mismatch in
-`vgeo_hwvis`; triId is delivered correctly). NEXT (perf, not correctness): a Sponza-scale profiling
-pass + M4b HZB two-pass occlusion.
+`vgeo_hwvis`; triId is delivered correctly).
+
+**M4b HZB occlusion — attempted, reverted (backend parity blocker).** A same-frame Hi-Z occlusion
+cut (`csCutHzb`: view_proj-in-push, in-shader frustum planes to fit the 256-byte VK push, the
+conservative single-region Hi-Z test from `csCullHzb`, HZB built from the mesh-fill depth) was
+implemented and wired opt-in (`P14_VGEO_HZB`). It is **perfectly conservative on Vulkan (HZB-on ≡
+HZB-off, 0.000/ch)** but **systematically over-culls a few silhouette clusters on D3D12
+(0.013/ch)** — deterministic (not a race), and isolated to the occlusion *sampling* (the in-shader
+frustum planes are 0.000/ch on both). That exceeds the DX≡VK ≤0.001 hard rule, and the gallery has
+no genuine vgeo occlusion to validate the cull direction, so it was reverted rather than merged
+broken. NEXT (perf, not correctness): root-cause the DX occlusion-sampling divergence (HZB depth
+content / texture Load) against a genuinely-occluded scene (Sponza), likely with a per-FIF pyramid;
+then Sponza-scale profiling. Multi-material scene-cook remains the other named follow-up.
 
 ## Gates (every increment)
 
