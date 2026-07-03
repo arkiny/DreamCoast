@@ -60,18 +60,12 @@ VSOut vsMain(uint vid: SV_VertexID)
     return o;
 }
 
-float edge(float2 a, float2 b, float2 p)
+// Screen-space TBN from world-position + uv derivatives. Same math as `gbuffer.slang`, but the
+// derivatives are passed in ANALYTICALLY (not `ddx`/`ddy`): in a full-screen visibility resolve the
+// 2×2 quad straddles different triangles, so hardware derivatives are garbage at triangle edges.
+float3 apply_normal_map(float3 n, float3 dp1, float3 dp2, float2 duv1, float2 duv2,
+                        float3 tangent_normal)
 {
-    return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
-}
-
-// Screen-space TBN from world-position + uv derivatives, identical to `gbuffer.slang`.
-float3 apply_normal_map(float3 n, float3 world_pos, float2 uv, float3 tangent_normal)
-{
-    float3 dp1 = ddx(world_pos);
-    float3 dp2 = ddy(world_pos);
-    float2 duv1 = ddx(uv);
-    float2 duv2 = ddy(uv);
     float3 dp2perp = cross(dp2, n);
     float3 dp1perp = cross(n, dp1);
     float3 t = dp2perp * duv1.x + dp1perp * duv2.x;
@@ -97,14 +91,12 @@ GBufferOut fsGBuffer(VSOut i)
     uint payload = (uint)(packed & 0xFFFFFFFFu);
     uint cluster = payload >> 7;
     uint tri = payload & 0x7Fu;
-    uint depth_key = (uint)(packed >> 32);
 
     uint4 rec = g.storage_buffers[pc.rec_buf].Load4(cluster * 96);
     uint voff = rec.x, toff = rec.z;
 
     uint3 li = g.storage_buffers[pc.tri_buf].Load3((toff + tri * 3) * 4);
-    float2 sp[3];
-    float invw[3];
+    float4 clip[3];
     float3 nrm[3];
     float2 uvs[3];
     float3 wpos[3];
@@ -117,38 +109,70 @@ GBufferOut fsGBuffer(VSOut i)
         uvs[k] = asfloat(g.storage_buffers[pc.vtx_buf].Load2(b + 24));
         wpos[k] = mul(pc.model, float4(p, 1.0)).xyz;
         nrm[k] = mul((float3x3)pc.model, nl);
-        float4 clip = mul(pc.mvp, float4(p, 1.0));
-        float w = max(clip.w, 1e-6);
-        invw[k] = 1.0 / w;
-        float3 ndc = clip.xyz / w;
-        sp[k] = float2((ndc.x * 0.5 + 0.5) * pc.width, (0.5 - ndc.y * 0.5) * pc.height);
+        clip[k] = mul(pc.mvp, float4(p, 1.0)); // keep HOMOGENEOUS — do NOT divide by w here
     }
 
-    float2 p = float2(x + 0.5, y + 0.5);
-    float area = edge(sp[0], sp[1], sp[2]);
-    float inv = (abs(area) < 1e-12) ? 0.0 : 1.0 / area;
-    float b0 = edge(sp[1], sp[2], p) * inv;
-    float b1 = edge(sp[2], sp[0], p) * inv;
-    float b2 = edge(sp[0], sp[1], p) * inv;
-    // Perspective-correct weights (÷ clip w, renormalize) — matches HW fixed-function interpolation.
-    float g0 = b0 * invw[0], g1 = b1 * invw[1], g2 = b2 * invw[2];
-    float gs = g0 + g1 + g2;
-    float rcp = (abs(gs) < 1e-12) ? 0.0 : 1.0 / gs;
-    g0 *= rcp;
-    g1 *= rcp;
-    g2 *= rcp;
+    // Perspective-correct barycentric via a HOMOGENEOUS (pre-divide) solve. A per-vertex `xy/w`
+    // projection is invalid when a vertex crosses the near plane (clip.w <= 0) — the `max(w,eps)`
+    // clamp then places the vertex at a garbage screen position, warping the barycentric into an
+    // affine-looking UV streak on large grazing triangles (corridor walls/vaults). Instead solve for
+    // the true barycentric `lam` (sum 1) such that the interpolated clip point projects to this
+    // pixel's NDC (u,v):  lam·clip.x = u·(lam·clip.w),  lam·clip.y = v·(lam·clip.w),  sum(lam)=1.
+    // The first two rows are the vectors A=(clip.x - u·clip.w) and B=(clip.y - v·clip.w); `lam` is
+    // orthogonal to both (their cross product), renormalized to sum 1. No division by any per-vertex
+    // w, so w<=0 vertices are handled exactly like the HW rasterizer. `lam` is the TRUE 3D
+    // barycentric, so world pos / normal / uv interpolate linearly (Schied & Dachsbacher, "Deferred
+    // Attribute Interpolation", HPG 2015 — the same pre-divide edge math Nanite uses).
+    float u = 2.0 * (float(x) + 0.5) / float(pc.width) - 1.0;
+    float v = 1.0 - 2.0 * (float(y) + 0.5) / float(pc.height);
+    float3 W = float3(clip[0].w, clip[1].w, clip[2].w);
+    float3 A = float3(clip[0].x, clip[1].x, clip[2].x) - u * W;
+    float3 B = float3(clip[0].y, clip[1].y, clip[2].y) - v * W;
+    float3 L = cross(A, B);
+    float s = L.x + L.y + L.z;
+    float rs = (abs(s) < 1e-20) ? 0.0 : 1.0 / s;
+    float3 lam = L * rs;
 
-    float3 world_pos = g0 * wpos[0] + g1 * wpos[1] + g2 * wpos[2];
-    float3 world_normal = g0 * nrm[0] + g1 * nrm[1] + g2 * nrm[2];
-    float2 uv = g0 * uvs[0] + g1 * uvs[1] + g2 * uvs[2];
+    // Analytic screen-space derivatives of the barycentric (∂lam/∂pixel), for correct texture mip
+    // gradients and TBN in the full-screen resolve — hardware ddx/ddy would sample across triangle
+    // boundaries. dA/du = -W, dB/dv = -W → dL/du = -cross(W,B), dL/dv = cross(W,A); then
+    // ∂lam/∂u = (dL/du - lam·sum(dL/du))·rs, chained by ∂u/∂px = 2/width, ∂v/∂py = -2/height.
+    float3 Lu = -cross(W, B);
+    float3 Lv = cross(W, A);
+    float3 dlam_du = (Lu - lam * (Lu.x + Lu.y + Lu.z)) * rs;
+    float3 dlam_dv = (Lv - lam * (Lv.x + Lv.y + Lv.z)) * rs;
+    float dpx = 2.0 / float(pc.width);
+    float dpy = -2.0 / float(pc.height);
 
-    // ── Material resolve — mirrors gbuffer.slang fsMain ──────────────────────────────────────────
-    float mip_bias = pc.mr_factor.z;
+    float3 world_pos = lam.x * wpos[0] + lam.y * wpos[1] + lam.z * wpos[2];
+    float3 world_normal = lam.x * nrm[0] + lam.y * nrm[1] + lam.z * nrm[2];
+    float2 uv = lam.x * uvs[0] + lam.y * uvs[1] + lam.z * uvs[2];
+
+    // EXACT window-space depth for SV_Depth: the interpolated clip point P = Σ lam·clip projects to
+    // z = P.z/P.w — full float32 precision, identical to what the HW rasterizer writes for the mesh
+    // fill. (Reconstructing from the packed 32-bit key instead loses ~8 bits through `float(uint>2^24)`
+    // and rounds differently than the mesh path → the two fight in the depth composite, letting the
+    // wall behind a grazing arch soffit bleed through as streaks.) This is view-independent of the
+    // Y-flip (z row is unaffected), so it composites correctly against the mesh-fill depth on DX≡VK.
+    float pz = lam.x * clip[0].z + lam.y * clip[1].z + lam.z * clip[2].z;
+    float pw = lam.x * clip[0].w + lam.y * clip[1].w + lam.z * clip[2].w;
+    float exact_depth = pz / pw;
+
+    // Analytic UV / world-position screen derivatives (fold `mip_bias` into the gradient scale, since
+    // SampleGrad takes gradients not a bias: LOD += bias ⇔ grad *= exp2(bias)).
+    float grad_scale = exp2(pc.mr_factor.z);
+    float2 uv_dx = (dlam_du.x * uvs[0] + dlam_du.y * uvs[1] + dlam_du.z * uvs[2]) * dpx * grad_scale;
+    float2 uv_dy = (dlam_dv.x * uvs[0] + dlam_dv.y * uvs[1] + dlam_dv.z * uvs[2]) * dpy * grad_scale;
+    float3 wp_dx = (dlam_du.x * wpos[0] + dlam_du.y * wpos[1] + dlam_du.z * wpos[2]) * dpx;
+    float3 wp_dy = (dlam_dv.x * wpos[0] + dlam_dv.y * wpos[1] + dlam_dv.z * wpos[2]) * dpy;
+
+    // ── Material resolve — mirrors gbuffer.slang fsMain, but samples with SampleGrad(analytic uv
+    // gradients) instead of implicit derivatives (the visibility-resolve mip-selection fix). ──────
     float cutoff = pc.mr_factor.w;
     float3 albedo = pc.base_color_factor.rgb;
     if (pc.tex.x != NO_TEXTURE)
     {
-        float4 bc = g.textures[pc.tex.x].SampleBias(g.samp_wrap, uv, mip_bias);
+        float4 bc = g.textures[pc.tex.x].SampleGrad(g.samp_wrap, uv, uv_dx, uv_dy);
         albedo *= bc.rgb;
         float a = bc.a * pc.base_color_factor.a;
         if (cutoff > 0.0 && a < cutoff)
@@ -158,15 +182,15 @@ GBufferOut fsGBuffer(VSOut i)
     float roughness = pc.mr_factor.y;
     if (pc.tex.y != NO_TEXTURE)
     {
-        float3 mr = g.textures[pc.tex.y].SampleBias(g.samp_wrap, uv, mip_bias).rgb;
+        float3 mr = g.textures[pc.tex.y].SampleGrad(g.samp_wrap, uv, uv_dx, uv_dy).rgb;
         roughness *= mr.g;
         metallic *= mr.b;
     }
     float3 n = normalize(world_normal);
     if (pc.tex.z != NO_TEXTURE)
     {
-        float3 tn = g.textures[pc.tex.z].SampleBias(g.samp_wrap, uv, mip_bias).rgb * 2.0 - 1.0;
-        n = apply_normal_map(n, world_pos, uv, tn);
+        float3 tn = g.textures[pc.tex.z].SampleGrad(g.samp_wrap, uv, uv_dx, uv_dy).rgb * 2.0 - 1.0;
+        n = apply_normal_map(n, wp_dx, wp_dy, uv_dx, uv_dy, tn);
     }
 
     o.albedo = float4(albedo, 1.0);
@@ -174,6 +198,6 @@ GBufferOut fsGBuffer(VSOut i)
     o.material = float4(metallic, saturate(roughness), 1.0, 0.0);
     o.position = float4(world_pos, 1.0);
     // Reconstruct window-space depth from the visibility buffer's packed depth key (nearest→max).
-    o.depth = 1.0 - float(depth_key) / 4294967040.0;
+    o.depth = exact_depth;
     return o;
 }
