@@ -63,8 +63,11 @@ float3 cluster_hue(uint id)
 void meshMain(
     uint gid: SV_GroupID,
     uint lane: SV_GroupThreadID,
-    out indices uint3 tris[MAX_TRIS],
-    out vertices VertexOut verts[MAX_VERTS])
+    // `indices` / `vertices` imply `out`; the explicit `out` triggers a Slang 2026.10.2 → DXC 1.9
+    // malformed-codegen bug (`out indices out uint3`). Dropping it warns E54001 but emits valid
+    // DXIL; SPIR-V / Metal unaffected. (See vgeo_meshlet.slang.)
+    indices uint3 tris[MAX_TRIS],
+    vertices VertexOut verts[MAX_VERTS])
 {
     // Direct path (M2): cluster = base + threadgroup. Cut path (M3): the LOD-cut compute wrote
     // the selected cluster indices into `vis_buf`, so look ours up by threadgroup.

@@ -27,8 +27,12 @@ struct VertexOut
 [outputtopology("triangle")]
 void meshMain(
     uint lane : SV_GroupThreadID,
-    out indices uint3 tris[1],
-    out vertices VertexOut verts[3])
+    // The `indices` / `vertices` output modifiers already imply the `out` direction; the
+    // explicit `out` is a Slang 2026.10.2 → DXC 1.9 codegen hazard (Slang emits a malformed
+    // `out indices out uint3` that DXC rejects). Dropping it makes Slang warn E54001 but emit
+    // valid DXIL, and SPIR-V / Metal are unaffected.
+    indices uint3 tris[1],
+    vertices VertexOut verts[3])
 {
     SetMeshOutputCounts(3, 1);
 
