@@ -69,7 +69,10 @@ void meshMain(
 {
     uint cluster = g.storage_buffers[pc.hw_list].Load(gid * 4);
     uint4 rec = g.storage_buffers[pc.rec_buf].Load4(cluster * 96);
-    uint voff = rec.x, vcount = rec.y, toff = rec.z, tcount = rec.w;
+    // Clamp counts to the declared output maxima before `SetMeshOutputCounts` — required for
+    // correctness and the fix for an NVIDIA VK_EXT_mesh_shader issue where an unbounded
+    // storage-loaded count makes the mesh draw emit nothing (see vgeo_cluster.slang).
+    uint voff = rec.x, vcount = min(rec.y, MAX_VERTS), toff = rec.z, tcount = min(rec.w, MAX_TRIS);
     SetMeshOutputCounts(vcount, tcount);
 
     if (lane < vcount)

@@ -410,6 +410,9 @@ pub struct VulkanMeshPipeline {
     layout: vk::PipelineLayout,
     bindless: bool,
     uniform_buffer: bool,
+    /// The stage set the push-constant range was declared with (MESH|FRAGMENT, plus TASK when an
+    /// object stage exists). The command buffer pushes with exactly these stages.
+    push_stages: vk::ShaderStageFlags,
 }
 
 impl VulkanMeshPipeline {
@@ -430,13 +433,14 @@ impl VulkanMeshPipeline {
             if let Some(t) = task {
                 device.device.destroy_shader_module(t, None);
             }
-            let (pipeline, layout) = result?;
+            let (pipeline, layout, push_stages) = result?;
             Ok(Self {
                 device,
                 pipeline,
                 layout,
                 bindless: desc.bindless,
                 uniform_buffer: desc.uniform_buffer,
+                push_stages,
             })
         }
     }
@@ -455,6 +459,10 @@ impl VulkanMeshPipeline {
 
     pub(crate) fn uses_uniform(&self) -> bool {
         self.uniform_buffer
+    }
+
+    pub(crate) fn push_stages(&self) -> vk::ShaderStageFlags {
+        self.push_stages
     }
 }
 
@@ -478,7 +486,7 @@ unsafe fn build_mesh(
     task: Option<vk::ShaderModule>,
     ms: vk::ShaderModule,
     fs: vk::ShaderModule,
-) -> Result<(vk::Pipeline, vk::PipelineLayout), EngineError> {
+) -> Result<(vk::Pipeline, vk::PipelineLayout, vk::ShaderStageFlags), EngineError> {
     unsafe {
         let ms_entry =
             CString::new(desc.mesh_entry).map_err(|e| EngineError::Rhi(e.to_string()))?;
@@ -537,12 +545,16 @@ unsafe fn build_mesh(
         } else {
             vec![device.bindless_layout]
         };
+        // Push constants are visible to the stages that actually exist in the pipeline. Declaring
+        // TASK_EXT here when there is no task shader makes the RADV/NV drivers deliver nothing to
+        // the mesh stage on some paths, so only include TASK_EXT when an object stage is present.
+        // `push_constants_mesh` on the command buffer pushes the matching stage set.
+        let mut push_stage_flags = vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::FRAGMENT;
+        if desc.object_bytes.is_some() {
+            push_stage_flags |= vk::ShaderStageFlags::TASK_EXT;
+        }
         let push_ranges = [vk::PushConstantRange::default()
-            .stage_flags(
-                vk::ShaderStageFlags::TASK_EXT
-                    | vk::ShaderStageFlags::MESH_EXT
-                    | vk::ShaderStageFlags::FRAGMENT,
-            )
+            .stage_flags(push_stage_flags)
             .offset(0)
             .size(desc.push_constant_size)];
         let mut layout_ci = vk::PipelineLayoutCreateInfo::default();
@@ -597,7 +609,7 @@ unsafe fn build_mesh(
             .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
             .map_err(|(_, e)| vk_err(e))?;
 
-        Ok((pipelines[0], layout))
+        Ok((pipelines[0], layout, push_stage_flags))
     }
 }
 

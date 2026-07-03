@@ -359,7 +359,7 @@ impl DeviceShared {
                 bindless_set,
                 bindless_sampler,
                 bindless_sampler_wrap,
-            ) = create_bindless(&device, has_raytracing, max_anisotropy)?;
+            ) = create_bindless(&device, has_raytracing, has_mesh_shader, max_anisotropy)?;
             let (globals_pool, globals_layout, globals_set) = create_globals(&device)?;
 
             Ok(Self {
@@ -675,6 +675,7 @@ impl DeviceShared {
 fn create_bindless(
     device: &ash::Device,
     has_raytracing: bool,
+    has_mesh_shader: bool,
     max_anisotropy: f32,
 ) -> Result<
     (
@@ -732,8 +733,20 @@ fn create_bindless(
         // compute passes sample textures) AND the RT stages (closest-hit material
         // textures). Storage image/buffer are written by compute; the storage buffer
         // is also read by the vertex stage (particle vertex-pull).
-        let sampled_stages =
-            vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE | rt_stages;
+        // Phase 14 Track B: the mesh + task stages read bindless storage buffers (cluster
+        // geometry) and, in material mode, sample textures. `MESH_EXT`/`TASK_EXT` are only valid
+        // flag bits when `VK_EXT_mesh_shader` is enabled, so gate them on the capability (D3D12's
+        // `SHADER_VISIBILITY_ALL` covers these stages unconditionally). Without these, the cluster
+        // mesh shader's storage-buffer reads are invalid and it emits no geometry on Vulkan.
+        let mesh_stages = if has_mesh_shader {
+            vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::TASK_EXT
+        } else {
+            vk::ShaderStageFlags::empty()
+        };
+        let sampled_stages = vk::ShaderStageFlags::FRAGMENT
+            | vk::ShaderStageFlags::COMPUTE
+            | rt_stages
+            | mesh_stages;
         let dynamic = vk::DescriptorBindingFlags::PARTIALLY_BOUND
             | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
         let mut bindings = vec![
@@ -771,7 +784,8 @@ fn create_bindless(
                     vk::ShaderStageFlags::COMPUTE
                         | vk::ShaderStageFlags::VERTEX
                         | vk::ShaderStageFlags::FRAGMENT
-                        | rt_stages,
+                        | rt_stages
+                        | mesh_stages,
                 ),
         ];
         let mut flags = vec![
