@@ -30,10 +30,10 @@ mod level;
 mod mesh;
 mod volume;
 
-pub use cluster::{read_clusters, write_clusters};
+pub use cluster::{read_clusters, read_clusters_opt, write_clusters};
 pub use gltf::{read_scene, write_scene};
 pub use level::{read_level, write_level};
-pub use mesh::{read, write};
+pub use mesh::{read, write, write_with_clusters};
 pub use volume::{read_albedo, read_sdf, write_albedo, write_sdf};
 
 use dreamcoast_core::EngineError;

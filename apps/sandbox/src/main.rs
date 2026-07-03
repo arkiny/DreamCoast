@@ -485,7 +485,7 @@ fn run() -> anyhow::Result<()> {
     if mesh_shader_test_enabled() {
         return run_mesh_shader_test(backend, &mut window, &device, &mut swapchain);
     }
-    // Phase 14 M1e: build the LOD DAG for the loaded model and render a chosen LOD level.
+    // Phase 14 M1e: load the COOKED LOD DAG for the model and render a chosen LOD level.
     if vgeo_test_enabled() {
         return run_vgeo_test(
             backend,
@@ -493,7 +493,10 @@ fn run() -> anyhow::Result<()> {
             &device,
             &mut swapchain,
             model,
-            model_radius,
+            &model_path,
+            &model_ref,
+            &cache_dir,
+            compress_tex,
         );
     }
 

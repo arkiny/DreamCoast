@@ -26,10 +26,9 @@ const BC_FMT_BC3: u32 = 2;
 const BC_FMT_BC4: u32 = 3;
 const BC_FMT_BC7: u32 = 4;
 
-/// Serialize `mesh` into a `.dcasset` byte buffer. `src_hash` is the
-/// [`super::source_hash`] of the source asset (glTF bytes), embedded for invalidation.
-pub fn write(mesh: &MeshData, src_hash: u64) -> Vec<u8> {
-    let chunks = collect_chunks(mesh);
+/// Frame a `(chunk_type, payload)` list into a `.dcasset` container: header + directory +
+/// payloads. Shared by [`write`] and [`write_with_clusters`].
+fn write_chunks(chunks: &[(u32, Vec<u8>)], src_hash: u64) -> Vec<u8> {
     let dir_size = DIR_ENTRY_SIZE * chunks.len();
     let payload_start = HEADER_SIZE + dir_size;
 
@@ -44,7 +43,7 @@ pub fn write(mesh: &MeshData, src_hash: u64) -> Vec<u8> {
 
     // Directory: type/offset/size, offsets relative to file start.
     let mut offset = payload_start as u64;
-    for (ty, payload) in &chunks {
+    for (ty, payload) in chunks {
         w.u32(*ty);
         w.u64(offset);
         w.u64(payload.len() as u64);
@@ -52,10 +51,34 @@ pub fn write(mesh: &MeshData, src_hash: u64) -> Vec<u8> {
     }
 
     // Payloads, in the same order as the directory.
-    for (_, payload) in &chunks {
+    for (_, payload) in chunks {
         w.bytes(payload);
     }
     w.buf
+}
+
+/// Serialize `mesh` into a `.dcasset` byte buffer. `src_hash` is the
+/// [`super::source_hash`] of the source asset (glTF bytes), embedded for invalidation.
+pub fn write(mesh: &MeshData, src_hash: u64) -> Vec<u8> {
+    write_chunks(&collect_chunks(mesh), src_hash)
+}
+
+/// Serialize `mesh` PLUS its virtual-geometry cluster pages into one `.dcasset` — the cooked
+/// form a mesh ships in: `CHUNK_MESH` (+ textures) is the static-mesh **fallback** the runtime
+/// uses when mesh shaders / the vgeo path are unavailable, and `CHUNK_CLUSTERS` is the LOD DAG.
+/// [`read`] ignores the cluster chunk, so a fallback-only load is unchanged; [`super::cluster::
+/// read_clusters_opt`] pulls the clusters when the capable path wants them (Phase 14).
+pub fn write_with_clusters(
+    mesh: &MeshData,
+    clusters: &crate::vgeo::MeshClusters,
+    src_hash: u64,
+) -> Vec<u8> {
+    let mut chunks = collect_chunks(mesh);
+    chunks.push((
+        super::CHUNK_CLUSTERS,
+        super::cluster::encode_clusters(clusters),
+    ));
+    write_chunks(&chunks, src_hash)
 }
 
 /// Decode a `.dcasset` buffer into its [`Header`] and [`MeshData`]. Unknown chunk

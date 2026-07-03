@@ -746,24 +746,29 @@ pub(crate) fn vgeo_test_enabled() -> bool {
     std::env::args().skip(1).any(|a| a == "--vgeo-test")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_vgeo_test(
     backend: BackendKind,
     window: &mut Window,
     device: &Device,
     swapchain: &mut Swapchain,
     model: MeshData,
-    model_radius: f32,
+    source: &std::path::Path,
+    cache_key: &str,
+    cache_dir: &std::path::Path,
+    tex: dreamcoast_asset::cook::TexCompress,
 ) -> anyhow::Result<()> {
     use dreamcoast_asset::vgeo;
 
-    let dag = vgeo::build_lod_dag(&model.vertices, &model.indices, 0);
+    // Consume the COOKED cluster pages baked into the `.dcasset` (cooking on a miss), exercising
+    // the real cooked pipeline end to end rather than rebuilding the DAG here.
+    let mut dag = dreamcoast_asset::cook::load_cooked_clusters(source, cache_key, cache_dir, tex)?;
     let levels = vgeo::lod_levels(&dag);
     info!(
-        "vgeo LOD DAG: {} clusters across {} LOD level(s) ({} source verts, {} tris)",
+        "cooked vgeo LOD DAG: {} clusters across {} LOD level(s) ({} verts)",
         dag.clusters.len(),
         levels.len(),
         dag.vertices.len(),
-        model.indices.len() / 3
     );
     for &l in &levels {
         let (mut cn, mut tn) = (0u32, 0u32);
@@ -777,6 +782,21 @@ pub(crate) fn run_vgeo_test(
         info!("  LOD {l}: {cn} clusters, {tn} tris, self_error {emin:.4}..{emax:.4}");
     }
 
+    // The cooked geometry is in raw (pre-normalization) coordinates; recenter it on the origin so
+    // the mesh-test camera (which frames a radius around the origin) sees it, and derive the radius
+    // from its own bounds.
+    let mut center = Vec3::ZERO;
+    for v in &dag.vertices {
+        center += Vec3::from(v.pos);
+    }
+    center /= dag.vertices.len().max(1) as f32;
+    let mut radius = 0.0f32;
+    for v in &mut dag.vertices {
+        let p = Vec3::from(v.pos) - center;
+        v.pos = p.to_array();
+        radius = radius.max(p.length());
+    }
+
     // Pick the LOD to render (clamped to the coarsest available).
     let want: u32 = std::env::var("VGEO_LOD")
         .ok()
@@ -784,16 +804,24 @@ pub(crate) fn run_vgeo_test(
         .unwrap_or(0);
     let lod = want.min(*levels.last().unwrap_or(&0));
     let indices = vgeo::lod_indices(&dag, lod);
-    info!("rendering LOD {lod}: {} triangles", indices.len() / 3);
+    info!(
+        "rendering cooked LOD {lod}: {} triangles",
+        indices.len() / 3
+    );
 
-    // Reconstruct a renderable mesh (whole vertex pool + this LOD's index subset) and reuse the
-    // textured mesh-test render path. Moves the source material (the vgeo branch then returns).
     let lod_model = MeshData {
         vertices: dag.vertices,
         indices,
         material: model.material,
     };
-    run_mesh_test(backend, window, device, swapchain, &lod_model, model_radius)
+    run_mesh_test(
+        backend,
+        window,
+        device,
+        swapchain,
+        &lod_model,
+        radius.max(1e-3),
+    )
 }
 
 /// `--frames N` cap for the clear-test loop (smoke testing); `None` = unlimited.

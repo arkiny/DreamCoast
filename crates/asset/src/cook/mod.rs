@@ -110,13 +110,17 @@ pub fn load_cooked(
         return Ok((mesh, LoadOutcome::CacheHit));
     }
 
-    // Miss: cook from glTF (optionally block-compressing eligible textures) and
-    // write the cache (write failure is non-fatal).
+    // Miss: cook from glTF (optionally block-compressing eligible textures) and write the cache
+    // (write failure is non-fatal). The cooked `.dcasset` bakes BOTH the static-mesh fallback
+    // (`CHUNK_MESH` + textures) AND the virtual-geometry LOD DAG (`CHUNK_CLUSTERS`), so a
+    // capability-gated runtime can pick either from one file. `read` returns only the fallback,
+    // so this is transparent to the existing render path.
     let mut mesh = load_gltf(source)?;
     if tex.enabled() {
         texture::compress_material(&mut mesh.material, tex);
     }
-    let cooked = dcasset::write(&mesh, key);
+    let clusters = crate::vgeo::build_lod_dag(&mesh.vertices, &mesh.indices, 0);
+    let cooked = dcasset::write_with_clusters(&mesh, &clusters, key);
     if let Err(e) = write_atomic(&cache_file, &cooked) {
         tracing_warn(&format!(
             "failed to write cooked asset {}: {e}",
@@ -124,6 +128,26 @@ pub fn load_cooked(
         ));
     }
     Ok((mesh, LoadOutcome::Cooked))
+}
+
+/// Load the virtual-geometry cluster pages of the asset at `source`, cooking on a miss (which
+/// also writes the fallback mesh). Returns the LOD DAG baked into the cooked `.dcasset`. Errors
+/// if the asset can't be cooked or the cooked file carries no cluster chunk (a fallback-only
+/// asset). Phase 14: the vgeo render path (and the `--vgeo-test` viewer) consume this instead of
+/// rebuilding the DAG at runtime, exercising the real cooked pipeline end to end.
+pub fn load_cooked_clusters(
+    source: &Path,
+    cache_key: &str,
+    cache_dir: &Path,
+    tex: TexCompress,
+) -> Result<crate::vgeo::MeshClusters, EngineError> {
+    // Ensure the asset is cooked (writes the combined file on a miss), then read its clusters.
+    load_cooked(source, cache_key, cache_dir, tex)?;
+    let cache_file = cache_path(cache_dir, cache_key);
+    let bytes = std::fs::read(&cache_file)
+        .map_err(|e| EngineError::Asset(format!("read cooked {}: {e}", cache_file.display())))?;
+    dcasset::read_clusters_opt(&bytes)?
+        .ok_or_else(|| EngineError::Asset("cooked asset has no cluster chunk".into()))
 }
 
 /// Load a glTF **scene** (multi-mesh/multi-material) as a cooked, block-compressed
