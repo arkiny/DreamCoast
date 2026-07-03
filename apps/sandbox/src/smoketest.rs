@@ -516,16 +516,17 @@ pub(crate) fn run_atomic64_test(backend: BackendKind, device: &Device) -> anyhow
         threads_per_group: [64, 1, 1],
     })?;
 
-    // R64 target: zero-initialised (so every packed write wins the `atomicMax`), host-visible
-    // for CPU readback, registered in the bindless storage table.
-    let vis = device.create_storage_buffer_init(
-        &StorageBufferDesc {
-            size: (SLOTS as u64) * 8,
-            stride: 8,
-            indirect: false,
-        },
-        &vec![0u8; (SLOTS as usize) * 8],
-    )?;
+    // R64 target: host-visible so the GPU can UAV-atomic into it AND the CPU can read it back
+    // (CUSTOM-L0 on D3D12 / HOST_COHERENT on Vulkan / Shared on Metal). A DEFAULT-heap `_init`
+    // buffer is NOT host-readable on D3D12 — only Metal's unified memory tolerated that, so this
+    // is the DX≡VK fix for the smoke. Zero-initialised (via `write`) so every packed value wins
+    // the `atomicMax`; registered in the bindless storage table.
+    let vis = device.create_storage_buffer_host(&StorageBufferDesc {
+        size: (SLOTS as u64) * 8,
+        stride: 8,
+        indirect: false,
+    })?;
+    vis.write(&vec![0u8; (SLOTS as usize) * 8])?;
     // Indirect dispatch args: threadgroup counts (x, y, z) read on the GPU.
     let groups_x = COUNT.div_ceil(64);
     let mut args_bytes = Vec::with_capacity(12);
@@ -549,16 +550,19 @@ pub(crate) fn run_atomic64_test(backend: BackendKind, device: &Device) -> anyhow
 
     let queue = device.queue();
     let cmd = device.create_command_buffer()?;
-    let image_available = device.create_semaphore()?;
-    let render_finished = device.create_semaphore()?;
     let fence = device.create_fence(false)?;
 
     cmd.begin()?;
+    // D3D12 `ExecuteIndirect` reads the argument buffer in INDIRECT_ARGUMENT state; transition it
+    // (no-op on Vulkan/Metal). Without this the D3D12 debug layer flags a resource-state error.
+    cmd.storage_buffer_to_indirect(&args);
     cmd.bind_compute_pipeline(&pipeline);
     cmd.push_constants_compute(&push);
     cmd.dispatch_indirect(&args, 0);
     cmd.end()?;
-    queue.submit(&cmd, &image_available, &render_finished, &fence)?;
+    // Headless one-shot: no swapchain semaphores (waiting on an unsignaled `image_available`
+    // would trip a Vulkan `VUID-vkQueueSubmit-pWaitSemaphores` validation error).
+    queue.submit_oneshot(&cmd, &fence)?;
     fence.wait()?;
 
     let mut bytes = vec![0u8; (SLOTS as usize) * 8];
