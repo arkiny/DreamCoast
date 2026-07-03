@@ -226,6 +226,15 @@ pub struct QualityPreset {
     /// Variance-clamp tightness for `reflect_history_clamp == 2` (`P_REFL_CLAMP_GAMMA`). Lower = tighter
     /// (more lag removed, more risk of clipping valid history); ~1.0-1.5 typical. Ignored for modes 0/1.
     pub reflect_clamp_gamma: f32,
+    /// SSR-resolve history neighbourhood clamp (`ssr_resolve.slang`), `P_SSR_HISTORY_CLAMP`. The SSR
+    /// mirror path samples the previous-frame lit-history, so it forms a lighting feedback loop; a plain
+    /// EMA only low-passes the resulting period-2 limit cycle (columns/thin geo shimmer), it does not
+    /// kill it. `1` = variance clamp (mean +- `ssr_clamp_gamma`*sigma) of the reprojected history into
+    /// the current spatial neighbourhood — the step that breaks the oscillation. `0` = off (byte-
+    /// identical legacy resolve; forced for the gallery anchor). Default 0 pending DX=VK verification.
+    pub ssr_history_clamp: u32,
+    /// Variance-clamp tightness for `ssr_history_clamp == 1` (`P_SSR_CLAMP_GAMMA`). ~1.0-1.5 typical.
+    pub ssr_clamp_gamma: f32,
     /// GI temporal denoiser history-clamp mode (`gdf_temporal.slang` params.w), `P_GI_TEMPORAL_CLAMP`:
     /// `0` = off — the measured fix for the static GI shimmer (the legacy hard 3x3 clamp is built from
     /// the noisy spp1 GI, so it drags the converged history back to per-frame noise = flicker; off lets
@@ -416,6 +425,8 @@ pub fn gallery_preset() -> QualityPreset {
         gi_atrous_steps: 2,       // two à-trous iterations (legacy denoise)
         reflect_history_clamp: 0, // off (legacy resolve, no neighbourhood clamp)
         reflect_clamp_gamma: 1.25,
+        ssr_history_clamp: 0, // off (byte-identical anchor; SSR feedback clamp is opt-in)
+        ssr_clamp_gamma: 1.25,
         gi_temporal_clamp: 1.0, // hard 3x3 GI temporal clamp (legacy byte-identical anchor)
     }
 }
@@ -664,6 +675,17 @@ mod tests {
             "{label}: reflect_history_clamp {} out of 0..=2",
             p.reflect_history_clamp
         );
+        // SSR-resolve history-clamp MODE: .min(1) => 0/1.
+        assert!(
+            p.ssr_history_clamp <= 1,
+            "{label}: ssr_history_clamp {} out of 0..=1",
+            p.ssr_history_clamp
+        );
+        assert!(
+            (0.0..=8.0).contains(&p.ssr_clamp_gamma),
+            "{label}: ssr_clamp_gamma {} out of 0..=8",
+            p.ssr_clamp_gamma
+        );
         // Soft-PCF tap count: clamp(1, 16) (POISSON16 array bound in the shader).
         assert!(
             (1..=16).contains(&p.shadow_taps),
@@ -767,6 +789,11 @@ mod tests {
             "gallery reflect_history_clamp (off)"
         );
         assert_eq!(g.reflect_clamp_gamma, 1.25, "gallery reflect_clamp_gamma");
+        assert_eq!(
+            g.ssr_history_clamp, 0,
+            "gallery ssr_history_clamp (off = byte-identical anchor)"
+        );
+        assert_eq!(g.ssr_clamp_gamma, 1.25, "gallery ssr_clamp_gamma");
         assert_eq!(
             g.gi_temporal_clamp, 1.0,
             "gallery gi_temporal_clamp (hard 3x3)"
@@ -907,7 +934,8 @@ mod tests {
                 gi_half_res: true, cache_relight_spp: 1, gi_max_steps: 24, reflect_max_steps: 96,
                 reflect_half_res: true, render_scale: 1.0, gdf_cone_k: 0.02, gi_res_div: 3,
                 reflect_res_div: 2, ao_res_div: 1, gi_atrous_steps: 2, reflect_history_clamp: 1,
-                reflect_clamp_gamma: 1.25, gi_temporal_clamp: 0.0,
+                reflect_clamp_gamma: 1.25, ssr_history_clamp: 0, ssr_clamp_gamma: 1.25,
+                gi_temporal_clamp: 0.0,
             ),
             groups: (resolution: 2, global_illumination: 1, reflection: 1, ambient_occlusion: 2,
                      shadow: 1, surface_cache: 1),

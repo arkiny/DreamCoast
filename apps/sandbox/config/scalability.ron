@@ -47,6 +47,8 @@
                 gi_atrous_steps: 2,
                 reflect_history_clamp: 1,
                 reflect_clamp_gamma: 1.25,
+                ssr_history_clamp: 0,
+                ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
             ),
             groups: (
@@ -87,6 +89,8 @@
                 gi_atrous_steps: 2,
                 reflect_history_clamp: 1,
                 reflect_clamp_gamma: 1.25,
+                ssr_history_clamp: 0,
+                ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
             ),
             groups: (
@@ -128,6 +132,8 @@
                 gi_atrous_steps: 2,
                 reflect_history_clamp: 2,
                 reflect_clamp_gamma: 1.25,
+                ssr_history_clamp: 0,
+                ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
             ),
             groups: (
@@ -170,6 +176,8 @@
                 gi_atrous_steps: 1,
                 reflect_history_clamp: 1,
                 reflect_clamp_gamma: 1.25,
+                ssr_history_clamp: 0,
+                ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
             ),
             groups: (

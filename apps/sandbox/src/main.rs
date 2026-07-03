@@ -822,6 +822,11 @@ struct App {
     /// Reflection temporal history clamp (0 off / 1 hard / 2 variance; gallery forced 0) + variance γ.
     reflect_history_clamp: u32,
     reflect_clamp_gamma: f32,
+    /// SSR resolve history neighbourhood clamp (breaks the mirror lit-history feedback oscillation a
+    /// plain EMA only low-passes): 0 = off (byte-identical), 1 = variance clamp (mean ± γ·σ). Gallery
+    /// forced 0. `P_SSR_HISTORY_CLAMP` / `P_SSR_CLAMP_GAMMA` override.
+    ssr_history_clamp: u32,
+    ssr_clamp_gamma: f32,
     /// GI temporal denoiser history-clamp (gdf_temporal params.w): 0 off (content; fixes shimmer),
     /// 1 hard (gallery legacy byte-identical), >1.5 variance γ.
     gi_temporal_clamp: f32,
@@ -2457,6 +2462,19 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(base.reflect_clamp_gamma)
             .clamp(0.0, 8.0);
+        // SSR-resolve history feedback clamp (0 off / 1 variance). Gallery base is 0 (byte-identical
+        // anchor); content tiers default 0 too pending DX=VK verification. `P_SSR_HISTORY_CLAMP` +
+        // `P_SSR_CLAMP_GAMMA` override (set =1 to break the mirror lit-history feedback shimmer).
+        let ssr_history_clamp = std::env::var("P_SSR_HISTORY_CLAMP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.ssr_history_clamp)
+            .min(1);
+        let ssr_clamp_gamma = std::env::var("P_SSR_CLAMP_GAMMA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(base.ssr_clamp_gamma)
+            .clamp(0.0, 8.0);
         // GI temporal history clamp: gallery forced to 1.0 (hard 3x3 = legacy byte-identical anchor);
         // content takes the tier (0.0 = off = the static-shimmer fix). `P_GI_TEMPORAL_CLAMP` override.
         let gi_temporal_clamp = std::env::var("P_GI_TEMPORAL_CLAMP")
@@ -2822,6 +2840,8 @@ impl App {
             sc_viz,
             reflect_history_clamp,
             reflect_clamp_gamma,
+            ssr_history_clamp,
+            ssr_clamp_gamma,
             gi_temporal_clamp,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
@@ -5442,6 +5462,8 @@ impl App {
                         self.scene_radius * 0.02,
                         firefly_max,
                         2.0,
+                        self.ssr_history_clamp,
+                        self.ssr_clamp_gamma,
                     )
                 } else {
                     self.reflect

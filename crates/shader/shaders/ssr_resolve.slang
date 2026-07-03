@@ -36,6 +36,13 @@ struct ResolvePush
     uint flip_y;             // bit0 = Vulkan Y
     uint reset;              // 1 = ignore history (first frame / view change)
     float4 params;           // x = reject dist, y = EMA alpha, z = firefly clamp max, w = kernel radius
+    // History neighbourhood clamp (breaks the mirror lit-history FEEDBACK loop that a plain EMA only
+    // low-passes, not kills — a period-2 limit cycle survives an EMA whose loop gain >= 1). Clamps the
+    // reprojected history into the current spatial neighbourhood's radiance range before the blend, so
+    // a feedback overshoot lands outside the range and is pulled back. Reference SW-GI / reflection
+    // denoisers clamp history the same way (mean +- gamma*sigma). 0 = off (byte-identical legacy resolve).
+    uint clamp_mode;         // 0 = off, 1 = variance clamp (mean +- clamp_gamma*sigma)
+    float clamp_gamma;       // variance-clamp tightness (mode 1); ignored when off
 };
 
 [[vk::push_constant]]
@@ -99,6 +106,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 num = float3(0, 0, 0);
     float conf_num = 0.0;
     float den = 0.0;
+    // Unweighted neighbourhood moments (radiance) for the history clamp box below. Accumulated over the
+    // same valid-ray set; only consumed when `clamp_mode != 0`, so OFF stays byte-identical.
+    float3 m1 = float3(0, 0, 0);
+    float3 m2 = float3(0, 0, 0);
+    float mcnt = 0.0;
     for (int dy = -r; dy <= r; dy++)
     {
         for (int dx = -r; dx <= r; dx++)
@@ -116,6 +128,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             num += a.rgb * w;
             conf_num += a.a * w;
             den += w;
+            m1 += a.rgb;
+            m2 += a.rgb * a.rgb;
+            mcnt += 1.0;
         }
     }
     bool have_sample = den > 1e-6;
@@ -144,7 +159,19 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 {
                     if (have_sample)
                     {
-                        accum_rgb = lerp(ph.rgb, spatial, pc.params.y);
+                        // Clamp the (view-dependent, possibly fed-back) reprojected history into this
+                        // frame's local reflection range before the EMA — the step that actually kills
+                        // the mirror lit-history feedback oscillation the EMA alone only low-passes.
+                        // Needs >= 2 samples for a meaningful sigma; else fall back to the raw EMA.
+                        float3 hist_rgb = ph.rgb;
+                        if (pc.clamp_mode != 0u && mcnt > 1.5)
+                        {
+                            float3 mean = m1 / mcnt;
+                            float3 sigma = sqrt(max(m2 / mcnt - mean * mean, float3(0, 0, 0)));
+                            float3 ext = pc.clamp_gamma * sigma;
+                            hist_rgb = clamp(hist_rgb, mean - ext, mean + ext);
+                        }
+                        accum_rgb = lerp(hist_rgb, spatial, pc.params.y);
                         accum_conf = lerp(ph.a, conf, pc.params.y);
                     }
                     else
