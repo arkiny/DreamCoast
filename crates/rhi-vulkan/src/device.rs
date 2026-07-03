@@ -1,7 +1,7 @@
 //! Logical device, queue, command pool, and resource creation.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use dreamcoast_core::EngineError;
@@ -31,8 +31,11 @@ pub(crate) const CUBE_COUNT: u32 = 64;
 /// these; its index space is separate and 0-based (Phase 7).
 pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
 /// Size of the bindless storage-buffer (UAV) table (binding 4). Compute/vertex
-/// read-write these; separate 0-based index space (Phase 7).
-pub(crate) const STORAGE_BUFFER_COUNT: u32 = 64;
+/// read-write these; separate 0-based index space (Phase 7). Raised 64→128 for Phase 14
+/// virtual geometry: the GI-heavy default scene already fills all 64 slots, leaving no room
+/// for vgeo's cluster-page / visibility / cut buffers. Must match `Bindless.storage_buffers[N]`
+/// in bindless.slang and the same constant in rhi-d3d12 / rhi-metal.
+pub(crate) const STORAGE_BUFFER_COUNT: u32 = 128;
 /// Size of the bindless sampled 3D-volume table (binding 6). Trilinear-sampled
 /// distance fields; separate 0-based index space (Phase 11 Stage B).
 pub(crate) const VOLUME_COUNT: u32 = 64;
@@ -60,7 +63,14 @@ pub(crate) struct DeviceShared {
     bindless_next: AtomicU32,
     cube_next: AtomicU32,
     storage_image_next: AtomicU32,
+    // High-water mark for the bindless storage-buffer table, plus a free-list of slots
+    // returned by dropped buffers. `register_storage_buffer` reuses a freed slot before
+    // bumping the mark, so a long run that creates + destroys storage buffers (resize,
+    // subsystem teardown) no longer walks the table monotonically to overflow. Reclaim is
+    // safe because a buffer only Drops after the frames that referenced it have retired
+    // (the handoff contract), so no in-flight command reads a reused slot's stale descriptor.
     storage_buffer_next: AtomicU32,
+    storage_buffer_free: Mutex<Vec<u32>>,
     volume_next: AtomicU32,
     storage_volume_next: AtomicU32,
     // Per-frame globals (set 1): one UNIFORM_BUFFER_DYNAMIC binding, written once
@@ -79,6 +89,15 @@ pub(crate) struct DeviceShared {
     pub compute_queue: vk::Queue,
     pub compute_command_pool: vk::CommandPool,
     pub has_dedicated_compute: bool,
+    // 64-bit buffer atomics (Phase 14 virtual geometry): true when `shaderInt64` +
+    // `shaderBufferInt64Atomics` are supported and enabled at device creation. The SW
+    // rasterizer's visibility buffer records `(depth<<32)|payload` with a single
+    // `OpAtomicUMax` on a u64 storage buffer, which needs both features.
+    pub has_atomic_int64: bool,
+    // Mesh + task shaders (Phase 14 virtual geometry Track B): true when `VK_EXT_mesh_shader`
+    // and its `meshShader`+`taskShader` features are enabled. Gates `create_mesh_pipeline`
+    // and the HW-path vgeo smokes.
+    pub has_mesh_shader: bool,
     // Hardware ray tracing (Phase 8): true when the acceleration-structure +
     // ray-query + ray-tracing-pipeline extensions are enabled.
     pub has_raytracing: bool,
@@ -89,6 +108,9 @@ pub(crate) struct DeviceShared {
     // `vkGetRayTracingShaderGroupHandlesKHR`, `vkCmdTraceRaysKHR`) and the SBT
     // record sizing it requires; `Some` only when `has_raytracing` (Phase 8 M5).
     pub rt_pipeline_loader: Option<ash::khr::ray_tracing_pipeline::Device>,
+    // Mesh-shader command loader (`vkCmdDrawMeshTasksEXT` / `…IndirectEXT`); `Some` only
+    // when `has_mesh_shader` (Phase 14 Track B).
+    pub mesh_shader_loader: Option<ash::ext::mesh_shader::Device>,
     pub rt_handle_size: u32,
     pub rt_handle_alignment: u32,
     pub rt_base_alignment: u32,
@@ -169,6 +191,29 @@ impl DeviceShared {
             let phys_limits = raw_inst
                 .get_physical_device_properties(instance.physical_device)
                 .limits;
+
+            // 64-bit buffer atomics (Phase 14 virtual geometry). `shaderBufferInt64Atomics` is
+            // Vulkan-1.2 core (promoted from `VK_KHR_shader_atomic_int64`); the visibility-buffer
+            // `OpAtomicUMax` on a u64 also needs the base `shaderInt64` feature for the Int64 type.
+            // Probe both via a `Features2` chain and only enable when supported, so devices without
+            // it still create a valid logical device (the vgeo path then gates off via capabilities).
+            // Mesh + task shaders (Phase 14 virtual geometry Track B, `VK_EXT_mesh_shader`). Probe
+            // the extension AND the `taskShader`+`meshShader` features in the same `Features2`
+            // chain; enable only when both are present so devices without it still create a valid
+            // logical device (the HW-path vgeo smokes gate off via `capabilities().mesh_shader`).
+            let mesh_ext_supported = supported_exts
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(ash::ext::mesh_shader::NAME));
+            let mut probe_vk12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut probe_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+            let mut probe_features2 = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut probe_vk12)
+                .push_next(&mut probe_mesh);
+            raw_inst.get_physical_device_features2(instance.physical_device, &mut probe_features2);
+            let has_atomic_int64 =
+                phys_features.shader_int64 != 0 && probe_vk12.shader_buffer_int64_atomics != 0;
+            let has_mesh_shader =
+                mesh_ext_supported && probe_mesh.mesh_shader != 0 && probe_mesh.task_shader != 0;
             let max_anisotropy = if aniso_req > 1.0 && phys_features.sampler_anisotropy != 0 {
                 aniso_req.min(phys_limits.max_sampler_anisotropy)
             } else {
@@ -180,6 +225,9 @@ impl DeviceShared {
                 for name in &rt_extensions {
                     device_extensions.push(name.as_ptr());
                 }
+            }
+            if has_mesh_shader {
+                device_extensions.push(ash::ext::mesh_shader::NAME.as_ptr());
             }
             let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
                 .dynamic_rendering(true)
@@ -194,7 +242,9 @@ impl DeviceShared {
                 .descriptor_binding_sampled_image_update_after_bind(true)
                 .descriptor_binding_storage_image_update_after_bind(true)
                 .descriptor_binding_storage_buffer_update_after_bind(true)
-                .buffer_device_address(has_raytracing);
+                .buffer_device_address(has_raytracing)
+                // Phase 14: 64-bit buffer atomics for the SW-raster visibility buffer.
+                .shader_buffer_int64_atomics(has_atomic_int64);
             // SV_VertexID full-screen-triangle shaders (triangle/post/blur) compile
             // to SPIR-V using the DrawParameters capability.
             let mut features11 =
@@ -215,7 +265,9 @@ impl DeviceShared {
                 // (D3D12 IndependentBlendEnable / Metal per-attachment are always available).
                 .independent_blend(true)
                 // 1b: only requested + supported when P_ANISO opts in (else false = unchanged).
-                .sampler_anisotropy(max_anisotropy > 1.0);
+                .sampler_anisotropy(max_anisotropy > 1.0)
+                // Phase 14: the Int64 type used by the visibility-buffer atomicMax / u64 store.
+                .shader_int64(has_atomic_int64);
             // RT feature structs (Phase 8) — only chained when the extensions are
             // enabled, else validation rejects the unsupported feature structs.
             let mut accel_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
@@ -229,6 +281,10 @@ impl DeviceShared {
             let mut rt_pipeline_features =
                 vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
                     .ray_tracing_pipeline(true);
+            // Phase 14: task + mesh stages, chained only when the extension is enabled.
+            let mut mesh_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+                .task_shader(true)
+                .mesh_shader(true);
 
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
                 .features(base_features)
@@ -240,6 +296,9 @@ impl DeviceShared {
                     .push_next(&mut accel_features)
                     .push_next(&mut ray_query_features)
                     .push_next(&mut rt_pipeline_features);
+            }
+            if has_mesh_shader {
+                features2 = features2.push_next(&mut mesh_features);
             }
 
             let device_ci = vk::DeviceCreateInfo::default()
@@ -263,6 +322,10 @@ impl DeviceShared {
                 has_raytracing.then(|| ash::khr::acceleration_structure::Device::new(raw, &device));
             let rt_pipeline_loader =
                 has_raytracing.then(|| ash::khr::ray_tracing_pipeline::Device::new(raw, &device));
+            // Mesh-shader command loader (`vkCmdDrawMeshTasksEXT` etc.); `Some` only when
+            // `VK_EXT_mesh_shader` is enabled (Phase 14 Track B).
+            let mesh_shader_loader =
+                has_mesh_shader.then(|| ash::ext::mesh_shader::Device::new(raw, &device));
             // Device-level debug-utils loader (cmd labels + object names), only when
             // the instance enabled VK_EXT_debug_utils (debug build + validation).
             let debug_utils = instance
@@ -303,7 +366,7 @@ impl DeviceShared {
                 bindless_set,
                 bindless_sampler,
                 bindless_sampler_wrap,
-            ) = create_bindless(&device, has_raytracing, max_anisotropy)?;
+            ) = create_bindless(&device, has_raytracing, has_mesh_shader, max_anisotropy)?;
             let (globals_pool, globals_layout, globals_set) = create_globals(&device)?;
 
             Ok(Self {
@@ -323,6 +386,7 @@ impl DeviceShared {
                 cube_next: AtomicU32::new(0),
                 storage_image_next: AtomicU32::new(0),
                 storage_buffer_next: AtomicU32::new(0),
+                storage_buffer_free: Mutex::new(Vec::new()),
                 volume_next: AtomicU32::new(0),
                 storage_volume_next: AtomicU32::new(0),
                 globals_pool,
@@ -333,9 +397,12 @@ impl DeviceShared {
                 compute_queue,
                 compute_command_pool,
                 has_dedicated_compute,
+                has_atomic_int64,
+                has_mesh_shader,
                 has_raytracing,
                 accel_loader,
                 rt_pipeline_loader,
+                mesh_shader_loader,
                 rt_handle_size,
                 rt_handle_alignment,
                 rt_base_alignment,
@@ -487,7 +554,18 @@ impl DeviceShared {
     /// Register a storage-buffer (UAV) in the bindless table (binding 4),
     /// returning its index in the separate 0-based storage-buffer space.
     pub(crate) fn register_storage_buffer(&self, buffer: vk::Buffer, range: u64) -> u32 {
-        let index = self.storage_buffer_next.fetch_add(1, Ordering::Relaxed);
+        // Reuse a freed slot before bumping the high-water mark (see the field docs).
+        let index = self
+            .storage_buffer_free
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| self.storage_buffer_next.fetch_add(1, Ordering::Relaxed));
+        assert!(
+            index < STORAGE_BUFFER_COUNT,
+            "bindless storage-buffer table overflow (> {STORAGE_BUFFER_COUNT}); raise \
+             STORAGE_BUFFER_COUNT across bindless.slang + all three backends"
+        );
         let info = [vk::DescriptorBufferInfo::default()
             .buffer(buffer)
             .offset(0)
@@ -500,6 +578,13 @@ impl DeviceShared {
             .buffer_info(&info);
         unsafe { self.device.update_descriptor_sets(&[write], &[]) };
         index
+    }
+
+    /// Return a storage-buffer slot to the free-list (called from `VulkanStorageBuffer::drop`).
+    /// The stale descriptor at `index` is left in place — no shader indexes a freed slot, and the
+    /// next `register_storage_buffer` that reuses the slot overwrites it.
+    pub(crate) fn free_storage_buffer(&self, index: u32) {
+        self.storage_buffer_free.lock().unwrap().push(index);
     }
 
     /// Register a sampled 3D volume view in the bindless table (binding 6),
@@ -616,6 +701,7 @@ impl DeviceShared {
 fn create_bindless(
     device: &ash::Device,
     has_raytracing: bool,
+    has_mesh_shader: bool,
     max_anisotropy: f32,
 ) -> Result<
     (
@@ -673,8 +759,20 @@ fn create_bindless(
         // compute passes sample textures) AND the RT stages (closest-hit material
         // textures). Storage image/buffer are written by compute; the storage buffer
         // is also read by the vertex stage (particle vertex-pull).
-        let sampled_stages =
-            vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE | rt_stages;
+        // Phase 14 Track B: the mesh + task stages read bindless storage buffers (cluster
+        // geometry) and, in material mode, sample textures. `MESH_EXT`/`TASK_EXT` are only valid
+        // flag bits when `VK_EXT_mesh_shader` is enabled, so gate them on the capability (D3D12's
+        // `SHADER_VISIBILITY_ALL` covers these stages unconditionally). Without these, the cluster
+        // mesh shader's storage-buffer reads are invalid and it emits no geometry on Vulkan.
+        let mesh_stages = if has_mesh_shader {
+            vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::TASK_EXT
+        } else {
+            vk::ShaderStageFlags::empty()
+        };
+        let sampled_stages = vk::ShaderStageFlags::FRAGMENT
+            | vk::ShaderStageFlags::COMPUTE
+            | rt_stages
+            | mesh_stages;
         let dynamic = vk::DescriptorBindingFlags::PARTIALLY_BOUND
             | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
         let mut bindings = vec![
@@ -712,7 +810,8 @@ fn create_bindless(
                     vk::ShaderStageFlags::COMPUTE
                         | vk::ShaderStageFlags::VERTEX
                         | vk::ShaderStageFlags::FRAGMENT
-                        | rt_stages,
+                        | rt_stages
+                        | mesh_stages,
                 ),
         ];
         let mut flags = vec![
@@ -1140,23 +1239,27 @@ impl VulkanDevice {
         }
     }
 
-    /// Compile a mesh-shader pipeline (Phase 14). Windows-box follow-up: requires
-    /// `VK_EXT_mesh_shader` enabled at device creation. Gated off via [`Self::capabilities`]
-    /// until then, so this is never reached (Metal is the verified path; DX≡VK follow-up).
+    /// Compile a mesh-shader pipeline (Phase 14 Track B): a `mesh`+`fragment` (optionally
+    /// `task`) pipeline built through `VK_EXT_mesh_shader`. Requires
+    /// [`DeviceCapabilities::mesh_shader`] (callers gate on it).
     pub fn create_mesh_pipeline(
         &self,
-        _desc: &rhi_types::MeshPipelineDesc,
+        desc: &rhi_types::MeshPipelineDesc,
     ) -> Result<crate::VulkanMeshPipeline, EngineError> {
-        unimplemented!("Vulkan mesh-shader pipeline pending (Phase 14 Windows follow-up)")
+        crate::VulkanMeshPipeline::new(self.shared.clone(), desc)
     }
 
-    /// Optional GPU capabilities (Phase 14 virtual geometry). NOTE: reports all-`false`
-    /// until the Windows-box follow-up enables the corresponding device features at creation
-    /// (`VK_EXT_mesh_shader`, `shaderBufferInt64Atomics`) and probes them here. The vgeo
-    /// smokes gate on this, so they fail clearly on Vulkan until then (Metal is verified on
-    /// the macOS box; DX≡VK is the tracked follow-up).
+    /// Optional GPU capabilities (Phase 14 virtual geometry). `atomic_int64` reflects the
+    /// probed + enabled `shaderInt64` + `shaderBufferInt64Atomics` features (the SW-raster
+    /// visibility-buffer path); `mesh_shader` reflects `VK_EXT_mesh_shader` + its
+    /// `meshShader`/`taskShader` features (Track B HW path).
     pub fn capabilities(&self) -> rhi_types::DeviceCapabilities {
-        rhi_types::DeviceCapabilities::default()
+        rhi_types::DeviceCapabilities {
+            mesh_shader: self.shared.has_mesh_shader,
+            atomic_int64: self.shared.has_atomic_int64,
+            // `vkCmdDispatchIndirect` is Vulkan-1.0 core — always available.
+            dispatch_indirect: true,
+        }
     }
 
     /// Whether hardware ray tracing is available (acceleration-structure +

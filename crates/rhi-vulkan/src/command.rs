@@ -28,6 +28,10 @@ pub struct VulkanCommandBuffer {
     current_layout: Cell<vk::PipelineLayout>,
     // Dynamic offset into the globals buffer for the next PBR pipeline bind.
     globals_offset: Cell<u32>,
+    // Push-constant stage set of the currently bound mesh pipeline (Phase 14 Track B). The
+    // range's stages depend on whether the pipeline has a task stage, so `push_constants_mesh`
+    // must push exactly what the bound pipeline's layout declared.
+    mesh_push_stages: Cell<vk::ShaderStageFlags>,
 }
 
 impl VulkanCommandBuffer {
@@ -59,6 +63,7 @@ impl VulkanCommandBuffer {
             pool,
             current_layout: Cell::new(vk::PipelineLayout::null()),
             globals_offset: Cell::new(0),
+            mesh_push_stages: Cell::new(vk::ShaderStageFlags::empty()),
         })
     }
 
@@ -940,14 +945,19 @@ impl VulkanCommandBuffer {
     /// UAV barrier on a storage buffer: order a compute write before any later
     /// shader read (compute / vertex / fragment).
     pub fn storage_buffer_barrier(&self, buffer: &VulkanStorageBuffer) {
+        // src covers COMPUTE/RT *and* the graphics stages: the Phase 14 Track B HW mesh-vis pass
+        // writes the shared visibility buffer from its FRAGMENT stage (mesh + fragment atomicMax),
+        // so ordering that write before a later reader needs FRAGMENT (and VERTEX, for the
+        // particle/cull vertex-pull producers) in the source scope too. D3D12/Metal UAV barriers
+        // are stage-agnostic; only Vulkan needs the explicit stages. Widening src is conservative —
+        // it only adds a dependency on stages that don't touch this buffer for compute producers.
+        let gfx = vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER;
         self.buffer_memory_barrier(
             buffer.raw(),
             vk::AccessFlags::SHADER_WRITE,
             vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            self.storage_stages(),
-            self.storage_stages()
-                | vk::PipelineStageFlags::VERTEX_SHADER
-                | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            self.storage_stages() | gfx,
+            self.storage_stages() | gfx,
         );
     }
 
@@ -1232,25 +1242,82 @@ impl VulkanCommandBuffer {
         }
     }
 
-    /// Bind a mesh-shader pipeline (Phase 14). Windows-box follow-up (`VK_EXT_mesh_shader`);
-    /// gated off via [`crate::VulkanDevice::capabilities`] until then.
-    pub fn bind_mesh_pipeline(&self, _pipeline: &crate::VulkanMeshPipeline) {
-        unimplemented!("Vulkan bind_mesh_pipeline pending (Phase 14 Windows follow-up)")
+    /// Bind a mesh-shader pipeline (Phase 14 Track B) and its bindless set 0 + globals set 1
+    /// (if any), mirroring [`Self::bind_graphics_pipeline`]. Draw with [`Self::draw_mesh_tasks`].
+    pub fn bind_mesh_pipeline(&self, pipeline: &crate::VulkanMeshPipeline) {
+        unsafe {
+            self.device.device.cmd_bind_pipeline(
+                self.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline.raw(),
+            );
+            self.current_layout.set(pipeline.layout());
+            self.mesh_push_stages.set(pipeline.push_stages());
+            if pipeline.is_bindless() {
+                self.device.device.cmd_bind_descriptor_sets(
+                    self.cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.layout(),
+                    0,
+                    &[self.device.bindless_set],
+                    &[],
+                );
+            }
+            if pipeline.uses_uniform() {
+                self.device.device.cmd_bind_descriptor_sets(
+                    self.cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.layout(),
+                    1,
+                    &[self.device.globals_set],
+                    &[self.globals_offset.get()],
+                );
+            }
+        }
     }
 
-    /// Draw mesh threadgroups (Phase 14). Windows-box follow-up (`cmd_draw_mesh_tasks_ext`).
-    pub fn draw_mesh_tasks(&self, _x: u32, _y: u32, _z: u32) {
-        unimplemented!("Vulkan draw_mesh_tasks pending (Phase 14 Windows follow-up)")
+    /// Draw `(x, y, z)` mesh threadgroups of the bound mesh pipeline (`vkCmdDrawMeshTasksEXT`).
+    pub fn draw_mesh_tasks(&self, x: u32, y: u32, z: u32) {
+        let loader = self
+            .device
+            .mesh_shader_loader
+            .as_ref()
+            .expect("mesh-shader loader (mesh-shader-capable device)");
+        unsafe { loader.cmd_draw_mesh_tasks(self.cmd, x, y, z) };
     }
 
-    /// Mesh-pipeline push constants (Phase 14). Windows-box follow-up.
-    pub fn push_constants_mesh(&self, _data: &[u8]) {
-        unimplemented!("Vulkan push_constants_mesh pending (Phase 14 Windows follow-up)")
+    /// Mesh-pipeline push constants (visible to task/mesh/fragment). The range's stage flags
+    /// must match the pipeline layout's (see `build_mesh`), so push to all three.
+    pub fn push_constants_mesh(&self, data: &[u8]) {
+        unsafe {
+            self.device.device.cmd_push_constants(
+                self.cmd,
+                self.current_layout.get(),
+                self.mesh_push_stages.get(),
+                0,
+                data,
+            );
+        }
     }
 
-    /// Indirect mesh draw (Phase 14 M3). Windows-box follow-up (`cmd_draw_mesh_tasks_indirect_ext`).
-    pub fn draw_mesh_tasks_indirect(&self, _buffer: &VulkanStorageBuffer, _offset: u64) {
-        unimplemented!("Vulkan draw_mesh_tasks_indirect pending (Phase 14 Windows follow-up)")
+    /// Indirect mesh draw (Phase 14 M3): the threadgroup grid is read from `buffer[offset..]`
+    /// as one `VkDrawMeshTasksIndirectCommandEXT` (three `u32` groupCount, matching the layout
+    /// the LOD-cut compute writes). The buffer must be in indirect-read state.
+    pub fn draw_mesh_tasks_indirect(&self, buffer: &VulkanStorageBuffer, offset: u64) {
+        let loader = self
+            .device
+            .mesh_shader_loader
+            .as_ref()
+            .expect("mesh-shader loader (mesh-shader-capable device)");
+        unsafe {
+            loader.cmd_draw_mesh_tasks_indirect(
+                self.cmd,
+                buffer.raw(),
+                offset,
+                1,
+                std::mem::size_of::<vk::DrawMeshTasksIndirectCommandEXT>() as u32,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

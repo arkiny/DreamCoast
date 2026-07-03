@@ -26,8 +26,8 @@ use std::cell::RefCell;
 use rhi_types::{ClearColor, Extent2D, Rect2D};
 
 use crate::{
-    Buffer, CommandBuffer, ComputePipeline, Cubemap, DepthBuffer, GraphicsPipeline, QueryHeap,
-    RaytracingPipeline, RenderTarget, Result, StorageBuffer, Swapchain, Volume,
+    Buffer, CommandBuffer, ComputePipeline, Cubemap, DepthBuffer, GraphicsPipeline, MeshPipeline,
+    QueryHeap, RaytracingPipeline, RenderTarget, Result, StorageBuffer, Swapchain, Volume,
 };
 
 /// A `Send` raw pointer to a borrowed facade resource, valid for the frame under
@@ -143,6 +143,11 @@ pub trait Recorder {
     fn bind_index_buffer(&self, buffer: &Buffer, wide: bool);
     fn push_constants(&self, data: &[u8]);
     fn draw_indexed(&self, index_count: u32, first_index: u32, vertex_offset: i32);
+    // Phase 14 Track B: mesh-shader (HW virtual-geometry) commands.
+    fn bind_mesh_pipeline(&self, pipeline: &MeshPipeline);
+    fn draw_mesh_tasks(&self, x: u32, y: u32, z: u32);
+    fn push_constants_mesh(&self, data: &[u8]);
+    fn draw_mesh_tasks_indirect(&self, buffer: &StorageBuffer, offset: u64);
 }
 
 /// [`CommandBuffer`] records immediately by forwarding to its inherent methods.
@@ -320,6 +325,18 @@ impl Recorder for CommandBuffer {
     }
     fn draw_indexed(&self, index_count: u32, first_index: u32, vertex_offset: i32) {
         CommandBuffer::draw_indexed(self, index_count, first_index, vertex_offset)
+    }
+    fn bind_mesh_pipeline(&self, pipeline: &MeshPipeline) {
+        CommandBuffer::bind_mesh_pipeline(self, pipeline)
+    }
+    fn draw_mesh_tasks(&self, x: u32, y: u32, z: u32) {
+        CommandBuffer::draw_mesh_tasks(self, x, y, z)
+    }
+    fn push_constants_mesh(&self, data: &[u8]) {
+        CommandBuffer::push_constants_mesh(self, data)
+    }
+    fn draw_mesh_tasks_indirect(&self, buffer: &StorageBuffer, offset: u64) {
+        CommandBuffer::draw_mesh_tasks_indirect(self, buffer, offset)
     }
 }
 
@@ -500,6 +517,23 @@ pub enum RhiCommand {
         first_index: u32,
         vertex_offset: i32,
     },
+    // Phase 14 Track B: mesh-shader commands.
+    BindMeshPipeline {
+        pipeline: ResPtr<MeshPipeline>,
+    },
+    DrawMeshTasks {
+        x: u32,
+        y: u32,
+        z: u32,
+    },
+    PushConstantsMesh {
+        off: u32,
+        len: u32,
+    },
+    DrawMeshTasksIndirect {
+        buffer: ResPtr<StorageBuffer>,
+        offset: u64,
+    },
 }
 
 #[derive(Default)]
@@ -606,7 +640,8 @@ impl CommandList {
             match &mut c {
                 RhiCommand::PushConstants { off, .. }
                 | RhiCommand::PushConstantsCompute { off, .. }
-                | RhiCommand::PushConstantsRt { off, .. } => *off += push_base,
+                | RhiCommand::PushConstantsRt { off, .. }
+                | RhiCommand::PushConstantsMesh { off, .. } => *off += push_base,
                 RhiCommand::BeginDebugLabel { off, .. } => *off += labels_base,
                 RhiCommand::BeginRenderingTargets { off, .. } => *off += targets_base,
                 _ => {}
@@ -824,6 +859,16 @@ impl CommandList {
                     first_index,
                     vertex_offset,
                 } => cmd.draw_indexed(index_count, first_index, vertex_offset),
+                RhiCommand::BindMeshPipeline { pipeline } => {
+                    cmd.bind_mesh_pipeline(unsafe { pipeline.get() })
+                }
+                RhiCommand::DrawMeshTasks { x, y, z } => cmd.draw_mesh_tasks(x, y, z),
+                RhiCommand::PushConstantsMesh { off, len } => {
+                    cmd.push_constants_mesh(blob(off, len))
+                }
+                RhiCommand::DrawMeshTasksIndirect { buffer, offset } => {
+                    cmd.draw_mesh_tasks_indirect(unsafe { buffer.get() }, offset)
+                }
             }
         }
         Ok(())
@@ -1220,6 +1265,34 @@ impl Recorder for CommandList {
             vertex_offset,
         });
     }
+    fn bind_mesh_pipeline(&self, pipeline: &MeshPipeline) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BindMeshPipeline {
+                pipeline: ResPtr::new(pipeline),
+            });
+    }
+    fn draw_mesh_tasks(&self, x: u32, y: u32, z: u32) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::DrawMeshTasks { x, y, z });
+    }
+    fn push_constants_mesh(&self, data: &[u8]) {
+        let mut i = self.inner.borrow_mut();
+        let (off, len) = i.push_blob(data);
+        i.cmds.push(RhiCommand::PushConstantsMesh { off, len });
+    }
+    fn draw_mesh_tasks_indirect(&self, buffer: &StorageBuffer, offset: u64) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::DrawMeshTasksIndirect {
+                buffer: ResPtr::new(buffer),
+                offset,
+            });
+    }
 }
 
 #[cfg(test)]
@@ -1237,6 +1310,30 @@ mod tests {
         list.draw_indexed(36, 0, 0);
         assert_eq!(list.len(), 5);
         assert_eq!(list.inner.borrow().push, vec![1, 2, 3, 4, 9, 9]);
+    }
+
+    #[test]
+    fn records_mesh_commands_into_push_arena() {
+        // Phase 14 Track B: the mesh commands record like the others, and
+        // push_constants_mesh shares the `push` arena with the graphics/compute pushes.
+        let list = CommandList::new();
+        list.draw_mesh_tasks(4, 1, 1);
+        list.push_constants_mesh(&[7, 7, 7, 7]);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.inner.borrow().push, vec![7, 7, 7, 7]);
+        // The mesh push offset is rebased on append, like the other push kinds.
+        let a = CommandList::new();
+        a.push_constants(&[1, 2]);
+        let b = CommandList::new();
+        b.push_constants_mesh(&[3, 4]);
+        a.append(b);
+        let inner = a.inner.borrow();
+        match inner.cmds.last().unwrap() {
+            RhiCommand::PushConstantsMesh { off, len } => {
+                assert_eq!(&inner.push[*off as usize..(*off + *len) as usize], &[3, 4]);
+            }
+            _ => panic!("expected PushConstantsMesh last"),
+        }
     }
 
     #[test]

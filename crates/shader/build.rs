@@ -54,22 +54,158 @@ fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
     h
 }
 
-/// HLSL shader profile for a (target, stage), or `None` for the Metal target (which
+/// HLSL shader profile for a (target, stage, key), or `None` for the Metal target (which
 /// derives everything from the stage). **Single source of truth** shared by both the
 /// cache key and the slangc `-profile` arg below, so the key can never drift from what
 /// is actually compiled. Ray-tracing stages need a DXIL *library* (`lib_6_5`); inline
 /// `RayQuery` requires >= 6.5. SPIR-V uses `sm_6_5` for every stage (RT comes from the
-/// stage capability).
-fn profile_for(target: &str, stage: &str) -> Option<&'static str> {
+/// stage capability). A few DXIL entry points need `sm_6_6` — see `dxil_needs_sm66`.
+fn profile_for(target: &str, stage: &str, key: &str) -> Option<&'static str> {
     match target {
         "spirv" => Some("sm_6_5"),
         "dxil" => Some(if is_rt_stage(stage) {
             "lib_6_5"
+        } else if dxil_needs_sm66(key) {
+            "sm_6_6"
         } else {
             "sm_6_5"
         }),
         _ => None,
     }
+}
+
+/// DXIL entry points that require **Shader Model 6.6**. Slang internally auto-upgrades the
+/// profile when it sees an SM6.6-only op (it warns E41012), but that upgrade does NOT reach
+/// the shader-model DXC targets, so a 64-bit buffer atomic (`InterlockedMax64` — the
+/// visibility-buffer primitive of Phase 14 virtual geometry) lowers to `dx.op.atomicBinOp.i64`
+/// and DXC rejects it with "64-bit atomic operations should only be used in Shader Model 6.6+".
+/// Setting the profile to `sm_6_6` here fixes it. This is **per-entry**, not per-file:
+/// `vgeo_swraster`'s `csClear` uses no atomic and stays on 6.5 (only `csRaster` needs 6.6).
+/// Keep in sync with any shader that gains a 64-bit atomic or another SM6.6-only op. SPIR-V
+/// needs no analogue — Slang infers the `Int64Atomics` capability from the op directly.
+///
+/// `vgeo_hwvis_fs` is the Track B (HW-path) counterpart of `vgeo_swraster_cs`: its fragment
+/// stage records the same `(depthKey<<32)|payload` into the R64 visibility buffer with an
+/// `InterlockedMax64`, so it needs SM6.6 too. The mesh stages (`*_ms`) carry no atomic and stay
+/// on the default `sm_6_5` (the minimum mesh-shader profile).
+fn dxil_needs_sm66(key: &str) -> bool {
+    matches!(key, "vgeo_atomic_cs" | "vgeo_swraster_cs" | "vgeo_hwvis_fs")
+}
+
+/// Mesh entry points whose DXIL must be produced via the slang→HLSL→patch→DXC workaround
+/// below instead of a direct `slangc -target dxil`. Slang 2026.10.2 has a HLSL-emit bug: when a
+/// mesh shader declares **all three** output kinds (`vertices` + `indices` + `primitives`) it
+/// drops the `vertices` modifier from the vertex-output parameter, so DXC rejects the SV_Position
+/// semantic ("invalid for shader model: ms"). Two-output mesh shaders (`vgeo_meshlet`,
+/// `vgeo_cluster` = vertices+indices) are unaffected and compile directly. SPIR-V + Metal emit the
+/// modifier correctly, so only DXIL needs the patch. Keep in sync with any mesh shader that adds a
+/// per-`primitives` output. See `compile_mesh_dxil_via_hlsl_patch`.
+fn dxil_mesh_needs_vertices_patch(key: &str) -> bool {
+    matches!(key, "vgeo_hwvis_ms")
+}
+
+/// Re-insert the `out vertices` modifier Slang drops from a mesh shader's vertex-output parameter
+/// (see `dxil_mesh_needs_vertices_patch`). The buggy emission is `<Type>  verts_<N>[<M>U]`; DXC
+/// needs `out vertices <Type>  verts_<N>[...]`. The parameter is named `verts` by convention in
+/// our mesh shaders, so the patch keys on that. Returns the HLSL unchanged (and the caller's
+/// assertion fires) if the pattern is absent — e.g. if a future Slang fixes the bug, the direct
+/// path in the emit loop is used instead.
+fn patch_mesh_vertices_out(hlsl: &str) -> String {
+    // Operate only on the entry function signature line (the body also mentions `verts_`).
+    let Some(line_start) = hlsl.find("void meshMain(") else {
+        return hlsl.to_string();
+    };
+    let line_end = hlsl[line_start..]
+        .find(')')
+        .map(|o| line_start + o)
+        .unwrap_or(hlsl.len());
+    let sig = &hlsl[line_start..line_end];
+    // Find the vertex-output parameter `<Type>  verts_<N>` inside the signature.
+    let Some(rel) = sig.find("  verts_") else {
+        return hlsl.to_string();
+    };
+    let abs = line_start + rel; // index of the first of the two spaces before `verts_`
+    let bytes = hlsl.as_bytes();
+    // Walk back over the two spaces, then the type identifier, to the type-token start.
+    let mut i = abs;
+    while i > 0 && bytes[i - 1] == b' ' {
+        i -= 1;
+    }
+    while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+        i -= 1;
+    }
+    // Already patched / already correct (Slang fixed): leave it.
+    if hlsl[..i].trim_end().ends_with("vertices") {
+        return hlsl.to_string();
+    }
+    let mut out = String::with_capacity(hlsl.len() + 13);
+    out.push_str(&hlsl[..i]);
+    out.push_str("out vertices ");
+    out.push_str(&hlsl[i..]);
+    out
+}
+
+/// Produce DXIL for a three-output mesh shader via slang→HLSL, patch the dropped `vertices`
+/// modifier, then compile the patched HLSL with `slangc -pass-through dxc` (Slang's bundled
+/// dxcompiler — no standalone dxc.exe needed). See `dxil_mesh_needs_vertices_patch`.
+fn compile_mesh_dxil_via_hlsl_patch(
+    slangc: &Path,
+    tool_home: &Path,
+    src_path: &Path,
+    job: &Job,
+    profile: &str,
+    out_path: &Path,
+) -> Result<(), String> {
+    let hlsl_path = out_path.with_extension("patch.hlsl");
+    // 1) slang → HLSL.
+    let out = slang_command(slangc, tool_home)
+        .arg(src_path)
+        .args(["-target", "hlsl"])
+        .args(["-entry", job.entry])
+        .args(["-stage", job.stage])
+        .args(["-profile", profile])
+        .arg("-o")
+        .arg(&hlsl_path)
+        .output()
+        .map_err(|e| format!("failed to launch slangc (HLSL): {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "slangc HLSL failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    // 2) patch the dropped `out vertices` modifier.
+    let hlsl = std::fs::read_to_string(&hlsl_path).map_err(|e| e.to_string())?;
+    let patched = patch_mesh_vertices_out(&hlsl);
+    if !patched.contains("out vertices") {
+        return Err(format!(
+            "mesh-DXIL patch found no vertex-output parameter to fix in {} — the Slang emission \
+             may have changed; review patch_mesh_vertices_out",
+            hlsl_path.display()
+        ));
+    }
+    std::fs::write(&hlsl_path, &patched).map_err(|e| e.to_string())?;
+    // 3) patched HLSL → DXIL via slang's bundled DXC (pass-through).
+    let out = slang_command(slangc, tool_home)
+        .arg(&hlsl_path)
+        .args(["-target", "dxil"])
+        .args(["-entry", job.entry])
+        .args(["-stage", job.stage])
+        .args(["-profile", profile])
+        .args(["-pass-through", "dxc"])
+        .arg("-o")
+        .arg(out_path)
+        .output()
+        .map_err(|e| format!("failed to launch slangc (pass-through dxc): {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "slangc pass-through dxc failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
 }
 
 /// Preprocessor `-D` defines for a target. **Single source of truth** for both the
@@ -161,7 +297,7 @@ fn cell_key(
     cache_dir: &Path,
     out_dir: &Path,
 ) -> CellKey {
-    let profile = profile_for(target, job.stage);
+    let profile = profile_for(target, job.stage, job.key);
     let defines = defines_for(target, job.key);
     let defines_str: String = defines.iter().map(|(k, v)| format!("{k}={v};")).collect();
     let params = format!(
@@ -1152,6 +1288,10 @@ fn main() {
         for (target, ext, _suffix, _required) in TARGETS {
             if !target_selected(target, &target_os)
                 || (*target == "metallib" && is_rt_stage(job.stage))
+                // The 3-output mesh-DXIL workaround is compiled inline in the emit loop
+                // (two slangc invocations + an HLSL patch), not through the single-Command
+                // parallel queue — mirror the Metal RT-pipeline branch's inline handling.
+                || (*target == "dxil" && dxil_mesh_needs_vertices_patch(job.key))
             {
                 continue;
             }
@@ -1255,6 +1395,43 @@ fn main() {
                             emit_none(&mut generated, RT_PIPELINE_DISPATCH_KEY, "metallib");
                             rt_pipeline_dispatch_emitted = true;
                         }
+                    }
+                }
+                continue;
+            }
+
+            // 3-output mesh-DXIL workaround (Slang codegen bug): compiled inline via
+            // slang→HLSL→patch→DXC. Cached like any other cell (manifest + on-disk artifact),
+            // just produced by a dedicated two-step path. Skipped in the parallel pre-pass.
+            if *target == "dxil" && dxil_mesh_needs_vertices_patch(job.key) {
+                let ck = cell_key(
+                    base_hash, &src_bytes, job, target, ext, &cache_dir, &out_dir,
+                );
+                if manifest.get(&ck.artifact_name) == Some(&ck.key_hash) && ck.out_path.exists() {
+                    emit_some(&mut generated, job.key, suffix, &ck.out_path);
+                    cache_hits += 1;
+                    continue;
+                }
+                match compile_mesh_dxil_via_hlsl_patch(
+                    &slangc,
+                    &shader_tool_home,
+                    &src_path,
+                    job,
+                    ck.profile.unwrap_or("sm_6_6"),
+                    &ck.out_path,
+                ) {
+                    Ok(()) => {
+                        emit_some(&mut generated, job.key, suffix, &ck.out_path);
+                        manifest.insert(ck.artifact_name, ck.key_hash);
+                        cache_compiled += 1;
+                    }
+                    Err(e) => {
+                        println!(
+                            "cargo:warning={} [{}/dxil] mesh-DXIL workaround failed \
+                             (optional target unavailable): {e}",
+                            job.src, job.entry
+                        );
+                        emit_none(&mut generated, job.key, suffix);
                     }
                 }
                 continue;

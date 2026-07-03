@@ -49,9 +49,10 @@ pub(crate) const CUBE_COUNT: u32 = 64;
 pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
 
 /// Size of the bindless storage-buffer (UAV) table. Matches `STORAGE_BUFFER_COUNT`
-/// in rhi-vulkan / rhi-d3d12 and `Bindless.storage_buffers[64]`; storage buffer `i`
-/// lives at handle slot `STORAGE_BUFFER_BASE + i` (M5).
-pub(crate) const STORAGE_BUFFER_COUNT: u32 = 64;
+/// in rhi-vulkan / rhi-d3d12 and `Bindless.storage_buffers[N]`; storage buffer `i`
+/// lives at handle slot `STORAGE_BUFFER_BASE + i` (M5). Raised 64→128 for Phase 14 virtual
+/// geometry (the GI-heavy default scene already fills all 64 slots — see the rhi-vulkan note).
+pub(crate) const STORAGE_BUFFER_COUNT: u32 = 128;
 
 /// First argument-buffer slot of the storage-image region. Mirrors the
 /// `Bindless { textures[1024], samp, cubes[64], storage_images[64],
@@ -172,11 +173,17 @@ pub(crate) struct DeviceShared {
     /// needs the texture object for each registered UAV slot instead of only the
     /// current resident set.
     storage_images: RefCell<StorageImageSlots>,
-    /// Every storage buffer ever created. They are persistent (seeded on the GPU,
-    /// never reallocated), so they stay permanently resident — made `useResource`
-    /// (`Read | Write` on compute, `Read` on the particle/cull draw vertex stage)
-    /// on every bindless encoder.
-    storage_buffers: RefCell<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    /// Live storage buffers, indexed by their bindless slot (`None` = freed slot). Referenced by
+    /// the argument buffer via GPU address, so each must be kept alive + made `useResource`
+    /// (`Read | Write` on compute, `Read` on the particle/cull draw vertex stage) on every bindless
+    /// encoder. A dropped `MetalStorageBuffer` clears its slot here (freeing the buffer) and returns
+    /// the index to `storage_buf_free`, so a long run creating + destroying buffers no longer grows
+    /// this table monotonically. Reclaim is safe: the handoff contract defers a buffer's Drop until
+    /// the frames referencing it retire.
+    storage_buffers: RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>>,
+    /// Free-list of storage-buffer slots returned by dropped buffers (reused before the high-water
+    /// `storage_buf_next` is bumped).
+    storage_buf_free: RefCell<Vec<u32>>,
     /// Acceleration structures (TLAS + BLAS) bound via [`MetalDevice::bind_tlas`].
     /// They must be made resident (`useResource`) on the inline path tracer's
     /// compute encoder, since the TLAS is reached indirectly through the bindless
@@ -259,8 +266,17 @@ impl DeviceShared {
     /// its 8-byte GPU virtual address (the MSL `device T*`), not an `MTLResourceID`.
     /// The buffer is kept permanently resident.
     fn register_storage_buffer(&self, buffer: &Retained<ProtocolObject<dyn MTLBuffer>>) -> u32 {
-        let index = self.storage_buf_next.get();
-        self.storage_buf_next.set(index + 1);
+        // Reuse a freed slot before bumping the high-water mark (see the field docs).
+        let index = self.storage_buf_free.borrow_mut().pop().unwrap_or_else(|| {
+            let i = self.storage_buf_next.get();
+            self.storage_buf_next.set(i + 1);
+            i
+        });
+        assert!(
+            index < STORAGE_BUFFER_COUNT,
+            "bindless storage-buffer table overflow (> {STORAGE_BUFFER_COUNT}); raise \
+             STORAGE_BUFFER_COUNT across bindless.slang + all three backends"
+        );
         let slot = STORAGE_BUFFER_BASE + index;
         let n = std::mem::size_of::<u64>();
         let addr = buffer.gpuAddress();
@@ -268,8 +284,23 @@ impl DeviceShared {
             let dst = (self.arg_buffer.contents().as_ptr() as *mut u8).add(slot as usize * n);
             std::ptr::copy_nonoverlapping((&addr as *const u64).cast::<u8>(), dst, n);
         }
-        self.storage_buffers.borrow_mut().push(buffer.clone());
+        // Store at the slot index (extend with `None` up to the slot when the mark grew).
+        let mut bufs = self.storage_buffers.borrow_mut();
+        if index as usize >= bufs.len() {
+            bufs.resize_with(index as usize + 1, || None);
+        }
+        bufs[index as usize] = Some(buffer.clone());
         index
+    }
+
+    /// Return a storage-buffer slot to the free-list and drop the device's strong ref to the
+    /// buffer (called from `MetalStorageBuffer::drop`). Safe: the handoff contract defers the Drop
+    /// until the referencing frames retire, so the argument-buffer slot is no longer read.
+    pub(crate) fn free_storage_buffer(&self, index: u32) {
+        if let Some(slot) = self.storage_buffers.borrow_mut().get_mut(index as usize) {
+            *slot = None;
+        }
+        self.storage_buf_free.borrow_mut().push(index);
     }
 
     /// Register a 3D volume texture in the bindless sampled-volume table
@@ -371,10 +402,10 @@ impl DeviceShared {
         self.storage_images.borrow()
     }
 
-    /// The storage buffers (UAV), all permanently resident.
+    /// The live storage buffers (UAV) by slot (`None` = freed); callers `.flatten()` to skip holes.
     pub(crate) fn storage_buffers(
         &self,
-    ) -> std::cell::Ref<'_, Vec<Retained<ProtocolObject<dyn MTLBuffer>>>> {
+    ) -> std::cell::Ref<'_, Vec<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>> {
         self.storage_buffers.borrow()
     }
 
@@ -539,6 +570,7 @@ impl MetalInstance {
             storage_resident: RefCell::new(Vec::new()),
             storage_images: RefCell::new(Vec::new()),
             storage_buffers: RefCell::new(Vec::new()),
+            storage_buf_free: RefCell::new(Vec::new()),
             rt_resident: RefCell::new(Vec::new()),
             rt_tlas: RefCell::new(None),
         });
@@ -747,7 +779,7 @@ impl MetalDevice {
             )
             .ok_or_else(|| rhi_err("storage buffer alloc failed"))?;
         let index = self.shared.register_storage_buffer(&buffer);
-        Ok(MetalStorageBuffer::new(buffer, index))
+        Ok(MetalStorageBuffer::new(self.shared.clone(), buffer, index))
     }
 
     /// Host-visible storage buffer (`StorageModeShared`) for per-frame CPU writes —
@@ -768,7 +800,7 @@ impl MetalDevice {
             )
             .ok_or_else(|| rhi_err("host storage buffer alloc failed"))?;
         let index = self.shared.register_storage_buffer(&buffer);
-        Ok(MetalStorageBuffer::new(buffer, index))
+        Ok(MetalStorageBuffer::new(self.shared.clone(), buffer, index))
     }
 
     /// Host-seeded storage buffer (Phase 8 RT geometry + per-instance table read by
@@ -794,7 +826,7 @@ impl MetalDevice {
             );
         }
         let index = self.shared.register_storage_buffer(&buffer);
-        Ok(MetalStorageBuffer::new(buffer, index))
+        Ok(MetalStorageBuffer::new(self.shared.clone(), buffer, index))
     }
 
     /// Store the per-frame globals UBO. `slice_size` is unused on Metal (the

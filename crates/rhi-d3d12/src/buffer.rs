@@ -408,3 +408,11 @@ impl D3d12StorageBuffer {
         self.state.set(state);
     }
 }
+
+impl Drop for D3d12StorageBuffer {
+    fn drop(&mut self) {
+        // Return the bindless slot to the free-list; the COM `resource` releases itself. Safe
+        // because the handoff contract defers this Drop until the referencing frames retire.
+        self.device.free_storage_buffer(self.index);
+    }
+}
