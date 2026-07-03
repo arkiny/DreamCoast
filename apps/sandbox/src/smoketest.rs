@@ -1009,7 +1009,7 @@ pub(crate) fn run_vgeo_mesh(
         Some(device.create_compute_pipeline(&ComputePipelineDesc {
             compute_bytes: cs,
             compute_entry: if bin { "csCutBin" } else { "csCut" },
-            push_constant_size: 144,
+            push_constant_size: 224,
             bindless: true,
             uniform_buffer: false,
             threads_per_group: [64, 1, 1],
@@ -1354,7 +1354,7 @@ pub(crate) fn run_vgeo_mesh(
             let planes = crate::push::frustum_planes(
                 Mat4::perspective_rh(60f32.to_radians(), w as f32 / h as f32, 0.05, 100.0) * view,
             );
-            let mut cpc = [0u8; 144];
+            let mut cpc = [0u8; 224];
             for (i, plane) in planes.iter().enumerate() {
                 for (j, f) in plane.iter().enumerate() {
                     cpc[i * 16 + j * 4..i * 16 + j * 4 + 4].copy_from_slice(&f.to_le_bytes());
@@ -1380,6 +1380,13 @@ pub(crate) fn run_vgeo_mesh(
                 cpc[136..140].copy_from_slice(&sw_args.storage_index().to_le_bytes());
                 cpc[140..144].copy_from_slice(&bin_px.to_le_bytes());
             }
+            // World-space cut (M-integration): the viewer recenters its mesh, so cluster space IS
+            // world → `model = identity`, `max_scale = 1` make the shader's transform a no-op.
+            let ident = Mat4::IDENTITY.to_cols_array();
+            for (i, v) in ident.iter().enumerate() {
+                cpc[144 + i * 4..148 + i * 4].copy_from_slice(&v.to_le_bytes());
+            }
+            cpc[208..212].copy_from_slice(&1.0f32.to_le_bytes());
             cmd.bind_compute_pipeline(cut_pipeline.as_ref().unwrap());
             cmd.push_constants_compute(&cpc);
             cmd.dispatch(total_clusters.div_ceil(64), 1, 1);

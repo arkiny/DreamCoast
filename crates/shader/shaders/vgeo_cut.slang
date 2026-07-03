@@ -19,8 +19,8 @@
 // position is three SCALAR floats, matching the byte layout the app writes.
 struct PushConstants
 {
-    float4 planes[6];  //   0: frustum planes (xyz=inward normal, w=d), normalized (96 B)
-    float cam_x;       //  96: world-space camera position (scalars, no float3 alignment)
+    float4 planes[6];  //   0: WORLD frustum planes (xyz=inward normal, w=d), normalized (96 B)
+    float cam_x;       //  96: WORLD camera position (scalars, no float3 alignment)
     float cam_y;
     float cam_z;
     float proj_factor; // 108: 0.5 * screen_height / tan(fov/2): world error → px at unit distance
@@ -29,11 +29,15 @@ struct PushConstants
     uint rec_buf;      // 120: GpuCluster records slot (96 B/record)
     uint vis_buf;      // 124: output list slot — `csCut`: the whole cut; `csCutBin`: the HW list
     uint args_buf;     // 128: output args {countX,1,1} — `csCut`: the cut; `csCutBin`: HW args
-    // M5b binning tail — occupies `csCut`'s former pad, so `csCut`'s byte layout is UNCHANGED (it
-    // never reads these; the app still writes 144 B with these zero for `csCut`).
     uint sw_list;      // 132: `csCutBin` SW-path visible-cluster list slot
     uint sw_args;      // 136: `csCutBin` SW-path indirect args {countX,1,1}
     float bin_px;      // 140: SW/HW split threshold — projected bounds diameter (px) below → SW
+    // Cluster bounds are stored in the mesh's LOCAL space; `model` transforms them to WORLD so the
+    // cull/error work for ANY object transform (incl. non-uniform node scale, where a local-space
+    // sphere test would be skewed). The self-contained viewer recenters its mesh and passes
+    // `model = identity`, `max_scale = 1` → a no-op (its old local == world behavior).
+    float4x4 model;    // 144: object → world (192 B total after the mat4)
+    float max_scale;   // 208: max column scale of `model` (conservatively scales sphere radii/errors)
 };
 
 [[vk::push_constant]]
@@ -44,12 +48,18 @@ float3 cam_pos()
     return float3(pc.cam_x, pc.cam_y, pc.cam_z);
 }
 
-// Screen-space (pixel) error of a world-space error `err` on a sphere (`center`, `radius`):
-// project by the near distance to the sphere. A cluster right at the camera → huge error.
-float screen_error(float err, float3 center, float radius)
+// A local-space point → world.
+float3 to_world(float3 p)
 {
-    float d = max(distance(cam_pos(), center) - radius, 1e-3);
-    return err * pc.proj_factor / d;
+    return mul(pc.model, float4(p, 1.0)).xyz;
+}
+
+// Screen-space (pixel) error of a WORLD error `err_w` on a WORLD sphere (`center_w`, `radius_w`):
+// project by the near distance to the sphere. A cluster right at the camera → huge error.
+float screen_error(float err_w, float3 center_w, float radius_w)
+{
+    float d = max(distance(cam_pos(), center_w) - radius_w, 1e-3);
+    return err_w * pc.proj_factor / d;
 }
 
 // Frustum cull: a bounding sphere is outside iff it is fully behind any inward-facing plane.
@@ -97,19 +107,22 @@ void csCut(uint3 tid: SV_DispatchThreadID)
     float3 cone_axis = asfloat(rec.Load3(base + 72));
     float cone_cutoff = asfloat(rec.Load(base + 84));
 
+    float ms = pc.max_scale;
     // LOD cut: draw iff this cluster's LOD is fine enough (self <= tau) but the parent is too
     // coarse (parent > tau). Group-uniform errors make every cluster in a group agree → no cracks.
-    float s_self = screen_error(self_err, self_c, self_r);
-    float s_par = (par_err >= 3.0e38) ? 1.0e30 : screen_error(par_err, par_c, par_r);
+    float s_self = screen_error(self_err * ms, to_world(self_c), self_r * ms);
+    float s_par =
+        (par_err >= 3.0e38) ? 1.0e30 : screen_error(par_err * ms, to_world(par_c), par_r * ms);
     if (!(s_self <= pc.tau && s_par > pc.tau))
         return;
 
     // Visibility cull (M4a): drop clusters that are off-screen (frustum) or entirely backfacing
-    // (normal cone). Both use the cluster's OWN bounds sphere — conservative, never drops a
-    // visible cluster.
-    if (outside_frustum(bnd_c, bnd_r))
+    // (normal cone), in WORLD space. Both use the cluster's OWN bounds sphere — conservative
+    // (radius scaled by the max axis scale), never drops a visible cluster.
+    float3 bnd_w = to_world(bnd_c);
+    if (outside_frustum(bnd_w, bnd_r * ms))
         return;
-    if (cone_backfacing(cone_axis, cone_cutoff, bnd_c))
+    if (cone_backfacing(normalize(mul((float3x3)pc.model, cone_axis)), cone_cutoff, bnd_w))
         return;
 
     {
@@ -132,18 +145,22 @@ bool select_cluster(uint c, out float3 bnd_c, out float bnd_r)
     float par_err = asfloat(rec.Load(base + 36));
     float3 par_c = asfloat(rec.Load3(base + 40));
     float par_r = asfloat(rec.Load(base + 52));
-    bnd_c = asfloat(rec.Load3(base + 56));
-    bnd_r = asfloat(rec.Load(base + 68));
     float3 cone_axis = asfloat(rec.Load3(base + 72));
     float cone_cutoff = asfloat(rec.Load(base + 84));
 
-    float s_self = screen_error(self_err, self_c, self_r);
-    float s_par = (par_err >= 3.0e38) ? 1.0e30 : screen_error(par_err, par_c, par_r);
+    float ms = pc.max_scale;
+    // Bounds returned in WORLD space (the binning caller projects them to a screen diameter).
+    bnd_c = to_world(asfloat(rec.Load3(base + 56)));
+    bnd_r = asfloat(rec.Load(base + 68)) * ms;
+
+    float s_self = screen_error(self_err * ms, to_world(self_c), self_r * ms);
+    float s_par =
+        (par_err >= 3.0e38) ? 1.0e30 : screen_error(par_err * ms, to_world(par_c), par_r * ms);
     if (!(s_self <= pc.tau && s_par > pc.tau))
         return false;
     if (outside_frustum(bnd_c, bnd_r))
         return false;
-    if (cone_backfacing(cone_axis, cone_cutoff, bnd_c))
+    if (cone_backfacing(normalize(mul((float3x3)pc.model, cone_axis)), cone_cutoff, bnd_c))
         return false;
     return true;
 }
