@@ -56,6 +56,19 @@ pub fn write_clusters(mc: &MeshClusters, src_hash: u64) -> Vec<u8> {
         }
         w.f32(c.cone_cutoff);
         w.u32(c.material);
+        // LOD DAG (M1d).
+        w.u32(c.lod_level);
+        w.u32(c.group);
+        w.f32(c.self_error);
+        for f in c.self_center {
+            w.f32(f);
+        }
+        w.f32(c.self_radius);
+        w.f32(c.parent_error);
+        for f in c.parent_center {
+            w.f32(f);
+        }
+        w.f32(c.parent_radius);
     }
 
     write_single_chunk(CHUNK_CLUSTERS, &w.buf, src_hash)
@@ -98,6 +111,14 @@ pub fn read_clusters(bytes: &[u8]) -> Result<(Header, MeshClusters), EngineError
             cone_axis: [r.f32()?, r.f32()?, r.f32()?],
             cone_cutoff: r.f32()?,
             material: r.u32()?,
+            lod_level: r.u32()?,
+            group: r.u32()?,
+            self_error: r.f32()?,
+            self_center: [r.f32()?, r.f32()?, r.f32()?],
+            self_radius: r.f32()?,
+            parent_error: r.f32()?,
+            parent_center: [r.f32()?, r.f32()?, r.f32()?],
+            parent_radius: r.f32()?,
         });
     }
 
@@ -116,7 +137,7 @@ pub fn read_clusters(bytes: &[u8]) -> Result<(Header, MeshClusters), EngineError
 mod tests {
     use super::*;
     use crate::MeshVertex;
-    use crate::vgeo::build_clusters;
+    use crate::vgeo::build_lod_dag;
 
     fn grid(n: u32) -> (Vec<MeshVertex>, Vec<u32>) {
         let mut verts = Vec::new();
@@ -141,9 +162,14 @@ mod tests {
 
     #[test]
     fn clusters_round_trip_byte_stable() {
-        let (verts, idx) = grid(24);
-        let mc = build_clusters(&verts, &idx, 3);
+        let (verts, idx) = grid(32);
+        // Full LOD DAG so the round-trip exercises the lod/error/sphere fields too.
+        let mc = build_lod_dag(&verts, &idx, 3);
         assert!(mc.clusters.len() > 1);
+        assert!(
+            mc.clusters.iter().any(|c| c.lod_level > 0),
+            "multi-LOD expected"
+        );
 
         let bytes = write_clusters(&mc, 0xDEAD_BEEF);
         let (header, back) = read_clusters(&bytes).expect("read clusters");
