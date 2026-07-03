@@ -922,6 +922,20 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "vgeo_meshlet_fs",
     },
+    // Phase 14 M2: resident cluster render via a mesh shader (reads cluster geometry from
+    // bindless storage buffers). Opt-in (`--vgeo-mesh`); no default pass references it.
+    Job {
+        src: "vgeo_cluster.slang",
+        entry: "meshMain",
+        stage: "mesh",
+        key: "vgeo_cluster_ms",
+    },
+    Job {
+        src: "vgeo_cluster.slang",
+        entry: "fragMain",
+        stage: "fragment",
+        key: "vgeo_cluster_fs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.

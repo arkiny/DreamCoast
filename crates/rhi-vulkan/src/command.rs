@@ -1243,6 +1243,11 @@ impl VulkanCommandBuffer {
         unimplemented!("Vulkan draw_mesh_tasks pending (Phase 14 Windows follow-up)")
     }
 
+    /// Mesh-pipeline push constants (Phase 14). Windows-box follow-up.
+    pub fn push_constants_mesh(&self, _data: &[u8]) {
+        unimplemented!("Vulkan push_constants_mesh pending (Phase 14 Windows follow-up)")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn image_barrier(
         &self,

@@ -939,6 +939,11 @@ impl D3d12CommandBuffer {
         unimplemented!("D3D12 draw_mesh_tasks pending (Phase 14 Windows follow-up)")
     }
 
+    /// Mesh-pipeline push constants (Phase 14). Windows-box follow-up.
+    pub fn push_constants_mesh(&self, _data: &[u8]) {
+        unimplemented!("D3D12 push_constants_mesh pending (Phase 14 Windows follow-up)")
+    }
+
     fn barrier(
         &self,
         resource: &ID3D12Resource,
