@@ -13,7 +13,7 @@ use dreamcoast_platform::Window;
 use rhi::{
     BackendKind, BlendMode, BufferDesc, BufferUsage, ClearColor, ComputePipelineDesc, DepthCompare,
     Device, Extent2D, Format, GraphicsPipelineDesc, MeshPipelineDesc, PrimitiveTopology,
-    StorageBufferDesc, Swapchain, Texture, VertexLayout,
+    StorageBuffer, StorageBufferDesc, Swapchain, Texture, VertexLayout,
 };
 use tracing::info;
 
@@ -973,24 +973,39 @@ pub(crate) fn run_vgeo_mesh(
     // writes the mesh-draw threadgroup count into `args_buf` for the indirect draw.
     // M5 software-raster mode (VGEO_SW=1): rasterize the cut's clusters into an R64 visibility
     // buffer via atomicMax, then visualize it. SW implies the cut (it needs the visible list).
+    // M5b HW/SW binning (VGEO_BIN=1): the cut is split into a HW (mesh-shader) list and a SW
+    // (compute-raster) list by projected screen size; both write the SAME R64 visibility buffer.
+    // `VGEO_BINPX` is the split threshold (projected bounds diameter in px, below → SW).
+    let bin = std::env::var("VGEO_BIN").ok().as_deref() == Some("1");
     let sw = std::env::var("VGEO_SW").ok().as_deref() == Some("1");
-    let cut = sw || std::env::var("VGEO_CUT").ok().as_deref() == Some("1");
+    let cut = sw || bin || std::env::var("VGEO_CUT").ok().as_deref() == Some("1");
     let tau: f32 = std::env::var("VGEO_TAU")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8.0);
+    let bin_px: f32 = std::env::var("VGEO_BINPX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16.0);
+    // `vis_buf`/`args_buf` are the cut's list/args (M3/M5a); in binning mode they carry the HW
+    // sub-list and `sw_list`/`sw_args` carry the SW sub-list.
     let vis_buf = sb(device, &vec![0u8; total_clusters as usize * 4], 4)?;
     let args_buf = sb(device, &[0u8; 12], 4)?; // {countX, 1, 1}
+    let sw_list = sb(device, &vec![0u8; total_clusters as usize * 4], 4)?;
+    let sw_args = sb(device, &[0u8; 12], 4)?;
     let cut_pipeline = if cut {
-        let cs = match backend {
-            BackendKind::Vulkan => dreamcoast_shader::vgeo_cut_cs_spirv(),
-            BackendKind::D3d12 => dreamcoast_shader::vgeo_cut_cs_dxil(),
-            BackendKind::Metal => dreamcoast_shader::vgeo_cut_cs_metallib(),
+        let cs = match (bin, backend) {
+            (false, BackendKind::Vulkan) => dreamcoast_shader::vgeo_cut_cs_spirv(),
+            (false, BackendKind::D3d12) => dreamcoast_shader::vgeo_cut_cs_dxil(),
+            (false, BackendKind::Metal) => dreamcoast_shader::vgeo_cut_cs_metallib(),
+            (true, BackendKind::Vulkan) => dreamcoast_shader::vgeo_cut_bin_cs_spirv(),
+            (true, BackendKind::D3d12) => dreamcoast_shader::vgeo_cut_bin_cs_dxil(),
+            (true, BackendKind::Metal) => dreamcoast_shader::vgeo_cut_bin_cs_metallib(),
         }
         .ok_or_else(|| anyhow!("vgeo_cut compute shader unavailable for {backend:?}"))?;
         Some(device.create_compute_pipeline(&ComputePipelineDesc {
             compute_bytes: cs,
-            compute_entry: "csCut",
+            compute_entry: if bin { "csCutBin" } else { "csCut" },
             push_constant_size: 144,
             bindless: true,
             uniform_buffer: false,
@@ -1008,7 +1023,12 @@ pub(crate) fn run_vgeo_mesh(
     } else {
         0
     };
-    if cut {
+    if bin {
+        info!(
+            "vgeo-mesh BIN: {total_clusters} clusters, tau {tau}px, HW/SW split at {bin_px}px \
+             diameter → HW mesh + SW raster into one R64 visibility buffer"
+        );
+    } else if cut {
         info!(
             "vgeo-mesh CUT: {total_clusters} clusters across all LODs, tau {tau}px, indirect draw"
         );
@@ -1054,7 +1074,7 @@ pub(crate) fn run_vgeo_mesh(
         stride: 8,
         indirect: false,
     })?;
-    let (sw_clear_pipeline, sw_raster_pipeline, vis_pipeline) = if sw {
+    let (sw_clear_pipeline, sw_raster_pipeline, vis_pipeline) = if sw || bin {
         let cshader = |spirv: fn() -> Option<&'static [u8]>,
                        dxil: fn() -> Option<&'static [u8]>,
                        metal: fn() -> Option<&'static [u8]>,
@@ -1130,6 +1150,46 @@ pub(crate) fn run_vgeo_mesh(
         (None, None, None)
     };
 
+    // M5b: the HW-path mesh pipeline that writes the shared visibility buffer (per-primitive triId
+    // + fragment atomicMax). No depth attachment — occlusion is resolved by the atomicMax, exactly
+    // like the SW rasterizer, so the HW/SW boundary agrees per pixel.
+    let hwvis_pipeline = if bin {
+        let (hms, hfs) = match backend {
+            BackendKind::Vulkan => (
+                dreamcoast_shader::vgeo_hwvis_ms_spirv(),
+                dreamcoast_shader::vgeo_hwvis_fs_spirv(),
+            ),
+            BackendKind::D3d12 => (
+                dreamcoast_shader::vgeo_hwvis_ms_dxil(),
+                dreamcoast_shader::vgeo_hwvis_fs_dxil(),
+            ),
+            BackendKind::Metal => (
+                dreamcoast_shader::vgeo_hwvis_ms_metallib(),
+                dreamcoast_shader::vgeo_hwvis_fs_metallib(),
+            ),
+        };
+        Some(device.create_mesh_pipeline(&MeshPipelineDesc {
+            object_bytes: None,
+            object_entry: "",
+            mesh_bytes: hms.ok_or_else(|| anyhow!("vgeo_hwvis mesh shader unavailable"))?,
+            mesh_entry: "meshMain",
+            fragment_bytes: hfs.ok_or_else(|| anyhow!("vgeo_hwvis fragment shader unavailable"))?,
+            fragment_entry: "fragMain",
+            color_formats: &[COLOR_FORMAT],
+            depth_format: None,
+            push_constant_size: 96, // mat4 mvp (64) + 8 u32 slots (32)
+            bindless: true,
+            uniform_buffer: false,
+            object_threads: [1, 1, 1],
+            mesh_threads: [128, 1, 1],
+            depth_test: false,
+            depth_write: false,
+            depth_compare: DepthCompare::Less,
+        })?)
+    } else {
+        None
+    };
+
     let queue = device.queue();
     let cmd = device.create_command_buffer()?;
     let image_available = device.create_semaphore()?;
@@ -1160,7 +1220,7 @@ pub(crate) fn run_vgeo_mesh(
             device.wait_idle()?;
             swapchain.recreate(&swapchain_desc(Extent2D::new(w, h)))?;
             depth = device.create_depth_buffer(Extent2D::new(w, h))?;
-            if sw {
+            if sw || bin {
                 visbuf = device.create_storage_buffer(&StorageBufferDesc {
                     size: vis_bytes(w, h),
                     stride: 8,
@@ -1231,13 +1291,21 @@ pub(crate) fn run_vgeo_mesh(
         cmd.begin()?;
 
         // M3: reset the indirect count and run the LOD-cut compute → visible list + args.
+        // M5b (bin): also reset the SW sub-list args; `csCutBin` splits the cut into HW + SW.
         if cut {
-            args_buf.write(
-                &[0u32, 1, 1]
-                    .iter()
-                    .flat_map(|w| w.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-            )?;
+            let reset = |b: &StorageBuffer| -> anyhow::Result<()> {
+                b.write(
+                    &[0u32, 1, 1]
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                )?;
+                Ok(())
+            };
+            reset(&args_buf)?;
+            if bin {
+                reset(&sw_args)?;
+            }
             let proj_factor = 0.5 * h as f32 / (30f32.to_radians()).tan();
             // Cut push (144 B): planes[6] (96) + cam xyz (12) + proj_factor + tau + 4 slots.
             // Frustum planes come from the UNFLIPPED proj*view (the no-flip cull matrix).
@@ -1264,14 +1332,27 @@ pub(crate) fn run_vgeo_mesh(
             for (i, word) in cwords.iter().enumerate() {
                 cpc[116 + i * 4..120 + i * 4].copy_from_slice(&word.to_le_bytes());
             }
+            // M5b tail (occupies csCut's former pad → zero for csCut): SW sub-list + threshold.
+            if bin {
+                cpc[132..136].copy_from_slice(&sw_list.storage_index().to_le_bytes());
+                cpc[136..140].copy_from_slice(&sw_args.storage_index().to_le_bytes());
+                cpc[140..144].copy_from_slice(&bin_px.to_le_bytes());
+            }
             cmd.bind_compute_pipeline(cut_pipeline.as_ref().unwrap());
             cmd.push_constants_compute(&cpc);
             cmd.dispatch(total_clusters.div_ceil(64), 1, 1);
         }
 
-        // M5: clear the R64 visibility buffer and rasterize the cut's clusters into it (compute),
-        // one threadgroup per visible cluster via the same indirect count.
-        if sw {
+        // M5: clear the R64 visibility buffer and rasterize the SW clusters into it (compute), one
+        // threadgroup per visible cluster via the indirect count. Single-SW mode rasterizes the
+        // whole cut (`vis_buf`/`args_buf`); binning mode rasterizes only the SW sub-list
+        // (`sw_list`/`sw_args`) and the HW mesh pass (below) writes the rest of the same buffer.
+        if sw || bin {
+            let (raster_list, raster_args) = if bin {
+                (&sw_list, &sw_args)
+            } else {
+                (&vis_buf, &args_buf)
+            };
             let mut spc = [0u8; 96];
             for (i, v) in mvp.iter().enumerate() {
                 spc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
@@ -1282,7 +1363,7 @@ pub(crate) fn run_vgeo_mesh(
                 tri_buf.storage_index(),
                 rec_buf.storage_index(),
                 visbuf.storage_index(),
-                vis_buf.storage_index(), // the cut's visible-cluster list
+                raster_list.storage_index(),
                 w,
                 h,
             ];
@@ -1294,7 +1375,7 @@ pub(crate) fn run_vgeo_mesh(
             cmd.dispatch((w * h).div_ceil(64), 1, 1);
             cmd.bind_compute_pipeline(sw_raster_pipeline.as_ref().unwrap());
             cmd.push_constants_compute(&spc);
-            cmd.dispatch_indirect(&args_buf, 0);
+            cmd.dispatch_indirect(raster_args, 0);
         }
 
         let color = ClearColor {
@@ -1304,14 +1385,44 @@ pub(crate) fn run_vgeo_mesh(
             a: 1.0,
         };
         cmd.transition_to_render_target(swapchain, image_index);
+        // M5b: HW mesh-vis pass — rasterize the HW sub-list into the SAME visibility buffer via a
+        // fragment atomicMax. It runs in its OWN render encoder so the cross-encoder hazard fence
+        // orders its visibility writes before the visualization pass reads them (its colour output
+        // is unused; the visualization pass overwrites the swapchain). Depth-less: the atomicMax
+        // resolves occlusion exactly like the SW rasterizer, so HW and SW agree per pixel.
+        if bin {
+            cmd.begin_rendering(swapchain, image_index, Some(color), None);
+            cmd.set_viewport_scissor(swapchain);
+            let mut hpc = [0u8; 96];
+            for (i, v) in mvp.iter().enumerate() {
+                hpc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            let words = [
+                vtx_buf.storage_index(),
+                remap_buf.storage_index(),
+                tri_buf.storage_index(),
+                rec_buf.storage_index(),
+                vis_buf.storage_index(), // the HW sub-list
+                visbuf.storage_index(),  // the shared R64 visibility buffer
+                w,
+                h,
+            ];
+            for (i, word) in words.iter().enumerate() {
+                hpc[64 + i * 4..68 + i * 4].copy_from_slice(&word.to_le_bytes());
+            }
+            cmd.bind_mesh_pipeline(hwvis_pipeline.as_ref().unwrap());
+            cmd.push_constants_mesh(&hpc);
+            cmd.draw_mesh_tasks_indirect(&args_buf, 0);
+            cmd.end_rendering();
+        }
         cmd.begin_rendering(
             swapchain,
             image_index,
             Some(color),
-            if sw { None } else { Some(&depth) },
+            if sw || bin { None } else { Some(&depth) },
         );
         cmd.set_viewport_scissor(swapchain);
-        if sw {
+        if sw || bin {
             // Full-screen visualization of the visibility buffer (cluster id → colour).
             let mut vpc = [0u8; 16];
             vpc[0..4].copy_from_slice(&visbuf.storage_index().to_le_bytes());
@@ -1364,12 +1475,23 @@ pub(crate) fn run_vgeo_mesh(
     }
     device.wait_idle()?;
     if cut {
-        let mut a = [0u8; 12];
-        args_buf.read_into(&mut a)?;
-        info!(
-            "vgeo-mesh cut: {} clusters selected (last frame)",
-            u32::from_le_bytes(a[0..4].try_into().unwrap())
-        );
+        let read_count = |b: &StorageBuffer| -> anyhow::Result<u32> {
+            let mut a = [0u8; 12];
+            b.read_into(&mut a)?;
+            Ok(u32::from_le_bytes(a[0..4].try_into().unwrap()))
+        };
+        if bin {
+            info!(
+                "vgeo-mesh bin: {} HW clusters + {} SW clusters selected (last frame)",
+                read_count(&args_buf)?,
+                read_count(&sw_args)?
+            );
+        } else {
+            info!(
+                "vgeo-mesh cut: {} clusters selected (last frame)",
+                read_count(&args_buf)?
+            );
+        }
     }
     // Keep the uploaded buffers alive for the loop's lifetime.
     let _ = (
@@ -1379,12 +1501,15 @@ pub(crate) fn run_vgeo_mesh(
         &rec_buf,
         &vis_buf,
         &args_buf,
+        &sw_list,
+        &sw_args,
         &checker,
         &cut_pipeline,
         &visbuf,
         &sw_clear_pipeline,
         &sw_raster_pipeline,
         &vis_pipeline,
+        &hwvis_pipeline,
     );
     info!("vgeo-mesh exited after {frames} frame(s)");
     Ok(())
