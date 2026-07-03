@@ -57,6 +57,8 @@ backend_enum!(/// A graphics pipeline.
     GraphicsPipeline => rhi_vulkan::VulkanGraphicsPipeline, rhi_d3d12::D3d12GraphicsPipeline, rhi_metal::MetalGraphicsPipeline);
 backend_enum!(/// A compute pipeline (Phase 7).
     ComputePipeline => rhi_vulkan::VulkanComputePipeline, rhi_d3d12::D3d12ComputePipeline, rhi_metal::MetalComputePipeline);
+backend_enum!(/// A mesh-shader pipeline (Phase 14 virtual geometry).
+    MeshPipeline => rhi_vulkan::VulkanMeshPipeline, rhi_d3d12::D3d12MeshPipeline, rhi_metal::MetalMeshPipeline);
 backend_enum!(/// A primary command buffer.
     CommandBuffer => rhi_vulkan::VulkanCommandBuffer, rhi_d3d12::D3d12CommandBuffer, rhi_metal::MetalCommandBuffer);
 backend_enum!(/// A CPU-GPU fence.
@@ -483,6 +485,18 @@ impl Device {
         }
     }
 
+    /// Compile a mesh-shader pipeline (Phase 14). Requires [`DeviceCapabilities::mesh_shader`].
+    pub fn create_mesh_pipeline(&self, desc: &MeshPipelineDesc) -> Result<MeshPipeline> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => Ok(MeshPipeline::Vulkan(d.create_mesh_pipeline(desc)?)),
+            #[cfg(windows)]
+            Self::D3d12(d) => Ok(MeshPipeline::D3d12(d.create_mesh_pipeline(desc)?)),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => Ok(MeshPipeline::Metal(d.create_mesh_pipeline(desc)?)),
+        }
+    }
+
     pub fn create_command_buffer(&self) -> Result<CommandBuffer> {
         match self {
             #[cfg(windows)]
@@ -559,6 +573,20 @@ impl Device {
             Self::D3d12(d) => d.device_info(),
             #[cfg(target_os = "macos")]
             Self::Metal(d) => d.device_info(),
+        }
+    }
+
+    /// Optional GPU capabilities (Phase 14 virtual geometry): mesh shaders, 64-bit buffer
+    /// atomics, indirect compute dispatch. Probed once from the adapter; opt-in code paths
+    /// consult these and fail clearly when a feature is missing.
+    pub fn capabilities(&self) -> DeviceCapabilities {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => d.capabilities(),
+            #[cfg(windows)]
+            Self::D3d12(d) => d.capabilities(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => d.capabilities(),
         }
     }
 
@@ -1625,6 +1653,34 @@ impl CommandBuffer {
         }
     }
 
+    /// Bind a mesh-shader pipeline inside a render pass (Phase 14). Draw with
+    /// [`Self::draw_mesh_tasks`].
+    pub fn bind_mesh_pipeline(&self, pipeline: &MeshPipeline) {
+        match (self, pipeline) {
+            #[cfg(windows)]
+            (Self::Vulkan(c), MeshPipeline::Vulkan(p)) => c.bind_mesh_pipeline(p),
+            #[cfg(windows)]
+            (Self::D3d12(c), MeshPipeline::D3d12(p)) => c.bind_mesh_pipeline(p),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(c), MeshPipeline::Metal(p)) => c.bind_mesh_pipeline(p),
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Draw `(x, y, z)` mesh threadgroups of the bound mesh pipeline (Phase 14). With a
+    /// task/object stage, `x*y*z` object threadgroups each amplify into mesh threadgroups.
+    pub fn draw_mesh_tasks(&self, x: u32, y: u32, z: u32) {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(c) => c.draw_mesh_tasks(x, y, z),
+            #[cfg(windows)]
+            Self::D3d12(c) => c.draw_mesh_tasks(x, y, z),
+            #[cfg(target_os = "macos")]
+            Self::Metal(c) => c.draw_mesh_tasks(x, y, z),
+        }
+    }
+
     /// Dispatch the bound compute pipeline over `(x, y, z)` workgroups.
     pub fn dispatch(&self, x: u32, y: u32, z: u32) {
         match self {
@@ -1634,6 +1690,23 @@ impl CommandBuffer {
             Self::D3d12(c) => c.dispatch(x, y, z),
             #[cfg(target_os = "macos")]
             Self::Metal(c) => c.dispatch(x, y, z),
+        }
+    }
+
+    /// Indirect compute dispatch (Phase 14): read the workgroup grid dimensions from
+    /// `buffer[offset..]` (three `u32`: x/y/z groups) on the GPU instead of passing them
+    /// from the CPU. Threadgroup size comes from the bound pipeline. Requires
+    /// [`DeviceCapabilities::dispatch_indirect`].
+    pub fn dispatch_indirect(&self, buffer: &StorageBuffer, offset: u64) {
+        match (self, buffer) {
+            #[cfg(windows)]
+            (Self::Vulkan(c), StorageBuffer::Vulkan(b)) => c.dispatch_indirect(b, offset),
+            #[cfg(windows)]
+            (Self::D3d12(c), StorageBuffer::D3d12(b)) => c.dispatch_indirect(b, offset),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(c), StorageBuffer::Metal(b)) => c.dispatch_indirect(b, offset),
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
         }
     }
 

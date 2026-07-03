@@ -899,6 +899,29 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "lit_history_cs",
     },
+    // Phase 14 (virtual geometry) M0 capability smokes. `vgeo_atomic` proves the
+    // cross-backend 64-bit `atomicMax` path (the visibility-buffer primitive);
+    // `vgeo_meshlet` proves the mesh-shader pipeline. Both are opt-in (`--atomic64-test`
+    // / `--mesh-shader-test`) and referenced by no default render pass, so the gallery
+    // anchor stays byte-identical.
+    Job {
+        src: "vgeo_atomic.slang",
+        entry: "csAtomicMax",
+        stage: "compute",
+        key: "vgeo_atomic_cs",
+    },
+    Job {
+        src: "vgeo_meshlet.slang",
+        entry: "meshMain",
+        stage: "mesh",
+        key: "vgeo_meshlet_ms",
+    },
+    Job {
+        src: "vgeo_meshlet.slang",
+        entry: "fragMain",
+        stage: "fragment",
+        key: "vgeo_meshlet_fs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.

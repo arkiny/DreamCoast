@@ -917,6 +917,28 @@ impl D3d12CommandBuffer {
         }
     }
 
+    /// Indirect compute dispatch (Phase 14): reads a `D3D12_DISPATCH_ARGUMENTS` (three `u32`)
+    /// from `buffer` at `offset` via `ExecuteIndirect`. Requires a DISPATCH command signature
+    /// on the device — wired in the Windows-box follow-up alongside enabling the SM6.6 64-bit
+    /// atomics / mesh-shader tiers. Until then [`Device::capabilities`] reports all-false, so
+    /// the vgeo smokes never reach this on D3D12.
+    pub fn dispatch_indirect(&self, _buffer: &D3d12StorageBuffer, _offset: u64) {
+        unimplemented!(
+            "D3D12 dispatch_indirect: DISPATCH command signature pending (Phase 14 Windows follow-up)"
+        );
+    }
+
+    /// Bind a mesh-shader pipeline (Phase 14). Windows-box follow-up (SM6.5 mesh PSO); gated
+    /// off via [`crate::D3d12Device::capabilities`] until then.
+    pub fn bind_mesh_pipeline(&self, _pipeline: &crate::D3d12MeshPipeline) {
+        unimplemented!("D3D12 bind_mesh_pipeline pending (Phase 14 Windows follow-up)")
+    }
+
+    /// Draw mesh threadgroups (Phase 14). Windows-box follow-up (`DispatchMesh`).
+    pub fn draw_mesh_tasks(&self, _x: u32, _y: u32, _z: u32) {
+        unimplemented!("D3D12 draw_mesh_tasks pending (Phase 14 Windows follow-up)")
+    }
+
     fn barrier(
         &self,
         resource: &ID3D12Resource,

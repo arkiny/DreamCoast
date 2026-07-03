@@ -667,6 +667,25 @@ impl D3d12Device {
         }
     }
 
+    /// Compile a mesh-shader pipeline (Phase 14). Windows-box follow-up: requires an SM6.5
+    /// mesh-shader PSO. Gated off via [`Self::capabilities`] until then, so this is never
+    /// reached (Metal is the verified path; DX≡VK follow-up).
+    pub fn create_mesh_pipeline(
+        &self,
+        _desc: &rhi_types::MeshPipelineDesc,
+    ) -> Result<crate::D3d12MeshPipeline, EngineError> {
+        unimplemented!("D3D12 mesh-shader pipeline pending (Phase 14 Windows follow-up)")
+    }
+
+    /// Optional GPU capabilities (Phase 14 virtual geometry). NOTE: reports all-`false`
+    /// until the Windows-box follow-up probes the corresponding D3D12 feature-support flags
+    /// (`D3D12_FEATURE_D3D12_OPTIONS7` mesh-shader tier, `OPTIONS9` 64-bit atomics) and the
+    /// mesh/indirect paths are exercised there. The vgeo smokes gate on this and fail clearly
+    /// on D3D12 until then (Metal is verified on the macOS box; DX≡VK is the tracked follow-up).
+    pub fn capabilities(&self) -> rhi_types::DeviceCapabilities {
+        rhi_types::DeviceCapabilities::default()
+    }
+
     /// Whether hardware ray tracing (DXR Tier >= 1.1) is available (Phase 8).
     pub fn has_raytracing(&self) -> bool {
         self.shared.has_raytracing

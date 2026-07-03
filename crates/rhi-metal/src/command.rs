@@ -59,6 +59,10 @@ pub struct MetalCommandBuffer {
     /// Threadgroup size of the bound compute pipeline, used by `dispatch` to turn
     /// threadgroup counts into `dispatchThreadgroups:threadsPerThreadgroup:`.
     pipeline_threads: Cell<MTLSize>,
+    /// Object/mesh stage threadgroup sizes of the bound mesh pipeline (Phase 14), applied by
+    /// `draw_mesh_tasks` (Metal needs them at draw time, like compute's `pipeline_threads`).
+    mesh_object_threads: Cell<MTLSize>,
+    mesh_threads: Cell<MTLSize>,
     rt_push_constants: RefCell<Vec<u8>>,
     /// Cross-encoder hazard fence. Metal only auto-tracks read-after-write hazards for
     /// resources reached *directly* by an encoder; a transient written as a render
@@ -94,6 +98,16 @@ impl MetalCommandBuffer {
             index_buffer: RefCell::new(None),
             globals_offset: Cell::new(0),
             pipeline_threads: Cell::new(MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            }),
+            mesh_object_threads: Cell::new(MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            }),
+            mesh_threads: Cell::new(MTLSize {
                 width: 1,
                 height: 1,
                 depth: 1,
@@ -758,6 +772,23 @@ impl MetalCommandBuffer {
         }
     }
 
+    /// Indirect compute dispatch (Phase 14): the threadgroup grid dimensions are read from
+    /// GPU memory at `buffer[offset..]` as a `MTLDispatchThreadgroupsIndirectArguments`
+    /// (three `u32`: threadgroups-per-grid x/y/z). Threadgroup size still comes from the
+    /// bound pipeline's `[numthreads]`. Lets an earlier compute pass size the dispatch (e.g.
+    /// the cluster-cull count) without a CPU round-trip.
+    pub fn dispatch_indirect(&self, buffer: &MetalStorageBuffer, offset: u64) {
+        if let Some(enc) = self.compute_encoder.borrow().as_ref() {
+            unsafe {
+                enc.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                    &buffer.buffer,
+                    offset as usize,
+                    self.pipeline_threads.get(),
+                );
+            }
+        }
+    }
+
     /// Upload compute push constants at [`PUSH_CONSTANT_INDEX`] (padded up to 16,
     /// like the graphics path).
     pub fn push_constants_compute(&self, data: &[u8]) {
@@ -873,6 +904,42 @@ impl MetalCommandBuffer {
                     (offset + i * 20) as usize,
                 );
             }
+        }
+    }
+
+    /// Bind a mesh-shader pipeline (Phase 14): set its render pipeline state and stash the
+    /// object/mesh threadgroup sizes for `draw_mesh_tasks`. The M0 smoke pipeline is
+    /// self-contained (a hardcoded triangle, no bindless/globals); the object/mesh-stage
+    /// argument-buffer + globals binding (`setObjectBuffer`/`setMeshBuffer`) lands in M2 where
+    /// a cluster mesh pipeline actually consumes it and the path becomes testable.
+    pub fn bind_mesh_pipeline(&self, pipeline: &crate::resources::MetalMeshPipeline) {
+        if pipeline.bindless || pipeline.uses_globals {
+            unimplemented!(
+                "mesh pipeline bindless/globals binding lands in Phase 14 M2 (not needed by the M0 smoke)"
+            );
+        }
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            enc.setRenderPipelineState(&pipeline.state);
+            self.mesh_object_threads.set(pipeline.object_threads);
+            self.mesh_threads.set(pipeline.mesh_threads);
+        }
+    }
+
+    /// Draw `x * y * z` mesh threadgroups of the bound mesh pipeline (Phase 14). The object
+    /// (task) and mesh threadgroup SIZES come from the bound pipeline (stashed at bind time);
+    /// with no object stage the object threadgroup is `(1,1,1)`.
+    pub fn draw_mesh_tasks(&self, x: u32, y: u32, z: u32) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            let groups = MTLSize {
+                width: x as usize,
+                height: y as usize,
+                depth: z as usize,
+            };
+            enc.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                groups,
+                self.mesh_object_threads.get(),
+                self.mesh_threads.get(),
+            );
         }
     }
 

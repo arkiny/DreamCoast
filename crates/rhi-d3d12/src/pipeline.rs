@@ -414,6 +414,15 @@ pub struct D3d12ComputePipeline {
     push_via_cbv: bool,
 }
 
+/// A mesh-shader pipeline (Phase 14 virtual geometry). Placeholder for the Windows-box
+/// follow-up: it must build a mesh-shader PSO (SM6.5, `D3D12_PIPELINE_STATE_STREAM` with
+/// MS/PS). Until then [`D3d12Device::capabilities`] reports `mesh_shader: false`, so nothing
+/// constructs this on D3D12 (the smokes gate on it and are verified on Metal). DX≡VK parity
+/// is the tracked follow-up.
+pub struct D3d12MeshPipeline {
+    _priv: (),
+}
+
 impl D3d12ComputePipeline {
     pub(crate) fn new(
         device: Rc<DeviceShared>,

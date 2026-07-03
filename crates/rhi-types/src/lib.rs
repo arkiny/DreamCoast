@@ -43,6 +43,27 @@ impl DeviceInfo {
     }
 }
 
+/// Optional GPU capabilities a backend/adapter may or may not expose, probed once at
+/// device creation. Phase 14 (virtual geometry) is the first consumer: its full path
+/// needs a mesh-shader pipeline, 64-bit buffer atomics (the visibility-buffer `atomicMax`),
+/// and indirect compute dispatch — none of which the earlier phases required, and each of
+/// which a given adapter can lack. Features gate opt-in code paths that must **fail
+/// clearly** (not silently mis-render) when unsupported; nothing in the default render
+/// path reads these, so a `false` here never affects an existing scene.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceCapabilities {
+    /// Mesh/task (object) shader pipelines (`draw_mesh_tasks`). Metal: Apple7+/Metal 3;
+    /// Vulkan: `VK_EXT_mesh_shader`; D3D12: SM6.5 mesh shaders.
+    pub mesh_shader: bool,
+    /// 64-bit buffer atomics (`InterlockedMax64` / `atomic_max_explicit`). Metal: Apple8+;
+    /// Vulkan: `shaderBufferInt64Atomics`; D3D12: SM6.6 64-bit atomics.
+    pub atomic_int64: bool,
+    /// Indirect compute dispatch (`dispatch_indirect`). Metal:
+    /// `dispatchThreadgroupsWithIndirectBuffer`; Vulkan: `vkCmdDispatchIndirect`;
+    /// D3D12: `ExecuteIndirect` over a DISPATCH signature. Near-universal, tracked for symmetry.
+    pub dispatch_indirect: bool,
+}
+
 /// A 2D size in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Extent2D {
@@ -397,6 +418,43 @@ pub struct ComputePipelineDesc<'a> {
     /// not, so the backend needs it to turn a `dispatch(x, y, z)` (threadgroup
     /// counts) into `dispatchThreadgroups:threadsPerThreadgroup:`.
     pub threads_per_group: [u32; 3],
+}
+
+/// A mesh-shader pipeline (Phase 14 virtual geometry): an optional task/object stage that
+/// amplifies into a mesh stage which emits primitives, then the fragment stage. Drawn with
+/// [`CommandBuffer::draw_mesh_tasks`] instead of a vertex draw. Requires
+/// [`DeviceCapabilities::mesh_shader`]. M0 exercises the mesh+fragment path (one hardcoded
+/// triangle, no object stage, no bindless); the object stage + per-cluster payload arrive in
+/// M2. `object_threads` / `mesh_threads` are the per-stage `[numthreads]` — Metal needs them
+/// at draw time (like compute); Vulkan/D3D12 bake them into the shader and ignore them.
+#[derive(Clone, Copy, Debug)]
+pub struct MeshPipelineDesc<'a> {
+    /// Task/object stage bytecode, or `None` for a mesh-only pipeline (M0).
+    pub object_bytes: Option<&'a [u8]>,
+    /// Task/object entry-point name (ignored when `object_bytes` is `None`).
+    pub object_entry: &'a str,
+    /// Mesh stage bytecode.
+    pub mesh_bytes: &'a [u8],
+    /// Mesh entry-point name.
+    pub mesh_entry: &'a str,
+    /// Fragment/pixel stage bytecode.
+    pub fragment_bytes: &'a [u8],
+    /// Fragment entry-point name.
+    pub fragment_entry: &'a str,
+    /// Color attachment formats, in attachment order.
+    pub color_formats: &'a [Format],
+    /// Depth attachment format (`None` = no depth).
+    pub depth_format: Option<Format>,
+    /// Size in bytes of the push/root constant block (0 = none). Visible to all stages.
+    pub push_constant_size: u32,
+    /// Whether the pipeline binds the device's bindless table (mesh/object stages).
+    pub bindless: bool,
+    /// Whether the pipeline binds the per-frame globals UBO.
+    pub uniform_buffer: bool,
+    /// Object (task) stage `[numthreads]`; `[1,1,1]` when there is no object stage.
+    pub object_threads: [u32; 3],
+    /// Mesh stage `[numthreads]`.
+    pub mesh_threads: [u32; 3],
 }
 
 /// A hardware ray-tracing pipeline (Phase 8 M5): one raygen, one miss, and one
