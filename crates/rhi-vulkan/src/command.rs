@@ -1248,6 +1248,11 @@ impl VulkanCommandBuffer {
         unimplemented!("Vulkan push_constants_mesh pending (Phase 14 Windows follow-up)")
     }
 
+    /// Indirect mesh draw (Phase 14 M3). Windows-box follow-up (`cmd_draw_mesh_tasks_indirect_ext`).
+    pub fn draw_mesh_tasks_indirect(&self, _buffer: &VulkanStorageBuffer, _offset: u64) {
+        unimplemented!("Vulkan draw_mesh_tasks_indirect pending (Phase 14 Windows follow-up)")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn image_barrier(
         &self,

@@ -923,9 +923,12 @@ pub(crate) fn run_vgeo_mesh(
     for &b in &dag.cluster_triangles {
         tri.extend_from_slice(&(b as u32).to_le_bytes());
     }
-    let mut rec = Vec::new();
-    let mut cluster_count = 0u32;
-    for c in dag.clusters.iter().filter(|c| c.lod_level == lod) {
+    // Per-cluster GpuCluster records (64 B), ALL clusters — the mesh shader reads the first 16
+    // bytes (offsets/counts) and the LOD-cut compute reads the self/parent error+sphere. The
+    // spheres are recentered by the same centroid as the vertices so camera-space projection lines
+    // up.
+    let mut rec = Vec::with_capacity(dag.clusters.len() * 64);
+    for c in &dag.clusters {
         for field in [
             c.vertex_offset,
             c.vertex_count,
@@ -934,12 +937,62 @@ pub(crate) fn run_vgeo_mesh(
         ] {
             rec.extend_from_slice(&field.to_le_bytes());
         }
-        cluster_count += 1;
+        let put = |rec: &mut Vec<u8>, f: f32| rec.extend_from_slice(&f.to_le_bytes());
+        let sc = Vec3::from(c.self_center) - center;
+        let pcn = Vec3::from(c.parent_center) - center;
+        put(&mut rec, c.self_error);
+        for f in sc.to_array() {
+            put(&mut rec, f);
+        }
+        put(&mut rec, c.self_radius);
+        put(&mut rec, c.parent_error);
+        for f in pcn.to_array() {
+            put(&mut rec, f);
+        }
+        put(&mut rec, c.parent_radius);
+        rec.extend_from_slice(&[0u8; 8]); // pad to 64
     }
+    // Direct-path (M2) span of the selected LOD (clusters are contiguous per level).
+    let lod_start = dag
+        .clusters
+        .iter()
+        .position(|c| c.lod_level == lod)
+        .unwrap_or(0) as u32;
+    let lod_count = dag.clusters.iter().filter(|c| c.lod_level == lod).count() as u32;
+    let total_clusters = dag.clusters.len() as u32;
+
     let vtx_buf = sb(device, &vtx, 32)?;
     let remap_buf = sb(device, &remap, 4)?;
     let tri_buf = sb(device, &tri, 4)?;
-    let rec_buf = sb(device, &rec, 16)?;
+    let rec_buf = sb(device, &rec, 64)?;
+
+    // M3 cut mode (VGEO_CUT=1): a compute pass selects the view-dependent cut into `vis_buf` and
+    // writes the mesh-draw threadgroup count into `args_buf` for the indirect draw.
+    let cut = std::env::var("VGEO_CUT").ok().as_deref() == Some("1");
+    let tau: f32 = std::env::var("VGEO_TAU")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8.0);
+    let vis_buf = sb(device, &vec![0u8; total_clusters as usize * 4], 4)?;
+    let args_buf = sb(device, &[0u8; 12], 4)?; // {countX, 1, 1}
+    let cut_pipeline = if cut {
+        let cs = match backend {
+            BackendKind::Vulkan => dreamcoast_shader::vgeo_cut_cs_spirv(),
+            BackendKind::D3d12 => dreamcoast_shader::vgeo_cut_cs_dxil(),
+            BackendKind::Metal => dreamcoast_shader::vgeo_cut_cs_metallib(),
+        }
+        .ok_or_else(|| anyhow!("vgeo_cut compute shader unavailable for {backend:?}"))?;
+        Some(device.create_compute_pipeline(&ComputePipelineDesc {
+            compute_bytes: cs,
+            compute_entry: "csCut",
+            push_constant_size: 48,
+            bindless: true,
+            uniform_buffer: false,
+            threads_per_group: [64, 1, 1],
+        })?)
+    } else {
+        None
+    };
 
     // A checker texture for material mode (the cooked cluster page carries no material).
     let checker = make_checker_texture(device)?;
@@ -949,14 +1002,20 @@ pub(crate) fn run_vgeo_mesh(
     } else {
         0
     };
-    info!(
-        "vgeo-mesh: LOD {lod}, {cluster_count} clusters via mesh shader, mode {}",
-        if mode == 1 {
-            "material"
-        } else {
-            "cluster-colour"
-        }
-    );
+    if cut {
+        info!(
+            "vgeo-mesh CUT: {total_clusters} clusters across all LODs, tau {tau}px, indirect draw"
+        );
+    } else {
+        info!(
+            "vgeo-mesh: LOD {lod}, {lod_count} clusters via mesh shader, mode {}",
+            if mode == 1 {
+                "material"
+            } else {
+                "cluster-colour"
+            }
+        );
+    }
 
     let pipeline = device.create_mesh_pipeline(&MeshPipelineDesc {
         object_bytes: None,
@@ -967,7 +1026,7 @@ pub(crate) fn run_vgeo_mesh(
         fragment_entry: "fragMain",
         color_formats: &[COLOR_FORMAT],
         depth_format: Some(DEPTH_FORMAT),
-        push_constant_size: 96,
+        push_constant_size: 112,
         bindless: true,
         uniform_buffer: false,
         object_threads: [1, 1, 1],
@@ -1036,23 +1095,63 @@ pub(crate) fn run_vgeo_mesh(
         }
         let mvp = (proj * view).to_cols_array();
 
-        // Push constant: mat4 mvp (64) + 8 u32 slots/flags (32) = 96.
-        let mut pc = [0u8; 96];
+        // Mesh push constant: mat4 mvp (64) + 12 u32 slots/flags (48) = 112.
+        let mut pc = [0u8; 112];
         for (i, v) in mvp.iter().enumerate() {
             pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
+        let vis_slot = if cut {
+            vis_buf.storage_index()
+        } else {
+            0xFFFF_FFFF
+        };
         let words = [
             vtx_buf.storage_index(),
             remap_buf.storage_index(),
             tri_buf.storage_index(),
             rec_buf.storage_index(),
-            0, // base_cluster
+            lod_start, // direct-path base cluster
             mode,
             tex_index,
-            0, // pad
+            vis_slot,
+            0,
+            0,
+            0,
+            0,
         ];
         for (i, word) in words.iter().enumerate() {
             pc[64 + i * 4..68 + i * 4].copy_from_slice(&word.to_le_bytes());
+        }
+
+        cmd.begin()?;
+
+        // M3: reset the indirect count and run the LOD-cut compute → visible list + args.
+        if cut {
+            args_buf.write(
+                &[0u32, 1, 1]
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            )?;
+            let proj_factor = 0.5 * h as f32 / (30f32.to_radians()).tan();
+            let mut cpc = [0u8; 48];
+            for (i, f) in eye.to_array().iter().enumerate() {
+                cpc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+            }
+            cpc[12..16].copy_from_slice(&proj_factor.to_le_bytes());
+            cpc[16..20].copy_from_slice(&tau.to_le_bytes());
+            let cwords = [
+                total_clusters,
+                rec_buf.storage_index(),
+                vis_buf.storage_index(),
+                args_buf.storage_index(),
+            ];
+            for (i, word) in cwords.iter().enumerate() {
+                cpc[20 + i * 4..24 + i * 4].copy_from_slice(&word.to_le_bytes());
+            }
+            cmd.bind_compute_pipeline(cut_pipeline.as_ref().unwrap());
+            cmd.push_constants_compute(&cpc);
+            cmd.dispatch(total_clusters.div_ceil(64), 1, 1);
         }
 
         let color = ClearColor {
@@ -1061,13 +1160,16 @@ pub(crate) fn run_vgeo_mesh(
             b: 0.12,
             a: 1.0,
         };
-        cmd.begin()?;
         cmd.transition_to_render_target(swapchain, image_index);
         cmd.begin_rendering(swapchain, image_index, Some(color), Some(&depth));
         cmd.set_viewport_scissor(swapchain);
         cmd.bind_mesh_pipeline(&pipeline);
         cmd.push_constants_mesh(&pc);
-        cmd.draw_mesh_tasks(cluster_count, 1, 1);
+        if cut {
+            cmd.draw_mesh_tasks_indirect(&args_buf, 0);
+        } else {
+            cmd.draw_mesh_tasks(lod_count, 1, 1);
+        }
         cmd.end_rendering();
 
         let capture = (!captures.is_empty() && frames == CAPTURE_FRAME).then(|| &captures[0]);
@@ -1102,7 +1204,25 @@ pub(crate) fn run_vgeo_mesh(
         }
     }
     device.wait_idle()?;
-    let _ = (&vtx_buf, &remap_buf, &tri_buf, &rec_buf, &checker); // keep resident for the loop
+    if cut {
+        let mut a = [0u8; 12];
+        args_buf.read_into(&mut a)?;
+        info!(
+            "vgeo-mesh cut: {} clusters selected (last frame)",
+            u32::from_le_bytes(a[0..4].try_into().unwrap())
+        );
+    }
+    // Keep the uploaded buffers alive for the loop's lifetime.
+    let _ = (
+        &vtx_buf,
+        &remap_buf,
+        &tri_buf,
+        &rec_buf,
+        &vis_buf,
+        &args_buf,
+        &checker,
+        &cut_pipeline,
+    );
     info!("vgeo-mesh exited after {frames} frame(s)");
     Ok(())
 }

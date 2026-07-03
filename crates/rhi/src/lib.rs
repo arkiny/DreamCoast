@@ -1681,6 +1681,21 @@ impl CommandBuffer {
         }
     }
 
+    /// Indirect mesh draw (Phase 14 M3): the threadgroup grid is read from `buffer[offset..]`
+    /// (three `u32`) on the GPU — the LOD-cut compute writes the selected-cluster count there.
+    pub fn draw_mesh_tasks_indirect(&self, buffer: &StorageBuffer, offset: u64) {
+        match (self, buffer) {
+            #[cfg(windows)]
+            (Self::Vulkan(c), StorageBuffer::Vulkan(b)) => c.draw_mesh_tasks_indirect(b, offset),
+            #[cfg(windows)]
+            (Self::D3d12(c), StorageBuffer::D3d12(b)) => c.draw_mesh_tasks_indirect(b, offset),
+            #[cfg(target_os = "macos")]
+            (Self::Metal(c), StorageBuffer::Metal(b)) => c.draw_mesh_tasks_indirect(b, offset),
+            #[cfg(windows)]
+            _ => unreachable!("{MIXED}"),
+        }
+    }
+
     /// Upload push/root constants for the bound **mesh** pipeline (object/mesh + fragment stages).
     pub fn push_constants_mesh(&self, data: &[u8]) {
         match self {
