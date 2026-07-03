@@ -142,10 +142,10 @@ so **I4 is required for Sponza-class scenes.** Two obstacles, in order of depth:
    and are unit-tested. A graph-based pass can record the HW mesh path into deferred IR. (The
    self-contained viewer still drives the HW path on the raw command buffer; the graph path is ready
    for the integration below.)
-2. Then the HW mesh-vis pass needs a UAV storage-write declaration (add
-   `RenderGraph::add_pass_with_storage_writes` — `PassNode.storage_writes` already exists + `writes()`
-   already chains it, so this is a few lines) + a scratch colour attachment; reuse the already-built
-   `csCutBin` + `vgeo_hwvis.slang` to split each object HW/SW into the shared visibility buffer.
+2. ~~Then the HW mesh-vis pass needs a UAV storage-write declaration~~ **DONE (I4):**
+   `RenderGraph::add_pass_with_storage_writes` + a scratch colour attachment; `csCutBin` +
+   `vgeo_hwvis.slang` split each object HW/SW into the shared visibility buffer, wired into
+   `VgeoSystem::record_object` behind `P14_VGEO_BIN=1`. See the "I4 … DONE" note below.
 
 **Alternative to HW binning:** a tiled / threadgroup-cooperative SW rasterizer (bin triangles to screen
 tiles, rasterize per-tile) stays in compute (no IR change) and also fixes large triangles. Either is a
@@ -226,10 +226,21 @@ boundary). `--mesh-shader-test` renders the RGB triangle on both backends. Mesh 
 validation-clean (the smoke loop's swapchain-sync VUIDs are pre-existing, identical to
 `--triangle-test`). Gallery anchor (features off) DX≡VK 0.001/ch — unregressed.
 
-**I4 progress:** the render-graph IR `Recorder` now carries the mesh-shader commands
-(`crates/rhi/command_list.rs`) — the RHI-level "real blocker" below is resolved. The remaining
-integration (a `RenderGraph` storage-write pass for the HW mesh-vis UAV + wiring `csCutBin`/
-`vgeo_hwvis` into `VgeoSystem`'s deferred G-buffer path) is the larger separable follow-on.
+**I4 (integrated HW/SW binning) — DONE.** `P14_VGEO_BIN=1` (needs mesh shaders) routes each vgeo
+object through the binning cut in the real deferred renderer: `csCutBin` splits the cut into a SW
+sub-list (compute raster) and an HW sub-list (`vgeo_hwvis` mesh shader, `draw_mesh_tasks_indirect`),
+both writing the SAME R64 visibility buffer, then the resolve → G-buffer as before. Enablers:
+`RenderGraph::add_pass_with_storage_writes` (a graphics pass that also UAV-writes the external
+visibility buffer, scheduled via WAW/RAW); the Vulkan `storage_buffer_barrier` src now covers the
+FRAGMENT stage (the HW-vis writes the visbuf from its fragment atomicMax; D3D12/Metal UAV barriers
+are stage-agnostic); `new_host` honours `INDIRECT_BUFFER` usage for the host-reset `hw_args`. The
+HW mesh-vis uses the Y-flipped `view_proj` (HW rasterizer) while the SW raster/resolve use the
+flip-free `cull_view_proj`, so both land the same screen pixels. **Verified (gallery, `P14_VGEO=1`):
+binning output byte-identical to SW-only on DX (0.000/ch) — HW and SW write bit-identical
+visibility — and DX≡VK 0.001/ch; gallery anchor (off) unchanged.** One benign SPIR-V validation
+warning (`VUID-…-OpVariable-08746`: a Slang per-primitive mesh→fragment decoration mismatch in
+`vgeo_hwvis`; triId is delivered correctly). NEXT (perf, not correctness): a Sponza-scale profiling
+pass + M4b HZB two-pass occlusion.
 
 ## Gates (every increment)
 

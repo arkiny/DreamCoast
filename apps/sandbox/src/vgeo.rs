@@ -6,8 +6,11 @@
 //! write the REAL Phase-6 G-buffer. Every eligible opaque object is routed through virtual geometry
 //! and overlaid on the mesh-rastered remainder (depth-composited), so a whole multi-object scene can
 //! render as virtual geometry — the per-static-mesh-asset direction (see
-//! `docs/phase-14-vgeo-integration.md`). SW-only for now; opt-in behind `P14_VGEO`, so the default
-//! renderer is untouched (gallery byte-identical).
+//! `docs/phase-14-vgeo-integration.md`). Opt-in behind `P14_VGEO`, so the default renderer is
+//! untouched (gallery byte-identical). `P14_VGEO_BIN=1` (needs mesh shaders) additionally splits each
+//! object HW/SW: `csCutBin` sends large-triangle clusters to the `vgeo_hwvis` mesh shader and
+//! micro-triangle clusters to the compute SW rasterizer, both writing the same visibility buffer
+//! (the Sponza-class large-triangle path). SW-only (bin off) covers small/medium-triangle meshes.
 //!
 //! One material per page (the mesh's) — matching a single-material mesh; a many-material model is
 //! split into per-mesh assets upstream (the scene-cook direction) rather than baking per-cluster
