@@ -65,6 +65,13 @@ void csClear(uint3 tid: SV_DispatchThreadID)
 void csRaster(uint gid: SV_GroupID, uint lane: SV_GroupThreadID)
 {
     uint cluster = g.storage_buffers[pc.vis_list].Load(gid * 4);
+    // Sentinel (0xFFFFFFFF) = an unused visible-list slot. The graph integration dispatches a
+    // FIXED group count (total clusters) rather than the cut's exact count (the render-graph IR
+    // recorder has no indirect compute dispatch), pre-clearing the list to the sentinel; skipping
+    // it makes the fixed dispatch equivalent to the indirect one. The viewer's indirect path only
+    // dispatches the exact cut count, so every slot is valid there and this never triggers.
+    if (cluster == 0xFFFFFFFFu)
+        return;
     uint4 rec = g.storage_buffers[pc.rec_buf].Load4(cluster * 96);
     uint voff = rec.x, toff = rec.z, tcount = rec.w;
     if (lane >= tcount)
