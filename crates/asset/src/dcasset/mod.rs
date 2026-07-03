@@ -24,11 +24,13 @@
 //! invalidation-key hashing); the per-payload chunk codecs live in [`mesh`]
 //! (mesh + textures), [`volume`] (SDF + albedo), and [`level`] (scene/level).
 
+mod cluster;
 mod gltf;
 mod level;
 mod mesh;
 mod volume;
 
+pub use cluster::{read_clusters, write_clusters};
 pub use gltf::{read_scene, write_scene};
 pub use level::{read_level, write_level};
 pub use mesh::{read, write};
@@ -42,7 +44,8 @@ pub const MAGIC: [u8; 8] = *b"DCASSET\0";
 /// Format version. **Bump on any layout OR cook-policy change** — the loader treats a
 /// mismatch as a cache miss and re-cooks, so an old `.dcasset` is never misread as a new
 /// one. v2: data textures (metallic-roughness) now cook to BC7 instead of staying RGBA8.
-pub const VERSION: u32 = 2;
+/// v3: virtual-geometry cluster pages (`CHUNK_CLUSTERS`, Phase 14 M1a).
+pub const VERSION: u32 = 3;
 
 // Chunk type tags (directory `type` field). Stable across versions; new payloads
 // get new tags. Unknown tags are skipped by the readers (forward compatibility).
@@ -57,6 +60,9 @@ pub(crate) const CHUNK_LEVEL: u32 = 5;
 /// Cooked glTF scene chunk: node hierarchy + per-primitive geometry + materials +
 /// the block-compressed texture table (static scenes; see [`gltf`]).
 pub(crate) const CHUNK_GLTF_SCENE: u32 = 6;
+/// Virtual-geometry cluster page chunk: a mesh's [`crate::vgeo::MeshClusters`] — vertex remap,
+/// packed `u8` triangle indices, and cluster records (see [`cluster`], Phase 14 M1a).
+pub(crate) const CHUNK_CLUSTERS: u32 = 7;
 
 /// Header byte size: magic(8) + version(4) + flags(4) + source_hash(8) +
 /// cook_params_hash(8) + chunk_count(4).
