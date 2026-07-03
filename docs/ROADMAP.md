@@ -323,8 +323,18 @@ per-instance 트랜스폼을 공급하는 단일 소스가 된다. 테스트는 
   반영해 해결 — 공유 셰이더/`rhi-types`/렌더 그래프 무변경이라 **Vulkan/D3D12 무회귀**.
   세부: [metal-backend.md](metal-backend.md) "Phase 10 Stage B/C".
 
-### Phase 14 — Virtual Geometry — 🧪 계획 (재배치됨, 고급 렌더링 트랙)
-세부: [phase-14-virtual-geometry.md](phase-14-virtual-geometry.md)
+### Phase 14 — Virtual Geometry — ✅ **완료 (완료 기준 충족, Windows DX≡VK)** — 잔여는 성능 후속
+세부: [phase-14-virtual-geometry.md](phase-14-virtual-geometry.md) · 통합·Track B: [phase-14-vgeo-integration.md](phase-14-vgeo-integration.md)
+> **완료 (2026-07-03):** 완료 기준 4개 모두 충족 — 화면 적응 LOD(뷰 종속 컷, group-uniform 에러로
+> 크랙/팝핑 없음), **SW/HW 경로 seam 없음**(M5b 바이너닝: HW 메시 셰이더 + SW 컴퓨트 래스터가 동일
+> R64 비저빌리티 버퍼에 bit-동일 기록 — BINPX 8≡80 출력 동일), **두 백엔드 일치**(D3D12≡Vulkan,
+> RTX 2070 SUPER, `--vgeo-mesh` 전 모드 0.000/ch, 통합 P14_VGEO 바이너닝 ≡ SW-only 0.000/ch). Track A
+> (SW 통합 경로) + Track B(메시 셰이더 HW 경로) + I4(디퍼드 렌더러 in-graph 바이너닝) + 렌더그래프 IR
+> 메시 커맨드 모두 main 머지(`2c4b172`). **잔여(성능 후속, 완료 기준 아님):** HZB 2-pass 오클루전은
+> `csCutHzb`로 구현 시도 → Vulkan 완벽 보수적(0.000/ch), **D3D12에서 실루엣 클러스터 소수를 체계적
+> 과다-컬(0.013/ch, DX≡VK 하드룰 위반)** → 근본 원인(프러스텀 평면은 양 백엔드 0.000, 오클루전 샘플링만
+> DX 상이; 결정적=레이스 아님) 미규명 + 실제 가림 씬(Sponza) 필요로 **되돌리고 후속으로 분리**(백엔드
+> 일치 하드룰 우선). 다중-머티리얼 씬-쿡 · Sponza 프로파일링도 후속.
 > **순서 조정 (2026-06-27):** Virtual Geometry는 초기에 **Phase 10**으로 계획됐으나, SW-RT(현 Phase 10)가
 > 먼저 완료되며 건너뛰었다. 엔진이 인프라 트랙(Phase 11 에셋 → 12 씬 그래프 → 13 애니메이션)으로 진행하면서
 > **맨 뒤 Phase 14(고급 렌더링 트랙)로 재배치**하고 뒤 phase 번호를 당겨 공석을 없앴다(SW-RT 11→10, 에셋
