@@ -41,8 +41,16 @@ one material for the whole cluster set (single-mesh/single-material object).
   has no indirect compute dispatch, so the SW raster uses a FIXED per-cluster dispatch over a
   `0xFFFFFFFF`-sentinel visible list (the cut fills the front, `csRaster` skips sentinels) instead of
   `dispatch_indirect`; the cluster geometry is normalized in `VgeoSystem::new` (same
-  `normalize_on_ground` arithmetic) so the object transform is the single model matrix. **NEXT: I4**
-  (binning-in-graph + M4b HZB), then multi-material/scene-cook.
+  `normalize_on_ground` arithmetic) so the object transform is the single model matrix.
+- **Multi-object coexistence (LANDED, commit `3aaf840`): vgeo overlays the mesh raster.** The render
+  graph clears a depth target only on its first writer and LOADs it afterward, so `P14_VGEO=1` now
+  renders the FULL scene: the mesh fill rasters every other opaque object + ground (clears), then the
+  vgeo resolve LOADs the four MRTs + depth and Less-tests the model's `SV_Depth` against them (empty
+  pixels `discard` → underlying values survive). Full gallery (3 mesh objects + vgeo avocado) vs
+  all-mesh = mean **0.0000153/channel** (0.019% silhouette-edge px); the avocado composites with
+  correct depth/shadows and appears in the chrome sphere's reflection. **NEXT: I4** (binning-in-graph
+  + M4b HZB), then multi-material/scene-cook (per-cluster material id + table for many-material
+  scenes; the cook and `VgeoSystem` are still single-`MeshClusters`/single-material).
 - **I2 spec (as-built above):** A subsystem mirroring `CullSystem` (`cull.rs`):
   - **Owns** persistent buffers built once at `App::new` from the loaded model's cooked clusters
     (`load_cooked_clusters`, as the viewer does): vertex pool / remap / triangles / records, plus the
