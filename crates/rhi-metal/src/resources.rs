@@ -6,12 +6,16 @@
 //! targets/cubemaps/heaps in M4, storage buffers in M5). Methods that the facade
 //! forwards but that aren't implemented yet are stubbed with `unimplemented!`.
 
+use std::rc::Rc;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLComputePipelineState, MTLDepthStencilState, MTLHeap, MTLRenderPipelineState,
     MTLSize, MTLTexture,
 };
+
+use crate::device::DeviceShared;
 
 /// Metal buffer-argument index that Slang assigns to the push-constant block.
 /// The bindless `ParameterBlock` carries the `[[vk::binding(0, 0)]]` pin (see
@@ -87,13 +91,23 @@ impl MetalBuffer {
 /// draw passes read it in their vertex stage. Kept permanently resident on the
 /// device (made `useResource` on every bindless compute/graphics encoder). (M5)
 pub struct MetalStorageBuffer {
+    /// The device, so `drop` can return the bindless slot to the free-list.
+    shared: Rc<DeviceShared>,
     pub(crate) buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     index: u32,
 }
 
 impl MetalStorageBuffer {
-    pub(crate) fn new(buffer: Retained<ProtocolObject<dyn MTLBuffer>>, index: u32) -> Self {
-        Self { buffer, index }
+    pub(crate) fn new(
+        shared: Rc<DeviceShared>,
+        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        index: u32,
+    ) -> Self {
+        Self {
+            shared,
+            buffer,
+            index,
+        }
     }
 
     /// Index of this buffer in the bindless storage-buffer table.
@@ -130,6 +144,14 @@ impl MetalStorageBuffer {
         }
         unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) };
         Ok(())
+    }
+}
+
+impl Drop for MetalStorageBuffer {
+    fn drop(&mut self) {
+        // Return the bindless slot + drop the device's strong ref to the buffer. Safe: the handoff
+        // contract defers this Drop until the referencing frames retire.
+        self.shared.free_storage_buffer(self.index);
     }
 }
 

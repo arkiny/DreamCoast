@@ -136,15 +136,16 @@ screen bounding box, so a wall triangle covering a large screen area loops over 
 the compute dispatch effectively hangs / is dropped. This is precisely the case **M5b binning** exists
 for (large clusters → the HW mesh path, only micro-triangles → SW). The integration is SW-only today,
 so **I4 is required for Sponza-class scenes.** Two obstacles, in order of depth:
-1. **The render-graph IR `Recorder` (`crates/rhi/command_list.rs`) has no mesh-shader support** — only
-   `draw` / `dispatch` / `draw_indexed_indirect`, no `bind_mesh_pipeline` / `draw_mesh_tasks[_indirect]`
-   (the self-contained viewer drove the HW path on the raw command buffer, outside the graph). So HW
-   binning in the *graph-based* renderer first needs mesh commands added to the IR `Recorder` +
-   `CommandList` + all three backends' translation. **This is the real blocker**, a moderate RHI change.
-2. Then the HW mesh-vis pass needs a UAV storage-write declaration (add
-   `RenderGraph::add_pass_with_storage_writes` — `PassNode.storage_writes` already exists + `writes()`
-   already chains it, so this is a few lines) + a scratch colour attachment; reuse the already-built
-   `csCutBin` + `vgeo_hwvis.slang` to split each object HW/SW into the shared visibility buffer.
+1. ~~**The render-graph IR `Recorder` (`crates/rhi/command_list.rs`) has no mesh-shader support**~~
+   **RESOLVED (Track B):** `bind_mesh_pipeline` / `draw_mesh_tasks` / `push_constants_mesh` /
+   `draw_mesh_tasks_indirect` are now in the `Recorder` trait, `RhiCommand`, `CommandList` translate,
+   and are unit-tested. A graph-based pass can record the HW mesh path into deferred IR. (The
+   self-contained viewer still drives the HW path on the raw command buffer; the graph path is ready
+   for the integration below.)
+2. ~~Then the HW mesh-vis pass needs a UAV storage-write declaration~~ **DONE (I4):**
+   `RenderGraph::add_pass_with_storage_writes` + a scratch colour attachment; `csCutBin` +
+   `vgeo_hwvis.slang` split each object HW/SW into the shared visibility buffer, wired into
+   `VgeoSystem::record_object` behind `P14_VGEO_BIN=1`. See the "I4 … DONE" note below.
 
 **Alternative to HW binning:** a tiled / threadgroup-cooperative SW rasterizer (bin triangles to screen
 tiles, rasterize per-tile) stays in compute (no IR change) and also fixes large triangles. Either is a
@@ -156,10 +157,93 @@ current SW-only path.
 - **Multi-material / scene-cook:** per-cluster material id + a material table so Sponza-class scenes
   (many meshes/materials) resolve correctly. The single-material step above is single-mesh only.
 - **HW/SW binning in-graph** and **M4b HZB** (I4).
-- **DX≡VK Windows parity** (verification-split); the VK/DX seam already compiles (metallib + SPIR-V).
+
+## DX≡VK Windows verification (DONE — RTX 2070 SUPER)
+
+The SW-only integration is now verified on D3D12 **and** Vulkan (branch `verify/vgeo-windows-dx-vk`).
+Findings + fixes (all root-cause, cross-backend):
+
+- **DXIL 64-bit atomics needed SM6.6.** `build.rs` compiled every non-RT DXIL stage at `sm_6_5`;
+  Slang's internal auto-upgrade doesn't reach the DXC shader model, so `InterlockedMax64`
+  (`vgeo_atomic` / `vgeo_swraster`'s `csRaster`) failed DXC. Fixed with a per-entry `sm_6_6` override.
+- **Device features weren't enabled/reported.** rhi-vulkan now probes+enables `shaderInt64` +
+  `shaderBufferInt64Atomics`; rhi-d3d12 probes SM6.6 + `AtomicInt64OnDescriptorHeapResourceSupported`
+  (OPTIONS11 — the visibility buffer is bindless/descriptor-heap-indexed). `capabilities()` reports
+  the real values on both. D3D12 `dispatch_indirect` implemented (DISPATCH command signature).
+- **Bindless storage-buffer table was full.** The GI-heavy default scene already uses **all 64**
+  slots (index 0..63), so vgeo overflowed binding 4 into the TLAS binding (VK VUID; DX silently
+  overwrote). Raised `STORAGE_BUFFER_COUNT` 64→128 across bindless.slang + all three backends
+  (heap offsets / root-sig ranges / registers derive from the constant). Off-path stays
+  byte-identical (VK) / 1-LSB (DX nondeterminism).
+- **The SW raster used the Y-flipped `view_proj`.** The raster + resolve do MANUAL `(0.5-ndc.y*0.5)`
+  NDC→pixel mapping (the no-flip window convention). On Vulkan `view_proj` carries the clip-space
+  Y-flip for the *hardware* pipeline, which vertically flipped the visbuf rows vs the resolve's
+  `SV_Position` reads — corrupting the whole scene's G-buffer. Switched the raster/resolve `mvp` to
+  the flip-free `cull_view_proj` (already used by the cut); DX unchanged, VK fixed.
+- Two Metal-isms in DX host paths: the `--atomic64-test` smoke and the vgeo per-frame scratch pool
+  host-wrote/read DEFAULT-heap buffers → switched to `create_storage_buffer_host` (CUSTOM-L0, both
+  UAV + CPU-mappable). The vgeo eligibility gate now checks `atomic_int64`, not `mesh_shader`
+  (the SW path needs no mesh shader — that was a Metal-ism, both caps ship together there).
+
+**Measured (1280×720, `--screenshot-clean`):** gallery `P14_VGEO=1` DX≡VK **0.000004/ch** (max byte
+101, silhouette-only); vgeo-vs-mesh **0.000714/ch** (DX) / **0.000715/ch** (VK) — the SW-vs-HW raster
+coverage rule, matching Metal; Lantern multi-mesh DX≡VK **0.000234/ch**. `P14_VGEO` off: VK
+byte-identical to pre-change main, DX ≤1 LSB. `--atomic64-test` PASSES both backends, validation-clean.
+
+## Track B — mesh-shader HW path DX≡VK (DONE — RTX 2070 SUPER)
+
+The hardware mesh-shader path (`--mesh-shader-test`, `--vgeo-mesh` CUT/SW/BIN, M5b binning) is now
+implemented and verified on D3D12 **and** Vulkan. Findings + fixes (all root-cause, cross-backend):
+
+- **Slang mesh→DXIL codegen.** Slang 2026.10.2 mis-emits mesh outputs: the explicit `out` on
+  `indices`/`primitives` produces a malformed `out … out …` DXC rejects. Dropping the explicit `out`
+  (the modifier implies it) fixes the 2-output shaders (`vgeo_meshlet`/`vgeo_cluster`). The 3-output
+  `vgeo_hwvis` (vertices+indices+**primitives**) hits a deeper bug — Slang drops the `vertices`
+  keyword — so its DXIL is built via a targeted `build.rs` slang→HLSL→patch→DXC path (bundled
+  `slangc -pass-through dxc`). `vgeo_hwvis_fs` joined `dxil_needs_sm66` (its `InterlockedMax64`).
+- **The mesh-shader pipeline seam was `unimplemented!()` on VK+DX.** VK: `VK_EXT_mesh_shader` enable +
+  `taskShader`/`meshShader` probe + `create_mesh_pipeline` (task+mesh+fragment) + `cmd_draw_mesh_tasks
+  [_indirect]_ext`. DX: OPTIONS7 `MeshShaderTier` probe + SM6.5 mesh PSO via
+  `D3D12_PIPELINE_STATE_STREAM` + `DispatchMesh` + `ExecuteIndirect` over a DISPATCH_MESH signature.
+- **VK bindless layout excluded the mesh stage.** The storage-buffer (and sampled) descriptor bindings
+  had no `MESH_EXT`/`TASK_EXT` stage flags, so the cluster mesh shader read nothing and emitted no
+  geometry on Vulkan (D3D12's `SHADER_VISIBILITY_ALL` covered it). Added, gated on `has_mesh_shader`.
+  The mesh push-constant range/stage set is tracked per pipeline (task stage only when present).
+- **NVIDIA VK `SetMeshOutputCounts` from an unbounded load = empty draw.** Feeding it a value straight
+  from `ByteAddressBuffer.Load` makes the whole mesh draw emit nothing on NVIDIA/Vulkan; clamping with
+  `min(count, MAX)` before the call gives the driver a static bound (and is a correctness fix — an
+  out-of-range count is UB). Applied to `vgeo_cluster` + `vgeo_hwvis`; identical output on DX/Metal.
+- **Viewer barriers/transitions (Metal-isms).** `run_vgeo_mesh` host-reset its indirect-args each frame
+  from a DEFAULT-heap buffer (illegal DX/VK → `create_storage_buffer_host`); missing cut-args →
+  INDIRECT_ARGUMENT + visbuf UAV barriers (empty draws); depth left in UNDEFINED (VUID-09588). The SW
+  compute raster + M6 resolve now use the flip-free matrix (manual NDC→pixel), only the HW-rasterized
+  cluster/hwvis passes use the Y-flipped `mvp`. `VGEO_ANGLE` pins the orbit for reproducible captures.
+
+**Measured (1280×720, Avocado, `VGEO_ANGLE=0.6`):** `--vgeo-mesh` **direct / cut / sw / bin / resolve /
+material all DX≡VK 0.000/ch (max 0)**. Binning verified across `VGEO_BINPX` 8/30/80 — the HW mesh and
+SW compute rasterizers write bit-identical visibility (BINPX 8 vs 80 output identical → seamless HW/SW
+boundary). `--mesh-shader-test` renders the RGB triangle on both backends. Mesh commands are
+validation-clean (the smoke loop's swapchain-sync VUIDs are pre-existing, identical to
+`--triangle-test`). Gallery anchor (features off) DX≡VK 0.001/ch — unregressed.
+
+**I4 (integrated HW/SW binning) — DONE.** `P14_VGEO_BIN=1` (needs mesh shaders) routes each vgeo
+object through the binning cut in the real deferred renderer: `csCutBin` splits the cut into a SW
+sub-list (compute raster) and an HW sub-list (`vgeo_hwvis` mesh shader, `draw_mesh_tasks_indirect`),
+both writing the SAME R64 visibility buffer, then the resolve → G-buffer as before. Enablers:
+`RenderGraph::add_pass_with_storage_writes` (a graphics pass that also UAV-writes the external
+visibility buffer, scheduled via WAW/RAW); the Vulkan `storage_buffer_barrier` src now covers the
+FRAGMENT stage (the HW-vis writes the visbuf from its fragment atomicMax; D3D12/Metal UAV barriers
+are stage-agnostic); `new_host` honours `INDIRECT_BUFFER` usage for the host-reset `hw_args`. The
+HW mesh-vis uses the Y-flipped `view_proj` (HW rasterizer) while the SW raster/resolve use the
+flip-free `cull_view_proj`, so both land the same screen pixels. **Verified (gallery, `P14_VGEO=1`):
+binning output byte-identical to SW-only on DX (0.000/ch) — HW and SW write bit-identical
+visibility — and DX≡VK 0.001/ch; gallery anchor (off) unchanged.** One benign SPIR-V validation
+warning (`VUID-…-OpVariable-08746`: a Slang per-primitive mesh→fragment decoration mismatch in
+`vgeo_hwvis`; triId is delivered correctly). NEXT (perf, not correctness): a Sponza-scale profiling
+pass + M4b HZB two-pass occlusion.
 
 ## Gates (every increment)
 
 `tools/golden-image.py --backend metal --only gallery` = `af70c1a5…` with `P14_VGEO` off;
-`cargo fmt` + `clippy -D warnings` clean; `cargo test` green; Metal-verified on this box, DX≡VK
-Windows follow-up.
+`cargo fmt` + `clippy -D warnings` clean; `cargo test` green; Metal-verified on the macOS box,
+**DX≡VK verified on Windows (RTX 2070 SUPER), ≤0.001/ch** (see the section above).

@@ -4,7 +4,10 @@ use std::ffi::c_void;
 use std::rc::Rc;
 
 use dreamcoast_core::EngineError;
-use rhi_types::{BlendMode, DepthCompare, GraphicsPipelineDesc, PrimitiveTopology, VertexLayout};
+use rhi_types::{
+    BlendMode, DepthCompare, GraphicsPipelineDesc, MeshPipelineDesc, PrimitiveTopology,
+    VertexLayout,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::{
     D3D_ROOT_SIGNATURE_VERSION_1, D3D12_BLEND_DESC, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE,
@@ -17,22 +20,31 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, D3D12_FILL_MODE_SOLID,
     D3D12_FILTER_ANISOTROPIC, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, D3D12_INPUT_ELEMENT_DESC, D3D12_INPUT_LAYOUT_DESC,
-    D3D12_LOGIC_OP_NOOP, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC,
-    D3D12_RENDER_TARGET_BLEND_DESC, D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR,
-    D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
-    D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_ROOT_PARAMETER_TYPE_CBV,
-    D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, D3D12_ROOT_SIGNATURE_DESC,
-    D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, D3D12_ROOT_SIGNATURE_FLAG_NONE,
-    D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL,
-    D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK, D3D12_STATIC_SAMPLER_DESC,
-    D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12SerializeRootSignature,
-    ID3D12PipelineState, ID3D12RootSignature,
+    D3D12_LOGIC_OP_NOOP, D3D12_PIPELINE_STATE_STREAM_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, D3D12_PRIMITIVE_TOPOLOGY_TYPE,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC, D3D12_RENDER_TARGET_BLEND_DESC,
+    D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER,
+    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+    D3D12_ROOT_PARAMETER_TYPE_CBV, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+    D3D12_ROOT_SIGNATURE_DESC, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+    D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D12_RT_FORMAT_ARRAY, D3D12_SHADER_BYTECODE,
+    D3D12_SHADER_VISIBILITY_ALL, D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+    D3D12_STATIC_SAMPLER_DESC, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+    D3D12SerializeRootSignature, ID3D12Device2, ID3D12PipelineState, ID3D12RootSignature,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT,
+    DXGI_FORMAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT,
     DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
-use windows::core::s;
+use windows::core::{Interface, s};
 
 use crate::device::{
     BINDLESS_COUNT, CUBE_COUNT, DeviceShared, STORAGE_BUFFER_BASE, STORAGE_BUFFER_COUNT,
@@ -414,13 +426,231 @@ pub struct D3d12ComputePipeline {
     push_via_cbv: bool,
 }
 
-/// A mesh-shader pipeline (Phase 14 virtual geometry). Placeholder for the Windows-box
-/// follow-up: it must build a mesh-shader PSO (SM6.5, `D3D12_PIPELINE_STATE_STREAM` with
-/// MS/PS). Until then [`D3d12Device::capabilities`] reports `mesh_shader: false`, so nothing
-/// constructs this on D3D12 (the smokes gate on it and are verified on Metal). DX≡VK parity
-/// is the tracked follow-up.
+/// A mesh-shader pipeline (Phase 14 virtual geometry Track B): an SM6.5 `MS`+`PS` (optionally
+/// `AS`) PSO built through a `D3D12_PIPELINE_STATE_STREAM`. Bound like a graphics pipeline
+/// (root signature + bindless table + optional globals CBV) and drawn with `DispatchMesh`.
 pub struct D3d12MeshPipeline {
-    _priv: (),
+    #[allow(dead_code)]
+    device: Rc<DeviceShared>,
+    root_signature: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    bindless: bool,
+    uniform_buffer: bool,
+}
+
+/// One aligned subobject in a `D3D12_PIPELINE_STATE_STREAM`. D3D12 requires each subobject to be
+/// `void*`-aligned (C++'s `CD3DX12` uses `alignas(void*)`); `align(8)` reproduces that so the
+/// 4-byte type tag is followed by the payload at the payload's natural offset and the next
+/// subobject starts 8-aligned.
+#[repr(C, align(8))]
+struct Sub<T: Copy> {
+    ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
+    val: T,
+}
+
+impl<T: Copy> Sub<T> {
+    fn new(ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, val: T) -> Self {
+        Self { ty, val }
+    }
+}
+
+/// The mesh-PSO subobject stream (fixed set; the amplification stage is an empty
+/// `D3D12_SHADER_BYTECODE` when absent, equivalent to omitting it). `#[repr(C)]` with each
+/// field an 8-aligned `Sub` lays the subobjects out contiguously and correctly aligned.
+#[repr(C)]
+struct MeshPsoStream {
+    root_signature: Sub<*mut core::ffi::c_void>,
+    amplification: Sub<D3D12_SHADER_BYTECODE>,
+    mesh: Sub<D3D12_SHADER_BYTECODE>,
+    pixel: Sub<D3D12_SHADER_BYTECODE>,
+    rasterizer: Sub<D3D12_RASTERIZER_DESC>,
+    blend: Sub<D3D12_BLEND_DESC>,
+    depth_stencil: Sub<D3D12_DEPTH_STENCIL_DESC>,
+    rt_formats: Sub<D3D12_RT_FORMAT_ARRAY>,
+    dsv_format: Sub<DXGI_FORMAT>,
+    sample_desc: Sub<DXGI_SAMPLE_DESC>,
+    sample_mask: Sub<u32>,
+    topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+}
+
+impl D3d12MeshPipeline {
+    pub(crate) fn new(
+        device: Rc<DeviceShared>,
+        desc: &MeshPipelineDesc,
+    ) -> Result<Self, EngineError> {
+        unsafe {
+            let root_signature = create_mesh_root_signature(&device, desc)?;
+
+            let mut rt_formats = D3D12_RT_FORMAT_ARRAY {
+                NumRenderTargets: desc.color_formats.len() as u32,
+                ..Default::default()
+            };
+            for (i, &fmt) in desc.color_formats.iter().enumerate() {
+                rt_formats.RTFormats[i] = to_dxgi_format(fmt);
+            }
+            let dsv_format = match desc.depth_format {
+                Some(f) => to_dxgi_format(f),
+                None => DXGI_FORMAT_UNKNOWN,
+            };
+            // Empty bytecode == "no amplification stage" when the caller passes none (M0/M2).
+            let amp_bytecode = match desc.object_bytes {
+                Some(bytes) => shader_bytecode(bytes),
+                None => D3D12_SHADER_BYTECODE::default(),
+            };
+
+            let stream = MeshPsoStream {
+                root_signature: Sub::new(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+                    root_signature.as_raw(),
+                ),
+                amplification: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, amp_bytecode),
+                mesh: Sub::new(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS,
+                    shader_bytecode(desc.mesh_bytes),
+                ),
+                pixel: Sub::new(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+                    shader_bytecode(desc.fragment_bytes),
+                ),
+                rasterizer: Sub::new(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+                    rasterizer_default(),
+                ),
+                blend: Sub::new(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
+                    blend_state(BlendMode::Opaque),
+                ),
+                depth_stencil: Sub::new(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
+                    depth_state(desc.depth_test, desc.depth_write, desc.depth_compare),
+                ),
+                rt_formats: Sub::new(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+                    rt_formats,
+                ),
+                dsv_format: Sub::new(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+                    dsv_format,
+                ),
+                sample_desc: Sub::new(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
+                    DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                ),
+                sample_mask: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, u32::MAX),
+                topology: Sub::new(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                ),
+            };
+
+            let stream_desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+                SizeInBytes: std::mem::size_of::<MeshPsoStream>(),
+                pPipelineStateSubobjectStream: &stream as *const _ as *mut core::ffi::c_void,
+            };
+            let device2: ID3D12Device2 = device.device.cast().map_err(d3d_err)?;
+            let pso: ID3D12PipelineState =
+                device2.CreatePipelineState(&stream_desc).map_err(d3d_err)?;
+
+            Ok(Self {
+                device,
+                root_signature,
+                pso,
+                bindless: desc.bindless,
+                uniform_buffer: desc.uniform_buffer,
+            })
+        }
+    }
+
+    pub(crate) fn root_signature(&self) -> &ID3D12RootSignature {
+        &self.root_signature
+    }
+
+    pub(crate) fn pso(&self) -> &ID3D12PipelineState {
+        &self.pso
+    }
+
+    pub(crate) fn is_bindless(&self) -> bool {
+        self.bindless
+    }
+
+    pub(crate) fn uses_uniform(&self) -> bool {
+        self.uniform_buffer
+    }
+}
+
+/// Root signature for a mesh pipeline: identical to the bindless graphics one (bindless table at
+/// param 0, inline 32-bit root constants at param 1 = `b0`, optional globals CBV at param 2 = `b1`)
+/// but with **no** `ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT` flag — a mesh pipeline has no input
+/// assembler. The mesh push blocks are small (≤112 B / 28 DWORDs), so they always fit inline (no
+/// root-CBV spill). Non-bindless mesh pipelines (M0 smoke) get an empty root signature.
+fn create_mesh_root_signature(
+    device: &DeviceShared,
+    desc: &MeshPipelineDesc,
+) -> Result<ID3D12RootSignature, EngineError> {
+    unsafe {
+        if !desc.bindless {
+            return serialize_and_create(
+                device,
+                &D3D12_ROOT_SIGNATURE_DESC {
+                    NumParameters: 0,
+                    pParameters: std::ptr::null(),
+                    NumStaticSamplers: 0,
+                    pStaticSamplers: std::ptr::null(),
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                },
+            );
+        }
+        let ranges = bindless_ranges();
+        let mut params = vec![
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: ranges.len() as u32,
+                        pDescriptorRanges: ranges.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                        Num32BitValues: desc.push_constant_size / 4,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        if desc.uniform_buffer {
+            params.push(D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR {
+                        ShaderRegister: 1,
+                        RegisterSpace: 0,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
+        let samplers = bindless_static_samplers();
+        serialize_and_create(
+            device,
+            &D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: samplers.len() as u32,
+                pStaticSamplers: samplers.as_ptr(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            },
+        )
+    }
 }
 
 impl D3d12ComputePipeline {

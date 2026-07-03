@@ -24,7 +24,7 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
     D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT, ID3D12CommandAllocator, ID3D12GraphicsCommandList,
-    ID3D12GraphicsCommandList4, ID3D12Resource,
+    ID3D12GraphicsCommandList4, ID3D12GraphicsCommandList6, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
 use windows::core::Interface;
@@ -917,36 +917,85 @@ impl D3d12CommandBuffer {
         }
     }
 
-    /// Indirect compute dispatch (Phase 14): reads a `D3D12_DISPATCH_ARGUMENTS` (three `u32`)
-    /// from `buffer` at `offset` via `ExecuteIndirect`. Requires a DISPATCH command signature
-    /// on the device — wired in the Windows-box follow-up alongside enabling the SM6.6 64-bit
-    /// atomics / mesh-shader tiers. Until then [`Device::capabilities`] reports all-false, so
-    /// the vgeo smokes never reach this on D3D12.
-    pub fn dispatch_indirect(&self, _buffer: &D3d12StorageBuffer, _offset: u64) {
-        unimplemented!(
-            "D3D12 dispatch_indirect: DISPATCH command signature pending (Phase 14 Windows follow-up)"
-        );
+    /// Indirect compute dispatch (Phase 14): reads a `D3D12_DISPATCH_ARGUMENTS` (three `u32`
+    /// groupCount, matching `VkDispatchIndirectCommand`) from `buffer` at `offset` via a single
+    /// `ExecuteIndirect` over the device's DISPATCH command signature. The buffer must be in the
+    /// `INDIRECT_ARGUMENT` state (see [`Self::storage_buffer_to_indirect`]).
+    pub fn dispatch_indirect(&self, buffer: &D3d12StorageBuffer, offset: u64) {
+        unsafe {
+            self.list.ExecuteIndirect(
+                &self.device.indirect_dispatch_signature,
+                1,
+                buffer.resource(),
+                offset,
+                None,
+                0,
+            );
+        }
     }
 
-    /// Bind a mesh-shader pipeline (Phase 14). Windows-box follow-up (SM6.5 mesh PSO); gated
-    /// off via [`crate::D3d12Device::capabilities`] until then.
-    pub fn bind_mesh_pipeline(&self, _pipeline: &crate::D3d12MeshPipeline) {
-        unimplemented!("D3D12 bind_mesh_pipeline pending (Phase 14 Windows follow-up)")
+    /// Bind a mesh-shader pipeline (Phase 14 Track B): root signature + bindless table + optional
+    /// globals CBV + PSO, mirroring [`Self::bind_graphics_pipeline`] (a mesh PSO binds through the
+    /// graphics root slots). No `IASetPrimitiveTopology` — a mesh pipeline has no input assembler.
+    pub fn bind_mesh_pipeline(&self, pipeline: &crate::D3d12MeshPipeline) {
+        if pipeline.is_bindless() {
+            self.ensure_descriptor_heaps();
+        }
+        unsafe {
+            self.list
+                .SetGraphicsRootSignature(pipeline.root_signature());
+            if pipeline.is_bindless() {
+                self.list
+                    .SetGraphicsRootDescriptorTable(0, self.device.srv_gpu_start());
+            }
+            if pipeline.uses_uniform() {
+                self.list
+                    .SetGraphicsRootConstantBufferView(2, self.globals_va.get());
+            }
+            self.list.SetPipelineState(pipeline.pso());
+        }
     }
 
-    /// Draw mesh threadgroups (Phase 14). Windows-box follow-up (`DispatchMesh`).
-    pub fn draw_mesh_tasks(&self, _x: u32, _y: u32, _z: u32) {
-        unimplemented!("D3D12 draw_mesh_tasks pending (Phase 14 Windows follow-up)")
+    /// Draw `(x, y, z)` mesh threadgroups of the bound mesh pipeline (`DispatchMesh`, requires
+    /// `ID3D12GraphicsCommandList6`, always available on a mesh-shader-capable device).
+    pub fn draw_mesh_tasks(&self, x: u32, y: u32, z: u32) {
+        unsafe {
+            let list6: ID3D12GraphicsCommandList6 = self
+                .list
+                .cast()
+                .expect("CommandList6 (mesh shaders available)");
+            list6.DispatchMesh(x, y, z);
+        }
     }
 
-    /// Mesh-pipeline push constants (Phase 14). Windows-box follow-up.
-    pub fn push_constants_mesh(&self, _data: &[u8]) {
-        unimplemented!("D3D12 push_constants_mesh pending (Phase 14 Windows follow-up)")
+    /// Mesh-pipeline push constants (param 1 = `b0`), same inline-32-bit-constants path as the
+    /// graphics push (mesh push blocks are small enough to never need the root-CBV spill).
+    pub fn push_constants_mesh(&self, data: &[u8]) {
+        unsafe {
+            self.list.SetGraphicsRoot32BitConstants(
+                1,
+                (data.len() / 4) as u32,
+                data.as_ptr() as *const c_void,
+                0,
+            );
+        }
     }
 
-    /// Indirect mesh draw (Phase 14 M3). Windows-box follow-up (`ExecuteIndirect` + DispatchMesh sig).
-    pub fn draw_mesh_tasks_indirect(&self, _buffer: &D3d12StorageBuffer, _offset: u64) {
-        unimplemented!("D3D12 draw_mesh_tasks_indirect pending (Phase 14 Windows follow-up)")
+    /// Indirect mesh draw (Phase 14 M3): a single `ExecuteIndirect` over the device's DISPATCH_MESH
+    /// command signature, reading a `D3D12_DISPATCH_MESH_ARGUMENTS` (three `u32`, matching
+    /// `VkDrawMeshTasksIndirectCommandEXT`) from `buffer` at `offset`. The buffer must be in the
+    /// `INDIRECT_ARGUMENT` state (see [`Self::storage_buffer_to_indirect`]).
+    pub fn draw_mesh_tasks_indirect(&self, buffer: &D3d12StorageBuffer, offset: u64) {
+        unsafe {
+            self.list.ExecuteIndirect(
+                &self.device.indirect_dispatch_mesh_signature,
+                1,
+                buffer.resource(),
+                offset,
+                None,
+                0,
+            );
+        }
     }
 
     fn barrier(
