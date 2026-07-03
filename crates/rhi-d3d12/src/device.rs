@@ -65,7 +65,7 @@ pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
 /// cluster-page / visibility / cut buffers. Downstream heap offsets (`TLAS_SLOT`, `VOLUME_BASE`,
 /// …) and the root-signature ranges derive from this, so the whole layout shifts consistently;
 /// must match `Bindless.storage_buffers[N]` in bindless.slang and rhi-vulkan / rhi-metal.
-pub(crate) const STORAGE_BUFFER_COUNT: u32 = 128;
+pub(crate) const STORAGE_BUFFER_COUNT: u32 = 2048;
 /// Heap offset where the storage-image UAV region begins.
 pub(crate) const STORAGE_IMAGE_BASE: u32 = BINDLESS_COUNT + CUBE_COUNT;
 /// Heap offset where the storage-buffer UAV region begins.

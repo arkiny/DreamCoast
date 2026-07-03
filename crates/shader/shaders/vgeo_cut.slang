@@ -38,6 +38,9 @@ struct PushConstants
     // `model = identity`, `max_scale = 1` → a no-op (its old local == world behavior).
     float4x4 model;    // 144: object → world (192 B total after the mat4)
     float max_scale;   // 208: max column scale of `model` (conservatively scales sphere radii/errors)
+    uint rec_base;     // 212: this page's first GLOBAL cluster index in the shared record buffer.
+                       //      Local cluster c → global gc = rec_base + c; the visible list stores gc
+                       //      so the raster/mesh/resolve address the consolidated buffers directly.
 };
 
 [[vk::push_constant]]
@@ -93,9 +96,10 @@ void csCut(uint3 tid: SV_DispatchThreadID)
     uint c = tid.x;
     if (c >= pc.total)
         return;
+    uint gc = pc.rec_base + c; // global cluster index into the shared record buffer
 
     RWByteAddressBuffer rec = g.storage_buffers[pc.rec_buf];
-    uint base = c * 96;
+    uint base = gc * 96;
     float self_err = asfloat(rec.Load(base + 16));
     float3 self_c = asfloat(rec.Load3(base + 20));
     float self_r = asfloat(rec.Load(base + 32));
@@ -127,9 +131,9 @@ void csCut(uint3 tid: SV_DispatchThreadID)
 
     {
         uint slot;
-        // Bump the indirect threadgroup count (args.x) and append our cluster index.
+        // Bump the indirect threadgroup count (args.x) and append our GLOBAL cluster index.
         g.storage_buffers[pc.args_buf].InterlockedAdd(0, 1, slot);
-        g.storage_buffers[pc.vis_buf].Store(slot * 4, c);
+        g.storage_buffers[pc.vis_buf].Store(slot * 4, gc);
     }
 }
 
@@ -176,9 +180,10 @@ void csCutBin(uint3 tid: SV_DispatchThreadID)
     uint c = tid.x;
     if (c >= pc.total)
         return;
+    uint gc = pc.rec_base + c; // global cluster index into the shared record buffer
     float3 bnd_c;
     float bnd_r;
-    if (!select_cluster(c, bnd_c, bnd_r))
+    if (!select_cluster(gc, bnd_c, bnd_r))
         return;
 
     // Projected bounds diameter in pixels: 2r * proj_factor / (nearest distance to the sphere).
@@ -189,5 +194,5 @@ void csCutBin(uint3 tid: SV_DispatchThreadID)
     uint args = (screen_diam < pc.bin_px) ? pc.sw_args : pc.args_buf;
     uint slot;
     g.storage_buffers[args].InterlockedAdd(0, 1, slot);
-    g.storage_buffers[list].Store(slot * 4, c);
+    g.storage_buffers[list].Store(slot * 4, gc);
 }
