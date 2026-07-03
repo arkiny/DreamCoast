@@ -1221,6 +1221,28 @@ impl VulkanCommandBuffer {
         }
     }
 
+    /// Indirect compute dispatch (Phase 14): grid dims read from `buffer[offset..]` as a
+    /// `VkDispatchIndirectCommand` (three `u32`). Not yet exercised — the vgeo smokes gate
+    /// on [`DeviceCapabilities`], which Vulkan reports all-false until the Windows follow-up.
+    pub fn dispatch_indirect(&self, buffer: &VulkanStorageBuffer, offset: u64) {
+        unsafe {
+            self.device
+                .device
+                .cmd_dispatch_indirect(self.cmd, buffer.raw(), offset);
+        }
+    }
+
+    /// Bind a mesh-shader pipeline (Phase 14). Windows-box follow-up (`VK_EXT_mesh_shader`);
+    /// gated off via [`crate::VulkanDevice::capabilities`] until then.
+    pub fn bind_mesh_pipeline(&self, _pipeline: &crate::VulkanMeshPipeline) {
+        unimplemented!("Vulkan bind_mesh_pipeline pending (Phase 14 Windows follow-up)")
+    }
+
+    /// Draw mesh threadgroups (Phase 14). Windows-box follow-up (`cmd_draw_mesh_tasks_ext`).
+    pub fn draw_mesh_tasks(&self, _x: u32, _y: u32, _z: u32) {
+        unimplemented!("Vulkan draw_mesh_tasks pending (Phase 14 Windows follow-up)")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn image_barrier(
         &self,

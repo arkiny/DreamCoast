@@ -11,8 +11,9 @@ use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_gui::{Gui, imgui};
 use dreamcoast_platform::Window;
 use rhi::{
-    BackendKind, BlendMode, BufferDesc, BufferUsage, ClearColor, DepthCompare, Device, Extent2D,
-    Format, GraphicsPipelineDesc, PrimitiveTopology, Swapchain, Texture, VertexLayout,
+    BackendKind, BlendMode, BufferDesc, BufferUsage, ClearColor, ComputePipelineDesc, DepthCompare,
+    Device, Extent2D, Format, GraphicsPipelineDesc, MeshPipelineDesc, PrimitiveTopology,
+    StorageBufferDesc, Swapchain, Texture, VertexLayout,
 };
 use tracing::info;
 
@@ -461,6 +462,279 @@ pub(crate) fn run_mesh_test(
     device.wait_idle()?;
     let _ = &depth; // kept alive for the loop
     info!("mesh-test exited after {frames} frame(s)");
+    Ok(())
+}
+
+// ── Phase 14 (virtual geometry) M0 capability smokes ────────────────────────────────
+
+/// Whether `--atomic64-test` was passed: run the 64-bit `atomicMax` capability smoke
+/// (Phase 14 M0). Proves the visibility-buffer primitive end-to-end — a compute kernel
+/// atomic-maxes packed `u64` values into a bindless storage buffer via an INDIRECT dispatch,
+/// then the CPU reads it back and checks each slot equals the max the shader should have
+/// written. Exercises the 64-bit-atomic + indirect-dispatch RHI paths at once.
+pub(crate) fn atomic64_test_enabled() -> bool {
+    std::env::args().skip(1).any(|a| a == "--atomic64-test")
+}
+
+/// Knuth multiplicative hash, matching `vgeo_atomic.slang`'s `hi` scatter exactly (u32
+/// wrapping). Kept in lockstep with the shader so the CPU expectation is the single source
+/// of truth for what the GPU must produce.
+fn atomic64_packed(i: u32) -> u64 {
+    let hi = i.wrapping_mul(2654435761) & 0xFFFF;
+    ((hi as u64) << 32) | (i as u64)
+}
+
+pub(crate) fn run_atomic64_test(backend: BackendKind, device: &Device) -> anyhow::Result<()> {
+    let caps = device.capabilities();
+    if !caps.atomic_int64 {
+        return Err(anyhow!(
+            "--atomic64-test: {backend:?} adapter lacks 64-bit buffer atomics (DeviceCapabilities::atomic_int64 = false)"
+        ));
+    }
+    if !caps.dispatch_indirect {
+        return Err(anyhow!(
+            "--atomic64-test: {backend:?} adapter lacks indirect compute dispatch"
+        ));
+    }
+
+    let cs = match backend {
+        BackendKind::Vulkan => dreamcoast_shader::vgeo_atomic_cs_spirv(),
+        BackendKind::D3d12 => dreamcoast_shader::vgeo_atomic_cs_dxil(),
+        BackendKind::Metal => dreamcoast_shader::vgeo_atomic_cs_metallib(),
+    }
+    .ok_or_else(|| anyhow!("vgeo_atomic compute shader unavailable for {backend:?}"))?;
+
+    const COUNT: u32 = 4096;
+    const SLOTS: u32 = 16;
+
+    let pipeline = device.create_compute_pipeline(&ComputePipelineDesc {
+        compute_bytes: cs,
+        compute_entry: "csAtomicMax",
+        push_constant_size: 16,
+        bindless: true,
+        uniform_buffer: false,
+        threads_per_group: [64, 1, 1],
+    })?;
+
+    // R64 target: zero-initialised (so every packed write wins the `atomicMax`), host-visible
+    // for CPU readback, registered in the bindless storage table.
+    let vis = device.create_storage_buffer_init(
+        &StorageBufferDesc {
+            size: (SLOTS as u64) * 8,
+            stride: 8,
+            indirect: false,
+        },
+        &vec![0u8; (SLOTS as usize) * 8],
+    )?;
+    // Indirect dispatch args: threadgroup counts (x, y, z) read on the GPU.
+    let groups_x = COUNT.div_ceil(64);
+    let mut args_bytes = Vec::with_capacity(12);
+    args_bytes.extend_from_slice(&groups_x.to_le_bytes());
+    args_bytes.extend_from_slice(&1u32.to_le_bytes());
+    args_bytes.extend_from_slice(&1u32.to_le_bytes());
+    let args = device.create_storage_buffer_init(
+        &StorageBufferDesc {
+            size: 12,
+            stride: 4,
+            indirect: true,
+        },
+        &args_bytes,
+    )?;
+
+    let mut push = Vec::with_capacity(16);
+    push.extend_from_slice(&vis.storage_index().to_le_bytes()); // buf_index
+    push.extend_from_slice(&COUNT.to_le_bytes()); // count
+    push.extend_from_slice(&SLOTS.to_le_bytes()); // slots
+    push.extend_from_slice(&0u32.to_le_bytes()); // pad
+
+    let queue = device.queue();
+    let cmd = device.create_command_buffer()?;
+    let image_available = device.create_semaphore()?;
+    let render_finished = device.create_semaphore()?;
+    let fence = device.create_fence(false)?;
+
+    cmd.begin()?;
+    cmd.bind_compute_pipeline(&pipeline);
+    cmd.push_constants_compute(&push);
+    cmd.dispatch_indirect(&args, 0);
+    cmd.end()?;
+    queue.submit(&cmd, &image_available, &render_finished, &fence)?;
+    fence.wait()?;
+
+    let mut bytes = vec![0u8; (SLOTS as usize) * 8];
+    vis.read_into(&mut bytes)?;
+
+    // CPU expectation: the max packed value routed to each slot (write wraps mod SLOTS).
+    let mut expected = vec![0u64; SLOTS as usize];
+    for i in 0..COUNT {
+        let s = (i % SLOTS) as usize;
+        expected[s] = expected[s].max(atomic64_packed(i));
+    }
+
+    let mut mismatches = 0usize;
+    for (s, exp) in expected.iter().enumerate() {
+        let got = u64::from_le_bytes(bytes[s * 8..s * 8 + 8].try_into().unwrap());
+        if got != *exp {
+            mismatches += 1;
+            info!("atomic64 slot {s}: got {got:#018x} expected {exp:#018x}");
+        }
+    }
+    if mismatches != 0 {
+        return Err(anyhow!(
+            "--atomic64-test FAILED: {mismatches}/{SLOTS} slots mismatched (64-bit atomicMax incorrect)"
+        ));
+    }
+
+    device.wait_idle()?;
+    info!(
+        "--atomic64-test PASSED on {backend:?}: {COUNT} threads → {SLOTS} slots, 64-bit atomicMax via indirect dispatch, CPU-verified"
+    );
+    Ok(())
+}
+
+/// Whether `--mesh-shader-test` was passed: run the mesh-shader pipeline capability smoke
+/// (Phase 14 M0). A single mesh threadgroup emits one hardcoded RGB triangle, proving
+/// `create_mesh_pipeline` + `draw_mesh_tasks` before any cluster data exists.
+pub(crate) fn mesh_shader_test_enabled() -> bool {
+    std::env::args().skip(1).any(|a| a == "--mesh-shader-test")
+}
+
+pub(crate) fn run_mesh_shader_test(
+    backend: BackendKind,
+    window: &mut Window,
+    device: &Device,
+    swapchain: &mut Swapchain,
+) -> anyhow::Result<()> {
+    if !device.capabilities().mesh_shader {
+        return Err(anyhow!(
+            "--mesh-shader-test: {backend:?} adapter lacks mesh shaders (DeviceCapabilities::mesh_shader = false)"
+        ));
+    }
+
+    let (ms, fs) = match backend {
+        BackendKind::Vulkan => (
+            dreamcoast_shader::vgeo_meshlet_ms_spirv(),
+            dreamcoast_shader::vgeo_meshlet_fs_spirv(),
+        ),
+        BackendKind::D3d12 => (
+            dreamcoast_shader::vgeo_meshlet_ms_dxil(),
+            dreamcoast_shader::vgeo_meshlet_fs_dxil(),
+        ),
+        BackendKind::Metal => (
+            dreamcoast_shader::vgeo_meshlet_ms_metallib(),
+            dreamcoast_shader::vgeo_meshlet_fs_metallib(),
+        ),
+    };
+    let ms = ms.ok_or_else(|| anyhow!("vgeo_meshlet mesh shader unavailable for {backend:?}"))?;
+    let fs =
+        fs.ok_or_else(|| anyhow!("vgeo_meshlet fragment shader unavailable for {backend:?}"))?;
+
+    let pipeline = device.create_mesh_pipeline(&MeshPipelineDesc {
+        object_bytes: None,
+        object_entry: "",
+        mesh_bytes: ms,
+        mesh_entry: "meshMain",
+        fragment_bytes: fs,
+        fragment_entry: "fragMain",
+        color_formats: &[COLOR_FORMAT],
+        depth_format: None,
+        push_constant_size: 0,
+        bindless: false,
+        uniform_buffer: false,
+        object_threads: [1, 1, 1],
+        mesh_threads: [3, 1, 1],
+    })?;
+
+    let queue = device.queue();
+    let cmd = device.create_command_buffer()?;
+    let image_available = device.create_semaphore()?;
+    let render_finished = device.create_semaphore()?;
+    let fence = device.create_fence(true)?;
+
+    let captures = screenshot_captures();
+    const CAPTURE_FRAME: u64 = 2;
+    let max_frames = clear_test_max_frames();
+    info!("running mesh-shader-test loop (press ESC or close the window to exit)");
+    let mut frames = 0u64;
+    let _ = window.take_resized();
+    while !window.should_close() {
+        if let Some(max) = max_frames
+            && frames >= max
+        {
+            break;
+        }
+        window.pump_events();
+        let (w, h) = window.size();
+        if w == 0 || h == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            continue;
+        }
+        if window.take_resized() {
+            device.wait_idle()?;
+            swapchain.recreate(&swapchain_desc(Extent2D::new(w, h)))?;
+        }
+
+        fence.wait()?;
+        let image_index = match swapchain.acquire_next_image(&image_available)? {
+            Some(i) => i,
+            None => {
+                swapchain.recreate(&swapchain_desc(Extent2D::new(w, h)))?;
+                continue;
+            }
+        };
+        fence.reset()?;
+
+        let color = ClearColor {
+            r: 0.1,
+            g: 0.1,
+            b: 0.12,
+            a: 1.0,
+        };
+        cmd.begin()?;
+        cmd.transition_to_render_target(swapchain, image_index);
+        cmd.begin_rendering(swapchain, image_index, Some(color), None);
+        cmd.set_viewport_scissor(swapchain);
+        cmd.bind_mesh_pipeline(&pipeline);
+        cmd.draw_mesh_tasks(1, 1, 1);
+        cmd.end_rendering();
+
+        let capture = (!captures.is_empty() && frames == CAPTURE_FRAME).then(|| &captures[0]);
+        let readback = if capture.is_some() {
+            let layout = device.swapchain_readback_layout(swapchain);
+            let buf = device.create_buffer(&BufferDesc {
+                size: layout.size,
+                usage: BufferUsage::Readback,
+            })?;
+            cmd.copy_swapchain_to_buffer(swapchain, image_index, &buf);
+            Some((buf, layout))
+        } else {
+            None
+        };
+
+        cmd.transition_to_present(swapchain, image_index);
+        cmd.end()?;
+        queue.submit(&cmd, &image_available, &render_finished, &fence)?;
+
+        if let (Some(cap), Some((buf, layout))) = (capture, readback.as_ref()) {
+            fence.wait()?;
+            let mut bytes = vec![0u8; layout.size as usize];
+            buf.read_into(&mut bytes)?;
+            save_screenshot(&cap.path, &bytes, layout)?;
+            info!(
+                "saved mesh-shader screenshot {} ({}x{})",
+                cap.path, layout.width, layout.height
+            );
+        }
+
+        queue.present(swapchain, image_index, &render_finished)?;
+        frames += 1;
+
+        if capture.is_some() {
+            break;
+        }
+    }
+    device.wait_idle()?;
+    info!("mesh-shader-test exited after {frames} frame(s)");
     Ok(())
 }
 

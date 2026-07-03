@@ -399,6 +399,15 @@ pub struct VulkanComputePipeline {
     uniform_buffer: bool,
 }
 
+/// A mesh-shader pipeline (Phase 14 virtual geometry). Placeholder for the Windows-box
+/// follow-up: it must enable `VK_EXT_mesh_shader` at device creation and build the pipeline
+/// via `task`+`mesh` stages. Until then [`VulkanDevice::capabilities`] reports
+/// `mesh_shader: false`, so nothing constructs this on Vulkan (the smokes gate on it and are
+/// verified on Metal). DX≡VK parity is the tracked follow-up.
+pub struct VulkanMeshPipeline {
+    _priv: (),
+}
+
 impl VulkanComputePipeline {
     pub(crate) fn new(
         device: Arc<DeviceShared>,

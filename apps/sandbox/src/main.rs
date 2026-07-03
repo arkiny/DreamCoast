@@ -477,6 +477,15 @@ fn run() -> anyhow::Result<()> {
         );
     }
 
+    // Phase 14 (virtual geometry) M0 capability smokes. `--atomic64-test` is headless
+    // (compute + CPU readback); `--mesh-shader-test` draws one mesh-shader triangle.
+    if atomic64_test_enabled() {
+        return run_atomic64_test(backend, &device);
+    }
+    if mesh_shader_test_enabled() {
+        return run_mesh_shader_test(backend, &mut window, &device, &mut swapchain);
+    }
+
     let mut app = App::new(
         window,
         instance,

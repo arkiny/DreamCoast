@@ -47,7 +47,7 @@ pub use cubemap::D3d12Cubemap;
 pub use depth::D3d12DepthBuffer;
 pub use device::{D3d12ComputeQueue, D3d12Device, D3d12Queue};
 pub use instance::D3d12Instance;
-pub use pipeline::{D3d12ComputePipeline, D3d12GraphicsPipeline};
+pub use pipeline::{D3d12ComputePipeline, D3d12GraphicsPipeline, D3d12MeshPipeline};
 pub use query::D3d12QueryHeap;
 pub use render_target::{D3d12RenderTarget, D3d12TransientHeap};
 pub use rt_pipeline::D3d12RaytracingPipeline;
