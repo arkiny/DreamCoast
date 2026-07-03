@@ -8,13 +8,16 @@
 
 use dreamcoast_core::EngineError;
 
-use super::{CHUNK_CLUSTERS, Header, Writer, open_chunk, write_single_chunk};
+use super::{
+    CHUNK_CLUSTERS, Header, Reader, Writer, open_chunk, read_directory, write_single_chunk,
+};
 use crate::MeshVertex;
 use crate::vgeo::{Cluster, MeshClusters};
 
-/// Serialize `mc` into a single-chunk `.dcasset` buffer. `src_hash` is the source mesh's
-/// [`super::source_hash`], embedded for cache invalidation.
-pub fn write_clusters(mc: &MeshClusters, src_hash: u64) -> Vec<u8> {
+/// Encode a [`MeshClusters`] into a raw chunk payload (no container framing) — the bytes of a
+/// `CHUNK_CLUSTERS` chunk. Shared by the standalone [`write_clusters`] and the combined
+/// mesh+clusters cook ([`super::mesh::write_with_clusters`]).
+pub(crate) fn encode_clusters(mc: &MeshClusters) -> Vec<u8> {
     let mut w = Writer::default();
 
     // Source vertex pool (position/normal/uv), so the page is self-contained.
@@ -71,14 +74,18 @@ pub fn write_clusters(mc: &MeshClusters, src_hash: u64) -> Vec<u8> {
         w.f32(c.parent_radius);
     }
 
-    write_single_chunk(CHUNK_CLUSTERS, &w.buf, src_hash)
+    w.buf
 }
 
-/// Decode a cluster-page `.dcasset` buffer into its [`Header`] and [`MeshClusters`]. Errors on
-/// bad magic, truncation, or a missing cluster chunk.
-pub fn read_clusters(bytes: &[u8]) -> Result<(Header, MeshClusters), EngineError> {
-    let (header, mut r) = open_chunk(bytes, CHUNK_CLUSTERS, "clusters")?;
+/// Serialize `mc` into a standalone single-chunk `.dcasset` buffer. `src_hash` is the source
+/// mesh's [`super::source_hash`], embedded for cache invalidation.
+pub fn write_clusters(mc: &MeshClusters, src_hash: u64) -> Vec<u8> {
+    write_single_chunk(CHUNK_CLUSTERS, &encode_clusters(mc), src_hash)
+}
 
+/// Decode a `CHUNK_CLUSTERS` payload (positioned reader) into a [`MeshClusters`]. Shared by the
+/// standalone and combined readers.
+pub(crate) fn decode_clusters(r: &mut Reader) -> Result<MeshClusters, EngineError> {
     let pool = r.u32()? as usize;
     let mut vertices = Vec::with_capacity(pool);
     for _ in 0..pool {
@@ -122,15 +129,37 @@ pub fn read_clusters(bytes: &[u8]) -> Result<(Header, MeshClusters), EngineError
         });
     }
 
-    Ok((
-        header,
-        MeshClusters {
-            vertices,
-            cluster_vertices,
-            cluster_triangles,
-            clusters,
-        },
-    ))
+    Ok(MeshClusters {
+        vertices,
+        cluster_vertices,
+        cluster_triangles,
+        clusters,
+    })
+}
+
+/// Decode a standalone cluster-page `.dcasset` buffer into its [`Header`] and [`MeshClusters`].
+/// Errors on bad magic, truncation, or a missing cluster chunk.
+pub fn read_clusters(bytes: &[u8]) -> Result<(Header, MeshClusters), EngineError> {
+    let (header, mut r) = open_chunk(bytes, CHUNK_CLUSTERS, "clusters")?;
+    Ok((header, decode_clusters(&mut r)?))
+}
+
+/// Find a `CHUNK_CLUSTERS` chunk in ANY `.dcasset` container (e.g. a combined mesh+clusters cook)
+/// and decode it, or `None` if the file has no cluster chunk (a fallback-only asset). The mesh
+/// readers already skip this chunk, so a combined file loads its mesh regardless.
+pub fn read_clusters_opt(bytes: &[u8]) -> Result<Option<MeshClusters>, EngineError> {
+    for (ty, offset, size) in read_directory(bytes)? {
+        if ty != CHUNK_CLUSTERS {
+            continue;
+        }
+        let end = offset
+            .checked_add(size)
+            .filter(|&e| e <= bytes.len())
+            .ok_or_else(|| EngineError::Asset("dcasset: clusters chunk out of bounds".into()))?;
+        let mut r = Reader::at(&bytes[..end], offset);
+        return Ok(Some(decode_clusters(&mut r)?));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -181,5 +210,35 @@ mod tests {
         assert_eq!(mc, back);
         // Re-encoding the decoded value is byte-identical (deterministic cook).
         assert_eq!(bytes, write_clusters(&back, 0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn combined_mesh_and_clusters_round_trip() {
+        use crate::{Material, MeshData};
+        let (verts, idx) = grid(24);
+        let clusters = build_lod_dag(&verts, &idx, 0);
+        let mesh = MeshData {
+            vertices: verts.clone(),
+            indices: idx.clone(),
+            material: Material::default(),
+        };
+
+        // The cooked form: fallback mesh + cluster pages in one container.
+        let bytes = super::super::mesh::write_with_clusters(&mesh, &clusters, 42);
+
+        // The fallback mesh reads back through the plain reader (cluster chunk ignored).
+        let (_, back_mesh) = super::super::mesh::read(&bytes).expect("read mesh");
+        assert_eq!(back_mesh.vertices.len(), verts.len());
+        assert_eq!(back_mesh.indices, idx);
+
+        // The cluster pages read back and match the builder output exactly.
+        let back = read_clusters_opt(&bytes)
+            .expect("read")
+            .expect("clusters present");
+        assert_eq!(back, clusters);
+
+        // A mesh-only cook (no clusters) reports no cluster chunk.
+        let mesh_only = super::super::mesh::write(&mesh, 42);
+        assert!(read_clusters_opt(&mesh_only).expect("read").is_none());
     }
 }
