@@ -33,7 +33,17 @@ one material for the whole cluster set (single-mesh/single-material object).
 ## Increment plan
 
 - **I1 (LANDED):** `vgeo_gbuffer.slang` producer shader + build.rs jobs.
-- **I2 (NEXT): `VgeoSystem` + wiring.** A subsystem mirroring `CullSystem` (`cull.rs`):
+- **I2 + I3 (LANDED, commit `9ea0004`): `VgeoSystem` + wiring + parity.** `apps/sandbox/src/vgeo.rs`
+  mirrors `CullSystem`; `P14_VGEO=1` produces the single model's G-buffer via cut → SW raster →
+  resolve, `=2` is the groundless mesh reference. **Metal parity: mean diff 0.0000152/channel** vs
+  the mesh fill (only ~0.02% silhouette-edge pixels differ — SW vs HW raster coverage rule). Gallery
+  anchor byte-identical when off. **Deviation from the spec below:** the render-graph IR `Recorder`
+  has no indirect compute dispatch, so the SW raster uses a FIXED per-cluster dispatch over a
+  `0xFFFFFFFF`-sentinel visible list (the cut fills the front, `csRaster` skips sentinels) instead of
+  `dispatch_indirect`; the cluster geometry is normalized in `VgeoSystem::new` (same
+  `normalize_on_ground` arithmetic) so the object transform is the single model matrix. **NEXT: I4**
+  (binning-in-graph + M4b HZB), then multi-material/scene-cook.
+- **I2 spec (as-built above):** A subsystem mirroring `CullSystem` (`cull.rs`):
   - **Owns** persistent buffers built once at `App::new` from the loaded model's cooked clusters
     (`load_cooked_clusters`, as the viewer does): vertex pool / remap / triangles / records, plus the
     per-frame scratch — R64 visibility buffer (recreated on resize), the cut's visible list, and the
