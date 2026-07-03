@@ -53,11 +53,16 @@ pub struct Cluster {
 }
 
 /// A mesh's clusterized geometry — the per-mesh **cluster page stream** serialized to
-/// `.dcasset`. `cluster_vertices` is the shared remap into the source mesh's vertex pool;
-/// `cluster_triangles` holds every cluster's `u8` local triangle indices back to back.
+/// `.dcasset`. Self-contained: it owns the source mesh's vertex pool (`vertices`), so a page
+/// carries everything the runtime needs to upload + draw without a separate mesh chunk.
+/// `cluster_vertices` remaps into `vertices`; `cluster_triangles` holds every cluster's `u8`
+/// local triangle indices back to back.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct MeshClusters {
-    /// Remap: `cluster_vertices[cluster.vertex_offset + local]` is the source-mesh vertex index.
+    /// The source mesh's vertex pool (position/normal/uv), in original order. Owned so the
+    /// cluster page is self-describing; `cluster_vertices` and the drawn geometry index into it.
+    pub vertices: Vec<MeshVertex>,
+    /// Remap: `cluster_vertices[cluster.vertex_offset + local]` is a `vertices` index.
     pub cluster_vertices: Vec<u32>,
     /// Local `u8` triangle indices (3 per triangle), addressing a cluster's vertex window.
     pub cluster_triangles: Vec<u8>,
@@ -70,7 +75,10 @@ pub struct MeshClusters {
 /// triangles in input order, so the same mesh always produces the same clusters (cook-cache
 /// friendly, cross-platform byte-identical).
 pub fn build_clusters(vertices: &[MeshVertex], indices: &[u32], material: u32) -> MeshClusters {
-    let mut out = MeshClusters::default();
+    let mut out = MeshClusters {
+        vertices: vertices.to_vec(),
+        ..Default::default()
+    };
     let tri_count = indices.len() / 3;
 
     // Current cluster accumulation state.
