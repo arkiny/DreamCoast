@@ -923,11 +923,11 @@ pub(crate) fn run_vgeo_mesh(
     for &b in &dag.cluster_triangles {
         tri.extend_from_slice(&(b as u32).to_le_bytes());
     }
-    // Per-cluster GpuCluster records (64 B), ALL clusters — the mesh shader reads the first 16
-    // bytes (offsets/counts) and the LOD-cut compute reads the self/parent error+sphere. The
-    // spheres are recentered by the same centroid as the vertices so camera-space projection lines
-    // up.
-    let mut rec = Vec::with_capacity(dag.clusters.len() * 64);
+    // Per-cluster GpuCluster records (96 B), ALL clusters — the mesh shader reads the first 16
+    // bytes (offsets/counts); the LOD-cut compute reads the self/parent error+sphere (LOD), the
+    // own bounds sphere (frustum + small cull), and the normal cone (backface cull). Spheres are
+    // recentered by the same centroid as the vertices so camera-space projection lines up.
+    let mut rec = Vec::with_capacity(dag.clusters.len() * 96);
     for c in &dag.clusters {
         for field in [
             c.vertex_offset,
@@ -938,19 +938,22 @@ pub(crate) fn run_vgeo_mesh(
             rec.extend_from_slice(&field.to_le_bytes());
         }
         let put = |rec: &mut Vec<u8>, f: f32| rec.extend_from_slice(&f.to_le_bytes());
-        let sc = Vec3::from(c.self_center) - center;
-        let pcn = Vec3::from(c.parent_center) - center;
-        put(&mut rec, c.self_error);
-        for f in sc.to_array() {
-            put(&mut rec, f);
-        }
+        let put3 = |rec: &mut Vec<u8>, v: [f32; 3]| {
+            for f in v {
+                rec.extend_from_slice(&f.to_le_bytes());
+            }
+        };
+        put(&mut rec, c.self_error); // 16
+        put3(&mut rec, (Vec3::from(c.self_center) - center).to_array());
         put(&mut rec, c.self_radius);
-        put(&mut rec, c.parent_error);
-        for f in pcn.to_array() {
-            put(&mut rec, f);
-        }
+        put(&mut rec, c.parent_error); // 36
+        put3(&mut rec, (Vec3::from(c.parent_center) - center).to_array());
         put(&mut rec, c.parent_radius);
-        rec.extend_from_slice(&[0u8; 8]); // pad to 64
+        put3(&mut rec, (Vec3::from(c.bounds_center) - center).to_array()); // 56
+        put(&mut rec, c.bounds_radius);
+        put3(&mut rec, c.cone_axis); // 72
+        put(&mut rec, c.cone_cutoff);
+        rec.extend_from_slice(&[0u8; 8]); // 88..96 pad
     }
     // Direct-path (M2) span of the selected LOD (clusters are contiguous per level).
     let lod_start = dag
@@ -964,7 +967,7 @@ pub(crate) fn run_vgeo_mesh(
     let vtx_buf = sb(device, &vtx, 32)?;
     let remap_buf = sb(device, &remap, 4)?;
     let tri_buf = sb(device, &tri, 4)?;
-    let rec_buf = sb(device, &rec, 64)?;
+    let rec_buf = sb(device, &rec, 96)?;
 
     // M3 cut mode (VGEO_CUT=1): a compute pass selects the view-dependent cut into `vis_buf` and
     // writes the mesh-draw threadgroup count into `args_buf` for the indirect draw.
@@ -985,7 +988,7 @@ pub(crate) fn run_vgeo_mesh(
         Some(device.create_compute_pipeline(&ComputePipelineDesc {
             compute_bytes: cs,
             compute_entry: "csCut",
-            push_constant_size: 48,
+            push_constant_size: 144,
             bindless: true,
             uniform_buffer: false,
             threads_per_group: [64, 1, 1],
@@ -1085,7 +1088,13 @@ pub(crate) fn run_vgeo_mesh(
         };
         fence.reset()?;
 
-        let focus = Vec3::new(0.0, 0.0, 0.0);
+        // VGEO_PAN offsets the look-at target so the object (at the origin) slides toward the
+        // screen edge — a way to see frustum culling drop the off-screen clusters.
+        let pan: f32 = std::env::var("VGEO_PAN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let focus = Vec3::new(pan * radius, 0.0, 0.0);
         let dist = radius * 3.0;
         let eye = focus + Vec3::new(angle.cos() * dist, radius * 0.6, angle.sin() * dist);
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
@@ -1134,12 +1143,22 @@ pub(crate) fn run_vgeo_mesh(
                     .collect::<Vec<u8>>(),
             )?;
             let proj_factor = 0.5 * h as f32 / (30f32.to_radians()).tan();
-            let mut cpc = [0u8; 48];
-            for (i, f) in eye.to_array().iter().enumerate() {
-                cpc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+            // Cut push (144 B): planes[6] (96) + cam xyz (12) + proj_factor + tau + 4 slots.
+            // Frustum planes come from the UNFLIPPED proj*view (the no-flip cull matrix).
+            let planes = crate::push::frustum_planes(
+                Mat4::perspective_rh(60f32.to_radians(), w as f32 / h as f32, 0.05, 100.0) * view,
+            );
+            let mut cpc = [0u8; 144];
+            for (i, plane) in planes.iter().enumerate() {
+                for (j, f) in plane.iter().enumerate() {
+                    cpc[i * 16 + j * 4..i * 16 + j * 4 + 4].copy_from_slice(&f.to_le_bytes());
+                }
             }
-            cpc[12..16].copy_from_slice(&proj_factor.to_le_bytes());
-            cpc[16..20].copy_from_slice(&tau.to_le_bytes());
+            for (i, f) in eye.to_array().iter().enumerate() {
+                cpc[96 + i * 4..100 + i * 4].copy_from_slice(&f.to_le_bytes());
+            }
+            cpc[108..112].copy_from_slice(&proj_factor.to_le_bytes());
+            cpc[112..116].copy_from_slice(&tau.to_le_bytes());
             let cwords = [
                 total_clusters,
                 rec_buf.storage_index(),
@@ -1147,7 +1166,7 @@ pub(crate) fn run_vgeo_mesh(
                 args_buf.storage_index(),
             ];
             for (i, word) in cwords.iter().enumerate() {
-                cpc[20 + i * 4..24 + i * 4].copy_from_slice(&word.to_le_bytes());
+                cpc[116 + i * 4..120 + i * 4].copy_from_slice(&word.to_le_bytes());
             }
             cmd.bind_compute_pipeline(cut_pipeline.as_ref().unwrap());
             cmd.push_constants_compute(&cpc);
