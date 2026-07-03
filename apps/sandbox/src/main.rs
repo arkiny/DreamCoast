@@ -4937,6 +4937,7 @@ impl App {
                     *page,
                     visbuf_ext,
                     cull_view_proj,
+                    view_proj,
                     eye,
                     *transform,
                     *material,
