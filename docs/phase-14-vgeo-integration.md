@@ -54,6 +54,32 @@ one material for the whole cluster set (single-mesh/single-material object).
   - **Wiring:** in `frame`, when `P14_VGEO` **and** the scene is a single vgeo-eligible object, call
     `self.vgeo.record_gbuffer(...)` instead of `self.deferred.record_gbuffer(...)`; else warn + fall
     back to the mesh fill. Off = the exact current call → gallery byte-identical.
+  #### I2 concrete facts (turnkey)
+  - **Construction plumbing:** `VgeoSystem::new` needs the model source path + cache dir + tex
+    compression (as `run_vgeo_mesh` does: `load_cooked_clusters(source, cache_key, cache_dir, tex)`).
+    `App::new` currently receives `&model` (the loaded `MeshData`), not the path, so build the
+    `VgeoSystem` in `main()` (which has `model_path` / `model_ref` / `cache_dir` / `compress_tex`)
+    **only when `P14_VGEO` is set**, and pass `Option<VgeoSystem>` into `App::new` (add a param) or a
+    setter. Off → `None`, zero new work on the default path.
+  - **Do NOT recenter** the cooked vertices (the viewer recentered to origin; here the object lives at
+    `obj.transform`). Upload the raw model-space vertex pool / records exactly as cooked.
+  - **Model-space cut (handles `obj.transform`, incl. uniform scale):** feed the cut compute frustum
+    planes from `crate::push::frustum_planes(cull_view_proj * obj.transform)` (`cull_view_proj =
+    proj_noflip * view`, already computed in `frame`) and `cam = obj.transform.inverse() * eye`. The
+    cluster spheres stay model-space; screen-error's `err/dist` ratio is scale-invariant, so this is
+    exact. `proj_factor` unchanged (`0.5*h/tan(fov/2)`).
+  - **Resolve push:** `mvp = view_proj * obj.transform`, `model = obj.transform`; material from the
+    single `SceneObject` (`base_color`, `metallic`, `roughness`, `tex`, `alpha_cutoff`).
+  - **Ground + depth:** run `record_gbuffer` with an **empty** scene slice (clears the 4 MRT +
+    draws only the ground into depth), then the vgeo resolve pass **LOADs** the MRTs and runs with
+    `depth_test = Less`, `depth_write = true` against `gbuf.depth` — `fsGBuffer` emits `SV_Depth`, so
+    the object occludes/were-occluded-by the ground correctly. Empty pixels `discard` → cleared
+    values survive. Shadows: `record_shadow` still rasters `opaque_scene` (the mesh is loaded), so the
+    object casts a mesh shadow unchanged.
+  - **Eligibility:** activate only when the opaque scene is exactly one non-decal object; else log a
+    warning and fall back to `record_gbuffer` (mesh fill). Skip decals/velocity/prepass on the vgeo
+    path for the first step.
+
 - **I3:** parity gate — `P14_VGEO=1` lit image vs the mesh-raster deferred render of the same
   single-model scene (path-tracer-style residual / direct diff), DX≡VK deferred to Windows.
 - **I4 (later):** re-enable HW/SW **binning** in the graph (the HW mesh pass needs a color attachment
