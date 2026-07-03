@@ -16,12 +16,14 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_COMMAND_SIGNATURE_DESC, D3D12_CPU_DESCRIPTOR_HANDLE,
     D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, D3D12_DESCRIPTOR_HEAP_DESC,
     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-    D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_D3D12_OPTIONS11, D3D12_FEATURE_DATA_D3D12_OPTIONS5,
+    D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_D3D12_OPTIONS11,
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
     D3D12_FEATURE_DATA_D3D12_OPTIONS11, D3D12_FEATURE_DATA_SHADER_MODEL,
     D3D12_FEATURE_SHADER_MODEL, D3D12_FENCE_FLAG_NONE, D3D12_GPU_DESCRIPTOR_HANDLE,
     D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
-    D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    D3D12_RAYTRACING_TIER_1_1, D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
+    D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
+    D3D12_MESH_SHADER_TIER_1, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RAYTRACING_TIER_1_1,
+    D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
     D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE, D3D12_SRV_DIMENSION_TEXTURE2D,
     D3D12_SRV_DIMENSION_TEXTURE3D, D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEX2D_SRV,
     D3D12_TEX2D_UAV, D3D12_TEX3D_SRV, D3D12_TEX3D_UAV, D3D12_TEXCUBE_SRV,
@@ -107,6 +109,10 @@ pub(crate) struct DeviceShared {
     // `D3D12_DISPATCH_ARGUMENTS`, Phase 14). 12-byte stride matches `VkDispatchIndirectCommand`
     // so one compute shader fills args for both APIs.
     pub indirect_dispatch_signature: ID3D12CommandSignature,
+    // Command signature for indirect mesh dispatch (`ExecuteIndirect` over a
+    // `D3D12_DISPATCH_MESH_ARGUMENTS`, Phase 14 Track B). 12-byte stride matches
+    // `VkDrawMeshTasksIndirectCommandEXT` so one LOD-cut compute fills args for both APIs.
+    pub indirect_dispatch_mesh_signature: ID3D12CommandSignature,
     // Async compute (Phase 7): a COMPUTE-type queue overlapping the DIRECT queue,
     // and a fence the compute queue signals / the graphics queue waits on (GPU
     // cross-queue sync). `async_value` holds the last value signaled.
@@ -124,6 +130,9 @@ pub(crate) struct DeviceShared {
     // SW-raster visibility buffer is a bindless (descriptor-heap-indexed) `RWByteAddressBuffer`
     // doing `InterlockedMax64`, so descriptor-heap atomics are exactly the required cap.
     has_atomic_int64: bool,
+    // Mesh + amplification shaders (Phase 14 virtual geometry Track B): true when
+    // OPTIONS7 `MeshShaderTier` >= TIER_1. Gates `create_mesh_pipeline` and the HW-path smokes.
+    has_mesh_shader: bool,
 }
 
 impl DeviceShared {
@@ -184,6 +193,17 @@ impl DeviceShared {
                     .AtomicInt64OnDescriptorHeapResourceSupported
                     .as_bool();
             let has_atomic_int64 = sm_ok && atomic64_heap;
+
+            // Mesh + amplification shaders (Phase 14 Track B): OPTIONS7 `MeshShaderTier` >= TIER_1.
+            let mut options7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            let has_mesh_shader = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    &mut options7 as *mut _ as *mut core::ffi::c_void,
+                    std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS7>() as u32,
+                )
+                .is_ok()
+                && options7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0;
 
             let queue_desc = D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -263,6 +283,33 @@ impl DeviceShared {
                 .map_err(d3d_err)?;
             let indirect_dispatch_signature = indirect_dispatch_signature
                 .ok_or_else(|| EngineError::Rhi("dispatch command signature null".into()))?;
+
+            // Indirect mesh-dispatch signature: one DISPATCH_MESH argument, 12-byte stride
+            // (matches `D3D12_DISPATCH_MESH_ARGUMENTS` = `VkDrawMeshTasksIndirectCommandEXT`'s
+            // three u32 groupCount, so one LOD-cut compute fills both APIs). No root arguments
+            // referenced → no root signature (like the draw/dispatch ones). Only built when the
+            // adapter has mesh shaders, since `DISPATCH_MESH` is otherwise an invalid argument.
+            let indirect_dispatch_mesh_signature = if has_mesh_shader {
+                let mesh_arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH,
+                    ..Default::default()
+                };
+                let mesh_sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
+                    ByteStride: 12,
+                    NumArgumentDescs: 1,
+                    pArgumentDescs: &mesh_arg,
+                    NodeMask: 0,
+                };
+                let mut sig: Option<ID3D12CommandSignature> = None;
+                device
+                    .CreateCommandSignature(&mesh_sig_desc, None, &mut sig)
+                    .map_err(d3d_err)?;
+                sig.ok_or_else(|| EngineError::Rhi("dispatch-mesh command signature null".into()))?
+            } else {
+                // Reuse the dispatch signature as an inert placeholder; never referenced without
+                // mesh shaders (the smokes gate on `capabilities().mesh_shader`).
+                indirect_dispatch_signature.clone()
+            };
             tracing::debug!("D3D12 device + queue ready");
 
             Ok(Self {
@@ -280,6 +327,7 @@ impl DeviceShared {
                 storage_volume_next: Cell::new(0),
                 indirect_draw_signature,
                 indirect_dispatch_signature,
+                indirect_dispatch_mesh_signature,
                 compute_queue,
                 async_fence,
                 async_value: Cell::new(0),
@@ -288,6 +336,7 @@ impl DeviceShared {
                 idle_value: Cell::new(0),
                 has_raytracing,
                 has_atomic_int64,
+                has_mesh_shader,
             })
         }
     }
@@ -733,25 +782,24 @@ impl D3d12Device {
         }
     }
 
-    /// Compile a mesh-shader pipeline (Phase 14). Windows-box follow-up: requires an SM6.5
-    /// mesh-shader PSO. Gated off via [`Self::capabilities`] until then, so this is never
-    /// reached (Metal is the verified path; DX≡VK follow-up).
+    /// Compile a mesh-shader pipeline (Phase 14 Track B): an SM6.5 `MS`+`PS` (optionally `AS`)
+    /// PSO built through a `D3D12_PIPELINE_STATE_STREAM`. Requires
+    /// [`DeviceCapabilities::mesh_shader`] (callers gate on it).
     pub fn create_mesh_pipeline(
         &self,
-        _desc: &rhi_types::MeshPipelineDesc,
+        desc: &rhi_types::MeshPipelineDesc,
     ) -> Result<crate::D3d12MeshPipeline, EngineError> {
-        unimplemented!("D3D12 mesh-shader pipeline pending (Phase 14 Windows follow-up)")
+        crate::D3d12MeshPipeline::new(self.shared.clone(), desc)
     }
 
-    /// Optional GPU capabilities (Phase 14 virtual geometry). NOTE: reports all-`false`
-    /// `atomic_int64` reflects the probed SM6.6 + `AtomicInt64OnDescriptorHeapResourceSupported`
-    /// (OPTIONS11) support (the SW-raster visibility-buffer path). `dispatch_indirect` is always
-    /// available (the DISPATCH command signature is created at device init). `mesh_shader` stays
-    /// `false` until the mesh-shader PSO seam is implemented (Track B); the SW-only vgeo path
-    /// needs only `atomic_int64`.
+    /// Optional GPU capabilities (Phase 14 virtual geometry). `atomic_int64` reflects the probed
+    /// SM6.6 + `AtomicInt64OnDescriptorHeapResourceSupported` (OPTIONS11) support (the SW-raster
+    /// visibility-buffer path); `mesh_shader` reflects OPTIONS7 `MeshShaderTier >= TIER_1` (Track B
+    /// HW path). `dispatch_indirect` is always available (the DISPATCH command signature is created
+    /// at device init).
     pub fn capabilities(&self) -> rhi_types::DeviceCapabilities {
         rhi_types::DeviceCapabilities {
-            mesh_shader: false,
+            mesh_shader: self.shared.has_mesh_shader,
             atomic_int64: self.shared.has_atomic_int64,
             dispatch_indirect: true,
         }

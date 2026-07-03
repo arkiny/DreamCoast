@@ -8,7 +8,8 @@ use std::sync::Arc;
 use ash::vk;
 use dreamcoast_core::EngineError;
 use rhi_types::{
-    BlendMode, ComputePipelineDesc, GraphicsPipelineDesc, PrimitiveTopology, VertexLayout,
+    BlendMode, ComputePipelineDesc, GraphicsPipelineDesc, MeshPipelineDesc, PrimitiveTopology,
+    VertexLayout,
 };
 
 use crate::device::DeviceShared;
@@ -399,13 +400,205 @@ pub struct VulkanComputePipeline {
     uniform_buffer: bool,
 }
 
-/// A mesh-shader pipeline (Phase 14 virtual geometry). Placeholder for the Windows-box
-/// follow-up: it must enable `VK_EXT_mesh_shader` at device creation and build the pipeline
-/// via `task`+`mesh` stages. Until then [`VulkanDevice::capabilities`] reports
-/// `mesh_shader: false`, so nothing constructs this on Vulkan (the smokes gate on it and are
-/// verified on Metal). DX≡VK parity is the tracked follow-up.
+/// A mesh-shader pipeline (Phase 14 virtual geometry Track B): a `mesh`(+`task`)+`fragment`
+/// pipeline built through `VK_EXT_mesh_shader`, drawn with `vkCmdDrawMeshTasksEXT`. Uses
+/// dynamic rendering + the shared bindless/globals descriptor sets, exactly like the graphics
+/// pipeline, but with no vertex input / input-assembly (the mesh stage produces primitives).
 pub struct VulkanMeshPipeline {
-    _priv: (),
+    device: Arc<DeviceShared>,
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    bindless: bool,
+    uniform_buffer: bool,
+}
+
+impl VulkanMeshPipeline {
+    pub(crate) fn new(
+        device: Arc<DeviceShared>,
+        desc: &MeshPipelineDesc,
+    ) -> Result<Self, EngineError> {
+        unsafe {
+            let ms = create_shader_module(&device.device, desc.mesh_bytes)?;
+            let fs = create_shader_module(&device.device, desc.fragment_bytes)?;
+            let task = match desc.object_bytes {
+                Some(bytes) => Some(create_shader_module(&device.device, bytes)?),
+                None => None,
+            };
+            let result = build_mesh(&device, desc, task, ms, fs);
+            device.device.destroy_shader_module(ms, None);
+            device.device.destroy_shader_module(fs, None);
+            if let Some(t) = task {
+                device.device.destroy_shader_module(t, None);
+            }
+            let (pipeline, layout) = result?;
+            Ok(Self {
+                device,
+                pipeline,
+                layout,
+                bindless: desc.bindless,
+                uniform_buffer: desc.uniform_buffer,
+            })
+        }
+    }
+
+    pub(crate) fn raw(&self) -> vk::Pipeline {
+        self.pipeline
+    }
+
+    pub(crate) fn layout(&self) -> vk::PipelineLayout {
+        self.layout
+    }
+
+    pub(crate) fn is_bindless(&self) -> bool {
+        self.bindless
+    }
+
+    pub(crate) fn uses_uniform(&self) -> bool {
+        self.uniform_buffer
+    }
+}
+
+impl Drop for VulkanMeshPipeline {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .device
+                .destroy_pipeline_layout(self.layout, None);
+        }
+    }
+}
+
+/// Build a mesh-shader pipeline: `task`(optional)+`mesh`+`fragment` stages, no vertex input,
+/// opaque blend, dynamic rendering to the given color/depth formats. Push constants are visible
+/// to all three stages (TASK|MESH|FRAGMENT), mirroring the graphics builder's VERTEX|FRAGMENT.
+unsafe fn build_mesh(
+    device: &DeviceShared,
+    desc: &MeshPipelineDesc,
+    task: Option<vk::ShaderModule>,
+    ms: vk::ShaderModule,
+    fs: vk::ShaderModule,
+) -> Result<(vk::Pipeline, vk::PipelineLayout), EngineError> {
+    unsafe {
+        let ms_entry =
+            CString::new(desc.mesh_entry).map_err(|e| EngineError::Rhi(e.to_string()))?;
+        let fs_entry =
+            CString::new(desc.fragment_entry).map_err(|e| EngineError::Rhi(e.to_string()))?;
+        let task_entry =
+            CString::new(desc.object_entry).map_err(|e| EngineError::Rhi(e.to_string()))?;
+
+        let mut stages = Vec::with_capacity(3);
+        if let Some(t) = task {
+            stages.push(
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::TASK_EXT)
+                    .module(t)
+                    .name(&task_entry),
+            );
+        }
+        stages.push(
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::MESH_EXT)
+                .module(ms)
+                .name(&ms_entry),
+        );
+        stages.push(
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fs)
+                .name(&fs_entry),
+        );
+
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        let opaque_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(false);
+        let attachments = vec![opaque_attachment; desc.color_formats.len()];
+        let color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        // Pipeline layout: bindless set (0) + optional globals set (1) + push constants
+        // (visible to task/mesh/fragment).
+        let set_layouts: Vec<vk::DescriptorSetLayout> = if desc.uniform_buffer {
+            vec![device.bindless_layout, device.globals_layout]
+        } else {
+            vec![device.bindless_layout]
+        };
+        let push_ranges = [vk::PushConstantRange::default()
+            .stage_flags(
+                vk::ShaderStageFlags::TASK_EXT
+                    | vk::ShaderStageFlags::MESH_EXT
+                    | vk::ShaderStageFlags::FRAGMENT,
+            )
+            .offset(0)
+            .size(desc.push_constant_size)];
+        let mut layout_ci = vk::PipelineLayoutCreateInfo::default();
+        if desc.bindless {
+            layout_ci = layout_ci.set_layouts(&set_layouts);
+        }
+        if desc.push_constant_size > 0 {
+            layout_ci = layout_ci.push_constant_ranges(&push_ranges);
+        }
+        let layout = device
+            .device
+            .create_pipeline_layout(&layout_ci, None)
+            .map_err(vk_err)?;
+
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(desc.depth_test)
+            .depth_write_enable(desc.depth_write)
+            .depth_compare_op(match desc.depth_compare {
+                rhi_types::DepthCompare::Less => vk::CompareOp::LESS,
+                rhi_types::DepthCompare::Equal => vk::CompareOp::EQUAL,
+            });
+
+        let color_formats: Vec<vk::Format> = desc
+            .color_formats
+            .iter()
+            .copied()
+            .map(to_vk_format)
+            .collect();
+        let depth_format = desc
+            .depth_format
+            .map(to_vk_format)
+            .unwrap_or(vk::Format::UNDEFINED);
+        let mut rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(depth_format);
+
+        // No pVertexInputState / pInputAssemblyState: a mesh pipeline has no input assembler
+        // (the mesh stage emits primitives directly). Both are ignored by the driver here.
+        let pipeline_ci = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .depth_stencil_state(&depth_stencil)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .push_next(&mut rendering);
+
+        let pipelines = device
+            .device
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
+            .map_err(|(_, e)| vk_err(e))?;
+
+        Ok((pipelines[0], layout))
+    }
 }
 
 impl VulkanComputePipeline {
