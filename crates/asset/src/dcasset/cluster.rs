@@ -9,12 +9,27 @@
 use dreamcoast_core::EngineError;
 
 use super::{CHUNK_CLUSTERS, Header, Writer, open_chunk, write_single_chunk};
+use crate::MeshVertex;
 use crate::vgeo::{Cluster, MeshClusters};
 
 /// Serialize `mc` into a single-chunk `.dcasset` buffer. `src_hash` is the source mesh's
 /// [`super::source_hash`], embedded for cache invalidation.
 pub fn write_clusters(mc: &MeshClusters, src_hash: u64) -> Vec<u8> {
     let mut w = Writer::default();
+
+    // Source vertex pool (position/normal/uv), so the page is self-contained.
+    w.u32(mc.vertices.len() as u32);
+    for v in &mc.vertices {
+        for f in v.pos {
+            w.f32(f);
+        }
+        for f in v.normal {
+            w.f32(f);
+        }
+        for f in v.uv {
+            w.f32(f);
+        }
+    }
 
     // Shared vertex remap.
     w.u32(mc.cluster_vertices.len() as u32);
@@ -51,6 +66,16 @@ pub fn write_clusters(mc: &MeshClusters, src_hash: u64) -> Vec<u8> {
 pub fn read_clusters(bytes: &[u8]) -> Result<(Header, MeshClusters), EngineError> {
     let (header, mut r) = open_chunk(bytes, CHUNK_CLUSTERS, "clusters")?;
 
+    let pool = r.u32()? as usize;
+    let mut vertices = Vec::with_capacity(pool);
+    for _ in 0..pool {
+        vertices.push(MeshVertex {
+            pos: [r.f32()?, r.f32()?, r.f32()?],
+            normal: [r.f32()?, r.f32()?, r.f32()?],
+            uv: [r.f32()?, r.f32()?],
+        });
+    }
+
     let vcount = r.u32()? as usize;
     let mut cluster_vertices = Vec::with_capacity(vcount);
     for _ in 0..vcount {
@@ -79,6 +104,7 @@ pub fn read_clusters(bytes: &[u8]) -> Result<(Header, MeshClusters), EngineError
     Ok((
         header,
         MeshClusters {
+            vertices,
             cluster_vertices,
             cluster_triangles,
             clusters,
@@ -122,6 +148,9 @@ mod tests {
         let bytes = write_clusters(&mc, 0xDEAD_BEEF);
         let (header, back) = read_clusters(&bytes).expect("read clusters");
         assert_eq!(header.source_hash, 0xDEAD_BEEF);
+        // The page is self-contained: the source vertex pool round-trips too.
+        assert_eq!(back.vertices.len(), verts.len());
+        assert_eq!(mc.vertices, back.vertices);
         // Full struct equality: the decode reconstructs the builder output exactly.
         assert_eq!(mc, back);
         // Re-encoding the decoded value is byte-identical (deterministic cook).
