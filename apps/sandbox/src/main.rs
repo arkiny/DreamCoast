@@ -485,14 +485,13 @@ fn run() -> anyhow::Result<()> {
     if mesh_shader_test_enabled() {
         return run_mesh_shader_test(backend, &mut window, &device, &mut swapchain);
     }
-    // Phase 14 M1e: load the COOKED LOD DAG for the model and render a chosen LOD level.
+    // Phase 14 M1e: load the COOKED LOD DAG and render the meshlet debug view (per-cluster colour).
     if vgeo_test_enabled() {
         return run_vgeo_test(
             backend,
             &mut window,
             &device,
             &mut swapchain,
-            model,
             &model_path,
             &model_ref,
             &cache_dir,

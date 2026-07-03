@@ -752,7 +752,6 @@ pub(crate) fn run_vgeo_test(
     window: &mut Window,
     device: &Device,
     swapchain: &mut Swapchain,
-    model: MeshData,
     source: &std::path::Path,
     cache_key: &str,
     cache_dir: &std::path::Path,
@@ -803,25 +802,113 @@ pub(crate) fn run_vgeo_test(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let lod = want.min(*levels.last().unwrap_or(&0));
-    let indices = vgeo::lod_indices(&dag, lod);
+    // Colour mode: per-cluster (the meshlet debug view, default) or per-LOD level.
+    let by_lod = matches!(std::env::var("VGEO_COLOR").ok().as_deref(), Some("lod"));
+
+    // Build the meshlet debug mesh: a distinct flat colour per cluster (or per LOD), shaded by
+    // the real vertex normal so the 3D form still reads. Each cluster's triangles are emitted with
+    // a UV that samples that cluster's slot in a hue palette (so we reuse the existing textured
+    // mesh pipeline — no debug shader needed). Non-indexed so adjacent clusters never share a hue.
+    let debug_mesh = meshlet_debug_mesh(&dag, lod, by_lod);
     info!(
-        "rendering cooked LOD {lod}: {} triangles",
-        indices.len() / 3
+        "meshlet debug: cooked LOD {lod}, {} clusters, {} triangles, colour by {}",
+        dag.clusters.iter().filter(|c| c.lod_level == lod).count(),
+        debug_mesh.indices.len() / 3,
+        if by_lod { "LOD" } else { "cluster" },
     );
 
-    let lod_model = MeshData {
-        vertices: dag.vertices,
-        indices,
-        material: model.material,
-    };
     run_mesh_test(
         backend,
         window,
         device,
         swapchain,
-        &lod_model,
+        &debug_mesh,
         radius.max(1e-3),
     )
+}
+
+/// HSV → RGB (`h`,`s`,`v` in `[0,1]`). Used to spread cluster ids across distinct hues.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
+    let h6 = h.fract() * 6.0;
+    let c = v * s;
+    let x = c * (1.0 - ((h6 % 2.0) - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match h6 as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [r + m, g + m, b + m]
+}
+
+/// A 256×1 palette of well-separated hues (golden-ratio spacing) as sRGB8 RGBA — the colour table
+/// the meshlet debug view samples by cluster/LOD id.
+fn hue_palette() -> dreamcoast_asset::ImageData {
+    let mut rgba8 = Vec::with_capacity(256 * 4);
+    for i in 0..256u32 {
+        let hue = (i as f32 * 0.618_034).fract();
+        let c = hsv_to_rgb(hue, 0.72, 0.95);
+        rgba8.extend_from_slice(&[
+            (c[0] * 255.0) as u8,
+            (c[1] * 255.0) as u8,
+            (c[2] * 255.0) as u8,
+            255,
+        ]);
+    }
+    dreamcoast_asset::ImageData {
+        width: 256,
+        height: 1,
+        rgba8,
+    }
+}
+
+/// Reconstruct a mesh where every cluster (or LOD level) at `lod` is a distinct flat colour,
+/// keeping real vertex normals for shading. Colour is carried in `uv.x` (the palette slot), so the
+/// stock textured mesh pipeline renders it; non-indexed so cluster colours never bleed at seams.
+fn meshlet_debug_mesh(
+    dag: &dreamcoast_asset::vgeo::MeshClusters,
+    lod: u32,
+    by_lod: bool,
+) -> MeshData {
+    let mut vertices: Vec<dreamcoast_asset::MeshVertex> = Vec::new();
+    for (draw_id, c) in dag
+        .clusters
+        .iter()
+        .filter(|c| c.lod_level == lod)
+        .enumerate()
+    {
+        // Palette slot: the LOD level, or a per-cluster id spread across the 256-entry palette.
+        let slot = if by_lod {
+            c.lod_level as usize
+        } else {
+            draw_id
+        } % 256;
+        let u = (slot as f32 + 0.5) / 256.0;
+        let vbase = c.vertex_offset as usize;
+        let tbase = c.triangle_offset as usize;
+        for k in 0..c.triangle_count as usize * 3 {
+            let src = dag.cluster_vertices[vbase + dag.cluster_triangles[tbase + k] as usize];
+            let v = dag.vertices[src as usize];
+            vertices.push(dreamcoast_asset::MeshVertex {
+                pos: v.pos,
+                normal: v.normal,
+                uv: [u, 0.5],
+            });
+        }
+    }
+    let indices: Vec<u32> = (0..vertices.len() as u32).collect();
+    let material = dreamcoast_asset::Material {
+        base_color: Some(dreamcoast_asset::TexData::Rgba8(hue_palette())),
+        ..Default::default()
+    };
+    MeshData {
+        vertices,
+        indices,
+        material,
+    }
 }
 
 /// `--frames N` cap for the clear-test loop (smoke testing); `None` = unlimited.
