@@ -27,9 +27,13 @@ struct PushConstants
     float tau;         // 112: pixel-error threshold (the LOD "tightness" knob)
     uint total;        // 116: total cluster count (all LODs)
     uint rec_buf;      // 120: GpuCluster records slot (96 B/record)
-    uint vis_buf;      // 124: output visible-cluster list slot
-    uint args_buf;     // 128: output indirect args {countX, 1, 1}
-    uint3 pad;
+    uint vis_buf;      // 124: output list slot — `csCut`: the whole cut; `csCutBin`: the HW list
+    uint args_buf;     // 128: output args {countX,1,1} — `csCut`: the cut; `csCutBin`: HW args
+    // M5b binning tail — occupies `csCut`'s former pad, so `csCut`'s byte layout is UNCHANGED (it
+    // never reads these; the app still writes 144 B with these zero for `csCut`).
+    uint sw_list;      // 132: `csCutBin` SW-path visible-cluster list slot
+    uint sw_args;      // 136: `csCutBin` SW-path indirect args {countX,1,1}
+    float bin_px;      // 140: SW/HW split threshold — projected bounds diameter (px) below → SW
 };
 
 [[vk::push_constant]]
@@ -114,4 +118,59 @@ void csCut(uint3 tid: SV_DispatchThreadID)
         g.storage_buffers[pc.args_buf].InterlockedAdd(0, 1, slot);
         g.storage_buffers[pc.vis_buf].Store(slot * 4, c);
     }
+}
+
+// Shared selection: the LOD cut + frustum + normal-cone tests (identical to `csCut`), returning
+// the cluster's own bounds sphere so the caller can also estimate its screen size for binning.
+bool select_cluster(uint c, out float3 bnd_c, out float bnd_r)
+{
+    RWByteAddressBuffer rec = g.storage_buffers[pc.rec_buf];
+    uint base = c * 96;
+    float self_err = asfloat(rec.Load(base + 16));
+    float3 self_c = asfloat(rec.Load3(base + 20));
+    float self_r = asfloat(rec.Load(base + 32));
+    float par_err = asfloat(rec.Load(base + 36));
+    float3 par_c = asfloat(rec.Load3(base + 40));
+    float par_r = asfloat(rec.Load(base + 52));
+    bnd_c = asfloat(rec.Load3(base + 56));
+    bnd_r = asfloat(rec.Load(base + 68));
+    float3 cone_axis = asfloat(rec.Load3(base + 72));
+    float cone_cutoff = asfloat(rec.Load(base + 84));
+
+    float s_self = screen_error(self_err, self_c, self_r);
+    float s_par = (par_err >= 3.0e38) ? 1.0e30 : screen_error(par_err, par_c, par_r);
+    if (!(s_self <= pc.tau && s_par > pc.tau))
+        return false;
+    if (outside_frustum(bnd_c, bnd_r))
+        return false;
+    if (cone_backfacing(cone_axis, cone_cutoff, bnd_c))
+        return false;
+    return true;
+}
+
+// M5b — HW/SW binning cut. Same cut selection as `csCut`, then classify each selected cluster by
+// its projected screen diameter: clusters smaller than `bin_px` (their ~124 triangles are
+// sub-pixel) go to the SW compute rasterizer, larger clusters to the HW mesh shader. Both paths
+// write the SAME R64 visibility buffer with the same packed rule, so the boundary has no seam.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void csCutBin(uint3 tid: SV_DispatchThreadID)
+{
+    uint c = tid.x;
+    if (c >= pc.total)
+        return;
+    float3 bnd_c;
+    float bnd_r;
+    if (!select_cluster(c, bnd_c, bnd_r))
+        return;
+
+    // Projected bounds diameter in pixels: 2r * proj_factor / (nearest distance to the sphere).
+    float dist = max(distance(cam_pos(), bnd_c) - bnd_r, 1e-3);
+    float screen_diam = 2.0 * bnd_r * pc.proj_factor / dist;
+
+    uint list = (screen_diam < pc.bin_px) ? pc.sw_list : pc.vis_buf;
+    uint args = (screen_diam < pc.bin_px) ? pc.sw_args : pc.args_buf;
+    uint slot;
+    g.storage_buffers[args].InterlockedAdd(0, 1, slot);
+    g.storage_buffers[list].Store(slot * 4, c);
 }

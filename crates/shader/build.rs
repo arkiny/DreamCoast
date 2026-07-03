@@ -943,6 +943,28 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "vgeo_cut_cs",
     },
+    // Phase 14 M5b: HW/SW binning cut — splits the cut into a HW (mesh-shader) list and a SW
+    // (compute-raster) list by projected screen size, each with its own indirect args.
+    Job {
+        src: "vgeo_cut.slang",
+        entry: "csCutBin",
+        stage: "compute",
+        key: "vgeo_cut_bin_cs",
+    },
+    // Phase 14 M5b: HW-path mesh shader writing into the same R64 visibility buffer as the SW
+    // rasterizer (per-primitive triId + fragment atomicMax → seamless HW/SW boundary).
+    Job {
+        src: "vgeo_hwvis.slang",
+        entry: "meshMain",
+        stage: "mesh",
+        key: "vgeo_hwvis_ms",
+    },
+    Job {
+        src: "vgeo_hwvis.slang",
+        entry: "fragMain",
+        stage: "fragment",
+        key: "vgeo_hwvis_fs",
+    },
     // Phase 14 M5: software rasterizer into an R64 visibility buffer + its visualization.
     Job {
         src: "vgeo_swraster.slang",
