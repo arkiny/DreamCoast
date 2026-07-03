@@ -61,6 +61,7 @@ mod smoketest;
 mod taau;
 mod translucent;
 mod velocity;
+mod vgeo;
 mod view;
 mod world;
 use app::*;
@@ -512,6 +513,37 @@ fn run() -> anyhow::Result<()> {
         );
     }
 
+    // Phase 14 renderer integration: build the virtual-geometry G-buffer producer from the loaded
+    // model's cooked clusters when opt-in `P14_VGEO` is set. Built here (not in `App::new`) because
+    // it needs the model source path / cache the App does not keep. Any failure (no clusters, no
+    // mesh-shader capability) logs and falls back to the mesh fill.
+    let vgeo = if std::env::var("P14_VGEO")
+        .ok()
+        .is_some_and(|v| !v.is_empty() && v != "0")
+    {
+        let (ww, wh) = window.size();
+        match vgeo::VgeoSystem::new(
+            &device,
+            backend,
+            &model_path,
+            &model_ref,
+            &cache_dir,
+            compress_tex,
+            Extent2D::new(ww.max(1), wh.max(1)),
+        ) {
+            Ok(v) => {
+                info!("P14_VGEO: virtual-geometry G-buffer producer enabled");
+                Some(v)
+            }
+            Err(e) => {
+                info!("P14_VGEO disabled ({e}); using the mesh G-buffer fill");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut app = App::new(
         window,
         instance,
@@ -523,6 +555,7 @@ fn run() -> anyhow::Result<()> {
         screenshot_mode,
         captures,
         validation_on,
+        vgeo,
     )?;
     app.run()
 }
@@ -547,6 +580,12 @@ struct App {
 
     // Feature bundles (see the per-module docs).
     deferred: DeferredRenderer,
+    /// Phase 14 renderer integration: virtual geometry as the G-buffer producer (opt-in `P14_VGEO`,
+    /// single-model scope). `None` = the default mesh fill (gallery byte-identical).
+    vgeo: Option<vgeo::VgeoSystem>,
+    /// `P14_VGEO` mode: 0 off, 1 = vgeo producer, 2 = mesh reference (groundless single model) for
+    /// the parity diff.
+    vgeo_mode: u32,
     gdf: GdfSystem,
     gi: GiSystem,
     gtao: gtao::GtaoSystem,
@@ -1085,7 +1124,20 @@ impl App {
         screenshot_mode: bool,
         captures: Vec<Capture>,
         validation_on: bool,
+        // Phase 14 renderer integration (opt-in `P14_VGEO`, built in `main` since it needs the model
+        // source path/cache the App doesn't keep). `None` on the default path.
+        vgeo: Option<vgeo::VgeoSystem>,
     ) -> anyhow::Result<Self> {
+        // `P14_VGEO`: 1 = virtual-geometry G-buffer producer, 2 = mesh reference (groundless single
+        // model) for the parity diff. Ignored (mode 0) when no `VgeoSystem` was built.
+        let vgeo_mode = if vgeo.is_some() {
+            std::env::var("P14_VGEO")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let queue = device.queue();
         // Phase-7 compute (post blur / GPU particles / GPU culling) is implemented
         // on all three backends (Metal compute landed in M5).
@@ -2680,6 +2732,8 @@ impl App {
             backend,
             gui,
             deferred,
+            vgeo,
+            vgeo_mode,
             gdf,
             gi,
             gtao,
@@ -4833,21 +4887,83 @@ impl App {
                 mip_bias,
             );
         }
-        self.deferred.record_gbuffer(
-            &mut graph,
-            gbuf,
-            opaque_scene,
-            &self.ground_vbuf,
-            &self.ground_ibuf,
-            self.ground_count,
-            view_proj,
-            self.ambient,
-            self.override_material,
-            self.metallic_override,
-            self.roughness_override,
-            mip_bias,
-            self.depth_prepass,
-        );
+        // Phase 14 renderer integration: virtual geometry produces the G-buffer under P14_VGEO
+        // (single-model scope). Identify the one textured opaque object; mode 1 resolves it from the
+        // visibility buffer, mode 2 rasters it via the mesh fill (groundless) as the parity
+        // reference. Anything else → the normal mesh fill over the whole scene (gallery byte-identical).
+        if let Some(v) = self.vgeo.as_mut() {
+            v.resize(&self.device, extent)?;
+        }
+        let vgeo_obj = if self.vgeo_mode > 0 {
+            let textured: Vec<usize> = opaque_scene
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| {
+                    o.kind == dreamcoast_asset::MaterialKind::Opaque && o.tex[0] != NO_TEXTURE
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if textured.len() == 1 {
+                Some(textured[0])
+            } else {
+                info!(
+                    "P14_VGEO: need exactly one textured opaque object, found {} — mesh fill",
+                    textured.len()
+                );
+                None
+            }
+        } else {
+            None
+        };
+        if let (1, Some(idx)) = (self.vgeo_mode, vgeo_obj)
+            && self.vgeo.is_some()
+        {
+            let o = &opaque_scene[idx];
+            let material = vgeo::VgeoMaterial {
+                base_color: o.base_color,
+                metallic: o.metallic,
+                roughness: o.roughness,
+                tex: o.tex,
+                alpha_cutoff: o.alpha_cutoff,
+            };
+            let transform = o.transform;
+            let v = self.vgeo.as_ref().unwrap();
+            v.record_gbuffer(
+                &mut graph,
+                gbuf,
+                self.fif,
+                view_proj,
+                cull_view_proj,
+                eye,
+                transform,
+                material,
+                self.ambient,
+                extent,
+            )?;
+        } else {
+            // Mode 2 (mesh reference) draws only the single model, groundless, for the diff; mode 0
+            // and fallbacks draw the whole scene with the ground (unchanged, gallery byte-identical).
+            let (scene_slice, draw_ground) = match (self.vgeo_mode, vgeo_obj) {
+                (2, Some(idx)) => (std::slice::from_ref(&opaque_scene[idx]), false),
+                _ => (opaque_scene, true),
+            };
+            self.deferred.record_gbuffer(
+                &mut graph,
+                gbuf,
+                scene_slice,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj,
+                self.ambient,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                mip_bias,
+                self.depth_prepass,
+                draw_ground,
+            );
+        }
         // Deferred surface-decal pass (decals A3): tint the G-buffer albedo for `kind == Decal`
         // drawables after the opaque fill, before lighting. No-op (no pass) when the scene has
         // no decals, so the gallery / non-decal scenes stay byte-identical.
@@ -6616,6 +6732,7 @@ impl App {
                 self.roughness_override,
                 sv_mip_bias,
                 false, // no depth pre-pass
+                true,  // draw the ground (unchanged)
             );
             // Lighting: shares the ONCE-rendered shadow atlas + IBL; screen-space GI/AO/reflection
             // inputs are gated on THIS VIEW'S `screen_space_gi` feature (off for the secondary view →
