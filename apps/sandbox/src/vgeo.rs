@@ -15,7 +15,7 @@
 use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_render::{ComputePassInfo, PassInfo, RenderGraph};
 use rhi::{
-    BackendKind, ClearColor, ComputePipeline, ComputePipelineDesc, DepthCompare, Device, Extent2D,
+    BackendKind, ComputePipeline, ComputePipelineDesc, DepthCompare, Device, Extent2D,
     GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, StorageBuffer, StorageBufferDesc,
     VertexLayout,
 };
@@ -327,7 +327,6 @@ impl VgeoSystem {
         eye: Vec3,
         model: Mat4,
         material: VgeoMaterial,
-        ambient: f32,
         extent: Extent2D,
     ) -> anyhow::Result<()> {
         let visbuf = &self.visbuf[fif];
@@ -438,33 +437,21 @@ impl VgeoSystem {
             },
         );
 
-        // ── Resolve: visibility buffer → the four G-buffer MRTs (+ depth), sole G-buffer pass ──
-        // Same clears as the mesh fill: albedo = ambient sky, normal/material black, position α=0
-        // (marks "no geometry"). `fsGBuffer` discards empty pixels so the cleared values survive.
-        let sky = ClearColor {
-            r: ambient,
-            g: ambient,
-            b: ambient,
-            a: 1.0,
-        };
+        // ── Resolve: visibility buffer → the four G-buffer MRTs (+ depth), OVERLAY ──
+        // The mesh fill runs first (draws the other opaque objects + ground, clearing the G-buffer +
+        // depth), so this LOADs every target and overlays the model where covered: `fsGBuffer`
+        // discards empty pixels (the cleared/other-object values survive) and emits SV_Depth, and the
+        // Less depth test against the loaded depth resolves the model vs the mesh-rastered objects.
         let resolve = &self.resolve_pipeline;
         let model_arr = model.to_cols_array();
         graph.add_pass(
             PassInfo {
                 name: "vgeo_resolve",
                 colors: vec![
-                    (gbuf.albedo, Some(sky)),
-                    (gbuf.normal, Some(ClearColor::BLACK)),
-                    (gbuf.material, Some(ClearColor::BLACK)),
-                    (
-                        gbuf.position,
-                        Some(ClearColor {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
-                    ),
+                    (gbuf.albedo, None),
+                    (gbuf.normal, None),
+                    (gbuf.material, None),
+                    (gbuf.position, None),
                 ],
                 depth: Some(gbuf.depth),
                 reads: vec![visbuf_ext],

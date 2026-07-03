@@ -4792,6 +4792,46 @@ impl App {
             None
         };
         let opaque_scene: &[SceneObject] = culled_scene.as_deref().unwrap_or(&scene);
+
+        // Phase 14 renderer integration (P14_VGEO=1): identify the single textured opaque object to
+        // produce via virtual geometry, and clone the OTHER opaque objects into an overlay set the
+        // mesh fill rasters first. Computed (and the visibility buffer resized) BEFORE the graph so
+        // both outlive `graph.execute`. `None` → the normal whole-scene mesh fill (gallery
+        // byte-identical). Extent is the G-buffer render resolution.
+        if let Some(v) = self.vgeo.as_mut() {
+            v.resize(&self.device, extent)?;
+        }
+        let vgeo_obj = if self.vgeo_mode == 1 && self.vgeo.is_some() {
+            let textured: Vec<usize> = opaque_scene
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| {
+                    o.kind == dreamcoast_asset::MaterialKind::Opaque && o.tex[0] != NO_TEXTURE
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if textured.len() == 1 {
+                Some(textured[0])
+            } else {
+                info!(
+                    "P14_VGEO: need exactly one textured opaque object, found {} — mesh fill",
+                    textured.len()
+                );
+                None
+            }
+        } else {
+            None
+        };
+        let vgeo_others: Vec<SceneObject> = match vgeo_obj {
+            Some(idx) => opaque_scene
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != idx)
+                .map(|(_, o)| o.clone())
+                .collect(),
+            None => Vec::new(),
+        };
+
         let mut graph = RenderGraph::new();
         // The backbuffer is the actual swapchain image (display extent); tonemap samples the
         // render-extent HDR by UV, so a render≠display extent just means a downscale at present.
@@ -4887,70 +4927,17 @@ impl App {
                 mip_bias,
             );
         }
-        // Phase 14 renderer integration: virtual geometry produces the G-buffer under P14_VGEO
-        // (single-model scope). Identify the one textured opaque object; mode 1 resolves it from the
-        // visibility buffer, mode 2 rasters it via the mesh fill (groundless) as the parity
-        // reference. Anything else → the normal mesh fill over the whole scene (gallery byte-identical).
-        if let Some(v) = self.vgeo.as_mut() {
-            v.resize(&self.device, extent)?;
-        }
-        let vgeo_obj = if self.vgeo_mode > 0 {
-            let textured: Vec<usize> = opaque_scene
-                .iter()
-                .enumerate()
-                .filter(|(_, o)| {
-                    o.kind == dreamcoast_asset::MaterialKind::Opaque && o.tex[0] != NO_TEXTURE
-                })
-                .map(|(i, _)| i)
-                .collect();
-            if textured.len() == 1 {
-                Some(textured[0])
-            } else {
-                info!(
-                    "P14_VGEO: need exactly one textured opaque object, found {} — mesh fill",
-                    textured.len()
-                );
-                None
-            }
-        } else {
-            None
-        };
+        // Phase 14 renderer integration: virtual geometry produces the model's G-buffer under
+        // P14_VGEO=1 (`vgeo_obj` / `vgeo_others` computed before the graph). The mesh fill rasters
+        // every other opaque object + ground first (clears), then the vgeo resolve overlays the model.
         if let (1, Some(idx)) = (self.vgeo_mode, vgeo_obj)
             && self.vgeo.is_some()
         {
-            let o = &opaque_scene[idx];
-            let material = vgeo::VgeoMaterial {
-                base_color: o.base_color,
-                metallic: o.metallic,
-                roughness: o.roughness,
-                tex: o.tex,
-                alpha_cutoff: o.alpha_cutoff,
-            };
-            let transform = o.transform;
-            let v = self.vgeo.as_ref().unwrap();
-            v.record_gbuffer(
-                &mut graph,
-                gbuf,
-                self.fif,
-                view_proj,
-                cull_view_proj,
-                eye,
-                transform,
-                material,
-                self.ambient,
-                extent,
-            )?;
-        } else {
-            // Mode 2 (mesh reference) draws only the single model, groundless, for the diff; mode 0
-            // and fallbacks draw the whole scene with the ground (unchanged, gallery byte-identical).
-            let (scene_slice, draw_ground) = match (self.vgeo_mode, vgeo_obj) {
-                (2, Some(idx)) => (std::slice::from_ref(&opaque_scene[idx]), false),
-                _ => (opaque_scene, true),
-            };
+            // Mesh fill for the other opaque objects + ground (clears the G-buffer + depth).
             self.deferred.record_gbuffer(
                 &mut graph,
                 gbuf,
-                scene_slice,
+                &vgeo_others,
                 &self.ground_vbuf,
                 &self.ground_ibuf,
                 self.ground_count,
@@ -4961,7 +4948,46 @@ impl App {
                 self.roughness_override,
                 mip_bias,
                 self.depth_prepass,
-                draw_ground,
+                true,
+            );
+            // Virtual-geometry overlay: resolve the model on top (LOAD + Less depth test).
+            let o = &opaque_scene[idx];
+            let material = vgeo::VgeoMaterial {
+                base_color: o.base_color,
+                metallic: o.metallic,
+                roughness: o.roughness,
+                tex: o.tex,
+                alpha_cutoff: o.alpha_cutoff,
+            };
+            let transform = o.transform;
+            self.vgeo.as_ref().unwrap().record_gbuffer(
+                &mut graph,
+                gbuf,
+                self.fif,
+                view_proj,
+                cull_view_proj,
+                eye,
+                transform,
+                material,
+                extent,
+            )?;
+        } else {
+            // Default / fallback: the whole scene with the ground (unchanged, gallery byte-identical).
+            self.deferred.record_gbuffer(
+                &mut graph,
+                gbuf,
+                opaque_scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj,
+                self.ambient,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                mip_bias,
+                self.depth_prepass,
+                true,
             );
         }
         // Deferred surface-decal pass (decals A3): tint the G-buffer albedo for `kind == Decal`
