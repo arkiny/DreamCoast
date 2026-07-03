@@ -71,8 +71,9 @@ void meshMain(
     uint cluster = (pc.vis_buf == 0xFFFFFFFFu)
         ? (pc.base_cluster + gid)
         : g.storage_buffers[pc.vis_buf].Load(gid * 4);
-    // GpuCluster record: first 16 bytes are {vertex_offset, vertex_count, tri_offset, tri_count}.
-    uint4 rec = g.storage_buffers[pc.rec_buf].Load4(cluster * 64);
+    // GpuCluster record (96 B): first 16 bytes are {vertex_offset, vertex_count, tri_offset,
+    // tri_count}.
+    uint4 rec = g.storage_buffers[pc.rec_buf].Load4(cluster * 96);
     uint voff = rec.x;
     uint vcount = rec.y;
     uint toff = rec.z;

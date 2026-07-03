@@ -14,33 +14,62 @@
 //   12 : tri_count     (u32)                             56..64 : pad
 #include "bindless.slang"
 
-// NOTE: the camera position is three SCALAR floats, NOT a `float3` — Metal aligns `float3` to 16
-// bytes in a constant buffer, which would shift every field after it and break the CPU-side push
-// packing. Scalars pack tight (4 B each), matching the byte layout the app writes.
+// NOTE: `float4` aligns to 16 B (so `planes[6]` packs tight), but a bare `float3` also aligns to
+// 16 B in a constant buffer and would silently shift every scalar after it — so the camera
+// position is three SCALAR floats, matching the byte layout the app writes.
 struct PushConstants
 {
-    float cam_x; // world-space camera position (scalar to avoid float3 alignment)
+    float4 planes[6];  //   0: frustum planes (xyz=inward normal, w=d), normalized (96 B)
+    float cam_x;       //  96: world-space camera position (scalars, no float3 alignment)
     float cam_y;
     float cam_z;
-    float proj_factor; // 0.5 * screen_height / tan(fov/2): world error → pixels at unit distance
-    float tau;         // pixel-error threshold (the LOD "tightness" knob)
-    uint total;        // total cluster count (all LODs)
-    uint rec_buf;      // GpuCluster records slot
-    uint vis_buf;      // output: visible-cluster list slot
-    uint args_buf;     // output: MTLDrawMeshThreadgroupsIndirectArguments {countX, 1, 1}
-    uint2 pad;
+    float proj_factor; // 108: 0.5 * screen_height / tan(fov/2): world error → px at unit distance
+    float tau;         // 112: pixel-error threshold (the LOD "tightness" knob)
+    uint total;        // 116: total cluster count (all LODs)
+    uint rec_buf;      // 120: GpuCluster records slot (96 B/record)
+    uint vis_buf;      // 124: output visible-cluster list slot
+    uint args_buf;     // 128: output indirect args {countX, 1, 1}
+    uint3 pad;
 };
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
 
+float3 cam_pos()
+{
+    return float3(pc.cam_x, pc.cam_y, pc.cam_z);
+}
+
 // Screen-space (pixel) error of a world-space error `err` on a sphere (`center`, `radius`):
 // project by the near distance to the sphere. A cluster right at the camera → huge error.
 float screen_error(float err, float3 center, float radius)
 {
-    float3 cam = float3(pc.cam_x, pc.cam_y, pc.cam_z);
-    float d = max(distance(cam, center) - radius, 1e-3);
+    float d = max(distance(cam_pos(), center) - radius, 1e-3);
     return err * pc.proj_factor / d;
+}
+
+// Frustum cull: a bounding sphere is outside iff it is fully behind any inward-facing plane.
+bool outside_frustum(float3 center, float radius)
+{
+    [unroll]
+    for (int p = 0; p < 6; ++p)
+        if (dot(pc.planes[p].xyz, center) + pc.planes[p].w < -radius)
+            return true;
+    return false;
+}
+
+// Normal-cone backface cull: every face normal lies within a cone of half-angle acos(cutoff) of
+// `axis`. The cluster is entirely backfacing iff the direction to the camera is more than 90°
+// past that spread from the axis: dot(axis, dirToCam) < -sin(halfAngle) = -sqrt(1-cutoff²).
+// `cutoff <= 0` means the spread is too wide to cull (stored -1 at build). Conservative → never
+// culls a visible cluster.
+bool cone_backfacing(float3 axis, float cutoff, float3 center)
+{
+    if (cutoff <= 0.0)
+        return false;
+    float3 to_cam = normalize(cam_pos() - center);
+    float sin_half = sqrt(max(1.0 - cutoff * cutoff, 0.0));
+    return dot(axis, to_cam) < -sin_half;
 }
 
 [shader("compute")]
@@ -52,22 +81,33 @@ void csCut(uint3 tid: SV_DispatchThreadID)
         return;
 
     RWByteAddressBuffer rec = g.storage_buffers[pc.rec_buf];
-    uint base = c * 64;
+    uint base = c * 96;
     float self_err = asfloat(rec.Load(base + 16));
     float3 self_c = asfloat(rec.Load3(base + 20));
     float self_r = asfloat(rec.Load(base + 32));
     float par_err = asfloat(rec.Load(base + 36));
     float3 par_c = asfloat(rec.Load3(base + 40));
     float par_r = asfloat(rec.Load(base + 52));
+    float3 bnd_c = asfloat(rec.Load3(base + 56));
+    float bnd_r = asfloat(rec.Load(base + 68));
+    float3 cone_axis = asfloat(rec.Load3(base + 72));
+    float cone_cutoff = asfloat(rec.Load(base + 84));
 
+    // LOD cut: draw iff this cluster's LOD is fine enough (self <= tau) but the parent is too
+    // coarse (parent > tau). Group-uniform errors make every cluster in a group agree → no cracks.
     float s_self = screen_error(self_err, self_c, self_r);
-    // A root cluster stores parent_error = FLT_MAX ("never coarsen past here") → always > tau.
     float s_par = (par_err >= 3.0e38) ? 1.0e30 : screen_error(par_err, par_c, par_r);
+    if (!(s_self <= pc.tau && s_par > pc.tau))
+        return;
 
-    // Draw this cluster iff its LOD is fine enough (self <= tau) but the parent is too coarse
-    // (parent > tau). Leaves have self_err 0 (always fine); the root has parent = inf (always
-    // the stop). Group-uniform errors make every cluster in a group agree → no cracks.
-    if (s_self <= pc.tau && s_par > pc.tau)
+    // Visibility cull (M4a): drop clusters that are off-screen (frustum) or entirely backfacing
+    // (normal cone). Both use the cluster's OWN bounds sphere — conservative, never drops a
+    // visible cluster.
+    if (outside_frustum(bnd_c, bnd_r))
+        return;
+    if (cone_backfacing(cone_axis, cone_cutoff, bnd_c))
+        return;
+
     {
         uint slot;
         // Bump the indirect threadgroup count (args.x) and append our cluster index.
