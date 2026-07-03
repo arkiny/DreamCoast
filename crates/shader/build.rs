@@ -936,6 +936,13 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "vgeo_cluster_fs",
     },
+    // Phase 14 M3: view-dependent LOD DAG cut selection (compute → visible list + indirect args).
+    Job {
+        src: "vgeo_cut.slang",
+        entry: "csCut",
+        stage: "compute",
+        key: "vgeo_cut_cs",
+    },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);
     // see the profile selection below.

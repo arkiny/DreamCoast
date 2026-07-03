@@ -944,6 +944,11 @@ impl D3d12CommandBuffer {
         unimplemented!("D3D12 push_constants_mesh pending (Phase 14 Windows follow-up)")
     }
 
+    /// Indirect mesh draw (Phase 14 M3). Windows-box follow-up (`ExecuteIndirect` + DispatchMesh sig).
+    pub fn draw_mesh_tasks_indirect(&self, _buffer: &D3d12StorageBuffer, _offset: u64) {
+        unimplemented!("D3D12 draw_mesh_tasks_indirect pending (Phase 14 Windows follow-up)")
+    }
+
     fn barrier(
         &self,
         resource: &ID3D12Resource,

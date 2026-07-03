@@ -141,12 +141,18 @@ impl MetalCommandBuffer {
 
     /// Wait the hazard fence on a freshly opened render encoder (before any stage runs), so
     /// it sees the writes of every prior encoder in this command buffer. No-op for the first
-    /// encoder (nothing recorded the fence yet).
+    /// encoder (nothing recorded the fence yet). Includes the Object/Mesh stages so a mesh
+    /// pipeline (Phase 14) sees a preceding compute pass's writes — the LOD-cut compute feeds the
+    /// mesh draw's indirect args + visible list, which are read in the Object/Mesh stages, not
+    /// Vertex (a mesh pipeline has no vertex stage).
     fn wait_fence_render(&self, enc: &ProtocolObject<dyn MTLRenderCommandEncoder>) {
         if self.fence_pending.get() {
             enc.waitForFence_beforeStages(
                 &self.fence,
-                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+                MTLRenderStages::Vertex
+                    | MTLRenderStages::Object
+                    | MTLRenderStages::Mesh
+                    | MTLRenderStages::Fragment,
             );
         }
     }
@@ -1023,6 +1029,23 @@ impl MetalCommandBuffer {
                 self.mesh_object_threads.get(),
                 self.mesh_threads.get(),
             );
+        }
+    }
+
+    /// Indirect mesh draw (Phase 14 M3): the object/mesh threadgroup GRID is read from
+    /// `buffer[offset..]` as a `MTLDrawMeshThreadgroupsIndirectArguments` (three `u32`
+    /// threadgroups-per-grid) — e.g. the LOD-cut compute writes the selected-cluster count there.
+    /// Threadgroup sizes come from the bound pipeline.
+    pub fn draw_mesh_tasks_indirect(&self, buffer: &MetalStorageBuffer, offset: u64) {
+        if let Some(enc) = self.encoder.borrow().as_ref() {
+            unsafe {
+                enc.drawMeshThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                    &buffer.buffer,
+                    offset as usize,
+                    self.mesh_object_threads.get(),
+                    self.mesh_threads.get(),
+                );
+            }
         }
     }
 

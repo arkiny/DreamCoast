@@ -28,11 +28,12 @@ struct PushConstants
     uint vtx_buf;      // vertex pool slot
     uint remap_buf;    // cluster_vertices slot
     uint tri_buf;      // cluster_triangles (u32) slot
-    uint rec_buf;      // cluster records slot
-    uint base_cluster; // global cluster index of SV_GroupID 0
+    uint rec_buf;      // GpuCluster records slot (64 B/record, ALL clusters)
+    uint base_cluster; // direct path: global cluster index of SV_GroupID 0
     uint mode;         // 0 = per-cluster colour, 1 = base-colour texture
     uint tex_index;    // base-colour bindless slot (material mode)
-    uint pad;
+    uint vis_buf;      // M3 cut: visible-cluster list slot (0xFFFFFFFF = direct path)
+    uint4 pad;
 };
 
 [[vk::push_constant]]
@@ -65,8 +66,13 @@ void meshMain(
     out indices uint3 tris[MAX_TRIS],
     out vertices VertexOut verts[MAX_VERTS])
 {
-    uint cluster = pc.base_cluster + gid;
-    uint4 rec = g.storage_buffers[pc.rec_buf].Load4(cluster * 16);
+    // Direct path (M2): cluster = base + threadgroup. Cut path (M3): the LOD-cut compute wrote
+    // the selected cluster indices into `vis_buf`, so look ours up by threadgroup.
+    uint cluster = (pc.vis_buf == 0xFFFFFFFFu)
+        ? (pc.base_cluster + gid)
+        : g.storage_buffers[pc.vis_buf].Load(gid * 4);
+    // GpuCluster record: first 16 bytes are {vertex_offset, vertex_count, tri_offset, tri_count}.
+    uint4 rec = g.storage_buffers[pc.rec_buf].Load4(cluster * 64);
     uint voff = rec.x;
     uint vcount = rec.y;
     uint toff = rec.z;
