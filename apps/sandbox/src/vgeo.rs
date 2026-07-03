@@ -81,9 +81,13 @@ impl VgeoSystem {
     ) -> anyhow::Result<Self> {
         use dreamcoast_scene::MeshHandle;
 
-        if !device.capabilities().mesh_shader {
+        // The integrated path is SW-only (compute cut / clear / raster + a full-screen resolve):
+        // it needs 64-bit buffer atomics for the visibility buffer, NOT mesh shaders. (Gating on
+        // mesh_shader was a Metal-ism — that backend reports both together; DX/VK expose them
+        // independently, and the mesh-shader HW path is Track B / I4.)
+        if !device.capabilities().atomic_int64 {
             anyhow::bail!(
-                "P14_VGEO: {backend:?} lacks the capabilities for virtual geometry (mesh_shader=false)"
+                "P14_VGEO: {backend:?} lacks 64-bit buffer atomics (atomic_int64=false) required by the SW visibility buffer"
             );
         }
 
@@ -332,22 +336,20 @@ impl VgeoSystem {
     ) -> anyhow::Result<()> {
         let slots = &mut self.pool[fif];
         while slots.len() < count {
-            let vislist = device.create_storage_buffer_init(
-                &StorageBufferDesc {
-                    size: (self.max_clusters.max(1) as u64) * 4,
-                    stride: 4,
-                    indirect: false,
-                },
-                &vec![0xFFu8; self.max_clusters.max(1) as usize * 4],
-            )?;
-            let args = device.create_storage_buffer_init(
-                &StorageBufferDesc {
-                    size: 12,
-                    stride: 4,
-                    indirect: false,
-                },
-                &[0u8; 12],
-            )?;
+            // Host-visible (not DEFAULT-heap `_init`): these are host-`write`-reset every frame
+            // below, which a DEFAULT-heap D3D12 buffer rejects (only Metal's unified memory allowed
+            // it). CUSTOM-L0 / HOST_COHERENT is CPU-writable AND a UAV, so the cut compute writes it
+            // on the GPU too. Seeded by the reset loop below (created empty here).
+            let vislist = device.create_storage_buffer_host(&StorageBufferDesc {
+                size: (self.max_clusters.max(1) as u64) * 4,
+                stride: 4,
+                indirect: false,
+            })?;
+            let args = device.create_storage_buffer_host(&StorageBufferDesc {
+                size: 12,
+                stride: 4,
+                indirect: false,
+            })?;
             slots.push((vislist, args));
         }
         for (vislist, args) in slots.iter().take(count) {
@@ -376,7 +378,6 @@ impl VgeoSystem {
         slot: usize,
         page_idx: usize,
         visbuf_ext: ResourceId,
-        view_proj: Mat4,
         cull_view_proj: Mat4,
         eye: Vec3,
         model: Mat4,
@@ -450,7 +451,15 @@ impl VgeoSystem {
         );
 
         // ── Clear the R64 visibility buffer, then SW-raster the cut into it ──
-        let mvp = (view_proj * model).to_cols_array();
+        // Use the FLIP-FREE `cull_view_proj` (not `view_proj`): the SW raster and the resolve both
+        // do MANUAL `(0.5 - ndc.y*0.5)` NDC→pixel mapping (the D3D/Metal window convention). On
+        // Vulkan `view_proj` carries the clip-space Y-flip that fixes the *hardware* pipeline, which
+        // would vertically flip this manual mapping — the visbuf rows would then mismatch the
+        // resolve's `SV_Position` reads, writing the object's G-buffer (with depth) at the wrong
+        // rows and corrupting the mesh objects there. `cull_view_proj = proj_noflip * view` is
+        // identical DX≡VK (and equals `view_proj` on D3D12/Metal when unjittered), so both backends
+        // land the visibility raster at the same screen pixels the deferred lighting samples.
+        let mvp = (cull_view_proj * model).to_cols_array();
         let clear = &self.clear_pipeline;
         let raster = &self.raster_pipeline;
         graph.add_compute_pass(

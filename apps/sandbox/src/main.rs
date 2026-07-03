@@ -4936,7 +4936,6 @@ impl App {
                     slot,
                     *page,
                     visbuf_ext,
-                    view_proj,
                     cull_view_proj,
                     eye,
                     *transform,

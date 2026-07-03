@@ -156,10 +156,41 @@ current SW-only path.
 - **Multi-material / scene-cook:** per-cluster material id + a material table so Sponza-class scenes
   (many meshes/materials) resolve correctly. The single-material step above is single-mesh only.
 - **HW/SW binning in-graph** and **M4b HZB** (I4).
-- **DX≡VK Windows parity** (verification-split); the VK/DX seam already compiles (metallib + SPIR-V).
+
+## DX≡VK Windows verification (DONE — RTX 2070 SUPER)
+
+The SW-only integration is now verified on D3D12 **and** Vulkan (branch `verify/vgeo-windows-dx-vk`).
+Findings + fixes (all root-cause, cross-backend):
+
+- **DXIL 64-bit atomics needed SM6.6.** `build.rs` compiled every non-RT DXIL stage at `sm_6_5`;
+  Slang's internal auto-upgrade doesn't reach the DXC shader model, so `InterlockedMax64`
+  (`vgeo_atomic` / `vgeo_swraster`'s `csRaster`) failed DXC. Fixed with a per-entry `sm_6_6` override.
+- **Device features weren't enabled/reported.** rhi-vulkan now probes+enables `shaderInt64` +
+  `shaderBufferInt64Atomics`; rhi-d3d12 probes SM6.6 + `AtomicInt64OnDescriptorHeapResourceSupported`
+  (OPTIONS11 — the visibility buffer is bindless/descriptor-heap-indexed). `capabilities()` reports
+  the real values on both. D3D12 `dispatch_indirect` implemented (DISPATCH command signature).
+- **Bindless storage-buffer table was full.** The GI-heavy default scene already uses **all 64**
+  slots (index 0..63), so vgeo overflowed binding 4 into the TLAS binding (VK VUID; DX silently
+  overwrote). Raised `STORAGE_BUFFER_COUNT` 64→128 across bindless.slang + all three backends
+  (heap offsets / root-sig ranges / registers derive from the constant). Off-path stays
+  byte-identical (VK) / 1-LSB (DX nondeterminism).
+- **The SW raster used the Y-flipped `view_proj`.** The raster + resolve do MANUAL `(0.5-ndc.y*0.5)`
+  NDC→pixel mapping (the no-flip window convention). On Vulkan `view_proj` carries the clip-space
+  Y-flip for the *hardware* pipeline, which vertically flipped the visbuf rows vs the resolve's
+  `SV_Position` reads — corrupting the whole scene's G-buffer. Switched the raster/resolve `mvp` to
+  the flip-free `cull_view_proj` (already used by the cut); DX unchanged, VK fixed.
+- Two Metal-isms in DX host paths: the `--atomic64-test` smoke and the vgeo per-frame scratch pool
+  host-wrote/read DEFAULT-heap buffers → switched to `create_storage_buffer_host` (CUSTOM-L0, both
+  UAV + CPU-mappable). The vgeo eligibility gate now checks `atomic_int64`, not `mesh_shader`
+  (the SW path needs no mesh shader — that was a Metal-ism, both caps ship together there).
+
+**Measured (1280×720, `--screenshot-clean`):** gallery `P14_VGEO=1` DX≡VK **0.000004/ch** (max byte
+101, silhouette-only); vgeo-vs-mesh **0.000714/ch** (DX) / **0.000715/ch** (VK) — the SW-vs-HW raster
+coverage rule, matching Metal; Lantern multi-mesh DX≡VK **0.000234/ch**. `P14_VGEO` off: VK
+byte-identical to pre-change main, DX ≤1 LSB. `--atomic64-test` PASSES both backends, validation-clean.
 
 ## Gates (every increment)
 
 `tools/golden-image.py --backend metal --only gallery` = `af70c1a5…` with `P14_VGEO` off;
-`cargo fmt` + `clippy -D warnings` clean; `cargo test` green; Metal-verified on this box, DX≡VK
-Windows follow-up.
+`cargo fmt` + `clippy -D warnings` clean; `cargo test` green; Metal-verified on the macOS box,
+**DX≡VK verified on Windows (RTX 2070 SUPER), ≤0.001/ch** (see the section above).
