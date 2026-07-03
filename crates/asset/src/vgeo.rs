@@ -405,6 +405,32 @@ fn group_bounds(mc: &MeshClusters, group: &[usize]) -> (Vec3, f32) {
     bounding_sphere(&mc.vertices, &verts)
 }
 
+/// Reconstruct the global (`vertices`) triangle index buffer for one LOD level — every cluster
+/// at `lod_level`, its `u8` local triangles remapped through its vertex window. Used by the
+/// debug viewer to render a chosen LOD and by the crack-free test to inspect its topology.
+pub fn lod_indices(mc: &MeshClusters, lod_level: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    for c in &mc.clusters {
+        if c.lod_level != lod_level {
+            continue;
+        }
+        let vbase = c.vertex_offset as usize;
+        let tbase = c.triangle_offset as usize;
+        for k in 0..c.triangle_count as usize * 3 {
+            out.push(mc.cluster_vertices[vbase + mc.cluster_triangles[tbase + k] as usize]);
+        }
+    }
+    out
+}
+
+/// The set of distinct LOD levels present, ascending (0 = finest).
+pub fn lod_levels(mc: &MeshClusters) -> Vec<u32> {
+    let mut ls: Vec<u32> = mc.clusters.iter().map(|c| c.lod_level).collect();
+    ls.sort_unstable();
+    ls.dedup();
+    ls
+}
+
 /// Build the full LOD DAG for a mesh (Phase 14 M1d): the finest clusters (LOD 0) plus
 /// recursively coarser levels. Each level groups the current clusters, merges + simplifies each
 /// group (locking its boundary so shared seams stay crack-free), and re-clusterizes the result
@@ -421,6 +447,10 @@ pub fn build_lod_dag(vertices: &[MeshVertex], indices: &[u32], material: u32) ->
 
     // Positions for the simplifier (shared across levels; vertices never change).
     let positions: Vec<Vec3> = mc.vertices.iter().map(|v| Vec3::from(v.pos)).collect();
+    // Seam vertices (position shared by another index — UV/normal splits) are locked at every
+    // level: index-based collapse can't tell the two sides coincide, so simplifying one side but
+    // not the other would tear the seam. Conservative but crack-free on real (seamed) assets.
+    let seam_lock = crate::simplify::duplicate_position_vertices(&positions);
 
     let mut lod_level = 1u32;
     let mut next_group_id = 0u32;
@@ -431,10 +461,20 @@ pub fn build_lod_dag(vertices: &[MeshVertex], indices: &[u32], material: u32) ->
         for group in &groups {
             let group_tris = group_global_indices(&mc, group);
             let tri_n = group_tris.len() / 3;
-            let locked = crate::simplify::open_boundary_vertices(&group_tris);
+            // Lock the group's boundary (its open-boundary edges = borders + edges shared with
+            // OTHER groups, so adjacent groups coarsen a shared seam identically) plus global
+            // position-seams. `locked_edges` additionally forbids deleting a border edge.
+            let locked_edges = crate::simplify::open_boundary_edges(&group_tris);
+            let mut locked = crate::simplify::open_boundary_vertices(&group_tris);
+            locked.extend(seam_lock.iter().copied());
             let target = (tri_n / 2).max(1);
-            let (simplified, err) =
-                crate::simplify::simplify_subset(&positions, &group_tris, target, &locked);
+            let (simplified, err) = crate::simplify::simplify_subset(
+                &positions,
+                &group_tris,
+                target,
+                &locked,
+                &locked_edges,
+            );
 
             // Monotone group error: the worst child's error plus this level's simplification.
             let child_max = group
@@ -634,6 +674,77 @@ mod tests {
         // Determinism.
         let mc2 = build_lod_dag(&verts, &idx, 5);
         assert_eq!(mc, mc2);
+    }
+
+    /// A torus: parametric `u×v` grid wrapped in both directions → a genuinely closed,
+    /// index-watertight mesh (no seam, no poles, no duplicated positions). The clean case for a
+    /// topological crack-free check.
+    fn torus(u: u32, v: u32) -> (Vec<MeshVertex>, Vec<u32>) {
+        use std::f32::consts::TAU;
+        let (big_r, small_r) = (3.0f32, 1.0f32);
+        let mut verts = Vec::new();
+        for i in 0..u {
+            for j in 0..v {
+                let (t, p) = (TAU * i as f32 / u as f32, TAU * j as f32 / v as f32);
+                let pos = [
+                    (big_r + small_r * p.cos()) * t.cos(),
+                    (big_r + small_r * p.cos()) * t.sin(),
+                    small_r * p.sin(),
+                ];
+                verts.push(MeshVertex {
+                    pos,
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0, 0.0],
+                });
+            }
+        }
+        let idx_of = |i: u32, j: u32| (i % u) * v + (j % v);
+        let mut idx = Vec::new();
+        for i in 0..u {
+            for j in 0..v {
+                let (a, b, c, d) = (
+                    idx_of(i, j),
+                    idx_of(i + 1, j),
+                    idx_of(i, j + 1),
+                    idx_of(i + 1, j + 1),
+                );
+                idx.extend_from_slice(&[a, b, c, b, d, c]);
+            }
+        }
+        (verts, idx)
+    }
+
+    #[test]
+    fn lod_levels_are_crack_free_on_a_closed_mesh() {
+        // A torus is closed and index-watertight: no open boundary. If simplification tore a
+        // seam, that LOD would gain boundary edges. Assert every LOD stays closed → crack-free.
+        // This is the M1 gate, checked topologically (stronger than eyeballing a screenshot).
+        let (verts, idx) = torus(64, 32);
+        assert!(
+            crate::simplify::open_boundary_vertices(&idx).is_empty(),
+            "test mesh must be closed"
+        );
+        assert!(
+            crate::simplify::duplicate_position_vertices(
+                &verts.iter().map(|v| Vec3::from(v.pos)).collect::<Vec<_>>()
+            )
+            .is_empty(),
+            "torus should have no duplicated positions"
+        );
+
+        let mc = build_lod_dag(&verts, &idx, 0);
+        let levels = lod_levels(&mc);
+        assert!(levels.len() >= 2, "expected multiple LODs, got {levels:?}");
+        for &l in &levels {
+            let lidx = lod_indices(&mc, l);
+            assert!(!lidx.is_empty(), "LOD {l} has no geometry");
+            let open = crate::simplify::open_boundary_vertices(&lidx);
+            assert!(
+                open.is_empty(),
+                "LOD {l} introduced {} boundary vertices (a crack)",
+                open.len()
+            );
+        }
     }
 
     #[test]

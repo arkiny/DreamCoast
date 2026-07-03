@@ -738,6 +738,64 @@ pub(crate) fn run_mesh_shader_test(
     Ok(())
 }
 
+/// Whether `--vgeo-test` was passed: build the virtual-geometry LOD DAG for the loaded model,
+/// log the LOD pyramid, and render a chosen level (`VGEO_LOD=n`, default 0) so LOD transitions
+/// can be inspected for cracks (the offline builder is topologically crack-free-tested; this is
+/// the visual counterpart). Phase 14 M1e.
+pub(crate) fn vgeo_test_enabled() -> bool {
+    std::env::args().skip(1).any(|a| a == "--vgeo-test")
+}
+
+pub(crate) fn run_vgeo_test(
+    backend: BackendKind,
+    window: &mut Window,
+    device: &Device,
+    swapchain: &mut Swapchain,
+    model: MeshData,
+    model_radius: f32,
+) -> anyhow::Result<()> {
+    use dreamcoast_asset::vgeo;
+
+    let dag = vgeo::build_lod_dag(&model.vertices, &model.indices, 0);
+    let levels = vgeo::lod_levels(&dag);
+    info!(
+        "vgeo LOD DAG: {} clusters across {} LOD level(s) ({} source verts, {} tris)",
+        dag.clusters.len(),
+        levels.len(),
+        dag.vertices.len(),
+        model.indices.len() / 3
+    );
+    for &l in &levels {
+        let (mut cn, mut tn) = (0u32, 0u32);
+        let (mut emin, mut emax) = (f32::MAX, 0.0f32);
+        for c in dag.clusters.iter().filter(|c| c.lod_level == l) {
+            cn += 1;
+            tn += c.triangle_count;
+            emin = emin.min(c.self_error);
+            emax = emax.max(c.self_error);
+        }
+        info!("  LOD {l}: {cn} clusters, {tn} tris, self_error {emin:.4}..{emax:.4}");
+    }
+
+    // Pick the LOD to render (clamped to the coarsest available).
+    let want: u32 = std::env::var("VGEO_LOD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let lod = want.min(*levels.last().unwrap_or(&0));
+    let indices = vgeo::lod_indices(&dag, lod);
+    info!("rendering LOD {lod}: {} triangles", indices.len() / 3);
+
+    // Reconstruct a renderable mesh (whole vertex pool + this LOD's index subset) and reuse the
+    // textured mesh-test render path. Moves the source material (the vgeo branch then returns).
+    let lod_model = MeshData {
+        vertices: dag.vertices,
+        indices,
+        material: model.material,
+    };
+    run_mesh_test(backend, window, device, swapchain, &lod_model, model_radius)
+}
+
 /// `--frames N` cap for the clear-test loop (smoke testing); `None` = unlimited.
 pub(crate) fn clear_test_max_frames() -> Option<u64> {
     let mut args = std::env::args().skip(1);

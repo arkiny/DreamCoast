@@ -18,6 +18,11 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use dreamcoast_core::glam::{DVec3, Vec3};
 
+/// An undirected edge as a sorted vertex-index pair.
+fn edge_key(a: u32, b: u32) -> (u32, u32) {
+    if a < b { (a, b) } else { (b, a) }
+}
+
 /// A symmetric 4×4 quadric `Q` (Garland–Heckbert) storing the 10 unique upper-triangle terms
 /// `[a², ab, ac, ad, b², bc, bd, c², cd, d²]` for a plane `(a,b,c,d)`. `f64` for stability.
 #[derive(Clone, Copy, Default)]
@@ -99,15 +104,19 @@ impl Ord for Collapse {
     }
 }
 
-/// Simplify a triangle mesh to at most `target_tris` triangles by QEM edge collapses, never
-/// removing a `locked` vertex (so shared boundaries stay put). `positions` is the vertex pool;
-/// `indices` are triangles into it. Returns the coarsened index buffer (into the SAME
-/// `positions`) and the maximum geometric error (world-space distance) introduced. Deterministic.
+/// Simplify a triangle mesh to at most `target_tris` triangles by QEM edge collapses. Two
+/// constraints keep shared boundaries crack-free: a `locked` vertex is never removed, and a
+/// `locked_edges` edge is never deleted — even by collapsing the interior apex of the triangle
+/// that carries it (which would otherwise degenerate the triangle and tear the border). Pass the
+/// group's open-boundary edges as `locked_edges` (and their endpoints, plus seams, as `locked`).
+/// `positions` is the vertex pool; `indices` are triangles into it. Returns the coarsened index
+/// buffer (into the SAME `positions`) and the max geometric error introduced. Deterministic.
 pub fn simplify_subset(
     positions: &[Vec3],
     indices: &[u32],
     target_tris: usize,
     locked: &HashSet<u32>,
+    locked_edges: &HashSet<(u32, u32)>,
 ) -> (Vec<u32>, f64) {
     let n = positions.len();
     let pos: Vec<DVec3> = positions.iter().map(|p| p.as_dvec3()).collect();
@@ -195,6 +204,22 @@ pub fn simplify_subset(
         if locked.contains(&c.u) {
             continue; // never remove a locked vertex
         }
+        // Edge-preservation guard: collapsing `u` onto `v` degenerates any triangle (u,v,w),
+        // which would delete the border edge (v,w). If (v,w) is locked, forbid this collapse so
+        // the shared boundary survives identically on both sides (crack-free).
+        let deletes_locked_edge = incident[c.u as usize].iter().any(|&ti| {
+            let Some(t) = tris[ti] else { return false };
+            if !t.contains(&c.v) {
+                return false;
+            }
+            // The third vertex of the triangle (the one that isn't u or v).
+            let w = t.iter().copied().find(|&x| x != c.u && x != c.v);
+            w.map(|w| locked_edges.contains(&edge_key(c.v, w)))
+                .unwrap_or(false)
+        });
+        if deletes_locked_edge {
+            continue;
+        }
         // Apply: rewrite u→v in every incident triangle, dropping degenerates.
         let u_tris: Vec<usize> = incident[c.u as usize].iter().copied().collect();
         let mut removed = 0usize;
@@ -240,26 +265,58 @@ pub fn simplify_subset(
     (out, max_err)
 }
 
-/// Vertices on the mesh's **open boundary** — endpoints of any edge used by exactly one
-/// triangle. The LOD DAG locks these (plus the group-shared boundary) so simplification cannot
-/// tear an edge two groups share. Edges are keyed on the global vertex indices in `indices`.
-pub fn open_boundary_vertices(indices: &[u32]) -> HashSet<u32> {
+/// Edges on the mesh's **open boundary** — used by exactly one triangle. For a group's triangle
+/// soup these are the group's border: true mesh borders plus edges shared with another group
+/// (whose other triangle lives in that group). The LOD DAG passes these as `locked_edges` so a
+/// shared border is coarsened identically on both sides (crack-free).
+pub fn open_boundary_edges(indices: &[u32]) -> HashSet<(u32, u32)> {
     let mut edge_count: HashMap<(u32, u32), u32> = HashMap::new();
     for t in indices.chunks_exact(3) {
         for k in 0..3 {
-            let (a, b) = (t[k], t[(k + 1) % 3]);
-            let e = if a < b { (a, b) } else { (b, a) };
-            *edge_count.entry(e).or_insert(0) += 1;
+            *edge_count
+                .entry(edge_key(t[k], t[(k + 1) % 3]))
+                .or_insert(0) += 1;
         }
     }
+    edge_count
+        .into_iter()
+        .filter(|&(_, n)| n == 1)
+        .map(|(e, _)| e)
+        .collect()
+}
+
+/// Endpoints of every open-boundary edge (see [`open_boundary_edges`]) — the vertices the LOD
+/// DAG locks so a border vertex is never removed.
+pub fn open_boundary_vertices(indices: &[u32]) -> HashSet<u32> {
     let mut locked = HashSet::new();
-    for ((a, b), n) in edge_count {
-        if n == 1 {
-            locked.insert(a);
-            locked.insert(b);
-        }
+    for (a, b) in open_boundary_edges(indices) {
+        locked.insert(a);
+        locked.insert(b);
     }
     locked
+}
+
+/// Vertices whose position is shared by another distinct index — **seam** vertices (a UV/normal
+/// split, or a longitude seam). Index-based edge collapse can't see that the two sides coincide,
+/// so collapsing one side but not the other tears a visible crack. The LOD DAG locks these so a
+/// seam is preserved identically on both sides. Positions are keyed bit-exactly (the cook is
+/// deterministic), so only truly-coincident vertices weld.
+pub fn duplicate_position_vertices(positions: &[Vec3]) -> HashSet<u32> {
+    let mut first: HashMap<[u32; 3], u32> = HashMap::new();
+    let mut dup = HashSet::new();
+    for (i, p) in positions.iter().enumerate() {
+        let key = [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
+        match first.get(&key) {
+            Some(&j) => {
+                dup.insert(j);
+                dup.insert(i as u32);
+            }
+            None => {
+                first.insert(key, i as u32);
+            }
+        }
+    }
+    dup
 }
 
 #[cfg(test)]
@@ -289,7 +346,7 @@ mod tests {
         let (pos, idx) = grid(9);
         let tri_count = idx.len() / 3;
         let target = tri_count / 2;
-        let (out, err) = simplify_subset(&pos, &idx, target, &HashSet::new());
+        let (out, err) = simplify_subset(&pos, &idx, target, &HashSet::new(), &HashSet::new());
         assert!(out.len() / 3 <= target, "reached target triangle count");
         assert!(out.len() / 3 > 0, "did not collapse to nothing");
         // Every collapse is within the z=0 plane, so QEM error is ~0.
@@ -305,7 +362,7 @@ mod tests {
         let locked = open_boundary_vertices(&idx);
         assert!(!locked.is_empty());
         // Aggressive target to force collapsing everything collapsible.
-        let (out, _) = simplify_subset(&pos, &idx, 1, &locked);
+        let (out, _) = simplify_subset(&pos, &idx, 1, &locked, &open_boundary_edges(&idx));
         let used: HashSet<u32> = out.iter().copied().collect();
         // Boundary ring vertices must all still be referenced (never removed).
         for v in &locked {
@@ -317,8 +374,8 @@ mod tests {
     fn deterministic() {
         let (pos, idx) = grid(12);
         let t = idx.len() / 3 / 2;
-        let a = simplify_subset(&pos, &idx, t, &HashSet::new());
-        let b = simplify_subset(&pos, &idx, t, &HashSet::new());
+        let a = simplify_subset(&pos, &idx, t, &HashSet::new(), &HashSet::new());
+        let b = simplify_subset(&pos, &idx, t, &HashSet::new(), &HashSet::new());
         assert_eq!(a.0, b.0);
         assert_eq!(a.1.to_bits(), b.1.to_bits());
     }
