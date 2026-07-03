@@ -513,37 +513,6 @@ fn run() -> anyhow::Result<()> {
         );
     }
 
-    // Phase 14 renderer integration: build the virtual-geometry G-buffer producer from the loaded
-    // model's cooked clusters when opt-in `P14_VGEO` is set. Built here (not in `App::new`) because
-    // it needs the model source path / cache the App does not keep. Any failure (no clusters, no
-    // mesh-shader capability) logs and falls back to the mesh fill.
-    let vgeo = if std::env::var("P14_VGEO")
-        .ok()
-        .is_some_and(|v| !v.is_empty() && v != "0")
-    {
-        let (ww, wh) = window.size();
-        match vgeo::VgeoSystem::new(
-            &device,
-            backend,
-            &model_path,
-            &model_ref,
-            &cache_dir,
-            compress_tex,
-            Extent2D::new(ww.max(1), wh.max(1)),
-        ) {
-            Ok(v) => {
-                info!("P14_VGEO: virtual-geometry G-buffer producer enabled");
-                Some(v)
-            }
-            Err(e) => {
-                info!("P14_VGEO disabled ({e}); using the mesh G-buffer fill");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let mut app = App::new(
         window,
         instance,
@@ -555,7 +524,6 @@ fn run() -> anyhow::Result<()> {
         screenshot_mode,
         captures,
         validation_on,
-        vgeo,
     )?;
     app.run()
 }
@@ -1124,20 +1092,13 @@ impl App {
         screenshot_mode: bool,
         captures: Vec<Capture>,
         validation_on: bool,
-        // Phase 14 renderer integration (opt-in `P14_VGEO`, built in `main` since it needs the model
-        // source path/cache the App doesn't keep). `None` on the default path.
-        vgeo: Option<vgeo::VgeoSystem>,
     ) -> anyhow::Result<Self> {
-        // `P14_VGEO`: 1 = virtual-geometry G-buffer producer, 2 = mesh reference (groundless single
-        // model) for the parity diff. Ignored (mode 0) when no `VgeoSystem` was built.
-        let vgeo_mode = if vgeo.is_some() {
-            std::env::var("P14_VGEO")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // `P14_VGEO=1` routes every eligible opaque object through virtual geometry (the `VgeoSystem`
+        // is built below from the mesh registry). 0 = off (default renderer, gallery byte-identical).
+        let vgeo_mode: u32 = std::env::var("P14_VGEO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let queue = device.queue();
         // Phase-7 compute (post blur / GPU particles / GPU culling) is implemented
         // on all three backends (Metal compute landed in M5).
@@ -2721,6 +2682,29 @@ impl App {
         // (crisp cutout / hashed soft edges). So enabling gltf routing is deferred to the Phase
         // 20 work that also adds the G-buffer suppression; foliage behaviour is unchanged here.
         // See `docs/translucency-pass.md` (§ glTF routing).
+
+        // Phase 14 renderer integration: when P14_VGEO is on, build a virtual-geometry cluster page
+        // per registered mesh (built from the registry's CPU geometry, matching the uploaded mesh
+        // exactly). Every eligible opaque object then renders as virtual geometry, overlaid on the
+        // mesh-rastered remainder. Any failure logs and falls back to the mesh fill (mode stays set,
+        // but the frame guards on `vgeo.is_some()`).
+        let vgeo = if vgeo_mode > 0 {
+            let (ww, wh) = window.size();
+            match vgeo::VgeoSystem::new(
+                &device,
+                backend,
+                &mesh_registry,
+                Extent2D::new(ww.max(1), wh.max(1)),
+            ) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    info!("P14_VGEO disabled ({e}); using the mesh G-buffer fill");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             window,
@@ -4793,44 +4777,39 @@ impl App {
         };
         let opaque_scene: &[SceneObject] = culled_scene.as_deref().unwrap_or(&scene);
 
-        // Phase 14 renderer integration (P14_VGEO=1): identify the single textured opaque object to
-        // produce via virtual geometry, and clone the OTHER opaque objects into an overlay set the
-        // mesh fill rasters first. Computed (and the visibility buffer resized) BEFORE the graph so
-        // both outlive `graph.execute`. `None` → the normal whole-scene mesh fill (gallery
-        // byte-identical). Extent is the G-buffer render resolution.
+        // Phase 14 renderer integration (P14_VGEO=1): route each opaque object to virtual geometry
+        // when its mesh has a cluster page; the rest are mesh-rastered. Computed (+ the visibility
+        // buffer resized, + the per-object scratch pool prepared) BEFORE the graph so all of it
+        // outlives `graph.execute`. Off / no page → the normal mesh fill (gallery byte-identical).
         if let Some(v) = self.vgeo.as_mut() {
             v.resize(&self.device, extent)?;
         }
-        let vgeo_obj = if self.vgeo_mode == 1 && self.vgeo.is_some() {
-            let textured: Vec<usize> = opaque_scene
-                .iter()
-                .enumerate()
-                .filter(|(_, o)| {
-                    o.kind == dreamcoast_asset::MaterialKind::Opaque && o.tex[0] != NO_TEXTURE
-                })
-                .map(|(i, _)| i)
-                .collect();
-            if textured.len() == 1 {
-                Some(textured[0])
-            } else {
-                info!(
-                    "P14_VGEO: need exactly one textured opaque object, found {} — mesh fill",
-                    textured.len()
-                );
-                None
+        // `(page index, material, world transform)` per vgeo object + the mesh-rastered remainder.
+        let mut vgeo_draws: Vec<(usize, vgeo::VgeoMaterial, Mat4)> = Vec::new();
+        let mut vgeo_others: Vec<SceneObject> = Vec::new();
+        if self.vgeo_mode == 1
+            && let Some(v) = self.vgeo.as_ref()
+        {
+            for o in opaque_scene {
+                match (o.kind, v.page_for(&o.mesh)) {
+                    (dreamcoast_asset::MaterialKind::Opaque, Some(page)) => vgeo_draws.push((
+                        page,
+                        vgeo::VgeoMaterial {
+                            base_color: o.base_color,
+                            metallic: o.metallic,
+                            roughness: o.roughness,
+                            tex: o.tex,
+                            alpha_cutoff: o.alpha_cutoff,
+                        },
+                        o.transform,
+                    )),
+                    _ => vgeo_others.push(o.clone()),
+                }
             }
-        } else {
-            None
-        };
-        let vgeo_others: Vec<SceneObject> = match vgeo_obj {
-            Some(idx) => opaque_scene
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != idx)
-                .map(|(_, o)| o.clone())
-                .collect(),
-            None => Vec::new(),
-        };
+        }
+        if let Some(v) = self.vgeo.as_mut() {
+            v.prepare(&self.device, self.fif, vgeo_draws.len())?;
+        }
 
         let mut graph = RenderGraph::new();
         // The backbuffer is the actual swapchain image (display extent); tonemap samples the
@@ -4927,13 +4906,10 @@ impl App {
                 mip_bias,
             );
         }
-        // Phase 14 renderer integration: virtual geometry produces the model's G-buffer under
-        // P14_VGEO=1 (`vgeo_obj` / `vgeo_others` computed before the graph). The mesh fill rasters
-        // every other opaque object + ground first (clears), then the vgeo resolve overlays the model.
-        if let (1, Some(idx)) = (self.vgeo_mode, vgeo_obj)
-            && self.vgeo.is_some()
-        {
-            // Mesh fill for the other opaque objects + ground (clears the G-buffer + depth).
+        // Phase 14 renderer integration: under P14_VGEO=1 every opaque object with a cluster page is
+        // produced by virtual geometry. The mesh fill rasters the remainder + ground first (clears),
+        // then each vgeo object is resolved on top (LOAD + Less depth test → depth-composited).
+        if !vgeo_draws.is_empty() {
             self.deferred.record_gbuffer(
                 &mut graph,
                 gbuf,
@@ -4950,27 +4926,24 @@ impl App {
                 self.depth_prepass,
                 true,
             );
-            // Virtual-geometry overlay: resolve the model on top (LOAD + Less depth test).
-            let o = &opaque_scene[idx];
-            let material = vgeo::VgeoMaterial {
-                base_color: o.base_color,
-                metallic: o.metallic,
-                roughness: o.roughness,
-                tex: o.tex,
-                alpha_cutoff: o.alpha_cutoff,
-            };
-            let transform = o.transform;
-            self.vgeo.as_ref().unwrap().record_gbuffer(
-                &mut graph,
-                gbuf,
-                self.fif,
-                view_proj,
-                cull_view_proj,
-                eye,
-                transform,
-                material,
-                extent,
-            )?;
+            let v = self.vgeo.as_ref().unwrap();
+            let visbuf_ext = vgeo::VgeoSystem::import_visbuf(&mut graph);
+            for (slot, (page, material, transform)) in vgeo_draws.iter().enumerate() {
+                v.record_object(
+                    &mut graph,
+                    gbuf,
+                    self.fif,
+                    slot,
+                    *page,
+                    visbuf_ext,
+                    view_proj,
+                    cull_view_proj,
+                    eye,
+                    *transform,
+                    *material,
+                    extent,
+                );
+            }
         } else {
             // Default / fallback: the whole scene with the ground (unchanged, gallery byte-identical).
             self.deferred.record_gbuffer(

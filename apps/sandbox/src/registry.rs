@@ -116,6 +116,11 @@ impl MeshRegistry {
         handle
     }
 
+    /// Number of uploaded meshes (handles are `0..len`).
+    pub(crate) fn len(&self) -> u32 {
+        self.meshes.len() as u32
+    }
+
     /// Resolve a handle to a shared [`GpuMesh`] (cheap `Rc` clone).
     pub(crate) fn get(&self, handle: MeshHandle) -> Rc<GpuMesh> {
         self.meshes[handle.0 as usize].clone()
