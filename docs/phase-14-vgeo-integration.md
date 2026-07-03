@@ -127,6 +127,21 @@ this is an **M1 asset-pipeline robustness gap** (the M1 gate was a single-compon
 account for removed/collapsed geometry in the LOD error, especially per connected component, in
 `crates/asset/src/{vgeo.rs,simplify.rs}`. Single-component meshes (the gallery) are unaffected.
 
+## Scale finding — Sponza needs HW/SW binning (I4)
+
+Full Sponza (`SCENE_GLTF=assets/Sponza/Sponza.gltf`) builds all **103 cluster pages / 25 materials**
+and the small-triangle objects (plants, props) render correctly, but the large-triangle walls / floor
+/ roof are **missing**: the SW rasterizer rasterizes one triangle per thread by looping over its
+screen bounding box, so a wall triangle covering a large screen area loops over millions of pixels →
+the compute dispatch effectively hangs / is dropped. This is precisely the case **M5b binning** exists
+for (large clusters → the HW mesh path, only micro-triangles → SW). The integration is SW-only today,
+so **I4 (binning in the graph) is required for Sponza-class scenes.** I4's obstacle: a graph render
+pass (the HW mesh-vis pass) must declare a UAV storage-write (the visibility buffer) for ordering —
+`PassInfo` has no `storage_writes` today — and needs a colour attachment; add both, then reuse
+`csCutBin` + `vgeo_hwvis.slang` (already built) to split each object's clusters HW/SW into the shared
+visibility buffer before the resolve. Small/medium-triangle meshes (gallery, Lantern) are fully
+correct on the SW-only path.
+
 ## Deferred / out of scope (see `dreamcoast-vgeo-followups`)
 
 - **Multi-material / scene-cook:** per-cluster material id + a material table so Sponza-class scenes
