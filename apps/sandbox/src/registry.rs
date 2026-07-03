@@ -209,7 +209,9 @@ pub(crate) fn build_scene(
             for cx in [lmn[0], lmx[0]] {
                 for cy in [lmn[1], lmx[1]] {
                     for cz in [lmn[2], lmx[2]] {
-                        let w = d.world.transform_point3(dreamcoast_core::glam::vec3(cx, cy, cz));
+                        let w = d
+                            .world
+                            .transform_point3(dreamcoast_core::glam::vec3(cx, cy, cz));
                         wmn = wmn.min(w);
                         wmx = wmx.max(w);
                     }

@@ -99,7 +99,7 @@ impl ReflectSystem {
             dreamcoast_shader::ssr_resolve_cs_dxil,
             dreamcoast_shader::ssr_resolve_cs_metallib,
             "ssr_resolve",
-            224,
+            240,
             false,
         )?;
         let reflect_pipeline = compute(
@@ -464,6 +464,8 @@ impl ReflectSystem {
         reject_dist: f32,
         clamp_max: f32,
         kernel_radius: f32,
+        clamp_mode: u32,
+        clamp_gamma: f32,
     ) -> ResourceId {
         let pipe = self
             .ssr_resolve_pipeline
@@ -522,6 +524,8 @@ impl ReflectSystem {
                     0.15, // temporal EMA alpha (spatial resolve already cut the variance)
                     clamp_max,
                     kernel_radius,
+                    clamp_mode,
+                    clamp_gamma,
                 ));
                 cmd.dispatch(hw.div_ceil(8), hh.div_ceil(8), 1);
                 Ok(())

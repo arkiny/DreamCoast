@@ -105,10 +105,12 @@ pub(crate) struct GdfSystem {
     /// relight budget, + the compute pipeline that fills it. `None` until the cache is built.
     card_vis: Option<StorageBuffer>,
     cache_vis_pipeline: Option<ComputePipeline>,
-    /// A2-fix (Lumen-aligned): host-visible 1-uint buffers (ping-pong by `cache_frame % 2`) that the
-    /// relight `InterlockedMax`es with `asuint(max EMA delta)`. The host reads the slot's value from
-    /// 2 frames ago (fence-complete) to freeze the relight ONLY on MEASURED convergence — never a
-    /// frame-count guess, which locked an unconverged cache on slow-multibounce scenes (IntelSponza).
+    /// A2-fix: host-visible 2-uint buffers (ping-pong by `cache_frame % 2`, `[sum_fp, count]`) that the
+    /// relight `InterlockedAdd`s the per-channel EMA step into; the host divides to the MEAN step. It
+    /// reads the slot's value from 2 frames ago (fence-complete) to freeze the relight ONLY on MEASURED
+    /// convergence — never a frame-count guess, which locked an unconverged cache on slow-multibounce
+    /// scenes (IntelSponza). A priority/budget scheduler is the general-engine analogue; this is the
+    /// measured-convergence form that stays image-identical on any scene.
     cache_conv: [Option<StorageBuffer>; 2],
     /// QHD/UHD track: surface-cache atlas tile edge (texels/card side), runtime so content can use
     /// a smaller tile (cheaper, resolution-INDEPENDENT relight) while the gallery keeps `CARD_TILE`
@@ -1000,9 +1002,10 @@ impl GdfSystem {
     /// Stage D2b: the per-card visibility buffer's bindless storage index (for the relight pass),
     /// or `None` when the cache / visibility pipeline isn't built.
     /// A2-fix: probe THIS frame's convergence slot. Returns `(bindless index to hand the relight,
-    /// max EMA delta measured 2 frames ago)`. Reads the value the same-parity slot got 2 frames back
-    /// (fence-complete, race-free) then clears it to 0 so this frame's relight starts a fresh
-    /// `InterlockedMax`. A frozen (skipped) relight leaves it 0 ⇒ a converged cache keeps reading 0.
+    /// mean EMA delta measured 2 frames ago)`. Reads the `[sum_fp, count]` the same-parity slot got 2
+    /// frames back (fence-complete, race-free), divides to the mean, then clears it to 0 so this frame's
+    /// relight starts a fresh `InterlockedAdd`. A frozen (skipped) relight leaves it 0 (`count == 0` ⇒
+    /// treated as not-yet-measured), so the host holds the latch rather than re-freezing on a stale read.
     pub(crate) fn cache_conv_probe(&self) -> Option<(u32, f32)> {
         let slot = (self.cache_frame % 2) as usize;
         let buf = self.cache_conv[slot].as_ref()?;
