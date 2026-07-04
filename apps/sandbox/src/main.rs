@@ -2702,6 +2702,7 @@ impl App {
                 backend,
                 &mesh_registry,
                 Extent2D::new(ww.max(1), wh.max(1)),
+                &app::cooked_cache_dir().join("vgeo"),
             ) {
                 Ok(v) => Some(v),
                 Err(e) => {

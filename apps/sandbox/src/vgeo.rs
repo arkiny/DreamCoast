@@ -120,6 +120,7 @@ impl VgeoSystem {
         backend: BackendKind,
         registry: &MeshRegistry,
         extent: Extent2D,
+        cache_dir: &std::path::Path,
     ) -> anyhow::Result<Self> {
         use dreamcoast_scene::MeshHandle;
 
@@ -159,7 +160,7 @@ impl VgeoSystem {
             if cpu.indices.len() < 3 {
                 continue;
             }
-            let dag = dreamcoast_asset::vgeo::build_lod_dag(&cpu.vertices, &cpu.indices, 0);
+            let dag = Self::load_or_build_dag(cache_dir, &cpu.vertices, &cpu.indices);
             if dag.clusters.is_empty() {
                 continue;
             }
@@ -368,6 +369,42 @@ impl VgeoSystem {
             bin,
             bin_px,
         })
+    }
+
+    /// Load a mesh's LOD DAG from the per-mesh cluster cache, or build it (`build_lod_dag`) and
+    /// cache it. The key is the geometry hash + the `.dcasset` format version, so a geometry or
+    /// format change re-cooks that one mesh; a hit skips the (seconds-per-mesh) DAG build — the
+    /// difference between an instant vgeo start and minutes for a Sponza-scale scene. Reuses the
+    /// standalone cluster-page `.dcasset` (`dcasset::write_clusters`/`read_clusters`); a read/write
+    /// failure just falls back to building (cache is an optimization, never a correctness source).
+    fn load_or_build_dag(
+        cache_dir: &std::path::Path,
+        verts: &[dreamcoast_asset::MeshVertex],
+        indices: &[u32],
+    ) -> dreamcoast_asset::vgeo::MeshClusters {
+        use dreamcoast_asset::dcasset;
+        let mut bytes = Vec::with_capacity(verts.len() * 32 + indices.len() * 4);
+        for v in verts {
+            for f in v.pos.iter().chain(&v.normal).chain(&v.uv) {
+                bytes.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        for &i in indices {
+            bytes.extend_from_slice(&i.to_le_bytes());
+        }
+        let hash = dcasset::source_hash(&bytes);
+        let file = cache_dir.join(format!("{hash:016x}.dcasset"));
+        if let Ok(b) = std::fs::read(&file)
+            && let Ok((h, mc)) = dcasset::read_clusters(&b)
+            && h.version == dcasset::VERSION
+            && h.source_hash == hash
+        {
+            return mc;
+        }
+        let mc = dreamcoast_asset::vgeo::build_lod_dag(verts, indices, 0);
+        let _ = std::fs::create_dir_all(cache_dir);
+        let _ = std::fs::write(&file, dcasset::write_clusters(&mc, hash));
+        mc
     }
 
     /// Append a cluster DAG into the consolidated global arrays, baking this page's base offsets
