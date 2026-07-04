@@ -243,7 +243,23 @@ pub fn simplify_subset(
         let qu = quad[c.u as usize];
         quad[c.v as usize].add(&qu);
         generation[c.v as usize] += 1;
-        max_err = max_err.max(c.cost.sqrt());
+        // QEM (plane distance) is PLANAR-LOSSLESS: a collapse that fans an interior vertex out into
+        // long, thin, COPLANAR triangles bridging across an opening costs ≈0 QEM, yet it changes
+        // COVERAGE (the stretched triangle fills the opening, occluding what's behind). QEM cannot
+        // see that. So also bound the error by the geometric SIZE the collapse introduced — the
+        // longest edge among the survivor's resulting triangles that grew past its pre-collapse
+        // extent. A coarse cluster's error is then ≥ its triangle size, so the runtime LOD cut only
+        // selects it once those triangles are sub-`tau` on screen (distance-appropriate) — matching
+        // the always-LOD0 mesh fill up close, where a stretched bridge would otherwise pop forward.
+        let mut span = 0.0f64;
+        for &ti in &incident[c.v as usize] {
+            if let Some(t) = tris[ti] {
+                for k in 0..3 {
+                    span = span.max((pos[t[k] as usize] - pos[t[(k + 1) % 3] as usize]).length());
+                }
+            }
+        }
+        max_err = max_err.max(c.cost.sqrt()).max(span);
         live_tris -= removed;
 
         // Re-price edges around the survivor.
@@ -342,17 +358,22 @@ mod tests {
     }
 
     #[test]
-    fn planar_grid_simplifies_with_zero_error() {
-        let (pos, idx) = grid(9);
+    fn planar_grid_simplifies_with_bounded_span_error() {
+        let (pos, idx) = grid(9); // 8×8 quads, unit spacing → extent 8
         let tri_count = idx.len() / 3;
         let target = tri_count / 2;
         let (out, err) = simplify_subset(&pos, &idx, target, &HashSet::new(), &HashSet::new());
         assert!(out.len() / 3 <= target, "reached target triangle count");
         assert!(out.len() / 3 > 0, "did not collapse to nothing");
-        // Every collapse is within the z=0 plane, so QEM error is ~0.
+        // The QEM (plane-distance) part is 0 (all collapses stay in z=0), but the reported error now
+        // ALSO bounds the geometric SPAN the collapse introduces — the longest resulting triangle
+        // edge — so a coarse LOD is only selected once its triangles are sub-`tau` on screen (the
+        // fix for near-coplanar bridge collapses that QEM alone rates as lossless). So the error is
+        // NOT ~0 but is bounded by the coarsened triangle size (≤ the grid's 8-unit extent here).
+        assert!(err > 0.0, "span error should be non-zero for a coarsened grid");
         assert!(
-            err < 1e-6,
-            "planar simplification should be lossless, got {err}"
+            err <= 8.0 * std::f64::consts::SQRT_2 + 1e-6,
+            "span error must stay bounded by the grid diagonal, got {err}"
         );
     }
 
