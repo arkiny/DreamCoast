@@ -117,6 +117,17 @@ bool select_cluster(uint gc, float4x4 model, float max_scale, uint cull_backface
     return true;
 }
 
+// True iff the cluster's WORLD bounds sphere straddles the near plane (`planes[4]` = the standard-Z
+// `z>=0` near plane from `push::frustum_planes`). Near-crossing clusters must rasterize on the HW
+// mesh path, whose fixed-function rasterizer clips at the near plane; the SW compute raster would
+// otherwise drop whole near-crossing triangles (see docs/phase-14-vgeo-nearclip.md). This mirrors
+// Nanite's `bUseHWRaster |= Cull.bNeedsClipping` (NaniteClusterCulling.usf). The cluster already
+// passed the frustum cull, so it is not fully behind the near plane — this only flags a straddle.
+bool crosses_near(float3 bnd_c, float bnd_r)
+{
+    return dot(pc.planes[4].xyz, bnd_c) + pc.planes[4].w < bnd_r;
+}
+
 // SW-only cut: append the work index `t` of every selected cluster to the single visible list.
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -157,8 +168,11 @@ void csCutSceneBin(uint3 tid: SV_DispatchThreadID)
     float dist = max(distance(cam_pos(), bnd_c) - bnd_r, 1e-3);
     float screen_diam = 2.0 * bnd_r * pc.proj_factor / dist;
 
-    uint list = (screen_diam < pc.bin_px) ? pc.sw_list : pc.vis_buf;
-    uint args = (screen_diam < pc.bin_px) ? pc.sw_args : pc.args_buf;
+    // HW for large clusters OR any near-plane straddler (the HW rasterizer clips near; the SW raster
+    // cannot). SW otherwise.
+    bool use_hw = (screen_diam >= pc.bin_px) || crosses_near(bnd_c, bnd_r);
+    uint list = use_hw ? pc.vis_buf : pc.sw_list;
+    uint args = use_hw ? pc.args_buf : pc.sw_args;
     uint slot;
     g.storage_buffers[args].InterlockedAdd(0, 1, slot);
     g.storage_buffers[list].Store(slot * 4, t);
@@ -204,12 +218,13 @@ void csCutSceneP1(uint3 tid: SV_DispatchThreadID)
         return;
     }
 
-    // HW/SW split (binning). Large clusters go to the HW mesh list and always draw in phase 1.
+    // HW/SW split (binning). Large clusters — and any near-plane straddler (HW clips near, SW can't)
+    // — go to the HW mesh list and always draw in phase 1.
     if (pc.bin_enabled != 0u)
     {
         float dist = max(distance(cam_pos(), bnd_c) - bnd_r, 1e-3);
         float screen_diam = 2.0 * bnd_r * pc.proj_factor / dist;
-        if (screen_diam >= pc.bin_px)
+        if (screen_diam >= pc.bin_px || crosses_near(bnd_c, bnd_r))
         {
             uint hslot;
             g.storage_buffers[pc.args_buf].InterlockedAdd(0, 1, hslot);
