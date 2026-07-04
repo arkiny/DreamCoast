@@ -694,6 +694,10 @@ impl VgeoSystem {
             })?;
         }
         for chain in &mut self.hzb_pyramid {
+            // Drop the old levels FIRST so their bindless storage-image slots return to the
+            // free-list before the replacement allocates — otherwise the resize transiently holds
+            // old + new slots and can still spike the 64-slot table (see the RHI reclaim fix).
+            chain.clear();
             *chain = make_hzb_levels(device, extent)?;
         }
         Ok(())

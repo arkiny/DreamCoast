@@ -200,6 +200,8 @@ impl MetalDepthBuffer {
 /// `rt_to_sampled` / `rt_to_render_target` hooks (Metal tracks the write→read
 /// hazard across encoders itself). (M4)
 pub struct MetalRenderTarget {
+    /// The device, so `drop` can return the bindless storage-image slot to the free-list.
+    shared: Rc<DeviceShared>,
     pub(crate) texture: Retained<ProtocolObject<dyn MTLTexture>>,
     index: u32,
     /// Storage-image (UAV) index — `None` until compute lands in M5.
@@ -208,11 +210,13 @@ pub struct MetalRenderTarget {
 
 impl MetalRenderTarget {
     pub(crate) fn new(
+        shared: Rc<DeviceShared>,
         texture: Retained<ProtocolObject<dyn MTLTexture>>,
         index: u32,
         storage_index: Option<u32>,
     ) -> Self {
         Self {
+            shared,
             texture,
             index,
             storage_index,
@@ -229,6 +233,17 @@ impl MetalRenderTarget {
 
     /// Debug name (Phase 9 M2) — no-op on the Metal stub.
     pub fn set_name(&self, _name: &str) {}
+}
+
+impl Drop for MetalRenderTarget {
+    /// Return the bindless storage-image slot so recreating storage targets (resize) does not leak
+    /// the 64-slot UAV table. The sampled `index` (large table) is not yet reclaimed. Safe: the
+    /// handoff contract defers the Drop until the referencing frames retire.
+    fn drop(&mut self) {
+        if let Some(idx) = self.storage_index {
+            self.shared.free_storage_image(idx);
+        }
+    }
 }
 
 /// A 3D (volume) texture for Phase 11 Stage B distance fields. A single `Private`

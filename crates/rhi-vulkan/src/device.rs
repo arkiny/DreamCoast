@@ -29,7 +29,7 @@ pub(crate) const BINDLESS_COUNT: u32 = 1024;
 pub(crate) const CUBE_COUNT: u32 = 64;
 /// Size of the bindless storage-image (UAV) table (binding 3). Compute writes
 /// these; its index space is separate and 0-based (Phase 7).
-pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
+pub(crate) const STORAGE_IMAGE_COUNT: u32 = 256;
 /// Size of the bindless storage-buffer (UAV) table (binding 4). Compute/vertex
 /// read-write these; separate 0-based index space (Phase 7). Raised 64→128 for Phase 14
 /// virtual geometry: the GI-heavy default scene already fills all 64 slots, leaving no room
@@ -67,7 +67,12 @@ pub(crate) struct DeviceShared {
     pub bindless_sampler_wrap: vk::Sampler,
     bindless_next: AtomicU32,
     cube_next: AtomicU32,
+    // Storage-IMAGE (binding 3) high-water mark + free-list of slots returned by dropped render
+    // targets, mirroring the storage-buffer reclaim below. Without it, recreating storage render
+    // targets (the per-FIF vgeo HZB pyramid on resize) walked the 64-slot table to overflow. Same
+    // safety: a target only Drops after its frames retire (resize `wait_idle`s first).
     storage_image_next: AtomicU32,
+    storage_image_free: Mutex<Vec<u32>>,
     // High-water mark for the bindless storage-buffer table, plus a free-list of slots
     // returned by dropped buffers. `register_storage_buffer` reuses a freed slot before
     // bumping the mark, so a long run that creates + destroys storage buffers (resize,
@@ -391,6 +396,7 @@ impl DeviceShared {
                 bindless_next: AtomicU32::new(0),
                 cube_next: AtomicU32::new(0),
                 storage_image_next: AtomicU32::new(0),
+                storage_image_free: Mutex::new(Vec::new()),
                 storage_buffer_next: AtomicU32::new(0),
                 storage_buffer_free: Mutex::new(Vec::new()),
                 volume_next: AtomicU32::new(0),
@@ -542,7 +548,18 @@ impl DeviceShared {
     /// returning its index in the separate 0-based storage-image space. Compute
     /// writes it (image layout GENERAL).
     pub(crate) fn register_storage_image(&self, view: vk::ImageView) -> u32 {
-        let index = self.storage_image_next.fetch_add(1, Ordering::Relaxed);
+        // Reuse a freed slot before bumping the high-water mark (see the field docs).
+        let index = self
+            .storage_image_free
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| self.storage_image_next.fetch_add(1, Ordering::Relaxed));
+        assert!(
+            index < STORAGE_IMAGE_COUNT,
+            "bindless storage-image table overflow (> {STORAGE_IMAGE_COUNT}); raise \
+             STORAGE_IMAGE_COUNT across bindless.slang + all three backends"
+        );
         let image_info = vk::DescriptorImageInfo::default()
             .image_view(view)
             .image_layout(vk::ImageLayout::GENERAL);
@@ -591,6 +608,11 @@ impl DeviceShared {
     /// next `register_storage_buffer` that reuses the slot overwrites it.
     pub(crate) fn free_storage_buffer(&self, index: u32) {
         self.storage_buffer_free.lock().unwrap().push(index);
+    }
+
+    /// Return a storage-image slot to the free-list (called from `VulkanRenderTarget::drop`).
+    pub(crate) fn free_storage_image(&self, index: u32) {
+        self.storage_image_free.lock().unwrap().push(index);
     }
 
     /// Register a sampled 3D volume view in the bindless table (binding 6),
