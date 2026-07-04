@@ -89,7 +89,16 @@ fn profile_for(target: &str, stage: &str, key: &str) -> Option<&'static str> {
 /// `InterlockedMax64`, so it needs SM6.6 too. The mesh stages (`*_ms`) carry no atomic and stay
 /// on the default `sm_6_5` (the minimum mesh-shader profile).
 fn dxil_needs_sm66(key: &str) -> bool {
-    matches!(key, "vgeo_atomic_cs" | "vgeo_swraster_cs" | "vgeo_hwvis_fs")
+    matches!(
+        key,
+        "vgeo_atomic_cs"
+            | "vgeo_swraster_cs"
+            | "vgeo_hwvis_fs"
+            // Unified per-frame SCENE path (docs/phase-14-vgeo-unified-pass.md): its SW raster +
+            // HW-vis fragment record into the same R64 visibility buffer via InterlockedMax64.
+            | "vgeo_scene_raster_cs"
+            | "vgeo_scene_hwvis_fs"
+    )
 }
 
 /// Mesh entry points whose DXIL must be produced via the slang→HLSL→patch→DXC workaround
@@ -101,7 +110,7 @@ fn dxil_needs_sm66(key: &str) -> bool {
 /// modifier correctly, so only DXIL needs the patch. Keep in sync with any mesh shader that adds a
 /// per-`primitives` output. See `compile_mesh_dxil_via_hlsl_patch`.
 fn dxil_mesh_needs_vertices_patch(key: &str) -> bool {
-    matches!(key, "vgeo_hwvis_ms")
+    matches!(key, "vgeo_hwvis_ms" | "vgeo_scene_hwvis_ms")
 }
 
 /// Re-insert the `out vertices` modifier Slang drops from a mesh shader's vertex-output parameter
@@ -1153,6 +1162,46 @@ const JOBS: &[Job] = &[
         entry: "fsGBuffer",
         stage: "fragment",
         key: "vgeo_gbuffer_fs",
+    },
+    // Phase 14 unified per-frame vgeo pass (docs/phase-14-vgeo-unified-pass.md): one scene-wide
+    // cut/clear/raster/hwvis/resolve set (not one per object). The scene shaders read a per-instance
+    // transform + material from an instance table via a work-list indirection (Nanite VisibleCluster
+    // → InstanceId). `vgeo_gbuffer` above is the shared scene resolve (fragment).
+    Job {
+        src: "vgeo_scene_cut.slang",
+        entry: "csCutScene",
+        stage: "compute",
+        key: "vgeo_scene_cut_cs",
+    },
+    Job {
+        src: "vgeo_scene_cut.slang",
+        entry: "csCutSceneBin",
+        stage: "compute",
+        key: "vgeo_scene_cut_bin_cs",
+    },
+    Job {
+        src: "vgeo_scene_raster.slang",
+        entry: "csClearScene",
+        stage: "compute",
+        key: "vgeo_scene_clear_cs",
+    },
+    Job {
+        src: "vgeo_scene_raster.slang",
+        entry: "csRasterScene",
+        stage: "compute",
+        key: "vgeo_scene_raster_cs",
+    },
+    Job {
+        src: "vgeo_scene_hwvis.slang",
+        entry: "meshMain",
+        stage: "mesh",
+        key: "vgeo_scene_hwvis_ms",
+    },
+    Job {
+        src: "vgeo_scene_hwvis.slang",
+        entry: "fragMain",
+        stage: "fragment",
+        key: "vgeo_scene_hwvis_fs",
     },
     // Full ray-tracing pipeline (Phase 8 M5): raygen / miss / closest-hit compiled
     // as separate entry points. On DXIL these emit a shader *library* (lib_6_5);

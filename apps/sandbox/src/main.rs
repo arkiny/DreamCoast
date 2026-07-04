@@ -2585,8 +2585,10 @@ impl App {
         let mut cache_compute_fence = Vec::with_capacity(FRAMES_IN_FLIGHT);
         // GPU profiler: one timestamp query heap per frame in flight (read back after
         // that slot's fence, so the results never stall the GPU). MAX_QUERIES covers
-        // (scheduled passes + 1) boundaries with headroom (Phase 9 M1).
-        const MAX_QUERIES: u32 = 32;
+        // (scheduled passes + 1) boundaries with headroom (Phase 9 M1). Raised 32→128 for the
+        // unified vgeo pass: a full Sponza-class frame (deferred + GDF SW-RT + vgeo scene passes)
+        // now fits, so `PROFILE_GPU` dumps under vgeo instead of overflowing the heap.
+        const MAX_QUERIES: u32 = 128;
         let mut query_heaps = Vec::with_capacity(FRAMES_IN_FLIGHT);
         // Cached-shadow (S1) persistent depth: one app-owned SHADOW_SIZE depth per frame-in-flight
         // (sampleable), rendered OUTSIDE the graph like the IBL env capture. Per-FIF so a moving
@@ -4827,9 +4829,15 @@ impl App {
                 }
             }
         }
-        if let Some(v) = self.vgeo.as_mut() {
-            v.prepare(&self.device, self.fif, vgeo_draws.len())?;
-        }
+        // Build the whole scene's instance table + work list up front (must outlive `graph.execute`).
+        // `vgeo_work` (= Σ instance clusters) sizes the single scene-wide cut/raster dispatch.
+        let vgeo_work = if !vgeo_draws.is_empty()
+            && let Some(v) = self.vgeo.as_mut()
+        {
+            v.prepare_scene(&self.device, self.fif, &vgeo_draws, cull_view_proj, view_proj)?
+        } else {
+            0
+        };
 
         let mut graph = RenderGraph::new();
         // The backbuffer is the actual swapchain image (display extent); tonemap samples the
@@ -4948,22 +4956,18 @@ impl App {
             );
             let v = self.vgeo.as_ref().unwrap();
             let visbuf_ext = vgeo::VgeoSystem::import_visbuf(&mut graph);
-            for (slot, (page, material, transform)) in vgeo_draws.iter().enumerate() {
-                v.record_object(
-                    &mut graph,
-                    gbuf,
-                    self.fif,
-                    slot,
-                    *page,
-                    visbuf_ext,
-                    cull_view_proj,
-                    view_proj,
-                    eye,
-                    *transform,
-                    *material,
-                    extent,
-                );
-            }
+            // One scene-wide cut → clear → raster → (HW mesh-vis) → resolve for every vgeo object.
+            v.record_scene(
+                &mut graph,
+                gbuf,
+                self.fif,
+                vgeo_work,
+                visbuf_ext,
+                cull_view_proj,
+                eye,
+                mip_bias,
+                extent,
+            );
         } else {
             // Default / fallback: the whole scene with the ground (unchanged, gallery byte-identical).
             self.deferred.record_gbuffer(
