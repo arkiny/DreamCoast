@@ -47,7 +47,8 @@ pub const MAGIC: [u8; 8] = *b"DCASSET\0";
 /// v3: virtual-geometry cluster pages (`CHUNK_CLUSTERS`, Phase 14 M1a).
 /// v4: cluster pages carry their own source vertex pool (self-contained; Phase 14 M1a).
 /// v5: cluster records carry LOD-DAG fields (lod_level/group/self+parent error+sphere; M1d).
-pub const VERSION: u32 = 5;
+/// v6: materials carry glTF `doubleSided` (drives vgeo's per-material backface cull).
+pub const VERSION: u32 = 6;
 
 // Chunk type tags (directory `type` field). Stable across versions; new payloads
 // get new tags. Unknown tags are skipped by the readers (forward compatibility).

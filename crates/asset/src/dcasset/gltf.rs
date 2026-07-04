@@ -269,6 +269,7 @@ fn encode_material(w: &mut Writer, m: &GltfMaterial) {
         MaterialKind::Decal => KIND_DECAL,
         MaterialKind::Transparent => KIND_TRANSPARENT,
     });
+    w.u32(m.double_sided as u32);
 }
 
 fn decode_material(r: &mut Reader) -> Result<GltfMaterial, EngineError> {
@@ -292,6 +293,7 @@ fn decode_material(r: &mut Reader) -> Result<GltfMaterial, EngineError> {
         KIND_TRANSPARENT => MaterialKind::Transparent,
         _ => MaterialKind::Opaque,
     };
+    let double_sided = r.u32()? != 0;
     Ok(GltfMaterial {
         base_color_factor,
         metallic_factor,
@@ -304,6 +306,7 @@ fn decode_material(r: &mut Reader) -> Result<GltfMaterial, EngineError> {
         alpha_cutoff,
         alpha_mode,
         kind,
+        double_sided,
     })
 }
 
@@ -367,6 +370,7 @@ mod tests {
                 alpha_cutoff: 0.5,
                 alpha_mode: AlphaMode::Mask,
                 kind: MaterialKind::Masked,
+                double_sided: true,
             }],
             images: vec![
                 TexData::Bc {

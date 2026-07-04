@@ -36,6 +36,7 @@ struct PushConstants
     uint vis_list;  // visible-cluster list (from the cut)
     uint width;     // render target size
     uint height;
+    uint cull_backface; // 1 = backface-cull (single-sided material); 0 = two-sided (no cull)
 };
 
 [[vk::push_constant]]
@@ -94,6 +95,14 @@ void csRaster(uint gid: SV_GroupID, uint lane: SV_GroupThreadID)
     float2 a = sp[0].xy, b = sp[1].xy, c = sp[2].xy;
     float area = edge(a, b, c);
     if (abs(area) < 1e-9)
+        return;
+    // Per-triangle backface cull for single-sided (glTF `doubleSided=false`) materials — Nanite's
+    // per-triangle screen-winding test (`NaniteRasterizer.ush`). `sp` comes from the FLIP-FREE
+    // `cull_view_proj` so the sign is DX≡VK-consistent (unlike the Y-flipped HW `view_proj`). This
+    // both removes silhouette back-face bleed AND skips ~half a closed mesh's triangles. Two-sided
+    // materials (`cull_backface==0`, e.g. Sponza curtains) keep both faces, matching the CULL_NONE
+    // mesh fill. Front-facing here (screen y-down) is `area > 0`.
+    if (pc.cull_backface != 0 && area > 0.0)
         return;
     float inv = 1.0 / area;
 

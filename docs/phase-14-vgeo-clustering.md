@@ -104,5 +104,11 @@ tiebreak problem:
   no `.rdc` is captured. Cracking the soffit needs either that injection fixed or a GPU→CPU
   visibility-buffer readback for offline inspection — tracked separately from this clustering work.
 
-**Conclusion:** the soffit streak is orthogonal to clustering; do M-B for culling on its own
-merits, and debug the soffit with real ground truth as a separate task.
+**Conclusion (superseded 2026-07-04):** the M-A/tiebreak prototypes above were correctly
+reverted, but the "orthogonal to clustering / not LOD" call was **wrong** — it rested on two
+measurement artifacts (an 8-bit-rounded `self_error` debug that hid a tiny LOD1 error, and a
+tonemapped distance view). Ground truth via a per-pixel GPU probe shows the soffit streak **IS**
+an LOD problem: the cut selects a coarsened cluster whose near-coplanar QEM collapse **expands the
+wall silhouette across the arch opening** (`VGEO_TAU=0` → 0 diff vs mesh-fill; `TAU=8` → 9385 px).
+The fix (feature/silhouette-edge locking in the simplifier) is therefore **part of** this
+clustering/DAG work, not separate — see `docs/phase-14-vgeo-lod-soffit-fix.md`.

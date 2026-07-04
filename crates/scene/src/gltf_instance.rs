@@ -166,6 +166,7 @@ mod tests {
                 alpha_cutoff: 0.0,
                 alpha_mode: dreamcoast_asset::AlphaMode::Opaque,
                 kind: dreamcoast_asset::MaterialKind::Opaque,
+                double_sided: false,
             }],
             images: vec![],
             animations: vec![],
