@@ -80,13 +80,38 @@ bool outside_frustum(float3 center, float radius)
 // past that spread from the axis: dot(axis, dirToCam) < -sin(halfAngle) = -sqrt(1-cutoff²).
 // `cutoff <= 0` means the spread is too wide to cull (stored -1 at build). Conservative → never
 // culls a visible cluster.
-bool cone_backfacing(float3 axis, float cutoff, float3 center)
+// Normal-cone backface cluster cull is DISABLED by default: our clusterizer is a naive greedy
+// in-order sweep, so a cluster's normal cone (avg-normal axis + min-dot cutoff) is loose and
+// often inaccurate. Culling on it drops clusters that still show front faces at a grazing
+// silhouette, leaving coverage gaps that back faces bleed through (the sphere-pole "crown"). The
+// depth test already discards backfacing fragments correctly (front is nearer), so the only cost of
+// keeping backface clusters is a little extra raster work — an acceptable trade for correctness in
+// the default renderer. Re-enable once the LOD build produces tight per-cluster cones (the planned
+// Nanite-style spatial clustering); the `cone_backfacing` test below is then the CORRECT,
+// radius-aware form to use. See docs/phase-14-vgeo-lod-soffit-fix.md.
+static const bool CONE_CULL_ENABLED = false;
+
+bool cone_backfacing(float3 axis, float cutoff, float3 center, float radius)
 {
     if (cutoff <= 0.0)
         return false;
-    float3 to_cam = normalize(cam_pos() - center);
+    float3 cw = center - cam_pos(); // camera → cluster
+    float dist = length(cw);
+    if (dist <= radius)
+        return false; // camera inside/near the cluster bounds → never cull
+    float3 d = cw / dist;
     float sin_half = sqrt(max(1.0 - cutoff * cutoff, 0.0));
-    return dot(axis, to_cam) < -sin_half;
+    // Account for the cluster's ANGULAR EXTENT: the bounds sphere subtends asin(radius/dist), so the
+    // view direction to its surface spans a cone of that half-angle around `d`. Culling only on the
+    // center over-culls a cluster that STRADDLES the grazing silhouette (its near edge still shows
+    // front faces) — the source of the pole "crown" (back faces bleeding through the gap). Cull only
+    // when EVERY normal (within `sin_half` of `axis`) from EVERY point in the sphere faces away:
+    // dot(axis, d) > sin(half_angle + angular_radius) = sin_half·cos(ar) + cutoff·sin(ar). This is
+    // strictly MORE conservative than the center-only test (higher threshold), so it never culls a
+    // cluster with a visible front face. (Standard meshoptimizer/niagara radius-aware cone cull.)
+    float sr = saturate(radius / dist); // sin(angular radius)
+    float cr = sqrt(max(1.0 - sr * sr, 0.0));
+    return dot(axis, d) > sin_half * cr + cutoff * sr;
 }
 
 [shader("compute")]
@@ -126,7 +151,8 @@ void csCut(uint3 tid: SV_DispatchThreadID)
     float3 bnd_w = to_world(bnd_c);
     if (outside_frustum(bnd_w, bnd_r * ms))
         return;
-    if (cone_backfacing(normalize(mul((float3x3)pc.model, cone_axis)), cone_cutoff, bnd_w))
+    if (CONE_CULL_ENABLED
+        && cone_backfacing(normalize(mul((float3x3)pc.model, cone_axis)), cone_cutoff, bnd_w, bnd_r * ms))
         return;
 
     {
@@ -164,7 +190,8 @@ bool select_cluster(uint c, out float3 bnd_c, out float bnd_r)
         return false;
     if (outside_frustum(bnd_c, bnd_r))
         return false;
-    if (cone_backfacing(normalize(mul((float3x3)pc.model, cone_axis)), cone_cutoff, bnd_c))
+    if (CONE_CULL_ENABLED
+        && cone_backfacing(normalize(mul((float3x3)pc.model, cone_axis)), cone_cutoff, bnd_c, bnd_r))
         return false;
     return true;
 }
