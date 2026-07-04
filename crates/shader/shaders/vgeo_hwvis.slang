@@ -29,7 +29,7 @@ void atomicMaxU64(RWByteAddressBuffer buf, uint elem, uint64_t val)
 
 struct PushConstants
 {
-    float4x4 mvp;   // 64
+    float4x4 mvp;   // 0: Y-flipped view_proj*model for HW-raster SV_Position
     uint vtx_buf;   // vertex pool (32 B/vertex)
     uint remap_buf; // cluster_vertices (u32)
     uint tri_buf;   // cluster_triangles (u32, 3/tri)
@@ -37,7 +37,9 @@ struct PushConstants
     uint hw_list;   // HW visible-cluster list (from the binning cut)
     uint vis_buf;   // R64 visibility buffer (u64/pixel)
     uint width;
-    uint height;
+    uint height;         // 8 uints @64..96
+    float4x4 cull_mvp;   // 96: FLIP-FREE cull_view_proj*model for the DX≡VK-consistent backface test
+    uint cull_backface;  // 160: 1 = backface-cull (single-sided material); 0 = two-sided (no cull)
 };
 
 [[vk::push_constant]]
@@ -85,7 +87,34 @@ void meshMain(
     }
     if (lane < tcount)
     {
-        tris[lane] = g.storage_buffers[pc.tri_buf].Load3((toff + lane * 3) * 4);
+        uint3 tl = g.storage_buffers[pc.tri_buf].Load3((toff + lane * 3) * 4);
+        // Per-triangle backface cull for single-sided materials (Nanite NaniteRasterizer.ush). The
+        // winding uses the FLIP-FREE `cull_mvp` mapped to the SAME SCREEN-PIXEL space as the SW raster
+        // (`vgeo_swraster.slang`), so HW and SW cull the SAME faces with the SAME predicate (`area >
+        // 0` = backface). Screen-pixel units (×width/height, ~10⁶ scale) instead of NDC (~1) keep the
+        // sign robust for near-edge-on triangles — the DXIL-vs-SPIR-V rounding at `area ≈ 0` no longer
+        // flips a triangle's cull between backends (the tiny-NDC-area form drifted DX≡VK past 0.001).
+        // A vertex crossing the near plane (w ≤ 0) makes the winding unreliable → keep the triangle.
+        // Backface → DEGENERATE the triangle so the HW rasterizer emits no fragments.
+        if (pc.cull_backface != 0)
+        {
+            uint3 rm = uint3(
+                g.storage_buffers[pc.remap_buf].Load((voff + tl.x) * 4),
+                g.storage_buffers[pc.remap_buf].Load((voff + tl.y) * 4),
+                g.storage_buffers[pc.remap_buf].Load((voff + tl.z) * 4));
+            float4 c0 = mul(pc.cull_mvp, float4(asfloat(g.storage_buffers[pc.vtx_buf].Load3(rm.x * 32)), 1.0));
+            float4 c1 = mul(pc.cull_mvp, float4(asfloat(g.storage_buffers[pc.vtx_buf].Load3(rm.y * 32)), 1.0));
+            float4 c2 = mul(pc.cull_mvp, float4(asfloat(g.storage_buffers[pc.vtx_buf].Load3(rm.z * 32)), 1.0));
+            bool near_ok = c0.w > 1e-6 && c1.w > 1e-6 && c2.w > 1e-6;
+            float w = float(pc.width), h = float(pc.height);
+            float2 s0 = float2((c0.x / c0.w * 0.5 + 0.5) * w, (0.5 - c0.y / c0.w * 0.5) * h);
+            float2 s1 = float2((c1.x / c1.w * 0.5 + 0.5) * w, (0.5 - c1.y / c1.w * 0.5) * h);
+            float2 s2 = float2((c2.x / c2.w * 0.5 + 0.5) * w, (0.5 - c2.y / c2.w * 0.5) * h);
+            float area = (s1.x - s0.x) * (s2.y - s0.y) - (s1.y - s0.y) * (s2.x - s0.x);
+            if (near_ok && area > 0.0)
+                tl = uint3(0, 0, 0); // backface → degenerate → no fragments
+        }
+        tris[lane] = tl;
         PrimOut pr;
         pr.payload = (cluster << 7) | lane;
         prims[lane] = pr;

@@ -138,6 +138,10 @@ pub struct GltfMaterial {
     pub alpha_mode: AlphaMode,
     /// Engine routing tag derived once at import via [`classify_material`] (`alpha_mode` + name).
     pub kind: MaterialKind,
+    /// glTF `doubleSided`: true = render both faces (no backface cull), false = single-sided.
+    /// Drives the rasterizer's per-material backface cull (vgeo culls single-sided clusters; the
+    /// mesh fill stays two-sided). glTF default is `false`.
+    pub double_sided: bool,
 }
 
 /// Keyframe interpolation mode for an animation sampler (glTF's three modes).
@@ -253,6 +257,7 @@ pub fn load_gltf_scene(path: impl AsRef<Path>) -> Result<GltfScene, EngineError>
                 alpha_cutoff,
                 alpha_mode,
                 kind,
+                double_sided: m.double_sided(),
             }
         })
         .collect();

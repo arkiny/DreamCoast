@@ -153,6 +153,9 @@ pub(crate) struct MaterialDesc {
     /// materials; only glTF imports can be `Decal`/`Transparent`. Drives the deferred-decal
     /// pass split (decals modify the G-buffer's albedo instead of overwriting it as opaque).
     pub(crate) kind: MaterialKind,
+    /// glTF `doubleSided` (default `false` for imports; procedural/gallery materials pass `true`
+    /// to preserve their historical two-sided render). vgeo backface-culls single-sided materials.
+    pub(crate) two_sided: bool,
 }
 
 /// A material's representative linear albedo for the GDF/GI bake. `tex_average` is the
@@ -232,6 +235,7 @@ pub(crate) fn build_scene(
                 tex: mat.tex,
                 alpha_cutoff: mat.alpha_cutoff,
                 kind: mat.kind,
+                two_sided: mat.two_sided,
                 casts_shadow: d.casts_shadow,
                 skin: None,
                 morph: None,
@@ -301,6 +305,7 @@ pub(crate) fn upload_gltf_scene(
             albedo,
             alpha_cutoff: m.alpha_cutoff,
             kind: m.kind,
+            two_sided: m.double_sided,
         }));
     }
     // Fallback for primitives with no material (glTF default material).
@@ -312,6 +317,7 @@ pub(crate) fn upload_gltf_scene(
         albedo: representative_albedo(None, Material::default().base_color_factor),
         alpha_cutoff: 0.0,
         kind: MaterialKind::Opaque,
+        two_sided: true, // no-material fallback → two-sided (never accidentally cull geometry)
     });
 
     let mut per_mesh: Vec<Vec<(MeshHandle, MaterialHandle)>> =

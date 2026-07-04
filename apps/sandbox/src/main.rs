@@ -212,6 +212,9 @@ pub(crate) struct SceneObject {
     /// Renderer routing tag from material classification (deferred-decal pass split). `Opaque`
     /// for procedural/level drawables; glTF imports may be `Decal`/`Transparent`.
     pub(crate) kind: dreamcoast_asset::MaterialKind,
+    /// glTF `doubleSided`: `false` = single-sided (vgeo backface-culls its clusters). Procedural
+    /// drawables pass `true`. Only vgeo consumes it (the mesh fill stays `CULL_NONE`).
+    pub(crate) two_sided: bool,
     pub(crate) casts_shadow: bool,
     /// GPU-skinning storage-buffer indices `[joints, weights, palette, joint_count]`
     /// when this drawable is skinned (animation Stage B.2); `None` = static. Set by the
@@ -1411,6 +1414,7 @@ impl App {
                 ),
                 alpha_cutoff: 0.0,
                 kind: dreamcoast_asset::MaterialKind::Opaque,
+                two_sided: true, // procedural gallery material → keep two-sided (byte-identical anchor)
             });
             let mat_chrome = material_registry.add(MaterialDesc {
                 base_color: [0.95, 0.96, 0.97, 1.0],
@@ -1420,6 +1424,7 @@ impl App {
                 albedo: registry::representative_albedo(None, [0.95, 0.96, 0.97, 1.0]),
                 alpha_cutoff: 0.0,
                 kind: dreamcoast_asset::MaterialKind::Opaque,
+                two_sided: true, // procedural gallery material → keep two-sided (byte-identical anchor)
             });
             let mat_copper = material_registry.add(MaterialDesc {
                 base_color: [0.95, 0.64, 0.54, 1.0],
@@ -1429,6 +1434,7 @@ impl App {
                 albedo: registry::representative_albedo(None, [0.95, 0.64, 0.54, 1.0]),
                 alpha_cutoff: 0.0,
                 kind: dreamcoast_asset::MaterialKind::Opaque,
+                two_sided: true, // procedural gallery material → keep two-sided (byte-identical anchor)
             });
             let mat_red = material_registry.add(MaterialDesc {
                 base_color: [0.85, 0.25, 0.2, 1.0],
@@ -1438,6 +1444,7 @@ impl App {
                 albedo: registry::representative_albedo(None, [0.85, 0.25, 0.2, 1.0]),
                 alpha_cutoff: 0.0,
                 kind: dreamcoast_asset::MaterialKind::Opaque,
+                two_sided: true, // procedural gallery material → keep two-sided (byte-identical anchor)
             });
             // Spawn order defines the deterministic draw / TLAS-instance order (model,
             // chrome, copper, cube) — the order the legacy flat list used.
@@ -4800,6 +4807,7 @@ impl App {
                             roughness: o.roughness,
                             tex: o.tex,
                             alpha_cutoff: o.alpha_cutoff,
+                            two_sided: o.two_sided,
                         },
                         o.transform,
                     )),

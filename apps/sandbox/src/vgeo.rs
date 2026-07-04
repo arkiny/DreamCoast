@@ -40,6 +40,9 @@ pub(crate) struct VgeoMaterial {
     /// base color, metallic-roughness, normal, emissive bindless indices (`NO_TEXTURE` if absent).
     pub(crate) tex: [u32; 4],
     pub(crate) alpha_cutoff: f32,
+    /// glTF `doubleSided`: `false` → the raster backface-culls this object's clusters (per-triangle,
+    /// Nanite-style). `true` → two-sided (no cull), matching the `CULL_NONE` mesh fill.
+    pub(crate) two_sided: bool,
 }
 
 /// All meshes' cluster geometry consolidated into FOUR bindless storage buffers (not four *per
@@ -228,7 +231,7 @@ impl VgeoSystem {
             dreamcoast_shader::vgeo_swraster_clear_cs_dxil,
             dreamcoast_shader::vgeo_swraster_clear_cs_metallib,
             "csClear",
-            96,
+            100,
             [64, 1, 1],
         )?;
         let raster_pipeline = compute(
@@ -236,7 +239,7 @@ impl VgeoSystem {
             dreamcoast_shader::vgeo_swraster_cs_dxil,
             dreamcoast_shader::vgeo_swraster_cs_metallib,
             "csRaster",
-            96,
+            100,
             [128, 1, 1],
         )?;
         let (rvs, rfs) = match backend {
@@ -331,7 +334,7 @@ impl VgeoSystem {
                     // its colour output is unused). Matches the scratch target `record_object` makes.
                     color_formats: &[crate::GB_ALBEDO_FMT],
                     depth_format: None,
-                    push_constant_size: 96, // mat4 mvp (64) + 8 u32 slots (32)
+                    push_constant_size: 164, // mvp (64) + 8 u32 (32) + cull_mvp (64) + cull flag (4)
                     bindless: true,
                     uniform_buffer: false,
                     object_threads: [1, 1, 1],
@@ -667,6 +670,9 @@ impl VgeoSystem {
         // would vertically flip this manual mapping — the visbuf rows would then mismatch the
         // resolve's `SV_Position` reads. `cull_view_proj = proj_noflip * view` is identical DX≡VK.
         let mvp = (cull_view_proj * model).to_cols_array();
+        // Per-triangle backface cull for single-sided (glTF `doubleSided=false`) materials (both the
+        // SW raster and the HW mesh shader use it). Two-sided materials keep both faces = CULL_NONE.
+        let cull_backface: u32 = (!material.two_sided) as u32;
         let clear = &self.clear_pipeline;
         let raster = &self.raster_pipeline;
         graph.add_compute_pass(
@@ -676,7 +682,7 @@ impl VgeoSystem {
                 reads: vec![sw_args_ext, sw_list_ext],
             },
             move |ctx| {
-                let mut spc = [0u8; 96];
+                let mut spc = [0u8; 100];
                 for (i, v) in mvp.iter().enumerate() {
                     spc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
                 }
@@ -689,6 +695,7 @@ impl VgeoSystem {
                     sw_list.storage_index(),
                     w,
                     h,
+                    cull_backface,
                 ]
                 .iter()
                 .enumerate()
@@ -718,6 +725,8 @@ impl VgeoSystem {
         if let Some(binp) = self.bin.as_ref() {
             let hwvis = &binp.hwvis;
             let hmvp = (view_proj * model).to_cols_array();
+            // Flip-free mvp for the mesh shader's DX≡VK-consistent backface test (see vgeo_hwvis).
+            let hcmvp = (cull_view_proj * model).to_cols_array();
             let scratch = graph.create_color("vgeo_hwvis_scratch", crate::GB_ALBEDO_FMT, extent);
             graph.add_pass_with_storage_writes(
                 PassInfo {
@@ -736,7 +745,7 @@ impl VgeoSystem {
                 },
                 vec![visbuf_ext],
                 move |ctx| {
-                    let mut hpc = [0u8; 96];
+                    let mut hpc = [0u8; 164];
                     for (i, v) in hmvp.iter().enumerate() {
                         hpc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
                     }
@@ -755,6 +764,10 @@ impl VgeoSystem {
                     {
                         hpc[64 + i * 4..68 + i * 4].copy_from_slice(&word.to_le_bytes());
                     }
+                    for (i, v) in hcmvp.iter().enumerate() {
+                        hpc[96 + i * 4..100 + i * 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    hpc[160..164].copy_from_slice(&cull_backface.to_le_bytes());
                     let cmd = ctx.cmd();
                     cmd.bind_mesh_pipeline(hwvis);
                     cmd.push_constants_mesh(&hpc);
