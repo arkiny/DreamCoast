@@ -7,30 +7,28 @@
 // pipeline (shadow / GDF / PBR lighting / tonemap) then consumes it UNCHANGED, so virtual geometry
 // becomes a drop-in G-buffer producer rather than a debug view.
 //
-// Single-material scope (first integration step): the whole cluster set uses one material (the
-// loaded model's), matching a single-mesh/single-material object. Per-cluster materials (Sponza,
-// many meshes) are a scene-cook follow-up (material id per cluster + a material table). The material
-// logic below mirrors `gbuffer.slang`'s `fsMain` byte-for-byte so a resolved surface shades
-// identically to rasterizing the same triangles directly.
-#include "bindless.slang"
+// SCENE resolve (unified per-frame pass): one full-screen resolve for the whole scene. The per-pixel
+// payload stores a WORK INDEX `t`; `work[t] = (instance, global cluster)` recovers the instance, and
+// the per-object transform + material come from the instance table (not push constants) — the Nanite
+// `VisibleCluster.InstanceId → GetInstanceSceneData` indirection (docs/phase-14-vgeo-unified-pass.md).
+// The material logic below mirrors `gbuffer.slang`'s `fsMain` byte-for-byte so a resolved surface
+// shades identically to rasterizing the same triangles directly.
+#include "vgeo_scene_common.slang"
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
 
 struct PushConstants
 {
-    float4x4 mvp;               //   0: view_proj * model (project verts to screen for barycentric)
-    float4x4 model;             //  64: object → world (world position + normal)
-    uint vtx_buf;               // 128: vertex pool (32 B/vertex: pos[3], normal[3], uv[2])
-    uint remap_buf;             // 132: cluster_vertices (u32)
-    uint tri_buf;               // 136: cluster_triangles (u32, 3/tri)
-    uint rec_buf;               // 140: GpuCluster records (96 B)
-    uint vis_buf;               // 144: R64 visibility buffer (u64/pixel)
-    uint width;                 // 148
-    uint height;                // 152
-    uint pad0;                  // 156
-    float4 base_color_factor;   // 160
-    float4 mr_factor;           // 176: x metallic, y roughness, z mip bias, w alpha cutoff
-    uint4 tex;                   // 192: x base_color, y metallic_roughness, z normal, w emissive
+    uint vtx_buf;    //  0: vertex pool (32 B/vertex: pos[3], normal[3], uv[2])
+    uint remap_buf;  //  4: cluster_vertices (u32)
+    uint tri_buf;    //  8: cluster_triangles (u32, 3/tri)
+    uint rec_buf;    // 12: GpuCluster records (96 B)
+    uint vis_buf;    // 16: R64 visibility buffer (u64/pixel)
+    uint work_buf;   // 20: work list (uint2: instance, global cluster)
+    uint inst_buf;   // 24: instance table (SceneInstance, 256 B)
+    uint width;      // 28
+    uint height;     // 32
+    float mip_bias;  // 36: per-frame global texture LOD bias (folds into the SampleGrad gradient)
 };
 
 [[vk::push_constant]]
@@ -89,10 +87,14 @@ GBufferOut fsGBuffer(VSOut i)
         discard; // no geometry → leave the cleared G-buffer (position.a == 0)
 
     uint payload = (uint)(packed & 0xFFFFFFFFu);
-    uint cluster = payload >> 7;
+    uint t = payload >> 7;          // WORK INDEX (not a raw cluster)
     uint tri = payload & 0x7Fu;
 
-    uint4 rec = g.storage_buffers[pc.rec_buf].Load4(cluster * 96);
+    // Recover the instance + global cluster from the work list, then its transform + material.
+    uint2 w = loadWork(pc.work_buf, t);
+    InstanceData inst = loadInstance(pc.inst_buf, w.x);
+
+    uint4 rec = g.storage_buffers[pc.rec_buf].Load4(w.y * 96);
     uint voff = rec.x, toff = rec.z;
 
     uint3 li = g.storage_buffers[pc.tri_buf].Load3((toff + tri * 3) * 4);
@@ -107,9 +109,9 @@ GBufferOut fsGBuffer(VSOut i)
         float3 p = asfloat(g.storage_buffers[pc.vtx_buf].Load3(b));
         float3 nl = asfloat(g.storage_buffers[pc.vtx_buf].Load3(b + 12));
         uvs[k] = asfloat(g.storage_buffers[pc.vtx_buf].Load2(b + 24));
-        wpos[k] = mul(pc.model, float4(p, 1.0)).xyz;
-        nrm[k] = mul((float3x3)pc.model, nl);
-        clip[k] = mul(pc.mvp, float4(p, 1.0)); // keep HOMOGENEOUS — do NOT divide by w here
+        wpos[k] = mul(inst.model, float4(p, 1.0)).xyz;
+        nrm[k] = mul((float3x3)inst.model, nl);
+        clip[k] = mul(inst.mvp, float4(p, 1.0)); // keep HOMOGENEOUS — do NOT divide by w here
     }
 
     // Perspective-correct barycentric via a HOMOGENEOUS (pre-divide) solve. A per-vertex `xy/w`
@@ -160,7 +162,7 @@ GBufferOut fsGBuffer(VSOut i)
 
     // Analytic UV / world-position screen derivatives (fold `mip_bias` into the gradient scale, since
     // SampleGrad takes gradients not a bias: LOD += bias ⇔ grad *= exp2(bias)).
-    float grad_scale = exp2(pc.mr_factor.z);
+    float grad_scale = exp2(pc.mip_bias);
     float2 uv_dx = (dlam_du.x * uvs[0] + dlam_du.y * uvs[1] + dlam_du.z * uvs[2]) * dpx * grad_scale;
     float2 uv_dy = (dlam_dv.x * uvs[0] + dlam_dv.y * uvs[1] + dlam_dv.z * uvs[2]) * dpy * grad_scale;
     float3 wp_dx = (dlam_du.x * wpos[0] + dlam_du.y * wpos[1] + dlam_du.z * wpos[2]) * dpx;
@@ -168,28 +170,28 @@ GBufferOut fsGBuffer(VSOut i)
 
     // ── Material resolve — mirrors gbuffer.slang fsMain, but samples with SampleGrad(analytic uv
     // gradients) instead of implicit derivatives (the visibility-resolve mip-selection fix). ──────
-    float cutoff = pc.mr_factor.w;
-    float3 albedo = pc.base_color_factor.rgb;
-    if (pc.tex.x != NO_TEXTURE)
+    float cutoff = inst.mr.w;
+    float3 albedo = inst.base_color.rgb;
+    if (inst.tex.x != NO_TEXTURE)
     {
-        float4 bc = g.textures[pc.tex.x].SampleGrad(g.samp_wrap, uv, uv_dx, uv_dy);
+        float4 bc = g.textures[inst.tex.x].SampleGrad(g.samp_wrap, uv, uv_dx, uv_dy);
         albedo *= bc.rgb;
-        float a = bc.a * pc.base_color_factor.a;
+        float a = bc.a * inst.base_color.a;
         if (cutoff > 0.0 && a < cutoff)
             discard;
     }
-    float metallic = pc.mr_factor.x;
-    float roughness = pc.mr_factor.y;
-    if (pc.tex.y != NO_TEXTURE)
+    float metallic = inst.mr.x;
+    float roughness = inst.mr.y;
+    if (inst.tex.y != NO_TEXTURE)
     {
-        float3 mr = g.textures[pc.tex.y].SampleGrad(g.samp_wrap, uv, uv_dx, uv_dy).rgb;
+        float3 mr = g.textures[inst.tex.y].SampleGrad(g.samp_wrap, uv, uv_dx, uv_dy).rgb;
         roughness *= mr.g;
         metallic *= mr.b;
     }
     float3 n = normalize(world_normal);
-    if (pc.tex.z != NO_TEXTURE)
+    if (inst.tex.z != NO_TEXTURE)
     {
-        float3 tn = g.textures[pc.tex.z].SampleGrad(g.samp_wrap, uv, uv_dx, uv_dy).rgb * 2.0 - 1.0;
+        float3 tn = g.textures[inst.tex.z].SampleGrad(g.samp_wrap, uv, uv_dx, uv_dy).rgb * 2.0 - 1.0;
         n = apply_normal_map(n, wp_dx, wp_dy, uv_dx, uv_dy, tn);
     }
 
