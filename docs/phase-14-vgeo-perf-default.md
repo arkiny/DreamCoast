@@ -1,6 +1,6 @@
 # Phase 14 — vgeo: DAG cache, default-on, perf, and the cone-cull follow-up
 
-Status: items 1 / 2 / 4 **DONE (2026-07-04)**; item 3 **planned**. This is the "make vgeo the
+Status: items 1 / 2 / 3 / 4 **DONE (2026-07-04)**. This is the "make vgeo the
 default renderer" track that follows the correctness fixes in
 [`docs/phase-14-vgeo-lod-soffit-fix.md`](phase-14-vgeo-lod-soffit-fix.md).
 
@@ -57,23 +57,37 @@ Profiler note: `PROFILE_GPU`'s headless dump is skipped under vgeo because vgeo 
 consolidated vgeo pass (single cut/raster/resolve over all objects) would both fix profiling and cut
 per-object overhead — tracked with item 3.
 
-## 3. Re-enable the normal-cone cluster cull (PLANNED)
+## 3. Re-enable the normal-cone cluster cull (DONE)
 
-The normal-cone backface **cluster** cull is disabled (see the soffit-fix doc §2) because the naive
-greedy in-order clusterizer produces **loose, inaccurate cones** that over-cull silhouette clusters.
-Re-enabling it (recovering that culling perf) needs **tight per-cluster bounds**, i.e. the planned
-Nanite-style build (`docs/phase-14-vgeo-clustering.md`, "M-B"):
+The normal-cone backface **cluster** cull was disabled because the naive greedy in-order clusterizer
+produced **loose cones** that over-culled silhouette clusters (the sphere-pole "crown"). Two changes
+make it correct:
 
-1. **Spatial clustering** — replace the in-order greedy sweep with a Morton-order spatial partition
-   (position-welded, no METIS FFI) so a cluster is a compact spatial patch → a tight normal cone +
-   bounding sphere.
-2. **Tight cone build** — recompute `cone_axis` / `cone_cutoff` (and the bounds sphere) from the
-   spatially-coherent cluster; the corrected radius-aware `cone_backfacing` (already in
-   `vgeo_cut.slang`) then culls reliably.
-3. **Flip `CONE_CULL_ENABLED` on** and re-verify: cone-on ≡ cone-off render (perfectly conservative),
-   DX≡VK ≤ 0.001, and measure the cut/raster saving.
+1. **Morton spatial clusterizer** (`crates/asset/src/vgeo.rs`) — the greedy meshlet sweep now visits
+   triangles in **Morton (Z-order) centroid order** instead of index order (`morton_triangle_order`,
+   10-bit-per-axis grid over the mesh AABB, deterministic). Each 124-tri chunk is a compact spatial
+   patch → a tight bounding sphere + normal cone. Only the cluster *shape* changes, not the format
+   or runtime contract; the FFI-free analogue of Nanite's METIS spatial partition. Changes every
+   cluster page → `dcasset::VERSION` 6→7 (caches re-cook).
+2. **`doubleSided` gating** — the cone cull is enabled (`CONE_CULL_ENABLED = true`) but only for
+   **single-sided** materials (`pc.cull_backface`, the same flag the per-triangle backface cull
+   uses). A two-sided mesh (the copper sphere, curtains) shows both faces to match the CULL_NONE
+   mesh fill, so it is never cone-culled — the missing condition that caused the crown. For
+   single-sided closed geometry, culling all-backface clusters equals the CULL_NONE result (front
+   occludes back) with ~half the raster dispatches. The radius-aware `cone_backfacing` (meshopt/
+   niagara form) is the runtime test.
 
-Adjacent follow-ups surfaced by items 1/2/4: a **per-frame consolidated vgeo pass** (one cut/raster/
-resolve over all objects instead of per-object serialization) to cut overhead + fix `PROFILE_GPU`,
-and **HZB same-frame occlusion** (attempted + reverted in M4b, needs a genuinely-occluded scene like
-Intel Sponza to validate the cull direction DX≡VK).
+Verified (RTX 2070 SUPER): copper sphere (two-sided) vgeo-vs-mesh **4e-06** (crown gone); Sponza
+(single-sided) vgeo-vs-mesh **2.6e-05**, DX≡VK **9e-06**; 71 asset tests pass (Morton preserves
+caps / crack-free / determinism). The cull halves the backface-cluster raster dispatches on
+single-sided closed geometry.
+
+## Remaining follow-ups
+
+- **Per-frame consolidated vgeo pass** — one cut/raster/resolve over all objects instead of the
+  current per-object serialization; cuts per-object overhead AND fixes `PROFILE_GPU` (whose timer-
+  query heap overflows on the per-object passes).
+- **HZB same-frame occlusion** — attempted + reverted in M4b; needs a genuinely-occluded scene
+  (Intel Sponza) to validate the cull direction DX≡VK.
+- **Re-cook Intel New Sponza** once (VERSION 7): its cluster cache + scene textures re-cook (~17 min
+  cold), then load in ~17 s.
