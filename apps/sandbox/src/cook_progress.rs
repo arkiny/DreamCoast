@@ -50,7 +50,10 @@ impl ProgressSink for TermProgress {
                 .map(|i| if i < filled { '#' } else { '-' })
                 .collect();
             let mut err = std::io::stderr();
-            let _ = write!(err, "\r  cook: {label:<22} [{bar}] {pct:3}% ({done}/{total})");
+            let _ = write!(
+                err,
+                "\r  cook: {label:<22} [{bar}] {pct:3}% ({done}/{total})"
+            );
             if done == total {
                 let _ = writeln!(err);
             }

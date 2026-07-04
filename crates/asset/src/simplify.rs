@@ -370,7 +370,10 @@ mod tests {
         // edge — so a coarse LOD is only selected once its triangles are sub-`tau` on screen (the
         // fix for near-coplanar bridge collapses that QEM alone rates as lossless). So the error is
         // NOT ~0 but is bounded by the coarsened triangle size (≤ the grid's 8-unit extent here).
-        assert!(err > 0.0, "span error should be non-zero for a coarsened grid");
+        assert!(
+            err > 0.0,
+            "span error should be non-zero for a coarsened grid"
+        );
         assert!(
             err <= 8.0 * std::f64::consts::SQRT_2 + 1e-6,
             "span error must stay bounded by the grid diagonal, got {err}"
