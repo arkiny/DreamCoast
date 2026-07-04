@@ -39,6 +39,23 @@ and D3D12 (≤ 0.001 avg/channel, verified on an RTX 2070 SUPER); Metal is at ne
 - **glTF animation** — node TRS clips (all 3 interpolation modes), **GPU vertex skinning**
   (vertex-pulling, Metal+VK+D3D12) + skinned shadows, and morph targets — driven from the
   ECS (`SCENE_GLTF=<gltf> GLTF_ANIM`).
+- **Virtual geometry** — a Nanite-style cluster/LOD-DAG pipeline: meshes are split into
+  meshlets with a QEM-simplified LOD DAG, a compute cut selects a crack-free continuous LOD,
+  and an R64 **visibility buffer** is filled by a HW mesh-shader path (large triangles) and a
+  compute software rasterizer (micro-triangles), then resolved into the same deferred G-buffer.
+  Per-triangle backface culling honours glTF `doubleSided`. A drop-in G-buffer producer, byte-
+  matching the mesh fill (`P14_VGEO=1 P14_VGEO_BIN=1`).
+  See [`docs/phase-14-vgeo-lod-soffit-fix.md`](docs/phase-14-vgeo-lod-soffit-fix.md).
+
+![Intel "New Sponza" with the cypress-tree pack, rendered through the virtual-geometry visibility buffer](docs/media/vgeo-intel-sponza.png)
+
+## Graphics features at a glance
+
+The deferred pipeline writes a four-target G-buffer, then a full-screen pass shades it with
+Cook-Torrance PBR plus software-ray-traced ambient (a baked global distance field drives AO
+and one-bounce diffuse GI). Every channel is inspectable at runtime via `DEBUG_VIEW`:
+
+![Debug views: lit result, G-buffer albedo/normal/metallic/roughness/world-position, GDF AO and GI](docs/images/graphics-features.png)
 
 Phases 0–12 are complete, plus the Phase 15 multithread core (M1–M4: job system →
 render/RHI thread split → parallel recording) and glTF **animation** (node + skinning +
