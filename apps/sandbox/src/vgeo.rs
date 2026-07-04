@@ -620,6 +620,9 @@ impl VgeoSystem {
             .max(model.y_axis.truncate().length())
             .max(model.z_axis.truncate().length());
         let model_arr = model.to_cols_array();
+        // Per-triangle backface cull for single-sided (glTF `doubleSided=false`) materials — used by
+        // the SW raster, the HW mesh shader, AND (gated) the cut's normal-cone backface cluster cull.
+        let cull_backface: u32 = (!material.two_sided) as u32;
         let proj_factor = 0.5 * h as f32 / (30f32.to_radians()).tan();
         // The SW list rasterized in compute (SW-only: the whole cut = hw_list; binning: the SW
         // sub-list); its ordering handle.
@@ -687,6 +690,7 @@ impl VgeoSystem {
                 }
                 cpc[208..212].copy_from_slice(&max_scale.to_le_bytes());
                 cpc[212..216].copy_from_slice(&rec_base.to_le_bytes());
+                cpc[216..220].copy_from_slice(&cull_backface.to_le_bytes());
                 let cmd = ctx.cmd();
                 // `hw_args` feeds the HW mesh draw's indirect grid (binning): reset last frame's
                 // INDIRECT_ARGUMENT state back to storage before the cut UAV-writes the count.
@@ -713,9 +717,6 @@ impl VgeoSystem {
         // would vertically flip this manual mapping — the visbuf rows would then mismatch the
         // resolve's `SV_Position` reads. `cull_view_proj = proj_noflip * view` is identical DX≡VK.
         let mvp = (cull_view_proj * model).to_cols_array();
-        // Per-triangle backface cull for single-sided (glTF `doubleSided=false`) materials (both the
-        // SW raster and the HW mesh shader use it). Two-sided materials keep both faces = CULL_NONE.
-        let cull_backface: u32 = (!material.two_sided) as u32;
         let clear = &self.clear_pipeline;
         let raster = &self.raster_pipeline;
         graph.add_compute_pass(

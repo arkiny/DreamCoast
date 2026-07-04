@@ -101,13 +101,60 @@ pub struct MeshClusters {
 /// assigned to a group).
 pub const UNGROUPED: u32 = u32::MAX;
 
+/// Spread the low 10 bits of `x` so each occupies every 3rd bit (Morton/Z-order interleave).
+fn part1by2(x: u32) -> u32 {
+    let mut x = x & 0x3ff;
+    x = (x | (x << 16)) & 0x030000ff;
+    x = (x | (x << 8)) & 0x0300f00f;
+    x = (x | (x << 4)) & 0x030c30c3;
+    x = (x | (x << 2)) & 0x09249249;
+    x
+}
+
+/// 30-bit Morton (Z-order) code of a 10-bit-per-axis grid cell.
+fn morton3(x: u32, y: u32, z: u32) -> u32 {
+    part1by2(x) | (part1by2(y) << 1) | (part1by2(z) << 2)
+}
+
+/// Triangle visit order that makes the greedy sweep produce **spatially compact** clusters: sort
+/// triangles by the Morton code of their centroid within the mesh AABB (10-bit grid/axis). An
+/// index-order sweep scatters a cluster across the mesh → a loose bounding sphere + wide normal
+/// cone (weak frustum/backface cluster culling); Morton order keeps each 124-tri chunk a local
+/// patch → tight bounds + a tight cone. Deterministic (stable tie-break on triangle index); no
+/// HashMap in the output path. Only the cluster *shape* changes — not the format or the runtime
+/// contract (Nanite builds spatial clusters via METIS; this is the FFI-free Morton analogue).
+fn morton_triangle_order(vertices: &[MeshVertex], indices: &[u32]) -> Vec<usize> {
+    let tri_count = indices.len() / 3;
+    let mut mn = Vec3::splat(f32::INFINITY);
+    let mut mx = Vec3::splat(f32::NEG_INFINITY);
+    for v in vertices {
+        let p = Vec3::from(v.pos);
+        mn = mn.min(p);
+        mx = mx.max(p);
+    }
+    let ext = (mx - mn).max(Vec3::splat(1e-6));
+    let mut keyed: Vec<(u32, usize)> = (0..tri_count)
+        .map(|t| {
+            let c = (Vec3::from(vertices[indices[t * 3] as usize].pos)
+                + Vec3::from(vertices[indices[t * 3 + 1] as usize].pos)
+                + Vec3::from(vertices[indices[t * 3 + 2] as usize].pos))
+                / 3.0;
+            let g = ((c - mn) / ext).clamp(Vec3::ZERO, Vec3::ONE) * 1023.0;
+            (morton3(g.x as u32, g.y as u32, g.z as u32), t)
+        })
+        .collect();
+    keyed.sort_unstable_by_key(|&(code, t)| (code, t));
+    keyed.into_iter().map(|(_, t)| t).collect()
+}
+
 /// Greedy meshlet sweep over `indices` (into `vertices`), producing a self-contained chunk of
 /// clusters (`cluster_vertices`, `cluster_triangles`, `clusters`) with offsets relative to the
 /// returned arrays — the caller rebases them when appending to a [`MeshClusters`]. LOD metadata:
 /// `lod_level` / `self_error`; `self_sphere` is the group-uniform LOD sphere for coarse levels,
 /// or `None` at LOD0 (each cluster uses its own bounds, since `self_error` is 0 there). `group`
 /// and the `parent_*` fields default to "ungrouped / root" and are filled in by the DAG build.
-/// Deterministic (input triangle order).
+/// Triangles are visited in **Morton spatial order** ([`morton_triangle_order`]) so clusters are
+/// compact patches with tight bounds/cones. Deterministic.
 #[allow(clippy::type_complexity)]
 fn clusterize(
     vertices: &[MeshVertex],
@@ -120,7 +167,6 @@ fn clusterize(
     let mut cv: Vec<u32> = Vec::new();
     let mut ct: Vec<u8> = Vec::new();
     let mut clusters: Vec<Cluster> = Vec::new();
-    let tri_count = indices.len() / 3;
 
     let mut window: Vec<u32> = Vec::with_capacity(MAX_CLUSTER_VERTICES);
     let mut local_of: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
@@ -163,7 +209,7 @@ fn clusterize(
         tris.clear();
     };
 
-    for t in 0..tri_count {
+    for &t in &morton_triangle_order(vertices, indices) {
         let tri = [indices[t * 3], indices[t * 3 + 1], indices[t * 3 + 2]];
         let new_verts = tri.iter().filter(|v| !local_of.contains_key(v)).count();
         let would_overflow = window.len() + new_verts > MAX_CLUSTER_VERTICES

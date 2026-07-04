@@ -41,6 +41,8 @@ struct PushConstants
     uint rec_base;     // 212: this page's first GLOBAL cluster index in the shared record buffer.
                        //      Local cluster c → global gc = rec_base + c; the visible list stores gc
                        //      so the raster/mesh/resolve address the consolidated buffers directly.
+    uint cull_backface; // 216: 1 = single-sided material → allow the normal-cone backface cluster
+                        //      cull; 0 = two-sided (doubleSided) → never cone-cull (both faces show).
 };
 
 [[vk::push_constant]]
@@ -80,16 +82,16 @@ bool outside_frustum(float3 center, float radius)
 // past that spread from the axis: dot(axis, dirToCam) < -sin(halfAngle) = -sqrt(1-cutoff²).
 // `cutoff <= 0` means the spread is too wide to cull (stored -1 at build). Conservative → never
 // culls a visible cluster.
-// Normal-cone backface cluster cull is DISABLED by default: our clusterizer is a naive greedy
-// in-order sweep, so a cluster's normal cone (avg-normal axis + min-dot cutoff) is loose and
-// often inaccurate. Culling on it drops clusters that still show front faces at a grazing
-// silhouette, leaving coverage gaps that back faces bleed through (the sphere-pole "crown"). The
-// depth test already discards backfacing fragments correctly (front is nearer), so the only cost of
-// keeping backface clusters is a little extra raster work — an acceptable trade for correctness in
-// the default renderer. Re-enable once the LOD build produces tight per-cluster cones (the planned
-// Nanite-style spatial clustering); the `cone_backfacing` test below is then the CORRECT,
-// radius-aware form to use. See docs/phase-14-vgeo-lod-soffit-fix.md.
-static const bool CONE_CULL_ENABLED = false;
+// Normal-cone backface cluster cull: ENABLED for SINGLE-SIDED materials only (`pc.cull_backface`),
+// with the Morton spatial clusterizer's tight cones. Two conditions make it safe now: (1) tight
+// cones — the spatial clusterizer keeps each cluster a compact patch, so a cluster's cone is
+// accurate and the radius-aware `cone_backfacing` only culls genuinely all-backfacing clusters;
+// (2) single-sided gating — a two-sided (`doubleSided`) mesh like the copper sphere shows BOTH
+// faces (matching the CULL_NONE mesh fill), so cone-culling its back clusters would leave the
+// silhouette "crown" of back-face bleed; gating on `cull_backface` (the same flag the per-triangle
+// backface cull uses) skips those meshes. For single-sided closed geometry, culling all-backface
+// clusters is exactly the CULL_NONE result (front occludes back) with ~half the raster dispatches.
+static const bool CONE_CULL_ENABLED = true;
 
 bool cone_backfacing(float3 axis, float cutoff, float3 center, float radius)
 {
@@ -151,7 +153,7 @@ void csCut(uint3 tid: SV_DispatchThreadID)
     float3 bnd_w = to_world(bnd_c);
     if (outside_frustum(bnd_w, bnd_r * ms))
         return;
-    if (CONE_CULL_ENABLED
+    if (CONE_CULL_ENABLED && pc.cull_backface != 0
         && cone_backfacing(normalize(mul((float3x3)pc.model, cone_axis)), cone_cutoff, bnd_w, bnd_r * ms))
         return;
 
@@ -190,7 +192,7 @@ bool select_cluster(uint c, out float3 bnd_c, out float bnd_r)
         return false;
     if (outside_frustum(bnd_c, bnd_r))
         return false;
-    if (CONE_CULL_ENABLED
+    if (CONE_CULL_ENABLED && pc.cull_backface != 0
         && cone_backfacing(normalize(mul((float3x3)pc.model, cone_axis)), cone_cutoff, bnd_c, bnd_r))
         return false;
     return true;
