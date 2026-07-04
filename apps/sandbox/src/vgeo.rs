@@ -139,6 +139,7 @@ impl VgeoSystem {
         registry: &MeshRegistry,
         extent: Extent2D,
         cache_dir: &std::path::Path,
+        progress: &mut dyn crate::cook_progress::ProgressSink,
     ) -> anyhow::Result<Self> {
         use dreamcoast_scene::MeshHandle;
 
@@ -184,14 +185,20 @@ impl VgeoSystem {
             .collect();
         let mut dags: Vec<Option<dreamcoast_asset::vgeo::MeshClusters>> =
             (0..registry.len()).map(|_| None).collect();
-        crate::cook_progress::parallel_cook("vgeo cluster DAGs", &mut dags, 1, |i, slot| {
-            if let Some((verts, indices)) = inputs[i] {
-                let dag = Self::load_or_build_dag(cache_dir, verts, indices);
-                if !dag.clusters.is_empty() {
-                    *slot = Some(dag);
+        crate::cook_progress::parallel_cook(
+            "vgeo cluster DAGs",
+            &mut dags,
+            1,
+            |i, slot| {
+                if let Some((verts, indices)) = inputs[i] {
+                    let dag = Self::load_or_build_dag(cache_dir, verts, indices);
+                    if !dag.clusters.is_empty() {
+                        *slot = Some(dag);
+                    }
                 }
-            }
-        });
+            },
+            progress,
+        );
         for (i, dag) in dags.iter().enumerate() {
             let Some(dag) = dag else { continue };
             let page = Self::append_page(&mut gvtx, &mut gremap, &mut gtri, &mut grec, dag);

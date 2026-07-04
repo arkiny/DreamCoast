@@ -46,6 +46,7 @@ mod gtao;
 mod hzb;
 mod ibl;
 mod level;
+mod loading;
 mod mesh;
 mod mesh_sdf;
 mod morph;
@@ -330,6 +331,32 @@ fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
         },
         image_count: 3,
     }
+}
+
+/// Build the progress sink for a parallel cook phase: the graphical in-window ImGui
+/// [`loading::LoadingScreen`] for an interactive run, or a plain terminal bar
+/// ([`cook_progress::TermProgress`]) when headless (a screenshot/CI run — drawing a loading frame is
+/// pointless there and would fight the capture's own frames). Created fresh around each phase so its
+/// `window`/`gui` borrows last only for that phase (the rest of setup can still use them).
+fn cook_sink<'a>(
+    headless: bool,
+    window: &'a mut dreamcoast_platform::Window,
+    device: &'a Device,
+    swapchain: &'a Swapchain,
+    gui: &'a mut Gui,
+) -> anyhow::Result<Box<dyn cook_progress::ProgressSink + 'a>> {
+    Ok(if headless || std::env::var_os("NO_LOADING_UI").is_some() {
+        Box::new(cook_progress::TermProgress::new())
+    } else {
+        Box::new(loading::LoadingScreen::new(
+            window,
+            device,
+            swapchain,
+            gui,
+            FRAMES_IN_FLIGHT,
+            std::time::Instant::now(),
+        )?)
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1086,7 +1113,7 @@ fn halton(mut i: u32, base: u32) -> f32 {
 impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        window: Window,
+        mut window: Window,
         instance: Instance,
         device: Device,
         swapchain: Swapchain,
@@ -1112,6 +1139,11 @@ impl App {
         // / tonemap graphics pipelines, the compute post-process pipeline, and the
         // per-frame globals uniform buffer.
         let deferred = DeferredRenderer::new(&device, backend, swapchain.format())?;
+
+        // ImGui context — created HERE (before the multi-minute cold cook, not just before the
+        // render loop) so the cook can present an in-window loading screen (see `cook_sink` below /
+        // `loading.rs`). `mut` because both the loading frames and the render loop drive it.
+        let mut gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
 
         // Phase 11 software ray tracing + global distance field (Stage A analytic
         // trace, Stage B volumes / SDF bake / GDF merge / GDF trace, Stage C1 world
@@ -1758,7 +1790,12 @@ impl App {
                         Option<dreamcoast_asset::sdf::AlbedoVolumes>,
                     )>,
                 > = (0..specs.len()).map(|_| None).collect();
-                crate::cook_progress::parallel_cook("per-mesh SDF", &mut baked, 1, |i, slot| {
+                let mut sink = cook_sink(screenshot_mode, &mut window, &device, &swapchain, &mut gui)?;
+                crate::cook_progress::parallel_cook(
+                    "per-mesh SDF",
+                    &mut baked,
+                    1,
+                    |i, slot| {
                     let s = &specs[i];
                     let (mut vol, _) = dreamcoast_asset::cook::load_or_bake_mesh_sdf(
                         &s.mvtx, &s.midx, s.dim, s.mn, s.mx, &cache_dir,
@@ -1786,7 +1823,10 @@ impl App {
                         av
                     });
                     *slot = Some((vol, alb));
-                });
+                    },
+                    sink.as_mut(),
+                );
+                drop(sink);
 
                 // Assemble in unique-mesh (specs) order — identical to the original first-seen order,
                 // so `mesh_sdfs` / `mesh_albedos` and the composite are byte-for-byte the serial bake.
@@ -2061,8 +2101,6 @@ impl App {
                 gdf.build_surface_cache(&device, &cards, num_cards, cache_tile, card_albedo)?;
             }
         }
-
-        let gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
 
         // One render-graph transient pool per frame-in-flight (reused only after the
         // frame slot's fence has signaled — no cross-frame hazards).
@@ -2738,13 +2776,20 @@ impl App {
         // but the frame guards on `vgeo.is_some()`).
         let vgeo = if vgeo_mode > 0 {
             let (ww, wh) = window.size();
-            match vgeo::VgeoSystem::new(
-                &device,
-                backend,
-                &mesh_registry,
-                Extent2D::new(ww.max(1), wh.max(1)),
-                &app::cooked_cache_dir().join("vgeo"),
-            ) {
+            // Scoped so the loading-screen sink's window/gui borrows end before `Self` moves them.
+            let result = {
+                let mut sink =
+                    cook_sink(screenshot_mode, &mut window, &device, &swapchain, &mut gui)?;
+                vgeo::VgeoSystem::new(
+                    &device,
+                    backend,
+                    &mesh_registry,
+                    Extent2D::new(ww.max(1), wh.max(1)),
+                    &app::cooked_cache_dir().join("vgeo"),
+                    sink.as_mut(),
+                )
+            };
+            match result {
                 Ok(v) => Some(v),
                 Err(e) => {
                     info!("P14_VGEO disabled ({e}); using the mesh G-buffer fill");

@@ -29,6 +29,8 @@ pub struct Gui {
     ctx: Context,
     pipeline: GraphicsPipeline,
     _font: Texture,
+    /// Occupies bindless slot 0 so the font (and any later texture) never gets imgui's NULL id 0.
+    _slot0_guard: Texture,
     backend: BackendKind,
     frames: Vec<FrameBuffers>,
 }
@@ -44,6 +46,22 @@ impl Gui {
         let mut ctx = Context::create();
         ctx.set_ini_filename(None);
 
+        // imgui reserves texture id 0 as the NULL texture (`ImTextureID` 0 = "no texture"). Our
+        // bindless allocator hands out slot 0 as a normal slot, so if the font atlas lands there the
+        // imgui shader/`NewFrame` treats the font as absent → every frame renders nothing and
+        // `igGetDrawData` returns invalid data (a crash in `DrawData::draw_lists`). This surfaced
+        // only once `Gui::new` moved before the scene textures (the font became the first texture).
+        // Reserve slot 0 with a 1×1 throwaway (kept alive for the Gui's lifetime) so the font — and
+        // any later texture — always gets a non-zero id. Costs one of 1024 bindless slots.
+        let slot0_guard = device.create_texture(
+            &TextureDesc {
+                width: 1,
+                height: 1,
+                format: Format::Rgba8Unorm,
+            },
+            &[255, 255, 255, 255],
+        )?;
+
         let font = {
             let fonts = ctx.fonts();
             let tex = fonts.build_rgba32_texture();
@@ -55,6 +73,7 @@ impl Gui {
                 },
                 tex.data,
             )?;
+            debug_assert!(texture.bindless_index() != 0, "font must not be imgui NULL id 0");
             fonts.tex_id = imgui::TextureId::from(texture.bindless_index() as usize);
             texture
         };
@@ -104,6 +123,7 @@ impl Gui {
             ctx,
             pipeline,
             _font: font,
+            _slot0_guard: slot0_guard,
             backend,
             frames,
         })
@@ -140,6 +160,13 @@ impl Gui {
         frame_index: usize,
     ) -> Result<(), EngineError> {
         let draw_data: &DrawData = self.ctx.render();
+        // imgui's FIRST frame after context init (and any frame with no visible UI) produces no
+        // geometry; its `DrawData` has no draw lists and `draw_lists()` would read a garbage
+        // `cmd_lists_count`. Skip it — there is nothing to draw. (The main render loop never hits an
+        // empty frame, so this only matters for the pre-render-loop cook loading screen.)
+        if draw_data.total_vtx_count == 0 {
+            return Ok(());
+        }
         let [disp_w, disp_h] = draw_data.display_size;
         if disp_w <= 0.0 || disp_h <= 0.0 {
             return Ok(());
