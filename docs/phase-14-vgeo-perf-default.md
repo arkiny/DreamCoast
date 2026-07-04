@@ -87,7 +87,12 @@ single-sided closed geometry.
 - **Per-frame consolidated vgeo pass** — one cut/raster/resolve over all objects instead of the
   current per-object serialization; cuts per-object overhead AND fixes `PROFILE_GPU` (whose timer-
   query heap overflows on the per-object passes).
-- **HZB same-frame occlusion** — attempted + reverted in M4b; needs a genuinely-occluded scene
-  (Intel Sponza) to validate the cull direction DX≡VK.
+- **HZB same-frame occlusion** — **DONE (2026-07-05)**, see
+  [`docs/phase-14-vgeo-hzb-occlusion.md`](phase-14-vgeo-hzb-occlusion.md). Two-phase Nanite-style
+  cull on the unified pass (`P14_VGEO_HZB`, non-gallery default on): phase-1 raster → mid-frame
+  Hi-Z → phase-2 conservative re-test. Correctness follows from the phase-2 test being conservative
+  (a verbatim port of the byte-verified P7 `csCullHzb`), so the vis-buffer resolve is identical for
+  any conservative subset — DX≡VK / OFF≡ON hold even though DX and VK cull different amounts.
+  Verified: 306 clusters culled with OFF≡ON 0.000/ch (the M4b over-cull is gone).
 - **Re-cook Intel New Sponza** once (VERSION 7): its cluster cache + scene textures re-cook (~17 min
   cold), then load in ~17 s.
