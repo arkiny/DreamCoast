@@ -24,7 +24,7 @@ const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
 /// editing any of them recompiles all dependents (they include no per-job tracking otherwise —
 /// an omitted entry silently ships stale bytecode). Keep in sync with the `#include`s under
 /// `shaders/` (a non-JOB `.slang` — or the RT-pipeline root-sig JSON — belongs here).
-const SHARED_INCLUDES: [&str; 12] = [
+const SHARED_INCLUDES: [&str; 13] = [
     "bindless.slang",
     "rt_common.slang",
     "rt_pipeline_metal_rootsig.json",
@@ -37,6 +37,7 @@ const SHARED_INCLUDES: [&str; 12] = [
     "wrc_common.slang",
     "light_cluster_common.slang",
     "pbr_brdf.slang",
+    "hzb_test.slang",
 ];
 
 // FNV-1a 64-bit — dependency-free content hash for the shader cook cache (Phase 12
@@ -783,6 +784,12 @@ const JOBS: &[Job] = &[
         key: "hzb_reduce_cs",
     },
     Job {
+        src: "hzb_copy_vis.slang",
+        entry: "csCopyVis",
+        stage: "compute",
+        key: "hzb_copy_vis_cs",
+    },
+    Job {
         src: "cull_draw.slang",
         entry: "vsMain",
         stage: "vertex",
@@ -1191,6 +1198,18 @@ const JOBS: &[Job] = &[
         entry: "csCutSceneBin",
         stage: "compute",
         key: "vgeo_scene_cut_bin_cs",
+    },
+    Job {
+        src: "vgeo_scene_cut.slang",
+        entry: "csCutSceneP1",
+        stage: "compute",
+        key: "vgeo_scene_cut_p1_cs",
+    },
+    Job {
+        src: "vgeo_scene_cut.slang",
+        entry: "csCutSceneP2",
+        stage: "compute",
+        key: "vgeo_scene_cut_p2_cs",
     },
     Job {
         src: "vgeo_scene_raster.slang",

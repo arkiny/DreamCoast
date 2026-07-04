@@ -253,6 +253,15 @@ broken. NEXT (perf, not correctness): root-cause the DX occlusion-sampling diver
 content / texture Load) against a genuinely-occluded scene (Sponza), likely with a per-FIF pyramid;
 then Sponza-scale profiling. Multi-material scene-cook remains the other named follow-up.
 
+> **RESOLVED (2026-07-05) — see [`docs/phase-14-vgeo-hzb-occlusion.md`](phase-14-vgeo-hzb-occlusion.md).**
+> Re-implemented as **two-phase same-frame** occlusion on the unified `csCutScene` (not a single
+> prev-frame cut): phase-1 raster of the last-frame-visible + HW clusters → mid-frame Hi-Z from the
+> vis buffer → phase-2 conservative re-test of the deferred clusters (a **verbatim port** of the P7
+> `csCullHzb` test in the shared `hzb_test.slang`, with a **per-FIF pyramid**). The M4b DX over-cull
+> is gone: on a view where D3D12 culls 306 clusters as hidden, HZB-on ≡ HZB-off **0.000/ch**, and
+> DX≡VK 0.000 — because a conservative cull leaves the vis-buffer resolve identical for any subset,
+> so the backends may cull *different amounts* and still match. `P14_VGEO_HZB`, non-gallery default on.
+
 ## Gates (every increment)
 
 `tools/golden-image.py --backend metal --only gallery` = `af70c1a5…` with `P14_VGEO` off;

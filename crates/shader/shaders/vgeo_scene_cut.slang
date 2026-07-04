@@ -11,6 +11,7 @@
 // duplicated here rather than shared because the two differ in how they source `model` (per-instance
 // table vs per-object push) — the same reason `atomicMaxU64` is duplicated across the raster paths.
 #include "vgeo_scene_common.slang"
+#include "hzb_test.slang" // conservative HZB occlusion test (P2), shared with the P7 grid cull
 
 struct PushConstants
 {
@@ -29,6 +30,8 @@ struct PushConstants
     float bin_px;      // 140: SW/HW split threshold — projected bounds diameter (px) below → SW
     uint work_buf;     // 144: work list (uint2: instance, global cluster)
     uint inst_buf;     // 148: instance table (SceneInstance, 256 B)
+    uint status_buf;   // 152: per-work status (0 culled / 1 drawn / 2 defer) — csCutSceneP1 only
+    uint bin_enabled;  // 156: 1 = HW/SW split like csCutSceneBin — csCutSceneP1 only
 };
 
 [[vk::push_constant]]
@@ -159,4 +162,151 @@ void csCutSceneBin(uint3 tid: SV_DispatchThreadID)
     uint slot;
     g.storage_buffers[args].InterlockedAdd(0, 1, slot);
     g.storage_buffers[list].Store(slot * 4, t);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Two-phase same-frame HZB occlusion (docs/phase-14-vgeo-hzb-occlusion.md). Phase 1 draws the
+// clusters that were visible last frame (+ all HW/large clusters); the app builds a Hi-Z from
+// that partial depth; phase 2 re-tests the DEFERRED clusters against it and draws the ones that
+// survive. Correctness (hence DX≡VK and OFF≡ON) follows from the phase-2 test being *conservative*
+// (`hzbOccluded`, the byte-verified P7 test): the R64 vis buffer resolves the final per-pixel
+// winner by depth regardless of which clusters rastered, so dropping a genuinely-occluded cluster
+// leaves the resolved G-buffer identical.
+//
+// `status[t]` (per-work, per-FIF, carried across frames): 0 = culled, 1 = drawn/visible, 2 = defer.
+// csCutSceneP1 reuses `pc` (PushConstants) — the SW visible list is always `sw_list`/`sw_args`,
+// the HW list is `vis_buf`/`args_buf` (binning), exactly matching csCutSceneBin's slots.
+
+static const uint STATUS_CULLED = 0u;
+static const uint STATUS_DRAWN = 1u;
+static const uint STATUS_DEFER = 2u;
+
+// Phase 1: run the identical cut selection, then route. HW/large clusters always draw in phase 1
+// (never occlusion-tested). SW clusters draw in phase 1 only if they were visible last frame,
+// else they are deferred to phase 2's HZB re-test. Every processed `t` gets a fresh status.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void csCutSceneP1(uint3 tid: SV_DispatchThreadID)
+{
+    uint t = tid.x;
+    if (t >= pc.total)
+        return;
+    uint2 w = loadWork(pc.work_buf, t);
+    InstanceData inst = loadInstance(pc.inst_buf, w.x);
+    uint cull_backface = (inst.mr.z != 0.0) ? 1u : 0u;
+    RWByteAddressBuffer status = g.storage_buffers[pc.status_buf];
+
+    float3 bnd_c;
+    float bnd_r;
+    if (!select_cluster(w.y, inst.model, inst.max_scale, cull_backface, bnd_c, bnd_r))
+    {
+        status.Store(t * 4, STATUS_CULLED);
+        return;
+    }
+
+    // HW/SW split (binning). Large clusters go to the HW mesh list and always draw in phase 1.
+    if (pc.bin_enabled != 0u)
+    {
+        float dist = max(distance(cam_pos(), bnd_c) - bnd_r, 1e-3);
+        float screen_diam = 2.0 * bnd_r * pc.proj_factor / dist;
+        if (screen_diam >= pc.bin_px)
+        {
+            uint hslot;
+            g.storage_buffers[pc.args_buf].InterlockedAdd(0, 1, hslot);
+            g.storage_buffers[pc.vis_buf].Store(hslot * 4, t);
+            status.Store(t * 4, STATUS_DRAWN);
+            return;
+        }
+    }
+
+    // SW cluster: two-phase gated on last-frame visibility (status carried over per FIF).
+    uint was = status.Load(t * 4);
+    if (was == STATUS_DRAWN)
+    {
+        uint slot;
+        g.storage_buffers[pc.sw_args].InterlockedAdd(0, 1, slot);
+        g.storage_buffers[pc.sw_list].Store(slot * 4, t);
+        status.Store(t * 4, STATUS_DRAWN);
+    }
+    else
+    {
+        status.Store(t * 4, STATUS_DEFER);
+    }
+}
+
+// Phase 2 push — the deferred re-test needs only the cluster's world bounds + the Hi-Z. No
+// frustum/LOD/cone (already passed in phase 1). `vp` = flip-free view_proj (columns), matching
+// the instance-table `mvp` and the P7 cull convention.
+struct CutP2Push
+{
+    float4 vp[4];    //   0: unjittered, no-Y-flip view_proj (columns)
+    uint total;      //  64: W — total work-list length
+    uint rec_buf;    //  68: GpuCluster records (96 B)
+    uint work_buf;   //  72: work list (uint2)
+    uint inst_buf;   //  76: instance table (SceneInstance, 256 B)
+    uint status_buf; //  80: per-work status
+    uint p2_list;    //  84: phase-2 SW visible list (work indices)
+    uint p2_args;    //  88: phase-2 indirect args {countX,1,1}
+    uint hzb_base;   //  92: bindless sampled index of vgeo HZB level 0
+    uint hzb_levels; //  96: HZB mip count
+    uint hzb_w;      // 100: HZB level-0 width  (texels)
+    uint hzb_h;      // 104: HZB level-0 height (texels)
+    uint stats_buf;  // 108: host-visible [deferred, occluded] counters; 0xffffffff = disabled
+};
+
+[[vk::push_constant]]
+ConstantBuffer<CutP2Push> pc2 : register(b0, space0);
+
+// The cluster's WORLD bounds sphere (center to world via `model`, radius scaled by `max_scale`) —
+// the same two values `select_cluster` computes; factored out so phase 2 can recover them without
+// re-running the full LOD/frustum/cone selection.
+void cluster_world_bounds(uint rec_buf, uint gc, float4x4 model, float max_scale,
+                          out float3 bnd_c, out float bnd_r)
+{
+    RWByteAddressBuffer rec = g.storage_buffers[rec_buf];
+    uint base = gc * 96;
+    bnd_c = to_world(model, asfloat(rec.Load3(base + 56)));
+    bnd_r = asfloat(rec.Load(base + 68)) * max_scale;
+}
+
+// Phase 2: for each DEFERRED cluster, run the conservative HZB occlusion test on its world bounds
+// sphere against the phase-1 Hi-Z. Survivors draw in phase 2 (append to the p2 SW list) and are
+// marked visible; occluded clusters are dropped for the frame (status → culled).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void csCutSceneP2(uint3 tid: SV_DispatchThreadID)
+{
+    uint t = tid.x;
+    if (t >= pc2.total)
+        return;
+    RWByteAddressBuffer status = g.storage_buffers[pc2.status_buf];
+    if (status.Load(t * 4) != STATUS_DEFER)
+        return;
+    if (pc2.stats_buf != 0xffffffffu)
+    {
+        uint dummy;
+        g.storage_buffers[pc2.stats_buf].InterlockedAdd(0, 1, dummy); // deferred (HZB-tested)
+    }
+
+    uint2 w = loadWork(pc2.work_buf, t);
+    InstanceData inst = loadInstance(pc2.inst_buf, w.x);
+    float3 bnd_c;
+    float bnd_r;
+    cluster_world_bounds(pc2.rec_buf, w.y, inst.model, inst.max_scale, bnd_c, bnd_r);
+
+    if (hzbOccluded(pc2.vp, pc2.hzb_base, pc2.hzb_levels, pc2.hzb_w, pc2.hzb_h, bnd_c, bnd_r))
+    {
+        if (pc2.stats_buf != 0xffffffffu)
+        {
+            uint dummy;
+            g.storage_buffers[pc2.stats_buf].InterlockedAdd(4, 1, dummy); // occlusion-culled
+        }
+        status.Store(t * 4, STATUS_CULLED); // provably hidden → drop (resolve unchanged)
+        return;
+    }
+
+    uint slot;
+    g.storage_buffers[pc2.p2_args].InterlockedAdd(0, 1, slot);
+    g.storage_buffers[pc2.p2_list].Store(slot * 4, t);
+    status.Store(t * 4, STATUS_DRAWN);
 }

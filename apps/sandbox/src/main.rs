@@ -461,7 +461,11 @@ fn run() -> anyhow::Result<()> {
     if let Some(path) = std::env::args()
         .skip(1)
         .position(|a| a == "--loading-test")
-        .and_then(|_| std::env::args().skip_while(|a| a != "--loading-test").nth(1))
+        .and_then(|_| {
+            std::env::args()
+                .skip_while(|a| a != "--loading-test")
+                .nth(1)
+        })
     {
         return loading::run_capture(&device, backend, &swapchain, &path);
     }
@@ -566,6 +570,10 @@ struct App {
     /// Phase 14 renderer integration: virtual geometry as the G-buffer producer (opt-in `P14_VGEO`,
     /// single-model scope). `None` = the default mesh fill (gallery byte-identical).
     vgeo: Option<vgeo::VgeoSystem>,
+    /// Two-phase same-frame HZB occlusion for the vgeo producer (docs/phase-14-vgeo-hzb-occlusion):
+    /// default ON for non-gallery when vgeo is active, `P14_VGEO_HZB=0/1` overrides, gallery OFF
+    /// (byte anchor). Only consulted when `vgeo_mode == 1`.
+    vgeo_hzb: bool,
     /// `P14_VGEO` mode: 0 off, 1 = vgeo producer, 2 = mesh reference (groundless single model) for
     /// the parity diff.
     vgeo_mode: u32,
@@ -1262,9 +1270,16 @@ impl App {
         // use the captured-cube IBL (forced via `legacy_ibl` below).
         let gallery_scene = !world_mode && level_select.is_none() && scene_gltf_path.is_none();
         // Resolve the virtual-geometry mode now that the scene kind + caps are known (see `vgeo_env`).
-        let vgeo_mode: u32 = vgeo_env.unwrap_or(
-            (!gallery_scene && device.capabilities().atomic_int64) as u32,
-        );
+        let vgeo_mode: u32 =
+            vgeo_env.unwrap_or((!gallery_scene && device.capabilities().atomic_int64) as u32);
+        // Two-phase same-frame HZB occlusion (docs/phase-14-vgeo-hzb-occlusion.md): default ON for
+        // non-gallery scenes when the vgeo producer is active, OFF for the gallery byte anchor.
+        // `P14_VGEO_HZB=0/1` overrides. Conservative-by-construction, so ON vs OFF is output-
+        // identical; the gate exists to preserve the gallery anchor and allow disabling.
+        let vgeo_hzb: bool = std::env::var("P14_VGEO_HZB")
+            .ok()
+            .map(|s| s != "0")
+            .unwrap_or(vgeo_mode == 1 && !gallery_scene);
         let levels_dir = std::path::PathBuf::from("apps/sandbox/levels");
         // Content scenes (levels / glTF imports / worlds) carry large multi-material assets —
         // e.g. Sponza + foliage needs ~7.8 GB of uncompressed textures, right at an 8 GB card's
@@ -1769,8 +1784,12 @@ impl App {
                         let i = specs.len();
                         // F5: the per-mesh albedo (baked over the SAME grid) keys on the mesh + this
                         // first drawable's representative material colour (uniform per drawable here).
-                        let albedo = permesh_albedo
-                            .then(|| (material_registry.get(d.material).albedo, cpu.indices.len() / 3));
+                        let albedo = permesh_albedo.then(|| {
+                            (
+                                material_registry.get(d.material).albedo,
+                                cpu.indices.len() / 3,
+                            )
+                        });
                         specs.push(BakeSpec {
                             mvtx: dreamcoast_asset::sdf::encode_vertices_fused(&cpu.vertices),
                             midx: dreamcoast_asset::sdf::encode_indices(&cpu.indices),
@@ -1804,33 +1823,39 @@ impl App {
                     &mut baked,
                     1,
                     |i, slot| {
-                    let s = &specs[i];
-                    let (mut vol, _) = dreamcoast_asset::cook::load_or_bake_mesh_sdf(
-                        &s.mvtx, &s.midx, s.dim, s.mn, s.mx, &cache_dir,
-                    );
-                    // Mostly-negative DF ⇒ globally-inverted normals (open space read as "inside"):
-                    // negate so the sign is correct (removes compose poisoning + spurious AO/GI floor
-                    // blotches). The 60 % threshold only flips clearly-inverted meshes.
-                    let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count();
-                    if neg * 5 > vol.voxels.len() * 3 {
-                        for v in &mut vol.voxels {
-                            *v = -*v;
-                        }
-                        negated.fetch_add(1, Ordering::Relaxed);
-                    }
-                    let alb = s.albedo.map(|(colour, tri_count)| {
-                        let mut tri_albedo = Vec::with_capacity(tri_count * 12);
-                        for _ in 0..tri_count {
-                            for c in colour {
-                                tri_albedo.extend_from_slice(&c.to_le_bytes());
-                            }
-                        }
-                        let (av, _) = dreamcoast_asset::cook::load_or_bake_mesh_albedo(
-                            &s.mvtx, &s.midx, &tri_albedo, s.dim, s.mn, s.mx, &cache_dir,
+                        let s = &specs[i];
+                        let (mut vol, _) = dreamcoast_asset::cook::load_or_bake_mesh_sdf(
+                            &s.mvtx, &s.midx, s.dim, s.mn, s.mx, &cache_dir,
                         );
-                        av
-                    });
-                    *slot = Some((vol, alb));
+                        // Mostly-negative DF ⇒ globally-inverted normals (open space read as "inside"):
+                        // negate so the sign is correct (removes compose poisoning + spurious AO/GI floor
+                        // blotches). The 60 % threshold only flips clearly-inverted meshes.
+                        let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count();
+                        if neg * 5 > vol.voxels.len() * 3 {
+                            for v in &mut vol.voxels {
+                                *v = -*v;
+                            }
+                            negated.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let alb = s.albedo.map(|(colour, tri_count)| {
+                            let mut tri_albedo = Vec::with_capacity(tri_count * 12);
+                            for _ in 0..tri_count {
+                                for c in colour {
+                                    tri_albedo.extend_from_slice(&c.to_le_bytes());
+                                }
+                            }
+                            let (av, _) = dreamcoast_asset::cook::load_or_bake_mesh_albedo(
+                                &s.mvtx,
+                                &s.midx,
+                                &tri_albedo,
+                                s.dim,
+                                s.mn,
+                                s.mx,
+                                &cache_dir,
+                            );
+                            av
+                        });
+                        *slot = Some((vol, alb));
                     },
                     &mut sink,
                 );
@@ -2819,6 +2844,7 @@ impl App {
             gui,
             deferred,
             vgeo,
+            vgeo_hzb,
             vgeo_mode,
             gdf,
             gi,
@@ -4922,7 +4948,13 @@ impl App {
         let vgeo_work = if !vgeo_draws.is_empty()
             && let Some(v) = self.vgeo.as_mut()
         {
-            v.prepare_scene(&self.device, self.fif, &vgeo_draws, cull_view_proj, view_proj)?
+            v.prepare_scene(
+                &self.device,
+                self.fif,
+                &vgeo_draws,
+                cull_view_proj,
+                view_proj,
+            )?
         } else {
             0
         };
@@ -5055,6 +5087,7 @@ impl App {
                 eye,
                 mip_bias,
                 extent,
+                self.vgeo_hzb,
             );
         } else {
             // Default / fallback: the whole scene with the ground (unchanged, gallery byte-identical).
@@ -7183,6 +7216,27 @@ impl App {
                 println!(
                     "[hzb] instances: {} total, {} survived, {} occlusion-culled",
                     GRID_COUNT, survived, culled
+                );
+            }
+        }
+
+        // vgeo two-phase occlusion stats (`VGEO_HZB_STATS=1`): the phase-2 deferred / occlusion-
+        // culled cluster counts, accumulated MONOTONICALLY across frames (never GPU-cleared, so no
+        // frames-in-flight race). Proves the same-frame cull actually engages (and, with OFF≡ON
+        // byte-equality, that it is conservative). Diagnostic only — the per-frame average is the
+        // cumulative over the frames rendered.
+        if self.vgeo_mode == 1
+            && self.vgeo_hzb
+            && let Some(v) = self.vgeo.as_ref()
+        {
+            let (deferred, occluded) = v.read_occ_stats();
+            if (deferred | occluded) != 0
+                && (self.frame_no.is_multiple_of(60)
+                    || (self.screenshot_mode && self.frame_no + 1 >= warmup + 1))
+            {
+                println!(
+                    "[vgeo-hzb] phase-2 cumulative over {} frames: {deferred} deferred (HZB-tested), {occluded} occlusion-culled",
+                    self.frame_no + 1
                 );
             }
         }
