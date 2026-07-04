@@ -1096,12 +1096,12 @@ impl App {
         captures: Vec<Capture>,
         validation_on: bool,
     ) -> anyhow::Result<Self> {
-        // `P14_VGEO=1` routes every eligible opaque object through virtual geometry (the `VgeoSystem`
-        // is built below from the mesh registry). 0 = off (default renderer, gallery byte-identical).
-        let vgeo_mode: u32 = std::env::var("P14_VGEO")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        // `P14_VGEO` routes every eligible opaque static object through virtual geometry (the
+        // `VgeoSystem` is built below from the mesh registry). Resolved after `gallery_scene` and
+        // the device caps are known: **default ON for non-gallery scenes** on a 64-bit-atomics
+        // adapter (the visibility-buffer requirement), OFF for the gallery (the fixed-exposure
+        // byte-identical DX≡VK anchor). `P14_VGEO=0/1` overrides. `None` here = "auto".
+        let vgeo_env: Option<u32> = std::env::var("P14_VGEO").ok().and_then(|s| s.parse().ok());
         let queue = device.queue();
         // Phase-7 compute (post blur / GPU particles / GPU culling) is implemented
         // on all three backends (Metal compute landed in M5).
@@ -1223,6 +1223,10 @@ impl App {
         // The gallery is the only scene with the GDF/HW-RT path; glTF + levels + worlds
         // use the captured-cube IBL (forced via `legacy_ibl` below).
         let gallery_scene = !world_mode && level_select.is_none() && scene_gltf_path.is_none();
+        // Resolve the virtual-geometry mode now that the scene kind + caps are known (see `vgeo_env`).
+        let vgeo_mode: u32 = vgeo_env.unwrap_or(
+            (!gallery_scene && device.capabilities().atomic_int64) as u32,
+        );
         let levels_dir = std::path::PathBuf::from("apps/sandbox/levels");
         // Content scenes (levels / glTF imports / worlds) carry large multi-material assets —
         // e.g. Sponza + foliage needs ~7.8 GB of uncompressed textures, right at an 8 GB card's
@@ -4799,19 +4803,26 @@ impl App {
             && let Some(v) = self.vgeo.as_ref()
         {
             for o in opaque_scene {
+                // Skinned / morphed objects deform per frame, but the vgeo cluster page is baked
+                // from the static bind pose — route them to the mesh fill (which runs the GPU
+                // skinning/morph vertex shader) so animation is never frozen. Only static opaque
+                // geometry with a page goes through virtual geometry.
+                let animated = o.skin.is_some() || o.morph.is_some();
                 match (o.kind, v.page_for(&o.mesh)) {
-                    (dreamcoast_asset::MaterialKind::Opaque, Some(page)) => vgeo_draws.push((
-                        page,
-                        vgeo::VgeoMaterial {
-                            base_color: o.base_color,
-                            metallic: o.metallic,
-                            roughness: o.roughness,
-                            tex: o.tex,
-                            alpha_cutoff: o.alpha_cutoff,
-                            two_sided: o.two_sided,
-                        },
-                        o.transform,
-                    )),
+                    (dreamcoast_asset::MaterialKind::Opaque, Some(page)) if !animated => {
+                        vgeo_draws.push((
+                            page,
+                            vgeo::VgeoMaterial {
+                                base_color: o.base_color,
+                                metallic: o.metallic,
+                                roughness: o.roughness,
+                                tex: o.tex,
+                                alpha_cutoff: o.alpha_cutoff,
+                                two_sided: o.two_sided,
+                            },
+                            o.transform,
+                        ));
+                    }
                     _ => vgeo_others.push(o.clone()),
                 }
             }

@@ -289,9 +289,15 @@ impl VgeoSystem {
             .and_then(|s| s.parse().ok())
             .unwrap_or(16.0);
 
-        // M5b HW/SW binning (opt-in). Needs mesh shaders for the HW path; if requested on an adapter
-        // without them, warn and stay SW-only rather than failing the whole vgeo path.
-        let bin_requested = std::env::var("P14_VGEO_BIN").ok().as_deref() == Some("1");
+        // M5b HW/SW binning: needs mesh shaders for the HW path. **Default ON** when the adapter has
+        // mesh shaders (the large-triangle path a Sponza-class scene needs — SW-only per-thread
+        // raster can drop big clusters); `P14_VGEO_BIN=0` forces SW-only. Without mesh shaders it
+        // warns and stays SW-only rather than failing the whole vgeo path.
+        let bin_requested = match std::env::var("P14_VGEO_BIN").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => device.capabilities().mesh_shader,
+        };
         let bin = if bin_requested {
             if !device.capabilities().mesh_shader {
                 tracing::warn!(
