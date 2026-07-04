@@ -169,20 +169,35 @@ impl VgeoSystem {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut pages: Vec<ClusterPage> = Vec::new();
         let mut mesh_to_page: HashMap<usize, usize> = HashMap::new();
-        for i in 0..registry.len() {
-            let handle = MeshHandle(i);
-            let cpu = registry.cpu(handle);
-            if cpu.indices.len() < 3 {
-                continue;
+
+        // Build each mesh's LOD DAG on the job-system workers, then assemble the pages sequentially
+        // in mesh order (append order → byte-identical consolidation regardless of build order). The
+        // slow part is `load_or_build_dag` (cache read or `build_lod_dag`); it is per-mesh
+        // independent and cross-process deterministic, so the parallel result equals the serial one.
+        // Gather the CPU geometry slices up front on this thread: `MeshRegistry` holds `Rc<GpuMesh>`
+        // (not `Sync`) so it can't cross to a worker, but the plain-data vertex/index slices can.
+        let inputs: Vec<Option<(&[dreamcoast_asset::MeshVertex], &[u32])>> = (0..registry.len())
+            .map(|i| {
+                let cpu = registry.cpu(MeshHandle(i));
+                (cpu.indices.len() >= 3).then_some((cpu.vertices.as_slice(), cpu.indices.as_slice()))
+            })
+            .collect();
+        let mut dags: Vec<Option<dreamcoast_asset::vgeo::MeshClusters>> =
+            (0..registry.len()).map(|_| None).collect();
+        crate::cook_progress::parallel_cook("vgeo cluster DAGs", &mut dags, 1, |i, slot| {
+            if let Some((verts, indices)) = inputs[i] {
+                let dag = Self::load_or_build_dag(cache_dir, verts, indices);
+                if !dag.clusters.is_empty() {
+                    *slot = Some(dag);
+                }
             }
-            let dag = Self::load_or_build_dag(cache_dir, &cpu.vertices, &cpu.indices);
-            if dag.clusters.is_empty() {
-                continue;
-            }
-            let page = Self::append_page(&mut gvtx, &mut gremap, &mut gtri, &mut grec, &dag);
+        });
+        for (i, dag) in dags.iter().enumerate() {
+            let Some(dag) = dag else { continue };
+            let page = Self::append_page(&mut gvtx, &mut gremap, &mut gtri, &mut grec, dag);
             let idx = pages.len();
             pages.push(page);
-            mesh_to_page.insert(Rc::as_ptr(&registry.get(handle)) as usize, idx);
+            mesh_to_page.insert(Rc::as_ptr(&registry.get(MeshHandle(i as u32))) as usize, idx);
         }
         if pages.is_empty() {
             anyhow::bail!("P14_VGEO: no mesh produced clusters");

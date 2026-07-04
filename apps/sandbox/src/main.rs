@@ -35,6 +35,7 @@ mod camera;
 mod clipmap;
 mod cluster;
 mod compose;
+mod cook_progress;
 mod csm;
 mod cull;
 mod deferred;
@@ -1692,6 +1693,7 @@ impl App {
             let mut compose_objects: Vec<crate::compose::ComposeObject> = Vec::new();
             if use_permesh {
                 use std::collections::HashMap;
+                use std::sync::atomic::{AtomicU32, Ordering};
                 let cache_dir = app::cooked_cache_dir();
                 // G1 (gdf-reference-alignment.md): small-mesh radius cull — drop tiny drawables
                 // from the composite (they barely move low-frequency GI/AO but each is a full
@@ -1700,9 +1702,23 @@ impl App {
                     .ok()
                     .and_then(|v| v.trim().parse::<f32>().ok())
                     .unwrap_or(crate::compose::DEFAULT_MIN_MESH_RADIUS);
+
+                // Sequential dedup + radius-cull pass. It touches the `Rc`-holding registries, so it
+                // stays on this thread; it encodes each UNIQUE mesh's bake inputs into OWNED bytes so
+                // the parallel bake below borrows no registry. `draw_refs` records every surviving
+                // drawable's (world, unique-mesh index) in draw-list order for the compose.
+                struct BakeSpec {
+                    mvtx: Vec<u8>,
+                    midx: Vec<u8>,
+                    dim: u32,
+                    mn: [f32; 3],
+                    mx: [f32; 3],
+                    albedo: Option<([f32; 3], usize)>, // (material colour, triangle count)
+                }
+                let mut specs: Vec<BakeSpec> = Vec::new();
+                let mut draw_refs: Vec<(dreamcoast_core::glam::Mat4, usize)> = Vec::new();
                 let mut mesh_index: HashMap<u32, usize> = HashMap::new();
                 let mut culled = 0u32;
-                let mut negated = 0u32;
                 for d in world.draw_list() {
                     let cpu = mesh_registry.cpu(d.mesh);
                     let (mn, mx) = dreamcoast_asset::sdf::mesh_local_aabb_padded(&cpu.vertices);
@@ -1712,59 +1728,78 @@ impl App {
                         culled += 1;
                         continue;
                     }
-                    let mi = if let Some(&i) = mesh_index.get(&d.mesh.0) {
+                    let mi = *mesh_index.entry(d.mesh.0).or_insert_with(|| {
+                        let i = specs.len();
+                        // F5: the per-mesh albedo (baked over the SAME grid) keys on the mesh + this
+                        // first drawable's representative material colour (uniform per drawable here).
+                        let albedo = permesh_albedo
+                            .then(|| (material_registry.get(d.material).albedo, cpu.indices.len() / 3));
+                        specs.push(BakeSpec {
+                            mvtx: dreamcoast_asset::sdf::encode_vertices_fused(&cpu.vertices),
+                            midx: dreamcoast_asset::sdf::encode_indices(&cpu.indices),
+                            dim: dreamcoast_asset::sdf::mesh_sdf_dim(mn, mx),
+                            mn,
+                            mx,
+                            albedo,
+                        });
                         i
-                    } else {
-                        let mdim = dreamcoast_asset::sdf::mesh_sdf_dim(mn, mx);
-                        let mvtx = dreamcoast_asset::sdf::encode_vertices_fused(&cpu.vertices);
-                        let midx = dreamcoast_asset::sdf::encode_indices(&cpu.indices);
-                        let (mut vol, _) = dreamcoast_asset::cook::load_or_bake_mesh_sdf(
-                            &mvtx, &midx, mdim, mn, mx, &cache_dir,
+                    });
+                    draw_refs.push((d.world, mi));
+                }
+
+                // Parallel per-mesh bake on the job-system workers — the expensive step (a full CPU
+                // SDF bake per unique mesh; a cache hit just reads the `.dcasset`). Each bake is
+                // order-independent + cross-process deterministic, so the parallel result equals the
+                // serial one; assembling in `specs` order below keeps the consolidation byte-identical.
+                let negated = AtomicU32::new(0);
+                let mut baked: Vec<
+                    Option<(
+                        dreamcoast_asset::sdf::SdfVolume,
+                        Option<dreamcoast_asset::sdf::AlbedoVolumes>,
+                    )>,
+                > = (0..specs.len()).map(|_| None).collect();
+                crate::cook_progress::parallel_cook("per-mesh SDF", &mut baked, 1, |i, slot| {
+                    let s = &specs[i];
+                    let (mut vol, _) = dreamcoast_asset::cook::load_or_bake_mesh_sdf(
+                        &s.mvtx, &s.midx, s.dim, s.mn, s.mx, &cache_dir,
+                    );
+                    // Mostly-negative DF ⇒ globally-inverted normals (open space read as "inside"):
+                    // negate so the sign is correct (removes compose poisoning + spurious AO/GI floor
+                    // blotches). The 60 % threshold only flips clearly-inverted meshes.
+                    let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count();
+                    if neg * 5 > vol.voxels.len() * 3 {
+                        for v in &mut vol.voxels {
+                            *v = -*v;
+                        }
+                        negated.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let alb = s.albedo.map(|(colour, tri_count)| {
+                        let mut tri_albedo = Vec::with_capacity(tri_count * 12);
+                        for _ in 0..tri_count {
+                            for c in colour {
+                                tri_albedo.extend_from_slice(&c.to_le_bytes());
+                            }
+                        }
+                        let (av, _) = dreamcoast_asset::cook::load_or_bake_mesh_albedo(
+                            &s.mvtx, &s.midx, &tri_albedo, s.dim, s.mn, s.mx, &cache_dir,
                         );
-                        // A per-mesh DF that is *mostly* negative has globally-inverted normals
-                        // (it reads open space as "inside"): negate it so the sign is correct.
-                        // This removes the compose poisoning *and* the spurious floor-occlusion
-                        // blotches those meshes cause via AO/GI. A correct solid is mostly
-                        // positive outside and a correct thin sheet ~50 %, so the 60 % threshold
-                        // only flips clearly-inverted meshes.
-                        let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count();
-                        if neg * 5 > vol.voxels.len() * 3 {
-                            for v in &mut vol.voxels {
-                                *v = -*v;
-                            }
-                            negated += 1;
-                        }
-                        mesh_sdfs.push(vol);
-                        // F5: bake this unique mesh's albedo over the same grid. Albedo depends on
-                        // the drawable's material too, so — matching the mesh-only dedup here — we
-                        // key it on the mesh + this first drawable's representative material colour
-                        // (uniform per drawable in these scenes), repeated per triangle.
-                        if permesh_albedo {
-                            let alb = material_registry.get(d.material).albedo;
-                            let tri_count = cpu.indices.len() / 3;
-                            let mut tri_albedo = Vec::with_capacity(tri_count * 12);
-                            for _ in 0..tri_count {
-                                for c in alb {
-                                    tri_albedo.extend_from_slice(&c.to_le_bytes());
-                                }
-                            }
-                            let (av, _) = dreamcoast_asset::cook::load_or_bake_mesh_albedo(
-                                &mvtx,
-                                &midx,
-                                &tri_albedo,
-                                mdim,
-                                mn,
-                                mx,
-                                &cache_dir,
-                            );
-                            mesh_albedos.push(av);
-                        }
-                        let i = mesh_sdfs.len() - 1;
-                        mesh_index.insert(d.mesh.0, i);
-                        i
-                    };
+                        av
+                    });
+                    *slot = Some((vol, alb));
+                });
+
+                // Assemble in unique-mesh (specs) order — identical to the original first-seen order,
+                // so `mesh_sdfs` / `mesh_albedos` and the composite are byte-for-byte the serial bake.
+                for b in baked {
+                    let (vol, alb) = b.expect("every spec baked");
+                    mesh_sdfs.push(vol);
+                    if let Some(av) = alb {
+                        mesh_albedos.push(av);
+                    }
+                }
+                for &(world_m, mi) in &draw_refs {
                     compose_objects.push(crate::compose::ComposeObject::new(
-                        d.world,
+                        world_m,
                         mi,
                         &mesh_sdfs[mi],
                     ));
@@ -1776,7 +1811,7 @@ impl App {
                     compose_objects.len(),
                     culled,
                     min_radius,
-                    negated
+                    negated.load(Ordering::Relaxed)
                 );
             }
             let sdf_bytes = if !use_permesh {
