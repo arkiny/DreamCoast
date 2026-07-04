@@ -7,8 +7,8 @@
 //! RHI core change) and the cook keeps uploading on the device's queue concurrently. Vulkan needs
 //! external queue synchronization, so it keeps the terminal bar until a later step.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 

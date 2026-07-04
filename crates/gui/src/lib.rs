@@ -73,7 +73,10 @@ impl Gui {
                 },
                 tex.data,
             )?;
-            debug_assert!(texture.bindless_index() != 0, "font must not be imgui NULL id 0");
+            debug_assert!(
+                texture.bindless_index() != 0,
+                "font must not be imgui NULL id 0"
+            );
             fonts.tex_id = imgui::TextureId::from(texture.bindless_index() as usize);
             texture
         };
