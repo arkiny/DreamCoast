@@ -118,6 +118,11 @@ unsafe impl Send for Swapchain {}
 unsafe impl Send for CommandBuffer {}
 unsafe impl Send for Fence {}
 unsafe impl Send for Semaphore {}
+// The startup loading thread (`apps/sandbox/src/loading.rs`, D3D12 only) owns a loading pipeline for
+// its lifetime under the same single-owner handoff: created on the main thread, moved in, and its
+// `Rc<DeviceShared>` is decremented only when the thread drops it — which `join()` completes before
+// the main thread resumes `Rc` traffic. The D3D12 PSO/COM handle is itself thread-safe.
+unsafe impl Send for GraphicsPipeline {}
 
 /// One mesh's geometry for a BLAS build: its vertex + index buffers plus the
 /// plain shape data (Phase 8). Pairs facade [`Buffer`] handles with [`BlasGeometry`].
