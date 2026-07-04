@@ -1,159 +1,291 @@
-//! A minimal ImGui loading screen shown in the main window while the startup cook runs on the job
-//! workers, so the window stays live (pumped + a progress bar) instead of the OS "Not Responding"
-//! freeze. It implements [`crate::cook_progress::ProgressSink`]: each `tick` pumps window events and
-//! presents one frame — acquire → clear → ImGui progress bar → present. Best-effort: any swapchain
-//! error (resize race, out-of-date image) is swallowed so a UI hiccup never blocks the cook.
+//! Slate-style loading screen — a dedicated thread that presents a procedural progress bar every
+//! frame while the main thread runs the cold cook, so the window stays live (never black / "Not
+//! Responding"). See docs/loading-screen-thread.md.
 //!
-//! Created after the swapchain + `Gui` (both moved before the cook) and dropped before the real
-//! renderer is built, so it only borrows the window/device/swapchain/gui for the cook's duration.
+//! **D3D12-only for now.** Its command queue is FREE-THREADED, so the loading thread owns its own
+//! `Queue` clone + the swapchain (the existing `P15_RHI_THREAD` single-owner handoff — no mutex, no
+//! RHI core change) and the cook keeps uploading on the device's queue concurrently. Vulkan needs
+//! external queue synchronization, so it keeps the terminal bar until a later step.
 
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use dreamcoast_gui::{Gui, imgui};
-use dreamcoast_platform::Window;
-use rhi::{ClearColor, CommandBuffer, Device, Fence, Semaphore, Swapchain};
+use rhi::{
+    BackendKind, BlendMode, ClearColor, CommandBuffer, DepthCompare, Device, Extent2D, Fence,
+    Format, GraphicsPipeline, GraphicsPipelineDesc, PrimitiveTopology, Queue, Semaphore, Swapchain,
+    VertexLayout,
+};
 
-use crate::cook_progress::ProgressSink;
+/// Shared cook progress the loading thread renders: `frac` in permille (0..1000) + a stop flag.
+pub(crate) struct LoadingState {
+    frac: AtomicU32,
+    stop: AtomicBool,
+}
 
-pub(crate) struct LoadingScreen<'a> {
-    window: &'a mut Window,
-    device: &'a Device,
-    // Shared: the loading frames only `acquire_next_image`/`present` (both take `&`); a resize
-    // (`recreate`, `&mut`) is skipped — the frame is just dropped until the next acquire succeeds.
-    swapchain: &'a Swapchain,
-    gui: &'a mut Gui,
+impl LoadingState {
+    fn new() -> Self {
+        Self {
+            frac: AtomicU32::new(0),
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    /// Set the progress fraction (0.0..1.0) — called by the cook at phase boundaries.
+    pub(crate) fn set(&self, frac: f32) {
+        self.frac
+            .store((frac.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
+    }
+}
+
+/// `--loading-test <path>`: render ONE loading-bar frame (progress from `LOADING_FRAC`, default 0.6)
+/// and save it as a PNG — a visual check of the bar without needing the live window. Single-threaded
+/// (the device is used directly here, not from the loading thread).
+pub(crate) fn run_capture(device: &Device, swapchain: &Swapchain, path: &str) -> anyhow::Result<()> {
+    use rhi::{BufferDesc, BufferUsage};
+    let ext = swapchain.extent_2d();
+    let pipeline = build_pipeline(device, swapchain.format())?;
+    let cmd = device.create_command_buffer()?;
+    let image_available = device.create_semaphore()?;
+    let render_finished = device.create_semaphore()?;
+    let fence = device.create_fence(true)?;
+    let frac: f32 = std::env::var("LOADING_FRAC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.6);
+    let layout = device.swapchain_readback_layout(swapchain);
+    let buf = device.create_buffer(&BufferDesc {
+        size: layout.size,
+        usage: BufferUsage::Readback,
+    })?;
+
+    fence.wait()?;
+    let image_index = swapchain
+        .acquire_next_image(&image_available)?
+        .ok_or_else(|| anyhow::anyhow!("swapchain acquire failed"))?;
+    fence.reset()?;
+    let pc = push_bytes(frac, 0.5, ext.width, ext.height);
+    cmd.begin()?;
+    cmd.transition_to_render_target(swapchain, image_index);
+    cmd.begin_rendering(
+        swapchain,
+        image_index,
+        Some(ClearColor {
+            r: 0.055,
+            g: 0.065,
+            b: 0.085,
+            a: 1.0,
+        }),
+        None,
+    );
+    cmd.set_viewport_scissor(swapchain);
+    cmd.bind_graphics_pipeline(&pipeline);
+    cmd.push_constants(&pc);
+    cmd.draw(3, 1);
+    cmd.end_rendering();
+    cmd.transition_to_present(swapchain, image_index);
+    cmd.copy_swapchain_to_buffer(swapchain, image_index, &buf);
+    cmd.end()?;
+    device
+        .queue()
+        .submit(&cmd, &image_available, &render_finished, &fence)?;
+    fence.wait()?;
+    let mut bytes = vec![0u8; layout.size as usize];
+    buf.read_into(&mut bytes)?;
+    crate::app::save_screenshot(path, &bytes, &layout)?;
+    device.wait_idle()?;
+    tracing::info!("loading-test: saved {path} (frac {frac})");
+    Ok(())
+}
+
+/// Build the loading-bar graphics pipeline. `bindless: true` even though the shader reads no
+/// bindless resource: the non-bindless root signature is empty (no push-constant slot), whereas the
+/// bindless one has 32-bit root constants at b0 (the slot `push_constants` writes).
+/// `bind_graphics_pipeline` rebinds the shared descriptor heap; the shader never samples it, so the
+/// cook adding textures to the heap concurrently is harmless.
+pub(crate) fn build_pipeline(device: &Device, format: Format) -> anyhow::Result<GraphicsPipeline> {
+    let vs = dreamcoast_shader::loading_vs_dxil()
+        .ok_or_else(|| anyhow::anyhow!("loading vertex shader unavailable"))?;
+    let fs = dreamcoast_shader::loading_fs_dxil()
+        .ok_or_else(|| anyhow::anyhow!("loading fragment shader unavailable"))?;
+    Ok(device.create_graphics_pipeline(&GraphicsPipelineDesc {
+        vertex_bytes: vs,
+        fragment_bytes: fs,
+        vertex_entry: "vsMain",
+        fragment_entry: "fsMain",
+        color_formats: &[format],
+        topology: PrimitiveTopology::TriangleList,
+        vertex_layout: VertexLayout::None,
+        blend: BlendMode::Opaque,
+        push_constant_size: 16,
+        bindless: true,
+        uniform_buffer: false,
+        depth_test: false,
+        depth_write: false,
+        depth_compare: DepthCompare::Less,
+        depth_format: None,
+    })?)
+}
+
+/// Pack the loading push constant: progress fraction + a time value + the target size.
+pub(crate) fn push_bytes(frac: f32, time: f32, w: u32, h: u32) -> [u8; 16] {
+    let mut pc = [0u8; 16];
+    pc[0..4].copy_from_slice(&frac.to_le_bytes());
+    pc[4..8].copy_from_slice(&time.to_le_bytes());
+    pc[8..12].copy_from_slice(&w.to_le_bytes());
+    pc[12..16].copy_from_slice(&h.to_le_bytes());
+    pc
+}
+
+/// A running loading thread. `finish()` stops it and reclaims the swapchain for the render loop.
+pub(crate) struct LoadingThread {
+    state: Arc<LoadingState>,
+    handle: JoinHandle<Swapchain>,
+}
+
+impl LoadingThread {
+    /// The shared progress the cook bumps as it advances.
+    pub(crate) fn state(&self) -> &Arc<LoadingState> {
+        &self.state
+    }
+
+    /// Signal the thread to stop, join it, and return the swapchain for the real render loop. The
+    /// join blocks until the thread has dropped its pipeline/command-buffer (their `Rc<DeviceShared>`
+    /// decrements finish before the main thread resumes `Rc` traffic — the single-owner contract).
+    pub(crate) fn finish(self) -> Swapchain {
+        self.state.stop.store(true, Ordering::Release);
+        self.handle.join().expect("loading thread panicked")
+    }
+}
+
+/// Spawn the loading thread (interactive D3D12 only). On any other backend / headless, hands the
+/// swapchain straight back as `Err` so the caller keeps it and uses the terminal bar. Moves the
+/// swapchain + a queue clone + a freshly-built loading pipeline + sync into the thread; it solely
+/// owns them until `finish()`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn(
+    device: &Device,
+    backend: BackendKind,
+    swapchain: Swapchain,
+    swap_format: Format,
+    extent: Extent2D,
+    headless: bool,
+) -> anyhow::Result<Result<LoadingThread, Swapchain>> {
+    if headless || backend != BackendKind::D3d12 {
+        return Ok(Err(swapchain));
+    }
+    let pipeline = build_pipeline(device, swap_format)?;
+    let queue = device.queue();
+    let cmd = device.create_command_buffer()?;
+    let image_available = device.create_semaphore()?;
+    let render_finished = device.create_semaphore()?;
+    let fence = device.create_fence(true)?;
+    let state = Arc::new(LoadingState::new());
+
+    let thread_state = Arc::clone(&state);
+    let handle = std::thread::Builder::new()
+        .name("loading".into())
+        .spawn(move || {
+            run(
+                swapchain,
+                queue,
+                pipeline,
+                cmd,
+                image_available,
+                render_finished,
+                fence,
+                extent,
+                thread_state,
+            )
+        })?;
+    Ok(Ok(LoadingThread { state, handle }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run(
+    swapchain: Swapchain,
+    queue: Queue,
+    pipeline: GraphicsPipeline,
     cmd: CommandBuffer,
     image_available: Semaphore,
     render_finished: Semaphore,
     fence: Fence,
-    fif: usize,
-    frames_in_flight: usize,
-    last: Instant,
-    /// Set once if a frame errors, so we don't spam the log for every tick of a broken swapchain.
-    warned: bool,
-}
-
-impl<'a> LoadingScreen<'a> {
-    pub(crate) fn new(
-        window: &'a mut Window,
-        device: &'a Device,
-        swapchain: &'a Swapchain,
-        gui: &'a mut Gui,
-        frames_in_flight: usize,
-        now: Instant,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
-            cmd: device.create_command_buffer()?,
-            image_available: device.create_semaphore()?,
-            render_finished: device.create_semaphore()?,
-            fence: device.create_fence(true)?,
-            window,
-            device,
-            swapchain,
-            gui,
-            fif: 0,
-            frames_in_flight,
-            last: now,
-            warned: false,
-        })
-    }
-
-    /// Present one loading frame. Returns `Err` on a swapchain failure (the caller's `tick` swallows
-    /// it) — never propagates so the cook keeps running.
-    fn present(&mut self, label: &str, done: usize, total: usize) -> anyhow::Result<()> {
-        self.window.pump_events();
-        let (w, h) = self.window.size();
-        if w == 0 || h == 0 {
-            return Ok(()); // minimized — nothing to draw
-        }
-
-        // Acquire FIRST — a skipped frame (out-of-date swapchain, minimized) must not leave an ImGui
-        // frame half-started: `new_frame` and `render` are always paired below, or neither runs.
-        let fence = &self.fence;
-        fence.wait()?;
-        let image_index = match self.swapchain.acquire_next_image(&self.image_available)? {
-            Some(i) => i,
-            None => return Ok(()),
-        };
-        fence.reset()?;
-
-        let now = Instant::now();
-        let dt = (now - self.last).as_secs_f32().clamp(1.0 / 240.0, 0.1);
-        self.last = now;
-
-        // Build the ImGui frame: a centred, borderless progress panel.
-        let pct = if total == 0 {
-            1.0
-        } else {
-            done.min(total) as f32 / total as f32
-        };
-        let ui = self
-            .gui
-            .new_frame(dt, [w as f32, h as f32], self.window.input());
-        ui.window("cooking")
-            .position([w as f32 * 0.5, h as f32 * 0.5], imgui::Condition::Always)
-            .position_pivot([0.5, 0.5])
-            .size([460.0, 0.0], imgui::Condition::Always)
-            .title_bar(false)
-            .resizable(false)
-            .movable(false)
-            .build(|| {
-                ui.text("Cooking DreamCoast assets…");
-                ui.spacing();
-                ui.text(label);
-                imgui::ProgressBar::new(pct)
-                    .size([440.0, 24.0])
-                    .overlay_text(format!("{:.0}%  ({done}/{total})", pct * 100.0))
-                    .build(ui);
-            });
-
-        let cmd = &self.cmd;
-        cmd.begin()?;
-        cmd.transition_to_render_target(self.swapchain, image_index);
-        cmd.begin_rendering(
-            self.swapchain,
-            image_index,
-            Some(ClearColor {
-                r: 0.02,
-                g: 0.02,
-                b: 0.03,
-                a: 1.0,
-            }),
-            None,
-        );
-        self.gui.render(self.device, cmd, self.fif)?;
-        cmd.end_rendering();
-        cmd.transition_to_present(self.swapchain, image_index);
-        cmd.end()?;
-        self.device.queue().submit(
-            cmd,
-            &self.image_available,
-            &self.render_finished,
-            fence,
-        )?;
-        self.device
-            .queue()
-            .present(self.swapchain, image_index, &self.render_finished)?;
-        self.fif = (self.fif + 1) % self.frames_in_flight;
-        Ok(())
-    }
-}
-
-impl ProgressSink for LoadingScreen<'_> {
-    fn tick(&mut self, label: &str, done: usize, total: usize) {
-        if let Err(e) = self.present(label, done, total)
-            && !self.warned
+    extent: Extent2D,
+    state: Arc<LoadingState>,
+) -> Swapchain {
+    let start = Instant::now();
+    let (w, h) = (extent.width, extent.height);
+    let mut warned = false;
+    while !state.stop.load(Ordering::Acquire) {
+        if let Err(e) = present_frame(
+            &swapchain,
+            &queue,
+            &pipeline,
+            &cmd,
+            &image_available,
+            &render_finished,
+            &fence,
+            w,
+            h,
+            &state,
+            start,
+        ) && !warned
         {
-            self.warned = true;
-            tracing::warn!("loading screen present failed ({e}); cook continues without it");
+            warned = true;
+            tracing::warn!("loading frame failed ({e}); cook continues without the bar");
         }
+        std::thread::sleep(Duration::from_millis(16));
     }
+    let _ = fence.wait(); // drain the last in-flight frame before handing the swapchain back
+    swapchain
 }
 
-impl Drop for LoadingScreen<'_> {
-    fn drop(&mut self) {
-        // The cook's last presented frame may still be in flight; let it retire before the borrowed
-        // swapchain/device are reused by the real renderer.
-        let _ = self.device.wait_idle();
-    }
+#[allow(clippy::too_many_arguments)]
+fn present_frame(
+    swapchain: &Swapchain,
+    queue: &Queue,
+    pipeline: &GraphicsPipeline,
+    cmd: &CommandBuffer,
+    image_available: &Semaphore,
+    render_finished: &Semaphore,
+    fence: &Fence,
+    w: u32,
+    h: u32,
+    state: &LoadingState,
+    start: Instant,
+) -> anyhow::Result<()> {
+    fence.wait()?;
+    let image_index = match swapchain.acquire_next_image(image_available)? {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+    fence.reset()?;
+
+    let frac = state.frac.load(Ordering::Relaxed) as f32 / 1000.0;
+    let pc = push_bytes(frac, start.elapsed().as_secs_f32(), w, h);
+
+    cmd.begin()?;
+    cmd.transition_to_render_target(swapchain, image_index);
+    cmd.begin_rendering(
+        swapchain,
+        image_index,
+        Some(ClearColor {
+            r: 0.055,
+            g: 0.065,
+            b: 0.085,
+            a: 1.0,
+        }),
+        None,
+    );
+    cmd.set_viewport_scissor(swapchain);
+    cmd.bind_graphics_pipeline(pipeline);
+    cmd.push_constants(&pc);
+    cmd.draw(3, 1);
+    cmd.end_rendering();
+    cmd.transition_to_present(swapchain, image_index);
+    cmd.end()?;
+    queue.submit(cmd, image_available, render_finished, fence)?;
+    queue.present(swapchain, image_index, render_finished)?;
+    Ok(())
 }

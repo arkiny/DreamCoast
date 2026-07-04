@@ -333,32 +333,6 @@ fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
     }
 }
 
-/// Build the progress sink for a parallel cook phase: the graphical in-window ImGui
-/// [`loading::LoadingScreen`] for an interactive run, or a plain terminal bar
-/// ([`cook_progress::TermProgress`]) when headless (a screenshot/CI run — drawing a loading frame is
-/// pointless there and would fight the capture's own frames). Created fresh around each phase so its
-/// `window`/`gui` borrows last only for that phase (the rest of setup can still use them).
-fn cook_sink<'a>(
-    headless: bool,
-    window: &'a mut dreamcoast_platform::Window,
-    device: &'a Device,
-    swapchain: &'a Swapchain,
-    gui: &'a mut Gui,
-) -> anyhow::Result<Box<dyn cook_progress::ProgressSink + 'a>> {
-    Ok(if headless || std::env::var_os("NO_LOADING_UI").is_some() {
-        Box::new(cook_progress::TermProgress::new())
-    } else {
-        Box::new(loading::LoadingScreen::new(
-            window,
-            device,
-            swapchain,
-            gui,
-            FRAMES_IN_FLIGHT,
-            std::time::Instant::now(),
-        )?)
-    })
-}
-
 fn main() -> anyhow::Result<()> {
     // `--log-file <path>` mirrors logs to a file (the logging layer reads the env
     // var). It's a CLI flag, not just the env var, because GPU capture launchers
@@ -481,6 +455,16 @@ fn run() -> anyhow::Result<()> {
     );
 
     let mut swapchain = device.create_swapchain(&swapchain_desc(Extent2D::new(w, h)))?;
+
+    // `--loading-test <path>`: render one loading-bar frame + save it (visual check of the loading
+    // screen without the live window). `LOADING_FRAC=<0..1>` sets the fill.
+    if let Some(path) = std::env::args()
+        .skip(1)
+        .position(|a| a == "--loading-test")
+        .and_then(|_| std::env::args().skip_while(|a| a != "--loading-test").nth(1))
+    {
+        return loading::run_capture(&device, &swapchain, &path);
+    }
 
     // M0 backend bring-up: a minimal acquire→clear→present loop that needs no
     // pipelines or shaders. The Metal backend defaults through this until the
@@ -1113,7 +1097,7 @@ fn halton(mut i: u32, base: u32) -> f32 {
 impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        mut window: Window,
+        window: Window,
         instance: Instance,
         device: Device,
         swapchain: Swapchain,
@@ -1140,10 +1124,28 @@ impl App {
         // per-frame globals uniform buffer.
         let deferred = DeferredRenderer::new(&device, backend, swapchain.format())?;
 
-        // ImGui context — created HERE (before the multi-minute cold cook, not just before the
-        // render loop) so the cook can present an in-window loading screen (see `cook_sink` below /
-        // `loading.rs`). `mut` because both the loading frames and the render loop drive it.
-        let mut gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
+        let gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
+
+        // ── Slate-style loading screen (docs/loading-screen-thread.md). From HERE the cold cook can
+        // run for minutes (Intel New Sponza), so hand the swapchain to a dedicated thread that
+        // presents a progress bar every frame (D3D12 only — free-threaded queue; VK/Metal/headless
+        // keep the swapchain + terminal bar). Cache format/extent/image-count/readback BEFORE the
+        // move — the cook uses these; the swapchain object is reclaimed by `finish()` after the cook.
+        let swap_extent_cached = swapchain.extent_2d();
+        let swap_format_cached = swapchain.format();
+        let swap_image_count = swapchain.image_count();
+        let readback_layout_cached = device.swapchain_readback_layout(&swapchain);
+        let loading = loading::spawn(
+            &device,
+            backend,
+            swapchain,
+            swap_format_cached,
+            swap_extent_cached,
+            screenshot_mode,
+        )?;
+        if let Ok(lt) = &loading {
+            lt.state().set(0.05);
+        }
 
         // Phase 11 software ray tracing + global distance field (Stage A analytic
         // trace, Stage B volumes / SDF bake / GDF merge / GDF trace, Stage C1 world
@@ -1195,7 +1197,7 @@ impl App {
         // depth feeds an occlusion-aware variant of the cull compute. Compute-only; the
         // pyramid is sized to the render extent and resized in-frame if it changes.
         let hzb = if compute_supported {
-            Some(HzbSystem::new(&device, backend, swapchain.extent_2d())?)
+            Some(HzbSystem::new(&device, backend, swap_extent_cached)?)
         } else {
             None
         };
@@ -1790,7 +1792,12 @@ impl App {
                         Option<dreamcoast_asset::sdf::AlbedoVolumes>,
                     )>,
                 > = (0..specs.len()).map(|_| None).collect();
-                let mut sink = cook_sink(screenshot_mode, &mut window, &device, &swapchain, &mut gui)?;
+                // The loading thread owns the window now, so the parallel cook just logs to the
+                // terminal; it still bumps the loading bar via the shared state below.
+                if let Ok(lt) = &loading {
+                    lt.state().set(0.55);
+                }
+                let mut sink = crate::cook_progress::TermProgress::new();
                 crate::cook_progress::parallel_cook(
                     "per-mesh SDF",
                     &mut baked,
@@ -1824,9 +1831,8 @@ impl App {
                     });
                     *slot = Some((vol, alb));
                     },
-                    sink.as_mut(),
+                    &mut sink,
                 );
-                drop(sink);
 
                 // Assemble in unique-mesh (specs) order — identical to the original first-seen order,
                 // so `mesh_sdfs` / `mesh_albedos` and the composite are byte-for-byte the serial bake.
@@ -2701,7 +2707,7 @@ impl App {
             .clamp(0.3333, 1.0);
         let profiler_on = std::env::var("PROFILE_GPU").is_ok();
         let slot_pass_names: Vec<Vec<&'static str>> = vec![Vec::new(); FRAMES_IN_FLIGHT];
-        let render_finished = build_render_finished(&device, swapchain.image_count())?;
+        let render_finished = build_render_finished(&device, swap_image_count)?;
 
         // Image-based lighting (see `ibl.rs`): the procedural-sky / capture /
         // irradiance / prefilter / BRDF pipelines, the ping-pong environment cube
@@ -2736,13 +2742,8 @@ impl App {
         // albedo were uploaded, so their one-time GPU bakes are pre-satisfied.
         let scene_gdf_cooked = gdf.scene_sdf_is_cooked();
         let scene_albedo_cooked = gdf.scene_albedo_is_cooked();
-
-        // Snapshot the swapchain's extent/format/readback-layout before it is moved
-        // into the struct, so the record thread can read them while the RHI thread
-        // owns the swapchain (M4 B3). Kept in sync on resize.
-        let swap_extent_cached = swapchain.extent_2d();
-        let swap_format_cached = swapchain.format();
-        let readback_layout_cached = device.swapchain_readback_layout(&swapchain);
+        // (swap_extent_cached / swap_format_cached / readback_layout_cached were snapshotted before
+        // the swapchain moved to the loading thread — see the loading-thread spawn above.)
 
         // PR-3: seed the translucency slot. `P_TRANSLUCENT_TEST=1` spawns two overlapping
         // tinted glass panes in the gallery (there is no translucent sample asset yet), to
@@ -2776,19 +2777,18 @@ impl App {
         // but the frame guards on `vgeo.is_some()`).
         let vgeo = if vgeo_mode > 0 {
             let (ww, wh) = window.size();
-            // Scoped so the loading-screen sink's window/gui borrows end before `Self` moves them.
-            let result = {
-                let mut sink =
-                    cook_sink(screenshot_mode, &mut window, &device, &swapchain, &mut gui)?;
-                vgeo::VgeoSystem::new(
-                    &device,
-                    backend,
-                    &mesh_registry,
-                    Extent2D::new(ww.max(1), wh.max(1)),
-                    &app::cooked_cache_dir().join("vgeo"),
-                    sink.as_mut(),
-                )
-            };
+            if let Ok(lt) = &loading {
+                lt.state().set(0.8);
+            }
+            let mut sink = cook_progress::TermProgress::new();
+            let result = vgeo::VgeoSystem::new(
+                &device,
+                backend,
+                &mesh_registry,
+                Extent2D::new(ww.max(1), wh.max(1)),
+                &app::cooked_cache_dir().join("vgeo"),
+                &mut sink,
+            );
             match result {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -2798,6 +2798,17 @@ impl App {
             }
         } else {
             None
+        };
+
+        // Cook done — stop the loading thread (if any) and reclaim the swapchain for the render
+        // loop. `finish()` joins, so the loading thread's pipeline/command-buffer `Rc` drops complete
+        // before the render loop touches the device (single-owner contract). `Err` = never spawned.
+        if let Ok(lt) = &loading {
+            lt.state().set(1.0);
+        }
+        let swapchain = match loading {
+            Ok(lt) => lt.finish(),
+            Err(sc) => sc,
         };
 
         Ok(Self {

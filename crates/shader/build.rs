@@ -420,6 +420,19 @@ const JOBS: &[Job] = &[
         stage: "fragment",
         key: "triangle_fs",
     },
+    // Startup loading screen — a procedural progress bar (docs/loading-screen-thread.md).
+    Job {
+        src: "loading.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "loading_vs",
+    },
+    Job {
+        src: "loading.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "loading_fs",
+    },
     Job {
         src: "imgui.slang",
         entry: "vsMain",
