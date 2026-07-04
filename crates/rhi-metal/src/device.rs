@@ -46,7 +46,7 @@ pub(crate) const CUBE_COUNT: u32 = 64;
 /// Size of the bindless storage-image (UAV) table. Matches `STORAGE_IMAGE_COUNT`
 /// in rhi-vulkan / rhi-d3d12 and `Bindless.storage_images[64]`; storage image `i`
 /// lives at handle slot `STORAGE_IMAGE_BASE + i` (M5).
-pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
+pub(crate) const STORAGE_IMAGE_COUNT: u32 = 256;
 
 /// Size of the bindless storage-buffer (UAV) table. Matches `STORAGE_BUFFER_COUNT`
 /// in rhi-vulkan / rhi-d3d12 and `Bindless.storage_buffers[N]`; storage buffer `i`
@@ -184,6 +184,10 @@ pub(crate) struct DeviceShared {
     /// Free-list of storage-buffer slots returned by dropped buffers (reused before the high-water
     /// `storage_buf_next` is bumped).
     storage_buf_free: RefCell<Vec<u32>>,
+    /// Free-list of bindless storage-IMAGE slots returned by dropped render targets, mirroring
+    /// `storage_buf_free`. Without it, recreating storage targets (the per-FIF vgeo HZB pyramid /
+    /// transient compute targets on window resize) walked the 64-slot table to overflow.
+    storage_img_free: RefCell<Vec<u32>>,
     /// Acceleration structures (TLAS + BLAS) bound via [`MetalDevice::bind_tlas`].
     /// They must be made resident (`useResource`) on the inline path tracer's
     /// compute encoder, since the TLAS is reached indirectly through the bindless
@@ -250,8 +254,17 @@ impl DeviceShared {
     /// cube it is not made resident here; `rt_to_storage` does that before a compute
     /// pass writes it.
     fn register_storage_image(&self, texture: &Retained<ProtocolObject<dyn MTLTexture>>) -> u32 {
-        let index = self.storage_img_next.get();
-        self.storage_img_next.set(index + 1);
+        // Reuse a freed slot before bumping the high-water mark (see the field docs).
+        let index = self.storage_img_free.borrow_mut().pop().unwrap_or_else(|| {
+            let i = self.storage_img_next.get();
+            self.storage_img_next.set(i + 1);
+            i
+        });
+        assert!(
+            index < STORAGE_IMAGE_COUNT,
+            "bindless storage-image table overflow (> {STORAGE_IMAGE_COUNT}); raise \
+             STORAGE_IMAGE_COUNT across bindless.slang + all three backends"
+        );
         self.write_handle(STORAGE_IMAGE_BASE + index, texture.gpuResourceID());
         let mut images = self.storage_images.borrow_mut();
         if images.len() <= index as usize {
@@ -301,6 +314,16 @@ impl DeviceShared {
             *slot = None;
         }
         self.storage_buf_free.borrow_mut().push(index);
+    }
+
+    /// Return a storage-image slot to the free-list and drop the device's strong ref to the texture
+    /// (called from `MetalRenderTarget::drop`). Safe: the handoff contract defers the Drop until the
+    /// referencing frames retire, so the slot's descriptor is no longer read.
+    pub(crate) fn free_storage_image(&self, index: u32) {
+        if let Some(slot) = self.storage_images.borrow_mut().get_mut(index as usize) {
+            *slot = None;
+        }
+        self.storage_img_free.borrow_mut().push(index);
     }
 
     /// Register a 3D volume texture in the bindless sampled-volume table
@@ -571,6 +594,7 @@ impl MetalInstance {
             storage_images: RefCell::new(Vec::new()),
             storage_buffers: RefCell::new(Vec::new()),
             storage_buf_free: RefCell::new(Vec::new()),
+            storage_img_free: RefCell::new(Vec::new()),
             rt_resident: RefCell::new(Vec::new()),
             rt_tlas: RefCell::new(None),
         });
@@ -1148,7 +1172,12 @@ impl MetalDevice {
         let storage_index = desc
             .storage
             .then(|| self.shared.register_storage_image(&texture));
-        Ok(MetalRenderTarget::new(texture, index, storage_index))
+        Ok(MetalRenderTarget::new(
+            self.shared.clone(),
+            texture,
+            index,
+            storage_index,
+        ))
     }
 
     /// Create a render-target cubemap (6 faces, `mip_levels` each) usable as a
@@ -1239,7 +1268,12 @@ impl MetalDevice {
         let storage_index = desc
             .storage
             .then(|| self.shared.register_storage_image(&texture));
-        Ok(MetalRenderTarget::new(texture, index, storage_index))
+        Ok(MetalRenderTarget::new(
+            self.shared.clone(),
+            texture,
+            index,
+            storage_index,
+        ))
     }
 }
 

@@ -169,6 +169,11 @@ impl VulkanRenderTarget {
 
 impl Drop for VulkanRenderTarget {
     fn drop(&mut self) {
+        // Return the bindless storage-image slot so recreating storage targets (resize) does not
+        // leak the 64-slot table. The sampled `index` (large table) is not yet reclaimed.
+        if let Some(idx) = self.storage_index {
+            self.device.free_storage_image(idx);
+        }
         unsafe {
             self.device.device.destroy_image_view(self.view, None);
             self.device.device.destroy_image(self.image, None);

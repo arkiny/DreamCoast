@@ -57,8 +57,14 @@ pub(crate) const BINDLESS_COUNT: u32 = 1024;
 /// space is separate from the 2D table and starts at 0.
 pub(crate) const CUBE_COUNT: u32 = 64;
 /// Size of the bindless storage-image UAV table (Phase 7), in the heap region
-/// right after the cubes. Separate 0-based index space (`u0, space0`).
-pub(crate) const STORAGE_IMAGE_COUNT: u32 = 64;
+/// right after the cubes. Separate 0-based index space (`u0, space0`). Raised 64→256 for Phase 14:
+/// the per-FIF vgeo HZB pyramid + grid HZB pyramid + transient compute targets allocate one UAV
+/// slot PER MIP, so a GI-heavy scene at high resolution neared the old 64-slot ceiling (the crash
+/// on window resize before slot reclamation landed). Generous like `STORAGE_BUFFER_COUNT`, matching
+/// UE's large-bindless-heap approach; downstream bases + the root-signature range derive from it, so
+/// the layout shifts consistently — must match `Bindless.storage_images[N]` in bindless.slang and
+/// rhi-vulkan / rhi-metal.
+pub(crate) const STORAGE_IMAGE_COUNT: u32 = 256;
 /// Size of the bindless storage-buffer UAV table (Phase 7), after the storage
 /// images. Separate 0-based index space (`u0, space1`). Raised 64→128 for Phase 14 virtual
 /// geometry: the GI-heavy default scene already fills all 64 slots, leaving no room for vgeo's
@@ -99,7 +105,14 @@ pub(crate) struct DeviceShared {
     pub srv_size: u32,
     srv_next: Cell<u32>,
     cube_next: Cell<u32>,
+    // High-water mark for the bindless storage-IMAGE (UAV) table + a free-list of slots returned by
+    // dropped render targets, mirroring the storage-buffer reclaim below. Without it, recreating
+    // storage render targets (e.g. the per-FIF vgeo HZB pyramid on window resize) walked the table
+    // monotonically past its 64-slot end into the adjacent storage-buffer region → descriptor
+    // corruption → device removal on resize. Reclaim is safe: a target only Drops after the frames
+    // referencing it retire (resize does `wait_idle` first).
     storage_image_next: Cell<u32>,
+    storage_image_free: RefCell<Vec<u32>>,
     // High-water mark for the bindless storage-buffer table + a free-list of slots returned by
     // dropped buffers. `register_storage_buffer` reuses a freed slot before bumping the mark, so a
     // long run creating + destroying storage buffers (resize, subsystem teardown) no longer walks
@@ -329,6 +342,7 @@ impl DeviceShared {
                 srv_next: Cell::new(0),
                 cube_next: Cell::new(0),
                 storage_image_next: Cell::new(0),
+                storage_image_free: RefCell::new(Vec::new()),
                 storage_buffer_next: Cell::new(0),
                 storage_buffer_free: RefCell::new(Vec::new()),
                 volume_next: Cell::new(0),
@@ -483,8 +497,21 @@ impl DeviceShared {
     /// Create a Texture2D UAV for `resource` in the reserved storage-image heap
     /// region; returns the 0-based storage-image index (Phase 7).
     pub(crate) fn register_storage_image(&self, resource: &ID3D12Resource, format: Format) -> u32 {
-        let index = self.storage_image_next.get();
-        self.storage_image_next.set(index + 1);
+        // Reuse a freed slot before bumping the high-water mark (see the field docs).
+        let index = self
+            .storage_image_free
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| {
+                let i = self.storage_image_next.get();
+                self.storage_image_next.set(i + 1);
+                i
+            });
+        assert!(
+            index < STORAGE_IMAGE_COUNT,
+            "bindless storage-image table overflow (> {STORAGE_IMAGE_COUNT}); raise \
+             STORAGE_IMAGE_COUNT across bindless.slang + all three backends"
+        );
         let handle = self.cpu_handle(STORAGE_IMAGE_BASE + index);
         let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: to_dxgi_format(format),
@@ -609,6 +636,11 @@ impl DeviceShared {
     /// reuse overwrites it.
     pub(crate) fn free_storage_buffer(&self, index: u32) {
         self.storage_buffer_free.borrow_mut().push(index);
+    }
+
+    /// Return a storage-image slot to the free-list (called from `D3d12RenderTarget::drop`).
+    pub(crate) fn free_storage_image(&self, index: u32) {
+        self.storage_image_free.borrow_mut().push(index);
     }
 
     /// Record + submit a one-time command list and wait for completion.

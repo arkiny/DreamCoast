@@ -56,7 +56,7 @@ struct Bindless
     Texture2D           textures[1024];      // binding 0 — sampled images
     SamplerState        samp;                // binding 1 — shared sampler
     TextureCube         cubes[64];           // binding 2 — sampled cubemaps
-    RWTexture2D<float4> storage_images[64];  // binding 3 — storage images (UAV)
+    RWTexture2D<float4> storage_images[256]; // binding 3 — storage images (UAV)
     RWByteAddressBuffer storage_buffers[2048]; // binding 4 — storage buffers (UAV)
     // binding 5 — scene TLAS for hardware ray tracing (Phase 8). Present only on
     // RT-capable devices; shaders that don't trace drop it (Slang omits the unused
