@@ -513,6 +513,21 @@ impl Device {
         }
     }
 
+    /// A command buffer that can be recorded from a DEDICATED thread concurrently with the rest of
+    /// the engine (the startup loading thread). On Vulkan it gets its own command pool (VK pools are
+    /// externally synchronized); D3D12/Metal command buffers each already own their allocator, so
+    /// this is just [`create_command_buffer`](Self::create_command_buffer) there.
+    pub fn create_isolated_command_buffer(&self) -> Result<CommandBuffer> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => Ok(CommandBuffer::Vulkan(d.create_isolated_command_buffer()?)),
+            #[cfg(windows)]
+            Self::D3d12(d) => Ok(CommandBuffer::D3d12(d.create_command_buffer()?)),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => Ok(CommandBuffer::Metal(d.create_command_buffer()?)),
+        }
+    }
+
     /// Create a GPU timestamp query heap of `count` queries for per-pass profiling
     /// (Phase 9 M1). Pair with [`RenderGraph::execute`]'s profiler argument.
     pub fn create_query_heap(&self, count: u32) -> Result<QueryHeap> {
@@ -2126,6 +2141,20 @@ impl Queue {
             }
             #[cfg(windows)]
             _ => unreachable!("{MIXED}"),
+        }
+    }
+
+    /// Drain the graphics queue (all submits + presents complete). The loading thread calls this
+    /// before dropping its per-image present semaphores so Vulkan doesn't destroy one in use.
+    /// D3D12/Metal keep presented resources alive via refcounting, so it's a no-op there.
+    pub fn wait_idle(&self) -> Result<()> {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(q) => q.wait_idle(),
+            #[cfg(windows)]
+            Self::D3d12(_) => Ok(()),
+            #[cfg(target_os = "macos")]
+            Self::Metal(_) => Ok(()),
         }
     }
 }

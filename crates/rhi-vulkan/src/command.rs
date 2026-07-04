@@ -32,21 +32,46 @@ pub struct VulkanCommandBuffer {
     // range's stages depend on whether the pipeline has a task stage, so `push_constants_mesh`
     // must push exactly what the bound pipeline's layout declared.
     mesh_push_stages: Cell<vk::ShaderStageFlags>,
+    // `true` when this buffer allocated its OWN command pool (the startup loading thread — a VK
+    // command pool is not thread-safe, so a thread that records concurrently with the cook's
+    // `immediate_submit` needs its own pool). `Drop` then also destroys the pool.
+    owns_pool: bool,
 }
 
 impl VulkanCommandBuffer {
     pub(crate) fn new(device: Arc<DeviceShared>) -> Result<Self, EngineError> {
         let pool = device.command_pool;
-        Self::from_pool(device, pool)
+        Self::from_pool(device, pool, false)
     }
 
     /// Allocate a command buffer on the async-compute family's pool (Phase 7).
     pub(crate) fn new_compute(device: Arc<DeviceShared>) -> Result<Self, EngineError> {
         let pool = device.compute_command_pool;
-        Self::from_pool(device, pool)
+        Self::from_pool(device, pool, false)
     }
 
-    fn from_pool(device: Arc<DeviceShared>, pool: vk::CommandPool) -> Result<Self, EngineError> {
+    /// Allocate a command buffer with a DEDICATED command pool — for a thread that records
+    /// concurrently with the rest of the engine (the startup loading thread). VK command pools are
+    /// externally synchronized, so this thread must not share the device's pool. The pool is
+    /// destroyed with the buffer.
+    pub(crate) fn new_isolated(device: Arc<DeviceShared>) -> Result<Self, EngineError> {
+        let pool_ci = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(device.graphics_family);
+        let pool = unsafe {
+            device
+                .device
+                .create_command_pool(&pool_ci, None)
+                .map_err(vk_err)?
+        };
+        Self::from_pool(device, pool, true)
+    }
+
+    fn from_pool(
+        device: Arc<DeviceShared>,
+        pool: vk::CommandPool,
+        owns_pool: bool,
+    ) -> Result<Self, EngineError> {
         let alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -64,6 +89,7 @@ impl VulkanCommandBuffer {
             current_layout: Cell::new(vk::PipelineLayout::null()),
             globals_offset: Cell::new(0),
             mesh_push_stages: Cell::new(vk::ShaderStageFlags::empty()),
+            owns_pool,
         })
     }
 
@@ -1433,6 +1459,9 @@ impl Drop for VulkanCommandBuffer {
             self.device
                 .device
                 .free_command_buffers(self.pool, &[self.cmd]);
+            if self.owns_pool {
+                self.device.device.destroy_command_pool(self.pool, None);
+            }
         }
     }
 }
