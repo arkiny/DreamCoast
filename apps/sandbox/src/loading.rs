@@ -25,7 +25,7 @@ pub(crate) struct LoadingState {
 }
 
 impl LoadingState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             frac: AtomicU32::new(0),
             stop: AtomicBool::new(false),
@@ -39,13 +39,51 @@ impl LoadingState {
     }
 }
 
+/// A [`ProgressSink`](crate::cook_progress::ProgressSink) that maps a parallel phase's `done/total`
+/// into a `[lo, hi]` slice of the overall loading bar (so the bar advances smoothly WITHIN a phase,
+/// not just at boundaries) and also logs to the terminal. Used for the per-mesh SDF + vgeo DAG cooks.
+pub(crate) struct PhaseSink {
+    state: Arc<LoadingState>,
+    lo: f32,
+    hi: f32,
+    term: crate::cook_progress::TermProgress,
+}
+
+impl PhaseSink {
+    pub(crate) fn new(state: Arc<LoadingState>, lo: f32, hi: f32) -> Self {
+        Self {
+            state,
+            lo,
+            hi,
+            term: crate::cook_progress::TermProgress::new(),
+        }
+    }
+}
+
+impl crate::cook_progress::ProgressSink for PhaseSink {
+    fn tick(&mut self, label: &str, done: usize, total: usize) {
+        let f = if total == 0 {
+            0.0
+        } else {
+            done.min(total) as f32 / total as f32
+        };
+        self.state.set(self.lo + (self.hi - self.lo) * f);
+        self.term.tick(label, done, total);
+    }
+}
+
 /// `--loading-test <path>`: render ONE loading-bar frame (progress from `LOADING_FRAC`, default 0.6)
 /// and save it as a PNG — a visual check of the bar without needing the live window. Single-threaded
 /// (the device is used directly here, not from the loading thread).
-pub(crate) fn run_capture(device: &Device, swapchain: &Swapchain, path: &str) -> anyhow::Result<()> {
+pub(crate) fn run_capture(
+    device: &Device,
+    backend: BackendKind,
+    swapchain: &Swapchain,
+    path: &str,
+) -> anyhow::Result<()> {
     use rhi::{BufferDesc, BufferUsage};
     let ext = swapchain.extent_2d();
-    let pipeline = build_pipeline(device, swapchain.format())?;
+    let pipeline = build_pipeline(device, backend, swapchain.format())?;
     let cmd = device.create_command_buffer()?;
     let image_available = device.create_semaphore()?;
     let render_finished = device.create_semaphore()?;
@@ -99,16 +137,37 @@ pub(crate) fn run_capture(device: &Device, swapchain: &Swapchain, path: &str) ->
     Ok(())
 }
 
-/// Build the loading-bar graphics pipeline. `bindless: true` even though the shader reads no
-/// bindless resource: the non-bindless root signature is empty (no push-constant slot), whereas the
-/// bindless one has 32-bit root constants at b0 (the slot `push_constants` writes).
-/// `bind_graphics_pipeline` rebinds the shared descriptor heap; the shader never samples it, so the
-/// cook adding textures to the heap concurrently is harmless.
-pub(crate) fn build_pipeline(device: &Device, format: Format) -> anyhow::Result<GraphicsPipeline> {
-    let vs = dreamcoast_shader::loading_vs_dxil()
-        .ok_or_else(|| anyhow::anyhow!("loading vertex shader unavailable"))?;
-    let fs = dreamcoast_shader::loading_fs_dxil()
-        .ok_or_else(|| anyhow::anyhow!("loading fragment shader unavailable"))?;
+/// Build the loading-bar graphics pipeline. The `bindless` flag differs per backend because the
+/// shader has a push constant but reads no bindless resource:
+///   * D3D12 — `bindless: true`: the non-bindless root signature is EMPTY (no push-constant slot);
+///     the bindless one has 32-bit root constants at b0 (the slot `push_constants` writes).
+///     `bind_graphics_pipeline` rebinds the shared descriptor heap (unused by the shader — harmless).
+///   * Vulkan — `bindless: false`: the pipeline layout still gets the push-constant range from
+///     `push_constant_size`, with NO descriptor set — exactly what a push-only shader needs.
+pub(crate) fn build_pipeline(
+    device: &Device,
+    backend: BackendKind,
+    format: Format,
+) -> anyhow::Result<GraphicsPipeline> {
+    let (vs, fs, bindless) = match backend {
+        BackendKind::D3d12 => (
+            dreamcoast_shader::loading_vs_dxil(),
+            dreamcoast_shader::loading_fs_dxil(),
+            true,
+        ),
+        BackendKind::Vulkan => (
+            dreamcoast_shader::loading_vs_spirv(),
+            dreamcoast_shader::loading_fs_spirv(),
+            false,
+        ),
+        BackendKind::Metal => (
+            dreamcoast_shader::loading_vs_metallib(),
+            dreamcoast_shader::loading_fs_metallib(),
+            false,
+        ),
+    };
+    let vs = vs.ok_or_else(|| anyhow::anyhow!("loading vertex shader unavailable"))?;
+    let fs = fs.ok_or_else(|| anyhow::anyhow!("loading fragment shader unavailable"))?;
     Ok(device.create_graphics_pipeline(&GraphicsPipelineDesc {
         vertex_bytes: vs,
         fragment_bytes: fs,
@@ -119,7 +178,7 @@ pub(crate) fn build_pipeline(device: &Device, format: Format) -> anyhow::Result<
         vertex_layout: VertexLayout::None,
         blend: BlendMode::Opaque,
         push_constant_size: 16,
-        bindless: true,
+        bindless,
         uniform_buffer: false,
         depth_test: false,
         depth_write: false,
@@ -145,11 +204,6 @@ pub(crate) struct LoadingThread {
 }
 
 impl LoadingThread {
-    /// The shared progress the cook bumps as it advances.
-    pub(crate) fn state(&self) -> &Arc<LoadingState> {
-        &self.state
-    }
-
     /// Signal the thread to stop, join it, and return the swapchain for the real render loop. The
     /// join blocks until the thread has dropped its pipeline/command-buffer (their `Rc<DeviceShared>`
     /// decrements finish before the main thread resumes `Rc` traffic — the single-owner contract).
@@ -170,18 +224,27 @@ pub(crate) fn spawn(
     swapchain: Swapchain,
     swap_format: Format,
     extent: Extent2D,
+    state: Arc<LoadingState>,
     headless: bool,
 ) -> anyhow::Result<Result<LoadingThread, Swapchain>> {
-    if headless || backend != BackendKind::D3d12 {
+    // D3D12 (free-threaded queue) + Vulkan (queue guarded by `graphics_queue_lock`). Metal / headless
+    // hand the swapchain straight back and use the terminal bar.
+    if headless || matches!(backend, BackendKind::Metal) {
         return Ok(Err(swapchain));
     }
-    let pipeline = build_pipeline(device, swap_format)?;
+    let pipeline = build_pipeline(device, backend, swap_format)?;
     let queue = device.queue();
-    let cmd = device.create_command_buffer()?;
+    // Dedicated command pool (VK pools aren't thread-safe — the loading thread records while the
+    // cook's `immediate_submit` uses the device's pool).
+    let cmd = device.create_isolated_command_buffer()?;
     let image_available = device.create_semaphore()?;
-    let render_finished = device.create_semaphore()?;
+    // One `render_finished` semaphore PER swapchain image: `present` consumes it (not fence-gated),
+    // so reusing a single one across frames trips the VK "semaphore may still be in use by the
+    // swapchain" hazard (VUID-vkQueueSubmit-pSignalSemaphores-00067). Indexed by acquired image.
+    let render_finished: Vec<Semaphore> = (0..swapchain.image_count())
+        .map(|_| device.create_semaphore())
+        .collect::<Result<_, _>>()?;
     let fence = device.create_fence(true)?;
-    let state = Arc::new(LoadingState::new());
 
     let thread_state = Arc::clone(&state);
     let handle = std::thread::Builder::new()
@@ -209,7 +272,7 @@ fn run(
     pipeline: GraphicsPipeline,
     cmd: CommandBuffer,
     image_available: Semaphore,
-    render_finished: Semaphore,
+    render_finished: Vec<Semaphore>,
     fence: Fence,
     extent: Extent2D,
     state: Arc<LoadingState>,
@@ -237,7 +300,9 @@ fn run(
         }
         std::thread::sleep(Duration::from_millis(16));
     }
-    let _ = fence.wait(); // drain the last in-flight frame before handing the swapchain back
+    let _ = fence.wait(); // drain the last in-flight SUBMIT before handing the swapchain back
+    let _ = queue.wait_idle(); // …and the last PRESENT, so the render_finished semaphores aren't
+    // destroyed while a swapchain present still references them (Vulkan VUID-vkDestroySemaphore-05149)
     swapchain
 }
 
@@ -248,7 +313,7 @@ fn present_frame(
     pipeline: &GraphicsPipeline,
     cmd: &CommandBuffer,
     image_available: &Semaphore,
-    render_finished: &Semaphore,
+    render_finished: &[Semaphore],
     fence: &Fence,
     w: u32,
     h: u32,
@@ -261,6 +326,7 @@ fn present_frame(
         None => return Ok(()),
     };
     fence.reset()?;
+    let render_finished = &render_finished[image_index as usize];
 
     let frac = state.frac.load(Ordering::Relaxed) as f32 / 1000.0;
     let pc = push_bytes(frac, start.elapsed().as_secs_f32(), w, h);

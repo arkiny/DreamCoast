@@ -50,6 +50,11 @@ pub(crate) struct DeviceShared {
     pub device: ash::Device,
     pub swapchain_loader: ash::khr::swapchain::Device,
     pub queue: vk::Queue,
+    /// Serializes graphics-queue submits/presents. VK requires external synchronization on a queue
+    /// — the startup loading thread presents on the graphics queue while the cook uploads
+    /// (`immediate_submit`) on it, so every `vkQueueSubmit`/`vkQueuePresentKHR` on `queue` locks
+    /// this (fence WAITS stay outside the lock). Uncontended once the loading thread joins.
+    pub graphics_queue_lock: Mutex<()>,
     pub physical_device: vk::PhysicalDevice,
     pub command_pool: vk::CommandPool,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
@@ -374,6 +379,7 @@ impl DeviceShared {
                 device,
                 swapchain_loader,
                 queue,
+                graphics_queue_lock: Mutex::new(()),
                 physical_device: instance.physical_device,
                 command_pool,
                 mem_props,
@@ -684,9 +690,14 @@ impl DeviceShared {
                 .device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(vk_err)?;
-            self.device
-                .queue_submit(self.queue, &[submit], fence)
-                .map_err(vk_err)?;
+            {
+                // Serialize with the loading thread's present on the same graphics queue (VK
+                // external sync); the fence WAIT below stays outside the lock.
+                let _q = self.graphics_queue_lock.lock().unwrap();
+                self.device
+                    .queue_submit(self.queue, &[submit], fence)
+                    .map_err(vk_err)?;
+            }
             self.device
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(vk_err)?;
@@ -1042,6 +1053,12 @@ impl VulkanDevice {
         command::VulkanCommandBuffer::new(self.shared.clone())
     }
 
+    /// A command buffer with a dedicated command pool, for a thread that records concurrently with
+    /// the rest of the engine (the startup loading thread). See [`VulkanCommandBuffer::new_isolated`].
+    pub fn create_isolated_command_buffer(&self) -> Result<VulkanCommandBuffer, EngineError> {
+        command::VulkanCommandBuffer::new_isolated(self.shared.clone())
+    }
+
     /// Create a timestamp query heap of `count` queries (Phase 9 profiling).
     pub fn create_query_heap(
         &self,
@@ -1341,6 +1358,7 @@ impl VulkanQueue {
         fence: &VulkanFence,
     ) -> Result<(), EngineError> {
         unsafe {
+            let _q = self.shared.graphics_queue_lock.lock().unwrap();
             let wait_semaphores = [wait.raw()];
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let signal_semaphores = [signal.raw()];
@@ -1369,6 +1387,7 @@ impl VulkanQueue {
         fence: &VulkanFence,
     ) -> Result<(), EngineError> {
         unsafe {
+            let _q = self.shared.graphics_queue_lock.lock().unwrap();
             let wait_semaphores = [wait.raw(), compute_wait.raw()];
             let wait_stages = [
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
@@ -1396,6 +1415,7 @@ impl VulkanQueue {
         fence: &VulkanFence,
     ) -> Result<(), EngineError> {
         unsafe {
+            let _q = self.shared.graphics_queue_lock.lock().unwrap();
             let command_buffers = [cmd.raw()];
             let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
             self.shared
@@ -1403,6 +1423,13 @@ impl VulkanQueue {
                 .queue_submit(self.shared.queue, &[submit], fence.raw())
                 .map_err(vk_err)
         }
+    }
+
+    /// Wait for the graphics queue to drain (all submits + presents complete). Used by the loading
+    /// thread before it destroys its per-image present semaphores.
+    pub fn wait_idle(&self) -> Result<(), EngineError> {
+        let _q = self.shared.graphics_queue_lock.lock().unwrap();
+        unsafe { self.shared.device.queue_wait_idle(self.shared.queue) }.map_err(vk_err)
     }
 
     /// Present a swapchain image, waiting on `wait`. Returns `true` if the
@@ -1414,6 +1441,7 @@ impl VulkanQueue {
         wait: &VulkanSemaphore,
     ) -> Result<bool, EngineError> {
         unsafe {
+            let _q = self.shared.graphics_queue_lock.lock().unwrap();
             let wait_semaphores = [wait.raw()];
             let swapchains = [swapchain.raw()];
             let indices = [image_index];

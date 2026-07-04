@@ -463,7 +463,7 @@ fn run() -> anyhow::Result<()> {
         .position(|a| a == "--loading-test")
         .and_then(|_| std::env::args().skip_while(|a| a != "--loading-test").nth(1))
     {
-        return loading::run_capture(&device, &swapchain, &path);
+        return loading::run_capture(&device, backend, &swapchain, &path);
     }
 
     // M0 backend bring-up: a minimal acquire→clear→present loop that needs no
@@ -1135,17 +1135,20 @@ impl App {
         let swap_format_cached = swapchain.format();
         let swap_image_count = swapchain.image_count();
         let readback_layout_cached = device.swapchain_readback_layout(&swapchain);
+        // Shared progress the loading thread renders; the cook bumps it (coarse boundaries here +
+        // fine-grained `PhaseSink` within the parallel cooks). Lives even when no thread runs
+        // (Metal/headless) — the cook's updates are then just harmless no-ops.
+        let loading_state = std::sync::Arc::new(loading::LoadingState::new());
         let loading = loading::spawn(
             &device,
             backend,
             swapchain,
             swap_format_cached,
             swap_extent_cached,
+            std::sync::Arc::clone(&loading_state),
             screenshot_mode,
         )?;
-        if let Ok(lt) = &loading {
-            lt.state().set(0.05);
-        }
+        loading_state.set(0.05);
 
         // Phase 11 software ray tracing + global distance field (Stage A analytic
         // trace, Stage B volumes / SDF bake / GDF merge / GDF trace, Stage C1 world
@@ -1792,12 +1795,10 @@ impl App {
                         Option<dreamcoast_asset::sdf::AlbedoVolumes>,
                     )>,
                 > = (0..specs.len()).map(|_| None).collect();
-                // The loading thread owns the window now, so the parallel cook just logs to the
-                // terminal; it still bumps the loading bar via the shared state below.
-                if let Ok(lt) = &loading {
-                    lt.state().set(0.55);
-                }
-                let mut sink = crate::cook_progress::TermProgress::new();
+                // The loading thread owns the window; this phase advances the bar smoothly across
+                // its [0.30, 0.60] slice (per-mesh SDF is the bulk of a cold cook) + logs.
+                let mut sink =
+                    loading::PhaseSink::new(std::sync::Arc::clone(&loading_state), 0.30, 0.60);
                 crate::cook_progress::parallel_cook(
                     "per-mesh SDF",
                     &mut baked,
@@ -2777,10 +2778,8 @@ impl App {
         // but the frame guards on `vgeo.is_some()`).
         let vgeo = if vgeo_mode > 0 {
             let (ww, wh) = window.size();
-            if let Ok(lt) = &loading {
-                lt.state().set(0.8);
-            }
-            let mut sink = cook_progress::TermProgress::new();
+            let mut sink =
+                loading::PhaseSink::new(std::sync::Arc::clone(&loading_state), 0.70, 0.97);
             let result = vgeo::VgeoSystem::new(
                 &device,
                 backend,
@@ -2803,9 +2802,7 @@ impl App {
         // Cook done — stop the loading thread (if any) and reclaim the swapchain for the render
         // loop. `finish()` joins, so the loading thread's pipeline/command-buffer `Rc` drops complete
         // before the render loop touches the device (single-owner contract). `Err` = never spawned.
-        if let Ok(lt) = &loading {
-            lt.state().set(1.0);
-        }
+        loading_state.set(1.0);
         let swapchain = match loading {
             Ok(lt) => lt.finish(),
             Err(sc) => sc,
