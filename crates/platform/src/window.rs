@@ -102,6 +102,11 @@ impl Window {
 
             let _ = ShowWindow(hwnd, SW_SHOW);
 
+            // Stop Windows from replacing the window with the grey "(Not Responding)" ghost when the
+            // main thread is busy (a synchronous cold cook). A dedicated loading thread keeps
+            // presenting, but this also covers any brief main-thread stall.
+            DisableProcessWindowsGhosting();
+
             Ok(Self {
                 hwnd,
                 hinstance,

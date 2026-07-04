@@ -184,6 +184,12 @@ pub(crate) fn resolve_asset_path(path: &str) -> PathBuf {
 /// assets are shared across `cargo run` from any cwd), else beside the executable
 /// for a shipped layout. The cook creates the directory on first write.
 pub(crate) fn cooked_cache_dir() -> PathBuf {
+    // `DC_CACHE_DIR=<path>` redirects the cooked-asset cache to an arbitrary directory — a fresh
+    // path forces a full cold cook (demo the loading screen / benchmark a cold start) without
+    // disturbing the shared workspace cache.
+    if let Some(dir) = std::env::var_os("DC_CACHE_DIR") {
+        return PathBuf::from(dir);
+    }
     // `CARGO_MANIFEST_DIR` is `<root>/apps/sandbox`; the workspace root is two up.
     if let Some(root) = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2)
         && root.exists()
