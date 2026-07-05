@@ -21,6 +21,10 @@ pub mod primitives;
 pub mod sdf;
 pub mod sdf_atlas;
 pub mod simplify;
+/// Native ASCII USD (`.usda`) point-cache reader (from-scratch, no deps).
+pub mod usd;
+/// Baked vertex-animation cache — the neutral type both importers + the cook share.
+pub mod vcache;
 pub mod vgeo;
 
 #[cfg(feature = "fbx")]
@@ -33,6 +37,7 @@ pub use gltf_scene::{
 pub use level::LevelData;
 pub use level_graph::{LevelGraph, WorldChunk};
 pub use primitives::{cornell_box, unit_cube, uv_sphere};
+pub use vcache::{VcMesh, VertexCache};
 
 /// A mesh vertex (matches `rhi::VertexLayout::Mesh`: 32-byte stride).
 #[repr(C)]
