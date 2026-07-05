@@ -3087,7 +3087,7 @@ impl App {
             gi_volume_period: std::env::var("P_GI_VOLUME_PERIOD")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1)
+                .unwrap_or(base.gi_volume_period as u64)
                 .max(1),
             skyvis_tint,
             skyvis_min_occ,
