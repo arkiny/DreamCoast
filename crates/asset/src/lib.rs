@@ -6,6 +6,8 @@ use std::path::Path;
 
 use dreamcoast_core::EngineError;
 
+/// Native Alembic (`.abc`) reader — Ogawa container layer (from-scratch, no deps).
+pub mod alembic;
 pub mod bc;
 pub mod cook;
 pub mod dcasset;
