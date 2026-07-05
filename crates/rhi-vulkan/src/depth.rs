@@ -133,6 +133,8 @@ impl VulkanDepthBuffer {
 
 impl Drop for VulkanDepthBuffer {
     fn drop(&mut self) {
+        // Return the bindless SRV slot so recreating the depth buffer on resize does not leak it.
+        self.device.free_texture(self.index);
         unsafe {
             self.device.device.destroy_image_view(self.view, None);
             self.device.device.destroy_image(self.image, None);

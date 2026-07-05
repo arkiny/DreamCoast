@@ -104,6 +104,11 @@ pub(crate) struct DeviceShared {
     pub srv_heap: ID3D12DescriptorHeap,
     pub srv_size: u32,
     srv_next: Cell<u32>,
+    // Free-list of bindless SRV (sampled 2D-texture) slots returned by dropped render targets /
+    // depth buffers, mirroring the storage-image/-buffer reclaim. Static textures never free (they
+    // live the app's lifetime), so this only recycles the transient targets recreated on window
+    // resize — otherwise those slowly leaked the 1024-slot SRV table.
+    srv_free: RefCell<Vec<u32>>,
     cube_next: Cell<u32>,
     // High-water mark for the bindless storage-IMAGE (UAV) table + a free-list of slots returned by
     // dropped render targets, mirroring the storage-buffer reclaim below. Without it, recreating
@@ -340,6 +345,7 @@ impl DeviceShared {
                 srv_heap,
                 srv_size,
                 srv_next: Cell::new(0),
+                srv_free: RefCell::new(Vec::new()),
                 cube_next: Cell::new(0),
                 storage_image_next: Cell::new(0),
                 storage_image_free: RefCell::new(Vec::new()),
@@ -368,10 +374,31 @@ impl DeviceShared {
         unsafe { self.srv_heap.GetGPUDescriptorHandleForHeapStart() }
     }
 
+    /// Allocate a bindless SRV slot: reuse a freed one (dropped render target / depth buffer) before
+    /// bumping the high-water mark. Shared by `register_texture` / `register_sampled_depth`.
+    fn next_srv_slot(&self) -> u32 {
+        let index = self.srv_free.borrow_mut().pop().unwrap_or_else(|| {
+            let i = self.srv_next.get();
+            self.srv_next.set(i + 1);
+            i
+        });
+        assert!(
+            index < BINDLESS_COUNT,
+            "bindless SRV table overflow (> {BINDLESS_COUNT})"
+        );
+        index
+    }
+
+    /// Return an SRV slot to the free-list (called from `D3d12RenderTarget` / `D3d12DepthBuffer`
+    /// drop). The stale descriptor is left in place — no shader indexes a freed slot until reuse
+    /// overwrites it. Safe: resize `wait_idle`s before dropping.
+    pub(crate) fn free_texture(&self, index: u32) {
+        self.srv_free.borrow_mut().push(index);
+    }
+
     /// Create an SRV for `resource` at the next bindless slot; returns its index.
     pub(crate) fn register_texture(&self, resource: &ID3D12Resource, format: Format) -> u32 {
-        let index = self.srv_next.get();
-        self.srv_next.set(index + 1);
+        let index = self.next_srv_slot();
         let cpu = unsafe { self.srv_heap.GetCPUDescriptorHandleForHeapStart() };
         let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: cpu.ptr + (index as usize) * (self.srv_size as usize),
@@ -402,8 +429,7 @@ impl DeviceShared {
     /// bindless slot (so a depth buffer can be sampled as a shadow map); returns
     /// its index.
     pub(crate) fn register_sampled_depth(&self, resource: &ID3D12Resource) -> u32 {
-        let index = self.srv_next.get();
-        self.srv_next.set(index + 1);
+        let index = self.next_srv_slot();
         let cpu = unsafe { self.srv_heap.GetCPUDescriptorHandleForHeapStart() };
         let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: cpu.ptr + (index as usize) * (self.srv_size as usize),

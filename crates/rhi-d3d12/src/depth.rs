@@ -162,3 +162,11 @@ impl D3d12DepthBuffer {
         }
     }
 }
+
+impl Drop for D3d12DepthBuffer {
+    /// Return the bindless SRV slot so recreating the depth buffer on resize does not leak the SRV
+    /// table. Safe: resize `wait_idle`s before dropping.
+    fn drop(&mut self) {
+        self.device.free_texture(self.index);
+    }
+}

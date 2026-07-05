@@ -174,10 +174,10 @@ impl D3d12RenderTarget {
 }
 
 impl Drop for D3d12RenderTarget {
-    /// Return the bindless storage-image slot so recreating storage targets (resize) does not leak
-    /// the 64-slot UAV table. The texture SRV slot lives in the 1024-slot table and is not yet
-    /// reclaimed (a separate, non-urgent leak). Safe: resize `wait_idle`s before dropping.
+    /// Return the bindless slots (sampled SRV + optional storage-image UAV) so recreating targets on
+    /// resize does not leak either table. Safe: resize `wait_idle`s before dropping.
     fn drop(&mut self) {
+        self.device.free_texture(self.index);
         if let Some(idx) = self.storage_index {
             self.device.free_storage_image(idx);
         }
