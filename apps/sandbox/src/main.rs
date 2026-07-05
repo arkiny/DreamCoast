@@ -32,6 +32,7 @@ use tracing::info;
 mod app;
 mod atmosphere;
 mod camera;
+mod character;
 mod clipmap;
 mod cluster;
 mod compose;
@@ -1349,6 +1350,60 @@ impl App {
                 Vec3::ZERO,
                 content_compress,
             )?;
+            // Phase 13 Stage E: opt-in skinned/static character overlay (default off →
+            // the level renders byte-unchanged). Verifies the ufbx FBX importer + GPU skin
+            // cache against Intel Sponza. See docs/phase-13-fbx-knight.md.
+            if std::env::var("SPONZA_CHARS").is_ok() {
+                // Animated skinned VoxelCharacter (glTF): exercises the skin-cache + anim
+                // path on top of a level. The glb is authored in metres; clip 1 = "Idle".
+                let (voxel, _) = dreamcoast_asset::cook::load_or_cook_gltf_scene(
+                    std::path::Path::new("assets/VoxelCharacter/glb/f_1.glb"),
+                    "assets/VoxelCharacter/glb/f_1.glb",
+                    &app::cooked_cache_dir(),
+                    content_compress,
+                )?;
+                let anim = std::env::var("CHAR_ANIM")
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(1);
+                character::overlay(
+                    &device,
+                    &mut world,
+                    &mut mesh_registry,
+                    &mut material_registry,
+                    &mut textures,
+                    &voxel,
+                    &character::voxel_placement(),
+                    Some(anim),
+                    "voxel",
+                    &mut gltf_skinned,
+                )?;
+                // Static knight (FBX geometry): proves the ufbx importer end-to-end. Its FBX
+                // carries no skin weights, so it renders its bind pose (no animation).
+                #[cfg(feature = "fbx")]
+                {
+                    let knight = dreamcoast_asset::load_fbx_scene(
+                        "assets/Knight/Knight_USD_002.fbx",
+                        None::<&std::path::Path>,
+                    )?;
+                    character::overlay(
+                        &device,
+                        &mut world,
+                        &mut mesh_registry,
+                        &mut material_registry,
+                        &mut textures,
+                        &knight,
+                        &character::knight_placement(),
+                        None,
+                        "knight",
+                        &mut gltf_skinned,
+                    )?;
+                }
+                #[cfg(not(feature = "fbx"))]
+                info!(
+                    "SPONZA_CHARS: knight needs `--features fbx`; overlaying VoxelCharacter only"
+                );
+            }
         } else if let Some(path) = &scene_gltf_path {
             // Stage B: import the whole node hierarchy + every primitive/material/image,
             // through the cooked, block-compressed `.dcasset` (a hit skips glTF parse +

@@ -15,3 +15,16 @@ rhi-types.workspace = true
 # .dclevel cook (Stage E) reuses the same serde-ready LevelData model.
 serde.workspace = true
 ron.workspace = true
+# FBX import (Phase 13 Stage E), opt-in behind the `fbx` feature. The official ufbx
+# binding (same author as ufbx) vendors ufbx.c and builds it with `cc` (no bindgen,
+# no libclang) — a git dependency pinned to a rev, so nothing is committed or pulled
+# from crates.io. License: MIT OR PDDL-1.0 (public domain). See docs/phase-13-fbx-knight.md.
+ufbx = { git = "https://github.com/ufbx/ufbx-rust", rev = "b608754e3d513572bcc1f59eb8604a2cfe3b2a0a", optional = true }
+# PNG/texture decode for FBX materials (glTF brings its own image path). Optional so
+# the default build doesn't pull it directly.
+image = { workspace = true, optional = true }
+
+[features]
+# FBX importer (ufbx). Off by default → the glTF-only build has zero extra deps and
+# needs no C compiler; enabling it links the vendored ufbx.c.
+fbx = ["dep:ufbx", "dep:image"]

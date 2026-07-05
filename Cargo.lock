@@ -300,9 +300,11 @@ version = "0.0.0"
 dependencies = [
  "dreamcoast-core",
  "gltf",
+ "image",
  "rhi-types",
  "ron",
  "serde",
+ "ufbx",
 ]
 
 [[package]]
@@ -1592,6 +1594,14 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "ufbx"
+version = "0.11.2"
+source = "git+https://github.com/ufbx/ufbx-rust?rev=b608754e3d513572bcc1f59eb8604a2cfe3b2a0a#b608754e3d513572bcc1f59eb8604a2cfe3b2a0a"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
