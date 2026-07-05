@@ -59,6 +59,47 @@ void csClear(uint3 tid: SV_DispatchThreadID)
     g.storage_buffers[pc.vis_buf].Store<uint64_t>(px * 8, 0);
 }
 
+// Clip-space (homogeneous) → screen (pixel xy + NDC z). Valid only for `clip.z >= 0` (in front of
+// the standard-Z near plane, so `clip.w > 0`); the caller guarantees that (fast path or post-clip).
+float3 project(float4 clip)
+{
+    float3 ndc = clip.xyz / clip.w;
+    return float3((ndc.x * 0.5 + 0.5) * pc.width, (0.5 - ndc.y * 0.5) * pc.height, ndc.z);
+}
+
+// Rasterize ONE screen-space triangle (verts = pixel xy + NDC z) into the R64 visibility buffer.
+// Shared by the fast path and each near-clipped sub-triangle (see `csRaster`).
+void rasterTri(float3 s0, float3 s1, float3 s2, uint cull_backface, uint payload)
+{
+    float2 a = s0.xy, b = s1.xy, c = s2.xy;
+    float area = edge(a, b, c);
+    if (abs(area) < 1e-9)
+        return;
+    if (cull_backface != 0 && area > 0.0)
+        return;
+    float inv = 1.0 / area;
+    int minx = max(0, (int)floor(min(a.x, min(b.x, c.x))));
+    int maxx = min((int)pc.width - 1, (int)ceil(max(a.x, max(b.x, c.x))));
+    int miny = max(0, (int)floor(min(a.y, min(b.y, c.y))));
+    int maxy = min((int)pc.height - 1, (int)ceil(max(a.y, max(b.y, c.y))));
+    for (int y = miny; y <= maxy; ++y)
+    {
+        for (int x = minx; x <= maxx; ++x)
+        {
+            float2 p = float2(x + 0.5, y + 0.5);
+            float w0 = edge(b, c, p) * inv;
+            float w1 = edge(c, a, p) * inv;
+            float w2 = edge(a, b, p) * inv;
+            if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0)
+                continue;
+            float d = saturate(w0 * s0.z + w1 * s1.z + w2 * s2.z);
+            uint depth_key = 0xFFFFFFFFu - asuint(d);
+            uint64_t packed = ((uint64_t)depth_key << 32) | (uint64_t)payload;
+            atomicMaxU64(g.storage_buffers[pc.vis_buf], (uint)y * pc.width + (uint)x, packed);
+        }
+    }
+}
+
 // One threadgroup per visible cluster (`SV_GroupID` indexes the cut's visible list); one thread
 // per triangle rasterizes it into the visibility buffer.
 [shader("compute")]
@@ -78,62 +119,52 @@ void csRaster(uint gid: SV_GroupID, uint lane: SV_GroupThreadID)
     if (lane >= tcount)
         return;
 
-    // Fetch the triangle's three vertices, project to screen space (pixels) + NDC depth.
     uint3 li = g.storage_buffers[pc.tri_buf].Load3((toff + lane * 3) * 4);
-    float3 sp[3];
+    uint payload = (cluster << 7) | lane; // clusterId<<7 | triId (triId < 128)
+
+    // Fetch the 3 clip-space verts (HOMOGENEOUS). `pc.mvp` is the FLIP-FREE `cull_view_proj`, so the
+    // screen winding sign is DX≡VK-consistent (front = `area > 0`, screen y-down).
+    float4 clip[3];
+    [unroll]
     for (int k = 0; k < 3; ++k)
     {
         uint remap = g.storage_buffers[pc.remap_buf].Load((voff + li[k]) * 4);
         float3 p = asfloat(g.storage_buffers[pc.vtx_buf].Load3(remap * 32));
-        float4 clip = mul(pc.mvp, float4(p, 1.0));
-        if (clip.w <= 1e-6)
-            return; // crosses behind the camera → skip (crude near clip)
-        float3 ndc = clip.xyz / clip.w;
-        sp[k] = float3((ndc.x * 0.5 + 0.5) * pc.width, (0.5 - ndc.y * 0.5) * pc.height, ndc.z);
+        clip[k] = mul(pc.mvp, float4(p, 1.0));
     }
 
-    float2 a = sp[0].xy, b = sp[1].xy, c = sp[2].xy;
-    float area = edge(a, b, c);
-    if (abs(area) < 1e-9)
-        return;
-    // Per-triangle backface cull for single-sided (glTF `doubleSided=false`) materials — Nanite's
-    // per-triangle screen-winding test (`NaniteRasterizer.ush`). `sp` comes from the FLIP-FREE
-    // `cull_view_proj` so the sign is DX≡VK-consistent (unlike the Y-flipped HW `view_proj`). This
-    // both removes silhouette back-face bleed AND skips ~half a closed mesh's triangles. Two-sided
-    // materials (`cull_backface==0`, e.g. Sponza curtains) keep both faces, matching the CULL_NONE
-    // mesh fill. Front-facing here (screen y-down) is `area > 0`.
-    if (pc.cull_backface != 0 && area > 0.0)
-        return;
-    float inv = 1.0 / area;
-
-    int minx = max(0, (int)floor(min(a.x, min(b.x, c.x))));
-    int maxx = min((int)pc.width - 1, (int)ceil(max(a.x, max(b.x, c.x))));
-    int miny = max(0, (int)floor(min(a.y, min(b.y, c.y))));
-    int maxy = min((int)pc.height - 1, (int)ceil(max(a.y, max(b.y, c.y))));
-
-    uint payload = (cluster << 7) | lane; // clusterId<<7 | triId (triId < 128)
-
-    for (int y = miny; y <= maxy; ++y)
+    // Near-plane coverage (standard-Z: in front ⇔ clip.z >= 0). Fast path = fully in front. Fully
+    // behind = drop. Otherwise Sutherland-Hodgman clip against z>=0 into 1–2 sub-triangles carrying
+    // the SAME payload — the resolve reconstructs attributes from the original triangle via its
+    // w-robust homogeneous barycentric (mirrors the production vgeo_scene_raster near-clip).
+    bool in0 = clip[0].z >= 0.0, in1 = clip[1].z >= 0.0, in2 = clip[2].z >= 0.0;
+    if (in0 && in1 && in2)
     {
-        for (int x = minx; x <= maxx; ++x)
+        rasterTri(project(clip[0]), project(clip[1]), project(clip[2]), pc.cull_backface, payload);
+        return;
+    }
+    if (!in0 && !in1 && !in2)
+        return;
+
+    float3 poly[4];
+    uint n = 0;
+    [unroll]
+    for (int e = 0; e < 3; ++e)
+    {
+        float4 va = clip[e];
+        float4 vb = clip[(e + 1) % 3];
+        bool ain = va.z >= 0.0;
+        bool bin = vb.z >= 0.0;
+        if (ain)
+            poly[n++] = project(va);
+        if (ain != bin)
         {
-            float2 p = float2(x + 0.5, y + 0.5);
-            // Barycentric weights (vertex a↔edge bc, etc.), scaled by 1/area so signs match `area`.
-            float w0 = edge(b, c, p) * inv;
-            float w1 = edge(c, a, p) * inv;
-            float w2 = edge(a, b, p) * inv;
-            if (w0 < 0.0 || w1 < 0.0 || w2 < 0.0)
-                continue;
-            float d = saturate(w0 * sp[0].z + w1 * sp[1].z + w2 * sp[2].z);
-            // Nearest (small depth) → largest key, so a single atomicMax keeps the front-most.
-            // Reinterpret the float bits (monotonic for d >= 0) instead of scaling by 2^32 in float:
-            // the float32 multiply would collapse the depth to ~24 bits and re-quantize an
-            // already-float depth, spuriously TYING distinct near-coplanar surfaces (grazing arch
-            // soffit vs the wall behind) that the HW depth test resolves — the source of the
-            // dither/streaks. `0xFFFFFFFF - asuint(d)` preserves the full float32 ordering exactly.
-            uint depth_key = 0xFFFFFFFFu - asuint(d);
-            uint64_t packed = ((uint64_t)depth_key << 32) | (uint64_t)payload;
-            atomicMaxU64(g.storage_buffers[pc.vis_buf], (uint)y * pc.width + (uint)x, packed);
+            float tpar = va.z / (va.z - vb.z); // z = 0 crossing; opposite signs ⇒ denom != 0
+            poly[n++] = project(lerp(va, vb, tpar));
         }
     }
+    if (n >= 3)
+        rasterTri(poly[0], poly[1], poly[2], pc.cull_backface, payload);
+    if (n == 4)
+        rasterTri(poly[0], poly[2], poly[3], pc.cull_backface, payload);
 }

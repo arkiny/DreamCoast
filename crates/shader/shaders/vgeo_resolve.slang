@@ -53,12 +53,6 @@ float3 cluster_hue(uint id)
     return lerp(float3(1.0, 1.0, 1.0), c, 0.72);
 }
 
-// 2D edge function (twice the signed area of triangle a,b,p) — same convention as the SW raster.
-float edge(float2 a, float2 b, float2 p)
-{
-    return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
-}
-
 [shader("fragment")]
 float4 fragMain(VSOut i): SV_Target
 {
@@ -80,47 +74,38 @@ float4 fragMain(VSOut i): SV_Target
     uint4 rec = g.storage_buffers[pc.rec_buf].Load4(cluster * 96);
     uint voff = rec.x, toff = rec.z;
 
-    // Fetch the triangle's three vertices; project to screen (pixels) + keep clip w + attributes.
+    // Fetch the triangle's three vertices; keep clip HOMOGENEOUS (a near-crossing vertex has w<=0
+    // and would project to garbage under a per-vertex xy/w) + attributes.
     uint3 li = g.storage_buffers[pc.tri_buf].Load3((toff + tri * 3) * 4);
-    float2 sp[3];
-    float invw[3];
+    float4 clip[3];
     float3 nrm[3];
     float2 uvs[3];
     for (int k = 0; k < 3; ++k)
     {
         uint remap = g.storage_buffers[pc.remap_buf].Load((voff + li[k]) * 4);
         uint b = remap * 32;
-        float3 p = asfloat(g.storage_buffers[pc.vtx_buf].Load3(b));
+        float3 pw = asfloat(g.storage_buffers[pc.vtx_buf].Load3(b));
         nrm[k] = asfloat(g.storage_buffers[pc.vtx_buf].Load3(b + 12));
         uvs[k] = asfloat(g.storage_buffers[pc.vtx_buf].Load2(b + 24));
-        float4 clip = mul(pc.mvp, float4(p, 1.0));
-        float w = max(clip.w, 1e-6);
-        invw[k] = 1.0 / w;
-        float3 ndc = clip.xyz / w;
-        sp[k] = float2((ndc.x * 0.5 + 0.5) * pc.width, (0.5 - ndc.y * 0.5) * pc.height);
+        clip[k] = mul(pc.mvp, float4(pw, 1.0));
     }
 
-    // Screen-linear barycentric at the pixel centre (same edge-function raster rule as M5a).
-    float2 p = float2(x + 0.5, y + 0.5);
-    float area = edge(sp[0], sp[1], sp[2]);
-    float inv = (abs(area) < 1e-12) ? 0.0 : 1.0 / area;
-    float b0 = edge(sp[1], sp[2], p) * inv;
-    float b1 = edge(sp[2], sp[0], p) * inv;
-    float b2 = edge(sp[0], sp[1], p) * inv;
+    // Perspective-correct barycentric via a HOMOGENEOUS (pre-divide) solve — robust to w<=0
+    // (near-crossing) verts, exactly like the HW rasterizer / the production `vgeo_gbuffer` resolve
+    // (Schied & Dachsbacher). Solve `lam` (sum 1) so Σ lam·clip projects to this pixel's NDC (u,v);
+    // no division by a per-vertex w. Identical to the old screen-space weights for in-front verts.
+    float u = 2.0 * (float(x) + 0.5) / float(pc.width) - 1.0;
+    float v = 1.0 - 2.0 * (float(y) + 0.5) / float(pc.height);
+    float3 W = float3(clip[0].w, clip[1].w, clip[2].w);
+    float3 A = float3(clip[0].x, clip[1].x, clip[2].x) - u * W;
+    float3 B = float3(clip[0].y, clip[1].y, clip[2].y) - v * W;
+    float3 L = cross(A, B);
+    float s = L.x + L.y + L.z;
+    float rs = (abs(s) < 1e-20) ? 0.0 : 1.0 / s;
+    float3 lam = L * rs;
 
-    // Perspective-correct weights: divide the screen-linear barys by clip w and renormalize, so
-    // attributes interpolate exactly like the HW rasterizer's fixed-function interpolation (M2).
-    float g0 = b0 * invw[0], g1 = b1 * invw[1], g2 = b2 * invw[2];
-    float gs = g0 + g1 + g2;
-    float rcp = (abs(gs) < 1e-12) ? 0.0 : 1.0 / gs;
-    g0 *= rcp;
-    g1 *= rcp;
-    g2 *= rcp;
-
-    float3 n = normalize(g0 * nrm[0] + g1 * nrm[1] + g2 * nrm[2]);
-    float2 uv = g0 * uvs[0] + g1 * uvs[1] + g2 * uvs[2];
-    // (World position for the G-buffer interpolates the same way — `g0*p0 + g1*p1 + g2*p2` — and is
-    // added when the Phase-6 MRT is wired at renderer integration.)
+    float3 n = normalize(lam.x * nrm[0] + lam.y * nrm[1] + lam.z * nrm[2]);
+    float2 uv = lam.x * uvs[0] + lam.y * uvs[1] + lam.z * uvs[2];
 
     // Shade identically to the M2 direct cluster render so the resolve is visually verifiable.
     float ndl = saturate(dot(n, normalize(float3(0.4, 0.8, 0.5)))) * 0.75 + 0.25;
