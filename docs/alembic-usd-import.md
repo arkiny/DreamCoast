@@ -38,11 +38,26 @@ Intel New Sponza **knight**의 애니메이션은 FBX에 없다(스킨 웨이트
 - **A5 — 검증**: knight abc가 Intel Sponza에서 애니메이션 재생, DX≡VK(결정적 CPU 디코드 + 정적 업로드),
   무회귀. 좌표/스케일 정합(Xform 적용 후 ~1.9m).
 
-## 트랙 B — USD 애니메이션 임포트 (후속)
-- USD(Pixar OpenUSD)는 대형 포맷: **Crate(바이너리 `.usdc`)** + ASCII(`.usda`) + Sdf/스키마 계층.
-  knight USD = 스켈레탈(UsdSkel: skeleton + joint anim + blend). from-scratch로 `.usdc` Crate 파서 +
-  UsdSkel 스키마 → 기존 스킨 캐시([[fbx-importer-stage-e]] 경로)로 매핑.
-- 별도 Phase 규모. 트랙 A 완료 후 착수. 세부는 진행 시 이 문서에 확장.
+## 트랙 B — USD 애니메이션 임포트 (다음)
+
+> **knight USD는 ASCII `.usda` (`#usda 1.0`)** — 바이너리 Crate 아님(확인됨). 텍스트 파싱이라
+> 훨씬 다룰 만하다. `pkg_e_knight_anim/knight_USD_PREVIEW_SURFACE_ANIM_002_1.usd` (665MB ASCII, UsdSkel).
+
+- **아키텍처 결정(사용자, 2026-07-05): 애셋은 레벨에 쿡되는 게 아니라 별도 애셋으로 쿡되고, 레벨은
+  쿡된 애셋을 참조/로드한다.** 기존 glTF→`.dcasset` 쿡 패턴(`load_or_cook_gltf_scene`: 레벨이 소스
+  경로 참조 → 첫 로드 시 `cache/dcasset/`로 쿡 → 이후 CacheHit)을 **애니메이션 모델**로 일반화.
+- **B1 — ASCII USD (`.usda`) 파서** (`crates/asset/src/usd/`, from-scratch): prim/property/metadata +
+  **time samples** 서브셋. USD 문법(중괄호 prim 계층, `def`/`over`, typed attrs, `.timeSamples`).
+- **B2 — UsdSkel 서브셋 → `GltfScene`**: `Skeleton`(joints, bindTransforms, restTransforms) +
+  `SkelAnimation`(joint translations/rotations/scales time-samples) + skinning primvars
+  (`primvars:skel:jointIndices`/`jointWeights` + `geomBindTransform`) → 기존 중립 타입
+  (`GltfScene` skins+animations+per-vertex joints/weights). **기존 스킨 캐시 경로 재사용**
+  ([[fbx-importer-stage-e]] `skin::build_skinned_meshes` + `AnimationPlayer`).
+- **B3 — 별도 애셋 쿡**: `load_or_cook_usd(path,key,cache) -> 쿡된 스킨드 모델 .dcasset`(신규 청크:
+  스켈레톤/스킨/클립/메시). **레벨/오버레이는 쿡된 애셋을 로드**(USD 실시간 디코드 금지 — 맵처럼 CacheHit).
+- **B4 — 검증**: knight가 쿡된 Intel Sponza에서 **스킨 애니메이션**, DX≡VK, 쿡 애셋 CacheHit 빠른 로드.
+- **companion A3**: Alembic vertex cache도 같은 "별도 애셋 쿡 → 레벨 참조" 패턴으로 쿡(현재 A4는 매
+  시작 1.4GB 실시간 디코드). 두 애니메이션 애셋(skinned USD/FBX, vcache abc)이 동일 쿡 아키텍처 공유.
 
 ## 리스크
 - **스키마 리버스 정확도**: Alembic property 헤더/타입 인코딩을 정확히 디코드해야(오독=쓰레기). Python
