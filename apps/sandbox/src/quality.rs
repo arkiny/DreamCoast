@@ -431,6 +431,21 @@ pub fn gallery_preset() -> QualityPreset {
     }
 }
 
+/// Baked-deform (vertex-cache) frame budget: the max resident frames a cooked deform keeps
+/// ([`dreamcoast_asset::VertexCache::decimate`]). `0` (the default) = unbudgeted — every frame
+/// resident, the accurate path (a walking-knight `.abc` is ~1.26 GB, `.usda` ~223 MB). A non-zero
+/// cap evenly subsamples the frames at COOK time (bounding disk + RAM) while preserving playback
+/// duration, the coarse memory-budget lever a game / a lower `RenderQuality` tier turns down.
+///
+/// `DEFORM_MAX_FRAMES=<n>` overrides it. Single source of truth (read once in `build_level`); the
+/// seam for folding this into the per-tier [`QualityPreset`] table once it is tier-driven.
+pub fn deform_max_frames() -> u32 {
+    std::env::var("DEFORM_MAX_FRAMES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 /// Resolve a boolean knob: explicit env (`0`/`false`/`off` => false, any other value => true)
 /// overrides the tier default; unset => `tier_default`. Replaces the old presence-only
 /// (`var_os(..).is_some()`) toggles so a higher tier's on-by-default can still be turned off

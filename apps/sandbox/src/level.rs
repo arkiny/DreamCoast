@@ -211,19 +211,22 @@ pub(crate) fn build_level(
     // on reload — no live 665 MB / 1.4 GB decode) and spawn a player under the entity transform.
     // This is the "level loads the cooked asset" architecture completed through the declarative
     // level system (replacing the former `KNIGHT_USD`/`KNIGHT_ABC` env overlay).
+    let deform_budget = crate::quality::deform_max_frames();
     let mut players = Vec::with_capacity(level.deforms.len());
     for (i, d) in level.deforms.iter().enumerate() {
         let (cache, outcome) = load_or_cook_vcache(
             Path::new(&d.source),
             &d.source,
             &crate::app::cooked_cache_dir(),
+            deform_budget,
         )?;
         tracing::info!(
-            "deform '{}' ({outcome:?}): {} meshes, {} frames @ {} fps",
+            "deform '{}' ({outcome:?}): {} meshes, {} frames @ {} fps (budget {})",
             d.source,
             cache.meshes.len(),
             cache.num_frames,
-            cache.fps
+            cache.fps,
+            deform_budget
         );
         let place = Mat4::from_translation(origin) * Mat4::from_cols_array(&d.transform);
         let material = deform_material(d.material_override);
