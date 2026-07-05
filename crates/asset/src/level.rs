@@ -16,13 +16,19 @@ use std::path::Path;
 use dreamcoast_core::EngineError;
 use serde::{Deserialize, Serialize};
 
-/// A whole scene: entities + lights + camera + environment.
+/// A whole scene: entities + lights + camera + environment + baked deforms.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct LevelData {
     pub entities: Vec<Entity>,
     pub lights: Vec<Light>,
     pub camera: Camera,
     pub environment: Environment,
+    /// Baked vertex-cache deforms (animated meshes with no rig — e.g. the knight point cache).
+    /// A first-class level entity: the source `.abc`/`.usda` is cooked to its own `.dcasset` and
+    /// played back at runtime. `#[serde(default)]` keeps pre-deform `.level` RON forward-compatible
+    /// (an absent field parses to an empty list).
+    #[serde(default)]
+    pub deforms: Vec<DeformEntity>,
 }
 
 impl LevelData {
@@ -55,6 +61,22 @@ pub struct Entity {
     /// World transform, column-major (`glam::Mat4::to_cols_array` order).
     pub transform: [f32; 16],
     /// Optional per-instance material override (else the asset's own material).
+    pub material_override: Option<MaterialOverride>,
+}
+
+/// A placed baked vertex-cache **deform** — an animated mesh with no rig (the knight point
+/// cache). Unlike [`Entity`] it references a *source* deformation cache (`.abc` Alembic or
+/// `.usd(a)` USD point cache), which the runtime cooks to its own `.dcasset` (CacheHit on
+/// reload) and plays back per-frame. Kept a separate list from [`Entity`] because it carries
+/// no static material table and is driven by the deform player, not the static draw path.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeformEntity {
+    /// Source vertex-cache path (`.abc` / `.usd` / `.usda`), cooked to a `.dcasset` on load.
+    pub source: String,
+    /// World transform, column-major (`glam::Mat4::to_cols_array` order).
+    pub transform: [f32; 16],
+    /// Optional per-instance material override (else a default brushed-metal surface — the
+    /// cache carries no textures).
     pub material_override: Option<MaterialOverride>,
 }
 
@@ -160,9 +182,29 @@ mod tests {
             }],
             camera: Camera::default(),
             environment: Environment::default(),
+            deforms: vec![DeformEntity {
+                source: "assets/Knight/knight.usda".into(),
+                transform: [
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 3.5, 0.0, 0.0, 1.0,
+                ],
+                material_override: None,
+            }],
         };
         let text = level.to_ron().expect("serialize");
         let parsed: LevelData = ron::from_str(&text).expect("parse");
         assert_eq!(parsed, level);
+    }
+
+    #[test]
+    fn ron_without_deforms_defaults_empty() {
+        // A pre-deform `.level` (no `deforms` field) still parses — the field defaults to empty.
+        let text = r#"(
+            entities: [],
+            lights: [],
+            camera: (position: (0, 1, 3), target: (0, 0, 0), fov_y_deg: 45, znear: 0.05, zfar: 100),
+            environment: (sun_dir: (-0.4, -1, -0.3), sun_intensity: 3, sky_white_balance: (1, 1, 1)),
+        )"#;
+        let parsed: LevelData = ron::from_str(text).expect("parse without deforms");
+        assert!(parsed.deforms.is_empty());
     }
 }

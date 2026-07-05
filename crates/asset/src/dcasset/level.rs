@@ -4,7 +4,9 @@
 use dreamcoast_core::EngineError;
 
 use super::{CHUNK_LEVEL, Header, Reader, Writer, open_chunk, write_single_chunk};
-use crate::level::{Camera, Entity, Environment, LevelData, Light, LightKind, MaterialOverride};
+use crate::level::{
+    Camera, DeformEntity, Entity, Environment, LevelData, Light, LightKind, MaterialOverride,
+};
 
 // Light kind tags stored in a level chunk.
 const LIGHT_DIRECTIONAL: u32 = 0;
@@ -78,6 +80,25 @@ fn encode_level(level: &LevelData) -> Vec<u8> {
     for v in env.sky_white_balance {
         w.f32(v);
     }
+    // Deforms (v9). Appended last so a pre-v9 chunk is a strict prefix of this layout.
+    w.u32(level.deforms.len() as u32);
+    for d in &level.deforms {
+        w.str(&d.source);
+        for f in d.transform {
+            w.f32(f);
+        }
+        match &d.material_override {
+            Some(o) => {
+                w.u32(1);
+                for c in o.base_color_factor {
+                    w.f32(c);
+                }
+                w.f32(o.metallic);
+                w.f32(o.roughness);
+            }
+            None => w.u32(0),
+        }
+    }
     w.buf
 }
 
@@ -142,11 +163,39 @@ fn decode_level(r: &mut Reader) -> Result<LevelData, EngineError> {
         sky_white_balance: vec3(r)?,
     };
 
+    // Deforms (v9). A v8 chunk ends at `environment`; reading the count off its end yields EOF,
+    // which we treat as zero deforms (so an old shipped `.dcasset` decodes cleanly). A live cook
+    // always writes this block, and the VERSION gate re-cooks a stale cache from RON regardless.
+    let deform_count = r.u32().unwrap_or(0);
+    let mut deforms = Vec::with_capacity(deform_count as usize);
+    for _ in 0..deform_count {
+        let source = r.str()?;
+        let mut transform = [0.0f32; 16];
+        for t in &mut transform {
+            *t = r.f32()?;
+        }
+        let material_override = if r.u32()? != 0 {
+            Some(MaterialOverride {
+                base_color_factor: [r.f32()?, r.f32()?, r.f32()?, r.f32()?],
+                metallic: r.f32()?,
+                roughness: r.f32()?,
+            })
+        } else {
+            None
+        };
+        deforms.push(DeformEntity {
+            source,
+            transform,
+            material_override,
+        });
+    }
+
     Ok(LevelData {
         entities,
         lights,
         camera,
         environment,
+        deforms,
     })
 }
 
@@ -202,6 +251,25 @@ mod tests {
                 sun_intensity: 4.0,
                 sky_white_balance: [1.0, 0.95, 0.9],
             },
+            deforms: vec![
+                DeformEntity {
+                    source: "assets/Knight/knight.usda".into(),
+                    transform: [
+                        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 3.5, 0.0, 0.0,
+                        1.0,
+                    ],
+                    material_override: Some(MaterialOverride {
+                        base_color_factor: [0.58, 0.58, 0.6, 1.0],
+                        metallic: 0.6,
+                        roughness: 0.45,
+                    }),
+                },
+                DeformEntity {
+                    source: "assets/cloth.abc".into(),
+                    transform: [0.0; 16],
+                    material_override: None,
+                },
+            ],
         };
         let bytes = write_level(&level, 0x1e7e1);
         let (header, decoded) = read_level(&bytes).expect("decode");

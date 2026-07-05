@@ -52,7 +52,8 @@ pub const MAGIC: [u8; 8] = *b"DCASSET\0";
 /// v6: materials carry glTF `doubleSided` (drives vgeo's per-material backface cull).
 /// v7: Morton spatial clusterizer (tight per-cluster bounds/cones) — changes every cluster page.
 /// v8: baked vertex-animation cache (`CHUNK_VCACHE`, Track B) — cooked `.abc` / `.usda` caches.
-pub const VERSION: u32 = 8;
+/// v9: `CHUNK_LEVEL` carries a baked-deform entity list (declarative vertex-cache placements).
+pub const VERSION: u32 = 9;
 
 // Chunk type tags (directory `type` field). Stable across versions; new payloads
 // get new tags. Unknown tags are skipped by the readers (forward compatibility).

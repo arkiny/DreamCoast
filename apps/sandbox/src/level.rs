@@ -11,18 +11,20 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use dreamcoast_asset::cook::{TexCompress, load_or_cook_gltf_scene, load_or_cook_level};
-use dreamcoast_asset::level::{Entity as LevelEntity, LightKind, MaterialOverride};
+use dreamcoast_asset::cook::{
+    TexCompress, load_or_cook_gltf_scene, load_or_cook_level, load_or_cook_vcache,
+};
+use dreamcoast_asset::level::{DeformEntity, Entity as LevelEntity, LightKind, MaterialOverride};
 use dreamcoast_asset::{GltfScene, LevelData, unit_cube, uv_sphere};
 use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_scene::{LocalTransform, MeshInstance, Name, Parent, World, instantiate_gltf};
 use rhi::{Device, Texture};
 
-use crate::NO_TEXTURE;
 use crate::registry::{
     MaterialDesc, MaterialRegistry, MeshRegistry, PrimitiveHandles, gltf_bounds,
     representative_albedo, upload_gltf_scene,
 };
+use crate::{NO_TEXTURE, deform};
 
 /// The world-space AABB of a placed scene (metres), for framing the camera.
 pub(crate) type Bounds = (Vec3, Vec3);
@@ -150,7 +152,7 @@ pub(crate) fn build_level(
     // BCn texture-compression tier for imported glTF textures (content scenes default to
     // `Fast`; the gallery anchor keeps `Off`). Cuts texture VRAM ~4× on large levels.
     compress: TexCompress,
-) -> anyhow::Result<Option<Bounds>> {
+) -> anyhow::Result<(Option<Bounds>, Vec<deform::DeformPlayer>)> {
     // Cache each glTF asset's import + uploaded handles so a row of the same model
     // (e.g. lanterns) uploads once.
     let mut gltf_cache: HashMap<String, (GltfScene, PrimitiveHandles)> = HashMap::new();
@@ -204,7 +206,69 @@ pub(crate) fn build_level(
                 .with(local_from_cols(&place.to_cols_array()));
         }
     }
-    Ok((bmin.x <= bmax.x).then_some((bmin, bmax)))
+
+    // Baked vertex-cache deforms (declarative): cook each source to its own `.dcasset` (CacheHit
+    // on reload — no live 665 MB / 1.4 GB decode) and spawn a player under the entity transform.
+    // This is the "level loads the cooked asset" architecture completed through the declarative
+    // level system (replacing the former `KNIGHT_USD`/`KNIGHT_ABC` env overlay).
+    let mut players = Vec::with_capacity(level.deforms.len());
+    for (i, d) in level.deforms.iter().enumerate() {
+        let (cache, outcome) = load_or_cook_vcache(
+            Path::new(&d.source),
+            &d.source,
+            &crate::app::cooked_cache_dir(),
+        )?;
+        tracing::info!(
+            "deform '{}' ({outcome:?}): {} meshes, {} frames @ {} fps",
+            d.source,
+            cache.meshes.len(),
+            cache.num_frames,
+            cache.fps
+        );
+        let place = Mat4::from_translation(origin) * Mat4::from_cols_array(&d.transform);
+        let material = deform_material(d.material_override);
+        let label = deform_label(&d.source, i);
+        players.push(deform::spawn(
+            device,
+            world,
+            meshes,
+            materials,
+            cache,
+            local_from_cols(&place.to_cols_array()),
+            material,
+            &label,
+        )?);
+    }
+
+    Ok(((bmin.x <= bmax.x).then_some((bmin, bmax)), players))
+}
+
+/// A deform's surface: the level's per-instance override (two-sided opaque, matching the deform
+/// convention), else the default brushed-metal ([`deform::brushed_metal`]).
+fn deform_material(ov: Option<MaterialOverride>) -> MaterialDesc {
+    match ov {
+        Some(o) => MaterialDesc {
+            base_color: o.base_color_factor,
+            metallic: o.metallic,
+            roughness: o.roughness,
+            tex: [NO_TEXTURE; 4],
+            albedo: representative_albedo(None, o.base_color_factor),
+            alpha_cutoff: 0.0,
+            kind: dreamcoast_asset::MaterialKind::Opaque,
+            two_sided: true,
+        },
+        None => deform::brushed_metal(),
+    }
+}
+
+/// A short scene-graph label for a deform from its source file stem (`knight`, `cloth`, …),
+/// falling back to the list index so two sources with the same stem stay distinct.
+fn deform_label(source: &str, index: usize) -> String {
+    Path::new(source)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("deform{index}"))
 }
 
 /// Discover the `.level` files in `dir`, writing the built-in levels first if missing
@@ -215,6 +279,10 @@ pub(crate) fn ensure_level_files(dir: &Path) -> anyhow::Result<Vec<String>> {
         ("gallery.level", gallery_level as fn() -> LevelData),
         ("lanterns.level", lanterns_level as fn() -> LevelData),
         ("sponza.level", sponza_level as fn() -> LevelData),
+        (
+            "sponza_knight.level",
+            sponza_knight_level as fn() -> LevelData,
+        ),
         (
             "sponza_intel.level",
             sponza_intel_level as fn() -> LevelData,
@@ -306,6 +374,7 @@ pub(crate) fn gallery_level() -> LevelData {
         lights: vec![],
         camera: Camera::default(),
         environment: Environment::default(),
+        deforms: Vec::new(),
     }
 }
 
@@ -335,6 +404,7 @@ pub(crate) fn lanterns_level() -> LevelData {
         }],
         camera: Camera::default(),
         environment: Environment::default(),
+        deforms: Vec::new(),
     }
 }
 
@@ -393,7 +463,26 @@ pub(crate) fn sponza_level() -> LevelData {
             zfar: 100.0,
         },
         environment: Environment::default(),
+        deforms: Vec::new(),
     }
+}
+
+/// Crytek Sponza + the **knight vertex-cache deform** — the declarative baked-deform demo. Same
+/// atrium as [`sponza_level`], with the animated knight standing mid-nave as a first-class
+/// `deforms` entity (cooked from `assets/Knight/knight.usda` to its own `.dcasset`, CacheHit on
+/// reload). Replaces the former `KNIGHT_USD=1` env overlay. The knight asset is local-only
+/// (gitignored); loading errors cleanly if absent, exactly like Sponza itself.
+pub(crate) fn sponza_knight_level() -> LevelData {
+    let mut level = sponza_level();
+    level.deforms = vec![DeformEntity {
+        source: "assets/Knight/knight.usda".into(),
+        // Mid-nave, feet at y=0, rotated 90° about Y to face the camera (metres).
+        transform: (Mat4::from_translation(Vec3::new(3.5, 0.0, 0.0))
+            * Mat4::from_rotation_y(90f32.to_radians()))
+        .to_cols_array(),
+        material_override: None,
+    }];
+    level
 }
 
 /// Intel "New Sponza" (the high-quality benchmark building) overlaid with its **curtains**
@@ -446,6 +535,7 @@ pub(crate) fn sponza_intel_level() -> LevelData {
             sun_intensity: 100000.0,
             sky_white_balance: [1.0, 1.0, 1.0],
         },
+        deforms: Vec::new(),
     }
 }
 
@@ -502,6 +592,7 @@ pub(crate) fn sponza_trees_level() -> LevelData {
             sun_intensity: 100000.0,
             sky_white_balance: [1.0, 1.0, 1.0],
         },
+        deforms: Vec::new(),
     }
 }
 
@@ -570,5 +661,6 @@ pub(crate) fn sponza_hero_level() -> LevelData {
             // without sacrificing the direct beam. Boost R, trim B → neutral stone.
             sky_white_balance: [1.2, 1.05, 0.8],
         },
+        deforms: Vec::new(),
     }
 }

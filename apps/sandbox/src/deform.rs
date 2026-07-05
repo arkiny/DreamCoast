@@ -16,7 +16,7 @@
 use std::rc::Rc;
 
 use dreamcoast_asset::{MaterialKind, MeshVertex, VcMesh, VertexCache};
-use dreamcoast_core::glam::{Quat, Vec3};
+use dreamcoast_core::glam::Vec3;
 use dreamcoast_scene::{LocalTransform, MeshInstance, Name, Parent, World};
 use rhi::{Device, StorageBuffer, StorageBufferDesc};
 use tracing::{info, warn};
@@ -226,8 +226,8 @@ impl DeformPlayer {
 /// Spawn a decoded vertex cache into the level: upload each part's frame-0 geometry (the
 /// registry base + a per-fif ring), spawn a drawable per part under a placement wrapper, and
 /// return the player that animates them. The cache's parts are pre-assembled in one metre/Y-up
-/// space, so a single wrapper transform places the whole thing. `material` is the shared
-/// surface (the cache carries no textures); `label` names the wrapper for the scene graph.
+/// space, so the single wrapper `place` transform positions the whole thing; `material` is the
+/// shared surface (the cache carries no textures); `label` names the wrapper for the scene graph.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     device: &Device,
@@ -235,19 +235,12 @@ pub(crate) fn spawn(
     meshes: &mut MeshRegistry,
     materials: &mut MaterialRegistry,
     cache: VertexCache,
-    place: &Placement,
+    place: LocalTransform,
     material: MaterialDesc,
     label: &str,
 ) -> anyhow::Result<DeformPlayer> {
     let root = world.spawn();
-    world.insert(
-        root,
-        LocalTransform {
-            translation: place.translation,
-            rotation: Quat::from_rotation_y(place.rotation_y_deg.to_radians()),
-            scale: Vec3::splat(place.scale),
-        },
-    );
+    world.insert(root, place);
     world.insert(root, Name(format!("deform:{label}")));
 
     let material = materials.add(material);
@@ -329,15 +322,4 @@ pub(crate) fn spawn(
         time,
         want_velocity,
     })
-}
-
-/// Default placement for the knight deform cache in Intel Sponza (metres, feet at y=0). Tunable
-/// via `CHAR_KNIGHT_ABC` (`"x,y,z,rotDeg,scale"`).
-pub(crate) fn knight_placement() -> Placement {
-    Placement {
-        translation: Vec3::new(3.5, 0.0, 0.0),
-        rotation_y_deg: 90.0,
-        scale: 1.0,
-    }
-    .with_env("CHAR_KNIGHT_ABC")
 }

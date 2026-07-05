@@ -105,8 +105,11 @@ impl Streaming {
         let mut meshes = MeshRegistry::new();
         let mut materials = MaterialRegistry::new();
         let mut textures: Vec<Texture> = Vec::new();
-        // The chunk's own AABB isn't needed (world framing is fixed); ignore it.
-        let _bounds = build_level(
+        // The chunk's own AABB isn't needed (world framing is fixed); ignore it. Streamed chunks
+        // don't drive deform players yet (world-mode deforms are out of scope — the players would
+        // spawn frame-0 geometry but never advance), so drop them; add them to the streaming tick
+        // when a world chunk needs an animated deform.
+        let (_bounds, _deforms) = build_level(
             device,
             &level_data,
             &mut world,
