@@ -352,6 +352,14 @@ pub enum DepthCompare {
     /// pass to compute clip-space position with the identical instruction sequence
     /// (same `mvp`, same shader math) so the depths match bit-exactly.
     Equal,
+    /// `LESS_OR_EQUAL` on **every** backend (unlike [`Less`], which is strict `LESS` on
+    /// Vulkan/D3D12 but `LessEqual` on Metal — a per-backend quirk). For a pass that RE-DRAWS
+    /// the opaque surface against the shared, already-written depth and must admit the coplanar
+    /// (equal-depth) fragment — e.g. the velocity pass. Using [`Less`] there silently rendered
+    /// nothing on VK/D3D12 (equal fails) while working on Metal; this variant is uniform.
+    ///
+    /// [`Less`]: DepthCompare::Less
+    LessEqual,
 }
 
 /// Graphics pipeline parameters.
