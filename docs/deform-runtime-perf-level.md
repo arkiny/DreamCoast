@@ -24,8 +24,14 @@
   보존), `load_or_cook_vcache(max_frames)` 키에 fold, `quality::deform_max_frames`(env `DEFORM_MAX_FRAMES`,
   기본 0=무예산). `DEFORM_MAX_FRAMES=100`: knight 300→100f@8fps, 쿡 223MB→**76MB**, DX≡VK 0.130/ch.
   **윈도우 스트리밍(offset table + 프레임 창)은 후속** — 이 데시메이션이 결정적·항상-정확한 coarse 예산.
-- **Phase E ⏳ 보류** — VK 1080p 60fps perf 회복은 실기(RTX 2070S) measure.py 반복 필요(헤드리스 검증
-  불가) → 사용자와 별도 세션. 아래 계획 유효.
+- **Phase E ✅** `79282e9` — VK 1080p 60fps perf 회복. RTX2070S 헤드리스 `PROFILE_GPU` 재측정(메모리
+  프로파일 stale — top이 gdf_reflect 아닌 **gdf_ao**, sdf_cache_light은 Med에 부재). Med 3-knob 리튠
+  (사용자 승인): `ao_res_div 1→2`(gdf_ao 6.7–8.1→1.7–2.1ms, 반해상+guided upsample), `ssao off`(중복
+  2차 AO 제거 ~2.6–2.8ms), `gi_volume_period 1→4`(QualityPreset 신규 필드, view-independent DDGI 암토화).
+  reflect는 div2 유지(선명). **결과: DX 24→~15.8ms(~63fps), VK 25.1→~16.5ms(~60fps)**, DX≡VK 0.093/ch.
+  gallery PT 앵커 불변(gallery_preset resolve). med legacy-lock 테스트 → 리튠 baseline lock으로 전환.
+  reflect_res_div=4는 parity 0.463(더 큼)이라 미채택. **후속:** VK가 60fps 경계(worst ~59fps) — 여유
+  위해 gi_volume 추가 amortize / VK async overlap 여지. 실기 인터랙티브 vsync 확인 권장.
 
 
 ## 배경 (직전 세션, main 5c4f8c7)
