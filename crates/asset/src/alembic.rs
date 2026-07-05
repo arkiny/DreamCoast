@@ -165,22 +165,10 @@ impl Ogawa {
 // Alembic `AbcCoreOgawa/ReadUtil.cpp` (ReadPropertyHeaders / ReadObjectHeaders).
 // ============================================================================
 
-/// One mesh of a [`VertexCache`]: a constant triangle-index list plus a position array
-/// per frame (all frames share topology). Positions are in the engine's metres/Y-up.
-pub struct VcMesh {
-    pub name: String,
-    pub indices: Vec<u32>,
-    /// `frames[f]` = per-vertex positions for frame `f` (all the same length).
-    pub frames: Vec<Vec<[f32; 3]>>,
-}
-
-/// A baked vertex-animation cache decoded from an Alembic `.abc`: a set of meshes each
-/// carrying every frame's deformed positions. Playback = pick `frames[frame]`.
-pub struct VertexCache {
-    pub meshes: Vec<VcMesh>,
-    pub num_frames: usize,
-    pub fps: f32,
-}
+// The vertex-cache types are neutral (shared with the USD importer + the cook), so they
+// live in [`crate::vcache`]; re-exported here for the established `alembic::{VcMesh,
+// VertexCache}` import paths.
+pub use crate::vcache::{VcMesh, VertexCache};
 
 /// Source-unit → engine-metre scale. Alembic here is authored in centimetres (Maya).
 const ABC_TO_M: f32 = 0.01;

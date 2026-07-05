@@ -28,12 +28,14 @@ mod cluster;
 mod gltf;
 mod level;
 mod mesh;
+mod vcache;
 mod volume;
 
 pub use cluster::{read_clusters, read_clusters_opt, write_clusters};
 pub use gltf::{read_scene, write_scene};
 pub use level::{read_level, write_level};
 pub use mesh::{read, write, write_with_clusters};
+pub use vcache::{read_vcache, write_vcache};
 pub use volume::{read_albedo, read_sdf, write_albedo, write_sdf};
 
 use dreamcoast_core::EngineError;
@@ -49,7 +51,8 @@ pub const MAGIC: [u8; 8] = *b"DCASSET\0";
 /// v5: cluster records carry LOD-DAG fields (lod_level/group/self+parent error+sphere; M1d).
 /// v6: materials carry glTF `doubleSided` (drives vgeo's per-material backface cull).
 /// v7: Morton spatial clusterizer (tight per-cluster bounds/cones) — changes every cluster page.
-pub const VERSION: u32 = 7;
+/// v8: baked vertex-animation cache (`CHUNK_VCACHE`, Track B) — cooked `.abc` / `.usda` caches.
+pub const VERSION: u32 = 8;
 
 // Chunk type tags (directory `type` field). Stable across versions; new payloads
 // get new tags. Unknown tags are skipped by the readers (forward compatibility).
@@ -68,6 +71,9 @@ pub(crate) const CHUNK_GLTF_SCENE: u32 = 6;
 /// vertex pool, vertex remap, packed `u8` triangle indices, and cluster records (self-contained;
 /// see [`cluster`], Phase 14 M1a).
 pub(crate) const CHUNK_CLUSTERS: u32 = 7;
+/// Baked vertex-animation cache chunk: a [`crate::vcache::VertexCache`] — per-mesh constant
+/// topology + every frame's deformed positions (from an `.abc` / `.usda`; see [`vcache`]).
+pub(crate) const CHUNK_VCACHE: u32 = 8;
 
 /// Header byte size: magic(8) + version(4) + flags(4) + source_hash(8) +
 /// cook_params_hash(8) + chunk_count(4).

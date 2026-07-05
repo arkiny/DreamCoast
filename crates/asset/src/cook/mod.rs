@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 
 use dreamcoast_core::EngineError;
 
+use crate::vcache::VertexCache;
 use crate::{GltfScene, MeshData, dcasset, load_gltf, load_gltf_scene};
 
 /// Which path [`load_cooked`] took, for the caller to log (startup speedup is
@@ -206,6 +207,95 @@ pub fn load_or_cook_gltf_scene(
         }
     }
     Ok((scene, LoadOutcome::Cooked))
+}
+
+/// Load a baked **vertex-animation cache** (`.abc` Alembic or `.usda` USD) as a cooked
+/// `.dcasset`, cooking + caching on a miss. This is the separate-asset cook for the knight
+/// deformation caches: the level references the *source* path, the first load cooks the
+/// decoded [`VertexCache`] to `cache/dcasset/`, and every later load is a `CacheHit` that
+/// skips the multi-hundred-MB text/Ogawa decode entirely (the architecture requirement:
+/// assets cook as their own file; the level *loads* the cooked asset).
+///
+/// The invalidation key is the source file's **cheap metadata** (length + mtime + path),
+/// not a content hash — hashing a 665 MB / 1.4 GB source on every launch would defeat the
+/// point of the cache (fast reload). A changed source (different size or mtime) re-cooks.
+pub fn load_or_cook_vcache(
+    source: &Path,
+    cache_key: &str,
+    cache_dir: &Path,
+) -> Result<(VertexCache, LoadOutcome), EngineError> {
+    let cache_file = cache_path(cache_dir, cache_key);
+
+    // Shipped path: source absent → trust a cached `.dcasset` if present.
+    let Some(key) = source_meta_key(source) else {
+        if let Ok(bytes) = std::fs::read(&cache_file)
+            && let Ok((_, cache)) = dcasset::read_vcache(&bytes)
+        {
+            return Ok((cache, LoadOutcome::CacheHitNoSource));
+        }
+        return Err(EngineError::Asset(format!(
+            "no source cache and no cooked .dcasset for {}",
+            source.display()
+        )));
+    };
+
+    // Hit: a cached header whose metadata key matches the live source → decode it directly.
+    if let Ok(bytes) = std::fs::read(&cache_file)
+        && let Ok(header) = dcasset::read_header(&bytes)
+        && header.version == dcasset::VERSION
+        && header.source_hash == key
+        && header.cook_params_hash == dcasset::cook_params_hash()
+        && let Ok((_, cache)) = dcasset::read_vcache(&bytes)
+    {
+        return Ok((cache, LoadOutcome::CacheHit));
+    }
+
+    // Miss: decode the source by extension, cook the `.dcasset`, write it (non-fatal on fail).
+    let cache = decode_vcache_source(source)?;
+    let cooked = dcasset::write_vcache(&cache, key);
+    if let Err(e) = write_atomic(&cache_file, &cooked) {
+        tracing_warn(&format!(
+            "failed to write cooked vcache {}: {e}",
+            cache_file.display()
+        ));
+    }
+    Ok((cache, LoadOutcome::Cooked))
+}
+
+/// Decode a vertex-cache source by extension: `.abc` → the Alembic reader, `.usd`/`.usda`
+/// → the ASCII USD reader. Both yield the same neutral [`VertexCache`].
+fn decode_vcache_source(source: &Path) -> Result<VertexCache, EngineError> {
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "abc" => crate::alembic::read_vertex_cache(source),
+        "usd" | "usda" | "usdc" => crate::usd::read_vertex_cache(source),
+        other => Err(EngineError::Asset(format!(
+            "unsupported vertex-cache source extension '.{other}' ({})",
+            source.display()
+        ))),
+    }
+}
+
+/// A cheap, cwd-independent identity key for a large source file: length + mtime + the
+/// logical path, folded into the invalidation hash. `None` when the source is absent
+/// (shipped-asset path). Deliberately avoids reading the file's bytes.
+fn source_meta_key(source: &Path) -> Option<u64> {
+    let md = std::fs::metadata(source).ok()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut h = dcasset::hash_begin();
+    h = dcasset::hash_update(h, &md.len().to_le_bytes());
+    h = dcasset::hash_update(h, &mtime.to_le_bytes());
+    h = dcasset::hash_update(h, source.to_string_lossy().as_bytes());
+    Some(h)
 }
 
 /// Whether a scene has no skin / morph / animation side data — only static scenes are
