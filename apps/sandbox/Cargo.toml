@@ -23,6 +23,12 @@ image.workspace = true
 serde.workspace = true
 ron.workspace = true
 
+[features]
+# FBX import (Phase 13 Stage E) — forwards to the asset crate's ufbx-backed importer.
+# Off by default (no C compiler needed); build with `--features fbx` to overlay the
+# knight FBX in the Intel Sponza character-verification scene (`SPONZA_CHARS=1`).
+fbx = ["dreamcoast-asset/fbx"]
+
 # Debug-only: in-app RenderDoc frame-capture trigger (RDOC_CAPTURE=1, run under
 # `renderdoccmd capture`). Loads the injected RenderDoc module at runtime; a no-op
 # (RenderDoc::new() → Err → None) when not running under RenderDoc.

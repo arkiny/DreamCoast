@@ -6,9 +6,14 @@ use std::path::Path;
 
 use dreamcoast_core::EngineError;
 
+/// Native Alembic (`.abc`) reader — Ogawa container layer (from-scratch, no deps).
+pub mod alembic;
 pub mod bc;
 pub mod cook;
 pub mod dcasset;
+/// FBX import via ufbx (Phase 13 Stage E), gated behind the `fbx` feature.
+#[cfg(feature = "fbx")]
+pub mod fbx;
 pub mod gltf_scene;
 pub mod level;
 pub mod level_graph;
@@ -18,6 +23,8 @@ pub mod sdf_atlas;
 pub mod simplify;
 pub mod vgeo;
 
+#[cfg(feature = "fbx")]
+pub use fbx::load_fbx_scene;
 pub use gltf_scene::{
     AlphaMode, ChannelData, GltfAnimation, GltfChannel, GltfMaterial, GltfNode, GltfPrimitive,
     GltfScene, GltfSkin, Interpolation, MaterialKind, MorphTarget, classify_material,

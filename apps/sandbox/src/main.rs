@@ -32,6 +32,7 @@ use tracing::info;
 mod app;
 mod atmosphere;
 mod camera;
+mod character;
 mod clipmap;
 mod cluster;
 mod compose;
@@ -618,6 +619,9 @@ struct App {
     /// CPU-skinned primitives (animation Stage B). Empty unless an imported glTF scene
     /// has skins; each is re-skinned + uploaded per frame (inline path only).
     skinned: Vec<skin::SkinnedMesh>,
+    /// Alembic vertex-cache player (the knight `.abc` animation), if overlaid. Its per-frame
+    /// vertex-buffer rewrite runs alongside the skin-cache update each frame.
+    vcache: Option<character::VertexCachePlayer>,
     /// Morph-target primitives (animation Stage C). Empty unless an imported glTF scene
     /// has morph targets; GPU primitives write a per-frame weights buffer (the VS blends),
     /// CPU ones re-blend + upload a vertex ring each frame (inline path only).
@@ -1303,6 +1307,7 @@ impl App {
         // scene's native scale. `None` keeps the legacy gallery framing.
         let mut scene_bounds: Option<level::Bounds> = None;
         let mut gltf_skinned: Vec<skin::SkinnedMesh> = Vec::new();
+        let mut gltf_vcache: Option<character::VertexCachePlayer> = None;
         let mut gltf_morphed = morph::MorphSet::default();
         // A level's authored camera (applied as the initial view if non-default).
         let mut level_view: Option<(Vec3, Vec3)> = None;
@@ -1349,6 +1354,76 @@ impl App {
                 Vec3::ZERO,
                 content_compress,
             )?;
+            // Phase 13 Stage E: opt-in skinned/static character overlay (default off →
+            // the level renders byte-unchanged). Verifies the ufbx FBX importer + GPU skin
+            // cache against Intel Sponza. See docs/phase-13-fbx-knight.md.
+            if std::env::var("SPONZA_CHARS").is_ok() {
+                // Animated skinned VoxelCharacter (glTF): exercises the skin-cache + anim
+                // path on top of a level. The glb is authored in metres; clip 1 = "Idle".
+                let (voxel, _) = dreamcoast_asset::cook::load_or_cook_gltf_scene(
+                    std::path::Path::new("assets/VoxelCharacter/glb/f_1.glb"),
+                    "assets/VoxelCharacter/glb/f_1.glb",
+                    &app::cooked_cache_dir(),
+                    content_compress,
+                )?;
+                let anim = std::env::var("CHAR_ANIM")
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(1);
+                character::overlay(
+                    &device,
+                    &mut world,
+                    &mut mesh_registry,
+                    &mut material_registry,
+                    &mut textures,
+                    &voxel,
+                    &character::voxel_placement(),
+                    Some(anim),
+                    "voxel",
+                    &mut gltf_skinned,
+                )?;
+                // Static knight (FBX geometry): proves the ufbx importer end-to-end. Its FBX
+                // carries no skin weights, so it renders its bind pose (no animation).
+                #[cfg(feature = "fbx")]
+                {
+                    let knight = dreamcoast_asset::load_fbx_scene(
+                        "assets/Knight/Knight_USD_002.fbx",
+                        None::<&std::path::Path>,
+                    )?;
+                    character::overlay(
+                        &device,
+                        &mut world,
+                        &mut mesh_registry,
+                        &mut material_registry,
+                        &mut textures,
+                        &knight,
+                        &character::knight_placement(),
+                        None,
+                        "knight",
+                        &mut gltf_skinned,
+                    )?;
+                }
+                #[cfg(not(feature = "fbx"))]
+                info!(
+                    "SPONZA_CHARS: knight needs `--features fbx`; overlaying VoxelCharacter only"
+                );
+            }
+            // Alembic vertex-cache playback (A4): the knight's *actual* baked animation
+            // (its FBX has no skin weights). Opt-in `KNIGHT_ABC=1`; default off = no-reg.
+            // See docs/alembic-usd-import.md.
+            if std::env::var("KNIGHT_ABC").is_ok() {
+                let cache = dreamcoast_asset::alembic::read_vertex_cache(
+                    "assets/Knight/knight_ANIM_001.rnd.abc",
+                )?;
+                gltf_vcache = Some(character::overlay_vcache(
+                    &device,
+                    &mut world,
+                    &mut mesh_registry,
+                    &mut material_registry,
+                    cache,
+                    &character::knight_abc_placement(),
+                )?);
+            }
         } else if let Some(path) = &scene_gltf_path {
             // Stage B: import the whole node hierarchy + every primitive/material/image,
             // through the cooked, block-compressed `.dcasset` (a hit skips glTF parse +
@@ -2867,6 +2942,7 @@ impl App {
             mesh_registry,
             material_registry,
             skinned: gltf_skinned,
+            vcache: gltf_vcache,
             morphed: gltf_morphed,
             level_paths,
             current_level,
@@ -3696,6 +3772,14 @@ impl App {
         if !self.skinned.is_empty() && self.rhi_thread.is_none() {
             skin::update_palettes(&mut self.skinned, &self.world, fif)?;
             skin::patch_scene(&self.skinned, &mut scene, &mut prev_scene, fif);
+        }
+        // Alembic vertex-cache playback (A4): rewrite each part's vertex buffer to this
+        // frame. Like skinning it relies on this slot's frame-start fence wait, so it's
+        // inline-path only (not P15_RHI_THREAD). Independent of `skinned`.
+        if self.rhi_thread.is_none()
+            && let Some(vc) = self.vcache.as_mut()
+        {
+            vc.update(FIXED_DT)?;
         }
         // Animation Stage C: blend morph targets (GPU = write the per-frame weights
         // buffer; CPU = re-blend the vertex ring) + patch this frame's drawables. Inline
