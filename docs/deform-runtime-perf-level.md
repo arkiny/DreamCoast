@@ -7,6 +7,27 @@
 
 브랜치: `feat/deform-runtime-perf` (main `5c4f8c7`에서 분기). 각 Phase = 독립 검증 커밋.
 
+## 구현 상태 (2026-07-06)
+- **Phase A ✅** `9568f76` — 일반 `deform` 모듈(`character.rs`→`deform.rs`, `DeformPlayer`) + per-FIF
+  VB 링 더블버퍼(morph CPU 경로 선례). `MeshRegistry::upload_geometry_aabb`(deform 파트 always-visible
+  AABB, 대모션 컬링 정확). DX≡VK 0.142/ch.
+- **Phase B ✅** `2eb3db4`(RHI) + `bde854c`(sandbox) — 베이크드-정점 모션벡터(`vsMainDeform` + per-fif
+  prev-position bindless storage 링, `P_VELOCITY=1`일 때만 할당). **발견+수정한 선재 버그:** velocity
+  패스가 `DepthCompare::Less`를 써서 VK/D3D12(strict LESS, Metal은 LessEqual 매핑)에서 동일-깊이 표면을
+  전부 reject → Windows에서 모션벡터 패스가 **아무것도 렌더 안 함**(Metal에서만 동작). 백엔드 균일한
+  `DepthCompare::LessEqual` 추가. 변형 knight 모션 확인(전엔 0), lit+TAAU DX≡VK 0.158/ch 0.03%>8.
+- **Phase C ✅** `5a44856` — vcache를 `.level` 1급 `deforms` 엔티티로 승격. `LevelData.deforms`
+  (`#[serde(default)]`), `CHUNK_LEVEL` codec v8→**v9**(deforms 추가, v8 prefix 호환 = EOF→0),
+  `build_level`가 쿡+spawn, `deform::spawn`이 full `LocalTransform` 수용. `KNIGHT_USD/ABC` env 해킹
+  제거, 신규 `sponza_knight.level`. DX≡VK 0.070/ch. 핫스왑(`load_level`) 플레이어 재생성.
+- **Phase D ✅** `ed4f163` — 프레임 데시메이션 메모리 예산. `VertexCache::decimate`(균등 서브샘플, duration
+  보존), `load_or_cook_vcache(max_frames)` 키에 fold, `quality::deform_max_frames`(env `DEFORM_MAX_FRAMES`,
+  기본 0=무예산). `DEFORM_MAX_FRAMES=100`: knight 300→100f@8fps, 쿡 223MB→**76MB**, DX≡VK 0.130/ch.
+  **윈도우 스트리밍(offset table + 프레임 창)은 후속** — 이 데시메이션이 결정적·항상-정확한 coarse 예산.
+- **Phase E ⏳ 보류** — VK 1080p 60fps perf 회복은 실기(RTX 2070S) measure.py 반복 필요(헤드리스 검증
+  불가) → 사용자와 별도 세션. 아래 계획 유효.
+
+
 ## 배경 (직전 세션, main 5c4f8c7)
 - 네이티브 애니메이션 임포트 트랙 종료: FBX(ufbx) + Alembic(.abc) + 네이티브 ASCII USD(.usda) 포인트
   캐시. 두 소스 → 중립 `crate::vcache::VertexCache` → 하나의 쿡 `cook::load_or_cook_vcache`
