@@ -66,6 +66,10 @@ pub(crate) struct DeviceShared {
     pub bindless_sampler: vk::Sampler,
     pub bindless_sampler_wrap: vk::Sampler,
     bindless_next: AtomicU32,
+    // Free-list of bindless sampled-image (SRV, binding 0) slots returned by dropped render targets
+    // / depth buffers, mirroring the storage reclaim. Static textures never free (app-lifetime), so
+    // this only recycles the transient targets recreated on resize.
+    bindless_free: Mutex<Vec<u32>>,
     cube_next: AtomicU32,
     // Storage-IMAGE (binding 3) high-water mark + free-list of slots returned by dropped render
     // targets, mirroring the storage-buffer reclaim below. Without it, recreating storage render
@@ -394,6 +398,7 @@ impl DeviceShared {
                 bindless_sampler,
                 bindless_sampler_wrap,
                 bindless_next: AtomicU32::new(0),
+                bindless_free: Mutex::new(Vec::new()),
                 cube_next: AtomicU32::new(0),
                 storage_image_next: AtomicU32::new(0),
                 storage_image_free: Mutex::new(Vec::new()),
@@ -511,7 +516,17 @@ impl DeviceShared {
 
     /// Register a sampled image view in the bindless table, returning its index.
     pub(crate) fn register_sampled_image(&self, view: vk::ImageView) -> u32 {
-        let index = self.bindless_next.fetch_add(1, Ordering::Relaxed);
+        // Reuse a freed slot before bumping the high-water mark (see the field docs).
+        let index = self
+            .bindless_free
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| self.bindless_next.fetch_add(1, Ordering::Relaxed));
+        assert!(
+            index < BINDLESS_COUNT,
+            "bindless SRV table overflow (> {BINDLESS_COUNT})"
+        );
         let image_info = vk::DescriptorImageInfo::default()
             .image_view(view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -613,6 +628,12 @@ impl DeviceShared {
     /// Return a storage-image slot to the free-list (called from `VulkanRenderTarget::drop`).
     pub(crate) fn free_storage_image(&self, index: u32) {
         self.storage_image_free.lock().unwrap().push(index);
+    }
+
+    /// Return a sampled-image (SRV) slot to the free-list (called from `VulkanRenderTarget` /
+    /// `VulkanDepthBuffer` drop). Static textures never free — app-lifetime.
+    pub(crate) fn free_texture(&self, index: u32) {
+        self.bindless_free.lock().unwrap().push(index);
     }
 
     /// Register a sampled 3D volume view in the bindless table (binding 6),
