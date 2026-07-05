@@ -274,6 +274,7 @@ pub(crate) fn build_scene(
                 casts_shadow: d.casts_shadow,
                 skin: None,
                 morph: None,
+                deform: None,
             }
         })
         .collect()

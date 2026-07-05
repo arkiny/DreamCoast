@@ -230,6 +230,11 @@ pub(crate) struct SceneObject {
     /// which instead swaps the vertex buffer). Set by the per-frame morph patch; the
     /// G-buffer/shadow passes draw these with the morph pipeline + the bind-pose buffer.
     pub(crate) morph: Option<[u32; 4]>,
+    /// Baked vertex-cache **deform** velocity hook: the PREVIOUS-frame position storage-buffer
+    /// bindless index when this drawable is a deform part (`None` = not a deform, or velocity off).
+    /// The G-buffer just draws the current ring VB (`mesh`); only the velocity pass consumes this,
+    /// reading the prev positions to compute per-vertex motion. Set by the deform patch each frame.
+    pub(crate) deform: Option<u32>,
 }
 
 /// A level's lighting (sun + point lights), applied in the `Globals` assembly in

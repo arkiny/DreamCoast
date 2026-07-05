@@ -51,6 +51,10 @@ struct PushConstants
     // `morph_prev.x`. `vsMainMorphed` reads them.
     uint4 morph;          // x deltas, y weights(curr), z target_count, w vertex_count
     uint4 morph_prev;     // x weights(prev), yzw unused
+    // Baked vertex-cache (deform): the PREVIOUS-frame position storage buffer. The current
+    // positions come from the bound frame vertex buffer (`input.pos`), so no current index is
+    // needed. `vsMainDeform` reads `deform_prev.x`.
+    uint4 deform_prev;    // x prev-frame positions (tight float3/vertex), yzw unused
 };
 
 [[vk::push_constant]]
@@ -152,6 +156,23 @@ VSOutput vsMainMorphed(VSInput input, uint vid : SV_VertexID)
 
     VSOutput o;
     o.cur_clip = mul(pc.mvp, float4(cur_pos, 1.0));
+    o.prev_clip = mul(pc.prev_mvp, float4(prev_pos, 1.0));
+    o.clip = o.cur_clip;
+    return o;
+}
+
+// Baked vertex-cache (deform) velocity: current position from the bound frame vertex buffer
+// (`input.pos`, this frame's ring VB), previous position from the prev-frame position storage
+// (`deform_prev.x`, tightly-packed float3/vertex) by `SV_VertexID` — so the motion follows the
+// baked surface deformation, not just the static placement node / camera.
+[shader("vertex")]
+VSOutput vsMainDeform(VSInput input, uint vid : SV_VertexID)
+{
+    RWByteAddressBuffer prev = g.storage_buffers[pc.deform_prev.x];
+    float3 prev_pos = prev.Load<float3>(vid * 12);
+
+    VSOutput o;
+    o.cur_clip = mul(pc.mvp, float4(input.pos, 1.0));
     o.prev_clip = mul(pc.prev_mvp, float4(prev_pos, 1.0));
     o.clip = o.cur_clip;
     return o;

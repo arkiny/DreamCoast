@@ -18,7 +18,7 @@ use std::rc::Rc;
 use dreamcoast_asset::{MaterialKind, MeshVertex, VcMesh, VertexCache};
 use dreamcoast_core::glam::{Quat, Vec3};
 use dreamcoast_scene::{LocalTransform, MeshInstance, Name, Parent, World};
-use rhi::Device;
+use rhi::{Device, StorageBuffer, StorageBufferDesc};
 use tracing::{info, warn};
 
 use crate::FRAMES_IN_FLIGHT;
@@ -26,6 +26,22 @@ use crate::mesh::{upload_geometry, vertex_slice_bytes};
 use crate::registry::{
     GpuMesh, MaterialDesc, MaterialRegistry, MeshRegistry, representative_albedo,
 };
+
+/// View a `[f32; 3]` position slice as raw bytes (tightly packed, 12 B/vertex) — the layout the
+/// velocity deform shader reads via `Load<float3>(vid * 12)`.
+fn position_bytes(pos: &[[f32; 3]]) -> &[u8] {
+    // SAFETY: `[f32; 3]` is `#[repr(Rust)]` but is a plain 12-byte POD with no padding; a `&[[f32;3]]`
+    // → `&[u8]` reinterpret of `size_of_val` bytes is sound and matches the shader's 12 B stride.
+    unsafe { std::slice::from_raw_parts(pos.as_ptr() as *const u8, std::mem::size_of_val(pos)) }
+}
+
+fn storage_desc(size: usize) -> StorageBufferDesc {
+    StorageBufferDesc {
+        size: size as u64,
+        stride: 12, // one tight float3 position per vertex
+        indirect: false,
+    }
+}
 
 /// Where + how big a deforming character/prop stands in the level (world metres; `scale` also
 /// converts a source authored in cm to metres). Shared by the glTF/FBX overlay
@@ -127,6 +143,15 @@ struct DeformPart {
     ring: Vec<Rc<GpuMesh>>,
     /// Index of this part in [`VertexCache::meshes`] (the source of per-frame positions).
     vc_index: usize,
+    /// Per-fif prev-position storage ring for the velocity pass (motion vectors): `pos_ring[fif]`
+    /// holds this frame's positions (tight float3/vertex), `pos_idx` their bindless indices. Empty
+    /// when velocity is off (default) — no allocation on the default path.
+    pos_ring: Vec<StorageBuffer>,
+    pos_idx: Vec<u32>,
+    /// The position-storage bindless index written LAST frame (the previous surface), recorded in
+    /// [`DeformPlayer::update`] before this frame overwrites `pos_ring[fif]`. The velocity pass reads
+    /// it to reconstruct each vertex's previous position (single prev-pose source for deform draws).
+    prev_pos_idx: u32,
 }
 
 /// Plays a decoded [`VertexCache`]: holds the cache + each part's per-fif buffer ring, and
@@ -136,6 +161,9 @@ pub(crate) struct DeformPlayer {
     /// One entry per `cache.meshes` part; `None` for an empty/degenerate part.
     parts: Vec<Option<DeformPart>>,
     time: f32,
+    /// Whether to maintain the per-frame prev-position storage for the velocity pass
+    /// (`P_VELOCITY=1`). Off by default → the storage ring is never allocated or written.
+    want_velocity: bool,
 }
 
 impl DeformPlayer {
@@ -148,20 +176,36 @@ impl DeformPlayer {
         }
         self.time += dt;
         let frame = ((self.time * self.cache.fps) as usize) % self.cache.num_frames;
-        for part in self.parts.iter().flatten() {
-            let m = &self.cache.meshes[part.vc_index];
+        let prev_fif = (fif + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
+        // Disjoint field borrows so the loop can read `cache` while mutating `parts`.
+        let Self {
+            cache,
+            parts,
+            want_velocity,
+            ..
+        } = self;
+        for part in parts.iter_mut().flatten() {
+            let m = &cache.meshes[part.vc_index];
             if m.frames.is_empty() {
                 continue;
             }
+            let f = frame.min(m.frames.len() - 1);
             let verts = frame_vertices(m, frame);
             part.ring[fif].vbuf.write(vertex_slice_bytes(&verts))?;
+            if *want_velocity {
+                // The OTHER ring slot still holds last frame's positions (this frame overwrites
+                // `fif`); record its index as the previous surface before uploading this frame's.
+                part.prev_pos_idx = part.pos_idx[prev_fif];
+                part.pos_ring[fif].write(position_bytes(&m.frames[f]))?;
+            }
         }
         Ok(())
     }
 
     /// Swap each animated drawable to this frame's ring buffer (matched by `Rc` identity to the
-    /// part's `base_mesh`). Run on the freshly built scene list each frame, after [`Self::update`].
-    /// Mirrors [`crate::morph::patch_scene`]'s CPU path.
+    /// part's `base_mesh`) and, when velocity is on, hook its prev-frame position storage index
+    /// so the velocity pass can compute per-vertex deform motion. Run on the freshly built scene
+    /// list each frame, after [`Self::update`]. Mirrors [`crate::morph::patch_scene`]'s CPU path.
     pub(crate) fn patch_scene(&self, scene: &mut [crate::SceneObject], fif: usize) {
         for obj in scene.iter_mut() {
             if let Some(part) = self
@@ -171,6 +215,9 @@ impl DeformPlayer {
                 .find(|p| Rc::ptr_eq(&obj.mesh, &p.base_mesh))
             {
                 obj.mesh = part.ring[fif].clone();
+                if self.want_velocity {
+                    obj.deform = Some(part.prev_pos_idx);
+                }
             }
         }
     }
@@ -205,6 +252,11 @@ pub(crate) fn spawn(
 
     let material = materials.add(material);
 
+    // Per-frame prev-position storage (for motion vectors) is only maintained when the velocity
+    // pass is on (`P_VELOCITY=1`, the same env `velocity_on` reads) — otherwise the default path
+    // allocates no storage buffers / bindless slots.
+    let want_velocity = crate::quality::env_bool("P_VELOCITY", false);
+
     let mut parts = Vec::with_capacity(cache.meshes.len());
     let mut n_parts = 0usize;
     for (vc_index, m) in cache.meshes.iter().enumerate() {
@@ -232,10 +284,26 @@ pub(crate) fn spawn(
                 local_aabb: ALWAYS_VISIBLE,
             }));
         }
+        // Prev-position storage ring (velocity only): seed every slot with frame-0 positions so the
+        // first frame reports zero motion (prev == curr), not garbage.
+        let (mut pos_ring, mut pos_idx) = (Vec::new(), Vec::new());
+        if want_velocity {
+            let pos0 = position_bytes(&m.frames[0]);
+            for _ in 0..FRAMES_IN_FLIGHT {
+                let sb = device.create_storage_buffer_host(&storage_desc(pos0.len()))?;
+                sb.write(pos0)?;
+                pos_idx.push(sb.storage_index());
+                pos_ring.push(sb);
+            }
+        }
+        let prev_pos_idx = pos_idx.first().copied().unwrap_or(0);
         parts.push(Some(DeformPart {
             base_mesh,
             ring,
             vc_index,
+            pos_ring,
+            pos_idx,
+            prev_pos_idx,
         }));
 
         let e = world.spawn();
@@ -255,7 +323,12 @@ pub(crate) fn spawn(
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0.0);
-    Ok(DeformPlayer { cache, parts, time })
+    Ok(DeformPlayer {
+        cache,
+        parts,
+        time,
+        want_velocity,
+    })
 }
 
 /// Default placement for the knight deform cache in Intel Sponza (metres, feet at y=0). Tunable
