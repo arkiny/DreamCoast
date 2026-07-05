@@ -7232,7 +7232,7 @@ impl App {
             let (deferred, occluded) = v.read_occ_stats();
             if (deferred | occluded) != 0
                 && (self.frame_no.is_multiple_of(60)
-                    || (self.screenshot_mode && self.frame_no + 1 >= warmup + 1))
+                    || (self.screenshot_mode && self.frame_no >= warmup))
             {
                 println!(
                     "[vgeo-hzb] phase-2 cumulative over {} frames: {deferred} deferred (HZB-tested), {occluded} occlusion-culled",
