@@ -619,6 +619,9 @@ struct App {
     /// CPU-skinned primitives (animation Stage B). Empty unless an imported glTF scene
     /// has skins; each is re-skinned + uploaded per frame (inline path only).
     skinned: Vec<skin::SkinnedMesh>,
+    /// Alembic vertex-cache player (the knight `.abc` animation), if overlaid. Its per-frame
+    /// vertex-buffer rewrite runs alongside the skin-cache update each frame.
+    vcache: Option<character::VertexCachePlayer>,
     /// Morph-target primitives (animation Stage C). Empty unless an imported glTF scene
     /// has morph targets; GPU primitives write a per-frame weights buffer (the VS blends),
     /// CPU ones re-blend + upload a vertex ring each frame (inline path only).
@@ -1304,6 +1307,7 @@ impl App {
         // scene's native scale. `None` keeps the legacy gallery framing.
         let mut scene_bounds: Option<level::Bounds> = None;
         let mut gltf_skinned: Vec<skin::SkinnedMesh> = Vec::new();
+        let mut gltf_vcache: Option<character::VertexCachePlayer> = None;
         let mut gltf_morphed = morph::MorphSet::default();
         // A level's authored camera (applied as the initial view if non-default).
         let mut level_view: Option<(Vec3, Vec3)> = None;
@@ -1403,6 +1407,22 @@ impl App {
                 info!(
                     "SPONZA_CHARS: knight needs `--features fbx`; overlaying VoxelCharacter only"
                 );
+            }
+            // Alembic vertex-cache playback (A4): the knight's *actual* baked animation
+            // (its FBX has no skin weights). Opt-in `KNIGHT_ABC=1`; default off = no-reg.
+            // See docs/alembic-usd-import.md.
+            if std::env::var("KNIGHT_ABC").is_ok() {
+                let cache = dreamcoast_asset::alembic::read_vertex_cache(
+                    "assets/Knight/knight_ANIM_001.rnd.abc",
+                )?;
+                gltf_vcache = Some(character::overlay_vcache(
+                    &device,
+                    &mut world,
+                    &mut mesh_registry,
+                    &mut material_registry,
+                    cache,
+                    &character::knight_abc_placement(),
+                )?);
             }
         } else if let Some(path) = &scene_gltf_path {
             // Stage B: import the whole node hierarchy + every primitive/material/image,
@@ -2922,6 +2942,7 @@ impl App {
             mesh_registry,
             material_registry,
             skinned: gltf_skinned,
+            vcache: gltf_vcache,
             morphed: gltf_morphed,
             level_paths,
             current_level,
@@ -3751,6 +3772,14 @@ impl App {
         if !self.skinned.is_empty() && self.rhi_thread.is_none() {
             skin::update_palettes(&mut self.skinned, &self.world, fif)?;
             skin::patch_scene(&self.skinned, &mut scene, &mut prev_scene, fif);
+        }
+        // Alembic vertex-cache playback (A4): rewrite each part's vertex buffer to this
+        // frame. Like skinning it relies on this slot's frame-start fence wait, so it's
+        // inline-path only (not P15_RHI_THREAD). Independent of `skinned`.
+        if self.rhi_thread.is_none()
+            && let Some(vc) = self.vcache.as_mut()
+        {
+            vc.update(FIXED_DT)?;
         }
         // Animation Stage C: blend morph targets (GPU = write the per-frame weights
         // buffer; CPU = re-blend the vertex ring) + patch this frame's drawables. Inline
