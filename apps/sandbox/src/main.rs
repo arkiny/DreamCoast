@@ -1408,13 +1408,31 @@ impl App {
                     "SPONZA_CHARS: knight needs `--features fbx`; overlaying VoxelCharacter only"
                 );
             }
-            // Alembic vertex-cache playback (A4): the knight's *actual* baked animation
-            // (its FBX has no skin weights). Opt-in `KNIGHT_ABC=1`; default off = no-reg.
-            // See docs/alembic-usd-import.md.
-            if std::env::var("KNIGHT_ABC").is_ok() {
-                let cache = dreamcoast_asset::alembic::read_vertex_cache(
-                    "assets/Knight/knight_ANIM_001.rnd.abc",
+            // Baked vertex-cache playback (Track B): the knight's *actual* deformation
+            // animation (its FBX has no skin weights). The cache is cooked as a SEPARATE
+            // asset — `.usda` (native USD point cache) or `.abc` (Alembic) → CHUNK_VCACHE —
+            // and the level *loads the cooked asset* (CacheHit on reload, no live
+            // 665 MB/1.4 GB decode). Opt-in `KNIGHT_USD=1` or `KNIGHT_ABC=1`; default off.
+            // See docs/alembic-usd-import.md (Track B).
+            let vcache_source = if std::env::var("KNIGHT_USD").is_ok() {
+                Some("assets/Knight/knight.usda")
+            } else if std::env::var("KNIGHT_ABC").is_ok() {
+                Some("assets/Knight/knight_ANIM_001.rnd.abc")
+            } else {
+                None
+            };
+            if let Some(src) = vcache_source {
+                let (cache, outcome) = dreamcoast_asset::cook::load_or_cook_vcache(
+                    std::path::Path::new(src),
+                    src,
+                    &app::cooked_cache_dir(),
                 )?;
+                info!(
+                    "vcache knight '{src}' ({outcome:?}): {} meshes, {} frames @ {} fps",
+                    cache.meshes.len(),
+                    cache.num_frames,
+                    cache.fps
+                );
                 gltf_vcache = Some(character::overlay_vcache(
                     &device,
                     &mut world,

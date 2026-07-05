@@ -38,26 +38,37 @@ Intel New Sponza **knight**의 애니메이션은 FBX에 없다(스킨 웨이트
 - **A5 — 검증**: knight abc가 Intel Sponza에서 애니메이션 재생, DX≡VK(결정적 CPU 디코드 + 정적 업로드),
   무회귀. 좌표/스케일 정합(Xform 적용 후 ~1.9m).
 
-## 트랙 B — USD 애니메이션 임포트 (다음)
+## 트랙 B — USD 애니메이션 임포트 ✅ DONE (2026-07-05)
 
-> **knight USD는 ASCII `.usda` (`#usda 1.0`)** — 바이너리 Crate 아님(확인됨). 텍스트 파싱이라
-> 훨씬 다룰 만하다. `pkg_e_knight_anim/knight_USD_PREVIEW_SURFACE_ANIM_002_1.usd` (665MB ASCII, UsdSkel).
+> **⚠ 실측 정정 (2026-07-05):** `pkg_e_knight_anim/knight_USD_PREVIEW_SURFACE_ANIM_002_1.usd`
+> (665MB, ASCII `#usda 1.0`)는 **UsdSkel(스켈레탈)이 아니라 베이크된 포인트 캐시**였다. 135개
+> `def Mesh` prim 각각이 `point3f[] points.timeSamples`(프레임별 정점 위치) +
+> `faceVertexIndices`/`faceVertexCounts`(토폴로지) + `extent`만 가진다. 전체 파일에
+> `SkelRoot`/`Skeleton`/`primvars:skel`/`SkelAnimation` = **0건**. 즉 이 USD는 Alembic과 동일한
+> 베이크 변형 캐시(리그 없음)이고, 진짜 스킨/리그는 Maya `.ma`(USD 아님)에만 있다.
+> **사용자 결정(2026-07-05): 포인트 캐시로 피벗** — USD 임포터는 기존 중립 `VertexCache`(Alembic과
+> 동일 타입)를 산출하고, USD/Alembic 두 소스를 **하나의 vertex-cache 쿡 경로**로 통합한다.
 
-- **아키텍처 결정(사용자, 2026-07-05): 애셋은 레벨에 쿡되는 게 아니라 별도 애셋으로 쿡되고, 레벨은
-  쿡된 애셋을 참조/로드한다.** 기존 glTF→`.dcasset` 쿡 패턴(`load_or_cook_gltf_scene`: 레벨이 소스
-  경로 참조 → 첫 로드 시 `cache/dcasset/`로 쿡 → 이후 CacheHit)을 **애니메이션 모델**로 일반화.
-- **B1 — ASCII USD (`.usda`) 파서** (`crates/asset/src/usd/`, from-scratch): prim/property/metadata +
-  **time samples** 서브셋. USD 문법(중괄호 prim 계층, `def`/`over`, typed attrs, `.timeSamples`).
-- **B2 — UsdSkel 서브셋 → `GltfScene`**: `Skeleton`(joints, bindTransforms, restTransforms) +
-  `SkelAnimation`(joint translations/rotations/scales time-samples) + skinning primvars
-  (`primvars:skel:jointIndices`/`jointWeights` + `geomBindTransform`) → 기존 중립 타입
-  (`GltfScene` skins+animations+per-vertex joints/weights). **기존 스킨 캐시 경로 재사용**
-  ([[fbx-importer-stage-e]] `skin::build_skinned_meshes` + `AnimationPlayer`).
-- **B3 — 별도 애셋 쿡**: `load_or_cook_usd(path,key,cache) -> 쿡된 스킨드 모델 .dcasset`(신규 청크:
-  스켈레톤/스킨/클립/메시). **레벨/오버레이는 쿡된 애셋을 로드**(USD 실시간 디코드 금지 — 맵처럼 CacheHit).
-- **B4 — 검증**: knight가 쿡된 Intel Sponza에서 **스킨 애니메이션**, DX≡VK, 쿡 애셋 CacheHit 빠른 로드.
-- **companion A3**: Alembic vertex cache도 같은 "별도 애셋 쿡 → 레벨 참조" 패턴으로 쿡(현재 A4는 매
-  시작 1.4GB 실시간 디코드). 두 애니메이션 애셋(skinned USD/FBX, vcache abc)이 동일 쿡 아키텍처 공유.
+- **아키텍처(사용자, 2026-07-05): 애셋은 별도 애셋으로 쿡되고, 레벨은 쿡된 애셋을 로드한다.** 이
+  요구는 그대로 달성됨 — `.abc`/`.usda` → `CHUNK_VCACHE` `.dcasset` → 레벨이 CacheHit 로드.
+- **B1 — ASCII USD (`.usda`) 파서** ✅ (`crates/asset/src/usd.rs`, 무의존): prim 트리
+  (`def`/`over`/`class` + `{ }` 바디) + typed attr + `.timeSamples` dict. **`points`/
+  `faceVertexIndices`/`faceVertexCounts`만 실체화**하고 나머지(extent/primvars/xformOp/메타데이터)는
+  brace-matching으로 빠르게 스킵 → point float만 파싱. 변환은 무시(이 애셋의 xformOpOrder =
+  `[translate:pivot, !invert!translate:pivot]` = net identity, 루트 `!resetXformStack!` → 이미 조립된
+  단일 metre 공간, Alembic 파트와 동일). **실측: 665MB → 2.8s 디코드, 135메시/300프레임@24fps/122k tri.**
+- **B2 — USD Mesh 포인트캐시 → 중립 `VertexCache`** ✅: `crate::vcache::{VcMesh, VertexCache}`로
+  타입을 중립화(Alembic도 재수출). UsdSkel→GltfScene 스킨 경로는 이 애셋에 스켈레톤이 없어 불가 →
+  포인트 캐시로 산출, 기존 `character::overlay_vcache` + `VertexCachePlayer` 재사용.
+- **B3 — 별도 애셋 쿡 (통합)** ✅: `dcasset::{write,read}_vcache`(`CHUNK_VCACHE`, VERSION 8) +
+  `cook::load_or_cook_vcache(path,key,cache)`. 확장자로 디코더 디스패치(`.abc`→alembic, `.usd(a)`→usd).
+  무효화 키는 **소스 파일의 len+mtime+path**(665MB/1.4GB를 매 시작 해시하지 않음 → CacheHit 빠름).
+  레벨 오버레이(`KNIGHT_USD=1`/`KNIGHT_ABC=1`)가 **쿡된 애셋을 로드**(실시간 디코드 금지).
+- **B4 — 검증** ✅: Crytek Sponza에서 USD knight 렌더(쿡 애셋), 두번째 로드 CacheHit, DX≡VK
+  diff 0.10%>8 (베이스라인 no-knight 0.01%>8 + 씬 GI의 알려진 backend 1-LSB, 지오메트리 결정적).
+  쿡 `.dcasset` = 223MB. clippy/fmt 클린, 기본 경로 무회귀.
+- **companion A3** ✅: Alembic vertex cache도 동일 `load_or_cook_vcache` 경로로 쿡(더 이상 매 시작
+  1.4GB 실시간 디코드 아님). 두 소스가 하나의 쿡 아키텍처 공유.
 
 ## 리스크
 - **스키마 리버스 정확도**: Alembic property 헤더/타입 인코딩을 정확히 디코드해야(오독=쓰레기). Python
