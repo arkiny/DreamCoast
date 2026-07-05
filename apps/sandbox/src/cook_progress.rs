@@ -43,7 +43,7 @@ impl TermProgress {
 impl ProgressSink for TermProgress {
     fn tick(&mut self, label: &str, done: usize, total: usize) {
         let done = done.min(total);
-        let pct = if total == 0 { 100 } else { done * 100 / total };
+        let pct = (done * 100).checked_div(total).unwrap_or(100);
         if self.tty {
             let filled = pct * BAR_WIDTH / 100;
             let bar: String = (0..BAR_WIDTH)

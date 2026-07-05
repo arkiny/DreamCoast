@@ -100,9 +100,12 @@ pub(crate) const SAMP_WRAP_SLOT: u32 = STORAGE_VOLUME_BASE + STORAGE_VOLUME_COUN
 pub(crate) const ARG_BUFFER_SLOTS: u32 = SAMP_WRAP_SLOT + 1;
 
 type MetalTextureHandle = Retained<ProtocolObject<dyn MTLTexture>>;
+type MetalBufferHandle = Retained<ProtocolObject<dyn MTLBuffer>>;
 type SampledTextureSlots = Vec<Option<MetalTextureHandle>>;
 type CubeTextureSlots = Vec<Option<MetalTextureHandle>>;
 type StorageImageSlots = Vec<Option<MetalTextureHandle>>;
+/// Live storage buffers by bindless slot (`None` = freed). See [`MetalDevice::storage_buffers`].
+type StorageBufferSlots = Vec<Option<MetalBufferHandle>>;
 
 #[derive(Clone)]
 pub(crate) struct RtTlasBinding {
@@ -180,7 +183,7 @@ pub(crate) struct DeviceShared {
     /// the index to `storage_buf_free`, so a long run creating + destroying buffers no longer grows
     /// this table monotonically. Reclaim is safe: the handoff contract defers a buffer's Drop until
     /// the frames referencing it retire.
-    storage_buffers: RefCell<Vec<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>>,
+    storage_buffers: RefCell<StorageBufferSlots>,
     /// Free-list of storage-buffer slots returned by dropped buffers (reused before the high-water
     /// `storage_buf_next` is bumped).
     storage_buf_free: RefCell<Vec<u32>>,
@@ -426,9 +429,7 @@ impl DeviceShared {
     }
 
     /// The live storage buffers (UAV) by slot (`None` = freed); callers `.flatten()` to skip holes.
-    pub(crate) fn storage_buffers(
-        &self,
-    ) -> std::cell::Ref<'_, Vec<Option<Retained<ProtocolObject<dyn MTLBuffer>>>>> {
+    pub(crate) fn storage_buffers(&self) -> std::cell::Ref<'_, StorageBufferSlots> {
         self.storage_buffers.borrow()
     }
 
