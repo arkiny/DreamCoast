@@ -112,6 +112,10 @@ struct CullHzbPush
 [[vk::push_constant]]
 ConstantBuffer<CullHzbPush> hc : register(b0, space0);
 
+// Shared conservative HZB occlusion test (single source of truth, also used by the Phase-14 vgeo
+// two-phase cut). Requires `bindless.slang` (included above).
+#include "hzb_test.slang"
+
 // Zero the (survived, occlusion-culled) stats counters. Runs as a 1-thread dispatch
 // ordered (via a UAV barrier) BEFORE the cull, so the per-frame count is correct even
 // with frames in flight (a host-side zero would race the in-flight GPU writes).
@@ -131,27 +135,6 @@ float3 hzb_instance_center(uint i)
     return float3((float(gx) - half) * hc.spacing, hc.y_height, (float(gz) - half) * hc.spacing);
 }
 
-// Project a world point to screen UV (0..1) + NDC depth (0..1, standard-Z).
-// Returns false when the point is behind the camera (w <= 0).
-bool hzb_project(float3 wp, out float2 uv, out float ndc_z)
-{
-    float4 c = hc.vp[0] * wp.x + hc.vp[1] * wp.y + hc.vp[2] * wp.z + hc.vp[3];
-    uv = float2(0, 0);
-    ndc_z = 0;
-    if (c.w <= 1e-6)
-        return false;
-    float3 ndc = c.xyz / c.w;
-    // NDC -> texture UV. NDC +Y is UP (screen top) while depth-texture row 0 is ALSO
-    // the top, so V flips: uv.y = 0.5 - 0.5*ndc.y. Backend-uniform — the cull matrix
-    // is the no-flip view_proj on every backend (Vulkan's clip-space flip is baked
-    // into the scene render, so its depth image has the same top-down orientation).
-    // (The unflipped V sampled the vertical mirror: a top-of-screen instance read the
-    // floor's near depth and false-culled — caught by the conservatism gate.)
-    uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    ndc_z = ndc.z; // proj_noflip -> z already in [0,1]
-    return true;
-}
-
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void csCullHzb(uint3 tid: SV_DispatchThreadID)
@@ -169,83 +152,17 @@ void csCullHzb(uint3 tid: SV_DispatchThreadID)
             return;
     }
 
-    // HZB occlusion test. Screen AABB from the 8 world corners (per-axis half-extent =
-    // the bounding-sphere radius: a conservative over-estimate that never shrinks the
-    // footprint). Track the AABB in UV and the NEAREST NDC depth over the corners.
-    if (hc.enabled != 0)
+    // Conservative HZB occlusion test (shared `hzbOccluded`, the single source of truth also used
+    // by the Phase-14 vgeo two-phase cut), against last frame's pyramid.
+    if (hc.enabled != 0
+        && hzbOccluded(hc.vp, hc.hzb_base, hc.hzb_levels, hc.hzb_w, hc.hzb_h, center, hc.cube_radius))
     {
-        float r = hc.cube_radius;
-        float2 uv_min = float2(1e9, 1e9);
-        float2 uv_max = float2(-1e9, -1e9);
-        float z_near = 1e9;
-        bool any_front = false;
-        [unroll]
-        for (int cx = -1; cx <= 1; cx += 2)
-            [unroll] for (int cy = -1; cy <= 1; cy += 2)
-                [unroll] for (int cz = -1; cz <= 1; cz += 2)
-                {
-                    float3 wp = center + float3(cx, cy, cz) * r;
-                    float2 uv;
-                    float ndc_z;
-                    if (hzb_project(wp, uv, ndc_z))
-                    {
-                        any_front = true;
-                        uv_min = min(uv_min, uv);
-                        uv_max = max(uv_max, uv);
-                        z_near = min(z_near, ndc_z);
-                    }
-                }
-        // Only cull on a fully-projected, on-screen, in-front AABB (never on a partial
-        // projection — that is the conservative fallback that guarantees no false cull).
-        bool safe = any_front && uv_min.x >= 0.0 && uv_min.y >= 0.0 && uv_max.x <= 1.0 &&
-                    uv_max.y <= 1.0 && z_near >= 0.0;
-        if (safe)
+        if (hc.stats_index != 0xffffffffu)
         {
-            // Coarsest mip whose texel size covers the AABB extent, then the 4-tap
-            // (2x2) test on the AABB's CORNER texels: a texel-sized AABB can still
-            // straddle a texel boundary, so a single center tap misses the neighbour
-            // texel's depths and can false-cull at a depth discontinuity (roof/sky
-            // edge — caught by the conservatism gate). If the corner texels span
-            // more than 2 per axis (boundary-aligned edge case), go one mip coarser.
-            float2 ext_px = (uv_max - uv_min) * float2(hc.hzb_w, hc.hzb_h);
-            float max_px = max(ext_px.x, ext_px.y);
-            int mip = int(ceil(log2(max(max_px, 1.0))));
-            mip = clamp(mip, 0, int(hc.hzb_levels) - 1);
-            uint mw = max(hc.hzb_w >> uint(mip), 1u);
-            uint mh = max(hc.hzb_h >> uint(mip), 1u);
-            int2 t0 = int2(clamp(int(uv_min.x * float(mw)), 0, int(mw) - 1),
-                           clamp(int(uv_min.y * float(mh)), 0, int(mh) - 1));
-            int2 t1 = int2(clamp(int(uv_max.x * float(mw)), 0, int(mw) - 1),
-                           clamp(int(uv_max.y * float(mh)), 0, int(mh) - 1));
-            if ((t1.x - t0.x > 1 || t1.y - t0.y > 1) && mip + 1 < int(hc.hzb_levels))
-            {
-                mip += 1;
-                mw = max(hc.hzb_w >> uint(mip), 1u);
-                mh = max(hc.hzb_h >> uint(mip), 1u);
-                t0 = int2(clamp(int(uv_min.x * float(mw)), 0, int(mw) - 1),
-                          clamp(int(uv_min.y * float(mh)), 0, int(mh) - 1));
-                t1 = int2(clamp(int(uv_max.x * float(mw)), 0, int(mw) - 1),
-                          clamp(int(uv_max.y * float(mh)), 0, int(mh) - 1));
-            }
-            // HZB mips live in consecutive bindless slots (base + level).
-            float hzb_max = g.textures[hc.hzb_base + uint(mip)].Load(int3(t0, 0)).r;
-            hzb_max = max(hzb_max,
-                          g.textures[hc.hzb_base + uint(mip)].Load(int3(t1.x, t0.y, 0)).r);
-            hzb_max = max(hzb_max,
-                          g.textures[hc.hzb_base + uint(mip)].Load(int3(t0.x, t1.y, 0)).r);
-            hzb_max = max(hzb_max, g.textures[hc.hzb_base + uint(mip)].Load(int3(t1, 0)).r);
-            // Occluded iff the nearest point is farther than every occluder in the
-            // region. Epsilon keeps a co-planar instance visible (no z-fight false cull).
-            if (z_near > hzb_max + 1e-5)
-            {
-                if (hc.stats_index != 0xffffffffu)
-                {
-                    uint dummy;
-                    g.storage_buffers[hc.stats_index].InterlockedAdd(4, 1, dummy); // occlusion-culled
-                }
-                return;
-            }
+            uint dummy;
+            g.storage_buffers[hc.stats_index].InterlockedAdd(4, 1, dummy); // occlusion-culled
         }
+        return;
     }
 
     if (hc.stats_index != 0xffffffffu)
