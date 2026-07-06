@@ -190,15 +190,13 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
     float2 brdf = g.textures[globals.ibl.w].SampleLevel(g.samp, float2(n_dot_v, roughness), 0.0).rg;
     float3 specular = refl * (f * brdf.x + brdf.y);
 
-    // DEBUG_VIEW=21: AO (material + GDF far-field) attenuates only the DIFFUSE ambient; the traced
-    // SW-RT reflection already accounts for occlusion along its ray, so multiplying the mirror
+    // AO (material + GDF far-field) attenuates only the DIFFUSE ambient. The traced SW-RT
+    // reflection already accounts for occlusion along its own ray, so multiplying the mirror
     // specular by AO double-counts it — and for a reflective object baked INTO the distance field
-    // (which self-occludes -> gdf_ao≈0) it kills the reflection entirely (a black chrome ball). The
-    // default path keeps the legacy `(diffuse+specular)*ao` and the caller's `*gdf_ao` for a
-    // byte-identical gallery anchor; the fix path applies AO to diffuse only.
-    if (globals.counts.y == 21)
-        return kd * diffuse * (ao * gdf_ao) + specular;
-    return (kd * diffuse + specular) * ao;
+    // (which self-occludes -> gdf_ao≈0) it would kill the reflection entirely (a black chrome
+    // ball). So AO applies to diffuse only; the specular reflection carries its own occlusion.
+    // (Gallery anchor stays byte-identical: its specular pixels have ao·gdf_ao == 1.)
+    return kd * diffuse * (ao * gdf_ao) + specular;
 }
 
 // --- Soft-shadow quality tier (the scalability seam): one place to swap counts.
@@ -582,13 +580,11 @@ float4 fsMain(VSOutput input) : SV_Target
     if (pc.skyvis_index != NO_TEXTURE)
         sky_vis = saturate(g.textures[pc.skyvis_index].Sample(g.samp, input.uv).r);
 
+    // `ambient_ibl` already applied the GDF far-field AO to the DIFFUSE ambient and left the traced
+    // specular reflection un-occluded (it carries its own ray occlusion), so there is no separate
+    // `ambient *= gdf_ao` here — that would double-count AO on diffuse and wrongly darken specular.
     float3 ambient = ambient_ibl(n, v, world_pos, albedo, metallic, roughness, ao, f0,
                                  swrt_refl, has_swrt, sky_vis, gdf_ao);
-    // Default/gallery: apply the GDF far-field AO to the whole ambient (byte-identical legacy). The
-    // DEBUG_VIEW=21 fix path already applied AO to the diffuse term inside ambient_ibl and must NOT
-    // re-attenuate its (correctly un-occluded) specular reflection.
-    if (globals.counts.y != 21)
-        ambient *= gdf_ao;
 
     // Stage C3: 1-bounce diffuse GI marched against the scene GDF in a prior compute
     // pass. The GI image holds the mean incoming radiance (indirect irradiance) from

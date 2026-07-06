@@ -78,9 +78,31 @@ all. This is a larger, scene-specific effort with uncertain payoff and is left a
 follow-up; clipmap-by-default for large content scenes also requires re-baselining the content
 goldens (`sponza_gdf_ao`, `sponza_sc_viz`); the gallery stays single-level, anchor unchanged.
 
+### Fix 4 — AO no longer attenuates the traced specular reflection (DEFAULT)
+
+`ambient_ibl` previously multiplied the *whole* ambient — diffuse **and** the traced SW-RT specular
+reflection — by the material + GDF far-field AO (`(kd·diffuse + specular)·ao`, then `ambient *=
+gdf_ao`). That double-counts occlusion on the reflection: the traced ray already integrates the
+occlusion it sees along its path, and for a reflective object baked *into* the distance field (which
+self-occludes → `gdf_ao ≈ 0`) it crushed the reflection to black — a black chrome ball. The fix
+applies AO to the **diffuse** ambient only; the specular reflection carries its own ray occlusion
+(`kd·diffuse·(ao·gdf_ao) + specular`).
+
+Previously gated behind `DEBUG_VIEW=21`; now the **default** path (gate removed). Verified:
+
+- **Gallery anchor `af70c1a5` byte-identical** (Metal, deterministic across runs) — its specular
+  pixels have `ao·gdf_ao == 1`, so the expression is unchanged there. The hard gate holds.
+- The two content sha-goldens (`sponza_gdf_ao`, `sponza_sc_viz`) were **not** rebaselined: they are
+  **non-deterministic run-to-run** on the flickering Intel-Sponza content scene (period-2 reflect /
+  GI feedback — see `swrt_reflect`), so an exact-sha capture is not a valid gate for them and already
+  failed on clean HEAD *before* this change (three consecutive runs each produced a different sha).
+  Rebaselining a flickering scene's sha would fabricate a false gate. A **tolerant PNG golden**
+  (avg/channel) for the content scenes is the real follow-up; the runner already notes "no PNG golden
+  for tolerant diff" for these two.
+
 ## Verification
 
-- Gallery anchor `af70c1a5` byte-identical after Fix 1 and Fix 2 (Metal). Clippy clean.
+- Gallery anchor `af70c1a5` byte-identical after Fix 1, Fix 2, and Fix 4 (Metal). Clippy + fmt clean.
 - Intel Sponza knight: black → GI-lit polished steel.
 - **DX≡VK parity is a Windows follow-up** — the shader and push changes are backend-uniform, but
   reflection radiance was only verified on Metal here.
