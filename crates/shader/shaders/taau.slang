@@ -224,6 +224,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float gamma = pc.params.z;
     float3 box_min = mean - gamma * sigma;
     float3 box_max = mean + gamma * sigma;
+    // Firefly cap on the INPUT sample (content only, params.w > 0): a pixel far brighter than its own
+    // 3x3 σ is an outlier (a sub-pixel specular spark the jitter lands on this texel) that pops as a
+    // firefly when it blends into the history. Clip it toward the neighbourhood box so it enters as a
+    // highlight, not a spark. The gallery (params.w == 0) keeps the raw input → byte-identical anchor.
+    if (pc.params.w > 0.0)
+        cur = ycocg_to_rgb(clip_aabb(box_min, box_max, rgb_to_ycocg(cur)));
     // Reference-engine (TSR) anti-flicker clamp-error: a tight μ±γσ box RE-CLIPS the converged history
     // every frame on a static high-contrast edge — the sub-pixel jitter shifts the low-res neighborhood
     // statistics, so the shifting box snaps the (stable) history to a different face each frame = the
