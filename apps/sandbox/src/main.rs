@@ -2164,6 +2164,9 @@ impl App {
             // scene now, so build it unless the IBL escape hatch is forced (then it would be
             // unused — skip the ~67 MB atlas + per-frame relight). MAX_CARDS (fuse.rs) bounds
             // it; cards are draw-list-driven.
+            // HQ reflection mode (content opt-in): card every drawable + a sharper reflection trace
+            // for crisp, uniform large-scene chrome (used at card-build below and the res-div later).
+            let hq_reflect = !gallery_scene && quality::env_bool("P11_REFLECT_HQ", false);
             let build_cache = std::env::var_os("P11_LEGACY_IBL").is_none();
             if build_cache {
                 // F1 (surface-cache virtualization): rank drawables for card residency from a
@@ -2186,8 +2189,18 @@ impl App {
                         },
                     };
                 let card_cam = fuse::CardCamera::from_look(ref_eye, ref_focus);
+                // HQ reflection mode (`P11_REFLECT_HQ`): card EVERY drawable so a grazing reflection
+                // reads smooth cached radiance instead of the analytic per-voxel albedo (the residual
+                // coloured blobs on a large-scene chrome reflection). Costs extra atlas memory +
+                // warm-up relight; the default budget stays 1024 (gallery is within budget either way
+                // → byte-identical anchor). Pairs with the sharper reflection trace res below.
+                let card_budget = if hq_reflect {
+                    1u32 << 20
+                } else {
+                    fuse::MAX_CARDS
+                };
                 let (cards, card_albedo, _residency) =
-                    fuse::build_surface_cards(&obj_aabb, &obj_albedo, &card_cam);
+                    fuse::build_surface_cards(&obj_aabb, &obj_albedo, &card_cam, card_budget);
                 let num_cards = (cards.len() / 64) as u32;
                 // C: content stamps the drawable's true albedo onto its cards (fine color);
                 // the gallery keeps the legacy voxel-volume albedo (byte-identical anchor).
@@ -2590,10 +2603,13 @@ impl App {
         // macOS/M3 perf (M3-C): reflection trace-resolution divisor used when `reflect_half_res` is on
         // (2 = legacy half = the old `div_ceil(2)`, 4 = quarter). Only affects content (the gallery
         // traces full-res = byte-identical). `P_REFLECT_RES_DIV` overrides the tier.
+        // HQ mode traces the reflection at 1/3 res (vs the Apple tier's 1/6) so the improved card
+        // coverage resolves into a crisp chrome; `P_REFLECT_RES_DIV` still overrides explicitly.
+        let hq_reflect = !gallery_scene && quality::env_bool("P11_REFLECT_HQ", false);
         let reflect_res_div = std::env::var("P_REFLECT_RES_DIV")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(base.reflect_res_div)
+            .unwrap_or(if hq_reflect { 3 } else { base.reflect_res_div })
             .clamp(1, 16);
         // macOS/M3 perf: GDF AO trace-resolution divisor (1 = full-res = byte-identical; 2 = half).
         // Traced at 1/div then joint-bilateral upsampled; the gallery never runs gdf_ao so the anchor
