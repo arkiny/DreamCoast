@@ -145,6 +145,25 @@ float3 albedo_at(float3 p)
     return cm_albedo(reflect_clip(), p, pc.params.y);
 }
 
+// Cone-blurred per-voxel albedo for the UNcovered (analytic) reflection path. The surface cache is
+// sampled with a ray-cone MIP so cached far reflections are smooth; the analytic fallback used the
+// raw per-voxel `albedo_at` at a single (imprecise) point, so uncarded far hits read blocky, colour-
+// bleeding voxels — the residual speckle in the demagnified centre. Average the albedo over the cone
+// footprint (a few taps in the hit's tangent plane, radius = the same cone `sample_radius`) so an
+// uncovered far surface reads a smooth averaged colour matching its cached neighbours. `radius == 0`
+// (near hits / cone off) collapses to the single tap = the legacy value.
+float3 albedo_cone(float3 p, float3 n, float radius)
+{
+    if (radius <= 1e-4)
+        return albedo_at(p);
+    float3 t, bt;
+    onb(n, t, bt);
+    float3 s = albedo_at(p);
+    s += albedo_at(p + t * radius) + albedo_at(p - t * radius);
+    s += albedo_at(p + bt * radius) + albedo_at(p - bt * radius);
+    return s * (1.0 / 5.0);
+}
+
 float3 scene_normal(float3 p)
 {
     const float e = 0.012;
@@ -407,7 +426,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             // red cube / green avocado bleeding onto the reflected floor). Use the ground's
             // own albedo (matches deferred.rs's [0.8] ground material) for ground hits.
             bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp);
-            float3 hit_albedo = is_ground ? pc.ground_albedo.xyz : albedo_at(hp);
+            // Cone-blurred albedo (content, vol_on) so an uncovered far reflection is as smooth as
+            // its cached neighbours instead of blocky per-voxel colour. Near hits (radius→0) and the
+            // gallery (vol_on false) keep the single-tap legacy albedo.
+            float ablur = vol_on ? (0.05 + t * 0.08) : 0.0;
+            float3 hit_albedo = is_ground ? pc.ground_albedo.xyz : albedo_cone(hp, hn, ablur);
             // Lambertian reflected surface: albedo/PI * irradiance, so the reflection of a
             // diffuse surface matches its directly-shaded appearance. The cache path (meshed
             // hits) gets the same 1/PI in sdf_cache_light.slang.
@@ -448,6 +471,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         else
             color = sky(dir, sun_dir, sun_i, false);
     }
+
 
     // A3: persist this freshly-traced (surface point, radiance) for next frame's reuse gate.
     if (skip_write)
