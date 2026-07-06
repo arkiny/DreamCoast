@@ -3274,7 +3274,18 @@ impl App {
     /// interior face whose gather rays rarely escape still receives this fraction of the sky
     /// irradiance, matching the deferred pass's `occlude_sky_diffuse` MinOcclusion so REFLECTED
     /// shadowed surfaces don't crush to black. `0` for the gallery anchor (byte-identical); content
-    /// defaults to `0.6`, overridable via `P_REFLECT_SKYFILL`.
+    /// defaults to `1.0`, overridable via `P_REFLECT_SKYFILL`.
+    ///
+    /// Why 1.0 (was 0.6): the cache gather's sky-on-miss shrinks as the surface cache FILLS (more rays
+    /// hit cached surfaces than escape to sky), so over the warm-up the reflected surfaces lose their
+    /// skylight and drift to a muddy, over-warm multibounce equilibrium — the chrome ball's edges
+    /// visibly "stain" from clean sky-blue toward brown as the cache converges. The primary deferred
+    /// pass gives every surface the FULL occluded IBL-diffuse skylight, so a floor below 1.0 makes the
+    /// reflected copy of a surface systematically dimmer/warmer than the surface renders directly. A
+    /// floor of 1.0 restores that parity — reflected surfaces keep the sky term the primary gives them
+    /// (measured: whole-scene brightness essentially unchanged, few fully-enclosed faces; the ball's
+    /// grazing edge stops browning). `occlude_sky_diffuse` still occludes below the floor for genuinely
+    /// enclosed geometry via the per-ray gather, so this isn't a flat ambient add.
     fn cache_skylight_floor(&self) -> f32 {
         if self.is_gallery {
             0.0
@@ -3282,7 +3293,7 @@ impl App {
             std::env::var("P_REFLECT_SKYFILL")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(0.6)
+                .unwrap_or(1.0)
         }
     }
 
@@ -6117,6 +6128,7 @@ impl App {
                     1.0,
                     firefly_max,
                     self.reflect_max_roughness,
+                    !self.is_gallery, // content: near-mirror uses GDF/cache, not the unreliable SSR
                 ))
             }
             _ => None,
@@ -6794,6 +6806,7 @@ impl App {
                     1.0,
                     firefly_max,
                     self.reflect_max_roughness,
+                    false, // standalone SSR/hybrid viz — keep the full SSR blend
                 );
                 // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
                 self.reflect.record_lit_history(

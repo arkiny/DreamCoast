@@ -848,6 +848,13 @@ impl ReflectSystem {
         gdf_scale: f32,
         clamp_max: f32,
         max_roughness: f32,
+        // Content: drop SSR on NEAR-MIRROR surfaces and use the GDF/surface-cache reflection instead.
+        // Our SSR has no hit-validation (uncertain/depth-thickness), so on a convex SW-RT mirror (the
+        // chrome sphere) its screen march finds unreliable glancing hits that a partial blend smears in
+        // as a messy edge. The reference engine keeps SSR only as a validated hard-switch upgrade; until
+        // that validation exists, the (HQ) GDF/cache is the cleaner mirror source. Gallery passes false
+        // → byte-identical anchor.
+        skip_mirror_ssr: bool,
     ) -> ResourceId {
         let pipe = self
             .composite_pipeline
@@ -877,6 +884,7 @@ impl ReflectSystem {
                     clamp_max,
                     material_index,
                     max_roughness,
+                    skip_mirror_ssr,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

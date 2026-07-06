@@ -1703,6 +1703,7 @@ pub(crate) fn reflect_composite_push(
     clamp_max: f32,
     material_index: u32,
     max_roughness: f32,
+    skip_mirror_ssr: bool,
 ) -> [u8; 48] {
     let mut pc = [0u8; 48];
     pc[0..4].copy_from_slice(&ssr_index.to_le_bytes());
@@ -1714,6 +1715,7 @@ pub(crate) fn reflect_composite_push(
     pc[24..28].copy_from_slice(&clamp_max.to_le_bytes());
     pc[28..32].copy_from_slice(&material_index.to_le_bytes());
     pc[32..36].copy_from_slice(&max_roughness.to_le_bytes());
+    pc[36..40].copy_from_slice(&u32::from(skip_mirror_ssr).to_le_bytes()); // pad0: content near-mirror SSR skip
     pc
 }
 
