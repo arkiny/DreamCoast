@@ -37,6 +37,8 @@ pub(crate) struct VelocitySystem {
     skinned_pipeline: GraphicsPipeline,
     /// GPU-morph motion (prev weights).
     morphed_pipeline: GraphicsPipeline,
+    /// Baked vertex-cache (deform) motion (prev-frame position storage buffer).
+    deform_pipeline: GraphicsPipeline,
     /// DEBUG_VIEW=11 colour-code compute.
     viz_pipeline: ComputePipeline,
 }
@@ -68,12 +70,18 @@ impl VelocitySystem {
                 topology: PrimitiveTopology::TriangleList,
                 vertex_layout: VertexLayout::Mesh,
                 blend: BlendMode::Opaque,
-                push_constant_size: 192, // mvp(64)+prev_mvp(64)+skin(16)+skin_prev(16)+morph(16)+morph_prev(16)
+                push_constant_size: 208, // mvp(64)+prev_mvp(64)+skin(16)+skin_prev(16)+morph(16)+morph_prev(16)+deform_prev(16)
                 bindless: true,
                 uniform_buffer: false,
                 depth_test: true,
                 depth_write: false, // depth already written by the G-buffer fill; test-only (no perturb)
-                depth_compare: DepthCompare::Less,
+                // The velocity pass re-draws the opaque surface at the SAME depth the G-buffer fill
+                // wrote, using that shared depth as its z-test to pick the nearest surface per pixel.
+                // That is an EQUAL-depth match, so the compare must admit equality — `Less` rejected
+                // every coplanar fragment (the pass wrote nothing; the velocity target stayed cleared
+                // to zero, so even camera / skin / morph / deform motion never appeared). `LessEqual`
+                // is the documented "equal-ish against the shared depth" intent.
+                depth_compare: DepthCompare::LessEqual,
                 depth_format: Some(DEPTH_FORMAT),
             })?)
         };
@@ -98,6 +106,13 @@ impl VelocitySystem {
             dreamcoast_shader::velocity_morphed_vs_metallib,
             "vsMainMorphed",
         )?;
+        let deform_pipeline = mk(
+            "velocity_deform",
+            dreamcoast_shader::velocity_deform_vs_spirv,
+            dreamcoast_shader::velocity_deform_vs_dxil,
+            dreamcoast_shader::velocity_deform_vs_metallib,
+            "vsMainDeform",
+        )?;
         let viz_cs = load_compute_shader(
             backend,
             dreamcoast_shader::velocity_viz_cs_spirv,
@@ -117,6 +132,7 @@ impl VelocitySystem {
             pipeline,
             skinned_pipeline,
             morphed_pipeline,
+            deform_pipeline,
             viz_pipeline,
         })
     }
@@ -166,6 +182,12 @@ impl VelocitySystem {
                         cmd.bind_graphics_pipeline(&self.skinned_pipeline);
                     } else if obj.morph.is_some() {
                         cmd.bind_graphics_pipeline(&self.morphed_pipeline);
+                    } else if obj.deform.is_some() {
+                        // Baked vertex-cache: current positions from this frame's ring VB (obj.mesh),
+                        // previous from the prev-frame position storage buffer (`obj.deform`). The
+                        // static placement is already in `mvp`/`prev_mvp`, so the shader just swaps
+                        // the previous position — the deform motion falls out of the subtraction.
+                        cmd.bind_graphics_pipeline(&self.deform_pipeline);
                     }
                     cmd.push_constants(&velocity_push(
                         mvp,
@@ -174,11 +196,12 @@ impl VelocitySystem {
                         [prev.skin_palette, 0, 0, 0],
                         obj.morph.unwrap_or([0; 4]),
                         [prev.morph_weights, 0, 0, 0],
+                        [obj.deform.unwrap_or(0), 0, 0, 0],
                     ));
                     cmd.bind_vertex_buffer(&obj.mesh.vbuf, 32);
                     cmd.bind_index_buffer(&obj.mesh.ibuf, true);
                     cmd.draw_indexed(obj.mesh.index_count, 0, 0);
-                    if obj.skin.is_some() || obj.morph.is_some() {
+                    if obj.skin.is_some() || obj.morph.is_some() || obj.deform.is_some() {
                         cmd.bind_graphics_pipeline(&self.pipeline); // restore
                     }
                 }
@@ -186,7 +209,7 @@ impl VelocitySystem {
                 let g_mvp = view_proj.to_cols_array();
                 let g_prev = prev_view_proj.to_cols_array();
                 cmd.push_constants(&velocity_push(
-                    g_mvp, g_prev, [0; 4], [0; 4], [0; 4], [0; 4],
+                    g_mvp, g_prev, [0; 4], [0; 4], [0; 4], [0; 4], [0; 4],
                 ));
                 cmd.bind_vertex_buffer(ground_vbuf, 32);
                 cmd.bind_index_buffer(ground_ibuf, true);
@@ -250,8 +273,9 @@ impl Default for PrevPose {
     }
 }
 
-/// Pack the velocity push block (192 bytes): mvp(64) + prev_mvp(64) + skin u32x4(16) +
-/// skin_prev u32x4(16) + morph u32x4(16) + morph_prev u32x4(16).
+/// Pack the velocity push block (208 bytes): mvp(64) + prev_mvp(64) + skin u32x4(16) +
+/// skin_prev u32x4(16) + morph u32x4(16) + morph_prev u32x4(16) + deform_prev u32x4(16).
+#[allow(clippy::too_many_arguments)]
 fn velocity_push(
     mvp: [f32; 16],
     prev_mvp: [f32; 16],
@@ -259,8 +283,9 @@ fn velocity_push(
     skin_prev: [u32; 4],
     morph: [u32; 4],
     morph_prev: [u32; 4],
-) -> [u8; 192] {
-    let mut pc = [0u8; 192];
+    deform_prev: [u32; 4],
+) -> [u8; 208] {
+    let mut pc = [0u8; 208];
     for (i, f) in mvp.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
@@ -282,6 +307,10 @@ fn velocity_push(
     }
     for (i, s) in morph_prev.iter().enumerate() {
         let o = 176 + i * 4;
+        pc[o..o + 4].copy_from_slice(&s.to_le_bytes());
+    }
+    for (i, s) in deform_prev.iter().enumerate() {
+        let o = 192 + i * 4;
         pc[o..o + 4].copy_from_slice(&s.to_le_bytes());
     }
     pc

@@ -107,6 +107,7 @@ pub(crate) fn build(
         dsd.setDepthCompareFunction(match desc.depth_compare {
             DepthCompare::Less => MTLCompareFunction::LessEqual,
             DepthCompare::Equal => MTLCompareFunction::Equal,
+            DepthCompare::LessEqual => MTLCompareFunction::LessEqual,
         });
         dsd.setDepthWriteEnabled(desc.depth_write);
         Some(
@@ -169,6 +170,7 @@ pub(crate) fn build_mesh(
         dsd.setDepthCompareFunction(match desc.depth_compare {
             DepthCompare::Less => MTLCompareFunction::LessEqual,
             DepthCompare::Equal => MTLCompareFunction::Equal,
+            DepthCompare::LessEqual => MTLCompareFunction::LessEqual,
         });
         dsd.setDepthWriteEnabled(desc.depth_write);
         Some(

@@ -50,6 +50,7 @@
                 ssr_history_clamp: 0,
                 ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
+                gi_volume_period: 4,
             ),
             groups: (
                 resolution: 0,
@@ -60,7 +61,11 @@
                 surface_cache: 0,
             ),
         ),
-        // Default — identical to the pre-tier behavior. Do not change without re-baselining.
+        // Content default. Mostly the pre-tier legacy values; three cost knobs were retuned for the
+        // Sponza 1080p-60fps track (docs/sponza-perf.md, user-approved 2026-07-06): `ssao` off (the
+        // redundant 2nd AO — gdf_ao already gives contact AO), `ao_res_div` 2 (half-res AO, a low-
+        // frequency term), `gi_volume_period` 4 (amortize the view-independent DDGI update). The
+        // gallery PT anchor resolves against `gallery_preset()`, NOT this, so it is unaffected.
         (
             tier: Med,
             preset: (
@@ -71,7 +76,7 @@
                 ssr_stochastic: false,
                 reflect_max_roughness: 0.5,
                 gdf_ao: true,
-                ssao: true,
+                ssao: false,
                 firefly_clamp: true,
                 shadow_softness: 0.0,
                 shadow_taps: 16,
@@ -85,13 +90,14 @@
                 gdf_cone_k: 0.02,
                 gi_res_div: 3,
                 reflect_res_div: 2,
-                ao_res_div: 1,
+                ao_res_div: 2,
                 gi_atrous_steps: 2,
                 reflect_history_clamp: 1,
                 reflect_clamp_gamma: 1.25,
                 ssr_history_clamp: 0,
                 ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
+                gi_volume_period: 4,
             ),
             groups: (
                 resolution: 2,
@@ -135,6 +141,7 @@
                 ssr_history_clamp: 0,
                 ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
+                gi_volume_period: 1,
             ),
             groups: (
                 resolution: 2,
@@ -179,6 +186,7 @@
                 ssr_history_clamp: 0,
                 ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
+                gi_volume_period: 4,
             ),
             groups: (
                 resolution: 1,

@@ -586,6 +586,12 @@ const JOBS: &[Job] = &[
     },
     Job {
         src: "velocity.slang",
+        entry: "vsMainDeform",
+        stage: "vertex",
+        key: "velocity_deform_vs",
+    },
+    Job {
+        src: "velocity.slang",
         entry: "fsMain",
         stage: "fragment",
         key: "velocity_fs",

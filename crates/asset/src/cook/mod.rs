@@ -219,15 +219,21 @@ pub fn load_or_cook_gltf_scene(
 /// The invalidation key is the source file's **cheap metadata** (length + mtime + path),
 /// not a content hash — hashing a 665 MB / 1.4 GB source on every launch would defeat the
 /// point of the cache (fast reload). A changed source (different size or mtime) re-cooks.
+///
+/// `max_frames` is the memory budget: when non-zero, the decoded cache is decimated to at most
+/// that many frames ([`VertexCache::decimate`]) BEFORE it is cooked, so the budget bounds both
+/// the on-disk `.dcasset` and the resident set. It is folded into the cache key, so changing the
+/// budget re-cooks. `0` = unbudgeted (every frame resident, the legacy behaviour).
 pub fn load_or_cook_vcache(
     source: &Path,
     cache_key: &str,
     cache_dir: &Path,
+    max_frames: u32,
 ) -> Result<(VertexCache, LoadOutcome), EngineError> {
     let cache_file = cache_path(cache_dir, cache_key);
 
     // Shipped path: source absent → trust a cached `.dcasset` if present.
-    let Some(key) = source_meta_key(source) else {
+    let Some(base_key) = source_meta_key(source) else {
         if let Ok(bytes) = std::fs::read(&cache_file)
             && let Ok((_, cache)) = dcasset::read_vcache(&bytes)
         {
@@ -238,6 +244,9 @@ pub fn load_or_cook_vcache(
             source.display()
         )));
     };
+    // Fold the frame budget into the key so a budget change re-cooks (a smaller cap = fewer frames
+    // baked into the `.dcasset`; the header `source_hash` mismatch triggers the re-cook).
+    let key = dcasset::hash_update(base_key, &max_frames.to_le_bytes());
 
     // Hit: a cached header whose metadata key matches the live source → decode it directly.
     if let Ok(bytes) = std::fs::read(&cache_file)
@@ -250,8 +259,10 @@ pub fn load_or_cook_vcache(
         return Ok((cache, LoadOutcome::CacheHit));
     }
 
-    // Miss: decode the source by extension, cook the `.dcasset`, write it (non-fatal on fail).
-    let cache = decode_vcache_source(source)?;
+    // Miss: decode the source by extension, apply the frame budget, cook the `.dcasset`, write it
+    // (non-fatal on fail). Decimating BEFORE the write bounds the cooked file + the resident set.
+    let mut cache = decode_vcache_source(source)?;
+    cache.decimate(max_frames as usize);
     let cooked = dcasset::write_vcache(&cache, key);
     if let Err(e) = write_atomic(&cache_file, &cooked) {
         tracing_warn(&format!(

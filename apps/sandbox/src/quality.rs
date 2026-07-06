@@ -242,6 +242,13 @@ pub struct QualityPreset {
     /// hard 3x3 min/max (legacy; forced for the gallery byte-identical anchor). `> 1.5` = variance clamp
     /// with gamma = this value (a wide outlier reject that still converges). Content defaults off.
     pub gi_temporal_clamp: f32,
+    /// Sponza 1080p-60fps track: amortize the **view-independent** DDGI `gi_volume` update over N
+    /// frames (`P_GI_VOLUME_PERIOD`) — update 1 frame in N, the rest bind the persistent last volume
+    /// (the multibounce EMA carries it). `1` = every frame (High / gallery quality). `> 1` = cheaper
+    /// (the VK view-independent floor the perf track attacks) at the cost of slower GI convergence —
+    /// imperceptible on a mostly-static scene. `gi_volume` is off for the gallery, so this never
+    /// touches the byte-identical anchor; clamped `>= 1` at the consumer. See `docs/sponza-perf.md`.
+    pub gi_volume_period: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -428,7 +435,23 @@ pub fn gallery_preset() -> QualityPreset {
         ssr_history_clamp: 0, // off (byte-identical anchor; SSR feedback clamp is opt-in)
         ssr_clamp_gamma: 1.25,
         gi_temporal_clamp: 1.0, // hard 3x3 GI temporal clamp (legacy byte-identical anchor)
+        gi_volume_period: 1,    // every-frame volume update (gallery runs no gi_volume anyway)
     }
+}
+
+/// Baked-deform (vertex-cache) frame budget: the max resident frames a cooked deform keeps
+/// ([`dreamcoast_asset::VertexCache::decimate`]). `0` (the default) = unbudgeted — every frame
+/// resident, the accurate path (a walking-knight `.abc` is ~1.26 GB, `.usda` ~223 MB). A non-zero
+/// cap evenly subsamples the frames at COOK time (bounding disk + RAM) while preserving playback
+/// duration, the coarse memory-budget lever a game / a lower `RenderQuality` tier turns down.
+///
+/// `DEFORM_MAX_FRAMES=<n>` overrides it. Single source of truth (read once in `build_level`); the
+/// seam for folding this into the per-tier [`QualityPreset`] table once it is tier-driven.
+pub fn deform_max_frames() -> u32 {
+    std::env::var("DEFORM_MAX_FRAMES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 /// Resolve a boolean knob: explicit env (`0`/`false`/`off` => false, any other value => true)
@@ -722,6 +745,12 @@ mod tests {
             "{label}: gi_temporal_clamp {} out of 0..=16",
             p.gi_temporal_clamp
         );
+        // gi_volume amortization period: `.max(1)` at the consumer — must be >= 1.
+        assert!(
+            p.gi_volume_period >= 1,
+            "{label}: gi_volume_period {} must be >= 1",
+            p.gi_volume_period
+        );
     }
 
     /// Every tier's `preset()` resolves within the validated ranges its consumers clamp to.
@@ -798,19 +827,42 @@ mod tests {
             g.gi_temporal_clamp, 1.0,
             "gallery gi_temporal_clamp (hard 3x3)"
         );
+        assert_eq!(
+            g.gi_volume_period, 1,
+            "gallery gi_volume_period (every-frame; gallery runs no gi_volume anyway)"
+        );
     }
 
-    /// `Med` reproduces the pre-tier hardcoded defaults (the no-regression baseline) for the fields
-    /// the design doc calls out. A drift here is a byte-identical-anchor risk for content Med.
+    /// `Med` is the content-default tier. Most fields still match the pre-tier legacy defaults; the
+    /// **Sponza 1080p-60fps retune** (docs/sponza-perf.md, user-approved 2026-07-06) deliberately
+    /// changed three cost knobs — `ssao` off (the redundant 2nd AO; `gdf_ao` already supplies contact
+    /// AO), `ao_res_div` 2 (half-res AO — a low-frequency contact term survives it), and
+    /// `gi_volume_period` 4 (amortize the view-independent DDGI update). The gallery PT anchor is
+    /// unaffected (it resolves against `gallery_preset`, not Med). This test locks the retuned Med so
+    /// a future edit can't silently drift it; the gallery/High quality path keeps the legacy values.
     #[test]
-    fn med_matches_legacy_defaults() {
+    fn med_locks_content_default_baseline() {
         let m = preset(RenderQuality::Med);
+        // Unchanged legacy fields.
         assert_eq!(m.gi_spp, 1, "Med gi_spp");
         assert_eq!(m.render_scale, 1.0, "Med render_scale (native)");
         assert_eq!(m.reflect_max_roughness, 0.5, "Med reflect_max_roughness");
         assert_eq!(m.reflect_max_steps, 96, "Med reflect_max_steps");
+        assert_eq!(
+            m.reflect_res_div, 2,
+            "Med reflect_res_div (sharp reflections kept)"
+        );
         assert!(m.gdf_ao, "Med gdf_ao");
-        assert!(m.ssao, "Med ssao (legacy content default)");
+        // 60fps retune (deliberate; gallery anchor unaffected).
+        assert!(
+            !m.ssao,
+            "Med ssao OFF (redundant 2nd AO removed; 60fps retune)"
+        );
+        assert_eq!(m.ao_res_div, 2, "Med ao_res_div half-res (60fps retune)");
+        assert_eq!(
+            m.gi_volume_period, 4,
+            "Med gi_volume_period amortized (60fps retune)"
+        );
     }
 
     /// The embedded (`include_str!`) config parses and covers every tier. This is the invariant the
@@ -935,7 +987,7 @@ mod tests {
                 reflect_half_res: true, render_scale: 1.0, gdf_cone_k: 0.02, gi_res_div: 3,
                 reflect_res_div: 2, ao_res_div: 1, gi_atrous_steps: 2, reflect_history_clamp: 1,
                 reflect_clamp_gamma: 1.25, ssr_history_clamp: 0, ssr_clamp_gamma: 1.25,
-                gi_temporal_clamp: 0.0,
+                gi_temporal_clamp: 0.0, gi_volume_period: 4,
             ),
             groups: (resolution: 2, global_illumination: 1, reflection: 1, ambient_occlusion: 2,
                      shadow: 1, surface_cache: 1),

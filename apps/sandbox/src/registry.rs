@@ -82,6 +82,29 @@ impl MeshRegistry {
         Ok(self.push(vbuf, ibuf, index_count, vertices.to_vec(), indices.to_vec()))
     }
 
+    /// Upload raw vertex/index slices with an **explicit** local AABB (overriding the computed
+    /// per-vertex bounds). For deforming geometry (a vertex-cache part) whose per-frame positions
+    /// exceed the frame-0 bounds: pass an always-visible AABB (e.g. `[[-1e9;3],[1e9;3]]`) so the
+    /// CPU frustum cull, which reads the base mesh's bounds once at `build_scene`, never drops a
+    /// part whose deformed geometry has moved outside its frame-0 box.
+    pub(crate) fn upload_geometry_aabb(
+        &mut self,
+        device: &Device,
+        vertices: &[MeshVertex],
+        indices: &[u32],
+        local_aabb: [[f32; 3]; 2],
+    ) -> anyhow::Result<MeshHandle> {
+        let (vbuf, ibuf, index_count) = upload_geometry(device, vertices, indices)?;
+        Ok(self.push_aabb(
+            vbuf,
+            ibuf,
+            index_count,
+            vertices.to_vec(),
+            indices.to_vec(),
+            local_aabb,
+        ))
+    }
+
     fn push(
         &mut self,
         vbuf: Buffer,
@@ -90,7 +113,6 @@ impl MeshRegistry {
         vertices: Vec<MeshVertex>,
         indices: Vec<u32>,
     ) -> MeshHandle {
-        let handle = MeshHandle(self.meshes.len() as u32);
         let mut mn = [f32::INFINITY; 3];
         let mut mx = [f32::NEG_INFINITY; 3];
         for v in &vertices {
@@ -105,6 +127,19 @@ impl MeshRegistry {
         } else {
             [mn, mx]
         };
+        self.push_aabb(vbuf, ibuf, index_count, vertices, indices, local_aabb)
+    }
+
+    fn push_aabb(
+        &mut self,
+        vbuf: Buffer,
+        ibuf: Buffer,
+        index_count: u32,
+        vertices: Vec<MeshVertex>,
+        indices: Vec<u32>,
+        local_aabb: [[f32; 3]; 2],
+    ) -> MeshHandle {
+        let handle = MeshHandle(self.meshes.len() as u32);
         self.meshes.push(Rc::new(GpuMesh {
             vbuf,
             ibuf,
@@ -239,6 +274,7 @@ pub(crate) fn build_scene(
                 casts_shadow: d.casts_shadow,
                 skin: None,
                 morph: None,
+                deform: None,
             }
         })
         .collect()

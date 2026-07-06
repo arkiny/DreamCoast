@@ -40,6 +40,7 @@ mod cook_progress;
 mod csm;
 mod cull;
 mod deferred;
+mod deform;
 mod fuse;
 mod gdf;
 mod gi;
@@ -229,6 +230,11 @@ pub(crate) struct SceneObject {
     /// which instead swaps the vertex buffer). Set by the per-frame morph patch; the
     /// G-buffer/shadow passes draw these with the morph pipeline + the bind-pose buffer.
     pub(crate) morph: Option<[u32; 4]>,
+    /// Baked vertex-cache **deform** velocity hook: the PREVIOUS-frame position storage-buffer
+    /// bindless index when this drawable is a deform part (`None` = not a deform, or velocity off).
+    /// The G-buffer just draws the current ring VB (`mesh`); only the velocity pass consumes this,
+    /// reading the prev positions to compute per-vertex motion. Set by the deform patch each frame.
+    pub(crate) deform: Option<u32>,
 }
 
 /// A level's lighting (sun + point lights), applied in the `Globals` assembly in
@@ -619,9 +625,10 @@ struct App {
     /// CPU-skinned primitives (animation Stage B). Empty unless an imported glTF scene
     /// has skins; each is re-skinned + uploaded per frame (inline path only).
     skinned: Vec<skin::SkinnedMesh>,
-    /// Alembic vertex-cache player (the knight `.abc` animation), if overlaid. Its per-frame
-    /// vertex-buffer rewrite runs alongside the skin-cache update each frame.
-    vcache: Option<character::VertexCachePlayer>,
+    /// Baked vertex-cache deform players (declarative `.level` `deforms` entities — the knight
+    /// `.abc`/`.usda` animation). Each per-fif ring rewrite + drawable swap runs alongside the
+    /// skin-cache update every frame. Rebuilt on a level hot-swap.
+    vcaches: Vec<deform::DeformPlayer>,
     /// Morph-target primitives (animation Stage C). Empty unless an imported glTF scene
     /// has morph targets; GPU primitives write a per-frame weights buffer (the VS blends),
     /// CPU ones re-blend + upload a vertex ring each frame (inline path only).
@@ -1307,7 +1314,7 @@ impl App {
         // scene's native scale. `None` keeps the legacy gallery framing.
         let mut scene_bounds: Option<level::Bounds> = None;
         let mut gltf_skinned: Vec<skin::SkinnedMesh> = Vec::new();
-        let mut gltf_vcache: Option<character::VertexCachePlayer> = None;
+        let mut level_vcaches: Vec<deform::DeformPlayer> = Vec::new();
         let mut gltf_morphed = morph::MorphSet::default();
         // A level's authored camera (applied as the initial view if non-default).
         let mut level_view: Option<(Vec3, Vec3)> = None;
@@ -1344,7 +1351,7 @@ impl App {
             level_view = level::level_camera(&level);
             level_lighting_override = Some(level_lighting(&level));
             level_sky_wb = Some(level.environment.sky_white_balance);
-            scene_bounds = level::build_level(
+            let (bounds, players) = level::build_level(
                 &device,
                 &level,
                 &mut world,
@@ -1354,6 +1361,10 @@ impl App {
                 Vec3::ZERO,
                 content_compress,
             )?;
+            scene_bounds = bounds;
+            // Declarative baked-deform players (the level's `deforms` entities). The frame loop
+            // drives every one — no env overlay hack.
+            level_vcaches = players;
             // Phase 13 Stage E: opt-in skinned/static character overlay (default off →
             // the level renders byte-unchanged). Verifies the ufbx FBX importer + GPU skin
             // cache against Intel Sponza. See docs/phase-13-fbx-knight.md.
@@ -1408,40 +1419,9 @@ impl App {
                     "SPONZA_CHARS: knight needs `--features fbx`; overlaying VoxelCharacter only"
                 );
             }
-            // Baked vertex-cache playback (Track B): the knight's *actual* deformation
-            // animation (its FBX has no skin weights). The cache is cooked as a SEPARATE
-            // asset — `.usda` (native USD point cache) or `.abc` (Alembic) → CHUNK_VCACHE —
-            // and the level *loads the cooked asset* (CacheHit on reload, no live
-            // 665 MB/1.4 GB decode). Opt-in `KNIGHT_USD=1` or `KNIGHT_ABC=1`; default off.
-            // See docs/alembic-usd-import.md (Track B).
-            let vcache_source = if std::env::var("KNIGHT_USD").is_ok() {
-                Some("assets/Knight/knight.usda")
-            } else if std::env::var("KNIGHT_ABC").is_ok() {
-                Some("assets/Knight/knight_ANIM_001.rnd.abc")
-            } else {
-                None
-            };
-            if let Some(src) = vcache_source {
-                let (cache, outcome) = dreamcoast_asset::cook::load_or_cook_vcache(
-                    std::path::Path::new(src),
-                    src,
-                    &app::cooked_cache_dir(),
-                )?;
-                info!(
-                    "vcache knight '{src}' ({outcome:?}): {} meshes, {} frames @ {} fps",
-                    cache.meshes.len(),
-                    cache.num_frames,
-                    cache.fps
-                );
-                gltf_vcache = Some(character::overlay_vcache(
-                    &device,
-                    &mut world,
-                    &mut mesh_registry,
-                    &mut material_registry,
-                    cache,
-                    &character::knight_abc_placement(),
-                )?);
-            }
+            // Baked vertex-cache deforms (the knight's actual deformation animation) are now
+            // first-class `.level` `deforms` entities — cooked + spawned inside `build_level`
+            // above (see `sponza_knight.level`), not an env overlay.
         } else if let Some(path) = &scene_gltf_path {
             // Stage B: import the whole node hierarchy + every primitive/material/image,
             // through the cooked, block-compressed `.dcasset` (a hit skips glTF parse +
@@ -2960,7 +2940,7 @@ impl App {
             mesh_registry,
             material_registry,
             skinned: gltf_skinned,
-            vcache: gltf_vcache,
+            vcaches: level_vcaches,
             morphed: gltf_morphed,
             level_paths,
             current_level,
@@ -3107,7 +3087,7 @@ impl App {
             gi_volume_period: std::env::var("P_GI_VOLUME_PERIOD")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1)
+                .unwrap_or(base.gi_volume_period as u64)
                 .max(1),
             skyvis_tint,
             skyvis_min_occ,
@@ -3420,7 +3400,7 @@ impl App {
         let mut mesh_registry = MeshRegistry::new();
         let mut material_registry = MaterialRegistry::new();
         let mut textures: Vec<Texture> = Vec::new();
-        let bounds = level::build_level(
+        let (bounds, players) = level::build_level(
             &self.device,
             &level,
             &mut world,
@@ -3435,6 +3415,8 @@ impl App {
         self.mesh_registry = mesh_registry;
         self.material_registry = material_registry;
         self._textures = textures;
+        // Swap in the new level's deform players (drops the previous level's).
+        self.vcaches = players;
         self.current_level = idx;
         // Re-frame the camera for the new level's native-scale bounds.
         if let Some((min, max)) = bounds {
@@ -3791,13 +3773,15 @@ impl App {
             skin::update_palettes(&mut self.skinned, &self.world, fif)?;
             skin::patch_scene(&self.skinned, &mut scene, &mut prev_scene, fif);
         }
-        // Alembic vertex-cache playback (A4): rewrite each part's vertex buffer to this
-        // frame. Like skinning it relies on this slot's frame-start fence wait, so it's
-        // inline-path only (not P15_RHI_THREAD). Independent of `skinned`.
-        if self.rhi_thread.is_none()
-            && let Some(vc) = self.vcache.as_mut()
-        {
-            vc.update(FIXED_DT)?;
+        // Baked vertex-cache playback: rewrite THIS frame-in-flight's ring buffer to the
+        // current frame and swap each drawable to it (double-buffered, real-time-safe).
+        // Like skinning it relies on this slot's frame-start fence wait, so it's inline-path
+        // only (not P15_RHI_THREAD). Independent of `skinned`.
+        if self.rhi_thread.is_none() {
+            for vc in self.vcaches.iter_mut() {
+                vc.update(fif, FIXED_DT)?;
+                vc.patch_scene(&mut scene, fif);
+            }
         }
         // Animation Stage C: blend morph targets (GPU = write the per-frame weights
         // buffer; CPU = re-blend the vertex ring) + patch this frame's drawables. Inline

@@ -85,6 +85,7 @@ mod tests {
             lights: vec![],
             camera: Camera::default(),
             environment: Environment::default(),
+            deforms: vec![],
         }
     }
 

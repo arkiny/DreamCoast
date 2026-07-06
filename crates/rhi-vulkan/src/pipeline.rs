@@ -353,6 +353,7 @@ unsafe fn build(
             .depth_compare_op(match desc.depth_compare {
                 rhi_types::DepthCompare::Less => vk::CompareOp::LESS,
                 rhi_types::DepthCompare::Equal => vk::CompareOp::EQUAL,
+                rhi_types::DepthCompare::LessEqual => vk::CompareOp::LESS_OR_EQUAL,
             });
 
         let color_formats: Vec<vk::Format> = desc
@@ -575,6 +576,7 @@ unsafe fn build_mesh(
             .depth_compare_op(match desc.depth_compare {
                 rhi_types::DepthCompare::Less => vk::CompareOp::LESS,
                 rhi_types::DepthCompare::Equal => vk::CompareOp::EQUAL,
+                rhi_types::DepthCompare::LessEqual => vk::CompareOp::LESS_OR_EQUAL,
             });
 
         let color_formats: Vec<vk::Format> = desc
