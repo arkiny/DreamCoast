@@ -195,6 +195,38 @@ float refl_shadow(float3 origin, float3 dir, float maxt)
     return saturate(res);
 }
 
+// Real SH band-0/1 basis normalisation (matches gi_volume.slang / gdf_gi.slang — keep in lockstep).
+static const float SH_C0 = 0.2820947918; // sqrt(1/(4*pi))
+static const float SH_C1 = 0.4886025119; // sqrt(3/(4*pi))
+
+// Reference-engine reflection technique: sample the world-space directional-irradiance volume
+// (radiance cache, the 12 SH coeff volumes contiguous from `base`, updated in gi_volume.slang with
+// multibounce) at a reflection HIT and reconstruct the cosine-weighted hemispherical irradiance
+// E(n). This is the indirect term that keeps a reflected shadowed surface at its GI-lit colour
+// instead of the analytic sun-only re-light going near-black. Returns 0 outside the volume bounds.
+// Mirrors the reconstruction in gdf_gi.slang's volume path (A0/PI = 1, A1/PI = 2/3).
+float3 sample_gi_irradiance(uint base, float3 p, float3 n)
+{
+    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
+    if (!(all(uvw >= 0.0) && all(uvw <= 1.0)))
+        return float3(0.0, 0.0, 0.0);
+    uvw = saturate(uvw);
+    float3 c[4];
+    [unroll]
+    for (int k = 0; k < 4; k++)
+        c[k] = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (int ch = 0; ch < 3; ch++)
+    {
+        [unroll]
+        for (int k = 0; k < 4; k++)
+            c[k][ch] = g.volumes[base + uint(ch * 4 + k)].SampleLevel(g.samp, uvw, 0.0).x;
+    }
+    float3 e = c[0] * SH_C0
+               + (2.0 / 3.0) * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]);
+    return max(e, float3(0.0, 0.0, 0.0));
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void csMain(uint3 tid: SV_DispatchThreadID)
@@ -213,6 +245,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // Background: reflect nothing — show the sky along the view ray (so the viz reads as
     // the scene; C7 only consumes this for shaded pixels anyway).
     float sy = (pc.flip_y & 1u) != 0u ? 1.0 : -1.0;
+    // GI irradiance volume base index packed into flip_y's spare bits (bit0 = Y-flip; the 240-byte
+    // push is full, D3D12 root budget forbids growing it). Encoded as (base+1)<<1 so 0 = off.
+    uint vol_pack = pc.flip_y >> 1;
+    bool vol_on = vol_pack != 0u;
+    uint vol_base = vol_on ? (vol_pack - 1u) : 0xFFFFFFFFu;
     float2 ndc = float2(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * sy);
     if (depth >= 1.0)
     {
@@ -321,14 +358,18 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         bool cached = false;
         if (pc.cache.x != 0xFFFFFFFFu)
         {
+            // Fix 2 (coverage): a coarse-field reflection HIT is imprecise by ~half a voxel, so
+            // widen the card acceptance by that much for CONTENT (vol_on) — lets the hit match the
+            // card of the surface it grazed and read its precise cached multibounce radiance instead
+            // of the darker analytic fallback. 0 for the gallery (vol_on false) -> byte-identical.
+            float cache_bias = vol_on ? 0.006 * length(GDF_MAX - GDF_MIN) : 0.0;
             color = sample_surface_cache(hp, hn, pc.cache.x, pc.cache.y, pc.cache.z,
-                                         pc.cache.w, pc.cache_tile, cached);
+                                         pc.cache.w, pc.cache_tile, cache_bias, cached);
         }
         if (!cached)
         {
             float ndl = max(dot(hn, sun_dir), 0.0);
             float sh = ndl > 0.0 ? refl_shadow(hp + hn * 0.004, sun_dir, max_dist) : 1.0;
-            float fill = sky_fill * (0.5 + 0.5 * hn.y);
             // The ground plane is analytic — it's NOT in the per-voxel albedo volume, so
             // albedo_at() would return the nearest *object's* colour for a ground hit (the
             // red cube / green avocado bleeding onto the reflected floor). Use the ground's
@@ -338,7 +379,22 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             // Lambertian reflected surface: albedo/PI * irradiance, so the reflection of a
             // diffuse surface matches its directly-shaded appearance. The cache path (meshed
             // hits) gets the same 1/PI in sdf_cache_light.slang.
-            color = hit_albedo * (sun_i * ndl * sh + fill) * (1.0 / GGX_PI);
+            if (vol_on)
+            {
+                // Reference-engine approach: add the GI-lit INDIRECT irradiance (radiance-cache
+                // volume) so a reflected SHADOWED surface reads its real GI colour, not black. The
+                // indirect E matches gdf_gi.slang's convention (outgoing = albedo * E, no extra
+                // /PI), so it is added OUTSIDE the direct term's 1/PI to be energy-consistent with
+                // how the deferred lighting consumes the same volume.
+                float3 e = sample_gi_irradiance(vol_base, hp, hn);
+                color = hit_albedo * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
+            }
+            else
+            {
+                // Volume absent (e.g. the gallery) -> the legacy crude sky fill. Byte-identical.
+                float fill = sky_fill * (0.5 + 0.5 * hn.y);
+                color = hit_albedo * (sun_i * ndl * sh + fill) * (1.0 / GGX_PI);
+            }
         }
     }
     else

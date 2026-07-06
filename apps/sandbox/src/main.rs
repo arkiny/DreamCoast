@@ -5517,6 +5517,10 @@ impl App {
         // Indoor skylight-occlusion image (directional sky-visibility), produced on the volume GI
         // path and consumed by the lighting (occludes the IBL diffuse skylight). `None` otherwise.
         let mut gi_skyvis_out: Option<ResourceId> = None;
+        // Hoisted out of the GI match arm so the reflection pass (recorded later, out of that arm's
+        // scope) can sample the SAME radiance-cache volume + reuse its exact write-order handle for
+        // the GI-lit indirect term at reflection hits. `None` unless the volume GI path runs.
+        let mut gi_reflect_arg: Option<(u32, u32, ResourceId)> = None;
         let gdf_gi_out = match (self.gdf_gi, scene_gdf_vol, scene_gdf_ext) {
             (true, Some(vol), Some(ext)) if self.screen_probe => {
                 // Screen-space radiance probes (P1+): per-tile probe trace into an octahedral
@@ -5645,6 +5649,7 @@ impl App {
                     } else {
                         None
                     };
+                gi_reflect_arg = gi_volume_arg; // expose to the later reflection pass (same handle)
                 let (traced, skyvis) = self.gi.record_gi(
                     &mut graph,
                     vol,
@@ -5918,6 +5923,7 @@ impl App {
                     },
                     scene_albedo,
                     reflect_cache_arg,
+                    gi_reflect_arg, // GI-lit indirect at reflection hits (radiance cache)
                     scene_clip,
                     &scene_clip_vols,
                     self.reflect_max_steps,
@@ -6563,6 +6569,7 @@ impl App {
                 },
                 scene_albedo,
                 reflect_cache_arg,
+                None, // GI volume off (standalone reflection viz path)
                 scene_clip,
                 &scene_clip_vols,
                 self.reflect_max_steps,
@@ -6648,6 +6655,7 @@ impl App {
                     },
                     scene_albedo,
                     reflect_cache_arg,
+                    None, // GI volume off (standalone reflection viz path)
                     scene_clip,
                     &scene_clip_vols,
                     self.reflect_max_steps,

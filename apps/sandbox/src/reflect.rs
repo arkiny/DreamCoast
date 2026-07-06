@@ -702,6 +702,10 @@ impl ReflectSystem {
         frame: u32,
         albedo: Option<(&'a [Volume; 3], ResourceId)>,
         cache: Option<([u32; 5], ResourceId)>,
+        // GI irradiance volume (radiance cache): (radiance_base, skyvis_base, write-order handle),
+        // same tuple the GI pass gets. Sampled at reflection hits for the GI-lit indirect term so
+        // shadowed reflected surfaces aren't black. `None` (gallery) -> legacy analytic fill.
+        gi_volume: Option<(u32, u32, ResourceId)>,
         clip: (u32, u32),
         clip_vols: &'a [&'a Volume],
         max_steps: u32,
@@ -734,6 +738,11 @@ impl ReflectSystem {
         if let Some((_, ext)) = cache {
             reads.push(ext);
         }
+        if let Some((_, _, ext)) = gi_volume {
+            reads.push(ext); // barrier the reflection sample after this frame's volume update
+        }
+        // vol_r = radiance SH base (the reflection only needs the irradiance set, not sky-vis).
+        let gi_vol_base = gi_volume.map(|(rb, _, _)| rb).unwrap_or(u32::MAX);
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
         // A3: order this frame's skip-buffer writes (imported external; read is last frame's slot,
         // covered by the frame fence, so it isn't graph-tracked — same pattern as refl_accum).
@@ -782,6 +791,7 @@ impl ReflectSystem {
                     cw,
                     ch,
                     flip_y,
+                    gi_vol_base, // GI irradiance volume base (u32::MAX = off, legacy fill)
                     material_index,
                     aabb_min,
                     aabb_max,

@@ -151,7 +151,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     {
         bool found = false;
         float3 sc = sample_surface_cache(p, n, pc.sc_cards, pc.sc_pos, pc.sc_rad, pc.sc_num,
-                                         pc.sc_tile, found);
+                                         pc.sc_tile, 0.0, found);
         if (found)
         {
             // Card radiance is already final lit (incl. skylight) at high res — display directly.

@@ -9,8 +9,14 @@
 // `found` reports whether a card covered the query point; on a miss it is false and the
 // caller can fall back (e.g. the analytic ground, which has no cards, would otherwise read
 // black). Returns 0 on a miss.
+// `extra_tol` widens the on-surface acceptance distance (world units) — 0 for the primary
+// consumers (GI gather / cache re-light / viz), so their coverage is byte-identical. A reflection
+// ray whose HIT position is imprecise (coarse distance-field march) passes a small positive bias
+// so it can still match the card of the surface it grazed instead of falling through to the darker
+// analytic fallback (reference-engine surface-cache reflection: a hit reads cached lit radiance).
 float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos_index,
-                            uint cache_rad_index, uint num_cards, uint tile, out bool found)
+                            uint cache_rad_index, uint num_cards, uint tile, float extra_tol,
+                            out bool found)
 {
     found = false;
     int best = -1;
@@ -48,7 +54,7 @@ float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos
         // cube's cached colour. A texel-sized tolerance keeps legitimate on-surface hits
         // (even on deep concavities, since this measures distance to the captured point).
         float dist = length(capt.xyz - p);
-        float tol = max((length(ua) + length(va)) / float(tile) * 4.0, 0.02);
+        float tol = max((length(ua) + length(va)) / float(tile) * 4.0, 0.02) + extra_tol;
         if (dist > tol)
             continue; // captured a different (farther) surface than the query point
 

@@ -196,7 +196,7 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
                 bool cache_hit;
                 indirect += sample_surface_cache(q, geo_normal(q), pc.cards_index,
                                                  pc.cache_pos_index, pc.cache_rad_read,
-                                                 pc.num_cards, pc.tile, cache_hit);
+                                                 pc.num_cards, pc.tile, 0.0, cache_hit);
                 break;
             }
             // P3 cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01) legacy).

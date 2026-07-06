@@ -1538,6 +1538,10 @@ pub(crate) fn gdf_reflect_push(
     width: u32,
     height: u32,
     flip_y: u32,
+    // GI irradiance-volume base index (radiance cache) sampled at reflection hits for the indirect
+    // term; u32::MAX = off (gallery) -> legacy analytic sky fill, byte-identical. Packed into
+    // flip_y's spare bits below (the 240-byte block is full; D3D12 root budget forbids growing it).
+    gi_vol_base: u32,
     material_index: u32,
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
@@ -1586,7 +1590,16 @@ pub(crate) fn gdf_reflect_push(
     pc[108..112].copy_from_slice(&out_index.to_le_bytes());
     pc[112..116].copy_from_slice(&width.to_le_bytes());
     pc[116..120].copy_from_slice(&height.to_le_bytes());
-    pc[120..124].copy_from_slice(&flip_y.to_le_bytes());
+    // Pack the GI-volume base into flip_y's upper bits (shader reads bit0 for the Y-flip and
+    // `>> 1` for the volume). Encode (base+1) so 0 = off; base indices are small (< bindless
+    // volume count) so this never collides with bit0.
+    let flip_packed = (flip_y & 1)
+        | if gi_vol_base == u32::MAX {
+            0
+        } else {
+            (gi_vol_base + 1) << 1
+        };
+    pc[120..124].copy_from_slice(&flip_packed.to_le_bytes());
     pc[124..128].copy_from_slice(&material_index.to_le_bytes());
     for (i, v) in aabb_min.iter().enumerate() {
         pc[128 + i * 4..132 + i * 4].copy_from_slice(&v.to_le_bytes());
