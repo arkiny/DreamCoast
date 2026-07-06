@@ -373,11 +373,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         bool cached = false;
         if (pc.cache.x != 0xFFFFFFFFu)
         {
-            // Fix 2 (coverage): a coarse-field reflection HIT is imprecise by ~half a voxel, so
-            // widen the card acceptance by that much for CONTENT (vol_on) — lets the hit match the
-            // card of the surface it grazed and read its precise cached multibounce radiance instead
-            // of the darker analytic fallback. 0 for the gallery (vol_on false) -> byte-identical.
-            float cache_bias = vol_on ? 0.006 * length(GDF_MAX - GDF_MIN) : 0.0;
+            // Reference-engine (Lumen) cone-based card acceptance: the coarse-field reflection HIT is
+            // imprecise, and the imprecision GROWS with the ray distance `t` (a far hit lands farther
+            // from the true surface). A FIXED tolerance (the old 0.006·diag) matched near cards but
+            // FAILED far ones → those far hits fell to the coarse per-voxel-albedo analytic path = the
+            // blocky, colour-bleeding chrome centre. Grow the acceptance with distance (like Lumen's
+            // ray-cone SampleRadius) so far reflected surfaces still read their smooth cached lit
+            // radiance instead of albedo. 0 for the gallery (vol_on false) -> byte-identical.
+            float cache_bias = vol_on ? (0.006 * length(GDF_MAX - GDF_MIN) + t * 0.03) : 0.0;
             color = sample_surface_cache(hp, hn, pc.cache.x, pc.cache.y, pc.cache.z,
                                          pc.cache.w, pc.cache_tile, cache_bias, cached);
         }

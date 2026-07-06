@@ -22,6 +22,7 @@ float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos
     int best = -1;
     uint best_texel = 0u;
     float best_score = 0.0;
+    float best_uu = 0.0, best_vv = 0.0;
     for (uint c = 0u; c < num_cards; c++)
     {
         uint b = c * 64u;
@@ -64,10 +65,48 @@ float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos
             best_score = score;
             best = int(c);
             best_texel = texel;
+            best_uu = uu;
+            best_vv = vv;
         }
     }
     if (best < 0)
         return float3(0.0, 0.0, 0.0);
     found = true;
+
+    // NEAREST texel (primary consumers / gallery, extra_tol == 0) → byte-identical.
+    if (extra_tol <= 0.0)
+        return asfloat(g.storage_buffers[cache_rad_index].Load3(best_texel * 16u));
+
+    // Reference-engine (Lumen) BILINEAR card-atlas fetch (content, extra_tol > 0): a demagnified far
+    // reflection maps many pixels onto few cache texels — a NEAREST read then reads them as hard
+    // blocks (the blocky chrome centre). Interpolate the best card's 2x2 texel quad, skipping texels
+    // that captured no geometry and renormalising by the valid weight, so the reflection reads a
+    // smooth cached radiance instead of stair-stepped blocks.
+    float fu = (best_uu * 0.5 + 0.5) * float(tile) - 0.5;
+    float fv = (best_vv * 0.5 + 0.5) * float(tile) - 0.5;
+    float ff = floor(fu), fg = floor(fv);
+    float wu = saturate(fu - ff), wv = saturate(fv - fg);
+    int tx0 = clamp(int(ff), 0, int(tile) - 1);
+    int ty0 = clamp(int(fg), 0, int(tile) - 1);
+    int tx1 = min(tx0 + 1, int(tile) - 1);
+    int ty1 = min(ty0 + 1, int(tile) - 1);
+    int bt2[4] = { ty0 * int(tile) + tx0, ty0 * int(tile) + tx1, ty1 * int(tile) + tx0,
+                   ty1 * int(tile) + tx1 };
+    float w4[4] = { (1.0 - wu) * (1.0 - wv), wu * (1.0 - wv), (1.0 - wu) * wv, wu * wv };
+    uint base = uint(best) * (tile * tile);
+    float3 sum = float3(0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    [unroll] for (int i = 0; i < 4; i++)
+    {
+        uint tex = base + uint(bt2[i]);
+        float capw = asfloat(g.storage_buffers[cache_pos_index].Load4(tex * 16u)).w;
+        if (capw > 0.5)
+        {
+            sum += w4[i] * asfloat(g.storage_buffers[cache_rad_index].Load3(tex * 16u));
+            wsum += w4[i];
+        }
+    }
+    if (wsum > 1e-4)
+        return sum / wsum;
     return asfloat(g.storage_buffers[cache_rad_index].Load3(best_texel * 16u));
 }
