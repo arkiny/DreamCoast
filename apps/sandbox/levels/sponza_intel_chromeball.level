@@ -1,0 +1,42 @@
+(
+    entities: [
+        (
+            asset: "assets/IntelSponza/main_sponza/NewSponza_Main_glTF_003.gltf",
+            transform: (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            material_override: None,
+        ),
+        (
+            asset: "assets/IntelSponza/pkg_a_curtains/NewSponza_Curtains_glTF.gltf",
+            transform: (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            material_override: None,
+        ),
+        (
+            // Static chrome ball in the nave centre (unit uv_sphere scaled to ~1.2 m radius, at
+            // world (-2, 1.5, 0)). Being a STATIC level mesh it is baked into the GDF, so this is the
+            // control case: does a static polished-metal reflector show a clean reflection?
+            asset: "sphere",
+            transform: (1.2, 0.0, 0.0, 0.0, 0.0, 1.2, 0.0, 0.0, 0.0, 0.0, 1.2, 0.0, -2.0, 1.5, 0.0, 1.0),
+            material_override: Some((base_color_factor: (0.9, 0.9, 0.9, 1.0), metallic: 1.0, roughness: 0.05)),
+        ),
+    ],
+    lights: [
+        (
+            kind: Directional,
+            vec: (-0.3, -0.9, -0.2),
+            color: (1.0, 0.96, 0.9),
+            intensity: 100000.0,
+        ),
+    ],
+    camera: (
+        position: (4.5, 1.6, 0.0),
+        target: (-2.0, 1.5, 0.0),
+        fov_y_deg: 45.0,
+        znear: 0.05,
+        zfar: 100.0,
+    ),
+    environment: (
+        sun_dir: (-0.3, -0.9, -0.2),
+        sun_intensity: 100000.0,
+        sky_white_balance: (1.0, 1.0, 1.0),
+    ),
+)

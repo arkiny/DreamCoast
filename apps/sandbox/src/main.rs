@@ -5916,7 +5916,10 @@ impl App {
                     self.flip_y,
                     // Content: fixed frame (0) → temporally stable GGX jitter (no reflection
                     // sparkle). Gallery: real frame → byte-identical legacy anchor.
-                    if self.is_gallery {
+                    // TEST P_REFLECT_ACCUM: frame-VARYING GGX jitter so the temporal resolve
+                    // actually accumulates a different ray each frame (real convergence), instead of
+                    // the content default's FIXED frame-0 jitter (spatial-gather-only, no temporal).
+                    if self.is_gallery || std::env::var_os("P_REFLECT_ACCUM").is_some() {
                         self.frame_no as u32
                     } else {
                         0
@@ -6569,7 +6572,7 @@ impl App {
                 },
                 scene_albedo,
                 reflect_cache_arg,
-                None, // GI volume off (standalone reflection viz path)
+                gi_reflect_arg, // GI-lit indirect so the reflection viz shows the real reflection
                 scene_clip,
                 &scene_clip_vols,
                 self.reflect_max_steps,
@@ -6655,7 +6658,7 @@ impl App {
                     },
                     scene_albedo,
                     reflect_cache_arg,
-                    None, // GI volume off (standalone reflection viz path)
+                    gi_reflect_arg, // GI-lit indirect so the reflection viz shows the real reflection
                     scene_clip,
                     &scene_clip_vols,
                     self.reflect_max_steps,
