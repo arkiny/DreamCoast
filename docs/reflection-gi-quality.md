@@ -56,19 +56,27 @@ cache re-light, viz) pass `0.0` → byte-identical. The reflection passes ~half 
 of the surface it grazed and reads its precise multibounce radiance instead of the analytic fallback.
 Card-budget scaling for large scenes is a follow-up (memory/relight-cost tradeoff; not changed here).
 
-### Fix 3 — trace hierarchy (clipmap) — structural
+### Fix 3 — trace hierarchy (clipmap / per-mesh SDF) — structural
 
-The multi-resolution **clipmap** field already exists as opt-in (`P11_GDF_CLIP_LEVELS=N`, default 1 =
-the single 48³ volume); the reflection march already samples it via `reflect_clip()`. Enabling a
-clipmap gives content reflections a finer near-camera field (sharper hits, better thin-geometry
-capture) at bounded far cost — the reference-engine clipmap approach. Remaining structural work to
-make this the default for large content scenes:
+The multi-resolution **clipmap** field (`P11_GDF_CLIP_LEVELS=N`, default 1) and **per-mesh direct
+SDF** (`P11_DIRECT_SDF`) already exist as opt-in; the reflection march samples them via
+`reflect_clip()`. Both are the reference-engine finer-field approaches for sharp / thin-geometry hits.
 
-- Re-baseline the content goldens (`sponza_gdf_ao`, `sponza_sc_viz`) once the clipmap is on by
-  default for those scenes (the gallery stays single-level, anchor unchanged).
-- Thin geometry (cloth/curtains): capture via a screen-trace first bounce and/or per-mesh distance
-  fields (`P11_DIRECT_SDF`) so it is reflected even where the coarse field drops it.
-- Scale the surface-cache card budget with scene drawable count.
+**Empirical finding (Intel Sponza knight):** neither changed the reflection — a 3-level clipmap moved
+the knight by 0.009/ch (0.02 % of pixels), per-mesh direct SDF by 0.012/ch. **Field resolution is not
+this scene's lever.** After Fix 1 the reflection radiance comes from the world-space GI *volume*,
+which returns nearly the same irradiance whether the ray hits precisely or coarsely — so making the
+hit sharper does not change the reflected colour. The near-black was the analytic GI-less re-light
+(Fix 1), never the field precision.
+
+The remaining lever for *sharp, bright, coloured* reflections of specific surfaces (e.g. the curtains)
+is **surface-cache coverage** — the reflection must sample the hit surface's precise cached lit
+radiance, which needs (a) a card on that surface (raise/scale the `MAX_CARDS` budget with scene
+drawable count) and (b) the ray to hit it (finer field helps here, but only once a card exists).
+Thin cloth additionally needs a two-sided distance field or a screen-trace first bounce to be hit at
+all. This is a larger, scene-specific effort with uncertain payoff and is left as a documented
+follow-up; clipmap-by-default for large content scenes also requires re-baselining the content
+goldens (`sponza_gdf_ao`, `sponza_sc_viz`); the gallery stays single-level, anchor unchanged.
 
 ## Verification
 
