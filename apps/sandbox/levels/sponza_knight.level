@@ -48,7 +48,11 @@
         (
             source: "assets/Knight/knight.usda",
             transform: (-0.00000004371139, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, -0.00000004371139, 0.0, 3.5, 0.0, 0.0, 1.0),
-            material_override: None,
+            // Polished gunmetal armour: full metallic + low roughness reads as steel in the bright
+            // Sponza interior (the generic `brushed_metal` default — metallic 0.6 / roughness 0.45,
+            // light grey — washes out to matte white here). Slightly darker blue-grey base so the
+            // environment reflection carries the metal look instead of the diffuse tint.
+            material_override: Some((base_color_factor: (0.35, 0.36, 0.40, 1.0), metallic: 1.0, roughness: 0.2)),
         ),
     ],
 )

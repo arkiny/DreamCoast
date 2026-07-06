@@ -1,0 +1,49 @@
+(
+    entities: [
+        (
+            asset: "assets/IntelSponza/main_sponza/NewSponza_Main_glTF_003.gltf",
+            transform: (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            material_override: None,
+        ),
+        (
+            asset: "assets/IntelSponza/pkg_a_curtains/NewSponza_Curtains_glTF.gltf",
+            transform: (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            material_override: None,
+        ),
+    ],
+    lights: [
+        (
+            kind: Directional,
+            vec: (-0.3, -0.9, -0.2),
+            color: (1.0, 0.96, 0.9),
+            intensity: 100000.0,
+        ),
+    ],
+    camera: (
+        // Tight frontal close-up on the knight's helmet: camera on the +X side (knight faces +X, sun
+        // from +X → visor lit) at the SAME z as the knight (z=-1.5) so the head sits against the open
+        // nave down-axis, not the side column. Zoomed in (fov 36).
+        position: (3.0, 1.42, -1.5),
+        target: (0.0, 1.28, -1.5),
+        fov_y_deg: 36.0,
+        znear: 0.05,
+        zfar: 100.0,
+    ),
+    environment: (
+        sun_dir: (-0.3, -0.9, -0.2),
+        sun_intensity: 100000.0,
+        sky_white_balance: (1.0, 1.0, 1.0),
+    ),
+    deforms: [
+        (
+            // Knight at z=-1.5 (off the right-arcade column line, out in the open nave so the camera
+            // frames it against the open down-axis, not the column/curtains), facing +X toward camera.
+            source: "assets/Knight/knight.usda",
+            transform: (0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.5, 1.0),
+            // Polished steel (pure mirror) to exercise the SW-RT reflection GI term: metallic 1.0 has
+            // no diffuse, so it reads its reflected radiance directly. With the radiance-cache indirect
+            // now fed into reflection hits it shows the GI-lit surroundings instead of the old black.
+            material_override: Some((base_color_factor: (0.55, 0.56, 0.60, 1.0), metallic: 1.0, roughness: 0.15)),
+        ),
+    ],
+)
