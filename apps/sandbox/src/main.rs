@@ -6826,6 +6826,18 @@ impl App {
                 taau_jitter_uv,
                 false,
                 velocity_target,
+                // TSR-style clamp-box expansion: widens the variance box ∝ local contrast so a static
+                // high-contrast edge's converged history isn't re-clipped each frame under jitter (the
+                // dominant upsampling shimmer). 0 for the gallery (byte-identical anchor); content
+                // defaults to 1.0, `P_TAAU_CLAMP_EXPAND` tunes.
+                if self.is_gallery {
+                    0.0
+                } else {
+                    std::env::var("P_TAAU_CLAMP_EXPAND")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(2.0)
+                },
             ))
         } else {
             None

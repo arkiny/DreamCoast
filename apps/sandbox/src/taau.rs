@@ -175,6 +175,7 @@ impl TaauSystem {
         jitter_uv: [f32; 2],
         force_reset: bool,
         velocity: Option<ResourceId>,
+        clamp_expand: f32,
     ) -> ResourceId {
         let pipe = self.pipeline.as_ref().expect("taau pipeline");
         let frame = self.frame;
@@ -230,6 +231,7 @@ impl TaauSystem {
                     reject_dist,
                     max_hist,
                     gamma,
+                    clamp_expand,
                     jitter_uv,
                     velocity_index,
                 ));

@@ -224,6 +224,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float gamma = pc.params.z;
     float3 box_min = mean - gamma * sigma;
     float3 box_max = mean + gamma * sigma;
+    // Reference-engine (TSR) anti-flicker clamp-error: a tight μ±γσ box RE-CLIPS the converged history
+    // every frame on a static high-contrast edge — the sub-pixel jitter shifts the low-res neighborhood
+    // statistics, so the shifting box snaps the (stable) history to a different face each frame = the
+    // dominant upsampling shimmer. Widen the box by a fraction of its OWN size (∝ local contrast, so
+    // flat areas — where the box is tiny — barely move and don't ghost), letting static detail
+    // CONVERGE. `params.w` = 0 (gallery) is exact byte-identical; content passes the expansion factor.
+    float3 clamp_err = (box_max - box_min) * pc.params.w;
+    box_min -= clamp_err;
+    box_max += clamp_err;
 
     // World point of THIS pixel (validation + storage) and of the closest neighbor (reprojection
     // motion — closest-depth dilation so silhouettes fetch the foreground history).

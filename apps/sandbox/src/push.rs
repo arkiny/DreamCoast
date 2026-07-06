@@ -1312,6 +1312,7 @@ pub(crate) fn taau_push(
     reject_dist: f32,
     max_hist: f32,
     variance_gamma: f32,
+    clamp_expand: f32,
     jitter_uv: [f32; 2],
     velocity_index: u32,
 ) -> [u8; 240] {
@@ -1343,6 +1344,8 @@ pub(crate) fn taau_push(
     pc[192..196].copy_from_slice(&reject_dist.to_le_bytes());
     pc[196..200].copy_from_slice(&max_hist.to_le_bytes());
     pc[200..204].copy_from_slice(&variance_gamma.to_le_bytes());
+    // params.w: TSR-style clamp-box expansion factor (0 = tight box = byte-identical anchor).
+    pc[204..208].copy_from_slice(&clamp_expand.to_le_bytes());
     // float4 jitter (xy = current jitter in UV) at the next 16-byte row.
     pc[208..212].copy_from_slice(&jitter_uv[0].to_le_bytes());
     pc[212..216].copy_from_slice(&jitter_uv[1].to_le_bytes());
