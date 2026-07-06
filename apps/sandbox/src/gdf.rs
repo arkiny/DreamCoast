@@ -1123,6 +1123,7 @@ impl GdfSystem {
         conv_idx: u32,
         skylight_floor: f32,
         irradiance_index: u32,
+        gather_firefly: f32,
         sky_gain: f32,
         sky_wb: [f32; 3],
     ) {
@@ -1217,6 +1218,7 @@ impl GdfSystem {
                     cone_k,
                     conv_idx,
                     irradiance_index,
+                    gather_firefly,
                     sky_gain,
                     sky_wb,
                 ));
@@ -1251,6 +1253,7 @@ impl GdfSystem {
         conv_idx: u32,
         skylight_floor: f32,
         irradiance_index: u32,
+        gather_firefly: f32,
         sky_gain: f32,
         sky_wb: [f32; 3],
     ) {
@@ -1340,6 +1343,7 @@ impl GdfSystem {
             cone_k,
             conv_idx,
             irradiance_index,
+            gather_firefly,
             sky_gain,
             sky_wb,
         ));

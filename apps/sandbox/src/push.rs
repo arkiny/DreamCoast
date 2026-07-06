@@ -791,6 +791,7 @@ pub(crate) fn cache_light_push(
     cone_k: f32,
     conv_buf: u32,
     irradiance_index: u32,
+    gather_firefly: f32,
     sky_gain: f32,
     sky_wb: [f32; 3],
 ) -> [u8; 160] {
@@ -843,6 +844,8 @@ pub(crate) fn cache_light_push(
     pc[132..136].copy_from_slice(&conv_buf.to_le_bytes());
     // Skylight-floor IBL irradiance cube index (former pad1 slot @136). 0xFFFFFFFF = absent (floor off).
     pc[136..140].copy_from_slice(&irradiance_index.to_le_bytes());
+    // Per-sample firefly clamp for the indirect gather (former pad2 slot @140). 0 = off.
+    pc[140..144].copy_from_slice(&gather_firefly.to_le_bytes());
     // Sky (float4 at offset 144, after cone_k + 3 pad floats): x = gain, yzw = white balance —
     // the same procedural-sky params the path tracer uses, for the relight's sky-on-miss.
     pc[144..148].copy_from_slice(&sky_gain.to_le_bytes());

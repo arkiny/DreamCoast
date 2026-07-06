@@ -3261,6 +3261,25 @@ impl App {
         }
     }
 
+    /// Per-sample firefly clamp for the surface-cache indirect gather (`sdf_cache_light`), in physical
+    /// radiance units. The reference engine's LumenRadiosity clamps each hemisphere sample to
+    /// `MaxRayIntensity · OneOverPreExposure` at the source; a single bright, frame-varying gather ray
+    /// otherwise pops as a moving sparkle and keeps the relight EMA above its convergence-freeze
+    /// epsilon (so the cache never settles). Our exposure maps physical→~1, so the physical ceiling is
+    /// `MaxRayIntensity / exposure`. `0` for the gallery (byte-identical); `P_CACHE_FIREFLY` tunes the
+    /// intensity (default 40, the reference default).
+    fn cache_gather_firefly(&self) -> f32 {
+        if self.is_gallery {
+            0.0
+        } else {
+            let max_ray = std::env::var("P_CACHE_FIREFLY")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(40.0);
+            max_ray / self.exposure.max(1e-6)
+        }
+    }
+
     /// The swapchain (inline path). Panics if the RHI thread owns it.
     fn swapchain(&self) -> &Swapchain {
         self.swapchain
@@ -5452,6 +5471,7 @@ impl App {
                         relight_conv_idx,
                         self.cache_skylight_floor(),
                         self.irradiance_cube_index(),
+                        self.cache_gather_firefly(),
                         self.sky_gain,
                         self.sky_wb,
                     );
@@ -7184,6 +7204,7 @@ impl App {
                     relight_conv_idx,
                     self.cache_skylight_floor(),
                     self.irradiance_cube_index(),
+                    self.cache_gather_firefly(),
                     self.sky_gain,
                     self.sky_wb,
                 );

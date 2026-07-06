@@ -41,7 +41,9 @@ struct CacheLightPush
                           // freezes the relight ONLY on MEASURED convergence (a general engine budgets by
                           // priority rather than a frame-count freeze). 0xFFFFFFFF = disabled.
     uint irradiance_index; // IBL diffuse-irradiance cube (skylight-floor fill; 0xFFFFFFFF = absent = off)
-    float pad2;
+    float gather_firefly;  // per-sample firefly clamp for the indirect gather (max radiance, physical
+                           // units; 0 = off = byte-identical). Reference-engine LumenRadiosity clamps
+                           // each hemisphere sample to MaxRayIntensity·OneOverPreExposure at the source.
     float4 sky;           // x = sky gain, yzw = white balance (matches the path tracer's sky)
 };
 
@@ -63,6 +65,19 @@ uint pcg(inout uint state)
     return (word >> 22) ^ word;
 }
 float rnd(inout uint s) { return float(pcg(s) & 0xFFFFFFu) / float(0x1000000); }
+
+// Reference-engine (LumenRadiosity) per-sample firefly clamp: cap the max channel to `maxr`
+// (physical radiance), scaling the whole sample so the hue is preserved. A single bright gather
+// sample can otherwise dominate the low-spp mean and — since the ray set varies per frame — pop as a
+// moving sparkle that keeps the relight's EMA step above the convergence-freeze epsilon. `maxr <= 0`
+// disables it (byte-identical). Applied at the SOURCE, before the mean + temporal EMA.
+float3 clamp_firefly(float3 v, float maxr)
+{
+    if (maxr <= 0.0)
+        return v;
+    float m = max(v.x, max(v.y, v.z));
+    return m > maxr ? v * (maxr / m) : v;
+}
 void onb(float3 n, out float3 t, out float3 b)
 {
     t = normalize(abs(n.x) > 0.9 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
@@ -196,9 +211,10 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
             {
                 hit = true;
                 bool cache_hit;
-                indirect += sample_surface_cache(q, geo_normal(q), pc.cards_index,
-                                                 pc.cache_pos_index, pc.cache_rad_read,
-                                                 pc.num_cards, pc.tile, 0.0, cache_hit);
+                float3 s = sample_surface_cache(q, geo_normal(q), pc.cards_index,
+                                                pc.cache_pos_index, pc.cache_rad_read,
+                                                pc.num_cards, pc.tile, 0.0, cache_hit);
+                indirect += clamp_firefly(s, pc.gather_firefly);
                 break;
             }
             // P3 cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01) legacy).
@@ -208,7 +224,8 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
         }
         if (!hit)
         {
-            indirect += procedural_sky(dir, sun_dir, sun_i, pc.sky.x, false) * pc.sky.yzw;
+            float3 s = procedural_sky(dir, sun_dir, sun_i, pc.sky.x, false) * pc.sky.yzw;
+            indirect += clamp_firefly(s, pc.gather_firefly);
             miss_count++;
         }
     }
