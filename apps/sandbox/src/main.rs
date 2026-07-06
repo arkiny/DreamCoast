@@ -3659,7 +3659,13 @@ impl App {
         // jitter blurs/destabilizes their accumulation. bit1 of the flip word selects that path in
         // gdf_temporal/reflect_temporal; cleared (no jitter) = integer-floor fetch = byte-identical
         // to the legacy path. Computed once here, applied at both call sites.
-        let temporal_flip = self.flip_y | if taau_jitter_active { 2 } else { 0 };
+        // bit2 (content only): the reflection temporal resolve reprojects the VIRTUAL IMAGE (the
+        // reflected point at the hit distance) instead of the surface, so a mirror reflection stays
+        // stable under camera motion instead of swimming. Gallery keeps the surface reproject
+        // (byte-identical). Applied only to near-mirrors in-shader (sr == 0).
+        let temporal_flip = self.flip_y
+            | if taau_jitter_active { 2 } else { 0 }
+            | if self.is_gallery { 0 } else { 4 };
 
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32();

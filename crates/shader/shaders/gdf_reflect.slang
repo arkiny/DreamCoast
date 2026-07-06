@@ -304,13 +304,16 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float4 ppos = asfloat(g.storage_buffers[sk.read].Load4(lin * 32u));
             if (ppos.w > 0.5 && distance(p, ppos.xyz) < reject)
             {
-                float3 prad = asfloat(g.storage_buffers[sk.read].Load4(lin * 32u + 16u)).rgb;
+                // The persisted radiance slot's .w carries the reflection HIT DISTANCE (world) so the
+                // temporal resolve can reproject the virtual image (reference-engine mirror denoise).
+                float4 pradf = asfloat(g.storage_buffers[sk.read].Load4(lin * 32u + 16u));
+                float3 prad = pradf.rgb;
                 if (skip_write)
                 {
                     g.storage_buffers[sk.write].Store4(lin * 32u, asuint(float4(p, 1.0)));
-                    g.storage_buffers[sk.write].Store4(lin * 32u + 16u, asuint(float4(prad, 0.0)));
+                    g.storage_buffers[sk.write].Store4(lin * 32u + 16u, asuint(float4(prad, pradf.w)));
                 }
-                g.storage_images[pc.out_index][tid.xy] = float4(prad, 1.0);
+                g.storage_images[pc.out_index][tid.xy] = float4(prad, pradf.w);
                 return;
             }
         }
@@ -473,11 +476,18 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     }
 
 
+    // Reflection HIT DISTANCE (world units) in the output/persist `.w` — the temporal resolve uses it
+    // to reproject the VIRTUAL IMAGE (the reflected point at `surface_dist + t` along the view ray) so a
+    // mirror reflection stays stable under camera motion instead of swimming (reference-engine
+    // LumenReflectionDenoiserTemporal virtual-image reproject). `t` is the ray parameter at the hit
+    // (≈ ray max on a miss = the sky, effectively far). Alpha is unused by the composite/lighting, so
+    // this is inert for every non-temporal-resolve consumer (gallery byte-identical).
+    float hit_dist = t;
     // A3: persist this freshly-traced (surface point, radiance) for next frame's reuse gate.
     if (skip_write)
     {
         g.storage_buffers[sk.write].Store4(lin * 32u, asuint(float4(p, 1.0)));
-        g.storage_buffers[sk.write].Store4(lin * 32u + 16u, asuint(float4(color, 0.0)));
+        g.storage_buffers[sk.write].Store4(lin * 32u + 16u, asuint(float4(color, hit_dist)));
     }
-    g.storage_images[pc.out_index][tid.xy] = float4(color, 1.0);
+    g.storage_images[pc.out_index][tid.xy] = float4(color, hit_dist);
 }

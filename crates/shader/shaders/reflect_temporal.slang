@@ -204,12 +204,28 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         clamp_hi = min(cmax, mean + pc.clamp_gamma * sigma);
     }
 
+    // VIRTUAL-IMAGE reprojection (content, flip_y bit2 — reference-engine LumenReflectionDenoiser-
+    // Temporal): a mirror's reflected content appears at the HIT distance BEHIND the surface, so
+    // reprojecting the SURFACE point into the previous frame (the legacy path) fetches the wrong
+    // history under camera motion and the reflection SWIMS / never converges. Instead reproject the
+    // reflected point itself — the point `surface_dist + hit_dist` along the view ray (the virtual
+    // image). `hit_dist` is the reflection ray length, carried in the reflection's `.w` (gdf_reflect).
+    // Gallery / legacy (bit2 clear) reprojects the surface = byte-identical anchor.
+    float hit_dist = g.textures[pc.refl_index].SampleLevel(g.samp, uv, 0.0).a;
+    float3 to_surf = world_pos - pc.cam_pos.xyz;
+    float surf_dist = length(to_surf);
+    float3 virt_pos =
+        pc.cam_pos.xyz + (to_surf / max(surf_dist, 1e-4)) * (surf_dist + max(hit_dist, 0.0));
+    // Only near-mirrors (sr == 0) use the virtual image; a glossy lobe's hit distance is diffuse,
+    // so those keep the surface reproject (unchanged). Content flag = flip_y bit2.
+    float3 reproj_pos = (((pc.flip_y & 4u) != 0u) && sr == 0) ? virt_pos : world_pos;
+
     float3 accum = sample_tm;
     float len = 1.0;
     if (pc.reset == 0u)
     {
         float sy = (pc.flip_y & 1u) != 0u ? 1.0 : -1.0;
-        float4 pclip = mul(pc.prev_view_proj, float4(world_pos, 1.0));
+        float4 pclip = mul(pc.prev_view_proj, float4(reproj_pos, 1.0));
         if (pclip.w > 0.0)
         {
             float3 pndc = pclip.xyz / pclip.w;
@@ -218,7 +234,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             {
                 float3 hist_rgb;
                 float hist_len;
-                fetch_refl_history(puv, world_pos, hist_rgb, hist_len);
+                fetch_refl_history(puv, reproj_pos, hist_rgb, hist_len);
                 if (hist_len > 0.5)
                 {
                     // Neighbourhood-clamp the (view-dependent) stale history into this frame's local
@@ -242,7 +258,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // Sanitize before storing: a NaN would persist in the accumulator and spread via EMA.
     accum = make_finite(accum);
     g.storage_buffers[pc.accum_write].Store4(idx * 16u, asuint(float4(accum, len)));
-    g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(world_pos, 1.0)));
+    g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(reproj_pos, 1.0)));
 
     float3 resolved = from_tm(accum);
     // Hue-preserving firefly clamp on the resolved radiance.
