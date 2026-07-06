@@ -706,6 +706,10 @@ impl ReflectSystem {
         // same tuple the GI pass gets. Sampled at reflection hits for the GI-lit indirect term so
         // shadowed reflected surfaces aren't black. `None` (gallery) -> legacy analytic fill.
         gi_volume: Option<(u32, u32, ResourceId)>,
+        // IBL diffuse-irradiance cube index (physical-units skylight). For content (gi_volume present)
+        // it rides the shader-unused `sky_fill` push slot; a reflected uncovered/shadowed surface and
+        // an escaped (sky) ray floor to this instead of near-black. `u32::MAX` / gallery -> legacy.
+        irradiance_index: u32,
         clip: (u32, u32),
         clip_vols: &'a [&'a Volume],
         max_steps: u32,
@@ -799,7 +803,13 @@ impl ReflectSystem {
                     diag, // sample distance clamp
                     diag, // reflection ray max distance
                     0.7,  // constant hit-albedo fallback (sentinel albedo => achromatic, pre-C8a)
-                    0.25, // sky fill at the reflected hit
+                    // sky_fill slot: content (vol on) overloads it with the IBL irradiance cube index
+                    // (the shader reads it only on the vol_on skylight-fill path); gallery keeps 0.25.
+                    if gi_vol_base != u32::MAX {
+                        f32::from_bits(irradiance_index)
+                    } else {
+                        0.25
+                    },
                     bias,
                     albedo_rgb,
                     frame,

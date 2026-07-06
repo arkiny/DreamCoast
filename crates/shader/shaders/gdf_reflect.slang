@@ -324,6 +324,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float max_dist = pc.params.x;
     float sky_fill = pc.params.z;
     float bias = pc.params.w;
+    // Content (vol_on) overloads the sky_fill slot with the IBL diffuse-irradiance cube index — the
+    // physical-units skylight the deferred pass samples. Used to fill an uncovered/shadowed reflected
+    // surface (analytic path) and an escaped (sky) ray with real skylight instead of near-black.
+    uint irr_idx = vol_on ? asuint(pc.params.z) : 0xFFFFFFFFu;
+    bool has_irr = irr_idx != 0xFFFFFFFFu;
 
     // Sphere-trace the reflection ray. Stage D3: content lowers the step cap; gallery = 96.
     int max_steps = int(max(pc.max_steps, 1u));
@@ -388,6 +393,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 // how the deferred lighting consumes the same volume.
                 float3 e = sample_gi_irradiance(vol_base, hp, hn);
                 color = hit_albedo * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
+                // Physical IBL-diffuse skylight fill: the radiance-cache volume `e` is a LOCAL bounce
+                // term and is ~0 where the cache is cold, so an uncovered reflected surface would go
+                // near-black. Add the same sky irradiance the deferred pass gives every surface
+                // (`irradiance_cube(hn) * albedo`) so a reflected shadowed/uncovered face reads its
+                // true skylit grey — the reflection then matches the directly-shaded scene.
+                if (has_irr)
+                    color += g.cubes[irr_idx].SampleLevel(g.samp, hn, 0.0).rgb * hit_albedo;
             }
             else
             {
@@ -399,7 +411,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     }
     else
     {
-        color = sky(dir, sun_dir, sun_i, false); // specular miss -> sky w/o sun (direct light owns the glint)
+        // Specular miss -> the sky the mirror ray sees. Content samples the physical IBL cube (the
+        // deferred pass's captured sky, in scene lux) so an escaped ray reads a bright sky instead of
+        // the tiny unscaled procedural gradient (which metered to ~black in a lux-lit scene, leaving
+        // black speckle holes). The irradiance cube is cosine-convolved (≈π·radiance), so /π brings it
+        // back to a directional sky radiance. Gallery keeps the legacy gradient (byte-identical).
+        if (has_irr)
+            color = g.cubes[irr_idx].SampleLevel(g.samp, dir, 0.0).rgb * (1.0 / GGX_PI);
+        else
+            color = sky(dir, sun_dir, sun_i, false);
     }
 
     // A3: persist this freshly-traced (surface point, radiance) for next frame's reuse gate.

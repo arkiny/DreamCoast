@@ -5964,6 +5964,7 @@ impl App {
                     scene_albedo,
                     reflect_cache_arg,
                     gi_reflect_arg, // GI-lit indirect at reflection hits (radiance cache)
+                    self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                     scene_clip,
                     &scene_clip_vols,
                     self.reflect_max_steps,
@@ -6610,6 +6611,7 @@ impl App {
                 scene_albedo,
                 reflect_cache_arg,
                 gi_reflect_arg, // GI-lit indirect so the reflection viz shows the real reflection
+                self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                 scene_clip,
                 &scene_clip_vols,
                 self.reflect_max_steps,
@@ -6696,6 +6698,7 @@ impl App {
                     scene_albedo,
                     reflect_cache_arg,
                     gi_reflect_arg, // GI-lit indirect so the reflection viz shows the real reflection
+                    self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                     scene_clip,
                     &scene_clip_vols,
                     self.reflect_max_steps,
