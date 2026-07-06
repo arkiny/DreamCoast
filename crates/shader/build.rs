@@ -874,6 +874,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "sdf_cache_light_cs",
     },
+    // Reflection cone-LOD: surface-cache radiance MIP-pyramid generation (2×2 downsample).
+    Job {
+        src: "sdf_cache_mipgen.slang",
+        entry: "mipMain",
+        stage: "compute",
+        key: "sdf_cache_mipgen_cs",
+    },
     // Phase 11 Stage B (B3): merge per-mesh SDF instances into a global distance field.
     Job {
         src: "gdf_merge.slang",

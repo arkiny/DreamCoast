@@ -933,6 +933,10 @@ struct App {
     /// C8g: use the surface cache as the GDF reflection hit radiance (default on); ground hits
     /// (no cards) fall back to the per-ray re-light. Cheaper than the full GI cache above.
     reflect_cache: bool,
+    /// Reflection cone-LOD: sample the surface-cache radiance MIP pyramid by the ray-cone footprint
+    /// so a demagnified far reflection reads a coarse averaged level (smooth) instead of stair-
+    /// stepped mip0 blocks. Content default on; `P11_REFLECT_MIP=0` falls back to mip0 bilinear.
+    reflect_mip: bool,
     /// Firefly clamp: bound the per-sample radiance in the reflection source / composite / GI
     /// gather so a bright specular pixel can't become a speckle. Off => unbounded (pre-clamp).
     firefly_clamp: bool,
@@ -2663,6 +2667,10 @@ impl App {
             && gdf.has_surface_cache()
             && gdf.has_cache_lighting()
             && quality::env_bool("P11_REFLECT_CACHE", base.reflect_cache);
+        // Reflection cone-LOD MIP: default on when the reflection cache is used; a demagnified far
+        // reflection then reads a coarse averaged surface-cache MIP (smooth) rather than mip0 blocks.
+        // `P11_REFLECT_MIP=0` opts out (mip0 bilinear = the pre-MIP path).
+        let reflect_mip = reflect_cache && quality::env_bool("P11_REFLECT_MIP", true);
         // Firefly clamp on by default (P11_FIREFLY_CLAMP=0 to disable / compare).
         let firefly_clamp = quality::env_bool("P11_FIREFLY_CLAMP", base.firefly_clamp);
         // C8d: roughness above which screen-mirror SSR stops contributing (GDF takes over). Gallery
@@ -3129,6 +3137,7 @@ impl App {
             cache_viz,
             surface_cache,
             reflect_cache,
+            reflect_mip,
             firefly_clamp,
             reflect_max_roughness,
             ssr_stochastic,
@@ -5491,10 +5500,30 @@ impl App {
             }
             _ => None,
         };
-        let reflect_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
-            Some(ext) if self.reflect_cache => {
-                cache_read.map(|(c, p, r, n, t)| ([c, p, r, n, t], ext))
+        // Reflection cone-LOD: generate the surface-cache radiance MIP pyramid from the freshly-lit
+        // mip0, so a demagnified far reflection reads a coarse averaged level (smooth) instead of
+        // stair-stepped mip0 blocks. Ordered after the relight; returns a handle the reflection reads
+        // after. `None` (no pyramid / reflect_cache off) → the reflection keeps the mip0 bilinear path.
+        let cache_mip_ext: Option<ResourceId> = match (scene_cache_lit_ext, cache_read) {
+            (Some(lit), Some((_, _, rad, _, _))) if self.reflect_cache && self.reflect_mip => {
+                self.gdf.record_cache_mipgen(&mut graph, lit, rad)
             }
+            _ => None,
+        };
+        let reflect_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
+            Some(ext) if self.reflect_cache => cache_read.map(|(c, p, r, n, t)| {
+                // Pack the MIP pyramid into the tile slot: tile | max_mip<<8 | mip_index<<16 (all
+                // ≤16 bits; 0xFFFF mip_index = no pyramid). Order the reflection after mipgen when
+                // the pyramid exists (its handle), else after the relight directly.
+                let (tile_packed, order) = match (self.gdf.reflect_cache_mip_info(), cache_mip_ext)
+                {
+                    (Some((mip_idx, max_mip)), Some(mip_ext)) => {
+                        (t | (max_mip << 8) | (mip_idx << 16), mip_ext)
+                    }
+                    _ => (t | (0xFFFFu32 << 16), ext),
+                };
+                ([c, p, r, n, tile_packed], order)
+            }),
             _ => None,
         };
         // Stage C2: GDF ambient occlusion, multiplied into the lighting ambient term.

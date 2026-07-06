@@ -757,6 +757,47 @@ pub(crate) fn cache_view_push(
     pc
 }
 
+/// Pack the reflection cone-LOD MIP-generation push (48 bytes = 12 u32). One dispatch per level
+/// downsamples the surface-cache radiance atlas 2×2 into the MIP pyramid. `src_rad` is mip0 (the
+/// freshly-lit slot) at level 1 and the pyramid buffer for higher levels; `src_pos` supplies mip0
+/// validity (level 1 only). `parent_stride`/`off_prev` locate the parent within its buffer,
+/// `dst_stride`/`off_cur` the destination within the pyramid. `res_cur`/`res_prev` are the level
+/// edges. Layout mirrors `MipGenPush` in `sdf_cache_mipgen.slang`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdf_cache_mipgen_push(
+    src_rad: u32,
+    src_pos: u32,
+    dst: u32,
+    num_cards: u32,
+    level: u32,
+    res_cur: u32,
+    res_prev: u32,
+    parent_stride: u32,
+    off_prev: u32,
+    dst_stride: u32,
+    off_cur: u32,
+) -> [u8; 48] {
+    let mut pc = [0u8; 48];
+    let fields = [
+        src_rad,
+        src_pos,
+        dst,
+        num_cards,
+        level,
+        res_cur,
+        res_prev,
+        parent_stride,
+        off_prev,
+        dst_stride,
+        off_cur,
+        0u32, // pad to 48 B (12 u32)
+    ];
+    for (i, v) in fields.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc
+}
+
 /// Pack the Phase 11 Stage C8b2 surface-cache lighting push block (112 bytes): card +
 /// cache buffer indices, GDF sampled, atlas dims, spp/frame/reset, then float4 sun /
 /// aabb_min(+ground) / aabb_max(+clamp) / params(sky_fill, temporal alpha, bias, ray max).

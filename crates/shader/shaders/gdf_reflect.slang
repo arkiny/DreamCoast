@@ -381,8 +381,22 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             // ray-cone SampleRadius) so far reflected surfaces still read their smooth cached lit
             // radiance instead of albedo. 0 for the gallery (vol_on false) -> byte-identical.
             float cache_bias = vol_on ? (0.006 * length(GDF_MAX - GDF_MIN) + t * 0.03) : 0.0;
-            color = sample_surface_cache(hp, hn, pc.cache.x, pc.cache.y, pc.cache.z,
-                                         pc.cache.w, pc.cache_tile, cache_bias, cached);
+            // The reflection packs the MIP pyramid into cache_tile's spare bits: tile | max_mip<<8 |
+            // mip_index<<16 (mip_index 0xFFFF = no pyramid). The same distance-growing cone_bias is
+            // the ray-cone footprint (world units) that selects the MIP — near hits stay at mip0,
+            // far demagnified hits read a coarse averaged level → smooth chrome instead of blocks.
+            uint c_tile = pc.cache_tile & 0xFFu;
+            uint c_maxmip = (pc.cache_tile >> 8) & 0xFu;
+            uint c_mip16 = (pc.cache_tile >> 16) & 0xFFFFu;
+            uint mip_index = (c_mip16 == 0xFFFFu) ? 0xFFFFFFFFu : c_mip16;
+            // Ray-cone footprint that selects the MIP (world units) — DECOUPLED from `cache_bias`
+            // (which is the card-acceptance tolerance; widening THAT scatters cross-card). This grows
+            // with hit distance `t` so a far demagnified reflection reads a coarse averaged level
+            // while a near/face-on hit stays near mip0 (sharp). Slope ≈ a per-pixel cone half-angle.
+            float mip_radius = 0.05 + t * 0.08;
+            color = sample_surface_cache_cone(hp, hn, pc.cache.x, pc.cache.y, pc.cache.z, pc.cache.w,
+                                              c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
+                                              cached);
         }
         if (!cached)
         {
