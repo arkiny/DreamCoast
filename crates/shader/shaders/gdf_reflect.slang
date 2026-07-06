@@ -302,7 +302,17 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // the temporal resolve accumulates them into the glossy lobe). Near-mirror stays sharp.
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
     float3 dir;
-    if (roughness > 0.04)
+    // Mirror threshold: a polished metal (roughness up to ~0.125) traces the DETERMINISTIC reflection
+    // ray (no GGX jitter), so it settles to a stable sharp reflection every frame instead of a
+    // stochastic 1-ray/frame sample that sparkles (the reflect_temporal near-mirror boundary is the
+    // same 0.125 = sr==0, so these carry no neighbourhood clamp and rely on being deterministic). Only
+    // genuinely GLOSSY surfaces (> threshold) need the importance-sampled lobe + temporal reconstruction.
+    // Content raises the threshold to 0.125; the gallery keeps 0.04 (its chrome sphere is 0.08 = GGX,
+    // byte-identical anchor). The content flag rides `max_steps` bit 31 (the step cap is < 2^31), since
+    // `vol_on` is true for the gallery too and can't distinguish it.
+    bool content_refl = (pc.max_steps & 0x80000000u) != 0u;
+    float mirror_thresh = content_refl ? 0.125 : 0.04;
+    if (roughness > mirror_thresh)
     {
         // GGX importance-sampled reflection ray. `pc.frame` decorrelates the jitter per frame; the
         // host passes a FIXED frame (0) for content so the per-pixel jitter is temporally STABLE —
@@ -331,7 +341,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     bool has_irr = irr_idx != 0xFFFFFFFFu;
 
     // Sphere-trace the reflection ray. Stage D3: content lowers the step cap; gallery = 96.
-    int max_steps = int(max(pc.max_steps, 1u));
+    int max_steps = int(max(pc.max_steps & 0x7FFFFFFFu, 1u));
     const float HIT_EPS = 0.001;
     float t = bias;
     bool hit = false;

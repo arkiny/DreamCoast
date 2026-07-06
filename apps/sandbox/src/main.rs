@@ -5934,12 +5934,14 @@ impl App {
                 } else {
                     extent
                 };
-                // Frame-varying GGX jitter (real convergence) is the default; `P_REFLECT_FIXED_JITTER`
-                // restores the old fixed frame-0 sample. The A3 reuse stays on — its 1/K stagger still
-                // feeds fresh samples, so `reflect_temporal` converges while the reuse keeps the cost
-                // near the fixed-jitter path.
+                // Jitter frame: a near-mirror takes the deterministic pure-mirror path (no jitter, so
+                // it settles to a stable sharp reflection regardless of this). GLOSSY surfaces GGX-
+                // sample one ray/frame; content uses a FIXED frame-0 jitter so the sample is temporally
+                // STABLE (the resolve reconstructs the lobe spatially) — a frame-VARYING ray never
+                // settles under the 1-ray/frame accumulation (auto-exposure + motion reject the history)
+                // and reads as sparkle. `P_REFLECT_ACCUM=1` forces frame-varying (studies convergence).
                 let refl_frame_varying =
-                    self.is_gallery || std::env::var_os("P_REFLECT_FIXED_JITTER").is_none();
+                    self.is_gallery || std::env::var_os("P_REFLECT_ACCUM").is_some();
                 let refl_traced = self.reflect.record_gdf_reflect(
                     &mut graph,
                     vol,
@@ -5976,7 +5978,7 @@ impl App {
                     self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                     scene_clip,
                     &scene_clip_vols,
-                    self.reflect_max_steps,
+                    self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
                     self.gdf_cone_k,
                     {
                         // A3: prime the skip buffer every frame (write); enable REUSE (read) only once
@@ -6623,7 +6625,7 @@ impl App {
                 self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                 scene_clip,
                 &scene_clip_vols,
-                self.reflect_max_steps,
+                self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
                 self.gdf_cone_k,
                 [u32::MAX; 4], // viz path: no adaptive skip
             )),
@@ -6710,7 +6712,7 @@ impl App {
                     self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                     scene_clip,
                     &scene_clip_vols,
-                    self.reflect_max_steps,
+                    self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
                     self.gdf_cone_k,
                     [u32::MAX; 4], // standalone viz: no adaptive skip
                 );
