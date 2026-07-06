@@ -1121,6 +1121,8 @@ impl GdfSystem {
         alpha: f32,
         cone_k: f32,
         conv_idx: u32,
+        skylight_floor: f32,
+        irradiance_index: u32,
         sky_gain: f32,
         sky_wb: [f32; 3],
     ) {
@@ -1204,16 +1206,17 @@ impl GdfSystem {
                     0.0,
                     aabb_max,
                     diag,
-                    0.25,                            // sky fill irradiance
+                    skylight_floor, // sky-visibility floor (0 = off = byte-identical)
                     if reset { 1.0 } else { alpha }, // temporal alpha (D3: period-aware)
-                    diag * 0.01,                     // surface bias
-                    diag,                            // gather ray max distance
+                    diag * 0.01,    // surface bias
+                    diag,           // gather ray max distance
                     clip.0,
                     clip.1,
                     relight_period.max(1),
                     card_vis_index,
                     cone_k,
                     conv_idx,
+                    irradiance_index,
                     sky_gain,
                     sky_wb,
                 ));
@@ -1246,6 +1249,8 @@ impl GdfSystem {
         feedback: bool,
         cone_k: f32,
         conv_idx: u32,
+        skylight_floor: f32,
+        irradiance_index: u32,
         sky_gain: f32,
         sky_wb: [f32; 3],
     ) {
@@ -1324,7 +1329,7 @@ impl GdfSystem {
             0.0,
             aabb_max,
             diag,
-            0.25,
+            skylight_floor,
             if reset { 1.0 } else { alpha },
             diag * 0.01,
             diag,
@@ -1334,6 +1339,7 @@ impl GdfSystem {
             card_vis_index,
             cone_k,
             conv_idx,
+            irradiance_index,
             sky_gain,
             sky_wb,
         ));

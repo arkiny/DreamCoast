@@ -3237,6 +3237,30 @@ impl App {
             .expect("queue is owned by the RHI thread")
     }
 
+    /// The IBL diffuse-irradiance cube's bindless index (`0xFFFFFFFF` when no IBL is bound), for the
+    /// surface-cache / reflection skylight-floor fill. Same cube the deferred pass samples for its
+    /// IBL diffuse ambient — so a reflected/cached shadowed surface floors to the same skylight.
+    fn irradiance_cube_index(&self) -> u32 {
+        let i = self.ibl.lighting_indices()[1];
+        if i < 0 { u32::MAX } else { i as u32 }
+    }
+
+    /// Minimum sky-visibility floor for the surface-cache relight (`sdf_cache_light`): an enclosed
+    /// interior face whose gather rays rarely escape still receives this fraction of the sky
+    /// irradiance, matching the deferred pass's `occlude_sky_diffuse` MinOcclusion so REFLECTED
+    /// shadowed surfaces don't crush to black. `0` for the gallery anchor (byte-identical); content
+    /// defaults to `0.6`, overridable via `P_REFLECT_SKYFILL`.
+    fn cache_skylight_floor(&self) -> f32 {
+        if self.is_gallery {
+            0.0
+        } else {
+            std::env::var("P_REFLECT_SKYFILL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.6)
+        }
+    }
+
     /// The swapchain (inline path). Panics if the RHI thread owns it.
     fn swapchain(&self) -> &Swapchain {
         self.swapchain
@@ -4839,9 +4863,20 @@ impl App {
         // anchor stays byte-identical; the wider stride just reserves room for the second view's
         // camera slice.
         let globals_offset = (fif as u64 * MAX_VIEWS) * GLOBALS_SLICE;
-        // Firefly clamp ceiling (raw radiance, max component). ~8 keeps diffuse + moderate
-        // gloss but caps blown-out specular spikes; 1e30 = effectively off (byte-identical).
-        let firefly_max = if self.firefly_clamp { 8.0f32 } else { 1e30 };
+        // Firefly clamp ceiling for the reflection temporal resolve. This is a max on RAW radiance,
+        // so a FIXED value only makes sense at a fixed exposure: the gallery's legacy 8.0 sits at its
+        // 0.6 exposure. A physically-lit content scene meters far darker (`exposure = 1/(1.2·2^EV100)`
+        // ≈ 4e-4 at EV100 11), so its raw radiance runs into the thousands — a raw ceiling of 8 then
+        // crushes EVERY reflection to black (a mirror in a sunlit nave reads pure black). Scale the
+        // ceiling with the scene exposure so it caps at the same ~8 EXPOSED units everywhere; the
+        // gallery keeps the exact 8.0 (byte-identical anchor). 1e30 = off.
+        let firefly_max = if !self.firefly_clamp {
+            1e30
+        } else if self.is_gallery {
+            8.0f32
+        } else {
+            8.0f32 / self.exposure.max(1e-6)
+        };
         self.deferred
             .write_globals(globals_offset, globals_bytes(&globals))?;
 
@@ -5415,6 +5450,8 @@ impl App {
                         relight_alpha,
                         self.gdf_cone_k,
                         relight_conv_idx,
+                        self.cache_skylight_floor(),
+                        self.irradiance_cube_index(),
                         self.sky_gain,
                         self.sky_wb,
                     );
@@ -7131,6 +7168,8 @@ impl App {
                     self.cache_feedback,
                     self.gdf_cone_k,
                     relight_conv_idx,
+                    self.cache_skylight_floor(),
+                    self.irradiance_cube_index(),
                     self.sky_gain,
                     self.sky_wb,
                 );

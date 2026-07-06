@@ -780,7 +780,7 @@ pub(crate) fn cache_light_push(
     ground_y: f32,
     aabb_max: [f32; 3],
     dist_clamp: f32,
-    sky_fill: f32,
+    skylight_floor: f32,
     alpha: f32,
     bias: f32,
     ray_max: f32,
@@ -790,6 +790,7 @@ pub(crate) fn cache_light_push(
     card_vis_index: u32,
     cone_k: f32,
     conv_buf: u32,
+    irradiance_index: u32,
     sky_gain: f32,
     sky_wb: [f32; 3],
 ) -> [u8; 160] {
@@ -824,7 +825,7 @@ pub(crate) fn cache_light_push(
         pc[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
     pc[92..96].copy_from_slice(&dist_clamp.to_le_bytes());
-    pc[96..100].copy_from_slice(&sky_fill.to_le_bytes());
+    pc[96..100].copy_from_slice(&skylight_floor.to_le_bytes());
     pc[100..104].copy_from_slice(&alpha.to_le_bytes());
     pc[104..108].copy_from_slice(&bias.to_le_bytes());
     pc[108..112].copy_from_slice(&ray_max.to_le_bytes());
@@ -840,6 +841,8 @@ pub(crate) fn cache_light_push(
     pc[128..132].copy_from_slice(&cone_k.to_le_bytes());
     // A2-fix: host-visible convergence buffer index (former pad0 slot @132). 0xFFFFFFFF = disabled.
     pc[132..136].copy_from_slice(&conv_buf.to_le_bytes());
+    // Skylight-floor IBL irradiance cube index (former pad1 slot @136). 0xFFFFFFFF = absent (floor off).
+    pc[136..140].copy_from_slice(&irradiance_index.to_le_bytes());
     // Sky (float4 at offset 144, after cone_k + 3 pad floats): x = gain, yzw = white balance —
     // the same procedural-sky params the path tracer uses, for the relight's sky-on-miss.
     pc[144..148].copy_from_slice(&sky_gain.to_le_bytes());

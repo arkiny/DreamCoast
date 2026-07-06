@@ -32,14 +32,15 @@ struct CacheLightPush
     float4 sun;           // xyz direction toward the sun, w = intensity
     float4 aabb_min;      // xyz GDF world min, w = ground plane Y
     float4 aabb_max;      // xyz GDF world max, w = sample distance clamp
-    float4 params;        // x (unused, was sky_fill), y temporal alpha, z surface bias, w ray max
+    float4 params;        // x = skylight floor (min sky-visibility; 0 = off = byte-identical), y temporal
+                          // alpha, z surface bias, w ray max
     uint4 clip;           // Stage B clipmap: x = descriptor index, y = level count
     float cone_k;         // P3: cone-trace LOD slope (0 = legacy linear march = byte-identical)
     uint conv_buf;        // A2-fix: relight InterlockedAdds the per-channel EMA step into this host-
                           // visible buffer ([0]=sum_fp, [4]=count); the host divides to the MEAN step and
                           // freezes the relight ONLY on MEASURED convergence (a general engine budgets by
                           // priority rather than a frame-count freeze). 0xFFFFFFFF = disabled.
-    float pad1;
+    uint irradiance_index; // IBL diffuse-irradiance cube (skylight-floor fill; 0xFFFFFFFF = absent = off)
     float pad2;
     float4 sky;           // x = sky gain, yzw = white balance (matches the path tracer's sky)
 };
@@ -177,6 +178,7 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     // occluded skylight (only rays that escape see the sky) matches the ground truth.
     float3 indirect = float3(0, 0, 0);
     uint spp = max(pc.spp, 1u);
+    uint miss_count = 0u; // gather rays that escaped to sky = this texel's sky visibility estimate
     uint seed = (t * 9277u + pc.frame * 26699u) | 1u;
     float bias = pc.params.z;
     float maxt = pc.params.w;
@@ -205,9 +207,25 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
                 break;
         }
         if (!hit)
+        {
             indirect += procedural_sky(dir, sun_dir, sun_i, pc.sky.x, false) * pc.sky.yzw;
+            miss_count++;
+        }
     }
     indirect /= float(spp);
+
+    // Skylight-visibility FLOOR (matches the deferred pass's `occlude_sky_diffuse` MinOcclusion):
+    // an enclosed interior face whose gather rays rarely escape still receives a floor of the sky
+    // irradiance, so a REFLECTED (or cached) shadowed surface reads its true skylit grey instead of
+    // crushing to black. The gather already contributes ~E·(escaped/spp); top it up to E·floor when
+    // the estimated sky visibility falls below the floor. floor = 0 (gallery) → exact byte-identical.
+    float sky_floor = pc.params.x;
+    if (sky_floor > 0.0 && pc.irradiance_index != 0xFFFFFFFFu)
+    {
+        float esc = float(miss_count) / float(spp);
+        float3 E = g.cubes[pc.irradiance_index].SampleLevel(g.samp, n, 0.0).rgb;
+        indirect += E * max(sky_floor - esc, 0.0);
+    }
 
     // Lambertian: outgoing radiance = albedo/PI * irradiance. The direct term is an
     // irradiance, so it needs the 1/PI (matching the deferred direct + the GI fix); the
