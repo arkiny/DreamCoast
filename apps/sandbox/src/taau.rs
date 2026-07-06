@@ -193,7 +193,13 @@ impl TaauSystem {
         // 16-frame history balances stability (jitter hidden) against gather-accumulation softening;
         // the FXAA pre-pass removes the per-frame edge aliasing that long history used to mask, so
         // it need not run longer. gamma = variance-box half-width (γσ), ~1 = standard.
-        let max_hist = 32.0_f32;
+        // Content (clamp_expand > 0) accumulates a longer history so the EMA blends the jittered input
+        // more gently → less residual upsampling shimmer. Gallery keeps 32 (byte-identical anchor).
+        let max_hist = if clamp_expand > 0.0 {
+            64.0_f32
+        } else {
+            32.0_f32
+        };
         let gamma = 1.0_f32;
         let mut reads = vec![hdr, depth];
         if let Some(v) = velocity {
