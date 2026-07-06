@@ -933,6 +933,10 @@ struct App {
     /// C8g: use the surface cache as the GDF reflection hit radiance (default on); ground hits
     /// (no cards) fall back to the per-ray re-light. Cheaper than the full GI cache above.
     reflect_cache: bool,
+    /// Reflection cone-LOD: sample the surface-cache radiance MIP pyramid by the ray-cone footprint
+    /// so a demagnified far reflection reads a coarse averaged level (smooth) instead of stair-
+    /// stepped mip0 blocks. Content default on; `P11_REFLECT_MIP=0` falls back to mip0 bilinear.
+    reflect_mip: bool,
     /// Firefly clamp: bound the per-sample radiance in the reflection source / composite / GI
     /// gather so a bright specular pixel can't become a speckle. Off => unbounded (pre-clamp).
     firefly_clamp: bool,
@@ -2160,6 +2164,9 @@ impl App {
             // scene now, so build it unless the IBL escape hatch is forced (then it would be
             // unused — skip the ~67 MB atlas + per-frame relight). MAX_CARDS (fuse.rs) bounds
             // it; cards are draw-list-driven.
+            // HQ reflection mode (content opt-in): card every drawable + a sharper reflection trace
+            // for crisp, uniform large-scene chrome (used at card-build below and the res-div later).
+            let hq_reflect = !gallery_scene && quality::env_bool("P11_REFLECT_HQ", false);
             let build_cache = std::env::var_os("P11_LEGACY_IBL").is_none();
             if build_cache {
                 // F1 (surface-cache virtualization): rank drawables for card residency from a
@@ -2182,8 +2189,18 @@ impl App {
                         },
                     };
                 let card_cam = fuse::CardCamera::from_look(ref_eye, ref_focus);
+                // HQ reflection mode (`P11_REFLECT_HQ`): card EVERY drawable so a grazing reflection
+                // reads smooth cached radiance instead of the analytic per-voxel albedo (the residual
+                // coloured blobs on a large-scene chrome reflection). Costs extra atlas memory +
+                // warm-up relight; the default budget stays 1024 (gallery is within budget either way
+                // → byte-identical anchor). Pairs with the sharper reflection trace res below.
+                let card_budget = if hq_reflect {
+                    1u32 << 20
+                } else {
+                    fuse::MAX_CARDS
+                };
                 let (cards, card_albedo, _residency) =
-                    fuse::build_surface_cards(&obj_aabb, &obj_albedo, &card_cam);
+                    fuse::build_surface_cards(&obj_aabb, &obj_albedo, &card_cam, card_budget);
                 let num_cards = (cards.len() / 64) as u32;
                 // C: content stamps the drawable's true albedo onto its cards (fine color);
                 // the gallery keeps the legacy voxel-volume albedo (byte-identical anchor).
@@ -2586,10 +2603,13 @@ impl App {
         // macOS/M3 perf (M3-C): reflection trace-resolution divisor used when `reflect_half_res` is on
         // (2 = legacy half = the old `div_ceil(2)`, 4 = quarter). Only affects content (the gallery
         // traces full-res = byte-identical). `P_REFLECT_RES_DIV` overrides the tier.
+        // HQ mode traces the reflection at 1/3 res (vs the Apple tier's 1/6) so the improved card
+        // coverage resolves into a crisp chrome; `P_REFLECT_RES_DIV` still overrides explicitly.
+        let hq_reflect = !gallery_scene && quality::env_bool("P11_REFLECT_HQ", false);
         let reflect_res_div = std::env::var("P_REFLECT_RES_DIV")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(base.reflect_res_div)
+            .unwrap_or(if hq_reflect { 3 } else { base.reflect_res_div })
             .clamp(1, 16);
         // macOS/M3 perf: GDF AO trace-resolution divisor (1 = full-res = byte-identical; 2 = half).
         // Traced at 1/div then joint-bilateral upsampled; the gallery never runs gdf_ao so the anchor
@@ -2663,6 +2683,10 @@ impl App {
             && gdf.has_surface_cache()
             && gdf.has_cache_lighting()
             && quality::env_bool("P11_REFLECT_CACHE", base.reflect_cache);
+        // Reflection cone-LOD MIP: default on when the reflection cache is used; a demagnified far
+        // reflection then reads a coarse averaged surface-cache MIP (smooth) rather than mip0 blocks.
+        // `P11_REFLECT_MIP=0` opts out (mip0 bilinear = the pre-MIP path).
+        let reflect_mip = reflect_cache && quality::env_bool("P11_REFLECT_MIP", true);
         // Firefly clamp on by default (P11_FIREFLY_CLAMP=0 to disable / compare).
         let firefly_clamp = quality::env_bool("P11_FIREFLY_CLAMP", base.firefly_clamp);
         // C8d: roughness above which screen-mirror SSR stops contributing (GDF takes over). Gallery
@@ -3129,6 +3153,7 @@ impl App {
             cache_viz,
             surface_cache,
             reflect_cache,
+            reflect_mip,
             firefly_clamp,
             reflect_max_roughness,
             ssr_stochastic,
@@ -3235,6 +3260,60 @@ impl App {
         self.queue
             .as_ref()
             .expect("queue is owned by the RHI thread")
+    }
+
+    /// The IBL diffuse-irradiance cube's bindless index (`0xFFFFFFFF` when no IBL is bound), for the
+    /// surface-cache / reflection skylight-floor fill. Same cube the deferred pass samples for its
+    /// IBL diffuse ambient — so a reflected/cached shadowed surface floors to the same skylight.
+    fn irradiance_cube_index(&self) -> u32 {
+        let i = self.ibl.lighting_indices()[1];
+        if i < 0 { u32::MAX } else { i as u32 }
+    }
+
+    /// Minimum sky-visibility floor for the surface-cache relight (`sdf_cache_light`): an enclosed
+    /// interior face whose gather rays rarely escape still receives this fraction of the sky
+    /// irradiance, matching the deferred pass's `occlude_sky_diffuse` MinOcclusion so REFLECTED
+    /// shadowed surfaces don't crush to black. `0` for the gallery anchor (byte-identical); content
+    /// defaults to `1.0`, overridable via `P_REFLECT_SKYFILL`.
+    ///
+    /// Why 1.0 (was 0.6): the cache gather's sky-on-miss shrinks as the surface cache FILLS (more rays
+    /// hit cached surfaces than escape to sky), so over the warm-up the reflected surfaces lose their
+    /// skylight and drift to a muddy, over-warm multibounce equilibrium — the chrome ball's edges
+    /// visibly "stain" from clean sky-blue toward brown as the cache converges. The primary deferred
+    /// pass gives every surface the FULL occluded IBL-diffuse skylight, so a floor below 1.0 makes the
+    /// reflected copy of a surface systematically dimmer/warmer than the surface renders directly. A
+    /// floor of 1.0 restores that parity — reflected surfaces keep the sky term the primary gives them
+    /// (measured: whole-scene brightness essentially unchanged, few fully-enclosed faces; the ball's
+    /// grazing edge stops browning). `occlude_sky_diffuse` still occludes below the floor for genuinely
+    /// enclosed geometry via the per-ray gather, so this isn't a flat ambient add.
+    fn cache_skylight_floor(&self) -> f32 {
+        if self.is_gallery {
+            0.0
+        } else {
+            std::env::var("P_REFLECT_SKYFILL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0)
+        }
+    }
+
+    /// Per-sample firefly clamp for the surface-cache indirect gather (`sdf_cache_light`), in physical
+    /// radiance units. The reference engine's LumenRadiosity clamps each hemisphere sample to
+    /// `MaxRayIntensity · OneOverPreExposure` at the source; a single bright, frame-varying gather ray
+    /// otherwise pops as a moving sparkle and keeps the relight EMA above its convergence-freeze
+    /// epsilon (so the cache never settles). Our exposure maps physical→~1, so the physical ceiling is
+    /// `MaxRayIntensity / exposure`. `0` for the gallery (byte-identical); `P_CACHE_FIREFLY` tunes the
+    /// intensity (default 40, the reference default).
+    fn cache_gather_firefly(&self) -> f32 {
+        if self.is_gallery {
+            0.0
+        } else {
+            let max_ray = std::env::var("P_CACHE_FIREFLY")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(40.0);
+            max_ray / self.exposure.max(1e-6)
+        }
     }
 
     /// The swapchain (inline path). Panics if the RHI thread owns it.
@@ -3580,7 +3659,13 @@ impl App {
         // jitter blurs/destabilizes their accumulation. bit1 of the flip word selects that path in
         // gdf_temporal/reflect_temporal; cleared (no jitter) = integer-floor fetch = byte-identical
         // to the legacy path. Computed once here, applied at both call sites.
-        let temporal_flip = self.flip_y | if taau_jitter_active { 2 } else { 0 };
+        // bit2 (content only): the reflection temporal resolve reprojects the VIRTUAL IMAGE (the
+        // reflected point at the hit distance) instead of the surface, so a mirror reflection stays
+        // stable under camera motion instead of swimming. Gallery keeps the surface reproject
+        // (byte-identical). Applied only to near-mirrors in-shader (sr == 0).
+        let temporal_flip = self.flip_y
+            | if taau_jitter_active { 2 } else { 0 }
+            | if self.is_gallery { 0 } else { 4 };
 
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32();
@@ -4839,9 +4924,20 @@ impl App {
         // anchor stays byte-identical; the wider stride just reserves room for the second view's
         // camera slice.
         let globals_offset = (fif as u64 * MAX_VIEWS) * GLOBALS_SLICE;
-        // Firefly clamp ceiling (raw radiance, max component). ~8 keeps diffuse + moderate
-        // gloss but caps blown-out specular spikes; 1e30 = effectively off (byte-identical).
-        let firefly_max = if self.firefly_clamp { 8.0f32 } else { 1e30 };
+        // Firefly clamp ceiling for the reflection temporal resolve. This is a max on RAW radiance,
+        // so a FIXED value only makes sense at a fixed exposure: the gallery's legacy 8.0 sits at its
+        // 0.6 exposure. A physically-lit content scene meters far darker (`exposure = 1/(1.2·2^EV100)`
+        // ≈ 4e-4 at EV100 11), so its raw radiance runs into the thousands — a raw ceiling of 8 then
+        // crushes EVERY reflection to black (a mirror in a sunlit nave reads pure black). Scale the
+        // ceiling with the scene exposure so it caps at the same ~8 EXPOSED units everywhere; the
+        // gallery keeps the exact 8.0 (byte-identical anchor). 1e30 = off.
+        let firefly_max = if !self.firefly_clamp {
+            1e30
+        } else if self.is_gallery {
+            8.0f32
+        } else {
+            8.0f32 / self.exposure.max(1e-6)
+        };
         self.deferred
             .write_globals(globals_offset, globals_bytes(&globals))?;
 
@@ -5415,6 +5511,9 @@ impl App {
                         relight_alpha,
                         self.gdf_cone_k,
                         relight_conv_idx,
+                        self.cache_skylight_floor(),
+                        self.irradiance_cube_index(),
+                        self.cache_gather_firefly(),
                         self.sky_gain,
                         self.sky_wb,
                     );
@@ -5434,10 +5533,30 @@ impl App {
             }
             _ => None,
         };
-        let reflect_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
-            Some(ext) if self.reflect_cache => {
-                cache_read.map(|(c, p, r, n, t)| ([c, p, r, n, t], ext))
+        // Reflection cone-LOD: generate the surface-cache radiance MIP pyramid from the freshly-lit
+        // mip0, so a demagnified far reflection reads a coarse averaged level (smooth) instead of
+        // stair-stepped mip0 blocks. Ordered after the relight; returns a handle the reflection reads
+        // after. `None` (no pyramid / reflect_cache off) → the reflection keeps the mip0 bilinear path.
+        let cache_mip_ext: Option<ResourceId> = match (scene_cache_lit_ext, cache_read) {
+            (Some(lit), Some((_, _, rad, _, _))) if self.reflect_cache && self.reflect_mip => {
+                self.gdf.record_cache_mipgen(&mut graph, lit, rad)
             }
+            _ => None,
+        };
+        let reflect_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
+            Some(ext) if self.reflect_cache => cache_read.map(|(c, p, r, n, t)| {
+                // Pack the MIP pyramid into the tile slot: tile | max_mip<<8 | mip_index<<16 (all
+                // ≤16 bits; 0xFFFF mip_index = no pyramid). Order the reflection after mipgen when
+                // the pyramid exists (its handle), else after the relight directly.
+                let (tile_packed, order) = match (self.gdf.reflect_cache_mip_info(), cache_mip_ext)
+                {
+                    (Some((mip_idx, max_mip)), Some(mip_ext)) => {
+                        (t | (max_mip << 8) | (mip_idx << 16), mip_ext)
+                    }
+                    _ => (t | (0xFFFFu32 << 16), ext),
+                };
+                ([c, p, r, n, tile_packed], order)
+            }),
             _ => None,
         };
         // Stage C2: GDF ambient occlusion, multiplied into the lighting ambient term.
@@ -5517,6 +5636,10 @@ impl App {
         // Indoor skylight-occlusion image (directional sky-visibility), produced on the volume GI
         // path and consumed by the lighting (occludes the IBL diffuse skylight). `None` otherwise.
         let mut gi_skyvis_out: Option<ResourceId> = None;
+        // Hoisted out of the GI match arm so the reflection pass (recorded later, out of that arm's
+        // scope) can sample the SAME radiance-cache volume + reuse its exact write-order handle for
+        // the GI-lit indirect term at reflection hits. `None` unless the volume GI path runs.
+        let mut gi_reflect_arg: Option<(u32, u32, ResourceId)> = None;
         let gdf_gi_out = match (self.gdf_gi, scene_gdf_vol, scene_gdf_ext) {
             (true, Some(vol), Some(ext)) if self.screen_probe => {
                 // Screen-space radiance probes (P1+): per-tile probe trace into an octahedral
@@ -5645,6 +5768,7 @@ impl App {
                     } else {
                         None
                     };
+                gi_reflect_arg = gi_volume_arg; // expose to the later reflection pass (same handle)
                 let (traced, skyvis) = self.gi.record_gi(
                     &mut graph,
                     vol,
@@ -5892,6 +6016,14 @@ impl App {
                 } else {
                     extent
                 };
+                // Jitter frame: a near-mirror takes the deterministic pure-mirror path (no jitter, so
+                // it settles to a stable sharp reflection regardless of this). GLOSSY surfaces GGX-
+                // sample one ray/frame; content uses a FIXED frame-0 jitter so the sample is temporally
+                // STABLE (the resolve reconstructs the lobe spatially) — a frame-VARYING ray never
+                // settles under the 1-ray/frame accumulation (auto-exposure + motion reject the history)
+                // and reads as sparkle. `P_REFLECT_ACCUM=1` forces frame-varying (studies convergence).
+                let refl_frame_varying =
+                    self.is_gallery || std::env::var_os("P_REFLECT_ACCUM").is_some();
                 let refl_traced = self.reflect.record_gdf_reflect(
                     &mut graph,
                     vol,
@@ -5909,18 +6041,26 @@ impl App {
                     rw,
                     rh,
                     self.flip_y,
-                    // Content: fixed frame (0) → temporally stable GGX jitter (no reflection
-                    // sparkle). Gallery: real frame → byte-identical legacy anchor.
-                    if self.is_gallery {
+                    // Frame-VARYING GGX jitter: a different reflection ray each frame so the temporal
+                    // resolve actually ACCUMULATES (real convergence of the glossy lobe / near-mirror),
+                    // not just a spatial gather of one fixed sample. This is now the default for content
+                    // too: the fixed frame-0 jitter never converged (a permanent 1-sample blocky
+                    // pattern), and it was only chosen because the old absolute firefly clamp crushed
+                    // the accumulation — with the exposure-relative clamp the frame-varying history
+                    // resolves cleanly. Gallery already used the real frame (byte-identical anchor).
+                    // `P_REFLECT_FIXED_JITTER=1` restores the old fixed-0 behaviour.
+                    if refl_frame_varying {
                         self.frame_no as u32
                     } else {
                         0
                     },
                     scene_albedo,
                     reflect_cache_arg,
+                    gi_reflect_arg, // GI-lit indirect at reflection hits (radiance cache)
+                    self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                     scene_clip,
                     &scene_clip_vols,
-                    self.reflect_max_steps,
+                    self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
                     self.gdf_cone_k,
                     {
                         // A3: prime the skip buffer every frame (write); enable REUSE (read) only once
@@ -5994,6 +6134,7 @@ impl App {
                     1.0,
                     firefly_max,
                     self.reflect_max_roughness,
+                    !self.is_gallery, // content: near-mirror uses GDF/cache, not the unreliable SSR
                 ))
             }
             _ => None,
@@ -6563,9 +6704,11 @@ impl App {
                 },
                 scene_albedo,
                 reflect_cache_arg,
+                gi_reflect_arg, // GI-lit indirect so the reflection viz shows the real reflection
+                self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                 scene_clip,
                 &scene_clip_vols,
-                self.reflect_max_steps,
+                self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
                 self.gdf_cone_k,
                 [u32::MAX; 4], // viz path: no adaptive skip
             )),
@@ -6648,9 +6791,11 @@ impl App {
                     },
                     scene_albedo,
                     reflect_cache_arg,
+                    gi_reflect_arg, // GI-lit indirect so the reflection viz shows the real reflection
+                    self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                     scene_clip,
                     &scene_clip_vols,
-                    self.reflect_max_steps,
+                    self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
                     self.gdf_cone_k,
                     [u32::MAX; 4], // standalone viz: no adaptive skip
                 );
@@ -6667,6 +6812,7 @@ impl App {
                     1.0,
                     firefly_max,
                     self.reflect_max_roughness,
+                    false, // standalone SSR/hybrid viz — keep the full SSR blend
                 );
                 // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
                 self.reflect.record_lit_history(
@@ -6744,6 +6890,18 @@ impl App {
                 taau_jitter_uv,
                 false,
                 velocity_target,
+                // TSR-style clamp-box expansion: widens the variance box ∝ local contrast so a static
+                // high-contrast edge's converged history isn't re-clipped each frame under jitter (the
+                // dominant upsampling shimmer). 0 for the gallery (byte-identical anchor); content
+                // defaults to 1.0, `P_TAAU_CLAMP_EXPAND` tunes.
+                if self.is_gallery {
+                    0.0
+                } else {
+                    std::env::var("P_TAAU_CLAMP_EXPAND")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(2.0)
+                },
             ))
         } else {
             None
@@ -7120,6 +7278,9 @@ impl App {
                     self.cache_feedback,
                     self.gdf_cone_k,
                     relight_conv_idx,
+                    self.cache_skylight_floor(),
+                    self.irradiance_cube_index(),
+                    self.cache_gather_firefly(),
                     self.sky_gain,
                     self.sky_wb,
                 );

@@ -145,6 +145,25 @@ float3 albedo_at(float3 p)
     return cm_albedo(reflect_clip(), p, pc.params.y);
 }
 
+// Cone-blurred per-voxel albedo for the UNcovered (analytic) reflection path. The surface cache is
+// sampled with a ray-cone MIP so cached far reflections are smooth; the analytic fallback used the
+// raw per-voxel `albedo_at` at a single (imprecise) point, so uncarded far hits read blocky, colour-
+// bleeding voxels — the residual speckle in the demagnified centre. Average the albedo over the cone
+// footprint (a few taps in the hit's tangent plane, radius = the same cone `sample_radius`) so an
+// uncovered far surface reads a smooth averaged colour matching its cached neighbours. `radius == 0`
+// (near hits / cone off) collapses to the single tap = the legacy value.
+float3 albedo_cone(float3 p, float3 n, float radius)
+{
+    if (radius <= 1e-4)
+        return albedo_at(p);
+    float3 t, bt;
+    onb(n, t, bt);
+    float3 s = albedo_at(p);
+    s += albedo_at(p + t * radius) + albedo_at(p - t * radius);
+    s += albedo_at(p + bt * radius) + albedo_at(p - bt * radius);
+    return s * (1.0 / 5.0);
+}
+
 float3 scene_normal(float3 p)
 {
     const float e = 0.012;
@@ -195,6 +214,38 @@ float refl_shadow(float3 origin, float3 dir, float maxt)
     return saturate(res);
 }
 
+// Real SH band-0/1 basis normalisation (matches gi_volume.slang / gdf_gi.slang — keep in lockstep).
+static const float SH_C0 = 0.2820947918; // sqrt(1/(4*pi))
+static const float SH_C1 = 0.4886025119; // sqrt(3/(4*pi))
+
+// Reference-engine reflection technique: sample the world-space directional-irradiance volume
+// (radiance cache, the 12 SH coeff volumes contiguous from `base`, updated in gi_volume.slang with
+// multibounce) at a reflection HIT and reconstruct the cosine-weighted hemispherical irradiance
+// E(n). This is the indirect term that keeps a reflected shadowed surface at its GI-lit colour
+// instead of the analytic sun-only re-light going near-black. Returns 0 outside the volume bounds.
+// Mirrors the reconstruction in gdf_gi.slang's volume path (A0/PI = 1, A1/PI = 2/3).
+float3 sample_gi_irradiance(uint base, float3 p, float3 n)
+{
+    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
+    if (!(all(uvw >= 0.0) && all(uvw <= 1.0)))
+        return float3(0.0, 0.0, 0.0);
+    uvw = saturate(uvw);
+    float3 c[4];
+    [unroll]
+    for (int k = 0; k < 4; k++)
+        c[k] = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (int ch = 0; ch < 3; ch++)
+    {
+        [unroll]
+        for (int k = 0; k < 4; k++)
+            c[k][ch] = g.volumes[base + uint(ch * 4 + k)].SampleLevel(g.samp, uvw, 0.0).x;
+    }
+    float3 e = c[0] * SH_C0
+               + (2.0 / 3.0) * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]);
+    return max(e, float3(0.0, 0.0, 0.0));
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void csMain(uint3 tid: SV_DispatchThreadID)
@@ -213,6 +264,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // Background: reflect nothing — show the sky along the view ray (so the viz reads as
     // the scene; C7 only consumes this for shaded pixels anyway).
     float sy = (pc.flip_y & 1u) != 0u ? 1.0 : -1.0;
+    // GI irradiance volume base index packed into flip_y's spare bits (bit0 = Y-flip; the 240-byte
+    // push is full, D3D12 root budget forbids growing it). Encoded as (base+1)<<1 so 0 = off.
+    uint vol_pack = pc.flip_y >> 1;
+    bool vol_on = vol_pack != 0u;
+    uint vol_base = vol_on ? (vol_pack - 1u) : 0xFFFFFFFFu;
     float2 ndc = float2(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * sy);
     if (depth >= 1.0)
     {
@@ -248,13 +304,16 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float4 ppos = asfloat(g.storage_buffers[sk.read].Load4(lin * 32u));
             if (ppos.w > 0.5 && distance(p, ppos.xyz) < reject)
             {
-                float3 prad = asfloat(g.storage_buffers[sk.read].Load4(lin * 32u + 16u)).rgb;
+                // The persisted radiance slot's .w carries the reflection HIT DISTANCE (world) so the
+                // temporal resolve can reproject the virtual image (reference-engine mirror denoise).
+                float4 pradf = asfloat(g.storage_buffers[sk.read].Load4(lin * 32u + 16u));
+                float3 prad = pradf.rgb;
                 if (skip_write)
                 {
                     g.storage_buffers[sk.write].Store4(lin * 32u, asuint(float4(p, 1.0)));
-                    g.storage_buffers[sk.write].Store4(lin * 32u + 16u, asuint(float4(prad, 0.0)));
+                    g.storage_buffers[sk.write].Store4(lin * 32u + 16u, asuint(float4(prad, pradf.w)));
                 }
-                g.storage_images[pc.out_index][tid.xy] = float4(prad, 1.0);
+                g.storage_images[pc.out_index][tid.xy] = float4(prad, pradf.w);
                 return;
             }
         }
@@ -265,7 +324,17 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // the temporal resolve accumulates them into the glossy lobe). Near-mirror stays sharp.
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
     float3 dir;
-    if (roughness > 0.04)
+    // Mirror threshold: a polished metal (roughness up to ~0.125) traces the DETERMINISTIC reflection
+    // ray (no GGX jitter), so it settles to a stable sharp reflection every frame instead of a
+    // stochastic 1-ray/frame sample that sparkles (the reflect_temporal near-mirror boundary is the
+    // same 0.125 = sr==0, so these carry no neighbourhood clamp and rely on being deterministic). Only
+    // genuinely GLOSSY surfaces (> threshold) need the importance-sampled lobe + temporal reconstruction.
+    // Content raises the threshold to 0.125; the gallery keeps 0.04 (its chrome sphere is 0.08 = GGX,
+    // byte-identical anchor). The content flag rides `max_steps` bit 31 (the step cap is < 2^31), since
+    // `vol_on` is true for the gallery too and can't distinguish it.
+    bool content_refl = (pc.max_steps & 0x80000000u) != 0u;
+    float mirror_thresh = content_refl ? 0.125 : 0.04;
+    if (roughness > mirror_thresh)
     {
         // GGX importance-sampled reflection ray. `pc.frame` decorrelates the jitter per frame; the
         // host passes a FIXED frame (0) for content so the per-pixel jitter is temporally STABLE —
@@ -287,9 +356,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float max_dist = pc.params.x;
     float sky_fill = pc.params.z;
     float bias = pc.params.w;
+    // Content (vol_on) overloads the sky_fill slot with the IBL diffuse-irradiance cube index — the
+    // physical-units skylight the deferred pass samples. Used to fill an uncovered/shadowed reflected
+    // surface (analytic path) and an escaped (sky) ray with real skylight instead of near-black.
+    uint irr_idx = vol_on ? asuint(pc.params.z) : 0xFFFFFFFFu;
+    bool has_irr = irr_idx != 0xFFFFFFFFu;
 
     // Sphere-trace the reflection ray. Stage D3: content lowers the step cap; gallery = 96.
-    int max_steps = int(max(pc.max_steps, 1u));
+    int max_steps = int(max(pc.max_steps & 0x7FFFFFFFu, 1u));
     const float HIT_EPS = 0.001;
     float t = bias;
     bool hit = false;
@@ -321,36 +395,99 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         bool cached = false;
         if (pc.cache.x != 0xFFFFFFFFu)
         {
-            color = sample_surface_cache(hp, hn, pc.cache.x, pc.cache.y, pc.cache.z,
-                                         pc.cache.w, pc.cache_tile, cached);
+            // Reference-engine (Lumen) cone-based card acceptance: the coarse-field reflection HIT is
+            // imprecise, and the imprecision GROWS with the ray distance `t` (a far hit lands farther
+            // from the true surface). A FIXED tolerance (the old 0.006·diag) matched near cards but
+            // FAILED far ones → those far hits fell to the coarse per-voxel-albedo analytic path = the
+            // blocky, colour-bleeding chrome centre. Grow the acceptance with distance (like Lumen's
+            // ray-cone SampleRadius) so far reflected surfaces still read their smooth cached lit
+            // radiance instead of albedo. 0 for the gallery (vol_on false) -> byte-identical.
+            float cache_bias = vol_on ? (0.006 * length(GDF_MAX - GDF_MIN) + t * 0.03) : 0.0;
+            // The reflection packs the MIP pyramid into cache_tile's spare bits: tile | max_mip<<8 |
+            // mip_index<<16 (mip_index 0xFFFF = no pyramid). The same distance-growing cone_bias is
+            // the ray-cone footprint (world units) that selects the MIP — near hits stay at mip0,
+            // far demagnified hits read a coarse averaged level → smooth chrome instead of blocks.
+            uint c_tile = pc.cache_tile & 0xFFu;
+            uint c_maxmip = (pc.cache_tile >> 8) & 0xFu;
+            uint c_mip16 = (pc.cache_tile >> 16) & 0xFFFFu;
+            uint mip_index = (c_mip16 == 0xFFFFu) ? 0xFFFFFFFFu : c_mip16;
+            // Ray-cone footprint that selects the MIP (world units) — DECOUPLED from `cache_bias`
+            // (which is the card-acceptance tolerance; widening THAT scatters cross-card). This grows
+            // with hit distance `t` so a far demagnified reflection reads a coarse averaged level
+            // while a near/face-on hit stays near mip0 (sharp). Slope ≈ a per-pixel cone half-angle.
+            float mip_radius = 0.05 + t * 0.08;
+            color = sample_surface_cache_cone(hp, hn, pc.cache.x, pc.cache.y, pc.cache.z, pc.cache.w,
+                                              c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
+                                              cached);
         }
         if (!cached)
         {
             float ndl = max(dot(hn, sun_dir), 0.0);
             float sh = ndl > 0.0 ? refl_shadow(hp + hn * 0.004, sun_dir, max_dist) : 1.0;
-            float fill = sky_fill * (0.5 + 0.5 * hn.y);
             // The ground plane is analytic — it's NOT in the per-voxel albedo volume, so
             // albedo_at() would return the nearest *object's* colour for a ground hit (the
             // red cube / green avocado bleeding onto the reflected floor). Use the ground's
             // own albedo (matches deferred.rs's [0.8] ground material) for ground hits.
             bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp);
-            float3 hit_albedo = is_ground ? pc.ground_albedo.xyz : albedo_at(hp);
+            // Cone-blurred albedo (content, vol_on) so an uncovered far reflection is as smooth as
+            // its cached neighbours instead of blocky per-voxel colour. Near hits (radius→0) and the
+            // gallery (vol_on false) keep the single-tap legacy albedo.
+            float ablur = vol_on ? (0.05 + t * 0.08) : 0.0;
+            float3 hit_albedo = is_ground ? pc.ground_albedo.xyz : albedo_cone(hp, hn, ablur);
             // Lambertian reflected surface: albedo/PI * irradiance, so the reflection of a
             // diffuse surface matches its directly-shaded appearance. The cache path (meshed
             // hits) gets the same 1/PI in sdf_cache_light.slang.
-            color = hit_albedo * (sun_i * ndl * sh + fill) * (1.0 / GGX_PI);
+            if (vol_on)
+            {
+                // Reference-engine approach: add the GI-lit INDIRECT irradiance (radiance-cache
+                // volume) so a reflected SHADOWED surface reads its real GI colour, not black. The
+                // indirect E matches gdf_gi.slang's convention (outgoing = albedo * E, no extra
+                // /PI), so it is added OUTSIDE the direct term's 1/PI to be energy-consistent with
+                // how the deferred lighting consumes the same volume.
+                float3 e = sample_gi_irradiance(vol_base, hp, hn);
+                color = hit_albedo * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
+                // Physical IBL-diffuse skylight fill: the radiance-cache volume `e` is a LOCAL bounce
+                // term and is ~0 where the cache is cold, so an uncovered reflected surface would go
+                // near-black. Add the same sky irradiance the deferred pass gives every surface
+                // (`irradiance_cube(hn) * albedo`) so a reflected shadowed/uncovered face reads its
+                // true skylit grey — the reflection then matches the directly-shaded scene.
+                if (has_irr)
+                    color += g.cubes[irr_idx].SampleLevel(g.samp, hn, 0.0).rgb * hit_albedo;
+            }
+            else
+            {
+                // Volume absent (e.g. the gallery) -> the legacy crude sky fill. Byte-identical.
+                float fill = sky_fill * (0.5 + 0.5 * hn.y);
+                color = hit_albedo * (sun_i * ndl * sh + fill) * (1.0 / GGX_PI);
+            }
         }
     }
     else
     {
-        color = sky(dir, sun_dir, sun_i, false); // specular miss -> sky w/o sun (direct light owns the glint)
+        // Specular miss -> the sky the mirror ray sees. Content samples the physical IBL cube (the
+        // deferred pass's captured sky, in scene lux) so an escaped ray reads a bright sky instead of
+        // the tiny unscaled procedural gradient (which metered to ~black in a lux-lit scene, leaving
+        // black speckle holes). The irradiance cube is cosine-convolved (≈π·radiance), so /π brings it
+        // back to a directional sky radiance. Gallery keeps the legacy gradient (byte-identical).
+        if (has_irr)
+            color = g.cubes[irr_idx].SampleLevel(g.samp, dir, 0.0).rgb * (1.0 / GGX_PI);
+        else
+            color = sky(dir, sun_dir, sun_i, false);
     }
 
+
+    // Reflection HIT DISTANCE (world units) in the output/persist `.w` — the temporal resolve uses it
+    // to reproject the VIRTUAL IMAGE (the reflected point at `surface_dist + t` along the view ray) so a
+    // mirror reflection stays stable under camera motion instead of swimming (reference-engine
+    // LumenReflectionDenoiserTemporal virtual-image reproject). `t` is the ray parameter at the hit
+    // (≈ ray max on a miss = the sky, effectively far). Alpha is unused by the composite/lighting, so
+    // this is inert for every non-temporal-resolve consumer (gallery byte-identical).
+    float hit_dist = t;
     // A3: persist this freshly-traced (surface point, radiance) for next frame's reuse gate.
     if (skip_write)
     {
         g.storage_buffers[sk.write].Store4(lin * 32u, asuint(float4(p, 1.0)));
-        g.storage_buffers[sk.write].Store4(lin * 32u + 16u, asuint(float4(color, 0.0)));
+        g.storage_buffers[sk.write].Store4(lin * 32u + 16u, asuint(float4(color, hit_dist)));
     }
-    g.storage_images[pc.out_index][tid.xy] = float4(color, 1.0);
+    g.storage_images[pc.out_index][tid.xy] = float4(color, hit_dist);
 }

@@ -154,7 +154,7 @@ float3 bs_trace_bounce(BounceScene bs, float3 origin, float3 dir, out float esca
             {
                 bool cached = false;
                 float3 r = sample_surface_cache(p, hn, bs.cache.x, bs.cache.y, bs.cache.z,
-                                                bs.cache.w, bs.cache_tile, cached);
+                                                bs.cache.w, bs.cache_tile, 0.0, cached);
                 if (cached)
                     return r;
             }

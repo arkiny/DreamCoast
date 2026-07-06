@@ -757,6 +757,47 @@ pub(crate) fn cache_view_push(
     pc
 }
 
+/// Pack the reflection cone-LOD MIP-generation push (48 bytes = 12 u32). One dispatch per level
+/// downsamples the surface-cache radiance atlas 2×2 into the MIP pyramid. `src_rad` is mip0 (the
+/// freshly-lit slot) at level 1 and the pyramid buffer for higher levels; `src_pos` supplies mip0
+/// validity (level 1 only). `parent_stride`/`off_prev` locate the parent within its buffer,
+/// `dst_stride`/`off_cur` the destination within the pyramid. `res_cur`/`res_prev` are the level
+/// edges. Layout mirrors `MipGenPush` in `sdf_cache_mipgen.slang`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdf_cache_mipgen_push(
+    src_rad: u32,
+    src_pos: u32,
+    dst: u32,
+    num_cards: u32,
+    level: u32,
+    res_cur: u32,
+    res_prev: u32,
+    parent_stride: u32,
+    off_prev: u32,
+    dst_stride: u32,
+    off_cur: u32,
+) -> [u8; 48] {
+    let mut pc = [0u8; 48];
+    let fields = [
+        src_rad,
+        src_pos,
+        dst,
+        num_cards,
+        level,
+        res_cur,
+        res_prev,
+        parent_stride,
+        off_prev,
+        dst_stride,
+        off_cur,
+        0u32, // pad to 48 B (12 u32)
+    ];
+    for (i, v) in fields.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc
+}
+
 /// Pack the Phase 11 Stage C8b2 surface-cache lighting push block (112 bytes): card +
 /// cache buffer indices, GDF sampled, atlas dims, spp/frame/reset, then float4 sun /
 /// aabb_min(+ground) / aabb_max(+clamp) / params(sky_fill, temporal alpha, bias, ray max).
@@ -780,7 +821,7 @@ pub(crate) fn cache_light_push(
     ground_y: f32,
     aabb_max: [f32; 3],
     dist_clamp: f32,
-    sky_fill: f32,
+    skylight_floor: f32,
     alpha: f32,
     bias: f32,
     ray_max: f32,
@@ -790,6 +831,8 @@ pub(crate) fn cache_light_push(
     card_vis_index: u32,
     cone_k: f32,
     conv_buf: u32,
+    irradiance_index: u32,
+    gather_firefly: f32,
     sky_gain: f32,
     sky_wb: [f32; 3],
 ) -> [u8; 160] {
@@ -824,7 +867,7 @@ pub(crate) fn cache_light_push(
         pc[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
     pc[92..96].copy_from_slice(&dist_clamp.to_le_bytes());
-    pc[96..100].copy_from_slice(&sky_fill.to_le_bytes());
+    pc[96..100].copy_from_slice(&skylight_floor.to_le_bytes());
     pc[100..104].copy_from_slice(&alpha.to_le_bytes());
     pc[104..108].copy_from_slice(&bias.to_le_bytes());
     pc[108..112].copy_from_slice(&ray_max.to_le_bytes());
@@ -840,6 +883,10 @@ pub(crate) fn cache_light_push(
     pc[128..132].copy_from_slice(&cone_k.to_le_bytes());
     // A2-fix: host-visible convergence buffer index (former pad0 slot @132). 0xFFFFFFFF = disabled.
     pc[132..136].copy_from_slice(&conv_buf.to_le_bytes());
+    // Skylight-floor IBL irradiance cube index (former pad1 slot @136). 0xFFFFFFFF = absent (floor off).
+    pc[136..140].copy_from_slice(&irradiance_index.to_le_bytes());
+    // Per-sample firefly clamp for the indirect gather (former pad2 slot @140). 0 = off.
+    pc[140..144].copy_from_slice(&gather_firefly.to_le_bytes());
     // Sky (float4 at offset 144, after cone_k + 3 pad floats): x = gain, yzw = white balance —
     // the same procedural-sky params the path tracer uses, for the relight's sky-on-miss.
     pc[144..148].copy_from_slice(&sky_gain.to_le_bytes());
@@ -1306,6 +1353,7 @@ pub(crate) fn taau_push(
     reject_dist: f32,
     max_hist: f32,
     variance_gamma: f32,
+    clamp_expand: f32,
     jitter_uv: [f32; 2],
     velocity_index: u32,
 ) -> [u8; 240] {
@@ -1337,6 +1385,8 @@ pub(crate) fn taau_push(
     pc[192..196].copy_from_slice(&reject_dist.to_le_bytes());
     pc[196..200].copy_from_slice(&max_hist.to_le_bytes());
     pc[200..204].copy_from_slice(&variance_gamma.to_le_bytes());
+    // params.w: TSR-style clamp-box expansion factor (0 = tight box = byte-identical anchor).
+    pc[204..208].copy_from_slice(&clamp_expand.to_le_bytes());
     // float4 jitter (xy = current jitter in UV) at the next 16-byte row.
     pc[208..212].copy_from_slice(&jitter_uv[0].to_le_bytes());
     pc[212..216].copy_from_slice(&jitter_uv[1].to_le_bytes());
@@ -1538,6 +1588,10 @@ pub(crate) fn gdf_reflect_push(
     width: u32,
     height: u32,
     flip_y: u32,
+    // GI irradiance-volume base index (radiance cache) sampled at reflection hits for the indirect
+    // term; u32::MAX = off (gallery) -> legacy analytic sky fill, byte-identical. Packed into
+    // flip_y's spare bits below (the 240-byte block is full; D3D12 root budget forbids growing it).
+    gi_vol_base: u32,
     material_index: u32,
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
@@ -1586,7 +1640,16 @@ pub(crate) fn gdf_reflect_push(
     pc[108..112].copy_from_slice(&out_index.to_le_bytes());
     pc[112..116].copy_from_slice(&width.to_le_bytes());
     pc[116..120].copy_from_slice(&height.to_le_bytes());
-    pc[120..124].copy_from_slice(&flip_y.to_le_bytes());
+    // Pack the GI-volume base into flip_y's upper bits (shader reads bit0 for the Y-flip and
+    // `>> 1` for the volume). Encode (base+1) so 0 = off; base indices are small (< bindless
+    // volume count) so this never collides with bit0.
+    let flip_packed = (flip_y & 1)
+        | if gi_vol_base == u32::MAX {
+            0
+        } else {
+            (gi_vol_base + 1) << 1
+        };
+    pc[120..124].copy_from_slice(&flip_packed.to_le_bytes());
     pc[124..128].copy_from_slice(&material_index.to_le_bytes());
     for (i, v) in aabb_min.iter().enumerate() {
         pc[128 + i * 4..132 + i * 4].copy_from_slice(&v.to_le_bytes());
@@ -1640,6 +1703,7 @@ pub(crate) fn reflect_composite_push(
     clamp_max: f32,
     material_index: u32,
     max_roughness: f32,
+    skip_mirror_ssr: bool,
 ) -> [u8; 48] {
     let mut pc = [0u8; 48];
     pc[0..4].copy_from_slice(&ssr_index.to_le_bytes());
@@ -1651,6 +1715,7 @@ pub(crate) fn reflect_composite_push(
     pc[24..28].copy_from_slice(&clamp_max.to_le_bytes());
     pc[28..32].copy_from_slice(&material_index.to_le_bytes());
     pc[32..36].copy_from_slice(&max_roughness.to_le_bytes());
+    pc[36..40].copy_from_slice(&u32::from(skip_mirror_ssr).to_le_bytes()); // pad0: content near-mirror SSR skip
     pc
 }
 

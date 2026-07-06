@@ -23,6 +23,27 @@ use objc2_quartz_core::CAMetalLayer;
 /// macOS virtual key code for Escape (used to request close, like the Win32 path).
 const KEY_ESCAPE: u16 = 53;
 
+/// Translate a macOS hardware key code (`kVK_ANSI_*` / `kVK_*`) into the Win32 virtual-key code the
+/// input layer + camera controller speak, so keyboard controls behave identically to the Windows
+/// path. Without this, macOS reports e.g. `W == 13` while the fly camera checks `VK_W == 0x57`, so
+/// WASD silently does nothing. Only the keys the app actually queries are mapped; anything else is
+/// passed through (the app never checks those slots).
+fn mac_keycode_to_vk(kc: u16) -> u16 {
+    match kc {
+        0x00 => 0x41,        // A
+        0x01 => 0x53,        // S
+        0x02 => 0x44,        // D
+        0x0D => 0x57,        // W
+        0x0C => 0x51,        // Q
+        0x0E => 0x45,        // E
+        0x38 | 0x3C => 0x10, // Shift (left / right) -> VK_SHIFT
+        0x30 => 0x09,        // Tab -> VK_TAB
+        0x35 => 0x1B,        // Escape -> VK_ESCAPE
+        0x78 => 0x71,        // F2
+        other => other,
+    }
+}
+
 /// An open application window.
 pub struct Window {
     window: Retained<NSWindow>,
@@ -133,7 +154,7 @@ impl Window {
         match ty {
             NSEventType::KeyDown => {
                 let kc = event.keyCode();
-                self.input.set_key(kc as usize, true);
+                self.input.set_key(mac_keycode_to_vk(kc) as usize, true);
                 if kc == KEY_ESCAPE {
                     self.should_close = true;
                 }
@@ -149,7 +170,7 @@ impl Window {
             }
             NSEventType::KeyUp => {
                 let kc = event.keyCode();
-                self.input.set_key(kc as usize, false);
+                self.input.set_key(mac_keycode_to_vk(kc) as usize, false);
             }
             NSEventType::LeftMouseDown => self.input.set_button(0, true),
             NSEventType::LeftMouseUp => self.input.set_button(0, false),

@@ -135,7 +135,7 @@ float3 occlude_sky_diffuse(float3 irradiance, float sky_vis)
 
 float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float metallic,
                    float roughness, float ao, float3 f0, float3 swrt_refl, bool has_swrt,
-                   float sky_vis)
+                   float sky_vis, float gdf_ao)
 {
     if (globals.ibl.y < 0)
         return globals.ambient.rgb * albedo * ao;
@@ -190,7 +190,13 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
     float2 brdf = g.textures[globals.ibl.w].SampleLevel(g.samp, float2(n_dot_v, roughness), 0.0).rg;
     float3 specular = refl * (f * brdf.x + brdf.y);
 
-    return (kd * diffuse + specular) * ao;
+    // AO (material + GDF far-field) attenuates only the DIFFUSE ambient. The traced SW-RT
+    // reflection already accounts for occlusion along its own ray, so multiplying the mirror
+    // specular by AO double-counts it — and for a reflective object baked INTO the distance field
+    // (which self-occludes -> gdf_ao≈0) it would kill the reflection entirely (a black chrome
+    // ball). So AO applies to diffuse only; the specular reflection carries its own occlusion.
+    // (Gallery anchor stays byte-identical: its specular pixels have ao·gdf_ao == 1.)
+    return kd * diffuse * (ao * gdf_ao) + specular;
 }
 
 // --- Soft-shadow quality tier (the scalability seam): one place to swap counts.
@@ -439,6 +445,15 @@ float4 fsMain(VSOutput input) : SV_Target
     float3 albedo = albedo_ao.rgb;
     float metallic = mat.r;
     float roughness = max(mat.g, 0.04);
+    // DEBUG_VIEW=20: force the ENTIRE scene to a polished near-mirror (metallic 1, low roughness,
+    // bright neutral F0) so every surface shows its reflection — used to watch the SW-RT reflection
+    // fill in / converge over frames. Not a color-replace debug view: the normal lit result stands.
+    if (globals.counts.y == 20)
+    {
+        metallic = 1.0;
+        roughness = 0.05;
+        albedo = float3(0.95, 0.95, 0.95);
+    }
     float ao = mat.b;
     float3 world_pos = pos.xyz;
     float3 n = normalize(normal);
@@ -565,8 +580,11 @@ float4 fsMain(VSOutput input) : SV_Target
     if (pc.skyvis_index != NO_TEXTURE)
         sky_vis = saturate(g.textures[pc.skyvis_index].Sample(g.samp, input.uv).r);
 
+    // `ambient_ibl` already applied the GDF far-field AO to the DIFFUSE ambient and left the traced
+    // specular reflection un-occluded (it carries its own ray occlusion), so there is no separate
+    // `ambient *= gdf_ao` here — that would double-count AO on diffuse and wrongly darken specular.
     float3 ambient = ambient_ibl(n, v, world_pos, albedo, metallic, roughness, ao, f0,
-                                 swrt_refl, has_swrt, sky_vis) * gdf_ao;
+                                 swrt_refl, has_swrt, sky_vis, gdf_ao);
 
     // Stage C3: 1-bounce diffuse GI marched against the scene GDF in a prior compute
     // pass. The GI image holds the mean incoming radiance (indirect irradiance) from
@@ -589,7 +607,9 @@ float4 fsMain(VSOutput input) : SV_Target
     float3 color = (ambient + lo) * exposure;
 
     // Debug views (counts.y): 1 albedo, 2 normal, 3 metallic, 4 roughness,
-    // 5 world pos, 6 AO, 7 direct light, 8 IBL ambient, 9 GDF AO, 10 GDF GI. 0 = lit.
+    // 5 world pos, 6 AO, 7 direct light, 8 IBL ambient, 9 GDF AO, 10 GDF GI,
+    // 11 light-count heatmap, 12 reflection buffer (the raw SW-RT reflected radiance sampled at
+    // this pixel — what a mirror here would show; 0 where no reflection is bound). 0 = lit.
     int dbg = globals.counts.y;
     if (dbg == 1) color = albedo;
     else if (dbg == 2) color = n * 0.5 + 0.5;
@@ -609,6 +629,14 @@ float4 fsMain(VSOutput input) : SV_Target
         color = float3(saturate(t * 2.0 - 1.0), saturate(1.0 - abs(t - 0.5) * 2.0), saturate(1.0 - t * 2.0));
         if (lights_touched == 0)
             color = float3(0.0);
+    }
+    // 12: the reflection buffer — the raw SW-RT reflected radiance this pixel receives. MAGENTA
+    // flags a pathological value (NaN / Inf / negative) so corruption is obvious; otherwise the raw
+    // reflected radiance (no exposure) so magnitudes read directly. 0 when no reflection is bound.
+    else if (dbg == 12)
+    {
+        bool bad = any(isnan(swrt_refl)) || any(isinf(swrt_refl)) || any(swrt_refl < 0.0);
+        color = bad ? float3(1.0, 0.0, 1.0) : (has_swrt ? swrt_refl : float3(0.0));
     }
 
     // PR-7 CSM cascade-index overlay (csm_params.y): tint the lit color by which cascade

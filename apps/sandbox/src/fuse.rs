@@ -140,9 +140,10 @@ fn card_priority(aabb: &([f32; 3], [f32; 3]), cam: &CardCamera) -> f64 {
 pub(crate) fn select_card_residency(
     drawable_aabb: &[([f32; 3], [f32; 3])],
     cam: &CardCamera,
+    max_cards: u32,
 ) -> CardResidency {
     let n = drawable_aabb.len();
-    let max_drawables = (MAX_CARDS / CARDS_PER_DRAWABLE) as usize;
+    let max_drawables = (max_cards.max(CARDS_PER_DRAWABLE) / CARDS_PER_DRAWABLE) as usize;
     if n <= max_drawables {
         return CardResidency::all_resident(n);
     }
@@ -284,15 +285,16 @@ pub(crate) fn build_surface_cards(
     drawable_aabb: &[([f32; 3], [f32; 3])],
     drawable_albedo: &[[f32; 3]],
     cam: &CardCamera,
+    max_cards: u32,
 ) -> (Vec<u8>, Vec<u8>, CardResidency) {
-    let residency = select_card_residency(drawable_aabb, cam);
+    let residency = select_card_residency(drawable_aabb, cam, max_cards);
     let keep = &residency.resident;
     if !residency.coarse_fallback.is_empty() {
         info!(
             "surface cache: {} drawables exceed the {}-card budget — {} keep cards \
              (camera-priority residency), {} on coarse fallback (dense-field lit, not dropped)",
             drawable_aabb.len(),
-            MAX_CARDS,
+            max_cards,
             keep.len(),
             residency.coarse_fallback.len(),
         );
@@ -364,7 +366,7 @@ mod tests {
     fn within_budget_keeps_all_in_order() {
         let cam = CardCamera::from_look(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO);
         let aabbs: Vec<_> = (0..10).map(|i| boxed([i as f32, 0.0, 0.0], 0.5)).collect();
-        let r = select_card_residency(&aabbs, &cam);
+        let r = select_card_residency(&aabbs, &cam, MAX_CARDS);
         assert_eq!(r.resident, (0..10).collect::<Vec<_>>());
         assert!(r.coarse_fallback.is_empty());
     }
@@ -379,7 +381,7 @@ mod tests {
 
         // Exactly at the cap: everything resident.
         let at: Vec<_> = (0..cap).map(|i| boxed([i as f32, 0.0, 0.0], 0.5)).collect();
-        let r = select_card_residency(&at, &cam);
+        let r = select_card_residency(&at, &cam, MAX_CARDS);
         assert_eq!(r.resident.len(), cap);
         assert!(r.coarse_fallback.is_empty());
 
@@ -387,7 +389,7 @@ mod tests {
         let over: Vec<_> = (0..cap + 1)
             .map(|i| boxed([i as f32, 0.0, 0.0], 0.5))
             .collect();
-        let r = select_card_residency(&over, &cam);
+        let r = select_card_residency(&over, &cam, MAX_CARDS);
         assert_eq!(r.resident.len(), cap);
         assert_eq!(r.coarse_fallback.len(), 1);
         // Partition: resident ∪ fallback == 0..N, disjoint, each sorted ascending.
@@ -410,8 +412,8 @@ mod tests {
         let aabbs: Vec<_> = (0..cap + 2)
             .map(|i| boxed([0.0, 0.0, 20.0 - i as f32], 0.4))
             .collect();
-        let r1 = select_card_residency(&aabbs, &cam);
-        let r2 = select_card_residency(&aabbs, &cam);
+        let r1 = select_card_residency(&aabbs, &cam, MAX_CARDS);
+        let r2 = select_card_residency(&aabbs, &cam, MAX_CARDS);
         assert_eq!(r1, r2, "residency must be run-to-run identical");
         // Farthest two (largest index ⇒ most negative Z ⇒ farthest from eye at +Z) fall back.
         assert_eq!(r1.coarse_fallback, vec![cap, cap + 1]);
@@ -428,7 +430,7 @@ mod tests {
             .collect();
         // Insert a near drawable at draw-list index 0.
         aabbs.insert(0, boxed([0.0, 0.0, -2.0], 0.5));
-        let r = select_card_residency(&aabbs, &cam);
+        let r = select_card_residency(&aabbs, &cam, MAX_CARDS);
         assert!(
             r.resident.contains(&0),
             "the near drawable (index 0) must keep its card"

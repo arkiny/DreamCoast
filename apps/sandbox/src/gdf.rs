@@ -96,11 +96,24 @@ pub(crate) struct GdfSystem {
     /// ping-pong ([0]/[1], %2); the async-compute path uses a 3-slot ring (%3) so the slot the
     /// async queue writes is never one an in-flight graphics frame still reads (no WAR hazard).
     cache_radiance: [Option<StorageBuffer>; 3],
+    /// Reflection MIP pyramid (levels 1..=`mip_levels()`) of the surface-cache radiance atlas,
+    /// regenerated each frame from the freshly-lit mip0 (`cache_rad_mips_gen`). A demagnified far
+    /// reflection maps many pixels onto few mip0 texels → NEAREST/bilinear at mip0 reads them as
+    /// hard blocks; a ray-cone footprint selects a coarse MIP whose 2×2 average smooths the far
+    /// reflection (reference-engine surface-cache cone LOD). Each texel packs `float4(radiance.rgb,
+    /// coverage)` — coverage is the captured fraction, so the sampler can skip uncaptured texels and
+    /// renormalise exactly like the mip0 bilinear. `None` ⇒ no mip path (content falls to mip0
+    /// bilinear; gallery never reads it). Content-only; the gallery/GI consumers keep mip0-nearest.
+    cache_rad_mips: Option<StorageBuffer>,
     cache_frame: u32,
     /// Async-compute relight: the surface-cache relight runs on the compute queue overlapping the
     /// graphics frame, and consumers read the PREVIOUS frame's radiance (1-frame latency). Opt-in.
     cache_async: bool,
     cache_light_pipeline: Option<ComputePipeline>,
+    /// Reflection cone-LOD MIP generator: downsamples the surface-cache radiance atlas 2×2 per
+    /// level (uncaptured texels weighted out + renormalised) into `cache_rad_mips`. One dispatch
+    /// per level, chained by storage barriers. `None` ⇒ no mip pyramid (content = mip0 bilinear).
+    cache_mipgen_pipeline: Option<ComputePipeline>,
     /// Stage D2b: per-card camera-frustum visibility (1 uint/card; 1 = on-screen) driving the
     /// relight budget, + the compute pipeline that fills it. `None` until the cache is built.
     card_vis: Option<StorageBuffer>,
@@ -296,6 +309,16 @@ impl GdfSystem {
             160,
             [64, 1, 1],
         )?;
+        // Reflection cone-LOD: MIP pyramid generator for the surface-cache radiance atlas.
+        let cache_mipgen_pipeline = compute(
+            "mipMain",
+            dreamcoast_shader::sdf_cache_mipgen_cs_spirv,
+            dreamcoast_shader::sdf_cache_mipgen_cs_dxil,
+            dreamcoast_shader::sdf_cache_mipgen_cs_metallib,
+            "sdf_cache_mipgen",
+            48,
+            [64, 1, 1],
+        )?;
         // Stage D2b: per-card camera-frustum visibility for the relight budget.
         let cache_vis_pipeline = compute(
             "csMain",
@@ -441,9 +464,11 @@ impl GdfSystem {
             cache_capture_pipeline,
             cache_view_pipeline,
             cache_radiance: [None, None, None],
+            cache_rad_mips: None,
             cache_frame: 0,
             cache_async: false,
             cache_light_pipeline,
+            cache_mipgen_pipeline,
             card_vis: None,
             cache_conv: [None, None],
             cache_vis_pipeline,
@@ -978,6 +1003,20 @@ impl GdfSystem {
         self.cache_pos = make()?;
         self.cache_albedo = make()?;
         self.cache_radiance = [make()?, make()?, make()?];
+        // Reflection cone-LOD: the MIP pyramid of the radiance atlas (levels 1..=mip_levels; mip0
+        // stays in `cache_radiance`). `float4(rad.rgb, coverage)` per texel, `num_cards *
+        // card_mip_texels` total. Only when the generator pipeline exists (content). The gallery /
+        // GI consumers never read it (mip0-nearest), so it costs nothing there.
+        self.cache_rad_mips = if self.cache_mipgen_pipeline.is_some() {
+            let mip_texels = (num_cards as u64) * (Self::card_mip_texels(self.card_tile) as u64);
+            Some(device.create_storage_buffer(&StorageBufferDesc {
+                size: mip_texels.max(1) * 16,
+                stride: 16,
+                indirect: false,
+            })?)
+        } else {
+            None
+        };
         // Stage D2b: 1 uint / card visibility flag (filled each frame by record_cache_visibility).
         self.card_vis = Some(device.create_storage_buffer(&StorageBufferDesc {
             size: (num_cards as u64) * 4,
@@ -1070,6 +1109,124 @@ impl GdfSystem {
         Some((cards, pos, rad, self.num_cards, self.card_tile))
     }
 
+    /// Reflection cone-LOD: the surface-cache MIP pyramid buffer's bindless index + the highest
+    /// MIP level the reflection sampler may select (= number of levels above mip0). `None` until
+    /// the pyramid is built (content only). The reflection packs these so a demagnified far hit
+    /// reads a coarse averaged MIP instead of stair-stepped mip0 blocks.
+    pub(crate) fn reflect_cache_mip_info(&self) -> Option<(u32, u32)> {
+        let mips = self.cache_rad_mips.as_ref()?;
+        Some((mips.storage_index(), Self::mip_levels(self.card_tile)))
+    }
+
+    /// Number of MIP levels generated above mip0 for a card tile edge `tile` (levels whose edge
+    /// `tile >> L` is ≥ 1). tile=32 → 5 (edges 16,8,4,2,1).
+    pub(crate) fn mip_levels(tile: u32) -> u32 {
+        let mut l = 0u32;
+        let mut r = tile;
+        while r > 1 {
+            r >>= 1;
+            l += 1;
+        }
+        l
+    }
+
+    /// Total texels per card across MIP levels 1..=`mip_levels` (mip0 stays in `cache_radiance`).
+    /// tile=32 → 16²+8²+4²+2²+1² = 341.
+    fn card_mip_texels(tile: u32) -> u32 {
+        let mut sum = 0u32;
+        let mut r = tile >> 1;
+        while r >= 1 {
+            sum += r * r;
+            if r == 1 {
+                break;
+            }
+            r >>= 1;
+        }
+        sum
+    }
+
+    /// Reflection cone-LOD: generate the MIP pyramid of the surface-cache radiance atlas from the
+    /// freshly-lit mip0 (`rad_read_index`, the slot the consumers read). One dispatch per level
+    /// (1..=`mip_levels`), each a 2×2 average of its parent with uncaptured texels weighted out and
+    /// the result renormalised (the mip0 bilinear rule, propagated up the pyramid via a per-texel
+    /// coverage in `.w`). Ordered after the relight (`lit_ext`) via the graph; returns a write
+    /// handle to chain the reflection read after. `None` without the pyramid / pipeline.
+    pub(crate) fn record_cache_mipgen<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        lit_ext: ResourceId,
+        rad_read_index: u32,
+    ) -> Option<ResourceId> {
+        let pipe = self.cache_mipgen_pipeline.as_ref()?;
+        let mip_buf = self.cache_rad_mips.as_ref()?;
+        let dst = mip_buf.storage_index();
+        let cpos = self.cache_pos.as_ref()?.storage_index();
+        let num_cards = self.num_cards;
+        let tile = self.card_tile;
+        let levels = Self::mip_levels(tile);
+        let dst_card_stride = Self::card_mip_texels(tile);
+        // Precompute (level, res_cur, res_prev, parent_card_stride, off_prev, off_cur) per level so
+        // the closure just packs + dispatches. off_* are the per-card texel offsets within the mip
+        // buffer; the mip0 parent (level 1) lives in its own buffer at stride tile² with off 0.
+        let mut steps: Vec<(u32, u32, u32, u32, u32, u32)> = Vec::with_capacity(levels as usize);
+        let mut off_prev = 0u32;
+        for l in 1..=levels {
+            let res_cur = tile >> l;
+            let res_prev = tile >> (l - 1);
+            let (parent_stride, op) = if l == 1 {
+                (tile * tile, 0u32) // parent = mip0 in cache_radiance
+            } else {
+                (dst_card_stride, off_prev)
+            };
+            let off_cur = if l == 1 {
+                0
+            } else {
+                off_prev + res_prev * res_prev
+            };
+            steps.push((l, res_cur, res_prev, parent_stride, op, off_cur));
+            off_prev = off_cur;
+        }
+        let mip_ext = graph.import_external("cache_rad_mips");
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "sdf_cache_mipgen",
+                storage_writes: vec![mip_ext],
+                reads: vec![lit_ext],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                for (i, &(level, res_cur, res_prev, parent_stride, op, off_cur)) in
+                    steps.iter().enumerate()
+                {
+                    // Level 1's parent is mip0 (the freshly-lit radiance slot); higher levels read
+                    // the pyramid's previous level, so barrier between dispatches.
+                    if i > 0 {
+                        cmd.storage_buffer_barrier(mip_buf);
+                    }
+                    let src_rad = if level == 1 { rad_read_index } else { dst };
+                    cmd.push_constants_compute(&crate::push::sdf_cache_mipgen_push(
+                        src_rad,
+                        cpos,
+                        dst,
+                        num_cards,
+                        level,
+                        res_cur,
+                        res_prev,
+                        parent_stride,
+                        op,
+                        dst_card_stride,
+                        off_cur,
+                    ));
+                    let threads = num_cards * res_cur * res_cur;
+                    cmd.dispatch(threads.div_ceil(64), 1, 1);
+                }
+                Ok(())
+            },
+        );
+        Some(mip_ext)
+    }
+
     /// Stage D2b: fill the per-card visibility buffer for this frame's camera (frustum planes,
     /// Y-flip-free so DX≡VK). Records the compute pass and returns the visibility graph handle to
     /// pass into `record_cache_light` (for the read barrier). `None` without the cache / pipeline.
@@ -1121,6 +1278,9 @@ impl GdfSystem {
         alpha: f32,
         cone_k: f32,
         conv_idx: u32,
+        skylight_floor: f32,
+        irradiance_index: u32,
+        gather_firefly: f32,
         sky_gain: f32,
         sky_wb: [f32; 3],
     ) {
@@ -1204,16 +1364,18 @@ impl GdfSystem {
                     0.0,
                     aabb_max,
                     diag,
-                    0.25,                            // sky fill irradiance
+                    skylight_floor, // sky-visibility floor (0 = off = byte-identical)
                     if reset { 1.0 } else { alpha }, // temporal alpha (D3: period-aware)
-                    diag * 0.01,                     // surface bias
-                    diag,                            // gather ray max distance
+                    diag * 0.01,    // surface bias
+                    diag,           // gather ray max distance
                     clip.0,
                     clip.1,
                     relight_period.max(1),
                     card_vis_index,
                     cone_k,
                     conv_idx,
+                    irradiance_index,
+                    gather_firefly,
                     sky_gain,
                     sky_wb,
                 ));
@@ -1246,6 +1408,9 @@ impl GdfSystem {
         feedback: bool,
         cone_k: f32,
         conv_idx: u32,
+        skylight_floor: f32,
+        irradiance_index: u32,
+        gather_firefly: f32,
         sky_gain: f32,
         sky_wb: [f32; 3],
     ) {
@@ -1324,7 +1489,7 @@ impl GdfSystem {
             0.0,
             aabb_max,
             diag,
-            0.25,
+            skylight_floor,
             if reset { 1.0 } else { alpha },
             diag * 0.01,
             diag,
@@ -1334,6 +1499,8 @@ impl GdfSystem {
             card_vis_index,
             cone_k,
             conv_idx,
+            irradiance_index,
+            gather_firefly,
             sky_gain,
             sky_wb,
         ));

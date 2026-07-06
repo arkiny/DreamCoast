@@ -702,6 +702,14 @@ impl ReflectSystem {
         frame: u32,
         albedo: Option<(&'a [Volume; 3], ResourceId)>,
         cache: Option<([u32; 5], ResourceId)>,
+        // GI irradiance volume (radiance cache): (radiance_base, skyvis_base, write-order handle),
+        // same tuple the GI pass gets. Sampled at reflection hits for the GI-lit indirect term so
+        // shadowed reflected surfaces aren't black. `None` (gallery) -> legacy analytic fill.
+        gi_volume: Option<(u32, u32, ResourceId)>,
+        // IBL diffuse-irradiance cube index (physical-units skylight). For content (gi_volume present)
+        // it rides the shader-unused `sky_fill` push slot; a reflected uncovered/shadowed surface and
+        // an escaped (sky) ray floor to this instead of near-black. `u32::MAX` / gallery -> legacy.
+        irradiance_index: u32,
         clip: (u32, u32),
         clip_vols: &'a [&'a Volume],
         max_steps: u32,
@@ -734,6 +742,11 @@ impl ReflectSystem {
         if let Some((_, ext)) = cache {
             reads.push(ext);
         }
+        if let Some((_, _, ext)) = gi_volume {
+            reads.push(ext); // barrier the reflection sample after this frame's volume update
+        }
+        // vol_r = radiance SH base (the reflection only needs the irradiance set, not sky-vis).
+        let gi_vol_base = gi_volume.map(|(rb, _, _)| rb).unwrap_or(u32::MAX);
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
         // A3: order this frame's skip-buffer writes (imported external; read is last frame's slot,
         // covered by the frame fence, so it isn't graph-tracked — same pattern as refl_accum).
@@ -782,6 +795,7 @@ impl ReflectSystem {
                     cw,
                     ch,
                     flip_y,
+                    gi_vol_base, // GI irradiance volume base (u32::MAX = off, legacy fill)
                     material_index,
                     aabb_min,
                     aabb_max,
@@ -789,7 +803,13 @@ impl ReflectSystem {
                     diag, // sample distance clamp
                     diag, // reflection ray max distance
                     0.7,  // constant hit-albedo fallback (sentinel albedo => achromatic, pre-C8a)
-                    0.25, // sky fill at the reflected hit
+                    // sky_fill slot: content (vol on) overloads it with the IBL irradiance cube index
+                    // (the shader reads it only on the vol_on skylight-fill path); gallery keeps 0.25.
+                    if gi_vol_base != u32::MAX {
+                        f32::from_bits(irradiance_index)
+                    } else {
+                        0.25
+                    },
                     bias,
                     albedo_rgb,
                     frame,
@@ -828,6 +848,13 @@ impl ReflectSystem {
         gdf_scale: f32,
         clamp_max: f32,
         max_roughness: f32,
+        // Content: drop SSR on NEAR-MIRROR surfaces and use the GDF/surface-cache reflection instead.
+        // Our SSR has no hit-validation (uncertain/depth-thickness), so on a convex SW-RT mirror (the
+        // chrome sphere) its screen march finds unreliable glancing hits that a partial blend smears in
+        // as a messy edge. The reference engine keeps SSR only as a validated hard-switch upgrade; until
+        // that validation exists, the (HQ) GDF/cache is the cleaner mirror source. Gallery passes false
+        // → byte-identical anchor.
+        skip_mirror_ssr: bool,
     ) -> ResourceId {
         let pipe = self
             .composite_pipeline
@@ -857,6 +884,7 @@ impl ReflectSystem {
                     clamp_max,
                     material_index,
                     max_roughness,
+                    skip_mirror_ssr,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

@@ -74,6 +74,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float npow = pc.params.y;
 
     float3 sum = float3(0.0, 0.0, 0.0);
+    float asum = 0.0;
     float wsum = 0.0;
     for (int dy = 0; dy <= 1; dy++)
     {
@@ -91,7 +92,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 
             float3 qp = reconstruct(quv, qd);
             float3 qn = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, quv, 0.0).xyz);
-            float3 qcol = g.textures[pc.gi_half_index].SampleLevel(g.samp, quv, 0.0).rgb;
+            float4 qc4 = g.textures[pc.gi_half_index].SampleLevel(g.samp, quv, 0.0);
+            float3 qcol = qc4.rgb;
 
             // Bilinear spatial weight x edge-stopping (position + normal), as in à-trous.
             float w_bil = (dx == 0 ? 1.0 - frac.x : frac.x) * (dy == 0 ? 1.0 - frac.y : frac.y);
@@ -100,13 +102,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float w = w_bil * w_pos * w_nrm;
 
             sum += qcol * w;
+            asum += qc4.a * w; // carry the input alpha (reflection HIT DISTANCE; AO/GI = 1 → unchanged)
             wsum += w;
         }
     }
 
     // All taps rejected (thin geometry / silhouette): fall back to a plain bilinear fetch so
     // the pixel still gets indirect light rather than going black.
-    float3 outc = wsum > 1e-5 ? sum / wsum
-                              : g.textures[pc.gi_half_index].SampleLevel(g.samp, uv, 0.0).rgb;
-    g.storage_images[pc.out_index][tid.xy] = float4(outc, 1.0);
+    float4 fb = g.textures[pc.gi_half_index].SampleLevel(g.samp, uv, 0.0);
+    float3 outc = wsum > 1e-5 ? sum / wsum : fb.rgb;
+    float outa = wsum > 1e-5 ? asum / wsum : fb.a;
+    g.storage_images[pc.out_index][tid.xy] = float4(outc, outa);
 }

@@ -54,6 +54,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     //     GDF rather than darkening the metal (also routes backend-divergent march pixels to the
     //     deterministic GDF, keeping the full-res mirror VK≡DX-stable). ---
     float ssr_trust = 1.0 - smoothstep(0.1, max(pc.max_roughness, 0.12), roughness);
+    // Content (pad0): on a NEAR-MIRROR surface, use the GDF/surface-cache reflection ONLY — do not
+    // blend SSR. Our SSR has no hit-validation (uncertain / depth-thickness / history-depth like the
+    // reference engine's screen-trace), so on a convex SW-RT mirror (the chrome sphere) it finds
+    // unreliable glancing hits that a partial blend smears in as a messy silhouette. Glossy surfaces
+    // keep SSR (its error is hidden by the broad lobe). The reference engine keeps SSR only as a
+    // validated hard-switch upgrade; until that exists, the HQ GDF/cache is the cleaner mirror source.
+    if (pc.pad0 == 1u && roughness < 0.1)
+        ssr_trust = 0.0;
     float ssr_lum = dot(ssr.rgb, float3(0.299, 0.587, 0.114));
     float gdf_lum = dot(gdf, float3(0.299, 0.587, 0.114));
     float valid = ssr_lum > 0.25 * gdf_lum ? 1.0 : 0.0;
