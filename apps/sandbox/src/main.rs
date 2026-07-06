@@ -5934,6 +5934,12 @@ impl App {
                 } else {
                     extent
                 };
+                // Frame-varying GGX jitter (real convergence) is the default; `P_REFLECT_FIXED_JITTER`
+                // restores the old fixed frame-0 sample. The A3 reuse stays on — its 1/K stagger still
+                // feeds fresh samples, so `reflect_temporal` converges while the reuse keeps the cost
+                // near the fixed-jitter path.
+                let refl_frame_varying =
+                    self.is_gallery || std::env::var_os("P_REFLECT_FIXED_JITTER").is_none();
                 let refl_traced = self.reflect.record_gdf_reflect(
                     &mut graph,
                     vol,
@@ -5951,12 +5957,15 @@ impl App {
                     rw,
                     rh,
                     self.flip_y,
-                    // Content: fixed frame (0) → temporally stable GGX jitter (no reflection
-                    // sparkle). Gallery: real frame → byte-identical legacy anchor.
-                    // TEST P_REFLECT_ACCUM: frame-VARYING GGX jitter so the temporal resolve
-                    // actually accumulates a different ray each frame (real convergence), instead of
-                    // the content default's FIXED frame-0 jitter (spatial-gather-only, no temporal).
-                    if self.is_gallery || std::env::var_os("P_REFLECT_ACCUM").is_some() {
+                    // Frame-VARYING GGX jitter: a different reflection ray each frame so the temporal
+                    // resolve actually ACCUMULATES (real convergence of the glossy lobe / near-mirror),
+                    // not just a spatial gather of one fixed sample. This is now the default for content
+                    // too: the fixed frame-0 jitter never converged (a permanent 1-sample blocky
+                    // pattern), and it was only chosen because the old absolute firefly clamp crushed
+                    // the accumulation — with the exposure-relative clamp the frame-varying history
+                    // resolves cleanly. Gallery already used the real frame (byte-identical anchor).
+                    // `P_REFLECT_FIXED_JITTER=1` restores the old fixed-0 behaviour.
+                    if refl_frame_varying {
                         self.frame_no as u32
                     } else {
                         0
