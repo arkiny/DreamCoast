@@ -942,6 +942,12 @@ struct App {
     /// are `reflect_spatial_kernel` / fixed. Off ⇒ temporal keeps out.a = 1.0, byte-identical.
     reflect_spatial: bool,
     reflect_spatial_kernel: f32,
+    /// Track A5: blue-noise stochastic reflection — a bundle that enables frame-varying + low-
+    /// discrepancy (blue-noise) GGX jitter + the A1 resolve + the A4 denoiser together, so the
+    /// temporal pass converges the glossy lobe (escaping the fixed-jitter dead end) instead of
+    /// sparkling. `P_REFLECT_STOCHASTIC` (content only; gallery keeps its white inline jitter →
+    /// anchor untouched). Sets `max_steps` bit30 for the SW trace so it draws the blue-noise ray.
+    reflect_stochastic: bool,
     /// SSR resolve history neighbourhood clamp (breaks the mirror lit-history feedback oscillation a
     /// plain EMA only low-passes): 0 = off (byte-identical), 1 = variance clamp (mean ± γ·σ). Gallery
     /// forced 0. `P_SSR_HISTORY_CLAMP` / `P_SSR_CLAMP_GAMMA` override.
@@ -2851,6 +2857,10 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(8.0)
             .clamp(1.0, 16.0);
+        // Track A5: blue-noise stochastic reflection bundle (frame-varying + blue-noise + A1 + A4).
+        // Content opt-in; default off (content sequence unchanged, gallery anchor untouched).
+        let reflect_stochastic =
+            !gallery_scene && std::env::var_os("P_REFLECT_STOCHASTIC").is_some();
         // SSR-resolve history feedback clamp (0 off / 1 variance). Gallery base is 0 (byte-identical
         // anchor); content tiers default 0 too pending DX=VK verification. `P_SSR_HISTORY_CLAMP` +
         // `P_SSR_CLAMP_GAMMA` override (set =1 to break the mirror lit-history feedback shimmer).
@@ -3279,6 +3289,7 @@ impl App {
             reflect_resolve_kernel,
             reflect_spatial,
             reflect_spatial_kernel,
+            reflect_stochastic,
             ssr_history_clamp,
             ssr_clamp_gamma,
             gi_temporal_clamp,
@@ -6188,8 +6199,9 @@ impl App {
                 // STABLE (the resolve reconstructs the lobe spatially) — a frame-VARYING ray never
                 // settles under the 1-ray/frame accumulation (auto-exposure + motion reject the history)
                 // and reads as sparkle. `P_REFLECT_ACCUM=1` forces frame-varying (studies convergence).
-                let refl_frame_varying =
-                    self.is_gallery || std::env::var_os("P_REFLECT_ACCUM").is_some();
+                let refl_frame_varying = self.is_gallery
+                    || self.reflect_stochastic // A5: blue-noise needs frame-varying to converge
+                    || std::env::var_os("P_REFLECT_ACCUM").is_some();
                 let refl_traced = self.reflect.record_gdf_reflect(
                     &mut graph,
                     vol,
@@ -6226,7 +6238,15 @@ impl App {
                     self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                     scene_clip,
                     &scene_clip_vols,
-                    self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
+                    // bit31 = content flag (mirror threshold); bit30 = A5 blue-noise stochastic (SW
+                    // trace only — HWRT's max_steps field carries the lit-history index instead).
+                    self.reflect_max_steps
+                        | if self.is_gallery { 0 } else { 0x8000_0000 }
+                        | if self.reflect_stochastic && !self.hwrt {
+                            0x4000_0000
+                        } else {
+                            0
+                        },
                     self.gdf_cone_k,
                     {
                         // A3: prime the skip buffer every frame (write); enable REUSE (read) only once
@@ -6263,7 +6283,9 @@ impl App {
                 // through. Gallery never enables it (anchor untouched). `mirror_thresh` mirrors
                 // gdf_reflect.slang's content branch (0.125). When it runs, the temporal pass drops its
                 // own box average (`resolve_ran`) so the ratio-estimated sharpness survives.
-                let resolve_ran = self.reflect_resolve && self.reflect.has_reflect_resolve();
+                // A5: the stochastic bundle enables the A1 resolve + A4 denoiser alongside blue-noise.
+                let resolve_ran = (self.reflect_resolve || self.reflect_stochastic)
+                    && self.reflect.has_reflect_resolve();
                 let refl_resolved = if resolve_ran {
                     self.reflect.record_reflect_resolve(
                         &mut graph,
@@ -6284,6 +6306,7 @@ impl App {
                         },
                         0.125, // content mirror threshold — keep in lockstep with gdf_reflect.slang
                         self.reflect_resolve_kernel,
+                        self.reflect_stochastic, // A5: reconstruct blue-noise rays when stochastic
                     )
                 } else {
                     refl_traced
@@ -6329,9 +6352,12 @@ impl App {
                     self.reflect_history_clamp,
                     self.reflect_clamp_gamma,
                     resolve_ran, // A1: drop the box average when the ratio-estimator resolve ran
-                    self.reflect_spatial && self.reflect.has_reflect_spatial(), // A4a: accumulate variance
+                    (self.reflect_spatial || self.reflect_stochastic)
+                        && self.reflect.has_reflect_spatial(), // A4a: accumulate variance
                 );
-                let gdf_resolved = if self.reflect_spatial && self.reflect.has_reflect_spatial() {
+                let gdf_resolved = if (self.reflect_spatial || self.reflect_stochastic)
+                    && self.reflect.has_reflect_spatial()
+                {
                     // A4b: variance-guided bilateral denoise (post-temporal, full-res, content opt-in).
                     self.reflect.record_reflect_spatial(
                         &mut graph,

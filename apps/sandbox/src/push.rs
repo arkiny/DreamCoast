@@ -1812,6 +1812,7 @@ pub(crate) fn reflect_resolve_push(
     frame: u32,
     mirror_thresh: f32,
     kernel_radius: f32,
+    stochastic: u32,
 ) -> [u8; 128] {
     let mut pc = [0u8; 128];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -1831,6 +1832,7 @@ pub(crate) fn reflect_resolve_push(
     pc[112..116].copy_from_slice(&frame.to_le_bytes());
     pc[116..120].copy_from_slice(&mirror_thresh.to_le_bytes());
     pc[120..124].copy_from_slice(&kernel_radius.to_le_bytes());
+    pc[124..128].copy_from_slice(&stochastic.to_le_bytes());
     pc
 }
 

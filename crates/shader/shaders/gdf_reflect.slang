@@ -19,6 +19,7 @@
 #include "bindless.slang"
 #include "clipmap.slang"
 #include "surface_cache.slang"
+#include "reflect_ggx.slang" // A5: shared blue-noise GGX sampler (content path; kept in lockstep)
 
 struct ReflectPush
 {
@@ -363,17 +364,24 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float mirror_thresh = content_refl ? 0.125 : 0.04;
     if (roughness > mirror_thresh)
     {
-        // GGX importance-sampled reflection ray. `pc.frame` decorrelates the jitter per frame; the
-        // host passes a FIXED frame (0) for content so the per-pixel jitter is temporally STABLE —
-        // the temporal pass can't average a 1-ray/frame stochastic lobe to convergence (auto-exposure
-        // shifts reject the history too), so a frame-varying ray leaves sparkle, while a fixed jitter
-        // + the resolve's spatial gather reconstructs the lobe smoothly. The gallery passes the real
-        // frame to stay byte-identical to its legacy anchor.
-        uint rng = (tid.x * 1973u + tid.y * 9277u + pc.frame * 26699u) | 1u;
-        float3 h = sample_ggx(n, roughness, rng);
-        dir = reflect(-v, h);
-        if (dot(dir, n) <= 0.0)
-            dir = reflect(-v, n); // keep the ray in the upper hemisphere
+        if (content_refl)
+        {
+            // A5: content routes through the shared sampler so the A1 resolve reconstructs the SAME
+            // ray. `stochastic` (max_steps bit30) selects blue-noise (frame-varying, low-discrepancy)
+            // vs the legacy white jitter. Blue-noise + the A1/A4 denoiser lets the temporal pass
+            // converge the lobe instead of the fixed-jitter dead end.
+            uint stochastic = (pc.max_steps & 0x40000000u) != 0u ? 1u : 0u;
+            dir = refl_ggx_dir(n, v, roughness, tid.x, tid.y, pc.frame, stochastic);
+        }
+        else
+        {
+            // Gallery: inline white jitter (byte-identical anchor). `pc.frame` decorrelates per frame.
+            uint rng = (tid.x * 1973u + tid.y * 9277u + pc.frame * 26699u) | 1u;
+            float3 h = sample_ggx(n, roughness, rng);
+            dir = reflect(-v, h);
+            if (dot(dir, n) <= 0.0)
+                dir = reflect(-v, n); // keep the ray in the upper hemisphere
+        }
     }
     else
     {
@@ -425,7 +433,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     }
 #else
     // Sphere-trace the reflection ray. Stage D3: content lowers the step cap; gallery = 96.
-    int max_steps = int(max(pc.max_steps & 0x7FFFFFFFu, 1u));
+    // Mask off the content flag (bit31) AND the A5 stochastic flag (bit30) to get the real step cap
+    // (content caps are < 2^30). Gallery cap (96) is unaffected → byte-identical.
+    int max_steps = int(max(pc.max_steps & 0x3FFFFFFFu, 1u));
     const float HIT_EPS = 0.001;
     for (int i = 0; i < max_steps; i++)
     {

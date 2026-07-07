@@ -30,12 +30,11 @@ void refl_onb(float3 n, out float3 t, out float3 b)
     t = normalize(abs(n.x) > 0.9 ? cross(n, float3(0, 1, 0)) : cross(n, float3(1, 0, 0)));
     b = cross(n, t);
 }
-// GGX NDF importance sample: a microfacet half-vector around the surface normal. Bit-identical to
-// `gdf_reflect.slang::sample_ggx`.
-float3 refl_sample_ggx(float3 n, float roughness, inout uint rng)
+// GGX NDF importance sample from explicit uniforms (u1, u2). The half-vector math is bit-identical
+// to `gdf_reflect.slang::sample_ggx` (phi from u1, cos-theta from u2).
+float3 refl_sample_ggx_uv(float3 n, float roughness, float u1, float u2)
 {
     float a = max(roughness * roughness, 1e-3);
-    float u1 = refl_rnd01(rng), u2 = refl_rnd01(rng);
     float phi = 2.0 * REFL_GGX_PI * u1;
     float ct = sqrt((1.0 - u2) / (1.0 + (a * a - 1.0) * u2));
     float st = sqrt(saturate(1.0 - ct * ct));
@@ -43,14 +42,37 @@ float3 refl_sample_ggx(float3 n, float roughness, inout uint rng)
     refl_onb(n, t, bvec);
     return normalize(t * (st * cos(phi)) + bvec * (st * sin(phi)) + n * ct);
 }
+// White-noise variant (draws u1,u2 from the pcg stream) — bit-identical to gdf_reflect's inline.
+float3 refl_sample_ggx(float3 n, float roughness, inout uint rng)
+{
+    float u1 = refl_rnd01(rng), u2 = refl_rnd01(rng);
+    return refl_sample_ggx_uv(n, roughness, u1, u2);
+}
 
 // Reconstruct the exact reflection ray direction the trace cast for pixel (px, py) at `frame`.
-// Mirrors `gdf_reflect.slang` ray-gen: `rng = px*1973 + py*9277 + frame*26699 | 1`, GGX half-vector,
-// `reflect(-v, h)`, with the upper-hemisphere fallback. `v` = normalized surface->camera direction.
-float3 refl_ggx_dir(float3 n, float3 v, float roughness, uint px, uint py, uint frame)
+// `stochastic == 0`: WHITE noise — `rng = px*1973 + py*9277 + frame*26699 | 1`, bit-identical to
+//   gdf_reflect's inline path (the legacy fixed/varying jitter).
+// `stochastic != 0`: A5 low-discrepancy BLUE-noise — a per-pixel spatial offset (hash; the spatial
+//   distribution is reweighted by the A1 ratio estimator anyway) rotated per frame by the R2 additive
+//   recurrence (Roberts' generalized golden ratio) so the temporal sequence is low-discrepancy and
+//   converges fast without the white-noise sparkle. gdf_reflect (content) and the A1 resolve MUST
+//   pass the same `stochastic` so the resolve reconstructs the identical ray.
+float3 refl_ggx_dir(float3 n, float3 v, float roughness, uint px, uint py, uint frame, uint stochastic)
 {
-    uint rng = (px * 1973u + py * 9277u + frame * 26699u) | 1u;
-    float3 h = refl_sample_ggx(n, roughness, rng);
+    float3 h;
+    if (stochastic != 0u)
+    {
+        uint s = (px * 1973u + py * 9277u) | 1u;
+        float2 base = float2(refl_rnd01(s), refl_rnd01(s));
+        float2 shift = frac(float(frame) * float2(0.7548776662, 0.5698402910));
+        float2 u = frac(base + shift);
+        h = refl_sample_ggx_uv(n, roughness, u.x, u.y);
+    }
+    else
+    {
+        uint rng = (px * 1973u + py * 9277u + frame * 26699u) | 1u;
+        h = refl_sample_ggx(n, roughness, rng);
+    }
     float3 dir = reflect(-v, h);
     if (dot(dir, n) <= 0.0)
         dir = reflect(-v, n); // keep the ray in the upper hemisphere

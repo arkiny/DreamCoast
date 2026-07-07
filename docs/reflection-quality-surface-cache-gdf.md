@@ -164,8 +164,23 @@ frame-varying)의 **수렴 전제** — frame-varying 스토캐스틱에서 temp
   bit-match), =1은 블루노이즈. gdf_reflect content가 이걸 호출(gallery는 인라인 유지=byte-identical),
   A1 resolve도 같은 flag로 재구성 → 항상 일치.
 - **번들 opt-in `P_REFLECT_STOCHASTIC`** = frame-varying + 블루노이즈 + A1 + A4를 함께 켬(개별 조합의
-  불일치 방지). max_steps bit30에 stochastic flag(push 무증가; bit31=content). 검증 후 content 기본화 검토.
-- **검증:** 글로시볼 수렴 HF-noise ↓ + sparkle ↓(<0.2 목표) vs 고정+A1, 갤러리 byte-identical, 볼/평면 모두.
+  불일치 방지). max_steps bit30에 stochastic flag(push 무증가; bit31=content).
+
+#### A5 구현 완료 + 검증 (opt-in `P_REFLECT_STOCHASTIC`, 기본 off)
+공유 `reflect_ggx.slang` `refl_ggx_dir(...,stochastic)`(0=백색/gdf 인라인 bit-match, 1=R2 저불일치
+블루노이즈); gdf_reflect content가 호출(gallery 인라인 유지), A1 resolve도 같은 flag로 재구성. 번들이
+frame-varying+A1+A4를 함께 켬. 갤러리 `af70c1a5` byte-identical, clippy/fmt clean.
+
+**검증 결과 (글로시볼, 정직):** A5 HF-noise 1.855 / sparkle 0.586 — **white frame-varying+A1+A4
+(1.84/0.62)과 사실상 동일, 이득 안 보임.** 이미지도 세 경우(고정+A1 / white-fv / A5) 모두 깨끗하고 유사.
+**원인 = 잔여가 jitter 노이즈가 아니라 서피스캐시/GI 수렴 mottle**(C0 드리프트와 같은 근본). 디노이저·jitter는
+없는 노이즈를 못 줄임 — **병목이 상류(캐시/GI 수렴)**.
+
+**전략적 결론 (중요):** A1/A4/A5는 정확한 레퍼런스급 디노이저 인프라이고 A5는 고정-jitter dead end를
+올바르게 탈출(사용자 통찰)하지만, **현 content 파이프라인의 가시적 잔여는 서피스캐시/GI 수렴이 지배** →
+디노이저 이득이 가려짐. **다음 최고 레버 = Track C(서피스캐시 색 캡처 + 반사-보이는 카드 relight 우선순위
++ GI 수렴 가속)**, 이게 드리프트(C0)도 함께 해결. A1/A4/A5는 그 위에서 값이 드러남(수렴된 GI + 러프 로브 +
+카메라 이동).
 
 ### Track B — trace 계층 (온스크린 정확도, HWRT 없이 미러 선명)
 

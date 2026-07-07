@@ -36,7 +36,7 @@ struct ResolvePush
     uint frame;             // the jitter frame the trace used (must match gdf_reflect's `frame`)
     float mirror_thresh;    // roughness <= this => deterministic mirror ray (passthrough, no gather)
     float kernel_radius;    // max spatial gather radius in texels (roughness-scaled below)
-    uint pad0;
+    uint stochastic;        // A5: 0 = white jitter, 1 = blue-noise — must match gdf_reflect's sampler
 };
 
 [[vk::push_constant]]
@@ -100,7 +100,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float3 nworld = reconstruct(nuv, ndepth);
             float3 vq = normalize(pc.cam_pos.xyz - nworld);
             // Reconstruct the exact ray this neighbour cast (same deterministic jitter as the trace).
-            float3 dir_q = refl_ggx_dir(nq, vq, nrough, uint(np.x), uint(np.y), pc.frame);
+            float3 dir_q = refl_ggx_dir(nq, vq, nrough, uint(np.x), uint(np.y), pc.frame, pc.stochastic);
             if (dot(n, dir_q) <= 0.0)
                 continue; // not in the centre pixel's upper hemisphere
             float pdf_q = refl_ggx_pdf(nq, vq, dir_q, nrough);

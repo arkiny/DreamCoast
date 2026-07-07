@@ -620,6 +620,8 @@ impl ReflectSystem {
         frame: u32,
         mirror_thresh: f32,
         kernel_radius: f32,
+        // A5: 0 = white jitter, 1 = blue-noise — must match the sampler gdf_reflect used this frame.
+        stochastic: bool,
     ) -> ResourceId {
         let pipe = self
             .resolve_pipeline
@@ -654,6 +656,7 @@ impl ReflectSystem {
                     frame,
                     mirror_thresh,
                     kernel_radius,
+                    u32::from(stochastic),
                 ));
                 cmd.dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
                 Ok(())
