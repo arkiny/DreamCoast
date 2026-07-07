@@ -52,14 +52,36 @@ visible win needs one of:
   now reflects the real scene with correct lit colours (red/teal drapes, columns, arch, floor tiles)
   — a clear sharpness win over the milky SurfaceCache blob; floor sparkle unchanged (0.0135 ≈ SW).**
   Gallery `af70c1a5` byte-identical (off). Residual blockiness = the half-res trace (a later tier knob).
-- **Phase D — Hit Lighting**: full material + shadow-ray evaluation at the hit (highest quality),
-  needs consolidated per-instance geometry/material buffers to dodge the 64-slot bindless overflow.
+## What else landed
+
+- **Phase C — full-res HWRT reflection** (`P_HWRT_FULLRES`): traces the reflection at full resolution
+  (no half-res + upsample) for a crisp mirror — the chrome ball shows sharp columns, drapes, arch and
+  floor tiles. ~4x cost (a quality/screenshot mode); default `P_HWRT` keeps the half-res trace.
+- **Phase D — HWRT GI shaded from the surface cache** (`P_HWRT_GI` + content TLAS): the HWRT GI
+  permutation now casts the cosine-hemisphere bounce rays against the BVH (closest hit) and shades
+  the hit from the surface cache (`bs_shade_hit`, shared with the SW march) — actual bounced radiance,
+  not the visibility-only first increment. Active on content with `P_HWRT=1 P_HWRT_GI=1 P_GI_VOLUME=0`
+  (the volume path returns before the HWRT block). Gallery byte-identical (the `bs_shade_hit` extract
+  is a pure refactor of the SW path).
+
+## Remaining — Phase E: Hit Lighting (deferred, large)
+
+Full material + shadow-ray evaluation at the HW hit (reference `HitLighting` / `HitLightingForReflections`).
+Value: sharp/accurate **off-screen** reflections (on-screen is already sharp via B.2/C; off-screen
+currently uses the surface cache). Requires new infrastructure that the SurfaceCache path deliberately
+avoids: **consolidated per-instance geometry + material buffers** — pack all content vertices into ONE
+storage buffer + all indices into ONE + a per-instance offset/material table (the vgeo "4 buffers"
+precedent, [[dreamcoast-vgeo-metal-atomic64]]), dodging the 64-slot per-primitive bindless overflow.
+At a HW hit: `InstanceID → offset table → fetch 3 verts by PrimitiveIndex → barycentric-interpolate
+normal/UV → sample the material texture (bindless) → sun (HW shadow ray) + IBL`. This is a separate
+multi-part feature (Rust consolidated-buffer build + shader fetch/interp/material/shadow); deferred as
+its own phase rather than rushed, since A→D already deliver the visible reflection/GI wins.
 
 ## Roadmap
 
 A (content accel) ✔ → B (HWRT trace + surface-cache shade) ✔ → B.2 (screen-color-at-hit — the sharp
-win) ✔ → **C (HWRT GI, extend `P_HWRT_GI` to content + cache shading)** → D (Hit Lighting). Possible
-tier knob: full-res HWRT reflection to remove the residual half-res blockiness.
+win) ✔ → C (full-res reflection mode) ✔ → D (HWRT GI + cache shading) ✔ → **E (Hit Lighting —
+deferred, needs consolidated geometry)**.
 
 ## Gates
 
