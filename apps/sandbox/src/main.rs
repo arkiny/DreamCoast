@@ -930,6 +930,12 @@ struct App {
     /// smooth its blocky "sparkle" on rough content surfaces (the floor) while keeping the traced
     /// reflection's correct local colour. `P_REFL_ROUGH_BLUR`; 0 = off, gallery forced to 0.
     reflect_rough_blur: f32,
+    /// Track A1: run the spatial ratio-estimator resolve (`reflect_resolve.slang`) at trace res
+    /// before the upsample — reconstructs each glossy neighbour's GGX ray and reweights by
+    /// `pdf_p/pdf_q` to sharpen the glossy reflection instead of box-blurring it. `P_REFLECT_RESOLVE`
+    /// (content only; gallery never runs it → anchor untouched). Kernel radius = `reflect_resolve_kernel`.
+    reflect_resolve: bool,
+    reflect_resolve_kernel: f32,
     /// SSR resolve history neighbourhood clamp (breaks the mirror lit-history feedback oscillation a
     /// plain EMA only low-passes): 0 = off (byte-identical), 1 = variance clamp (mean ± γ·σ). Gallery
     /// forced 0. `P_SSR_HISTORY_CLAMP` / `P_SSR_CLAMP_GAMMA` override.
@@ -2821,6 +2827,15 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(6.0)
             .clamp(0.0, 32.0);
+        // Track A1: opt-in spatial ratio-estimator resolve of the glossy reflection (content only;
+        // default off so the content sha goldens are unchanged until measured — the gallery never
+        // runs it regardless, keeping the anchor byte-identical). Kernel radius `P_REFLECT_RESOLVE_R`.
+        let reflect_resolve = !gallery_scene && std::env::var_os("P_REFLECT_RESOLVE").is_some();
+        let reflect_resolve_kernel = std::env::var("P_REFLECT_RESOLVE_R")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(2.0)
+            .clamp(1.0, 4.0);
         // SSR-resolve history feedback clamp (0 off / 1 variance). Gallery base is 0 (byte-identical
         // anchor); content tiers default 0 too pending DX=VK verification. `P_SSR_HISTORY_CLAMP` +
         // `P_SSR_CLAMP_GAMMA` override (set =1 to break the mirror lit-history feedback shimmer).
@@ -3245,6 +3260,8 @@ impl App {
             reflect_history_clamp,
             reflect_clamp_gamma,
             reflect_rough_blur,
+            reflect_resolve,
+            reflect_resolve_kernel,
             ssr_history_clamp,
             ssr_clamp_gamma,
             gi_temporal_clamp,
@@ -6223,10 +6240,41 @@ impl App {
                         None
                     },
                 );
+                // Track A1: spatial ratio-estimator resolve at TRACE res (content opt-in), BEFORE the
+                // upsample — reconstructs each glossy neighbour's GGX ray and reweights by pdf_p/pdf_q
+                // to sharpen the glossy lobe instead of the legacy box blur. Near-mirror pixels pass
+                // through. Gallery never enables it (anchor untouched). `mirror_thresh` mirrors
+                // gdf_reflect.slang's content branch (0.125). When it runs, the temporal pass drops its
+                // own box average (`resolve_ran`) so the ratio-estimated sharpness survives.
+                let resolve_ran = self.reflect_resolve && self.reflect.has_reflect_resolve();
+                let refl_resolved = if resolve_ran {
+                    self.reflect.record_reflect_resolve(
+                        &mut graph,
+                        refl_traced,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        refl_extent,
+                        rw,
+                        rh,
+                        inv_view_proj,
+                        eye,
+                        self.flip_y,
+                        if refl_frame_varying {
+                            self.frame_no as u32
+                        } else {
+                            0
+                        },
+                        0.125, // content mirror threshold — keep in lockstep with gdf_reflect.slang
+                        self.reflect_resolve_kernel,
+                    )
+                } else {
+                    refl_traced
+                };
                 let gdf_refl = if refl_half {
                     self.gi.record_upsample(
                         &mut graph,
-                        refl_traced,
+                        refl_resolved,
                         g_depth,
                         g_normal,
                         extent,
@@ -6240,7 +6288,7 @@ impl App {
                         self.flip_y,
                     )
                 } else {
-                    refl_traced
+                    refl_resolved
                 };
                 // C8j: temporally resolve the stochastic GGX GDF reflection (레퍼런스식; the rough
                 // lobe is sampled by real rays + denoised, so it's correctly blurred without an
@@ -6263,6 +6311,7 @@ impl App {
                     0.25, // tonemap-space range for stable HDR accumulation
                     self.reflect_history_clamp,
                     self.reflect_clamp_gamma,
+                    resolve_ran, // A1: drop the box average when the ratio-estimator resolve ran
                 );
                 Some(self.reflect.record_composite(
                     &mut graph,

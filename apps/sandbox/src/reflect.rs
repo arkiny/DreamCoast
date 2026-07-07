@@ -14,8 +14,8 @@ use rhi::{
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
-    gdf_reflect_push, lit_history_push, reflect_composite_push, reflect_temporal_push, ssr_push,
-    ssr_resolve_push,
+    gdf_reflect_push, lit_history_push, reflect_composite_push, reflect_resolve_push,
+    reflect_temporal_push, ssr_push, ssr_resolve_push,
 };
 
 pub(crate) struct ReflectSystem {
@@ -28,6 +28,7 @@ pub(crate) struct ReflectSystem {
     reflect_hwrt_pipeline: Option<ComputePipeline>,
     composite_pipeline: Option<ComputePipeline>, // C7 hybrid composite
     lit_history_pipeline: Option<ComputePipeline>, // C7b lit-color history capture
+    resolve_pipeline: Option<ComputePipeline>,   // A1 spatial ratio-estimator resolve (trace res)
     temporal_pipeline: Option<ComputePipeline>,  // C8j stochastic-GDF-reflection temporal resolve
     /// C8j stochastic GDF reflection temporal accumulation: ping-pong byte-address buffers —
     /// `accum` (tonemap-space rgb + history len) and `pos` (surface world point + valid), at the
@@ -146,6 +147,15 @@ impl ReflectSystem {
             32,
             false,
         )?;
+        // A1: spatial ratio-estimator resolve of the stochastic GGX GDF reflection (trace res).
+        let resolve_pipeline = compute(
+            dreamcoast_shader::reflect_resolve_cs_spirv,
+            dreamcoast_shader::reflect_resolve_cs_dxil,
+            dreamcoast_shader::reflect_resolve_cs_metallib,
+            "reflect_resolve",
+            128,
+            false,
+        )?;
         // C8j: temporal resolve of the stochastic GGX GDF reflection.
         let temporal_pipeline = compute(
             dreamcoast_shader::reflect_temporal_cs_spirv,
@@ -162,6 +172,7 @@ impl ReflectSystem {
             reflect_hwrt_pipeline,
             composite_pipeline,
             lit_history_pipeline,
+            resolve_pipeline,
             temporal_pipeline,
             refl_accum: [None, None],
             refl_pos: [None, None],
@@ -567,6 +578,74 @@ impl ReflectSystem {
         out
     }
 
+    pub(crate) fn has_reflect_resolve(&self) -> bool {
+        self.resolve_pipeline.is_some()
+    }
+
+    /// A1: spatial ratio-estimator resolve of the stochastic GGX GDF reflection, at the TRACE
+    /// resolution (before the bilateral upsample). Reconstructs each neighbour's ray direction from
+    /// the same deterministic per-pixel jitter and reweights the borrowed sample by `pdf_p/pdf_q`
+    /// (Stachowiak's ratio estimator — the same scheme `record_ssr_resolve` uses). Stateless (no
+    /// history). Near-mirror pixels pass through. Returns the resolved trace-res reflection.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_reflect_resolve<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        refl: ResourceId,
+        depth: ResourceId,
+        normal: ResourceId,
+        material: ResourceId,
+        extent: Extent2D,
+        rw: u32,
+        rh: u32,
+        inv_view_proj: [f32; 16],
+        eye: Vec3,
+        flip_y: u32,
+        frame: u32,
+        mirror_thresh: f32,
+        kernel_radius: f32,
+    ) -> ResourceId {
+        let pipe = self
+            .resolve_pipeline
+            .as_ref()
+            .expect("reflect resolve pipeline");
+        let out = graph.create_storage_image("reflect_resolved_spatial", HDR_FORMAT, extent);
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "reflect_resolve",
+                storage_writes: vec![out],
+                reads: vec![refl, depth, normal, material],
+            },
+            move |ctx| {
+                let refl_index = ctx.sampled_index(refl);
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let material_index = ctx.sampled_index(material);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&reflect_resolve_push(
+                    &inv_view_proj,
+                    eye,
+                    refl_index,
+                    depth_index,
+                    normal_index,
+                    material_index,
+                    out_index,
+                    rw,
+                    rh,
+                    flip_y,
+                    frame,
+                    mirror_thresh,
+                    kernel_radius,
+                ));
+                cmd.dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
     /// C8j: temporally resolve the stochastic GGX GDF reflection. Reprojects each surface into
     /// the previous frame, EMA-accumulates the noisy single-ray sample (in tonemap space), and
     /// disocclusion-rejects. `prepare_reflect_accum` must have run this frame.
@@ -590,6 +669,8 @@ impl ReflectSystem {
         tonemap_range: f32,
         clamp_mode: u32,
         clamp_gamma: f32,
+        // A1: 1 = the spatial ratio-estimator resolve already ran → skip this pass's box average.
+        spatial_off: bool,
     ) -> ResourceId {
         let pipe = self
             .temporal_pipeline
@@ -649,6 +730,7 @@ impl ReflectSystem {
                     tonemap_range,
                     clamp_mode,
                     clamp_gamma,
+                    u32::from(spatial_off),
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

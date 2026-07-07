@@ -24,7 +24,7 @@ const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
 /// editing any of them recompiles all dependents (they include no per-job tracking otherwise —
 /// an omitted entry silently ships stale bytecode). Keep in sync with the `#include`s under
 /// `shaders/` (a non-JOB `.slang` — or the RT-pipeline root-sig JSON — belongs here).
-const SHARED_INCLUDES: [&str; 13] = [
+const SHARED_INCLUDES: [&str; 14] = [
     "bindless.slang",
     "rt_common.slang",
     "rt_pipeline_metal_rootsig.json",
@@ -38,6 +38,7 @@ const SHARED_INCLUDES: [&str; 13] = [
     "light_cluster_common.slang",
     "pbr_brdf.slang",
     "hzb_test.slang",
+    "reflect_ggx.slang",
 ];
 
 // FNV-1a 64-bit — dependency-free content hash for the shader cook cache (Phase 12
@@ -1076,6 +1077,14 @@ const JOBS: &[Job] = &[
         entry: "csMain",
         stage: "compute",
         key: "reflect_composite_cs",
+    },
+    // Track A1: spatial ratio-estimator resolve of the stochastic GGX GDF reflection (trace res,
+    // before the upsample) — reconstructs each neighbour's ray + reweights by pdf_p/pdf_q.
+    Job {
+        src: "reflect_resolve.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "reflect_resolve_cs",
     },
     // Phase 11 Stage C (C8j): temporal resolve of the stochastic GGX GDF reflection.
     Job {

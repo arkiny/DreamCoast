@@ -33,6 +33,7 @@ struct ReflTemporalPush
     float4 params;           // x = reject dist, y = max history len, z = firefly clamp, w = tonemap range
     uint clamp_mode;         // history neighbourhood clamp: 0 = off, 1 = hard AABB, 2 = variance (mean +- g*sigma)
     float clamp_gamma;       // variance-clamp tightness (mode 2); ignored otherwise
+    uint spatial_off;        // A1: 1 = the ratio-estimator resolve already ran → skip the box average
 };
 
 [[vk::push_constant]]
@@ -154,6 +155,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // The neighbourhood is always >= 3x3 (`cr`) so even a sharp mirror (spatial radius 0) has stats.
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
     int sr = clamp(int(roughness * 8.0), 0, 3);
+    // A1: when the spatial ratio-estimator resolve already denoised the trace, skip this box average
+    // (it would re-blur the sharpened glossy lobe) — but keep the >= 3x3 stats radius `cr` for the
+    // history neighbourhood clamp. `spatial_off == 0` (gallery / legacy) keeps the box = byte-identical.
+    if (pc.spatial_off != 0u)
+        sr = 0;
     int cr = max(sr, 1);
     float2 texel = 1.0 / res;
     float3 center = g.textures[pc.refl_index].SampleLevel(g.samp, uv, 0.0).rgb;
