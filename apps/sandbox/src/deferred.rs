@@ -1202,6 +1202,9 @@ impl DeferredRenderer {
         // Opt-in albedo-tinted multi-bounce AO on the diffuse ambient (reference AOMultiBounce).
         // Default false => scalar AO, byte-identical anchor.
         ao_multibounce: bool,
+        // Opt-in bent-normal cone-cone occlusion on the prefilter-cube specular (reference
+        // GetDistanceFieldAOSpecularOcclusion). SW-RT reflection is left untouched. Default false.
+        spec_occlusion: bool,
     ) {
         let mut reads = vec![gbuf.albedo, gbuf.normal, gbuf.material, gbuf.position];
         if let Some(sm) = shadow_map {
@@ -1275,6 +1278,7 @@ impl DeferredRenderer {
                     skyvis_min_occ,
                     [cl_grid, cl_index, cl_light, cl_count],
                     ao_multibounce as u32,
+                    spec_occlusion as u32,
                 ));
                 cmd.draw(3, 1);
                 Ok(())
@@ -1479,8 +1483,9 @@ fn pbr_push(
     // (0xFFFFFFFF) selects the brute-force point-light loop (byte-identical anchor).
     cluster: [u32; 4],
     ao_multibounce: u32,
-) -> [u8; 80] {
-    let mut pc = [0u8; 80];
+    spec_occlusion: u32,
+) -> [u8; 84] {
+    let mut pc = [0u8; 84];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1500,6 +1505,7 @@ fn pbr_push(
         pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
     }
     pc[76..80].copy_from_slice(&ao_multibounce.to_le_bytes());
+    pc[80..84].copy_from_slice(&spec_occlusion.to_le_bytes());
     pc
 }
 

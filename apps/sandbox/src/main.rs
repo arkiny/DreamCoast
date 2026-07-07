@@ -823,6 +823,11 @@ struct App {
     /// albedo so cavities keep the surface's own bounced colour (reference AOMultiBounce) instead of
     /// darkening flat. Opt-in because it changes any AO<1 pixel (incl. the gallery); off = anchor.
     ao_multibounce: bool,
+    /// Bent-normal specular occlusion (`P_SPEC_OCCLUSION`, default off): cone-cone occlusion of the
+    /// prefilter-CUBE ambient specular by the bent-normal visibility cone (reference
+    /// GetDistanceFieldAOSpecularOcclusion). The SW-RT reflection carries its own ray occlusion so
+    /// it is untouched; active only on the legacy-IBL / cube-specular path. off = anchor.
+    spec_occlusion: bool,
     /// 레퍼런스 엔진 GI-fidelity: world irradiance volume (DDGI-lite radiance cache). When on, the GI pass
     /// samples a multibounce-propagating world volume instead of a single-bounce ray march — the
     /// real fix for deep-interior darkness. Content-only (`P_GI_VOLUME`); gallery forced off.
@@ -2497,6 +2502,9 @@ impl App {
         // Multi-bounce AO (reference AOMultiBounce): albedo-tinted energy return on the diffuse AO.
         // Opt-in (default off) — it recolours every AO<1 pixel including the gallery anchor.
         let ao_multibounce = quality::env_bool("P_AO_MULTIBOUNCE", false);
+        // Bent-normal specular occlusion of the prefilter-cube ambient specular (reference
+        // GetDistanceFieldAOSpecularOcclusion). Opt-in (default off); SW-RT reflection untouched.
+        let spec_occlusion = quality::env_bool("P_SPEC_OCCLUSION", false);
         // PR-4 (render-pipeline re-baseline track): opt-in analytic height fog. Off by default
         // (`P_HEIGHT_FOG=1` to enable) so the byte-identical gallery/regression anchors are
         // untouched — the atmosphere slot exists in the graph wiring unconditionally, but the
@@ -3126,6 +3134,7 @@ impl App {
             hwrt_gi,
             bent_normal,
             ao_multibounce,
+            spec_occlusion,
             gi_volume,
             gi_volume_period: std::env::var("P_GI_VOLUME_PERIOD")
                 .ok()
@@ -6235,6 +6244,7 @@ impl App {
             },
             cluster_lighting,
             self.ao_multibounce,
+            self.spec_occlusion,
         );
         // Auto-exposure metering: read this frame's lit HDR, adapt the exposure for next frame.
         // After lighting (the `hdr` read orders it). `adapt` = 1-exp(-dt·speed) (eye/iris speed).
@@ -7172,6 +7182,7 @@ impl App {
                 u32::MAX, // static exposure (auto-exposure meter is a primary-view resource)
                 None,
                 self.ao_multibounce,
+                self.spec_occlusion,
             );
             // Composite the second view as a PiP inset. A tonemap pass that LOADS (does not clear)
             // the backbuffer and restricts its draw to the top-right inset viewport rect, so the

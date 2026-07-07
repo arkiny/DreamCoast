@@ -61,6 +61,7 @@ struct PushConstants
     uint cluster_light_buf; // packed Light[] (position/radius/color/intensity)
     uint cluster_light_count; // number of lights in cluster_light_buf (dbg heatmap normalisation)
     uint ao_multibounce; // 1 = albedo-tinted multi-bounce AO on the diffuse ambient (opt-in); 0 = off
+    uint spec_occlusion; // 1 = bent-normal cone-cone occlusion on the prefilter-cube specular (opt-in)
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -139,6 +140,38 @@ float3 ao_multi_bounce(float3 base_color, float ao)
     float3 b = -4.7951 * base_color + 0.6417;
     float3 c = 2.7552 * base_color + 0.6903;
     return max(float3(ao), ((ao * a + b) * ao + c) * ao);
+}
+
+// Bent-normal specular occlusion (reference engine GetDistanceFieldAOSpecularOcclusion). The
+// diffuse skylight is occluded by the sky-visibility scalar; the ambient SPECULAR should be
+// occluded by how much of the glossy REFLECTION cone is blocked by scene geometry. Model both the
+// reflection lobe (roughness -> cone angle) and the unoccluded sky (bent normal -> a cone of
+// half-angle V·PI around the bent direction) as cones and take their overlap. This applies ONLY to
+// the prefilter-cube specular: a traced SW-RT reflection already resolves occlusion along its ray
+// (per the reflection track), so occluding it again would double-count.
+static const float SPEC_PI = 3.14159265359;
+
+// Overlap fraction of two cones separated by `angle_between` (reference ApproximateConeConeIntersection).
+float approx_cone_cone_intersection(float arc0, float arc1, float angle_between)
+{
+    float diff = abs(arc0 - arc1);
+    return smoothstep(0.0, 1.0, 1.0 - saturate((angle_between - diff) / (arc0 + arc1 - diff)));
+}
+
+// Specular occlusion in [0,1] from the (unit) bent normal, its sky visibility V, the mirror
+// reflection direction, and roughness. bent length < eps (gallery / no producer) -> 1 (no-op).
+float spec_occlusion_bent(float3 bent_unit, float sky_vis, float3 mirror, float roughness)
+{
+    if (length(bent_unit) < 1e-4)
+        return 1.0; // no bent normal => no directional occlusion (byte-identical anchor)
+    float unoccluded_angle = saturate(sky_vis) * SPEC_PI; // bent-normal cone half-angle (= length·PI)
+    float refl_cone_angle = max(roughness, 0.1) * SPEC_PI; // glossy reflection lobe half-angle
+    float angle_between = acos(clamp(dot(bent_unit, normalize(mirror)), -1.0, 1.0));
+    float occ = approx_cone_cone_intersection(refl_cone_angle, unoccluded_angle, angle_between);
+    // Near-fully-occluded: the bent direction is unreliable, so fade to shadowed (reference).
+    occ = lerp(0.0, occ, saturate((unoccluded_angle - 0.1) / 0.2));
+    // MinOcclusion floor (shared with the diffuse path): =1 disables it -> occ 1, no-op.
+    return lerp(occ, 1.0, pc.skyvis_min_occ);
 }
 
 // Directional (bent-normal) skylight occlusion — the reference engine's DFAO -> skylight coupling.
@@ -226,6 +259,17 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
 
     float2 brdf = g.textures[globals.ibl.w].SampleLevel(g.samp, float2(n_dot_v, roughness), 0.0).rg;
     float3 specular = refl * (f * brdf.x + brdf.y);
+
+    // Bent-normal specular occlusion (opt-in): occlude the prefilter-CUBE specular by how much of
+    // the reflection cone the scene blocks (cone-cone vs the bent-normal visibility cone). Only the
+    // cube path — the SW-RT reflection (`has_swrt`) already resolves occlusion along its ray, so it
+    // is left untouched (the reflection-track rule). bent == 0 / spec_occlusion off => no-op.
+    if (pc.spec_occlusion != 0u && !has_swrt)
+    {
+        float so = spec_occlusion_bent(sky_bent, sky_vis, reflect(-v, n), roughness);
+        float lum = dot(specular, float3(0.2126, 0.7152, 0.0722));
+        specular = specular * so + (pc.skyvis_tint * lum) * (1.0 - so); // neutral leak (reference ExtraIndirectSpecular)
+    }
 
     // AO (material + GDF far-field) attenuates only the DIFFUSE ambient. The traced SW-RT
     // reflection already accounts for occlusion along its own ray, so multiplying the mirror
