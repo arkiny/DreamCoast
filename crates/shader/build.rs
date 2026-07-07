@@ -1093,6 +1093,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "reflect_temporal_cs",
     },
+    // Track A4b: variance-guided bilateral reflection denoiser (post-temporal, full-res).
+    Job {
+        src: "reflect_spatial.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "reflect_spatial_cs",
+    },
     // Phase 11 Stage C (C7b): lit-color history capture (raw radiance) for SSR reprojection.
     Job {
         src: "lit_history.slang",

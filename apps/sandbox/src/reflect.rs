@@ -15,7 +15,7 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
     gdf_reflect_push, lit_history_push, reflect_composite_push, reflect_resolve_push,
-    reflect_temporal_push, ssr_push, ssr_resolve_push,
+    reflect_spatial_push, reflect_temporal_push, ssr_push, ssr_resolve_push,
 };
 
 pub(crate) struct ReflectSystem {
@@ -29,12 +29,16 @@ pub(crate) struct ReflectSystem {
     composite_pipeline: Option<ComputePipeline>, // C7 hybrid composite
     lit_history_pipeline: Option<ComputePipeline>, // C7b lit-color history capture
     resolve_pipeline: Option<ComputePipeline>,   // A1 spatial ratio-estimator resolve (trace res)
-    temporal_pipeline: Option<ComputePipeline>,  // C8j stochastic-GDF-reflection temporal resolve
+    spatial_pipeline: Option<ComputePipeline>, // A4b variance-guided bilateral denoiser (full res)
+    temporal_pipeline: Option<ComputePipeline>, // C8j stochastic-GDF-reflection temporal resolve
     /// C8j stochastic GDF reflection temporal accumulation: ping-pong byte-address buffers —
     /// `accum` (tonemap-space rgb + history len) and `pos` (surface world point + valid), at the
     /// full render extent. The resolve reprojects the surface into the previous frame.
     refl_accum: [Option<StorageBuffer>; 2],
     refl_pos: [Option<StorageBuffer>; 2],
+    /// A4a: per-pixel 2nd-moment (luminance²) accumulation ping-pong (scalar in .x), for the A4b
+    /// variance-guided spatial denoiser. Allocated alongside `refl_accum`; used only when denoise is on.
+    refl_moment: [Option<StorageBuffer>; 2],
     refl_accum_extent: (u32, u32),
     refl_accum_frame: u32,
     /// A3 adaptive temporal skip (docs/lossless-opt-ledger.md): a half-res ping-pong (32 B/px —
@@ -156,13 +160,22 @@ impl ReflectSystem {
             128,
             false,
         )?;
+        // A4b: variance-guided bilateral reflection denoiser (post-temporal, full res).
+        let spatial_pipeline = compute(
+            dreamcoast_shader::reflect_spatial_cs_spirv,
+            dreamcoast_shader::reflect_spatial_cs_dxil,
+            dreamcoast_shader::reflect_spatial_cs_metallib,
+            "reflect_spatial",
+            128,
+            false,
+        )?;
         // C8j: temporal resolve of the stochastic GGX GDF reflection.
         let temporal_pipeline = compute(
             dreamcoast_shader::reflect_temporal_cs_spirv,
             dreamcoast_shader::reflect_temporal_cs_dxil,
             dreamcoast_shader::reflect_temporal_cs_metallib,
             "reflect_temporal",
-            224,
+            240,
             false,
         )?;
         Ok(Self {
@@ -173,9 +186,11 @@ impl ReflectSystem {
             composite_pipeline,
             lit_history_pipeline,
             resolve_pipeline,
+            spatial_pipeline,
             temporal_pipeline,
             refl_accum: [None, None],
             refl_pos: [None, None],
+            refl_moment: [None, None],
             refl_accum_extent: (0, 0),
             refl_accum_frame: 0,
             refl_skip: [None, None],
@@ -254,6 +269,7 @@ impl ReflectSystem {
             };
             self.refl_accum = [make()?, make()?];
             self.refl_pos = [make()?, make()?];
+            self.refl_moment = [make()?, make()?];
             self.refl_accum_extent = (cw, ch);
             self.refl_accum_frame = 0;
         }
@@ -646,6 +662,71 @@ impl ReflectSystem {
         out
     }
 
+    pub(crate) fn has_reflect_spatial(&self) -> bool {
+        self.spatial_pipeline.is_some()
+    }
+
+    /// A4b: variance-guided bilateral reflection denoiser (post-temporal, full resolution). Reads the
+    /// temporal output (rgb + per-pixel StdDev in .a from A4a) + G-buffer, and blurs only the noisy
+    /// pixels with depth/normal/variance-driven edge stops (mirror = passthrough). Returns the
+    /// denoised reflection (linear, for the composite).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_reflect_spatial<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        refl: ResourceId,
+        depth: ResourceId,
+        normal: ResourceId,
+        material: ResourceId,
+        extent: Extent2D,
+        cw: u32,
+        ch: u32,
+        inv_view_proj: [f32; 16],
+        eye: Vec3,
+        flip_y: u32,
+        kernel_radius: f32,
+        tonemap_range: f32,
+    ) -> ResourceId {
+        let pipe = self
+            .spatial_pipeline
+            .as_ref()
+            .expect("reflect spatial pipeline");
+        let out = graph.create_storage_image("reflect_denoised", HDR_FORMAT, extent);
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "reflect_spatial",
+                storage_writes: vec![out],
+                reads: vec![refl, depth, normal, material],
+            },
+            move |ctx| {
+                let refl_index = ctx.sampled_index(refl);
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let material_index = ctx.sampled_index(material);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&reflect_spatial_push(
+                    &inv_view_proj,
+                    eye,
+                    refl_index,
+                    depth_index,
+                    normal_index,
+                    material_index,
+                    out_index,
+                    cw,
+                    ch,
+                    flip_y,
+                    kernel_radius,
+                    tonemap_range,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
     /// C8j: temporally resolve the stochastic GGX GDF reflection. Reprojects each surface into
     /// the previous frame, EMA-accumulates the noisy single-ray sample (in tonemap space), and
     /// disocclusion-rejects. `prepare_reflect_accum` must have run this frame.
@@ -671,6 +752,8 @@ impl ReflectSystem {
         clamp_gamma: f32,
         // A1: 1 = the spatial ratio-estimator resolve already ran → skip this pass's box average.
         spatial_off: bool,
+        // A4a: accumulate the per-pixel 2nd moment + emit StdDev in out.a for the A4b spatial denoiser.
+        denoise: bool,
     ) -> ResourceId {
         let pipe = self
             .temporal_pipeline
@@ -693,12 +776,32 @@ impl ReflectSystem {
             .as_ref()
             .expect("pos w")
             .storage_index();
+        // A4a: 2nd-moment ping-pong indices (sentinel when denoise off ⇒ shader skips all M2 work).
+        let (moment_r, moment_w) = if denoise {
+            (
+                self.refl_moment[read]
+                    .as_ref()
+                    .map(|b| b.storage_index())
+                    .unwrap_or(u32::MAX),
+                self.refl_moment[write]
+                    .as_ref()
+                    .map(|b| b.storage_index())
+                    .unwrap_or(u32::MAX),
+            )
+        } else {
+            (u32::MAX, u32::MAX)
+        };
+        let denoise_on = denoise && moment_r != u32::MAX && moment_w != u32::MAX;
         let accum_w_ext = graph.import_external("refl_accum_w");
         let pos_w_ext = graph.import_external("refl_pos_w");
+        let mut writes = vec![out, accum_w_ext, pos_w_ext];
+        if denoise_on {
+            writes.push(graph.import_external("refl_moment_w"));
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "reflect_temporal",
-                storage_writes: vec![out, accum_w_ext, pos_w_ext],
+                storage_writes: writes,
                 reads: vec![refl, depth, material],
             },
             move |ctx| {
@@ -731,6 +834,9 @@ impl ReflectSystem {
                     clamp_mode,
                     clamp_gamma,
                     u32::from(spatial_off),
+                    moment_r,
+                    moment_w,
+                    u32::from(denoise_on),
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

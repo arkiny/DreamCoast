@@ -936,6 +936,12 @@ struct App {
     /// (content only; gallery never runs it → anchor untouched). Kernel radius = `reflect_resolve_kernel`.
     reflect_resolve: bool,
     reflect_resolve_kernel: f32,
+    /// Track A4: variance-guided reflection denoiser. Enables A4a (per-pixel 2nd-moment accumulation
+    /// in `reflect_temporal`) + A4b (the `reflect_spatial` bilateral pass, post-temporal). `P_REFLECT_
+    /// SPATIAL` (content only; gallery never runs it → anchor untouched). Kernel radius / sample count
+    /// are `reflect_spatial_kernel` / fixed. Off ⇒ temporal keeps out.a = 1.0, byte-identical.
+    reflect_spatial: bool,
+    reflect_spatial_kernel: f32,
     /// SSR resolve history neighbourhood clamp (breaks the mirror lit-history feedback oscillation a
     /// plain EMA only low-passes): 0 = off (byte-identical), 1 = variance clamp (mean ± γ·σ). Gallery
     /// forced 0. `P_SSR_HISTORY_CLAMP` / `P_SSR_CLAMP_GAMMA` override.
@@ -2836,6 +2842,15 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(2.0)
             .clamp(1.0, 4.0);
+        // Track A4: variance-guided reflection denoiser (temporal 2nd moment + post-temporal bilateral).
+        // Content opt-in; default off so the content goldens are unchanged and the gallery anchor stays
+        // byte-identical (it never runs the pass). Kernel radius (px) via `P_REFLECT_SPATIAL_R`.
+        let reflect_spatial = !gallery_scene && std::env::var_os("P_REFLECT_SPATIAL").is_some();
+        let reflect_spatial_kernel = std::env::var("P_REFLECT_SPATIAL_R")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(8.0)
+            .clamp(1.0, 16.0);
         // SSR-resolve history feedback clamp (0 off / 1 variance). Gallery base is 0 (byte-identical
         // anchor); content tiers default 0 too pending DX=VK verification. `P_SSR_HISTORY_CLAMP` +
         // `P_SSR_CLAMP_GAMMA` override (set =1 to break the mirror lit-history feedback shimmer).
@@ -3262,6 +3277,8 @@ impl App {
             reflect_rough_blur,
             reflect_resolve,
             reflect_resolve_kernel,
+            reflect_spatial,
+            reflect_spatial_kernel,
             ssr_history_clamp,
             ssr_clamp_gamma,
             gi_temporal_clamp,
@@ -6312,7 +6329,28 @@ impl App {
                     self.reflect_history_clamp,
                     self.reflect_clamp_gamma,
                     resolve_ran, // A1: drop the box average when the ratio-estimator resolve ran
+                    self.reflect_spatial && self.reflect.has_reflect_spatial(), // A4a: accumulate variance
                 );
+                let gdf_resolved = if self.reflect_spatial && self.reflect.has_reflect_spatial() {
+                    // A4b: variance-guided bilateral denoise (post-temporal, full-res, content opt-in).
+                    self.reflect.record_reflect_spatial(
+                        &mut graph,
+                        gdf_resolved,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        extent,
+                        cw,
+                        ch,
+                        inv_view_proj,
+                        eye,
+                        self.flip_y,
+                        self.reflect_spatial_kernel,
+                        0.25, // tonemap-space range (matches reflect_temporal params.w)
+                    )
+                } else {
+                    gdf_resolved
+                };
                 Some(self.reflect.record_composite(
                     &mut graph,
                     ssr,

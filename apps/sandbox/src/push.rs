@@ -1749,8 +1749,12 @@ pub(crate) fn reflect_temporal_push(
     clamp_mode: u32,
     clamp_gamma: f32,
     spatial_off: u32,
-) -> [u8; 224] {
-    let mut pc = [0u8; 224];
+    // A4a: per-pixel 2nd-moment (variance) accumulation buffers + enable. Sentinel/0 = off (no M2).
+    moment_read: u32,
+    moment_write: u32,
+    denoise: u32,
+) -> [u8; 240] {
+    let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1783,6 +1787,10 @@ pub(crate) fn reflect_temporal_push(
     // A1: skip the spatial box average when the ratio-estimator resolve already ran (0 = keep it,
     // byte-identical legacy).
     pc[216..220].copy_from_slice(&spatial_off.to_le_bytes());
+    // A4a: 2nd-moment ping-pong indices + enable (own 16-byte row at 220; denoise 0 => byte-identical).
+    pc[220..224].copy_from_slice(&moment_read.to_le_bytes());
+    pc[224..228].copy_from_slice(&moment_write.to_le_bytes());
+    pc[228..232].copy_from_slice(&denoise.to_le_bytes());
     pc
 }
 
@@ -1823,6 +1831,44 @@ pub(crate) fn reflect_resolve_push(
     pc[112..116].copy_from_slice(&frame.to_le_bytes());
     pc[116..120].copy_from_slice(&mirror_thresh.to_le_bytes());
     pc[120..124].copy_from_slice(&kernel_radius.to_le_bytes());
+    pc
+}
+
+/// Pack the Track A4b reflection spatial-denoiser push block (128 bytes): inv_view_proj (64) +
+/// cam_pos (16) + sampled indices (16) + (out, width, height, flip_y) (16) + (kernel_radius,
+/// tonemap_range, pad, pad) (16).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reflect_spatial_push(
+    inv_view_proj: &[f32; 16],
+    cam_pos: Vec3,
+    refl_index: u32,
+    depth_index: u32,
+    normal_index: u32,
+    material_index: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    kernel_radius: f32,
+    tonemap_range: f32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&cam_pos.x.to_le_bytes());
+    pc[68..72].copy_from_slice(&cam_pos.y.to_le_bytes());
+    pc[72..76].copy_from_slice(&cam_pos.z.to_le_bytes());
+    pc[80..84].copy_from_slice(&refl_index.to_le_bytes());
+    pc[84..88].copy_from_slice(&depth_index.to_le_bytes());
+    pc[88..92].copy_from_slice(&normal_index.to_le_bytes());
+    pc[92..96].copy_from_slice(&material_index.to_le_bytes());
+    pc[96..100].copy_from_slice(&out_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&width.to_le_bytes());
+    pc[104..108].copy_from_slice(&height.to_le_bytes());
+    pc[108..112].copy_from_slice(&flip_y.to_le_bytes());
+    pc[112..116].copy_from_slice(&kernel_radius.to_le_bytes());
+    pc[116..120].copy_from_slice(&tonemap_range.to_le_bytes());
     pc
 }
 
