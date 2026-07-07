@@ -6158,6 +6158,9 @@ impl App {
                         }
                     },
                     self.hwrt,
+                    self.deferred.globals_buffer(),
+                    globals_offset,
+                    self.reflect.lit_hist_read_index(),
                 );
                 let gdf_refl = if refl_half {
                     self.gi.record_upsample(
@@ -6798,6 +6801,9 @@ impl App {
                 self.gdf_cone_k,
                 [u32::MAX; 4], // viz path: no adaptive skip
                 self.hwrt,
+                self.deferred.globals_buffer(),
+                globals_offset,
+                self.reflect.lit_hist_read_index(),
             )),
             _ => None,
         };
@@ -6886,6 +6892,9 @@ impl App {
                     self.gdf_cone_k,
                     [u32::MAX; 4], // standalone viz: no adaptive skip
                     self.hwrt,
+                    self.deferred.globals_buffer(),
+                    globals_offset,
+                    self.reflect.lit_hist_read_index(),
                 );
                 // Standalone viz: no temporal resolve buffers here, so feed the GDF reflection
                 // straight into the composite (the resolve runs only in the lighting-fed path).

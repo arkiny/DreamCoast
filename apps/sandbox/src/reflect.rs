@@ -116,6 +116,8 @@ impl ReflectSystem {
         )?;
         // Phase 16 HWRT hybrid permutation — same push layout (240B), traces the TLAS. Built only on
         // RT-capable devices (it references the acceleration structure); absent ⇒ SW march is used.
+        // `uniform_buffer: true` binds the globals UBO (set 1/b1) for the B.2 screen-color-at-hit
+        // reprojection (`prev_view_proj`), like SSR — the matrix doesn't fit the 240 B push.
         let reflect_hwrt_pipeline = if device.has_raytracing() {
             compute(
                 dreamcoast_shader::gdf_reflect_hwrt_cs_spirv,
@@ -123,7 +125,7 @@ impl ReflectSystem {
                 dreamcoast_shader::gdf_reflect_hwrt_cs_metallib,
                 "gdf_reflect_hwrt",
                 240,
-                false,
+                true,
             )?
         } else {
             None
@@ -343,6 +345,18 @@ impl ReflectSystem {
     /// reads the buffer this frame wrote.
     pub(crate) fn advance_history(&mut self) {
         self.lit_hist_frame = self.lit_hist_frame.saturating_add(1);
+    }
+
+    /// Phase 16 B.2: the bindless storage index of the PREVIOUS frame's lit-radiance history (the
+    /// same buffer SSR reprojects into), for the HWRT reflection's screen-color-at-hit. `0x7FFFFFFF`
+    /// = no history bound (the shader then keeps the surface-cache shading). Capped to 31 bits since
+    /// it rides the reflection push's march-cap field (bit 31 is the content flag).
+    pub(crate) fn lit_hist_read_index(&self) -> u32 {
+        let read = ((self.lit_hist_frame + 1) % 2) as usize;
+        self.lit_hist[read]
+            .as_ref()
+            .map(|b| b.storage_index() & 0x7FFF_FFFF)
+            .unwrap_or(0x7FFF_FFFF)
     }
 
     /// C5/C7b: screen-space reflections. A full-screen compute pass reflects the view ray
@@ -741,15 +755,27 @@ impl ReflectSystem {
         // still shaded from the surface cache. Falls back to the SW pipeline if the permutation is
         // absent (non-RT device). Default false ⇒ SW march (gallery byte-identical).
         hwrt: bool,
+        // Phase 16 B.2 screen-color-at-hit: the globals UBO (for `prev_view_proj`) + the PREVIOUS
+        // frame's lit-radiance history index. Consumed only on the HWRT path (the HW pipeline binds
+        // globals; the index rides the march-cap push field, unused there). Ignored by the SW path.
+        globals: &'a Buffer,
+        globals_offset: u64,
+        lit_hist: u32,
     ) -> ResourceId {
-        let pipe = if hwrt {
-            self.reflect_hwrt_pipeline
-                .as_ref()
-                .or(self.reflect_pipeline.as_ref())
+        let use_hwrt = hwrt && self.reflect_hwrt_pipeline.is_some();
+        let pipe = if use_hwrt {
+            self.reflect_hwrt_pipeline.as_ref()
         } else {
             self.reflect_pipeline.as_ref()
         }
         .expect("gdf reflect pipeline");
+        // The lit-history index rides the march-cap field on the HWRT path (bit 31 stays the content
+        // flag); the SW path keeps the real step cap. So screen-color-at-hit needs no push growth.
+        let max_steps = if use_hwrt {
+            (max_steps & 0x8000_0000) | (lit_hist & 0x7FFF_FFFF)
+        } else {
+            max_steps
+        };
         let out = graph.create_storage_image("gdf_reflect_out", HDR_FORMAT, extent);
         let sampled = scene_gdf.sampled_index();
         let diag = {
@@ -810,6 +836,11 @@ impl ReflectSystem {
                 } else {
                     [u32::MAX; 3]
                 };
+                // B.2: the HWRT pipeline binds the globals UBO for the screen-color-at-hit
+                // reprojection (`prev_view_proj`); the SW pipeline has no globals binding.
+                if use_hwrt {
+                    cmd.set_globals(globals, globals_offset);
+                }
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&gdf_reflect_push(
                     &inv_view_proj,

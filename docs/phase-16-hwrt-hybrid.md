@@ -40,19 +40,26 @@ In SurfaceCache mode the HW hit is shaded from the low-res surface-cache atlas, 
 the cache's *resolution*. Measured: floor sparkle ≈ unchanged (0.013 → 0.016 cloud-fraction). So the
 visible win needs one of:
 
-- **Phase B.2 — screen-color-at-hit** (reference `SampleSceneColorAtHit`): project the HW hit to the
-  previous frame's screen and sample the **lit HDR history** (sharp, full-res) when the reprojected
-  depth validates; fall back to the surface cache when off-screen. HWRT supplies the validated hit
-  that our SSR lacked (the reason content mirrors skip SSR), so this is the natural sharp-reflection
-  path. Needs the reflection pass to bind the globals UBO (for `prev_view_proj`) like SSR does — the
-  push can't hold another matrix (240 B already).
+- **Phase B.2 — screen-color-at-hit ✔ (LANDED)** (reference `SampleSceneColorAtHit`): at the HW hit,
+  reproject to the previous frame via `globals.prev_view_proj`, validate against the current depth
+  (reconstruct the world point at the reprojected UV and compare — rejects occluders), and sample the
+  full-res **lit-radiance history** (`lit_hist`, the same buffer SSR reprojects into) for a SHARP
+  reflection; the surface cache stays the off-screen / occluded fallback. HWRT supplies the validated
+  hit that our SSR lacked (why content mirrors skip SSR). Plumbing: the HWRT reflect pipeline binds
+  the globals UBO (`uniform_buffer: true`) for `prev_view_proj`; the lit-history index rides the
+  march-cap push field (unused in the HW variant) so the 240 B push doesn't grow; `depth.GetDimensions`
+  gives the full-res dims to index the history at a half-res trace. **Result (Metal): the chrome ball
+  now reflects the real scene with correct lit colours (red/teal drapes, columns, arch, floor tiles)
+  — a clear sharpness win over the milky SurfaceCache blob; floor sparkle unchanged (0.0135 ≈ SW).**
+  Gallery `af70c1a5` byte-identical (off). Residual blockiness = the half-res trace (a later tier knob).
 - **Phase D — Hit Lighting**: full material + shadow-ray evaluation at the hit (highest quality),
   needs consolidated per-instance geometry/material buffers to dodge the 64-slot bindless overflow.
 
 ## Roadmap
 
-A (content accel) ✔ → B (HWRT trace + surface-cache shade) ✔ → **B.2 (screen-color-at-hit — the
-sharp win)** → C (HWRT GI, extend `P_HWRT_GI` to content + cache shading) → D (Hit Lighting).
+A (content accel) ✔ → B (HWRT trace + surface-cache shade) ✔ → B.2 (screen-color-at-hit — the sharp
+win) ✔ → **C (HWRT GI, extend `P_HWRT_GI` to content + cache shading)** → D (Hit Lighting). Possible
+tier knob: full-res HWRT reflection to remove the residual half-res blockiness.
 
 ## Gates
 

@@ -72,6 +72,33 @@ SkipCfg unpack_skip()
 [[vk::push_constant]]
 ConstantBuffer<ReflectPush> pc : register(b0, space0);
 
+#ifdef HWRT_REFLECT
+// Per-frame globals (set 1 / b1) — the same UBO the deferred PBR / SSR passes bind (opted into via
+// the compute pipeline's `uniform_buffer`). Only `prev_view_proj` is read, for the B.2 screen-color-
+// at-hit reprojection; the layout must match the host `Globals` (mirrors ssr.slang's subset).
+struct Globals
+{
+    float4 camera_pos;
+    float4 sun_direction;
+    float4 sun_color;
+    float4 ambient;
+    int4 counts;
+    float4 point_pos[4];
+    float4 point_color[4];
+    float4x4 light_view_proj;
+    float4 shadow;
+    float4x4 inv_view_proj;
+    int4 ibl;
+    float4 probe;
+    float4 probe_box_min;
+    float4 probe_box_max;
+    float4x4 prev_view_proj; // world -> previous clip
+};
+
+[[vk::binding(0, 1)]]
+ConstantBuffer<Globals> globals : register(b1, space0);
+#endif
+
 #define GDF_MIN (pc.aabb_min.xyz)
 #define GDF_MAX (pc.aabb_max.xyz)
 #define GROUND_Y (pc.aabb_min.w)
@@ -412,12 +439,55 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     if (hit)
     {
         float3 hn = scene_normal(hp);
+        bool cached = false;
+#ifdef HWRT_REFLECT
+        // Phase 16 B.2 — screen-color-at-hit (reference-engine `SampleSceneColorAtHit`): the hardware
+        // ray hit REAL geometry, so if that surface is visible on screen its FULL-RES lit colour is
+        // already in the previous frame's lit-radiance history (`globals.prev_view_proj` + the
+        // `lit_hist` buffer). Sample it directly for a SHARP reflection — the low-res surface cache
+        // is only the off-screen / occluded fallback. This is the sharp-reflection win the SW trace
+        // couldn't give, and the validated HW hit is exactly what our screen-space SSR lacked.
+        // The lit-history index rides the (march-cap) field — unused in the HW variant (no march).
+        {
+            uint lit_hist = pc.max_steps & 0x7FFFFFFFu;
+            float4 pclip = mul(globals.prev_view_proj, float4(hp, 1.0));
+            if (lit_hist != 0x7FFFFFFFu && pclip.w > 0.0)
+            {
+                float3 pndc = pclip.xyz / pclip.w;
+                float2 puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
+                if (all(puv >= 0.0) && all(puv <= 1.0))
+                {
+                    float sd = g.textures[pc.depth_index].SampleLevel(g.samp, puv, 0.0).r;
+                    if (sd < 1.0)
+                    {
+                        // Visibility validation: the depth-buffer surface at `puv` must BE the hit,
+                        // not an occluder in front of it — reconstruct its world point and compare.
+                        float2 vndc = float2(puv.x * 2.0 - 1.0, (puv.y * 2.0 - 1.0) * sy);
+                        float4 vw = mul(pc.inv_view_proj, float4(vndc, sd, 1.0));
+                        float3 sworld = vw.xyz / vw.w;
+                        float vtol = 0.01 * length(GDF_MAX - GDF_MIN) + t * 0.02;
+                        if (distance(sworld, hp) < vtol)
+                        {
+                            // lit_hist is FULL-res; the trace may be half-res, so index it with the
+                            // depth texture's own (full-res) dimensions — no extra push field needed.
+                            uint fw, fh;
+                            g.textures[pc.depth_index].GetDimensions(fw, fh);
+                            int2 pp = clamp(int2(puv * float2(fw, fh)), int2(0, 0),
+                                            int2(int(fw) - 1, int(fh) - 1));
+                            uint pidx = uint(pp.y) * fw + uint(pp.x);
+                            color = asfloat(g.storage_buffers[lit_hist].Load4(pidx * 16u)).rgb;
+                            cached = true; // sharp on-screen hit — skip the low-res cache + analytic
+                        }
+                    }
+                }
+            }
+        }
+#endif
         // C8b3/C8g: the reflected surface's cached (multibounce, accurately-lit) radiance — a
         // direct lookup when the cache is bound. The cache only covers the meshed objects (no
         // cards for the analytic ground), so on a cache MISS fall back to the C8a per-ray
         // re-light instead of black (which previously left the ground reflection dark).
-        bool cached = false;
-        if (pc.cache.x != 0xFFFFFFFFu)
+        if (!cached && pc.cache.x != 0xFFFFFFFFu)
         {
             // Reference-engine (Lumen) cone-based card acceptance: the coarse-field reflection HIT is
             // imprecise, and the imprecision GROWS with the ray distance `t` (a far hit lands farther
