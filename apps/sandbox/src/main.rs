@@ -2736,17 +2736,30 @@ impl App {
             .unwrap_or(base.gdf_cone_k)
             .clamp(0.0, 1.0);
         // Reflection history clamp permutation (0 off / 1 hard / 2 variance). Gallery forced to 0
-        // (byte-identical legacy resolve = regression anchor); content takes the tier. `P_REFL_CLAMP`
-        // + `P_REFL_CLAMP_GAMMA` override.
+        // (byte-identical legacy resolve = regression anchor); CONTENT defaults to 2 (Salvi/Karis
+        // variance clipping) to suppress glossy-reflection fireflies — the noisy GGX-sampled
+        // reflection of brightly-sunlit nearby geometry that the denoiser otherwise spreads into soft
+        // white "sparkle" blobs on the rough floor. The clamp is gated to sr > 0 (glossy/rough) in
+        // the shader, so near-mirrors (the chrome sphere) are untouched. `P_REFL_CLAMP` +
+        // `P_REFL_CLAMP_GAMMA` override; tight gamma (0.5) is safe because it only bounds the
+        // low-frequency rough lobe's history, never a mirror's high-frequency detail.
         let reflect_history_clamp = std::env::var("P_REFL_CLAMP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(base.reflect_history_clamp)
+            .unwrap_or(if gallery_scene {
+                base.reflect_history_clamp
+            } else {
+                2
+            })
             .min(2);
         let reflect_clamp_gamma = std::env::var("P_REFL_CLAMP_GAMMA")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(base.reflect_clamp_gamma)
+            .unwrap_or(if gallery_scene {
+                base.reflect_clamp_gamma
+            } else {
+                0.5
+            })
             .clamp(0.0, 8.0);
         // SSR-resolve history feedback clamp (0 off / 1 variance). Gallery base is 0 (byte-identical
         // anchor); content tiers default 0 too pending DX=VK verification. `P_SSR_HISTORY_CLAMP` +
