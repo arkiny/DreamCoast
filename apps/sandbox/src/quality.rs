@@ -249,6 +249,21 @@ pub struct QualityPreset {
     /// imperceptible on a mostly-static scene. `gi_volume` is off for the gallery, so this never
     /// touches the byte-identical anchor; clamped `>= 1` at the consumer. See `docs/sponza-perf.md`.
     pub gi_volume_period: u32,
+    /// Phase 16 hybrid HW ray tracing (`P_HWRT`): trace content reflections against the real triangle
+    /// BVH (built at load) + surface-cache / screen-color shading, instead of the SW distance-field
+    /// march. A tier/scalability option, env-overridable; `false` for every current tier + the gallery
+    /// (byte-identical anchor). `#[serde(default)]` so the on-disk RON tiers need no new key.
+    #[serde(default)]
+    pub hwrt_reflect: bool,
+    /// `P_HWRT_HITLIGHTING`: shade an OFF-SCREEN reflection HW hit with the real material (consolidated
+    /// geometry + albedo texture + HW shadow ray) instead of the low-res surface cache. Implies
+    /// `hwrt_reflect`. Default off.
+    #[serde(default)]
+    pub hwrt_reflect_hitlighting: bool,
+    /// `P_HWRT_FULLRES`: trace the HWRT reflection at full resolution (crisp mirror, ~4x cost — a
+    /// quality/screenshot mode). Implies `hwrt_reflect`. Default off.
+    #[serde(default)]
+    pub hwrt_reflect_fullres: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +451,9 @@ pub fn gallery_preset() -> QualityPreset {
         ssr_clamp_gamma: 1.25,
         gi_temporal_clamp: 1.0, // hard 3x3 GI temporal clamp (legacy byte-identical anchor)
         gi_volume_period: 1,    // every-frame volume update (gallery runs no gi_volume anyway)
+        hwrt_reflect: false,    // SW-RT reflection (the gallery has its own path-tracer accel)
+        hwrt_reflect_hitlighting: false,
+        hwrt_reflect_fullres: false,
     }
 }
 

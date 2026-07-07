@@ -819,6 +819,10 @@ struct App {
     /// device is RT-capable AND the content scene's TLAS was built. The reflection trace then routes
     /// through the scene BVH + surface-cache shading instead of the GDF sphere-march. Default off.
     hwrt: bool,
+    /// Whether the content HWRT acceleration structures were BUILT at load (`P_HWRT` / tier). When
+    /// true, `hwrt` (the runtime reflection toggle) can be flipped live in the settings UI without a
+    /// rebuild; when false, HWRT can't be enabled this run (the accel isn't built).
+    hwrt_available: bool,
     /// Phase 16 C: `P_HWRT_FULLRES` — trace the HWRT reflection at full resolution (crisp mirror,
     /// ~4x cost). Implies `hwrt`. Default off keeps the half-res HWRT trace for interactive perf.
     hwrt_fullres: bool,
@@ -1770,38 +1774,9 @@ impl App {
             gallery_scene,
         )?;
 
-        // Phase 16 (HWRT hybrid): opt-in hardware-ray-traced reflections. `P_HWRT=1` builds the
-        // CONTENT scene's BLAS/TLAS (the gallery uses its own path-tracer accel) and routes the
-        // reflection trace through the scene TLAS + surface-cache shading. Requires an RT-capable
-        // device; default off keeps the SW-RT path (gallery byte-identical). Only for content
-        // scenes with geometry (the ECS draw list); world-streaming mode is out of scope.
-        let hwrt = std::env::var_os("P_HWRT").is_some()
-            && device.has_raytracing()
-            && !gallery_scene
-            && !world_mode
-            && !world.draw_list().is_empty();
-        if hwrt {
-            rt.build_content_accel(
-                &device,
-                &world.draw_list(),
-                &mesh_registry,
-                &material_registry,
-            );
-        }
-        let hwrt = hwrt && rt.has_content_scene();
-        // Phase 16 C: `P_HWRT_FULLRES=1` traces the HWRT reflection at FULL resolution (no half-res
-        // trace + upsample) for a crisp mirror — dramatically sharper on the chrome ball / floor, but
-        // ~4x the reflection cost (a quality/screenshot mode). Default (P_HWRT alone) keeps the half-res
-        // trace for interactive perf. Requires HWRT.
-        let hwrt_fullres = hwrt && std::env::var_os("P_HWRT_FULLRES").is_some();
-        // Phase 16 E: `P_HWRT_HITLIGHTING=1` shades an OFF-SCREEN reflection HW hit with the real
-        // material (fetch normal/UV from the consolidated geometry, sample the albedo texture, sun +
-        // HW shadow ray + IBL) instead of the low-res surface cache — the reference "Hit Lighting"
-        // mode for off-screen reflections. On-screen hits still use the (sharp) screen-color path.
-        // Requires the consolidated hit table (built with the TLAS). Default off.
-        let hwrt_hitlighting = hwrt
-            && rt.content_hit_indices().is_some()
-            && std::env::var_os("P_HWRT_HITLIGHTING").is_some();
+        // Phase 16 (HWRT hybrid): the opt-in decision + content accel build is resolved AFTER the
+        // quality tier `base` is known (below), so a tier can enable it and the env vars override —
+        // it's a first-class scalability option, not just a raw env flag.
 
         // Scalable-GI Stage 0: fuse the opaque draw list into one world-space triangle
         // soup and register it as the scene GDF (baked once on the graph). Ground is
@@ -2405,6 +2380,36 @@ impl App {
         } else {
             quality::preset(quality)
         };
+
+        // Phase 16 (HWRT hybrid): opt-in hardware-ray-traced reflections, resolved as a scalability
+        // option — the tier preset drives the default, the env vars override (`env_bool`). `P_HWRT`
+        // builds the CONTENT scene's BLAS/TLAS + consolidated geometry (the gallery uses its own
+        // path-tracer accel) and routes the reflection through the scene TLAS + surface-cache /
+        // screen-color / hit-lighting shading. Requires an RT-capable device + content geometry;
+        // gallery / world-streaming out of scope, so it stays byte-identical there.
+        let hwrt = quality::env_bool("P_HWRT", base.hwrt_reflect)
+            && device.has_raytracing()
+            && !gallery_scene
+            && !world_mode
+            && !world.draw_list().is_empty();
+        if hwrt {
+            rt.build_content_accel(
+                &device,
+                &world.draw_list(),
+                &mesh_registry,
+                &material_registry,
+            );
+        }
+        // Built at launch → the reflection can be toggled live in the UI without a rebuild.
+        let hwrt_available = hwrt && rt.has_content_scene();
+        let hwrt = hwrt_available;
+        // `P_HWRT_FULLRES`: full-res reflection trace (crisp mirror, ~4x cost — a quality mode).
+        let hwrt_fullres = hwrt && quality::env_bool("P_HWRT_FULLRES", base.hwrt_reflect_fullres);
+        // `P_HWRT_HITLIGHTING`: shade off-screen HW hits with the real material (needs the hit table).
+        let hwrt_hitlighting = hwrt
+            && rt.content_hit_indices().is_some()
+            && quality::env_bool("P_HWRT_HITLIGHTING", base.hwrt_reflect_hitlighting);
+
         info!(
             "RenderQuality tier: {} (RENDER_QUALITY; GPU \"{}\")",
             quality.label(),
@@ -3201,6 +3206,7 @@ impl App {
             gdf_gi,
             hwrt_gi,
             hwrt,
+            hwrt_available,
             hwrt_fullres,
             hwrt_hitlighting,
             bent_normal,
@@ -4218,6 +4224,10 @@ impl App {
                 reflect_max_steps,
                 reflect_res_div,
                 reflect_half_res,
+                hwrt,
+                hwrt_available,
+                hwrt_hitlighting,
+                hwrt_fullres,
                 ao_res_div,
                 gi_atrous_steps,
                 gdf_cone_k,
@@ -4417,6 +4427,20 @@ impl App {
                             }
                             if ui.checkbox("Reflect half-res trace", reflect_half_res) {
                                 *reflect_half_res = gi.has_upsample() && *reflect_half_res;
+                            }
+                            // Phase 16 HW-RT hybrid reflections. The base toggle flips the runtime
+                            // reflection between the hardware BVH trace and the SW distance-field
+                            // march — but only when the acceleration structures were built at load
+                            // (launch with `P_HWRT=1`, or a tier that enables it); the sub-modes then
+                            // toggle live. Off / not-built keeps the SW-RT path.
+                            if *hwrt_available {
+                                ui.checkbox("HW-RT reflections", hwrt);
+                                if *hwrt {
+                                    ui.checkbox("  Hit Lighting (off-screen)", hwrt_hitlighting);
+                                    ui.checkbox("  Full-res mirror (~4x cost)", hwrt_fullres);
+                                }
+                            } else {
+                                ui.text("HW-RT reflections: launch with P_HWRT=1");
                             }
                             if ui.checkbox("GDF ambient occlusion", gdf_ao) {
                                 *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && *gdf_ao;
