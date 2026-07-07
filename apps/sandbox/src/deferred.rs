@@ -1199,6 +1199,9 @@ impl DeferredRenderer {
         // *_ext ids order the lighting pass after the cluster-build compute pass. `None` = the
         // brute-force globals.point_pos[] path (default, gallery byte-identical).
         cluster: Option<(ResourceId, ResourceId, u32, u32, u32, u32)>,
+        // Opt-in albedo-tinted multi-bounce AO on the diffuse ambient (reference AOMultiBounce).
+        // Default false => scalar AO, byte-identical anchor.
+        ao_multibounce: bool,
     ) {
         let mut reads = vec![gbuf.albedo, gbuf.normal, gbuf.material, gbuf.position];
         if let Some(sm) = shadow_map {
@@ -1271,6 +1274,7 @@ impl DeferredRenderer {
                     skyvis_tint,
                     skyvis_min_occ,
                     [cl_grid, cl_index, cl_light, cl_count],
+                    ao_multibounce as u32,
                 ));
                 cmd.draw(3, 1);
                 Ok(())
@@ -1474,8 +1478,9 @@ fn pbr_push(
     // Clustered light bufs: [grid_buf, index_buf, light_buf, light_count]. grid_buf == u32::MAX
     // (0xFFFFFFFF) selects the brute-force point-light loop (byte-identical anchor).
     cluster: [u32; 4],
-) -> [u8; 76] {
-    let mut pc = [0u8; 76];
+    ao_multibounce: u32,
+) -> [u8; 80] {
+    let mut pc = [0u8; 80];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1494,6 +1499,7 @@ fn pbr_push(
         let o = 60 + i * 4;
         pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
     }
+    pc[76..80].copy_from_slice(&ao_multibounce.to_le_bytes());
     pc
 }
 

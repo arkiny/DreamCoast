@@ -60,6 +60,7 @@ struct PushConstants
     uint cluster_index_buf; // flat light-index list u32[CLUSTER_COUNT * MAX_LIGHTS_PER_CLUSTER]
     uint cluster_light_buf; // packed Light[] (position/radius/color/intensity)
     uint cluster_light_count; // number of lights in cluster_light_buf (dbg heatmap normalisation)
+    uint ao_multibounce; // 1 = albedo-tinted multi-bounce AO on the diffuse ambient (opt-in); 0 = off
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -126,6 +127,20 @@ VSOutput vsMain(uint id: SV_VertexID)
 // the indoor floor keeps brightness but loses the blue cast — the coloured GI bounce then shows),
 // with a MinOcclusion floor so it never crushes to black. sky_vis = 1 -> exact no-op. The tint
 // fraction and min-occlusion floor come from the push (`P_SKYVIS_TINT` / `P_SKYVIS_MIN_OCC`).
+// Multi-bounce ambient occlusion (reference engine AOMultiBounce): a scalar AO over-darkens because
+// light bounces multiple times inside a cavity, and those inter-reflections are tinted by the
+// surface's own albedo. This cubic per-channel polynomial restores that energy — it lifts the AO
+// back toward 1 in the surface's albedo colour (a red cavity stays red instead of going grey-dark),
+// while a black surface keeps the raw AO. `max(AO, ·)` guarantees it never darkens below the input.
+// Ref: DeferredShadingCommon.ush AOMultiBounce. Reduces to the scalar AO when disabled (opt-in).
+float3 ao_multi_bounce(float3 base_color, float ao)
+{
+    float3 a = 2.0404 * base_color - 0.3324;
+    float3 b = -4.7951 * base_color + 0.6417;
+    float3 c = 2.7552 * base_color + 0.6903;
+    return max(float3(ao), ((ao * a + b) * ao + c) * ao);
+}
+
 // Directional (bent-normal) skylight occlusion — the reference engine's DFAO -> skylight coupling.
 // Instead of a scalar V multiply of the surface-normal irradiance, sample the diffuse skylight
 // ALONG the bent normal (the unoccluded average direction) so an interior receives skylight biased
@@ -218,7 +233,13 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
     // (which self-occludes -> gdf_ao≈0) it would kill the reflection entirely (a black chrome
     // ball). So AO applies to diffuse only; the specular reflection carries its own occlusion.
     // (Gallery anchor stays byte-identical: its specular pixels have ao·gdf_ao == 1.)
-    return kd * diffuse * (ao * gdf_ao) + specular;
+    // Multi-bounce AO (opt-in): recolour the scalar diffuse AO by the albedo so cavities keep the
+    // surface's own bounced colour instead of going flat-dark. Off (default) => scalar ao·gdf_ao,
+    // byte-identical anchor. `ao·gdf_ao == 1` => ao_multi_bounce returns 1 => unchanged even when on.
+    float3 diff_ao = (pc.ao_multibounce != 0u)
+                         ? ao_multi_bounce(albedo, ao * gdf_ao)
+                         : float3(ao * gdf_ao);
+    return kd * diffuse * diff_ao + specular;
 }
 
 // --- Soft-shadow quality tier (the scalability seam): one place to swap counts.
