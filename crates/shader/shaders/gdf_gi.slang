@@ -228,7 +228,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 #ifdef HWRT_GI
     if (pc.hwrt != 0u)
     {
-        float vis = 0.0;
+        // Phase 16 D: hardware-ray-traced GI. Cast the same cosine-hemisphere bounce rays against the
+        // real triangle BVH (closest hit) and shade the hit from the surface cache — the actual
+        // bounced radiance, identical to the SW march's `bs_shade_hit`, not the visibility-only first
+        // increment. Accurate hits (no distance-field leaking) with the same GI look. Requires the
+        // content TLAS (P_HWRT) and the ray-march GI path (P_GI_VOLUME=0; the volume path returns
+        // above). The escape returns 0 — the sky is supplied by the IBL diffuse, as the SW march.
+        BounceScene bs = gi_bounce_scene();
+        float3 sum = float3(0.0, 0.0, 0.0);
         for (uint s = 0; s < spp; s++)
         {
             float3 dir = bounce_cosine_hemisphere(n, seed);
@@ -237,16 +244,22 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             ray.Direction = dir;
             ray.TMin = 0.0;
             ray.TMax = pc.params.x; // bounce reach = scene diagonal (same as the SW ray_max)
-            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-            q.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, ray);
+            RayQuery<RAY_FLAG_NONE> q;
+            q.TraceRayInline(g.tlas, RAY_FLAG_NONE, 0xFF, ray);
             q.Proceed();
-            // Escaped (no hit within reach) => this direction sees the sky => visible.
-            if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
-                vis += 1.0;
+            float3 b = float3(0.0, 0.0, 0.0);
+            if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+            {
+                float3 hp = origin + dir * q.CommittedRayT();
+                b = bs_shade_hit(bs, hp, bs_scene_normal(bs, hp));
+            }
+            // Firefly clamp per sample (before averaging), matching the SW path.
+            float m = max(b.r, max(b.g, b.b));
+            if (m > pc.clamp_max)
+                b *= pc.clamp_max / m;
+            sum += b;
         }
-        vis /= float(spp);
-        // Same sky-fill scale the SW escape uses, so the magnitude is comparable to the march path.
-        float3 e = float3(pc.params.z, pc.params.z, pc.params.z) * vis;
+        float3 e = sum / float(spp);
         g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
         return;
     }
