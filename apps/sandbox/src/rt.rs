@@ -45,6 +45,11 @@ pub(crate) struct RtSystem {
     /// ECS draw list, for the hardware-ray-traced reflection/GI trace. Opt-in (`P_HWRT`); the
     /// gallery uses `scene` above instead. Kept alive while its TLAS is bound.
     content_scene: Option<RaytracingScene>,
+    /// Phase 16 E (Hit Lighting): consolidated content geometry + material table — ONE shared vertex
+    /// buffer, ONE index buffer (absolute indices), ONE per-drawable record buffer — so a HW hit can
+    /// fetch the real material (normal/UV/albedo texture) and re-light off-screen reflections. Three
+    /// bindless slots total (no per-primitive overflow). Built alongside the content TLAS.
+    content_hit: Option<(StorageBuffer, StorageBuffer, StorageBuffer)>,
     /// Path-tracer per-instance table (vertex/index SB indices + material).
     instance_table: Option<StorageBuffer>,
     /// Keeps the per-instance vertex/index storage buffers alive for the table.
@@ -342,6 +347,7 @@ impl RtSystem {
             pt_pipeline,
             scene: scene_rt,
             content_scene: None,
+            content_hit: None,
             instance_table,
             _geometry: geometry,
             instance_count,
@@ -372,6 +378,7 @@ impl RtSystem {
         device: &Device,
         drawables: &[Drawable],
         registry: &MeshRegistry,
+        materials: &crate::registry::MaterialRegistry,
     ) {
         if !device.has_raytracing() || drawables.is_empty() {
             return;
@@ -425,11 +432,28 @@ impl RtSystem {
             }
             Err(e) => tracing::error!("content ray-tracing scene build failed: {e}"),
         }
+        // Phase 16 E: the consolidated geometry + material table for Hit Lighting (only useful once
+        // the TLAS exists). A build failure is non-fatal — the reflection falls back to the surface
+        // cache for off-screen hits.
+        if self.content_scene.is_some() {
+            match crate::mesh::build_content_hit_table(device, drawables, registry, materials) {
+                Ok(bufs) => self.content_hit = Some(bufs),
+                Err(e) => tracing::error!("content hit-lighting table build failed: {e}"),
+            }
+        }
     }
 
     /// Whether the content scene's TLAS was built (Phase 16 HWRT hybrid opt-in).
     pub(crate) fn has_content_scene(&self) -> bool {
         self.content_scene.is_some()
+    }
+
+    /// Phase 16 E: the bindless storage indices `(vertices, indices, drawable table)` of the
+    /// consolidated content geometry/material table for Hit Lighting, or `None` if not built.
+    pub(crate) fn content_hit_indices(&self) -> Option<(u32, u32, u32)> {
+        self.content_hit
+            .as_ref()
+            .map(|(v, i, t)| (v.storage_index(), i.storage_index(), t.storage_index()))
     }
 
     // Feature-availability predicates (drive the UI + toggle defaults).

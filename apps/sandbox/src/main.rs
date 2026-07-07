@@ -822,6 +822,10 @@ struct App {
     /// Phase 16 C: `P_HWRT_FULLRES` — trace the HWRT reflection at full resolution (crisp mirror,
     /// ~4x cost). Implies `hwrt`. Default off keeps the half-res HWRT trace for interactive perf.
     hwrt_fullres: bool,
+    /// Phase 16 E: `P_HWRT_HITLIGHTING` — shade an off-screen reflection HW hit with the real
+    /// material (consolidated geometry + albedo texture + sun/HW-shadow/IBL) instead of the surface
+    /// cache. Implies `hwrt` and the built hit table. Default off.
+    hwrt_hitlighting: bool,
     /// Bent-normal skylight: when true (`P_BENT_NORMAL`, default on) the GI pass writes the SH
     /// sky-vis band-1 vector (the DFAO bent normal) into the sky-vis image so the lighting samples
     /// the diffuse skylight along it. Only affects the content sky-vis path; gallery byte-identical.
@@ -1777,7 +1781,12 @@ impl App {
             && !world_mode
             && !world.draw_list().is_empty();
         if hwrt {
-            rt.build_content_accel(&device, &world.draw_list(), &mesh_registry);
+            rt.build_content_accel(
+                &device,
+                &world.draw_list(),
+                &mesh_registry,
+                &material_registry,
+            );
         }
         let hwrt = hwrt && rt.has_content_scene();
         // Phase 16 C: `P_HWRT_FULLRES=1` traces the HWRT reflection at FULL resolution (no half-res
@@ -1785,6 +1794,14 @@ impl App {
         // ~4x the reflection cost (a quality/screenshot mode). Default (P_HWRT alone) keeps the half-res
         // trace for interactive perf. Requires HWRT.
         let hwrt_fullres = hwrt && std::env::var_os("P_HWRT_FULLRES").is_some();
+        // Phase 16 E: `P_HWRT_HITLIGHTING=1` shades an OFF-SCREEN reflection HW hit with the real
+        // material (fetch normal/UV from the consolidated geometry, sample the albedo texture, sun +
+        // HW shadow ray + IBL) instead of the low-res surface cache — the reference "Hit Lighting"
+        // mode for off-screen reflections. On-screen hits still use the (sharp) screen-color path.
+        // Requires the consolidated hit table (built with the TLAS). Default off.
+        let hwrt_hitlighting = hwrt
+            && rt.content_hit_indices().is_some()
+            && std::env::var_os("P_HWRT_HITLIGHTING").is_some();
 
         // Scalable-GI Stage 0: fuse the opaque draw list into one world-space triangle
         // soup and register it as the scene GDF (baked once on the graph). Ground is
@@ -3185,6 +3202,7 @@ impl App {
             hwrt_gi,
             hwrt,
             hwrt_fullres,
+            hwrt_hitlighting,
             bent_normal,
             ao_multibounce,
             spec_occlusion,
@@ -6175,6 +6193,11 @@ impl App {
                     self.deferred.globals_buffer(),
                     globals_offset,
                     self.reflect.lit_hist_read_index(),
+                    if self.hwrt_hitlighting {
+                        self.rt.content_hit_indices()
+                    } else {
+                        None
+                    },
                 );
                 let gdf_refl = if refl_half {
                     self.gi.record_upsample(
@@ -6818,6 +6841,11 @@ impl App {
                 self.deferred.globals_buffer(),
                 globals_offset,
                 self.reflect.lit_hist_read_index(),
+                if self.hwrt_hitlighting {
+                    self.rt.content_hit_indices()
+                } else {
+                    None
+                },
             )),
             _ => None,
         };
@@ -6909,6 +6937,11 @@ impl App {
                     self.deferred.globals_buffer(),
                     globals_offset,
                     self.reflect.lit_hist_read_index(),
+                    if self.hwrt_hitlighting {
+                        self.rt.content_hit_indices()
+                    } else {
+                        None
+                    },
                 );
                 // Standalone viz: no temporal resolve buffers here, so feed the GDF reflection
                 // straight into the composite (the resolve runs only in the lighting-fed path).

@@ -761,8 +761,14 @@ impl ReflectSystem {
         globals: &'a Buffer,
         globals_offset: u64,
         lit_hist: u32,
+        // Phase 16 E (Hit Lighting): consolidated content geometry/material `(vtx, idx, table)`
+        // bindless indices for shading an OFF-SCREEN HW hit with the real material. `Some` only on the
+        // HWRT path with the table built; rides the (HWRT-unused) coarse-albedo push slots + frame
+        // bit31 (the enable), so no push growth. `None` ⇒ off-screen hits keep the surface cache.
+        hit_lighting: Option<(u32, u32, u32)>,
     ) -> ResourceId {
         let use_hwrt = hwrt && self.reflect_hwrt_pipeline.is_some();
+        let hit_lighting = if use_hwrt { hit_lighting } else { None };
         let pipe = if use_hwrt {
             self.reflect_hwrt_pipeline.as_ref()
         } else {
@@ -835,6 +841,14 @@ impl ReflectSystem {
                     ]
                 } else {
                     [u32::MAX; 3]
+                };
+                // Phase 16 E: in Hit Lighting mode the coarse-albedo volume slots (unused — hit
+                // lighting replaces the analytic fallback) instead carry the consolidated geometry/
+                // material `(vtx, idx, table)` indices, and `frame` bit31 flags the mode. Zero push
+                // growth (avoids a D3D12 root-CBV spill on the shared reflect push).
+                let (albedo_rgb, frame) = match hit_lighting {
+                    Some((v, i, t)) => ([v, i, t], frame | 0x8000_0000),
+                    None => (albedo_rgb, frame),
                 };
                 // B.2: the HWRT pipeline binds the globals UBO for the screen-color-at-hit
                 // reprojection (`prev_view_proj`); the SW pipeline has no globals binding.

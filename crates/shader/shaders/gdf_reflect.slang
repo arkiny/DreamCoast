@@ -398,6 +398,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // leaking or low-res card blockiness (the floor sparkle / blurry chrome). The hit is shaded from
     // the surface cache below EXACTLY as the SW path (SurfaceCache mode), so only the trace changes.
     // Closest-hit pattern mirrors rt_trace.slang (RAY_FLAG_NONE + single Proceed + CommittedRayT).
+    // E: the hit's instance/primitive/barycentrics/object-to-world are captured for Hit Lighting.
+    uint hl_inst = 0u;
+    uint hl_prim = 0u;
+    float2 hl_bary = float2(0.0, 0.0);
+    float3x4 hl_o2w = float3x4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0);
     {
         RayDesc ray;
         ray.Origin = p;
@@ -412,6 +417,10 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             t = q.CommittedRayT();
             hp = p + dir * t;
             hit = true;
+            hl_inst = q.CommittedInstanceID();
+            hl_prim = q.CommittedPrimitiveIndex();
+            hl_bary = q.CommittedTriangleBarycentrics();
+            hl_o2w = q.CommittedObjectToWorld3x4();
         }
     }
 #else
@@ -480,6 +489,66 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                         }
                     }
                 }
+            }
+        }
+        // Phase 16 E — Hit Lighting (OFF-SCREEN): the on-screen path failed (behind camera / occluded),
+        // so shade this HW hit with the REAL material instead of the low-res surface cache. `frame`
+        // bit31 = enabled; the consolidated (vertex, index, drawable-table) bindless indices ride the
+        // coarse-albedo push slots (unused here — Hit Lighting replaces the analytic fallback). Fetch
+        // the hit triangle's interpolated normal + UV, sample the albedo texture, and re-light with the
+        // sun (HW shadow ray) + GI radiance cache + IBL sky — the same energy convention as the analytic
+        // path below, but with the accurate material/normal/shadow. Reference: Lumen HitLighting mode.
+        if (!cached && (pc.frame & 0x80000000u) != 0u)
+        {
+            uint tbl = pc.albedo_b;
+            uint rbase = hl_inst * 48u;
+            uint idx_base = g.storage_buffers[tbl].Load(rbase + 0u);
+            uint prim_count = g.storage_buffers[tbl].Load(rbase + 4u);
+            if (hl_prim < prim_count)
+            {
+                uint tex_albedo = g.storage_buffers[tbl].Load(rbase + 8u);
+                float4 base_color = asfloat(g.storage_buffers[tbl].Load4(rbase + 16u));
+                uint tri = (idx_base + hl_prim * 3u) * 4u;
+                uint i0 = g.storage_buffers[pc.albedo_g].Load(tri);
+                uint i1 = g.storage_buffers[pc.albedo_g].Load(tri + 4u);
+                uint i2 = g.storage_buffers[pc.albedo_g].Load(tri + 8u);
+                float3 n0 = asfloat(g.storage_buffers[pc.albedo_r].Load3(i0 * 32u + 12u));
+                float3 n1 = asfloat(g.storage_buffers[pc.albedo_r].Load3(i1 * 32u + 12u));
+                float3 n2 = asfloat(g.storage_buffers[pc.albedo_r].Load3(i2 * 32u + 12u));
+                float2 uv0 = asfloat(g.storage_buffers[pc.albedo_r].Load2(i0 * 32u + 24u));
+                float2 uv1 = asfloat(g.storage_buffers[pc.albedo_r].Load2(i1 * 32u + 24u));
+                float2 uv2 = asfloat(g.storage_buffers[pc.albedo_r].Load2(i2 * 32u + 24u));
+                float b0 = 1.0 - hl_bary.x - hl_bary.y;
+                float3 n_obj = n0 * b0 + n1 * hl_bary.x + n2 * hl_bary.y;
+                float2 uv = uv0 * b0 + uv1 * hl_bary.x + uv2 * hl_bary.y;
+                float3 nw = normalize(mul((float3x3)hl_o2w, n_obj));
+                if (dot(nw, dir) > 0.0)
+                    nw = -nw; // face the incoming ray (two-sided)
+                float3 alb = base_color.rgb;
+                if (tex_albedo != 0xFFFFFFFFu)
+                    alb *= g.textures[tex_albedo].SampleLevel(g.samp_wrap, uv, 0.0).rgb;
+                // Sun with a HARDWARE shadow ray (accurate vs the GDF shadow march).
+                float ndl = max(dot(nw, sun_dir), 0.0);
+                float sh = 1.0;
+                if (ndl > 0.0)
+                {
+                    RayDesc sray;
+                    sray.Origin = hp + nw * 0.01;
+                    sray.Direction = sun_dir;
+                    sray.TMin = 0.001;
+                    sray.TMax = max_dist;
+                    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
+                    sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, sray);
+                    sq.Proceed();
+                    if (sq.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+                        sh = 0.0;
+                }
+                // Same energy convention as the analytic content path: direct/PI + GI cache + IBL sky.
+                float3 e = vol_on ? sample_gi_irradiance(vol_base, hp, nw) : float3(0.0, 0.0, 0.0);
+                color = alb * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
+                if (has_irr)
+                    color += g.cubes[irr_idx].SampleLevel(g.samp, nw, 0.0).rgb * alb;
+                cached = true; // shaded with the real material — skip the surface cache + analytic
             }
         }
 #endif
