@@ -64,13 +64,33 @@ visible win needs one of:
   (the volume path returns before the HWRT block). Gallery byte-identical (the `bs_shade_hit` extract
   is a pure refactor of the SW path).
 
-## Remaining — Phase E: Hit Lighting (deferred, large)
+## Phase E — Hit Lighting (LANDED, inline + consolidated geometry)
 
-Full material + shadow-ray evaluation at the HW hit for sharp/accurate **off-screen** reflections
-(on-screen is already sharp via B.2/C; off-screen currently uses the surface cache). Opt-in / cache-miss
-only — expensive (full BSDF + N shadow rays per hit).
+Off-screen reflection HW hits (where screen-color-at-hit can't reach) now shade with the REAL material
+instead of the low-res surface cache. Opt-in `P_HWRT_HITLIGHTING`.
 
-**How the reference engine does it (extracted verbatim):** Hit Lighting is **RT-PIPELINE ONLY — inline
+**Chosen approach (b) — inline + consolidated geometry, NOT the reference's RT-pipeline + SBT.** We
+have a SINGLE metallic-roughness PBR model, so the reference's per-material closest-hit shaders (the
+one thing the SBT buys) gain us nothing; consolidated geometry + one PBR eval scales fine and reuses
+the proven inline RayQuery path (avoids the less-tested Metal RT-pipeline).
+- **E1** `mesh.rs::build_content_hit_table`: ALL unique meshes packed into ONE vertex buffer + ONE
+  index buffer (indices rebased absolute into the shared vertex buffer) + ONE per-drawable
+  `{idx_base, prim_count, material}` record buffer — three bindless slots total regardless of mesh
+  count (dodges the 64-slot per-primitive overflow; a reusable asset that also unblocks a content HW
+  path tracer). Built alongside the content TLAS; `rt.rs` `content_hit` / `content_hit_indices()`.
+- **E2** `gdf_reflect.slang` HWRT_REFLECT: capture the hit's instance/primitive/barycentrics/
+  object-to-world; when enabled (`frame` bit31; the vtx/idx/table indices ride the HWRT-unused
+  coarse-albedo push slots → no push growth / no D3D12 CBV spill), fetch the triangle's interpolated
+  normal + UV, sample the albedo texture (wrap sampler), re-light with sun (HW shadow ray) + GI
+  radiance cache + IBL sky (same energy convention as the analytic path). Reuses the B.2 screen-color
+  path for on-screen hits (the reference's two-pass bookmark idea, collapsed into one inline trace).
+
+Result (Metal, chromeball): the ball reflects the FULL scene with real materials — the off-screen ring
+shows real curtains/columns/floor tiles, not the blurry cache. Gallery `af70c1a5` byte-identical (off).
+
+## Reference — how the reference engine does Hit Lighting (extracted verbatim, for the record)
+
+We deliberately deviated from this (see approach (b) above). **How the reference engine does it:** Hit Lighting is **RT-PIPELINE ONLY — inline
 RayQuery is explicitly forbidden** (`LumenReflectionHardwareRayTracing.cpp:225`: `if (Inline &&
 HitLighting) return false;`). It relies on the **Shader Binding Table**: each mesh/material has its own
 closest-hit shader (`MaterialCHS`, `RayTracingMaterialHitShaders.usf:639`); at a hit the HW invokes that
@@ -101,9 +121,11 @@ phase (either approach is multi-part) rather than rushed, since A→D already de
 
 ## Roadmap
 
-A (content accel) ✔ → B (HWRT trace + surface-cache shade) ✔ → B.2 (screen-color-at-hit — the sharp
-win) ✔ → C (full-res reflection mode) ✔ → D (HWRT GI + cache shading) ✔ → **E (Hit Lighting —
-deferred, needs consolidated geometry)**.
+A (content accel) ✔ → B (HWRT trace + surface-cache shade) ✔ → B.2 (screen-color-at-hit) ✔ → C
+(full-res reflection mode) ✔ → D (HWRT GI + cache shading) ✔ → E (Hit Lighting, inline + consolidated
+geometry) ✔. **All phases complete.** Follow-ups: DX≡VK Windows parity (Metal-only line); a Hit
+Lighting perf pass (it re-shades every off-screen pixel — the reference's cache-miss-only gating is a
+possible optimization); wiring the consolidated geometry into a content HW path tracer.
 
 ## Gates
 
