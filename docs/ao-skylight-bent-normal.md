@@ -100,10 +100,42 @@ float ApproximateConeConeIntersection(float ArcLength0, float ArcLength1, float 
 5. **Reconcile** — the bent normal *reuses* the SH sky-vis volume (no second computation). Docs +
    DX≡VK Windows follow-up.
 
+## Status (Metal-verified, `feature/bent-normal-ao-skylight`)
+
+- **Stage 1 — producer** (`9f17dfa`): bent normal written to `gi_skyvis.gba`. Gallery byte-identical
+  (nothing reads `.gba` yet). `P_BENT_NORMAL` default on.
+- **Stage 2 — consumer** (`07f4cbf`): diffuse skylight sampled along the bent normal. Gallery
+  `af70c1a5` byte-identical (scalar fallback). On `sponza_intel` the effect is correctly LOCALIZED
+  to the partial-sky-visibility zone: V(n)≈0 across ~99% of this enclosed hall (the pre-existing
+  sky-vis behaviour the shipped scalar de-blue relies on), where `vis→0` zeroes the directional
+  term (bent-on == bent-off, tint leak only); a smooth, sensible bent normal appears only where the
+  sky is partially visible (`DEBUG_VIEW=13` sky-vis, `14` bent normal). Removed the superseded
+  `occlude_sky_diffuse`.
+- **Stage 3 — multi-bounce AO** (`e31ebda`): `AOMultiBounce(albedo, ao)` on the diffuse AO. Opt-in
+  `P_AO_MULTIBOUNCE` (default off — recolours any AO<1 pixel). Gallery byte-identical off AND on
+  (its `ao·gdf_ao==1`, nothing to act on). On `sponza_intel` enabled it warms AO cavities toward
+  the sandstone albedo (mean +1.95R / +0.22G / −0.94B, the correct energy-return direction).
+- **Stage 4 — specular occlusion** (`0c957c4`): bent-normal cone-cone occlusion of the prefilter-
+  CUBE specular only (`!has_swrt`); the SW-RT reflection is left untouched (it carries its own ray
+  occlusion). Opt-in `P_SPEC_OCCLUSION` (default off). Gallery byte-identical off AND on. Reachable
+  config = cube specular + bent normal (`P11_LEGACY_IBL=1 P11_GDF_GI=1`): enabled, it attenuates the
+  blue sky-specular in occluded interiors (47.8k px, mean −13G/−26B) — indoors stops mirroring the
+  bright sky. In the default SW-RT content path it is intentionally inert.
+- **Stage 5 — reconcile**: the bent normal REUSES the SH sky-vis volume — the band-1 vector
+  `∫V(ω)·ω` that reconstruction previously discarded. The scalar V (band-0-weighted) and the bent
+  direction (band-1 vector) are read from the SAME 4 SH volumes in one pass; no second computation,
+  no extra volumes, no push growth on the producer. SH-L1 sky-vis is thus the single source for
+  BOTH the scalar occlusion strength and the directional bent normal.
+
 ## Gates
 
-- Gallery golden `af70c1a5` byte-identical (all stages).
-- Path-tracer parity (`P8_PATHTRACE=1`, `tools/rt-compare.py`) is the lighting success metric;
-  indoor crevice/curtain directionality should move toward the PT reference.
-- Determinism (run-to-run bit-identical); integer-hash cross-backend safety preserved.
-- DX≡VK Windows parity is a follow-up (Metal-verified here).
+- Gallery golden `af70c1a5` byte-identical — verified after every stage (the deterministic gate).
+- Path-tracer parity is **gallery-only**: the HW path tracer has no content-scene BLAS, so
+  `P8_PATHTRACE=1` on `sponza_intel` falls back to the raster and is NOT a usable reference there
+  (measured: `pt` ≈ scalar raster). The content scene is also non-deterministic run-to-run (~0.28
+  mean, the host-readback GI convergence latch), so byte-exact content A/B isn't possible; validation
+  used isolated debug views + effect magnitude vs the noise floor.
+- Determinism of the gallery anchor preserved; integer-hash / SH reconstruction is cross-backend
+  deterministic.
+- **DX≡VK Windows parity is the outstanding follow-up** (Metal-verified here). The two new pbr push
+  fields (`ao_multibounce`, `spec_occlusion`) are trailing u32 scalars (76→84B) — layout-safe.
