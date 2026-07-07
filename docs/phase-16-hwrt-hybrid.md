@@ -66,16 +66,38 @@ visible win needs one of:
 
 ## Remaining — Phase E: Hit Lighting (deferred, large)
 
-Full material + shadow-ray evaluation at the HW hit (reference `HitLighting` / `HitLightingForReflections`).
-Value: sharp/accurate **off-screen** reflections (on-screen is already sharp via B.2/C; off-screen
-currently uses the surface cache). Requires new infrastructure that the SurfaceCache path deliberately
-avoids: **consolidated per-instance geometry + material buffers** — pack all content vertices into ONE
-storage buffer + all indices into ONE + a per-instance offset/material table (the vgeo "4 buffers"
-precedent, [[dreamcoast-vgeo-metal-atomic64]]), dodging the 64-slot per-primitive bindless overflow.
-At a HW hit: `InstanceID → offset table → fetch 3 verts by PrimitiveIndex → barycentric-interpolate
-normal/UV → sample the material texture (bindless) → sun (HW shadow ray) + IBL`. This is a separate
-multi-part feature (Rust consolidated-buffer build + shader fetch/interp/material/shadow); deferred as
-its own phase rather than rushed, since A→D already deliver the visible reflection/GI wins.
+Full material + shadow-ray evaluation at the HW hit for sharp/accurate **off-screen** reflections
+(on-screen is already sharp via B.2/C; off-screen currently uses the surface cache). Opt-in / cache-miss
+only — expensive (full BSDF + N shadow rays per hit).
+
+**How the reference engine does it (extracted verbatim):** Hit Lighting is **RT-PIPELINE ONLY — inline
+RayQuery is explicitly forbidden** (`LumenReflectionHardwareRayTracing.cpp:225`: `if (Inline &&
+HitLighting) return false;`). It relies on the **Shader Binding Table**: each mesh/material has its own
+closest-hit shader (`MaterialCHS`, `RayTracingMaterialHitShaders.usf:639`); at a hit the HW invokes that
+material's shader, which **automatically** interpolates the triangle's vertex attributes
+(`CalcInterpolants`) and evaluates the material (`GetMaterialPixelParameters`) into a full material
+payload (`FPackedMaterialClosestHitPayload`) — **no manual geometry/material buffer fetch**. Lighting is
+then `CalculateLightingAtHit` → `CalculateDirectLighting` → `AccumulateResults` (a **shadow ray per
+light against the TLAS**) + skylight; secondary bounces stay on the surface cache. A **two-pass bookmark**
+(`FLumenRayHitBookmark`) lets the cheap SurfaceCache DEFAULT pass record the hit so the HitLighting pass
+re-shades the SAME hit **without re-traversing the BVH**, and only for cache-miss pixels
+(`!Result.bIsRadianceCompleted`).
+
+**Two approaches for our engine (a genuine fork):**
+- **(a) Reference-faithful — RT pipeline + SBT.** Route reflection rays through our RT pipeline (M5/M7,
+  Metal Shader Converter) with per-material closest-hit shaders; geometry/material fetch is automatic per
+  hit-group. Scales to many materials, but needs SBT management across ~448 meshes + material hit shaders,
+  and leans on the Metal RT-pipeline path (less battle-tested than our inline RayQuery).
+- **(b) Inline + consolidated geometry.** Keep the inline compute reflection and fetch geometry/material
+  manually: pack all content verts→1 storage buffer, indices→1, + a per-instance offset/material table
+  (vgeo "4 buffers" precedent, [[dreamcoast-vgeo-metal-atomic64]]), dodging the 64-slot per-primitive
+  bindless overflow. At a hit: `InstanceID → offset → fetch 3 verts by PrimitiveIndex → barycentric
+  normal/UV → material tex → sun (HW shadow ray) + IBL`. Fits our current inline architecture (no SBT),
+  but is a deviation from how the reference does it.
+
+**Reusable now:** the reference's two-pass **bookmark** structure maps directly onto ours — keep B
+(SurfaceCache) as pass 1, run E (HitLighting) only on cache-miss pixels as pass 2. Deferred as its own
+phase (either approach is multi-part) rather than rushed, since A→D already deliver the visible wins.
 
 ## Roadmap
 
