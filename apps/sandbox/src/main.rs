@@ -819,6 +819,9 @@ struct App {
     /// device is RT-capable AND the content scene's TLAS was built. The reflection trace then routes
     /// through the scene BVH + surface-cache shading instead of the GDF sphere-march. Default off.
     hwrt: bool,
+    /// Phase 16 C: `P_HWRT_FULLRES` — trace the HWRT reflection at full resolution (crisp mirror,
+    /// ~4x cost). Implies `hwrt`. Default off keeps the half-res HWRT trace for interactive perf.
+    hwrt_fullres: bool,
     /// Bent-normal skylight: when true (`P_BENT_NORMAL`, default on) the GI pass writes the SH
     /// sky-vis band-1 vector (the DFAO bent normal) into the sky-vis image so the lighting samples
     /// the diffuse skylight along it. Only affects the content sky-vis path; gallery byte-identical.
@@ -1777,6 +1780,11 @@ impl App {
             rt.build_content_accel(&device, &world.draw_list(), &mesh_registry);
         }
         let hwrt = hwrt && rt.has_content_scene();
+        // Phase 16 C: `P_HWRT_FULLRES=1` traces the HWRT reflection at FULL resolution (no half-res
+        // trace + upsample) for a crisp mirror — dramatically sharper on the chrome ball / floor, but
+        // ~4x the reflection cost (a quality/screenshot mode). Default (P_HWRT alone) keeps the half-res
+        // trace for interactive perf. Requires HWRT.
+        let hwrt_fullres = hwrt && std::env::var_os("P_HWRT_FULLRES").is_some();
 
         // Scalable-GI Stage 0: fuse the opaque draw list into one world-space triangle
         // soup and register it as the scene GDF (baked once on the graph). Ground is
@@ -3176,6 +3184,7 @@ impl App {
             gdf_gi,
             hwrt_gi,
             hwrt,
+            hwrt_fullres,
             bent_normal,
             ao_multibounce,
             spec_occlusion,
@@ -5120,7 +5129,9 @@ impl App {
         // A3: (re)allocate the adaptive-skip ping-pong at the gdf_reflect TRACE extent (half-res when
         // reflect_half_res). Divisor mirrors the record path (rdiv=1 when full-res).
         if self.swrt_reflect && self.reflect_skip && self.reflect.has_gdf_reflect() {
-            let rdiv = if self.reflect_half_res {
+            // Mirror the record path: P_HWRT_FULLRES forces full-res (rdiv 1) so the skip ping-pong
+            // matches the trace extent (Phase 16 C).
+            let rdiv = if self.reflect_half_res && !self.hwrt_fullres {
                 self.reflect_res_div.max(1)
             } else {
                 1
@@ -6080,7 +6091,10 @@ impl App {
                 // the legacy half-res exactly (`cw.div_ceil(2)` == the old `hcw/hch`); the Apple tier
                 // uses `div = 4` (quarter-res) — the measured single lever on gdf_reflect. Gallery keeps
                 // `reflect_half_res` off ⇒ div collapses to 1 (full-res, byte-identical anchor).
-                let refl_half = self.reflect_half_res;
+                // Phase 16 C: `P_HWRT_FULLRES` traces the HWRT reflection at FULL resolution — removes
+                // the residual half-res blockiness on the chrome ball / floor (a crisp mirror) at ~4x
+                // cost (a quality/screenshot mode). Default HWRT keeps the half-res trace for perf.
+                let refl_half = self.reflect_half_res && !self.hwrt_fullres;
                 let rdiv = if refl_half {
                     self.reflect_res_div.max(1)
                 } else {
