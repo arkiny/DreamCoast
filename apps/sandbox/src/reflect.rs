@@ -855,6 +855,9 @@ impl ReflectSystem {
         // that validation exists, the (HQ) GDF/cache is the cleaner mirror source. Gallery passes false
         // → byte-identical anchor.
         skip_mirror_ssr: bool,
+        // Roughness-scaled blur radius (texels) that smooths the low-res reflection's blocky
+        // "sparkle" on rough surfaces while keeping its correct local colour. 0 = off (gallery).
+        rough_blur: f32,
     ) -> ResourceId {
         let pipe = self
             .composite_pipeline
@@ -885,6 +888,7 @@ impl ReflectSystem {
                     material_index,
                     max_roughness,
                     skip_mirror_ssr,
+                    rough_blur,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

@@ -29,12 +29,46 @@ struct CompositePush
     uint material_index; // sampled full-res G-buffer material (g = roughness)
     float max_roughness; // SSR (screen mirror) fades out by this roughness; above it = GDF only
     uint pad0;
-    uint pad1;
+    float rough_blur;    // max roughness-blur radius in texels (0 = off, gallery byte-identical)
     uint pad2;
 };
 
 [[vk::push_constant]]
 ConstantBuffer<CompositePush> pc : register(b0, space0);
+
+// Roughness-scaled blur of the low-res GDF reflection. The rough lobe is traced at reduced
+// resolution (perf), so the reflection of bright geometry arrives as coarse blocks the bilateral
+// upsample leaves as soft "sparkle" patches on the floor. A rough reflection is low-frequency, so
+// blurring it is physically fine AND keeps the traced reflection's correct LOCAL colour (unlike a
+// prefilter-cube fallback, which is sky-blue). Taps are weighted by roughness similarity so a rough
+// surface never pulls in a neighbouring mirror's sharp reflection. rough_blur == 0 => plain fetch
+// (gallery anchor). Deterministic (fixed tap ring) => cross-backend safe.
+float3 blur_gdf(float2 uv, float roughness, float2 res)
+{
+    float3 c = g.textures[pc.gdf_index].SampleLevel(g.samp, uv, 0.0).rgb;
+    float radius = pc.rough_blur * smoothstep(0.4, 0.9, roughness);
+    if (radius < 0.5)
+        return c;
+    float2 texel = radius / res;
+    float3 sum = c;
+    float wsum = 1.0;
+    // 8-tap ring (unit circle), deterministic — one blurred sample per rough pixel, cheap full-res.
+    const float2 dirs[8] = {
+        float2(1, 0), float2(0.707, 0.707), float2(0, 1), float2(-0.707, 0.707),
+        float2(-1, 0), float2(-0.707, -0.707), float2(0, -1), float2(0.707, -0.707),
+    };
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        float2 suv = uv + dirs[i] * texel;
+        float3 s = g.textures[pc.gdf_index].SampleLevel(g.samp, suv, 0.0).rgb;
+        float rn = g.textures[pc.material_index].SampleLevel(g.samp, suv, 0.0).g;
+        float w = saturate(1.0 - abs(rn - roughness) * 4.0); // roughness-similarity edge stop
+        sum += s * w;
+        wsum += w;
+    }
+    return sum / wsum;
+}
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -45,8 +79,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 
     float2 uv = (float2(tid.xy) + 0.5) / float2(pc.width, pc.height);
     float4 ssr = g.textures[pc.ssr_index].SampleLevel(g.samp, uv, 0.0);
-    float3 gdf = g.textures[pc.gdf_index].SampleLevel(g.samp, uv, 0.0).rgb * pc.gdf_scale;
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
+    float3 gdf = blur_gdf(uv, roughness, float2(pc.width, pc.height)) * pc.gdf_scale;
 
     // --- Blend (C8d): SSR owns the sharp end; the GDF takes over past `max_roughness`.
     //   * `ssr.a` (edge-fade / hit confidence) routes off-screen misses to the GDF / sky fallback.

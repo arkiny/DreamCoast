@@ -911,6 +911,10 @@ struct App {
     /// Reflection temporal history clamp (0 off / 1 hard / 2 variance; gallery forced 0) + variance γ.
     reflect_history_clamp: u32,
     reflect_clamp_gamma: f32,
+    /// Roughness-scaled blur radius (texels) applied to the low-res reflection in the composite to
+    /// smooth its blocky "sparkle" on rough content surfaces (the floor) while keeping the traced
+    /// reflection's correct local colour. `P_REFL_ROUGH_BLUR`; 0 = off, gallery forced to 0.
+    reflect_rough_blur: f32,
     /// SSR resolve history neighbourhood clamp (breaks the mirror lit-history feedback oscillation a
     /// plain EMA only low-passes): 0 = off (byte-identical), 1 = variance clamp (mean ± γ·σ). Gallery
     /// forced 0. `P_SSR_HISTORY_CLAMP` / `P_SSR_CLAMP_GAMMA` override.
@@ -2761,6 +2765,13 @@ impl App {
                 0.5
             })
             .clamp(0.0, 8.0);
+        // Roughness-scaled reflection blur radius (texels) — smooths the low-res reflection's blocky
+        // sparkle on rough content surfaces. Content default 6.0; gallery forced 0 at the call site.
+        let reflect_rough_blur = std::env::var("P_REFL_ROUGH_BLUR")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(6.0)
+            .clamp(0.0, 32.0);
         // SSR-resolve history feedback clamp (0 off / 1 variance). Gallery base is 0 (byte-identical
         // anchor); content tiers default 0 too pending DX=VK verification. `P_SSR_HISTORY_CLAMP` +
         // `P_SSR_CLAMP_GAMMA` override (set =1 to break the mirror lit-history feedback shimmer).
@@ -3180,6 +3191,7 @@ impl App {
             sc_viz,
             reflect_history_clamp,
             reflect_clamp_gamma,
+            reflect_rough_blur,
             ssr_history_clamp,
             ssr_clamp_gamma,
             gi_temporal_clamp,
@@ -6179,6 +6191,13 @@ impl App {
                     firefly_max,
                     self.reflect_max_roughness,
                     !self.is_gallery, // content: near-mirror uses GDF/cache, not the unreliable SSR
+                    // Roughness-blur the low-res reflection to smooth its blocky sparkle on rough
+                    // content surfaces (the floor); 0 on the gallery = byte-identical anchor.
+                    if self.is_gallery {
+                        0.0
+                    } else {
+                        self.reflect_rough_blur
+                    },
                 ))
             }
             _ => None,
@@ -6859,6 +6878,11 @@ impl App {
                     firefly_max,
                     self.reflect_max_roughness,
                     false, // standalone SSR/hybrid viz — keep the full SSR blend
+                    if self.is_gallery {
+                        0.0
+                    } else {
+                        self.reflect_rough_blur
+                    },
                 );
                 // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
                 self.reflect.record_lit_history(
