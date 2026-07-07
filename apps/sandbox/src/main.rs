@@ -815,6 +815,10 @@ struct App {
     /// first increment returns a hardware-traced VISIBILITY term only (hit lighting is a later
     /// increment) and requires the BLAS/TLAS built by `rt.rs` (currently the gallery scene only).
     hwrt_gi: bool,
+    /// Phase 16 HWRT hybrid: hardware-ray-traced reflections opt-in (`P_HWRT`). True only when the
+    /// device is RT-capable AND the content scene's TLAS was built. The reflection trace then routes
+    /// through the scene BVH + surface-cache shading instead of the GDF sphere-march. Default off.
+    hwrt: bool,
     /// Bent-normal skylight: when true (`P_BENT_NORMAL`, default on) the GI pass writes the SH
     /// sky-vis band-1 vector (the DFAO bent normal) into the sky-vis image so the lighting samples
     /// the diffuse skylight along it. Only affects the content sky-vis path; gallery byte-identical.
@@ -1747,7 +1751,7 @@ impl App {
         // scene — plus the M3/M4/M5 RT pipelines. See `rt.rs`. The sample scene's TLAS
         // is bound on construction (the startup default). The instance table's mesh
         // order MUST match the TLAS custom_index order (scene objects, then ground).
-        let rt = RtSystem::new(
+        let mut rt = RtSystem::new(
             &device,
             backend,
             &scene,
@@ -1758,6 +1762,21 @@ impl App {
             ground_count,
             gallery_scene,
         )?;
+
+        // Phase 16 (HWRT hybrid): opt-in hardware-ray-traced reflections. `P_HWRT=1` builds the
+        // CONTENT scene's BLAS/TLAS (the gallery uses its own path-tracer accel) and routes the
+        // reflection trace through the scene TLAS + surface-cache shading. Requires an RT-capable
+        // device; default off keeps the SW-RT path (gallery byte-identical). Only for content
+        // scenes with geometry (the ECS draw list); world-streaming mode is out of scope.
+        let hwrt = std::env::var_os("P_HWRT").is_some()
+            && device.has_raytracing()
+            && !gallery_scene
+            && !world_mode
+            && !world.draw_list().is_empty();
+        if hwrt {
+            rt.build_content_accel(&device, &world.draw_list(), &mesh_registry);
+        }
+        let hwrt = hwrt && rt.has_content_scene();
 
         // Scalable-GI Stage 0: fuse the opaque draw list into one world-space triangle
         // soup and register it as the scene GDF (baked once on the graph). Ground is
@@ -3156,6 +3175,7 @@ impl App {
             ssao_params,
             gdf_gi,
             hwrt_gi,
+            hwrt,
             bent_normal,
             ao_multibounce,
             spec_occlusion,
@@ -6137,6 +6157,7 @@ impl App {
                             _ => [u32::MAX; 4],
                         }
                     },
+                    self.hwrt,
                 );
                 let gdf_refl = if refl_half {
                     self.gi.record_upsample(
@@ -6776,6 +6797,7 @@ impl App {
                 self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
                 self.gdf_cone_k,
                 [u32::MAX; 4], // viz path: no adaptive skip
+                self.hwrt,
             )),
             _ => None,
         };
@@ -6863,6 +6885,7 @@ impl App {
                     self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
                     self.gdf_cone_k,
                     [u32::MAX; 4], // standalone viz: no adaptive skip
+                    self.hwrt,
                 );
                 // Standalone viz: no temporal resolve buffers here, so feed the GDF reflection
                 // straight into the composite (the resolve runs only in the lighting-fed path).

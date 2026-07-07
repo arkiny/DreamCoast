@@ -230,12 +230,16 @@ fn defines_for(target: &str, key: &str) -> &'static [(&'static str, &'static str
     // the default `gdf_gi` leaves it out so it references no acceleration structure — Slang then
     // omits the TLAS binding, keeping the scalable SW-default GI independent of RT capability and
     // free of the RT path's register pressure. HW-RT is loaded only when opted in (a High tier).
-    let hwrt = key == "gdf_gi_hwrt_cs";
-    match (target, hwrt) {
-        ("metallib", true) => &[("RT_METAL_TARGET", "1"), ("HWRT_GI", "1")],
-        ("metallib", false) => &[("RT_METAL_TARGET", "1")],
-        (_, true) => &[("HWRT_GI", "1")],
-        (_, false) => &[],
+    // The `gdf_reflect_hwrt` permutation (Phase 16 HWRT hybrid) is the same shape: `HWRT_REFLECT`
+    // compiles the hardware-ray-traced reflection trace in; the default `gdf_reflect` omits it.
+    let metal = target == "metallib";
+    match (metal, key) {
+        (true, "gdf_gi_hwrt_cs") => &[("RT_METAL_TARGET", "1"), ("HWRT_GI", "1")],
+        (false, "gdf_gi_hwrt_cs") => &[("HWRT_GI", "1")],
+        (true, "gdf_reflect_hwrt_cs") => &[("RT_METAL_TARGET", "1"), ("HWRT_REFLECT", "1")],
+        (false, "gdf_reflect_hwrt_cs") => &[("HWRT_REFLECT", "1")],
+        (true, _) => &[("RT_METAL_TARGET", "1")],
+        (false, _) => &[],
     }
 }
 
@@ -1055,6 +1059,16 @@ const JOBS: &[Job] = &[
         entry: "csMain",
         stage: "compute",
         key: "gdf_reflect_cs",
+    },
+    // Phase 16 HWRT hybrid: the same reflection shader with the hardware-ray-traced trace compiled
+    // in (`HWRT_REFLECT`, via `defines_for`) — traces the scene TLAS instead of the GDF march, then
+    // shades the hit from the surface cache. Loaded only when `P_HWRT` is opted in on an RT-capable
+    // device; the default variant above references no acceleration structure.
+    Job {
+        src: "gdf_reflect.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_reflect_hwrt_cs",
     },
     // Phase 11 Stage C (C7): hybrid reflection composite (SSR over GDF / sky).
     Job {

@@ -22,9 +22,13 @@ pub(crate) struct ReflectSystem {
     ssr_pipeline: Option<ComputePipeline>, // C5 screen-space reflections (stochastic half-res)
     ssr_resolve_pipeline: Option<ComputePipeline>, // stochastic SSR temporal resolve
     reflect_pipeline: Option<ComputePipeline>, // C6 GDF reflection fallback
+    /// Phase 16 HWRT hybrid: the reflection shader's `HWRT_REFLECT` permutation (traces the scene
+    /// TLAS instead of the GDF march, then shades the hit from the surface cache). Built only on
+    /// RT-capable devices; bound in place of `reflect_pipeline` when `P_HWRT` is opted in.
+    reflect_hwrt_pipeline: Option<ComputePipeline>,
     composite_pipeline: Option<ComputePipeline>, // C7 hybrid composite
     lit_history_pipeline: Option<ComputePipeline>, // C7b lit-color history capture
-    temporal_pipeline: Option<ComputePipeline>, // C8j stochastic-GDF-reflection temporal resolve
+    temporal_pipeline: Option<ComputePipeline>,  // C8j stochastic-GDF-reflection temporal resolve
     /// C8j stochastic GDF reflection temporal accumulation: ping-pong byte-address buffers —
     /// `accum` (tonemap-space rgb + history len) and `pos` (surface world point + valid), at the
     /// full render extent. The resolve reprojects the surface into the previous frame.
@@ -110,6 +114,20 @@ impl ReflectSystem {
             240,
             false,
         )?;
+        // Phase 16 HWRT hybrid permutation — same push layout (240B), traces the TLAS. Built only on
+        // RT-capable devices (it references the acceleration structure); absent ⇒ SW march is used.
+        let reflect_hwrt_pipeline = if device.has_raytracing() {
+            compute(
+                dreamcoast_shader::gdf_reflect_hwrt_cs_spirv,
+                dreamcoast_shader::gdf_reflect_hwrt_cs_dxil,
+                dreamcoast_shader::gdf_reflect_hwrt_cs_metallib,
+                "gdf_reflect_hwrt",
+                240,
+                false,
+            )?
+        } else {
+            None
+        };
         let composite_pipeline = compute(
             dreamcoast_shader::reflect_composite_cs_spirv,
             dreamcoast_shader::reflect_composite_cs_dxil,
@@ -139,6 +157,7 @@ impl ReflectSystem {
             ssr_pipeline,
             ssr_resolve_pipeline,
             reflect_pipeline,
+            reflect_hwrt_pipeline,
             composite_pipeline,
             lit_history_pipeline,
             temporal_pipeline,
@@ -717,11 +736,20 @@ impl ReflectSystem {
         // A3 adaptive temporal skip: (read_idx, write_idx, K stagger, real frame). read == u32::MAX
         // disables reuse; write == u32::MAX disables the persist. Both sentinel = legacy full trace.
         skip: [u32; 4],
+        // Phase 16 HWRT hybrid: when true, trace the reflection ray against the scene TLAS (the
+        // `HWRT_REFLECT` permutation) instead of the GDF sphere-march. Same push layout; the hit is
+        // still shaded from the surface cache. Falls back to the SW pipeline if the permutation is
+        // absent (non-RT device). Default false ⇒ SW march (gallery byte-identical).
+        hwrt: bool,
     ) -> ResourceId {
-        let pipe = self
-            .reflect_pipeline
-            .as_ref()
-            .expect("gdf reflect pipeline");
+        let pipe = if hwrt {
+            self.reflect_hwrt_pipeline
+                .as_ref()
+                .or(self.reflect_pipeline.as_ref())
+        } else {
+            self.reflect_pipeline.as_ref()
+        }
+        .expect("gdf reflect pipeline");
         let out = graph.create_storage_image("gdf_reflect_out", HDR_FORMAT, extent);
         let sampled = scene_gdf.sampled_index();
         let diag = {

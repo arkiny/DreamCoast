@@ -21,10 +21,16 @@ use rhi::{
 };
 use tracing::info;
 
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use dreamcoast_scene::{Drawable, MeshHandle};
+
 use crate::SceneObject;
 use crate::app::load_compute_shader;
 use crate::mesh::{PtMaterial, build_pt_instance_table};
 use crate::push::{mat4_to_3x4, rt_path_push, rt_trace_push};
+use crate::registry::{GpuMesh, MeshRegistry};
 
 pub(crate) struct RtSystem {
     /// M3 inline ray-query trace (compute + `RayQuery`).
@@ -35,6 +41,10 @@ pub(crate) struct RtSystem {
     pt_pipeline: Option<RaytracingPipeline>,
     /// Sample scene: BLAS-per-mesh + one TLAS (kept alive while bound).
     scene: Option<RaytracingScene>,
+    /// Content scene (Phase 16 HWRT hybrid): per-unique-mesh BLAS + one world TLAS built from the
+    /// ECS draw list, for the hardware-ray-traced reflection/GI trace. Opt-in (`P_HWRT`); the
+    /// gallery uses `scene` above instead. Kept alive while its TLAS is bound.
+    content_scene: Option<RaytracingScene>,
     /// Path-tracer per-instance table (vertex/index SB indices + material).
     instance_table: Option<StorageBuffer>,
     /// Keeps the per-instance vertex/index storage buffers alive for the table.
@@ -331,6 +341,7 @@ impl RtSystem {
             path_pipeline,
             pt_pipeline,
             scene: scene_rt,
+            content_scene: None,
             instance_table,
             _geometry: geometry,
             instance_count,
@@ -344,6 +355,81 @@ impl RtSystem {
             last_pt_key: None,
             bound_cornell: false,
         })
+    }
+
+    /// Phase 16 (HWRT hybrid): build the CONTENT scene's acceleration structures — one BLAS per
+    /// unique mesh referenced by the ECS draw list, and a single TLAS over the drawable instances
+    /// (world transforms) — then bind the TLAS into the bindless table so the hardware-ray-traced
+    /// reflection/GI compute passes can trace `g.tlas`. Unlike the path tracer's per-instance
+    /// geometry table (which needs one vertex + one index storage buffer per instance and would
+    /// overflow the 64-slot bindless limit on a 400+ mesh scene), this builds ONLY the TLAS (one
+    /// bindless slot): the hardware ray returns a hit position/distance, and the hit is shaded from
+    /// the surface cache (SurfaceCache mode), so no per-hit geometry lookup is required. Opt-in
+    /// (`P_HWRT`); the gallery keeps its own `scene` accel. No-op without an RT-capable device or on
+    /// an empty draw list. The `RaytracingScene` is stored so its BLAS/TLAS outlive the frame loop.
+    pub(crate) fn build_content_accel(
+        &mut self,
+        device: &Device,
+        drawables: &[Drawable],
+        registry: &MeshRegistry,
+    ) {
+        if !device.has_raytracing() || drawables.is_empty() {
+            return;
+        }
+        // Unique meshes, in first-seen draw order → one BLAS each (deduped so instanced content
+        // shares a BLAS). `index_of` maps a mesh handle to its BLAS index in the geometry list.
+        let mut order: Vec<MeshHandle> = Vec::new();
+        let mut index_of: HashMap<MeshHandle, u32> = HashMap::new();
+        for d in drawables {
+            index_of.entry(d.mesh).or_insert_with(|| {
+                let idx = order.len() as u32;
+                order.push(d.mesh);
+                idx
+            });
+        }
+        // Hold the `Rc<GpuMesh>` handles alive across the build; `RtGeometry` borrows their buffers.
+        let meshes: Vec<Rc<GpuMesh>> = order.iter().map(|&h| registry.get(h)).collect();
+        let geoms: Vec<RtGeometry> = meshes
+            .iter()
+            .map(|m| RtGeometry {
+                vertex_buffer: &m.vbuf,
+                index_buffer: &m.ibuf,
+                geometry: BlasGeometry {
+                    vertex_count: m.vertex_count,
+                    vertex_stride: 32,
+                    index_count: m.index_count,
+                },
+            })
+            .collect();
+        let instances: Vec<TlasInstance> = drawables
+            .iter()
+            .enumerate()
+            .map(|(i, d)| TlasInstance {
+                blas_index: index_of[&d.mesh],
+                transform: mat4_to_3x4(d.world),
+                custom_index: i as u32,
+                mask: 0xFF,
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        match device.build_raytracing_scene(&geoms, &instances) {
+            Ok(s) => {
+                device.bind_tlas(&s);
+                info!(
+                    "content ray-tracing scene built: {} BLAS + 1 TLAS ({} instances) in {:.1}ms",
+                    geoms.len(),
+                    instances.len(),
+                    started.elapsed().as_secs_f32() * 1000.0
+                );
+                self.content_scene = Some(s);
+            }
+            Err(e) => tracing::error!("content ray-tracing scene build failed: {e}"),
+        }
+    }
+
+    /// Whether the content scene's TLAS was built (Phase 16 HWRT hybrid opt-in).
+    pub(crate) fn has_content_scene(&self) -> bool {
+        self.content_scene.is_some()
     }
 
     // Feature-availability predicates (drive the UI + toggle defaults).

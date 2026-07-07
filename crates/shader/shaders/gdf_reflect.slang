@@ -362,12 +362,35 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     uint irr_idx = vol_on ? asuint(pc.params.z) : 0xFFFFFFFFu;
     bool has_irr = irr_idx != 0xFFFFFFFFu;
 
-    // Sphere-trace the reflection ray. Stage D3: content lowers the step cap; gallery = 96.
-    int max_steps = int(max(pc.max_steps & 0x7FFFFFFFu, 1u));
-    const float HIT_EPS = 0.001;
     float t = bias;
     bool hit = false;
     float3 hp = p;
+#ifdef HWRT_REFLECT
+    // Phase 16 hybrid: trace the reflection ray against the REAL triangle BVH (the scene TLAS) with
+    // an inline RayQuery instead of the GDF sphere-march — exact hit points, no distance-field
+    // leaking or low-res card blockiness (the floor sparkle / blurry chrome). The hit is shaded from
+    // the surface cache below EXACTLY as the SW path (SurfaceCache mode), so only the trace changes.
+    // Closest-hit pattern mirrors rt_trace.slang (RAY_FLAG_NONE + single Proceed + CommittedRayT).
+    {
+        RayDesc ray;
+        ray.Origin = p;
+        ray.Direction = dir;
+        ray.TMin = bias; // avoid self-intersecting the origin surface
+        ray.TMax = max_dist;
+        RayQuery<RAY_FLAG_NONE> q;
+        q.TraceRayInline(g.tlas, RAY_FLAG_NONE, 0xFF, ray);
+        q.Proceed();
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+        {
+            t = q.CommittedRayT();
+            hp = p + dir * t;
+            hit = true;
+        }
+    }
+#else
+    // Sphere-trace the reflection ray. Stage D3: content lowers the step cap; gallery = 96.
+    int max_steps = int(max(pc.max_steps & 0x7FFFFFFFu, 1u));
+    const float HIT_EPS = 0.001;
     for (int i = 0; i < max_steps; i++)
     {
         float3 rp = p + dir * t;
@@ -383,6 +406,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         if (t > max_dist)
             break;
     }
+#endif
 
     float3 color;
     if (hit)
