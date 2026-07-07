@@ -177,6 +177,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         if (pc.vol_g != 0xFFFFFFFFu && pc.vol_b != 0xFFFFFFFFu)
         {
             float v = 1.0;
+            // Bent normal (unoccluded average direction). A zero vector = scalar fallback: the
+            // lighting then samples the diffuse skylight along the surface normal (the legacy path,
+            // byte-identical). A real bent normal is written only when P_BENT_NORMAL (flip bit1) is
+            // set and the probe grid covers this pixel.
+            float3 bent = float3(0.0, 0.0, 0.0);
             if (all(uvw >= 0.0) && all(uvw <= 1.0))
             {
                 float sc[4];
@@ -186,8 +191,21 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 v = sc[0] * SH_C0
                     + (2.0 / 3.0) * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2] + SH_C1 * n.x * sc[3]);
                 v = saturate(v);
+                // The band-1 SH vector IS the bent normal: sc[k] = Σ V(ω)·(SH_C1·ω_axis), so the
+                // vector (sc3, sc1, sc2) = ∫ V(ω)·ω dω = the visibility-weighted average unoccluded
+                // direction (the reference DFAO Σ ConeVisibility·ConeDir, recovered for free from
+                // coefficients we already sample). SH basis maps sc1→y, sc2→z, sc3→x. Written
+                // unit-length; the scalar V above stays the occlusion strength (as the reference
+                // keeps SkyVisibility separate from the normalized bent direction).
+                if ((pc.flip_y & 2u) != 0u)
+                {
+                    float3 b = float3(sc[3], sc[1], sc[2]);
+                    float bl = length(b);
+                    if (bl > 1e-5)
+                        bent = b / bl;
+                }
             }
-            g.storage_images[pc.vol_b][tid.xy] = float4(v, 0.0, 0.0, 1.0);
+            g.storage_images[pc.vol_b][tid.xy] = float4(v, bent);
         }
         return;
     }

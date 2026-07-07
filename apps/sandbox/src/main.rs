@@ -815,6 +815,10 @@ struct App {
     /// first increment returns a hardware-traced VISIBILITY term only (hit lighting is a later
     /// increment) and requires the BLAS/TLAS built by `rt.rs` (currently the gallery scene only).
     hwrt_gi: bool,
+    /// Bent-normal skylight: when true (`P_BENT_NORMAL`, default on) the GI pass writes the SH
+    /// sky-vis band-1 vector (the DFAO bent normal) into the sky-vis image so the lighting samples
+    /// the diffuse skylight along it. Only affects the content sky-vis path; gallery byte-identical.
+    bent_normal: bool,
     /// 레퍼런스 엔진 GI-fidelity: world irradiance volume (DDGI-lite radiance cache). When on, the GI pass
     /// samples a multibounce-propagating world volume instead of a single-bounce ray march — the
     /// real fix for deep-interior darkness. Content-only (`P_GI_VOLUME`); gallery forced off.
@@ -2480,6 +2484,12 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        // Bent-normal skylight: the GI pass writes the unoccluded average direction (the SH sky-vis
+        // band-1 vector = the DFAO bent normal) into the sky-vis image so the lighting can sample the
+        // diffuse skylight ALONG it (directional indoor occlusion) instead of the scalar V multiply.
+        // Default on for content (the sky-vis image is content-only → gallery byte-identical anyway);
+        // `P_BENT_NORMAL=0` zeroes the bent normal for A/B (pbr then falls back to the scalar path).
+        let bent_normal = quality::env_bool("P_BENT_NORMAL", true);
         // PR-4 (render-pipeline re-baseline track): opt-in analytic height fog. Off by default
         // (`P_HEIGHT_FOG=1` to enable) so the byte-identical gallery/regression anchors are
         // untouched — the atmosphere slot exists in the graph wiring unconditionally, but the
@@ -3107,6 +3117,7 @@ impl App {
             ssao_params,
             gdf_gi,
             hwrt_gi,
+            bent_normal,
             gi_volume,
             gi_volume_period: std::env::var("P_GI_VOLUME_PERIOD")
                 .ok()
@@ -5783,7 +5794,10 @@ impl App {
                     self.sun_intensity,
                     gw,
                     gh,
-                    self.flip_y,
+                    // bit1 = write the bent normal into the sky-vis image (P_BENT_NORMAL); bit0 is
+                    // the clip-space Y flip. gdf_gi only masks bit0 for reconstruction, so bit1 is
+                    // a safe side channel with zero push growth.
+                    self.flip_y | if self.bent_normal { 2 } else { 0 },
                     self.gi_spp,
                     self.frame_no as u32,
                     scene_albedo,
