@@ -956,6 +956,13 @@ struct App {
     /// (`=1` selects the reference-like default 0.4); 0 = off (content opt-in; gallery never sets
     /// it → anchor untouched). Rides `max_steps` bits 16..23 on the SW trace.
     reflect_prefilter: f32,
+    /// B2' glossy sample density: GGX rays per pixel per frame for the stochastic glossy band
+    /// (mirror < roughness < prefilter) — the direct fix for the ~50x undersampling (a denoiser
+    /// cannot average in radiance the rays never sampled). Samples advance the SAME low-discrepancy
+    /// sequence (seq = frame*K + s) and average in the tonemapped denoiser space; the A1 resolve
+    /// reconstructs all K neighbour rays. `P_REFLECT_GLOSSY_SPP=<K>` (1 = legacy single ray, the
+    /// default; content SW trace only). Rides `max_steps` bits 24..29.
+    reflect_glossy_spp: u32,
     /// Track C0-fix: surface-cache relight CONVERGE mode — K-cycle deterministic gather jitter +
     /// running-mean α=1/(1+N) (reference radiosity NumFramesAccumulated), so a static scene's cache
     /// actually reaches a fixed point and the measured freeze latch can arm. 0 = legacy (fixed-alpha
@@ -2890,6 +2897,16 @@ impl App {
                 .map(|v| if v == 1.0 { 0.4 } else { v.clamp(0.0, 0.996) })
                 .unwrap_or(0.0)
         };
+        // B2' glossy sample density: K GGX rays/pixel/frame for the stochastic glossy band.
+        let reflect_glossy_spp = if gallery_scene {
+            1
+        } else {
+            std::env::var("P_REFLECT_GLOSSY_SPP")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1)
+                .clamp(1, 32)
+        };
         // Track C0-fix: static-scene convergence seams (see the field docs). Content opt-in.
         let cache_converge = if gallery_scene {
             0
@@ -3350,6 +3367,7 @@ impl App {
             reflect_spatial_kernel,
             reflect_stochastic,
             reflect_prefilter,
+            reflect_glossy_spp,
             cache_converge,
             gi_stable,
             ssr_history_clamp,
@@ -6344,9 +6362,10 @@ impl App {
                     scene_clip,
                     &scene_clip_vols,
                     // bit31 = content flag (mirror threshold); bit30 = A5 blue-noise stochastic;
-                    // bits 16..23 = B2' rough-prefilter threshold (roughness*255, 0 = off). All SW
-                    // trace only — HWRT's max_steps field carries the lit-history index instead
-                    // (the step cap itself fits in bits 0..15, tiers cap it at 256).
+                    // bits 16..23 = B2' rough-prefilter threshold (roughness*255, 0 = off);
+                    // bits 24..29 = B2' glossy samples/pixel K. All SW trace only — HWRT's
+                    // max_steps field carries the lit-history index instead (the step cap itself
+                    // fits in bits 0..15, tiers cap it at 256).
                     self.reflect_max_steps
                         | if self.is_gallery { 0 } else { 0x8000_0000 }
                         | if self.reflect_stochastic && !self.hwrt {
@@ -6355,7 +6374,10 @@ impl App {
                             0
                         }
                         | if !self.hwrt {
-                            ((self.reflect_prefilter * 255.0) as u32 & 0xFF) << 16
+                            // K = 1 packs as 0 (the shader floors to 1) so default runs keep a
+                            // bit-stable push block.
+                            (((self.reflect_prefilter * 255.0) as u32 & 0xFF) << 16)
+                                | (((self.reflect_glossy_spp - 1) & 0x3F) << 24)
                         } else {
                             0
                         },
@@ -6419,9 +6441,11 @@ impl App {
                         0.125, // content mirror threshold — keep in lockstep with gdf_reflect.slang
                         self.reflect_resolve_kernel,
                         // bits 0..7: A5 sampler select (reconstruct blue-noise rays when stochastic);
-                        // bits 16..23: B2' prefilter threshold (prefiltered pixels pass through and
-                        // are never borrowed — their ray was a deterministic mirror, not a GGX draw).
+                        // bits 8..15: B2' glossy K-1 (reconstruct all K neighbour rays); bits
+                        // 16..23: B2' prefilter threshold (prefiltered pixels pass through and are
+                        // never borrowed — their ray was a deterministic mirror, not a GGX draw).
                         u32::from(self.reflect_stochastic)
+                            | (((self.reflect_glossy_spp - 1) & 0xFF) << 8)
                             | (((self.reflect_prefilter * 255.0) as u32 & 0xFF) << 16),
                     )
                 } else {

@@ -230,6 +230,22 @@ roughness ≥ 임계 픽셀은 스토캐스틱 GGX 대신 **결정적 미러 레
   둘 다 캐시 커버리지/해상도 = Track C 과제. SSR 기여는 배제 확인(`P11_REFLECT_MAX_ROUGHNESS=0.1` 무변화).
 - 기본 임계 0.4(레퍼런스 등가)에선 볼(0.3)은 스토캐스틱 유지 — 그 밴드는 B2' 샘플 밀도가 담당.
 
+#### B2' 글로시 샘플 밀도 구현 완료 (opt-in `P_REFLECT_GLOSSY_SPP=<K>`, 기본 1)
+스토캐스틱 글로시 밴드(mirror < r < 프리필터) 픽셀이 프레임당 **K개의 GGX 레이**를 트레이스 —
+동일 저불일치 시퀀스를 전진(`seq = frame·K + s`, R2 회전이 K프레임치를 한 프레임에 소화)하고 톤맵
+공간(A1과 동일)에서 평균. A1 resolve는 이웃의 K레이 전부 재구성해 ratio 가중 합산(`Σw_s·L̄`).
+배선: `max_steps` bits 24..29 = K−1(SW 콘텐츠 전용), resolve push bits 8..15. spp==1은 톤맵
+왕복 없이 기존 단일샘플 경로 그대로(비트 호환). 트레이스+셰이드 블록을 per-sample 루프로 랩.
+
+**검증 (glossyball K=8 + HQ 카드, Metal RELEASE):** 얼룩 대부분 소거(hf 7.96→7.62 최저),
+프레임간 플리커 0.368→**0.118**(3× 안정), 갤러리 byte-identical PASS, clippy/fmt clean.
+남은 미관: 반사가 다소 milky — 광각 로브 레이의 스카이 이스케이프(반사 오클루전 부재) 의심, 후속.
+
+**비용 (Metal 타이머, 상대 지표):** gdf_reflect K=1 6.2ms → **K=8 45.6ms(K 선형)** — 예상대로
+스크린-히트 조기 종료(B2' 후반) 없이는 과함. ⚠️**신규 발견: `P11_REFLECT_HQ`(전-drawable 449카드)가
+K=1에서도 30.5ms** — `sample_surface_cache_cone`이 히트당 **전 카드 선형 루프**(O(num_cards))라서.
+K=8+HQ = 245ms. 카드 룩업 가속(공간 해시/per-object 인덱스)이 Track C의 선행 과제로 승격되어야 함.
+
 ### Track B — trace 계층 (온스크린 정확도, HWRT 없이 미러 선명)
 
 #### B1. 검증된 screen-trace-first

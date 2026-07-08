@@ -37,9 +37,12 @@ struct ResolvePush
     float mirror_thresh;    // roughness <= this => deterministic mirror ray (passthrough, no gather)
     float kernel_radius;    // max spatial gather radius in texels (roughness-scaled below)
     uint stochastic;        // bits 0..7: A5 sampler (0 = white jitter, 1 = blue-noise — must match
-                            // gdf_reflect); bits 16..23: rough-prefilter threshold (roughness*255,
-                            // 0 = off) — a prefiltered pixel traced a deterministic mirror ray with
-                            // a wide cone, so it passes through (and can't be borrowed) like a mirror.
+                            // gdf_reflect); bits 8..15: B2' glossy samples/pixel K (0 → 1 — the
+                            // trace averaged K rays at seq = frame*K + s, so the ratio weight sums
+                            // over the same K reconstructions); bits 16..23: rough-prefilter
+                            // threshold (roughness*255, 0 = off) — a prefiltered pixel traced a
+                            // deterministic mirror ray with a wide cone, so it passes through
+                            // (and can't be borrowed) like a mirror.
 };
 
 [[vk::push_constant]]
@@ -70,6 +73,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // blur it); a prefiltered pixel is deterministic + already cone-averaged (nothing to denoise,
     // and its ray was NOT a GGX draw so the ratio weights don't apply).
     uint stoch = pc.stochastic & 0xFFu;
+    uint spp = ((pc.stochastic >> 8) & 0xFFu) + 1u; // packed as K-1 (0 = legacy single ray)
     uint pre8 = (pc.stochastic >> 16) & 0xFFu;
     float pre_thresh = pre8 != 0u ? float(pre8) * (1.0 / 255.0) : 2.0;
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
@@ -107,13 +111,23 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float3 nq = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, nuv, 0.0).xyz);
             float3 nworld = reconstruct(nuv, ndepth);
             float3 vq = normalize(pc.cam_pos.xyz - nworld);
-            // Reconstruct the exact ray this neighbour cast (same deterministic jitter as the trace).
-            float3 dir_q = refl_ggx_dir(nq, vq, nrough, uint(np.x), uint(np.y), pc.frame, stoch);
-            if (dot(n, dir_q) <= 0.0)
-                continue; // not in the centre pixel's upper hemisphere
-            float pdf_q = refl_ggx_pdf(nq, vq, dir_q, nrough);
-            float pdf_p = refl_ggx_pdf(n, v, dir_q, roughness);
-            float w = pdf_p / max(pdf_q, 1e-9); // ratio: how likely p would draw this borrowed ray
+            // Reconstruct the exact ray(s) this neighbour cast (same deterministic jitter law as
+            // the trace). B2' K > 1: the neighbour's stored value is the tonemapped mean of K rays
+            // at seq = frame*K + s, so approximate each ray's radiance by that mean and SUM the K
+            // per-ray ratios (Σ w_s · L_s ≈ (Σ w_s) · L̄) — exact for K = 1 (the legacy path).
+            float w = 0.0;
+            for (uint s = 0u; s < spp; s++)
+            {
+                float3 dir_q = refl_ggx_dir(nq, vq, nrough, uint(np.x), uint(np.y),
+                                            pc.frame * spp + s, stoch); // == pc.frame at K = 1
+                if (dot(n, dir_q) <= 0.0)
+                    continue; // not in the centre pixel's upper hemisphere
+                float pdf_q = refl_ggx_pdf(nq, vq, dir_q, nrough);
+                float pdf_p = refl_ggx_pdf(n, v, dir_q, roughness);
+                w += pdf_p / max(pdf_q, 1e-9); // ratio: how likely p would draw this borrowed ray
+            }
+            if (w <= 0.0)
+                continue;
             float3 ncol = g.textures[pc.refl_index].SampleLevel(g.samp, nuv, 0.0).rgb;
             // Average in the Reinhard "denoiser" space (V / (1 + luma·0.1)): the reference runs its
             // resolve/temporal/spatial averaging in this space so one HDR-bright borrowed hit (sky
