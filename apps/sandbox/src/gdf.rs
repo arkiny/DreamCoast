@@ -1605,7 +1605,6 @@ impl GdfSystem {
             .storage_index();
         let num_cards = self.num_cards;
         let num_texels = self.cache_total_texels; // C2a: Σ res² (uniform: num_cards · tile²)
-        let sampled = vol.sampled_index();
         let clip = self.clip_descriptor().unwrap_or((0, 1));
         let clip_vols = self.clip_level_volumes();
         let aabb_min = self.scene_aabb_min;
@@ -1641,7 +1640,11 @@ impl GdfSystem {
                     calb,
                     rad_read,
                     rad_write,
-                    sampled,
+                    // gdf_sampled slot, repurposed: the gather's card-lookup grid (identical results —
+                    // superset + ascending order; 0 = no grid = legacy full scan).
+                    self.surface_cache_grid()
+                        .map(|(c, po)| (c + 1) | ((po + 1) << 8))
+                        .unwrap_or(0),
                     num_cards,
                     self.tile_packed(), // C2a: layout index rides bits 8..15
                     num_texels,
@@ -1704,7 +1707,8 @@ impl GdfSystem {
         sky_gain: f32,
         sky_wb: [f32; 3],
     ) {
-        let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
+        // The volume itself is transitioned by the async-queue setup; assert it exists.
+        let _vol = self.scene_gdf.as_ref().expect("scene gdf volume");
         let pipe = self
             .cache_light_pipeline
             .as_ref()
@@ -1725,7 +1729,6 @@ impl GdfSystem {
         let rad_write = rad_write_buf.storage_index();
         let num_cards = self.num_cards;
         let num_texels = self.cache_total_texels; // C2a: Σ res² (uniform: num_cards · tile²)
-        let sampled = vol.sampled_index();
         let clip = self.clip_descriptor().unwrap_or((0, 1));
         let aabb_min = self.scene_aabb_min;
         let aabb_max = self.scene_aabb_max;
@@ -1766,7 +1769,11 @@ impl GdfSystem {
             calb,
             rad_read,
             rad_write,
-            sampled,
+            // gdf_sampled slot, repurposed: the gather's card-lookup grid (identical results —
+            // superset + ascending order; 0 = no grid = legacy full scan).
+            self.surface_cache_grid()
+                .map(|(c, po)| (c + 1) | ((po + 1) << 8))
+                .unwrap_or(0),
             num_cards,
             self.tile_packed(), // C2a: layout index rides bits 8..15
             num_texels,

@@ -301,3 +301,18 @@ float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos
                                      tile & 0xFFu, extra_tol, 0.0, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu,
                                      0xFFFFFFFFu, layout, found);
 }
+
+// Grid-accelerated variant of the legacy lookup (the relight gather's hot path — its hemisphere
+// rays hit geometry and scanned ALL cards per hit). The grid cell holds a SUPERSET of the cards
+// the acceptance can pass, in the same ascending order, and the best-pick is order-independent
+// for distinct scores (ties keep the first = lowest index in both) → identical results, O(cell).
+float3 sample_surface_cache_grid(float3 p, float3 n, uint cards_index, uint cache_pos_index,
+                                 uint cache_rad_index, uint num_cards, uint tile, float extra_tol,
+                                 uint grid_cells, uint grid_pool, out bool found)
+{
+    uint lay8 = (tile >> 8) & 0xFFu;
+    uint layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
+    return sample_surface_cache_cone(p, n, cards_index, cache_pos_index, cache_rad_index, num_cards,
+                                     tile & 0xFFu, extra_tol, 0.0, 0xFFFFFFFFu, 0u, grid_cells,
+                                     grid_pool, layout, found);
+}

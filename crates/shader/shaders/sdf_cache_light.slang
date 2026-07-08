@@ -22,7 +22,8 @@ struct CacheLightPush
     uint cache_alb_index;
     uint cache_rad_read;  // previous frame's radiance (gather + temporal source)
     uint cache_rad_write; // this frame's radiance out
-    uint gdf_sampled;
+    uint gdf_sampled; // REPURPOSED (never read as a volume): Track C card grid for the gather —
+                      // (cells+1) | (pool+1)<<8; 0 = no grid (legacy full card scan).
     uint num_cards;
     uint tile; // bits 0..7 tile edge; bits 8..15 C2a layout index + 1 (0 = uniform legacy)
     uint num_texels;
@@ -230,9 +231,14 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
             {
                 hit = true;
                 bool cache_hit;
-                float3 s = sample_surface_cache(q, geo_normal(q), pc.cards_index,
-                                                pc.cache_pos_index, pc.cache_rad_read,
-                                                pc.num_cards, pc.tile, 0.0, cache_hit);
+                // Track C: the gather's card lookup goes through the acceleration grid when the
+                // host built one (identical results — superset + ascending order; see the helper).
+                uint gc8 = pc.gdf_sampled & 0xFFu;
+                uint gp8 = (pc.gdf_sampled >> 8) & 0xFFu;
+                float3 s = sample_surface_cache_grid(
+                    q, geo_normal(q), pc.cards_index, pc.cache_pos_index, pc.cache_rad_read,
+                    pc.num_cards, pc.tile, 0.0, gc8 == 0u ? 0xFFFFFFFFu : gc8 - 1u,
+                    gp8 == 0u ? 0xFFFFFFFFu : gp8 - 1u, cache_hit);
                 indirect += clamp_firefly(s, pc.gather_firefly);
                 break;
             }
