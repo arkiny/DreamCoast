@@ -737,15 +737,18 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 // with hit distance `t` so a far demagnified reflection reads a coarse averaged level
                 // while a near/face-on hit stays near mip0 (sharp). Slope ≈ a per-pixel cone half-angle.
                 float mip_radius = 0.05 + t * cone_slope;
-                // Track C card grid: `cache.x` packs cards | (grid_cells+1)<<8 | (grid_pool+1)<<16
-                // (0 = no grid — gallery/legacy pass a bare index, bits 8.. zero). Bindless storage
-                // indices are < 64, so the low byte always holds the real cards index.
+                // Track C card grid + C2a layout: `cache.x` packs cards | (grid_cells+1)<<8 |
+                // (grid_pool+1)<<16 | (layout+1)<<24 (0 = off — gallery/legacy pass a bare index,
+                // bits 8.. zero). Bindless storage indices are < 64, so the low byte always holds
+                // the real cards index.
                 uint cards_idx = pc.cache.x & 0xFFu;
+                uint la8 = (pc.cache.x >> 24) & 0xFFu;
                 uint grid_cells = gc8 == 0u ? 0xFFFFFFFFu : gc8 - 1u;
                 uint grid_pool = gp8 == 0u ? 0xFFFFFFFFu : gp8 - 1u;
+                uint sc_layout = la8 == 0u ? 0xFFFFFFFFu : la8 - 1u;
                 color = sample_surface_cache_cone(hp, hn, cards_idx, pc.cache.y, pc.cache.z, pc.cache.w,
                                                   c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
-                                                  grid_cells, grid_pool, cached);
+                                                  grid_cells, grid_pool, sc_layout, cached);
             }
             if (!cached)
             {

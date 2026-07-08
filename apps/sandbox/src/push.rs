@@ -782,6 +782,8 @@ pub(crate) fn sdf_cache_mipgen_push(
     off_prev: u32,
     dst_stride: u32,
     off_cur: u32,
+    // C2a: adaptive layout index + 1 (0 = uniform legacy).
+    layout1: u32,
 ) -> [u8; 48] {
     let mut pc = [0u8; 48];
     let fields = [
@@ -796,7 +798,7 @@ pub(crate) fn sdf_cache_mipgen_push(
         off_prev,
         dst_stride,
         off_cur,
-        0u32, // pad to 48 B (12 u32)
+        layout1,
     ];
     for (i, v) in fields.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());

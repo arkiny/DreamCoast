@@ -13,6 +13,7 @@
 
 #include "bindless.slang"
 #include "clipmap.slang"
+#include "surface_cache.slang" // C2a: card_layout / layout_find_card helpers
 
 struct CacheCapturePush
 {
@@ -21,7 +22,7 @@ struct CacheCapturePush
     uint cache_alb_index; // storage buffer out: float4(albedo rgb, 0)
     uint gdf_sampled;     // volumes[] (SRV) index of the scene GDF (legacy; clipmap below)
     uint num_cards;
-    uint tile;            // card atlas tile edge (texels per side)
+    uint tile;            // bits 0..7 card atlas tile edge; bits 8..15 C2a layout index + 1 (0 = uniform)
     uint num_texels;      // num_cards * tile * tile
     uint clip_desc;       // Stage B: clipmap descriptor storage-buffer index
     uint albedo_r;        // C8a albedo channel volumes (0xFFFFFFFF = constant 0.7)
@@ -114,13 +115,19 @@ void cacheMain(uint3 tid: SV_DispatchThreadID)
     if (t >= pc.num_texels)
         return;
 
-    uint per_card = pc.tile * pc.tile;
-    uint card = t / per_card;
-    uint local = t % per_card;
-    uint tx = local % pc.tile;
-    uint ty = local / pc.tile;
-    float u = ((float(tx) + 0.5) / float(pc.tile)) * 2.0 - 1.0;
-    float v = ((float(ty) + 0.5) / float(pc.tile)) * 2.0 - 1.0;
+    // C2a: variable-tile mapping through the layout buffer (sentinel = uniform tile — the
+    // helpers collapse to the exact legacy `t / tile²` arithmetic, byte-identical).
+    uint lay8 = (pc.tile >> 8) & 0xFFu;
+    uint sc_layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
+    uint tile0 = pc.tile & 0xFFu;
+    uint card = layout_find_card(sc_layout, t, tile0, pc.num_cards);
+    uint2 lay = card_layout(sc_layout, card, tile0);
+    uint res = lay.y;
+    uint local = t - lay.x;
+    uint tx = local % res;
+    uint ty = local / res;
+    float u = ((float(tx) + 0.5) / float(res)) * 2.0 - 1.0;
+    float v = ((float(ty) + 0.5) / float(res)) * 2.0 - 1.0;
 
     // Card record: center.xyz/trace_depth, normal.xyz, u_axis.xyz (half-extent),
     // v_axis.xyz (half-extent). 64 bytes.
@@ -221,7 +228,7 @@ void cacheMain(uint3 tid: SV_DispatchThreadID)
             }
             // Accept when the nearest triangle is within a few card texels of the GDF hit
             // (object space ≈ world for content's mostly-uniform transforms).
-            float texel_w = 2.0 * max(length(u_axis), length(v_axis)) / float(pc.tile);
+            float texel_w = 2.0 * max(length(u_axis), length(v_axis)) / float(res);
             if (prim_count > 0u && best_d2 < texel_w * texel_w * 16.0)
             {
                 float3 col = base_color.rgb;

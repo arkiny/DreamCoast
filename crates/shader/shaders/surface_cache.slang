@@ -36,26 +36,72 @@ uint mip_stride(uint tile)
     return s;
 }
 
+// ---- C2a adaptive card resolution ------------------------------------------------------------
+// The atlas is variable-tile when a LAYOUT buffer is bound (16 B per card: mip0 atlas base texel,
+// this card's tile edge `res` (pow2), the card's MIP-pyramid base texel, pad). `layout ==
+// 0xFFFFFFFF` = the legacy uniform-tile atlas — every helper collapses to the exact legacy
+// arithmetic, so consumers stay byte-identical with the feature off.
+
+// (base, res) of card `c` — legacy: (c·tile², tile).
+uint2 card_layout(uint layout, uint c, uint tile)
+{
+    if (layout == 0xFFFFFFFFu)
+        return uint2(c * tile * tile, tile);
+    return g.storage_buffers[layout].Load2(c * 16u);
+}
+// The card's MIP-pyramid base texel (level-1 texel 0). Legacy: c · mip_stride(tile).
+uint card_mip_base(uint layout, uint c, uint tile)
+{
+    if (layout == 0xFFFFFFFFu)
+        return c * mip_stride(tile);
+    return g.storage_buffers[layout].Load(c * 16u + 8u);
+}
+// texel index -> card, via binary search on the layout's ascending `base` column (the per-texel
+// passes dispatch one thread per REAL atlas texel). Legacy: t / tile².
+uint layout_find_card(uint layout, uint t, uint tile, uint num_cards)
+{
+    if (layout == 0xFFFFFFFFu)
+        return t / max(tile * tile, 1u);
+    uint lo = 0u;
+    uint hi = num_cards - 1u;
+    [loop]
+    while (lo < hi)
+    {
+        uint mid = (lo + hi + 1u) >> 1u;
+        if (g.storage_buffers[layout].Load(mid * 16u) <= t)
+            lo = mid;
+        else
+            hi = mid - 1u;
+    }
+    return lo;
+}
+
 // One card's cached radiance at (uu,vv) card-space, sampled at the ray-cone MIP level. `half_ext`
 // is the card's max half-extent (world) → mip0 texel size; the cone footprint `sample_radius`
 // selects the level (reference-engine ComputeSurfaceCacheSample: log2(CardExtent / SampleRadius)),
 // bilinearly filtered with uncaptured texels weighted out + renormalised. Coarse levels come from
 // the pyramid (`float4(radiance, coverage)`); mip0 from the base atlas + capture-flag validity.
-float3 card_mip_sample(uint c, float uu, float vv, float half_ext, float sample_radius, uint tile,
-                       uint mip_index, uint max_mip, uint cache_rad_index, uint cache_pos_index)
+// C2a: the card is addressed by its layout triple — `c_base` (mip0 atlas base texel), `c_res`
+// (this card's tile edge), `c_mipb` (its pyramid base texel). The legacy uniform atlas passes
+// (c·tile², tile, c·mip_stride(tile)) — bit-identical arithmetic.
+float3 card_mip_sample(uint c_base, uint c_res, uint c_mipb, float uu, float vv, float half_ext,
+                       float sample_radius, uint mip_index, uint max_mip, uint cache_rad_index,
+                       uint cache_pos_index)
 {
     int mip = 0;
     if (mip_index != 0xFFFFFFFFu && half_ext > 1e-5)
     {
-        float texel0_world = (2.0 * half_ext) / float(tile); // mip0 texel size in world units
+        float texel0_world = (2.0 * half_ext) / float(c_res); // mip0 texel size in world units
         float footprint = sample_radius / max(texel0_world, 1e-6);
-        float mipf = clamp(log2(max(footprint, 1e-4)), 0.0, float(max_mip));
+        // Clamp to the card's OWN pyramid depth (an adaptive small card has fewer levels).
+        float lmax = min(float(max_mip), float(firstbithigh(max(c_res, 1u))));
+        float mipf = clamp(log2(max(footprint, 1e-4)), 0.0, lmax);
         mip = int(mipf + 0.5); // nearest level
     }
     if (mip >= 1)
     {
-        uint res = max(tile >> uint(mip), 1u);
-        uint base = c * mip_stride(tile) + mip_off(tile, uint(mip));
+        uint res = max(c_res >> uint(mip), 1u);
+        uint base = c_mipb + mip_off(c_res, uint(mip));
         float fu = (uu * 0.5 + 0.5) * float(res) - 0.5;
         float fv = (vv * 0.5 + 0.5) * float(res) - 0.5;
         float ff = floor(fu), fg = floor(fv);
@@ -83,17 +129,17 @@ float3 card_mip_sample(uint c, float uu, float vv, float half_ext, float sample_
         // Coarse level empty here (shouldn't happen for a covered card) → fall to mip0 below.
     }
     // mip0 bilinear (the f1fa851 fetch): 2×2 base texels, skip uncaptured + renormalise.
-    uint b0 = c * (tile * tile);
-    float fu = (uu * 0.5 + 0.5) * float(tile) - 0.5;
-    float fv = (vv * 0.5 + 0.5) * float(tile) - 0.5;
+    uint b0 = c_base;
+    float fu = (uu * 0.5 + 0.5) * float(c_res) - 0.5;
+    float fv = (vv * 0.5 + 0.5) * float(c_res) - 0.5;
     float ff = floor(fu), fg = floor(fv);
     float wu = saturate(fu - ff), wv = saturate(fv - fg);
-    int tx0 = clamp(int(ff), 0, int(tile) - 1);
-    int ty0 = clamp(int(fg), 0, int(tile) - 1);
-    int tx1 = min(tx0 + 1, int(tile) - 1);
-    int ty1 = min(ty0 + 1, int(tile) - 1);
-    int bt[4] = { ty0 * int(tile) + tx0, ty0 * int(tile) + tx1, ty1 * int(tile) + tx0,
-                  ty1 * int(tile) + tx1 };
+    int tx0 = clamp(int(ff), 0, int(c_res) - 1);
+    int ty0 = clamp(int(fg), 0, int(c_res) - 1);
+    int tx1 = min(tx0 + 1, int(c_res) - 1);
+    int ty1 = min(ty0 + 1, int(c_res) - 1);
+    int bt[4] = { ty0 * int(c_res) + tx0, ty0 * int(c_res) + tx1, ty1 * int(c_res) + tx0,
+                  ty1 * int(c_res) + tx1 };
     float w4[4] = { (1.0 - wu) * (1.0 - wv), wu * (1.0 - wv), (1.0 - wu) * wv, wu * wv };
     float3 sum = float3(0.0, 0.0, 0.0);
     float wsum = 0.0;
@@ -109,9 +155,9 @@ float3 card_mip_sample(uint c, float uu, float vv, float half_ext, float sample_
     }
     if (wsum > 1e-4)
         return sum / wsum;
-    uint tx = min(uint((uu * 0.5 + 0.5) * float(tile)), tile - 1u);
-    uint ty = min(uint((vv * 0.5 + 0.5) * float(tile)), tile - 1u);
-    return asfloat(g.storage_buffers[cache_rad_index].Load3((b0 + ty * tile + tx) * 16u));
+    uint tx = min(uint((uu * 0.5 + 0.5) * float(c_res)), c_res - 1u);
+    uint ty = min(uint((vv * 0.5 + 0.5) * float(c_res)), c_res - 1u);
+    return asfloat(g.storage_buffers[cache_rad_index].Load3((b0 + ty * c_res + tx) * 16u));
 }
 
 // Reference-engine cone-LOD surface-cache lookup. `sample_radius` is the ray-cone footprint at the
@@ -128,10 +174,12 @@ float3 card_mip_sample(uint c, float uu, float vv, float half_ext, float sample_
 // query point's cell therefore holds a SUPERSET of the cards the full O(num_cards) scan would
 // accept, in the same ascending order → identical results, O(cell) cost. Content reflection only;
 // every other consumer passes the sentinel and keeps the exact legacy scan.
+// `layout` (0xFFFFFFFF = uniform tile): the C2a adaptive-resolution layout buffer — per-card
+// (base, res, mip_base). All addressing below goes through it.
 float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cache_pos_index,
                                  uint cache_rad_index, uint num_cards, uint tile, float extra_tol,
                                  float sample_radius, uint mip_index, uint max_mip,
-                                 uint grid_cells, uint grid_pool, out bool found)
+                                 uint grid_cells, uint grid_pool, uint layout, out bool found)
 {
     found = false;
     int best = -1;
@@ -178,9 +226,11 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
         if (abs(uu) > 1.0 || abs(vv) > 1.0)
             continue; // outside the card footprint
 
-        uint tx = min(uint((uu * 0.5 + 0.5) * float(tile)), tile - 1u);
-        uint ty = min(uint((vv * 0.5 + 0.5) * float(tile)), tile - 1u);
-        uint texel = c * (tile * tile) + ty * tile + tx;
+        uint2 lay = card_layout(layout, c, tile); // (mip0 base texel, this card's tile edge)
+        uint c_res = lay.y;
+        uint tx = min(uint((uu * 0.5 + 0.5) * float(c_res)), c_res - 1u);
+        uint ty = min(uint((vv * 0.5 + 0.5) * float(c_res)), c_res - 1u);
+        uint texel = lay.x + ty * c_res + tx;
 
         float4 capt = asfloat(g.storage_buffers[cache_pos_index].Load4(texel * 16u));
         if (capt.w < 0.5)
@@ -192,7 +242,7 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
         // cube's cached colour. A texel-sized tolerance keeps legitimate on-surface hits
         // (even on deep concavities, since this measures distance to the captured point).
         float dist = length(capt.xyz - p);
-        float tol = max((length(ua) + length(va)) / float(tile) * 4.0, 0.02) + extra_tol;
+        float tol = max((length(ua) + length(va)) / float(c_res) * 4.0, 0.02) + extra_tol;
         if (dist > tol)
             continue; // captured a different (farther) surface than the query point
 
@@ -203,8 +253,9 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
             // different cards adjacent reflection pixels graze, so the cross-card colour jumps
             // (the residual blocky speckle) smooth out instead of snapping card-to-card.
             float half_ext = max(length(ua), length(va));
-            acc += score * card_mip_sample(c, uu, vv, half_ext, sample_radius, tile, mip_index,
-                                           max_mip, cache_rad_index, cache_pos_index);
+            acc += score * card_mip_sample(lay.x, c_res, card_mip_base(layout, c, tile), uu, vv,
+                                           half_ext, sample_radius, mip_index, max_mip,
+                                           cache_rad_index, cache_pos_index);
             acc_w += score;
         }
         if (score > best_score)
@@ -229,18 +280,24 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
         return acc / acc_w;
 
     // Content without a pyramid (P11_REFLECT_MIP=0): the single-best-card mip0 bilinear (f1fa851).
-    return card_mip_sample(uint(best), best_uu, best_vv, 0.0, 0.0, tile, 0xFFFFFFFFu, 0u,
+    uint2 blay = card_layout(layout, uint(best), tile);
+    return card_mip_sample(blay.x, blay.y, 0u, best_uu, best_vv, 0.0, 0.0, 0xFFFFFFFFu, 0u,
                            cache_rad_index, cache_pos_index);
 }
 
 // Legacy entry point (no cone LOD) — the primary consumers (GI gather / cache re-light /
 // viz / world radiance cache) call this so their coverage + sampling stay byte-identical.
 // Forwards sentinel MIP args, so `sample_surface_cache_cone` runs the exact pre-MIP path.
+// `tile` doubles as the C2a carrier: bits 0..7 = the uniform tile edge, bits 8..15 = the
+// adaptive layout buffer index + 1 (0 = uniform/legacy) — every legacy caller passes a bare
+// tile (≤ 64), so the packed form is backward-compatible without new push fields.
 float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos_index,
                             uint cache_rad_index, uint num_cards, uint tile, float extra_tol,
                             out bool found)
 {
+    uint lay8 = (tile >> 8) & 0xFFu;
+    uint layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
     return sample_surface_cache_cone(p, n, cards_index, cache_pos_index, cache_rad_index, num_cards,
-                                     tile, extra_tol, 0.0, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu,
-                                     0xFFFFFFFFu, found);
+                                     tile & 0xFFu, extra_tol, 0.0, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu,
+                                     0xFFFFFFFFu, layout, found);
 }

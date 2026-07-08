@@ -329,7 +329,20 @@ clean. 레거시 `bleed.py`는 부재 — 커튼 색 번짐 정량화는 C2 후 
 - seam: `P11_CARD_MESH_CAPTURE=1`. 갤러리는 기존 stamped 색 유지.
 - 검증: `bleed.py` 커튼 색 번짐 복원(빨강 옆 바닥 R−B↑), DX≡VK.
 
-#### C2. 적응 카드 해상도 (고정 32² → ResLevel 티어 + 피드백)
+#### C2a 구현 완료 (opt-in `P11_CACHE_ADAPTIVE_RES=1`, 2026-07-08)
+카드별 res = pow2(참조 카메라 `extent/dist` 밀도 구동, 8..64), **총 텍셀은 uniform 32² 예산으로
+정규화**(f64 이진탐색, 결정적) — 메모리 불변 재분배. 아키텍처: per-card 16B **layout 레코드**(mip0
+base, res, mip_base)를 단일 버퍼로, 인덱스는 `tile` bits 8..15(+1)에 동승 → `surface_cache_read`가
+packed tile을 반환하므로 **bounce/relight/wrc/viz는 호스트·셰이더 무변경으로 layout-aware**. 반사는
+cache.x bits 24..31(cache_tile이 MIP 필드로 재패킹되므로). 공유 헬퍼 `card_layout`/`card_mip_base`/
+`layout_find_card`(텍셀→카드 이진탐색), mipgen은 max-res 그리드 디스패치+카드별 조기 종료, per-card
+피라미드는 자체 깊이로 클램프. 센티널 = 기존 uniform 산술 그대로(갤러리 byte-identical PASS).
+
+**검증/측정:** adaptive 로그 8..64, 텍셀 총량 = uniform과 동일(1,044,480/1020카드; HQ 2,757,696).
+전후 diff 2.29/255(실제 재분배 효과). ⚠️relight 9.7→13.7ms(+42%): 개더의 전 카드 스캔이 후보마다
+layout 로드를 추가로 하기 때문 — **후속: relight 개더에도 카드 그리드 적용**(uniform에서도 이득,
+superset+오름차순이라 결과 동일 보장). 한계: 참조 카메라 거리 기반이라 반사가 읽는 원거리 카드는
+저해상 — C2b(스크린/반사 피드백 승급)가 표적 메커니즘.
 2단계로 분할:
 - **C2a 거리 구동 ResLevel**: 카드별 `res = clamp(RoundUpPow2(TexelDensity·Extent/dist), MIN, MAX)`;
   아틀라스를 가변-타일(서브-할당 bin, ≤코어는 공유 페이지 sub-alloc, ≥는 풀 페이지)로. `CARD_TILE` 고정

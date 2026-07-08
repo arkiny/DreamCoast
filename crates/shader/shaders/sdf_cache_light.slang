@@ -24,7 +24,7 @@ struct CacheLightPush
     uint cache_rad_write; // this frame's radiance out
     uint gdf_sampled;
     uint num_cards;
-    uint tile;
+    uint tile; // bits 0..7 tile edge; bits 8..15 C2a layout index + 1 (0 = uniform legacy)
     uint num_texels;
     uint spp;             // indirect gather rays / texel
     uint frame;           // RNG decorrelation
@@ -147,7 +147,10 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     // `relight_period == 1` ⇒ every card every frame ⇒ byte-identical to the legacy path (the
     // gallery regression anchor passes period 1). `reset` always relights all cards (first frame).
     uint relight_period = max(pc.clip.z, 1u);
-    uint card = t / max(pc.tile * pc.tile, 1u);
+    // C2a: variable-tile texel→card mapping (sentinel = the exact legacy `t / tile²`).
+    uint lay8 = (pc.tile >> 8) & 0xFFu;
+    uint sc_layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
+    uint card = layout_find_card(sc_layout, t, max(pc.tile & 0xFFu, 1u), pc.num_cards);
     // Stage D2b: camera-visibility priority. On-screen cards relight at the base budget period;
     // off-screen cards relight HIDDEN_MULT× less often (most of a dense scene's cards are out of
     // any one view, and they don't affect the current image — 레퍼런스 엔진 SW GI's visibility/staleness

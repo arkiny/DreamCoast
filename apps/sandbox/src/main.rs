@@ -2307,7 +2307,29 @@ impl App {
                     .and_then(|v| v.trim().parse::<u32>().ok())
                     .unwrap_or(32)
                     .clamp(4, 64);
-                gdf.build_surface_cache(&device, &cards, num_cards, cache_tile, card_albedo)?;
+                // C2a adaptive card resolution (opt-in): redistribute the SAME texel budget as
+                // the uniform atlas by camera relevance — near/large cards up to 64², far/small
+                // down to 8² — so the cache carries detail where reflections actually read it.
+                let card_res: Option<Vec<u32>> =
+                    if !gallery_scene && quality::env_bool("P11_CACHE_ADAPTIVE_RES", false) {
+                        Some(fuse::assign_card_res(
+                            &cards,
+                            &card_cam,
+                            8,
+                            64,
+                            (num_cards as u64) * (cache_tile as u64) * (cache_tile as u64),
+                        ))
+                    } else {
+                        None
+                    };
+                gdf.build_surface_cache(
+                    &device,
+                    &cards,
+                    num_cards,
+                    cache_tile,
+                    card_albedo,
+                    card_res.as_deref(),
+                )?;
                 // C1 mesh-triangle capture (opt-in): consolidated content geometry (the same
                 // layout as the HWRT hit-lighting table, built independently of RT capability)
                 // + the card→drawable instance map (table row + world→object 3x4 per resident
@@ -5879,6 +5901,14 @@ impl App {
                     Some((cells, pool)) => c | ((cells + 1) << 8) | ((pool + 1) << 16),
                     None => c,
                 };
+                // C2a: the reflection's cache_tile slot re-packs the tile with the MIP fields, so
+                // the adaptive layout index rides cache.x bits 24..31 instead (the shared tuple's
+                // tile carries it in bits 8..15 for every other consumer — strip to the raw edge).
+                let c = match self.gdf.surface_cache_layout() {
+                    Some(l) => c | ((l + 1) << 24),
+                    None => c,
+                };
+                let t = t & 0xFF;
                 // Pack the MIP pyramid into the tile slot: tile | max_mip<<8 | mip_index<<16 (all
                 // ≤16 bits; 0xFFFF mip_index = no pyramid). Order the reflection after mipgen when
                 // the pyramid exists (its handle), else after the relight directly.
