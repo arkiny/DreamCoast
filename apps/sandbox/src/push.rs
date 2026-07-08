@@ -1750,8 +1750,12 @@ pub(crate) fn reflect_composite_push(
     skip_mirror_ssr: bool,
     rough_blur: f32,
     ssr_cut: bool,
-) -> [u8; 48] {
-    let mut pc = [0u8; 48];
+    // B2 mirror compaction: (refine target sampled index, refine grid w, h). `None` = off
+    // (0xFFFFFFFF sentinel) — the legacy 48-byte prefix is bit-identical either way.
+    refine: Option<(u32, u32, u32)>,
+    refine_thresh: f32,
+) -> [u8; 64] {
+    let mut pc = [0u8; 64];
     pc[0..4].copy_from_slice(&ssr_index.to_le_bytes());
     pc[4..8].copy_from_slice(&gdf_index.to_le_bytes());
     pc[8..12].copy_from_slice(&out_index.to_le_bytes());
@@ -1764,6 +1768,38 @@ pub(crate) fn reflect_composite_push(
     pc[36..40].copy_from_slice(&u32::from(skip_mirror_ssr).to_le_bytes()); // pad0: content near-mirror SSR skip
     pc[40..44].copy_from_slice(&rough_blur.to_le_bytes()); // pad1: roughness-blur radius (0 = off/anchor)
     pc[44..48].copy_from_slice(&u32::from(ssr_cut).to_le_bytes()); // pad2: B1-lite SSR hard cut
+    // B2 mirror-compaction row: refine target + grid, roughness gate.
+    let (ri, rw, rh) = refine.unwrap_or((u32::MAX, 0, 0));
+    pc[48..52].copy_from_slice(&ri.to_le_bytes());
+    pc[52..56].copy_from_slice(&rw.to_le_bytes());
+    pc[56..60].copy_from_slice(&rh.to_le_bytes());
+    pc[60..64].copy_from_slice(&refine_thresh.to_le_bytes());
+    pc
+}
+
+/// Pack the B2 mirror-compaction classify/reset/args push block (32 bytes): depth + material +
+/// list + args + refine-target indices, the refine grid extent, and the near-mirror roughness
+/// threshold (lockstep with `gdf_reflect.slang`'s content `mirror_thresh`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reflect_compact_push(
+    depth_index: u32,
+    material_index: u32,
+    list_index: u32,
+    args_index: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    mirror_thresh: f32,
+) -> [u8; 32] {
+    let mut pc = [0u8; 32];
+    pc[0..4].copy_from_slice(&depth_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&material_index.to_le_bytes());
+    pc[8..12].copy_from_slice(&list_index.to_le_bytes());
+    pc[12..16].copy_from_slice(&args_index.to_le_bytes());
+    pc[16..20].copy_from_slice(&out_index.to_le_bytes());
+    pc[20..24].copy_from_slice(&width.to_le_bytes());
+    pc[24..28].copy_from_slice(&height.to_le_bytes());
+    pc[28..32].copy_from_slice(&mirror_thresh.to_le_bytes());
     pc
 }
 

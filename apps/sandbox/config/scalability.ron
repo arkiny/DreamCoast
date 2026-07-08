@@ -210,6 +210,11 @@
                 // Baked ACES tonemap LUT: the full RRT+ODT filmic response at one strip fetch
                 // per pixel (the legacy path evaluated a cheap analytic fit per pixel instead).
                 tonemap_aces: true,
+                // B2 mirror compaction: near-mirror pixels re-traced dense at half res via the
+                // compacted indirect dispatch — the 1/6-res trace's upsample cannot resolve a
+                // mirror image (chrome showed the trace texels as blocks). Cost scales with the
+                // on-screen mirror area.
+                reflect_compact_div: 2,
             ),
             groups: (
                 resolution: 1,

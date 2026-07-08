@@ -343,9 +343,28 @@ bool screen_trace(float3 p, float3 dir, float sy, float bias, float max_dist, ui
 #endif
 
 [shader("compute")]
+#ifdef REFLECT_COMPACT
+// B2 compaction: one thread per LISTED near-mirror pixel (see reflect_compact.slang) instead of
+// one per grid texel. The classify pass appended the pixel coords; this permutation re-traces
+// exactly those pixels at the (denser) refine resolution and writes them into the refine target.
+// The A3 skip slot is overloaded to carry the list/args storage-buffer indices (16 bits each —
+// bindless buffer indices are < 2048), so the 240 B push does not grow.
+[numthreads(64, 1, 1)]
+void csMain(uint3 tid_in: SV_DispatchThreadID)
+{
+    uint list_index = pc.skip_packed & 0xFFFFu;
+    // Count lives in the LIST header (mirrored by csArgs) — the args buffer is in INDIRECT
+    // state at dispatch time and must not be shader-read here.
+    uint count = g.storage_buffers[list_index].Load(0u);
+    if (tid_in.x >= count)
+        return;
+    uint packed = g.storage_buffers[list_index].Load(4u + tid_in.x * 4u);
+    uint3 tid = uint3(packed & 0xFFFFu, packed >> 16, 0u);
+#else
 [numthreads(8, 8, 1)]
 void csMain(uint3 tid: SV_DispatchThreadID)
 {
+#endif
     if (tid.x >= pc.width || tid.y >= pc.height)
         return;
 
@@ -354,7 +373,17 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 sun_dir = normalize(pc.sun.xyz);
     float sun_i = pc.sun.w;
     uint lin = tid.y * pc.width + tid.x;
+#ifdef REFLECT_COMPACT
+    // skip_packed carries the list/args indices here — the A3 reuse/persist is off by
+    // construction (the refine texels have no 32 B skip slots at this resolution).
+    SkipCfg sk;
+    sk.read = 0xFFu;
+    sk.write = 0xFFu;
+    sk.k = 0u;
+    sk.frame = 0u;
+#else
     SkipCfg sk = unpack_skip();
+#endif
     bool skip_write = (sk.write != 0xFFu); // A3: persist this pixel's (pos, radiance)
 
     // Background: reflect nothing — show the sky along the view ray (so the viz reads as
@@ -839,6 +868,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // (≈ ray max on a miss = the sky, effectively far). Alpha is unused by the composite/lighting, so
     // this is inert for every non-temporal-resolve consumer (gallery byte-identical).
     float hit_dist = t;
+#ifdef REFLECT_COMPACT
+    // The composite's validity-weighted fetch keys on `.a > 0` (the classify pass zeroed every
+    // un-traced refine texel), so a traced texel must never store an exact-zero hit distance.
+    hit_dist = max(hit_dist, 1e-4);
+#endif
     // A3: persist this freshly-traced (surface point, radiance) for next frame's reuse gate.
     if (skip_write)
     {

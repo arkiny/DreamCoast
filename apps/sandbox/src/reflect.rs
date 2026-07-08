@@ -14,8 +14,8 @@ use rhi::{
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
-    gdf_reflect_push, lit_history_push, reflect_composite_push, reflect_resolve_push,
-    reflect_spatial_push, reflect_temporal_push, ssr_push, ssr_resolve_push,
+    gdf_reflect_push, lit_history_push, reflect_compact_push, reflect_composite_push,
+    reflect_resolve_push, reflect_spatial_push, reflect_temporal_push, ssr_push, ssr_resolve_push,
 };
 
 pub(crate) struct ReflectSystem {
@@ -29,6 +29,21 @@ pub(crate) struct ReflectSystem {
     /// B2' screen-hit early-out: the `SCREEN_HIT` permutation (SW march with a screen-trace
     /// prepass per ray — validated on-screen hits read the prev-frame full-res lit history).
     reflect_screen_pipeline: Option<ComputePipeline>,
+    /// B2 mirror compaction: the `REFLECT_COMPACT` permutation (SCREEN_HIT shading re-traced
+    /// over the compacted near-mirror pixel list, one thread per LISTED pixel) plus its
+    /// classify/reset/args passes and app-owned list/args buffers at the refine extent. The
+    /// near-mirror band shows the sparse trace's texels directly (no denoiser can reconstruct
+    /// a mirror image the trace never resolved), so those pixels — and only those — are
+    /// re-traced dense; cost scales with the on-screen mirror area. See reflect_compact.slang.
+    reflect_compact_pipeline: Option<ComputePipeline>,
+    compact_reset_pipeline: Option<ComputePipeline>,
+    compact_classify_pipeline: Option<ComputePipeline>,
+    compact_args_pipeline: Option<ComputePipeline>,
+    /// Compacted pixel list (u32/texel: x | y<<16) + dispatch args ([gx, gy, gz, count], the
+    /// `indirect` buffer `dispatch_indirect` consumes).
+    compact_list: Option<StorageBuffer>,
+    compact_args: Option<StorageBuffer>,
+    compact_extent: (u32, u32),
     composite_pipeline: Option<ComputePipeline>, // C7 hybrid composite
     lit_history_pipeline: Option<ComputePipeline>, // C7b lit-color history capture
     resolve_pipeline: Option<ComputePipeline>,   // A1 spatial ratio-estimator resolve (trace res)
@@ -151,12 +166,82 @@ impl ReflectSystem {
             240,
             true,
         )?;
+        // B2 mirror compaction: the list-driven re-trace runs [numthreads(64,1,1)] (flat list
+        // index), so it can't share the [8,8,1] `compute` closure; same 240 B push + globals UBO
+        // as the SCREEN_HIT permutation whose shading path it compiles in.
+        let reflect_compact_pipeline = if compute_supported {
+            let cs = load_compute_shader(
+                backend,
+                dreamcoast_shader::gdf_reflect_compact_cs_spirv,
+                dreamcoast_shader::gdf_reflect_compact_cs_dxil,
+                dreamcoast_shader::gdf_reflect_compact_cs_metallib,
+                "gdf_reflect_compact",
+            )?;
+            Some(device.create_compute_pipeline(&ComputePipelineDesc {
+                compute_bytes: cs,
+                compute_entry: "csMain",
+                push_constant_size: 240,
+                bindless: true,
+                uniform_buffer: true,
+                threads_per_group: [64, 1, 1],
+            })?)
+        } else {
+            None
+        };
+        // The classify/reset/args entries are NOT `csMain` (three entries in one file), so they
+        // can't share the `compute` closure; explicit descs with matching threadgroup sizes.
+        let compact_pass = |spirv: fn() -> Option<&'static [u8]>,
+                            dxil: fn() -> Option<&'static [u8]>,
+                            metallib: fn() -> Option<&'static [u8]>,
+                            name: &str,
+                            entry: &'static str,
+                            threads: [u32; 3]|
+         -> anyhow::Result<Option<ComputePipeline>> {
+            if !compute_supported {
+                return Ok(None);
+            }
+            let cs = load_compute_shader(backend, spirv, dxil, metallib, name)?;
+            Ok(Some(device.create_compute_pipeline(
+                &ComputePipelineDesc {
+                    compute_bytes: cs,
+                    compute_entry: entry,
+                    push_constant_size: 32,
+                    bindless: true,
+                    uniform_buffer: false,
+                    threads_per_group: threads,
+                },
+            )?))
+        };
+        let compact_reset_pipeline = compact_pass(
+            dreamcoast_shader::reflect_compact_reset_cs_spirv,
+            dreamcoast_shader::reflect_compact_reset_cs_dxil,
+            dreamcoast_shader::reflect_compact_reset_cs_metallib,
+            "reflect_compact_reset",
+            "csReset",
+            [1, 1, 1],
+        )?;
+        let compact_classify_pipeline = compact_pass(
+            dreamcoast_shader::reflect_compact_classify_cs_spirv,
+            dreamcoast_shader::reflect_compact_classify_cs_dxil,
+            dreamcoast_shader::reflect_compact_classify_cs_metallib,
+            "reflect_compact_classify",
+            "csClassify",
+            [8, 8, 1],
+        )?;
+        let compact_args_pipeline = compact_pass(
+            dreamcoast_shader::reflect_compact_args_cs_spirv,
+            dreamcoast_shader::reflect_compact_args_cs_dxil,
+            dreamcoast_shader::reflect_compact_args_cs_metallib,
+            "reflect_compact_args",
+            "csArgs",
+            [1, 1, 1],
+        )?;
         let composite_pipeline = compute(
             dreamcoast_shader::reflect_composite_cs_spirv,
             dreamcoast_shader::reflect_composite_cs_dxil,
             dreamcoast_shader::reflect_composite_cs_metallib,
             "reflect_composite",
-            48,
+            64, // +B2 mirror-compaction row (refine target + grid + roughness gate)
             false,
         )?;
         let lit_history_pipeline = compute(
@@ -200,6 +285,13 @@ impl ReflectSystem {
             reflect_pipeline,
             reflect_hwrt_pipeline,
             reflect_screen_pipeline,
+            reflect_compact_pipeline,
+            compact_reset_pipeline,
+            compact_classify_pipeline,
+            compact_args_pipeline,
+            compact_list: None,
+            compact_args: None,
+            compact_extent: (0, 0),
             composite_pipeline,
             lit_history_pipeline,
             resolve_pipeline,
@@ -330,6 +422,45 @@ impl ReflectSystem {
 
     pub(crate) fn advance_reflect_skip(&mut self) {
         self.refl_skip_frame = self.refl_skip_frame.saturating_add(1);
+    }
+
+    /// B2 mirror compaction: every pipeline of the classify → args → compacted-re-trace chain
+    /// is available (compute-gated like the rest of the reflection stack).
+    pub(crate) fn has_reflect_compact(&self) -> bool {
+        self.reflect_compact_pipeline.is_some()
+            && self.compact_reset_pipeline.is_some()
+            && self.compact_classify_pipeline.is_some()
+            && self.compact_args_pipeline.is_some()
+    }
+
+    /// B2: (re)allocate the compacted pixel list (u32 per refine texel — capacity one entry per
+    /// texel, so the classify append can never overflow) and the 16 B indirect-args buffer at
+    /// the refine extent.
+    pub(crate) fn prepare_reflect_compact(
+        &mut self,
+        device: &Device,
+        rw: u32,
+        rh: u32,
+    ) -> anyhow::Result<()> {
+        if !self.has_reflect_compact() {
+            return Ok(());
+        }
+        if self.compact_extent != (rw, rh) {
+            device.wait_idle()?;
+            // Header u32 (count mirror) + capacity for every refine texel.
+            self.compact_list = Some(device.create_storage_buffer(&StorageBufferDesc {
+                size: 4 + (rw as u64) * (rh as u64) * 4,
+                stride: 4,
+                indirect: false,
+            })?);
+            self.compact_args = Some(device.create_storage_buffer(&StorageBufferDesc {
+                size: 16,
+                stride: 4,
+                indirect: true,
+            })?);
+            self.compact_extent = (rw, rh);
+        }
+        Ok(())
     }
 
     /// A3: the (read, write) storage indices for this frame's skip ping-pong, or `None` when the
@@ -1130,6 +1261,257 @@ impl ReflectSystem {
         out
     }
 
+    /// B2 mirror compaction: classify the near-mirror pixels of the `rw`×`rh` refine grid, turn
+    /// the count into indirect-dispatch args, and re-trace exactly those pixels dense with the
+    /// `REFLECT_COMPACT` permutation (SCREEN_HIT shading path, deterministic mirror rays).
+    /// Returns the refine target (rgb radiance, a = hit distance; un-traced texels zeroed) that
+    /// `record_composite` prefers for near-mirror pixels. Cost scales with the on-screen mirror
+    /// area, not the frame — a mirror-free view pays two single-thread passes, a classify at the
+    /// refine res, and an empty indirect dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_reflect_compact<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        scene_gdf: &'a Volume,
+        scene_gdf_ext: ResourceId,
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        depth: ResourceId,
+        normal: ResourceId,
+        material: ResourceId,
+        refine_extent: Extent2D,
+        inv_view_proj: [f32; 16],
+        eye: Vec3,
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        rw: u32,
+        rh: u32,
+        flip_y: u32,
+        frame: u32,
+        albedo: Option<(&'a [Volume; 3], ResourceId)>,
+        cache: Option<([u32; 5], ResourceId)>,
+        gi_volume: Option<(u32, u32, ResourceId)>,
+        irradiance_index: u32,
+        clip: (u32, u32),
+        clip_vols: &'a [&'a Volume],
+        max_steps: u32,
+        cone_k: f32,
+        globals: &'a Buffer,
+        globals_offset: u64,
+        lit_hist: u32,
+        mirror_thresh: f32,
+    ) -> ResourceId {
+        let reset = self.compact_reset_pipeline.as_ref().expect("compact reset");
+        let classify = self
+            .compact_classify_pipeline
+            .as_ref()
+            .expect("compact classify");
+        let args_pipe = self.compact_args_pipeline.as_ref().expect("compact args");
+        let trace = self
+            .reflect_compact_pipeline
+            .as_ref()
+            .expect("compact trace");
+        let list_buf = self.compact_list.as_ref().expect("compact list");
+        let args_buf = self.compact_args.as_ref().expect("compact args buf");
+        let list_idx = list_buf.storage_index();
+        let args_idx = args_buf.storage_index();
+
+        let out = graph.create_storage_image("reflect_refine", HDR_FORMAT, refine_extent);
+        let list_ext = graph.import_external("refl_compact_list");
+        let args_ext = graph.import_external("refl_compact_args");
+
+        // 1) Reset the append counter / dispatch args (and flip the args buffer back from last
+        //    frame's INDIRECT state into UAV).
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "refl_compact_reset",
+                storage_writes: vec![args_ext],
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.storage_buffer_to_storage(args_buf); // INDIRECT (prev frame) -> UAV
+                cmd.bind_compute_pipeline(reset);
+                cmd.push_constants_compute(&reflect_compact_push(
+                    0,
+                    0,
+                    list_idx,
+                    args_idx,
+                    0,
+                    rw,
+                    rh,
+                    mirror_thresh,
+                ));
+                cmd.dispatch(1, 1, 1);
+                cmd.storage_buffer_barrier(args_buf);
+                Ok(())
+            },
+        );
+        // 2) Classify: append every near-mirror refine texel; zero the refine target (validity
+        //    key for the composite fetch).
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "refl_compact_classify",
+                storage_writes: vec![out, list_ext, args_ext],
+                reads: vec![depth, material],
+            },
+            move |ctx| {
+                let depth_index = ctx.sampled_index(depth);
+                let material_index = ctx.sampled_index(material);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(classify);
+                cmd.push_constants_compute(&reflect_compact_push(
+                    depth_index,
+                    material_index,
+                    list_idx,
+                    args_idx,
+                    out_index,
+                    rw,
+                    rh,
+                    mirror_thresh,
+                ));
+                cmd.dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
+                cmd.storage_buffer_barrier(args_buf);
+                cmd.storage_buffer_barrier(list_buf);
+                Ok(())
+            },
+        );
+        // 3) Args: count -> ceil(count/64) groups (+ the count mirrored into the list header),
+        //    then flip the args buffer to indirect-args state for the dispatch.
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "refl_compact_args",
+                storage_writes: vec![args_ext, list_ext],
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(args_pipe);
+                cmd.push_constants_compute(&reflect_compact_push(
+                    0,
+                    0,
+                    list_idx,
+                    args_idx,
+                    0,
+                    rw,
+                    rh,
+                    mirror_thresh,
+                ));
+                cmd.dispatch(1, 1, 1);
+                cmd.storage_buffer_barrier(list_buf);
+                cmd.storage_buffer_to_indirect(args_buf);
+                Ok(())
+            },
+        );
+
+        // 4) Compacted dense re-trace of the listed pixels (indirect; same push layout as the
+        //    main trace, with the A3 skip slot carrying the list/args indices — see the
+        //    REFLECT_COMPACT block in gdf_reflect.slang).
+        let sampled = scene_gdf.sampled_index();
+        let diag = {
+            let d = [
+                aabb_max[0] - aabb_min[0],
+                aabb_max[1] - aabb_min[1],
+                aabb_max[2] - aabb_min[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        let bias = diag * 0.01;
+        let mut reads = vec![depth, normal, material, scene_gdf_ext, list_ext, args_ext];
+        if let Some((_, ext)) = albedo {
+            reads.push(ext);
+        }
+        if let Some((_, ext)) = cache {
+            reads.push(ext);
+        }
+        if let Some((_, _, ext)) = gi_volume {
+            reads.push(ext);
+        }
+        let gi_vol_base = gi_volume.map(|(rb, _, _)| rb).unwrap_or(u32::MAX);
+        let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "gdf_reflect_refine",
+                storage_writes: vec![out],
+                reads,
+            },
+            move |ctx| {
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let material_index = ctx.sampled_index(material);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(scene_gdf);
+                for v in clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
+                let albedo_rgb = if let Some((vols, _)) = albedo {
+                    for v in vols.iter() {
+                        cmd.volume_to_sampled(v);
+                    }
+                    [
+                        vols[0].sampled_index(),
+                        vols[1].sampled_index(),
+                        vols[2].sampled_index(),
+                    ]
+                } else {
+                    [u32::MAX; 3]
+                };
+                cmd.set_globals(globals, globals_offset);
+                cmd.bind_compute_pipeline(trace);
+                cmd.push_constants_compute(&gdf_reflect_push(
+                    &inv_view_proj,
+                    eye,
+                    sun_dir,
+                    sun_intensity,
+                    depth_index,
+                    normal_index,
+                    sampled,
+                    out_index,
+                    rw,
+                    rh,
+                    flip_y,
+                    gi_vol_base,
+                    material_index,
+                    aabb_min,
+                    aabb_max,
+                    0.0,
+                    diag,
+                    diag,
+                    // SCREEN_HIT overloads the dead hit-albedo slot with the lit-history index.
+                    f32::from_bits(lit_hist & 0x7FFF_FFFF),
+                    if gi_vol_base != u32::MAX {
+                        f32::from_bits(irradiance_index)
+                    } else {
+                        0.25
+                    },
+                    bias,
+                    albedo_rgb,
+                    frame,
+                    cache_idx,
+                    clip.0,
+                    clip.1,
+                    crate::GROUND_ALBEDO,
+                    max_steps,
+                    cone_k,
+                    // REFLECT_COMPACT overload: the A3 skip slot carries the list/args bindless
+                    // indices, byte-split so the packer's per-byte masking reassembles
+                    // `list | args << 16` exactly (indices are < 2048 = 11 bits each).
+                    [
+                        list_idx & 0xFF,
+                        (list_idx >> 8) & 0xFF,
+                        args_idx & 0xFF,
+                        (args_idx >> 8) & 0xFF,
+                    ],
+                ));
+                cmd.dispatch_indirect(args_buf, 0);
+                Ok(())
+            },
+        );
+        out
+    }
+
     /// C7: hybrid reflection composite. A full-screen compute pass blends the C5 SSR image
     /// (`ssr`, rgb = reflected color, a = confidence) over the C6 GDF reflection image
     /// (`gdf_reflect`, sky baked in on a ray escape) by the SSR confidence — SSR where it
@@ -1165,23 +1547,32 @@ impl ReflectSystem {
         // would double-count them and re-introduce its feedback wiggle. The `ssr` input is then
         // a stand-in (never sampled).
         ssr_cut: bool,
+        // B2 mirror compaction: the dense near-mirror re-trace `(refine target, grid w, grid h)`
+        // the composite prefers for roughness < `refine_thresh` pixels. `None` = off (legacy).
+        refine: Option<(ResourceId, u32, u32)>,
+        refine_thresh: f32,
     ) -> ResourceId {
         let pipe = self
             .composite_pipeline
             .as_ref()
             .expect("composite pipeline");
         let out = graph.create_storage_image("reflect_composite_out", HDR_FORMAT, extent);
+        let mut reads = vec![ssr, gdf_reflect, material];
+        if let Some((r, _, _)) = refine {
+            reads.push(r);
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "reflect_composite",
                 storage_writes: vec![out],
-                reads: vec![ssr, gdf_reflect, material],
+                reads,
             },
             move |ctx| {
                 let ssr_index = ctx.sampled_index(ssr);
                 let gdf_index = ctx.sampled_index(gdf_reflect);
                 let material_index = ctx.sampled_index(material);
                 let out_index = ctx.storage_index(out);
+                let refine_arg = refine.map(|(r, w, h)| (ctx.sampled_index(r), w, h));
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&reflect_composite_push(
@@ -1197,6 +1588,8 @@ impl ReflectSystem {
                     skip_mirror_ssr,
                     rough_blur,
                     ssr_cut,
+                    refine_arg,
+                    refine_thresh,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

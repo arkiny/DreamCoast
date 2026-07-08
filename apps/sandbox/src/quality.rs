@@ -321,6 +321,15 @@ pub struct QualityPreset {
     /// Off = legacy curve (byte-identical anchor); Apple ON (Metal-verified, DX≡VK pending).
     #[serde(default)]
     pub tonemap_aces: bool,
+    /// B2 mirror trace compaction (`P_REFLECT_COMPACT`): re-trace ONLY the near-mirror pixels
+    /// (roughness < 0.125) dense, at 1/div of the render res, via a classify → indirect-dispatch
+    /// chain — the sparse `reflect_res_div` trace's bilateral upsample cannot reconstruct a
+    /// mirror image (the information was never traced; no denoiser can add it), so a chrome
+    /// surface showed the trace texels as blocks. Cost scales with the on-screen mirror area,
+    /// not the frame. `0` = off (byte-identical anchor); needs `reflect_half_res` + the
+    /// SCREEN_HIT stack. Apple ON (Metal-verified, DX≡VK pending).
+    #[serde(default)]
+    pub reflect_compact_div: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +531,7 @@ pub fn gallery_preset() -> QualityPreset {
         cache_adaptive_res: false,
         taau_packed_history: false, // legacy 16B+16B history layout (anchor; TAAU off at scale 1)
         tonemap_aces: false,        // legacy per-pixel curve (the byte-identical anchor)
+        reflect_compact_div: 0,     // no mirror compaction (full-res trace needs none anyway)
     }
 }
 
@@ -943,6 +953,7 @@ mod tests {
             !g.tonemap_aces,
             "gallery tonemap_aces off (legacy curve anchor)"
         );
+        assert_eq!(g.reflect_compact_div, 0, "gallery reflect_compact_div off");
     }
 
     /// `Med` is the content-default tier. Most fields still match the pre-tier legacy defaults; the
@@ -988,6 +999,10 @@ mod tests {
             "Med taau_packed_history off (DX≡VK pending)"
         );
         assert!(!m.tonemap_aces, "Med tonemap_aces off (DX≡VK pending)");
+        assert_eq!(
+            m.reflect_compact_div, 0,
+            "Med reflect_compact_div off (DX≡VK pending)"
+        );
     }
 
     /// The embedded (`include_str!`) config parses and covers every tier. This is the invariant the
@@ -1061,6 +1076,10 @@ mod tests {
         assert!(
             apple.tonemap_aces,
             "Apple tonemap_aces on (baked ACES RRT+ODT LUT)"
+        );
+        assert_eq!(
+            apple.reflect_compact_div, 2,
+            "Apple reflect_compact_div (dense near-mirror re-trace at half res)"
         );
     }
 

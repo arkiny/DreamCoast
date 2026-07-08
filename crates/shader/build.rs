@@ -242,6 +242,14 @@ fn defines_for(target: &str, key: &str) -> &'static [(&'static str, &'static str
         (false, "gdf_reflect_hwrt_cs") => &[("HWRT_REFLECT", "1")],
         (true, "gdf_reflect_screen_cs") => &[("RT_METAL_TARGET", "1"), ("SCREEN_HIT", "1")],
         (false, "gdf_reflect_screen_cs") => &[("SCREEN_HIT", "1")],
+        // B2 mirror compaction: the SCREEN_HIT shading path re-traced over the compacted
+        // near-mirror pixel list (list-driven thread mapping, [numthreads(64,1,1)]).
+        (true, "gdf_reflect_compact_cs") => &[
+            ("RT_METAL_TARGET", "1"),
+            ("SCREEN_HIT", "1"),
+            ("REFLECT_COMPACT", "1"),
+        ],
+        (false, "gdf_reflect_compact_cs") => &[("SCREEN_HIT", "1"), ("REFLECT_COMPACT", "1")],
         (true, _) => &[("RT_METAL_TARGET", "1")],
         (false, _) => &[],
     }
@@ -1090,6 +1098,33 @@ const JOBS: &[Job] = &[
         entry: "csMain",
         stage: "compute",
         key: "gdf_reflect_screen_cs",
+    },
+    // B2 mirror compaction: the same reflection shader re-traced over the compacted near-mirror
+    // pixel list (SCREEN_HIT shading + REFLECT_COMPACT thread mapping, via `defines_for`).
+    Job {
+        src: "gdf_reflect.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_reflect_compact_cs",
+    },
+    // B2 mirror compaction: classify (append near-mirror pixels) + indirect-args passes.
+    Job {
+        src: "reflect_compact.slang",
+        entry: "csReset",
+        stage: "compute",
+        key: "reflect_compact_reset_cs",
+    },
+    Job {
+        src: "reflect_compact.slang",
+        entry: "csClassify",
+        stage: "compute",
+        key: "reflect_compact_classify_cs",
+    },
+    Job {
+        src: "reflect_compact.slang",
+        entry: "csArgs",
+        stage: "compute",
+        key: "reflect_compact_args_cs",
     },
     // Phase 11 Stage C (C7): hybrid reflection composite (SSR over GDF / sky).
     Job {

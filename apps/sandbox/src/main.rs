@@ -902,6 +902,10 @@ struct App {
     /// macOS/M3 perf (M3-C): reflection trace divisor when `reflect_half_res` is on (2 = legacy half,
     /// 4 = quarter). The one lever that cuts `gdf_reflect` (measured resolution-only). `P_REFLECT_RES_DIV`.
     reflect_res_div: u32,
+    /// B2 mirror compaction: near-mirror pixels re-traced dense at 1/div res via a compacted
+    /// indirect dispatch (0 = off). The sparse trace's upsample cannot reconstruct a mirror
+    /// image, so only those pixels pay for real rays. `P_REFLECT_COMPACT`.
+    reflect_compact_div: u32,
     /// macOS/M3 perf: GDF AO trace divisor (1 = full-res, 2 = half). Traced at 1/div + bilateral
     /// upsample; the Apple tier uses 2 (gdf_ao is the top pass after quarter-res reflection). `P_AO_RES_DIV`.
     ao_res_div: u32,
@@ -2837,6 +2841,13 @@ impl App {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(48)
             .clamp(16, 64);
+        // B2 mirror compaction: near-mirror pixels re-traced dense at 1/div res (0 = off).
+        // `P_REFLECT_COMPACT` overrides the tier.
+        let reflect_compact_div = std::env::var("P_REFLECT_COMPACT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.reflect_compact_div)
+            .clamp(0, 8);
         // macOS/M3 perf: GDF AO trace-resolution divisor (1 = full-res = byte-identical; 2 = half).
         // Traced at 1/div then joint-bilateral upsampled; the gallery never runs gdf_ao so the anchor
         // is unaffected. `P_AO_RES_DIV` overrides the tier.
@@ -3471,6 +3482,7 @@ impl App {
             gdf_cone_k,
             reflect_half_res,
             reflect_res_div,
+            reflect_compact_div,
             ao_res_div,
             gi_atrous_steps,
             gi_half_res,
@@ -5489,6 +5501,12 @@ impl App {
                 ch.div_ceil(rdiv),
             )?;
         }
+        // B2 mirror compaction: (re)allocate the pixel list + indirect args at the refine extent.
+        if self.swrt_reflect && self.reflect_compact_div > 0 && self.reflect.has_reflect_compact() {
+            let d = self.reflect_compact_div;
+            self.reflect
+                .prepare_reflect_compact(&self.device, cw.div_ceil(d), ch.div_ceil(d))?;
+        }
         // QHD/UHD TAAU: (re)allocate the full-res (output) history.
         if taau_active {
             self.taau
@@ -6770,6 +6788,61 @@ impl App {
                 } else {
                     gdf_resolved
                 };
+                // B2 mirror compaction: re-trace ONLY the near-mirror pixels dense (classify →
+                // indirect dispatch → the refine target the composite prefers below). The
+                // sparse-trace upsample cannot reconstruct a mirror image (the information was
+                // never traced — no denoiser can add it), so those pixels get real rays at
+                // 1/`reflect_compact_div` res; cost scales with the on-screen mirror area.
+                // SW path only (HWRT has its own full-res lever); content only (gallery anchor).
+                let refine = if !self.is_gallery
+                    && !self.hwrt
+                    && refl_half
+                    && self.reflect_compact_div > 0
+                    && self.reflect.has_reflect_compact()
+                {
+                    let d = self.reflect_compact_div;
+                    let (qw, qh) = (cw.div_ceil(d), ch.div_ceil(d));
+                    Some((
+                        self.reflect.record_reflect_compact(
+                            &mut graph,
+                            vol,
+                            ext,
+                            scene_aabb_min,
+                            scene_aabb_max,
+                            g_depth,
+                            g_normal,
+                            g_material,
+                            Extent2D::new(qw, qh),
+                            inv_view_proj,
+                            eye,
+                            self.sun_dir,
+                            self.sun_intensity,
+                            qw,
+                            qh,
+                            self.flip_y,
+                            self.frame_no as u32,
+                            scene_albedo,
+                            reflect_cache_arg,
+                            gi_reflect_arg,
+                            self.irradiance_cube_index(),
+                            scene_clip,
+                            &scene_clip_vols,
+                            // Content flag (bit31) selects the 0.125 mirror threshold in-shader;
+                            // the classified pixels all take the deterministic mirror branch, so
+                            // the stochastic/prefilter/K bits are irrelevant here.
+                            self.reflect_max_steps | 0x8000_0000,
+                            self.gdf_cone_k,
+                            self.deferred.globals_buffer(),
+                            globals_offset,
+                            self.reflect.lit_hist_read_index(),
+                            0.125, // near-mirror band — lockstep with gdf_reflect.slang content
+                        ),
+                        qw,
+                        qh,
+                    ))
+                } else {
+                    None
+                };
                 Some(self.reflect.record_composite(
                     &mut graph,
                     // B1-lite: SSR skipped under SCREEN_HIT — feed the GDF image in its slot
@@ -6792,6 +6865,8 @@ impl App {
                         self.reflect_rough_blur
                     },
                     ssr.is_none(), // B1-lite hard cut: GDF/screen-hit path only
+                    refine,
+                    0.125,
                 ))
             }
             _ => None,
@@ -7498,6 +7573,8 @@ impl App {
                         self.reflect_rough_blur
                     },
                     false, // viz keeps the SSR blend (no screen-hit trace here)
+                    None,  // no B2 mirror refine on the standalone viz path
+                    0.125,
                 );
                 // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
                 self.reflect.record_lit_history(

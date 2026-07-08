@@ -137,6 +137,7 @@ pub trait Recorder {
     fn storage_buffer_to_indirect(&self, buffer: &StorageBuffer);
     fn storage_buffer_to_storage(&self, buffer: &StorageBuffer);
     fn draw_indexed_indirect(&self, buffer: &StorageBuffer, offset: u64, draw_count: u32);
+    fn dispatch_indirect(&self, buffer: &StorageBuffer, offset: u64);
     fn set_scissor(&self, rect: Rect2D);
     fn set_viewport_scissor_rect(&self, rect: Rect2D);
     fn bind_vertex_buffer(&self, buffer: &Buffer, stride: u32);
@@ -307,6 +308,9 @@ impl Recorder for CommandBuffer {
     }
     fn draw_indexed_indirect(&self, buffer: &StorageBuffer, offset: u64, draw_count: u32) {
         CommandBuffer::draw_indexed_indirect(self, buffer, offset, draw_count)
+    }
+    fn dispatch_indirect(&self, buffer: &StorageBuffer, offset: u64) {
+        CommandBuffer::dispatch_indirect(self, buffer, offset)
     }
     fn set_scissor(&self, rect: Rect2D) {
         CommandBuffer::set_scissor(self, rect)
@@ -496,6 +500,10 @@ pub enum RhiCommand {
         buffer: ResPtr<StorageBuffer>,
         offset: u64,
         draw_count: u32,
+    },
+    DispatchIndirect {
+        buffer: ResPtr<StorageBuffer>,
+        offset: u64,
     },
     SetScissor {
         rect: Rect2D,
@@ -846,6 +854,9 @@ impl CommandList {
                     offset,
                     draw_count,
                 } => cmd.draw_indexed_indirect(unsafe { buffer.get() }, offset, draw_count),
+                RhiCommand::DispatchIndirect { buffer, offset } => {
+                    cmd.dispatch_indirect(unsafe { buffer.get() }, offset)
+                }
                 RhiCommand::SetScissor { rect } => cmd.set_scissor(rect),
                 RhiCommand::BindVertexBuffer { buffer, stride } => {
                     cmd.bind_vertex_buffer(unsafe { buffer.get() }, stride)
@@ -1221,6 +1232,15 @@ impl Recorder for CommandList {
                 buffer: ResPtr::new(buffer),
                 offset,
                 draw_count,
+            });
+    }
+    fn dispatch_indirect(&self, buffer: &StorageBuffer, offset: u64) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::DispatchIndirect {
+                buffer: ResPtr::new(buffer),
+                offset,
             });
     }
     fn set_scissor(&self, rect: Rect2D) {

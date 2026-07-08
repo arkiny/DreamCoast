@@ -32,7 +32,42 @@ struct CompositePush
     float rough_blur;    // max roughness-blur radius in texels (0 = off, gallery byte-identical)
     uint ssr_cut;        // B1-lite hard handoff: 1 = zero the SSR blend (GDF/screen-hit path only —
                          // the SCREEN_HIT trace already carries validated on-screen colours)
+    // B2 mirror compaction: the dense re-trace of the near-mirror pixels (0xFFFFFFFF = off).
+    // Near-mirror pixels take this over the low-res-upsampled `gdf_index` signal.
+    uint refine_index;   // sampled refine target (rgb radiance, a = hit distance / 0 = un-traced)
+    uint refine_w;       // refine grid resolution
+    uint refine_h;
+    float refine_thresh; // roughness below this reads the refine target (lockstep with classify)
 };
+
+// B2 refine fetch: validity-weighted manual bilinear over the refine target. The classify pass
+// zeroed every un-traced texel (`.a == 0`), so a silhouette texel whose refine-grid sample fell
+// on a non-mirror G-buffer pixel drops out of the filter instead of darkening the edge; if no
+// valid tap remains the caller keeps the legacy low-res signal.
+bool fetch_refine(float2 uv, out float3 color)
+{
+    float2 rres = float2(pc.refine_w, pc.refine_h);
+    float2 sp = uv * rres - 0.5;
+    float2 base = floor(sp);
+    float2 f = sp - base;
+    float wb[4] = { (1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y };
+    int2 off[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+    float3 acc = float3(0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    [unroll]
+    for (int i = 0; i < 4; i++)
+    {
+        int2 p = clamp(int2(base) + off[i], int2(0, 0), int2(rres) - 1);
+        float4 s = g.textures[pc.refine_index].Load(int3(p, 0));
+        if (s.a > 0.0)
+        {
+            acc += wb[i] * s.rgb;
+            wsum += wb[i];
+        }
+    }
+    color = wsum > 1e-3 ? acc / wsum : float3(0.0, 0.0, 0.0);
+    return wsum > 1e-3;
+}
 
 [[vk::push_constant]]
 ConstantBuffer<CompositePush> pc : register(b0, space0);
@@ -82,6 +117,16 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float4 ssr = g.textures[pc.ssr_index].SampleLevel(g.samp, uv, 0.0);
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
     float3 gdf = blur_gdf(uv, roughness, float2(pc.width, pc.height)) * pc.gdf_scale;
+    // B2 mirror compaction: near-mirror pixels take the dense re-trace over the low-res
+    // upsample (the mirror image was never resolvable from the sparse trace; see
+    // reflect_compact.slang). Falls through to the legacy signal where no refine texel is
+    // valid (classify/G-buffer silhouette disagreement).
+    if (pc.refine_index != 0xFFFFFFFFu && roughness < pc.refine_thresh)
+    {
+        float3 refined;
+        if (fetch_refine(uv, refined))
+            gdf = refined * pc.gdf_scale;
+    }
 
     // --- Blend (C8d): SSR owns the sharp end; the GDF takes over past `max_roughness`.
     //   * `ssr.a` (edge-fade / hit confidence) routes off-screen misses to the GDF / sky fallback.
