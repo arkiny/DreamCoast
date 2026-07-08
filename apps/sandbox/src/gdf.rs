@@ -81,6 +81,41 @@ pub(crate) struct GdfSystem {
     /// geometry atlases (flat storage buffers, one float4 / texel). C8b2 adds the re-lit
     /// radiance ping-pong; C8b3 looks it up at GI / reflection hits.
     cards: Option<StorageBuffer>,
+    /// Track C prerequisite — card-lookup acceleration grid. `sample_surface_cache_cone` was an
+    /// O(num_cards) linear scan PER REFLECTION HIT (30+ ms at 449 drawables / 2694 cards), so the
+    /// host builds a uniform world grid over the cards once at cache build: `card_grid_cells` =
+    /// 8-u32 header (grid min.xyz f32, cell size f32, res.xyz, pool len) + per-cell (offset,
+    /// count) pairs; `card_grid_pool` = the flat card-index pool. Each card is inserted into
+    /// every cell its influence volume overlaps, DILATED by the maximum acceptance tolerance the
+    /// shader can ever apply (texel tol + the ray-distance-growing cache bias at t = ray max), so
+    /// the grid query returns a superset of the cards the linear scan would accept → identical
+    /// results. Content reflection opt-in (`P_CACHE_GRID`); every other consumer keeps the scan.
+    card_grid_cells: Option<StorageBuffer>,
+    card_grid_pool: Option<StorageBuffer>,
+    /// C1 mesh-triangle capture (opt-in `P11_CARD_MESH_CAPTURE`): the consolidated content
+    /// geometry (object-space vertices / absolute indices / per-drawable material table — the
+    /// same layout the HWRT hit-lighting table uses) + the per-resident-drawable card-instance
+    /// map (table row + world→object 3x4). The capture pass projects each texel's GDF hit onto
+    /// the drawable's real triangles and reads the interpolated-UV base-color texture, giving
+    /// the cache per-texel texture detail instead of one flat stamped colour per drawable.
+    card_mesh: Option<(StorageBuffer, StorageBuffer, StorageBuffer, StorageBuffer)>,
+    /// C2a adaptive card resolution (opt-in `P11_CACHE_ADAPTIVE_RES`): per-card 16 B layout
+    /// records (mip0 atlas base texel, tile edge `res`, MIP-pyramid base texel, pad). `None` =
+    /// the legacy uniform-tile atlas. The layout index rides `tile` bits 8..15 (+1) into every
+    /// per-texel pass and the shared sampler, so all consumers address the variable-tile atlas
+    /// coherently; sentinel = byte-identical legacy arithmetic.
+    cache_layout: Option<StorageBuffer>,
+    /// Total mip0 atlas texels (adaptive: Σ res²; uniform: num_cards · tile²).
+    cache_total_texels: u32,
+    /// Largest / smallest per-card tile edge (uniform: both = `card_tile`). Max drives the
+    /// mipgen dispatch grid; min drives the card-grid tolerance dilation (largest texel).
+    cache_res_max: u32,
+    cache_res_min: u32,
+    /// C2b: per-card desired-resolution feedback (host-visible u32/card). The reflection's cone
+    /// sampler InterlockedMax-es the pow2 resolution each footprint wanted; the host reads it
+    /// back once (`P11_CACHE_RES_FEEDBACK` frame) and re-layouts the adaptive atlas around what
+    /// reflections ACTUALLY read — fixing the static distance prior's far-card under-resolution.
+    card_res_feedback: Option<StorageBuffer>,
     /// C: per-card source albedo (the drawable's representative color, 12 B/card). The
     /// capture stamps it onto the card so the GI/reflection cache carries the real surface
     /// color instead of the blurred per-voxel albedo volume. `None` ⇒ legacy volume path
@@ -287,7 +322,7 @@ impl GdfSystem {
             dreamcoast_shader::sdf_cache_capture_cs_dxil,
             dreamcoast_shader::sdf_cache_capture_cs_metallib,
             "sdf_cache_capture",
-            80,
+            96,
             [64, 1, 1],
         )?;
         let cache_view_pipeline = compute(
@@ -458,6 +493,14 @@ impl GdfSystem {
             card_src_albedo: None,
             albedo_bake_pipeline,
             cards: None,
+            card_grid_cells: None,
+            card_grid_pool: None,
+            card_mesh: None,
+            cache_layout: None,
+            cache_total_texels: 0,
+            cache_res_max: 0,
+            cache_res_min: 0,
+            card_res_feedback: None,
             cache_pos: None,
             cache_albedo: None,
             num_cards: 0,
@@ -959,6 +1002,7 @@ impl GdfSystem {
     /// buffers (captured geometry: `cache_pos` = hit pos + valid, `cache_albedo`). `cards`
     /// is the host-built card-record byte buffer (64 B / card). No-op without the capture
     /// pipeline. The card tile edge is `CARD_TILE`; the atlas is `num_cards * tile²` texels.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_surface_cache(
         &mut self,
         device: &Device,
@@ -966,11 +1010,33 @@ impl GdfSystem {
         num_cards: u32,
         tile: u32,
         card_albedo: Option<&[u8]>,
+        // C2a adaptive resolution: one pow2 tile edge per card (same texel budget as the uniform
+        // atlas, redistributed by camera relevance). `None` = the legacy uniform tile.
+        card_res: Option<&[u32]>,
+        // Track C card-lookup grid: the caller resolves it (tier default + `P_CACHE_GRID` env
+        // override) so the tier table stays the single source of truth; the grid build is still
+        // gated so the two extra bindless slots are only consumed when the consumer exists.
+        build_grid: bool,
     ) -> anyhow::Result<()> {
         if self.cache_capture_pipeline.is_none() || num_cards == 0 {
             return Ok(());
         }
         self.card_tile = tile.clamp(4, 64);
+        // C2a: build the per-card layout (base, res, mip_base) + the atlas totals. Uniform mode
+        // keeps the exact legacy sizes so everything downstream is byte-identical.
+        self.cache_layout = None;
+        self.cache_res_max = self.card_tile;
+        self.cache_res_min = self.card_tile;
+        let (total_texels, mip_total) = if let Some(resv) = card_res {
+            debug_assert_eq!(resv.len() as u32, num_cards);
+            self.upload_card_layout(device, resv)?
+        } else {
+            (
+                num_cards * self.card_tile * self.card_tile,
+                num_cards * Self::card_mip_texels(self.card_tile),
+            )
+        };
+        self.cache_total_texels = total_texels;
         self.cards = Some(device.create_storage_buffer_init(
             &StorageBufferDesc {
                 size: cards.len() as u64,
@@ -992,31 +1058,23 @@ impl GdfSystem {
             )?),
             _ => None,
         };
-        let texels = (num_cards * self.card_tile * self.card_tile) as u64;
-        let make = || -> anyhow::Result<Option<StorageBuffer>> {
-            Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
-                size: texels * 16,
-                stride: 16,
-                indirect: false,
-            })?))
-        };
-        self.cache_pos = make()?;
-        self.cache_albedo = make()?;
-        self.cache_radiance = [make()?, make()?, make()?];
-        // Reflection cone-LOD: the MIP pyramid of the radiance atlas (levels 1..=mip_levels; mip0
-        // stays in `cache_radiance`). `float4(rad.rgb, coverage)` per texel, `num_cards *
-        // card_mip_texels` total. Only when the generator pipeline exists (content). The gallery /
-        // GI consumers never read it (mip0-nearest), so it costs nothing there.
-        self.cache_rad_mips = if self.cache_mipgen_pipeline.is_some() {
-            let mip_texels = (num_cards as u64) * (Self::card_mip_texels(self.card_tile) as u64);
-            Some(device.create_storage_buffer(&StorageBufferDesc {
-                size: mip_texels.max(1) * 16,
-                stride: 16,
-                indirect: false,
-            })?)
-        } else {
-            None
-        };
+        // Per-texel atlases (pos / albedo / radiance ping-pong / MIP pyramid). The pyramid only
+        // exists with the generator pipeline (content); the gallery / GI consumers never read it.
+        self.alloc_cache_texel_buffers(device, total_texels, mip_total)?;
+        // C2b: the desired-res feedback buffer (adaptive mode + env opt-in only — host-visible,
+        // one u32 per card, zeroed; the reflection's cone sampler InterlockedMax-es into it).
+        self.card_res_feedback =
+            if card_res.is_some() && std::env::var_os("P11_CACHE_RES_FEEDBACK").is_some() {
+                let fbb = device.create_storage_buffer_host(&StorageBufferDesc {
+                    size: (num_cards as u64) * 4,
+                    stride: 4,
+                    indirect: false,
+                })?;
+                fbb.write(&vec![0u8; num_cards as usize * 4])?;
+                Some(fbb)
+            } else {
+                None
+            };
         // Stage D2b: 1 uint / card visibility flag (filled each frame by record_cache_visibility).
         self.card_vis = Some(device.create_storage_buffer(&StorageBufferDesc {
             size: (num_cards as u64) * 4,
@@ -1035,7 +1093,307 @@ impl GdfSystem {
         }
         self.num_cards = num_cards;
         self.cache_frame = 0;
+        // Track C prerequisite: the card-lookup acceleration grid (caller-resolved: tier default
+        // + `P_CACHE_GRID` override).
+        if build_grid {
+            self.build_card_grid(device, cards)?;
+        }
         Ok(())
+    }
+
+    /// Track C prerequisite: build the card-lookup acceleration grid (see the field docs on
+    /// `card_grid_cells`). Self-contained: bounds derive from the card records themselves. The
+    /// per-card dilation is the MAXIMUM acceptance tolerance `sample_surface_cache_cone` can ever
+    /// apply — `max(texel_tol, 0.02) + 0.006·diag + 0.03·t` at `t = ray max (≈ diag)` — with a
+    /// 1.25 safety factor on the diag term (the GDF volume the shader measures its diag from is
+    /// padded beyond the card union measured here). A cell query therefore returns a SUPERSET of
+    /// the cards the linear scan would accept: identical sampling results, O(cell) cost.
+    fn build_card_grid(&mut self, device: &Device, cards: &[u8]) -> anyhow::Result<()> {
+        self.card_grid_cells = None;
+        self.card_grid_pool = None;
+        let n = cards.len() / 64;
+        if n == 0 {
+            return Ok(());
+        }
+        let f = |o: usize| f32::from_le_bytes(cards[o..o + 4].try_into().unwrap());
+        // Per-card influence AABB: the card plane spans center ± u ± v, and captured points live
+        // up to trace_depth inward along -normal.
+        let mut boxes: Vec<([f32; 3], [f32; 3], f32)> = Vec::with_capacity(n);
+        let mut gmin = [f32::MAX; 3];
+        let mut gmax = [f32::MIN; 3];
+        for i in 0..n {
+            let b = i * 64;
+            let c = [f(b), f(b + 4), f(b + 8)];
+            let depth = f(b + 12);
+            let nrm = [f(b + 16), f(b + 20), f(b + 24)];
+            let ua = [f(b + 32), f(b + 36), f(b + 40)];
+            let va = [f(b + 48), f(b + 52), f(b + 56)];
+            let len = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            let mut lo = [0f32; 3];
+            let mut hi = [0f32; 3];
+            for k in 0..3 {
+                let ext = ua[k].abs() + va[k].abs();
+                let back = c[k] - nrm[k] * depth;
+                lo[k] = c[k].min(back) - ext;
+                hi[k] = c[k].max(back) + ext;
+                gmin[k] = gmin[k].min(lo[k]);
+                gmax[k] = gmax[k].max(hi[k]);
+            }
+            boxes.push((lo, hi, len(ua) + len(va)));
+        }
+        let ext = [gmax[0] - gmin[0], gmax[1] - gmin[1], gmax[2] - gmin[2]];
+        let diag = (ext[0] * ext[0] + ext[1] * ext[1] + ext[2] * ext[2]).sqrt();
+        // Worst-case shader acceptance in grid mode: 0.006·diag + the CAPPED distance term
+        // (0.012·diag — grid mode clamps it in-shader precisely so this dilation stays lean),
+        // safety-scaled 1.25 (the GDF volume the shader measures its diag from is padded beyond
+        // the card union measured here).
+        let bias_dil = (0.006 + 0.012) * diag * 1.25;
+        // C2a: the texel-tolerance dilation must cover the LARGEST texel = the smallest res.
+        let tile = self.cache_res_min.max(1) as f32;
+        // Grid bounds cover the dilated boxes; 64 cells along the longest axis.
+        let max_dil = boxes
+            .iter()
+            .map(|(_, _, uv)| (uv / tile * 4.0).max(0.02) + bias_dil)
+            .fold(0.0f32, f32::max);
+        for k in 0..3 {
+            gmin[k] -= max_dil;
+            gmax[k] += max_dil;
+        }
+        let ext = [gmax[0] - gmin[0], gmax[1] - gmin[1], gmax[2] - gmin[2]];
+        let cell = (ext[0].max(ext[1]).max(ext[2]) / 64.0).max(1e-3);
+        let res: [u32; 3] = std::array::from_fn(|k| ((ext[k] / cell).ceil() as u32).clamp(1, 64));
+        let num_cells = (res[0] * res[1] * res[2]) as usize;
+        let mut cell_cards: Vec<Vec<u32>> = vec![Vec::new(); num_cells];
+        for (i, (lo, hi, uv)) in boxes.iter().enumerate() {
+            let dil = (uv / tile * 4.0).max(0.02) + bias_dil;
+            let cr = |v: f32, k: usize| {
+                (((v - gmin[k]) / cell).floor() as i64).clamp(0, res[k] as i64 - 1) as u32
+            };
+            let (x0, x1) = (cr(lo[0] - dil, 0), cr(hi[0] + dil, 0));
+            let (y0, y1) = (cr(lo[1] - dil, 1), cr(hi[1] + dil, 1));
+            let (z0, z1) = (cr(lo[2] - dil, 2), cr(hi[2] + dil, 2));
+            for z in z0..=z1 {
+                for y in y0..=y1 {
+                    for x in x0..=x1 {
+                        cell_cards[((z * res[1] + y) * res[0] + x) as usize].push(i as u32);
+                    }
+                }
+            }
+        }
+        // Flatten: header (8 u32) + per-cell (offset, count) pairs; pool = the index lists in
+        // cell order (each ascending = the linear scan's relative order → identical FP sums).
+        let mut cells_bytes: Vec<u8> = Vec::with_capacity(32 + num_cells * 8);
+        for v in gmin {
+            cells_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        cells_bytes.extend_from_slice(&cell.to_le_bytes());
+        for r in res {
+            cells_bytes.extend_from_slice(&r.to_le_bytes());
+        }
+        let pool_len: usize = cell_cards.iter().map(Vec::len).sum();
+        cells_bytes.extend_from_slice(&(pool_len as u32).to_le_bytes());
+        let mut pool_bytes: Vec<u8> = Vec::with_capacity(pool_len * 4);
+        let mut offset = 0u32;
+        for list in &cell_cards {
+            cells_bytes.extend_from_slice(&offset.to_le_bytes());
+            cells_bytes.extend_from_slice(&(list.len() as u32).to_le_bytes());
+            for &c in list {
+                pool_bytes.extend_from_slice(&c.to_le_bytes());
+            }
+            offset += list.len() as u32;
+        }
+        if pool_bytes.is_empty() {
+            pool_bytes.extend_from_slice(&0u32.to_le_bytes()); // zero-size buffers are invalid
+        }
+        tracing::info!(
+            "surface cache: card grid {}x{}x{} cells, {} cards, {} pool entries ({:.1} MB)",
+            res[0],
+            res[1],
+            res[2],
+            n,
+            pool_len,
+            (cells_bytes.len() + pool_bytes.len()) as f64 / 1e6,
+        );
+        let make = |bytes: &[u8]| -> anyhow::Result<StorageBuffer> {
+            Ok(device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: bytes.len() as u64,
+                    stride: 4,
+                    indirect: false,
+                },
+                bytes,
+            )?)
+        };
+        self.card_grid_cells = Some(make(&cells_bytes)?);
+        self.card_grid_pool = Some(make(&pool_bytes)?);
+        Ok(())
+    }
+
+    /// C1 mesh-triangle capture: hand the capture pass the consolidated content geometry
+    /// (vertex / index / material-table storage) + the per-resident-drawable card-instance map
+    /// bytes (64 B each: table row u32, pad3, world→object 3x4 rows). Call BEFORE the capture
+    /// pass is recorded; `None`-safe (the capture falls back to the stamped albedo).
+    pub(crate) fn set_card_mesh_capture(
+        &mut self,
+        device: &Device,
+        vtx: StorageBuffer,
+        idx: StorageBuffer,
+        table: StorageBuffer,
+        card_inst_bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let inst = device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: card_inst_bytes.len() as u64,
+                stride: 16,
+                indirect: false,
+            },
+            card_inst_bytes,
+        )?;
+        self.card_mesh = Some((vtx, idx, table, inst));
+        Ok(())
+    }
+
+    /// C2a: build + upload the per-card layout records from a res assignment; returns
+    /// `(total mip0 texels, total pyramid texels)` and updates the res extrema.
+    fn upload_card_layout(&mut self, device: &Device, resv: &[u32]) -> anyhow::Result<(u32, u32)> {
+        let mut lay: Vec<u8> = Vec::with_capacity(resv.len() * 16);
+        let mut base = 0u32;
+        let mut mipb = 0u32;
+        let mut rmax = 4u32;
+        let mut rmin = u32::MAX;
+        for &r in resv {
+            lay.extend_from_slice(&base.to_le_bytes());
+            lay.extend_from_slice(&r.to_le_bytes());
+            lay.extend_from_slice(&mipb.to_le_bytes());
+            lay.extend_from_slice(&0u32.to_le_bytes());
+            base += r * r;
+            mipb += Self::card_mip_texels(r);
+            rmax = rmax.max(r);
+            rmin = rmin.min(r);
+        }
+        self.cache_layout = Some(device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: lay.len() as u64,
+                stride: 16,
+                indirect: false,
+            },
+            &lay,
+        )?);
+        self.cache_res_max = rmax;
+        self.cache_res_min = rmin.min(rmax);
+        tracing::info!(
+            "surface cache: adaptive res {}..{} — {} texels ({} cards; uniform {} would be {})",
+            self.cache_res_min,
+            rmax,
+            base,
+            resv.len(),
+            self.card_tile,
+            resv.len() as u32 * self.card_tile * self.card_tile,
+        );
+        Ok((base, mipb))
+    }
+
+    /// C2a/C2b: (re)allocate the per-texel atlas buffers for the current layout totals. The
+    /// contents are undefined until the next capture + reset relight.
+    fn alloc_cache_texel_buffers(
+        &mut self,
+        device: &Device,
+        total_texels: u32,
+        mip_total: u32,
+    ) -> anyhow::Result<()> {
+        let texels = total_texels as u64;
+        let make = || -> anyhow::Result<Option<StorageBuffer>> {
+            Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
+                size: texels.max(1) * 16,
+                stride: 16,
+                indirect: false,
+            })?))
+        };
+        self.cache_pos = make()?;
+        self.cache_albedo = make()?;
+        self.cache_radiance = [make()?, make()?, make()?];
+        self.cache_rad_mips = if self.cache_mipgen_pipeline.is_some() {
+            Some(device.create_storage_buffer(&StorageBufferDesc {
+                size: (mip_total as u64).max(1) * 16,
+                stride: 16,
+                indirect: false,
+            })?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// C2b: one-shot feedback re-layout. Reads the desired-res feedback the reflection recorded,
+    /// re-normalises it to the SAME texel budget, rebuilds the layout, and reallocates the atlas
+    /// (the caller must force a re-capture + reset relight, and should `wait_idle` first — the
+    /// old atlas buffers are dropped while no frame is in flight). Returns false when the
+    /// adaptive cache / feedback isn't active.
+    pub(crate) fn relayout_from_feedback(&mut self, device: &Device) -> anyhow::Result<bool> {
+        if self.card_res_feedback.is_none() || self.cache_layout.is_none() || self.num_cards == 0 {
+            return Ok(false);
+        }
+        let n = self.num_cards as usize;
+        let mut bytes = vec![0u8; n * 4];
+        self.card_res_feedback
+            .as_ref()
+            .expect("feedback")
+            .read_into(&mut bytes)?;
+        // Never-read cards floor to the minimum (they free budget for the cards reflections DO
+        // read); read cards ask for their recorded peak demand.
+        let desired: Vec<f64> = bytes
+            .chunks_exact(4)
+            .map(|c| {
+                u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                    .clamp(8, 64)
+                    .max(8) as f64
+            })
+            .collect();
+        let budget = (self.num_cards as u64) * (self.card_tile as u64) * (self.card_tile as u64);
+        let resv = crate::fuse::normalize_card_res(&desired, 8, 64, budget);
+        let (total, mip_total) = self.upload_card_layout(device, &resv)?;
+        self.cache_total_texels = total;
+        self.alloc_cache_texel_buffers(device, total, mip_total)?;
+        if let Some(fb) = self.card_res_feedback.as_ref() {
+            let _ = fb.write(&vec![0u8; n * 4]);
+        }
+        tracing::info!(
+            "surface cache: C2b feedback re-layout applied ({} texels)",
+            total
+        );
+        Ok(true)
+    }
+
+    /// C2b: the feedback buffer's bindless index (None = feature off / uniform atlas).
+    pub(crate) fn card_res_feedback_index(&self) -> Option<u32> {
+        Some(self.card_res_feedback.as_ref()?.storage_index())
+    }
+
+    /// C2a: `tile` with the adaptive layout index packed into bits 8..15 (+1; 0 = uniform).
+    /// This is the value every cache consumer receives — the shared sampler / per-texel passes
+    /// unpack it, and the sentinel collapses to the exact legacy arithmetic.
+    fn tile_packed(&self) -> u32 {
+        self.card_tile
+            | self
+                .cache_layout
+                .as_ref()
+                .map(|b| (b.storage_index() + 1) << 8)
+                .unwrap_or(0)
+    }
+
+    /// C2a: the adaptive layout buffer's bindless index (`None` = uniform tile). The reflection
+    /// carries it separately (its `cache_tile` slot re-packs the tile with the MIP fields).
+    pub(crate) fn surface_cache_layout(&self) -> Option<u32> {
+        self.cache_layout.as_ref().map(|b| b.storage_index())
+    }
+
+    /// Track C prerequisite: the card-lookup grid's bindless indices `(cells, pool)`, or `None`
+    /// when it wasn't built (env-gated). The reflection packs these into its cache push slot.
+    pub(crate) fn surface_cache_grid(&self) -> Option<(u32, u32)> {
+        Some((
+            self.card_grid_cells.as_ref()?.storage_index(),
+            self.card_grid_pool.as_ref()?.storage_index(),
+        ))
     }
 
     /// Stage D2b: the per-card visibility buffer's bindless storage index (for the relight pass),
@@ -1106,7 +1464,10 @@ impl GdfSystem {
             (self.cache_frame % 2) as usize
         };
         let rad = self.cache_radiance[slot].as_ref()?.storage_index();
-        Some((cards, pos, rad, self.num_cards, self.card_tile))
+        // C2a: the tile carries the adaptive layout index in bits 8..15 (+1; 0 = uniform), so
+        // every downstream consumer (bounce gather / relight / wrc viz / the shared sampler)
+        // addresses the variable-tile atlas without any per-consumer plumbing.
+        Some((cards, pos, rad, self.num_cards, self.tile_packed()))
     }
 
     /// Reflection cone-LOD: the surface-cache MIP pyramid buffer's bindless index + the highest
@@ -1115,7 +1476,8 @@ impl GdfSystem {
     /// reads a coarse averaged MIP instead of stair-stepped mip0 blocks.
     pub(crate) fn reflect_cache_mip_info(&self) -> Option<(u32, u32)> {
         let mips = self.cache_rad_mips.as_ref()?;
-        Some((mips.storage_index(), Self::mip_levels(self.card_tile)))
+        // C2a: the deepest pyramid belongs to the LARGEST card (the sampler clamps per card).
+        Some((mips.storage_index(), Self::mip_levels(self.cache_res_max)))
     }
 
     /// Number of MIP levels generated above mip0 for a card tile edge `tile` (levels whose edge
@@ -1162,7 +1524,19 @@ impl GdfSystem {
         let dst = mip_buf.storage_index();
         let cpos = self.cache_pos.as_ref()?.storage_index();
         let num_cards = self.num_cards;
-        let tile = self.card_tile;
+        // C2a adaptive: the dispatch grid + level count follow the LARGEST card's res; the shader
+        // early-outs per card and takes its offsets from the layout buffer (legacy strides below
+        // are ignored). layout1 = 0 keeps the exact legacy uniform path (byte-identical).
+        let layout1 = self
+            .cache_layout
+            .as_ref()
+            .map(|bf| bf.storage_index() + 1)
+            .unwrap_or(0);
+        let tile = if layout1 != 0 {
+            self.cache_res_max
+        } else {
+            self.card_tile
+        };
         let levels = Self::mip_levels(tile);
         let dst_card_stride = Self::card_mip_texels(tile);
         // Precompute (level, res_cur, res_prev, parent_card_stride, off_prev, off_cur) per level so
@@ -1217,6 +1591,7 @@ impl GdfSystem {
                         op,
                         dst_card_stride,
                         off_cur,
+                        layout1,
                     ));
                     let threads = num_cards * res_cur * res_cur;
                     cmd.dispatch(threads.div_ceil(64), 1, 1);
@@ -1314,8 +1689,7 @@ impl GdfSystem {
             .expect("rad")
             .storage_index();
         let num_cards = self.num_cards;
-        let num_texels = num_cards * self.card_tile * self.card_tile;
-        let sampled = vol.sampled_index();
+        let num_texels = self.cache_total_texels; // C2a: Σ res² (uniform: num_cards · tile²)
         let clip = self.clip_descriptor().unwrap_or((0, 1));
         let clip_vols = self.clip_level_volumes();
         let aabb_min = self.scene_aabb_min;
@@ -1351,9 +1725,13 @@ impl GdfSystem {
                     calb,
                     rad_read,
                     rad_write,
-                    sampled,
+                    // gdf_sampled slot, repurposed: the gather's card-lookup grid (identical results —
+                    // superset + ascending order; 0 = no grid = legacy full scan).
+                    self.surface_cache_grid()
+                        .map(|(c, po)| (c + 1) | ((po + 1) << 8))
+                        .unwrap_or(0),
                     num_cards,
-                    self.card_tile,
+                    self.tile_packed(), // C2a: layout index rides bits 8..15
                     num_texels,
                     spp,
                     frame,
@@ -1414,7 +1792,8 @@ impl GdfSystem {
         sky_gain: f32,
         sky_wb: [f32; 3],
     ) {
-        let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
+        // The volume itself is transitioned by the async-queue setup; assert it exists.
+        let _vol = self.scene_gdf.as_ref().expect("scene gdf volume");
         let pipe = self
             .cache_light_pipeline
             .as_ref()
@@ -1434,8 +1813,7 @@ impl GdfSystem {
         let rad_read = rad_read_buf.storage_index();
         let rad_write = rad_write_buf.storage_index();
         let num_cards = self.num_cards;
-        let num_texels = num_cards * self.card_tile * self.card_tile;
-        let sampled = vol.sampled_index();
+        let num_texels = self.cache_total_texels; // C2a: Σ res² (uniform: num_cards · tile²)
         let clip = self.clip_descriptor().unwrap_or((0, 1));
         let aabb_min = self.scene_aabb_min;
         let aabb_max = self.scene_aabb_max;
@@ -1476,9 +1854,13 @@ impl GdfSystem {
             calb,
             rad_read,
             rad_write,
-            sampled,
+            // gdf_sampled slot, repurposed: the gather's card-lookup grid (identical results —
+            // superset + ascending order; 0 = no grid = legacy full scan).
+            self.surface_cache_grid()
+                .map(|(c, po)| (c + 1) | ((po + 1) << 8))
+                .unwrap_or(0),
             num_cards,
-            self.card_tile,
+            self.tile_packed(), // C2a: layout index rides bits 8..15
             num_texels,
             spp,
             frame,
@@ -1538,9 +1920,22 @@ impl GdfSystem {
             .as_ref()
             .map(|b| b.storage_index())
             .unwrap_or(u32::MAX);
+        // C1: mesh-triangle capture indices (all-sentinel = off ⇒ stamped/volume albedo).
+        let mesh = self
+            .card_mesh
+            .as_ref()
+            .map(|(v, i, t, ci)| {
+                [
+                    v.storage_index(),
+                    i.storage_index(),
+                    t.storage_index(),
+                    ci.storage_index(),
+                ]
+            })
+            .unwrap_or([u32::MAX; 4]);
         let albedo = albedo_ext.and(self.scene_albedo.as_ref());
         let num_cards = self.num_cards;
-        let num_texels = num_cards * self.card_tile * self.card_tile;
+        let num_texels = self.cache_total_texels; // C2a: Σ res² (uniform: num_cards · tile²)
         let sampled = vol.sampled_index();
         let clip = self.clip_descriptor().unwrap_or((0, 1));
         let clip_vols = self.clip_level_volumes();
@@ -1589,7 +1984,7 @@ impl GdfSystem {
                     calb,
                     sampled,
                     num_cards,
-                    self.card_tile,
+                    self.tile_packed(), // C2a: layout index rides bits 8..15
                     num_texels,
                     albedo_rgb,
                     clip.0,
@@ -1598,6 +1993,7 @@ impl GdfSystem {
                     aabb_max,
                     diag,
                     card_albedo_index,
+                    mesh,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())
@@ -1639,7 +2035,7 @@ impl GdfSystem {
                     src_index,
                     out_index,
                     num_cards,
-                    self.card_tile,
+                    self.tile_packed(), // C2a: layout index rides bits 8..15
                     cw,
                     ch,
                 ));

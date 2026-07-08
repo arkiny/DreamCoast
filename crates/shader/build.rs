@@ -24,7 +24,7 @@ const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
 /// editing any of them recompiles all dependents (they include no per-job tracking otherwise —
 /// an omitted entry silently ships stale bytecode). Keep in sync with the `#include`s under
 /// `shaders/` (a non-JOB `.slang` — or the RT-pipeline root-sig JSON — belongs here).
-const SHARED_INCLUDES: [&str; 13] = [
+const SHARED_INCLUDES: [&str; 14] = [
     "bindless.slang",
     "rt_common.slang",
     "rt_pipeline_metal_rootsig.json",
@@ -38,6 +38,7 @@ const SHARED_INCLUDES: [&str; 13] = [
     "light_cluster_common.slang",
     "pbr_brdf.slang",
     "hzb_test.slang",
+    "reflect_ggx.slang",
 ];
 
 // FNV-1a 64-bit — dependency-free content hash for the shader cook cache (Phase 12
@@ -230,12 +231,18 @@ fn defines_for(target: &str, key: &str) -> &'static [(&'static str, &'static str
     // the default `gdf_gi` leaves it out so it references no acceleration structure — Slang then
     // omits the TLAS binding, keeping the scalable SW-default GI independent of RT capability and
     // free of the RT path's register pressure. HW-RT is loaded only when opted in (a High tier).
-    let hwrt = key == "gdf_gi_hwrt_cs";
-    match (target, hwrt) {
-        ("metallib", true) => &[("RT_METAL_TARGET", "1"), ("HWRT_GI", "1")],
-        ("metallib", false) => &[("RT_METAL_TARGET", "1")],
-        (_, true) => &[("HWRT_GI", "1")],
-        (_, false) => &[],
+    // The `gdf_reflect_hwrt` permutation (Phase 16 HWRT hybrid) is the same shape: `HWRT_REFLECT`
+    // compiles the hardware-ray-traced reflection trace in; the default `gdf_reflect` omits it.
+    let metal = target == "metallib";
+    match (metal, key) {
+        (true, "gdf_gi_hwrt_cs") => &[("RT_METAL_TARGET", "1"), ("HWRT_GI", "1")],
+        (false, "gdf_gi_hwrt_cs") => &[("HWRT_GI", "1")],
+        (true, "gdf_reflect_hwrt_cs") => &[("RT_METAL_TARGET", "1"), ("HWRT_REFLECT", "1")],
+        (false, "gdf_reflect_hwrt_cs") => &[("HWRT_REFLECT", "1")],
+        (true, "gdf_reflect_screen_cs") => &[("RT_METAL_TARGET", "1"), ("SCREEN_HIT", "1")],
+        (false, "gdf_reflect_screen_cs") => &[("SCREEN_HIT", "1")],
+        (true, _) => &[("RT_METAL_TARGET", "1")],
+        (false, _) => &[],
     }
 }
 
@@ -1056,6 +1063,26 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gdf_reflect_cs",
     },
+    // Phase 16 HWRT hybrid: the same reflection shader with the hardware-ray-traced trace compiled
+    // in (`HWRT_REFLECT`, via `defines_for`) — traces the scene TLAS instead of the GDF march, then
+    // shades the hit from the surface cache. Loaded only when `P_HWRT` is opted in on an RT-capable
+    // device; the default variant above references no acceleration structure.
+    Job {
+        src: "gdf_reflect.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_reflect_hwrt_cs",
+    },
+    // B2' screen-hit early-out: the same reflection shader with the SW screen-color-at-hit march
+    // compiled in (`SCREEN_HIT`, via `defines_for`) — a validated on-screen hit takes the previous
+    // frame's full-res lit radiance and skips the GDF march + cache shade. Binds the globals UBO
+    // (prev_view_proj). Loaded only when `P_REFLECT_SCREEN_HIT` is opted in.
+    Job {
+        src: "gdf_reflect.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_reflect_screen_cs",
+    },
     // Phase 11 Stage C (C7): hybrid reflection composite (SSR over GDF / sky).
     Job {
         src: "reflect_composite.slang",
@@ -1063,12 +1090,27 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "reflect_composite_cs",
     },
+    // Track A1: spatial ratio-estimator resolve of the stochastic GGX GDF reflection (trace res,
+    // before the upsample) — reconstructs each neighbour's ray + reweights by pdf_p/pdf_q.
+    Job {
+        src: "reflect_resolve.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "reflect_resolve_cs",
+    },
     // Phase 11 Stage C (C8j): temporal resolve of the stochastic GGX GDF reflection.
     Job {
         src: "reflect_temporal.slang",
         entry: "csMain",
         stage: "compute",
         key: "reflect_temporal_cs",
+    },
+    // Track A4b: variance-guided bilateral reflection denoiser (post-temporal, full-res).
+    Job {
+        src: "reflect_spatial.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "reflect_spatial_cs",
     },
     // Phase 11 Stage C (C7b): lit-color history capture (raw radiance) for SSR reprojection.
     Job {

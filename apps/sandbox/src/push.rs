@@ -697,8 +697,10 @@ pub(crate) fn cache_capture_push(
     aabb_max: [f32; 3],
     dist_clamp: f32,
     card_albedo_index: u32,
-) -> [u8; 80] {
-    let mut pc = [0u8; 80];
+    // C1 mesh-triangle capture: (vtx, idx, table, card_inst) bindless indices; all u32::MAX = off.
+    mesh: [u32; 4],
+) -> [u8; 96] {
+    let mut pc = [0u8; 96];
     let u = [
         cards_index,
         cache_pos_index,
@@ -726,6 +728,10 @@ pub(crate) fn cache_capture_push(
         pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
     pc[76..80].copy_from_slice(&dist_clamp.to_le_bytes());
+    // C1 mesh-triangle capture row (all-sentinel = off ⇒ legacy stamped/volume albedo).
+    for (i, v) in mesh.iter().enumerate() {
+        pc[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
     pc
 }
 
@@ -776,6 +782,8 @@ pub(crate) fn sdf_cache_mipgen_push(
     off_prev: u32,
     dst_stride: u32,
     off_cur: u32,
+    // C2a: adaptive layout index + 1 (0 = uniform legacy).
+    layout1: u32,
 ) -> [u8; 48] {
     let mut pc = [0u8; 48];
     let fields = [
@@ -790,7 +798,7 @@ pub(crate) fn sdf_cache_mipgen_push(
         off_prev,
         dst_stride,
         off_cur,
-        0u32, // pad to 48 B (12 u32)
+        layout1,
     ];
     for (i, v) in fields.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
@@ -1704,6 +1712,8 @@ pub(crate) fn reflect_composite_push(
     material_index: u32,
     max_roughness: f32,
     skip_mirror_ssr: bool,
+    rough_blur: f32,
+    ssr_cut: bool,
 ) -> [u8; 48] {
     let mut pc = [0u8; 48];
     pc[0..4].copy_from_slice(&ssr_index.to_le_bytes());
@@ -1716,6 +1726,8 @@ pub(crate) fn reflect_composite_push(
     pc[28..32].copy_from_slice(&material_index.to_le_bytes());
     pc[32..36].copy_from_slice(&max_roughness.to_le_bytes());
     pc[36..40].copy_from_slice(&u32::from(skip_mirror_ssr).to_le_bytes()); // pad0: content near-mirror SSR skip
+    pc[40..44].copy_from_slice(&rough_blur.to_le_bytes()); // pad1: roughness-blur radius (0 = off/anchor)
+    pc[44..48].copy_from_slice(&u32::from(ssr_cut).to_le_bytes()); // pad2: B1-lite SSR hard cut
     pc
 }
 
@@ -1746,8 +1758,13 @@ pub(crate) fn reflect_temporal_push(
     tonemap_range: f32,
     clamp_mode: u32,
     clamp_gamma: f32,
-) -> [u8; 224] {
-    let mut pc = [0u8; 224];
+    spatial_off: u32,
+    // A4a: per-pixel 2nd-moment (variance) accumulation buffers + enable. Sentinel/0 = off (no M2).
+    moment_read: u32,
+    moment_write: u32,
+    denoise: u32,
+) -> [u8; 240] {
+    let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1777,6 +1794,93 @@ pub(crate) fn reflect_temporal_push(
     // 2 variance) + variance gamma. mode 0 => the shader skips the clamp = byte-identical legacy.
     pc[208..212].copy_from_slice(&clamp_mode.to_le_bytes());
     pc[212..216].copy_from_slice(&clamp_gamma.to_le_bytes());
+    // A1: skip the spatial box average when the ratio-estimator resolve already ran (0 = keep it,
+    // byte-identical legacy).
+    pc[216..220].copy_from_slice(&spatial_off.to_le_bytes());
+    // A4a: 2nd-moment ping-pong indices + enable (own 16-byte row at 220; denoise 0 => byte-identical).
+    pc[220..224].copy_from_slice(&moment_read.to_le_bytes());
+    pc[224..228].copy_from_slice(&moment_write.to_le_bytes());
+    pc[228..232].copy_from_slice(&denoise.to_le_bytes());
+    pc
+}
+
+/// Pack the Track A1 reflection spatial-resolve push block (128 bytes): inv_view_proj (64) +
+/// cam_pos (16) + the four sampled indices (16) + (out, width, height, flip_y) (16) +
+/// (frame, mirror_thresh, kernel_radius, pad) (16). Stateless — no history buffers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reflect_resolve_push(
+    inv_view_proj: &[f32; 16],
+    cam_pos: Vec3,
+    refl_index: u32,
+    depth_index: u32,
+    normal_index: u32,
+    material_index: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    frame: u32,
+    mirror_thresh: f32,
+    kernel_radius: f32,
+    stochastic: u32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&cam_pos.x.to_le_bytes());
+    pc[68..72].copy_from_slice(&cam_pos.y.to_le_bytes());
+    pc[72..76].copy_from_slice(&cam_pos.z.to_le_bytes());
+    pc[80..84].copy_from_slice(&refl_index.to_le_bytes());
+    pc[84..88].copy_from_slice(&depth_index.to_le_bytes());
+    pc[88..92].copy_from_slice(&normal_index.to_le_bytes());
+    pc[92..96].copy_from_slice(&material_index.to_le_bytes());
+    pc[96..100].copy_from_slice(&out_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&width.to_le_bytes());
+    pc[104..108].copy_from_slice(&height.to_le_bytes());
+    pc[108..112].copy_from_slice(&flip_y.to_le_bytes());
+    pc[112..116].copy_from_slice(&frame.to_le_bytes());
+    pc[116..120].copy_from_slice(&mirror_thresh.to_le_bytes());
+    pc[120..124].copy_from_slice(&kernel_radius.to_le_bytes());
+    pc[124..128].copy_from_slice(&stochastic.to_le_bytes());
+    pc
+}
+
+/// Pack the Track A4b reflection spatial-denoiser push block (128 bytes): inv_view_proj (64) +
+/// cam_pos (16) + sampled indices (16) + (out, width, height, flip_y) (16) + (kernel_radius,
+/// tonemap_range, pad, pad) (16).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reflect_spatial_push(
+    inv_view_proj: &[f32; 16],
+    cam_pos: Vec3,
+    refl_index: u32,
+    depth_index: u32,
+    normal_index: u32,
+    material_index: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    flip_y: u32,
+    kernel_radius: f32,
+    tonemap_range: f32,
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[64..68].copy_from_slice(&cam_pos.x.to_le_bytes());
+    pc[68..72].copy_from_slice(&cam_pos.y.to_le_bytes());
+    pc[72..76].copy_from_slice(&cam_pos.z.to_le_bytes());
+    pc[80..84].copy_from_slice(&refl_index.to_le_bytes());
+    pc[84..88].copy_from_slice(&depth_index.to_le_bytes());
+    pc[88..92].copy_from_slice(&normal_index.to_le_bytes());
+    pc[92..96].copy_from_slice(&material_index.to_le_bytes());
+    pc[96..100].copy_from_slice(&out_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&width.to_le_bytes());
+    pc[104..108].copy_from_slice(&height.to_le_bytes());
+    pc[108..112].copy_from_slice(&flip_y.to_le_bytes());
+    pc[112..116].copy_from_slice(&kernel_radius.to_le_bytes());
+    pc[116..120].copy_from_slice(&tonemap_range.to_le_bytes());
     pc
 }
 

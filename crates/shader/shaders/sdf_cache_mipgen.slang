@@ -15,6 +15,7 @@
 // `src_pos.w`); higher levels read the pyramid's previous level (`float4(radiance, coverage)`).
 
 #include "bindless.slang"
+#include "surface_cache.slang" // C2a: mip_off helper (per-card adaptive pyramid offsets)
 
 struct MipGenPush
 {
@@ -23,13 +24,13 @@ struct MipGenPush
     uint dst;           // the MIP pyramid buffer (write)
     uint num_cards;     // cards in the atlas
     uint level;         // current MIP level, 1-based (1 = first level above mip0)
-    uint res_cur;       // this level's card tile edge (tile >> level)
+    uint res_cur;       // this level's card tile edge (tile >> level; adaptive: MAX-res edge)
     uint res_prev;      // parent's tile edge (tile >> (level-1)) == 2*res_cur
     uint parent_stride; // per-card texel stride of the parent buffer (tile² at level 1, else dst_stride)
     uint off_prev;      // per-card texel offset of the parent level within its buffer (0 at level 1)
     uint dst_stride;    // per-card texel stride of the pyramid buffer (Σ level texels)
     uint off_cur;       // per-card texel offset of this level within the pyramid buffer
-    uint pad;
+    uint pad;           // C2a: adaptive layout index + 1 (0 = uniform legacy — byte-identical path)
 };
 
 [[vk::push_constant]]
@@ -40,6 +41,9 @@ ConstantBuffer<MipGenPush> pc : register(b0, space0);
 void mipMain(uint3 tid: SV_DispatchThreadID)
 {
     uint t = tid.x;
+    // C2a adaptive: the dispatch covers num_cards × (MAX res >> level)² threads (uniform grid);
+    // a card whose own pyramid is shallower or smaller at this level early-outs, and the per-card
+    // base/offsets come from the layout buffer instead of the uniform strides.
     uint per_card = pc.res_cur * pc.res_cur;
     uint total = pc.num_cards * per_card;
     if (t >= total)
@@ -50,9 +54,27 @@ void mipMain(uint3 tid: SV_DispatchThreadID)
     uint tx = local % pc.res_cur;
     uint ty = local / pc.res_cur;
 
+    uint res_cur = pc.res_cur;
+    uint res_prev = pc.res_prev;
+    uint parent_base = card * pc.parent_stride + pc.off_prev;
+    uint dst_base = card * pc.dst_stride + pc.off_cur;
+    uint lay8 = pc.pad & 0xFFu;
+    if (lay8 != 0u)
+    {
+        uint layout = lay8 - 1u;
+        uint2 lay = g.storage_buffers[layout].Load2(card * 16u); // (mip0 base, res0)
+        uint res0 = lay.y;
+        res_cur = res0 >> pc.level;
+        if (res_cur == 0u || tx >= res_cur || ty >= res_cur)
+            return; // this card's pyramid ends above this level / is smaller than the grid
+        res_prev = res0 >> (pc.level - 1u);
+        uint mipb = g.storage_buffers[layout].Load(card * 16u + 8u);
+        parent_base = pc.level == 1u ? lay.x : (mipb + mip_off(res0, pc.level - 1u));
+        dst_base = mipb + mip_off(res0, pc.level);
+    }
+
     // 2×2 parent footprint (parent edge is exactly twice this level's).
     uint px0 = tx * 2u, py0 = ty * 2u;
-    uint parent_base = card * pc.parent_stride + pc.off_prev;
 
     float3 sum = float3(0.0, 0.0, 0.0);
     float wsum = 0.0;
@@ -61,9 +83,9 @@ void mipMain(uint3 tid: SV_DispatchThreadID)
     {
         uint px = px0 + (j & 1u);
         uint py = py0 + (j >> 1u);
-        if (px >= pc.res_prev || py >= pc.res_prev)
+        if (px >= res_prev || py >= res_prev)
             continue;
-        uint pt = parent_base + py * pc.res_prev + px;
+        uint pt = parent_base + py * res_prev + px;
         float w;
         float3 rad;
         if (pc.level == 1u)
@@ -86,6 +108,6 @@ void mipMain(uint3 tid: SV_DispatchThreadID)
 
     float3 out_rad = wsum > 1e-4 ? sum / wsum : float3(0.0, 0.0, 0.0);
     float coverage = wsum * 0.25; // captured fraction of the 2×2 footprint
-    uint dt = card * pc.dst_stride + pc.off_cur + ty * pc.res_cur + tx;
+    uint dt = dst_base + ty * res_cur + tx;
     g.storage_buffers[pc.dst].Store4(dt * 16u, asuint(float4(out_rad, coverage)));
 }

@@ -815,6 +815,34 @@ struct App {
     /// first increment returns a hardware-traced VISIBILITY term only (hit lighting is a later
     /// increment) and requires the BLAS/TLAS built by `rt.rs` (currently the gallery scene only).
     hwrt_gi: bool,
+    /// Phase 16 HWRT hybrid: hardware-ray-traced reflections opt-in (`P_HWRT`). True only when the
+    /// device is RT-capable AND the content scene's TLAS was built. The reflection trace then routes
+    /// through the scene BVH + surface-cache shading instead of the GDF sphere-march. Default off.
+    hwrt: bool,
+    /// Whether the content HWRT acceleration structures were BUILT at load (`P_HWRT` / tier). When
+    /// true, `hwrt` (the runtime reflection toggle) can be flipped live in the settings UI without a
+    /// rebuild; when false, HWRT can't be enabled this run (the accel isn't built).
+    hwrt_available: bool,
+    /// Phase 16 C: `P_HWRT_FULLRES` — trace the HWRT reflection at full resolution (crisp mirror,
+    /// ~4x cost). Implies `hwrt`. Default off keeps the half-res HWRT trace for interactive perf.
+    hwrt_fullres: bool,
+    /// Phase 16 E: `P_HWRT_HITLIGHTING` — shade an off-screen reflection HW hit with the real
+    /// material (consolidated geometry + albedo texture + sun/HW-shadow/IBL) instead of the surface
+    /// cache. Implies `hwrt` and the built hit table. Default off.
+    hwrt_hitlighting: bool,
+    /// Bent-normal skylight: when true (`P_BENT_NORMAL`, default on) the GI pass writes the SH
+    /// sky-vis band-1 vector (the DFAO bent normal) into the sky-vis image so the lighting samples
+    /// the diffuse skylight along it. Only affects the content sky-vis path; gallery byte-identical.
+    bent_normal: bool,
+    /// Multi-bounce AO (`P_AO_MULTIBOUNCE`, default off): recolour the scalar diffuse AO by the
+    /// albedo so cavities keep the surface's own bounced colour (reference AOMultiBounce) instead of
+    /// darkening flat. Opt-in because it changes any AO<1 pixel (incl. the gallery); off = anchor.
+    ao_multibounce: bool,
+    /// Bent-normal specular occlusion (`P_SPEC_OCCLUSION`, default off): cone-cone occlusion of the
+    /// prefilter-CUBE ambient specular by the bent-normal visibility cone (reference
+    /// GetDistanceFieldAOSpecularOcclusion). The SW-RT reflection carries its own ray occlusion so
+    /// it is untouched; active only on the legacy-IBL / cube-specular path. off = anchor.
+    spec_occlusion: bool,
     /// 레퍼런스 엔진 GI-fidelity: world irradiance volume (DDGI-lite radiance cache). When on, the GI pass
     /// samples a multibounce-propagating world volume instead of a single-bounce ray march — the
     /// real fix for deep-interior darkness. Content-only (`P_GI_VOLUME`); gallery forced off.
@@ -898,6 +926,66 @@ struct App {
     /// Reflection temporal history clamp (0 off / 1 hard / 2 variance; gallery forced 0) + variance γ.
     reflect_history_clamp: u32,
     reflect_clamp_gamma: f32,
+    /// Roughness-scaled blur radius (texels) applied to the low-res reflection in the composite to
+    /// smooth its blocky "sparkle" on rough content surfaces (the floor) while keeping the traced
+    /// reflection's correct local colour. `P_REFL_ROUGH_BLUR`; 0 = off, gallery forced to 0.
+    reflect_rough_blur: f32,
+    /// Track A1: run the spatial ratio-estimator resolve (`reflect_resolve.slang`) at trace res
+    /// before the upsample — reconstructs each glossy neighbour's GGX ray and reweights by
+    /// `pdf_p/pdf_q` to sharpen the glossy reflection instead of box-blurring it. `P_REFLECT_RESOLVE`
+    /// (content only; gallery never runs it → anchor untouched). Kernel radius = `reflect_resolve_kernel`.
+    reflect_resolve: bool,
+    reflect_resolve_kernel: f32,
+    /// Track A4: variance-guided reflection denoiser. Enables A4a (per-pixel 2nd-moment accumulation
+    /// in `reflect_temporal`) + A4b (the `reflect_spatial` bilateral pass, post-temporal). `P_REFLECT_
+    /// SPATIAL` (content only; gallery never runs it → anchor untouched). Kernel radius / sample count
+    /// are `reflect_spatial_kernel` / fixed. Off ⇒ temporal keeps out.a = 1.0, byte-identical.
+    reflect_spatial: bool,
+    reflect_spatial_kernel: f32,
+    /// Track A5: blue-noise stochastic reflection — a bundle that enables frame-varying + low-
+    /// discrepancy (blue-noise) GGX jitter + the A1 resolve + the A4 denoiser together, so the
+    /// temporal pass converges the glossy lobe (escaping the fixed-jitter dead end) instead of
+    /// sparkling. `P_REFLECT_STOCHASTIC` (content only; gallery keeps its white inline jitter →
+    /// anchor untouched). Sets `max_steps` bit30 for the SW trace so it draws the blue-noise ray.
+    reflect_stochastic: bool,
+    /// B2' rough-prefilter split: roughness at/above this threshold traces ONE deterministic mirror
+    /// ray and shades it with a roughness-driven cone footprint from the surface-cache MIP pyramid
+    /// (structural noise ZERO) instead of the stochastic 1-ray GGX estimator, which at any reachable
+    /// sample rate leaves residual speckle on wide lobes (reference engine: above RadianceCache.
+    /// MaxRoughness the trace is skipped for the prefiltered probe). `P_REFLECT_PREFILTER=<thresh>`
+    /// (`=1` selects the reference-like default 0.4); 0 = off (content opt-in; gallery never sets
+    /// it → anchor untouched). Rides `max_steps` bits 16..23 on the SW trace.
+    reflect_prefilter: f32,
+    /// B2' glossy sample density: GGX rays per pixel per frame for the stochastic glossy band
+    /// (mirror < roughness < prefilter) — the direct fix for the ~50x undersampling (a denoiser
+    /// cannot average in radiance the rays never sampled). Samples advance the SAME low-discrepancy
+    /// sequence (seq = frame*K + s) and average in the tonemapped denoiser space; the A1 resolve
+    /// reconstructs all K neighbour rays. `P_REFLECT_GLOSSY_SPP=<K>` (1 = legacy single ray, the
+    /// default; content SW trace only). Rides `max_steps` bits 24..29.
+    reflect_glossy_spp: u32,
+    /// B2' screen-hit early-out: per-ray screen-trace prepass in the SW reflection (the `SCREEN_
+    /// HIT` permutation) — a validated on-screen hit reads the previous frame's FULL-RES lit
+    /// radiance and skips the GDF march + surface-cache shade. Both the budget that makes
+    /// `reflect_glossy_spp` affordable (most indoor reflected surfaces are on screen) and a
+    /// strictly better colour (the HWRT screen-color-at-hit sharpness win, SW equivalent).
+    /// `P_REFLECT_SCREEN_HIT=1` (content only; gallery keeps the plain permutation → anchor
+    /// untouched).
+    reflect_screen_hit: bool,
+    /// C2b: one-shot feedback re-layout frame — at this frame the host reads the per-card
+    /// desired-res feedback the reflection recorded, re-normalises to the same texel budget and
+    /// rebuilds the adaptive atlas layout (re-capture + reset relight follow). 0 = off.
+    /// `P11_CACHE_RES_FEEDBACK=<frame>` (`=1` → 64). Requires `P11_CACHE_ADAPTIVE_RES`.
+    cache_res_feedback_frame: u32,
+    /// Track C0-fix: surface-cache relight CONVERGE mode — K-cycle deterministic gather jitter +
+    /// running-mean α=1/(1+N) (reference radiosity NumFramesAccumulated), so a static scene's cache
+    /// actually reaches a fixed point and the measured freeze latch can arm. 0 = legacy (fixed-alpha
+    /// EMA of frame-varying noise = permanent variance floor). `P_CACHE_CONVERGE=<K>` (content only).
+    cache_converge: u32,
+    /// Track C0-fix: GI irradiance-volume STABLE mode — pass a fixed jitter index (0) so each probe
+    /// traces the SAME deterministic direction set every update (reference radiance cache:
+    /// JITTER_TRACE_DIRECTION 0, "we want stable lighting"); a static scene's volume becomes an
+    /// idempotent overwrite = fixed point. `P_GI_STABLE=1` (content only).
+    gi_stable: bool,
     /// SSR resolve history neighbourhood clamp (breaks the mirror lit-history feedback oscillation a
     /// plain EMA only low-passes): 0 = off (byte-identical), 1 = variance clamp (mean ± γ·σ). Gallery
     /// forced 0. `P_SSR_HISTORY_CLAMP` / `P_SSR_CLAMP_GAMMA` override.
@@ -1284,6 +1372,24 @@ impl App {
         // The gallery is the only scene with the GDF/HW-RT path; glTF + levels + worlds
         // use the captured-cube IBL (forced via `legacy_ibl` below).
         let gallery_scene = !world_mode && level_select.is_none() && scene_gltf_path.is_none();
+        // RenderQuality tier (Stage D): `RENDER_QUALITY=low|med|high` (unset => platform default —
+        // an Apple GPU maps to the aggressive `Apple` tier, every other adapter stays on the legacy
+        // `Med` baseline). Resolved HERE, before the level build, because load-time knobs (the
+        // surface-cache card grid / adaptive res / mesh capture) already need the tier; the
+        // per-frame knobs below resolve against the same `base`. The gallery is the byte-identical
+        // path-tracer anchor, so it resolves against the fixed legacy `gallery_preset()` instead of
+        // the active tier — structurally, so a new tier knob can't break the anchor by forgetting a
+        // per-site `if gallery_scene { .. }` force. Each knob is
+        // `env_override.unwrap_or(base.<knob>).clamp(..)`: an explicit `P11_*`/`P_*` env always
+        // wins over the tier. The UI live-swap re-derives from the same `base` (RenderQuality
+        // combo) so the two resolution paths can never drift.
+        let device_info = device.device_info();
+        let quality = quality::RenderQuality::from_env_for_device(&device_info);
+        let base = if gallery_scene {
+            quality::gallery_preset()
+        } else {
+            quality::preset(quality)
+        };
         // Resolve the virtual-geometry mode now that the scene kind + caps are known (see `vgeo_env`).
         let vgeo_mode: u32 =
             vgeo_env.unwrap_or((!gallery_scene && device.capabilities().atomic_int64) as u32);
@@ -1730,7 +1836,7 @@ impl App {
         // scene — plus the M3/M4/M5 RT pipelines. See `rt.rs`. The sample scene's TLAS
         // is bound on construction (the startup default). The instance table's mesh
         // order MUST match the TLAS custom_index order (scene objects, then ground).
-        let rt = RtSystem::new(
+        let mut rt = RtSystem::new(
             &device,
             backend,
             &scene,
@@ -1741,6 +1847,10 @@ impl App {
             ground_count,
             gallery_scene,
         )?;
+
+        // Phase 16 (HWRT hybrid): the opt-in decision + content accel build is resolved AFTER the
+        // quality tier `base` is known (below), so a tier can enable it and the env vars override —
+        // it's a first-class scalability option, not just a raw env flag.
 
         // Scalable-GI Stage 0: fuse the opaque draw list into one world-space triangle
         // soup and register it as the scene GDF (baked once on the graph). Ground is
@@ -2199,7 +2309,7 @@ impl App {
                 } else {
                     fuse::MAX_CARDS
                 };
-                let (cards, card_albedo, _residency) =
+                let (cards, card_albedo, residency) =
                     fuse::build_surface_cards(&obj_aabb, &obj_albedo, &card_cam, card_budget);
                 let num_cards = (cards.len() / 64) as u32;
                 // C: content stamps the drawable's true albedo onto its cards (fine color);
@@ -2220,7 +2330,77 @@ impl App {
                     .and_then(|v| v.trim().parse::<u32>().ok())
                     .unwrap_or(32)
                     .clamp(4, 64);
-                gdf.build_surface_cache(&device, &cards, num_cards, cache_tile, card_albedo)?;
+                // C2a adaptive card resolution (opt-in): redistribute the SAME texel budget as
+                // the uniform atlas by camera relevance — near/large cards up to 64², far/small
+                // down to 8² — so the cache carries detail where reflections actually read it.
+                let card_res: Option<Vec<u32>> = if !gallery_scene
+                    && quality::env_bool("P11_CACHE_ADAPTIVE_RES", base.cache_adaptive_res)
+                {
+                    Some(fuse::assign_card_res(
+                        &cards,
+                        &card_cam,
+                        8,
+                        64,
+                        (num_cards as u64) * (cache_tile as u64) * (cache_tile as u64),
+                    ))
+                } else {
+                    None
+                };
+                gdf.build_surface_cache(
+                    &device,
+                    &cards,
+                    num_cards,
+                    cache_tile,
+                    card_albedo,
+                    card_res.as_deref(),
+                    // Track C card grid: pick-identical lookup acceleration (tier default +
+                    // `P_CACHE_GRID` override; content only — the gallery keeps the legacy scan).
+                    !gallery_scene && quality::env_bool("P_CACHE_GRID", base.cache_grid),
+                )?;
+                // C1 mesh-triangle capture (opt-in): consolidated content geometry (the same
+                // layout as the HWRT hit-lighting table, built independently of RT capability)
+                // + the card→drawable instance map (table row + world→object 3x4 per resident
+                // drawable). The capture then reads per-texel interpolated-UV texture albedo
+                // (+ opacity) instead of one flat stamped colour per drawable — the surface
+                // cache finally carries the curtain patterns a reflection should show.
+                if !gallery_scene
+                    && quality::env_bool("P11_CARD_MESH_CAPTURE", base.card_mesh_capture)
+                {
+                    let draw_list = world.draw_list();
+                    match mesh::build_content_hit_table(
+                        &device,
+                        &draw_list,
+                        &mesh_registry,
+                        &material_registry,
+                    ) {
+                        Ok((vtx, idx, table)) => {
+                            let mut rec: Vec<u8> =
+                                Vec::with_capacity(residency.resident.len() * 64);
+                            for &di in &residency.resident {
+                                let inv = draw_list[di].world.inverse();
+                                rec.extend_from_slice(&(di as u32).to_le_bytes());
+                                rec.extend_from_slice(&[0u8; 12]);
+                                // world→object as 3 row-major float4 rows (glam is column-major).
+                                let m = inv.to_cols_array_2d();
+                                for r in 0..3 {
+                                    for col in m.iter().take(4) {
+                                        rec.extend_from_slice(&col[r].to_le_bytes());
+                                    }
+                                }
+                            }
+                            gdf.set_card_mesh_capture(&device, vtx, idx, table, &rec)?;
+                            info!(
+                                "surface cache: C1 mesh-triangle capture on ({} resident drawables)",
+                                residency.resident.len()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "C1 mesh capture table build failed: {e:#} — stamped albedo"
+                            )
+                        }
+                    }
+                }
             }
         }
 
@@ -2325,25 +2505,38 @@ impl App {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         // RenderQuality tier (Stage D): `RENDER_QUALITY=low|med|high` (unset => platform default).
-        // The platform default consults the GPU identity (macOS perf, axis A): an Apple GPU maps to
-        // the aggressive `Apple` tier, every other / unknown GPU (incl. all VK/D3D12 adapters) stays
-        // on `Med` = the legacy no-reg baseline. An explicit `RENDER_QUALITY` value always wins over
-        // the platform default. `qp` is the single tier→knob table; each knob below reads its own env
-        // first and falls back to `qp.*`, so an explicit `P11_*`/`SHADOW_*`/`RENDER_SCALE`/`SSAO`
-        // override always wins over the tier.
-        let device_info = device.device_info();
-        let quality = quality::RenderQuality::from_env_for_device(&device_info);
-        // Scalability resolution base (single source of truth): the gallery is the byte-identical
-        // path-tracer anchor, so its knobs resolve against a fixed legacy preset rather than the
-        // active tier — structurally, so a new tier knob can't break the anchor by forgetting a
-        // per-site `if gallery_scene { .. }` force. Content scenes resolve against the tier preset.
-        // Each knob below is `env_override.unwrap_or(base.<knob>).clamp(..)`; the UI live-swap uses
-        // the same `base` (see the RenderQuality combo) so the two paths can never drift.
-        let base = if gallery_scene {
-            quality::gallery_preset()
-        } else {
-            quality::preset(quality)
-        };
+        // (`device_info` / `quality` / `base` were resolved before the level build — the load-time
+        // cache knobs needed them; see the tier block after `gallery_scene`.)
+
+        // Phase 16 (HWRT hybrid): opt-in hardware-ray-traced reflections, resolved as a scalability
+        // option — the tier preset drives the default, the env vars override (`env_bool`). `P_HWRT`
+        // builds the CONTENT scene's BLAS/TLAS + consolidated geometry (the gallery uses its own
+        // path-tracer accel) and routes the reflection through the scene TLAS + surface-cache /
+        // screen-color / hit-lighting shading. Requires an RT-capable device + content geometry;
+        // gallery / world-streaming out of scope, so it stays byte-identical there.
+        let hwrt = quality::env_bool("P_HWRT", base.hwrt_reflect)
+            && device.has_raytracing()
+            && !gallery_scene
+            && !world_mode
+            && !world.draw_list().is_empty();
+        if hwrt {
+            rt.build_content_accel(
+                &device,
+                &world.draw_list(),
+                &mesh_registry,
+                &material_registry,
+            );
+        }
+        // Built at launch → the reflection can be toggled live in the UI without a rebuild.
+        let hwrt_available = hwrt && rt.has_content_scene();
+        let hwrt = hwrt_available;
+        // `P_HWRT_FULLRES`: full-res reflection trace (crisp mirror, ~4x cost — a quality mode).
+        let hwrt_fullres = hwrt && quality::env_bool("P_HWRT_FULLRES", base.hwrt_reflect_fullres);
+        // `P_HWRT_HITLIGHTING`: shade off-screen HW hits with the real material (needs the hit table).
+        let hwrt_hitlighting = hwrt
+            && rt.content_hit_indices().is_some()
+            && quality::env_bool("P_HWRT_HITLIGHTING", base.hwrt_reflect_hitlighting);
+
         info!(
             "RenderQuality tier: {} (RENDER_QUALITY; GPU \"{}\")",
             quality.label(),
@@ -2480,6 +2673,18 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        // Bent-normal skylight: the GI pass writes the unoccluded average direction (the SH sky-vis
+        // band-1 vector = the DFAO bent normal) into the sky-vis image so the lighting can sample the
+        // diffuse skylight ALONG it (directional indoor occlusion) instead of the scalar V multiply.
+        // Default on for content (the sky-vis image is content-only → gallery byte-identical anyway);
+        // `P_BENT_NORMAL=0` zeroes the bent normal for A/B (pbr then falls back to the scalar path).
+        let bent_normal = quality::env_bool("P_BENT_NORMAL", true);
+        // Multi-bounce AO (reference AOMultiBounce): albedo-tinted energy return on the diffuse AO.
+        // Opt-in (default off) — it recolours every AO<1 pixel including the gallery anchor.
+        let ao_multibounce = quality::env_bool("P_AO_MULTIBOUNCE", false);
+        // Bent-normal specular occlusion of the prefilter-cube ambient specular (reference
+        // GetDistanceFieldAOSpecularOcclusion). Opt-in (default off); SW-RT reflection untouched.
+        let spec_occlusion = quality::env_bool("P_SPEC_OCCLUSION", false);
         // PR-4 (render-pipeline re-baseline track): opt-in analytic height fog. Off by default
         // (`P_HEIGHT_FOG=1` to enable) so the byte-identical gallery/regression anchors are
         // untouched — the atmosphere slot exists in the graph wiring unconditionally, but the
@@ -2711,25 +2916,129 @@ impl App {
             .unwrap_or(base.gdf_cone_k)
             .clamp(0.0, 1.0);
         // Reflection history clamp permutation (0 off / 1 hard / 2 variance). Gallery forced to 0
-        // (byte-identical legacy resolve = regression anchor); content takes the tier. `P_REFL_CLAMP`
-        // + `P_REFL_CLAMP_GAMMA` override.
+        // (byte-identical legacy resolve = regression anchor); CONTENT defaults to 2 (Salvi/Karis
+        // variance clipping) to suppress glossy-reflection fireflies — the noisy GGX-sampled
+        // reflection of brightly-sunlit nearby geometry that the denoiser otherwise spreads into soft
+        // white "sparkle" blobs on the rough floor. The clamp is gated to sr > 0 (glossy/rough) in
+        // the shader, so near-mirrors (the chrome sphere) are untouched. `P_REFL_CLAMP` +
+        // `P_REFL_CLAMP_GAMMA` override; tight gamma (0.5) is safe because it only bounds the
+        // low-frequency rough lobe's history, never a mirror's high-frequency detail.
         let reflect_history_clamp = std::env::var("P_REFL_CLAMP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(base.reflect_history_clamp)
+            .unwrap_or(if gallery_scene {
+                base.reflect_history_clamp
+            } else {
+                2
+            })
             .min(2);
         let reflect_clamp_gamma = std::env::var("P_REFL_CLAMP_GAMMA")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(base.reflect_clamp_gamma)
+            .unwrap_or(if gallery_scene {
+                base.reflect_clamp_gamma
+            } else {
+                0.5
+            })
             .clamp(0.0, 8.0);
+        // Roughness-scaled reflection blur radius (texels) — smooths the low-res reflection's blocky
+        // sparkle on rough content surfaces. Content default 6.0; gallery forced 0 at the call site.
+        let reflect_rough_blur = std::env::var("P_REFL_ROUGH_BLUR")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(6.0)
+            .clamp(0.0, 32.0);
+        // Track A1: opt-in spatial ratio-estimator resolve of the glossy reflection (content only;
+        // default off so the content sha goldens are unchanged until measured — the gallery never
+        // runs it regardless, keeping the anchor byte-identical). Kernel radius `P_REFLECT_RESOLVE_R`.
+        let reflect_resolve = !gallery_scene && std::env::var_os("P_REFLECT_RESOLVE").is_some();
+        let reflect_resolve_kernel = std::env::var("P_REFLECT_RESOLVE_R")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(2.0)
+            .clamp(1.0, 4.0);
+        // Track A4: variance-guided reflection denoiser (temporal 2nd moment + post-temporal bilateral).
+        // Content opt-in; default off so the content goldens are unchanged and the gallery anchor stays
+        // byte-identical (it never runs the pass). Kernel radius (px) via `P_REFLECT_SPATIAL_R`.
+        let reflect_spatial = !gallery_scene && std::env::var_os("P_REFLECT_SPATIAL").is_some();
+        let reflect_spatial_kernel = std::env::var("P_REFLECT_SPATIAL_R")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(8.0)
+            .clamp(1.0, 16.0);
+        // Track A5: blue-noise stochastic reflection bundle (frame-varying + blue-noise + A1 + A4).
+        // Tier default (Apple runs it; the other tiers keep it off pending DX≡VK) + env override.
+        // The gallery anchor never runs it.
+        let reflect_stochastic =
+            !gallery_scene && quality::env_bool("P_REFLECT_STOCHASTIC", base.reflect_stochastic);
+        // B2' rough-prefilter split threshold. `P_REFLECT_PREFILTER=1` = the reference-like default
+        // (0.4); an explicit fraction in (0,1) tunes it; 0 = off. Unset = tier default (Apple 0.4);
+        // gallery = off (anchor untouched).
+        let reflect_prefilter = if gallery_scene {
+            0.0
+        } else {
+            std::env::var("P_REFLECT_PREFILTER")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|v| if v == 1.0 { 0.4 } else { v.clamp(0.0, 0.996) })
+                .unwrap_or(base.reflect_prefilter)
+        };
+        // B2' glossy sample density: K GGX rays/pixel/frame for the stochastic glossy band.
+        // Unset = tier default (Apple 4 — measured ≈ K=1 cost with prefilter + screen-hit).
+        let reflect_glossy_spp = if gallery_scene {
+            1
+        } else {
+            std::env::var("P_REFLECT_GLOSSY_SPP")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(base.reflect_glossy_spp)
+                .clamp(1, 32)
+        };
+        // B2' screen-hit early-out (see the field docs). Tier default (Apple on) + env override.
+        let reflect_screen_hit =
+            !gallery_scene && quality::env_bool("P_REFLECT_SCREEN_HIT", base.reflect_screen_hit);
+        // C2b: one-shot feedback re-layout frame (see the field docs). Content opt-in.
+        let cache_res_feedback_frame = if gallery_scene {
+            0
+        } else {
+            std::env::var("P11_CACHE_RES_FEEDBACK")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|v| if v == 1 { 64 } else { v })
+                .unwrap_or(0)
+        };
+        // Track C0-fix: static-scene convergence seams (see the field docs). Content opt-in.
+        let cache_converge = if gallery_scene {
+            0
+        } else {
+            std::env::var("P_CACHE_CONVERGE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0)
+                .min(64)
+        };
+        let gi_stable = !gallery_scene && std::env::var_os("P_GI_STABLE").is_some();
+        // CONVERGE mode deliberately does NOT touch the cost parameters (spp / relight period /
+        // visibility feedback) — raising them (spp×K + period 2 + hidden-off) measured 360 ms/frame
+        // on Sponza-M3, unplayable. Determinism alone (fixed directions) makes every relight
+        // idempotent, so the freeze latch arms at the SAME warmup cost the tier already pays; the
+        // convergence horizon is the amortization cadence (visible ≈ period·K frames, off-screen
+        // ×HIDDEN_MULT ≈ tens of seconds) and the steady-state cost after the freeze is ZERO (below
+        // the legacy baseline). Lower `P11_CACHE_RELIGHT_PERIOD` manually to trade FPS for a faster
+        // settle (e.g. a loading-screen warmup).
         // SSR-resolve history feedback clamp (0 off / 1 variance). Gallery base is 0 (byte-identical
         // anchor); content tiers default 0 too pending DX=VK verification. `P_SSR_HISTORY_CLAMP` +
         // `P_SSR_CLAMP_GAMMA` override (set =1 to break the mirror lit-history feedback shimmer).
         let ssr_history_clamp = std::env::var("P_SSR_HISTORY_CLAMP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(base.ssr_history_clamp)
+            // CONVERGE mode defaults the variance clamp ON — the reference runs the clamp AND the
+            // small-alpha accumulation together (the clamp bounds amplitude, the alpha the rate).
+            .unwrap_or(if cache_converge != 0 {
+                1
+            } else {
+                base.ssr_history_clamp
+            })
             .min(1);
         let ssr_clamp_gamma = std::env::var("P_SSR_CLAMP_GAMMA")
             .ok()
@@ -2748,7 +3057,12 @@ impl App {
         let reflect_half_res =
             gi.has_upsample() && quality::env_bool("P11_REFLECT_HALF_RES", base.reflect_half_res);
         // C8d: default to the full-res mirror SSR; opt into the stochastic glossy path to compare.
-        let ssr_stochastic = quality::env_bool("P11_SSR_STOCHASTIC", base.ssr_stochastic);
+        // CONVERGE mode forces the stochastic path: the plain mirror SSR feeds the reprojected
+        // lit-history straight back into lighting with NO temporal blend — a gain-1 feedback map
+        // that visibly oscillates every frame (the reference damps this loop with an α ≈ 1/12
+        // accumulation on the reflection before it enters the composited color).
+        let ssr_stochastic =
+            quality::env_bool("P11_SSR_STOCHASTIC", base.ssr_stochastic) || cache_converge != 0;
         // Diagnostic single-object orbit: frame one scene object tightly so it can be
         // inspected from every side. `DIAG_OBJ=<index>` selects it (2 = copper sphere,
         // 3 = red cube); `DIAG_COPPER=1` / `DIAG_CUBE=1` are shortcuts. `DIAG_ANGLE=<deg>`
@@ -3107,6 +3421,13 @@ impl App {
             ssao_params,
             gdf_gi,
             hwrt_gi,
+            hwrt,
+            hwrt_available,
+            hwrt_fullres,
+            hwrt_hitlighting,
+            bent_normal,
+            ao_multibounce,
+            spec_occlusion,
             gi_volume,
             gi_volume_period: std::env::var("P_GI_VOLUME_PERIOD")
                 .ok()
@@ -3139,6 +3460,18 @@ impl App {
             sc_viz,
             reflect_history_clamp,
             reflect_clamp_gamma,
+            reflect_rough_blur,
+            reflect_resolve,
+            reflect_resolve_kernel,
+            reflect_spatial,
+            reflect_spatial_kernel,
+            reflect_stochastic,
+            reflect_prefilter,
+            reflect_glossy_spp,
+            reflect_screen_hit,
+            cache_res_feedback_frame,
+            cache_converge,
+            gi_stable,
             ssr_history_clamp,
             ssr_clamp_gamma,
             gi_temporal_clamp,
@@ -3971,6 +4304,11 @@ impl App {
         }
         // The unjittered (but Y-flipped) view-proj — the stable grid the TAAU history lives on.
         let view_proj_stable = proj * view;
+        // B1 (CONVERGE): bit-exact static camera this frame — the unjittered view-proj matches
+        // last frame's. Compared pre-jitter so TAAU sub-pixel jitter still counts as static (the
+        // temporal accumulators reproject it away); any real move/rotate breaks equality.
+        let camera_static =
+            self.frame_no > 0 && view_proj_stable.to_cols_array() == self.prev_view_proj_taau;
         // QHD/UHD TAAU: sub-pixel camera jitter (Halton(2,3)) so successive low-res frames sample
         // different sub-pixel positions; the TAAU history reconstructs full-res detail from them.
         // Applied to the scene projection only (cull_view_proj stays unjittered = stable culling);
@@ -4118,6 +4456,10 @@ impl App {
                 reflect_max_steps,
                 reflect_res_div,
                 reflect_half_res,
+                hwrt,
+                hwrt_available,
+                hwrt_hitlighting,
+                hwrt_fullres,
                 ao_res_div,
                 gi_atrous_steps,
                 gdf_cone_k,
@@ -4133,6 +4475,10 @@ impl App {
                 firefly_clamp,
                 reflect_max_roughness,
                 ssr_stochastic,
+                reflect_stochastic,
+                reflect_prefilter,
+                reflect_glossy_spp,
+                reflect_screen_hit,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -4242,6 +4588,14 @@ impl App {
                         *firefly_clamp = base.firefly_clamp;
                         *shadow_softness = base.shadow_softness;
                         *shadow_taps = base.shadow_taps.clamp(1, 16);
+                        // Reflection-quality v2 per-frame knobs (the load-time cache knobs —
+                        // grid / adaptive res / mesh capture — are fixed at level build). The
+                        // record paths carry their own capability gates (pipeline presence,
+                        // lit-history sentinel), so a tier can't enable what the device lacks.
+                        *reflect_stochastic = base.reflect_stochastic;
+                        *reflect_prefilter = base.reflect_prefilter;
+                        *reflect_glossy_spp = base.reflect_glossy_spp.clamp(1, 32);
+                        *reflect_screen_hit = base.reflect_screen_hit;
                     }
                     ui.text(format!(
                         "validation: {}",
@@ -4317,6 +4671,20 @@ impl App {
                             }
                             if ui.checkbox("Reflect half-res trace", reflect_half_res) {
                                 *reflect_half_res = gi.has_upsample() && *reflect_half_res;
+                            }
+                            // Phase 16 HW-RT hybrid reflections. The base toggle flips the runtime
+                            // reflection between the hardware BVH trace and the SW distance-field
+                            // march — but only when the acceleration structures were built at load
+                            // (launch with `P_HWRT=1`, or a tier that enables it); the sub-modes then
+                            // toggle live. Off / not-built keeps the SW-RT path.
+                            if *hwrt_available {
+                                ui.checkbox("HW-RT reflections", hwrt);
+                                if *hwrt {
+                                    ui.checkbox("  Hit Lighting (off-screen)", hwrt_hitlighting);
+                                    ui.checkbox("  Full-res mirror (~4x cost)", hwrt_fullres);
+                                }
+                            } else {
+                                ui.text("HW-RT reflections: launch with P_HWRT=1");
                             }
                             if ui.checkbox("GDF ambient occlusion", gdf_ao) {
                                 *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && *gdf_ao;
@@ -5035,6 +5403,19 @@ impl App {
         if self.gdf_hybrid || self.swrt_reflect {
             self.reflect.prepare_history(&self.device, cw, ch)?;
         }
+        // C2b: one-shot feedback re-layout — read the desired-res feedback the reflection has
+        // been recording, re-normalise to the same texel budget, rebuild the adaptive layout and
+        // reallocate the atlas (wait_idle: no frame in flight may still read the old buffers),
+        // then force a fresh capture + reset relight so the new layout re-converges.
+        if self.cache_res_feedback_frame != 0
+            && self.frame_no == self.cache_res_feedback_frame as u64
+        {
+            self.device.wait_idle()?;
+            if self.gdf.relayout_from_feedback(&self.device)? {
+                self.scene_cache_captured = false;
+                self.scene_cache_reset = true;
+            }
+        }
         // Stochastic SSR runs at half-res; (re)allocate its temporal accumulation buffers.
         let (hcw, hch) = (cw.div_ceil(2), ch.div_ceil(2));
         if self.swrt_reflect && self.ssr_stochastic && self.reflect.has_ssr_resolve() {
@@ -5047,7 +5428,9 @@ impl App {
         // A3: (re)allocate the adaptive-skip ping-pong at the gdf_reflect TRACE extent (half-res when
         // reflect_half_res). Divisor mirrors the record path (rdiv=1 when full-res).
         if self.swrt_reflect && self.reflect_skip && self.reflect.has_gdf_reflect() {
-            let rdiv = if self.reflect_half_res {
+            // Mirror the record path: P_HWRT_FULLRES forces full-res (rdiv 1) so the skip ping-pong
+            // matches the trace extent (Phase 16 C).
+            let rdiv = if self.reflect_half_res && !self.hwrt_fullres {
                 self.reflect_res_div.max(1)
             } else {
                 1
@@ -5405,6 +5788,12 @@ impl App {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(0.05)
                 .clamp(0.005, 1.0)
+        } else if self.cache_converge != 0 {
+            // CONVERGE mode (negative alpha = the seam): the relight cycles its gather jitter over K
+            // deterministic ray sets and accumulates with a running mean α = 1/(1+N) instead of the
+            // fixed-alpha EMA of fresh white noise (which has a permanent variance floor and NEVER
+            // converges — the measured freeze latch could not arm on IntelSponza). K = the window.
+            -(self.cache_converge as f32)
         } else if self.cache_feedback {
             (0.35 * (self.cache_relight_period as f32 / 8.0)).clamp(0.35, 0.8)
         } else {
@@ -5455,7 +5844,13 @@ impl App {
             // stable (so the probe reflects the current lighting) AND the mean EMA step below eps for
             // `cache_conv_k` consecutive frames. Once latched it holds (a frozen relight stops
             // measuring, so re-evaluating would oscillate) until the epoch changes above.
-            if !self.cache_frozen {
+            //
+            // CONVERGE mode (user directive): accumulation stays CONTINUOUS — never freeze. The
+            // running-mean + K-cycle jitter reach a bounded equilibrium while relight keeps running
+            // at the tier budget, so lighting keeps being tracked; and A3 reflect-skip reuse (gated
+            // on this latch) stays off — its stale-tile stagger read as visible crawl the moment the
+            // latch first armed on content ("jitter that stops when the camera moves").
+            if !self.cache_frozen && self.cache_converge == 0 {
                 if self.cache_stable_frames >= 2 && cache_conv_delta < self.cache_conv_eps {
                     self.cache_conv_stable = self.cache_conv_stable.saturating_add(1);
                 } else {
@@ -5466,6 +5861,14 @@ impl App {
                     && self.cache_conv_stable >= self.cache_conv_k
                 {
                     self.cache_frozen = true;
+                    // Visible confirmation that the measured-convergence latch armed (relight cost
+                    // drops to zero from here until the lighting epoch changes) — the CONVERGE-mode
+                    // warmup cost is bounded by this moment.
+                    tracing::info!(
+                        frame = self.frame_no,
+                        step = cache_conv_delta,
+                        "surface-cache relight FROZEN (measured convergence)"
+                    );
                 }
             }
             self.cache_frozen && !cache_reset_this_frame
@@ -5543,8 +5946,30 @@ impl App {
             }
             _ => None,
         };
+        // Track C card grid (opt-in `P_CACHE_GRID`, built at cache-build time): pack the grid's
+        // two bindless indices into the cards slot's spare bits — cards | (cells+1)<<8 |
+        // (pool+1)<<16 (0 = no grid; storage indices are < 64 so the low byte keeps the real
+        // cards index). Reflection-only: the GI/relight consumers keep the exact linear scan.
+        let cache_grid = self.gdf.surface_cache_grid();
         let reflect_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
             Some(ext) if self.reflect_cache => cache_read.map(|(c, p, r, n, t)| {
+                let c = match cache_grid {
+                    Some((cells, pool)) => c | ((cells + 1) << 8) | ((pool + 1) << 16),
+                    None => c,
+                };
+                // C2a: the reflection's cache_tile slot re-packs the tile with the MIP fields, so
+                // the adaptive layout index rides cache.x bits 24..31 instead (the shared tuple's
+                // tile carries it in bits 8..15 for every other consumer — strip to the raw edge).
+                let c = match self.gdf.surface_cache_layout() {
+                    Some(l) => c | ((l + 1) << 24),
+                    None => c,
+                };
+                // C2b: the desired-res feedback buffer rides cache.y bits 8..15 (0 = off).
+                let p = match self.gdf.card_res_feedback_index() {
+                    Some(f) => p | ((f + 1) << 8),
+                    None => p,
+                };
+                let t = t & 0xFF;
                 // Pack the MIP pyramid into the tile slot: tile | max_mip<<8 | mip_index<<16 (all
                 // ≤16 bits; 0xFFFF mip_index = no pyramid). Order the reflection after mipgen when
                 // the pyramid exists (its handle), else after the relight directly.
@@ -5759,7 +6184,16 @@ impl App {
                                 &scene_clip_vols,
                                 scene_albedo,
                                 crate::GROUND_ALBEDO,
-                                self.frame_no as u32,
+                                // C0-fix (`P_GI_STABLE`): a FIXED jitter index ⇒ every probe traces
+                                // the same deterministic direction set each update (the reference
+                                // radiance cache disables trace jitter for stability), so a static
+                                // scene's volume is an idempotent overwrite = a fixed point instead
+                                // of a fixed-alpha EMA over fresh per-frame noise (never settles).
+                                if self.gi_stable {
+                                    0
+                                } else {
+                                    self.frame_no as u32
+                                },
                                 self.gi_spp,
                                 0.1,
                             )
@@ -5783,7 +6217,10 @@ impl App {
                     self.sun_intensity,
                     gw,
                     gh,
-                    self.flip_y,
+                    // bit1 = write the bent normal into the sky-vis image (P_BENT_NORMAL); bit0 is
+                    // the clip-space Y flip. gdf_gi only masks bit0 for reconstruction, so bit1 is
+                    // a safe side channel with zero push growth.
+                    self.flip_y | if self.bent_normal { 2 } else { 0 },
                     self.gi_spp,
                     self.frame_no as u32,
                     scene_albedo,
@@ -5924,7 +6361,13 @@ impl App {
                 // gate that routes off-screen / grazing bad hits to the GDF (also keeping the march
                 // VK≡DX-stable). `P11_SSR_STOCHASTIC` selects the half-res GGX trace + ratio-
                 // estimator resolve instead (the glossy path; it goes dark on sharp metals).
-                let ssr = if self.ssr_stochastic {
+                // B1-lite hard handoff: with the SCREEN_HIT trace on, the GDF path already
+                // carries VALIDATED on-screen colours per ray, so the separate unvalidated SSR
+                // blend would only double-count them and re-introduce its feedback wiggle — skip
+                // recording SSR entirely (the composite gets a hard cut) and save its cost.
+                let ssr = if self.reflect_screen_hit {
+                    None
+                } else if self.ssr_stochastic {
                     let half = Extent2D::new(hcw, hch);
                     let (ssr_a, ssr_b) = self.reflect.record_ssr(
                         &mut graph,
@@ -5943,14 +6386,21 @@ impl App {
                         cw,
                         ch,
                         self.flip_y,
-                        self.frame_no as u32,
+                        // CONVERGE: cycle the GGX jitter over K=12 deterministic frames (reference
+                        // NumFramesAccumulated window) so the running mean below averages a periodic
+                        // ray set instead of fresh white noise (permanent variance floor).
+                        if self.cache_converge != 0 {
+                            (self.frame_no % 12) as u32
+                        } else {
+                            self.frame_no as u32
+                        },
                         self.scene_radius * 1.5,
                         self.scene_radius * 0.06,
                         true,
                         self.firefly_clamp,
                         true, // stochastic GGX jitter
                     );
-                    self.reflect.record_ssr_resolve(
+                    let resolved = self.reflect.record_ssr_resolve(
                         &mut graph,
                         ssr_a,
                         ssr_b,
@@ -5967,11 +6417,32 @@ impl App {
                         self.scene_radius * 0.02,
                         firefly_max,
                         2.0,
-                        self.ssr_history_clamp,
+                        // B1 (CONVERGE + static camera): drop the neighbourhood clamp — it
+                        // re-injects each frame's 12-cycle jitter into the converged mean at
+                        // full amplitude regardless of α (the ripple never decays inside it).
+                        if self.cache_converge != 0 && camera_static {
+                            0
+                        } else {
+                            self.ssr_history_clamp
+                        },
                         self.ssr_clamp_gamma,
-                    )
+                        // CONVERGE: running mean α=1/(1+N) (damps the lit-history feedback into
+                        // a contraction); legacy keeps the fixed 0.15 EMA. Static camera lifts
+                        // the N→12 saturation (B1): the 12-cycled jitter is periodic, so the
+                        // unbounded running mean converges to the exact 12-set average (wiggle
+                        // → 0); any camera move collapses N back to 12 in one frame.
+                        if self.cache_converge != 0 && camera_static {
+                            -16_777_216.0
+                        } else if self.cache_converge != 0 {
+                            -12.0
+                        } else {
+                            0.15
+                        },
+                    );
+                    Some(resolved)
                 } else {
-                    self.reflect
+                    let mirror = self
+                        .reflect
                         .record_ssr(
                             &mut graph,
                             self.deferred.globals_buffer(),
@@ -5996,7 +6467,8 @@ impl App {
                             self.firefly_clamp,
                             false, // mirror ray (composite handles roughness via the GDF prefilter)
                         )
-                        .0
+                        .0;
+                    Some(mirror)
                 };
                 // Stage D3 / M3-C: trace the reflection at 1/div res + bilateral upsample to full res
                 // before the temporal resolve. gdf_reflect.slang samples the G-buffer by normalized UV,
@@ -6004,7 +6476,10 @@ impl App {
                 // the legacy half-res exactly (`cw.div_ceil(2)` == the old `hcw/hch`); the Apple tier
                 // uses `div = 4` (quarter-res) — the measured single lever on gdf_reflect. Gallery keeps
                 // `reflect_half_res` off ⇒ div collapses to 1 (full-res, byte-identical anchor).
-                let refl_half = self.reflect_half_res;
+                // Phase 16 C: `P_HWRT_FULLRES` traces the HWRT reflection at FULL resolution — removes
+                // the residual half-res blockiness on the chrome ball / floor (a crisp mirror) at ~4x
+                // cost (a quality/screenshot mode). Default HWRT keeps the half-res trace for perf.
+                let refl_half = self.reflect_half_res && !self.hwrt_fullres;
                 let rdiv = if refl_half {
                     self.reflect_res_div.max(1)
                 } else {
@@ -6022,8 +6497,9 @@ impl App {
                 // STABLE (the resolve reconstructs the lobe spatially) — a frame-VARYING ray never
                 // settles under the 1-ray/frame accumulation (auto-exposure + motion reject the history)
                 // and reads as sparkle. `P_REFLECT_ACCUM=1` forces frame-varying (studies convergence).
-                let refl_frame_varying =
-                    self.is_gallery || std::env::var_os("P_REFLECT_ACCUM").is_some();
+                let refl_frame_varying = self.is_gallery
+                    || self.reflect_stochastic // A5: blue-noise needs frame-varying to converge
+                    || std::env::var_os("P_REFLECT_ACCUM").is_some();
                 let refl_traced = self.reflect.record_gdf_reflect(
                     &mut graph,
                     vol,
@@ -6060,7 +6536,26 @@ impl App {
                     self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                     scene_clip,
                     &scene_clip_vols,
-                    self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
+                    // bit31 = content flag (mirror threshold); bit30 = A5 blue-noise stochastic;
+                    // bits 16..23 = B2' rough-prefilter threshold (roughness*255, 0 = off);
+                    // bits 24..29 = B2' glossy samples/pixel K. All SW trace only — HWRT's
+                    // max_steps field carries the lit-history index instead (the step cap itself
+                    // fits in bits 0..15, tiers cap it at 256).
+                    self.reflect_max_steps
+                        | if self.is_gallery { 0 } else { 0x8000_0000 }
+                        | if self.reflect_stochastic && !self.hwrt {
+                            0x4000_0000
+                        } else {
+                            0
+                        }
+                        | if !self.hwrt {
+                            // K = 1 packs as 0 (the shader floors to 1) so default runs keep a
+                            // bit-stable push block.
+                            (((self.reflect_prefilter * 255.0) as u32 & 0xFF) << 16)
+                                | (((self.reflect_glossy_spp - 1) & 0x3F) << 24)
+                        } else {
+                            0
+                        },
                     self.gdf_cone_k,
                     {
                         // A3: prime the skip buffer every frame (write); enable REUSE (read) only once
@@ -6081,11 +6576,61 @@ impl App {
                             _ => [u32::MAX; 4],
                         }
                     },
+                    self.hwrt,
+                    self.reflect_screen_hit,
+                    self.deferred.globals_buffer(),
+                    globals_offset,
+                    self.reflect.lit_hist_read_index(),
+                    if self.hwrt_hitlighting {
+                        self.rt.content_hit_indices()
+                    } else {
+                        None
+                    },
                 );
+                // Track A1: spatial ratio-estimator resolve at TRACE res (content opt-in), BEFORE the
+                // upsample — reconstructs each glossy neighbour's GGX ray and reweights by pdf_p/pdf_q
+                // to sharpen the glossy lobe instead of the legacy box blur. Near-mirror pixels pass
+                // through. Gallery never enables it (anchor untouched). `mirror_thresh` mirrors
+                // gdf_reflect.slang's content branch (0.125). When it runs, the temporal pass drops its
+                // own box average (`resolve_ran`) so the ratio-estimated sharpness survives.
+                // A5: the stochastic bundle enables the A1 resolve + A4 denoiser alongside blue-noise.
+                let resolve_ran = (self.reflect_resolve || self.reflect_stochastic)
+                    && self.reflect.has_reflect_resolve();
+                let refl_resolved = if resolve_ran {
+                    self.reflect.record_reflect_resolve(
+                        &mut graph,
+                        refl_traced,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        refl_extent,
+                        rw,
+                        rh,
+                        inv_view_proj,
+                        eye,
+                        self.flip_y,
+                        if refl_frame_varying {
+                            self.frame_no as u32
+                        } else {
+                            0
+                        },
+                        0.125, // content mirror threshold — keep in lockstep with gdf_reflect.slang
+                        self.reflect_resolve_kernel,
+                        // bits 0..7: A5 sampler select (reconstruct blue-noise rays when stochastic);
+                        // bits 8..15: B2' glossy K-1 (reconstruct all K neighbour rays); bits
+                        // 16..23: B2' prefilter threshold (prefiltered pixels pass through and are
+                        // never borrowed — their ray was a deterministic mirror, not a GGX draw).
+                        u32::from(self.reflect_stochastic)
+                            | (((self.reflect_glossy_spp - 1) & 0xFF) << 8)
+                            | (((self.reflect_prefilter * 255.0) as u32 & 0xFF) << 16),
+                    )
+                } else {
+                    refl_traced
+                };
                 let gdf_refl = if refl_half {
                     self.gi.record_upsample(
                         &mut graph,
-                        refl_traced,
+                        refl_resolved,
                         g_depth,
                         g_normal,
                         extent,
@@ -6099,11 +6644,22 @@ impl App {
                         self.flip_y,
                     )
                 } else {
-                    refl_traced
+                    refl_resolved
                 };
                 // C8j: temporally resolve the stochastic GGX GDF reflection (레퍼런스식; the rough
                 // lobe is sampled by real rays + denoised, so it's correctly blurred without an
                 // image-space prefilter that over-brightens rough metals).
+                //
+                // B1 (CONVERGE + static camera): lift the 64-frame history cap — the pass's
+                // `len = min(len+1, cap)` is already a running mean below the cap, so a huge cap
+                // makes α = 1/N and the accumulator truly converges (the fixed 1/64 α floor was a
+                // stationary AR(1) wiggle: per-frame GGX/TAAU jitter + the screen-hit lit-history
+                // feedback never decayed — measured flat at warmup 100 vs 400). The history clamp
+                // is dropped with it: re-clamping the converged mean into each frame's jittered
+                // 3×3 stats re-injects the very noise the mean removed. On camera motion the
+                // legacy cap/clamp return and `min(len, 64)` collapses the stored counter in one
+                // frame. Counter is a float32 — growth saturates at 2^24 (α floor 6e-8, i.e. done).
+                let refl_converge = self.cache_converge != 0 && camera_static;
                 let gdf_resolved = self.reflect.record_reflect_temporal(
                     &mut graph,
                     gdf_refl,
@@ -6117,15 +6673,46 @@ impl App {
                     eye,
                     temporal_flip,
                     self.scene_radius * 0.02,
-                    64.0,
+                    if refl_converge { 16_777_216.0 } else { 64.0 },
                     firefly_max,
                     0.25, // tonemap-space range for stable HDR accumulation
-                    self.reflect_history_clamp,
+                    if refl_converge {
+                        0
+                    } else {
+                        self.reflect_history_clamp
+                    },
                     self.reflect_clamp_gamma,
+                    resolve_ran, // A1: drop the box average when the ratio-estimator resolve ran
+                    (self.reflect_spatial || self.reflect_stochastic)
+                        && self.reflect.has_reflect_spatial(), // A4a: accumulate variance
                 );
+                let gdf_resolved = if (self.reflect_spatial || self.reflect_stochastic)
+                    && self.reflect.has_reflect_spatial()
+                {
+                    // A4b: variance-guided bilateral denoise (post-temporal, full-res, content opt-in).
+                    self.reflect.record_reflect_spatial(
+                        &mut graph,
+                        gdf_resolved,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        extent,
+                        cw,
+                        ch,
+                        inv_view_proj,
+                        eye,
+                        self.flip_y,
+                        self.reflect_spatial_kernel,
+                        0.25, // tonemap-space range (matches reflect_temporal params.w)
+                    )
+                } else {
+                    gdf_resolved
+                };
                 Some(self.reflect.record_composite(
                     &mut graph,
-                    ssr,
+                    // B1-lite: SSR skipped under SCREEN_HIT — feed the GDF image in its slot
+                    // (never sampled; the hard cut zeroes ssr_trust in-shader).
+                    ssr.unwrap_or(gdf_resolved),
                     gdf_resolved,
                     g_material,
                     extent,
@@ -6135,6 +6722,14 @@ impl App {
                     firefly_max,
                     self.reflect_max_roughness,
                     !self.is_gallery, // content: near-mirror uses GDF/cache, not the unreliable SSR
+                    // Roughness-blur the low-res reflection to smooth its blocky sparkle on rough
+                    // content surfaces (the floor); 0 on the gallery = byte-identical anchor.
+                    if self.is_gallery {
+                        0.0
+                    } else {
+                        self.reflect_rough_blur
+                    },
+                    ssr.is_none(), // B1-lite hard cut: GDF/screen-hit path only
                 ))
             }
             _ => None,
@@ -6212,6 +6807,8 @@ impl App {
                 u32::MAX
             },
             cluster_lighting,
+            self.ao_multibounce,
+            self.spec_occlusion,
         );
         // Auto-exposure metering: read this frame's lit HDR, adapt the exposure for next frame.
         // After lighting (the `hdr` read orders it). `adapt` = 1-exp(-dt·speed) (eye/iris speed).
@@ -6711,6 +7308,16 @@ impl App {
                 self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
                 self.gdf_cone_k,
                 [u32::MAX; 4], // viz path: no adaptive skip
+                self.hwrt,
+                false, // viz: plain trace (no screen-hit early-out)
+                self.deferred.globals_buffer(),
+                globals_offset,
+                self.reflect.lit_hist_read_index(),
+                if self.hwrt_hitlighting {
+                    self.rt.content_hit_indices()
+                } else {
+                    None
+                },
             )),
             _ => None,
         };
@@ -6798,6 +7405,16 @@ impl App {
                     self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
                     self.gdf_cone_k,
                     [u32::MAX; 4], // standalone viz: no adaptive skip
+                    self.hwrt,
+                    false, // standalone viz: plain trace (no screen-hit early-out)
+                    self.deferred.globals_buffer(),
+                    globals_offset,
+                    self.reflect.lit_hist_read_index(),
+                    if self.hwrt_hitlighting {
+                        self.rt.content_hit_indices()
+                    } else {
+                        None
+                    },
                 );
                 // Standalone viz: no temporal resolve buffers here, so feed the GDF reflection
                 // straight into the composite (the resolve runs only in the lighting-fed path).
@@ -6813,6 +7430,12 @@ impl App {
                     firefly_max,
                     self.reflect_max_roughness,
                     false, // standalone SSR/hybrid viz — keep the full SSR blend
+                    if self.is_gallery {
+                        0.0
+                    } else {
+                        self.reflect_rough_blur
+                    },
+                    false, // viz keeps the SSR blend (no screen-hit trace here)
                 );
                 // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
                 self.reflect.record_lit_history(
@@ -7148,6 +7771,8 @@ impl App {
                 !self.is_gallery,
                 u32::MAX, // static exposure (auto-exposure meter is a primary-view resource)
                 None,
+                self.ao_multibounce,
+                self.spec_occlusion,
             );
             // Composite the second view as a PiP inset. A tonemap pass that LOADS (does not clear)
             // the backbuffer and restricts its draw to the top-right inset viewport rect, so the

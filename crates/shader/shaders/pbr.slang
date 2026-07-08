@@ -60,6 +60,8 @@ struct PushConstants
     uint cluster_index_buf; // flat light-index list u32[CLUSTER_COUNT * MAX_LIGHTS_PER_CLUSTER]
     uint cluster_light_buf; // packed Light[] (position/radius/color/intensity)
     uint cluster_light_count; // number of lights in cluster_light_buf (dbg heatmap normalisation)
+    uint ao_multibounce; // 1 = albedo-tinted multi-bounce AO on the diffuse ambient (opt-in); 0 = off
+    uint spec_occlusion; // 1 = bent-normal cone-cone occlusion on the prefilter-cube specular (opt-in)
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -126,16 +128,84 @@ VSOutput vsMain(uint id: SV_VertexID)
 // the indoor floor keeps brightness but loses the blue cast — the coloured GI bounce then shows),
 // with a MinOcclusion floor so it never crushes to black. sky_vis = 1 -> exact no-op. The tint
 // fraction and min-occlusion floor come from the push (`P_SKYVIS_TINT` / `P_SKYVIS_MIN_OCC`).
-float3 occlude_sky_diffuse(float3 irradiance, float sky_vis)
+// Multi-bounce ambient occlusion (reference engine AOMultiBounce): a scalar AO over-darkens because
+// light bounces multiple times inside a cavity, and those inter-reflections are tinted by the
+// surface's own albedo. This cubic per-channel polynomial restores that energy — it lifts the AO
+// back toward 1 in the surface's albedo colour (a red cavity stays red instead of going grey-dark),
+// while a black surface keeps the raw AO. `max(AO, ·)` guarantees it never darkens below the input.
+// Ref: DeferredShadingCommon.ush AOMultiBounce. Reduces to the scalar AO when disabled (opt-in).
+float3 ao_multi_bounce(float3 base_color, float ao)
 {
+    float3 a = 2.0404 * base_color - 0.3324;
+    float3 b = -4.7951 * base_color + 0.6417;
+    float3 c = 2.7552 * base_color + 0.6903;
+    return max(float3(ao), ((ao * a + b) * ao + c) * ao);
+}
+
+// Bent-normal specular occlusion (reference engine GetDistanceFieldAOSpecularOcclusion). The
+// diffuse skylight is occluded by the sky-visibility scalar; the ambient SPECULAR should be
+// occluded by how much of the glossy REFLECTION cone is blocked by scene geometry. Model both the
+// reflection lobe (roughness -> cone angle) and the unoccluded sky (bent normal -> a cone of
+// half-angle V·PI around the bent direction) as cones and take their overlap. This applies ONLY to
+// the prefilter-cube specular: a traced SW-RT reflection already resolves occlusion along its ray
+// (per the reflection track), so occluding it again would double-count.
+static const float SPEC_PI = 3.14159265359;
+
+// Overlap fraction of two cones separated by `angle_between` (reference ApproximateConeConeIntersection).
+float approx_cone_cone_intersection(float arc0, float arc1, float angle_between)
+{
+    float diff = abs(arc0 - arc1);
+    return smoothstep(0.0, 1.0, 1.0 - saturate((angle_between - diff) / (arc0 + arc1 - diff)));
+}
+
+// Specular occlusion in [0,1] from the (unit) bent normal, its sky visibility V, the mirror
+// reflection direction, and roughness. bent length < eps (gallery / no producer) -> 1 (no-op).
+float spec_occlusion_bent(float3 bent_unit, float sky_vis, float3 mirror, float roughness)
+{
+    if (length(bent_unit) < 1e-4)
+        return 1.0; // no bent normal => no directional occlusion (byte-identical anchor)
+    float unoccluded_angle = saturate(sky_vis) * SPEC_PI; // bent-normal cone half-angle (= length·PI)
+    float refl_cone_angle = max(roughness, 0.1) * SPEC_PI; // glossy reflection lobe half-angle
+    float angle_between = acos(clamp(dot(bent_unit, normalize(mirror)), -1.0, 1.0));
+    float occ = approx_cone_cone_intersection(refl_cone_angle, unoccluded_angle, angle_between);
+    // Near-fully-occluded: the bent direction is unreliable, so fade to shadowed (reference).
+    occ = lerp(0.0, occ, saturate((unoccluded_angle - 0.1) / 0.2));
+    // MinOcclusion floor (shared with the diffuse path): =1 disables it -> occ 1, no-op.
+    return lerp(occ, 1.0, pc.skyvis_min_occ);
+}
+
+// Directional (bent-normal) skylight occlusion — the reference engine's DFAO -> skylight coupling.
+// Instead of a scalar V multiply of the surface-normal irradiance, sample the diffuse skylight
+// ALONG the bent normal (the unoccluded average direction) so an interior receives skylight biased
+// toward where the sky actually is, then attenuate by V and the projection factor. Grounded in the
+// reference SkyLightingDiffuseShared: SkyLightingNormal = lerp(bent, n, V) ("more bent normal in
+// corners"), DotProductFactor = lerp(dot(bent,n), 1, V), Lookup = irradiance(SkyLightingNormal),
+// Mul = V*DotProductFactor. When `bent` is zero (no producer, gallery, screen-probe path) this
+// reduces EXACTLY to the scalar path (skyN = n, dotFactor = 1: irradiance(n)*V + tint*lum*(1-V),
+// the previous occlude_sky_diffuse) — byte-identical fallback.
+float3 occlude_sky_diffuse_bent(float3 n, float sky_vis, float3 bent, uint irr_cube)
+{
+    float3 skyN = n;
+    float dot_factor = 1.0;
+    float bl = length(bent);
+    if (bl > 1e-4)
+    {
+        float3 nb = bent / bl;
+        float w = saturate(sky_vis); // BentNormalWeightFactor: open -> surface normal, corner -> bent
+        skyN = normalize(lerp(nb, n, w));
+        dot_factor = max(lerp(dot(nb, n), 1.0, w), 0.0); // never subtract light (full-sphere bent guard)
+    }
+    float3 irradiance = g.cubes[irr_cube].SampleLevel(g.samp, skyN, 0.0).rgb;
     float vis = lerp(saturate(sky_vis), 1.0, pc.skyvis_min_occ);
     float lum = dot(irradiance, float3(0.2126, 0.7152, 0.0722));
-    return irradiance * vis + (pc.skyvis_tint * lum) * (1.0 - vis);
+    // Occluded fraction -> neutral OcclusionTint leak (as in the scalar path); the direction bias
+    // is carried by `dot_factor` on the visible fraction. bent = 0 => dot_factor = 1 => identical.
+    return irradiance * (vis * dot_factor) + (pc.skyvis_tint * lum) * (1.0 - vis);
 }
 
 float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float metallic,
                    float roughness, float ao, float3 f0, float3 swrt_refl, bool has_swrt,
-                   float sky_vis, float gdf_ao)
+                   float sky_vis, float3 sky_bent, float gdf_ao)
 {
     if (globals.ibl.y < 0)
         return globals.ambient.rgb * albedo * ao;
@@ -146,11 +216,11 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
     float3 f = fresnel_schlick_roughness(n_dot_v, f0, roughness);
     float3 kd = (1.0 - f) * (1.0 - metallic);
 
-    float3 irradiance = g.cubes[globals.ibl.y].SampleLevel(g.samp, n, 0.0).rgb;
-    // 레퍼런스식 indoor skylight occlusion: occlude the diffuse skylight (irradiance) by the scene-
-    // scale sky visibility before the albedo, so an enclosed interior isn't flooded by the full
-    // (blue) diffuse skylight (sky_vis = 1 -> exact no-op, the gallery anchor).
-    float3 diffuse = occlude_sky_diffuse(irradiance, sky_vis) * albedo;
+    // 레퍼런스식 indoor skylight occlusion: sample the diffuse skylight along the bent normal (the
+    // unoccluded average direction) and occlude by the scene-scale sky visibility, so an enclosed
+    // interior isn't flooded by the full (blue) diffuse skylight and instead picks up light biased
+    // toward the actual sky opening. sky_vis = 1 with a zero bent normal -> exact no-op (gallery).
+    float3 diffuse = occlude_sky_diffuse_bent(n, sky_vis, sky_bent, globals.ibl.y) * albedo;
 
     float3 refl;
     if (has_swrt)
@@ -190,13 +260,30 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
     float2 brdf = g.textures[globals.ibl.w].SampleLevel(g.samp, float2(n_dot_v, roughness), 0.0).rg;
     float3 specular = refl * (f * brdf.x + brdf.y);
 
+    // Bent-normal specular occlusion (opt-in): occlude the prefilter-CUBE specular by how much of
+    // the reflection cone the scene blocks (cone-cone vs the bent-normal visibility cone). Only the
+    // cube path — the SW-RT reflection (`has_swrt`) already resolves occlusion along its ray, so it
+    // is left untouched (the reflection-track rule). bent == 0 / spec_occlusion off => no-op.
+    if (pc.spec_occlusion != 0u && !has_swrt)
+    {
+        float so = spec_occlusion_bent(sky_bent, sky_vis, reflect(-v, n), roughness);
+        float lum = dot(specular, float3(0.2126, 0.7152, 0.0722));
+        specular = specular * so + (pc.skyvis_tint * lum) * (1.0 - so); // neutral leak (reference ExtraIndirectSpecular)
+    }
+
     // AO (material + GDF far-field) attenuates only the DIFFUSE ambient. The traced SW-RT
     // reflection already accounts for occlusion along its own ray, so multiplying the mirror
     // specular by AO double-counts it — and for a reflective object baked INTO the distance field
     // (which self-occludes -> gdf_ao≈0) it would kill the reflection entirely (a black chrome
     // ball). So AO applies to diffuse only; the specular reflection carries its own occlusion.
     // (Gallery anchor stays byte-identical: its specular pixels have ao·gdf_ao == 1.)
-    return kd * diffuse * (ao * gdf_ao) + specular;
+    // Multi-bounce AO (opt-in): recolour the scalar diffuse AO by the albedo so cavities keep the
+    // surface's own bounced colour instead of going flat-dark. Off (default) => scalar ao·gdf_ao,
+    // byte-identical anchor. `ao·gdf_ao == 1` => ao_multi_bounce returns 1 => unchanged even when on.
+    float3 diff_ao = (pc.ao_multibounce != 0u)
+                         ? ao_multi_bounce(albedo, ao * gdf_ao)
+                         : float3(ao * gdf_ao);
+    return kd * diffuse * diff_ao + specular;
 }
 
 // --- Soft-shadow quality tier (the scalability seam): one place to swap counts.
@@ -575,16 +662,23 @@ float4 fsMain(VSOutput input) : SV_Target
         swrt_refl = g.textures[pc.reflect_index].Sample(g.samp, input.uv).rgb;
 
     // 레퍼런스식 indoor skylight occlusion: directional sky-visibility occludes the IBL diffuse
-    // skylight. Absent (0xFFFFFFFF) -> 1.0 (exact no-op, gallery anchor).
+    // skylight. Absent (0xFFFFFFFF) -> 1.0 (exact no-op, gallery anchor). `.gba` carries the bent
+    // normal (the unoccluded average direction) when the producer wrote one; a zero vector = scalar
+    // fallback (sample the skylight along the surface normal = the legacy path, byte-identical).
     float sky_vis = 1.0;
+    float3 sky_bent = float3(0.0, 0.0, 0.0);
     if (pc.skyvis_index != NO_TEXTURE)
-        sky_vis = saturate(g.textures[pc.skyvis_index].Sample(g.samp, input.uv).r);
+    {
+        float4 sv = g.textures[pc.skyvis_index].Sample(g.samp, input.uv);
+        sky_vis = saturate(sv.r);
+        sky_bent = sv.gba;
+    }
 
     // `ambient_ibl` already applied the GDF far-field AO to the DIFFUSE ambient and left the traced
     // specular reflection un-occluded (it carries its own ray occlusion), so there is no separate
     // `ambient *= gdf_ao` here — that would double-count AO on diffuse and wrongly darken specular.
     float3 ambient = ambient_ibl(n, v, world_pos, albedo, metallic, roughness, ao, f0,
-                                 swrt_refl, has_swrt, sky_vis, gdf_ao);
+                                 swrt_refl, has_swrt, sky_vis, sky_bent, gdf_ao);
 
     // Stage C3: 1-bounce diffuse GI marched against the scene GDF in a prior compute
     // pass. The GI image holds the mean incoming radiance (indirect irradiance) from
@@ -638,6 +732,9 @@ float4 fsMain(VSOutput input) : SV_Target
         bool bad = any(isnan(swrt_refl)) || any(isinf(swrt_refl)) || any(swrt_refl < 0.0);
         color = bad ? float3(1.0, 0.0, 1.0) : (has_swrt ? swrt_refl : float3(0.0));
     }
+    else if (dbg == 13) color = float3(sky_vis);           // directional sky visibility V(n)
+    else if (dbg == 14)                                    // bent normal (unoccluded avg dir); gray = none
+        color = length(sky_bent) > 1e-4 ? (normalize(sky_bent) * 0.5 + 0.5) : float3(0.5);
 
     // PR-7 CSM cascade-index overlay (csm_params.y): tint the lit color by which cascade
     // shades each pixel so the split boundaries are inspectable. Only active with CSM on.

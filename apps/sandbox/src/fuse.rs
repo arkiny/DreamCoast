@@ -349,6 +349,85 @@ pub(crate) fn build_surface_cards(
     (cards, card_albedo, residency)
 }
 
+/// C2a — distance-driven per-card resolution assignment. Desired texel density is proportional
+/// to the card's PROJECTED size from the reference camera (`extent / distance`, the reference
+/// engine's MaxProjectedSize rule); the result is quantised to a pow2 in `[min_res, max_res]`
+/// and the density scale is binary-searched so the TOTAL texel count stays within `budget`
+/// (same memory as the uniform atlas, redistributed by relevance). Deterministic (pure f64
+/// arithmetic on the inputs) → run-to-run identical layouts.
+pub(crate) fn assign_card_res(
+    cards: &[u8],
+    cam: &CardCamera,
+    min_res: u32,
+    max_res: u32,
+    budget_texels: u64,
+) -> Vec<u32> {
+    let n = cards.len() / 64;
+    if n == 0 {
+        return Vec::new();
+    }
+    let f = |o: usize| f32::from_le_bytes(cards[o..o + 4].try_into().unwrap()) as f64;
+    let eye = [cam.eye[0] as f64, cam.eye[1] as f64, cam.eye[2] as f64];
+    // Desired (unscaled) resolution per card: projected size = 2·max_half_extent / distance.
+    let mut desired: Vec<f64> = Vec::with_capacity(n);
+    for i in 0..n {
+        let b = i * 64;
+        let c = [f(b), f(b + 4), f(b + 8)];
+        let len3 = |x: f64, y: f64, z: f64| (x * x + y * y + z * z).sqrt();
+        let ua = len3(f(b + 32), f(b + 36), f(b + 40));
+        let va = len3(f(b + 48), f(b + 52), f(b + 56));
+        let ext = 2.0 * ua.max(va);
+        let dist = len3(c[0] - eye[0], c[1] - eye[1], c[2] - eye[2])
+            .max(ext * 0.25)
+            .max(1e-3);
+        desired.push(ext / dist);
+    }
+    normalize_card_res(&desired, min_res, max_res, budget_texels)
+}
+
+/// C2a/C2b — normalise a per-card desired-resolution vector to a texel budget: quantise
+/// `scale · desired` to pow2 in `[min_res, max_res]` and binary-search the scale so
+/// `Σ res² ≤ budget` (monotone). Deterministic pure-f64 arithmetic.
+pub(crate) fn normalize_card_res(
+    desired: &[f64],
+    min_res: u32,
+    max_res: u32,
+    budget_texels: u64,
+) -> Vec<u32> {
+    let quant = |v: f64| -> u32 {
+        let v = v.max(1.0);
+        let e = v.log2().round().max(0.0) as u32;
+        (1u32 << e.min(31)).clamp(min_res, max_res)
+    };
+    let total = |scale: f64| -> u64 {
+        desired
+            .iter()
+            .map(|d| {
+                let r = quant(d * scale) as u64;
+                r * r
+            })
+            .sum()
+    };
+    // Binary-search the density scale to the texel budget (monotone in scale). The lower bound
+    // sits below any useful scale (everything quantises to min_res there) so feedback-style
+    // desired vectors that ALREADY exceed the budget at scale 1 shrink correctly.
+    let (mut lo, mut hi) = (1e-4f64, 1e7f64);
+    if total(lo) > budget_texels {
+        // Even the minimum scale (everything at min_res) may exceed the budget for a huge card
+        // count — accept it (min_res is the floor).
+        return desired.iter().map(|d| quant(d * lo)).collect();
+    }
+    for _ in 0..48 {
+        let mid = 0.5 * (lo + hi);
+        if total(mid) <= budget_texels {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    desired.iter().map(|d| quant(d * lo)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

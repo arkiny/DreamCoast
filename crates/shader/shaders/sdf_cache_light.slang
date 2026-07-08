@@ -22,9 +22,10 @@ struct CacheLightPush
     uint cache_alb_index;
     uint cache_rad_read;  // previous frame's radiance (gather + temporal source)
     uint cache_rad_write; // this frame's radiance out
-    uint gdf_sampled;
+    uint gdf_sampled; // REPURPOSED (never read as a volume): Track C card grid for the gather —
+                      // (cells+1) | (pool+1)<<8; 0 = no grid (legacy full card scan).
     uint num_cards;
-    uint tile;
+    uint tile; // bits 0..7 tile edge; bits 8..15 C2a layout index + 1 (0 = uniform legacy)
     uint num_texels;
     uint spp;             // indirect gather rays / texel
     uint frame;           // RNG decorrelation
@@ -147,7 +148,10 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     // `relight_period == 1` ⇒ every card every frame ⇒ byte-identical to the legacy path (the
     // gallery regression anchor passes period 1). `reset` always relights all cards (first frame).
     uint relight_period = max(pc.clip.z, 1u);
-    uint card = t / max(pc.tile * pc.tile, 1u);
+    // C2a: variable-tile texel→card mapping (sentinel = the exact legacy `t / tile²`).
+    uint lay8 = (pc.tile >> 8) & 0xFFu;
+    uint sc_layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
+    uint card = layout_find_card(sc_layout, t, max(pc.tile & 0xFFu, 1u), pc.num_cards);
     // Stage D2b: camera-visibility priority. On-screen cards relight at the base budget period;
     // off-screen cards relight HIDDEN_MULT× less often (most of a dense scene's cards are out of
     // any one view, and they don't affect the current image — 레퍼런스 엔진 SW GI's visibility/staleness
@@ -194,7 +198,23 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     float3 indirect = float3(0, 0, 0);
     uint spp = max(pc.spp, 1u);
     uint miss_count = 0u; // gather rays that escaped to sky = this texel's sky visibility estimate
-    uint seed = (t * 9277u + pc.frame * 26699u) | 1u;
+    // CONVERGE mode (params.y < 0 ⇒ K = -params.y): the legacy frame-varying seed injects FRESH white
+    // noise into every relight, and a fixed-alpha EMA of white noise is an AR(1) process with a
+    // permanent variance floor α/(2-α)·σ² — the cache NEVER settles. The reference engine keeps
+    // accumulating CONTINUOUSLY (radiosity never stops) but converges statistically: its per-update
+    // jitter cycles over a DETERMINISTIC period equal to the accumulation window
+    // (Hammersley(TemporalIndex % MaxFramesAccumulated)) and it blends with a running mean
+    // α = 1/(1+N) saturating at that window (NumFramesAccumulated atlas). Here: the jitter index is
+    // this texel's RELIGHT ordinal (frame/period — one step per relight, regardless of amortization
+    // or the off-screen HIDDEN_MULT) modulo K, so K distinct stratified ray sets cycle forever; the
+    // running mean below averages the whole cycle exactly, after which the input is PERIODIC and the
+    // equilibrium is a bounded ripple ≈ σ/(1+K) — continuous accumulation, no freeze required, and
+    // lighting changes keep being tracked (a large change re-arms via the host epoch reset).
+    // params.y > 0 (gallery / legacy) keeps the frame-varying seed = byte-identical.
+    bool converge = pc.params.y < 0.0;
+    uint conv_k = converge ? max(uint(-pc.params.y + 0.5), 1u) : 1u;
+    uint jitter = converge ? ((pc.frame / period) % conv_k) : pc.frame;
+    uint seed = (t * 9277u + jitter * 26699u) | 1u;
     float bias = pc.params.z;
     float maxt = pc.params.w;
     for (uint s = 0; s < spp; s++)
@@ -211,9 +231,14 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
             {
                 hit = true;
                 bool cache_hit;
-                float3 s = sample_surface_cache(q, geo_normal(q), pc.cards_index,
-                                                pc.cache_pos_index, pc.cache_rad_read,
-                                                pc.num_cards, pc.tile, 0.0, cache_hit);
+                // Track C: the gather's card lookup goes through the acceleration grid when the
+                // host built one (identical results — superset + ascending order; see the helper).
+                uint gc8 = pc.gdf_sampled & 0xFFu;
+                uint gp8 = (pc.gdf_sampled >> 8) & 0xFFu;
+                float3 s = sample_surface_cache_grid(
+                    q, geo_normal(q), pc.cards_index, pc.cache_pos_index, pc.cache_rad_read,
+                    pc.num_cards, pc.tile, 0.0, gc8 == 0u ? 0xFFFFFFFFu : gc8 - 1u,
+                    gp8 == 0u ? 0xFFFFFFFFu : gp8 - 1u, cache_hit);
                 indirect += clamp_firefly(s, pc.gather_firefly);
                 break;
             }
@@ -250,11 +275,25 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     // stays as-is. Omitting the direct 1/PI made cached (reflected) surfaces ~PI too bright.
     float3 radiance = albedo * (direct_irr * (1.0 / PI) + indirect);
 
-    // Temporal EMA (skip on reset) — static cache converges; damps gather noise.
+    // Temporal blend (skip on reset). Legacy: fixed-alpha EMA (params.y). CONVERGE mode: a running
+    // mean α = 1/(1+N) with the per-texel relight counter N carried in the radiance `.w` (unread by
+    // every consumer — mipgen validity comes from `src_pos.w` and sampling uses Load3). N saturates at
+    // K, matching the K-cycle jitter above: the first K relights average the K stratified ray sets
+    // EXACTLY (running mean), after which the input repeats periodically and the blend is a bounded
+    // ripple the freeze latch measures below its epsilon (reference NumFramesAccumulated atlas).
+    float n_count = 1.0;
     if (pc.reset == 0u)
     {
-        float3 prev = make_finite(asfloat(g.storage_buffers[pc.cache_rad_read].Load3(t * 16u)));
-        radiance = lerp(prev, radiance, pc.params.y);
+        float4 prev4 = asfloat(g.storage_buffers[pc.cache_rad_read].Load4(t * 16u));
+        float3 prev = make_finite(prev4.rgb);
+        float alpha = pc.params.y;
+        if (converge)
+        {
+            float n_prev = clamp(prev4.w, 0.0, float(conv_k));
+            alpha = 1.0 / (1.0 + n_prev);
+            n_count = min(n_prev + 1.0, float(conv_k));
+        }
+        radiance = lerp(prev, radiance, alpha);
         // A2-fix convergence probe: the MEAN per-channel EMA step over the relit texels (buffer[0] =
         // sum in 1e4 fixed-point, buffer[1] = count). Mean, not max — a single stochastic-gather
         // outlier keeps a max pinned high forever, so max never reports convergence; the mean tracks
@@ -264,11 +303,20 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
         {
             float3 dv = abs(radiance - prev);
             float d = max(dv.x, max(dv.y, dv.z));
+            // CONVERGE mode: report the step RELATIVE to the texel's radiance. The absolute step is
+            // in physical units (a 100k-lux sun ⇒ cache values in the hundreds), so the host epsilon
+            // (0.02) was unreachable by construction — the freeze latch never armed on any physically
+            // lit content scene. Relative, eps 0.02 = "2% change", scale-invariant. Legacy keeps the
+            // absolute step (its eps was tuned for the gallery's unit-scale lighting).
+            if (converge)
+                d /= max(max(prev.x, max(prev.y, prev.z)), 1e-3);
             g.storage_buffers[pc.conv_buf].InterlockedAdd(0u, uint(min(d, 1e5) * 1e4));
             g.storage_buffers[pc.conv_buf].InterlockedAdd(4u, 1u);
         }
     }
     // Sanitize before storing: a NaN here would spread through the cache's gather + EMA
-    // every frame (the "black creeps in" failure on complex scenes).
-    g.storage_buffers[pc.cache_rad_write].Store4(t * 16u, asuint(float4(make_finite(radiance), 1.0)));
+    // every frame (the "black creeps in" failure on complex scenes). `.w` = the CONVERGE-mode
+    // relight counter N (legacy stores its constant 1.0 = byte-identical).
+    g.storage_buffers[pc.cache_rad_write].Store4(
+        t * 16u, asuint(float4(make_finite(radiance), converge ? n_count : 1.0)));
 }

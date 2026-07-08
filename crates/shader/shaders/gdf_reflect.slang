@@ -19,6 +19,7 @@
 #include "bindless.slang"
 #include "clipmap.slang"
 #include "surface_cache.slang"
+#include "reflect_ggx.slang" // A5: shared blue-noise GGX sampler (content path; kept in lockstep)
 
 struct ReflectPush
 {
@@ -71,6 +72,34 @@ SkipCfg unpack_skip()
 
 [[vk::push_constant]]
 ConstantBuffer<ReflectPush> pc : register(b0, space0);
+
+#if defined(HWRT_REFLECT) || defined(SCREEN_HIT)
+// Per-frame globals (set 1 / b1) — the same UBO the deferred PBR / SSR passes bind (opted into via
+// the compute pipeline's `uniform_buffer`). Only `prev_view_proj` is read, for the B.2 screen-color-
+// at-hit reprojection (HWRT) / the B2' screen-hit early-out march (SW SCREEN_HIT permutation); the
+// layout must match the host `Globals` (mirrors ssr.slang's subset).
+struct Globals
+{
+    float4 camera_pos;
+    float4 sun_direction;
+    float4 sun_color;
+    float4 ambient;
+    int4 counts;
+    float4 point_pos[4];
+    float4 point_color[4];
+    float4x4 light_view_proj;
+    float4 shadow;
+    float4x4 inv_view_proj;
+    int4 ibl;
+    float4 probe;
+    float4 probe_box_min;
+    float4 probe_box_max;
+    float4x4 prev_view_proj; // world -> previous clip
+};
+
+[[vk::binding(0, 1)]]
+ConstantBuffer<Globals> globals : register(b1, space0);
+#endif
 
 #define GDF_MIN (pc.aabb_min.xyz)
 #define GDF_MAX (pc.aabb_max.xyz)
@@ -142,7 +171,13 @@ float scene_occ(float3 p)
 // distance field's voxel grid; gives colored reflections instead of grey.
 float3 albedo_at(float3 p)
 {
+#ifdef SCREEN_HIT
+    // In this permutation `params.y` carries the lit-history buffer index (content always binds
+    // the albedo volumes, so the constant-albedo fallback slot is dead); keep a sane constant.
+    return cm_albedo(reflect_clip(), p, 0.7);
+#else
     return cm_albedo(reflect_clip(), p, pc.params.y);
+#endif
 }
 
 // Cone-blurred per-voxel albedo for the UNcovered (analytic) reflection path. The surface cache is
@@ -246,6 +281,67 @@ float3 sample_gi_irradiance(uint base, float3 p, float3 n)
     return max(e, float3(0.0, 0.0, 0.0));
 }
 
+#ifdef SCREEN_HIT
+// B2' screen-hit early-out — the SW screen-color-at-hit. March the reflection ray a short distance
+// and test each sample against the depth buffer; where the ray provably hits an on-screen surface,
+// take that surface's FULL-RES lit radiance from the previous frame's history instead of paying the
+// GDF sphere-march + surface-cache shade. That is both the trace budget that pays for the B2' K
+// rays (most indoor reflected surfaces ARE on screen) and a strictly better colour (exact full-res
+// lighting vs 32² card texels — the same reason the HWRT screen-color-at-hit is the sharpness win).
+// Projection uses `globals.prev_view_proj` and validates against the CURRENT depth buffer with the
+// same tolerance law as the Phase 16 B.2 HWRT screen path, so camera motion fails the validation
+// (falls back to the GDF march) instead of smearing. Returns true + colour + hit ray-parameter.
+bool screen_trace(float3 p, float3 dir, float sy, float bias, float max_dist, uint lit_hist,
+                  out float3 col, out float thit)
+{
+    col = float3(0.0, 0.0, 0.0);
+    thit = 0.0;
+    if (lit_hist >= 0x7FFFFFFFu)
+        return false; // 0x7FFFFFFF = no history bound (same sentinel as the HWRT path)
+    float diag = length(GDF_MAX - GDF_MIN);
+    float range = min(max_dist, 0.5 * diag);
+    // Exponential march: fine near the surface (contact reflections), coarse far.
+    const int STEPS = 24;
+    float t = max(bias * 2.0, range * 0.004);
+    float grow = pow(range / t, 1.0 / float(STEPS)); // t · grow^STEPS == range
+    [loop]
+    for (int i = 0; i < STEPS; i++)
+    {
+        t *= grow;
+        float3 rp = p + dir * t;
+        float4 pclip = mul(globals.prev_view_proj, float4(rp, 1.0));
+        if (pclip.w <= 0.0)
+            return false; // marched behind the camera — not an on-screen ray
+        float3 pndc = pclip.xyz / pclip.w;
+        float2 puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
+        if (!(all(puv >= 0.0) && all(puv <= 1.0)))
+            return false; // left the screen — the GDF owns the rest of the ray
+        float sd = g.textures[pc.depth_index].SampleLevel(g.samp, puv, 0.0).r;
+        if (sd >= 1.0)
+            continue; // background pixel — nothing to hit here
+        float2 vndc = float2(puv.x * 2.0 - 1.0, (puv.y * 2.0 - 1.0) * sy);
+        float4 vw = mul(pc.inv_view_proj, float4(vndc, sd, 1.0));
+        float3 sworld = vw.xyz / vw.w;
+        // Acceptance: the depth-buffer surface at `puv` must BE the ray sample (tolerance grows
+        // with t — a far sample tolerates more parallax). Mirrors the HWRT B.2 validation.
+        float vtol = 0.01 * diag + t * 0.02;
+        if (distance(sworld, rp) < vtol)
+        {
+            // lit history is FULL-res; index it with the depth texture's own dimensions.
+            uint fw, fh;
+            g.textures[pc.depth_index].GetDimensions(fw, fh);
+            int2 pp = clamp(int2(puv * float2(fw, fh)), int2(0, 0),
+                            int2(int(fw) - 1, int(fh) - 1));
+            uint pidx = uint(pp.y) * fw + uint(pp.x);
+            col = asfloat(g.storage_buffers[lit_hist].Load4(pidx * 16u)).rgb;
+            thit = t;
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void csMain(uint3 tid: SV_DispatchThreadID)
@@ -334,19 +430,40 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // `vol_on` is true for the gallery too and can't distinguish it.
     bool content_refl = (pc.max_steps & 0x80000000u) != 0u;
     float mirror_thresh = content_refl ? 0.125 : 0.04;
-    if (roughness > mirror_thresh)
+    // Rough-prefilter split (SW content opt-in): above this roughness the stochastic 1-ray/frame
+    // GGX estimator is the WRONG tool — the lobe is so wide that any reachable sample count leaves
+    // residual speckle (the ~50x undersampling diagnosis), while the surface-cache cone MIP already
+    // holds a prefiltered version of exactly the radiance the wide lobe integrates. So trace ONE
+    // deterministic mirror ray and sample the cache with a roughness-driven cone footprint instead:
+    // structural noise ZERO, and the visual difference from the true lobe integral is hidden by the
+    // lobe's own blur (reference engine: roughness above RadianceCache.MaxRoughness skips tracing
+    // and reads the prefiltered probe). Threshold rides `max_steps` bits 16..23 (roughness*255,
+    // 0 = off; the SW step cap fits in bits 0..15, tiers cap it at 256). The HWRT path never sets
+    // these bits (its max_steps field carries the lit-history index).
+    uint prefilter8 = (pc.max_steps >> 16) & 0xFFu;
+    bool prefiltered =
+        content_refl && prefilter8 != 0u && roughness >= float(prefilter8) * (1.0 / 255.0);
+    // A5 sampler select (max_steps bit30): blue-noise (frame-varying, low-discrepancy) vs the
+    // legacy white jitter. Hoisted here because the B2' sample loop below redraws with it too.
+    uint stoch_flag = (pc.max_steps & 0x40000000u) != 0u ? 1u : 0u;
+    if (roughness > mirror_thresh && !prefiltered)
     {
-        // GGX importance-sampled reflection ray. `pc.frame` decorrelates the jitter per frame; the
-        // host passes a FIXED frame (0) for content so the per-pixel jitter is temporally STABLE —
-        // the temporal pass can't average a 1-ray/frame stochastic lobe to convergence (auto-exposure
-        // shifts reject the history too), so a frame-varying ray leaves sparkle, while a fixed jitter
-        // + the resolve's spatial gather reconstructs the lobe smoothly. The gallery passes the real
-        // frame to stay byte-identical to its legacy anchor.
-        uint rng = (tid.x * 1973u + tid.y * 9277u + pc.frame * 26699u) | 1u;
-        float3 h = sample_ggx(n, roughness, rng);
-        dir = reflect(-v, h);
-        if (dot(dir, n) <= 0.0)
-            dir = reflect(-v, n); // keep the ray in the upper hemisphere
+        if (content_refl)
+        {
+            // A5: content routes through the shared sampler so the A1 resolve reconstructs the SAME
+            // ray. Blue-noise + the A1/A4 denoiser lets the temporal pass converge the lobe instead
+            // of the fixed-jitter dead end.
+            dir = refl_ggx_dir(n, v, roughness, tid.x, tid.y, pc.frame, stoch_flag);
+        }
+        else
+        {
+            // Gallery: inline white jitter (byte-identical anchor). `pc.frame` decorrelates per frame.
+            uint rng = (tid.x * 1973u + tid.y * 9277u + pc.frame * 26699u) | 1u;
+            float3 h = sample_ggx(n, roughness, rng);
+            dir = reflect(-v, h);
+            if (dot(dir, n) <= 0.0)
+                dir = reflect(-v, n); // keep the ray in the upper hemisphere
+        }
     }
     else
     {
@@ -362,120 +479,359 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     uint irr_idx = vol_on ? asuint(pc.params.z) : 0xFFFFFFFFu;
     bool has_irr = irr_idx != 0xFFFFFFFFu;
 
-    // Sphere-trace the reflection ray. Stage D3: content lowers the step cap; gallery = 96.
-    int max_steps = int(max(pc.max_steps & 0x7FFFFFFFu, 1u));
-    const float HIT_EPS = 0.001;
-    float t = bias;
-    bool hit = false;
-    float3 hp = p;
-    for (int i = 0; i < max_steps; i++)
+    // B2' glossy sample density (`P_REFLECT_GLOSSY_SPP`, max_steps bits 24..29, SW content
+    // only): K GGX rays per pixel per frame for the stochastic glossy band — the direct fix for
+    // the ~50x undersampling that leaves residual speckle no denoiser can remove (it cannot
+    // average in radiance the rays never sampled). Mirror / prefiltered / gallery pixels keep the
+    // single deterministic ray (K applies only where the ray is a GGX draw).
+    uint spp = 1u;
+#ifndef HWRT_REFLECT
+    if (content_refl && !prefiltered && roughness > mirror_thresh)
+        spp = ((pc.max_steps >> 24) & 0x3Fu) + 1u; // packed as K-1 (0 = legacy single ray)
+#endif
+    // Accumulators: K samples average in the Reinhard denoiser space (V / (1 + luma*0.1)) like the
+    // A1 resolve / temporal — a single bright HDR hit (sky through the lobe) must not dominate the
+    // mean. spp == 1 bypasses the tonemap round-trip entirely (bit-exact legacy single-sample
+    // path — the gallery anchor).
+    float3 acc_tm = float3(0.0, 0.0, 0.0);
+    float acc_t = 0.0;
+    float3 out_color = float3(0.0, 0.0, 0.0);
+    float out_t = 0.0;
+    [loop]
+    for (uint samp = 0u; samp < spp; samp++)
     {
-        float3 rp = p + dir * t;
-        float d = scene_march(rp);
-        if (d < HIT_EPS)
+        // Sample s of K redraws the GGX ray farther along the SAME low-discrepancy sequence
+        // (seq = frame*K + s): K samples/frame advance the R2 rotation exactly as K frames would,
+        // and the A1 resolve reconstructs every neighbour ray with the same law.
+        if (spp > 1u)
+            dir = refl_ggx_dir(n, v, roughness, tid.x, tid.y, pc.frame * spp + samp, stoch_flag);
+        float t = bias;
+        bool hit = false;
+        float3 hp = p;
+        // B2' screen-hit early-out: a validated on-screen hit takes the previous frame's full-res
+        // lit radiance and skips the GDF march + cache shade for this sample. Prefiltered pixels
+        // skip it — their colour must be the cache CONE average, not one sharp full-res sample.
+        bool screen_done = false;
+        float3 screen_col = float3(0.0, 0.0, 0.0);
+#ifdef SCREEN_HIT
+        if (content_refl && !prefiltered)
         {
-            hp = rp;
-            hit = true;
-            break;
+            float t_screen;
+            screen_done = screen_trace(p, dir, sy, bias, max_dist, asuint(pc.params.y),
+                                       screen_col, t_screen);
+            if (screen_done)
+                t = t_screen; // a miss must NOT touch t (the GDF march starts at `bias`)
         }
-        // P3 cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01) legacy).
-        t += max(d, max(0.01, pc.ground_albedo.w * t));
-        if (t > max_dist)
-            break;
-    }
+#endif
+#ifdef HWRT_REFLECT
+        // Phase 16 hybrid: trace the reflection ray against the REAL triangle BVH (the scene TLAS) with
+        // an inline RayQuery instead of the GDF sphere-march — exact hit points, no distance-field
+        // leaking or low-res card blockiness (the floor sparkle / blurry chrome). The hit is shaded from
+        // the surface cache below EXACTLY as the SW path (SurfaceCache mode), so only the trace changes.
+        // Closest-hit pattern mirrors rt_trace.slang (RAY_FLAG_NONE + single Proceed + CommittedRayT).
+        // E: the hit's instance/primitive/barycentrics/object-to-world are captured for Hit Lighting.
+        uint hl_inst = 0u;
+        uint hl_prim = 0u;
+        float2 hl_bary = float2(0.0, 0.0);
+        float3x4 hl_o2w = float3x4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0);
+        {
+            RayDesc ray;
+            ray.Origin = p;
+            ray.Direction = dir;
+            ray.TMin = bias; // avoid self-intersecting the origin surface
+            ray.TMax = max_dist;
+            RayQuery<RAY_FLAG_NONE> q;
+            q.TraceRayInline(g.tlas, RAY_FLAG_NONE, 0xFF, ray);
+            q.Proceed();
+            if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+            {
+                t = q.CommittedRayT();
+                hp = p + dir * t;
+                hit = true;
+                hl_inst = q.CommittedInstanceID();
+                hl_prim = q.CommittedPrimitiveIndex();
+                hl_bary = q.CommittedTriangleBarycentrics();
+                hl_o2w = q.CommittedObjectToWorld3x4();
+            }
+        }
+#else
+        // Sphere-trace the reflection ray. Stage D3: content lowers the step cap; gallery = 96.
+        // The step cap lives in bits 0..15 (tiers cap it at 256); the upper bits carry flags — bit31
+        // content, bit30 A5 stochastic, bits 16..23 the prefilter threshold. Gallery passes a bare
+        // cap (96, upper bits zero) → byte-identical.
+        int max_steps = int(max(pc.max_steps & 0xFFFFu, 1u));
+        const float HIT_EPS = 0.001;
+        for (int i = 0; i < max_steps && !screen_done; i++)
+        {
+            float3 rp = p + dir * t;
+            float d = scene_march(rp);
+            if (d < HIT_EPS)
+            {
+                hp = rp;
+                hit = true;
+                break;
+            }
+            // P3 cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01) legacy).
+            t += max(d, max(0.01, pc.ground_albedo.w * t));
+            if (t > max_dist)
+                break;
+        }
+#endif
 
-    float3 color;
-    if (hit)
-    {
-        float3 hn = scene_normal(hp);
-        // C8b3/C8g: the reflected surface's cached (multibounce, accurately-lit) radiance — a
-        // direct lookup when the cache is bound. The cache only covers the meshed objects (no
-        // cards for the analytic ground), so on a cache MISS fall back to the C8a per-ray
-        // re-light instead of black (which previously left the ground reflection dark).
-        bool cached = false;
-        if (pc.cache.x != 0xFFFFFFFFu)
+        float3 color;
+        // Ray-cone slope (world radius per unit hit distance). The stochastic path uses a small
+        // per-pixel half-angle (~0.08, the trace-res pixel cone) — the LOBE's spread is realised by
+        // the distribution of rays. The prefiltered path traces ONE mirror ray, so the lobe's spread
+        // must come from the cone itself: the median GGX half-vector tilt is tan(θ_h) ≈ α (= r²), and
+        // the REFLECTED direction deviates by 2·θ_h, so slope = tan(2θ_h) ≈ 2α (0.32 at the 0.4
+        // threshold, ~63° cone at roughness 1). The cache cone MIP / albedo cone then average the
+        // footprint the wide lobe would have integrated.
+        float alpha_pf = roughness * roughness;
+        float cone_slope = prefiltered ? clamp(2.0 * alpha_pf, 0.08, 2.0) : 0.08;
+        if (screen_done)
         {
-            // Reference-engine (Lumen) cone-based card acceptance: the coarse-field reflection HIT is
-            // imprecise, and the imprecision GROWS with the ray distance `t` (a far hit lands farther
-            // from the true surface). A FIXED tolerance (the old 0.006·diag) matched near cards but
-            // FAILED far ones → those far hits fell to the coarse per-voxel-albedo analytic path = the
-            // blocky, colour-bleeding chrome centre. Grow the acceptance with distance (like Lumen's
-            // ray-cone SampleRadius) so far reflected surfaces still read their smooth cached lit
-            // radiance instead of albedo. 0 for the gallery (vol_on false) -> byte-identical.
-            float cache_bias = vol_on ? (0.006 * length(GDF_MAX - GDF_MIN) + t * 0.03) : 0.0;
-            // The reflection packs the MIP pyramid into cache_tile's spare bits: tile | max_mip<<8 |
-            // mip_index<<16 (mip_index 0xFFFF = no pyramid). The same distance-growing cone_bias is
-            // the ray-cone footprint (world units) that selects the MIP — near hits stay at mip0,
-            // far demagnified hits read a coarse averaged level → smooth chrome instead of blocks.
-            uint c_tile = pc.cache_tile & 0xFFu;
-            uint c_maxmip = (pc.cache_tile >> 8) & 0xFu;
-            uint c_mip16 = (pc.cache_tile >> 16) & 0xFFFFu;
-            uint mip_index = (c_mip16 == 0xFFFFu) ? 0xFFFFFFFFu : c_mip16;
-            // Ray-cone footprint that selects the MIP (world units) — DECOUPLED from `cache_bias`
-            // (which is the card-acceptance tolerance; widening THAT scatters cross-card). This grows
-            // with hit distance `t` so a far demagnified reflection reads a coarse averaged level
-            // while a near/face-on hit stays near mip0 (sharp). Slope ≈ a per-pixel cone half-angle.
-            float mip_radius = 0.05 + t * 0.08;
-            color = sample_surface_cache_cone(hp, hn, pc.cache.x, pc.cache.y, pc.cache.z, pc.cache.w,
-                                              c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
-                                              cached);
+            // B2' screen hit: the previous frame's full-res lit radiance at the validated on-screen
+            // hit — no march, no cache shade (exact colour, ~free).
+            color = screen_col;
         }
-        if (!cached)
+        else if (hit)
         {
-            float ndl = max(dot(hn, sun_dir), 0.0);
-            float sh = ndl > 0.0 ? refl_shadow(hp + hn * 0.004, sun_dir, max_dist) : 1.0;
-            // The ground plane is analytic — it's NOT in the per-voxel albedo volume, so
-            // albedo_at() would return the nearest *object's* colour for a ground hit (the
-            // red cube / green avocado bleeding onto the reflected floor). Use the ground's
-            // own albedo (matches deferred.rs's [0.8] ground material) for ground hits.
-            bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp);
-            // Cone-blurred albedo (content, vol_on) so an uncovered far reflection is as smooth as
-            // its cached neighbours instead of blocky per-voxel colour. Near hits (radius→0) and the
-            // gallery (vol_on false) keep the single-tap legacy albedo.
-            float ablur = vol_on ? (0.05 + t * 0.08) : 0.0;
-            float3 hit_albedo = is_ground ? pc.ground_albedo.xyz : albedo_cone(hp, hn, ablur);
-            // Lambertian reflected surface: albedo/PI * irradiance, so the reflection of a
-            // diffuse surface matches its directly-shaded appearance. The cache path (meshed
-            // hits) gets the same 1/PI in sdf_cache_light.slang.
-            if (vol_on)
+            float3 hn = scene_normal(hp);
+            bool cached = false;
+#ifdef HWRT_REFLECT
+            // Phase 16 B.2 — screen-color-at-hit (reference-engine `SampleSceneColorAtHit`): the hardware
+            // ray hit REAL geometry, so if that surface is visible on screen its FULL-RES lit colour is
+            // already in the previous frame's lit-radiance history (`globals.prev_view_proj` + the
+            // `lit_hist` buffer). Sample it directly for a SHARP reflection — the low-res surface cache
+            // is only the off-screen / occluded fallback. This is the sharp-reflection win the SW trace
+            // couldn't give, and the validated HW hit is exactly what our screen-space SSR lacked.
+            // The lit-history index rides the (march-cap) field — unused in the HW variant (no march).
             {
-                // Reference-engine approach: add the GI-lit INDIRECT irradiance (radiance-cache
-                // volume) so a reflected SHADOWED surface reads its real GI colour, not black. The
-                // indirect E matches gdf_gi.slang's convention (outgoing = albedo * E, no extra
-                // /PI), so it is added OUTSIDE the direct term's 1/PI to be energy-consistent with
-                // how the deferred lighting consumes the same volume.
-                float3 e = sample_gi_irradiance(vol_base, hp, hn);
-                color = hit_albedo * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
-                // Physical IBL-diffuse skylight fill: the radiance-cache volume `e` is a LOCAL bounce
-                // term and is ~0 where the cache is cold, so an uncovered reflected surface would go
-                // near-black. Add the same sky irradiance the deferred pass gives every surface
-                // (`irradiance_cube(hn) * albedo`) so a reflected shadowed/uncovered face reads its
-                // true skylit grey — the reflection then matches the directly-shaded scene.
-                if (has_irr)
-                    color += g.cubes[irr_idx].SampleLevel(g.samp, hn, 0.0).rgb * hit_albedo;
+                uint lit_hist = pc.max_steps & 0x7FFFFFFFu;
+                float4 pclip = mul(globals.prev_view_proj, float4(hp, 1.0));
+                if (lit_hist != 0x7FFFFFFFu && pclip.w > 0.0)
+                {
+                    float3 pndc = pclip.xyz / pclip.w;
+                    float2 puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
+                    if (all(puv >= 0.0) && all(puv <= 1.0))
+                    {
+                        float sd = g.textures[pc.depth_index].SampleLevel(g.samp, puv, 0.0).r;
+                        if (sd < 1.0)
+                        {
+                            // Visibility validation: the depth-buffer surface at `puv` must BE the hit,
+                            // not an occluder in front of it — reconstruct its world point and compare.
+                            float2 vndc = float2(puv.x * 2.0 - 1.0, (puv.y * 2.0 - 1.0) * sy);
+                            float4 vw = mul(pc.inv_view_proj, float4(vndc, sd, 1.0));
+                            float3 sworld = vw.xyz / vw.w;
+                            float vtol = 0.01 * length(GDF_MAX - GDF_MIN) + t * 0.02;
+                            if (distance(sworld, hp) < vtol)
+                            {
+                                // lit_hist is FULL-res; the trace may be half-res, so index it with the
+                                // depth texture's own (full-res) dimensions — no extra push field needed.
+                                uint fw, fh;
+                                g.textures[pc.depth_index].GetDimensions(fw, fh);
+                                int2 pp = clamp(int2(puv * float2(fw, fh)), int2(0, 0),
+                                                int2(int(fw) - 1, int(fh) - 1));
+                                uint pidx = uint(pp.y) * fw + uint(pp.x);
+                                color = asfloat(g.storage_buffers[lit_hist].Load4(pidx * 16u)).rgb;
+                                cached = true; // sharp on-screen hit — skip the low-res cache + analytic
+                            }
+                        }
+                    }
+                }
             }
+            // Phase 16 E — Hit Lighting (OFF-SCREEN): the on-screen path failed (behind camera / occluded),
+            // so shade this HW hit with the REAL material instead of the low-res surface cache. `frame`
+            // bit31 = enabled; the consolidated (vertex, index, drawable-table) bindless indices ride the
+            // coarse-albedo push slots (unused here — Hit Lighting replaces the analytic fallback). Fetch
+            // the hit triangle's interpolated normal + UV, sample the albedo texture, and re-light with the
+            // sun (HW shadow ray) + GI radiance cache + IBL sky — the same energy convention as the analytic
+            // path below, but with the accurate material/normal/shadow. Reference: Lumen HitLighting mode.
+            if (!cached && (pc.frame & 0x80000000u) != 0u)
+            {
+                uint tbl = pc.albedo_b;
+                uint rbase = hl_inst * 48u;
+                uint idx_base = g.storage_buffers[tbl].Load(rbase + 0u);
+                uint prim_count = g.storage_buffers[tbl].Load(rbase + 4u);
+                if (hl_prim < prim_count)
+                {
+                    uint tex_albedo = g.storage_buffers[tbl].Load(rbase + 8u);
+                    float4 base_color = asfloat(g.storage_buffers[tbl].Load4(rbase + 16u));
+                    uint tri = (idx_base + hl_prim * 3u) * 4u;
+                    uint i0 = g.storage_buffers[pc.albedo_g].Load(tri);
+                    uint i1 = g.storage_buffers[pc.albedo_g].Load(tri + 4u);
+                    uint i2 = g.storage_buffers[pc.albedo_g].Load(tri + 8u);
+                    float3 n0 = asfloat(g.storage_buffers[pc.albedo_r].Load3(i0 * 32u + 12u));
+                    float3 n1 = asfloat(g.storage_buffers[pc.albedo_r].Load3(i1 * 32u + 12u));
+                    float3 n2 = asfloat(g.storage_buffers[pc.albedo_r].Load3(i2 * 32u + 12u));
+                    float2 uv0 = asfloat(g.storage_buffers[pc.albedo_r].Load2(i0 * 32u + 24u));
+                    float2 uv1 = asfloat(g.storage_buffers[pc.albedo_r].Load2(i1 * 32u + 24u));
+                    float2 uv2 = asfloat(g.storage_buffers[pc.albedo_r].Load2(i2 * 32u + 24u));
+                    float b0 = 1.0 - hl_bary.x - hl_bary.y;
+                    float3 n_obj = n0 * b0 + n1 * hl_bary.x + n2 * hl_bary.y;
+                    float2 uv = uv0 * b0 + uv1 * hl_bary.x + uv2 * hl_bary.y;
+                    float3 nw = normalize(mul((float3x3)hl_o2w, n_obj));
+                    if (dot(nw, dir) > 0.0)
+                        nw = -nw; // face the incoming ray (two-sided)
+                    float3 alb = base_color.rgb;
+                    if (tex_albedo != 0xFFFFFFFFu)
+                        alb *= g.textures[tex_albedo].SampleLevel(g.samp_wrap, uv, 0.0).rgb;
+                    // Sun with a HARDWARE shadow ray (accurate vs the GDF shadow march).
+                    float ndl = max(dot(nw, sun_dir), 0.0);
+                    float sh = 1.0;
+                    if (ndl > 0.0)
+                    {
+                        RayDesc sray;
+                        sray.Origin = hp + nw * 0.01;
+                        sray.Direction = sun_dir;
+                        sray.TMin = 0.001;
+                        sray.TMax = max_dist;
+                        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
+                        sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, sray);
+                        sq.Proceed();
+                        if (sq.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+                            sh = 0.0;
+                    }
+                    // Same energy convention as the analytic content path: direct/PI + GI cache + IBL sky.
+                    float3 e = vol_on ? sample_gi_irradiance(vol_base, hp, nw) : float3(0.0, 0.0, 0.0);
+                    color = alb * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
+                    if (has_irr)
+                        color += g.cubes[irr_idx].SampleLevel(g.samp, nw, 0.0).rgb * alb;
+                    cached = true; // shaded with the real material — skip the surface cache + analytic
+                }
+            }
+#endif
+            // C8b3/C8g: the reflected surface's cached (multibounce, accurately-lit) radiance — a
+            // direct lookup when the cache is bound. The cache only covers the meshed objects (no
+            // cards for the analytic ground), so on a cache MISS fall back to the C8a per-ray
+            // re-light instead of black (which previously left the ground reflection dark).
+            if (!cached && pc.cache.x != 0xFFFFFFFFu)
+            {
+                // Reference-engine (Lumen) cone-based card acceptance: the coarse-field reflection HIT is
+                // imprecise, and the imprecision GROWS with the ray distance `t` (a far hit lands farther
+                // from the true surface). A FIXED tolerance (the old 0.006·diag) matched near cards but
+                // FAILED far ones → those far hits fell to the coarse per-voxel-albedo analytic path = the
+                // blocky, colour-bleeding chrome centre. Grow the acceptance with distance (like Lumen's
+                // ray-cone SampleRadius) so far reflected surfaces still read their smooth cached lit
+                // radiance instead of albedo. 0 for the gallery (vol_on false) -> byte-identical.
+                // Track C card grid: unpack early — grid mode also CAPS the distance-growing
+                // acceptance term (at 1.2% of the diag, ≈ t = 0.4·diag of slack): the unbounded
+                // growth is what forced the host to dilate every card by the worst case (fat
+                // cells); beyond the cap a far hit accepts cards >1% of the scene away, which
+                // score ≈ 0 anyway (align/(1+4·dist)) and only pollute the cone average.
+                uint gc8 = (pc.cache.x >> 8) & 0xFFu;
+                uint gp8 = (pc.cache.x >> 16) & 0xFFu;
+                float diag_sc = length(GDF_MAX - GDF_MIN);
+                float bias_t = gc8 != 0u ? min(t * 0.03, 0.012 * diag_sc) : t * 0.03;
+                float cache_bias = vol_on ? (0.006 * diag_sc + bias_t) : 0.0;
+                // The reflection packs the MIP pyramid into cache_tile's spare bits: tile | max_mip<<8 |
+                // mip_index<<16 (mip_index 0xFFFF = no pyramid). The same distance-growing cone_bias is
+                // the ray-cone footprint (world units) that selects the MIP — near hits stay at mip0,
+                // far demagnified hits read a coarse averaged level → smooth chrome instead of blocks.
+                uint c_tile = pc.cache_tile & 0xFFu;
+                uint c_maxmip = (pc.cache_tile >> 8) & 0xFu;
+                uint c_mip16 = (pc.cache_tile >> 16) & 0xFFFFu;
+                uint mip_index = (c_mip16 == 0xFFFFu) ? 0xFFFFFFFFu : c_mip16;
+                // Ray-cone footprint that selects the MIP (world units) — DECOUPLED from `cache_bias`
+                // (which is the card-acceptance tolerance; widening THAT scatters cross-card). This grows
+                // with hit distance `t` so a far demagnified reflection reads a coarse averaged level
+                // while a near/face-on hit stays near mip0 (sharp). Slope ≈ a per-pixel cone half-angle.
+                float mip_radius = 0.05 + t * cone_slope;
+                // Track C card grid + C2a layout: `cache.x` packs cards | (grid_cells+1)<<8 |
+                // (grid_pool+1)<<16 | (layout+1)<<24 (0 = off — gallery/legacy pass a bare index,
+                // bits 8.. zero). Bindless storage indices are < 64, so the low byte always holds
+                // the real cards index.
+                uint cards_idx = pc.cache.x & 0xFFu;
+                uint la8 = (pc.cache.x >> 24) & 0xFFu;
+                uint grid_cells = gc8 == 0u ? 0xFFFFFFFFu : gc8 - 1u;
+                uint grid_pool = gp8 == 0u ? 0xFFFFFFFFu : gp8 - 1u;
+                uint sc_layout = la8 == 0u ? 0xFFFFFFFFu : la8 - 1u;
+                // C2b: `cache.y` packs cache_pos | (feedback+1)<<8 — the desired-res feedback the
+                // host re-layouts the adaptive atlas around (0 = off, legacy bare index).
+                uint cpos_idx = pc.cache.y & 0xFFu;
+                uint fb8 = (pc.cache.y >> 8) & 0xFFu;
+                uint sc_feedback = fb8 == 0u ? 0xFFFFFFFFu : fb8 - 1u;
+                color = sample_surface_cache_cone(hp, hn, cards_idx, cpos_idx, pc.cache.z, pc.cache.w,
+                                                  c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
+                                                  grid_cells, grid_pool, sc_layout, sc_feedback,
+                                                  cached);
+            }
+            if (!cached)
+            {
+                float ndl = max(dot(hn, sun_dir), 0.0);
+                float sh = ndl > 0.0 ? refl_shadow(hp + hn * 0.004, sun_dir, max_dist) : 1.0;
+                // The ground plane is analytic — it's NOT in the per-voxel albedo volume, so
+                // albedo_at() would return the nearest *object's* colour for a ground hit (the
+                // red cube / green avocado bleeding onto the reflected floor). Use the ground's
+                // own albedo (matches deferred.rs's [0.8] ground material) for ground hits.
+                bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp);
+                // Cone-blurred albedo (content, vol_on) so an uncovered far reflection is as smooth as
+                // its cached neighbours instead of blocky per-voxel colour. Near hits (radius→0) and the
+                // gallery (vol_on false) keep the single-tap legacy albedo.
+                float ablur = vol_on ? (0.05 + t * cone_slope) : 0.0;
+                float3 hit_albedo = is_ground ? pc.ground_albedo.xyz : albedo_cone(hp, hn, ablur);
+                // Lambertian reflected surface: albedo/PI * irradiance, so the reflection of a
+                // diffuse surface matches its directly-shaded appearance. The cache path (meshed
+                // hits) gets the same 1/PI in sdf_cache_light.slang.
+                if (vol_on)
+                {
+                    // Reference-engine approach: add the GI-lit INDIRECT irradiance (radiance-cache
+                    // volume) so a reflected SHADOWED surface reads its real GI colour, not black. The
+                    // indirect E matches gdf_gi.slang's convention (outgoing = albedo * E, no extra
+                    // /PI), so it is added OUTSIDE the direct term's 1/PI to be energy-consistent with
+                    // how the deferred lighting consumes the same volume.
+                    float3 e = sample_gi_irradiance(vol_base, hp, hn);
+                    color = hit_albedo * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
+                    // Physical IBL-diffuse skylight fill: the radiance-cache volume `e` is a LOCAL bounce
+                    // term and is ~0 where the cache is cold, so an uncovered reflected surface would go
+                    // near-black. Add the same sky irradiance the deferred pass gives every surface
+                    // (`irradiance_cube(hn) * albedo`) so a reflected shadowed/uncovered face reads its
+                    // true skylit grey — the reflection then matches the directly-shaded scene.
+                    if (has_irr)
+                        color += g.cubes[irr_idx].SampleLevel(g.samp, hn, 0.0).rgb * hit_albedo;
+                }
+                else
+                {
+                    // Volume absent (e.g. the gallery) -> the legacy crude sky fill. Byte-identical.
+                    float fill = sky_fill * (0.5 + 0.5 * hn.y);
+                    color = hit_albedo * (sun_i * ndl * sh + fill) * (1.0 / GGX_PI);
+                }
+            }
+        }
+        else
+        {
+            // Specular miss -> the sky the mirror ray sees. Content samples the physical IBL cube (the
+            // deferred pass's captured sky, in scene lux) so an escaped ray reads a bright sky instead of
+            // the tiny unscaled procedural gradient (which metered to ~black in a lux-lit scene, leaving
+            // black speckle holes). The irradiance cube is cosine-convolved (≈π·radiance), so /π brings it
+            // back to a directional sky radiance. Gallery keeps the legacy gradient (byte-identical).
+            if (has_irr)
+                color = g.cubes[irr_idx].SampleLevel(g.samp, dir, 0.0).rgb * (1.0 / GGX_PI);
             else
-            {
-                // Volume absent (e.g. the gallery) -> the legacy crude sky fill. Byte-identical.
-                float fill = sky_fill * (0.5 + 0.5 * hn.y);
-                color = hit_albedo * (sun_i * ndl * sh + fill) * (1.0 / GGX_PI);
-            }
+                color = sky(dir, sun_dir, sun_i, false);
         }
+
+        out_color = color;
+        out_t = t;
+        if (spp > 1u)
+        {
+            acc_tm += color / (1.0 + dot(color, float3(0.2126, 0.7152, 0.0722)) * 0.1);
+            acc_t += t;
+        }
+    }
+    float3 color;
+    float t;
+    if (spp == 1u)
+    {
+        color = out_color; // bit-exact legacy single-sample path
+        t = out_t;
     }
     else
     {
-        // Specular miss -> the sky the mirror ray sees. Content samples the physical IBL cube (the
-        // deferred pass's captured sky, in scene lux) so an escaped ray reads a bright sky instead of
-        // the tiny unscaled procedural gradient (which metered to ~black in a lux-lit scene, leaving
-        // black speckle holes). The irradiance cube is cosine-convolved (≈π·radiance), so /π brings it
-        // back to a directional sky radiance. Gallery keeps the legacy gradient (byte-identical).
-        if (has_irr)
-            color = g.cubes[irr_idx].SampleLevel(g.samp, dir, 0.0).rgb * (1.0 / GGX_PI);
-        else
-            color = sky(dir, sun_dir, sun_i, false);
+        float3 tm = acc_tm / float(spp);
+        color = tm / max(1.0 - dot(tm, float3(0.2126, 0.7152, 0.0722)) * 0.1, 1e-3);
+        t = acc_t / float(spp);
     }
-
-
     // Reflection HIT DISTANCE (world units) in the output/persist `.w` — the temporal resolve uses it
     // to reproject the VIRTUAL IMAGE (the reflected point at `surface_dist + t` along the view ray) so a
     // mirror reflection stays stable under camera motion instead of swimming (reference-engine

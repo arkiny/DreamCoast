@@ -132,6 +132,35 @@ float bs_gi_shadow(BounceScene bs, float3 origin, float3 dir)
 // `escaped` reports sky visibility along the ray: 1.0 if it reached the sky (no hit),
 // 0.0 if it hit geometry/ground. Used by the screen probes to build indoor skylight
 // occlusion; the per-pixel GI pass passes a throwaway and ignores it.
+// Shade a bounce-ray HIT (surface point `p`, normal `hn`) — the incoming radiance the receiver sees
+// along that ray. Shared by the SW sphere-march bounce and the Phase 16 HARDWARE-ray-traced GI, so
+// both produce the same GI regardless of how the hit was found. When the surface cache is bound the
+// radiance is the hit's cached (multibounce) radiance (a direct lookup, no per-ray re-light); on a
+// cache MISS (e.g. the analytic ground) it falls back to the per-ray coloured sun re-light.
+float3 bs_shade_hit(BounceScene bs, float3 p, float3 hn)
+{
+    if (bs.cache.x != 0xFFFFFFFFu)
+    {
+        bool cached = false;
+        float3 r = sample_surface_cache(p, hn, bs.cache.x, bs.cache.y, bs.cache.z, bs.cache.w,
+                                        bs.cache_tile, 0.0, cached);
+        if (cached)
+            return r;
+    }
+    float3 sun_dir = normalize(bs.sun_dir);
+    float ndl = max(dot(hn, sun_dir), 0.0);
+    float sh = ndl > 0.0 ? bs_gi_shadow(bs, p + hn * 0.004, sun_dir) : 1.0;
+    // Colored re-light: the hit's real surface albedo × sun (soft-shadowed) + a small hemispheric
+    // sky fill so shadowed surfaces still bounce a little. The analytic ground is not in the albedo
+    // volume, so use the ground's own albedo for a ground hit.
+    bool is_ground = (p.y - bs.ground_y) < bs_geo_inside(bs, p);
+    float3 hit_albedo = is_ground ? bs.ground_albedo : bs_albedo_at(bs, p);
+    // Lambertian: the bounce surface re-emits albedo/PI * irradiance (same 1/PI as the deferred
+    // direct term).
+    float sky_fill = bs.sky_term * (0.5 + 0.5 * hn.y);
+    return hit_albedo * (bs.sun_i * ndl * sh + sky_fill) * (1.0 / BOUNCE_PI);
+}
+
 float3 bs_trace_bounce(BounceScene bs, float3 origin, float3 dir, out float escaped)
 {
     escaped = 1.0; // assume sky-visible until a hit proves otherwise
@@ -147,29 +176,7 @@ float3 bs_trace_bounce(BounceScene bs, float3 origin, float3 dir, out float esca
         {
             escaped = 0.0;
             float3 hn = bs_scene_normal(bs, p);
-            // When the surface cache is bound, the incoming radiance along this ray is the hit
-            // surface's cached (multibounce) radiance — a direct lookup, no per-ray re-light. On a
-            // cache MISS (e.g. the analytic ground) fall back to the per-ray colored re-light.
-            if (bs.cache.x != 0xFFFFFFFFu)
-            {
-                bool cached = false;
-                float3 r = sample_surface_cache(p, hn, bs.cache.x, bs.cache.y, bs.cache.z,
-                                                bs.cache.w, bs.cache_tile, 0.0, cached);
-                if (cached)
-                    return r;
-            }
-            float3 sun_dir = normalize(bs.sun_dir);
-            float ndl = max(dot(hn, sun_dir), 0.0);
-            float sh = ndl > 0.0 ? bs_gi_shadow(bs, p + hn * 0.004, sun_dir) : 1.0;
-            // Colored re-light: the hit's real surface albedo × sun (soft-shadowed) + a small
-            // hemispheric sky fill so shadowed surfaces still bounce a little. The analytic ground
-            // is not in the albedo volume, so use the ground's own albedo for a ground hit.
-            bool is_ground = (p.y - bs.ground_y) < bs_geo_inside(bs, p);
-            float3 hit_albedo = is_ground ? bs.ground_albedo : bs_albedo_at(bs, p);
-            // Lambertian: the bounce surface re-emits albedo/PI * irradiance (same 1/PI as the
-            // deferred direct term).
-            float sky_fill = bs.sky_term * (0.5 + 0.5 * hn.y);
-            return hit_albedo * (bs.sun_i * ndl * sh + sky_fill) * (1.0 / BOUNCE_PI);
+            return bs_shade_hit(bs, p, hn);
         }
         // cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01) legacy).
         t += max(d, max(0.01, bs.cone_k * t));

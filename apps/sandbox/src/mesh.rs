@@ -132,6 +132,90 @@ pub(crate) fn vertex_slice_bytes(vertices: &[MeshVertex]) -> &[u8] {
     }
 }
 
+/// Phase 16 E (Hit Lighting): build the CONSOLIDATED content geometry + material table the
+/// hardware-ray-traced reflection reads to shade a hit with the real material (instead of the low-res
+/// surface cache) for off-screen reflections. Unlike `build_pt_instance_table` (one vertex + one
+/// index storage buffer PER instance → overflows the 64-slot bindless table on a 400+ mesh scene),
+/// this packs ALL unique meshes into ONE vertex buffer + ONE index buffer (indices rebased to be
+/// absolute into the shared vertex buffer), plus ONE per-drawable record buffer — three bindless
+/// slots total, regardless of mesh count. Returns `(vtx, idx, table)`; the caller keeps them alive
+/// and passes their bindless indices to the shader.
+///
+/// Per-drawable record (48 B, `custom_index` order = the TLAS instance order):
+///   [0] idx_base (u32, offset into `idx` in u32 units)  [4] prim_count (u32, triangle bound)
+///   [8] tex_albedo (u32 bindless, NO_TEXTURE = untextured)  [12] tex_mr (u32)
+///   [16..32] base_color (float4)  [32] metallic (f32)  [36] roughness (f32)  [40] ao (f32)  [44] pad
+pub(crate) fn build_content_hit_table(
+    device: &Device,
+    drawables: &[dreamcoast_scene::Drawable],
+    meshes: &crate::registry::MeshRegistry,
+    materials: &crate::registry::MaterialRegistry,
+) -> anyhow::Result<(rhi::StorageBuffer, rhi::StorageBuffer, rhi::StorageBuffer)> {
+    use std::collections::HashMap;
+    // Unique meshes in first-seen draw order (same dedup as the BLAS build) → geometry is stored
+    // once and shared across instances. `mesh_geo[handle] = (idx_base, prim_count)`.
+    let mut vtx_bytes: Vec<u8> = Vec::new();
+    let mut idx_bytes: Vec<u8> = Vec::new();
+    let mut mesh_geo: HashMap<dreamcoast_scene::MeshHandle, (u32, u32)> = HashMap::new();
+    for d in drawables {
+        mesh_geo.entry(d.mesh).or_insert_with(|| {
+            let cpu = meshes.cpu(d.mesh);
+            let vtx_base = (vtx_bytes.len() / 32) as u32; // vertex offset (32 B/vertex)
+            vtx_bytes.extend_from_slice(vertex_slice_bytes(&cpu.vertices));
+            let idx_base = (idx_bytes.len() / 4) as u32; // index offset (u32 units)
+            // Rebase each index to be ABSOLUTE into the shared vertex buffer, so the shader indexes
+            // `vtx[i]` directly without a per-vertex base add.
+            for &i in &cpu.indices {
+                idx_bytes.extend_from_slice(&(i + vtx_base).to_le_bytes());
+            }
+            let prim_count = (cpu.indices.len() / 3) as u32;
+            (idx_base, prim_count)
+        });
+    }
+    // Per-drawable records (custom_index order = draw list order = TLAS instance order).
+    let mut records: Vec<u8> = Vec::with_capacity(drawables.len() * 48);
+    for d in drawables {
+        let (idx_base, prim_count) = mesh_geo[&d.mesh];
+        let m = materials.get(d.material);
+        records.extend_from_slice(&idx_base.to_le_bytes());
+        records.extend_from_slice(&prim_count.to_le_bytes());
+        records.extend_from_slice(&m.tex[0].to_le_bytes()); // base-color texture (NO_TEXTURE if none)
+        records.extend_from_slice(&m.tex[1].to_le_bytes()); // metallic-roughness texture
+        for c in m.base_color {
+            records.extend_from_slice(&c.to_le_bytes());
+        }
+        records.extend_from_slice(&m.metallic.to_le_bytes());
+        records.extend_from_slice(&m.roughness.to_le_bytes());
+        records.extend_from_slice(&0f32.to_le_bytes()); // ao (unused for now)
+        records.extend_from_slice(&0u32.to_le_bytes()); // pad → 48 B
+    }
+    let vtx = device.create_storage_buffer_init(
+        &StorageBufferDesc {
+            size: vtx_bytes.len() as u64,
+            stride: 32,
+            indirect: false,
+        },
+        &vtx_bytes,
+    )?;
+    let idx = device.create_storage_buffer_init(
+        &StorageBufferDesc {
+            size: idx_bytes.len() as u64,
+            stride: 4,
+            indirect: false,
+        },
+        &idx_bytes,
+    )?;
+    let table = device.create_storage_buffer_init(
+        &StorageBufferDesc {
+            size: records.len() as u64,
+            stride: 48,
+            indirect: false,
+        },
+        &records,
+    )?;
+    Ok((vtx, idx, table))
+}
+
 /// Upload raw vertex/index slices into GPU vertex/index buffers (the inner of
 /// [`upload_mesh`]; also used by the registry-based glTF primitive upload).
 pub(crate) fn upload_geometry(

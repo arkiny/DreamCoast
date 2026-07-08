@@ -187,11 +187,26 @@
                 ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
                 gi_volume_period: 4,
+                // Reflection-quality v2 stack (Metal-verified on Apple hardware — this tier only
+                // exists on the Metal backend, so the pending DX≡VK pass can't be hit from here;
+                // Low/Med/High keep the serde-default OFF until the Windows parity run).
+                // Measured on M3/glossyball: prefilter removes the rough floor from the K loop,
+                // the screen-hit early-out serves on-screen hits from full-res lit history, and
+                // the card grid cuts the per-hit card scan — SPP4 full stack ≈ the K=1 legacy
+                // frame cost, with real glossy structure instead of the milky single-ray wash.
+                reflect_stochastic: true,
+                reflect_prefilter: 0.4,
+                reflect_glossy_spp: 4,
+                reflect_screen_hit: true,
+                cache_grid: true,
+                card_mesh_capture: true,
+                // cache_adaptive_res stays off: +~3ms relight (layout loads in the gather) —
+                // High-tier material once DX≡VK passes.
             ),
             groups: (
                 resolution: 1,
                 global_illumination: 0,
-                reflection: 0,
+                reflection: 1,
                 ambient_occlusion: 1,
                 shadow: 1,
                 surface_cache: 0,

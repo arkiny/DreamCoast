@@ -14,22 +14,34 @@ use rhi::{
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
-    gdf_reflect_push, lit_history_push, reflect_composite_push, reflect_temporal_push, ssr_push,
-    ssr_resolve_push,
+    gdf_reflect_push, lit_history_push, reflect_composite_push, reflect_resolve_push,
+    reflect_spatial_push, reflect_temporal_push, ssr_push, ssr_resolve_push,
 };
 
 pub(crate) struct ReflectSystem {
     ssr_pipeline: Option<ComputePipeline>, // C5 screen-space reflections (stochastic half-res)
     ssr_resolve_pipeline: Option<ComputePipeline>, // stochastic SSR temporal resolve
     reflect_pipeline: Option<ComputePipeline>, // C6 GDF reflection fallback
+    /// Phase 16 HWRT hybrid: the reflection shader's `HWRT_REFLECT` permutation (traces the scene
+    /// TLAS instead of the GDF march, then shades the hit from the surface cache). Built only on
+    /// RT-capable devices; bound in place of `reflect_pipeline` when `P_HWRT` is opted in.
+    reflect_hwrt_pipeline: Option<ComputePipeline>,
+    /// B2' screen-hit early-out: the `SCREEN_HIT` permutation (SW march with a screen-trace
+    /// prepass per ray — validated on-screen hits read the prev-frame full-res lit history).
+    reflect_screen_pipeline: Option<ComputePipeline>,
     composite_pipeline: Option<ComputePipeline>, // C7 hybrid composite
     lit_history_pipeline: Option<ComputePipeline>, // C7b lit-color history capture
+    resolve_pipeline: Option<ComputePipeline>,   // A1 spatial ratio-estimator resolve (trace res)
+    spatial_pipeline: Option<ComputePipeline>, // A4b variance-guided bilateral denoiser (full res)
     temporal_pipeline: Option<ComputePipeline>, // C8j stochastic-GDF-reflection temporal resolve
     /// C8j stochastic GDF reflection temporal accumulation: ping-pong byte-address buffers —
     /// `accum` (tonemap-space rgb + history len) and `pos` (surface world point + valid), at the
     /// full render extent. The resolve reprojects the surface into the previous frame.
     refl_accum: [Option<StorageBuffer>; 2],
     refl_pos: [Option<StorageBuffer>; 2],
+    /// A4a: per-pixel 2nd-moment (luminance²) accumulation ping-pong (scalar in .x), for the A4b
+    /// variance-guided spatial denoiser. Allocated alongside `refl_accum`; used only when denoise is on.
+    refl_moment: [Option<StorageBuffer>; 2],
     refl_accum_extent: (u32, u32),
     refl_accum_frame: u32,
     /// A3 adaptive temporal skip (docs/lossless-opt-ledger.md): a half-res ping-pong (32 B/px —
@@ -110,6 +122,35 @@ impl ReflectSystem {
             240,
             false,
         )?;
+        // Phase 16 HWRT hybrid permutation — same push layout (240B), traces the TLAS. Built only on
+        // RT-capable devices (it references the acceleration structure); absent ⇒ SW march is used.
+        // `uniform_buffer: true` binds the globals UBO (set 1/b1) for the B.2 screen-color-at-hit
+        // reprojection (`prev_view_proj`), like SSR — the matrix doesn't fit the 240 B push.
+        let reflect_hwrt_pipeline = if device.has_raytracing() {
+            compute(
+                dreamcoast_shader::gdf_reflect_hwrt_cs_spirv,
+                dreamcoast_shader::gdf_reflect_hwrt_cs_dxil,
+                dreamcoast_shader::gdf_reflect_hwrt_cs_metallib,
+                "gdf_reflect_hwrt",
+                240,
+                true,
+            )?
+        } else {
+            None
+        };
+        // B2' screen-hit early-out permutation — same push layout (240B), marches the reflection
+        // ray against the depth buffer first and takes the previous frame's full-res lit radiance
+        // on a validated on-screen hit (skipping the GDF march + cache shade). `uniform_buffer:
+        // true` binds the globals UBO for the reprojection (`prev_view_proj`), like the HWRT B.2
+        // screen path whose validation law it reuses.
+        let reflect_screen_pipeline = compute(
+            dreamcoast_shader::gdf_reflect_screen_cs_spirv,
+            dreamcoast_shader::gdf_reflect_screen_cs_dxil,
+            dreamcoast_shader::gdf_reflect_screen_cs_metallib,
+            "gdf_reflect_screen",
+            240,
+            true,
+        )?;
         let composite_pipeline = compute(
             dreamcoast_shader::reflect_composite_cs_spirv,
             dreamcoast_shader::reflect_composite_cs_dxil,
@@ -126,24 +167,47 @@ impl ReflectSystem {
             32,
             false,
         )?;
+        // A1: spatial ratio-estimator resolve of the stochastic GGX GDF reflection (trace res).
+        let resolve_pipeline = compute(
+            dreamcoast_shader::reflect_resolve_cs_spirv,
+            dreamcoast_shader::reflect_resolve_cs_dxil,
+            dreamcoast_shader::reflect_resolve_cs_metallib,
+            "reflect_resolve",
+            128,
+            false,
+        )?;
+        // A4b: variance-guided bilateral reflection denoiser (post-temporal, full res).
+        let spatial_pipeline = compute(
+            dreamcoast_shader::reflect_spatial_cs_spirv,
+            dreamcoast_shader::reflect_spatial_cs_dxil,
+            dreamcoast_shader::reflect_spatial_cs_metallib,
+            "reflect_spatial",
+            128,
+            false,
+        )?;
         // C8j: temporal resolve of the stochastic GGX GDF reflection.
         let temporal_pipeline = compute(
             dreamcoast_shader::reflect_temporal_cs_spirv,
             dreamcoast_shader::reflect_temporal_cs_dxil,
             dreamcoast_shader::reflect_temporal_cs_metallib,
             "reflect_temporal",
-            224,
+            240,
             false,
         )?;
         Ok(Self {
             ssr_pipeline,
             ssr_resolve_pipeline,
             reflect_pipeline,
+            reflect_hwrt_pipeline,
+            reflect_screen_pipeline,
             composite_pipeline,
             lit_history_pipeline,
+            resolve_pipeline,
+            spatial_pipeline,
             temporal_pipeline,
             refl_accum: [None, None],
             refl_pos: [None, None],
+            refl_moment: [None, None],
             refl_accum_extent: (0, 0),
             refl_accum_frame: 0,
             refl_skip: [None, None],
@@ -222,6 +286,7 @@ impl ReflectSystem {
             };
             self.refl_accum = [make()?, make()?];
             self.refl_pos = [make()?, make()?];
+            self.refl_moment = [make()?, make()?];
             self.refl_accum_extent = (cw, ch);
             self.refl_accum_frame = 0;
         }
@@ -324,6 +389,18 @@ impl ReflectSystem {
     /// reads the buffer this frame wrote.
     pub(crate) fn advance_history(&mut self) {
         self.lit_hist_frame = self.lit_hist_frame.saturating_add(1);
+    }
+
+    /// Phase 16 B.2: the bindless storage index of the PREVIOUS frame's lit-radiance history (the
+    /// same buffer SSR reprojects into), for the HWRT reflection's screen-color-at-hit. `0x7FFFFFFF`
+    /// = no history bound (the shader then keeps the surface-cache shading). Capped to 31 bits since
+    /// it rides the reflection push's march-cap field (bit 31 is the content flag).
+    pub(crate) fn lit_hist_read_index(&self) -> u32 {
+        let read = ((self.lit_hist_frame + 1) % 2) as usize;
+        self.lit_hist[read]
+            .as_ref()
+            .map(|b| b.storage_index() & 0x7FFF_FFFF)
+            .unwrap_or(0x7FFF_FFFF)
     }
 
     /// C5/C7b: screen-space reflections. A full-screen compute pass reflects the view ray
@@ -466,6 +543,9 @@ impl ReflectSystem {
         kernel_radius: f32,
         clamp_mode: u32,
         clamp_gamma: f32,
+        // Temporal blend factor: > 0 = legacy fixed-alpha EMA (0.15); < 0 = CONVERGE running mean
+        // with K = -alpha (reference NumFramesAccumulated-style, damps the lit-history feedback).
+        ema_alpha: f32,
     ) -> ResourceId {
         let pipe = self
             .ssr_resolve_pipeline
@@ -521,13 +601,151 @@ impl ReflectSystem {
                     flip_y,
                     u32::from(reset),
                     reject_dist,
-                    0.15, // temporal EMA alpha (spatial resolve already cut the variance)
+                    ema_alpha,
                     clamp_max,
                     kernel_radius,
                     clamp_mode,
                     clamp_gamma,
                 ));
                 cmd.dispatch(hw.div_ceil(8), hh.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
+    pub(crate) fn has_reflect_resolve(&self) -> bool {
+        self.resolve_pipeline.is_some()
+    }
+
+    /// A1: spatial ratio-estimator resolve of the stochastic GGX GDF reflection, at the TRACE
+    /// resolution (before the bilateral upsample). Reconstructs each neighbour's ray direction from
+    /// the same deterministic per-pixel jitter and reweights the borrowed sample by `pdf_p/pdf_q`
+    /// (Stachowiak's ratio estimator — the same scheme `record_ssr_resolve` uses). Stateless (no
+    /// history). Near-mirror pixels pass through. Returns the resolved trace-res reflection.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_reflect_resolve<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        refl: ResourceId,
+        depth: ResourceId,
+        normal: ResourceId,
+        material: ResourceId,
+        extent: Extent2D,
+        rw: u32,
+        rh: u32,
+        inv_view_proj: [f32; 16],
+        eye: Vec3,
+        flip_y: u32,
+        frame: u32,
+        mirror_thresh: f32,
+        kernel_radius: f32,
+        // Packed flags (mirrors ResolvePush.stochastic): bits 0..7 = A5 sampler select (0 white,
+        // 1 blue-noise — must match the sampler gdf_reflect used this frame); bits 16..23 = the B2'
+        // rough-prefilter threshold (roughness*255, 0 = off) so prefiltered pixels pass through.
+        stochastic: u32,
+    ) -> ResourceId {
+        let pipe = self
+            .resolve_pipeline
+            .as_ref()
+            .expect("reflect resolve pipeline");
+        let out = graph.create_storage_image("reflect_resolved_spatial", HDR_FORMAT, extent);
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "reflect_resolve",
+                storage_writes: vec![out],
+                reads: vec![refl, depth, normal, material],
+            },
+            move |ctx| {
+                let refl_index = ctx.sampled_index(refl);
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let material_index = ctx.sampled_index(material);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&reflect_resolve_push(
+                    &inv_view_proj,
+                    eye,
+                    refl_index,
+                    depth_index,
+                    normal_index,
+                    material_index,
+                    out_index,
+                    rw,
+                    rh,
+                    flip_y,
+                    frame,
+                    mirror_thresh,
+                    kernel_radius,
+                    stochastic,
+                ));
+                cmd.dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
+    pub(crate) fn has_reflect_spatial(&self) -> bool {
+        self.spatial_pipeline.is_some()
+    }
+
+    /// A4b: variance-guided bilateral reflection denoiser (post-temporal, full resolution). Reads the
+    /// temporal output (rgb + per-pixel StdDev in .a from A4a) + G-buffer, and blurs only the noisy
+    /// pixels with depth/normal/variance-driven edge stops (mirror = passthrough). Returns the
+    /// denoised reflection (linear, for the composite).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_reflect_spatial<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        refl: ResourceId,
+        depth: ResourceId,
+        normal: ResourceId,
+        material: ResourceId,
+        extent: Extent2D,
+        cw: u32,
+        ch: u32,
+        inv_view_proj: [f32; 16],
+        eye: Vec3,
+        flip_y: u32,
+        kernel_radius: f32,
+        tonemap_range: f32,
+    ) -> ResourceId {
+        let pipe = self
+            .spatial_pipeline
+            .as_ref()
+            .expect("reflect spatial pipeline");
+        let out = graph.create_storage_image("reflect_denoised", HDR_FORMAT, extent);
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "reflect_spatial",
+                storage_writes: vec![out],
+                reads: vec![refl, depth, normal, material],
+            },
+            move |ctx| {
+                let refl_index = ctx.sampled_index(refl);
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let material_index = ctx.sampled_index(material);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&reflect_spatial_push(
+                    &inv_view_proj,
+                    eye,
+                    refl_index,
+                    depth_index,
+                    normal_index,
+                    material_index,
+                    out_index,
+                    cw,
+                    ch,
+                    flip_y,
+                    kernel_radius,
+                    tonemap_range,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
             },
         );
@@ -557,6 +775,10 @@ impl ReflectSystem {
         tonemap_range: f32,
         clamp_mode: u32,
         clamp_gamma: f32,
+        // A1: 1 = the spatial ratio-estimator resolve already ran → skip this pass's box average.
+        spatial_off: bool,
+        // A4a: accumulate the per-pixel 2nd moment + emit StdDev in out.a for the A4b spatial denoiser.
+        denoise: bool,
     ) -> ResourceId {
         let pipe = self
             .temporal_pipeline
@@ -579,12 +801,32 @@ impl ReflectSystem {
             .as_ref()
             .expect("pos w")
             .storage_index();
+        // A4a: 2nd-moment ping-pong indices (sentinel when denoise off ⇒ shader skips all M2 work).
+        let (moment_r, moment_w) = if denoise {
+            (
+                self.refl_moment[read]
+                    .as_ref()
+                    .map(|b| b.storage_index())
+                    .unwrap_or(u32::MAX),
+                self.refl_moment[write]
+                    .as_ref()
+                    .map(|b| b.storage_index())
+                    .unwrap_or(u32::MAX),
+            )
+        } else {
+            (u32::MAX, u32::MAX)
+        };
+        let denoise_on = denoise && moment_r != u32::MAX && moment_w != u32::MAX;
         let accum_w_ext = graph.import_external("refl_accum_w");
         let pos_w_ext = graph.import_external("refl_pos_w");
+        let mut writes = vec![out, accum_w_ext, pos_w_ext];
+        if denoise_on {
+            writes.push(graph.import_external("refl_moment_w"));
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "reflect_temporal",
-                storage_writes: vec![out, accum_w_ext, pos_w_ext],
+                storage_writes: writes,
                 reads: vec![refl, depth, material],
             },
             move |ctx| {
@@ -616,6 +858,10 @@ impl ReflectSystem {
                     tonemap_range,
                     clamp_mode,
                     clamp_gamma,
+                    u32::from(spatial_off),
+                    moment_r,
+                    moment_w,
+                    u32::from(denoise_on),
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())
@@ -717,11 +963,47 @@ impl ReflectSystem {
         // A3 adaptive temporal skip: (read_idx, write_idx, K stagger, real frame). read == u32::MAX
         // disables reuse; write == u32::MAX disables the persist. Both sentinel = legacy full trace.
         skip: [u32; 4],
+        // Phase 16 HWRT hybrid: when true, trace the reflection ray against the scene TLAS (the
+        // `HWRT_REFLECT` permutation) instead of the GDF sphere-march. Same push layout; the hit is
+        // still shaded from the surface cache. Falls back to the SW pipeline if the permutation is
+        // absent (non-RT device). Default false ⇒ SW march (gallery byte-identical).
+        hwrt: bool,
+        // B2' screen-hit early-out: run the `SCREEN_HIT` SW permutation (per-ray screen-trace
+        // prepass; validated on-screen hits read the prev-frame full-res lit history and skip the
+        // GDF march + cache shade). SW only (ignored when `hwrt` wins); needs the lit history —
+        // sentinel index ⇒ the shader falls through to the plain march.
+        screen_hit: bool,
+        // Phase 16 B.2 screen-color-at-hit: the globals UBO (for `prev_view_proj`) + the PREVIOUS
+        // frame's lit-radiance history index. Consumed on the HWRT path (the index rides the
+        // march-cap push field, unused there) AND the SCREEN_HIT path (the index rides the
+        // constant-hit-albedo push slot, dead for content). Ignored by the plain SW path.
+        globals: &'a Buffer,
+        globals_offset: u64,
+        lit_hist: u32,
+        // Phase 16 E (Hit Lighting): consolidated content geometry/material `(vtx, idx, table)`
+        // bindless indices for shading an OFF-SCREEN HW hit with the real material. `Some` only on the
+        // HWRT path with the table built; rides the (HWRT-unused) coarse-albedo push slots + frame
+        // bit31 (the enable), so no push growth. `None` ⇒ off-screen hits keep the surface cache.
+        hit_lighting: Option<(u32, u32, u32)>,
     ) -> ResourceId {
-        let pipe = self
-            .reflect_pipeline
-            .as_ref()
-            .expect("gdf reflect pipeline");
+        let use_hwrt = hwrt && self.reflect_hwrt_pipeline.is_some();
+        let use_screen = !use_hwrt && screen_hit && self.reflect_screen_pipeline.is_some();
+        let hit_lighting = if use_hwrt { hit_lighting } else { None };
+        let pipe = if use_hwrt {
+            self.reflect_hwrt_pipeline.as_ref()
+        } else if use_screen {
+            self.reflect_screen_pipeline.as_ref()
+        } else {
+            self.reflect_pipeline.as_ref()
+        }
+        .expect("gdf reflect pipeline");
+        // The lit-history index rides the march-cap field on the HWRT path (bit 31 stays the content
+        // flag); the SW path keeps the real step cap. So screen-color-at-hit needs no push growth.
+        let max_steps = if use_hwrt {
+            (max_steps & 0x8000_0000) | (lit_hist & 0x7FFF_FFFF)
+        } else {
+            max_steps
+        };
         let out = graph.create_storage_image("gdf_reflect_out", HDR_FORMAT, extent);
         let sampled = scene_gdf.sampled_index();
         let diag = {
@@ -782,6 +1064,19 @@ impl ReflectSystem {
                 } else {
                     [u32::MAX; 3]
                 };
+                // Phase 16 E: in Hit Lighting mode the coarse-albedo volume slots (unused — hit
+                // lighting replaces the analytic fallback) instead carry the consolidated geometry/
+                // material `(vtx, idx, table)` indices, and `frame` bit31 flags the mode. Zero push
+                // growth (avoids a D3D12 root-CBV spill on the shared reflect push).
+                let (albedo_rgb, frame) = match hit_lighting {
+                    Some((v, i, t)) => ([v, i, t], frame | 0x8000_0000),
+                    None => (albedo_rgb, frame),
+                };
+                // B.2 / B2': the HWRT and SCREEN_HIT pipelines bind the globals UBO for the
+                // screen reprojection (`prev_view_proj`); the plain SW pipeline has no globals.
+                if use_hwrt || use_screen {
+                    cmd.set_globals(globals, globals_offset);
+                }
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&gdf_reflect_push(
                     &inv_view_proj,
@@ -802,7 +1097,14 @@ impl ReflectSystem {
                     0.0,  // world ground plane at y = 0
                     diag, // sample distance clamp
                     diag, // reflection ray max distance
-                    0.7,  // constant hit-albedo fallback (sentinel albedo => achromatic, pre-C8a)
+                    // Constant hit-albedo fallback (sentinel albedo => achromatic, pre-C8a). The
+                    // SCREEN_HIT permutation overloads this dead-for-content slot with the lit-
+                    // history index (its shader hard-codes 0.7 for the fallback instead).
+                    if use_screen {
+                        f32::from_bits(lit_hist & 0x7FFF_FFFF)
+                    } else {
+                        0.7
+                    },
                     // sky_fill slot: content (vol on) overloads it with the IBL irradiance cube index
                     // (the shader reads it only on the vol_on skylight-fill path); gallery keeps 0.25.
                     if gi_vol_base != u32::MAX {
@@ -855,6 +1157,14 @@ impl ReflectSystem {
         // that validation exists, the (HQ) GDF/cache is the cleaner mirror source. Gallery passes false
         // → byte-identical anchor.
         skip_mirror_ssr: bool,
+        // Roughness-scaled blur radius (texels) that smooths the low-res reflection's blocky
+        // "sparkle" on rough surfaces while keeping its correct local colour. 0 = off (gallery).
+        rough_blur: f32,
+        // B1-lite hard handoff: zero the SSR blend entirely — the GDF image (SCREEN_HIT trace)
+        // already carries validated on-screen colours per ray, so blending the unvalidated SSR
+        // would double-count them and re-introduce its feedback wiggle. The `ssr` input is then
+        // a stand-in (never sampled).
+        ssr_cut: bool,
     ) -> ResourceId {
         let pipe = self
             .composite_pipeline
@@ -885,6 +1195,8 @@ impl ReflectSystem {
                     material_index,
                     max_roughness,
                     skip_mirror_ssr,
+                    rough_blur,
+                    ssr_cut,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

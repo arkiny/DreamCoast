@@ -249,6 +249,63 @@ pub struct QualityPreset {
     /// imperceptible on a mostly-static scene. `gi_volume` is off for the gallery, so this never
     /// touches the byte-identical anchor; clamped `>= 1` at the consumer. See `docs/sponza-perf.md`.
     pub gi_volume_period: u32,
+    /// Phase 16 hybrid HW ray tracing (`P_HWRT`): trace content reflections against the real triangle
+    /// BVH (built at load) + surface-cache / screen-color shading, instead of the SW distance-field
+    /// march. A tier/scalability option, env-overridable; `false` for every current tier + the gallery
+    /// (byte-identical anchor). `#[serde(default)]` so the on-disk RON tiers need no new key.
+    #[serde(default)]
+    pub hwrt_reflect: bool,
+    /// `P_HWRT_HITLIGHTING`: shade an OFF-SCREEN reflection HW hit with the real material (consolidated
+    /// geometry + albedo texture + HW shadow ray) instead of the low-res surface cache. Implies
+    /// `hwrt_reflect`. Default off.
+    #[serde(default)]
+    pub hwrt_reflect_hitlighting: bool,
+    /// `P_HWRT_FULLRES`: trace the HWRT reflection at full resolution (crisp mirror, ~4x cost — a
+    /// quality/screenshot mode). Implies `hwrt_reflect`. Default off.
+    #[serde(default)]
+    pub hwrt_reflect_fullres: bool,
+    /// Reflection-quality v2, A5 bundle (`P_REFLECT_STOCHASTIC`): blue-noise frame-varying GGX
+    /// jitter + the A1 ratio-estimator resolve + the A4 variance denoiser. The stochastic glossy
+    /// chain the B2' knobs below build on. Metal-verified; Apple tier only until DX≡VK passes
+    /// (`#[serde(default)]` = off, so Low/Med/High and the on-disk RON need no new key).
+    #[serde(default)]
+    pub reflect_stochastic: bool,
+    /// B2' rough-prefilter split threshold (`P_REFLECT_PREFILTER`): roughness >= this traces ONE
+    /// deterministic mirror ray shaded from the cone-slope cache MIP (zero stochastic noise — the
+    /// measured 5.5x flicker win on rough surfaces); below it stays the stochastic glossy band.
+    /// `0.0` = off (legacy stochastic everywhere). Apple 0.4 (the reference-like split).
+    #[serde(default)]
+    pub reflect_prefilter: f32,
+    /// B2' glossy sample density (`P_REFLECT_GLOSSY_SPP`): K GGX rays/pixel/frame in the glossy
+    /// band (R2-advanced, tonemap-space averaged, resolve reconstructs all K neighbour rays).
+    /// 0/1 = legacy single ray. Apple 4 — measured ≈ the K=1 frame cost once the prefilter removes
+    /// the rough floor from the K loop and the screen-hit early-out pays for the ball.
+    #[serde(default)]
+    pub reflect_glossy_spp: u32,
+    /// B2' screen-hit early-out (`P_REFLECT_SCREEN_HIT`): per-ray validated screen march serves
+    /// on-screen hits from the previous frame's FULL-RES lit history (the SW screen-color-at-hit;
+    /// the sharpness win HWRT gets from its B.2 screen path) and skips the GDF march + card shade
+    /// for them. Enables the B1-lite hard SSR cut at the composite (the SSR blend is redundant
+    /// double counting + its own feedback oscillation once the trace carries screen colour).
+    #[serde(default)]
+    pub reflect_screen_hit: bool,
+    /// Track C card-lookup grid (`P_CACHE_GRID`): uniform world grid over the surface-cache cards
+    /// so the cone sampler / relight gather visit a superset cell list instead of scanning every
+    /// card per hit (O(N) -> O(cell)). Pick-identical results (measured 0.03/255, under run noise);
+    /// relight −47%, HQ reflections −46%. Built at cache-build time (load), not live-swappable.
+    #[serde(default)]
+    pub cache_grid: bool,
+    /// C1 mesh-triangle capture (`P11_CARD_MESH_CAPTURE`): the card capture projects GDF hits onto
+    /// the drawable's actual triangles and samples interpolated-UV texture albedo (+opacity) —
+    /// per-texel detail instead of one stamped colour per drawable. Load-time (capture is one-shot).
+    #[serde(default)]
+    pub card_mesh_capture: bool,
+    /// C2a adaptive card resolution (`P11_CACHE_ADAPTIVE_RES`): redistribute the SAME atlas texel
+    /// budget by camera relevance (per-card pow2 res 8..64, memory-invariant). Load-time layout.
+    /// Off on Apple: +~3ms relight vs uniform (layout loads in the gather) — High-tier material
+    /// once DX≡VK passes.
+    #[serde(default)]
+    pub cache_adaptive_res: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +493,18 @@ pub fn gallery_preset() -> QualityPreset {
         ssr_clamp_gamma: 1.25,
         gi_temporal_clamp: 1.0, // hard 3x3 GI temporal clamp (legacy byte-identical anchor)
         gi_volume_period: 1,    // every-frame volume update (gallery runs no gi_volume anyway)
+        hwrt_reflect: false,    // SW-RT reflection (the gallery has its own path-tracer accel)
+        hwrt_reflect_hitlighting: false,
+        hwrt_reflect_fullres: false,
+        // Reflection-quality v2 (all content-only techniques): pinned OFF so the anchor keeps the
+        // legacy trace/resolve/cache exactly (each call site also forces the gallery off).
+        reflect_stochastic: false,
+        reflect_prefilter: 0.0,
+        reflect_glossy_spp: 1,
+        reflect_screen_hit: false,
+        cache_grid: false,
+        card_mesh_capture: false,
+        cache_adaptive_res: false,
     }
 }
 
@@ -751,6 +820,19 @@ mod tests {
             "{label}: gi_volume_period {} must be >= 1",
             p.gi_volume_period
         );
+        // B2' prefilter threshold: a roughness fraction. The consumer clamps an explicit env to
+        // 0..=0.996 (`P_REFLECT_PREFILTER=1` is env shorthand for 0.4, never a preset value).
+        assert!(
+            (0.0..=0.996).contains(&p.reflect_prefilter),
+            "{label}: reflect_prefilter {} out of 0..=0.996",
+            p.reflect_prefilter
+        );
+        // B2' glossy sample density: consumer clamps to 1..=32 (0 = serde default = legacy 1).
+        assert!(
+            p.reflect_glossy_spp <= 32,
+            "{label}: reflect_glossy_spp {} out of 0..=32",
+            p.reflect_glossy_spp
+        );
     }
 
     /// Every tier's `preset()` resolves within the validated ranges its consumers clamp to.
@@ -831,6 +913,14 @@ mod tests {
             g.gi_volume_period, 1,
             "gallery gi_volume_period (every-frame; gallery runs no gi_volume anyway)"
         );
+        // Reflection-quality v2 knobs: all pinned off (legacy trace/resolve/cache = the anchor).
+        assert!(!g.reflect_stochastic, "gallery reflect_stochastic off");
+        assert_eq!(g.reflect_prefilter, 0.0, "gallery reflect_prefilter off");
+        assert_eq!(g.reflect_glossy_spp, 1, "gallery reflect_glossy_spp legacy");
+        assert!(!g.reflect_screen_hit, "gallery reflect_screen_hit off");
+        assert!(!g.cache_grid, "gallery cache_grid off");
+        assert!(!g.card_mesh_capture, "gallery card_mesh_capture off");
+        assert!(!g.cache_adaptive_res, "gallery cache_adaptive_res off");
     }
 
     /// `Med` is the content-default tier. Most fields still match the pre-tier legacy defaults; the
@@ -863,6 +953,14 @@ mod tests {
             m.gi_volume_period, 4,
             "Med gi_volume_period amortized (60fps retune)"
         );
+        // Reflection-quality v2 knobs stay OFF on Med (serde defaults; the tier is the
+        // byte-identical no-regression baseline and DX≡VK for the new shaders is pending).
+        assert!(!m.reflect_stochastic, "Med reflect_stochastic off");
+        assert_eq!(m.reflect_prefilter, 0.0, "Med reflect_prefilter off");
+        assert!(!m.reflect_screen_hit, "Med reflect_screen_hit off");
+        assert!(!m.cache_grid, "Med cache_grid off");
+        assert!(!m.card_mesh_capture, "Med card_mesh_capture off");
+        assert!(!m.cache_adaptive_res, "Med cache_adaptive_res off");
     }
 
     /// The embedded (`include_str!`) config parses and covers every tier. This is the invariant the
@@ -914,6 +1012,18 @@ mod tests {
         assert_eq!(apple.ao_res_div, 2, "Apple ao_res_div");
         assert_eq!(apple.gi_atrous_steps, 1, "Apple gi_atrous_steps");
         assert_eq!(apple.gi_res_div, 4, "Apple gi_res_div");
+        // Reflection-quality v2 stack (Metal-verified on this tier's hardware; the other tiers
+        // stay off until DX≡VK passes on the Windows box). SPP 4 = measured ≈ K=1 frame cost.
+        assert!(apple.reflect_stochastic, "Apple reflect_stochastic on");
+        assert_eq!(apple.reflect_prefilter, 0.4, "Apple reflect_prefilter");
+        assert_eq!(apple.reflect_glossy_spp, 4, "Apple reflect_glossy_spp");
+        assert!(apple.reflect_screen_hit, "Apple reflect_screen_hit on");
+        assert!(apple.cache_grid, "Apple cache_grid on");
+        assert!(apple.card_mesh_capture, "Apple card_mesh_capture on");
+        assert!(
+            !apple.cache_adaptive_res,
+            "Apple cache_adaptive_res off (relight gather +3ms; High-tier material post DX≡VK)"
+        );
     }
 
     /// The data-driven group levels reproduce the historical hard-coded `groups()` table exactly.
@@ -961,7 +1071,9 @@ mod tests {
             [
                 (Resolution, 1),
                 (GlobalIllumination, 0),
-                (Reflection, 0),
+                // 1: the reflection-quality v2 stack (stochastic + prefilter + SPP4 + screen-hit
+                // + card grid) at the cost-parity trace res — above Low's bare SSR, below Med's.
+                (Reflection, 1),
                 (AmbientOcclusion, 1),
                 (Shadow, 1),
                 (SurfaceCache, 0),

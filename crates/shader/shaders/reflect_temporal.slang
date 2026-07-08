@@ -33,6 +33,12 @@ struct ReflTemporalPush
     float4 params;           // x = reject dist, y = max history len, z = firefly clamp, w = tonemap range
     uint clamp_mode;         // history neighbourhood clamp: 0 = off, 1 = hard AABB, 2 = variance (mean +- g*sigma)
     float clamp_gamma;       // variance-clamp tightness (mode 2); ignored otherwise
+    uint spatial_off;        // A1: 1 = the ratio-estimator resolve already ran → skip the box average
+    // A4a: per-pixel 2nd-moment (luminance²) accumulation → variance for the A4b spatial denoiser.
+    // `denoise == 0` (gallery / legacy) skips all M2 work and leaves `out.a = 1.0` = byte-identical.
+    uint moment_read;        // storage buffer: previous accumulated M2 (x = luma², reprojected)
+    uint moment_write;
+    uint denoise;            // 1 = accumulate M2 + output StdDev in out.a for the spatial pass
 };
 
 [[vk::push_constant]]
@@ -106,6 +112,7 @@ float3 from_tm(float3 v)
     float l = dot(v, float3(0.2126, 0.7152, 0.0722));
     return v / max(1.0 - l * pc.params.w, 1e-3);
 }
+float luma(float3 v) { return dot(v, float3(0.2126, 0.7152, 0.0722)); }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -126,6 +133,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         g.storage_images[pc.out_index][tid.xy] = float4(bg, 1.0);
         g.storage_buffers[pc.accum_write].Store4(idx * 16u, asuint(float4(to_tm(bg), 1.0)));
         g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(0, 0, 0, 0)));
+        // A4a: reset the M2 accumulator on background so a later disocclusion doesn't read stale variance.
+        if (pc.denoise != 0u)
+            g.storage_buffers[pc.moment_write].Store4(idx * 16u, asuint(float4(0, 0, 0, 0)));
         return;
     }
 
@@ -154,6 +164,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // The neighbourhood is always >= 3x3 (`cr`) so even a sharp mirror (spatial radius 0) has stats.
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
     int sr = clamp(int(roughness * 8.0), 0, 3);
+    // A1: when the spatial ratio-estimator resolve already denoised the trace, skip this box average
+    // (it would re-blur the sharpened glossy lobe) — but keep the >= 3x3 stats radius `cr` for the
+    // history neighbourhood clamp. `spatial_off == 0` (gallery / legacy) keeps the box = byte-identical.
+    if (pc.spatial_off != 0u)
+        sr = 0;
     int cr = max(sr, 1);
     float2 texel = 1.0 / res;
     float3 center = g.textures[pc.refl_index].SampleLevel(g.samp, uv, 0.0).rgb;
@@ -216,12 +231,23 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float surf_dist = length(to_surf);
     float3 virt_pos =
         pc.cam_pos.xyz + (to_surf / max(surf_dist, 1e-4)) * (surf_dist + max(hit_dist, 0.0));
-    // Only near-mirrors (sr == 0) use the virtual image; a glossy lobe's hit distance is diffuse,
-    // so those keep the surface reproject (unchanged). Content flag = flip_y bit2.
-    float3 reproj_pos = (((pc.flip_y & 4u) != 0u) && sr == 0) ? virt_pos : world_pos;
+    // Only near-mirrors use the virtual image; a glossy lobe's hit distance is diffuse, so those
+    // keep the surface reproject. Gate on the ROUGHNESS mirror threshold (0.125, lockstep with
+    // gdf_reflect's content branch), NOT on `sr`: A1's `spatial_off` zeroes `sr` for every pixel,
+    // which routed glossy pixels through the virtual image — their per-frame GGX hit distance
+    // jitters by metres, so the stored virtual point failed the disocclusion radius every frame
+    // and glossy surfaces silently lost ALL temporal history (len pinned at 1, raw trace noise).
+    // Content flag = flip_y bit2; gallery/legacy (bit2 clear) is untouched.
+    bool near_mirror = roughness < 0.125;
+    float3 reproj_pos = (((pc.flip_y & 4u) != 0u) && near_mirror) ? virt_pos : world_pos;
 
     float3 accum = sample_tm;
     float len = 1.0;
+    // A4a: 2nd moment of the tonemap-space luminance (matches `accum`'s space) — EMA'd with the same
+    // alpha as radiance so `Var = M2 - Luma(accum)²` is the per-pixel temporal variance the A4b spatial
+    // denoiser uses to weight its luminance edge stop (reference-engine SpecularAndSecondMoment).
+    float cur_m2 = luma(sample_tm) * luma(sample_tm);
+    float moment2 = cur_m2;
     if (pc.reset == 0u)
     {
         float sy = (pc.flip_y & 1u) != 0u ? 1.0 : -1.0;
@@ -250,6 +276,16 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                         hist_rgb = clamp(hist_rgb, clamp_lo, clamp_hi);
                     len = min(hist_len + 1.0, pc.params.y);
                     accum = lerp(hist_rgb, sample_tm, 1.0 / len);
+                    // A4a: EMA the 2nd moment with the same alpha (integer-floor tap on the reprojected
+                    // history — the accumulated M2 is low-frequency, so a nearest fetch is sufficient).
+                    if (pc.denoise != 0u)
+                    {
+                        int2 pp = clamp(int2(floor(puv * res)), int2(0, 0),
+                                        int2(int(pc.width) - 1, int(pc.height) - 1));
+                        uint pidx = uint(pp.y) * pc.width + uint(pp.x);
+                        float hist_m2 = asfloat(g.storage_buffers[pc.moment_read].Load4(pidx * 16u)).x;
+                        moment2 = lerp(hist_m2, cur_m2, 1.0 / len);
+                    }
                 }
             }
         }
@@ -265,5 +301,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float m = max(resolved.r, max(resolved.g, resolved.b));
     if (m > pc.params.z)
         resolved *= pc.params.z / m;
-    g.storage_images[pc.out_index][tid.xy] = float4(resolved, 1.0);
+    // A4a: emit per-pixel StdDev (tonemap-space luminance) in `.a` for the A4b spatial denoiser; the
+    // variance is M2 - mean². `denoise == 0` keeps `.a = 1.0` (byte-identical legacy output).
+    float out_a = 1.0;
+    if (pc.denoise != 0u)
+    {
+        moment2 = make_finite(float3(moment2, 0, 0)).x;
+        g.storage_buffers[pc.moment_write].Store4(idx * 16u, asuint(float4(moment2, 0, 0, 0)));
+        float mean = luma(accum);
+        out_a = sqrt(max(moment2 - mean * mean, 0.0));
+    }
+    g.storage_images[pc.out_index][tid.xy] = float4(resolved, out_a);
 }

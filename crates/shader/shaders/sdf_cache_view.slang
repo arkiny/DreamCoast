@@ -7,6 +7,7 @@
 // built. Replaces the tonemap source as a standalone viz (`P11_CACHE_VIZ`).
 
 #include "bindless.slang"
+#include "surface_cache.slang" // C2a: card_layout helper
 
 struct CacheViewPush
 {
@@ -14,7 +15,7 @@ struct CacheViewPush
     uint cache_src_index; // storage buffer shown: albedo (C8b1) or radiance (C8b2)
     uint out_index;       // storage image
     uint num_cards;
-    uint tile;            // card atlas tile edge
+    uint tile;            // bits 0..7 tile edge; bits 8..15 C2a layout index + 1 (0 = uniform)
     uint width;
     uint height;
     uint pad0;
@@ -34,9 +35,13 @@ void viewMain(uint3 tid: SV_DispatchThreadID)
     float cf = uv.x * float(pc.num_cards);
     uint card = min(uint(cf), pc.num_cards - 1u);
     float fx = cf - float(card);
-    uint tx = min(uint(fx * float(pc.tile)), pc.tile - 1u);
-    uint ty = min(uint(uv.y * float(pc.tile)), pc.tile - 1u);
-    uint t = card * (pc.tile * pc.tile) + ty * pc.tile + tx;
+    uint lay8 = (pc.tile >> 8) & 0xFFu;
+    uint sc_layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
+    uint2 lay = card_layout(sc_layout, card, pc.tile & 0xFFu);
+    uint res = lay.y;
+    uint tx = min(uint(fx * float(res)), res - 1u);
+    uint ty = min(uint(uv.y * float(res)), res - 1u);
+    uint t = lay.x + ty * res + tx;
 
     float4 pos = asfloat(g.storage_buffers[pc.cache_pos_index].Load4(t * 16u));
     float3 src = asfloat(g.storage_buffers[pc.cache_src_index].Load3(t * 16u));
