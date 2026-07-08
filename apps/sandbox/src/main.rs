@@ -2286,7 +2286,7 @@ impl App {
                 } else {
                     fuse::MAX_CARDS
                 };
-                let (cards, card_albedo, _residency) =
+                let (cards, card_albedo, residency) =
                     fuse::build_surface_cards(&obj_aabb, &obj_albedo, &card_cam, card_budget);
                 let num_cards = (cards.len() / 64) as u32;
                 // C: content stamps the drawable's true albedo onto its cards (fine color);
@@ -2308,6 +2308,48 @@ impl App {
                     .unwrap_or(32)
                     .clamp(4, 64);
                 gdf.build_surface_cache(&device, &cards, num_cards, cache_tile, card_albedo)?;
+                // C1 mesh-triangle capture (opt-in): consolidated content geometry (the same
+                // layout as the HWRT hit-lighting table, built independently of RT capability)
+                // + the card→drawable instance map (table row + world→object 3x4 per resident
+                // drawable). The capture then reads per-texel interpolated-UV texture albedo
+                // (+ opacity) instead of one flat stamped colour per drawable — the surface
+                // cache finally carries the curtain patterns a reflection should show.
+                if !gallery_scene && quality::env_bool("P11_CARD_MESH_CAPTURE", false) {
+                    let draw_list = world.draw_list();
+                    match mesh::build_content_hit_table(
+                        &device,
+                        &draw_list,
+                        &mesh_registry,
+                        &material_registry,
+                    ) {
+                        Ok((vtx, idx, table)) => {
+                            let mut rec: Vec<u8> =
+                                Vec::with_capacity(residency.resident.len() * 64);
+                            for &di in &residency.resident {
+                                let inv = draw_list[di].world.inverse();
+                                rec.extend_from_slice(&(di as u32).to_le_bytes());
+                                rec.extend_from_slice(&[0u8; 12]);
+                                // world→object as 3 row-major float4 rows (glam is column-major).
+                                let m = inv.to_cols_array_2d();
+                                for r in 0..3 {
+                                    for col in m.iter().take(4) {
+                                        rec.extend_from_slice(&col[r].to_le_bytes());
+                                    }
+                                }
+                            }
+                            gdf.set_card_mesh_capture(&device, vtx, idx, table, &rec)?;
+                            info!(
+                                "surface cache: C1 mesh-triangle capture on ({} resident drawables)",
+                                residency.resident.len()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "C1 mesh capture table build failed: {e:#} — stamped albedo"
+                            )
+                        }
+                    }
+                }
             }
         }
 

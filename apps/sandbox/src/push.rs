@@ -697,8 +697,10 @@ pub(crate) fn cache_capture_push(
     aabb_max: [f32; 3],
     dist_clamp: f32,
     card_albedo_index: u32,
-) -> [u8; 80] {
-    let mut pc = [0u8; 80];
+    // C1 mesh-triangle capture: (vtx, idx, table, card_inst) bindless indices; all u32::MAX = off.
+    mesh: [u32; 4],
+) -> [u8; 96] {
+    let mut pc = [0u8; 96];
     let u = [
         cards_index,
         cache_pos_index,
@@ -726,6 +728,10 @@ pub(crate) fn cache_capture_push(
         pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
     pc[76..80].copy_from_slice(&dist_clamp.to_le_bytes());
+    // C1 mesh-triangle capture row (all-sentinel = off ⇒ legacy stamped/volume albedo).
+    for (i, v) in mesh.iter().enumerate() {
+        pc[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
     pc
 }
 

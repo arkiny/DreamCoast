@@ -92,6 +92,13 @@ pub(crate) struct GdfSystem {
     /// results. Content reflection opt-in (`P_CACHE_GRID`); every other consumer keeps the scan.
     card_grid_cells: Option<StorageBuffer>,
     card_grid_pool: Option<StorageBuffer>,
+    /// C1 mesh-triangle capture (opt-in `P11_CARD_MESH_CAPTURE`): the consolidated content
+    /// geometry (object-space vertices / absolute indices / per-drawable material table — the
+    /// same layout the HWRT hit-lighting table uses) + the per-resident-drawable card-instance
+    /// map (table row + world→object 3x4). The capture pass projects each texel's GDF hit onto
+    /// the drawable's real triangles and reads the interpolated-UV base-color texture, giving
+    /// the cache per-texel texture detail instead of one flat stamped colour per drawable.
+    card_mesh: Option<(StorageBuffer, StorageBuffer, StorageBuffer, StorageBuffer)>,
     /// C: per-card source albedo (the drawable's representative color, 12 B/card). The
     /// capture stamps it onto the card so the GI/reflection cache carries the real surface
     /// color instead of the blurred per-voxel albedo volume. `None` ⇒ legacy volume path
@@ -298,7 +305,7 @@ impl GdfSystem {
             dreamcoast_shader::sdf_cache_capture_cs_dxil,
             dreamcoast_shader::sdf_cache_capture_cs_metallib,
             "sdf_cache_capture",
-            80,
+            96,
             [64, 1, 1],
         )?;
         let cache_view_pipeline = compute(
@@ -471,6 +478,7 @@ impl GdfSystem {
             cards: None,
             card_grid_cells: None,
             card_grid_pool: None,
+            card_mesh: None,
             cache_pos: None,
             cache_albedo: None,
             num_cards: 0,
@@ -1184,6 +1192,30 @@ impl GdfSystem {
         Ok(())
     }
 
+    /// C1 mesh-triangle capture: hand the capture pass the consolidated content geometry
+    /// (vertex / index / material-table storage) + the per-resident-drawable card-instance map
+    /// bytes (64 B each: table row u32, pad3, world→object 3x4 rows). Call BEFORE the capture
+    /// pass is recorded; `None`-safe (the capture falls back to the stamped albedo).
+    pub(crate) fn set_card_mesh_capture(
+        &mut self,
+        device: &Device,
+        vtx: StorageBuffer,
+        idx: StorageBuffer,
+        table: StorageBuffer,
+        card_inst_bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let inst = device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: card_inst_bytes.len() as u64,
+                stride: 16,
+                indirect: false,
+            },
+            card_inst_bytes,
+        )?;
+        self.card_mesh = Some((vtx, idx, table, inst));
+        Ok(())
+    }
+
     /// Track C prerequisite: the card-lookup grid's bindless indices `(cells, pool)`, or `None`
     /// when it wasn't built (env-gated). The reflection packs these into its cache push slot.
     pub(crate) fn surface_cache_grid(&self) -> Option<(u32, u32)> {
@@ -1693,6 +1725,19 @@ impl GdfSystem {
             .as_ref()
             .map(|b| b.storage_index())
             .unwrap_or(u32::MAX);
+        // C1: mesh-triangle capture indices (all-sentinel = off ⇒ stamped/volume albedo).
+        let mesh = self
+            .card_mesh
+            .as_ref()
+            .map(|(v, i, t, ci)| {
+                [
+                    v.storage_index(),
+                    i.storage_index(),
+                    t.storage_index(),
+                    ci.storage_index(),
+                ]
+            })
+            .unwrap_or([u32::MAX; 4]);
         let albedo = albedo_ext.and(self.scene_albedo.as_ref());
         let num_cards = self.num_cards;
         let num_texels = num_cards * self.card_tile * self.card_tile;
@@ -1753,6 +1798,7 @@ impl GdfSystem {
                     aabb_max,
                     diag,
                     card_albedo_index,
+                    mesh,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())

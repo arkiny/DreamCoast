@@ -304,6 +304,16 @@ GDF march 앞에 hit-validation HZB 스크린 트레이스를 1차 바운스로.
 
 ### Track C — 서피스캐시 품질 (반사되는 색·디테일의 천장)
 
+#### C1 구현 완료 (opt-in `P11_CARD_MESH_CAPTURE=1`, 2026-07-08)
+캡처가 GDF 히트를 **드로어블의 실제 삼각형에 투영**(closest-point-on-triangle, Ericson)해 보간 UV로
+base-color 텍스처를 샘플(+LOD = 카드 텍셀 풋프린트 매칭) — 카드가 드로어블당 단일 스탬프 색 대신
+**per-texel 텍스처 디테일 + opacity(.w)** 를 담음. 지오는 HWRT 히트라이팅과 동일 레이아웃의 통합
+버퍼(RT 능력과 무관하게 빌드) + 카드→인스턴스 맵(table row + world→object 3x4). 수락 반경 = 카드
+텍셀 4배(초과 시 기존 스탬프 폴백). 캡처는 1회성이라 brute-force 최근접 스캔으로 충분.
+**검증:** 아틀라스 diff 5.65/255(내용 실변화), 볼 반사 크롭 diff 0.79(구조적) — 시각 효과는 32² 카드
+해상도에 제한됨 = **C2 적응 해상도가 페어**. 갤러리 byte-identical(센티널 시 .w=0 유지), clippy/fmt
+clean. 레거시 `bleed.py`는 부재 — 커튼 색 번짐 정량화는 C2 후 재측정.
+
 #### C1. mesh-card 색 캡처 (원 과제 "C")
 `sdf_cache_capture.slang`가 coarse albedo 볼륨 대신 **드로어블 메시 삼각형 albedo+opacity** 캡처
 (메시당 수백 tri 최근접). 커튼/얇은 천 색 복원.
