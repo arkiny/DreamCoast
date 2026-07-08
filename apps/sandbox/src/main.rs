@@ -5391,7 +5391,17 @@ impl App {
             key = key
                 .wrapping_mul(0x100_0000_01b3)
                 .wrapping_add(self.gi_spp as u64);
-            self.gi.prepare_denoise(&self.device, cw, ch, key)?;
+            // M3-C: the GI denoise (temporal + à-trous) runs at the GI TRACE res (before the
+            // bilateral upsample), so its history/scratch is sized to that res. Gallery keeps
+            // gi_half_res off ⇒ div 1 ⇒ full-res denoise = byte-identical anchor. Divisor
+            // mirrors the record path.
+            let gdiv = if self.gi_half_res {
+                self.gi_res_div.max(1)
+            } else {
+                1
+            };
+            self.gi
+                .prepare_denoise(&self.device, cw.div_ceil(gdiv), ch.div_ceil(gdiv), key)?;
         }
         // P4: (re)allocate the world radiance cache atlas for the scene's clipmap level count.
         if self.wrc || self.wrc_viz {
@@ -5421,9 +5431,23 @@ impl App {
         if self.swrt_reflect && self.ssr_stochastic && self.reflect.has_ssr_resolve() {
             self.reflect.prepare_ssr_accum(&self.device, hcw, hch)?;
         }
-        // C8j: (re)allocate the stochastic GDF-reflection temporal accumulation buffers (full-res).
+        // C8j / M3-C: (re)allocate the stochastic GDF-reflection temporal accumulation buffers.
+        // The temporal resolve (+ A4b spatial) runs at the reflection TRACE res — before the
+        // bilateral upsample — so the buffers are sized to that res (the full-res resolve was the
+        // reflection's single largest pass; at 1/div res it costs ~1/div²). Gallery keeps
+        // `reflect_half_res` off ⇒ div 1 ⇒ full-res resolve = byte-identical anchor. Divisor
+        // mirrors the record path (P_HWRT_FULLRES forces rdiv 1 there too).
         if self.swrt_reflect && self.reflect.has_reflect_temporal() {
-            self.reflect.prepare_reflect_accum(&self.device, cw, ch)?;
+            let rdiv = if self.reflect_half_res && !self.hwrt_fullres {
+                self.reflect_res_div.max(1)
+            } else {
+                1
+            };
+            self.reflect.prepare_reflect_accum(
+                &self.device,
+                cw.div_ceil(rdiv),
+                ch.div_ceil(rdiv),
+            )?;
         }
         // A3: (re)allocate the adaptive-skip ping-pong at the gdf_reflect TRACE extent (half-res when
         // reflect_half_res). Divisor mirrors the record path (rdiv=1 when full-res).
@@ -6236,10 +6260,35 @@ impl App {
                     self.hwrt_gi && gi_volume_arg.is_none(),
                 );
                 gi_skyvis_out = skyvis;
-                let raw = if half_gi {
-                    self.gi.record_upsample(
+                // M3-C: denoise at the GI TRACE res (before the bilateral upsample), then upsample
+                // the DENOISED GI to full res — the temporal + à-trous denoise was the biggest GI
+                // cost at full res on the upsampled quarter-res probes (gdf_temporal 2.1ms +
+                // gdf_atrous 3.6ms on Apple/M3). Gallery keeps gi_half_res off ⇒ denoise runs
+                // full-res with no upsample = the old order exactly (byte-identical anchor).
+                let denoised = if gi_denoise_active {
+                    self.gi.record_denoise(
                         &mut graph,
                         traced,
+                        g_depth,
+                        g_normal,
+                        gi_extent,
+                        inv_view_proj,
+                        self.prev_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        gw,
+                        gh,
+                        temporal_flip,
+                        self.gi_temporal_clamp,
+                        self.gi_atrous_steps,
+                    )
+                } else {
+                    traced
+                };
+                let out = if half_gi {
+                    self.gi.record_upsample(
+                        &mut graph,
+                        denoised,
                         g_depth,
                         g_normal,
                         extent,
@@ -6253,27 +6302,7 @@ impl App {
                         self.flip_y,
                     )
                 } else {
-                    traced
-                };
-                let out = if gi_denoise_active {
-                    self.gi.record_denoise(
-                        &mut graph,
-                        raw,
-                        g_depth,
-                        g_normal,
-                        extent,
-                        inv_view_proj,
-                        self.prev_view_proj,
-                        scene_aabb_min,
-                        scene_aabb_max,
-                        cw,
-                        ch,
-                        temporal_flip,
-                        self.gi_temporal_clamp,
-                        self.gi_atrous_steps,
-                    )
-                } else {
-                    raw
+                    denoised
                 };
                 Some(out)
             }
@@ -6627,28 +6656,15 @@ impl App {
                 } else {
                     refl_traced
                 };
-                let gdf_refl = if refl_half {
-                    self.gi.record_upsample(
-                        &mut graph,
-                        refl_resolved,
-                        g_depth,
-                        g_normal,
-                        extent,
-                        inv_view_proj,
-                        scene_aabb_min,
-                        scene_aabb_max,
-                        cw,
-                        ch,
-                        rw,
-                        rh,
-                        self.flip_y,
-                    )
-                } else {
-                    refl_resolved
-                };
-                // C8j: temporally resolve the stochastic GGX GDF reflection (레퍼런스식; the rough
-                // lobe is sampled by real rays + denoised, so it's correctly blurred without an
-                // image-space prefilter that over-brightens rough metals).
+                // C8j / M3-C: temporally resolve the stochastic GGX GDF reflection (레퍼런스식; the
+                // rough lobe is sampled by real rays + denoised, so it's correctly blurred without
+                // an image-space prefilter that over-brightens rough metals). The temporal resolve
+                // (+ the A4b spatial denoise below) runs at the reflection TRACE res — BEFORE the
+                // bilateral upsample — so it costs ~1/div² instead of full-res (the single largest
+                // reflection pass on Apple/M3); the upsample then lifts the DENOISED reflection to
+                // full res. It also reads the traced `.a` (hit distance for the virtual-image
+                // reprojection) directly instead of through the upsample. Gallery keeps `refl_half`
+                // off ⇒ trace res == full res + no upsample = the old order exactly.
                 //
                 // B1 (CONVERGE + static camera): lift the 64-frame history cap — the pass's
                 // `len = min(len+1, cap)` is already a running mean below the cap, so a huge cap
@@ -6662,12 +6678,12 @@ impl App {
                 let refl_converge = self.cache_converge != 0 && camera_static;
                 let gdf_resolved = self.reflect.record_reflect_temporal(
                     &mut graph,
-                    gdf_refl,
+                    refl_resolved,
                     g_depth,
                     g_material,
-                    extent,
-                    cw,
-                    ch,
+                    refl_extent,
+                    rw,
+                    rh,
                     inv_view_proj,
                     self.prev_view_proj,
                     eye,
@@ -6689,21 +6705,42 @@ impl App {
                 let gdf_resolved = if (self.reflect_spatial || self.reflect_stochastic)
                     && self.reflect.has_reflect_spatial()
                 {
-                    // A4b: variance-guided bilateral denoise (post-temporal, full-res, content opt-in).
+                    // A4b: variance-guided bilateral denoise (post-temporal, trace res — the noise
+                    // it targets lives at the trace res; depth/normal edge stops hold the contours).
                     self.reflect.record_reflect_spatial(
                         &mut graph,
                         gdf_resolved,
                         g_depth,
                         g_normal,
                         g_material,
-                        extent,
-                        cw,
-                        ch,
+                        refl_extent,
+                        rw,
+                        rh,
                         inv_view_proj,
                         eye,
                         self.flip_y,
                         self.reflect_spatial_kernel,
                         0.25, // tonemap-space range (matches reflect_temporal params.w)
+                    )
+                } else {
+                    gdf_resolved
+                };
+                // M3-C: the bilateral upsample lifts the DENOISED reflection to full res (last).
+                let gdf_resolved = if refl_half {
+                    self.gi.record_upsample(
+                        &mut graph,
+                        gdf_resolved,
+                        g_depth,
+                        g_normal,
+                        extent,
+                        inv_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        rw,
+                        rh,
+                        self.flip_y,
                     )
                 } else {
                     gdf_resolved

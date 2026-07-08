@@ -179,7 +179,9 @@
                 gdf_cone_k: 0.06,
                 gi_res_div: 4,
                 reflect_res_div: 6,
-                ao_res_div: 2,
+                // M3-C: quarter-res AO trace (the bilateral upsample lifts it back) — after the
+                // trace-res denoise reorders, gdf_ao was the remaining top pass (~3.9ms half-res).
+                ao_res_div: 4,
                 gi_atrous_steps: 1,
                 reflect_history_clamp: 1,
                 reflect_clamp_gamma: 1.25,

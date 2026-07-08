@@ -1009,7 +1009,10 @@ mod tests {
         assert_eq!(apple.render_scale, 0.67, "Apple render_scale");
         assert!(!apple.ssao, "Apple ssao off");
         assert_eq!(apple.reflect_res_div, 6, "Apple reflect_res_div");
-        assert_eq!(apple.ao_res_div, 2, "Apple ao_res_div");
+        assert_eq!(
+            apple.ao_res_div, 4,
+            "Apple ao_res_div (M3-C quarter-res AO)"
+        );
         assert_eq!(apple.gi_atrous_steps, 1, "Apple gi_atrous_steps");
         assert_eq!(apple.gi_res_div, 4, "Apple gi_res_div");
         // Reflection-quality v2 stack (Metal-verified on this tier's hardware; the other tiers
