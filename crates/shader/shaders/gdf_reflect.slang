@@ -785,6 +785,17 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             // the hit triangle's interpolated normal + UV, sample the albedo texture, and re-light with the
             // sun (HW shadow ray) + GI radiance cache + IBL sky — the same energy convention as the analytic
             // path below, but with the accurate material/normal/shadow. Reference: Lumen HitLighting mode.
+            // Hybrid hand-off (reference-engine surface-cache decomposition — FinalLighting =
+            // (Direct+Indirect)·Albedo/π): hit lighting no longer finalizes the colour. It
+            // captures the TRUE material albedo at the exact hit (`hl_alb`) and its analytic
+            // re-light as a fallback; the surface-cache cone below recovers the card's CONVERGED
+            // multibounce lighting as radiance/albedo, and the combine re-multiplies it by
+            // `hl_alb` — parity-grade tone (the cache path measures 1.2/255 vs the path tracer)
+            // carrying real texture detail. The pure analytic hit-light alone measured 27.5/255
+            // off the ground truth (its GI-volume ambient underestimates interior bounce).
+            float3 hl_alb = float3(0.0, 0.0, 0.0);
+            float3 hl_fallback = float3(0.0, 0.0, 0.0);
+            bool hl_have = false;
             if (!cached && (pc.frame & 0x80000000u) != 0u)
             {
                 uint tbl = pc.albedo_b;
@@ -832,13 +843,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     }
                     // Same energy convention as the analytic content path: direct/PI + GI cache + IBL sky.
                     float3 e = vol_on ? sample_gi_irradiance(vol_base, hp, nw) : float3(0.0, 0.0, 0.0);
-                    color = alb * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
+                    hl_alb = alb;
+                    hl_fallback = alb * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
                     if (has_irr)
-                        color += g.cubes[irr_idx].SampleLevel(g.samp, nw, 0.0).rgb * alb;
-                    cached = true; // shaded with the real material — skip the surface cache + analytic
+                        hl_fallback += g.cubes[irr_idx].SampleLevel(g.samp, nw, 0.0).rgb * alb;
+                    hl_have = true; // combine after the cache cone below (do NOT finalize here)
                 }
             }
 #endif
+            float3 cone_alb = float3(0.0, 0.0, 0.0);
             // C8b3/C8g: the reflected surface's cached (multibounce, accurately-lit) radiance — a
             // direct lookup when the cache is bound. The cache only covers the meshed objects (no
             // cards for the analytic ground), so on a cache MISS fall back to the C8a per-ray
@@ -901,11 +914,36 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 #else
                 const uint sc_mark = 0xFFFFFFFFu;
 #endif
+                // Captured-albedo atlas rides cache.y bits 24..31 (0 = off) — only fetched when
+                // the hit-lighting hybrid needs the radiance/albedo split (HWRT builds only).
+#ifdef HWRT_REFLECT
+                uint ab8 = (pc.cache.y >> 24) & 0xFFu;
+                uint sc_alb = (ab8 == 0u || !hl_have) ? 0xFFFFFFFFu : ab8 - 1u;
+#else
+                const uint sc_alb = 0xFFFFFFFFu;
+#endif
                 color = sample_surface_cache_cone(hp, hn, cards_idx, cpos_idx, pc.cache.z, pc.cache.w,
                                                   c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
                                                   grid_cells, grid_pool, sc_layout, sc_feedback,
-                                                  sc_mark, cached);
+                                                  sc_mark, sc_alb, cone_alb, cached);
             }
+#ifdef HWRT_REFLECT
+            // Hit-lighting hybrid combine: cache lighting × true material albedo. The clamp
+            // bounds the ratio where the 32² card albedo underestimates a dark texel.
+            if (hl_have)
+            {
+                if (cached && dot(cone_alb, float3(1.0, 1.0, 1.0)) > 1e-3)
+                {
+                    float3 ratio = clamp(hl_alb / max(cone_alb, 0.02), 0.0, 4.0);
+                    color *= ratio;
+                }
+                else if (!cached)
+                {
+                    color = hl_fallback; // no card coverage: keep the analytic hit-light
+                    cached = true;
+                }
+            }
+#endif
             if (!cached)
             {
                 float ndl = max(dot(hn, sun_dir), 0.0);

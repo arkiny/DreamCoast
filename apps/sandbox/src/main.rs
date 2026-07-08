@@ -6073,6 +6073,13 @@ impl App {
                     Some(m) if self.reflect_compact_div > 0 => p | ((m + 1) << 16),
                     _ => p,
                 };
+                // Hit-lighting hybrid: the captured-albedo atlas rides cache.y bits 24..31
+                // (0 = off) so the HWRT refine can recover the card's converged lighting as
+                // radiance/albedo and re-modulate it with the true material albedo.
+                let p = match self.gdf.cache_albedo_index() {
+                    a if a != u32::MAX && self.reflect_compact_hwrt => p | ((a + 1) << 24),
+                    _ => p,
+                };
                 let t = t & 0xFF;
                 // Pack the MIP pyramid into the tile slot: tile | max_mip<<8 | mip_index<<16 (all
                 // ≤16 bits; 0xFFFF mip_index = no pyramid). Order the reflection after mipgen when

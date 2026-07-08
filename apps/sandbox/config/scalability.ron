@@ -215,12 +215,12 @@
                 // mirror image (chrome showed the trace texels as blocks). Cost scales with the
                 // on-screen mirror area.
                 reflect_compact_div: 2,
-                // HWRT refine stays OFF: hit lighting's ambient (sparse GI-volume probes +
-                // IBL) underestimates the interior bounce light — the mirror turned vivid but
-                // diverged 27/255 from the PT ground truth (the SW cache path sits at 1.2/255).
-                // Env opt-in `P_REFLECT_COMPACT_HWRT=1` for A/B; flips ON once hit lighting
-                // reaches PT parity (cache-irradiance x detail-albedo hybrid, the follow-up).
-                reflect_compact_hwrt: false,
+                // HWRT refine: the compacted mirror rays trace the scene TLAS; shading is the
+                // hybrid — cache-cone lighting (converged multibounce, radiance/albedo split)
+                // re-modulated by the true material albedo at the exact hit. The whole mirror
+                // resolves coherent real-scene colours, and the refine is FASTER than the SW
+                // march it replaces (1.0 ms vs 1.4 ms, chromeball div2).
+                reflect_compact_hwrt: true,
             ),
             groups: (
                 resolution: 1,

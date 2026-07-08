@@ -186,13 +186,20 @@ float3 card_mip_sample(uint c_base, uint c_res, uint c_mipb, float uu, float vv,
 // HIDDEN_MULT budget; until they relight they shade from the skylight-heavy fallback and the
 // mirror shows two colour families during camera motion). Reflection-only (the GI/relight
 // consumers pass the sentinel — marking everything would erase the priority).
+// `alb_index` (0xFFFFFFFF = off) + `out_alb`: also return the CAPTURED-ALBEDO average over the
+// exact texels/weights the radiance sample used. The relight stores
+// `radiance = albedo * (direct/PI + indirect)`, so `radiance / out_alb` recovers the card's
+// converged multibounce lighting — the parity-grade ambient the HWRT hit lighting modulates
+// with its own sharp texture albedo (cache lighting x true material detail).
 float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cache_pos_index,
                                  uint cache_rad_index, uint num_cards, uint tile, float extra_tol,
                                  float sample_radius, uint mip_index, uint max_mip,
                                  uint grid_cells, uint grid_pool, uint layout, uint feedback,
-                                 uint mark, out bool found)
+                                 uint mark, uint alb_index, out float3 out_alb, out bool found)
 {
     found = false;
+    out_alb = float3(0.0, 0.0, 0.0);
+    float3 acc_alb = float3(0.0, 0.0, 0.0);
     int best = -1;
     uint best_texel = 0u;
     float best_score = 0.0;
@@ -277,6 +284,10 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
             // Mirror feedback: this card feeds a reflection — boost its relight priority.
             if (mark != 0xFFFFFFFFu)
                 g.storage_buffers[mark].InterlockedOr(c * 4u, 1u);
+            // Captured-albedo average over the same cone weights (mip0 texel; the albedo is a
+            // per-card capture with no pyramid, and it is low-frequency at card scale).
+            if (alb_index != 0xFFFFFFFFu)
+                acc_alb += score * asfloat(g.storage_buffers[alb_index].Load3(texel * 16u));
             acc += score * card_mip_sample(lay.x, c_res, card_mip_base(layout, c, tile), uu, vv,
                                            half_ext, sample_radius, mip_index, max_mip,
                                            cache_rad_index, cache_pos_index);
@@ -297,6 +308,8 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
     // Mirror feedback for the non-cone (single-best-card) content path.
     if (mark != 0xFFFFFFFFu)
         g.storage_buffers[mark].InterlockedOr(uint(best) * 4u, 1u);
+    if (alb_index != 0xFFFFFFFFu)
+        out_alb = asfloat(g.storage_buffers[alb_index].Load3(best_texel * 16u));
 
     // NEAREST texel (primary consumers / gallery, extra_tol == 0) → byte-identical.
     if (extra_tol <= 0.0)
@@ -304,7 +317,11 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
 
     // Content cone mode: the fit-weighted multi-card cone average.
     if (cone_mode && acc_w > 1e-6)
+    {
+        if (alb_index != 0xFFFFFFFFu)
+            out_alb = acc_alb / acc_w;
         return acc / acc_w;
+    }
 
     // Content without a pyramid (P11_REFLECT_MIP=0): the single-best-card mip0 bilinear (f1fa851).
     uint2 blay = card_layout(layout, uint(best), tile);
@@ -324,9 +341,11 @@ float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos
 {
     uint lay8 = (tile >> 8) & 0xFFu;
     uint layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
+    float3 alb_unused;
     return sample_surface_cache_cone(p, n, cards_index, cache_pos_index, cache_rad_index, num_cards,
                                      tile & 0xFFu, extra_tol, 0.0, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu,
-                                     0xFFFFFFFFu, layout, 0xFFFFFFFFu, 0xFFFFFFFFu, found);
+                                     0xFFFFFFFFu, layout, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                     alb_unused, found);
 }
 
 // Grid-accelerated variant of the legacy lookup (the relight gather's hot path — its hemisphere
@@ -339,7 +358,9 @@ float3 sample_surface_cache_grid(float3 p, float3 n, uint cards_index, uint cach
 {
     uint lay8 = (tile >> 8) & 0xFFu;
     uint layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
+    float3 alb_unused2;
     return sample_surface_cache_cone(p, n, cards_index, cache_pos_index, cache_rad_index, num_cards,
                                      tile & 0xFFu, extra_tol, 0.0, 0xFFFFFFFFu, 0u, grid_cells,
-                                     grid_pool, layout, 0xFFFFFFFFu, 0xFFFFFFFFu, found);
+                                     grid_pool, layout, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                     alb_unused2, found);
 }

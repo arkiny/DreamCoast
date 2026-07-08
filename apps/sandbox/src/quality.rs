@@ -335,11 +335,15 @@ pub struct QualityPreset {
     /// for the off-screen content a mirror shows, where the surface cache's simplified relight
     /// reads as a second (skylight-tinted) colour family. Per-frame cost stays bounded by the
     /// mirror area (it reuses the compact list); needs an RT-capable device (falls back to the
-    /// SW refine otherwise) and builds the content accel at load. OFF everywhere for now: the
-    /// mirror turns coherent + vivid but hit lighting's ambient (sparse GI-volume probes + IBL)
-    /// underestimates interior bounce — measured 27.5/255 off the PT ground truth where the SW
-    /// cache path sits at 1.2/255, and PT parity is the canon. Flips on once hit lighting gains
-    /// the cache-irradiance × detail-albedo hybrid ambient (follow-up track).
+    /// SW refine otherwise) and builds the content accel at load (~126 ms / 449 BLAS on the
+    /// chrome scene). Shading is the HYBRID: the surface-cache cone recovers the card's
+    /// converged multibounce lighting as radiance/albedo (the reference-engine FinalLighting
+    /// decomposition) and re-modulates it with the TRUE material albedo at the exact hit —
+    /// coherent real-scene colours across the whole mirror instead of sharp screen-hit patches
+    /// against washy card texels. (NOTE: content levels have no path-traced oracle — the PT
+    /// instance table is gallery-only — so this is validated visually; a content-level PT is
+    /// the follow-up that would make it measurable.) Apple ON (Metal-verified; refine 1.0 ms,
+    /// FASTER than the SW march it replaces).
     #[serde(default)]
     pub reflect_compact_hwrt: bool,
 }
@@ -1100,8 +1104,8 @@ mod tests {
             "Apple reflect_compact_div (dense near-mirror re-trace at half res)"
         );
         assert!(
-            !apple.reflect_compact_hwrt,
-            "Apple reflect_compact_hwrt off (hit lighting not yet at PT parity)"
+            apple.reflect_compact_hwrt,
+            "Apple reflect_compact_hwrt on (hybrid cache-lighting x detail-albedo mirror)"
         );
     }
 
