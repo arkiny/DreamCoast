@@ -231,9 +231,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float surf_dist = length(to_surf);
     float3 virt_pos =
         pc.cam_pos.xyz + (to_surf / max(surf_dist, 1e-4)) * (surf_dist + max(hit_dist, 0.0));
-    // Only near-mirrors (sr == 0) use the virtual image; a glossy lobe's hit distance is diffuse,
-    // so those keep the surface reproject (unchanged). Content flag = flip_y bit2.
-    float3 reproj_pos = (((pc.flip_y & 4u) != 0u) && sr == 0) ? virt_pos : world_pos;
+    // Only near-mirrors use the virtual image; a glossy lobe's hit distance is diffuse, so those
+    // keep the surface reproject. Gate on the ROUGHNESS mirror threshold (0.125, lockstep with
+    // gdf_reflect's content branch), NOT on `sr`: A1's `spatial_off` zeroes `sr` for every pixel,
+    // which routed glossy pixels through the virtual image — their per-frame GGX hit distance
+    // jitters by metres, so the stored virtual point failed the disocclusion radius every frame
+    // and glossy surfaces silently lost ALL temporal history (len pinned at 1, raw trace noise).
+    // Content flag = flip_y bit2; gallery/legacy (bit2 clear) is untouched.
+    bool near_mirror = roughness < 0.125;
+    float3 reproj_pos = (((pc.flip_y & 4u) != 0u) && near_mirror) ? virt_pos : world_pos;
 
     float3 accum = sample_tm;
     float len = 1.0;

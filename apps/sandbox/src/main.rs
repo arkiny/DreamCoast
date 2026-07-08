@@ -4294,6 +4294,11 @@ impl App {
         }
         // The unjittered (but Y-flipped) view-proj — the stable grid the TAAU history lives on.
         let view_proj_stable = proj * view;
+        // B1 (CONVERGE): bit-exact static camera this frame — the unjittered view-proj matches
+        // last frame's. Compared pre-jitter so TAAU sub-pixel jitter still counts as static (the
+        // temporal accumulators reproject it away); any real move/rotate breaks equality.
+        let camera_static =
+            self.frame_no > 0 && view_proj_stable.to_cols_array() == self.prev_view_proj_taau;
         // QHD/UHD TAAU: sub-pixel camera jitter (Halton(2,3)) so successive low-res frames sample
         // different sub-pixel positions; the TAAU history reconstructs full-res detail from them.
         // Applied to the scene projection only (cull_view_proj stays unjittered = stable culling);
@@ -6390,11 +6395,23 @@ impl App {
                         self.scene_radius * 0.02,
                         firefly_max,
                         2.0,
-                        self.ssr_history_clamp,
+                        // B1 (CONVERGE + static camera): drop the neighbourhood clamp — it
+                        // re-injects each frame's 12-cycle jitter into the converged mean at
+                        // full amplitude regardless of α (the ripple never decays inside it).
+                        if self.cache_converge != 0 && camera_static {
+                            0
+                        } else {
+                            self.ssr_history_clamp
+                        },
                         self.ssr_clamp_gamma,
-                        // CONVERGE: running mean α=1/(1+N), N→12 (damps the lit-history feedback
-                        // into a contraction); legacy keeps the fixed 0.15 EMA.
-                        if self.cache_converge != 0 {
+                        // CONVERGE: running mean α=1/(1+N) (damps the lit-history feedback into
+                        // a contraction); legacy keeps the fixed 0.15 EMA. Static camera lifts
+                        // the N→12 saturation (B1): the 12-cycled jitter is periodic, so the
+                        // unbounded running mean converges to the exact 12-set average (wiggle
+                        // → 0); any camera move collapses N back to 12 in one frame.
+                        if self.cache_converge != 0 && camera_static {
+                            -16_777_216.0
+                        } else if self.cache_converge != 0 {
                             -12.0
                         } else {
                             0.15
@@ -6610,6 +6627,17 @@ impl App {
                 // C8j: temporally resolve the stochastic GGX GDF reflection (레퍼런스식; the rough
                 // lobe is sampled by real rays + denoised, so it's correctly blurred without an
                 // image-space prefilter that over-brightens rough metals).
+                //
+                // B1 (CONVERGE + static camera): lift the 64-frame history cap — the pass's
+                // `len = min(len+1, cap)` is already a running mean below the cap, so a huge cap
+                // makes α = 1/N and the accumulator truly converges (the fixed 1/64 α floor was a
+                // stationary AR(1) wiggle: per-frame GGX/TAAU jitter + the screen-hit lit-history
+                // feedback never decayed — measured flat at warmup 100 vs 400). The history clamp
+                // is dropped with it: re-clamping the converged mean into each frame's jittered
+                // 3×3 stats re-injects the very noise the mean removed. On camera motion the
+                // legacy cap/clamp return and `min(len, 64)` collapses the stored counter in one
+                // frame. Counter is a float32 — growth saturates at 2^24 (α floor 6e-8, i.e. done).
+                let refl_converge = self.cache_converge != 0 && camera_static;
                 let gdf_resolved = self.reflect.record_reflect_temporal(
                     &mut graph,
                     gdf_refl,
@@ -6623,10 +6651,14 @@ impl App {
                     eye,
                     temporal_flip,
                     self.scene_radius * 0.02,
-                    64.0,
+                    if refl_converge { 16_777_216.0 } else { 64.0 },
                     firefly_max,
                     0.25, // tonemap-space range for stable HDR accumulation
-                    self.reflect_history_clamp,
+                    if refl_converge {
+                        0
+                    } else {
+                        self.reflect_history_clamp
+                    },
                     self.reflect_clamp_gamma,
                     resolve_ran, // A1: drop the box average when the ratio-estimator resolve ran
                     (self.reflect_spatial || self.reflect_stochastic)
