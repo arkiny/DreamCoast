@@ -132,6 +132,13 @@ impl Gui {
         })
     }
 
+    /// Whether ImGui wants the mouse this frame (cursor over / interacting with a UI
+    /// window, as of the LAST built frame — the standard ImGui gating for scene-side
+    /// mouse controls like the fly camera's free look).
+    pub fn want_capture_mouse(&self) -> bool {
+        self.ctx.io().want_capture_mouse
+    }
+
     /// Feed input + timing and begin a new UI frame. Build windows on the
     /// returned `Ui`, then call [`render`](Self::render).
     pub fn new_frame(&mut self, dt: f32, display_size: [f32; 2], input: &Input) -> &mut imgui::Ui {

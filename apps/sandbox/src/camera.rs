@@ -73,12 +73,14 @@ impl FlyCamera {
         self.position + self.forward()
     }
 
-    /// Advance the camera from this frame's input. Right mouse button held =
-    /// mouse-look; WASD = planar move, Q/E = down/up, Shift = sprint, wheel =
-    /// adjust base speed.
-    pub(crate) fn update(&mut self, input: &Input, dt: f32) {
-        // Mouse-look only while the right button is held (so it never fights ImGui).
-        if input.mouse_button(1) {
+    /// Advance the camera from this frame's input. Plain mouse move = mouse-look
+    /// (gated by `look_enabled`, false while the UI owns the cursor); WASD =
+    /// planar move, Q/E = down/up, Shift = sprint, wheel = adjust base speed.
+    pub(crate) fn update(&mut self, input: &Input, dt: f32, look_enabled: bool) {
+        // Free look on plain mouse movement (no button chord). The caller passes
+        // `look_enabled = false` while ImGui wants the cursor, so hovering /
+        // dragging a UI window doesn't spin the camera underneath it.
+        if look_enabled {
             let (dx, dy) = input.mouse_delta();
             self.yaw += dx as f32 * MOUSE_SENSITIVITY;
             self.pitch =

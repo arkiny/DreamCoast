@@ -4295,12 +4295,18 @@ impl App {
         let fly_active = self.cam_mode == camera::CameraMode::Fly
             && (!self.screenshot_mode || self.streaming.is_some());
         let (focus, eye) = if fly_active {
-            let seed_speed = self.scene_radius * 0.8;
+            // Base speed ~walking pace for a scene of this size (Sponza radius ~24 m ->
+            // ~3.5 m/s; Shift sprints 4x, wheel adjusts). The old 0.8x seed moved ~19 m/s
+            // indoors — unusable for close inspection.
+            let seed_speed = self.scene_radius * 0.15;
+            // Free look on plain mouse move; suppressed while ImGui wants the cursor
+            // (hovering / dragging a UI window must not spin the camera under it).
+            let look_enabled = !self.gui.want_capture_mouse();
             let fly = self
                 .fly
                 .get_or_insert_with(|| camera::FlyCamera::from_look(eye, focus, seed_speed));
             if !self.screenshot_mode {
-                fly.update(self.window.input(), dt);
+                fly.update(self.window.input(), dt, look_enabled);
             }
             (fly.focus(), fly.position)
         } else {
