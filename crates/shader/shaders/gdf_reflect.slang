@@ -714,7 +714,16 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 // blocky, colour-bleeding chrome centre. Grow the acceptance with distance (like Lumen's
                 // ray-cone SampleRadius) so far reflected surfaces still read their smooth cached lit
                 // radiance instead of albedo. 0 for the gallery (vol_on false) -> byte-identical.
-                float cache_bias = vol_on ? (0.006 * length(GDF_MAX - GDF_MIN) + t * 0.03) : 0.0;
+                // Track C card grid: unpack early — grid mode also CAPS the distance-growing
+                // acceptance term (at 1.2% of the diag, ≈ t = 0.4·diag of slack): the unbounded
+                // growth is what forced the host to dilate every card by the worst case (fat
+                // cells); beyond the cap a far hit accepts cards >1% of the scene away, which
+                // score ≈ 0 anyway (align/(1+4·dist)) and only pollute the cone average.
+                uint gc8 = (pc.cache.x >> 8) & 0xFFu;
+                uint gp8 = (pc.cache.x >> 16) & 0xFFu;
+                float diag_sc = length(GDF_MAX - GDF_MIN);
+                float bias_t = gc8 != 0u ? min(t * 0.03, 0.012 * diag_sc) : t * 0.03;
+                float cache_bias = vol_on ? (0.006 * diag_sc + bias_t) : 0.0;
                 // The reflection packs the MIP pyramid into cache_tile's spare bits: tile | max_mip<<8 |
                 // mip_index<<16 (mip_index 0xFFFF = no pyramid). The same distance-growing cone_bias is
                 // the ray-cone footprint (world units) that selects the MIP — near hits stay at mip0,
@@ -728,9 +737,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 // with hit distance `t` so a far demagnified reflection reads a coarse averaged level
                 // while a near/face-on hit stays near mip0 (sharp). Slope ≈ a per-pixel cone half-angle.
                 float mip_radius = 0.05 + t * cone_slope;
-                color = sample_surface_cache_cone(hp, hn, pc.cache.x, pc.cache.y, pc.cache.z, pc.cache.w,
+                // Track C card grid: `cache.x` packs cards | (grid_cells+1)<<8 | (grid_pool+1)<<16
+                // (0 = no grid — gallery/legacy pass a bare index, bits 8.. zero). Bindless storage
+                // indices are < 64, so the low byte always holds the real cards index.
+                uint cards_idx = pc.cache.x & 0xFFu;
+                uint grid_cells = gc8 == 0u ? 0xFFFFFFFFu : gc8 - 1u;
+                uint grid_pool = gp8 == 0u ? 0xFFFFFFFFu : gp8 - 1u;
+                color = sample_surface_cache_cone(hp, hn, cards_idx, pc.cache.y, pc.cache.z, pc.cache.w,
                                                   c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
-                                                  cached);
+                                                  grid_cells, grid_pool, cached);
             }
             if (!cached)
             {

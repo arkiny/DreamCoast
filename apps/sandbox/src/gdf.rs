@@ -81,6 +81,17 @@ pub(crate) struct GdfSystem {
     /// geometry atlases (flat storage buffers, one float4 / texel). C8b2 adds the re-lit
     /// radiance ping-pong; C8b3 looks it up at GI / reflection hits.
     cards: Option<StorageBuffer>,
+    /// Track C prerequisite — card-lookup acceleration grid. `sample_surface_cache_cone` was an
+    /// O(num_cards) linear scan PER REFLECTION HIT (30+ ms at 449 drawables / 2694 cards), so the
+    /// host builds a uniform world grid over the cards once at cache build: `card_grid_cells` =
+    /// 8-u32 header (grid min.xyz f32, cell size f32, res.xyz, pool len) + per-cell (offset,
+    /// count) pairs; `card_grid_pool` = the flat card-index pool. Each card is inserted into
+    /// every cell its influence volume overlaps, DILATED by the maximum acceptance tolerance the
+    /// shader can ever apply (texel tol + the ray-distance-growing cache bias at t = ray max), so
+    /// the grid query returns a superset of the cards the linear scan would accept → identical
+    /// results. Content reflection opt-in (`P_CACHE_GRID`); every other consumer keeps the scan.
+    card_grid_cells: Option<StorageBuffer>,
+    card_grid_pool: Option<StorageBuffer>,
     /// C: per-card source albedo (the drawable's representative color, 12 B/card). The
     /// capture stamps it onto the card so the GI/reflection cache carries the real surface
     /// color instead of the blurred per-voxel albedo volume. `None` ⇒ legacy volume path
@@ -458,6 +469,8 @@ impl GdfSystem {
             card_src_albedo: None,
             albedo_bake_pipeline,
             cards: None,
+            card_grid_cells: None,
+            card_grid_pool: None,
             cache_pos: None,
             cache_albedo: None,
             num_cards: 0,
@@ -1035,7 +1048,149 @@ impl GdfSystem {
         }
         self.num_cards = num_cards;
         self.cache_frame = 0;
+        // Track C prerequisite: the card-lookup acceleration grid (content reflection opt-in —
+        // the build is env-gated too so the two extra bindless slots are only consumed when the
+        // consumer exists).
+        if std::env::var_os("P_CACHE_GRID").is_some() {
+            self.build_card_grid(device, cards)?;
+        }
         Ok(())
+    }
+
+    /// Track C prerequisite: build the card-lookup acceleration grid (see the field docs on
+    /// `card_grid_cells`). Self-contained: bounds derive from the card records themselves. The
+    /// per-card dilation is the MAXIMUM acceptance tolerance `sample_surface_cache_cone` can ever
+    /// apply — `max(texel_tol, 0.02) + 0.006·diag + 0.03·t` at `t = ray max (≈ diag)` — with a
+    /// 1.25 safety factor on the diag term (the GDF volume the shader measures its diag from is
+    /// padded beyond the card union measured here). A cell query therefore returns a SUPERSET of
+    /// the cards the linear scan would accept: identical sampling results, O(cell) cost.
+    fn build_card_grid(&mut self, device: &Device, cards: &[u8]) -> anyhow::Result<()> {
+        self.card_grid_cells = None;
+        self.card_grid_pool = None;
+        let n = cards.len() / 64;
+        if n == 0 {
+            return Ok(());
+        }
+        let f = |o: usize| f32::from_le_bytes(cards[o..o + 4].try_into().unwrap());
+        // Per-card influence AABB: the card plane spans center ± u ± v, and captured points live
+        // up to trace_depth inward along -normal.
+        let mut boxes: Vec<([f32; 3], [f32; 3], f32)> = Vec::with_capacity(n);
+        let mut gmin = [f32::MAX; 3];
+        let mut gmax = [f32::MIN; 3];
+        for i in 0..n {
+            let b = i * 64;
+            let c = [f(b), f(b + 4), f(b + 8)];
+            let depth = f(b + 12);
+            let nrm = [f(b + 16), f(b + 20), f(b + 24)];
+            let ua = [f(b + 32), f(b + 36), f(b + 40)];
+            let va = [f(b + 48), f(b + 52), f(b + 56)];
+            let len = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            let mut lo = [0f32; 3];
+            let mut hi = [0f32; 3];
+            for k in 0..3 {
+                let ext = ua[k].abs() + va[k].abs();
+                let back = c[k] - nrm[k] * depth;
+                lo[k] = c[k].min(back) - ext;
+                hi[k] = c[k].max(back) + ext;
+                gmin[k] = gmin[k].min(lo[k]);
+                gmax[k] = gmax[k].max(hi[k]);
+            }
+            boxes.push((lo, hi, len(ua) + len(va)));
+        }
+        let ext = [gmax[0] - gmin[0], gmax[1] - gmin[1], gmax[2] - gmin[2]];
+        let diag = (ext[0] * ext[0] + ext[1] * ext[1] + ext[2] * ext[2]).sqrt();
+        // Worst-case shader acceptance in grid mode: 0.006·diag + the CAPPED distance term
+        // (0.012·diag — grid mode clamps it in-shader precisely so this dilation stays lean),
+        // safety-scaled 1.25 (the GDF volume the shader measures its diag from is padded beyond
+        // the card union measured here).
+        let bias_dil = (0.006 + 0.012) * diag * 1.25;
+        let tile = self.card_tile.max(1) as f32;
+        // Grid bounds cover the dilated boxes; 64 cells along the longest axis.
+        let max_dil = boxes
+            .iter()
+            .map(|(_, _, uv)| (uv / tile * 4.0).max(0.02) + bias_dil)
+            .fold(0.0f32, f32::max);
+        for k in 0..3 {
+            gmin[k] -= max_dil;
+            gmax[k] += max_dil;
+        }
+        let ext = [gmax[0] - gmin[0], gmax[1] - gmin[1], gmax[2] - gmin[2]];
+        let cell = (ext[0].max(ext[1]).max(ext[2]) / 64.0).max(1e-3);
+        let res: [u32; 3] = std::array::from_fn(|k| ((ext[k] / cell).ceil() as u32).clamp(1, 64));
+        let num_cells = (res[0] * res[1] * res[2]) as usize;
+        let mut cell_cards: Vec<Vec<u32>> = vec![Vec::new(); num_cells];
+        for (i, (lo, hi, uv)) in boxes.iter().enumerate() {
+            let dil = (uv / tile * 4.0).max(0.02) + bias_dil;
+            let cr = |v: f32, k: usize| {
+                (((v - gmin[k]) / cell).floor() as i64).clamp(0, res[k] as i64 - 1) as u32
+            };
+            let (x0, x1) = (cr(lo[0] - dil, 0), cr(hi[0] + dil, 0));
+            let (y0, y1) = (cr(lo[1] - dil, 1), cr(hi[1] + dil, 1));
+            let (z0, z1) = (cr(lo[2] - dil, 2), cr(hi[2] + dil, 2));
+            for z in z0..=z1 {
+                for y in y0..=y1 {
+                    for x in x0..=x1 {
+                        cell_cards[((z * res[1] + y) * res[0] + x) as usize].push(i as u32);
+                    }
+                }
+            }
+        }
+        // Flatten: header (8 u32) + per-cell (offset, count) pairs; pool = the index lists in
+        // cell order (each ascending = the linear scan's relative order → identical FP sums).
+        let mut cells_bytes: Vec<u8> = Vec::with_capacity(32 + num_cells * 8);
+        for v in gmin {
+            cells_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        cells_bytes.extend_from_slice(&cell.to_le_bytes());
+        for r in res {
+            cells_bytes.extend_from_slice(&r.to_le_bytes());
+        }
+        let pool_len: usize = cell_cards.iter().map(Vec::len).sum();
+        cells_bytes.extend_from_slice(&(pool_len as u32).to_le_bytes());
+        let mut pool_bytes: Vec<u8> = Vec::with_capacity(pool_len * 4);
+        let mut offset = 0u32;
+        for list in &cell_cards {
+            cells_bytes.extend_from_slice(&offset.to_le_bytes());
+            cells_bytes.extend_from_slice(&(list.len() as u32).to_le_bytes());
+            for &c in list {
+                pool_bytes.extend_from_slice(&c.to_le_bytes());
+            }
+            offset += list.len() as u32;
+        }
+        if pool_bytes.is_empty() {
+            pool_bytes.extend_from_slice(&0u32.to_le_bytes()); // zero-size buffers are invalid
+        }
+        tracing::info!(
+            "surface cache: card grid {}x{}x{} cells, {} cards, {} pool entries ({:.1} MB)",
+            res[0],
+            res[1],
+            res[2],
+            n,
+            pool_len,
+            (cells_bytes.len() + pool_bytes.len()) as f64 / 1e6,
+        );
+        let make = |bytes: &[u8]| -> anyhow::Result<StorageBuffer> {
+            Ok(device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: bytes.len() as u64,
+                    stride: 4,
+                    indirect: false,
+                },
+                bytes,
+            )?)
+        };
+        self.card_grid_cells = Some(make(&cells_bytes)?);
+        self.card_grid_pool = Some(make(&pool_bytes)?);
+        Ok(())
+    }
+
+    /// Track C prerequisite: the card-lookup grid's bindless indices `(cells, pool)`, or `None`
+    /// when it wasn't built (env-gated). The reflection packs these into its cache push slot.
+    pub(crate) fn surface_cache_grid(&self) -> Option<(u32, u32)> {
+        Some((
+            self.card_grid_cells.as_ref()?.storage_index(),
+            self.card_grid_pool.as_ref()?.storage_index(),
+        ))
     }
 
     /// Stage D2b: the per-card visibility buffer's bindless storage index (for the relight pass),

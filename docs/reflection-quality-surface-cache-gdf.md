@@ -266,7 +266,26 @@ GDF 마치 + 카드 셰이드를 통째로 스킵. lit_hist 인덱스는 이 per
 - 갤러리 `af70c1a5` byte-identical PASS, clippy/fmt clean.
 
 **권장 검증 스택(현재):** `P_CACHE_CONVERGE=32 P_GI_STABLE=1 P_REFLECT_STOCHASTIC=1
-P_REFLECT_GLOSSY_SPP=4..8 P_REFLECT_SCREEN_HIT=1 P_REFLECT_PREFILTER=1`
+P_REFLECT_GLOSSY_SPP=4..8 P_REFLECT_SCREEN_HIT=1 P_REFLECT_PREFILTER=1 P_CACHE_GRID=1`
+
+### Track C 선행 — 카드 룩업 그리드 가속 구현 완료 (opt-in `P_CACHE_GRID=1`)
+호스트가 캐시 빌드 시 카드 위로 균일 월드 그리드(최장축 64셀)를 1회 구축: 각 카드의 영향
+볼륨(카드 평면 ± u/v + trace_depth 안쪽) AABB를 **셰이더가 적용할 수 있는 최대 수용 톨러런스로
+팽창**해 겹치는 모든 셀에 삽입 → 셀 조회 = 선형 스캔이 수락했을 카드의 초집합(오름차순 유지 =
+FP 합 순서 동일) → **결과 동일, O(cell) 비용**. 버퍼 2개(헤더+per-cell (offset,count) / 인덱스 풀),
+인덱스는 `cache.x` 스페어 비트(cards | (cells+1)<<8 | (pool+1)<<16) — push 무성장. 반사 전용
+(GI/relight 컨슈머는 기존 스캔 유지).
+
+**동반 근본 수정:** 그리드 모드에서 t-증가 수용항을 `min(t·0.03, 0.012·diag)`로 **캡** — 언바운드
+수용 성장이 최악치 팽창(카드당 ±4.7%·diag)을 강제해 풀이 6.1M 엔트리(셀 평균 47카드)로 비대해지던
+근본. 캡 후 팽창 2.3%·diag. 캡 너머 수락되던 원거리 카드는 score≈0(align/(1+4d))로 콘 평균만
+오염하던 것들 — 그리드 ON/OFF 이미지 diff **0.03/255**(run-to-run 노이즈 0.06 이하 = 실질 동일).
+
+**측정 (glossyball, Metal, K=1):** HQ(div3, 2694카드) 30.5→**16.5ms**(−46%), 기본(div6, 1024카드)
+6.2→**4.7ms**(−24%). 풀 스택(SPP8+SCREEN_HIT+PREFILTER+GRID): 9.0ms, +HQ 21.6ms(트랙 시작점
+K8+HQ 245ms 대비 **11×**). ⚠️앞선 "HQ 30ms = 카드 루프" 귀속은 절반만 정확 — **HQ는 트레이스
+해상도도 div6→3(4× 픽셀)으로 올림**(캐시 OFF에도 21.9ms). 카드 루프 몫이 그리드로 제거된 것.
+갤러리 byte-identical PASS, clippy/fmt/unit tests clean.
 
 ### Track B — trace 계층 (온스크린 정확도, HWRT 없이 미러 선명)
 

@@ -122,9 +122,16 @@ float3 card_mip_sample(uint c, float uu, float vv, float half_ext, float sample_
 // colour) → accumulate EVERY card covering the imprecise hit, weighted by fit, each at its cone MIP
 // (reference-engine multi-card cone accumulation). Near/face-on hits collapse to a single sharp card
 // at mip0. Active only for content (`extra_tol > 0`); the primary consumers keep the legacy path.
+// `grid_cells`/`grid_pool` (0xFFFFFFFF = off): the Track C card-lookup acceleration grid — a
+// uniform world grid the HOST built over the cards, each cell listing every card whose influence
+// volume (dilated by the maximum acceptance tolerance this function can apply) overlaps it. The
+// query point's cell therefore holds a SUPERSET of the cards the full O(num_cards) scan would
+// accept, in the same ascending order → identical results, O(cell) cost. Content reflection only;
+// every other consumer passes the sentinel and keeps the exact legacy scan.
 float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cache_pos_index,
                                  uint cache_rad_index, uint num_cards, uint tile, float extra_tol,
-                                 float sample_radius, uint mip_index, uint max_mip, out bool found)
+                                 float sample_radius, uint mip_index, uint max_mip,
+                                 uint grid_cells, uint grid_pool, out bool found)
 {
     found = false;
     int best = -1;
@@ -135,8 +142,26 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
     bool cone_mode = (extra_tol > 0.0) && (mip_index != 0xFFFFFFFFu);
     float3 acc = float3(0.0, 0.0, 0.0);
     float acc_w = 0.0;
-    for (uint c = 0u; c < num_cards; c++)
+    // Card iteration domain: the query cell's card list (grid) or all cards (legacy scan).
+    bool use_grid = grid_cells != 0xFFFFFFFFu;
+    uint iter_n = num_cards;
+    uint pool_off = 0u;
+    if (use_grid)
     {
+        // Header: gmin.xyz f32, cell_size f32, res.xyz u32, pool len — then (offset,count)/cell.
+        float3 gmin = asfloat(g.storage_buffers[grid_cells].Load3(0u));
+        float csize = asfloat(g.storage_buffers[grid_cells].Load(12u));
+        uint3 res = g.storage_buffers[grid_cells].Load3(16u);
+        int3 ci = clamp(int3(floor((p - gmin) / csize)), int3(0, 0, 0),
+                        int3(res) - int3(1, 1, 1));
+        uint cell = (uint(ci.z) * res.y + uint(ci.y)) * res.x + uint(ci.x);
+        uint2 oc = g.storage_buffers[grid_cells].Load2(32u + cell * 8u);
+        pool_off = oc.x;
+        iter_n = oc.y;
+    }
+    for (uint k = 0u; k < iter_n; k++)
+    {
+        uint c = use_grid ? g.storage_buffers[grid_pool].Load((pool_off + k) * 4u) : k;
         uint b = c * 64u;
         float4 c0 = asfloat(g.storage_buffers[cards_index].Load4(b + 0u));
         float3 cn = asfloat(g.storage_buffers[cards_index].Load3(b + 16u));
@@ -216,5 +241,6 @@ float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos
                             out bool found)
 {
     return sample_surface_cache_cone(p, n, cards_index, cache_pos_index, cache_rad_index, num_cards,
-                                     tile, extra_tol, 0.0, 0xFFFFFFFFu, 0u, found);
+                                     tile, extra_tol, 0.0, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu,
+                                     0xFFFFFFFFu, found);
 }

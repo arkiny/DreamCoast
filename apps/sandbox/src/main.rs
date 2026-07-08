@@ -5826,8 +5826,17 @@ impl App {
             }
             _ => None,
         };
+        // Track C card grid (opt-in `P_CACHE_GRID`, built at cache-build time): pack the grid's
+        // two bindless indices into the cards slot's spare bits — cards | (cells+1)<<8 |
+        // (pool+1)<<16 (0 = no grid; storage indices are < 64 so the low byte keeps the real
+        // cards index). Reflection-only: the GI/relight consumers keep the exact linear scan.
+        let cache_grid = self.gdf.surface_cache_grid();
         let reflect_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
             Some(ext) if self.reflect_cache => cache_read.map(|(c, p, r, n, t)| {
+                let c = match cache_grid {
+                    Some((cells, pool)) => c | ((cells + 1) << 8) | ((pool + 1) << 16),
+                    None => c,
+                };
                 // Pack the MIP pyramid into the tile slot: tile | max_mip<<8 | mip_index<<16 (all
                 // ≤16 bits; 0xFFFF mip_index = no pyramid). Order the reflection after mipgen when
                 // the pyramid exists (its handle), else after the relight directly.
