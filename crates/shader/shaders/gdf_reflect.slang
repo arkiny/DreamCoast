@@ -291,8 +291,17 @@ float3 sample_gi_irradiance(uint base, float3 p, float3 n)
 // Projection uses `globals.prev_view_proj` and validates against the CURRENT depth buffer with the
 // same tolerance law as the Phase 16 B.2 HWRT screen path, so camera motion fails the validation
 // (falls back to the GDF march) instead of smearing. Returns true + colour + hit ray-parameter.
+// `spread` (radians of reflected-ray divergence per output texel) + `pa_full` (full-res pixel
+// angle) drive the B2-compaction anti-aliasing: at the validated hit, the ray's footprint in
+// lit-history pixels is `spread·t / (hit_dist·pa_full)`. A point fetch of the history is only
+// correct while that footprint is ~a pixel; a minified mirror (a distant curved reflector)
+// skips tens of pixels of reflected content per ray and point fetches turn into colour speckle
+// no later pass can remove. Moderate footprints take a footprint-spaced 3x3 box of the history;
+// past ~24 px the fetch REJECTS so the ray falls through to the cache cone, which is
+// prefiltered (the cone-traced mip chain is the correct minified answer). `spread = 0`
+// (every non-compact caller) keeps the legacy point fetch bit-exactly.
 bool screen_trace(float3 p, float3 dir, float sy, float bias, float max_dist, uint lit_hist,
-                  out float3 col, out float thit)
+                  out float3 col, out float thit, float spread, float pa_full)
 {
     col = float3(0.0, 0.0, 0.0);
     thit = 0.0;
@@ -332,8 +341,41 @@ bool screen_trace(float3 p, float3 dir, float sy, float bias, float max_dist, ui
             g.textures[pc.depth_index].GetDimensions(fw, fh);
             int2 pp = clamp(int2(puv * float2(fw, fh)), int2(0, 0),
                             int2(int(fw) - 1, int(fh) - 1));
-            uint pidx = uint(pp.y) * fw + uint(pp.x);
-            col = asfloat(g.storage_buffers[lit_hist].Load4(pidx * 16u)).rgb;
+            // B2 compaction footprint (see the function docs). 0 = legacy point fetch.
+            float fp_px = 0.0;
+            if (spread > 0.0)
+            {
+                float hit_dist = distance(pc.cam_pos.xyz, sworld);
+                fp_px = spread * t / max(hit_dist * pa_full, 1e-6);
+                if (fp_px > 24.0)
+                    return false; // too minified — the prefiltered cache cone owns this ray
+            }
+            if (fp_px > 3.0)
+            {
+                // Footprint-spaced 3x3 box of the history: a cheap low-pass matched to the
+                // minification, so adjacent rays integrate overlapping content instead of
+                // skipping between speckles.
+                int r = int(clamp(fp_px * (1.0 / 3.0), 1.0, 8.0));
+                float3 sum = float3(0.0, 0.0, 0.0);
+                [unroll]
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    [unroll]
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        int2 sp2 = clamp(pp + int2(dx, dy) * r, int2(0, 0),
+                                         int2(int(fw) - 1, int(fh) - 1));
+                        uint si = uint(sp2.y) * fw + uint(sp2.x);
+                        sum += asfloat(g.storage_buffers[lit_hist].Load4(si * 16u)).rgb;
+                    }
+                }
+                col = sum * (1.0 / 9.0);
+            }
+            else
+            {
+                uint pidx = uint(pp.y) * fw + uint(pp.x);
+                col = asfloat(g.storage_buffers[lit_hist].Load4(pidx * 16u)).rgb;
+            }
             thit = t;
             return true;
         }
@@ -445,6 +487,32 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     }
     float3 n = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, uv, 0.0).xyz);
     float3 v = normalize(pc.cam_pos.xyz - p);
+#ifdef REFLECT_COMPACT
+    // B2 anti-aliasing inputs (see screen_trace): per-texel reflected-ray divergence = the view
+    // cone of one refine texel + twice the surface-normal change across it (a curved mirror
+    // magnifies; the reflected direction turns 2x the normal). pa_full = full-res pixel angle.
+    float geo_spread;
+    float pa_full;
+    {
+        // One-texel view angle from the projection itself (two unprojected near-plane rays).
+        float4 c0 = mul(pc.inv_view_proj, float4(0.0, 0.0, 0.5, 1.0));
+        float4 c1 = mul(pc.inv_view_proj, float4(2.0 / float(pc.width), 0.0, 0.5, 1.0));
+        float3 r0 = normalize(c0.xyz / c0.w - pc.cam_pos.xyz);
+        float3 r1 = normalize(c1.xyz / c1.w - pc.cam_pos.xyz);
+        float texel_angle = acos(clamp(dot(r0, r1), -1.0, 1.0));
+        uint fw, fh;
+        g.textures[pc.depth_index].GetDimensions(fw, fh);
+        pa_full = texel_angle * float(pc.width) / max(float(fw), 1.0);
+        float3 n1 = normalize(
+            g.textures[pc.normal_index].SampleLevel(g.samp, uv + float2(1.0 / pc.width, 0.0), 0.0)
+                .xyz);
+        float dn = acos(clamp(dot(n, n1), -1.0, 1.0));
+        geo_spread = texel_angle + 2.0 * dn;
+    }
+#else
+    const float geo_spread = 0.0; // legacy: point-fetch screen hits (bit-identical)
+    const float pa_full = 1.0;
+#endif
     // C8j: GGX-importance-sample the reflection direction by roughness (one jittered ray/frame;
     // the temporal resolve accumulates them into the glossy lobe). Near-mirror stays sharp.
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
@@ -547,7 +615,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         {
             float t_screen;
             screen_done = screen_trace(p, dir, sy, bias, max_dist, asuint(pc.params.y),
-                                       screen_col, t_screen);
+                                       screen_col, t_screen, geo_spread, pa_full);
             if (screen_done)
                 t = t_screen; // a miss must NOT touch t (the GDF march starts at `bias`)
         }

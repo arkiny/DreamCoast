@@ -4116,6 +4116,12 @@ impl App {
                 }
             }
             self.tab_prev = tab;
+            // Pointer lock: capture the cursor while flying so the free look never stops at a
+            // screen edge (raw deltas keep flowing); hold Option/Alt to release it for the UI
+            // (the look pauses meanwhile — `look_enabled` keys off the capture below).
+            let alt_ui = self.window.input().key_down(0x12); // VK_MENU
+            let capture = self.cam_mode == camera::CameraMode::Fly && !alt_ui;
+            self.window.set_cursor_captured(capture);
         }
 
         // Path-trace + GI-denoise screenshots need a long warmup so the static-camera
@@ -4299,9 +4305,10 @@ impl App {
             // ~3.5 m/s; Shift sprints 4x, wheel adjusts). The old 0.8x seed moved ~19 m/s
             // indoors — unusable for close inspection.
             let seed_speed = self.scene_radius * 0.15;
-            // Free look on plain mouse move; suppressed while ImGui wants the cursor
-            // (hovering / dragging a UI window must not spin the camera under it).
-            let look_enabled = !self.gui.want_capture_mouse();
+            // Free look on plain mouse move. While the pointer is captured the UI can't be
+            // hovered (the cursor is frozen), so look is unconditional; un-captured (Option/Alt
+            // held for UI, or platforms without the lock) it defers to ImGui's mouse claim.
+            let look_enabled = self.window.input().captured() || !self.gui.want_capture_mouse();
             let fly = self
                 .fly
                 .get_or_insert_with(|| camera::FlyCamera::from_look(eye, focus, seed_speed));

@@ -13,7 +13,7 @@ use std::ffi::c_void;
 
 use dreamcoast_core::EngineError;
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -29,6 +29,9 @@ struct WindowState {
     resized: bool,
     size: (u32, u32),
     input: crate::Input,
+    /// Pointer-lock (fly-camera capture): cursor hidden + recentered every pump, raw motion
+    /// derived from the recenter diff (see `set_cursor_captured`).
+    captured: bool,
 }
 
 /// An open application window.
@@ -130,6 +133,40 @@ impl Window {
                     self.state.should_close = true;
                 }
             }
+            // Pointer lock: derive this frame's raw motion from the drift off the client-area
+            // centre, then snap the (hidden) cursor back — the classic recenter loop, so the
+            // fly look never stops at a screen edge. (macOS uses CG cursor disassociation.)
+            if self.state.captured {
+                use windows::Win32::Graphics::Gdi::ClientToScreen;
+                let (w, h) = self.state.size;
+                let centre = POINT {
+                    x: w as i32 / 2,
+                    y: h as i32 / 2,
+                };
+                let (px, py) = self.state.input.mouse_position();
+                self.state
+                    .input
+                    .add_raw_delta((px - centre.x) as f32, (py - centre.y) as f32);
+                let mut sp = centre;
+                let _ = ClientToScreen(self.hwnd, &mut sp);
+                let _ = SetCursorPos(sp.x, sp.y);
+                self.state.input.set_mouse_pos(centre.x, centre.y);
+            }
+        }
+    }
+
+    /// Pointer lock for the fly camera: `true` hides the cursor and recenters it every pump
+    /// (motion keeps arriving as raw deltas — see `Input::mouse_delta`); `false` restores the
+    /// normal cursor. Idempotent. NOTE: authored on the macOS box — exercise with the DX≡VK
+    /// Windows batch.
+    pub fn set_cursor_captured(&mut self, on: bool) {
+        if self.state.captured == on {
+            return;
+        }
+        self.state.captured = on;
+        self.state.input.set_captured(on);
+        unsafe {
+            let _ = ShowCursor(!on);
         }
     }
 

@@ -37,6 +37,7 @@ fn mac_keycode_to_vk(kc: u16) -> u16 {
         0x0C => 0x51,        // Q
         0x0E => 0x45,        // E
         0x38 | 0x3C => 0x10, // Shift (left / right) -> VK_SHIFT
+        0x3A | 0x3D => 0x12, // Option (left / right) -> VK_MENU (pointer-lock release chord)
         0x30 => 0x09,        // Tab -> VK_TAB
         0x35 => 0x1B,        // Escape -> VK_ESCAPE
         0x78 => 0x71,        // F2
@@ -55,6 +56,16 @@ pub struct Window {
     /// Backing scale factor (points -> pixels).
     scale: f64,
     input: crate::Input,
+    /// Pointer-lock (fly-camera capture): cursor hidden + disassociated from mouse motion,
+    /// so the raw per-event deltas keep flowing with no screen-edge limit.
+    captured: bool,
+}
+
+// Pointer-lock plumbing: freezing the on-screen cursor while the hardware deltas keep
+// arriving is a CoreGraphics service (there is no AppKit equivalent).
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
 }
 
 impl Window {
@@ -115,6 +126,7 @@ impl Window {
             size: (px.0 as u32, px.1 as u32),
             scale,
             input: crate::Input::default(),
+            captured: false,
         })
     }
 
@@ -189,6 +201,11 @@ impl Window {
                 let x = (p.x * self.scale) as i32;
                 let y = ((h - p.y) * self.scale) as i32;
                 self.input.set_mouse_pos(x, y);
+                // Raw hardware deltas (points -> physical px) for the pointer-locked fly look:
+                // they keep flowing while the cursor itself is frozen by the capture.
+                let (dx, dy) = (event.deltaX(), event.deltaY());
+                self.input
+                    .add_raw_delta((dx * self.scale) as f32, (dy * self.scale) as f32);
             }
             NSEventType::ScrollWheel => {
                 let dy = event.scrollingDeltaY();
@@ -245,5 +262,31 @@ impl Window {
     #[inline]
     pub fn metal_layer(&self) -> Retained<CAMetalLayer> {
         self.layer.clone()
+    }
+
+    /// Pointer lock for the fly camera: `true` hides the cursor and freezes it in place
+    /// (mouse motion keeps arriving as raw deltas — see `Input::mouse_delta`), so the look
+    /// never stops at a screen edge; `false` restores the normal cursor. Idempotent.
+    pub fn set_cursor_captured(&mut self, on: bool) {
+        if self.captured == on {
+            return;
+        }
+        self.captured = on;
+        self.input.set_captured(on);
+        unsafe {
+            CGAssociateMouseAndMouseCursorPosition(i32::from(!on));
+            if on {
+                objc2_app_kit::NSCursor::hide();
+            } else {
+                objc2_app_kit::NSCursor::unhide();
+            }
+        }
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        // Never leave the user's cursor hidden/frozen past the window's lifetime.
+        self.set_cursor_captured(false);
     }
 }

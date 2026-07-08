@@ -15,6 +15,13 @@ pub struct Input {
     has_mouse: bool,
     wheel: f32,
     chars: Vec<char>,
+    /// Pointer-lock state (fly-camera capture): while captured the OS cursor is hidden and
+    /// pinned, so [`Self::mouse_delta`] switches to the RAW per-event deltas below — the
+    /// position diff freezes (the cursor no longer moves) and would read zero at screen edges.
+    captured: bool,
+    /// Raw mouse motion accumulated this frame (physical px), fed from the platform's
+    /// per-event deltas (`NSEvent.deltaX/Y` / recenter diffs). Only consumed while captured.
+    raw_delta: (f32, f32),
 }
 
 impl Input {
@@ -36,13 +43,24 @@ impl Input {
         self.pos
     }
 
-    /// Cursor movement since the start of the current frame, in pixels.
+    /// Cursor movement since the start of the current frame, in pixels. While the pointer is
+    /// captured (fly-camera lock) this is the RAW motion instead — unbounded by the screen.
     #[inline]
     pub fn mouse_delta(&self) -> (i32, i32) {
-        (
-            self.pos.0 - self.frame_start_pos.0,
-            self.pos.1 - self.frame_start_pos.1,
-        )
+        if self.captured {
+            (self.raw_delta.0 as i32, self.raw_delta.1 as i32)
+        } else {
+            (
+                self.pos.0 - self.frame_start_pos.0,
+                self.pos.1 - self.frame_start_pos.1,
+            )
+        }
+    }
+
+    /// Whether the pointer is captured (hidden + pinned for fly-camera mouse look).
+    #[inline]
+    pub fn captured(&self) -> bool {
+        self.captured
     }
 
     /// Accumulated mouse wheel delta this frame (in notches; +up).
@@ -63,6 +81,17 @@ impl Input {
         self.frame_start_pos = self.pos;
         self.wheel = 0.0;
         self.chars.clear();
+        self.raw_delta = (0.0, 0.0);
+    }
+
+    pub(crate) fn add_raw_delta(&mut self, dx: f32, dy: f32) {
+        self.raw_delta.0 += dx;
+        self.raw_delta.1 += dy;
+    }
+
+    pub(crate) fn set_captured(&mut self, on: bool) {
+        self.captured = on;
+        self.raw_delta = (0.0, 0.0);
     }
 
     pub(crate) fn add_wheel(&mut self, delta: f32) {
@@ -104,6 +133,8 @@ impl Default for Input {
             has_mouse: false,
             wheel: 0.0,
             chars: Vec::new(),
+            captured: false,
+            raw_delta: (0.0, 0.0),
         }
     }
 }
