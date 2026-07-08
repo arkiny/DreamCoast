@@ -176,10 +176,15 @@ float3 card_mip_sample(uint c_base, uint c_res, uint c_mipb, float uu, float vv,
 // every other consumer passes the sentinel and keeps the exact legacy scan.
 // `layout` (0xFFFFFFFF = uniform tile): the C2a adaptive-resolution layout buffer — per-card
 // (base, res, mip_base). All addressing below goes through it.
+// `feedback` (0xFFFFFFFF = off): the C2b per-card desired-resolution feedback buffer — every
+// cone-mode sample InterlockedMax-es the pow2 resolution its footprint WANTED into the card's
+// slot, so the host can re-layout the atlas around what reflections actually read (the static
+// reference camera's distance prior under-resolves exactly those far cards).
 float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cache_pos_index,
                                  uint cache_rad_index, uint num_cards, uint tile, float extra_tol,
                                  float sample_radius, uint mip_index, uint max_mip,
-                                 uint grid_cells, uint grid_pool, uint layout, out bool found)
+                                 uint grid_cells, uint grid_pool, uint layout, uint feedback,
+                                 out bool found)
 {
     found = false;
     int best = -1;
@@ -253,6 +258,16 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
             // different cards adjacent reflection pixels graze, so the cross-card colour jumps
             // (the residual blocky speckle) smooth out instead of snapping card-to-card.
             float half_ext = max(length(ua), length(va));
+            // C2b: record the resolution this footprint WANTED (texel size ≈ sample_radius),
+            // rounded up to pow2 in [8, 64]. InterlockedMax keeps the card's peak demand.
+            if (feedback != 0xFFFFFFFFu)
+            {
+                float texels = (2.0 * half_ext) / max(sample_radius, 1e-4);
+                uint want = 8u;
+                while (want < 64u && float(want) < texels)
+                    want <<= 1u;
+                g.storage_buffers[feedback].InterlockedMax(c * 4u, want);
+            }
             acc += score * card_mip_sample(lay.x, c_res, card_mip_base(layout, c, tile), uu, vv,
                                            half_ext, sample_radius, mip_index, max_mip,
                                            cache_rad_index, cache_pos_index);
@@ -299,7 +314,7 @@ float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos
     uint layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
     return sample_surface_cache_cone(p, n, cards_index, cache_pos_index, cache_rad_index, num_cards,
                                      tile & 0xFFu, extra_tol, 0.0, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu,
-                                     0xFFFFFFFFu, layout, found);
+                                     0xFFFFFFFFu, layout, 0xFFFFFFFFu, found);
 }
 
 // Grid-accelerated variant of the legacy lookup (the relight gather's hot path — its hemisphere
@@ -314,5 +329,5 @@ float3 sample_surface_cache_grid(float3 p, float3 n, uint cards_index, uint cach
     uint layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
     return sample_surface_cache_cone(p, n, cards_index, cache_pos_index, cache_rad_index, num_cards,
                                      tile & 0xFFu, extra_tol, 0.0, 0xFFFFFFFFu, 0u, grid_cells,
-                                     grid_pool, layout, found);
+                                     grid_pool, layout, 0xFFFFFFFFu, found);
 }

@@ -382,6 +382,18 @@ pub(crate) fn assign_card_res(
             .max(1e-3);
         desired.push(ext / dist);
     }
+    normalize_card_res(&desired, min_res, max_res, budget_texels)
+}
+
+/// C2a/C2b — normalise a per-card desired-resolution vector to a texel budget: quantise
+/// `scale · desired` to pow2 in `[min_res, max_res]` and binary-search the scale so
+/// `Σ res² ≤ budget` (monotone). Deterministic pure-f64 arithmetic.
+pub(crate) fn normalize_card_res(
+    desired: &[f64],
+    min_res: u32,
+    max_res: u32,
+    budget_texels: u64,
+) -> Vec<u32> {
     let quant = |v: f64| -> u32 {
         let v = v.max(1.0);
         let e = v.log2().round().max(0.0) as u32;
@@ -396,8 +408,10 @@ pub(crate) fn assign_card_res(
             })
             .sum()
     };
-    // Binary-search the density scale to the texel budget (monotone in scale).
-    let (mut lo, mut hi) = (1.0f64, 1e7f64);
+    // Binary-search the density scale to the texel budget (monotone in scale). The lower bound
+    // sits below any useful scale (everything quantises to min_res there) so feedback-style
+    // desired vectors that ALREADY exceed the budget at scale 1 shrink correctly.
+    let (mut lo, mut hi) = (1e-4f64, 1e7f64);
     if total(lo) > budget_texels {
         // Even the minimum scale (everything at min_res) may exceed the budget for a huge card
         // count — accept it (min_res is the floor).

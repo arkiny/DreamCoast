@@ -746,9 +746,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 uint grid_cells = gc8 == 0u ? 0xFFFFFFFFu : gc8 - 1u;
                 uint grid_pool = gp8 == 0u ? 0xFFFFFFFFu : gp8 - 1u;
                 uint sc_layout = la8 == 0u ? 0xFFFFFFFFu : la8 - 1u;
-                color = sample_surface_cache_cone(hp, hn, cards_idx, pc.cache.y, pc.cache.z, pc.cache.w,
+                // C2b: `cache.y` packs cache_pos | (feedback+1)<<8 — the desired-res feedback the
+                // host re-layouts the adaptive atlas around (0 = off, legacy bare index).
+                uint cpos_idx = pc.cache.y & 0xFFu;
+                uint fb8 = (pc.cache.y >> 8) & 0xFFu;
+                uint sc_feedback = fb8 == 0u ? 0xFFFFFFFFu : fb8 - 1u;
+                color = sample_surface_cache_cone(hp, hn, cards_idx, cpos_idx, pc.cache.z, pc.cache.w,
                                                   c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
-                                                  grid_cells, grid_pool, sc_layout, cached);
+                                                  grid_cells, grid_pool, sc_layout, sc_feedback,
+                                                  cached);
             }
             if (!cached)
             {

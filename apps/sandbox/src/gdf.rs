@@ -111,6 +111,11 @@ pub(crate) struct GdfSystem {
     /// mipgen dispatch grid; min drives the card-grid tolerance dilation (largest texel).
     cache_res_max: u32,
     cache_res_min: u32,
+    /// C2b: per-card desired-resolution feedback (host-visible u32/card). The reflection's cone
+    /// sampler InterlockedMax-es the pow2 resolution each footprint wanted; the host reads it
+    /// back once (`P11_CACHE_RES_FEEDBACK` frame) and re-layouts the adaptive atlas around what
+    /// reflections ACTUALLY read — fixing the static distance prior's far-card under-resolution.
+    card_res_feedback: Option<StorageBuffer>,
     /// C: per-card source albedo (the drawable's representative color, 12 B/card). The
     /// capture stamps it onto the card so the GI/reflection cache carries the real surface
     /// color instead of the blurred per-voxel albedo volume. `None` ⇒ legacy volume path
@@ -495,6 +500,7 @@ impl GdfSystem {
             cache_total_texels: 0,
             cache_res_max: 0,
             cache_res_min: 0,
+            card_res_feedback: None,
             cache_pos: None,
             cache_albedo: None,
             num_cards: 0,
@@ -1018,41 +1024,7 @@ impl GdfSystem {
         self.cache_res_min = self.card_tile;
         let (total_texels, mip_total) = if let Some(resv) = card_res {
             debug_assert_eq!(resv.len() as u32, num_cards);
-            let mut lay: Vec<u8> = Vec::with_capacity(resv.len() * 16);
-            let mut base = 0u32;
-            let mut mipb = 0u32;
-            let mut rmax = 4u32;
-            let mut rmin = u32::MAX;
-            for &r in resv {
-                lay.extend_from_slice(&base.to_le_bytes());
-                lay.extend_from_slice(&r.to_le_bytes());
-                lay.extend_from_slice(&mipb.to_le_bytes());
-                lay.extend_from_slice(&0u32.to_le_bytes());
-                base += r * r;
-                mipb += Self::card_mip_texels(r);
-                rmax = rmax.max(r);
-                rmin = rmin.min(r);
-            }
-            self.cache_layout = Some(device.create_storage_buffer_init(
-                &StorageBufferDesc {
-                    size: lay.len() as u64,
-                    stride: 16,
-                    indirect: false,
-                },
-                &lay,
-            )?);
-            self.cache_res_max = rmax;
-            self.cache_res_min = rmin.min(rmax);
-            tracing::info!(
-                "surface cache: C2a adaptive res {}..{} — {} texels ({} cards; uniform {} would be {})",
-                self.cache_res_min,
-                rmax,
-                base,
-                num_cards,
-                self.card_tile,
-                num_cards * self.card_tile * self.card_tile,
-            );
-            (base, mipb)
+            self.upload_card_layout(device, resv)?
         } else {
             (
                 num_cards * self.card_tile * self.card_tile,
@@ -1081,30 +1053,23 @@ impl GdfSystem {
             )?),
             _ => None,
         };
-        let texels = total_texels as u64;
-        let make = || -> anyhow::Result<Option<StorageBuffer>> {
-            Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
-                size: texels * 16,
-                stride: 16,
-                indirect: false,
-            })?))
-        };
-        self.cache_pos = make()?;
-        self.cache_albedo = make()?;
-        self.cache_radiance = [make()?, make()?, make()?];
-        // Reflection cone-LOD: the MIP pyramid of the radiance atlas (levels 1..=mip_levels; mip0
-        // stays in `cache_radiance`). `float4(rad.rgb, coverage)` per texel, `num_cards *
-        // card_mip_texels` total. Only when the generator pipeline exists (content). The gallery /
-        // GI consumers never read it (mip0-nearest), so it costs nothing there.
-        self.cache_rad_mips = if self.cache_mipgen_pipeline.is_some() {
-            Some(device.create_storage_buffer(&StorageBufferDesc {
-                size: (mip_total as u64).max(1) * 16,
-                stride: 16,
-                indirect: false,
-            })?)
-        } else {
-            None
-        };
+        // Per-texel atlases (pos / albedo / radiance ping-pong / MIP pyramid). The pyramid only
+        // exists with the generator pipeline (content); the gallery / GI consumers never read it.
+        self.alloc_cache_texel_buffers(device, total_texels, mip_total)?;
+        // C2b: the desired-res feedback buffer (adaptive mode + env opt-in only — host-visible,
+        // one u32 per card, zeroed; the reflection's cone sampler InterlockedMax-es into it).
+        self.card_res_feedback =
+            if card_res.is_some() && std::env::var_os("P11_CACHE_RES_FEEDBACK").is_some() {
+                let fbb = device.create_storage_buffer_host(&StorageBufferDesc {
+                    size: (num_cards as u64) * 4,
+                    stride: 4,
+                    indirect: false,
+                })?;
+                fbb.write(&vec![0u8; num_cards as usize * 4])?;
+                Some(fbb)
+            } else {
+                None
+            };
         // Stage D2b: 1 uint / card visibility flag (filled each frame by record_cache_visibility).
         self.card_vis = Some(device.create_storage_buffer(&StorageBufferDesc {
             size: (num_cards as u64) * 4,
@@ -1282,6 +1247,122 @@ impl GdfSystem {
         )?;
         self.card_mesh = Some((vtx, idx, table, inst));
         Ok(())
+    }
+
+    /// C2a: build + upload the per-card layout records from a res assignment; returns
+    /// `(total mip0 texels, total pyramid texels)` and updates the res extrema.
+    fn upload_card_layout(&mut self, device: &Device, resv: &[u32]) -> anyhow::Result<(u32, u32)> {
+        let mut lay: Vec<u8> = Vec::with_capacity(resv.len() * 16);
+        let mut base = 0u32;
+        let mut mipb = 0u32;
+        let mut rmax = 4u32;
+        let mut rmin = u32::MAX;
+        for &r in resv {
+            lay.extend_from_slice(&base.to_le_bytes());
+            lay.extend_from_slice(&r.to_le_bytes());
+            lay.extend_from_slice(&mipb.to_le_bytes());
+            lay.extend_from_slice(&0u32.to_le_bytes());
+            base += r * r;
+            mipb += Self::card_mip_texels(r);
+            rmax = rmax.max(r);
+            rmin = rmin.min(r);
+        }
+        self.cache_layout = Some(device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: lay.len() as u64,
+                stride: 16,
+                indirect: false,
+            },
+            &lay,
+        )?);
+        self.cache_res_max = rmax;
+        self.cache_res_min = rmin.min(rmax);
+        tracing::info!(
+            "surface cache: adaptive res {}..{} — {} texels ({} cards; uniform {} would be {})",
+            self.cache_res_min,
+            rmax,
+            base,
+            resv.len(),
+            self.card_tile,
+            resv.len() as u32 * self.card_tile * self.card_tile,
+        );
+        Ok((base, mipb))
+    }
+
+    /// C2a/C2b: (re)allocate the per-texel atlas buffers for the current layout totals. The
+    /// contents are undefined until the next capture + reset relight.
+    fn alloc_cache_texel_buffers(
+        &mut self,
+        device: &Device,
+        total_texels: u32,
+        mip_total: u32,
+    ) -> anyhow::Result<()> {
+        let texels = total_texels as u64;
+        let make = || -> anyhow::Result<Option<StorageBuffer>> {
+            Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
+                size: texels.max(1) * 16,
+                stride: 16,
+                indirect: false,
+            })?))
+        };
+        self.cache_pos = make()?;
+        self.cache_albedo = make()?;
+        self.cache_radiance = [make()?, make()?, make()?];
+        self.cache_rad_mips = if self.cache_mipgen_pipeline.is_some() {
+            Some(device.create_storage_buffer(&StorageBufferDesc {
+                size: (mip_total as u64).max(1) * 16,
+                stride: 16,
+                indirect: false,
+            })?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// C2b: one-shot feedback re-layout. Reads the desired-res feedback the reflection recorded,
+    /// re-normalises it to the SAME texel budget, rebuilds the layout, and reallocates the atlas
+    /// (the caller must force a re-capture + reset relight, and should `wait_idle` first — the
+    /// old atlas buffers are dropped while no frame is in flight). Returns false when the
+    /// adaptive cache / feedback isn't active.
+    pub(crate) fn relayout_from_feedback(&mut self, device: &Device) -> anyhow::Result<bool> {
+        if self.card_res_feedback.is_none() || self.cache_layout.is_none() || self.num_cards == 0 {
+            return Ok(false);
+        }
+        let n = self.num_cards as usize;
+        let mut bytes = vec![0u8; n * 4];
+        self.card_res_feedback
+            .as_ref()
+            .expect("feedback")
+            .read_into(&mut bytes)?;
+        // Never-read cards floor to the minimum (they free budget for the cards reflections DO
+        // read); read cards ask for their recorded peak demand.
+        let desired: Vec<f64> = bytes
+            .chunks_exact(4)
+            .map(|c| {
+                u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                    .clamp(8, 64)
+                    .max(8) as f64
+            })
+            .collect();
+        let budget = (self.num_cards as u64) * (self.card_tile as u64) * (self.card_tile as u64);
+        let resv = crate::fuse::normalize_card_res(&desired, 8, 64, budget);
+        let (total, mip_total) = self.upload_card_layout(device, &resv)?;
+        self.cache_total_texels = total;
+        self.alloc_cache_texel_buffers(device, total, mip_total)?;
+        if let Some(fb) = self.card_res_feedback.as_ref() {
+            let _ = fb.write(&vec![0u8; n * 4]);
+        }
+        tracing::info!(
+            "surface cache: C2b feedback re-layout applied ({} texels)",
+            total
+        );
+        Ok(true)
+    }
+
+    /// C2b: the feedback buffer's bindless index (None = feature off / uniform atlas).
+    pub(crate) fn card_res_feedback_index(&self) -> Option<u32> {
+        Some(self.card_res_feedback.as_ref()?.storage_index())
     }
 
     /// C2a: `tile` with the adaptive layout index packed into bits 8..15 (+1; 0 = uniform).

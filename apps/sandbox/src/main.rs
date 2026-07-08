@@ -971,6 +971,11 @@ struct App {
     /// `P_REFLECT_SCREEN_HIT=1` (content only; gallery keeps the plain permutation → anchor
     /// untouched).
     reflect_screen_hit: bool,
+    /// C2b: one-shot feedback re-layout frame — at this frame the host reads the per-card
+    /// desired-res feedback the reflection recorded, re-normalises to the same texel budget and
+    /// rebuilds the adaptive atlas layout (re-capture + reset relight follow). 0 = off.
+    /// `P11_CACHE_RES_FEEDBACK=<frame>` (`=1` → 64). Requires `P11_CACHE_ADAPTIVE_RES`.
+    cache_res_feedback_frame: u32,
     /// Track C0-fix: surface-cache relight CONVERGE mode — K-cycle deterministic gather jitter +
     /// running-mean α=1/(1+N) (reference radiosity NumFramesAccumulated), so a static scene's cache
     /// actually reaches a fixed point and the measured freeze latch can arm. 0 = legacy (fixed-alpha
@@ -2982,6 +2987,16 @@ impl App {
         // B2' screen-hit early-out (see the field docs). Content opt-in.
         let reflect_screen_hit =
             !gallery_scene && std::env::var_os("P_REFLECT_SCREEN_HIT").is_some();
+        // C2b: one-shot feedback re-layout frame (see the field docs). Content opt-in.
+        let cache_res_feedback_frame = if gallery_scene {
+            0
+        } else {
+            std::env::var("P11_CACHE_RES_FEEDBACK")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|v| if v == 1 { 64 } else { v })
+                .unwrap_or(0)
+        };
         // Track C0-fix: static-scene convergence seams (see the field docs). Content opt-in.
         let cache_converge = if gallery_scene {
             0
@@ -3444,6 +3459,7 @@ impl App {
             reflect_prefilter,
             reflect_glossy_spp,
             reflect_screen_hit,
+            cache_res_feedback_frame,
             cache_converge,
             gi_stable,
             ssr_history_clamp,
@@ -5360,6 +5376,19 @@ impl App {
         if self.gdf_hybrid || self.swrt_reflect {
             self.reflect.prepare_history(&self.device, cw, ch)?;
         }
+        // C2b: one-shot feedback re-layout — read the desired-res feedback the reflection has
+        // been recording, re-normalise to the same texel budget, rebuild the adaptive layout and
+        // reallocate the atlas (wait_idle: no frame in flight may still read the old buffers),
+        // then force a fresh capture + reset relight so the new layout re-converges.
+        if self.cache_res_feedback_frame != 0
+            && self.frame_no == self.cache_res_feedback_frame as u64
+        {
+            self.device.wait_idle()?;
+            if self.gdf.relayout_from_feedback(&self.device)? {
+                self.scene_cache_captured = false;
+                self.scene_cache_reset = true;
+            }
+        }
         // Stochastic SSR runs at half-res; (re)allocate its temporal accumulation buffers.
         let (hcw, hch) = (cw.div_ceil(2), ch.div_ceil(2));
         if self.swrt_reflect && self.ssr_stochastic && self.reflect.has_ssr_resolve() {
@@ -5907,6 +5936,11 @@ impl App {
                 let c = match self.gdf.surface_cache_layout() {
                     Some(l) => c | ((l + 1) << 24),
                     None => c,
+                };
+                // C2b: the desired-res feedback buffer rides cache.y bits 8..15 (0 = off).
+                let p = match self.gdf.card_res_feedback_index() {
+                    Some(f) => p | ((f + 1) << 8),
+                    None => p,
                 };
                 let t = t & 0xFF;
                 // Pack the MIP pyramid into the tile slot: tile | max_mip<<8 | mip_index<<16 (all
