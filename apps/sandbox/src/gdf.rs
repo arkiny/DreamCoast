@@ -1002,6 +1002,7 @@ impl GdfSystem {
     /// buffers (captured geometry: `cache_pos` = hit pos + valid, `cache_albedo`). `cards`
     /// is the host-built card-record byte buffer (64 B / card). No-op without the capture
     /// pipeline. The card tile edge is `CARD_TILE`; the atlas is `num_cards * tile²` texels.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_surface_cache(
         &mut self,
         device: &Device,
@@ -1012,6 +1013,10 @@ impl GdfSystem {
         // C2a adaptive resolution: one pow2 tile edge per card (same texel budget as the uniform
         // atlas, redistributed by camera relevance). `None` = the legacy uniform tile.
         card_res: Option<&[u32]>,
+        // Track C card-lookup grid: the caller resolves it (tier default + `P_CACHE_GRID` env
+        // override) so the tier table stays the single source of truth; the grid build is still
+        // gated so the two extra bindless slots are only consumed when the consumer exists.
+        build_grid: bool,
     ) -> anyhow::Result<()> {
         if self.cache_capture_pipeline.is_none() || num_cards == 0 {
             return Ok(());
@@ -1088,10 +1093,9 @@ impl GdfSystem {
         }
         self.num_cards = num_cards;
         self.cache_frame = 0;
-        // Track C prerequisite: the card-lookup acceleration grid (content reflection opt-in —
-        // the build is env-gated too so the two extra bindless slots are only consumed when the
-        // consumer exists).
-        if std::env::var_os("P_CACHE_GRID").is_some() {
+        // Track C prerequisite: the card-lookup acceleration grid (caller-resolved: tier default
+        // + `P_CACHE_GRID` override).
+        if build_grid {
             self.build_card_grid(device, cards)?;
         }
         Ok(())

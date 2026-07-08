@@ -1372,6 +1372,24 @@ impl App {
         // The gallery is the only scene with the GDF/HW-RT path; glTF + levels + worlds
         // use the captured-cube IBL (forced via `legacy_ibl` below).
         let gallery_scene = !world_mode && level_select.is_none() && scene_gltf_path.is_none();
+        // RenderQuality tier (Stage D): `RENDER_QUALITY=low|med|high` (unset => platform default —
+        // an Apple GPU maps to the aggressive `Apple` tier, every other adapter stays on the legacy
+        // `Med` baseline). Resolved HERE, before the level build, because load-time knobs (the
+        // surface-cache card grid / adaptive res / mesh capture) already need the tier; the
+        // per-frame knobs below resolve against the same `base`. The gallery is the byte-identical
+        // path-tracer anchor, so it resolves against the fixed legacy `gallery_preset()` instead of
+        // the active tier — structurally, so a new tier knob can't break the anchor by forgetting a
+        // per-site `if gallery_scene { .. }` force. Each knob is
+        // `env_override.unwrap_or(base.<knob>).clamp(..)`: an explicit `P11_*`/`P_*` env always
+        // wins over the tier. The UI live-swap re-derives from the same `base` (RenderQuality
+        // combo) so the two resolution paths can never drift.
+        let device_info = device.device_info();
+        let quality = quality::RenderQuality::from_env_for_device(&device_info);
+        let base = if gallery_scene {
+            quality::gallery_preset()
+        } else {
+            quality::preset(quality)
+        };
         // Resolve the virtual-geometry mode now that the scene kind + caps are known (see `vgeo_env`).
         let vgeo_mode: u32 =
             vgeo_env.unwrap_or((!gallery_scene && device.capabilities().atomic_int64) as u32);
@@ -2315,18 +2333,19 @@ impl App {
                 // C2a adaptive card resolution (opt-in): redistribute the SAME texel budget as
                 // the uniform atlas by camera relevance — near/large cards up to 64², far/small
                 // down to 8² — so the cache carries detail where reflections actually read it.
-                let card_res: Option<Vec<u32>> =
-                    if !gallery_scene && quality::env_bool("P11_CACHE_ADAPTIVE_RES", false) {
-                        Some(fuse::assign_card_res(
-                            &cards,
-                            &card_cam,
-                            8,
-                            64,
-                            (num_cards as u64) * (cache_tile as u64) * (cache_tile as u64),
-                        ))
-                    } else {
-                        None
-                    };
+                let card_res: Option<Vec<u32>> = if !gallery_scene
+                    && quality::env_bool("P11_CACHE_ADAPTIVE_RES", base.cache_adaptive_res)
+                {
+                    Some(fuse::assign_card_res(
+                        &cards,
+                        &card_cam,
+                        8,
+                        64,
+                        (num_cards as u64) * (cache_tile as u64) * (cache_tile as u64),
+                    ))
+                } else {
+                    None
+                };
                 gdf.build_surface_cache(
                     &device,
                     &cards,
@@ -2334,6 +2353,9 @@ impl App {
                     cache_tile,
                     card_albedo,
                     card_res.as_deref(),
+                    // Track C card grid: pick-identical lookup acceleration (tier default +
+                    // `P_CACHE_GRID` override; content only — the gallery keeps the legacy scan).
+                    !gallery_scene && quality::env_bool("P_CACHE_GRID", base.cache_grid),
                 )?;
                 // C1 mesh-triangle capture (opt-in): consolidated content geometry (the same
                 // layout as the HWRT hit-lighting table, built independently of RT capability)
@@ -2341,7 +2363,9 @@ impl App {
                 // drawable). The capture then reads per-texel interpolated-UV texture albedo
                 // (+ opacity) instead of one flat stamped colour per drawable — the surface
                 // cache finally carries the curtain patterns a reflection should show.
-                if !gallery_scene && quality::env_bool("P11_CARD_MESH_CAPTURE", false) {
+                if !gallery_scene
+                    && quality::env_bool("P11_CARD_MESH_CAPTURE", base.card_mesh_capture)
+                {
                     let draw_list = world.draw_list();
                     match mesh::build_content_hit_table(
                         &device,
@@ -2481,25 +2505,8 @@ impl App {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         // RenderQuality tier (Stage D): `RENDER_QUALITY=low|med|high` (unset => platform default).
-        // The platform default consults the GPU identity (macOS perf, axis A): an Apple GPU maps to
-        // the aggressive `Apple` tier, every other / unknown GPU (incl. all VK/D3D12 adapters) stays
-        // on `Med` = the legacy no-reg baseline. An explicit `RENDER_QUALITY` value always wins over
-        // the platform default. `qp` is the single tier→knob table; each knob below reads its own env
-        // first and falls back to `qp.*`, so an explicit `P11_*`/`SHADOW_*`/`RENDER_SCALE`/`SSAO`
-        // override always wins over the tier.
-        let device_info = device.device_info();
-        let quality = quality::RenderQuality::from_env_for_device(&device_info);
-        // Scalability resolution base (single source of truth): the gallery is the byte-identical
-        // path-tracer anchor, so its knobs resolve against a fixed legacy preset rather than the
-        // active tier — structurally, so a new tier knob can't break the anchor by forgetting a
-        // per-site `if gallery_scene { .. }` force. Content scenes resolve against the tier preset.
-        // Each knob below is `env_override.unwrap_or(base.<knob>).clamp(..)`; the UI live-swap uses
-        // the same `base` (see the RenderQuality combo) so the two paths can never drift.
-        let base = if gallery_scene {
-            quality::gallery_preset()
-        } else {
-            quality::preset(quality)
-        };
+        // (`device_info` / `quality` / `base` were resolved before the level build — the load-time
+        // cache knobs needed them; see the tier block after `gallery_scene`.)
 
         // Phase 16 (HWRT hybrid): opt-in hardware-ray-traced reflections, resolved as a scalability
         // option — the tier preset drives the default, the env vars override (`env_bool`). `P_HWRT`
@@ -2960,11 +2967,13 @@ impl App {
             .unwrap_or(8.0)
             .clamp(1.0, 16.0);
         // Track A5: blue-noise stochastic reflection bundle (frame-varying + blue-noise + A1 + A4).
-        // Content opt-in; default off (content sequence unchanged, gallery anchor untouched).
+        // Tier default (Apple runs it; the other tiers keep it off pending DX≡VK) + env override.
+        // The gallery anchor never runs it.
         let reflect_stochastic =
-            !gallery_scene && std::env::var_os("P_REFLECT_STOCHASTIC").is_some();
+            !gallery_scene && quality::env_bool("P_REFLECT_STOCHASTIC", base.reflect_stochastic);
         // B2' rough-prefilter split threshold. `P_REFLECT_PREFILTER=1` = the reference-like default
-        // (0.4); an explicit fraction in (0,1) tunes it. 0 / unset / gallery = off (anchor untouched).
+        // (0.4); an explicit fraction in (0,1) tunes it; 0 = off. Unset = tier default (Apple 0.4);
+        // gallery = off (anchor untouched).
         let reflect_prefilter = if gallery_scene {
             0.0
         } else {
@@ -2972,21 +2981,22 @@ impl App {
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .map(|v| if v == 1.0 { 0.4 } else { v.clamp(0.0, 0.996) })
-                .unwrap_or(0.0)
+                .unwrap_or(base.reflect_prefilter)
         };
         // B2' glossy sample density: K GGX rays/pixel/frame for the stochastic glossy band.
+        // Unset = tier default (Apple 4 — measured ≈ K=1 cost with prefilter + screen-hit).
         let reflect_glossy_spp = if gallery_scene {
             1
         } else {
             std::env::var("P_REFLECT_GLOSSY_SPP")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(1)
+                .unwrap_or(base.reflect_glossy_spp)
                 .clamp(1, 32)
         };
-        // B2' screen-hit early-out (see the field docs). Content opt-in.
+        // B2' screen-hit early-out (see the field docs). Tier default (Apple on) + env override.
         let reflect_screen_hit =
-            !gallery_scene && std::env::var_os("P_REFLECT_SCREEN_HIT").is_some();
+            !gallery_scene && quality::env_bool("P_REFLECT_SCREEN_HIT", base.reflect_screen_hit);
         // C2b: one-shot feedback re-layout frame (see the field docs). Content opt-in.
         let cache_res_feedback_frame = if gallery_scene {
             0
@@ -4465,6 +4475,10 @@ impl App {
                 firefly_clamp,
                 reflect_max_roughness,
                 ssr_stochastic,
+                reflect_stochastic,
+                reflect_prefilter,
+                reflect_glossy_spp,
+                reflect_screen_hit,
                 profiler_on,
                 gpu_timings,
                 async_compute_supported,
@@ -4574,6 +4588,14 @@ impl App {
                         *firefly_clamp = base.firefly_clamp;
                         *shadow_softness = base.shadow_softness;
                         *shadow_taps = base.shadow_taps.clamp(1, 16);
+                        // Reflection-quality v2 per-frame knobs (the load-time cache knobs —
+                        // grid / adaptive res / mesh capture — are fixed at level build). The
+                        // record paths carry their own capability gates (pipeline presence,
+                        // lit-history sentinel), so a tier can't enable what the device lacks.
+                        *reflect_stochastic = base.reflect_stochastic;
+                        *reflect_prefilter = base.reflect_prefilter;
+                        *reflect_glossy_spp = base.reflect_glossy_spp.clamp(1, 32);
+                        *reflect_screen_hit = base.reflect_screen_hit;
                     }
                     ui.text(format!(
                         "validation: {}",
