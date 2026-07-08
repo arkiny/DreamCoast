@@ -239,6 +239,8 @@ fn defines_for(target: &str, key: &str) -> &'static [(&'static str, &'static str
         (false, "gdf_gi_hwrt_cs") => &[("HWRT_GI", "1")],
         (true, "gdf_reflect_hwrt_cs") => &[("RT_METAL_TARGET", "1"), ("HWRT_REFLECT", "1")],
         (false, "gdf_reflect_hwrt_cs") => &[("HWRT_REFLECT", "1")],
+        (true, "gdf_reflect_screen_cs") => &[("RT_METAL_TARGET", "1"), ("SCREEN_HIT", "1")],
+        (false, "gdf_reflect_screen_cs") => &[("SCREEN_HIT", "1")],
         (true, _) => &[("RT_METAL_TARGET", "1")],
         (false, _) => &[],
     }
@@ -1070,6 +1072,16 @@ const JOBS: &[Job] = &[
         entry: "csMain",
         stage: "compute",
         key: "gdf_reflect_hwrt_cs",
+    },
+    // B2' screen-hit early-out: the same reflection shader with the SW screen-color-at-hit march
+    // compiled in (`SCREEN_HIT`, via `defines_for`) — a validated on-screen hit takes the previous
+    // frame's full-res lit radiance and skips the GDF march + cache shade. Binds the globals UBO
+    // (prev_view_proj). Loaded only when `P_REFLECT_SCREEN_HIT` is opted in.
+    Job {
+        src: "gdf_reflect.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_reflect_screen_cs",
     },
     // Phase 11 Stage C (C7): hybrid reflection composite (SSR over GDF / sky).
     Job {

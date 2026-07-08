@@ -963,6 +963,14 @@ struct App {
     /// reconstructs all K neighbour rays. `P_REFLECT_GLOSSY_SPP=<K>` (1 = legacy single ray, the
     /// default; content SW trace only). Rides `max_steps` bits 24..29.
     reflect_glossy_spp: u32,
+    /// B2' screen-hit early-out: per-ray screen-trace prepass in the SW reflection (the `SCREEN_
+    /// HIT` permutation) — a validated on-screen hit reads the previous frame's FULL-RES lit
+    /// radiance and skips the GDF march + surface-cache shade. Both the budget that makes
+    /// `reflect_glossy_spp` affordable (most indoor reflected surfaces are on screen) and a
+    /// strictly better colour (the HWRT screen-color-at-hit sharpness win, SW equivalent).
+    /// `P_REFLECT_SCREEN_HIT=1` (content only; gallery keeps the plain permutation → anchor
+    /// untouched).
+    reflect_screen_hit: bool,
     /// Track C0-fix: surface-cache relight CONVERGE mode — K-cycle deterministic gather jitter +
     /// running-mean α=1/(1+N) (reference radiosity NumFramesAccumulated), so a static scene's cache
     /// actually reaches a fixed point and the measured freeze latch can arm. 0 = legacy (fixed-alpha
@@ -2907,6 +2915,9 @@ impl App {
                 .unwrap_or(1)
                 .clamp(1, 32)
         };
+        // B2' screen-hit early-out (see the field docs). Content opt-in.
+        let reflect_screen_hit =
+            !gallery_scene && std::env::var_os("P_REFLECT_SCREEN_HIT").is_some();
         // Track C0-fix: static-scene convergence seams (see the field docs). Content opt-in.
         let cache_converge = if gallery_scene {
             0
@@ -3368,6 +3379,7 @@ impl App {
             reflect_stochastic,
             reflect_prefilter,
             reflect_glossy_spp,
+            reflect_screen_hit,
             cache_converge,
             gi_stable,
             ssr_history_clamp,
@@ -6402,6 +6414,7 @@ impl App {
                         }
                     },
                     self.hwrt,
+                    self.reflect_screen_hit,
                     self.deferred.globals_buffer(),
                     globals_offset,
                     self.reflect.lit_hist_read_index(),
@@ -7115,6 +7128,7 @@ impl App {
                 self.gdf_cone_k,
                 [u32::MAX; 4], // viz path: no adaptive skip
                 self.hwrt,
+                false, // viz: plain trace (no screen-hit early-out)
                 self.deferred.globals_buffer(),
                 globals_offset,
                 self.reflect.lit_hist_read_index(),
@@ -7211,6 +7225,7 @@ impl App {
                     self.gdf_cone_k,
                     [u32::MAX; 4], // standalone viz: no adaptive skip
                     self.hwrt,
+                    false, // standalone viz: plain trace (no screen-hit early-out)
                     self.deferred.globals_buffer(),
                     globals_offset,
                     self.reflect.lit_hist_read_index(),

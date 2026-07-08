@@ -26,6 +26,9 @@ pub(crate) struct ReflectSystem {
     /// TLAS instead of the GDF march, then shades the hit from the surface cache). Built only on
     /// RT-capable devices; bound in place of `reflect_pipeline` when `P_HWRT` is opted in.
     reflect_hwrt_pipeline: Option<ComputePipeline>,
+    /// B2' screen-hit early-out: the `SCREEN_HIT` permutation (SW march with a screen-trace
+    /// prepass per ray — validated on-screen hits read the prev-frame full-res lit history).
+    reflect_screen_pipeline: Option<ComputePipeline>,
     composite_pipeline: Option<ComputePipeline>, // C7 hybrid composite
     lit_history_pipeline: Option<ComputePipeline>, // C7b lit-color history capture
     resolve_pipeline: Option<ComputePipeline>,   // A1 spatial ratio-estimator resolve (trace res)
@@ -135,6 +138,19 @@ impl ReflectSystem {
         } else {
             None
         };
+        // B2' screen-hit early-out permutation — same push layout (240B), marches the reflection
+        // ray against the depth buffer first and takes the previous frame's full-res lit radiance
+        // on a validated on-screen hit (skipping the GDF march + cache shade). `uniform_buffer:
+        // true` binds the globals UBO for the reprojection (`prev_view_proj`), like the HWRT B.2
+        // screen path whose validation law it reuses.
+        let reflect_screen_pipeline = compute(
+            dreamcoast_shader::gdf_reflect_screen_cs_spirv,
+            dreamcoast_shader::gdf_reflect_screen_cs_dxil,
+            dreamcoast_shader::gdf_reflect_screen_cs_metallib,
+            "gdf_reflect_screen",
+            240,
+            true,
+        )?;
         let composite_pipeline = compute(
             dreamcoast_shader::reflect_composite_cs_spirv,
             dreamcoast_shader::reflect_composite_cs_dxil,
@@ -183,6 +199,7 @@ impl ReflectSystem {
             ssr_resolve_pipeline,
             reflect_pipeline,
             reflect_hwrt_pipeline,
+            reflect_screen_pipeline,
             composite_pipeline,
             lit_history_pipeline,
             resolve_pipeline,
@@ -951,9 +968,15 @@ impl ReflectSystem {
         // still shaded from the surface cache. Falls back to the SW pipeline if the permutation is
         // absent (non-RT device). Default false ⇒ SW march (gallery byte-identical).
         hwrt: bool,
+        // B2' screen-hit early-out: run the `SCREEN_HIT` SW permutation (per-ray screen-trace
+        // prepass; validated on-screen hits read the prev-frame full-res lit history and skip the
+        // GDF march + cache shade). SW only (ignored when `hwrt` wins); needs the lit history —
+        // sentinel index ⇒ the shader falls through to the plain march.
+        screen_hit: bool,
         // Phase 16 B.2 screen-color-at-hit: the globals UBO (for `prev_view_proj`) + the PREVIOUS
-        // frame's lit-radiance history index. Consumed only on the HWRT path (the HW pipeline binds
-        // globals; the index rides the march-cap push field, unused there). Ignored by the SW path.
+        // frame's lit-radiance history index. Consumed on the HWRT path (the index rides the
+        // march-cap push field, unused there) AND the SCREEN_HIT path (the index rides the
+        // constant-hit-albedo push slot, dead for content). Ignored by the plain SW path.
         globals: &'a Buffer,
         globals_offset: u64,
         lit_hist: u32,
@@ -964,9 +987,12 @@ impl ReflectSystem {
         hit_lighting: Option<(u32, u32, u32)>,
     ) -> ResourceId {
         let use_hwrt = hwrt && self.reflect_hwrt_pipeline.is_some();
+        let use_screen = !use_hwrt && screen_hit && self.reflect_screen_pipeline.is_some();
         let hit_lighting = if use_hwrt { hit_lighting } else { None };
         let pipe = if use_hwrt {
             self.reflect_hwrt_pipeline.as_ref()
+        } else if use_screen {
+            self.reflect_screen_pipeline.as_ref()
         } else {
             self.reflect_pipeline.as_ref()
         }
@@ -1046,9 +1072,9 @@ impl ReflectSystem {
                     Some((v, i, t)) => ([v, i, t], frame | 0x8000_0000),
                     None => (albedo_rgb, frame),
                 };
-                // B.2: the HWRT pipeline binds the globals UBO for the screen-color-at-hit
-                // reprojection (`prev_view_proj`); the SW pipeline has no globals binding.
-                if use_hwrt {
+                // B.2 / B2': the HWRT and SCREEN_HIT pipelines bind the globals UBO for the
+                // screen reprojection (`prev_view_proj`); the plain SW pipeline has no globals.
+                if use_hwrt || use_screen {
                     cmd.set_globals(globals, globals_offset);
                 }
                 cmd.bind_compute_pipeline(pipe);
@@ -1071,7 +1097,14 @@ impl ReflectSystem {
                     0.0,  // world ground plane at y = 0
                     diag, // sample distance clamp
                     diag, // reflection ray max distance
-                    0.7,  // constant hit-albedo fallback (sentinel albedo => achromatic, pre-C8a)
+                    // Constant hit-albedo fallback (sentinel albedo => achromatic, pre-C8a). The
+                    // SCREEN_HIT permutation overloads this dead-for-content slot with the lit-
+                    // history index (its shader hard-codes 0.7 for the fallback instead).
+                    if use_screen {
+                        f32::from_bits(lit_hist & 0x7FFF_FFFF)
+                    } else {
+                        0.7
+                    },
                     // sky_fill slot: content (vol on) overloads it with the IBL irradiance cube index
                     // (the shader reads it only on the vol_on skylight-fill path); gallery keeps 0.25.
                     if gi_vol_base != u32::MAX {

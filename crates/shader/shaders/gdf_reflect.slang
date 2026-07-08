@@ -73,10 +73,11 @@ SkipCfg unpack_skip()
 [[vk::push_constant]]
 ConstantBuffer<ReflectPush> pc : register(b0, space0);
 
-#ifdef HWRT_REFLECT
+#if defined(HWRT_REFLECT) || defined(SCREEN_HIT)
 // Per-frame globals (set 1 / b1) — the same UBO the deferred PBR / SSR passes bind (opted into via
 // the compute pipeline's `uniform_buffer`). Only `prev_view_proj` is read, for the B.2 screen-color-
-// at-hit reprojection; the layout must match the host `Globals` (mirrors ssr.slang's subset).
+// at-hit reprojection (HWRT) / the B2' screen-hit early-out march (SW SCREEN_HIT permutation); the
+// layout must match the host `Globals` (mirrors ssr.slang's subset).
 struct Globals
 {
     float4 camera_pos;
@@ -170,7 +171,13 @@ float scene_occ(float3 p)
 // distance field's voxel grid; gives colored reflections instead of grey.
 float3 albedo_at(float3 p)
 {
+#ifdef SCREEN_HIT
+    // In this permutation `params.y` carries the lit-history buffer index (content always binds
+    // the albedo volumes, so the constant-albedo fallback slot is dead); keep a sane constant.
+    return cm_albedo(reflect_clip(), p, 0.7);
+#else
     return cm_albedo(reflect_clip(), p, pc.params.y);
+#endif
 }
 
 // Cone-blurred per-voxel albedo for the UNcovered (analytic) reflection path. The surface cache is
@@ -273,6 +280,67 @@ float3 sample_gi_irradiance(uint base, float3 p, float3 n)
                + (2.0 / 3.0) * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]);
     return max(e, float3(0.0, 0.0, 0.0));
 }
+
+#ifdef SCREEN_HIT
+// B2' screen-hit early-out — the SW screen-color-at-hit. March the reflection ray a short distance
+// and test each sample against the depth buffer; where the ray provably hits an on-screen surface,
+// take that surface's FULL-RES lit radiance from the previous frame's history instead of paying the
+// GDF sphere-march + surface-cache shade. That is both the trace budget that pays for the B2' K
+// rays (most indoor reflected surfaces ARE on screen) and a strictly better colour (exact full-res
+// lighting vs 32² card texels — the same reason the HWRT screen-color-at-hit is the sharpness win).
+// Projection uses `globals.prev_view_proj` and validates against the CURRENT depth buffer with the
+// same tolerance law as the Phase 16 B.2 HWRT screen path, so camera motion fails the validation
+// (falls back to the GDF march) instead of smearing. Returns true + colour + hit ray-parameter.
+bool screen_trace(float3 p, float3 dir, float sy, float bias, float max_dist, uint lit_hist,
+                  out float3 col, out float thit)
+{
+    col = float3(0.0, 0.0, 0.0);
+    thit = 0.0;
+    if (lit_hist >= 0x7FFFFFFFu)
+        return false; // 0x7FFFFFFF = no history bound (same sentinel as the HWRT path)
+    float diag = length(GDF_MAX - GDF_MIN);
+    float range = min(max_dist, 0.5 * diag);
+    // Exponential march: fine near the surface (contact reflections), coarse far.
+    const int STEPS = 24;
+    float t = max(bias * 2.0, range * 0.004);
+    float grow = pow(range / t, 1.0 / float(STEPS)); // t · grow^STEPS == range
+    [loop]
+    for (int i = 0; i < STEPS; i++)
+    {
+        t *= grow;
+        float3 rp = p + dir * t;
+        float4 pclip = mul(globals.prev_view_proj, float4(rp, 1.0));
+        if (pclip.w <= 0.0)
+            return false; // marched behind the camera — not an on-screen ray
+        float3 pndc = pclip.xyz / pclip.w;
+        float2 puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
+        if (!(all(puv >= 0.0) && all(puv <= 1.0)))
+            return false; // left the screen — the GDF owns the rest of the ray
+        float sd = g.textures[pc.depth_index].SampleLevel(g.samp, puv, 0.0).r;
+        if (sd >= 1.0)
+            continue; // background pixel — nothing to hit here
+        float2 vndc = float2(puv.x * 2.0 - 1.0, (puv.y * 2.0 - 1.0) * sy);
+        float4 vw = mul(pc.inv_view_proj, float4(vndc, sd, 1.0));
+        float3 sworld = vw.xyz / vw.w;
+        // Acceptance: the depth-buffer surface at `puv` must BE the ray sample (tolerance grows
+        // with t — a far sample tolerates more parallax). Mirrors the HWRT B.2 validation.
+        float vtol = 0.01 * diag + t * 0.02;
+        if (distance(sworld, rp) < vtol)
+        {
+            // lit history is FULL-res; index it with the depth texture's own dimensions.
+            uint fw, fh;
+            g.textures[pc.depth_index].GetDimensions(fw, fh);
+            int2 pp = clamp(int2(puv * float2(fw, fh)), int2(0, 0),
+                            int2(int(fw) - 1, int(fh) - 1));
+            uint pidx = uint(pp.y) * fw + uint(pp.x);
+            col = asfloat(g.storage_buffers[lit_hist].Load4(pidx * 16u)).rgb;
+            thit = t;
+            return true;
+        }
+    }
+    return false;
+}
+#endif
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -440,6 +508,21 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         float t = bias;
         bool hit = false;
         float3 hp = p;
+        // B2' screen-hit early-out: a validated on-screen hit takes the previous frame's full-res
+        // lit radiance and skips the GDF march + cache shade for this sample. Prefiltered pixels
+        // skip it — their colour must be the cache CONE average, not one sharp full-res sample.
+        bool screen_done = false;
+        float3 screen_col = float3(0.0, 0.0, 0.0);
+#ifdef SCREEN_HIT
+        if (content_refl && !prefiltered)
+        {
+            float t_screen;
+            screen_done = screen_trace(p, dir, sy, bias, max_dist, asuint(pc.params.y),
+                                       screen_col, t_screen);
+            if (screen_done)
+                t = t_screen; // a miss must NOT touch t (the GDF march starts at `bias`)
+        }
+#endif
 #ifdef HWRT_REFLECT
         // Phase 16 hybrid: trace the reflection ray against the REAL triangle BVH (the scene TLAS) with
         // an inline RayQuery instead of the GDF sphere-march — exact hit points, no distance-field
@@ -478,7 +561,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         // cap (96, upper bits zero) → byte-identical.
         int max_steps = int(max(pc.max_steps & 0xFFFFu, 1u));
         const float HIT_EPS = 0.001;
-        for (int i = 0; i < max_steps; i++)
+        for (int i = 0; i < max_steps && !screen_done; i++)
         {
             float3 rp = p + dir * t;
             float d = scene_march(rp);
@@ -505,7 +588,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         // footprint the wide lobe would have integrated.
         float alpha_pf = roughness * roughness;
         float cone_slope = prefiltered ? clamp(2.0 * alpha_pf, 0.08, 2.0) : 0.08;
-        if (hit)
+        if (screen_done)
+        {
+            // B2' screen hit: the previous frame's full-res lit radiance at the validated on-screen
+            // hit — no march, no cache shade (exact colour, ~free).
+            color = screen_col;
+        }
+        else if (hit)
         {
             float3 hn = scene_normal(hp);
             bool cached = false;

@@ -246,6 +246,28 @@ roughness ≥ 임계 픽셀은 스토캐스틱 GGX 대신 **결정적 미러 레
 K=1에서도 30.5ms** — `sample_surface_cache_cone`이 히트당 **전 카드 선형 루프**(O(num_cards))라서.
 K=8+HQ = 245ms. 카드 룩업 가속(공간 해시/per-object 인덱스)이 Track C의 선행 과제로 승격되어야 함.
 
+#### B2' 스크린-히트 조기 종료 구현 완료 (opt-in `P_REFLECT_SCREEN_HIT=1`)
+신규 `SCREEN_HIT` permutation(`gdf_reflect_screen_cs`, globals UBO 바인드): per-ray 스크린 마치
+프리패스(24스텝 지수 간격, `prev_view_proj` 투영 + 현재 depth 검증 — HWRT B.2와 동일 허용 법칙,
+`vtol = 0.01·diag + t·0.02`) — 검증된 온스크린 히트는 **prev 프레임 풀해상 lit 히스토리 색**을 읽고
+GDF 마치 + 카드 셰이드를 통째로 스킵. lit_hist 인덱스는 이 permutation 한정 `params.y`(콘텐츠에서
+죽은 상수 albedo 폴백 슬롯) 오버로드, push 무성장. 프리필터 픽셀은 제외(콘 평균이어야 함). 카메라
+이동 시 검증 실패 → GDF 폴백(스미어 없음).
+
+**검증/측정 (glossyball, Metal RELEASE, converge 스택):**
+- **품질 격변: 볼(r=0.3) 반사가 milky 워시 → 진짜 글로시 홀 반사**(커튼·아치·바닥, 올바른 색/콘트라스트)
+  — HWRT 트랙의 "screen-color-at-hit이 선명함의 핵심"이 SW 경로에서 재현됨.
+- **비용: 풀 스택(`SPP=8 + SCREEN_HIT + PREFILTER=1`) gdf_reflect 10.1ms, `SPP=4`면 6.4ms =
+  K=1 베이스라인(6.2ms)과 동급.** 프리필터가 러프 바닥을 K루프에서 제거(45.6→10.1의 대부분),
+  스크린-히트가 볼 레이 비용 지불. resolve 1.4→0.18ms(passthrough 확대).
+- 프레임간 플리커 0.319(vs 스토캐스틱 베이스 0.368, K8-GDF전용 0.118) — **잔여 = lit 히스토리가
+  반사를 포함한 합성 색이라는 피드백**(A6에서 규명한 것과 동일 구조; HWRT B.2도 같은 속성). 근본
+  해소는 B1(검증 스크린트레이스 하드 핸드오프 + 감쇠) 몫.
+- 갤러리 `af70c1a5` byte-identical PASS, clippy/fmt clean.
+
+**권장 검증 스택(현재):** `P_CACHE_CONVERGE=32 P_GI_STABLE=1 P_REFLECT_STOCHASTIC=1
+P_REFLECT_GLOSSY_SPP=4..8 P_REFLECT_SCREEN_HIT=1 P_REFLECT_PREFILTER=1`
+
 ### Track B — trace 계층 (온스크린 정확도, HWRT 없이 미러 선명)
 
 #### B1. 검증된 screen-trace-first
