@@ -1160,6 +1160,11 @@ impl ReflectSystem {
         // Roughness-scaled blur radius (texels) that smooths the low-res reflection's blocky
         // "sparkle" on rough surfaces while keeping its correct local colour. 0 = off (gallery).
         rough_blur: f32,
+        // B1-lite hard handoff: zero the SSR blend entirely — the GDF image (SCREEN_HIT trace)
+        // already carries validated on-screen colours per ray, so blending the unvalidated SSR
+        // would double-count them and re-introduce its feedback wiggle. The `ssr` input is then
+        // a stand-in (never sampled).
+        ssr_cut: bool,
     ) -> ResourceId {
         let pipe = self
             .composite_pipeline
@@ -1191,6 +1196,7 @@ impl ReflectSystem {
                     max_roughness,
                     skip_mirror_ssr,
                     rough_blur,
+                    ssr_cut,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

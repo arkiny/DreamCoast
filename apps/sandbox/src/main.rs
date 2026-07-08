@@ -6270,7 +6270,13 @@ impl App {
                 // gate that routes off-screen / grazing bad hits to the GDF (also keeping the march
                 // VK≡DX-stable). `P11_SSR_STOCHASTIC` selects the half-res GGX trace + ratio-
                 // estimator resolve instead (the glossy path; it goes dark on sharp metals).
-                let ssr = if self.ssr_stochastic {
+                // B1-lite hard handoff: with the SCREEN_HIT trace on, the GDF path already
+                // carries VALIDATED on-screen colours per ray, so the separate unvalidated SSR
+                // blend would only double-count them and re-introduce its feedback wiggle — skip
+                // recording SSR entirely (the composite gets a hard cut) and save its cost.
+                let ssr = if self.reflect_screen_hit {
+                    None
+                } else if self.ssr_stochastic {
                     let half = Extent2D::new(hcw, hch);
                     let (ssr_a, ssr_b) = self.reflect.record_ssr(
                         &mut graph,
@@ -6303,7 +6309,7 @@ impl App {
                         self.firefly_clamp,
                         true, // stochastic GGX jitter
                     );
-                    self.reflect.record_ssr_resolve(
+                    let resolved = self.reflect.record_ssr_resolve(
                         &mut graph,
                         ssr_a,
                         ssr_b,
@@ -6329,9 +6335,11 @@ impl App {
                         } else {
                             0.15
                         },
-                    )
+                    );
+                    Some(resolved)
                 } else {
-                    self.reflect
+                    let mirror = self
+                        .reflect
                         .record_ssr(
                             &mut graph,
                             self.deferred.globals_buffer(),
@@ -6356,7 +6364,8 @@ impl App {
                             self.firefly_clamp,
                             false, // mirror ray (composite handles roughness via the GDF prefilter)
                         )
-                        .0
+                        .0;
+                    Some(mirror)
                 };
                 // Stage D3 / M3-C: trace the reflection at 1/div res + bilateral upsample to full res
                 // before the temporal resolve. gdf_reflect.slang samples the G-buffer by normalized UV,
@@ -6583,7 +6592,9 @@ impl App {
                 };
                 Some(self.reflect.record_composite(
                     &mut graph,
-                    ssr,
+                    // B1-lite: SSR skipped under SCREEN_HIT — feed the GDF image in its slot
+                    // (never sampled; the hard cut zeroes ssr_trust in-shader).
+                    ssr.unwrap_or(gdf_resolved),
                     gdf_resolved,
                     g_material,
                     extent,
@@ -6600,6 +6611,7 @@ impl App {
                     } else {
                         self.reflect_rough_blur
                     },
+                    ssr.is_none(), // B1-lite hard cut: GDF/screen-hit path only
                 ))
             }
             _ => None,
@@ -7305,6 +7317,7 @@ impl App {
                     } else {
                         self.reflect_rough_blur
                     },
+                    false, // viz keeps the SSR blend (no screen-hit trace here)
                 );
                 // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
                 self.reflect.record_lit_history(

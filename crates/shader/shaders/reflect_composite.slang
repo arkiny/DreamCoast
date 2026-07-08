@@ -30,7 +30,8 @@ struct CompositePush
     float max_roughness; // SSR (screen mirror) fades out by this roughness; above it = GDF only
     uint pad0;
     float rough_blur;    // max roughness-blur radius in texels (0 = off, gallery byte-identical)
-    uint pad2;
+    uint ssr_cut;        // B1-lite hard handoff: 1 = zero the SSR blend (GDF/screen-hit path only —
+                         // the SCREEN_HIT trace already carries validated on-screen colours)
 };
 
 [[vk::push_constant]]
@@ -95,6 +96,10 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // keep SSR (its error is hidden by the broad lobe). The reference engine keeps SSR only as a
     // validated hard-switch upgrade; until that exists, the HQ GDF/cache is the cleaner mirror source.
     if (pc.pad0 == 1u && roughness < 0.1)
+        ssr_trust = 0.0;
+    // B1-lite hard handoff: the GDF image already holds validated on-screen colours (SCREEN_HIT
+    // trace) — a partial SSR blend would double-count them and re-add its feedback wiggle.
+    if (pc.ssr_cut == 1u)
         ssr_trust = 0.0;
     float ssr_lum = dot(ssr.rgb, float3(0.299, 0.587, 0.114));
     float gdf_lum = dot(gdf, float3(0.299, 0.587, 0.114));
