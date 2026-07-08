@@ -5663,7 +5663,13 @@ impl App {
             // stable (so the probe reflects the current lighting) AND the mean EMA step below eps for
             // `cache_conv_k` consecutive frames. Once latched it holds (a frozen relight stops
             // measuring, so re-evaluating would oscillate) until the epoch changes above.
-            if !self.cache_frozen {
+            //
+            // CONVERGE mode (user directive): accumulation stays CONTINUOUS — never freeze. The
+            // running-mean + K-cycle jitter reach a bounded equilibrium while relight keeps running
+            // at the tier budget, so lighting keeps being tracked; and A3 reflect-skip reuse (gated
+            // on this latch) stays off — its stale-tile stagger read as visible crawl the moment the
+            // latch first armed on content ("jitter that stops when the camera moves").
+            if !self.cache_frozen && self.cache_converge == 0 {
                 if self.cache_stable_frames >= 2 && cache_conv_delta < self.cache_conv_eps {
                     self.cache_conv_stable = self.cache_conv_stable.saturating_add(1);
                 } else {

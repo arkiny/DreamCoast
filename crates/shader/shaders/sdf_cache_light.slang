@@ -196,19 +196,21 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     uint miss_count = 0u; // gather rays that escaped to sky = this texel's sky visibility estimate
     // CONVERGE mode (params.y < 0 ⇒ K = -params.y): the legacy frame-varying seed injects FRESH white
     // noise into every relight, and a fixed-alpha EMA of white noise is an AR(1) process with a
-    // permanent variance floor α/(2-α)·σ² — the cache NEVER converges (the measured-convergence
-    // freeze can't arm). The reference engine converges because each relight is (a) a COMPLETE
-    // stratified hemisphere estimate (16 rays/probe, radiosity) and (b) drawn from a DETERMINISTIC
-    // direction set (the radiance cache disables trace jitter outright: "we want stable lighting").
-    // Here: a FIXED per-texel seed (no frame term — the host raises spp to K so one relight is a
-    // complete estimate), so a static texel's relight is IDEMPOTENT up to the multibounce transient;
-    // the running mean below (α = 1/(1+N)) smooths that transient, which decays geometrically
-    // (per-bounce gain = albedo < 1), so the EMA step falls below the freeze epsilon and the
-    // existing measured-convergence latch finally arms → the cache reaches a true fixed point.
+    // permanent variance floor α/(2-α)·σ² — the cache NEVER settles. The reference engine keeps
+    // accumulating CONTINUOUSLY (radiosity never stops) but converges statistically: its per-update
+    // jitter cycles over a DETERMINISTIC period equal to the accumulation window
+    // (Hammersley(TemporalIndex % MaxFramesAccumulated)) and it blends with a running mean
+    // α = 1/(1+N) saturating at that window (NumFramesAccumulated atlas). Here: the jitter index is
+    // this texel's RELIGHT ordinal (frame/period — one step per relight, regardless of amortization
+    // or the off-screen HIDDEN_MULT) modulo K, so K distinct stratified ray sets cycle forever; the
+    // running mean below averages the whole cycle exactly, after which the input is PERIODIC and the
+    // equilibrium is a bounded ripple ≈ σ/(1+K) — continuous accumulation, no freeze required, and
+    // lighting changes keep being tracked (a large change re-arms via the host epoch reset).
     // params.y > 0 (gallery / legacy) keeps the frame-varying seed = byte-identical.
     bool converge = pc.params.y < 0.0;
     uint conv_k = converge ? max(uint(-pc.params.y + 0.5), 1u) : 1u;
-    uint seed = converge ? ((t * 9277u) | 1u) : ((t * 9277u + pc.frame * 26699u) | 1u);
+    uint jitter = converge ? ((pc.frame / period) % conv_k) : pc.frame;
+    uint seed = (t * 9277u + jitter * 26699u) | 1u;
     float bias = pc.params.z;
     float maxt = pc.params.w;
     for (uint s = 0; s < spp; s++)
