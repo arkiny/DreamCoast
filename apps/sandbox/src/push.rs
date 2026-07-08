@@ -1347,6 +1347,7 @@ pub(crate) fn cache_vis_push(
     cards_index: u32,
     out_index: u32,
     num_cards: u32,
+    marks_index: u32,
 ) -> [u8; 112] {
     let mut pc = [0u8; 112];
     for (i, p) in planes.iter().enumerate() {
@@ -1358,6 +1359,8 @@ pub(crate) fn cache_vis_push(
     pc[96..100].copy_from_slice(&cards_index.to_le_bytes());
     pc[100..104].copy_from_slice(&out_index.to_le_bytes());
     pc[104..108].copy_from_slice(&num_cards.to_le_bytes());
+    // Mirror-feedback flags (u32::MAX = off): merged into the visibility priority + cleared.
+    pc[108..112].copy_from_slice(&marks_index.to_le_bytes());
     pc
 }
 

@@ -180,11 +180,17 @@ float3 card_mip_sample(uint c_base, uint c_res, uint c_mipb, float uu, float vv,
 // cone-mode sample InterlockedMax-es the pow2 resolution its footprint WANTED into the card's
 // slot, so the host can re-layout the atlas around what reflections actually read (the static
 // reference camera's distance prior under-resolves exactly those far cards).
+// `mark` (0xFFFFFFFF = off): the mirror-feedback buffer — every card this REFLECTION query
+// reads gets its flag set, and the visibility pass folds the flags into the relight priority
+// (a mirror mostly reflects OFF-SCREEN cards, which the frustum test relegates to the slow
+// HIDDEN_MULT budget; until they relight they shade from the skylight-heavy fallback and the
+// mirror shows two colour families during camera motion). Reflection-only (the GI/relight
+// consumers pass the sentinel — marking everything would erase the priority).
 float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cache_pos_index,
                                  uint cache_rad_index, uint num_cards, uint tile, float extra_tol,
                                  float sample_radius, uint mip_index, uint max_mip,
                                  uint grid_cells, uint grid_pool, uint layout, uint feedback,
-                                 out bool found)
+                                 uint mark, out bool found)
 {
     found = false;
     int best = -1;
@@ -268,6 +274,9 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
                     want <<= 1u;
                 g.storage_buffers[feedback].InterlockedMax(c * 4u, want);
             }
+            // Mirror feedback: this card feeds a reflection — boost its relight priority.
+            if (mark != 0xFFFFFFFFu)
+                g.storage_buffers[mark].InterlockedOr(c * 4u, 1u);
             acc += score * card_mip_sample(lay.x, c_res, card_mip_base(layout, c, tile), uu, vv,
                                            half_ext, sample_radius, mip_index, max_mip,
                                            cache_rad_index, cache_pos_index);
@@ -285,6 +294,9 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
     if (best < 0)
         return float3(0.0, 0.0, 0.0);
     found = true;
+    // Mirror feedback for the non-cone (single-best-card) content path.
+    if (mark != 0xFFFFFFFFu)
+        g.storage_buffers[mark].InterlockedOr(uint(best) * 4u, 1u);
 
     // NEAREST texel (primary consumers / gallery, extra_tol == 0) → byte-identical.
     if (extra_tol <= 0.0)
@@ -314,7 +326,7 @@ float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos
     uint layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
     return sample_surface_cache_cone(p, n, cards_index, cache_pos_index, cache_rad_index, num_cards,
                                      tile & 0xFFu, extra_tol, 0.0, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu,
-                                     0xFFFFFFFFu, layout, 0xFFFFFFFFu, found);
+                                     0xFFFFFFFFu, layout, 0xFFFFFFFFu, 0xFFFFFFFFu, found);
 }
 
 // Grid-accelerated variant of the legacy lookup (the relight gather's hot path — its hemisphere
@@ -329,5 +341,5 @@ float3 sample_surface_cache_grid(float3 p, float3 n, uint cards_index, uint cach
     uint layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
     return sample_surface_cache_cone(p, n, cards_index, cache_pos_index, cache_rad_index, num_cards,
                                      tile & 0xFFu, extra_tol, 0.0, 0xFFFFFFFFu, 0u, grid_cells,
-                                     grid_pool, layout, 0xFFFFFFFFu, found);
+                                     grid_pool, layout, 0xFFFFFFFFu, 0xFFFFFFFFu, found);
 }

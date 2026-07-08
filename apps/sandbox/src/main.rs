@@ -6049,6 +6049,12 @@ impl App {
                     Some(f) => p | ((f + 1) << 8),
                     None => p,
                 };
+                // Mirror feedback: the relight-priority mark buffer rides cache.y bits 16..23
+                // (0 = off). Gated with the B2 compaction knob — same Apple-only blast radius.
+                let p = match self.gdf.card_marks_index() {
+                    Some(m) if self.reflect_compact_div > 0 => p | ((m + 1) << 16),
+                    _ => p,
+                };
                 let t = t & 0xFF;
                 // Pack the MIP pyramid into the tile slot: tile | max_mip<<8 | mip_index<<16 (all
                 // ≤16 bits; 0xFFFF mip_index = no pyramid). Order the reflection after mipgen when

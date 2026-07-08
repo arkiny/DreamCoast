@@ -21,9 +21,9 @@ struct CacheVisPush
 {
     float4 planes[6];  // frustum planes (xyz = inward normal, w = d), Y-flip-free
     uint cards_index;  // card records (64 B each)
-    uint out_index;    // storage buffer: 1 uint / card (1 = visible, 0 = off-screen)
+    uint out_index;    // storage buffer: 1 uint / card (2 = mirror-read, 1 = visible, 0 = off)
     uint num_cards;
-    uint pad;
+    uint marks_index;  // mirror-feedback flags (1 uint / card; 0xFFFFFFFF = off) — merged + cleared
 };
 
 [[vk::push_constant]]
@@ -56,6 +56,17 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             visible = 0u; // fully outside this plane -> off-screen
             break;
         }
+    }
+    // Mirror feedback: a card the reflection read LAST frame outranks plain frustum visibility
+    // (2 -> the relight runs it at an accelerated period; see sdf_cache_light.slang). A mirror
+    // mostly reflects off-screen cards — without this they idle on the HIDDEN_MULT budget and
+    // shade from the skylight-heavy fallback for seconds after a camera move. Cleared here so
+    // the priority follows what the mirror is CURRENTLY reading.
+    if (pc.marks_index != 0xFFFFFFFFu)
+    {
+        if (g.storage_buffers[pc.marks_index].Load(c * 4u) != 0u)
+            visible = 2u;
+        g.storage_buffers[pc.marks_index].Store(c * 4u, 0u);
     }
     g.storage_buffers[pc.out_index].Store(c * 4u, visible);
 }

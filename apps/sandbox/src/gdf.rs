@@ -152,6 +152,10 @@ pub(crate) struct GdfSystem {
     /// Stage D2b: per-card camera-frustum visibility (1 uint/card; 1 = on-screen) driving the
     /// relight budget, + the compute pipeline that fills it. `None` until the cache is built.
     card_vis: Option<StorageBuffer>,
+    /// Mirror feedback: 1 uint/card flag the REFLECTION sampler sets for every card it reads;
+    /// the visibility pass folds it into the relight priority (off-screen cards a mirror shows
+    /// idle on the HIDDEN_MULT budget otherwise) and clears it. See surface_cache.slang.
+    card_marks: Option<StorageBuffer>,
     cache_vis_pipeline: Option<ComputePipeline>,
     /// A2-fix: host-visible 2-uint buffers (ping-pong by `cache_frame % 2`, `[sum_fp, count]`) that the
     /// relight `InterlockedAdd`s the per-channel EMA step into; the host divides to the MEAN step. It
@@ -513,6 +517,7 @@ impl GdfSystem {
             cache_light_pipeline,
             cache_mipgen_pipeline,
             card_vis: None,
+            card_marks: None,
             cache_conv: [None, None],
             cache_vis_pipeline,
             card_tile: CARD_TILE,
@@ -1081,6 +1086,14 @@ impl GdfSystem {
             stride: 4,
             indirect: false,
         })?);
+        // Mirror-feedback flags (zero-seeded; the visibility pass clears after each merge).
+        let marks = device.create_storage_buffer(&StorageBufferDesc {
+            size: (num_cards as u64) * 4,
+            stride: 4,
+            indirect: false,
+        })?;
+        marks.write(&vec![0u8; num_cards as usize * 4])?;
+        self.card_marks = Some(marks);
         // A2-fix: two host-visible convergence probes (ping-pong), each [sum_fp:u32, count:u32].
         for c in self.cache_conv.iter_mut() {
             let b = device.create_storage_buffer_host(&StorageBufferDesc {
@@ -1425,6 +1438,10 @@ impl GdfSystem {
     pub(crate) fn card_vis_index(&self) -> Option<u32> {
         Some(self.card_vis.as_ref()?.storage_index())
     }
+    /// Mirror-feedback flag buffer's bindless index (for the reflection's cache.y packing).
+    pub(crate) fn card_marks_index(&self) -> Option<u32> {
+        Some(self.card_marks.as_ref()?.storage_index())
+    }
     pub(crate) fn has_cache_visibility(&self) -> bool {
         self.cache_vis_pipeline.is_some() && self.card_vis.is_some()
     }
@@ -1613,6 +1630,11 @@ impl GdfSystem {
         let pipe = self.cache_vis_pipeline.as_ref()?;
         let cards = self.cards.as_ref()?.storage_index();
         let out = self.card_vis.as_ref()?.storage_index();
+        let marks = self
+            .card_marks
+            .as_ref()
+            .map(|b| b.storage_index())
+            .unwrap_or(u32::MAX);
         let num_cards = self.num_cards;
         let vis_ext = graph.import_external("card_vis");
         graph.add_compute_pass(
@@ -1624,7 +1646,7 @@ impl GdfSystem {
             move |ctx| {
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(pipe);
-                cmd.push_constants_compute(&cache_vis_push(&planes, cards, out, num_cards));
+                cmd.push_constants_compute(&cache_vis_push(&planes, cards, out, num_cards, marks));
                 cmd.dispatch(num_cards.div_ceil(64), 1, 1);
                 Ok(())
             },
@@ -1835,8 +1857,15 @@ impl GdfSystem {
         ) {
             (true, Some(vis_pipe), Some(vis_buf)) => {
                 let vis_out = vis_buf.storage_index();
+                let marks = self
+                    .card_marks
+                    .as_ref()
+                    .map(|b| b.storage_index())
+                    .unwrap_or(u32::MAX);
                 cmd.bind_compute_pipeline(vis_pipe);
-                cmd.push_constants_compute(&cache_vis_push(&planes, cards, vis_out, num_cards));
+                cmd.push_constants_compute(&cache_vis_push(
+                    &planes, cards, vis_out, num_cards, marks,
+                ));
                 cmd.dispatch(num_cards.div_ceil(64), 1, 1);
                 cmd.storage_buffer_barrier_compute(vis_buf); // visibility write -> relight read
                 vis_out

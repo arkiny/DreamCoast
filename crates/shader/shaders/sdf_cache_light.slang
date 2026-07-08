@@ -161,6 +161,14 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     if (pc.clip.w != 0xFFFFFFFFu)
     {
         uint vis = g.storage_buffers[pc.clip.w].Load(card * 4u);
+        // 2 = mirror-read (reflection feedback): the mirror shows this card DIRECTLY, so it
+        // relights on the base (on-screen) budget instead of idling on the HIDDEN_MULT one —
+        // an off-screen card a mirror reflects otherwise waits period×8 (~17 s at the Apple
+        // tier's period 64 / 30 fps) and shades from the skylight-heavy fallback meanwhile
+        // (the "two colour families" a moving mirror exposes). A chrome ball reads a broad
+        // slice of the pool, so the boost stops at the BASE period: an accelerated /2 tier
+        // measured +1.9 ms relight on the chrome scene for ~1 s faster convergence — not
+        // worth it against the 60 fps budget (env-tunable later if a scene demands it).
         period = (vis != 0u) ? relight_period : relight_period * HIDDEN_MULT;
     }
     bool selected = (pc.reset != 0u) || ((card % period) == (pc.frame % period));

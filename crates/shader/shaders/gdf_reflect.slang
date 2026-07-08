@@ -848,10 +848,22 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 uint cpos_idx = pc.cache.y & 0xFFu;
                 uint fb8 = (pc.cache.y >> 8) & 0xFFu;
                 uint sc_feedback = fb8 == 0u ? 0xFFFFFFFFu : fb8 - 1u;
+                // Mirror-feedback mark buffer rides cache.y bits 16..23 (0 = off): cards a
+                // NEAR-MIRROR ray reads get relight priority (see surface_cache.slang).
+                // COMPACT-ONLY: the main trace's glossy/prefiltered pixels cover most of the
+                // frame and read most of the pool — marking there accelerated ~half the cards
+                // and more than doubled the relight cost (measured 5.0 -> 13.2 ms). The mirror
+                // band is the one place the un-relit fallback is DIRECTLY visible.
+#ifdef REFLECT_COMPACT
+                uint mk8 = (pc.cache.y >> 16) & 0xFFu;
+                uint sc_mark = mk8 == 0u ? 0xFFFFFFFFu : mk8 - 1u;
+#else
+                const uint sc_mark = 0xFFFFFFFFu;
+#endif
                 color = sample_surface_cache_cone(hp, hn, cards_idx, cpos_idx, pc.cache.z, pc.cache.w,
                                                   c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
                                                   grid_cells, grid_pool, sc_layout, sc_feedback,
-                                                  cached);
+                                                  sc_mark, cached);
             }
             if (!cached)
             {
