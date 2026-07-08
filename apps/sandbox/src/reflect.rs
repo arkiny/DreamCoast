@@ -36,6 +36,10 @@ pub(crate) struct ReflectSystem {
     /// a mirror image the trace never resolved), so those pixels — and only those — are
     /// re-traced dense; cost scales with the on-screen mirror area. See reflect_compact.slang.
     reflect_compact_pipeline: Option<ComputePipeline>,
+    /// HWRT variant of the compacted re-trace (TLAS + screen-color/hit-lighting shading): true
+    /// material colours for the off-screen reflected content the surface cache approximates.
+    /// Built only on RT-capable devices.
+    reflect_compact_hwrt_pipeline: Option<ComputePipeline>,
     compact_reset_pipeline: Option<ComputePipeline>,
     compact_classify_pipeline: Option<ComputePipeline>,
     compact_args_pipeline: Option<ComputePipeline>,
@@ -212,6 +216,25 @@ impl ReflectSystem {
                 },
             )?))
         };
+        let reflect_compact_hwrt_pipeline = if compute_supported && device.has_raytracing() {
+            let cs = load_compute_shader(
+                backend,
+                dreamcoast_shader::gdf_reflect_compact_hwrt_cs_spirv,
+                dreamcoast_shader::gdf_reflect_compact_hwrt_cs_dxil,
+                dreamcoast_shader::gdf_reflect_compact_hwrt_cs_metallib,
+                "gdf_reflect_compact_hwrt",
+            )?;
+            Some(device.create_compute_pipeline(&ComputePipelineDesc {
+                compute_bytes: cs,
+                compute_entry: "csMain",
+                push_constant_size: 240,
+                bindless: true,
+                uniform_buffer: true,
+                threads_per_group: [64, 1, 1],
+            })?)
+        } else {
+            None
+        };
         let compact_reset_pipeline = compact_pass(
             dreamcoast_shader::reflect_compact_reset_cs_spirv,
             dreamcoast_shader::reflect_compact_reset_cs_dxil,
@@ -286,6 +309,7 @@ impl ReflectSystem {
             reflect_hwrt_pipeline,
             reflect_screen_pipeline,
             reflect_compact_pipeline,
+            reflect_compact_hwrt_pipeline,
             compact_reset_pipeline,
             compact_classify_pipeline,
             compact_args_pipeline,
@@ -1300,6 +1324,12 @@ impl ReflectSystem {
         globals_offset: u64,
         lit_hist: u32,
         mirror_thresh: f32,
+        // HWRT refine: trace the listed pixels against the scene TLAS and shade off-screen hits
+        // with the real material (`hit_lighting` = the consolidated (vtx, idx, table) indices) —
+        // the surface cache stops being the mirror's primary colour source. Falls back to the SW
+        // permutation when the pipeline/TLAS is absent.
+        hwrt: bool,
+        hit_lighting: Option<(u32, u32, u32)>,
     ) -> ResourceId {
         let reset = self.compact_reset_pipeline.as_ref().expect("compact reset");
         let classify = self
@@ -1307,10 +1337,14 @@ impl ReflectSystem {
             .as_ref()
             .expect("compact classify");
         let args_pipe = self.compact_args_pipeline.as_ref().expect("compact args");
-        let trace = self
-            .reflect_compact_pipeline
-            .as_ref()
-            .expect("compact trace");
+        let use_hwrt = hwrt && self.reflect_compact_hwrt_pipeline.is_some();
+        let hit_lighting = if use_hwrt { hit_lighting } else { None };
+        let trace = if use_hwrt {
+            self.reflect_compact_hwrt_pipeline.as_ref()
+        } else {
+            self.reflect_compact_pipeline.as_ref()
+        }
+        .expect("compact trace");
         let list_buf = self.compact_list.as_ref().expect("compact list");
         let args_buf = self.compact_args.as_ref().expect("compact args buf");
         let list_idx = list_buf.storage_index();
@@ -1458,6 +1492,18 @@ impl ReflectSystem {
                 } else {
                     [u32::MAX; 3]
                 };
+                // Phase 16 E overloads, exactly as record_gdf_reflect's HWRT path: hit-lighting
+                // rides the (HWRT-unused) coarse-albedo slots + frame bit31; the lit-history
+                // index rides the (HWRT-unused) march-cap field, keeping bit31 = content.
+                let (albedo_rgb, frame) = match hit_lighting {
+                    Some((v, i, t)) => ([v, i, t], frame | 0x8000_0000),
+                    None => (albedo_rgb, frame),
+                };
+                let max_steps = if use_hwrt {
+                    (max_steps & 0x8000_0000) | (lit_hist & 0x7FFF_FFFF)
+                } else {
+                    max_steps
+                };
                 cmd.set_globals(globals, globals_offset);
                 cmd.bind_compute_pipeline(trace);
                 cmd.push_constants_compute(&gdf_reflect_push(
@@ -1479,8 +1525,14 @@ impl ReflectSystem {
                     0.0,
                     diag,
                     diag,
-                    // SCREEN_HIT overloads the dead hit-albedo slot with the lit-history index.
-                    f32::from_bits(lit_hist & 0x7FFF_FFFF),
+                    // SCREEN_HIT overloads the dead hit-albedo slot with the lit-history index;
+                    // the HWRT variant carries it in max_steps instead and keeps the legacy
+                    // constant-albedo fallback here (mirrors record_gdf_reflect).
+                    if use_hwrt {
+                        0.7
+                    } else {
+                        f32::from_bits(lit_hist & 0x7FFF_FFFF)
+                    },
                     if gi_vol_base != u32::MAX {
                         f32::from_bits(irradiance_index)
                     } else {

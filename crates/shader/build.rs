@@ -250,6 +250,17 @@ fn defines_for(target: &str, key: &str) -> &'static [(&'static str, &'static str
             ("REFLECT_COMPACT", "1"),
         ],
         (false, "gdf_reflect_compact_cs") => &[("SCREEN_HIT", "1"), ("REFLECT_COMPACT", "1")],
+        // B2 mirror compaction, HWRT variant: exact triangle hits + screen-color/hit-lighting
+        // shading over the compacted near-mirror list — true material colours for the
+        // off-screen reflected content the surface cache can only approximate.
+        (true, "gdf_reflect_compact_hwrt_cs") => &[
+            ("RT_METAL_TARGET", "1"),
+            ("HWRT_REFLECT", "1"),
+            ("REFLECT_COMPACT", "1"),
+        ],
+        (false, "gdf_reflect_compact_hwrt_cs") => {
+            &[("HWRT_REFLECT", "1"), ("REFLECT_COMPACT", "1")]
+        }
         (true, _) => &[("RT_METAL_TARGET", "1")],
         (false, _) => &[],
     }
@@ -1106,6 +1117,13 @@ const JOBS: &[Job] = &[
         entry: "csMain",
         stage: "compute",
         key: "gdf_reflect_compact_cs",
+    },
+    // B2 mirror compaction, HWRT variant (TLAS trace + hit lighting; RT-capable devices only).
+    Job {
+        src: "gdf_reflect.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_reflect_compact_hwrt_cs",
     },
     // B2 mirror compaction: classify (append near-mirror pixels) + indirect-args passes.
     Job {

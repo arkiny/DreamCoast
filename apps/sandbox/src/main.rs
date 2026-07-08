@@ -906,6 +906,9 @@ struct App {
     /// indirect dispatch (0 = off). The sparse trace's upsample cannot reconstruct a mirror
     /// image, so only those pixels pay for real rays. `P_REFLECT_COMPACT`.
     reflect_compact_div: u32,
+    /// B2 HWRT refine: the compacted re-trace goes through the scene TLAS + hit lighting (true
+    /// material colours for off-screen mirror content). `P_REFLECT_COMPACT_HWRT`.
+    reflect_compact_hwrt: bool,
     /// macOS/M3 perf: GDF AO trace divisor (1 = full-res, 2 = half). Traced at 1/div + bilateral
     /// upsample; the Apple tier uses 2 (gdf_ao is the top pass after quarter-res reflection). `P_AO_RES_DIV`.
     ao_res_div: u32,
@@ -2532,7 +2535,18 @@ impl App {
             && !gallery_scene
             && !world_mode
             && !world.draw_list().is_empty();
-        if hwrt {
+        // B2 HWRT refine (`P_REFLECT_COMPACT_HWRT`): the compacted near-mirror re-trace goes
+        // through the scene TLAS + hit lighting instead of the GDF march + surface cache — true
+        // material colours for the off-screen content a mirror shows (the cache's simplified
+        // relight is the visible "two colour families"). Needs the same content accel as P_HWRT,
+        // but the per-frame HWRT cost stays bounded by the mirror area (compact list only).
+        let compact_hwrt_want =
+            quality::env_bool("P_REFLECT_COMPACT_HWRT", base.reflect_compact_hwrt)
+                && device.has_raytracing()
+                && !gallery_scene
+                && !world_mode
+                && !world.draw_list().is_empty();
+        if hwrt || compact_hwrt_want {
             rt.build_content_accel(
                 &device,
                 &world.draw_list(),
@@ -2549,6 +2563,9 @@ impl App {
         let hwrt_hitlighting = hwrt
             && rt.content_hit_indices().is_some()
             && quality::env_bool("P_HWRT_HITLIGHTING", base.hwrt_reflect_hitlighting);
+        // B2 HWRT refine: live only with the accel + hit table actually built.
+        let reflect_compact_hwrt =
+            compact_hwrt_want && rt.has_content_scene() && rt.content_hit_indices().is_some();
 
         info!(
             "RenderQuality tier: {} (RENDER_QUALITY; GPU \"{}\")",
@@ -3483,6 +3500,7 @@ impl App {
             reflect_half_res,
             reflect_res_div,
             reflect_compact_div,
+            reflect_compact_hwrt,
             ao_res_div,
             gi_atrous_steps,
             gi_half_res,
@@ -6855,6 +6873,12 @@ impl App {
                             globals_offset,
                             self.reflect.lit_hist_read_index(),
                             0.125, // near-mirror band — lockstep with gdf_reflect.slang content
+                            self.reflect_compact_hwrt,
+                            if self.reflect_compact_hwrt {
+                                self.rt.content_hit_indices()
+                            } else {
+                                None
+                            },
                         ),
                         qw,
                         qh,

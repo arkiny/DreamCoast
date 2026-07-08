@@ -215,6 +215,12 @@
                 // mirror image (chrome showed the trace texels as blocks). Cost scales with the
                 // on-screen mirror area.
                 reflect_compact_div: 2,
+                // HWRT refine stays OFF: hit lighting's ambient (sparse GI-volume probes +
+                // IBL) underestimates the interior bounce light — the mirror turned vivid but
+                // diverged 27/255 from the PT ground truth (the SW cache path sits at 1.2/255).
+                // Env opt-in `P_REFLECT_COMPACT_HWRT=1` for A/B; flips ON once hit lighting
+                // reaches PT parity (cache-irradiance x detail-albedo hybrid, the follow-up).
+                reflect_compact_hwrt: false,
             ),
             groups: (
                 resolution: 1,

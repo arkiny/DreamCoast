@@ -729,9 +729,50 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                                 g.textures[pc.depth_index].GetDimensions(fw, fh);
                                 int2 pp = clamp(int2(puv * float2(fw, fh)), int2(0, 0),
                                                 int2(int(fw) - 1, int(fh) - 1));
+#ifdef REFLECT_COMPACT
+                                // Same footprint anti-aliasing as the SW screen_trace (see its
+                                // docs): a minified mirror's point fetch of the history turns
+                                // into colour speckle. > 24 px falls through to hit lighting /
+                                // the cache cone; 3..24 px box-filters the history.
+                                float fp_px = geo_spread * t /
+                                              max(distance(pc.cam_pos.xyz, hp) * pa_full, 1e-6);
+                                if (fp_px <= 24.0)
+                                {
+                                    if (fp_px > 3.0)
+                                    {
+                                        int rr = int(clamp(fp_px * (1.0 / 3.0), 1.0, 8.0));
+                                        float3 bsum = float3(0.0, 0.0, 0.0);
+                                        [unroll]
+                                        for (int by = -1; by <= 1; by++)
+                                        {
+                                            [unroll]
+                                            for (int bx = -1; bx <= 1; bx++)
+                                            {
+                                                int2 sp2 =
+                                                    clamp(pp + int2(bx, by) * rr, int2(0, 0),
+                                                          int2(int(fw) - 1, int(fh) - 1));
+                                                uint si = uint(sp2.y) * fw + uint(sp2.x);
+                                                bsum += asfloat(g.storage_buffers[lit_hist]
+                                                                    .Load4(si * 16u))
+                                                            .rgb;
+                                            }
+                                        }
+                                        color = bsum * (1.0 / 9.0);
+                                    }
+                                    else
+                                    {
+                                        uint pidx = uint(pp.y) * fw + uint(pp.x);
+                                        color = asfloat(
+                                                    g.storage_buffers[lit_hist].Load4(pidx * 16u))
+                                                    .rgb;
+                                    }
+                                    cached = true;
+                                }
+#else
                                 uint pidx = uint(pp.y) * fw + uint(pp.x);
                                 color = asfloat(g.storage_buffers[lit_hist].Load4(pidx * 16u)).rgb;
                                 cached = true; // sharp on-screen hit — skip the low-res cache + analytic
+#endif
                             }
                         }
                     }

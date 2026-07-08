@@ -330,6 +330,18 @@ pub struct QualityPreset {
     /// SCREEN_HIT stack. Apple ON (Metal-verified, DX≡VK pending).
     #[serde(default)]
     pub reflect_compact_div: u32,
+    /// B2 HWRT refine (`P_REFLECT_COMPACT_HWRT`): the compacted near-mirror re-trace goes
+    /// through the scene TLAS with screen-color + hit-lighting shading — TRUE material colours
+    /// for the off-screen content a mirror shows, where the surface cache's simplified relight
+    /// reads as a second (skylight-tinted) colour family. Per-frame cost stays bounded by the
+    /// mirror area (it reuses the compact list); needs an RT-capable device (falls back to the
+    /// SW refine otherwise) and builds the content accel at load. OFF everywhere for now: the
+    /// mirror turns coherent + vivid but hit lighting's ambient (sparse GI-volume probes + IBL)
+    /// underestimates interior bounce — measured 27.5/255 off the PT ground truth where the SW
+    /// cache path sits at 1.2/255, and PT parity is the canon. Flips on once hit lighting gains
+    /// the cache-irradiance × detail-albedo hybrid ambient (follow-up track).
+    #[serde(default)]
+    pub reflect_compact_hwrt: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -532,6 +544,7 @@ pub fn gallery_preset() -> QualityPreset {
         taau_packed_history: false, // legacy 16B+16B history layout (anchor; TAAU off at scale 1)
         tonemap_aces: false,        // legacy per-pixel curve (the byte-identical anchor)
         reflect_compact_div: 0,     // no mirror compaction (full-res trace needs none anyway)
+        reflect_compact_hwrt: false, // no HWRT refine (no compaction to refine)
     }
 }
 
@@ -954,6 +967,7 @@ mod tests {
             "gallery tonemap_aces off (legacy curve anchor)"
         );
         assert_eq!(g.reflect_compact_div, 0, "gallery reflect_compact_div off");
+        assert!(!g.reflect_compact_hwrt, "gallery reflect_compact_hwrt off");
     }
 
     /// `Med` is the content-default tier. Most fields still match the pre-tier legacy defaults; the
@@ -1002,6 +1016,10 @@ mod tests {
         assert_eq!(
             m.reflect_compact_div, 0,
             "Med reflect_compact_div off (DX≡VK pending)"
+        );
+        assert!(
+            !m.reflect_compact_hwrt,
+            "Med reflect_compact_hwrt off (DX≡VK pending)"
         );
     }
 
@@ -1080,6 +1098,10 @@ mod tests {
         assert_eq!(
             apple.reflect_compact_div, 2,
             "Apple reflect_compact_div (dense near-mirror re-trace at half res)"
+        );
+        assert!(
+            !apple.reflect_compact_hwrt,
+            "Apple reflect_compact_hwrt off (hit lighting not yet at PT parity)"
         );
     }
 
