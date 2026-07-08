@@ -948,6 +948,14 @@ struct App {
     /// sparkling. `P_REFLECT_STOCHASTIC` (content only; gallery keeps its white inline jitter →
     /// anchor untouched). Sets `max_steps` bit30 for the SW trace so it draws the blue-noise ray.
     reflect_stochastic: bool,
+    /// B2' rough-prefilter split: roughness at/above this threshold traces ONE deterministic mirror
+    /// ray and shades it with a roughness-driven cone footprint from the surface-cache MIP pyramid
+    /// (structural noise ZERO) instead of the stochastic 1-ray GGX estimator, which at any reachable
+    /// sample rate leaves residual speckle on wide lobes (reference engine: above RadianceCache.
+    /// MaxRoughness the trace is skipped for the prefiltered probe). `P_REFLECT_PREFILTER=<thresh>`
+    /// (`=1` selects the reference-like default 0.4); 0 = off (content opt-in; gallery never sets
+    /// it → anchor untouched). Rides `max_steps` bits 16..23 on the SW trace.
+    reflect_prefilter: f32,
     /// Track C0-fix: surface-cache relight CONVERGE mode — K-cycle deterministic gather jitter +
     /// running-mean α=1/(1+N) (reference radiosity NumFramesAccumulated), so a static scene's cache
     /// actually reaches a fixed point and the measured freeze latch can arm. 0 = legacy (fixed-alpha
@@ -2871,6 +2879,17 @@ impl App {
         // Content opt-in; default off (content sequence unchanged, gallery anchor untouched).
         let reflect_stochastic =
             !gallery_scene && std::env::var_os("P_REFLECT_STOCHASTIC").is_some();
+        // B2' rough-prefilter split threshold. `P_REFLECT_PREFILTER=1` = the reference-like default
+        // (0.4); an explicit fraction in (0,1) tunes it. 0 / unset / gallery = off (anchor untouched).
+        let reflect_prefilter = if gallery_scene {
+            0.0
+        } else {
+            std::env::var("P_REFLECT_PREFILTER")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|v| if v == 1.0 { 0.4 } else { v.clamp(0.0, 0.996) })
+                .unwrap_or(0.0)
+        };
         // Track C0-fix: static-scene convergence seams (see the field docs). Content opt-in.
         let cache_converge = if gallery_scene {
             0
@@ -3330,6 +3349,7 @@ impl App {
             reflect_spatial,
             reflect_spatial_kernel,
             reflect_stochastic,
+            reflect_prefilter,
             cache_converge,
             gi_stable,
             ssr_history_clamp,
@@ -6323,12 +6343,19 @@ impl App {
                     self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
                     scene_clip,
                     &scene_clip_vols,
-                    // bit31 = content flag (mirror threshold); bit30 = A5 blue-noise stochastic (SW
-                    // trace only — HWRT's max_steps field carries the lit-history index instead).
+                    // bit31 = content flag (mirror threshold); bit30 = A5 blue-noise stochastic;
+                    // bits 16..23 = B2' rough-prefilter threshold (roughness*255, 0 = off). All SW
+                    // trace only — HWRT's max_steps field carries the lit-history index instead
+                    // (the step cap itself fits in bits 0..15, tiers cap it at 256).
                     self.reflect_max_steps
                         | if self.is_gallery { 0 } else { 0x8000_0000 }
                         | if self.reflect_stochastic && !self.hwrt {
                             0x4000_0000
+                        } else {
+                            0
+                        }
+                        | if !self.hwrt {
+                            ((self.reflect_prefilter * 255.0) as u32 & 0xFF) << 16
                         } else {
                             0
                         },
@@ -6391,7 +6418,11 @@ impl App {
                         },
                         0.125, // content mirror threshold — keep in lockstep with gdf_reflect.slang
                         self.reflect_resolve_kernel,
-                        self.reflect_stochastic, // A5: reconstruct blue-noise rays when stochastic
+                        // bits 0..7: A5 sampler select (reconstruct blue-noise rays when stochastic);
+                        // bits 16..23: B2' prefilter threshold (prefiltered pixels pass through and
+                        // are never borrowed — their ray was a deterministic mirror, not a GGX draw).
+                        u32::from(self.reflect_stochastic)
+                            | (((self.reflect_prefilter * 255.0) as u32 & 0xFF) << 16),
                     )
                 } else {
                     refl_traced

@@ -210,6 +210,26 @@ running mean α=1/(1+N) N→12(N은 pos `.w` 겸용, `params.y<0` seam), varianc
 - 이어서 Track C(캐시 색/해상도 — 저주파 얼룩), B1(검증 스크린트레이스 하드 핸드오프 — SSR 블렌드 구조
   자체 대체).
 
+#### 러프-프리필터 스플릿 구현 완료 (opt-in `P_REFLECT_PREFILTER=<thresh>`, `=1` → 기본 0.4)
+roughness ≥ 임계 픽셀은 스토캐스틱 GGX 대신 **결정적 미러 레이 1개 + roughness 구동 콘 풋프린트**로
+캐시 MIP를 샘플(`slope = tan(2θ_h) ≈ 2α`, α=r²; analytic 폴백의 `albedo_cone`도 동일 slope). 배선:
+임계가 `max_steps` bits 16..23(roughness×255, 0=off; SW 스텝 캡은 bits 0..15로 마스크 축소 — 티어 최대
+256이라 무손실), resolve push의 `stochastic` bits 16..23 동승 — 프리필터 픽셀은 resolve passthrough +
+이웃 차용 금지(GGX draw가 아님). HWRT 경로는 비트 미설정(max_steps가 lit_hist 인덱스). push 무성장.
+
+**검증 (glossyball, Metal RELEASE, converge 스택):**
+- **갤러리 `af70c1a5` byte-identical PASS**, clippy/fmt clean.
+- **프레임간 플리커(볼 크롭): 스토캐스틱 0.368 → 프리필터 0.067/255 (5.5× 안정)** — 잔여는 TAAU 디더
+  + 캐시 수렴 꼬리. 구조적 노이즈 0 설계 확인.
+- **임계 0.25 + `P11_REFLECT_HQ=1`(전-drawable 카드): 볼(r=0.3) 반사가 워시아웃 얼룩 → 알아볼 수 있는
+  홀 반사(아치·커튼·바닥 구조)로 변모.** HQ 단독(스토캐스틱 유지)은 여전히 얼룩 — 구조 복원의 주역은
+  프리필터 경로. 즉 현 샘플레이트(~0.1레이/px)에서 스토캐스틱+디노이저 체인은 수렴해도 '얼룩'으로
+  수렴하고, 결정적 콘 경로가 캐시가 가진 구조를 그대로 통과시킨다.
+- **잔여 한계(예상대로 Track C):** 콘 slope를 2α로 넓혀도 hf 불변 — 잔여 블록/블롭은 (a) 카드 미커버
+  히트의 per-voxel albedo analytic 폴백(기본 카드예산에서 지배적, HQ로 크게 해소), (b) 32² 카드 해상도.
+  둘 다 캐시 커버리지/해상도 = Track C 과제. SSR 기여는 배제 확인(`P11_REFLECT_MAX_ROUGHNESS=0.1` 무변화).
+- 기본 임계 0.4(레퍼런스 등가)에선 볼(0.3)은 스토캐스틱 유지 — 그 밴드는 B2' 샘플 밀도가 담당.
+
 ### Track B — trace 계층 (온스크린 정확도, HWRT 없이 미러 선명)
 
 #### B1. 검증된 screen-trace-first

@@ -623,8 +623,10 @@ impl ReflectSystem {
         frame: u32,
         mirror_thresh: f32,
         kernel_radius: f32,
-        // A5: 0 = white jitter, 1 = blue-noise — must match the sampler gdf_reflect used this frame.
-        stochastic: bool,
+        // Packed flags (mirrors ResolvePush.stochastic): bits 0..7 = A5 sampler select (0 white,
+        // 1 blue-noise — must match the sampler gdf_reflect used this frame); bits 16..23 = the B2'
+        // rough-prefilter threshold (roughness*255, 0 = off) so prefiltered pixels pass through.
+        stochastic: u32,
     ) -> ResourceId {
         let pipe = self
             .resolve_pipeline
@@ -659,7 +661,7 @@ impl ReflectSystem {
                     frame,
                     mirror_thresh,
                     kernel_radius,
-                    u32::from(stochastic),
+                    stochastic,
                 ));
                 cmd.dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
                 Ok(())

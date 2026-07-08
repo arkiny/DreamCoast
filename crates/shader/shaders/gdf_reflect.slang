@@ -362,7 +362,20 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // `vol_on` is true for the gallery too and can't distinguish it.
     bool content_refl = (pc.max_steps & 0x80000000u) != 0u;
     float mirror_thresh = content_refl ? 0.125 : 0.04;
-    if (roughness > mirror_thresh)
+    // Rough-prefilter split (SW content opt-in): above this roughness the stochastic 1-ray/frame
+    // GGX estimator is the WRONG tool — the lobe is so wide that any reachable sample count leaves
+    // residual speckle (the ~50x undersampling diagnosis), while the surface-cache cone MIP already
+    // holds a prefiltered version of exactly the radiance the wide lobe integrates. So trace ONE
+    // deterministic mirror ray and sample the cache with a roughness-driven cone footprint instead:
+    // structural noise ZERO, and the visual difference from the true lobe integral is hidden by the
+    // lobe's own blur (reference engine: roughness above RadianceCache.MaxRoughness skips tracing
+    // and reads the prefiltered probe). Threshold rides `max_steps` bits 16..23 (roughness*255,
+    // 0 = off; the SW step cap fits in bits 0..15, tiers cap it at 256). The HWRT path never sets
+    // these bits (its max_steps field carries the lit-history index).
+    uint prefilter8 = (pc.max_steps >> 16) & 0xFFu;
+    bool prefiltered =
+        content_refl && prefilter8 != 0u && roughness >= float(prefilter8) * (1.0 / 255.0);
+    if (roughness > mirror_thresh && !prefiltered)
     {
         if (content_refl)
         {
@@ -433,9 +446,10 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     }
 #else
     // Sphere-trace the reflection ray. Stage D3: content lowers the step cap; gallery = 96.
-    // Mask off the content flag (bit31) AND the A5 stochastic flag (bit30) to get the real step cap
-    // (content caps are < 2^30). Gallery cap (96) is unaffected → byte-identical.
-    int max_steps = int(max(pc.max_steps & 0x3FFFFFFFu, 1u));
+    // The step cap lives in bits 0..15 (tiers cap it at 256); the upper bits carry flags — bit31
+    // content, bit30 A5 stochastic, bits 16..23 the prefilter threshold. Gallery passes a bare
+    // cap (96, upper bits zero) → byte-identical.
+    int max_steps = int(max(pc.max_steps & 0xFFFFu, 1u));
     const float HIT_EPS = 0.001;
     for (int i = 0; i < max_steps; i++)
     {
@@ -455,6 +469,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 #endif
 
     float3 color;
+    // Ray-cone slope (world radius per unit hit distance). The stochastic path uses a small
+    // per-pixel half-angle (~0.08, the trace-res pixel cone) — the LOBE's spread is realised by
+    // the distribution of rays. The prefiltered path traces ONE mirror ray, so the lobe's spread
+    // must come from the cone itself: the median GGX half-vector tilt is tan(θ_h) ≈ α (= r²), and
+    // the REFLECTED direction deviates by 2·θ_h, so slope = tan(2θ_h) ≈ 2α (0.32 at the 0.4
+    // threshold, ~63° cone at roughness 1). The cache cone MIP / albedo cone then average the
+    // footprint the wide lobe would have integrated.
+    float alpha_pf = roughness * roughness;
+    float cone_slope = prefiltered ? clamp(2.0 * alpha_pf, 0.08, 2.0) : 0.08;
     if (hit)
     {
         float3 hn = scene_normal(hp);
@@ -588,7 +611,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             // (which is the card-acceptance tolerance; widening THAT scatters cross-card). This grows
             // with hit distance `t` so a far demagnified reflection reads a coarse averaged level
             // while a near/face-on hit stays near mip0 (sharp). Slope ≈ a per-pixel cone half-angle.
-            float mip_radius = 0.05 + t * 0.08;
+            float mip_radius = 0.05 + t * cone_slope;
             color = sample_surface_cache_cone(hp, hn, pc.cache.x, pc.cache.y, pc.cache.z, pc.cache.w,
                                               c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
                                               cached);
@@ -605,7 +628,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             // Cone-blurred albedo (content, vol_on) so an uncovered far reflection is as smooth as
             // its cached neighbours instead of blocky per-voxel colour. Near hits (radius→0) and the
             // gallery (vol_on false) keep the single-tap legacy albedo.
-            float ablur = vol_on ? (0.05 + t * 0.08) : 0.0;
+            float ablur = vol_on ? (0.05 + t * cone_slope) : 0.0;
             float3 hit_albedo = is_ground ? pc.ground_albedo.xyz : albedo_cone(hp, hn, ablur);
             // Lambertian reflected surface: albedo/PI * irradiance, so the reflection of a
             // diffuse surface matches its directly-shaded appearance. The cache path (meshed

@@ -36,7 +36,10 @@ struct ResolvePush
     uint frame;             // the jitter frame the trace used (must match gdf_reflect's `frame`)
     float mirror_thresh;    // roughness <= this => deterministic mirror ray (passthrough, no gather)
     float kernel_radius;    // max spatial gather radius in texels (roughness-scaled below)
-    uint stochastic;        // A5: 0 = white jitter, 1 = blue-noise — must match gdf_reflect's sampler
+    uint stochastic;        // bits 0..7: A5 sampler (0 = white jitter, 1 = blue-noise — must match
+                            // gdf_reflect); bits 16..23: rough-prefilter threshold (roughness*255,
+                            // 0 = off) — a prefiltered pixel traced a deterministic mirror ray with
+                            // a wide cone, so it passes through (and can't be borrowed) like a mirror.
 };
 
 [[vk::push_constant]]
@@ -62,10 +65,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float4 center = g.textures[pc.refl_index].SampleLevel(g.samp, uv, 0.0);
     float depth = g.textures[pc.depth_index].SampleLevel(g.samp, uv, 0.0).r;
 
-    // Background (sky along the view ray) or near-mirror surface: pass the traced value through
-    // unchanged. A mirror ray is deterministic + sharp; a ratio gather would blur it.
+    // Background (sky along the view ray), near-mirror, or rough-prefiltered surface: pass the
+    // traced value through unchanged. A mirror ray is deterministic + sharp (a ratio gather would
+    // blur it); a prefiltered pixel is deterministic + already cone-averaged (nothing to denoise,
+    // and its ray was NOT a GGX draw so the ratio weights don't apply).
+    uint stoch = pc.stochastic & 0xFFu;
+    uint pre8 = (pc.stochastic >> 16) & 0xFFu;
+    float pre_thresh = pre8 != 0u ? float(pre8) * (1.0 / 255.0) : 2.0;
     float roughness = g.textures[pc.material_index].SampleLevel(g.samp, uv, 0.0).g;
-    if (depth >= 1.0 || roughness <= pc.mirror_thresh)
+    if (depth >= 1.0 || roughness <= pc.mirror_thresh || roughness >= pre_thresh)
     {
         g.storage_images[pc.out_index][tid.xy] = center;
         return;
@@ -94,13 +102,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             if (ndepth >= 1.0 || abs(ndepth - depth) > 0.003)
                 continue; // different surface / background — would bleed across the silhouette
             float nrough = g.textures[pc.material_index].SampleLevel(g.samp, nuv, 0.0).g;
-            if (nrough <= pc.mirror_thresh)
-                continue; // neighbour cast a deterministic mirror ray (delta) — not reusable
+            if (nrough <= pc.mirror_thresh || nrough >= pre_thresh)
+                continue; // neighbour cast a deterministic mirror/prefiltered ray — not a GGX draw
             float3 nq = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, nuv, 0.0).xyz);
             float3 nworld = reconstruct(nuv, ndepth);
             float3 vq = normalize(pc.cam_pos.xyz - nworld);
             // Reconstruct the exact ray this neighbour cast (same deterministic jitter as the trace).
-            float3 dir_q = refl_ggx_dir(nq, vq, nrough, uint(np.x), uint(np.y), pc.frame, pc.stochastic);
+            float3 dir_q = refl_ggx_dir(nq, vq, nrough, uint(np.x), uint(np.y), pc.frame, stoch);
             if (dot(n, dir_q) <= 0.0)
                 continue; // not in the centre pixel's upper hemisphere
             float pdf_q = refl_ggx_pdf(nq, vq, dir_q, nrough);
