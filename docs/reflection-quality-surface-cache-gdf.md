@@ -182,6 +182,34 @@ frame-varying+A1+A4를 함께 켬. 갤러리 `af70c1a5` byte-identical, clippy/f
 + GI 수렴 가속)**, 이게 드리프트(C0)도 함께 해결. A1/A4/A5는 그 위에서 값이 드러남(수렴된 GI + 러프 로브 +
 카메라 이동).
 
+### Track A6 — SSR 피드백 감쇠 (구현 완료) + 글로시 샘플 기근 진단 (2026-07-08)
+
+**SSR 진동 (사용자 격리로 확정):** 글로시 볼의 매 프레임 움직임은 SSR — `P11_REFLECT_MAX_ROUGHNESS=0.1`
+(볼에서 SSR 제외)로 정지 확인. **UE 심층 분석 결론:** UE도 **같은 피드백 루프 보유**(스크린 트레이스가
+반사 포함 완전 합성 prev 씬컬러를 읽음 — `ScreenSpaceRayTracingInput` 캡처는 리플렉션 합성 후) — 안정성은
+루프 제거가 아니라 **감쇠 3중주**: ① 반사에 α≈1/12 포화 running mean(**결정타** — 피드백 맵을 수축으로;
+variance clamp 단독은 진폭만 제한, rate 못 제한 → limit cycle이 클램프 밴드 안에서 생존), ② per-hit
+`MaxRayIntensity=40` 클램프 / Karis `rcp(1+L)`, ③ variance clamp(①과 함께). miss는 블렌드가 아닌
+**하드 핸드오프**(compaction).
+
+**구현 (converge 번들에 통합, 갤러리 byte-identical):** converge 모드가 stochastic SSR 강제(plain 경로는
+EMA 없는 gain-1 루프), SSR jitter K=12 주기 순환(host가 `frame%12` 전달, 셰이더 무변경), `ssr_resolve`
+running mean α=1/(1+N) N→12(N은 pos `.w` 겸용, `params.y<0` seam), variance clamp 기본 on.
++ **A1 resolve를 Reinhard 톤맵 공간 평균으로 수정**(선형 평균은 밝은 HDR 히트 하나가 지배 → 흰 사각
+스파클; 레퍼런스는 resolve/temporal/spatial 전부 이 공간).
+
+**잔여 진단 — 글로시 샘플 기근 (스크린샷 확정):** 화면 채운 rough 0.3 미러 클로즈업의 잔여 스페클 =
+**~0.1 레이/디스플레이픽셀**(0.67 스케일 × div2) vs 레퍼런스 실효 ~5(풀해상+5..64샘플 재구성) — **~50×
+언더샘플**. 해상도(div6→2)로도 안 사라짐(사용자 확인) = 구조 문제. apple 티어 div=6은 과함(대형 박스).
+
+**다음 정식 트랙 (사용자 승인):**
+- **B2' 글로시 샘플 밀도** — trace compaction(스크린 히트 조기 종료로 예산 확보) + 글로시 픽셀 고밀도.
+- **러프-프리필터 스플릿** — roughness 상한 이상은 스토캐스틱 대신 **cone-필터 캐시/radiance-cache 경로**
+  (구조적 노이즈 0; 기존 `sample_surface_cache_cone` 재사용, 배선만). 레퍼런스도 RadianceCache.MaxRoughness
+  이상은 트레이스 대신 프리필터 프로브.
+- 이어서 Track C(캐시 색/해상도 — 저주파 얼룩), B1(검증 스크린트레이스 하드 핸드오프 — SSR 블렌드 구조
+  자체 대체).
+
 ### Track B — trace 계층 (온스크린 정확도, HWRT 없이 미러 선명)
 
 #### B1. 검증된 screen-trace-first

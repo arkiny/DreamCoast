@@ -107,13 +107,22 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float pdf_p = refl_ggx_pdf(n, v, dir_q, roughness);
             float w = pdf_p / max(pdf_q, 1e-9); // ratio: how likely p would draw this borrowed ray
             float3 ncol = g.textures[pc.refl_index].SampleLevel(g.samp, nuv, 0.0).rgb;
-            num += ncol * w;
+            // Average in the Reinhard "denoiser" space (V / (1 + luma·0.1)): the reference runs its
+            // resolve/temporal/spatial averaging in this space so one HDR-bright borrowed hit (sky
+            // through a glossy lobe) cannot dominate the ratio-weighted mean — in linear space that
+            // single hit IS the residual white square sparkle on the glossy ball.
+            num += (ncol / (1.0 + dot(ncol, float3(0.2126, 0.7152, 0.0722)) * 0.1)) * w;
             den += w;
         }
     }
 
     // Keep the centre pixel's hit distance in .a (the temporal pass's virtual-image reproject needs
     // it). If no neighbour contributed (every kernel ray off-lobe), fall back to the centre sample.
-    float3 resolved = den > 1e-6 ? num / den : center.rgb;
+    float3 resolved = center.rgb;
+    if (den > 1e-6)
+    {
+        float3 tm = num / den; // tonemapped-space mean → back to linear
+        resolved = tm / max(1.0 - dot(tm, float3(0.2126, 0.7152, 0.0722)) * 0.1, 1e-3);
+    }
     g.storage_images[pc.out_index][tid.xy] = float4(resolved, center.a);
 }

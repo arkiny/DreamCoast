@@ -138,6 +138,18 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float conf = have_sample ? saturate(conf_num / den) : 0.0;
 
     // --- Light temporal: reproject the surface, EMA-blend (disocclusion reject). ---
+    // CONVERGE mode (params.y < 0 ⇒ K = -params.y): running mean α = 1/(1+N) with the per-pixel
+    // sample counter N carried in the pos buffer's `.w` (its "valid" flag — N >= 1 keeps the > 0.5
+    // disocclusion test true). The reference reflection denoiser accumulates exactly this way
+    // (NumFramesAccumulated → 12 ⇒ steady α ≈ 1/13): the small saturating alpha is what damps the
+    // screen-trace ↔ lit-history FEEDBACK loop into a contraction (a variance clamp alone bounds the
+    // amplitude, not the rate — a period-2 limit cycle survives inside the clamp band), and paired
+    // with the host's K-cycled deterministic jitter the input is periodic, so the accumulator
+    // settles to a bounded ripple instead of a permanent white-noise variance floor.
+    // params.y > 0 = legacy fixed-alpha EMA (byte-identical).
+    bool converge = pc.params.y < 0.0;
+    float conv_k = converge ? max(-pc.params.y, 1.0) : 1.0;
+    float n_count = 1.0;
     float3 accum_rgb = spatial;
     float accum_conf = conf;
     if (pc.reset == 0u)
@@ -157,6 +169,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 float4 pp = asfloat(g.storage_buffers[pc.pos_read].Load4(pidx * 16u));
                 if (pp.w > 0.5 && distance(world_pos, pp.xyz) < pc.params.x)
                 {
+                    float n_prev = converge ? clamp(pp.w, 1.0, conv_k) : 0.0;
                     if (have_sample)
                     {
                         // Clamp the (view-dependent, possibly fed-back) reprojected history into this
@@ -171,11 +184,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                             float3 ext = pc.clamp_gamma * sigma;
                             hist_rgb = clamp(hist_rgb, mean - ext, mean + ext);
                         }
-                        accum_rgb = lerp(hist_rgb, spatial, pc.params.y);
-                        accum_conf = lerp(ph.a, conf, pc.params.y);
+                        float alpha = converge ? (1.0 / (1.0 + n_prev)) : pc.params.y;
+                        accum_rgb = lerp(hist_rgb, spatial, alpha);
+                        accum_conf = lerp(ph.a, conf, alpha);
+                        n_count = min(n_prev + 1.0, conv_k);
                     }
                     else
                     {
+                        n_count = max(n_prev, 1.0); // no new sample — hold the counter
                         // No valid ray this frame (every kernel ray missed / off-lobe): a sharp
                         // mirror reflecting off-screen sky hits this every frame. EMA-ing the 0 in
                         // decays the accumulation to black (the dark-metal blotches); instead keep
@@ -195,6 +211,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         accum_rgb *= pc.params.z / m;
 
     g.storage_buffers[pc.accum_write].Store4(idx * 16u, asuint(float4(accum_rgb, accum_conf)));
-    g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(world_pos, 1.0)));
+    // `.w` = the CONVERGE-mode sample counter N (>= 1, so the disocclusion `> 0.5` test still reads
+    // it as "valid"); legacy stores its constant 1.0 = byte-identical.
+    g.storage_buffers[pc.pos_write].Store4(
+        idx * 16u, asuint(float4(world_pos, converge ? n_count : 1.0)));
     g.storage_images[pc.out_index][tid.xy] = float4(accum_rgb, accum_conf);
 }

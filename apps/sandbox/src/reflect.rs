@@ -526,6 +526,9 @@ impl ReflectSystem {
         kernel_radius: f32,
         clamp_mode: u32,
         clamp_gamma: f32,
+        // Temporal blend factor: > 0 = legacy fixed-alpha EMA (0.15); < 0 = CONVERGE running mean
+        // with K = -alpha (reference NumFramesAccumulated-style, damps the lit-history feedback).
+        ema_alpha: f32,
     ) -> ResourceId {
         let pipe = self
             .ssr_resolve_pipeline
@@ -581,7 +584,7 @@ impl ReflectSystem {
                     flip_y,
                     u32::from(reset),
                     reject_dist,
-                    0.15, // temporal EMA alpha (spatial resolve already cut the variance)
+                    ema_alpha,
                     clamp_max,
                     kernel_radius,
                     clamp_mode,

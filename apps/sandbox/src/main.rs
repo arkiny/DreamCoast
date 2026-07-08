@@ -2896,7 +2896,13 @@ impl App {
         let ssr_history_clamp = std::env::var("P_SSR_HISTORY_CLAMP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(base.ssr_history_clamp)
+            // CONVERGE mode defaults the variance clamp ON — the reference runs the clamp AND the
+            // small-alpha accumulation together (the clamp bounds amplitude, the alpha the rate).
+            .unwrap_or(if cache_converge != 0 {
+                1
+            } else {
+                base.ssr_history_clamp
+            })
             .min(1);
         let ssr_clamp_gamma = std::env::var("P_SSR_CLAMP_GAMMA")
             .ok()
@@ -2915,7 +2921,12 @@ impl App {
         let reflect_half_res =
             gi.has_upsample() && quality::env_bool("P11_REFLECT_HALF_RES", base.reflect_half_res);
         // C8d: default to the full-res mirror SSR; opt into the stochastic glossy path to compare.
-        let ssr_stochastic = quality::env_bool("P11_SSR_STOCHASTIC", base.ssr_stochastic);
+        // CONVERGE mode forces the stochastic path: the plain mirror SSR feeds the reprojected
+        // lit-history straight back into lighting with NO temporal blend — a gain-1 feedback map
+        // that visibly oscillates every frame (the reference damps this loop with an α ≈ 1/12
+        // accumulation on the reflection before it enters the composited color).
+        let ssr_stochastic =
+            quality::env_bool("P11_SSR_STOCHASTIC", base.ssr_stochastic) || cache_converge != 0;
         // Diagnostic single-object orbit: frame one scene object tightly so it can be
         // inspected from every side. `DIAG_OBJ=<index>` selects it (2 = copper sphere,
         // 3 = red cube); `DIAG_COPPER=1` / `DIAG_CUBE=1` are shortcuts. `DIAG_ANGLE=<deg>`
@@ -6177,7 +6188,14 @@ impl App {
                         cw,
                         ch,
                         self.flip_y,
-                        self.frame_no as u32,
+                        // CONVERGE: cycle the GGX jitter over K=12 deterministic frames (reference
+                        // NumFramesAccumulated window) so the running mean below averages a periodic
+                        // ray set instead of fresh white noise (permanent variance floor).
+                        if self.cache_converge != 0 {
+                            (self.frame_no % 12) as u32
+                        } else {
+                            self.frame_no as u32
+                        },
                         self.scene_radius * 1.5,
                         self.scene_radius * 0.06,
                         true,
@@ -6203,6 +6221,13 @@ impl App {
                         2.0,
                         self.ssr_history_clamp,
                         self.ssr_clamp_gamma,
+                        // CONVERGE: running mean α=1/(1+N), N→12 (damps the lit-history feedback
+                        // into a contraction); legacy keeps the fixed 0.15 EMA.
+                        if self.cache_converge != 0 {
+                            -12.0
+                        } else {
+                            0.15
+                        },
                     )
                 } else {
                     self.reflect
