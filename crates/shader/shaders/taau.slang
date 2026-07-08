@@ -37,7 +37,8 @@ struct TaauPush
     float4 params;           // x = reject distance, y = max history, z = variance gamma, w unused
     float4 jitter;           // xy = current frame's jitter in UV (add to the stable UV to sample)
     uint velocity_index;     // sampled: RG16Float per-pixel motion vector, or 0xFFFFFFFF = absent
-    uint pad0, pad1, pad2;   // 16-byte align the tail
+    uint packed_hist;        // 1 = fp16-packed history, no pos buffer (see the packed helpers)
+    uint pad1, pad2;         // 16-byte align the tail
 };
 
 [[vk::push_constant]]
@@ -65,6 +66,33 @@ float3 clip_aabb(float3 amin, float3 amax, float3 q)
     return m > 1.0 ? center + v / m : q;
 }
 float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+// ---- fp16-packed history (packed_hist == 1) -------------------------------------------------
+// The history I/O dominates the pass at Retina-class output (hist 16B + pos 16B, ping-pong =
+// read+write ≈ 64B/px/frame). Two observations shrink it 4x with no algorithmic change:
+//   • The pos buffer's ONLY consumed field is `.w` (the "real prior surface" flag) — the world
+//     point itself is never read (the YCoCg clip replaced hard geometric disocclusion, see
+//     fetch_history_bilinear). A separate 16B/px validity buffer is pure waste: fold the flag
+//     into the history length (len == 0 = sky/no-surface, len >= 1 = valid — the accumulator
+//     never writes a fractional len below 1 for a real surface).
+//   • The accumulated rgb comes from an RGBA16Float HDR chain, so an fp16 history holds the
+//     full input precision (the reference engine's TAA history is fp16 for the same reason).
+// Layout: uint2 per pixel = f16(r)|f16(g)<<16, f16(b)|f16(len)<<16. The unpacked path (and its
+// buffers) is untouched — the packed layout is a strict opt-in (quality-tier knob).
+float4 hist_load_packed(uint buf, uint idx)
+{
+    uint2 d = g.storage_buffers[buf].Load2(idx * 8u);
+    return float4(f16tof32(d.x & 0xFFFFu), f16tof32(d.x >> 16), f16tof32(d.y & 0xFFFFu),
+                  f16tof32(d.y >> 16));
+}
+void hist_store_packed(uint buf, uint idx, float4 v)
+{
+    // Clamp to the fp16 finite range: f32tof16 of a larger float lands on +inf, which would
+    // poison every later EMA blend through this texel.
+    v = min(v, 65504.0);
+    uint2 d = uint2(f32tof16(v.x) | (f32tof16(v.y) << 16), f32tof16(v.z) | (f32tof16(v.w) << 16));
+    g.storage_buffers[buf].Store2(idx * 8u, d);
+}
 
 // Bilinear (sub-pixel) history fetch from the ping-pong storage buffers. The history lives in a
 // raw buffer (no hardware sampler), so do the 2x2 tap + weighting by hand. CRITICAL for jitter:
@@ -94,19 +122,33 @@ void fetch_history_bilinear(float2 puv, float3 world_pos, out float3 out_rgb, ou
         if (p.x < 0 || p.y < 0 || p.x >= int(pc.out_width) || p.y >= int(pc.out_height))
             continue;
         uint pidx = uint(p.y) * pc.out_width + uint(p.x);
-        float4 pp = asfloat(g.storage_buffers[pc.pos_read].Load4(pidx * 16u));
-        // Accept any tap that holds a real prior surface (pp.w). NO hard geometric disocclusion:
+        // Accept any tap that holds a real prior surface. NO hard geometric disocclusion:
         // a hard world-point reject left silhouette + grazing bands stuck at len 1 (full jitter
         // crawl), because under jitter those pixels flip sub-pixel coverage every frame and must
         // ACCUMULATE into an anti-aliased average rather than reset. The YCoCg neighborhood clip in
         // the caller is the anti-ghost for genuine (camera-motion) disocclusion — new content has a
         // different colour and is clipped out (Karis 2014).
-        if (pp.w > 0.5)
+        if (pc.packed_hist != 0u)
         {
-            float4 ph = asfloat(g.storage_buffers[pc.hist_read].Load4(pidx * 16u));
-            rgb_sum += w[i] * ph.rgb;
-            len_sum += w[i] * ph.a;
-            wsum += w[i];
+            // Packed layout: validity is folded into the length (len >= 1 = real surface, 0 = sky).
+            float4 ph = hist_load_packed(pc.hist_read, pidx);
+            if (ph.a > 0.5)
+            {
+                rgb_sum += w[i] * ph.rgb;
+                len_sum += w[i] * ph.a;
+                wsum += w[i];
+            }
+        }
+        else
+        {
+            float4 pp = asfloat(g.storage_buffers[pc.pos_read].Load4(pidx * 16u));
+            if (pp.w > 0.5)
+            {
+                float4 ph = asfloat(g.storage_buffers[pc.hist_read].Load4(pidx * 16u));
+                rgb_sum += w[i] * ph.rgb;
+                len_sum += w[i] * ph.a;
+                wsum += w[i];
+            }
         }
     }
     // Accept whenever ANY of the footprint is a real prior surface (re-normalized by the valid
@@ -198,8 +240,18 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     if (depth >= 1.0)
     {
         g.storage_images[pc.out_index][tid.xy] = float4(cur, 1.0);
-        g.storage_buffers[pc.hist_write].Store4(idx * 16u, asuint(float4(cur, 1.0)));
-        g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(0, 0, 0, 0)));
+        if (pc.packed_hist != 0u)
+        {
+            // len 0 = "no prior surface" (the packed replacement for pos.w = 0); the rgb is
+            // never consumed for an invalid texel (matching the unpacked path, whose sky rgb
+            // is likewise dead — taps gate on validity before touching the history).
+            hist_store_packed(pc.hist_write, idx, float4(cur, 0.0));
+        }
+        else
+        {
+            g.storage_buffers[pc.hist_write].Store4(idx * 16u, asuint(float4(cur, 1.0)));
+            g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(0, 0, 0, 0)));
+        }
         return;
     }
 
@@ -303,8 +355,16 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     }
 
     accum = make_finite(accum);
-    g.storage_buffers[pc.hist_write].Store4(idx * 16u, asuint(float4(accum, len)));
-    g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(world_pos, 1.0)));
+    if (pc.packed_hist != 0u)
+    {
+        // len >= 1 for every real surface, so the validity flag rides in the length.
+        hist_store_packed(pc.hist_write, idx, float4(accum, len));
+    }
+    else
+    {
+        g.storage_buffers[pc.hist_write].Store4(idx * 16u, asuint(float4(accum, len)));
+        g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(world_pos, 1.0)));
+    }
     // Output the accumulated result: for disoccluded / no-history pixels this is `cur` (the current
     // frame), so newly-revealed regions show the live frame instead of empty (black) history.
     g.storage_images[pc.out_index][tid.xy] = float4(accum, 1.0);

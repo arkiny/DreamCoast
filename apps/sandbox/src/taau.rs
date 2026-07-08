@@ -26,6 +26,11 @@ pub(crate) struct TaauSystem {
     pos: [Option<StorageBuffer>; 2],
     extent: (u32, u32),
     frame: u32,
+    /// fp16-packed history (`taau_packed_history` tier knob): `hist` shrinks to 8B/px (fp16
+    /// rgb + length, validity folded into the length) and `pos` is not allocated at all — its
+    /// only consumed field was the `.w` validity flag. Cuts the pass's dominant history traffic
+    /// ~4x at Retina-class output. Off = the legacy 16B+16B layout (byte-identical anchor).
+    packed: bool,
 }
 
 impl TaauSystem {
@@ -79,6 +84,7 @@ impl TaauSystem {
             pos: [None, None],
             extent: (0, 0),
             frame: 0,
+            packed: false,
         })
     }
 
@@ -128,23 +134,33 @@ impl TaauSystem {
         ow: u32,
         oh: u32,
         reset_key: u64,
+        packed: bool,
     ) -> anyhow::Result<()> {
         if self.pipeline.is_none() {
             return Ok(());
         }
         let _ = reset_key;
-        if self.extent != (ow, oh) {
+        if self.extent != (ow, oh) || self.packed != packed {
             device.wait_idle()?;
-            let make = || -> anyhow::Result<Option<StorageBuffer>> {
+            let make = |texel: u64| -> anyhow::Result<Option<StorageBuffer>> {
                 Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
-                    size: (ow as u64) * (oh as u64) * 16,
-                    stride: 16,
+                    size: (ow as u64) * (oh as u64) * texel,
+                    stride: texel as u32,
                     indirect: false,
                 })?))
             };
-            self.hist = [make()?, make()?];
-            self.pos = [make()?, make()?];
+            // Packed: fp16 rgb+len in 8B/px, and no pos buffers at all (see the struct docs).
+            self.hist = [
+                make(if packed { 8 } else { 16 })?,
+                make(if packed { 8 } else { 16 })?,
+            ];
+            self.pos = if packed {
+                [None, None]
+            } else {
+                [make(16)?, make(16)?]
+            };
             self.extent = (ow, oh);
+            self.packed = packed;
             self.frame = 0;
         }
         Ok(())
@@ -184,10 +200,19 @@ impl TaauSystem {
         let write = (frame % 2) as usize;
         let hist_r = self.hist[read].as_ref().expect("hist r").storage_index();
         let hist_w = self.hist[write].as_ref().expect("hist w").storage_index();
-        let pos_r = self.pos[read].as_ref().expect("pos r").storage_index();
-        let pos_w = self.pos[write].as_ref().expect("pos w").storage_index();
+        // Packed history has no pos buffers; the shader never touches the indices (packed_hist
+        // gates every pos access), so 0 is a safe placeholder.
+        let packed = self.packed;
+        let (pos_r, pos_w) = if packed {
+            (0, 0)
+        } else {
+            (
+                self.pos[read].as_ref().expect("pos r").storage_index(),
+                self.pos[write].as_ref().expect("pos w").storage_index(),
+            )
+        };
         let hist_w_ext = graph.import_external("taau_hist_w");
-        let pos_w_ext = graph.import_external("taau_pos_w");
+        let pos_w_ext = (!packed).then(|| graph.import_external("taau_pos_w"));
         let out = graph.create_storage_image("taau_out", HDR_FORMAT, out_extent);
         let reject_dist = scene_diag * 0.01;
         // 16-frame history balances stability (jitter hidden) against gather-accumulation softening;
@@ -205,10 +230,14 @@ impl TaauSystem {
         if let Some(v) = velocity {
             reads.push(v);
         }
+        let mut storage_writes = vec![out, hist_w_ext];
+        if let Some(p) = pos_w_ext {
+            storage_writes.push(p);
+        }
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "taau",
-                storage_writes: vec![out, hist_w_ext, pos_w_ext],
+                storage_writes,
                 reads,
             },
             move |ctx| {
@@ -240,6 +269,7 @@ impl TaauSystem {
                     clamp_expand,
                     jitter_uv,
                     velocity_index,
+                    u32::from(packed),
                 ));
                 cmd.dispatch(ow.div_ceil(8), oh.div_ceil(8), 1);
                 Ok(())

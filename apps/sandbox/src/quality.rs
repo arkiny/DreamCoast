@@ -306,6 +306,14 @@ pub struct QualityPreset {
     /// once DX≡VK passes.
     #[serde(default)]
     pub cache_adaptive_res: bool,
+    /// macOS 60fps margin (`P_TAAU_PACKED`): fp16-packed TAAU history — `hist` shrinks to 8B/px
+    /// (fp16 rgb + length, the validity flag folded into the length) and the 16B/px `pos` buffer
+    /// is dropped entirely (its only consumed field was `.w`). The history ping-pong is the TAAU
+    /// pass's dominant traffic at Retina-class output (~4x cut). fp16 holds the full precision of
+    /// the RGBA16Float HDR chain it accumulates. Off = legacy layout (byte-identical anchor);
+    /// Apple ON (Metal-verified), Low/Med/High after the DX≡VK parity run.
+    #[serde(default)]
+    pub taau_packed_history: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +513,7 @@ pub fn gallery_preset() -> QualityPreset {
         cache_grid: false,
         card_mesh_capture: false,
         cache_adaptive_res: false,
+        taau_packed_history: false, // legacy 16B+16B history layout (anchor; TAAU off at scale 1)
     }
 }
 
@@ -921,6 +930,7 @@ mod tests {
         assert!(!g.cache_grid, "gallery cache_grid off");
         assert!(!g.card_mesh_capture, "gallery card_mesh_capture off");
         assert!(!g.cache_adaptive_res, "gallery cache_adaptive_res off");
+        assert!(!g.taau_packed_history, "gallery taau_packed_history off");
     }
 
     /// `Med` is the content-default tier. Most fields still match the pre-tier legacy defaults; the
@@ -961,6 +971,10 @@ mod tests {
         assert!(!m.cache_grid, "Med cache_grid off");
         assert!(!m.card_mesh_capture, "Med card_mesh_capture off");
         assert!(!m.cache_adaptive_res, "Med cache_adaptive_res off");
+        assert!(
+            !m.taau_packed_history,
+            "Med taau_packed_history off (DX≡VK pending)"
+        );
     }
 
     /// The embedded (`include_str!`) config parses and covers every tier. This is the invariant the
@@ -1026,6 +1040,10 @@ mod tests {
         assert!(
             !apple.cache_adaptive_res,
             "Apple cache_adaptive_res off (relight gather +3ms; High-tier material post DX≡VK)"
+        );
+        assert!(
+            apple.taau_packed_history,
+            "Apple taau_packed_history on (fp16 history, 60fps-margin)"
         );
     }
 

@@ -1364,6 +1364,7 @@ pub(crate) fn taau_push(
     clamp_expand: f32,
     jitter_uv: [f32; 2],
     velocity_index: u32,
+    packed_hist: u32,
 ) -> [u8; 240] {
     let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -1401,6 +1402,8 @@ pub(crate) fn taau_push(
     // velocity target index (PR-2) at the next 16-byte row; 0xFFFFFFFF = absent (camera-only
     // reprojection, byte-identical to the pre-velocity path).
     pc[224..228].copy_from_slice(&velocity_index.to_le_bytes());
+    // fp16-packed history flag (0 = legacy 16B hist + 16B pos layout, the byte-identical anchor).
+    pc[228..232].copy_from_slice(&packed_hist.to_le_bytes());
     pc
 }
 

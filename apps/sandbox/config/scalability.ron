@@ -204,6 +204,9 @@
                 card_mesh_capture: true,
                 // cache_adaptive_res stays off: +~3ms relight (layout loads in the gather) —
                 // High-tier material once DX≡VK passes.
+                // 60fps-margin: fp16-packed TAAU history (8B/px, no pos buffer) — the history
+                // ping-pong dominates the taau pass at the Retina output this tier upscales to.
+                taau_packed_history: true,
             ),
             groups: (
                 resolution: 1,

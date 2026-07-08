@@ -1122,6 +1122,9 @@ struct App {
     /// frames when the internal render extent is smaller than the output. `P_TAAU=0` disables.
     taau: taau::TaauSystem,
     taau_on: bool,
+    /// 60fps-margin: fp16-packed TAAU history (8B/px hist + no pos buffer; the history ping-pong
+    /// dominates the taau pass at Retina output). Tier knob `taau_packed_history` / `P_TAAU_PACKED`.
+    taau_packed: bool,
     /// QHD/UHD: camera sub-pixel jitter for TAAU. Default ON in the upscale path — the jitter is the
     /// super-sampling signal that reconstructs full-res detail (Halton(2,3), ±0.5px). It is now
     /// coordinated across every screen-space temporal accumulator: TAAU + GI denoiser + reflection
@@ -2816,6 +2819,10 @@ impl App {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(if hq_reflect { 3 } else { base.reflect_res_div })
             .clamp(1, 16);
+        // 60fps-margin: fp16-packed TAAU history (8B/px hist, no pos buffer) — the history
+        // ping-pong dominates the taau pass at Retina-class output. Content-only (TAAU itself
+        // only runs when upscaling; the gallery renders at scale 1). `P_TAAU_PACKED` overrides.
+        let taau_packed = quality::env_bool("P_TAAU_PACKED", base.taau_packed_history);
         // macOS/M3 perf: GDF AO trace-resolution divisor (1 = full-res = byte-identical; 2 = half).
         // Traced at 1/div then joint-bilateral upsampled; the gallery never runs gdf_ao so the anchor
         // is unaffected. `P_AO_RES_DIV` overrides the tier.
@@ -3549,6 +3556,7 @@ impl App {
             render_scale,
             taau,
             taau_on: quality::env_bool("P_TAAU", true),
+            taau_packed,
             taau_jitter: quality::env_bool("P_TAAU_JITTER", true),
             taau_force: quality::env_bool("P_TAAU_FORCE", false),
             taa_mip_bias: std::env::var("TAA_MIP_BIAS")
@@ -5467,7 +5475,8 @@ impl App {
         }
         // QHD/UHD TAAU: (re)allocate the full-res (output) history.
         if taau_active {
-            self.taau.prepare(&self.device, sw, sh, 0)?;
+            self.taau
+                .prepare(&self.device, sw, sh, 0, self.taau_packed)?;
         }
 
         let extent = Extent2D::new(cw, ch); // scene render extent (RENDER_RES or swapchain)
