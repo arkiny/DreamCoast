@@ -948,6 +948,16 @@ struct App {
     /// sparkling. `P_REFLECT_STOCHASTIC` (content only; gallery keeps its white inline jitter →
     /// anchor untouched). Sets `max_steps` bit30 for the SW trace so it draws the blue-noise ray.
     reflect_stochastic: bool,
+    /// Track C0-fix: surface-cache relight CONVERGE mode — K-cycle deterministic gather jitter +
+    /// running-mean α=1/(1+N) (reference radiosity NumFramesAccumulated), so a static scene's cache
+    /// actually reaches a fixed point and the measured freeze latch can arm. 0 = legacy (fixed-alpha
+    /// EMA of frame-varying noise = permanent variance floor). `P_CACHE_CONVERGE=<K>` (content only).
+    cache_converge: u32,
+    /// Track C0-fix: GI irradiance-volume STABLE mode — pass a fixed jitter index (0) so each probe
+    /// traces the SAME deterministic direction set every update (reference radiance cache:
+    /// JITTER_TRACE_DIRECTION 0, "we want stable lighting"); a static scene's volume becomes an
+    /// idempotent overwrite = fixed point. `P_GI_STABLE=1` (content only).
+    gi_stable: bool,
     /// SSR resolve history neighbourhood clamp (breaks the mirror lit-history feedback oscillation a
     /// plain EMA only low-passes): 0 = off (byte-identical), 1 = variance clamp (mean ± γ·σ). Gallery
     /// forced 0. `P_SSR_HISTORY_CLAMP` / `P_SSR_CLAMP_GAMMA` override.
@@ -2861,6 +2871,39 @@ impl App {
         // Content opt-in; default off (content sequence unchanged, gallery anchor untouched).
         let reflect_stochastic =
             !gallery_scene && std::env::var_os("P_REFLECT_STOCHASTIC").is_some();
+        // Track C0-fix: static-scene convergence seams (see the field docs). Content opt-in.
+        let cache_converge = if gallery_scene {
+            0
+        } else {
+            std::env::var("P_CACHE_CONVERGE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0)
+                .min(64)
+        };
+        let gi_stable = !gallery_scene && std::env::var_os("P_GI_STABLE").is_some();
+        // CONVERGE mode needs each relight to be a COMPLETE stratified estimate (the reference
+        // radiosity traces its full 16-ray hemisphere every update) — with a fixed direction set and
+        // spp raised to K, one relight is idempotent up to the multibounce transient, so the
+        // measured-convergence freeze can actually arm. Gather cost rises K× only until the freeze
+        // stops the relight entirely (steady-state cost → 0).
+        let cache_relight_spp = if cache_converge != 0 {
+            cache_relight_spp.max(cache_converge)
+        } else {
+            cache_relight_spp
+        };
+        // CONVERGE mode also drops the relight amortization: the period exists to bound the
+        // steady-state relight cost, but in converge mode the freeze latch zeroes that cost anyway —
+        // while the off-screen HIDDEN_MULT(8×) on top of period 40 gave reflected (off-screen) cards
+        // a 320-frame cadence = a 1000+-frame convergence horizon (the ball's residual drift).
+        // period 2 (hidden ×8 ⇒ 16) → every card converges in ~K relights within tens of frames
+        // (20× faster horizon than the legacy 320-frame off-screen cadence) at half the full
+        // every-frame relight cost; the freeze then stops relight entirely.
+        let cache_relight_period = if cache_converge != 0 {
+            cache_relight_period.min(2)
+        } else {
+            cache_relight_period
+        };
         // SSR-resolve history feedback clamp (0 off / 1 variance). Gallery base is 0 (byte-identical
         // anchor); content tiers default 0 too pending DX=VK verification. `P_SSR_HISTORY_CLAMP` +
         // `P_SSR_CLAMP_GAMMA` override (set =1 to break the mirror lit-history feedback shimmer).
@@ -3290,6 +3333,8 @@ impl App {
             reflect_spatial,
             reflect_spatial_kernel,
             reflect_stochastic,
+            cache_converge,
+            gi_stable,
             ssr_history_clamp,
             ssr_clamp_gamma,
             gi_temporal_clamp,
@@ -5576,6 +5621,12 @@ impl App {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(0.05)
                 .clamp(0.005, 1.0)
+        } else if self.cache_converge != 0 {
+            // CONVERGE mode (negative alpha = the seam): the relight cycles its gather jitter over K
+            // deterministic ray sets and accumulates with a running mean α = 1/(1+N) instead of the
+            // fixed-alpha EMA of fresh white noise (which has a permanent variance floor and NEVER
+            // converges — the measured freeze latch could not arm on IntelSponza). K = the window.
+            -(self.cache_converge as f32)
         } else if self.cache_feedback {
             (0.35 * (self.cache_relight_period as f32 / 8.0)).clamp(0.35, 0.8)
         } else {
@@ -5930,7 +5981,16 @@ impl App {
                                 &scene_clip_vols,
                                 scene_albedo,
                                 crate::GROUND_ALBEDO,
-                                self.frame_no as u32,
+                                // C0-fix (`P_GI_STABLE`): a FIXED jitter index ⇒ every probe traces
+                                // the same deterministic direction set each update (the reference
+                                // radiance cache disables trace jitter for stability), so a static
+                                // scene's volume is an idempotent overwrite = a fixed point instead
+                                // of a fixed-alpha EMA over fresh per-frame noise (never settles).
+                                if self.gi_stable {
+                                    0
+                                } else {
+                                    self.frame_no as u32
+                                },
                                 self.gi_spp,
                                 0.1,
                             )

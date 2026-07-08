@@ -232,6 +232,33 @@ GDF march 앞에 hit-validation HZB 스크린 트레이스를 1차 바운스로.
 relight 비용↑). (2) **오프스크린 페널티 완화 / 반사-보이는 카드 relight 우선순위**(= C2b 피드백; 볼 잔여의
 근본). (3) 완전 동적에선 카메라 이동마다 재수렴하므로 이건 amortized 동적 GI의 본질 → 티어로 노출.
 
+#### C0-fix 구현 완료 — CONVERGE 모드 (opt-in `P_CACHE_CONVERGE=<K>` + `P_GI_STABLE=1`)
+**"지속적으로 변경됨"(수렴 불가)의 수학적 근본(레퍼런스 소스 대조로 확정):** 우리 relight/GI 볼륨은
+**매 업데이트 새 백색잡음 레이 + 고정 alpha EMA** — 이는 분산 바닥 `α/(2−α)·σ²`가 영원히 남는 AR(1)
+정상과정이라 **원리적으로 수렴 불가**(A2 freeze 래치가 IntelSponza에서 절대 arm 안 되던 이유).
+레퍼런스의 수렴 메커니즘(소스 인용 M1~M11): **running mean α=1/(1+N)**(NumFramesAccumulated 아틀라스,
+cap 4~12) + **결정적/주기적 방향 세트**(radiosity는 16-strata 완전 반구/업데이트 + `%MaxFrames` 순환
+placement; radiance cache는 **jitter를 아예 끄고**("we want stable lighting") 고정 방향 + idempotent
+덮어쓰기) + **수축 피드백**(albedo/π<1 — 우리도 이미 만족) + 잔여는 의도적 ±1-step 디더뿐.
+
+**구현:** `sdf_cache_light.slang` — `params.y<0` seam(K=−params.y): **고정 per-texel 방향**(M5, frame 항
+제거) + **running mean α=1/(1+N)**(M1/M2, N=radiance `.w`의 빈 채널 — 모든 컨슈머 Load3/pos.w만 읽음
+확인) + host가 **spp를 K로 상향**(M4, relight당 완전 추정 = idempotent) + **period ≤2**(오프스크린
+320프레임 지평선 제거 — freeze가 steady-state 비용을 0으로 만드니 amortization 불필요). `gi_volume`은
+셰이더 무변경 — host가 고정 jitter 인덱스 0 전달(M5). 갤러리 byte-identical(`af70c1a5` PASS).
+
+**측정 (glossyball, 40프레임 윈도우 볼/바닥 드리프트):**
+| | 볼 | 바닥 |
+|---|---|---|
+| 베이스라인(영구, 감쇠 안 함) | ~2.1 | ~0.46 |
+| CONVERGE 240v280 | 0.819 | 0.150 |
+| CONVERGE 280v320 | **0.676 (감쇠!)** | **0.089 (감쇠!)** |
+
+**결론: 수렴 달성** — 잔여가 윈도우마다 감쇠(지수 꼬리 = reflect_temporal 64프레임 히스토리가 빠지는 중,
+유한)이고 베이스라인처럼 영구 지속하지 않음. per-frame 0.09 글로벌은 TAAU/디더 바닥(레퍼런스도 의도적
+디더로 byte-identical 아님). AE 무관(격리 확인). **후속:** freeze-arm 시 reflect 히스토리 리셋(꼬리 단축),
+K/period 티어 튜닝, 동적 씬 invalidation(epoch은 sun/sky만 — 오브젝트 이동 미포함), DX≡VK Windows.
+
 #### C3. 카드 커버리지 스케일
 `MAX_CARDS`를 drawable 수에 스케일(또는 LRU 데맨드 페이징). 현 `P11_REFLECT_HQ`가 전-drawable 카드를
 주지만 메모리 큼 → RenderQuality 티어 노브로.

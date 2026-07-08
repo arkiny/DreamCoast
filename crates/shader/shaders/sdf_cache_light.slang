@@ -194,7 +194,21 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     float3 indirect = float3(0, 0, 0);
     uint spp = max(pc.spp, 1u);
     uint miss_count = 0u; // gather rays that escaped to sky = this texel's sky visibility estimate
-    uint seed = (t * 9277u + pc.frame * 26699u) | 1u;
+    // CONVERGE mode (params.y < 0 ⇒ K = -params.y): the legacy frame-varying seed injects FRESH white
+    // noise into every relight, and a fixed-alpha EMA of white noise is an AR(1) process with a
+    // permanent variance floor α/(2-α)·σ² — the cache NEVER converges (the measured-convergence
+    // freeze can't arm). The reference engine converges because each relight is (a) a COMPLETE
+    // stratified hemisphere estimate (16 rays/probe, radiosity) and (b) drawn from a DETERMINISTIC
+    // direction set (the radiance cache disables trace jitter outright: "we want stable lighting").
+    // Here: a FIXED per-texel seed (no frame term — the host raises spp to K so one relight is a
+    // complete estimate), so a static texel's relight is IDEMPOTENT up to the multibounce transient;
+    // the running mean below (α = 1/(1+N)) smooths that transient, which decays geometrically
+    // (per-bounce gain = albedo < 1), so the EMA step falls below the freeze epsilon and the
+    // existing measured-convergence latch finally arms → the cache reaches a true fixed point.
+    // params.y > 0 (gallery / legacy) keeps the frame-varying seed = byte-identical.
+    bool converge = pc.params.y < 0.0;
+    uint conv_k = converge ? max(uint(-pc.params.y + 0.5), 1u) : 1u;
+    uint seed = converge ? ((t * 9277u) | 1u) : ((t * 9277u + pc.frame * 26699u) | 1u);
     float bias = pc.params.z;
     float maxt = pc.params.w;
     for (uint s = 0; s < spp; s++)
@@ -250,11 +264,25 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     // stays as-is. Omitting the direct 1/PI made cached (reflected) surfaces ~PI too bright.
     float3 radiance = albedo * (direct_irr * (1.0 / PI) + indirect);
 
-    // Temporal EMA (skip on reset) — static cache converges; damps gather noise.
+    // Temporal blend (skip on reset). Legacy: fixed-alpha EMA (params.y). CONVERGE mode: a running
+    // mean α = 1/(1+N) with the per-texel relight counter N carried in the radiance `.w` (unread by
+    // every consumer — mipgen validity comes from `src_pos.w` and sampling uses Load3). N saturates at
+    // K, matching the K-cycle jitter above: the first K relights average the K stratified ray sets
+    // EXACTLY (running mean), after which the input repeats periodically and the blend is a bounded
+    // ripple the freeze latch measures below its epsilon (reference NumFramesAccumulated atlas).
+    float n_count = 1.0;
     if (pc.reset == 0u)
     {
-        float3 prev = make_finite(asfloat(g.storage_buffers[pc.cache_rad_read].Load3(t * 16u)));
-        radiance = lerp(prev, radiance, pc.params.y);
+        float4 prev4 = asfloat(g.storage_buffers[pc.cache_rad_read].Load4(t * 16u));
+        float3 prev = make_finite(prev4.rgb);
+        float alpha = pc.params.y;
+        if (converge)
+        {
+            float n_prev = clamp(prev4.w, 0.0, float(conv_k));
+            alpha = 1.0 / (1.0 + n_prev);
+            n_count = min(n_prev + 1.0, float(conv_k));
+        }
+        radiance = lerp(prev, radiance, alpha);
         // A2-fix convergence probe: the MEAN per-channel EMA step over the relit texels (buffer[0] =
         // sum in 1e4 fixed-point, buffer[1] = count). Mean, not max — a single stochastic-gather
         // outlier keeps a max pinned high forever, so max never reports convergence; the mean tracks
@@ -269,6 +297,8 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
         }
     }
     // Sanitize before storing: a NaN here would spread through the cache's gather + EMA
-    // every frame (the "black creeps in" failure on complex scenes).
-    g.storage_buffers[pc.cache_rad_write].Store4(t * 16u, asuint(float4(make_finite(radiance), 1.0)));
+    // every frame (the "black creeps in" failure on complex scenes). `.w` = the CONVERGE-mode
+    // relight counter N (legacy stores its constant 1.0 = byte-identical).
+    g.storage_buffers[pc.cache_rad_write].Store4(
+        t * 16u, asuint(float4(make_finite(radiance), converge ? n_count : 1.0)));
 }
