@@ -1125,6 +1125,12 @@ struct App {
     /// 60fps-margin: fp16-packed TAAU history (8B/px hist + no pos buffer; the history ping-pong
     /// dominates the taau pass at Retina output). Tier knob `taau_packed_history` / `P_TAAU_PACKED`.
     taau_packed: bool,
+    /// Baked ACES tonemap: replace the per-pixel Narkowicz curve with a per-frame-baked LUT
+    /// carrying the full ACES 1.3 RRT+ODT (+ the CDL grade). Tier knob `tonemap_aces` /
+    /// `P_TONEMAP_ACES`; the gallery keeps the legacy curve (anchor).
+    tonemap_aces: bool,
+    /// Tonemap-LUT resolution N (strip is N*N x N texels). `P_TONEMAP_LUT_SIZE`, default 48.
+    tonemap_lut_size: u32,
     /// QHD/UHD: camera sub-pixel jitter for TAAU. Default ON in the upscale path — the jitter is the
     /// super-sampling signal that reconstructs full-res detail (Halton(2,3), ±0.5px). It is now
     /// coordinated across every screen-space temporal accumulator: TAAU + GI denoiser + reflection
@@ -2823,6 +2829,14 @@ impl App {
         // ping-pong dominates the taau pass at Retina-class output. Content-only (TAAU itself
         // only runs when upscaling; the gallery renders at scale 1). `P_TAAU_PACKED` overrides.
         let taau_packed = quality::env_bool("P_TAAU_PACKED", base.taau_packed_history);
+        // Baked ACES tonemap LUT (production filmic curve; see aces.slang / tonemap_lut.slang).
+        // `P_TONEMAP_ACES` overrides the tier; `P_TONEMAP_LUT_SIZE` tunes the LUT resolution.
+        let tonemap_aces = quality::env_bool("P_TONEMAP_ACES", base.tonemap_aces);
+        let tonemap_lut_size = std::env::var("P_TONEMAP_LUT_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(48)
+            .clamp(16, 64);
         // macOS/M3 perf: GDF AO trace-resolution divisor (1 = full-res = byte-identical; 2 = half).
         // Traced at 1/div then joint-bilateral upsampled; the gallery never runs gdf_ao so the anchor
         // is unaffected. `P_AO_RES_DIV` overrides the tier.
@@ -3557,6 +3571,8 @@ impl App {
             taau,
             taau_on: quality::env_bool("P_TAAU", true),
             taau_packed,
+            tonemap_aces,
+            tonemap_lut_size,
             taau_jitter: quality::env_bool("P_TAAU_JITTER", true),
             taau_force: quality::env_bool("P_TAAU_FORCE", false),
             taa_mip_bias: std::env::var("TAA_MIP_BIAS")
@@ -7675,6 +7691,23 @@ impl App {
             let (s, o, p) = push::CDL_NEUTRAL;
             (0u32, s, o, p)
         };
+        // Baked ACES tonemap LUT (tier knob `tonemap_aces` / `P_TONEMAP_ACES`): bake the CDL
+        // grade + the ACES 1.3 RRT+ODT into a small strip (per frame, ~110K texels) and let the
+        // tonemap replace its per-pixel curve with one strip fetch. Applied to EVERY tonemap
+        // source (main lit + path-trace/debug viz) so the PT-parity capture pipeline tonemaps
+        // both sides identically. The gallery keeps the legacy per-pixel curve (anchor).
+        let tonemap_lut =
+            if self.tonemap_aces && !self.is_gallery && self.deferred.has_tonemap_lut() {
+                let n = self.tonemap_lut_size;
+                Some((
+                    self.deferred.record_tonemap_lut_bake(
+                        &mut graph, n, grade_on, cdl_slope, cdl_offset, cdl_power,
+                    ),
+                    n,
+                ))
+            } else {
+                None
+            };
         self.deferred.record_tonemap(
             &mut graph,
             backbuffer,
@@ -7691,6 +7724,7 @@ impl App {
             cdl_slope,
             cdl_offset,
             cdl_power,
+            tonemap_lut,
         );
 
         // PR-9 View Family (`docs/view-family.md`): render a SECOND view in the same frame against

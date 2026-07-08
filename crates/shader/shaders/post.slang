@@ -14,6 +14,7 @@
 // per backend (D3D12 = 0, Vulkan = 1).
 
 #include "bindless.slang"
+#include "aces.slang"
 
 struct VSOutput
 {
@@ -47,6 +48,13 @@ struct PushConstants
     float4 cdl_slope;  // gain  (per-channel multiplier; neutral 1,1,1)
     float4 cdl_offset; // lift  (per-channel additive;   neutral 0,0,0)
     float4 cdl_power;  // gamma (per-channel exponent;   neutral 1,1,1)
+    // Baked tonemap LUT (ACES 1.3 RRT+ODT + the CDL grade, see tonemap_lut.slang):
+    // 0xFFFFFFFF = off -> the legacy per-pixel Narkowicz curve below (byte-identical anchor).
+    // When bound, the LUT REPLACES both the grade and the curve (they are baked in).
+    uint lut_index;
+    float lut_size; // LUT resolution N (strip is N*N x N)
+    uint pad2;
+    uint pad3;
 };
 
 [[vk::push_constant]]
@@ -69,6 +77,25 @@ float3 aces(float3 x)
 {
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+// Baked tonemap-LUT fetch: manual trilinear on the 2D strip (N slices of N x N side by side;
+// blue = slice). Two hardware-bilinear taps on adjacent slices + a lerp. Tap UVs stay >= 0.5
+// texel inside their slice, so the bilinear footprint never bleeds across a slice seam.
+// Returns display-linear Rec.709 (the LUT bakes grade + RRT + ODT; see tonemap_lut.slang).
+float3 sample_tonemap_lut(float3 lin)
+{
+    float n = pc.lut_size;
+    float3 t = tonemap_lut_encode(lin);
+    float slice = t.z * (n - 1.0);
+    float s0 = floor(min(slice, n - 1.0 - 1e-4));
+    float f = slice - s0;
+    float2 inv_dim = 1.0 / float2(n * n, n);
+    float2 uv = float2(s0 * n + t.x * (n - 1.0) + 0.5, t.y * (n - 1.0) + 0.5) * inv_dim;
+    float3 c0 = g.textures[pc.lut_index].SampleLevel(g.samp, uv, 0.0).rgb;
+    float3 c1 =
+        g.textures[pc.lut_index].SampleLevel(g.samp, uv + float2(n * inv_dim.x, 0.0), 0.0).rgb;
+    return lerp(c0, c1, f);
 }
 
 [shader("fragment")]
@@ -98,14 +125,23 @@ float4 fsMain(VSOutput input) : SV_Target
     // exposure into the lighting pass (so it passes 1.0 here); the path-traced
     // output carries raw scene radiance and is exposed at this stage instead.
     float3 exposed = hdr * pc.exposure;
-    // PR-5 color grading (ASC CDL) in linear HDR, before the tonemap curve. Neutral
-    // params or `grade_on == 0` leave `exposed` untouched (byte-identical).
-    if (pc.grade_on != 0u)
+    float3 color;
+    if (pc.lut_index != 0xFFFFFFFFu)
     {
-        float3 graded = pc.cdl_slope.rgb * exposed + pc.cdl_offset.rgb;
-        exposed = pow(max(graded, 0.0), pc.cdl_power.rgb);
+        // Baked tonemap LUT: one strip fetch applies grade + ACES RRT/ODT (both baked).
+        color = sample_tonemap_lut(exposed);
     }
-    float3 color = aces(exposed);
+    else
+    {
+        // PR-5 color grading (ASC CDL) in linear HDR, before the tonemap curve. Neutral
+        // params or `grade_on == 0` leave `exposed` untouched (byte-identical).
+        if (pc.grade_on != 0u)
+        {
+            float3 graded = pc.cdl_slope.rgb * exposed + pc.cdl_offset.rgb;
+            exposed = pow(max(graded, 0.0), pc.cdl_power.rgb);
+        }
+        color = aces(exposed);
+    }
 
     if (pc.mode == 1)
     {

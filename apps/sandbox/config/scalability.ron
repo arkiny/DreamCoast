@@ -207,6 +207,9 @@
                 // 60fps-margin: fp16-packed TAAU history (8B/px, no pos buffer) — the history
                 // ping-pong dominates the taau pass at the Retina output this tier upscales to.
                 taau_packed_history: true,
+                // Baked ACES tonemap LUT: the full RRT+ODT filmic response at one strip fetch
+                // per pixel (the legacy path evaluated a cheap analytic fit per pixel instead).
+                tonemap_aces: true,
             ),
             groups: (
                 resolution: 1,

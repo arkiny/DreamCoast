@@ -24,7 +24,7 @@ const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
 /// editing any of them recompiles all dependents (they include no per-job tracking otherwise —
 /// an omitted entry silently ships stale bytecode). Keep in sync with the `#include`s under
 /// `shaders/` (a non-JOB `.slang` — or the RT-pipeline root-sig JSON — belongs here).
-const SHARED_INCLUDES: [&str; 14] = [
+const SHARED_INCLUDES: [&str; 15] = [
     "bindless.slang",
     "rt_common.slang",
     "rt_pipeline_metal_rootsig.json",
@@ -39,6 +39,7 @@ const SHARED_INCLUDES: [&str; 14] = [
     "pbr_brdf.slang",
     "hzb_test.slang",
     "reflect_ggx.slang",
+    "aces.slang",
 ];
 
 // FNV-1a 64-bit — dependency-free content hash for the shader cook cache (Phase 12
@@ -987,6 +988,13 @@ const JOBS: &[Job] = &[
         entry: "csMain",
         stage: "compute",
         key: "wrc_view_cs",
+    },
+    // Baked ACES tonemap LUT (CDL grade + ACES 1.3 RRT+ODT -> a 2D strip; see aces.slang).
+    Job {
+        src: "tonemap_lut.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "tonemap_lut_cs",
     },
     // Physical-camera auto-exposure: luminance histogram (pass 1) → adapted exposure (pass 2).
     Job {

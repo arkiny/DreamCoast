@@ -20,7 +20,7 @@ use rhi::{
 };
 
 use crate::app::{load_compute_shader, load_shader_pair};
-use crate::push::post_push;
+use crate::push::{post_push, tonemap_lut_push};
 use crate::{
     DEPTH_FORMAT, FRAMES_IN_FLIGHT, GB_ALBEDO_FMT, GB_MATERIAL_FMT, GB_NORMAL_FMT, GB_POSITION_FMT,
     GLOBALS_SLICE, GROUND_ALBEDO, HDR_FORMAT, MAX_VIEWS, NO_TEXTURE, SHADOW_SIZE, SceneObject,
@@ -79,6 +79,9 @@ pub(crate) struct DeferredRenderer {
     ae_resolve_pipeline: Option<ComputePipeline>,
     ae_hist_buf: Option<StorageBuffer>,
     exposure_buf: Option<StorageBuffer>,
+    /// Baked tonemap-LUT bake pass (ACES 1.3 RRT+ODT + CDL -> a 2D strip the tonemap fetches;
+    /// see `tonemap_lut.slang`). Compute-gated like auto-exposure; `None` = legacy curve only.
+    tonemap_lut_pipeline: Option<ComputePipeline>,
     /// Per-frame globals uniform buffer (one `GLOBALS_SLICE` slice per frame-in-flight).
     globals_buffer: Buffer,
 }
@@ -504,8 +507,8 @@ impl DeferredRenderer {
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
             // hdr_index + mode + flip_y + exposure + sharpen + inv_w/h + PR-5 bloom
-            // composite slot + ASC-CDL grading (see push::post_push).
-            push_constant_size: 96,
+            // composite slot + ASC-CDL grading + the baked tonemap-LUT row (see push::post_push).
+            push_constant_size: 112,
             bindless: true,
             uniform_buffer: false,
             depth_test: false,
@@ -574,6 +577,26 @@ impl DeferredRenderer {
             Err(_) => (None, None, None, None),
         };
 
+        // Baked tonemap-LUT bake pipeline (compute-gated, like auto-exposure).
+        let tonemap_lut_pipeline = (|| -> anyhow::Result<ComputePipeline> {
+            let cs = load_compute_shader(
+                backend,
+                dreamcoast_shader::tonemap_lut_cs_spirv,
+                dreamcoast_shader::tonemap_lut_cs_dxil,
+                dreamcoast_shader::tonemap_lut_cs_metallib,
+                "tonemap_lut",
+            )?;
+            Ok(device.create_compute_pipeline(&ComputePipelineDesc {
+                compute_bytes: cs,
+                compute_entry: "csMain",
+                push_constant_size: 64, // out + size + grade_on + pad + CDL slope/offset/power rows
+                bindless: true,
+                uniform_buffer: false,
+                threads_per_group: [8, 8, 1],
+            })?)
+        })()
+        .ok();
+
         // Per-frame globals uniform buffer. PR-9 view family: `FRAMES_IN_FLIGHT * MAX_VIEWS`
         // slices so each view in a frame gets its own camera-matrix slice (offset
         // `(fif * MAX_VIEWS + view) * GLOBALS_SLICE`). The default single-view path only touches
@@ -604,6 +627,7 @@ impl DeferredRenderer {
             ae_resolve_pipeline,
             ae_hist_buf,
             exposure_buf,
+            tonemap_lut_pipeline,
             globals_buffer,
         })
     }
@@ -1297,6 +1321,53 @@ impl DeferredRenderer {
     /// resource, `None` = off) and applies the ASC-CDL color grade (`grade_on == 0` or
     /// `CDL_NEUTRAL` = identity). The bloom resource, when present, is added to the pass
     /// `reads` so the graph sequences the bloom chain before tonemap.
+    /// Whether the baked tonemap-LUT bake pipeline is available (compute-gated).
+    pub(crate) fn has_tonemap_lut(&self) -> bool {
+        self.tonemap_lut_pipeline.is_some()
+    }
+
+    /// Bake the tonemap LUT for this frame: the ASC-CDL grade + the ACES 1.3 RRT + sRGB ODT
+    /// (`aces.slang`) evaluated into a `(size*size) x size` RGBA16F strip (blue = slice). Tiny
+    /// (N=48 -> 110K texels) so it bakes per frame — live grading edits need no invalidation.
+    /// The tonemap pass consumes the returned image via `record_tonemap`'s `lut` argument.
+    pub(crate) fn record_tonemap_lut_bake<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        size: u32,
+        grade_on: u32,
+        cdl_slope: [f32; 3],
+        cdl_offset: [f32; 3],
+        cdl_power: [f32; 3],
+    ) -> ResourceId {
+        let pipe = self
+            .tonemap_lut_pipeline
+            .as_ref()
+            .expect("tonemap_lut pipeline");
+        let out = graph.create_storage_image(
+            "tonemap_lut",
+            crate::HDR_FORMAT,
+            Extent2D::new(size * size, size),
+        );
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "tonemap_lut",
+                storage_writes: vec![out],
+                reads: vec![],
+            },
+            move |ctx| {
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(pipe);
+                cmd.push_constants_compute(&tonemap_lut_push(
+                    out_index, size, grade_on, cdl_slope, cdl_offset, cdl_power,
+                ));
+                cmd.dispatch((size * size).div_ceil(8), size.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_tonemap<'a>(
         &'a self,
@@ -1315,10 +1386,14 @@ impl DeferredRenderer {
         cdl_slope: [f32; 3],
         cdl_offset: [f32; 3],
         cdl_power: [f32; 3],
+        lut: Option<(ResourceId, u32)>,
     ) {
         let mut reads = vec![src];
         if let Some(b) = bloom {
             reads.push(b);
+        }
+        if let Some((l, _)) = lut {
+            reads.push(l);
         }
         graph.add_pass(
             PassInfo {
@@ -1330,6 +1405,9 @@ impl DeferredRenderer {
             move |ctx| {
                 let hdr_index = ctx.sampled_index(src);
                 let bloom_index = bloom.map(|b| ctx.sampled_index(b)).unwrap_or(u32::MAX);
+                let (lut_index, lut_size) = lut
+                    .map(|(l, n)| (ctx.sampled_index(l), n))
+                    .unwrap_or((u32::MAX, 0));
                 let cmd = ctx.cmd();
                 cmd.bind_graphics_pipeline(&self.post_pipeline);
                 cmd.push_constants(&post_push(
@@ -1346,6 +1424,8 @@ impl DeferredRenderer {
                     cdl_slope,
                     cdl_offset,
                     cdl_power,
+                    lut_index,
+                    lut_size,
                 ));
                 cmd.draw(3, 1);
                 Ok(())
@@ -1399,6 +1479,8 @@ impl DeferredRenderer {
                     s,
                     o,
                     p,
+                    u32::MAX, // no baked LUT (plain legacy curve; see the docs above)
+                    0,
                 ));
                 cmd.draw(3, 1);
                 Ok(())

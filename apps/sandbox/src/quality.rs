@@ -314,6 +314,13 @@ pub struct QualityPreset {
     /// Apple ON (Metal-verified), Low/Med/High after the DX≡VK parity run.
     #[serde(default)]
     pub taau_packed_history: bool,
+    /// Baked ACES tonemap (`P_TONEMAP_ACES`): replace the per-pixel Narkowicz approximation with
+    /// a per-frame-baked LUT strip carrying the full ACES 1.3 RRT + sRGB ODT (ported from the
+    /// A.M.P.A.S. reference; see `aces.slang`) + the ASC-CDL grade. Production filmic response
+    /// (proper highlight desaturation / red modifier / surround compensation) at ~1 fetch/px.
+    /// Off = legacy curve (byte-identical anchor); Apple ON (Metal-verified, DX≡VK pending).
+    #[serde(default)]
+    pub tonemap_aces: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +521,7 @@ pub fn gallery_preset() -> QualityPreset {
         card_mesh_capture: false,
         cache_adaptive_res: false,
         taau_packed_history: false, // legacy 16B+16B history layout (anchor; TAAU off at scale 1)
+        tonemap_aces: false,        // legacy per-pixel curve (the byte-identical anchor)
     }
 }
 
@@ -931,6 +939,10 @@ mod tests {
         assert!(!g.card_mesh_capture, "gallery card_mesh_capture off");
         assert!(!g.cache_adaptive_res, "gallery cache_adaptive_res off");
         assert!(!g.taau_packed_history, "gallery taau_packed_history off");
+        assert!(
+            !g.tonemap_aces,
+            "gallery tonemap_aces off (legacy curve anchor)"
+        );
     }
 
     /// `Med` is the content-default tier. Most fields still match the pre-tier legacy defaults; the
@@ -975,6 +987,7 @@ mod tests {
             !m.taau_packed_history,
             "Med taau_packed_history off (DX≡VK pending)"
         );
+        assert!(!m.tonemap_aces, "Med tonemap_aces off (DX≡VK pending)");
     }
 
     /// The embedded (`include_str!`) config parses and covers every tier. This is the invariant the
@@ -1044,6 +1057,10 @@ mod tests {
         assert!(
             apple.taau_packed_history,
             "Apple taau_packed_history on (fp16 history, 60fps-margin)"
+        );
+        assert!(
+            apple.tonemap_aces,
+            "Apple tonemap_aces on (baked ACES RRT+ODT LUT)"
         );
     }
 

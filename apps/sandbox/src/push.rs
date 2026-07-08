@@ -210,8 +210,10 @@ pub(crate) fn post_push(
     cdl_slope: [f32; 3],
     cdl_offset: [f32; 3],
     cdl_power: [f32; 3],
-) -> [u8; 96] {
-    let mut pc = [0u8; 96];
+    lut_index: u32,
+    lut_size: u32,
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
     pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
     pc[4..8].copy_from_slice(&mode.to_le_bytes());
     pc[8..12].copy_from_slice(&flip_y.to_le_bytes());
@@ -231,6 +233,37 @@ pub(crate) fn post_push(
     }
     for (i, v) in cdl_power.iter().enumerate() {
         pc[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // Baked tonemap-LUT row: index (u32::MAX = off -> the legacy per-pixel curve, the
+    // byte-identical anchor) + LUT resolution N as a float (the shader's texel math).
+    pc[96..100].copy_from_slice(&lut_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&(lut_size as f32).to_le_bytes());
+    pc
+}
+
+/// Pack the tonemap-LUT bake push block (64 bytes): (out_index, size, grade_on, pad) uints +
+/// the three ASC-CDL float4 rows (slope/offset/power — full rows, never float3+scalar, per the
+/// HLSL/SPIR-V vs MSL packing note on `post_push`). See `tonemap_lut.slang`.
+pub(crate) fn tonemap_lut_push(
+    out_index: u32,
+    size: u32,
+    grade_on: u32,
+    cdl_slope: [f32; 3],
+    cdl_offset: [f32; 3],
+    cdl_power: [f32; 3],
+) -> [u8; 64] {
+    let mut pc = [0u8; 64];
+    pc[0..4].copy_from_slice(&out_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&size.to_le_bytes());
+    pc[8..12].copy_from_slice(&grade_on.to_le_bytes());
+    for (i, v) in cdl_slope.iter().enumerate() {
+        pc[16 + i * 4..20 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in cdl_offset.iter().enumerate() {
+        pc[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in cdl_power.iter().enumerate() {
+        pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
     pc
 }
