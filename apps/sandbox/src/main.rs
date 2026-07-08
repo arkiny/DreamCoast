@@ -2882,28 +2882,14 @@ impl App {
                 .min(64)
         };
         let gi_stable = !gallery_scene && std::env::var_os("P_GI_STABLE").is_some();
-        // CONVERGE mode needs each relight to be a COMPLETE stratified estimate (the reference
-        // radiosity traces its full 16-ray hemisphere every update) — with a fixed direction set and
-        // spp raised to K, one relight is idempotent up to the multibounce transient, so the
-        // measured-convergence freeze can actually arm. Gather cost rises K× only until the freeze
-        // stops the relight entirely (steady-state cost → 0).
-        let cache_relight_spp = if cache_converge != 0 {
-            cache_relight_spp.max(cache_converge)
-        } else {
-            cache_relight_spp
-        };
-        // CONVERGE mode also drops the relight amortization: the period exists to bound the
-        // steady-state relight cost, but in converge mode the freeze latch zeroes that cost anyway —
-        // while the off-screen HIDDEN_MULT(8×) on top of period 40 gave reflected (off-screen) cards
-        // a 320-frame cadence = a 1000+-frame convergence horizon (the ball's residual drift).
-        // period 2 (hidden ×8 ⇒ 16) → every card converges in ~K relights within tens of frames
-        // (20× faster horizon than the legacy 320-frame off-screen cadence) at half the full
-        // every-frame relight cost; the freeze then stops relight entirely.
-        let cache_relight_period = if cache_converge != 0 {
-            cache_relight_period.min(2)
-        } else {
-            cache_relight_period
-        };
+        // CONVERGE mode deliberately does NOT touch the cost parameters (spp / relight period /
+        // visibility feedback) — raising them (spp×K + period 2 + hidden-off) measured 360 ms/frame
+        // on Sponza-M3, unplayable. Determinism alone (fixed directions) makes every relight
+        // idempotent, so the freeze latch arms at the SAME warmup cost the tier already pays; the
+        // convergence horizon is the amortization cadence (visible ≈ period·K frames, off-screen
+        // ×HIDDEN_MULT ≈ tens of seconds) and the steady-state cost after the freeze is ZERO (below
+        // the legacy baseline). Lower `P11_CACHE_RELIGHT_PERIOD` manually to trade FPS for a faster
+        // settle (e.g. a loading-screen warmup).
         // SSR-resolve history feedback clamp (0 off / 1 variance). Gallery base is 0 (byte-identical
         // anchor); content tiers default 0 too pending DX=VK verification. `P_SSR_HISTORY_CLAMP` +
         // `P_SSR_CLAMP_GAMMA` override (set =1 to break the mirror lit-history feedback shimmer).
@@ -5688,6 +5674,14 @@ impl App {
                     && self.cache_conv_stable >= self.cache_conv_k
                 {
                     self.cache_frozen = true;
+                    // Visible confirmation that the measured-convergence latch armed (relight cost
+                    // drops to zero from here until the lighting epoch changes) — the CONVERGE-mode
+                    // warmup cost is bounded by this moment.
+                    tracing::info!(
+                        frame = self.frame_no,
+                        step = cache_conv_delta,
+                        "surface-cache relight FROZEN (measured convergence)"
+                    );
                 }
             }
             self.cache_frozen && !cache_reset_this_frame

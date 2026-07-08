@@ -292,6 +292,13 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
         {
             float3 dv = abs(radiance - prev);
             float d = max(dv.x, max(dv.y, dv.z));
+            // CONVERGE mode: report the step RELATIVE to the texel's radiance. The absolute step is
+            // in physical units (a 100k-lux sun ⇒ cache values in the hundreds), so the host epsilon
+            // (0.02) was unreachable by construction — the freeze latch never armed on any physically
+            // lit content scene. Relative, eps 0.02 = "2% change", scale-invariant. Legacy keeps the
+            // absolute step (its eps was tuned for the gallery's unit-scale lighting).
+            if (converge)
+                d /= max(max(prev.x, max(prev.y, prev.z)), 1e-3);
             g.storage_buffers[pc.conv_buf].InterlockedAdd(0u, uint(min(d, 1e5) * 1e4));
             g.storage_buffers[pc.conv_buf].InterlockedAdd(4u, 1u);
         }
