@@ -730,44 +730,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                                 int2 pp = clamp(int2(puv * float2(fw, fh)), int2(0, 0),
                                                 int2(int(fw) - 1, int(fh) - 1));
 #ifdef REFLECT_COMPACT
-                                // Same footprint anti-aliasing as the SW screen_trace (see its
-                                // docs): a minified mirror's point fetch of the history turns
-                                // into colour speckle. > 24 px falls through to hit lighting /
-                                // the cache cone; 3..24 px box-filters the history.
-                                float fp_px = geo_spread * t /
-                                              max(distance(pc.cam_pos.xyz, hp) * pa_full, 1e-6);
-                                if (fp_px <= 24.0)
-                                {
-                                    if (fp_px > 3.0)
-                                    {
-                                        int rr = int(clamp(fp_px * (1.0 / 3.0), 1.0, 8.0));
-                                        float3 bsum = float3(0.0, 0.0, 0.0);
-                                        [unroll]
-                                        for (int by = -1; by <= 1; by++)
-                                        {
-                                            [unroll]
-                                            for (int bx = -1; bx <= 1; bx++)
-                                            {
-                                                int2 sp2 =
-                                                    clamp(pp + int2(bx, by) * rr, int2(0, 0),
-                                                          int2(int(fw) - 1, int(fh) - 1));
-                                                uint si = uint(sp2.y) * fw + uint(sp2.x);
-                                                bsum += asfloat(g.storage_buffers[lit_hist]
-                                                                    .Load4(si * 16u))
-                                                            .rgb;
-                                            }
-                                        }
-                                        color = bsum * (1.0 / 9.0);
-                                    }
-                                    else
-                                    {
-                                        uint pidx = uint(pp.y) * fw + uint(pp.x);
-                                        color = asfloat(
-                                                    g.storage_buffers[lit_hist].Load4(pidx * 16u))
-                                                    .rgb;
-                                    }
-                                    cached = true;
-                                }
+                                // Compacted mirror: NO screen-colour fetch at all. The fetch only
+                                // serves hits whose reflected footprint is near a pixel (a
+                                // distance-driven gate), so the mirror split into two tone
+                                // families along hit distance — near = full-deferred lit-history
+                                // colours, far = hybrid cache lighting (systematically softer).
+                                // A mirror must have ONE colour source to read as one material:
+                                // every compacted hit shades through the hybrid below (cache
+                                // lighting x true material albedo), whose tone is distance-
+                                // consistent; sharpness comes from the albedo detail + mip cone.
 #else
                                 uint pidx = uint(pp.y) * fw + uint(pp.x);
                                 color = asfloat(g.storage_buffers[lit_hist].Load4(pidx * 16u)).rgb;
