@@ -1225,10 +1225,16 @@ struct App {
     cam_mode: camera::CameraMode,
     fly: Option<camera::FlyCamera>,
     tab_prev: bool,
+    /// Edge detector for the M key (pointer-lock latch toggle).
+    m_prev: bool,
+    /// Latched pointer-lock release (M toggles): keeps the cursor free for the settings UI
+    /// without holding the Option/Alt chord; the fly look pauses while released.
+    cursor_released: bool,
 }
 
 const VK_F2: u16 = 0x71;
 const VK_TAB: u16 = 0x09;
+const VK_M: u16 = 0x4D;
 const SCREENSHOT_WARMUP: u64 = 3;
 // Path-trace screenshots need a long warmup so the static-camera accumulation
 // converges before the frame is captured.
@@ -3729,6 +3735,8 @@ impl App {
             },
             fly: world_fly,
             tab_prev: false,
+            m_prev: false,
+            cursor_released: false,
         })
     }
 
@@ -4245,10 +4253,18 @@ impl App {
             }
             self.tab_prev = tab;
             // Pointer lock: capture the cursor while flying so the free look never stops at a
-            // screen edge (raw deltas keep flowing); hold Option/Alt to release it for the UI
-            // (the look pauses meanwhile — `look_enabled` keys off the capture below).
+            // screen edge (raw deltas keep flowing). Two release paths: HOLD Option/Alt for a
+            // momentary peek, or TAP M to LATCH the release — working the settings UI (mode
+            // radios, sliders) needs a persistent cursor without holding a chord. The look
+            // pauses while released (`look_enabled` keys off the capture below).
+            let m = self.window.input().key_down(VK_M);
+            if m && !self.m_prev {
+                self.cursor_released = !self.cursor_released;
+            }
+            self.m_prev = m;
             let alt_ui = self.window.input().key_down(0x12); // VK_MENU
-            let capture = self.cam_mode == camera::CameraMode::Fly && !alt_ui;
+            let capture =
+                self.cam_mode == camera::CameraMode::Fly && !alt_ui && !self.cursor_released;
             self.window.set_cursor_captured(capture);
         }
 
@@ -4436,7 +4452,10 @@ impl App {
             // Free look on plain mouse move. While the pointer is captured the UI can't be
             // hovered (the cursor is frozen), so look is unconditional; un-captured (Option/Alt
             // held for UI, or platforms without the lock) it defers to ImGui's mouse claim.
-            let look_enabled = self.window.input().captured() || !self.gui.want_capture_mouse();
+            // The M latch is a full UI mode: no look at all while released (otherwise the view
+            // would still spin whenever the pointer strays off the settings window).
+            let look_enabled = (self.window.input().captured() || !self.gui.want_capture_mouse())
+                && !self.cursor_released;
             let fly = self
                 .fly
                 .get_or_insert_with(|| camera::FlyCamera::from_look(eye, focus, seed_speed));
@@ -4676,6 +4695,9 @@ impl App {
                         1.0 / dt.max(1e-4),
                         dt * 1000.0
                     ));
+                    // Keep the input bindings discoverable — the fly camera captures the mouse,
+                    // so the M latch is how you reach this window's widgets at all.
+                    ui.text_disabled("Tab: fly/orbit | M: mouse lock toggle | Alt: hold-release");
                     ui.text(format!("scene: {} objects + ground", scene.len()));
                     // Stage D: streaming chunk readout (world mode). Fly (WASD) across the
                     // chunk row to stream them in/out.

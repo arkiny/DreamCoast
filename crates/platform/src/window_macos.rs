@@ -38,6 +38,7 @@ fn mac_keycode_to_vk(kc: u16) -> u16 {
         0x0E => 0x45,        // E
         0x38 | 0x3C => 0x10, // Shift (left / right) -> VK_SHIFT
         0x3A | 0x3D => 0x12, // Option (left / right) -> VK_MENU (pointer-lock release chord)
+        0x2E => 0x4D,        // M (pointer-lock latch toggle)
         0x30 => 0x09,        // Tab -> VK_TAB
         0x35 => 0x1B,        // Escape -> VK_ESCAPE
         0x78 => 0x71,        // F2
