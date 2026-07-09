@@ -266,6 +266,12 @@ fn defines_for(target: &str, key: &str) -> &'static [(&'static str, &'static str
             &[("RT_METAL_TARGET", "1"), ("CACHE_HWRT_SHADOW", "1")]
         }
         (false, "sdf_cache_light_hwrt_cs") => &[("CACHE_HWRT_SHADOW", "1")],
+        // Card visibility, lit-calibration variant: per-card lit/cache probe with a TLAS
+        // occlusion check, EMA'd into the reflection sampler's per-card correction.
+        (true, "sdf_cache_visibility_calib_cs") => {
+            &[("RT_METAL_TARGET", "1"), ("CACHE_VIS_CALIB", "1")]
+        }
+        (false, "sdf_cache_visibility_calib_cs") => &[("CACHE_VIS_CALIB", "1")],
         (true, _) => &[("RT_METAL_TARGET", "1")],
         (false, _) => &[],
     }
@@ -1056,6 +1062,16 @@ const JOBS: &[Job] = &[
         entry: "csMain",
         stage: "compute",
         key: "sdf_cache_visibility_cs",
+    },
+    // Lit-calibration variant (`CACHE_VIS_CALIB`): the same pass also probes each on-screen
+    // card's lit/cache luminance ratio (TLAS occlusion check) into a per-card correction the
+    // reflection sampler applies — the sampled-feedback loop that pins cache tone to the lit
+    // tone regardless of estimator differences. RT-capable devices only.
+    Job {
+        src: "sdf_cache_visibility.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "sdf_cache_visibility_calib_cs",
     },
     // QHD/UHD track: temporal upsampling (TAAU) — low-res jittered render -> full-res accumulation.
     Job {

@@ -161,7 +161,12 @@ pub(crate) struct GdfSystem {
     /// the visibility pass folds it into the relight priority (off-screen cards a mirror shows
     /// idle on the HIDDEN_MULT budget otherwise) and clears it. See surface_cache.slang.
     card_marks: Option<StorageBuffer>,
+    /// Lit-calibration correction (1 f32/TEXEL, EMA state; seeded 1.0): the visibility pass's
+    /// calib permutation writes it, the reflection cone sampler multiplies card radiance by it.
+    card_corr: Option<StorageBuffer>,
     cache_vis_pipeline: Option<ComputePipeline>,
+    /// Lit-calibration permutation of the visibility pass (TLAS occlusion probe; RT-only).
+    cache_vis_calib_pipeline: Option<ComputePipeline>,
     /// A2-fix: host-visible 2-uint buffers (ping-pong by `cache_frame % 2`, `[sum_fp, count]`) that the
     /// relight `InterlockedAdd`s the per-channel EMA step into; the host divides to the MEAN step. It
     /// reads the slot's value from 2 frames ago (fence-complete) to freeze the relight ONLY on MEASURED
@@ -377,16 +382,31 @@ impl GdfSystem {
             48,
             [64, 1, 1],
         )?;
-        // Stage D2b: per-card camera-frustum visibility for the relight budget.
+        // Stage D2b: per-card camera-frustum visibility for the relight budget. (The push grew to
+        // 224 B for the calib fields; the base permutation ignores them — one packer serves both.)
         let cache_vis_pipeline = compute(
             "csMain",
             dreamcoast_shader::sdf_cache_visibility_cs_spirv,
             dreamcoast_shader::sdf_cache_visibility_cs_dxil,
             dreamcoast_shader::sdf_cache_visibility_cs_metallib,
             "sdf_cache_visibility",
-            112,
+            224,
             [64, 1, 1],
         )?;
+        // Lit-calibration permutation (TLAS occlusion probe — RT-capable devices only).
+        let cache_vis_calib_pipeline = if device.has_raytracing() {
+            compute(
+                "csMain",
+                dreamcoast_shader::sdf_cache_visibility_calib_cs_spirv,
+                dreamcoast_shader::sdf_cache_visibility_calib_cs_dxil,
+                dreamcoast_shader::sdf_cache_visibility_calib_cs_metallib,
+                "sdf_cache_visibility_calib",
+                224,
+                [64, 1, 1],
+            )?
+        } else {
+            None
+        };
         let trace_pipeline = compute(
             "csMain",
             dreamcoast_shader::gdf_trace_cs_spirv,
@@ -538,8 +558,10 @@ impl GdfSystem {
             cache_mipgen_pipeline,
             card_vis: None,
             card_marks: None,
+            card_corr: None,
             cache_conv: [None, None],
             cache_vis_pipeline,
+            cache_vis_calib_pipeline,
             card_tile: CARD_TILE,
             clip_desc: None,
             clip_count: 0,
@@ -1114,6 +1136,23 @@ impl GdfSystem {
         })?;
         marks.write(&vec![0u8; num_cards as usize * 4])?;
         self.card_marks = Some(marks);
+        // Lit-calibration correction (1 f32/TEXEL, seeded to 1.0 = no correction): the visibility
+        // pass EMAs on-screen texels' lit/cache luminance ratio into it (16 stratified probes per
+        // card per frame); the reflection cone sampler multiplies card radiance by it. Per-TEXEL,
+        // not per-card: a large card (the floor slab) spans sunlit and shadowed regions whose
+        // lit/cache ratios differ — a card scalar averages the disagreement away instead of
+        // fixing it (measured: a center-point card scalar moved the shadowed mirror < 1/255).
+        let num_texels = (num_cards as u64) * (self.card_tile as u64) * (self.card_tile as u64);
+        // Host-visible: the 1.0 seed is a CPU write (a device-local buffer's contents pointer is
+        // NULL on Metal — same reason card_res_feedback is host-visible).
+        let corr = device.create_storage_buffer_host(&StorageBufferDesc {
+            size: num_texels * 4,
+            stride: 4,
+            indirect: false,
+        })?;
+        let ones: Vec<u8> = (0..num_texels).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        corr.write(&ones)?;
+        self.card_corr = Some(corr);
         // A2-fix: two host-visible convergence probes (ping-pong), each [sum_fp:u32, count:u32].
         for c in self.cache_conv.iter_mut() {
             let b = device.create_storage_buffer_host(&StorageBufferDesc {
@@ -1642,12 +1681,27 @@ impl GdfSystem {
     /// Stage D2b: fill the per-card visibility buffer for this frame's camera (frustum planes,
     /// Y-flip-free so DX≡VK). Records the compute pass and returns the visibility graph handle to
     /// pass into `record_cache_light` (for the read barrier). `None` without the cache / pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_cache_visibility<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
         planes: [[f32; 4]; 6],
+        // Lit-calibration probe (None = off): the prev-frame camera the lit history was rendered
+        // with, the probe seed (frame counter), the lit-history buffer's bindless index + pixel
+        // dims + the Y convention. Selects the calib permutation (TLAS occlusion ray — the caller
+        // guarantees a bound TLAS).
+        calib: Option<([f32; 16], Vec3, u32, u32, (u32, u32), u32)>,
     ) -> Option<ResourceId> {
-        let pipe = self.cache_vis_pipeline.as_ref()?;
+        let calib = match (&self.cache_vis_calib_pipeline, calib) {
+            (Some(_), Some(c)) => Some(c),
+            _ => None,
+        };
+        let use_calib_pipe = calib.is_some();
+        let pipe = if use_calib_pipe {
+            self.cache_vis_calib_pipeline.as_ref()?
+        } else {
+            self.cache_vis_pipeline.as_ref()?
+        };
         let cards = self.cards.as_ref()?.storage_index();
         let out = self.card_vis.as_ref()?.storage_index();
         let marks = self
@@ -1655,6 +1709,30 @@ impl GdfSystem {
             .as_ref()
             .map(|b| b.storage_index())
             .unwrap_or(u32::MAX);
+        // The calib probe compares against the radiance the LIT HISTORY was rendered from — last
+        // frame's consumer slot ((cache_frame - 1) % 2; the sync ping-pong only — the async ring
+        // reads cross-queue and the knob is host-gated off there).
+        let calib_bufs = match (&self.card_corr, &self.cache_pos, calib) {
+            (Some(corr), Some(cpos), Some((pvp, eye, seed, lit, (w, h), flip)))
+                if !self.cache_async =>
+            {
+                Some((
+                    pvp,
+                    eye,
+                    seed,
+                    corr.storage_index(),
+                    lit,
+                    cpos.storage_index(),
+                    self.cache_radiance[((self.cache_frame + 1) % 2) as usize]
+                        .as_ref()?
+                        .storage_index(),
+                    self.card_tile,
+                    (w, h),
+                    flip,
+                ))
+            }
+            _ => None,
+        };
         let num_cards = self.num_cards;
         let vis_ext = graph.import_external("card_vis");
         graph.add_compute_pass(
@@ -1666,12 +1744,26 @@ impl GdfSystem {
             move |ctx| {
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(pipe);
-                cmd.push_constants_compute(&cache_vis_push(&planes, cards, out, num_cards, marks));
-                cmd.dispatch(num_cards.div_ceil(64), 1, 1);
+                cmd.push_constants_compute(&cache_vis_push(
+                    &planes, cards, out, num_cards, marks, calib_bufs,
+                ));
+                // Calib permutation: one thread per PROBE (64/card, lane 0 doubles as the
+                // frustum/marks thread) so the occlusion rays run in parallel.
+                if use_calib_pipe {
+                    cmd.dispatch(num_cards, 1, 1);
+                } else {
+                    cmd.dispatch(num_cards.div_ceil(64), 1, 1);
+                }
                 Ok(())
             },
         );
         Some(vis_ext)
+    }
+
+    /// The lit-calibration correction buffer's bindless index (for the reflection sampler), or
+    /// `None` before the cache is built.
+    pub(crate) fn card_corr_index(&self) -> Option<u32> {
+        self.card_corr.as_ref().map(|b| b.storage_index())
     }
 
     /// C8b2: re-light the surface cache this frame — direct sun (GDF soft-shadow) + sky +
@@ -1906,8 +1998,9 @@ impl GdfSystem {
                     .map(|b| b.storage_index())
                     .unwrap_or(u32::MAX);
                 cmd.bind_compute_pipeline(vis_pipe);
+                // No lit-calibration on the async queue (cross-queue lit-history read).
                 cmd.push_constants_compute(&cache_vis_push(
-                    &planes, cards, vis_out, num_cards, marks,
+                    &planes, cards, vis_out, num_cards, marks, None,
                 ));
                 cmd.dispatch(num_cards.div_ceil(64), 1, 1);
                 cmd.storage_buffer_barrier_compute(vis_buf); // visibility write -> relight read

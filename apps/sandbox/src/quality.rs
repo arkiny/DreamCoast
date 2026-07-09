@@ -361,6 +361,15 @@ pub struct QualityPreset {
     /// TLAS (`reflect_compact_hwrt`/`hwrt_reflect`/PT builds it); falls back to the march.
     #[serde(default)]
     pub cache_hwrt_shadow: bool,
+    /// Lit-calibration feedback (`P_CACHE_LIT_CALIB`): the card-visibility pass probes each
+    /// on-screen card's lit/cache luminance ratio — one projected point, TLAS-occlusion-checked
+    /// against the lit history — into a per-card EMA the REFLECTION sampler multiplies in
+    /// (clamped [0.5, 2]). The sampled-feedback loop that pins the mirror's cache family to the
+    /// lit family's tone regardless of which lighting estimator still disagrees; the GI/relight
+    /// consumers sample uncorrected so the radiosity fixed point cannot self-amplify. Needs the
+    /// content TLAS, the sync relight, and the uniform atlas layout.
+    #[serde(default)]
+    pub cache_lit_calib: bool,
     /// TLAS cache gather (`P_CACHE_HWRT_GATHER`, requires `cache_hwrt_shadow`): the relight's
     /// indirect rays trace exact triangles instead of the GDF march. The coarse field leaks
     /// through thin geometry (a shadowed floor texel's ray tunnels below the slab and reads the
@@ -585,6 +594,7 @@ pub fn gallery_preset() -> QualityPreset {
         reflect_compact_screen: false, // no compact screen fetch (no compaction at all)
         cache_hwrt_shadow: false,   // GDF-march relight shadow (byte-identical anchor)
         cache_hwrt_gather: false,   // GDF-march relight gather (byte-identical anchor)
+        cache_lit_calib: false,     // no lit-feedback correction (byte-identical anchor)
         cache_sky_occlude: false,   // legacy sky-on-miss relight (byte-identical anchor)
     }
 }
@@ -1155,6 +1165,10 @@ mod tests {
         assert!(
             apple.cache_hwrt_shadow,
             "Apple cache_hwrt_shadow on (TLAS sun visibility for the relight)"
+        );
+        assert!(
+            apple.cache_lit_calib,
+            "Apple cache_lit_calib on (per-texel lit-feedback correction for the mirror)"
         );
     }
 

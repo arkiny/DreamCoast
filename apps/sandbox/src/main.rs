@@ -871,6 +871,11 @@ struct App {
     /// TLAS cache gather (`P_CACHE_HWRT_GATHER`, tier `cache_hwrt_gather`): the relight's indirect
     /// rays trace exact triangles — the leak-prone GDF march inflates the gathered bounce.
     cache_hwrt_gather: bool,
+    /// Lit-calibration feedback (`P_CACHE_LIT_CALIB`, tier `cache_lit_calib`): the visibility pass
+    /// probes each on-screen card's lit/cache luminance ratio (TLAS occlusion check) into a
+    /// per-card EMA the reflection sampler applies — pins the mirror's cache family to the lit
+    /// family's tone regardless of which lighting estimator still disagrees.
+    cache_lit_calib: bool,
     /// PR-4 (render-pipeline re-baseline track): opt-in analytic exponential height fog
     /// (`P_HEIGHT_FOG=1`), composited in the atmosphere slot after opaque lighting +
     /// reflections, before TAAU/tonemap. Off by default (byte-identical gallery anchor —
@@ -1023,6 +1028,8 @@ struct App {
     gi_denoise: bool,
     /// Previous frame's view-projection (world -> clip) for C4 temporal reprojection.
     prev_view_proj: [f32; 16],
+    /// Previous frame's camera eye (the lit-calibration probe's occlusion-ray origin).
+    prev_eye: Vec3,
     /// QHD/UHD TAAU: previous frame's UNJITTERED view-projection (the stable grid the TAAU history
     /// lives on; the per-frame jitter must not enter the history reprojection).
     prev_view_proj_taau: [f32; 16],
@@ -2639,6 +2646,13 @@ impl App {
             && gdf.has_cache_lighting()
             && quality::env_bool("P_ASYNC_CACHE", async_default);
         gdf.set_cache_async(async_cache_on);
+        // Lit-calibration feedback: needs the content TLAS (occlusion probe), the sync relight
+        // (the async ring's cross-queue radiance has no safe read here), and the uniform atlas
+        // layout (the probe addresses the card's center texel directly).
+        let cache_lit_calib = quality::env_bool("P_CACHE_LIT_CALIB", base.cache_lit_calib)
+            && rt.has_content_scene()
+            && !async_cache_on
+            && gdf.surface_cache_layout().is_none();
         let gpu_cull = compute_supported && std::env::var_os("P7_CULL").is_some();
         // HZB occlusion culling (PR-8) is layered on the GPU frustum cull; it requires
         // P7_CULL (the cull grid it operates on). If HZB_CULL is set without P7_CULL,
@@ -3537,6 +3551,7 @@ impl App {
             cache_sky_occlude,
             cache_hwrt_shadow,
             cache_hwrt_gather,
+            cache_lit_calib,
             height_fog,
             second_view,
             fog_density,
@@ -3581,6 +3596,7 @@ impl App {
             gi_temporal_clamp,
             gi_denoise,
             prev_view_proj: Mat4::IDENTITY.to_cols_array(),
+            prev_eye: Vec3::ZERO,
             prev_view_proj_taau: Mat4::IDENTITY.to_cols_array(),
             gdf_ssr,
             gdf_reflect,
@@ -6047,8 +6063,27 @@ impl App {
                 if !self.async_cache_on && !cache_settled {
                     // Stage D2b: per-card camera visibility (Y-flip-free planes => DX≡VK).
                     let card_vis_ext = if self.cache_feedback {
-                        self.gdf
-                            .record_cache_visibility(&mut graph, frustum_planes(cull_view_proj))
+                        // Lit-calibration probe: prev camera + lit history (the probe validates
+                        // occlusion with a TLAS ray, so it needs the content TLAS bound).
+                        let lit = self.reflect.lit_hist_read_index();
+                        let calib =
+                            if self.cache_lit_calib && self.frame_no > 0 && lit != 0x7FFF_FFFF {
+                                Some((
+                                    self.prev_view_proj,
+                                    self.prev_eye,
+                                    self.frame_no as u32,
+                                    lit,
+                                    (cw, ch),
+                                    self.flip_y,
+                                ))
+                            } else {
+                                None
+                            };
+                        self.gdf.record_cache_visibility(
+                            &mut graph,
+                            frustum_planes(cull_view_proj),
+                            calib,
+                        )
                     } else {
                         None
                     };
@@ -6161,6 +6196,12 @@ impl App {
                         (t | (max_mip << 8) | (mip_idx << 16), mip_ext)
                     }
                     _ => (t | (0xFFFFu32 << 16), ext),
+                };
+                // Lit-calibration correction rides cache.w bits 16..23 (0 = off; the card count
+                // needs only the low 16 bits — legacy consumers of the shared tuple get it bare).
+                let n = match self.gdf.card_corr_index() {
+                    Some(ci) if self.cache_lit_calib => n | ((ci + 1) << 16),
+                    _ => n,
                 };
                 ([c, p, r, n, tile_packed], order)
             }),
@@ -8309,6 +8350,9 @@ impl App {
         }
         self.prev_view_proj = view_proj.to_cols_array();
         self.prev_view_proj_taau = view_proj_stable.to_cols_array();
+        // The lit-calibration probe re-projects card points into the lit HISTORY, so it needs the
+        // camera position that history was rendered from (paired with `prev_view_proj`).
+        self.prev_eye = eye;
         // Velocity (PR-2): stash this frame's per-object world transforms as next frame's prev pose
         // (single source; stable draw-list order). Only when velocity is on (else no cost / no state
         // churn). Uses the pre-skin transform for static/Spin draws; skinned draws carry identity

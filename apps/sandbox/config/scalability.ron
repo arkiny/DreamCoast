@@ -235,6 +235,10 @@
                 // march closes the courtyard aperture and shadows the whole sunlit floor in the
                 // cache (the mirror's missing sun shaft / shadow-boundary split).
                 cache_hwrt_shadow: true,
+                // Lit-calibration feedback: per-texel lit/cache ratio EMA (TLAS-validated probes)
+                // applied in the reflection sampler — converges the mirror's cache family onto
+                // the deferred tone (shadowed reflected floor 76 -> 45 vs deferred 49 /255).
+                cache_lit_calib: true,
             ),
             groups: (
                 resolution: 1,

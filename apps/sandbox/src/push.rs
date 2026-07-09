@@ -1360,14 +1360,30 @@ pub(crate) fn gdf_atrous_push(
 
 /// Pack the Stage D2b surface-cache visibility push block (112 bytes): 6 frustum planes
 /// (96, xyz inward normal + w) + (cards_index, out_index, num_cards, pad) uints (96..112).
+#[allow(clippy::type_complexity)]
 pub(crate) fn cache_vis_push(
     planes: &[[f32; 4]; 6],
     cards_index: u32,
     out_index: u32,
     num_cards: u32,
     marks_index: u32,
-) -> [u8; 112] {
-    let mut pc = [0u8; 112];
+    // Lit-calibration probe (None = off/sentinel): prev view-proj, prev eye, probe seed, then
+    // the (corr, lit_hist, cache_pos, cache_rad) indices, the uniform tile edge, the lit-history
+    // pixel dims, and the Y-flip word. See sdf_cache_visibility.slang's CacheVisPush.
+    calib: Option<(
+        [f32; 16],
+        Vec3,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        (u32, u32),
+        u32,
+    )>,
+) -> [u8; 224] {
+    let mut pc = [0u8; 224];
     for (i, p) in planes.iter().enumerate() {
         for (j, v) in p.iter().enumerate() {
             let o = i * 16 + j * 4;
@@ -1379,6 +1395,35 @@ pub(crate) fn cache_vis_push(
     pc[104..108].copy_from_slice(&num_cards.to_le_bytes());
     // Mirror-feedback flags (u32::MAX = off): merged into the visibility priority + cleared.
     pc[108..112].copy_from_slice(&marks_index.to_le_bytes());
+    // Calibration block (offset 112): corr_index = u32::MAX disables the probe entirely.
+    let (pvp, eye, seed, corr, lit, cpos, rad, tile, (w, h), flip) = calib.unwrap_or((
+        [0.0; 16],
+        Vec3::ZERO,
+        0,
+        u32::MAX,
+        u32::MAX,
+        u32::MAX,
+        u32::MAX,
+        0,
+        (0, 0),
+        0,
+    ));
+    for (i, v) in pvp.iter().enumerate() {
+        pc[112 + i * 4..116 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[176..180].copy_from_slice(&eye.x.to_le_bytes());
+    pc[180..184].copy_from_slice(&eye.y.to_le_bytes());
+    pc[184..188].copy_from_slice(&eye.z.to_le_bytes());
+    // prev_eye.w carries the probe stratification seed (frame counter).
+    pc[188..192].copy_from_slice(&seed.to_le_bytes());
+    pc[192..196].copy_from_slice(&corr.to_le_bytes());
+    pc[196..200].copy_from_slice(&lit.to_le_bytes());
+    pc[200..204].copy_from_slice(&cpos.to_le_bytes());
+    pc[204..208].copy_from_slice(&rad.to_le_bytes());
+    pc[208..212].copy_from_slice(&tile.to_le_bytes());
+    pc[212..216].copy_from_slice(&w.to_le_bytes());
+    pc[216..220].copy_from_slice(&h.to_le_bytes());
+    pc[220..224].copy_from_slice(&flip.to_le_bytes());
     pc
 }
 

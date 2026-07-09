@@ -1011,10 +1011,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 #else
                 const uint sc_alb = 0xFFFFFFFFu;
 #endif
-                color = sample_surface_cache_cone(hp, hn, cards_idx, cpos_idx, pc.cache.z, pc.cache.w,
+                // Lit-calibration correction rides cache.w bits 16..23 (+1; 0 = off — the card
+                // count needs only the low 16 bits, and legacy/gallery pass it bare).
+                uint nc16 = pc.cache.w & 0xFFFFu;
+                uint cr8 = (pc.cache.w >> 16) & 0xFFu;
+                uint sc_corr = cr8 == 0u ? 0xFFFFFFFFu : cr8 - 1u;
+                color = sample_surface_cache_cone(hp, hn, cards_idx, cpos_idx, pc.cache.z, nc16,
                                                   c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
                                                   grid_cells, grid_pool, sc_layout, sc_feedback,
-                                                  sc_mark, sc_alb, cone_alb, cached);
+                                                  sc_mark, sc_alb, sc_corr, cone_alb, cached);
             }
 #ifdef HWRT_REFLECT
             // Hit-lighting hybrid combine: cache lighting × true material albedo. The clamp
