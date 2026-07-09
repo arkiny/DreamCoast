@@ -2546,7 +2546,15 @@ impl App {
                 && !gallery_scene
                 && !world_mode
                 && !world.draw_list().is_empty();
-        if hwrt || compact_hwrt_want {
+        // The PT oracle (`--raytracing` on a level scene) needs the same content accel +
+        // consolidated table: without this, `P8_PATHTRACE` on a level silently rendered
+        // the raster — there was no ground-truth judge for content lighting/tone work.
+        let content_pt_want = crate::app::raytracing_enabled()
+            && device.has_raytracing()
+            && !gallery_scene
+            && !world_mode
+            && !world.draw_list().is_empty();
+        if hwrt || compact_hwrt_want || content_pt_want {
             rt.build_content_accel(
                 &device,
                 &world.draw_list(),
@@ -2617,7 +2625,9 @@ impl App {
         // Hardware ray tracing (DXR / VK_KHR) path tracer — the explicit `--raytracing` option
         // (or the legacy `P8_PATHTRACE` env). Separate from the SW-RT RenderQuality tiers, which
         // all use the GDF software path; this swaps the whole render for the HW-RT ground truth.
-        let path_trace = rt.has_trace() && rt.has_scene() && crate::app::raytracing_enabled();
+        let path_trace = rt.has_trace()
+            && (rt.has_scene() || rt.has_content_pt())
+            && crate::app::raytracing_enabled();
         let rt_debug = device.has_raytracing() && std::env::var_os("P8_RT_DEBUG").is_some();
         let cornell = rt.has_cornell() && std::env::var_os("P8_CORNELL").is_some();
         let sdf_trace = gdf.has_sdf_trace() && std::env::var_os("P11_SDF").is_some();
@@ -5420,8 +5430,10 @@ impl App {
         // reset key BEFORE building the render graph — the fallible buffer
         // (re)allocation must not sit on a `?` early-return path while the graph holds
         // borrows of transient resources.
-        let pt_active =
-            self.path_trace && !self.rt_debug && self.rt.has_path() && self.rt.has_instance_table();
+        let pt_active = self.path_trace
+            && !self.rt_debug
+            && self.rt.has_path()
+            && (self.rt.has_instance_table() || self.rt.has_content_pt());
         // The path tracer uses the Cornell scene (fixed front camera) when toggled,
         // else the orbiting open scene. `pt_eye` / `pt_inv_vp` feed the trace rays.
         let use_cornell = pt_active && self.cornell && self.rt.has_cornell();

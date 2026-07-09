@@ -64,6 +64,11 @@ void chMain(inout Payload p, BuiltInTriangleIntersectionAttributes attr)
     }
     float2 material_uv = hit_uv(inst, prim, attr.barycentrics);
     float3 n = hit_normal(inst, prim, attr.barycentrics);
+    // Content instances sit in the TLAS under real world transforms (rotations
+    // included) — rotate the object-space normal into world space (matches the
+    // inline path); the gallery/Cornell tables keep the raw normal.
+    if (content_instances())
+        n = normalize(mul((float3x3)ObjectToWorld3x4(), n));
     float3 wdir = WorldRayDirection();
     if (dot(n, wdir) > 0.0)
         n = -n; // face the incoming ray (two-sided)

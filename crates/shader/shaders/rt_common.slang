@@ -54,7 +54,8 @@ struct Instance
     uint tex_normal;   // tangent-space normal map
     uint tex_emissive; // emissive texture
     uint prim_count;   // triangle count (for closest-hit PrimitiveIndex bounds check)
-    uint pad1;
+    uint idx_base;     // content mode: this drawable's offset into the shared index
+                       // buffer (u32 units); 0 for the per-instance gallery tables
 };
 
 // PCG hash RNG (deterministic per seed -> identical across backends).
@@ -267,6 +268,17 @@ BsdfSample sample_bsdf(float3 n, float3 v, Surf s, inout uint rng)
     return r;
 }
 
+// Content-level instance source (the PT oracle on a level scene): `pc.inst_index`
+// packs the Phase 16 E consolidated hit table — drawable-record table in the low
+// byte, shared vertex / index storage indices (+1, 0 = off) in bits 8..15 / 16..23.
+// The gallery / Cornell tables pass a bare bindless index (< 64, upper bits zero),
+// so this predicate is what selects the record format — the legacy path is
+// byte-identical.
+bool content_instances()
+{
+    return (pc.inst_index >> 8) != 0u;
+}
+
 // Read an instance record from the table.
 Instance load_instance(uint id)
 {
@@ -281,7 +293,34 @@ Instance load_instance(uint id)
     inst.tex_normal = g.storage_buffers[pc.inst_index].Load(base + 48u);
     inst.tex_emissive = g.storage_buffers[pc.inst_index].Load(base + 52u);
     inst.prim_count = g.storage_buffers[pc.inst_index].Load(base + 56u);
-    inst.pad1 = 0u;
+    inst.idx_base = 0u;
+    return inst;
+}
+
+// Read a drawable record from the CONSOLIDATED content table (48 B, see
+// build_content_hit_table): all meshes share one vertex + one index buffer, so the
+// per-drawable record carries an index-buffer offset instead of buffer indices.
+Instance load_content_instance(uint id)
+{
+    uint tbl = pc.inst_index & 0xFFu;
+    uint base = id * 48u;
+    Instance inst;
+    inst.vtx = ((pc.inst_index >> 8) & 0xFFu) - 1u;
+    inst.idx = ((pc.inst_index >> 16) & 0xFFu) - 1u;
+    inst.idx_base = g.storage_buffers[tbl].Load(base + 0u);
+    inst.prim_count = g.storage_buffers[tbl].Load(base + 4u);
+    inst.tex_base = g.storage_buffers[tbl].Load(base + 8u);
+    inst.tex_mr = g.storage_buffers[tbl].Load(base + 12u);
+    inst.base_color = asfloat(g.storage_buffers[tbl].Load4(base + 16u));
+    // Content materials are not emitters — the record's .a is opacity, but the path
+    // tracer reads base_color.a as the emissive scale (the Cornell light), so zero it.
+    inst.base_color.a = 0.0;
+    float2 mr = asfloat(g.storage_buffers[tbl].Load2(base + 32u));
+    inst.params = float4(mr.x, mr.y, 1.0, 0.0);
+    // The consolidated record has no normal / emissive map slots (the HWRT hit
+    // lighting doesn't need them); the oracle shades with the geometric normal.
+    inst.tex_normal = NO_TEXTURE;
+    inst.tex_emissive = NO_TEXTURE;
     return inst;
 }
 
@@ -297,7 +336,7 @@ bool load_valid_instance(uint id, uint prim, out Instance inst)
     inst = (Instance)0;
     if (id >= (uint)pc.cam_pos.w)
         return false;
-    inst = load_instance(id);
+    inst = content_instances() ? load_content_instance(id) : load_instance(id);
     return prim < inst.prim_count;
 }
 
@@ -305,9 +344,10 @@ bool load_valid_instance(uint id, uint prim, out Instance inst)
 // Vertex layout: position @0 (float3), normal @12 (float3), uv @24 (float2), 32B.
 float3 hit_normal(Instance inst, uint prim, float2 bary)
 {
-    uint i0 = g.storage_buffers[inst.idx].Load(prim * 12u + 0u);
-    uint i1 = g.storage_buffers[inst.idx].Load(prim * 12u + 4u);
-    uint i2 = g.storage_buffers[inst.idx].Load(prim * 12u + 8u);
+    uint tri = (inst.idx_base + prim * 3u) * 4u;
+    uint i0 = g.storage_buffers[inst.idx].Load(tri + 0u);
+    uint i1 = g.storage_buffers[inst.idx].Load(tri + 4u);
+    uint i2 = g.storage_buffers[inst.idx].Load(tri + 8u);
     float3 n0 = asfloat(g.storage_buffers[inst.vtx].Load3(i0 * 32u + 12u));
     float3 n1 = asfloat(g.storage_buffers[inst.vtx].Load3(i1 * 32u + 12u));
     float3 n2 = asfloat(g.storage_buffers[inst.vtx].Load3(i2 * 32u + 12u));
@@ -327,9 +367,10 @@ float3 hit_normal(Instance inst, uint prim, float2 bary)
 // Barycentric-interpolated UV for material texture lookup.
 float2 hit_uv(Instance inst, uint prim, float2 bary)
 {
-    uint i0 = g.storage_buffers[inst.idx].Load(prim * 12u + 0u);
-    uint i1 = g.storage_buffers[inst.idx].Load(prim * 12u + 4u);
-    uint i2 = g.storage_buffers[inst.idx].Load(prim * 12u + 8u);
+    uint tri = (inst.idx_base + prim * 3u) * 4u;
+    uint i0 = g.storage_buffers[inst.idx].Load(tri + 0u);
+    uint i1 = g.storage_buffers[inst.idx].Load(tri + 4u);
+    uint i2 = g.storage_buffers[inst.idx].Load(tri + 8u);
     float2 uv0 = asfloat(g.storage_buffers[inst.vtx].Load2(i0 * 32u + 24u));
     float2 uv1 = asfloat(g.storage_buffers[inst.vtx].Load2(i1 * 32u + 24u));
     float2 uv2 = asfloat(g.storage_buffers[inst.vtx].Load2(i2 * 32u + 24u));
@@ -358,9 +399,10 @@ float primary_cone_spread(float2 ndc)
 // |n·rayDir|. Per-texture `0.5*log2(w*h)` is added in sample_texture_lod.
 float hit_lod_base(Instance inst, uint prim, float cone_width, float cos_theta)
 {
-    uint i0 = g.storage_buffers[inst.idx].Load(prim * 12u + 0u);
-    uint i1 = g.storage_buffers[inst.idx].Load(prim * 12u + 4u);
-    uint i2 = g.storage_buffers[inst.idx].Load(prim * 12u + 8u);
+    uint tri = (inst.idx_base + prim * 3u) * 4u;
+    uint i0 = g.storage_buffers[inst.idx].Load(tri + 0u);
+    uint i1 = g.storage_buffers[inst.idx].Load(tri + 4u);
+    uint i2 = g.storage_buffers[inst.idx].Load(tri + 8u);
     float3 p0 = asfloat(g.storage_buffers[inst.vtx].Load3(i0 * 32u + 0u));
     float3 p1 = asfloat(g.storage_buffers[inst.vtx].Load3(i1 * 32u + 0u));
     float3 p2 = asfloat(g.storage_buffers[inst.vtx].Load3(i2 * 32u + 0u));
@@ -411,9 +453,10 @@ float3 hit_shading_normal(Instance inst, uint prim, float2 bary, float3 geom_n, 
     if (dot(tangent_normal, tangent_normal) < 1e-6)
         return geom_n;
 
-    uint i0 = g.storage_buffers[inst.idx].Load(prim * 12u + 0u);
-    uint i1 = g.storage_buffers[inst.idx].Load(prim * 12u + 4u);
-    uint i2 = g.storage_buffers[inst.idx].Load(prim * 12u + 8u);
+    uint tri = (inst.idx_base + prim * 3u) * 4u;
+    uint i0 = g.storage_buffers[inst.idx].Load(tri + 0u);
+    uint i1 = g.storage_buffers[inst.idx].Load(tri + 4u);
+    uint i2 = g.storage_buffers[inst.idx].Load(tri + 8u);
     float3 p0 = asfloat(g.storage_buffers[inst.vtx].Load3(i0 * 32u + 0u));
     float3 p1 = asfloat(g.storage_buffers[inst.vtx].Load3(i1 * 32u + 0u));
     float3 p2 = asfloat(g.storage_buffers[inst.vtx].Load3(i2 * 32u + 0u));

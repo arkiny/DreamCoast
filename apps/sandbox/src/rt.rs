@@ -50,6 +50,9 @@ pub(crate) struct RtSystem {
     /// fetch the real material (normal/UV/albedo texture) and re-light off-screen reflections. Three
     /// bindless slots total (no per-primitive overflow). Built alongside the content TLAS.
     content_hit: Option<(StorageBuffer, StorageBuffer, StorageBuffer)>,
+    /// Content PT oracle: drawable count of the content TLAS (`cam_pos.w` bounds +
+    /// the accumulation key), set by `build_content_accel`.
+    content_instance_count: u32,
     /// Path-tracer per-instance table (vertex/index SB indices + material).
     instance_table: Option<StorageBuffer>,
     /// Keeps the per-instance vertex/index storage buffers alive for the table.
@@ -348,6 +351,7 @@ impl RtSystem {
             scene: scene_rt,
             content_scene: None,
             content_hit: None,
+            content_instance_count: 0,
             instance_table,
             _geometry: geometry,
             instance_count,
@@ -440,7 +444,25 @@ impl RtSystem {
                 Ok(bufs) => self.content_hit = Some(bufs),
                 Err(e) => tracing::error!("content hit-lighting table build failed: {e}"),
             }
+            self.content_instance_count = drawables.len() as u32;
         }
+    }
+
+    /// Content PT oracle: whether the path tracer can run on the content scene —
+    /// the content TLAS is built and the consolidated hit table doubles as its
+    /// instance/material table (the level equivalent of `has_instance_table`).
+    pub(crate) fn has_content_pt(&self) -> bool {
+        self.content_scene.is_some() && self.content_hit.is_some()
+    }
+
+    /// The path tracer's packed `inst_index` for the content scene: drawable-record
+    /// table in the low byte, shared vertex / index storage indices (+1) in bits
+    /// 8..15 / 16..23 — nonzero upper bits are what flip the shader into the 48-byte
+    /// consolidated record format (`content_instances()` in rt_common.slang).
+    /// Bindless storage indices are < 64, so the fields never overflow a byte.
+    fn content_pt_index(&self) -> Option<u32> {
+        self.content_hit_indices()
+            .map(|(v, i, t)| t | ((v + 1) << 8) | ((i + 1) << 16))
     }
 
     /// Whether the content scene's TLAS was built (Phase 16 HWRT hybrid opt-in).
@@ -587,15 +609,20 @@ impl RtSystem {
         // Index only (no borrow held into the graph closure — that would over-extend
         // the graph's lifetime vs. the transient resources).
         let accum_index = self.path_accum.as_ref().unwrap().storage_index();
-        let inst_index = if use_cornell {
-            self.cornell_table.as_ref().unwrap().storage_index()
+        // Instance/material source: the Cornell or gallery per-instance table, else
+        // the content scene's consolidated table (the level PT oracle).
+        let (inst_index, inst_count) = if use_cornell {
+            (
+                self.cornell_table.as_ref().unwrap().storage_index(),
+                self.cornell_instance_count,
+            )
+        } else if let Some(table) = self.instance_table.as_ref() {
+            (table.storage_index(), self.instance_count)
         } else {
-            self.instance_table.as_ref().unwrap().storage_index()
-        };
-        let inst_count = if use_cornell {
-            self.cornell_instance_count
-        } else {
-            self.instance_count
+            (
+                self.content_pt_index().expect("content PT table"),
+                self.content_instance_count,
+            )
         };
         // External resource so the graph orders the accumulation write (and inserts a
         // barrier before the next frame's read).

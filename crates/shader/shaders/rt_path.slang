@@ -55,6 +55,12 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
         float2 bary = q.CommittedTriangleBarycentrics();
         float2 material_uv = hit_uv(inst, prim, bary);
         float3 n = hit_normal(inst, prim, bary);
+        // Content instances sit in the TLAS under real world transforms (rotations
+        // included), so rotate the object-space normal into world space; normalize
+        // eats the uniform scale. The gallery/Cornell tables keep the raw normal
+        // (their transforms are direction-preserving) — byte-identical.
+        if (content_instances())
+            n = normalize(mul((float3x3)q.CommittedObjectToWorld3x4(), n));
         if (dot(n, ray.Direction) > 0.0)
             n = -n; // face the incoming ray (two-sided)
         // Ray-cone texture LOD: advance the cone to this hit, then derive the LOD
