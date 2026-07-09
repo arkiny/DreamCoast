@@ -226,6 +226,11 @@
                 // unoccluded IBL floor whose escape estimate over-injects blue on interior cards
                 // (the cache-vs-deferred tone split a mirror exposes).
                 cache_sky_occlude: true,
+                // Compact screen fetch, re-enabled by the parity skylight above (the tone seam
+                // that forced the single-source rebaseline is gone): near-footprint on-screen
+                // mirror hits read the full-res lit history — sharp reflections where the scene
+                // is visible, the hybrid cache cone elsewhere.
+                reflect_compact_screen: true,
             ),
             groups: (
                 resolution: 1,

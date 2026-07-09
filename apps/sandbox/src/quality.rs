@@ -345,6 +345,14 @@ pub struct QualityPreset {
     /// FASTER than the SW march it replaces).
     #[serde(default)]
     pub reflect_compact_hwrt: bool,
+    /// Compact-mirror screen fetch (`P_REFLECT_COMPACT_SCREEN`): the compacted HWRT mirror serves
+    /// on-screen hits whose reflected footprint is near a pixel from the full-res lit history
+    /// (sharp, box-filtered as the footprint grows); wider footprints keep the hybrid cache cone.
+    /// The footprint gate splits the mirror into two colour sources, so this is only viable with
+    /// `cache_sky_occlude` unifying their tones (it was dropped at the single-source rebaseline
+    /// for exactly that seam). Requires `reflect_compact_hwrt`.
+    #[serde(default)]
+    pub reflect_compact_screen: bool,
     /// Deferred-parity cache skylight (`P_CACHE_SKY_OCCLUDE`): the surface-cache relight takes its
     /// skylight from the SAME SH sky-visibility volumes + min-occlusion + tint the deferred lighting
     /// applies (`occlude_sky_diffuse_bent`), instead of the legacy per-ray sky-on-miss + unoccluded
@@ -558,6 +566,7 @@ pub fn gallery_preset() -> QualityPreset {
         tonemap_aces: false,        // legacy per-pixel curve (the byte-identical anchor)
         reflect_compact_div: 0,     // no mirror compaction (full-res trace needs none anyway)
         reflect_compact_hwrt: false, // no HWRT refine (no compaction to refine)
+        reflect_compact_screen: false, // no compact screen fetch (no compaction at all)
         cache_sky_occlude: false,   // legacy sky-on-miss relight (byte-identical anchor)
     }
 }
@@ -1120,6 +1129,10 @@ mod tests {
         assert!(
             apple.cache_sky_occlude,
             "Apple cache_sky_occlude on (deferred-parity cache skylight)"
+        );
+        assert!(
+            apple.reflect_compact_screen,
+            "Apple reflect_compact_screen on (sharp lit-history mirror hits, tone-unified)"
         );
     }
 

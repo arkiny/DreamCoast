@@ -1330,6 +1330,11 @@ impl ReflectSystem {
         // permutation when the pipeline/TLAS is absent.
         hwrt: bool,
         hit_lighting: Option<(u32, u32, u32)>,
+        // Compact screen fetch (max_steps bit30): serve near-pixel-footprint on-screen hits from
+        // the full-res lit history instead of the hybrid cache cone. Only viable with the
+        // deferred-parity cache skylight (the two sources must agree on tone or the footprint
+        // gate reads as a material seam).
+        screen_fetch: bool,
     ) -> ResourceId {
         let reset = self.compact_reset_pipeline.as_ref().expect("compact reset");
         let classify = self
@@ -1500,7 +1505,9 @@ impl ReflectSystem {
                     None => (albedo_rgb, frame),
                 };
                 let max_steps = if use_hwrt {
-                    (max_steps & 0x8000_0000) | (lit_hist & 0x7FFF_FFFF)
+                    (max_steps & 0x8000_0000)
+                        | if screen_fetch { 0x4000_0000 } else { 0 }
+                        | (lit_hist & 0x3FFF_FFFF)
                 } else {
                     max_steps
                 };

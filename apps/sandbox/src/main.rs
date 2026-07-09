@@ -915,6 +915,11 @@ struct App {
     /// B2 HWRT refine: the compacted re-trace goes through the scene TLAS + hit lighting (true
     /// material colours for off-screen mirror content). `P_REFLECT_COMPACT_HWRT`.
     reflect_compact_hwrt: bool,
+    /// Compact-mirror screen fetch (`P_REFLECT_COMPACT_SCREEN`, tier `reflect_compact_screen`):
+    /// near-pixel-footprint on-screen mirror hits read the full-res lit history; wider footprints
+    /// keep the hybrid cache cone. Only viable with `cache_sky_occlude` unifying the two sources'
+    /// tones (the footprint gate otherwise reads as a material seam — the faebad3 rebaseline).
+    reflect_compact_screen: bool,
     /// macOS/M3 perf: GDF AO trace divisor (1 = full-res, 2 = half). Traced at 1/div + bilateral
     /// upsample; the Apple tier uses 2 (gdf_ao is the top pass after quarter-res reflection). `P_AO_RES_DIV`.
     ao_res_div: u32,
@@ -2580,6 +2585,11 @@ impl App {
         // B2 HWRT refine: live only with the accel + hit table actually built.
         let reflect_compact_hwrt =
             compact_hwrt_want && rt.has_content_scene() && rt.content_hit_indices().is_some();
+        // Compact screen fetch: near-footprint mirror hits from the full-res lit history. Gated
+        // on the HWRT refine (the permutation that carries the gate) — the tone-parity dependency
+        // on `cache_sky_occlude` is resolved below once that knob is known.
+        let reflect_compact_screen_want = reflect_compact_hwrt
+            && quality::env_bool("P_REFLECT_COMPACT_SCREEN", base.reflect_compact_screen);
 
         info!(
             "RenderQuality tier: {} (RENDER_QUALITY; GPU \"{}\")",
@@ -2729,6 +2739,10 @@ impl App {
         // and only meaningful with the volume-GI path (the SH sky-visibility volumes it reads).
         let cache_sky_occlude =
             quality::env_bool("P_CACHE_SKY_OCCLUDE", base.cache_sky_occlude) && gi_volume;
+        // The compact screen fetch mixes lit-history and cache colours across a footprint gate,
+        // so it requires the parity skylight — without it the gate reads as a material seam
+        // (the exact regression the faebad3 single-source rebaseline removed).
+        let reflect_compact_screen = reflect_compact_screen_want && cache_sky_occlude;
         // Multi-bounce AO (reference AOMultiBounce): albedo-tinted energy return on the diffuse AO.
         // Opt-in (default off) — it recolours every AO<1 pixel including the gallery anchor.
         let ao_multibounce = quality::env_bool("P_AO_MULTIBOUNCE", false);
@@ -3522,6 +3536,7 @@ impl App {
             reflect_res_div,
             reflect_compact_div,
             reflect_compact_hwrt,
+            reflect_compact_screen,
             ao_res_div,
             gi_atrous_steps,
             gi_half_res,
@@ -6920,6 +6935,7 @@ impl App {
                             } else {
                                 None
                             },
+                            self.reflect_compact_screen,
                         ),
                         qw,
                         qh,
