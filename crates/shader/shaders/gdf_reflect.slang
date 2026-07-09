@@ -752,12 +752,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                                 {
                                     float fp_px = geo_spread * t /
                                                   max(distance(pc.cam_pos.xyz, hp) * pa_full, 1e-6);
-                                    if (fp_px <= 24.0)
+                                    if (fp_px <= 48.0)
                                     {
                                         float3 sc;
                                         if (fp_px > 3.0)
                                         {
-                                            int rr = int(clamp(fp_px * (1.0 / 3.0), 1.0, 8.0));
+                                            int rr = int(clamp(fp_px * (1.0 / 3.0), 1.0, 16.0));
                                             float3 bsum = float3(0.0, 0.0, 0.0);
                                             [unroll]
                                             for (int by = -1; by <= 1; by++)
@@ -785,10 +785,32 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                                         }
                                         // Hand-off band: pure screen colour while the footprint is
                                         // comfortably sub-filter (≤ 6 px), fading to the cache
-                                        // hybrid toward the 24 px AA limit. Inside the band the
-                                        // pixel resolves BOTH sources and lerps at the end of the
-                                        // hit branch — a gradient hand-off instead of a hard cut.
-                                        screen_w = 1.0 - smoothstep(6.0, 24.0, fp_px);
+                                        // hybrid toward 48 px. A curved mirror sweeps the whole
+                                        // footprint range across FEW mirror pixels, so the band
+                                        // must be wide in footprint terms to read as a gradient
+                                        // on the mirror at all; past ~24 px the sparse box filter
+                                        // undersamples, but its weight is ≤ ~0.35 there and
+                                        // falling — the cache dominates before the sparseness
+                                        // could read as speckle.
+                                        screen_w = 1.0 - smoothstep(6.0, 48.0, fp_px);
+                                        // The fetch's OTHER gates are binary too and their
+                                        // pass/fail contours are where the source cut actually
+                                        // shows (the footprint varies smoothly; the validation
+                                        // doesn't). A curved mirror compresses reflected-space
+                                        // margins into few mirror pixels, so the fades lean on
+                                        // quantities that stay smooth ACROSS the mirror: the
+                                        // reflected point's view depth (pclip.w → 0 = the
+                                        // behind-camera boundary, faded over ~5% of the scene
+                                        // diagonal), a wide screen-border margin, and the
+                                        // occlusion tolerance shell (about to lose the
+                                        // depth-buffer witness to a nearer surface).
+                                        float2 eb = min(puv, float2(1.0, 1.0) - puv);
+                                        screen_w *= smoothstep(0.0, 0.12, min(eb.x, eb.y));
+                                        screen_w *= smoothstep(
+                                            0.0, 0.05 * length(GDF_MAX - GDF_MIN), pclip.w);
+                                        screen_w *=
+                                            1.0 - smoothstep(0.5 * vtol, vtol,
+                                                             distance(sworld, hp));
                                         if (screen_w >= 1.0)
                                         {
                                             // Pure screen: finalize here and DISARM the end-of-hit
