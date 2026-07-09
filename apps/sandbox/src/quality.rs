@@ -340,9 +340,8 @@ pub struct QualityPreset {
     /// converged multibounce lighting as radiance/albedo (the reference-engine FinalLighting
     /// decomposition) and re-modulates it with the TRUE material albedo at the exact hit —
     /// coherent real-scene colours across the whole mirror instead of sharp screen-hit patches
-    /// against washy card texels. (NOTE: content levels have no path-traced oracle — the PT
-    /// instance table is gallery-only — so this is validated visually; a content-level PT is
-    /// the follow-up that would make it measurable.) Apple ON (Metal-verified; refine 1.0 ms,
+    /// against washy card texels. Measurable against the content-level PT oracle (`P8_PATHTRACE`
+    /// runs on levels via the consolidated hit table). Apple ON (Metal-verified; refine 1.0 ms,
     /// FASTER than the SW march it replaces).
     #[serde(default)]
     pub reflect_compact_hwrt: bool,
