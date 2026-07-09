@@ -1709,6 +1709,9 @@ impl GdfSystem {
         // HWRT sun shadow: select the TLAS-visibility permutation (the caller guarantees the
         // content TLAS is built + bound; falls back to the GDF-march pipeline when unavailable).
         hwrt_shadow: bool,
+        // TLAS gather (requires `hwrt_shadow`): the indirect rays trace exact triangles instead
+        // of the leak-prone GDF march.
+        hwrt_gather: bool,
     ) {
         // Stage D2b: feed the per-card visibility buffer index to the shader (sentinel = off =
         // uniform period). When present, declare it as a read so the graph barriers the relight
@@ -1816,6 +1819,7 @@ impl GdfSystem {
                     skyvis_index,
                     skyvis_tint,
                     skyvis_min_occ,
+                    u32::from(hwrt_shadow && hwrt_gather),
                     ao_params,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
@@ -1961,6 +1965,7 @@ impl GdfSystem {
             u32::MAX,
             0.0,
             0.0,
+            0,
             (0.0, 0.0, 0.0, 0.0),
         ));
         cmd.dispatch(num_texels.div_ceil(64), 1, 1);

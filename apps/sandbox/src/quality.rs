@@ -361,6 +361,14 @@ pub struct QualityPreset {
     /// TLAS (`reflect_compact_hwrt`/`hwrt_reflect`/PT builds it); falls back to the march.
     #[serde(default)]
     pub cache_hwrt_shadow: bool,
+    /// TLAS cache gather (`P_CACHE_HWRT_GATHER`, requires `cache_hwrt_shadow`): the relight's
+    /// indirect rays trace exact triangles instead of the GDF march. The coarse field leaks
+    /// through thin geometry (a shadowed floor texel's ray tunnels below the slab and reads the
+    /// SUNLIT top-side cards) and silently drops budget-exhausted rays — both inflate the
+    /// gathered bounce (shadowed-floor cache bounce measured ~50 where the deferred volume term
+    /// reads ~28 and the path tracer ~14).
+    #[serde(default)]
+    pub cache_hwrt_gather: bool,
     /// Deferred-parity cache skylight (`P_CACHE_SKY_OCCLUDE`): the surface-cache relight takes its
     /// skylight from the SAME SH sky-visibility volumes + min-occlusion + tint the deferred lighting
     /// applies (`occlude_sky_diffuse_bent`), instead of the legacy per-ray sky-on-miss + unoccluded
@@ -576,6 +584,7 @@ pub fn gallery_preset() -> QualityPreset {
         reflect_compact_hwrt: false, // no HWRT refine (no compaction to refine)
         reflect_compact_screen: false, // no compact screen fetch (no compaction at all)
         cache_hwrt_shadow: false,   // GDF-march relight shadow (byte-identical anchor)
+        cache_hwrt_gather: false,   // GDF-march relight gather (byte-identical anchor)
         cache_sky_occlude: false,   // legacy sky-on-miss relight (byte-identical anchor)
     }
 }

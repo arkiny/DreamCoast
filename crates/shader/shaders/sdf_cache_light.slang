@@ -52,7 +52,8 @@ struct CacheLightPush
                           // 0xFFFFFFFF = off = the legacy sky-on-miss + skylight-floor path)
     float skyvis_tint;    // neutral leak fraction of the occluded skylight (same value as the deferred)
     float skyvis_min_occ; // min sky-visibility floor (lerp V toward 1; same value as the deferred)
-    uint pad_sky;
+    uint flags;           // bit0: TLAS gather (CACHE_HWRT_SHADOW permutation only) — the indirect
+                          // rays trace exact triangles instead of the leak-prone GDF march
     float ao_reach;       // GDF-AO march reach (the SAME GiSystem::ao_params the screen AO uses —
                           // the parity skylight is occluded by the identical formula)
     float ao_strength;    // exponential occlusion strength
@@ -264,32 +265,65 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     for (uint s = 0; s < spp; s++)
     {
         float3 dir = cosine_hemisphere(n, seed);
-        float3 o = p + n * bias;
-        float tt = bias;
         bool hit = false;
-        for (int i = 0; i < 48; i++)
+        float3 qhit = float3(0.0, 0.0, 0.0);
+#ifdef CACHE_HWRT_SHADOW
+        if ((pc.flags & 1u) != 0u)
         {
-            float3 q = o + dir * tt;
-            float d = geo_march(q);
-            if (d < 0.0015)
+            // TLAS gather (flags bit0): the indirect ray hits exact triangles. The GDF march
+            // leaks through thin geometry (a shadowed floor texel's ray tunnels below the slab
+            // and reads the SUNLIT top-side cards) and its budget-exhausted rays vanish — both
+            // inflate the gathered bounce; the shadowed-floor cache measured ~50 of bounce where
+            // the deferred's volume term reads ~28 and the path tracer ~14. The small fixed
+            // origin bias replaces the coarse-field bias (exact triangles need no voxel margin).
+            RayDesc gray;
+            gray.Origin = p + n * 0.01;
+            gray.Direction = dir;
+            gray.TMin = 0.001;
+            gray.TMax = maxt;
+            RayQuery<RAY_FLAG_NONE> gq;
+            gq.TraceRayInline(g.tlas, RAY_FLAG_NONE, 0xFF, gray);
+            gq.Proceed();
+            if (gq.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
             {
                 hit = true;
-                bool cache_hit;
-                // Track C: the gather's card lookup goes through the acceleration grid when the
-                // host built one (identical results — superset + ascending order; see the helper).
-                uint gc8 = pc.gdf_sampled & 0xFFu;
-                uint gp8 = (pc.gdf_sampled >> 8) & 0xFFu;
-                float3 s = sample_surface_cache_grid(
-                    q, geo_normal(q), pc.cards_index, pc.cache_pos_index, pc.cache_rad_read,
-                    pc.num_cards, pc.tile, 0.0, gc8 == 0u ? 0xFFFFFFFFu : gc8 - 1u,
-                    gp8 == 0u ? 0xFFFFFFFFu : gp8 - 1u, cache_hit);
-                indirect += clamp_firefly(s, pc.gather_firefly);
-                break;
+                qhit = gray.Origin + dir * gq.CommittedRayT();
             }
-            // P3 cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01) legacy).
-            tt += max(d, max(0.01, pc.cone_k * tt));
-            if (tt > maxt)
-                break;
+        }
+        else
+#endif
+        {
+            float3 o = p + n * bias;
+            float tt = bias;
+            for (int i = 0; i < 48; i++)
+            {
+                float3 q = o + dir * tt;
+                float d = geo_march(q);
+                if (d < 0.0015)
+                {
+                    hit = true;
+                    qhit = q;
+                    break;
+                }
+                // P3 cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01)
+                // legacy).
+                tt += max(d, max(0.01, pc.cone_k * tt));
+                if (tt > maxt)
+                    break;
+            }
+        }
+        if (hit)
+        {
+            bool cache_hit;
+            // Track C: the gather's card lookup goes through the acceleration grid when the
+            // host built one (identical results — superset + ascending order; see the helper).
+            uint gc8 = pc.gdf_sampled & 0xFFu;
+            uint gp8 = (pc.gdf_sampled >> 8) & 0xFFu;
+            float3 s = sample_surface_cache_grid(
+                qhit, geo_normal(qhit), pc.cards_index, pc.cache_pos_index, pc.cache_rad_read,
+                pc.num_cards, pc.tile, 0.0, gc8 == 0u ? 0xFFFFFFFFu : gc8 - 1u,
+                gp8 == 0u ? 0xFFFFFFFFu : gp8 - 1u, cache_hit);
+            indirect += clamp_firefly(s, pc.gather_firefly);
         }
         if (!hit)
         {

@@ -868,6 +868,9 @@ struct App {
     /// direct-sun visibility traces the content TLAS instead of the GDF march (which closes small
     /// openings and shadows whole sunlit card regions — the mirror's missing sun shaft).
     cache_hwrt_shadow: bool,
+    /// TLAS cache gather (`P_CACHE_HWRT_GATHER`, tier `cache_hwrt_gather`): the relight's indirect
+    /// rays trace exact triangles — the leak-prone GDF march inflates the gathered bounce.
+    cache_hwrt_gather: bool,
     /// PR-4 (render-pipeline re-baseline track): opt-in analytic exponential height fog
     /// (`P_HEIGHT_FOG=1`), composited in the atmosphere slot after opaque lighting +
     /// reflections, before TAAU/tonemap. Off by default (byte-identical gallery anchor —
@@ -2599,6 +2602,9 @@ impl App {
         // the GDF-march pipeline without it (non-RT devices, gallery).
         let cache_hwrt_shadow = quality::env_bool("P_CACHE_HWRT_SHADOW", base.cache_hwrt_shadow)
             && rt.has_content_scene();
+        // TLAS gather rides the same permutation (see the tier-knob doc).
+        let cache_hwrt_gather =
+            cache_hwrt_shadow && quality::env_bool("P_CACHE_HWRT_GATHER", base.cache_hwrt_gather);
 
         info!(
             "RenderQuality tier: {} (RENDER_QUALITY; GPU \"{}\")",
@@ -3530,6 +3536,7 @@ impl App {
             skyvis_min_occ,
             cache_sky_occlude,
             cache_hwrt_shadow,
+            cache_hwrt_gather,
             height_fog,
             second_view,
             fog_density,
@@ -6080,6 +6087,7 @@ impl App {
                         // is occluded by the identical formula (only read in sky-occlusion mode).
                         gi::GiSystem::ao_params(scene_aabb_min, scene_aabb_max),
                         self.cache_hwrt_shadow,
+                        self.cache_hwrt_gather,
                     );
                     self.scene_cache_reset = false;
                 }
