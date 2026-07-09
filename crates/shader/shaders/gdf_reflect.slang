@@ -336,6 +336,13 @@ bool screen_trace(float3 p, float3 dir, float sy, float bias, float max_dist, ui
         float vtol = 0.01 * diag + t * 0.02;
         if (distance(sworld, rp) < vtol)
         {
+            // Self-acceptance guard: at small t the sample still hugs the REFLECTOR, projects
+            // onto its own pixels, and the parallax tolerance (sized for far hits) swallows the
+            // gap — the mirror then feeds back its own lit colour (a bright featureless band
+            // along a convex mirror's rim). A depth surface this close to the ray ORIGIN cannot
+            // be reflected content; skip it and keep marching.
+            if (distance(sworld, p) < vtol)
+                continue;
             // lit history is FULL-res; index it with the depth texture's own dimensions.
             uint fw, fh;
             g.textures[pc.depth_index].GetDimensions(fw, fh);
@@ -658,11 +665,22 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         // cap (96, upper bits zero) → byte-identical.
         int max_steps = int(max(pc.max_steps & 0xFFFFu, 1u));
         const float HIT_EPS = 0.001;
+        // Content: a hit only counts once the ray has ESCAPED the reflector's own blurred field
+        // (field value past ~0.4% of the scene diagonal ≈ half a near voxel). A grazing ray off a
+        // convex mirror's rim hugs its own coarse field for a metre-plus — the direction bias
+        // cannot clear it — and the "hit" then cache-samples the MIRROR'S OWN cards: the bottom
+        // band of the chrome ball read as a featureless bright blob of its own card radiance.
+        // Suppressed self-hits fall through to the analytic path (voxel-albedo floor tone) or the
+        // real surface farther along. Gallery starts pre-escaped — the accept-first-hit legacy,
+        // byte-identical even for rays whose biased origin reads a NEGATIVE field value.
+        float d_escape = 0.004 * length(GDF_MAX - GDF_MIN);
+        bool escaped = !vol_on;
         for (int i = 0; i < max_steps && !screen_done; i++)
         {
             float3 rp = p + dir * t;
             float d = scene_march(rp);
-            if (d < HIT_EPS)
+            escaped = escaped || d >= d_escape;
+            if (d < HIT_EPS && escaped)
             {
                 hp = rp;
                 hit = true;
@@ -1046,7 +1064,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 // albedo_at() would return the nearest *object's* colour for a ground hit (the
                 // red cube / green avocado bleeding onto the reflected floor). Use the ground's
                 // own albedo (matches deferred.rs's [0.8] ground material) for ground hits.
-                bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp);
+                // Content scenes (vol_on) bake their real floor MESH into the albedo volume, so
+                // the volume answers correctly at a ground-plane hit too — and the constant grey
+                // is visibly wrong there (the SW near-mirror band: short rays reject the card
+                // tolerance, fall here, and the mirror's bottom turns into a featureless blob of
+                // pc.ground_albedo). The constant stays for the gallery, whose analytic ground is
+                // NOT in the volume (nearest-object colour would bleed onto it) — byte-identical.
+                bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp) && !vol_on;
                 // Cone-blurred albedo (content, vol_on) so an uncovered far reflection is as smooth as
                 // its cached neighbours instead of blocky per-voxel colour. Near hits (radius→0) and the
                 // gallery (vol_on false) keep the single-tap legacy albedo.
