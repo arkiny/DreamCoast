@@ -611,6 +611,10 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             dir = refl_ggx_dir(n, v, roughness, tid.x, tid.y, pc.frame * spp + samp, stoch_flag);
         float t = bias;
         bool hit = false;
+        // A ray that never saw open space (a contact gap under a mirror) — its point is
+        // topologically ENCLOSED, so the analytic fallback must not top it up with the
+        // unoccluded sky irradiance (that read as a bright blue pool under the ball).
+        bool trapped = false;
         float3 hp = p;
         // B2' screen-hit early-out: a validated on-screen hit takes the previous frame's full-res
         // lit radiance and skips the GDF march + cache shade for this sample. Prefiltered pixels
@@ -665,21 +669,34 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         // cap (96, upper bits zero) → byte-identical.
         int max_steps = int(max(pc.max_steps & 0xFFFFu, 1u));
         const float HIT_EPS = 0.001;
-        // Content: a hit only counts once the ray has ESCAPED the reflector's own blurred field
-        // (field value past ~0.4% of the scene diagonal ≈ half a near voxel). A grazing ray off a
-        // convex mirror's rim hugs its own coarse field for a metre-plus — the direction bias
-        // cannot clear it — and the "hit" then cache-samples the MIRROR'S OWN cards: the bottom
-        // band of the chrome ball read as a featureless bright blob of its own card radiance.
-        // Suppressed self-hits fall through to the analytic path (voxel-albedo floor tone) or the
-        // real surface farther along. Gallery starts pre-escaped — the accept-first-hit legacy,
-        // byte-identical even for rays whose biased origin reads a NEGATIVE field value.
+        // Content self-hit filter: a grazing ray off a convex mirror's rim hugs — or wraps
+        // around — its own coarse blurred field (the direction bias cannot clear it; a normal
+        // test cannot identify it either, since the wrap lands on the far side of the curve),
+        // "hits" its own surface, and cache-samples the MIRROR'S OWN cards: the chrome ball's
+        // bottom band read as a featureless bright blob of its own card radiance. A hit only
+        // counts once the ray has ESCAPED open space (field value past ~0.4% of the scene
+        // diagonal). Rays TRAPPED to the end (a contact gap, e.g. under the ball, never sees
+        // open space) resolve as a hit at their final position below — the local cache/analytic
+        // floor tone — NOT as a sky miss (that read as a blue pool under the mirror). Gallery
+        // starts pre-escaped — the accept-first-hit legacy, byte-identical even for rays whose
+        // biased origin reads a NEGATIVE field value.
         float d_escape = 0.004 * length(GDF_MAX - GDF_MIN);
         bool escaped = !vol_on;
+        // Closest approach along a trapped ray (the march can end up crawling INSIDE geometry
+        // once its step floor bottoms out — that point answers nothing; the min-|d| point sits
+        // ON a real surface and its cards can).
+        float d_min = 1e9;
+        float t_min = t;
         for (int i = 0; i < max_steps && !screen_done; i++)
         {
             float3 rp = p + dir * t;
             float d = scene_march(rp);
             escaped = escaped || d >= d_escape;
+            if (abs(d) < d_min)
+            {
+                d_min = abs(d);
+                t_min = t;
+            }
             if (d < HIT_EPS && escaped)
             {
                 hp = rp;
@@ -690,6 +707,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             t += max(d, max(0.01, pc.ground_albedo.w * t));
             if (t > max_dist)
                 break;
+        }
+        // Trapped ray (see above): shade its closest approach instead of falling to the sky miss.
+        if (!hit && !escaped && !screen_done)
+        {
+            t = min(t_min, max_dist);
+            hp = p + dir * t;
+            hit = true;
+            trapped = true;
         }
 #endif
 
@@ -982,6 +1007,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 float diag_sc = length(GDF_MAX - GDF_MIN);
                 float bias_t = gc8 != 0u ? min(t * 0.03, 0.012 * diag_sc) : t * 0.03;
                 float cache_bias = vol_on ? (0.006 * diag_sc + bias_t) : 0.0;
+                // A TRAPPED endpoint (see the march) is not a converged surface hit — its
+                // positional uncertainty is the whole contact gap — so give the card acceptance
+                // the matching radius: the floor card ~a gap-width away holds the converged
+                // (tone-calibrated) radiance this enclosed region actually reflects. Without it
+                // the lookup missed and the analytic (GI-volume ~0 in a gap, no sky) went black.
+                if (trapped)
+                    cache_bias *= 2.0;
                 // The reflection packs the MIP pyramid into cache_tile's spare bits: tile | max_mip<<8 |
                 // mip_index<<16 (mip_index 0xFFFF = no pyramid). The same distance-growing cone_bias is
                 // the ray-cone footprint (world units) that selects the MIP — near hits stay at mip0,
@@ -1092,8 +1124,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     // term and is ~0 where the cache is cold, so an uncovered reflected surface would go
                     // near-black. Add the same sky irradiance the deferred pass gives every surface
                     // (`irradiance_cube(hn) * albedo`) so a reflected shadowed/uncovered face reads its
-                    // true skylit grey — the reflection then matches the directly-shaded scene.
-                    if (has_irr)
+                    // true skylit grey — the reflection then matches the directly-shaded scene. A
+                    // TRAPPED endpoint (see the march) is enclosed by construction — no sky there.
+                    if (has_irr && !trapped)
                         color += g.cubes[irr_idx].SampleLevel(g.samp, hn, 0.0).rgb * hit_albedo;
                 }
                 else
