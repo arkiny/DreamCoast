@@ -201,7 +201,31 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     float3 sun_dir = normalize(pc.sun.xyz);
     float sun_i = pc.sun.w;
     float ndl = max(dot(n, sun_dir), 0.0);
+#ifdef CACHE_HWRT_SHADOW
+    // Exact triangle sun visibility (the permutation the host selects when the content TLAS
+    // exists): the coarse GDF march can close small openings — a courtyard roof aperture reads
+    // as solid — which shadows entire sunlit card regions. The mirror then shows a flat grey
+    // floor where the deferred (and the path tracer) show a crisp sun shaft: the reflected
+    // shadow boundary splits between the two sources. One opaque any-hit ray fixes the
+    // visibility at the source; hard edges also match the deferred's default hard PCF closer
+    // than the wide 16·h/t GDF penumbra. Same pattern as the hit-lighting shadow ray.
+    float sh = 1.0;
+    if (ndl > 0.0)
+    {
+        RayDesc sray;
+        sray.Origin = p + n * 0.01;
+        sray.Direction = sun_dir;
+        sray.TMin = 0.001;
+        sray.TMax = pc.params.w;
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
+        sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, sray);
+        sq.Proceed();
+        if (sq.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+            sh = 0.0;
+    }
+#else
     float sh = ndl > 0.0 ? sun_shadow(p + n * 0.004, sun_dir) : 1.0;
+#endif
     // Direct sun only (the skylight now comes from the indirect gather's sky-on-miss below, matching
     // the reference: a per-ray OCCLUDED skylight instead of the old unoccluded `sky_fill` ambient).
     float3 direct_irr = float3(sun_i * ndl * sh, sun_i * ndl * sh, sun_i * ndl * sh);

@@ -231,6 +231,10 @@
                 // mirror hits read the full-res lit history — sharp reflections where the scene
                 // is visible, the hybrid cache cone elsewhere.
                 reflect_compact_screen: true,
+                // HWRT cache sun shadow: TLAS visibility for the relight's direct sun — the GDF
+                // march closes the courtyard aperture and shadows the whole sunlit floor in the
+                // cache (the mirror's missing sun shaft / shadow-boundary split).
+                cache_hwrt_shadow: true,
             ),
             groups: (
                 resolution: 1,

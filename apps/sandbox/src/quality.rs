@@ -353,6 +353,14 @@ pub struct QualityPreset {
     /// for exactly that seam). Requires `reflect_compact_hwrt`.
     #[serde(default)]
     pub reflect_compact_screen: bool,
+    /// HWRT cache sun shadow (`P_CACHE_HWRT_SHADOW`): the relight's direct-sun visibility traces
+    /// the scene TLAS (one opaque any-hit ray) instead of the GDF sphere march. The coarse field
+    /// closes small openings (a courtyard aperture reads solid), which shadows whole sunlit card
+    /// regions — the mirror then shows a flat grey floor where the deferred/PT show a crisp sun
+    /// shaft, splitting the reflected shadow boundary between colour sources. Needs the content
+    /// TLAS (`reflect_compact_hwrt`/`hwrt_reflect`/PT builds it); falls back to the march.
+    #[serde(default)]
+    pub cache_hwrt_shadow: bool,
     /// Deferred-parity cache skylight (`P_CACHE_SKY_OCCLUDE`): the surface-cache relight takes its
     /// skylight from the SAME SH sky-visibility volumes + min-occlusion + tint the deferred lighting
     /// applies (`occlude_sky_diffuse_bent`), instead of the legacy per-ray sky-on-miss + unoccluded
@@ -567,6 +575,7 @@ pub fn gallery_preset() -> QualityPreset {
         reflect_compact_div: 0,     // no mirror compaction (full-res trace needs none anyway)
         reflect_compact_hwrt: false, // no HWRT refine (no compaction to refine)
         reflect_compact_screen: false, // no compact screen fetch (no compaction at all)
+        cache_hwrt_shadow: false,   // GDF-march relight shadow (byte-identical anchor)
         cache_sky_occlude: false,   // legacy sky-on-miss relight (byte-identical anchor)
     }
 }
@@ -1133,6 +1142,10 @@ mod tests {
         assert!(
             apple.reflect_compact_screen,
             "Apple reflect_compact_screen on (sharp lit-history mirror hits, tone-unified)"
+        );
+        assert!(
+            apple.cache_hwrt_shadow,
+            "Apple cache_hwrt_shadow on (TLAS sun visibility for the relight)"
         );
     }
 

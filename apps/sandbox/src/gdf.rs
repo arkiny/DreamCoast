@@ -145,6 +145,11 @@ pub(crate) struct GdfSystem {
     /// graphics frame, and consumers read the PREVIOUS frame's radiance (1-frame latency). Opt-in.
     cache_async: bool,
     cache_light_pipeline: Option<ComputePipeline>,
+    /// HWRT-shadow relight permutation (`CACHE_HWRT_SHADOW`): direct-sun visibility traces the
+    /// scene TLAS instead of the GDF sphere march (the coarse field closes small openings and
+    /// shadows whole sunlit card regions). Built only on RT-capable devices; selected per-record
+    /// by the caller when the content TLAS is bound.
+    cache_light_hwrt_pipeline: Option<ComputePipeline>,
     /// Reflection cone-LOD MIP generator: downsamples the surface-cache radiance atlas 2×2 per
     /// level (uncaptured texels weighted out + renormalised) into `cache_rad_mips`. One dispatch
     /// per level, chained by storage barriers. `None` ⇒ no mip pyramid (content = mip0 bilinear).
@@ -348,6 +353,20 @@ impl GdfSystem {
             176,
             [64, 1, 1],
         )?;
+        // HWRT-shadow relight permutation (RT-capable devices only; see the field doc).
+        let cache_light_hwrt_pipeline = if device.has_raytracing() {
+            compute(
+                "lightMain",
+                dreamcoast_shader::sdf_cache_light_hwrt_cs_spirv,
+                dreamcoast_shader::sdf_cache_light_hwrt_cs_dxil,
+                dreamcoast_shader::sdf_cache_light_hwrt_cs_metallib,
+                "sdf_cache_light_hwrt",
+                176,
+                [64, 1, 1],
+            )?
+        } else {
+            None
+        };
         // Reflection cone-LOD: MIP pyramid generator for the surface-cache radiance atlas.
         let cache_mipgen_pipeline = compute(
             "mipMain",
@@ -515,6 +534,7 @@ impl GdfSystem {
             cache_frame: 0,
             cache_async: false,
             cache_light_pipeline,
+            cache_light_hwrt_pipeline,
             cache_mipgen_pipeline,
             card_vis: None,
             card_marks: None,
@@ -1683,6 +1703,9 @@ impl GdfSystem {
         skyvis_index: u32,
         skyvis_tint: f32,
         skyvis_min_occ: f32,
+        // HWRT sun shadow: select the TLAS-visibility permutation (the caller guarantees the
+        // content TLAS is built + bound; falls back to the GDF-march pipeline when unavailable).
+        hwrt_shadow: bool,
     ) {
         // Stage D2b: feed the per-card visibility buffer index to the shader (sentinel = off =
         // uniform period). When present, declare it as a read so the graph barriers the relight
@@ -1692,10 +1715,16 @@ impl GdfSystem {
             None => u32::MAX,
         };
         let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
-        let pipe = self
-            .cache_light_pipeline
-            .as_ref()
-            .expect("cache light pipeline");
+        let pipe = if hwrt_shadow {
+            self.cache_light_hwrt_pipeline.as_ref()
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            self.cache_light_pipeline
+                .as_ref()
+                .expect("cache light pipeline")
+        });
         let cards = self.cards.as_ref().expect("cards").storage_index();
         let cpos = self.cache_pos.as_ref().expect("cache pos").storage_index();
         let calb = self

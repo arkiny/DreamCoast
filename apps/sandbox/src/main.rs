@@ -864,6 +864,10 @@ struct App {
     /// escape estimate over-injects blue on interior cards — the cache-vs-deferred tone split).
     /// Needs the volume-GI path; the relight falls back to legacy while the volume has no data.
     cache_sky_occlude: bool,
+    /// HWRT cache sun shadow (`P_CACHE_HWRT_SHADOW`, tier `cache_hwrt_shadow`): the relight's
+    /// direct-sun visibility traces the content TLAS instead of the GDF march (which closes small
+    /// openings and shadows whole sunlit card regions — the mirror's missing sun shaft).
+    cache_hwrt_shadow: bool,
     /// PR-4 (render-pipeline re-baseline track): opt-in analytic exponential height fog
     /// (`P_HEIGHT_FOG=1`), composited in the atmosphere slot after opaque lighting +
     /// reflections, before TAAU/tonemap. Off by default (byte-identical gallery anchor —
@@ -2590,6 +2594,11 @@ impl App {
         // on `cache_sky_occlude` is resolved below once that knob is known.
         let reflect_compact_screen_want = reflect_compact_hwrt
             && quality::env_bool("P_REFLECT_COMPACT_SCREEN", base.reflect_compact_screen);
+        // HWRT cache sun shadow: TLAS visibility for the relight's direct sun (see the tier-knob
+        // doc). Needs the content TLAS actually built + bound; the relight record falls back to
+        // the GDF-march pipeline without it (non-RT devices, gallery).
+        let cache_hwrt_shadow = quality::env_bool("P_CACHE_HWRT_SHADOW", base.cache_hwrt_shadow)
+            && rt.has_content_scene();
 
         info!(
             "RenderQuality tier: {} (RENDER_QUALITY; GPU \"{}\")",
@@ -3520,6 +3529,7 @@ impl App {
             skyvis_tint,
             skyvis_min_occ,
             cache_sky_occlude,
+            cache_hwrt_shadow,
             height_fog,
             second_view,
             fog_density,
@@ -6066,6 +6076,7 @@ impl App {
                         },
                         self.skyvis_tint,
                         self.skyvis_min_occ,
+                        self.cache_hwrt_shadow,
                     );
                     self.scene_cache_reset = false;
                 }

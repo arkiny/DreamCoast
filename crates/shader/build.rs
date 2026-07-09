@@ -261,6 +261,11 @@ fn defines_for(target: &str, key: &str) -> &'static [(&'static str, &'static str
         (false, "gdf_reflect_compact_hwrt_cs") => {
             &[("HWRT_REFLECT", "1"), ("REFLECT_COMPACT", "1")]
         }
+        // Surface-cache relight, HWRT-shadow variant: TLAS sun visibility (see the Job entry).
+        (true, "sdf_cache_light_hwrt_cs") => {
+            &[("RT_METAL_TARGET", "1"), ("CACHE_HWRT_SHADOW", "1")]
+        }
+        (false, "sdf_cache_light_hwrt_cs") => &[("CACHE_HWRT_SHADOW", "1")],
         (true, _) => &[("RT_METAL_TARGET", "1")],
         (false, _) => &[],
     }
@@ -900,6 +905,16 @@ const JOBS: &[Job] = &[
         entry: "lightMain",
         stage: "compute",
         key: "sdf_cache_light_cs",
+    },
+    // HWRT-shadow permutation (`CACHE_HWRT_SHADOW`): the relight's direct-sun visibility traces
+    // the scene TLAS (exact triangles) instead of the GDF sphere march — the coarse field can
+    // close small openings (a courtyard aperture reads solid), shadowing whole sunlit card
+    // regions the deferred lights. Loaded only on RT-capable devices with a content TLAS.
+    Job {
+        src: "sdf_cache_light.slang",
+        entry: "lightMain",
+        stage: "compute",
+        key: "sdf_cache_light_hwrt_cs",
     },
     // Reflection cone-LOD: surface-cache radiance MIP-pyramid generation (2×2 downsample).
     Job {
