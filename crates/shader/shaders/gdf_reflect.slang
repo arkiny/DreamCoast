@@ -684,7 +684,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         // threshold, ~63° cone at roughness 1). The cache cone MIP / albedo cone then average the
         // footprint the wide lobe would have integrated.
         float alpha_pf = roughness * roughness;
+#ifdef REFLECT_COMPACT
+        // The compacted refine runs at div2 — its per-texel cone is ~3x tighter than the 1/6-res
+        // trace the 0.08 slope was tuned for, so the inherited slope over-blurs the cache MIP for
+        // the mirror (washy floor shaft / soft far reflections). The dense ray grid already
+        // handles the blockiness the wide cone used to hide.
+        const float cone_slope = 0.03;
+#else
         float cone_slope = prefiltered ? clamp(2.0 * alpha_pf, 0.08, 2.0) : 0.08;
+#endif
         if (screen_done)
         {
             // B2' screen hit: the previous frame's full-res lit radiance at the validated on-screen
@@ -882,7 +890,30 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                         nw = -nw; // face the incoming ray (two-sided)
                     float3 alb = base_color.rgb;
                     if (tex_albedo != 0xFFFFFFFFu)
-                        alb *= g.textures[tex_albedo].SampleLevel(g.samp_wrap, uv, 0.0).rgb;
+                    {
+                        // Ray-cone texture LOD (the path tracer's hit_lod_base): a mip-0 point
+                        // sample of a MINIFIED reflection turns the albedo into per-ray speckle
+                        // no cone/resolve can average out. Derive the LOD from the cone footprint
+                        // at the hit vs the triangle's world/UV areas (object-space areas — a
+                        // uniform instance scale shifts the LOD slightly, same caveat as the PT).
+                        float3 p0 = asfloat(g.storage_buffers[pc.albedo_r].Load3(i0 * 32u));
+                        float3 p1 = asfloat(g.storage_buffers[pc.albedo_r].Load3(i1 * 32u));
+                        float3 p2 = asfloat(g.storage_buffers[pc.albedo_r].Load3(i2 * 32u));
+                        float a_uv = abs((uv1.x - uv0.x) * (uv2.y - uv0.y)
+                                         - (uv2.x - uv0.x) * (uv1.y - uv0.y));
+                        float a_world = length(cross(p1 - p0, p2 - p0));
+                        float ratio = a_world > 1e-12 ? a_uv / a_world : 0.0;
+                        float cosw = max(abs(dot(nw, dir)), 1e-3);
+                        // Cone width at the hit: the same footprint the cache MIP selection uses.
+                        float cwid = 0.05 + t * cone_slope;
+                        uint tw, th;
+                        g.textures[tex_albedo].GetDimensions(tw, th);
+                        float lod = max(0.5 * log2(max(ratio, 1e-20))
+                                            + log2(max(cwid, 1e-8) / cosw)
+                                            + 0.5 * log2(float(max(tw * th, 1u))),
+                                        0.0);
+                        alb *= g.textures[tex_albedo].SampleLevel(g.samp_wrap, uv, lod).rgb;
+                    }
                     // Sun with a HARDWARE shadow ray (accurate vs the GDF shadow march).
                     float ndl = max(dot(nw, sun_dir), 0.0);
                     float sh = 1.0;
