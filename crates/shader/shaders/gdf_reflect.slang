@@ -695,6 +695,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         {
             float3 hn = scene_normal(hp);
             bool cached = false;
+#if defined(HWRT_REFLECT) && defined(REFLECT_COMPACT)
+            // Gate-band hand-off state: in the footprint band the screen colour does NOT finalize
+            // the pixel — the cache/hybrid colour still resolves below and the two are blended at
+            // the end of the hit branch, so the source transition is a gradient, not a cut.
+            float3 screen_mix = float3(0.0, 0.0, 0.0);
+            float screen_w = 0.0;
+#endif
 #ifdef HWRT_REFLECT
             // Phase 16 B.2 — screen-color-at-hit (reference-engine `SampleSceneColorAtHit`): the hardware
             // ray hit REAL geometry, so if that surface is visible on screen its FULL-RES lit colour is
@@ -747,6 +754,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                                                   max(distance(pc.cam_pos.xyz, hp) * pa_full, 1e-6);
                                     if (fp_px <= 24.0)
                                     {
+                                        float3 sc;
                                         if (fp_px > 3.0)
                                         {
                                             int rr = int(clamp(fp_px * (1.0 / 3.0), 1.0, 8.0));
@@ -766,16 +774,34 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                                                                 .rgb;
                                                 }
                                             }
-                                            color = bsum * (1.0 / 9.0);
+                                            sc = bsum * (1.0 / 9.0);
                                         }
                                         else
                                         {
                                             uint pidx = uint(pp.y) * fw + uint(pp.x);
-                                            color = asfloat(g.storage_buffers[lit_hist].Load4(
-                                                                pidx * 16u))
-                                                        .rgb;
+                                            sc = asfloat(g.storage_buffers[lit_hist].Load4(
+                                                             pidx * 16u))
+                                                     .rgb;
                                         }
-                                        cached = true;
+                                        // Hand-off band: pure screen colour while the footprint is
+                                        // comfortably sub-filter (≤ 6 px), fading to the cache
+                                        // hybrid toward the 24 px AA limit. Inside the band the
+                                        // pixel resolves BOTH sources and lerps at the end of the
+                                        // hit branch — a gradient hand-off instead of a hard cut.
+                                        screen_w = 1.0 - smoothstep(6.0, 24.0, fp_px);
+                                        if (screen_w >= 1.0)
+                                        {
+                                            // Pure screen: finalize here and DISARM the end-of-hit
+                                            // blend (screen_mix stays zero — blending against it
+                                            // would black the pixel out).
+                                            color = sc;
+                                            cached = true;
+                                            screen_w = 0.0;
+                                        }
+                                        else
+                                        {
+                                            screen_mix = sc;
+                                        }
                                     }
                                 }
 #else
@@ -995,6 +1021,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     color = hit_albedo * (sun_i * ndl * sh + fill) * (1.0 / GGX_PI);
                 }
             }
+#if defined(HWRT_REFLECT) && defined(REFLECT_COMPACT)
+            // Gate-band hand-off: blend the (box-filtered) screen colour over the resolved
+            // cache/hybrid colour across the footprint band (see the fetch above).
+            if (screen_w > 0.0)
+                color = lerp(color, screen_mix, screen_w);
+#endif
         }
         else
         {
