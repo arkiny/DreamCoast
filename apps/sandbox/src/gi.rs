@@ -682,6 +682,35 @@ impl GiSystem {
         (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
     }
 
+    /// Stage-C2 GDF-AO parameters `(reach, strength, bias, floor)` — the SINGLE SOURCE both the
+    /// screen-space AO pass and the surface-cache relight's deferred-parity skylight use, so a
+    /// cached (reflected) surface is occluded by exactly the AO the deferred gives it directly.
+    ///
+    /// AO is a LOCAL contact effect at a fixed physical scale (1 unit = 1 m), not a fraction of
+    /// the whole scene, so the reach is a metric distance capped at 0.5 m — a contact-scale band
+    /// that hugs the contact line (a column meeting the floor) instead of smearing ~1 m up the
+    /// column. Strength 2.0: a present-but-subtle contact shade (3.0 over-darkened the interior
+    /// while the AO input was unreliable; 1.5 read too faint once fixed). Floor 0.3: deep contacts
+    /// keep at least this fraction of the ambient (gdf_ao.slang remaps to [floor, 1]) so recesses
+    /// read as soft shade, not near-black. `AO_REACH` / `AO_STRENGTH` / `AO_FLOOR` override.
+    pub(crate) fn ao_params(aabb_min: [f32; 3], aabb_max: [f32; 3]) -> (f32, f32, f32, f32) {
+        let diag = Self::diag(aabb_min, aabb_max);
+        let reach = std::env::var("AO_REACH")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or((diag * 0.07).min(0.5));
+        let bias = (diag * 0.004).min(0.02);
+        let strength = std::env::var("AO_STRENGTH")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(2.0);
+        let floor = std::env::var("AO_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.3);
+        (reach, strength, bias, floor)
+    }
+
     /// Stage C2: GDF ambient occlusion. A full-screen compute pass reconstructs each
     /// pixel's world surface point from the depth G-buffer, marches the world scene GDF
     /// along the world normal, and writes an AO factor [0,1] the lighting pass multiplies
@@ -710,37 +739,8 @@ impl GiSystem {
         let aop = self.ao_pipeline.as_ref().expect("gdf ao pipeline");
         let out = graph.create_storage_image("gdf_ao_out", HDR_FORMAT, extent);
         let sampled = scene_gdf.sampled_index();
-        // AO is a LOCAL contact effect at a fixed physical scale (1 unit = 1 m), not a fraction of
-        // the whole scene, so the reach is a metric distance (capped) regardless of scene size —
-        // `diag * 0.07` alone would make a big scene (Sponza diag ~37 -> 2.6 m) treat every wall
-        // within 2.6 m as an occluder. The exponential falloff (gdf_ao.slang) never crushes to pure
-        // black. Strength `1.5`: the earlier `3.0` was pushed up while the AO was unreliable (the
-        // G-buffer depth it samples was being discarded/cleared — see `fix/gbuffer-depth-store`);
-        // now that it applies correctly every frame, 3.0 over-darkened the interior, so it is dialled
-        // back to a subtle, natural contact occlusion. `AO_STRENGTH` / `AO_REACH` tune it.
+        let (reach, strength, bias, floor) = Self::ao_params(aabb_min, aabb_max);
         let diag = Self::diag(aabb_min, aabb_max);
-        // Reach capped at 0.5 m: a contact-scale band so the occlusion hugs the contact line
-        // (a column meeting the floor) instead of smearing ~1 m up the column.
-        let reach = std::env::var("AO_REACH")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or((diag * 0.07).min(0.5));
-        let bias = (diag * 0.004).min(0.02);
-        // Strength `2.0`: `1.5` (set when the depth fix first made AO reliable) read too faint in the
-        // interiors, so it is nudged up for a more present contact shade — still well below the `3.0`
-        // that over-darkened the scene. (AO is slated for a `RenderQuality`/UI parameterization; this
-        // is just a better default in the meantime.) `AO_STRENGTH` overrides.
-        let strength = std::env::var("AO_STRENGTH")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(2.0);
-        // AO floor: deep contacts keep at least this fraction of the ambient (gdf_ao.slang remaps
-        // to [floor, 1]) so column bases / recesses read as soft shade, not near-black. Lowered
-        // `0.4 -> 0.3` so the deepest contacts can read a touch darker without crushing to black.
-        let floor = std::env::var("AO_FLOOR")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.3);
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "gdf_ao",

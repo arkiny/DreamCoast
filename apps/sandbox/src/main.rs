@@ -6076,6 +6076,9 @@ impl App {
                         },
                         self.skyvis_tint,
                         self.skyvis_min_occ,
+                        // The same AO params the screen-space GDF AO uses — the parity skylight
+                        // is occluded by the identical formula (only read in sky-occlusion mode).
+                        gi::GiSystem::ao_params(scene_aabb_min, scene_aabb_max),
                         self.cache_hwrt_shadow,
                     );
                     self.scene_cache_reset = false;

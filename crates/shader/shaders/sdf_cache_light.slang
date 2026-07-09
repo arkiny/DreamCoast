@@ -53,6 +53,11 @@ struct CacheLightPush
     float skyvis_tint;    // neutral leak fraction of the occluded skylight (same value as the deferred)
     float skyvis_min_occ; // min sky-visibility floor (lerp V toward 1; same value as the deferred)
     uint pad_sky;
+    float ao_reach;       // GDF-AO march reach (the SAME GiSystem::ao_params the screen AO uses —
+                          // the parity skylight is occluded by the identical formula)
+    float ao_strength;    // exponential occlusion strength
+    float ao_bias;        // surface offset before the march
+    float ao_floor;       // remap floor: deep contacts keep >= this fraction of the ambient
 };
 
 [[vk::push_constant]]
@@ -339,7 +344,32 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
         float3 E = g.cubes[pc.irradiance_index].SampleLevel(g.samp, skyN, 0.0).rgb;
         float vis = lerp(v, 1.0, pc.skyvis_min_occ);
         float lum = dot(E, float3(0.2126, 0.7152, 0.0722));
-        indirect += E * (vis * dot_factor) + (pc.skyvis_tint * lum) * (1.0 - vis);
+        // Deferred-parity contact AO: `ambient_ibl` multiplies its diffuse skylight by the marched
+        // GDF AO (Stage C2), so the card's skylight must carry the same factor or a cached
+        // (reflected) shadowed surface reads ~1/AO brighter than the deferred shades it directly
+        // (measured 1.8x on the chromeball's shadowed floor). The exact gdf_ao.slang formula —
+        // 5 taps along the normal, exponential falloff, [floor, 1] remap — with the same host
+        // params (GiSystem::ao_params). The per-texel material AO map is not captured on cards,
+        // so that (mild) factor is the one term intentionally left out.
+        float ao = 1.0;
+        if (pc.ao_reach > 0.0)
+        {
+            float3 q0 = p + n * pc.ao_bias;
+            float occ = 0.0;
+            float sca = 1.0;
+            [unroll]
+            for (int k = 0; k < 5; k++)
+            {
+                float h = 0.001 + pc.ao_reach * (float(k) + 1.0) / 5.0;
+                float3 q = q0 + n * h;
+                float d = min(geo_inside(q), q.y - pc.aabb_min.w);
+                occ += (h - d) * sca;
+                sca *= 0.92;
+            }
+            ao = exp(-pc.ao_strength * max(occ, 0.0));
+            ao = pc.ao_floor + (1.0 - pc.ao_floor) * ao;
+        }
+        indirect += (E * (vis * dot_factor) + (pc.skyvis_tint * lum) * (1.0 - vis)) * ao;
     }
     // Legacy skylight-visibility FLOOR (matches the old deferred `occlude_sky_diffuse` MinOcclusion):
     // an enclosed interior face whose gather rays rarely escape still receives a floor of the sky

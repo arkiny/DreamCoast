@@ -350,7 +350,7 @@ impl GdfSystem {
             dreamcoast_shader::sdf_cache_light_cs_dxil,
             dreamcoast_shader::sdf_cache_light_cs_metallib,
             "sdf_cache_light",
-            176,
+            192,
             [64, 1, 1],
         )?;
         // HWRT-shadow relight permutation (RT-capable devices only; see the field doc).
@@ -361,7 +361,7 @@ impl GdfSystem {
                 dreamcoast_shader::sdf_cache_light_hwrt_cs_dxil,
                 dreamcoast_shader::sdf_cache_light_hwrt_cs_metallib,
                 "sdf_cache_light_hwrt",
-                176,
+                192,
                 [64, 1, 1],
             )?
         } else {
@@ -1703,6 +1703,9 @@ impl GdfSystem {
         skyvis_index: u32,
         skyvis_tint: f32,
         skyvis_min_occ: f32,
+        // GDF-AO params (reach, strength, bias, floor) for the parity skylight — the same
+        // `GiSystem::ao_params` the screen-space AO uses (only read in sky-occlusion mode).
+        ao_params: (f32, f32, f32, f32),
         // HWRT sun shadow: select the TLAS-visibility permutation (the caller guarantees the
         // content TLAS is built + bound; falls back to the GDF-march pipeline when unavailable).
         hwrt_shadow: bool,
@@ -1813,6 +1816,7 @@ impl GdfSystem {
                     skyvis_index,
                     skyvis_tint,
                     skyvis_min_occ,
+                    ao_params,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())
@@ -1952,10 +1956,12 @@ impl GdfSystem {
             // Deferred-parity skylight stays OFF on the async-compute path: the sky-visibility SH
             // volumes are updated on the GRAPHICS queue every frame, and an async relight sampling
             // them cross-queue has no layout/hazard ordering here. The D3D12 async default runs
-            // with the legacy skylight until the DX≡VK batch wires a safe handoff.
+            // with the legacy skylight until the DX≡VK batch wires a safe handoff. (The AO params
+            // are only read in sky-occlusion mode, so they ride along as zeros.)
             u32::MAX,
             0.0,
             0.0,
+            (0.0, 0.0, 0.0, 0.0),
         ));
         cmd.dispatch(num_texels.div_ceil(64), 1, 1);
         // Make the relight write available before the queue signals (graphics reads it next frame).

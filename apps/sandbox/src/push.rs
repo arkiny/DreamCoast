@@ -879,8 +879,9 @@ pub(crate) fn cache_light_push(
     skyvis_index: u32,
     skyvis_tint: f32,
     skyvis_min_occ: f32,
-) -> [u8; 176] {
-    let mut pc = [0u8; 176];
+    ao_params: (f32, f32, f32, f32),
+) -> [u8; 192] {
+    let mut pc = [0u8; 192];
     let u = [
         cards_index,
         cache_pos_index,
@@ -942,6 +943,12 @@ pub(crate) fn cache_light_push(
     pc[160..164].copy_from_slice(&skyvis_index.to_le_bytes());
     pc[164..168].copy_from_slice(&skyvis_tint.to_le_bytes());
     pc[168..172].copy_from_slice(&skyvis_min_occ.to_le_bytes());
+    // GDF-AO params (offset 176): (reach, strength, bias, floor) — the SAME `GiSystem::ao_params`
+    // the screen-space AO pass uses, so the parity skylight is occluded by the identical formula.
+    pc[176..180].copy_from_slice(&ao_params.0.to_le_bytes());
+    pc[180..184].copy_from_slice(&ao_params.1.to_le_bytes());
+    pc[184..188].copy_from_slice(&ao_params.2.to_le_bytes());
+    pc[188..192].copy_from_slice(&ao_params.3.to_le_bytes());
     pc
 }
 
