@@ -843,6 +843,10 @@ impl GdfSystem {
         atlas_dim: [u32; 3],
         build: &crate::mesh_sdf::MeshSdfBuild,
         albedo_atlas: Option<[&[u8]; 3]>,
+        // Detail-replace (`P11_SDF_DETAIL_REPLACE` / tier `sdf_detail_replace`): where any
+        // instance's atlas SDF covers a point, the atlas union IS the field — the coarse dense
+        // term only answers uncovered space. See ms_geo in mesh_sdf_sample.slang.
+        detail_replace: bool,
     ) -> anyhow::Result<()> {
         if self.scene_gdf.is_none() {
             return Ok(());
@@ -954,6 +958,13 @@ impl GdfSystem {
                 pu(&mut h, 0);
             }
         }
+        // Flags word (offset 112): bit0 = detail-replace (atlas coverage overrides the dense
+        // term — the 0.75 m dense voxels otherwise force d≈0 through contact gaps and defeat
+        // the accurate atlas exactly where mirrors need it).
+        pu(&mut h, u32::from(detail_replace));
+        pu(&mut h, 0);
+        pu(&mut h, 0);
+        pu(&mut h, 0);
         let header = sbuf(&h, 16)?;
 
         self.sdf_atlas = Some(atlas);
@@ -2079,6 +2090,11 @@ impl GdfSystem {
         scene_gdf_ext: ResourceId,
         albedo_ext: Option<ResourceId>,
         cache_ext: ResourceId,
+        // Occlusion invalidation (`P_CACHE_CAPTURE_OCCL`, tile bit16): a texel whose union-field
+        // hit sits farther from the card's OWN drawable's triangles than the field blur explains
+        // captured an OCCLUDER — store it invalid instead of a wrong witness. Needs the C1 mesh
+        // tables (no-op without them).
+        occl_invalidate: bool,
     ) {
         let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
         let pipe = self
@@ -2162,7 +2178,8 @@ impl GdfSystem {
                     calb,
                     sampled,
                     num_cards,
-                    self.tile_packed(), // C2a: layout index rides bits 8..15
+                    // C2a: layout index rides bits 8..15; bit16 = occlusion invalidation.
+                    self.tile_packed() | if occl_invalidate { 0x10000 } else { 0 },
                     num_texels,
                     albedo_rgb,
                     clip.0,

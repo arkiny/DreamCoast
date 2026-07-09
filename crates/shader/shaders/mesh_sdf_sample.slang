@@ -49,6 +49,9 @@ struct MeshSdfHeader
     uint alb_atlas_g;
     uint alb_atlas_b;
     uint alb_atlas_active;
+    // bit0 = detail-replace: where any instance's atlas covers `p`, the atlas union IS the
+    // field (the dense term only answers uncovered space). See ms_geo.
+    uint flags;
 };
 
 MeshSdfHeader ms_load_header(uint hidx)
@@ -61,6 +64,7 @@ MeshSdfHeader ms_load_header(uint hidx)
     uint4 w4 = b.Load4(64u);
     uint4 w5 = b.Load4(80u);
     uint4 w6 = b.Load4(96u);
+    uint4 w7 = b.Load4(112u);
     MeshSdfHeader h;
     h.grid_min = asfloat(w0.xyz);
     h.atlas_idx = w0.w;
@@ -80,6 +84,7 @@ MeshSdfHeader ms_load_header(uint hidx)
     h.alb_atlas_g = w6.y;
     h.alb_atlas_b = w6.z;
     h.alb_atlas_active = w6.w;
+    h.flags = w7.x;
     return h;
 }
 
@@ -106,6 +111,15 @@ float ms_geo(uint hidx, float3 p, float clamp_d)
 {
     MeshSdfHeader h = ms_load_header(hidx);
     float best = min(ms_dense(h, p), clamp_d);
+    // Detail-replace (flags bit0): the atlas union over the covering instances, WITHOUT the
+    // dense seed. The ~0.75 m dense voxels read d≈0 throughout a contact gap (under the chrome
+    // ball) and min() drags the accurate atlas down to them — the exact place mirror rays need
+    // the atlas's answer. Where any instance covers `p` the atlas IS the field (the reference
+    // engine's detail traces replace its global field the same way); the dense term keeps
+    // answering uncovered space (empty-space stepping + the few instances culled from the
+    // atlas set).
+    float atlas_best = clamp_d;
+    bool covered = false;
 
     uint c = ms_cell_index(h, p);
     uint2 range = g.storage_buffers[h.cell_buf].Load2(c * 8u); // (offset, count)
@@ -129,12 +143,17 @@ float ms_geo(uint hidx, float3 p, float clamp_d)
         float3 t = (lp - aabb_min) / max(aabb_max - aabb_min, float3(1e-8));
         if (any(t < 0.0) || any(t > 1.0))
             continue;
+        covered = true;
         float3 uvw = uvw_bias + saturate(t) * uvw_scale;
         float d = g.volumes[h.atlas_idx].SampleLevel(g.samp, uvw, 0.0).x * dist_scale;
         // Nearest surface wins (smallest |distance|), matching the CPU composite's union.
         if (abs(d) < abs(best))
             best = d;
+        if (abs(d) < abs(atlas_best))
+            atlas_best = d;
     }
+    if ((h.flags & 1u) != 0u && covered)
+        return atlas_best;
     return best;
 }
 

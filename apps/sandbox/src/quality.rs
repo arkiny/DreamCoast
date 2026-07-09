@@ -361,6 +361,19 @@ pub struct QualityPreset {
     /// TLAS (`reflect_compact_hwrt`/`hwrt_reflect`/PT builds it); falls back to the march.
     #[serde(default)]
     pub cache_hwrt_shadow: bool,
+    /// Capture occlusion invalidation (`P_CACHE_CAPTURE_OCCL`): a card texel whose union-field
+    /// capture hit sits farther from the card's OWN drawable's triangles than the field blur
+    /// explains captured an OCCLUDER (floor texels under the chrome ball hold the ball's
+    /// surface) — store it invalid so samplers skip it instead of reading a wrong witness.
+    /// Needs the C1 mesh-capture tables.
+    #[serde(default)]
+    pub cache_capture_occl: bool,
+    /// SDF detail-replace (`P11_SDF_DETAIL_REPLACE`): where any instance's atlas SDF covers a
+    /// point, the atlas union IS the field — the coarse dense term (0.75 m voxels, which read
+    /// d≈0 through contact gaps and defeat the atlas exactly where mirrors need it) only answers
+    /// uncovered space. Reference-engine structure: detail traces replace the global field.
+    #[serde(default)]
+    pub sdf_detail_replace: bool,
     /// Lit-calibration feedback (`P_CACHE_LIT_CALIB`): the card-visibility pass probes each
     /// on-screen card's lit/cache luminance ratio — one projected point, TLAS-occlusion-checked
     /// against the lit history — into a per-card EMA the REFLECTION sampler multiplies in
@@ -595,6 +608,8 @@ pub fn gallery_preset() -> QualityPreset {
         cache_hwrt_shadow: false,   // GDF-march relight shadow (byte-identical anchor)
         cache_hwrt_gather: false,   // GDF-march relight gather (byte-identical anchor)
         cache_lit_calib: false,     // no lit-feedback correction (byte-identical anchor)
+        sdf_detail_replace: false,  // legacy min(dense, atlas) union (byte-identical anchor)
+        cache_capture_occl: false,  // keep occluded captures (byte-identical anchor)
         cache_sky_occlude: false,   // legacy sky-on-miss relight (byte-identical anchor)
     }
 }
@@ -1216,6 +1231,10 @@ mod tests {
         assert!(
             apple.cache_lit_calib,
             "Apple cache_lit_calib on (per-texel lit-feedback correction for the mirror)"
+        );
+        assert!(
+            apple.sdf_detail_replace,
+            "Apple sdf_detail_replace on (atlas coverage overrides the dense term)"
         );
     }
 

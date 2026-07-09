@@ -878,6 +878,9 @@ struct App {
     /// TLAS cache gather (`P_CACHE_HWRT_GATHER`, tier `cache_hwrt_gather`): the relight's indirect
     /// rays trace exact triangles — the leak-prone GDF march inflates the gathered bounce.
     cache_hwrt_gather: bool,
+    /// Capture occlusion invalidation (`P_CACHE_CAPTURE_OCCL`, tier `cache_capture_occl`): card
+    /// texels whose capture hit an occluder store invalid instead of a wrong witness.
+    cache_capture_occl: bool,
     /// Lit-calibration feedback (`P_CACHE_LIT_CALIB`, tier `cache_lit_calib`): the visibility pass
     /// probes each on-screen card's lit/cache luminance ratio (TLAS occlusion check) into a
     /// per-card EMA the reflection sampler applies — pins the mirror's cache family to the lit
@@ -2308,7 +2311,14 @@ impl App {
                 let alb_ref = alb_ch
                     .as_ref()
                     .map(|c| [c[0].as_slice(), c[1].as_slice(), c[2].as_slice()]);
-                gdf.install_mesh_sdf(&device, &atlas.to_le_bytes(), atlas.dim, &build, alb_ref)?;
+                gdf.install_mesh_sdf(
+                    &device,
+                    &atlas.to_le_bytes(),
+                    atlas.dim,
+                    &build,
+                    alb_ref,
+                    quality::env_bool("P11_SDF_DETAIL_REPLACE", base.sdf_detail_replace),
+                )?;
             }
             // Phase 12 item 3: optional GPU→CPU volume-readback round-trip check. Reads
             // the just-uploaded scene SDF back and confirms it equals the bytes we
@@ -2637,6 +2647,9 @@ impl App {
         // TLAS gather rides the same permutation (see the tier-knob doc).
         let cache_hwrt_gather =
             cache_hwrt_shadow && quality::env_bool("P_CACHE_HWRT_GATHER", base.cache_hwrt_gather);
+        // Capture occlusion invalidation (see the tier-knob doc; needs the C1 mesh tables —
+        // the shader no-ops without them).
+        let cache_capture_occl = quality::env_bool("P_CACHE_CAPTURE_OCCL", base.cache_capture_occl);
 
         info!(
             "RenderQuality tier: {} (RENDER_QUALITY; GPU \"{}\")",
@@ -3578,6 +3591,7 @@ impl App {
             cache_sky_occlude,
             cache_hwrt_shadow,
             cache_hwrt_gather,
+            cache_capture_occl,
             cache_lit_calib,
             height_fog,
             second_view,
@@ -6022,8 +6036,13 @@ impl App {
             (true, Some(gdf_ext)) => {
                 let ext = graph.import_external("scene_cache");
                 if !self.scene_cache_captured {
-                    self.gdf
-                        .record_cache_capture(&mut graph, gdf_ext, scene_albedo_ext, ext);
+                    self.gdf.record_cache_capture(
+                        &mut graph,
+                        gdf_ext,
+                        scene_albedo_ext,
+                        ext,
+                        self.cache_capture_occl,
+                    );
                     self.scene_cache_captured = true;
                 }
                 Some(ext)

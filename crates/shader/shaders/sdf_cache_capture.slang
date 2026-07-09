@@ -200,6 +200,7 @@ void cacheMain(uint3 tid: SV_DispatchThreadID)
             float4 base_color = asfloat(g.storage_buffers[pc.mesh_table].Load4(rbase + 16u));
             float best_d2 = 1e30;
             float2 best_uv = float2(0.0, 0.0);
+            float3 best_q = po; // closest point on the drawable's own triangles (occlusion test)
             float3 best_a = po, best_b = po, best_c = po;
             float2 uv_a = float2(0, 0), uv_b = float2(0, 0), uv_c = float2(0, 0);
             [loop]
@@ -218,6 +219,7 @@ void cacheMain(uint3 tid: SV_DispatchThreadID)
                 if (d2 < best_d2)
                 {
                     best_d2 = d2;
+                    best_q = q;
                     float2 u0 = asfloat(g.storage_buffers[pc.mesh_vtx].Load2(i0 * 32u + 24u));
                     float2 u1 = asfloat(g.storage_buffers[pc.mesh_vtx].Load2(i1 * 32u + 24u));
                     float2 u2 = asfloat(g.storage_buffers[pc.mesh_vtx].Load2(i2 * 32u + 24u));
@@ -225,6 +227,26 @@ void cacheMain(uint3 tid: SV_DispatchThreadID)
                     best_a = a; best_b = b; best_c = c;
                     uv_a = u0; uv_b = u1; uv_c = u2;
                 }
+            }
+            // Occlusion invalidation (tile bit16): the sphere-trace runs on the UNION field, so
+            // a texel whose own surface is occluded captures the OCCLUDER instead — floor
+            // texels under the chrome ball hold the BALL's surface, and reflections near the
+            // contact gap answered ~4x over the path tracer. Genuine occlusion needs BOTH:
+            // the hit is farther from the card's OWN drawable's triangles than the field blur
+            // explains (absolute world tolerance — the per-texel acceptance below is
+            // card-relative and lets a whole occluder through on a large card), AND the own
+            // surface lies FARTHER ALONG the trace than the hit (something in front of it).
+            // The along-trace condition spares texels whose own surface is merely laterally
+            // offset by union imprecision (far walls) — invalidating those exposed the bright
+            // analytic fallback across whole reflected regions.
+            if ((pc.tile & 0x10000u) != 0u && prim_count > 0u)
+            {
+                float occl_tol = 0.003 * length(pc.aabb_max.xyz - pc.aabb_min.xyz);
+                float3 dir_o = normalize(float3(dot(w2o0.xyz, dir), dot(w2o1.xyz, dir),
+                                                dot(w2o2.xyz, dir)));
+                bool own_behind = dot(best_q - po, dir_o) > occl_tol;
+                if (best_d2 > occl_tol * occl_tol && own_behind)
+                    valid = 0.0;
             }
             // Accept when the nearest triangle is within a few card texels of the GDF hit
             // (object space ≈ world for content's mostly-uniform transforms).

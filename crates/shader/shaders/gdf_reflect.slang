@@ -680,7 +680,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         // floor tone — NOT as a sky miss (that read as a blue pool under the mirror). Gallery
         // starts pre-escaped — the accept-first-hit legacy, byte-identical even for rays whose
         // biased origin reads a NEGATIVE field value.
-        float d_escape = 0.004 * length(GDF_MAX - GDF_MIN);
+        // The escape threshold keys to the field's actual blur band: with detail-replace
+        // (direct per-mesh sampling + flags bit0) the atlas voxel is ~an order finer than the
+        // dense grid, so a quarter threshold lets contact-gap rays that genuinely see accurate
+        // open space (the ball-floor gap clears ~3x this) escape and hit the real floor instead
+        // of resolving as trapped.
+        bool ms_detail =
+            pc.clip_count == 0u && (ms_load_header(pc.clip_desc).flags & 1u) != 0u;
+        float d_escape = (ms_detail ? 0.001 : 0.004) * length(GDF_MAX - GDF_MIN);
         bool escaped = !vol_on;
         // Closest approach along a trapped ray (the march can end up crawling INSIDE geometry
         // once its step floor bottoms out — that point answers nothing; the min-|d| point sits

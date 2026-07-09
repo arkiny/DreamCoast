@@ -239,6 +239,10 @@
                 // applied in the reflection sampler — converges the mirror's cache family onto
                 // the deferred tone (shadowed reflected floor 76 -> 45 vs deferred 49 /255).
                 cache_lit_calib: true,
+                // SDF detail-replace: atlas coverage overrides the dense term (the 0.75 m dense
+                // voxels read d≈0 through contact gaps and defeat the atlas exactly where the
+                // mirror needs it — the ball-bottom band resolves instead of trapping).
+                sdf_detail_replace: true,
             ),
             groups: (
                 resolution: 1,
