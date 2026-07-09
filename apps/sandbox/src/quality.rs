@@ -628,6 +628,53 @@ pub fn env_bool(name: &str, tier_default: bool) -> bool {
     }
 }
 
+/// Reflection pipeline mode — the UI-facing single source the frame loop derives every
+/// per-pass HWRT reflection decision from (`App::apply_reflect_mode`). The tier/env knobs
+/// (`P_HWRT`, `P_REFLECT_COMPACT_HWRT`, `P_REFLECT_COMPACT_SCREEN`) collapse into an initial
+/// mode at launch; `P_REFLECT_MODE=sw|hybrid|hw` overrides it directly, and the UI switches
+/// it live (the acceleration structures are built at load whenever the device + scene allow,
+/// so no rebuild is needed).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReflectMode {
+    /// GDF sphere-march + surface cache only — no TLAS use in the reflection. The fallback
+    /// for non-RT devices and the cheapest tier.
+    Software,
+    /// SW march for the broad phase; the compacted near-mirror pixel list re-traces on the
+    /// TLAS with screen-fetch / hit-lighting shading (the Apple-tier default — HWRT cost
+    /// stays bounded by the on-screen mirror area).
+    Hybrid,
+    /// Every reflection ray traces the TLAS — exact hits everywhere, the quality mode.
+    Hardware,
+}
+
+impl ReflectMode {
+    /// Resolve the launch mode: `P_REFLECT_MODE` wins, else infer from the resolved
+    /// per-pass knobs (main HWRT trace => Hardware, HWRT near-mirror refine => Hybrid).
+    pub fn resolve(hwrt_main: bool, hwrt_compact: bool) -> Self {
+        let inferred = if hwrt_main {
+            Self::Hardware
+        } else if hwrt_compact {
+            Self::Hybrid
+        } else {
+            Self::Software
+        };
+        match std::env::var("P_REFLECT_MODE") {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "sw" | "software" => Self::Software,
+                "hybrid" => Self::Hybrid,
+                "hw" | "hardware" => Self::Hardware,
+                other => {
+                    eprintln!(
+                        "[reflect] P_REFLECT_MODE='{other}' unknown (sw|hybrid|hw) — using {inferred:?}"
+                    );
+                    inferred
+                }
+            },
+            Err(_) => inferred,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scalability groups (organizing layer)
 // ---------------------------------------------------------------------------

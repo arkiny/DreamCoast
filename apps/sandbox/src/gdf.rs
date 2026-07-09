@@ -30,6 +30,11 @@ use crate::push::{
 /// Volume edge length in voxels (cube). The bake/merge/view all share it.
 const VOLUME_DIM: u32 = 64;
 
+/// Lit-calibration probe args for `record_cache_visibility`: the prev-frame view-projection the
+/// lit history was rendered with, the prev eye (TLAS occlusion-ray origin), the probe seed
+/// (frame counter), the lit-history buffer's bindless index, its pixel dims, and the Y-flip word.
+pub(crate) type CacheCalibArgs = ([f32; 16], Vec3, u32, u32, (u32, u32), u32);
+
 pub(crate) struct GdfSystem {
     /// Per-mesh SDF bake target (B2) + GDF merge source (B3).
     volume: Option<Volume>,
@@ -1686,11 +1691,9 @@ impl GdfSystem {
         &'a self,
         graph: &mut RenderGraph<'a>,
         planes: [[f32; 4]; 6],
-        // Lit-calibration probe (None = off): the prev-frame camera the lit history was rendered
-        // with, the probe seed (frame counter), the lit-history buffer's bindless index + pixel
-        // dims + the Y convention. Selects the calib permutation (TLAS occlusion ray — the caller
-        // guarantees a bound TLAS).
-        calib: Option<([f32; 16], Vec3, u32, u32, (u32, u32), u32)>,
+        // Lit-calibration probe (None = off). Selects the calib permutation (TLAS occlusion
+        // ray — the caller guarantees a bound TLAS).
+        calib: Option<CacheCalibArgs>,
     ) -> Option<ResourceId> {
         let calib = match (&self.cache_vis_calib_pipeline, calib) {
             (Some(_), Some(c)) => Some(c),

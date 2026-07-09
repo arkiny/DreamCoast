@@ -815,20 +815,27 @@ struct App {
     /// first increment returns a hardware-traced VISIBILITY term only (hit lighting is a later
     /// increment) and requires the BLAS/TLAS built by `rt.rs` (currently the gallery scene only).
     hwrt_gi: bool,
-    /// Phase 16 HWRT hybrid: hardware-ray-traced reflections opt-in (`P_HWRT`). True only when the
-    /// device is RT-capable AND the content scene's TLAS was built. The reflection trace then routes
-    /// through the scene BVH + surface-cache shading instead of the GDF sphere-march. Default off.
+    /// Reflection pipeline mode (`quality::ReflectMode`) — the UI-facing single source. Every
+    /// per-pass HWRT reflection boolean below (`hwrt`, `reflect_compact_hwrt`,
+    /// `reflect_compact_screen`) is DERIVED from it each frame (`apply_reflect_mode`), so the UI
+    /// switches the whole pipeline live and the flags can never drift out of a valid combination.
+    reflect_mode: quality::ReflectMode,
+    /// Whether the HWRT reflection substrate exists this run: RT device + content TLAS + the
+    /// consolidated hit table (all built at load whenever the device/scene allow). False locks
+    /// `reflect_mode` to Software for the session.
+    reflect_hw_ready: bool,
+    /// The user/tier screen-fetch intent (`P_REFLECT_COMPACT_SCREEN`), pre-gating: the effective
+    /// `reflect_compact_screen` derives as `Hybrid/Hardware && this && cache_sky_occlude`.
+    reflect_screen_want: bool,
+    /// Phase 16 HWRT hybrid: the MAIN reflection trace goes through the scene BVH instead of the
+    /// GDF sphere-march. DERIVED from `reflect_mode` (Hardware) — do not set directly.
     hwrt: bool,
-    /// Whether the content HWRT acceleration structures were BUILT at load (`P_HWRT` / tier). When
-    /// true, `hwrt` (the runtime reflection toggle) can be flipped live in the settings UI without a
-    /// rebuild; when false, HWRT can't be enabled this run (the accel isn't built).
-    hwrt_available: bool,
     /// Phase 16 C: `P_HWRT_FULLRES` — trace the HWRT reflection at full resolution (crisp mirror,
-    /// ~4x cost). Implies `hwrt`. Default off keeps the half-res HWRT trace for interactive perf.
+    /// ~4x cost). Armed independently; only active while `hwrt` (Hardware mode) is on.
     hwrt_fullres: bool,
     /// Phase 16 E: `P_HWRT_HITLIGHTING` — shade an off-screen reflection HW hit with the real
     /// material (consolidated geometry + albedo texture + sun/HW-shadow/IBL) instead of the surface
-    /// cache. Implies `hwrt` and the built hit table. Default off.
+    /// cache. Armed independently; only consulted by the HWRT paths (Hybrid/Hardware).
     hwrt_hitlighting: bool,
     /// Bent-normal skylight: when true (`P_BENT_NORMAL`, default on) the GI pass writes the SH
     /// sky-vis band-1 vector (the DFAO bent normal) into the sky-vis image so the lighting samples
@@ -2579,7 +2586,14 @@ impl App {
             && !gallery_scene
             && !world_mode
             && !world.draw_list().is_empty();
-        if hwrt || compact_hwrt_want || content_pt_want {
+        // Build the accel whenever the device + scene ALLOW it (not only when a launch knob asks):
+        // the acceleration structures are the substrate the ReflectMode UI switches onto live, so
+        // a Software-tier launch on an RT machine can still flip to Hybrid/Hardware at runtime.
+        let hwrt_possible = device.has_raytracing()
+            && !gallery_scene
+            && !world_mode
+            && !world.draw_list().is_empty();
+        if hwrt_possible || content_pt_want {
             rt.build_content_accel(
                 &device,
                 &world.draw_list(),
@@ -2587,23 +2601,28 @@ impl App {
                 &material_registry,
             );
         }
-        // Built at launch → the reflection can be toggled live in the UI without a rebuild.
-        let hwrt_available = hwrt && rt.has_content_scene();
-        let hwrt = hwrt_available;
-        // `P_HWRT_FULLRES`: full-res reflection trace (crisp mirror, ~4x cost — a quality mode).
-        let hwrt_fullres = hwrt && quality::env_bool("P_HWRT_FULLRES", base.hwrt_reflect_fullres);
-        // `P_HWRT_HITLIGHTING`: shade off-screen HW hits with the real material (needs the hit table).
-        let hwrt_hitlighting = hwrt
-            && rt.content_hit_indices().is_some()
+        // The HWRT reflection substrate: TLAS + consolidated hit table, both built above. When
+        // false the mode is locked to Software for the session.
+        let reflect_hw_ready = rt.has_content_scene() && rt.content_hit_indices().is_some();
+        // `P_HWRT_FULLRES` / `P_HWRT_HITLIGHTING`: armed from env/tier independently of the launch
+        // mode (a live switch to Hardware picks them up); only the HWRT paths consult them.
+        let hwrt_fullres = quality::env_bool("P_HWRT_FULLRES", base.hwrt_reflect_fullres);
+        let hwrt_hitlighting = reflect_hw_ready
             && quality::env_bool("P_HWRT_HITLIGHTING", base.hwrt_reflect_hitlighting);
-        // B2 HWRT refine: live only with the accel + hit table actually built.
-        let reflect_compact_hwrt =
-            compact_hwrt_want && rt.has_content_scene() && rt.content_hit_indices().is_some();
-        // Compact screen fetch: near-footprint mirror hits from the full-res lit history. Gated
-        // on the HWRT refine (the permutation that carries the gate) — the tone-parity dependency
-        // on `cache_sky_occlude` is resolved below once that knob is known.
-        let reflect_compact_screen_want = reflect_compact_hwrt
-            && quality::env_bool("P_REFLECT_COMPACT_SCREEN", base.reflect_compact_screen);
+        // The launch knobs collapse into the UI-facing mode; the effective per-pass booleans are
+        // (re-)derived from it every frame (`apply_reflect_mode`).
+        let reflect_mode = if reflect_hw_ready {
+            quality::ReflectMode::resolve(hwrt, compact_hwrt_want)
+        } else {
+            quality::ReflectMode::Software
+        };
+        let hwrt = hwrt && reflect_hw_ready;
+        let reflect_compact_hwrt = compact_hwrt_want && reflect_hw_ready;
+        // Compact screen fetch intent (`P_REFLECT_COMPACT_SCREEN`): the effective flag derives as
+        // `Hybrid/Hardware && want && cache_sky_occlude` (resolved below once that knob is known).
+        let reflect_screen_want =
+            quality::env_bool("P_REFLECT_COMPACT_SCREEN", base.reflect_compact_screen);
+        let reflect_compact_screen_want = reflect_compact_hwrt && reflect_screen_want;
         // HWRT cache sun shadow: TLAS visibility for the relight's direct sun (see the tier-knob
         // doc). Needs the content TLAS actually built + bound; the relight record falls back to
         // the GDF-march pipeline without it (non-RT devices, gallery).
@@ -3534,7 +3553,9 @@ impl App {
             gdf_gi,
             hwrt_gi,
             hwrt,
-            hwrt_available,
+            reflect_mode,
+            reflect_hw_ready,
+            reflect_screen_want,
             hwrt_fullres,
             hwrt_hitlighting,
             bent_normal,
@@ -3805,6 +3826,26 @@ impl App {
 
     /// Run the render loop until the window closes (or, in screenshot mode, every
     /// requested capture is saved).
+    /// Derive the per-pass reflection booleans from the UI-facing `reflect_mode` (the single
+    /// source). Runs every frame right after the UI: idempotent, and the availability gate
+    /// (`reflect_hw_ready`) keeps env/UI-selected states valid on every device.
+    fn apply_reflect_mode(&mut self) {
+        if !self.reflect_hw_ready {
+            self.reflect_mode = quality::ReflectMode::Software;
+        }
+        let (hw_main, hw_compact) = match self.reflect_mode {
+            quality::ReflectMode::Software => (false, false),
+            quality::ReflectMode::Hybrid => (false, true),
+            quality::ReflectMode::Hardware => (true, true),
+        };
+        self.hwrt = hw_main;
+        self.reflect_compact_hwrt = hw_compact;
+        // The screen fetch mixes lit-history and cache colours across the footprint gate, so it
+        // additionally requires the parity skylight (tone-matched sources — the cfdf2f4 seam).
+        self.reflect_compact_screen =
+            hw_compact && self.reflect_screen_want && self.cache_sky_occlude;
+    }
+
     fn run(&mut self) -> anyhow::Result<()> {
         // M4 B3: opt into the separate RHI (submit) thread. Default off = the inline
         // single-thread path (byte-identical). Async-compute paths stay on the inline
@@ -4592,8 +4633,8 @@ impl App {
                 reflect_max_steps,
                 reflect_res_div,
                 reflect_half_res,
-                hwrt,
-                hwrt_available,
+                reflect_mode,
+                reflect_hw_ready,
                 hwrt_hitlighting,
                 hwrt_fullres,
                 ao_res_div,
@@ -4808,19 +4849,38 @@ impl App {
                             if ui.checkbox("Reflect half-res trace", reflect_half_res) {
                                 *reflect_half_res = gi.has_upsample() && *reflect_half_res;
                             }
-                            // Phase 16 HW-RT hybrid reflections. The base toggle flips the runtime
-                            // reflection between the hardware BVH trace and the SW distance-field
-                            // march — but only when the acceleration structures were built at load
-                            // (launch with `P_HWRT=1`, or a tier that enables it); the sub-modes then
-                            // toggle live. Off / not-built keeps the SW-RT path.
-                            if *hwrt_available {
-                                ui.checkbox("HW-RT reflections", hwrt);
-                                if *hwrt {
+                            // Reflection pipeline mode — the UI-facing single source; every
+                            // per-pass HWRT boolean derives from it each frame
+                            // (`apply_reflect_mode`), so the switch is live and the flags can
+                            // never drift into an invalid combination. Software = GDF march +
+                            // surface cache; Hybrid = SW broad phase + HWRT near-mirror refine
+                            // (cost bounded by the mirror area); Hardware = every reflection ray
+                            // on the TLAS.
+                            ui.text("Reflection pipeline:");
+                            if *reflect_hw_ready {
+                                ui.radio_button(
+                                    "Software (GDF)",
+                                    reflect_mode,
+                                    quality::ReflectMode::Software,
+                                );
+                                ui.radio_button(
+                                    "Hybrid (HW near-mirror)",
+                                    reflect_mode,
+                                    quality::ReflectMode::Hybrid,
+                                );
+                                ui.radio_button(
+                                    "Hardware (full HW trace)",
+                                    reflect_mode,
+                                    quality::ReflectMode::Hardware,
+                                );
+                                if *reflect_mode != quality::ReflectMode::Software {
                                     ui.checkbox("  Hit Lighting (off-screen)", hwrt_hitlighting);
+                                }
+                                if *reflect_mode == quality::ReflectMode::Hardware {
                                     ui.checkbox("  Full-res mirror (~4x cost)", hwrt_fullres);
                                 }
                             } else {
-                                ui.text("HW-RT reflections: launch with P_HWRT=1");
+                                ui.text("  Software only (needs an RT device + content scene)");
                             }
                             if ui.checkbox("GDF ambient occlusion", gdf_ao) {
                                 *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && *gdf_ao;
@@ -5157,6 +5217,9 @@ impl App {
             None
         } else {
             self.in_flight[fif].reset()?;
+            // Reflection pipeline: derive the per-pass HWRT booleans from the (possibly
+            // UI-switched) mode before anything below reads them.
+            self.apply_reflect_mode();
             let cmd = &self.command_buffers[fif];
             cmd.begin()?;
             Some(cmd)
@@ -5576,7 +5639,7 @@ impl App {
         // `reflect_half_res` off ⇒ div 1 ⇒ full-res resolve = byte-identical anchor. Divisor
         // mirrors the record path (P_HWRT_FULLRES forces rdiv 1 there too).
         if self.swrt_reflect && self.reflect.has_reflect_temporal() {
-            let rdiv = if self.reflect_half_res && !self.hwrt_fullres {
+            let rdiv = if self.reflect_half_res && !(self.hwrt && self.hwrt_fullres) {
                 self.reflect_res_div.max(1)
             } else {
                 1
@@ -5592,7 +5655,7 @@ impl App {
         if self.swrt_reflect && self.reflect_skip && self.reflect.has_gdf_reflect() {
             // Mirror the record path: P_HWRT_FULLRES forces full-res (rdiv 1) so the skip ping-pong
             // matches the trace extent (Phase 16 C).
-            let rdiv = if self.reflect_half_res && !self.hwrt_fullres {
+            let rdiv = if self.reflect_half_res && !(self.hwrt && self.hwrt_fullres) {
                 self.reflect_res_div.max(1)
             } else {
                 1
@@ -6707,7 +6770,7 @@ impl App {
                 // Phase 16 C: `P_HWRT_FULLRES` traces the HWRT reflection at FULL resolution — removes
                 // the residual half-res blockiness on the chrome ball / floor (a crisp mirror) at ~4x
                 // cost (a quality/screenshot mode). Default HWRT keeps the half-res trace for perf.
-                let refl_half = self.reflect_half_res && !self.hwrt_fullres;
+                let refl_half = self.reflect_half_res && !(self.hwrt && self.hwrt_fullres);
                 let rdiv = if refl_half {
                     self.reflect_res_div.max(1)
                 } else {
