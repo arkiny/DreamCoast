@@ -346,6 +346,16 @@ pub struct QualityPreset {
     /// FASTER than the SW march it replaces).
     #[serde(default)]
     pub reflect_compact_hwrt: bool,
+    /// Deferred-parity cache skylight (`P_CACHE_SKY_OCCLUDE`): the surface-cache relight takes its
+    /// skylight from the SAME SH sky-visibility volumes + min-occlusion + tint the deferred lighting
+    /// applies (`occlude_sky_diffuse_bent`), instead of the legacy per-ray sky-on-miss + unoccluded
+    /// IBL floor. The legacy escape estimate leaks/step-exhausts to sky on interior cards, which
+    /// over-injects the blue skylight — the cache-vs-deferred "two tone families" a mirror exposes
+    /// (chromeball crop blue-bias 18.9 vs the PT oracle's 2.7). Needs the volume-GI path (falls back
+    /// to legacy without it). Apple ON (Metal-verified); Low/Med/High keep the serde-default OFF
+    /// until the DX≡VK parity run.
+    #[serde(default)]
+    pub cache_sky_occlude: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +559,7 @@ pub fn gallery_preset() -> QualityPreset {
         tonemap_aces: false,        // legacy per-pixel curve (the byte-identical anchor)
         reflect_compact_div: 0,     // no mirror compaction (full-res trace needs none anyway)
         reflect_compact_hwrt: false, // no HWRT refine (no compaction to refine)
+        cache_sky_occlude: false,   // legacy sky-on-miss relight (byte-identical anchor)
     }
 }
 
@@ -1106,6 +1117,10 @@ mod tests {
         assert!(
             apple.reflect_compact_hwrt,
             "Apple reflect_compact_hwrt on (hybrid cache-lighting x detail-albedo mirror)"
+        );
+        assert!(
+            apple.cache_sky_occlude,
+            "Apple cache_sky_occlude on (deferred-parity cache skylight)"
         );
     }
 

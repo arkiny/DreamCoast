@@ -221,6 +221,11 @@
                 // resolves coherent real-scene colours, and the refine is FASTER than the SW
                 // march it replaces (1.0 ms vs 1.4 ms, chromeball div2).
                 reflect_compact_hwrt: true,
+                // Deferred-parity cache skylight: the relight reads the SAME SH sky-visibility
+                // occlusion the deferred lighting applies, instead of the legacy sky-on-miss +
+                // unoccluded IBL floor whose escape estimate over-injects blue on interior cards
+                // (the cache-vs-deferred tone split a mirror exposes).
+                cache_sky_occlude: true,
             ),
             groups: (
                 resolution: 1,

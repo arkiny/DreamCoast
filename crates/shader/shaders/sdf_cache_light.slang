@@ -14,6 +14,8 @@
 #include "sky_common.slang"
 
 static const float PI = 3.14159265359;
+static const float SH_C0 = 0.2820947918; // sqrt(1/(4*pi))
+static const float SH_C1 = 0.4886025119; // sqrt(3/(4*pi))
 
 struct CacheLightPush
 {
@@ -46,6 +48,11 @@ struct CacheLightPush
                            // units; 0 = off = byte-identical). Reference-engine LumenRadiosity clamps
                            // each hemisphere sample to MaxRayIntensity·OneOverPreExposure at the source.
     float4 sky;           // x = sky gain, yzw = white balance (matches the path tracer's sky)
+    uint skyvis_index;    // sampled base of the 4 sky-visibility SH volumes (deferred-parity skylight;
+                          // 0xFFFFFFFF = off = the legacy sky-on-miss + skylight-floor path)
+    float skyvis_tint;    // neutral leak fraction of the occluded skylight (same value as the deferred)
+    float skyvis_min_occ; // min sky-visibility floor (lerp V toward 1; same value as the deferred)
+    uint pad_sky;
 };
 
 [[vk::push_constant]]
@@ -257,20 +264,66 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
         }
         if (!hit)
         {
-            float3 s = procedural_sky(dir, sun_dir, sun_i, pc.sky.x, false) * pc.sky.yzw;
-            indirect += clamp_firefly(s, pc.gather_firefly);
+            // Deferred-parity mode: an escaped ray contributes 0 (the skylight is supplied by the
+            // occluded SH term below, exactly like gdf_gi's decomposition — no double counting).
+            // A ray that merely exhausts its step/distance budget INSIDE the scene also lands here;
+            // in legacy mode it wrongly reads as sky, which over-injects the blue skylight on
+            // interior cards with long sightlines — the cache-vs-deferred tone split.
+            if (pc.skyvis_index == 0xFFFFFFFFu)
+            {
+                float3 s = procedural_sky(dir, sun_dir, sun_i, pc.sky.x, false) * pc.sky.yzw;
+                indirect += clamp_firefly(s, pc.gather_firefly);
+            }
             miss_count++;
         }
     }
     indirect /= float(spp);
 
-    // Skylight-visibility FLOOR (matches the deferred pass's `occlude_sky_diffuse` MinOcclusion):
+    if (pc.skyvis_index != 0xFFFFFFFFu && pc.irradiance_index != 0xFFFFFFFFu)
+    {
+        // Deferred-parity skylight: the SAME SH sky-visibility volumes + bent normal + min-occlusion
+        // floor + neutral OcclusionTint leak the lighting pass applies (occlude_sky_diffuse_bent) —
+        // one skylight definition for both pipelines, so a cached (reflected) surface reads the sky
+        // term the deferred gives the same surface directly. Replaces the per-ray sky-on-miss (whose
+        // escape estimate leaks/exhausts to blue indoors) AND the unoccluded skylight floor.
+        float3 uvw = (p - pc.aabb_min.xyz) / (pc.aabb_max.xyz - pc.aabb_min.xyz);
+        float v = 1.0; // outside the volume = open sky (matches gdf_gi)
+        float3 bent = float3(0.0, 0.0, 0.0);
+        if (all(uvw >= 0.0) && all(uvw <= 1.0))
+        {
+            float sc[4];
+            [unroll]
+            for (int k = 0; k < 4; k++)
+                sc[k] = g.volumes[pc.skyvis_index + uint(k)].SampleLevel(g.samp, uvw, 0.0).x;
+            v = saturate(sc[0] * SH_C0
+                         + (2.0 / 3.0)
+                               * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2] + SH_C1 * n.x * sc[3]));
+            // The band-1 SH vector is the bent normal (visibility-weighted average unoccluded
+            // direction); basis maps sc1→y, sc2→z, sc3→x (same recovery as gdf_gi).
+            float3 bv = float3(sc[3], sc[1], sc[2]);
+            if (dot(bv, bv) > 1e-8)
+                bent = normalize(bv);
+        }
+        float3 skyN = n;
+        float dot_factor = 1.0;
+        if (dot(bent, bent) > 1e-8)
+        {
+            float w = v; // open -> surface normal, corner -> bent (reference weighting)
+            skyN = normalize(lerp(bent, n, w));
+            dot_factor = max(lerp(dot(bent, n), 1.0, w), 0.0);
+        }
+        float3 E = g.cubes[pc.irradiance_index].SampleLevel(g.samp, skyN, 0.0).rgb;
+        float vis = lerp(v, 1.0, pc.skyvis_min_occ);
+        float lum = dot(E, float3(0.2126, 0.7152, 0.0722));
+        indirect += E * (vis * dot_factor) + (pc.skyvis_tint * lum) * (1.0 - vis);
+    }
+    // Legacy skylight-visibility FLOOR (matches the old deferred `occlude_sky_diffuse` MinOcclusion):
     // an enclosed interior face whose gather rays rarely escape still receives a floor of the sky
     // irradiance, so a REFLECTED (or cached) shadowed surface reads its true skylit grey instead of
     // crushing to black. The gather already contributes ~E·(escaped/spp); top it up to E·floor when
     // the estimated sky visibility falls below the floor. floor = 0 (gallery) → exact byte-identical.
     float sky_floor = pc.params.x;
-    if (sky_floor > 0.0 && pc.irradiance_index != 0xFFFFFFFFu)
+    if (pc.skyvis_index == 0xFFFFFFFFu && sky_floor > 0.0 && pc.irradiance_index != 0xFFFFFFFFu)
     {
         float esc = float(miss_count) / float(spp);
         float3 E = g.cubes[pc.irradiance_index].SampleLevel(g.samp, n, 0.0).rgb;

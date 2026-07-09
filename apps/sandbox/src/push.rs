@@ -876,8 +876,11 @@ pub(crate) fn cache_light_push(
     gather_firefly: f32,
     sky_gain: f32,
     sky_wb: [f32; 3],
-) -> [u8; 160] {
-    let mut pc = [0u8; 160];
+    skyvis_index: u32,
+    skyvis_tint: f32,
+    skyvis_min_occ: f32,
+) -> [u8; 176] {
+    let mut pc = [0u8; 176];
     let u = [
         cards_index,
         cache_pos_index,
@@ -934,6 +937,11 @@ pub(crate) fn cache_light_push(
     for (i, v) in sky_wb.iter().enumerate() {
         pc[148 + i * 4..152 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
+    // Deferred-parity skylight (offset 160): sky-visibility SH volume base + the SAME
+    // min-occlusion / tint values the lighting pass applies. 0xFFFFFFFF = legacy sky-on-miss.
+    pc[160..164].copy_from_slice(&skyvis_index.to_le_bytes());
+    pc[164..168].copy_from_slice(&skyvis_tint.to_le_bytes());
+    pc[168..172].copy_from_slice(&skyvis_min_occ.to_le_bytes());
     pc
 }
 

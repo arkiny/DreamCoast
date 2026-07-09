@@ -308,6 +308,19 @@ impl GiSystem {
         self.gi_vol_frame = self.gi_vol_frame.saturating_add(1);
     }
 
+    /// The PREVIOUS (completed) frame's sky-visibility SH base, for consumers recorded BEFORE this
+    /// frame's volume update — the surface-cache relight's deferred-parity skylight. That slot was
+    /// transitioned back to sampled at the end of its update and is not written this frame, so it
+    /// reads cleanly with one frame of latency (hidden by the cache's EMA, like the async relight).
+    /// `None` until the first update has landed (the slot's contents are undefined before then).
+    pub(crate) fn gi_skyvis_prev_sampled(&self) -> Option<u32> {
+        if self.gi_vol_frame == 0 {
+            return None;
+        }
+        let prev = ((self.gi_vol_frame + 1) % 2) as usize;
+        self.gi_skyvis[prev][0].as_ref().map(|v| v.sampled_index())
+    }
+
     /// 레퍼런스 엔진 GI-fidelity track: update the world irradiance volume (DDGI-lite). Each probe casts
     /// sphere rays into the scene GDF, shades hits (direct + the PREVIOUS volume = multibounce),
     /// EMA-accumulates into the write slot. Returns the write graph handle (a read dep for the GI

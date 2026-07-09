@@ -345,7 +345,7 @@ impl GdfSystem {
             dreamcoast_shader::sdf_cache_light_cs_dxil,
             dreamcoast_shader::sdf_cache_light_cs_metallib,
             "sdf_cache_light",
-            160,
+            176,
             [64, 1, 1],
         )?;
         // Reflection cone-LOD: MIP pyramid generator for the surface-cache radiance atlas.
@@ -1680,6 +1680,9 @@ impl GdfSystem {
         gather_firefly: f32,
         sky_gain: f32,
         sky_wb: [f32; 3],
+        skyvis_index: u32,
+        skyvis_tint: f32,
+        skyvis_min_occ: f32,
     ) {
         // Stage D2b: feed the per-card visibility buffer index to the shader (sentinel = off =
         // uniform period). When present, declare it as a read so the graph barriers the relight
@@ -1778,6 +1781,9 @@ impl GdfSystem {
                     gather_firefly,
                     sky_gain,
                     sky_wb,
+                    skyvis_index,
+                    skyvis_tint,
+                    skyvis_min_occ,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())
@@ -1914,6 +1920,13 @@ impl GdfSystem {
             gather_firefly,
             sky_gain,
             sky_wb,
+            // Deferred-parity skylight stays OFF on the async-compute path: the sky-visibility SH
+            // volumes are updated on the GRAPHICS queue every frame, and an async relight sampling
+            // them cross-queue has no layout/hazard ordering here. The D3D12 async default runs
+            // with the legacy skylight until the DX≡VK batch wires a safe handoff.
+            u32::MAX,
+            0.0,
+            0.0,
         ));
         cmd.dispatch(num_texels.div_ceil(64), 1, 1);
         // Make the relight write available before the queue signals (graphics reads it next frame).

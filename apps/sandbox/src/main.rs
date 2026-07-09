@@ -858,6 +858,12 @@ struct App {
     /// no-op sentinel image so it stays byte-identical.
     skyvis_tint: f32,
     skyvis_min_occ: f32,
+    /// Deferred-parity cache skylight (`P_CACHE_SKY_OCCLUDE`, tier `cache_sky_occlude`): the
+    /// surface-cache relight takes its skylight from the SAME SH sky-visibility occlusion the
+    /// deferred lighting applies, instead of the legacy sky-on-miss + unoccluded IBL floor (whose
+    /// escape estimate over-injects blue on interior cards — the cache-vs-deferred tone split).
+    /// Needs the volume-GI path; the relight falls back to legacy while the volume has no data.
+    cache_sky_occlude: bool,
     /// PR-4 (render-pipeline re-baseline track): opt-in analytic exponential height fog
     /// (`P_HEIGHT_FOG=1`), composited in the atmosphere slot after opaque lighting +
     /// reflections, before TAAU/tonemap. Off by default (byte-identical gallery anchor —
@@ -2719,6 +2725,10 @@ impl App {
         // Default on for content (the sky-vis image is content-only → gallery byte-identical anyway);
         // `P_BENT_NORMAL=0` zeroes the bent normal for A/B (pbr then falls back to the scalar path).
         let bent_normal = quality::env_bool("P_BENT_NORMAL", true);
+        // Deferred-parity cache skylight (see the App field doc): tier-driven, env-overridable,
+        // and only meaningful with the volume-GI path (the SH sky-visibility volumes it reads).
+        let cache_sky_occlude =
+            quality::env_bool("P_CACHE_SKY_OCCLUDE", base.cache_sky_occlude) && gi_volume;
         // Multi-bounce AO (reference AOMultiBounce): albedo-tinted energy return on the diffuse AO.
         // Opt-in (default off) — it recolours every AO<1 pixel including the gallery anchor.
         let ao_multibounce = quality::env_bool("P_AO_MULTIBOUNCE", false);
@@ -3495,6 +3505,7 @@ impl App {
                 .max(1),
             skyvis_tint,
             skyvis_min_occ,
+            cache_sky_occlude,
             height_fog,
             second_view,
             fog_density,
@@ -6029,6 +6040,17 @@ impl App {
                         self.cache_gather_firefly(),
                         self.sky_gain,
                         self.sky_wb,
+                        // Deferred-parity skylight: the previous frame's completed sky-visibility
+                        // slot (this pass records before the volume update; the 1-frame latency is
+                        // hidden by the cache EMA). Sentinel until the first update lands, or when
+                        // the knob is off — the shader then keeps the legacy sky-on-miss path.
+                        if self.cache_sky_occlude {
+                            self.gi.gi_skyvis_prev_sampled().unwrap_or(u32::MAX)
+                        } else {
+                            u32::MAX
+                        },
+                        self.skyvis_tint,
+                        self.skyvis_min_occ,
                     );
                     self.scene_cache_reset = false;
                 }
