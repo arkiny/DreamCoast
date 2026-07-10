@@ -245,8 +245,15 @@ void cacheMain(uint3 tid: SV_DispatchThreadID)
                 float3 dir_o = normalize(float3(dot(w2o0.xyz, dir), dot(w2o1.xyz, dir),
                                                 dot(w2o2.xyz, dir)));
                 bool own_behind = dot(best_q - po, dir_o) > occl_tol;
+                // valid = -1 (not 0): an OCCLUDER WITNESS — the texel still carries the
+                // occluder's hit position, and the reflection sampler's invalid-routing uses
+                // that to report "this query point is enclosed by something the cache cannot
+                // answer for" (dark fallback, no sky top-up) instead of letting the bilinear
+                // renormalise onto the bright neighbouring texels outside the occluder's
+                // footprint. Every existing consumer tests `w > 0.5` / `w < 0.5`, so -1 is
+                // indistinguishable from the never-captured 0 for them.
                 if (best_d2 > occl_tol * occl_tol && own_behind)
-                    valid = 0.0;
+                    valid = -1.0;
             }
             // Accept when the nearest triangle is within a few card texels of the GDF hit
             // (object space ≈ world for content's mostly-uniform transforms).

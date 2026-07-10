@@ -368,6 +368,42 @@ pub struct QualityPreset {
     /// Needs the C1 mesh-capture tables.
     #[serde(default)]
     pub cache_capture_occl: bool,
+    /// Occluder-witness routing (`P_CACHE_OCCL_ROUTE`): a reflection cache miss whose query saw
+    /// an in-tolerance capture-invalidated texel (an occluder witness — e.g. the floor texels
+    /// under the chrome ball) routes to the DARK analytic fallback (no unoccluded sky top-up):
+    /// the capture proved the point is enclosed, and no valid witness of its radiance exists
+    /// anywhere in the cache. Without routing, invalidation alone is inert (measured 97.6 vs
+    /// 100 — the miss just fell to the bright fallback). Needs `cache_capture_occl` for the
+    /// witnesses to exist (inert without it); reflection-only (GI/relight keep the legacy scan).
+    #[serde(default)]
+    pub cache_occl_route: bool,
+    /// Validity-weighted probe interpolation (`P_REFLECT_PROBE_VALID`): the reflection
+    /// fallback's GI-volume read excludes probes whose voxel centre sits inside geometry
+    /// (occupancy from the scene field) and renormalises — the reference radiance-cache probe
+    /// interpolation. The plain trilinear mixes the ~0 SH of enclosed probes, so a contact gap
+    /// read as a sharp black disc; with validity weighting the nearest open-space probes answer
+    /// and the falloff into the gap is smooth. Reflection fallback only (cache-miss lanes).
+    #[serde(default)]
+    pub reflect_probe_valid: bool,
+    /// Graze-ramp march threshold (`P_REFLECT_GRAZE_EPS`): the SW reflection march accepts a
+    /// hit at `d < 1mm + 0.25·cone_k·t` instead of the fixed 1 mm — the reference SW trace's
+    /// expand-surface ramp. A near-tangent ray off a mirror's bottom rim otherwise skims
+    /// metres over the floor it geometrically re-enters and resolves on the bright sunlit
+    /// mid-corridor card (the contact-gap bowl, SW ~96 vs hybrid 61); with the ramp it stops
+    /// at its first true graze (t 0.2..1 m, the shadowed near floor — where the exact HW
+    /// trace lands). Positional slack ≤ the cone footprint the cache sampling already absorbs.
+    #[serde(default)]
+    pub reflect_graze_eps: bool,
+    /// SW compact screen-color-at-hit (`P_REFLECT_HIT_FETCH`): the compacted SW mirror march's
+    /// HIT gets the same on-screen lit-history fetch the HWRT hybrid shades from (footprint
+    /// box filter + the 6..48 px hand-off band). The pre-march screen trace cannot serve a
+    /// contact band — its samples cross the mirror-occluded zone and then leave the frame —
+    /// but the fetch AT the hit validates by proximity near the contact and reads the
+    /// on-screen contact region's lit colour: the grazing-aware witness (screen-space
+    /// reflections darken a glossy floor at grazing) the diffuse-only card cannot provide.
+    /// This is how the hybrid's contact band gets its tone (SW band 96 vs hybrid 61 /255).
+    #[serde(default)]
+    pub reflect_hit_fetch: bool,
     /// SDF detail-replace (`P11_SDF_DETAIL_REPLACE`): where any instance's atlas SDF covers a
     /// point, the atlas union IS the field — the coarse dense term (0.75 m voxels, which read
     /// d≈0 through contact gaps and defeat the atlas exactly where mirrors need it) only answers
@@ -610,6 +646,10 @@ pub fn gallery_preset() -> QualityPreset {
         cache_lit_calib: false,     // no lit-feedback correction (byte-identical anchor)
         sdf_detail_replace: false,  // legacy min(dense, atlas) union (byte-identical anchor)
         cache_capture_occl: false,  // keep occluded captures (byte-identical anchor)
+        cache_occl_route: false,    // no occluder-witness routing (needs invalidation anyway)
+        reflect_probe_valid: false, // plain trilinear GI-volume read (byte-identical anchor)
+        reflect_graze_eps: false,   // fixed 1 mm march threshold (byte-identical anchor)
+        reflect_hit_fetch: false,   // no SW hit fetch (byte-identical anchor)
         cache_sky_occlude: false,   // legacy sky-on-miss relight (byte-identical anchor)
     }
 }
@@ -1235,6 +1275,18 @@ mod tests {
         assert!(
             apple.sdf_detail_replace,
             "Apple sdf_detail_replace on (atlas coverage overrides the dense term)"
+        );
+        assert!(
+            apple.reflect_hit_fetch,
+            "Apple reflect_hit_fetch on (SW compact screen-color-at-hit for the contact band)"
+        );
+        assert!(
+            !apple.cache_capture_occl
+                && !apple.cache_occl_route
+                && !apple.reflect_probe_valid
+                && !apple.reflect_graze_eps,
+            "occluder-witness routing / validity probes / graze ramp stay opt-in (no measured \
+             win over the hit fetch on the contact band; knobs remain available)"
         );
     }
 

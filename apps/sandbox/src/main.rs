@@ -881,6 +881,22 @@ struct App {
     /// Capture occlusion invalidation (`P_CACHE_CAPTURE_OCCL`, tier `cache_capture_occl`): card
     /// texels whose capture hit an occluder store invalid instead of a wrong witness.
     cache_capture_occl: bool,
+    /// Occluder-witness routing (`P_CACHE_OCCL_ROUTE`, tier `cache_occl_route`): a reflection
+    /// cache miss that saw an invalidated (occluder-witness) texel routes to the dark analytic
+    /// fallback — no unoccluded sky top-up for a point the capture proved enclosed.
+    cache_occl_route: bool,
+    /// Validity-weighted probe interpolation (`P_REFLECT_PROBE_VALID`, tier
+    /// `reflect_probe_valid`): the reflection fallback's GI-volume read excludes probes inside
+    /// geometry and renormalises (reference radiance-cache probe interpolation).
+    reflect_probe_valid: bool,
+    /// Graze-ramp march threshold (`P_REFLECT_GRAZE_EPS`, tier `reflect_graze_eps`): the SW
+    /// reflection march's hit acceptance grows with distance (expand-surface ramp) so tangent
+    /// rays resolve at their first true graze instead of skimming to a bright far card.
+    reflect_graze_eps: bool,
+    /// SW compact screen-color-at-hit (`P_REFLECT_HIT_FETCH`, tier `reflect_hit_fetch`): the
+    /// compacted SW mirror march's hit gets the HWRT hybrid's on-screen lit-history fetch —
+    /// the grazing-aware witness for the contact band the diffuse card cannot provide.
+    reflect_hit_fetch: bool,
     /// Lit-calibration feedback (`P_CACHE_LIT_CALIB`, tier `cache_lit_calib`): the visibility pass
     /// probes each on-screen card's lit/cache luminance ratio (TLAS occlusion check) into a
     /// per-card EMA the reflection sampler applies — pins the mirror's cache family to the lit
@@ -2650,6 +2666,13 @@ impl App {
         // Capture occlusion invalidation (see the tier-knob doc; needs the C1 mesh tables —
         // the shader no-ops without them).
         let cache_capture_occl = quality::env_bool("P_CACHE_CAPTURE_OCCL", base.cache_capture_occl);
+        // Occluder-witness routing: inert without the invalidation writing the witnesses.
+        let cache_occl_route =
+            cache_capture_occl && quality::env_bool("P_CACHE_OCCL_ROUTE", base.cache_occl_route);
+        let reflect_probe_valid =
+            quality::env_bool("P_REFLECT_PROBE_VALID", base.reflect_probe_valid);
+        let reflect_graze_eps = quality::env_bool("P_REFLECT_GRAZE_EPS", base.reflect_graze_eps);
+        let reflect_hit_fetch = quality::env_bool("P_REFLECT_HIT_FETCH", base.reflect_hit_fetch);
 
         info!(
             "RenderQuality tier: {} (RENDER_QUALITY; GPU \"{}\")",
@@ -3592,6 +3615,10 @@ impl App {
             cache_hwrt_shadow,
             cache_hwrt_gather,
             cache_capture_occl,
+            cache_occl_route,
+            reflect_probe_valid,
+            reflect_graze_eps,
+            reflect_hit_fetch,
             cache_lit_calib,
             height_fog,
             second_view,
@@ -6301,6 +6328,16 @@ impl App {
                     }
                     _ => (t | (0xFFFFu32 << 16), ext),
                 };
+                // Contact-gap routing flags ride the free bits 12..13 between the max_mip
+                // nibble (8..11) and the mip index (16..): bit12 = occluder-witness routing
+                // (`P_CACHE_OCCL_ROUTE`), bit13 = validity-weighted probe interpolation
+                // (`P_REFLECT_PROBE_VALID`). Reflection-only — the shared GI/relight tuple
+                // carries a bare tile.
+                let tile_packed = tile_packed
+                    | if self.cache_occl_route { 1 << 12 } else { 0 }
+                    | if self.reflect_probe_valid { 1 << 13 } else { 0 }
+                    | if self.reflect_graze_eps { 1 << 14 } else { 0 }
+                    | if self.reflect_hit_fetch { 1 << 15 } else { 0 };
                 // Lit-calibration correction rides cache.w bits 16..23 (0 = off; the card count
                 // needs only the low 16 bits — legacy consumers of the shared tuple get it bare).
                 let n = match self.gdf.card_corr_index() {

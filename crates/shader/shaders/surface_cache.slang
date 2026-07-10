@@ -195,14 +195,23 @@ float3 card_mip_sample(uint c_base, uint c_res, uint c_mipb, float uu, float vv,
 // ratio the visibility pass EMAs (sdf_cache_visibility.slang). Applied to the REFLECTION
 // paths only (cone + best-card content); the GI/relight consumers sample uncorrected so the
 // radiosity fixed point stays pure and the feedback loop cannot self-amplify.
+// `occl_route` (0 = off) + `out occluded`: occluder-witness routing for the contact-gap
+// reflection band. A capture-invalidated texel (w = -1, sdf_cache_capture occlusion pass)
+// proves the query point sits UNDER an occluder — the floor texels beneath the chrome ball
+// hold the ball's surface position, not the shadowed floor. Without routing, that query
+// either renormalises onto the bright sunlit texels outside the occluder's footprint or
+// falls to the analytic fallback WITH its unoccluded sky top-up — both read ~4x over the
+// path tracer. When no card answers but an in-tolerance occluder witness was seen, report
+// `occluded = true` so the caller can route to the DARK fallback (no sky) instead.
 float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cache_pos_index,
                                  uint cache_rad_index, uint num_cards, uint tile, float extra_tol,
                                  float sample_radius, uint mip_index, uint max_mip,
                                  uint grid_cells, uint grid_pool, uint layout, uint feedback,
-                                 uint mark, uint alb_index, uint corr, out float3 out_alb,
-                                 out bool found)
+                                 uint mark, uint alb_index, uint corr, uint occl_route,
+                                 out float3 out_alb, out bool found, out bool occluded)
 {
     found = false;
+    occluded = false;
     out_alb = float3(0.0, 0.0, 0.0);
     float3 acc_alb = float3(0.0, 0.0, 0.0);
     int best = -1;
@@ -256,8 +265,6 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
         uint texel = lay.x + ty * c_res + tx;
 
         float4 capt = asfloat(g.storage_buffers[cache_pos_index].Load4(texel * 16u));
-        if (capt.w < 0.5)
-            continue; // that texel captured no geometry
         // The query must lie ON the captured surface, within a few texels. Using the card's
         // trace_depth (c0.w) as the tolerance was far too loose: a card on an object's AABB
         // face reaches a full object-depth inward, so a ground point under the cube matched
@@ -266,6 +273,15 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
         // (even on deep concavities, since this measures distance to the captured point).
         float dist = length(capt.xyz - p);
         float tol = max((length(ua) + length(va)) / float(c_res) * 4.0, 0.02) + extra_tol;
+        if (capt.w < 0.5)
+        {
+            // Occluder witness (w = -1): capt.xyz holds the OCCLUDER's surface, so an
+            // in-tolerance query is a point the occluder encloses — no valid witness exists
+            // anywhere in the cache. Flag it (consumed only if the whole scan misses).
+            if (occl_route != 0u && capt.w < -0.5 && dist <= tol)
+                occluded = true;
+            continue; // that texel captured no geometry (or an occluder)
+        }
         if (dist > tol)
             continue; // captured a different (farther) surface than the query point
 
@@ -313,6 +329,7 @@ float3 sample_surface_cache_cone(float3 p, float3 n, uint cards_index, uint cach
     if (best < 0)
         return float3(0.0, 0.0, 0.0);
     found = true;
+    occluded = false; // a real card answered — the witness flag only routes a full miss
     // Mirror feedback for the non-cone (single-best-card) content path.
     if (mark != 0xFFFFFFFFu)
         g.storage_buffers[mark].InterlockedOr(uint(best) * 4u, 1u);
@@ -353,10 +370,11 @@ float3 sample_surface_cache(float3 p, float3 n, uint cards_index, uint cache_pos
     uint lay8 = (tile >> 8) & 0xFFu;
     uint layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
     float3 alb_unused;
+    bool occl_unused;
     return sample_surface_cache_cone(p, n, cards_index, cache_pos_index, cache_rad_index, num_cards,
                                      tile & 0xFFu, extra_tol, 0.0, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu,
                                      0xFFFFFFFFu, layout, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
-                                     0xFFFFFFFFu, alb_unused, found);
+                                     0xFFFFFFFFu, 0u, alb_unused, found, occl_unused);
 }
 
 // Grid-accelerated variant of the legacy lookup (the relight gather's hot path — its hemisphere
@@ -370,8 +388,9 @@ float3 sample_surface_cache_grid(float3 p, float3 n, uint cards_index, uint cach
     uint lay8 = (tile >> 8) & 0xFFu;
     uint layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
     float3 alb_unused2;
+    bool occl_unused2;
     return sample_surface_cache_cone(p, n, cards_index, cache_pos_index, cache_rad_index, num_cards,
                                      tile & 0xFFu, extra_tol, 0.0, 0xFFFFFFFFu, 0u, grid_cells,
                                      grid_pool, layout, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
-                                     0xFFFFFFFFu, alb_unused2, found);
+                                     0xFFFFFFFFu, 0u, alb_unused2, found, occl_unused2);
 }

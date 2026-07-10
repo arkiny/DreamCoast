@@ -243,6 +243,11 @@
                 // voxels read d≈0 through contact gaps and defeat the atlas exactly where the
                 // mirror needs it — the ball-bottom band resolves instead of trapping).
                 sdf_detail_replace: true,
+                // SW compact screen-color-at-hit: the SW mirror march's hit reads the same
+                // on-screen lit-history fetch the HWRT hybrid shades from — the contact-gap
+                // band gets its grazing-aware witness (chromeball band 96 -> 63 vs hybrid 63,
+                // PT 22 /255). Software ReflectMode only (the HWRT fetch has its own gate).
+                reflect_hit_fetch: true,
             ),
             groups: (
                 resolution: 1,

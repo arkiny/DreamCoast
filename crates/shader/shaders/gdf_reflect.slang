@@ -281,6 +281,65 @@ float3 sample_gi_irradiance(uint base, float3 p, float3 n)
     return max(e, float3(0.0, 0.0, 0.0));
 }
 
+// Validity-weighted probe interpolation (reference radiance-cache style; cache_tile bit13,
+// opt-in): the hardware trilinear above mixes in probes whose voxel centre sits INSIDE
+// geometry — their SH is ~0 and not a witness of the query's radiance, so a contact gap
+// under a mirror interpolates toward black (measured as a sharp black disc, perceptually
+// worse than the bright bowl it replaced). Re-do the trilinear by hand over the 2x2x2 probe
+// corners, weighting each by its OCCUPANCY (probe centre in open space, `scene_occ > 0`) and
+// renormalising: the nearest unoccluded probes answer, and the result ramps to 0 only where
+// EVERY neighbouring probe is enclosed — the deepest sliver of the gap, which the path
+// tracer also shows near-black, so the falloff is smooth instead of a disc edge. Fallback
+// path only (a cache miss), so the extra taps stay off the hot lanes.
+float3 sample_gi_irradiance_valid(uint base, float3 p, float3 n)
+{
+    float3 ext = GDF_MAX - GDF_MIN;
+    float3 uvw = (p - GDF_MIN) / ext;
+    if (!(all(uvw >= 0.0) && all(uvw <= 1.0)))
+        return float3(0.0, 0.0, 0.0);
+    uint dw, dh, dd;
+    g.volumes[base].GetDimensions(dw, dh, dd);
+    float3 dims = float3(float(dw), float(dh), float(dd));
+    float3 f = saturate(uvw) * dims - 0.5;
+    float3 f0 = floor(f);
+    float3 fr = f - f0;
+    int3 i0 = int3(f0);
+    int3 imax = int3(int(dw) - 1, int(dh) - 1, int(dd) - 1);
+    float3 c[4];
+    [unroll]
+    for (int k = 0; k < 4; k++)
+        c[k] = float3(0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    [loop]
+    for (int ci = 0; ci < 8; ci++)
+    {
+        int3 off = int3(ci & 1, (ci >> 1) & 1, (ci >> 2) & 1);
+        float3 fw = lerp(float3(1.0, 1.0, 1.0) - fr, fr, float3(off));
+        float w = fw.x * fw.y * fw.z;
+        if (w <= 1e-4)
+            continue;
+        int3 ip = clamp(i0 + off, int3(0, 0, 0), imax);
+        float3 probe = GDF_MIN + ((float3(ip) + 0.5) / dims) * ext;
+        if (scene_occ(probe) <= 0.0)
+            continue; // occupied probe — exclude it from the interpolation
+        [unroll]
+        for (int ch = 0; ch < 3; ch++)
+        {
+            [unroll]
+            for (int k = 0; k < 4; k++)
+                c[k][ch] += w * g.volumes[base + uint(ch * 4 + k)].Load(int4(ip, 0)).x;
+        }
+        wsum += w;
+    }
+    if (wsum <= 1e-4)
+        return float3(0.0, 0.0, 0.0); // fully enclosed — genuinely dark
+    float rw = 1.0 / wsum;
+    float3 e = (c[0] * SH_C0
+                + (2.0 / 3.0) * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]))
+               * rw;
+    return max(e, float3(0.0, 0.0, 0.0));
+}
+
 #ifdef SCREEN_HIT
 // B2' screen-hit early-out — the SW screen-color-at-hit. March the reflection ray a short distance
 // and test each sample against the depth buffer; where the ray provably hits an on-screen surface,
@@ -443,6 +502,19 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     uint vol_pack = pc.flip_y >> 1;
     bool vol_on = vol_pack != 0u;
     uint vol_base = vol_on ? (vol_pack - 1u) : 0xFFFFFFFFu;
+    // Contact-gap routing flags (cache_tile bits 12..13 — the max_mip nibble is 8..11 and the
+    // mip index starts at 16, so these ride free; the gallery packs a bare tile = both off).
+    // bit12 (`P_CACHE_OCCL_ROUTE`): a cache miss whose query saw an occluder-witness texel
+    // routes to the DARK analytic fallback (no sky top-up) — the point is enclosed.
+    // bit13 (`P_REFLECT_PROBE_VALID`): the fallback's GI-volume read uses the
+    // validity-weighted probe interpolation instead of the plain trilinear.
+    bool occl_route = (pc.cache_tile & 0x1000u) != 0u;
+    bool probe_valid = (pc.cache_tile & 0x2000u) != 0u;
+    // bit14 (`P_REFLECT_GRAZE_EPS`): cone-proportional march hit threshold — see the march.
+    bool graze_eps = (pc.cache_tile & 0x4000u) != 0u;
+    // bit15 (`P_REFLECT_HIT_FETCH`): SW compact screen-color-at-hit — the marched hit gets the
+    // same on-screen lit-history fetch the HWRT hybrid shades from (see the fetch block).
+    bool hit_fetch = (pc.cache_tile & 0x8000u) != 0u;
     float2 ndc = float2(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * sy);
     if (depth >= 1.0)
     {
@@ -704,7 +776,22 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 d_min = abs(d);
                 t_min = t;
             }
-            if (d < HIT_EPS && escaped)
+            // Graze ramp (bit14, content opt-in): the fixed 1 mm threshold under-detects a
+            // GRAZING surface — a near-tangent ray off the mirror's bottom rim escapes the
+            // contact blur, then skims metres above the floor it geometrically re-enters
+            // (d stays at the clearance, never < 1 mm) and finally dips somewhere on the
+            // SUNLIT mid-corridor floor: the contact-gap band read that bright far card
+            // (~96) instead of the shadowed near floor the exact trace hits (hybrid t was
+            // 0.2..0.5 m where the SW march ran 2..8 m). Growing the threshold with the
+            // marched distance — the reference SW trace's expand-surface ramp ("avoid
+            // self-occlusion near the start, detect thin surfaces far") — resolves the ray
+            // at its first true graze; the slope is a quarter of the cone-LOD step floor so
+            // the acceptance can never outrun the marcher's own step, and the positional
+            // slack it introduces (≤ the cone footprint at that distance) is exactly what
+            // the cache cone MIP / acceptance tolerance already absorb. cone_k = 0 (gallery)
+            // keeps the ramp at the legacy constant even if the bit were set.
+            float hit_eps = graze_eps ? HIT_EPS + 0.25 * pc.ground_albedo.w * t : HIT_EPS;
+            if (d < hit_eps && escaped)
             {
                 hp = rp;
                 hit = true;
@@ -753,25 +840,48 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         {
             float3 hn = scene_normal(hp);
             bool cached = false;
-#if defined(HWRT_REFLECT) && defined(REFLECT_COMPACT)
+            // Occluder-witness routing (bit12): set by the cache lookup below when the query's
+            // texel proves the point sits UNDER an occluder — route to the dark fallback.
+            bool occluded = false;
+#ifdef REFLECT_COMPACT
             // Gate-band hand-off state: in the footprint band the screen colour does NOT finalize
             // the pixel — the cache/hybrid colour still resolves below and the two are blended at
             // the end of the hit branch, so the source transition is a gradient, not a cut.
             float3 screen_mix = float3(0.0, 0.0, 0.0);
             float screen_w = 0.0;
 #endif
-#ifdef HWRT_REFLECT
-            // Phase 16 B.2 — screen-color-at-hit (reference-engine `SampleSceneColorAtHit`): the hardware
+#if defined(HWRT_REFLECT) || (defined(SCREEN_HIT) && defined(REFLECT_COMPACT))
+            // Phase 16 B.2 — screen-color-at-hit (reference-engine `SampleSceneColorAtHit`): the
             // ray hit REAL geometry, so if that surface is visible on screen its FULL-RES lit colour is
             // already in the previous frame's lit-radiance history (`globals.prev_view_proj` + the
             // `lit_hist` buffer). Sample it directly for a SHARP reflection — the low-res surface cache
             // is only the off-screen / occluded fallback. This is the sharp-reflection win the SW trace
             // couldn't give, and the validated HW hit is exactly what our screen-space SSR lacked.
             // The lit-history index rides the (march-cap) field — unused in the HW variant (no march).
+            //
+            // SW compact (`SCREEN_HIT`+`REFLECT_COMPACT`, bit15 opt-in): the same fetch serves the
+            // MARCHED hit. The pre-march screen_trace above cannot serve a contact band — its
+            // samples cross the mirror-occluded zone (validation correctly fails against the
+            // mirror's own depth) and then leave the frame below it — but the fetch AT the hit
+            // validates by proximity: near a resting mirror's contact the depth surface (the
+            // mirror's on-screen bottom) is spatially within the parallax tolerance of the true
+            // reflected floor, so the band reads the on-screen contact region's lit colour — the
+            // grazing-aware witness (screen-space reflections darken a glossy floor at grazing)
+            // the diffuse-only card can never provide. This is exactly how the HWRT hybrid's
+            // contact band gets its tone; without it the SW band read the card's diffuse
+            // radiance, ~1.5x the hybrid and ~4x the path tracer.
             {
+#ifdef HWRT_REFLECT
                 // bit31 = content flag; bit30 = compact screen-fetch enable (REFLECT_COMPACT
                 // only — see below); the low bits carry the lit-history bindless index.
                 uint lit_hist = pc.max_steps & 0x3FFFFFFFu;
+                bool fetch_on = (pc.max_steps & 0x40000000u) != 0u;
+#else
+                // SW: the lit-history index rides params.y (the SCREEN_HIT overload); max_steps
+                // bit30 is the A5 stochastic flag here, so the gate is the bit15 knob instead.
+                uint lit_hist = asuint(pc.params.y);
+                bool fetch_on = hit_fetch;
+#endif
                 float4 pclip = mul(globals.prev_view_proj, float4(hp, 1.0));
                 if (lit_hist != 0x7FFFFFFFu && pclip.w > 0.0)
                 {
@@ -806,7 +916,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                                 // history), so it was dropped for a single source; the relight's
                                 // deferred-parity skylight re-unified the tones, which is what
                                 // makes the mix viable again. Gate OFF = single-source hybrid.
-                                if ((pc.max_steps & 0x40000000u) != 0u)
+                                if (fetch_on)
                                 {
                                     float fp_px = geo_spread * t /
                                                   max(distance(pc.cam_pos.xyz, hp) * pa_full, 1e-6);
@@ -894,6 +1004,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     }
                 }
             }
+#endif
+#ifdef HWRT_REFLECT
             // Phase 16 E — Hit Lighting (OFF-SCREEN): the on-screen path failed (behind camera / occluded),
             // so shade this HW hit with the REAL material instead of the low-res surface cache. `frame`
             // bit31 = enabled; the consolidated (vertex, index, drawable-table) bindless indices ride the
@@ -911,6 +1023,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             // off the ground truth (its GI-volume ambient underestimates interior bounce).
             float3 hl_alb = float3(0.0, 0.0, 0.0);
             float3 hl_fallback = float3(0.0, 0.0, 0.0);
+            // The IBL-sky part of the fallback, kept separate so the occluder-witness routing
+            // can drop it (an enclosed hit sees no sky) without losing the direct + GI terms.
+            float3 hl_sky = float3(0.0, 0.0, 0.0);
             bool hl_have = false;
             if (!cached && (pc.frame & 0x80000000u) != 0u)
             {
@@ -981,11 +1096,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                             sh = 0.0;
                     }
                     // Same energy convention as the analytic content path: direct/PI + GI cache + IBL sky.
-                    float3 e = vol_on ? sample_gi_irradiance(vol_base, hp, nw) : float3(0.0, 0.0, 0.0);
+                    float3 e = vol_on ? (probe_valid ? sample_gi_irradiance_valid(vol_base, hp, nw)
+                                                     : sample_gi_irradiance(vol_base, hp, nw))
+                                      : float3(0.0, 0.0, 0.0);
                     hl_alb = alb;
                     hl_fallback = alb * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
                     if (has_irr)
-                        hl_fallback += g.cubes[irr_idx].SampleLevel(g.samp, nw, 0.0).rgb * alb;
+                        hl_sky = g.cubes[irr_idx].SampleLevel(g.samp, nw, 0.0).rgb * alb;
                     hl_have = true; // combine after the cache cone below (do NOT finalize here)
                 }
             }
@@ -1076,7 +1193,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 color = sample_surface_cache_cone(hp, hn, cards_idx, cpos_idx, pc.cache.z, nc16,
                                                   c_tile, cache_bias, mip_radius, mip_index, c_maxmip,
                                                   grid_cells, grid_pool, sc_layout, sc_feedback,
-                                                  sc_mark, sc_alb, sc_corr, cone_alb, cached);
+                                                  sc_mark, sc_alb, sc_corr, occl_route ? 1u : 0u,
+                                                  cone_alb, cached, occluded);
             }
 #ifdef HWRT_REFLECT
             // Hit-lighting hybrid combine: cache lighting × true material albedo. The clamp
@@ -1090,7 +1208,9 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 }
                 else if (!cached)
                 {
-                    color = hl_fallback; // no card coverage: keep the analytic hit-light
+                    // No card coverage: keep the analytic hit-light. An occluder-witness miss
+                    // (bit12) drops the sky term — the enclosed point sees no sky.
+                    color = hl_fallback + (occluded ? float3(0.0, 0.0, 0.0) : hl_sky);
                     cached = true;
                 }
             }
@@ -1125,15 +1245,18 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     // indirect E matches gdf_gi.slang's convention (outgoing = albedo * E, no extra
                     // /PI), so it is added OUTSIDE the direct term's 1/PI to be energy-consistent with
                     // how the deferred lighting consumes the same volume.
-                    float3 e = sample_gi_irradiance(vol_base, hp, hn);
+                    float3 e = probe_valid ? sample_gi_irradiance_valid(vol_base, hp, hn)
+                                           : sample_gi_irradiance(vol_base, hp, hn);
                     color = hit_albedo * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
                     // Physical IBL-diffuse skylight fill: the radiance-cache volume `e` is a LOCAL bounce
                     // term and is ~0 where the cache is cold, so an uncovered reflected surface would go
                     // near-black. Add the same sky irradiance the deferred pass gives every surface
                     // (`irradiance_cube(hn) * albedo`) so a reflected shadowed/uncovered face reads its
                     // true skylit grey — the reflection then matches the directly-shaded scene. A
-                    // TRAPPED endpoint (see the march) is enclosed by construction — no sky there.
-                    if (has_irr && !trapped)
+                    // TRAPPED endpoint (see the march) is enclosed by construction — no sky there;
+                    // same for an occluder-witness cache miss (bit12: the capture PROVED the point
+                    // sits under an occluder, so the unoccluded top-up is exactly the bright bowl).
+                    if (has_irr && !trapped && !occluded)
                         color += g.cubes[irr_idx].SampleLevel(g.samp, hn, 0.0).rgb * hit_albedo;
                 }
                 else
@@ -1143,7 +1266,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     color = hit_albedo * (sun_i * ndl * sh + fill) * (1.0 / GGX_PI);
                 }
             }
-#if defined(HWRT_REFLECT) && defined(REFLECT_COMPACT)
+#ifdef REFLECT_COMPACT
             // Gate-band hand-off: blend the (box-filtered) screen colour over the resolved
             // cache/hybrid colour across the footprint band (see the fetch above).
             if (screen_w > 0.0)
