@@ -220,6 +220,229 @@ fn compile_mesh_dxil_via_hlsl_patch(
     Ok(())
 }
 
+// ── Vulkan mesh→fragment per-primitive interface patch ───────────────────────────────────────
+//
+// Slang 2026.10.2 decorates a mesh shader's per-primitive output with SPIR-V `PerPrimitiveEXT`,
+// but leaves the MATCHING fragment input as an ordinary `Flat` varying (no `PerPrimitiveEXT`).
+// Vulkan then rejects `vkCreateGraphicsPipelines` on strict drivers ("Mesh stage is decorated
+// with PerPrimitiveEXT while the Fragment stage is not") — NVIDIA tolerates it, but it is a real
+// interface-rate mismatch. Slang exposes no surface syntax for a per-primitive fragment input
+// (`perprimitive` is an IR decoration only), so — in the same spirit as the mesh-DXIL HLSL
+// workaround above — we patch the compiled fragment SPIR-V directly. The paired MESH module is the
+// source of truth: whichever interface Locations it decorates `PerPrimitiveEXT` are the ones the
+// fragment inputs at those Locations must also carry, so this stays correct if a shader later mixes
+// per-vertex and per-primitive user inputs. Bump BUILD_RECIPE_VERSION when this recipe changes.
+const SPIRV_MAGIC: u32 = 0x0723_0203;
+const SPV_OP_EXTENSION: u16 = 10;
+const SPV_OP_CAPABILITY: u16 = 17;
+const SPV_OP_VARIABLE: u16 = 59;
+const SPV_OP_DECORATE: u16 = 71;
+const SPV_CAP_MESH_SHADING_EXT: u32 = 5283; // MeshShadingEXT (5266 is the NV alias — wrong ext)
+const SPV_DECOR_LOCATION: u32 = 30;
+const SPV_DECOR_PERPRIMITIVE_EXT: u32 = 5271; // PerPrimitiveEXT (== PerPrimitiveNV alias)
+const SPV_STORAGE_CLASS_INPUT: u32 = 1;
+
+/// Fragment entry keys whose SPIR-V needs the per-primitive input patch, mapped to the paired mesh
+/// entry key that supplies the authoritative per-primitive Locations. Keep in sync with any mesh
+/// shader that adds a per-`primitives` output read by its fragment stage.
+fn spirv_perprimitive_mesh_pair(key: &str) -> Option<&'static str> {
+    match key {
+        "vgeo_hwvis_fs" => Some("vgeo_hwvis_ms"),
+        "vgeo_scene_hwvis_fs" => Some("vgeo_scene_hwvis_ms"),
+        _ => None,
+    }
+}
+
+/// Parse a SPIR-V byte blob into little-endian words, or `None` if it is not SPIR-V.
+fn spirv_words(bytes: &[u8]) -> Option<Vec<u32>> {
+    if bytes.len() < 20 || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let words: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    (words[0] == SPIRV_MAGIC).then_some(words)
+}
+
+/// Visit `(opcode, operands)` for each instruction after the 5-word header.
+fn spirv_for_each(words: &[u32], mut f: impl FnMut(u16, &[u32])) {
+    let mut i = 5;
+    while i < words.len() {
+        let len = (words[i] >> 16) as usize;
+        if len == 0 || i + len > words.len() {
+            break;
+        }
+        f((words[i] & 0xFFFF) as u16, &words[i + 1..i + len]);
+        i += len;
+    }
+}
+
+/// Decode a SPIR-V literal string (null-terminated, packed LE) from operand words.
+fn spirv_decode_string(words: &[u32]) -> String {
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Encode a string as SPIR-V operand words (null-terminated, zero-padded to a word boundary).
+fn spirv_encode_string(s: &str) -> Vec<u32> {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    while !bytes.len().is_multiple_of(4) {
+        bytes.push(0);
+    }
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// The interface Locations the mesh module decorates `PerPrimitiveEXT` (variable-level `OpDecorate`).
+fn mesh_perprimitive_locations(mesh: &[u32]) -> std::collections::HashSet<u32> {
+    use std::collections::{HashMap, HashSet};
+    let mut id_loc: HashMap<u32, u32> = HashMap::new();
+    let mut perprim: HashSet<u32> = HashSet::new();
+    spirv_for_each(mesh, |op, ops| {
+        if op == SPV_OP_DECORATE && ops.len() >= 2 {
+            match ops[1] {
+                SPV_DECOR_LOCATION if ops.len() >= 3 => {
+                    id_loc.insert(ops[0], ops[2]);
+                }
+                SPV_DECOR_PERPRIMITIVE_EXT => {
+                    perprim.insert(ops[0]);
+                }
+                _ => {}
+            }
+        }
+    });
+    perprim.iter().filter_map(|id| id_loc.get(id).copied()).collect()
+}
+
+/// Fragment `Input` variable ids sitting at one of `locs` that are not already `PerPrimitiveEXT`.
+fn frag_input_ids_needing_perprimitive(
+    frag: &[u32],
+    locs: &std::collections::HashSet<u32>,
+) -> Vec<u32> {
+    use std::collections::{HashMap, HashSet};
+    let mut inputs: HashSet<u32> = HashSet::new();
+    let mut id_loc: HashMap<u32, u32> = HashMap::new();
+    let mut already: HashSet<u32> = HashSet::new();
+    spirv_for_each(frag, |op, ops| match op {
+        // OpVariable operands: [ResultType, Result, StorageClass, ..]
+        SPV_OP_VARIABLE if ops.len() >= 3 && ops[2] == SPV_STORAGE_CLASS_INPUT => {
+            inputs.insert(ops[1]);
+        }
+        SPV_OP_DECORATE if ops.len() >= 2 => match ops[1] {
+            SPV_DECOR_LOCATION if ops.len() >= 3 => {
+                id_loc.insert(ops[0], ops[2]);
+            }
+            SPV_DECOR_PERPRIMITIVE_EXT => {
+                already.insert(ops[0]);
+            }
+            _ => {}
+        },
+        _ => {}
+    });
+    let mut out: Vec<u32> = inputs
+        .into_iter()
+        .filter(|id| !already.contains(id) && id_loc.get(id).is_some_and(|l| locs.contains(l)))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// Rebuild `frag` with `MeshShadingEXT` + `SPV_EXT_mesh_shader` enabled and a `PerPrimitiveEXT`
+/// decoration added for each `targets` id, inserted at the correct SPIR-V logical-layout boundaries.
+fn spirv_add_perprimitive(frag: &[u32], targets: &[u32]) -> Vec<u32> {
+    let mut has_cap = false;
+    let mut has_ext = false;
+    spirv_for_each(frag, |op, ops| match op {
+        SPV_OP_CAPABILITY if ops.first() == Some(&SPV_CAP_MESH_SHADING_EXT) => has_cap = true,
+        SPV_OP_EXTENSION if spirv_decode_string(ops) == "SPV_EXT_mesh_shader" => has_ext = true,
+        _ => {}
+    });
+
+    // Insertion boundaries (word index just past the last instruction of each kind).
+    let (mut cap_end, mut ext_end, mut dec_end) = (5usize, 0usize, 0usize);
+    let mut i = 5;
+    while i < frag.len() {
+        let len = (frag[i] >> 16) as usize;
+        if len == 0 || i + len > frag.len() {
+            break;
+        }
+        match (frag[i] & 0xFFFF) as u16 {
+            SPV_OP_CAPABILITY => cap_end = i + len,
+            SPV_OP_EXTENSION => ext_end = i + len,
+            SPV_OP_DECORATE => dec_end = i + len,
+            _ => {}
+        }
+        i += len;
+    }
+    let ext_at = if ext_end != 0 { ext_end } else { cap_end };
+    let dec_at = if dec_end != 0 { dec_end } else { frag.len() };
+
+    let new_cap: Vec<u32> = if has_cap {
+        vec![]
+    } else {
+        vec![(2 << 16) | SPV_OP_CAPABILITY as u32, SPV_CAP_MESH_SHADING_EXT]
+    };
+    let new_ext: Vec<u32> = if has_ext {
+        vec![]
+    } else {
+        let s = spirv_encode_string("SPV_EXT_mesh_shader");
+        let mut inst = Vec::with_capacity(1 + s.len());
+        inst.push((((1 + s.len()) as u32) << 16) | SPV_OP_EXTENSION as u32);
+        inst.extend_from_slice(&s);
+        inst
+    };
+    let mut new_dec: Vec<u32> = Vec::with_capacity(targets.len() * 3);
+    for &t in targets {
+        new_dec.extend_from_slice(&[(3 << 16) | SPV_OP_DECORATE as u32, t, SPV_DECOR_PERPRIMITIVE_EXT]);
+    }
+
+    // Boundaries are monotonic (cap_end <= ext_at <= dec_at); splice in order. No new <id>s are
+    // introduced (decorations reference existing ids), so the header's id-bound is unchanged.
+    let mut out =
+        Vec::with_capacity(frag.len() + new_cap.len() + new_ext.len() + new_dec.len());
+    out.extend_from_slice(&frag[..cap_end]);
+    out.extend_from_slice(&new_cap);
+    out.extend_from_slice(&frag[cap_end..ext_at]);
+    out.extend_from_slice(&new_ext);
+    out.extend_from_slice(&frag[ext_at..dec_at]);
+    out.extend_from_slice(&new_dec);
+    out.extend_from_slice(&frag[dec_at..]);
+    out
+}
+
+/// Patch a compiled fragment SPIR-V file to carry the mesh→fragment per-primitive interface
+/// decoration, driven by its paired mesh module. Idempotent; returns the number of inputs decorated
+/// (0 = nothing to do, file left untouched).
+fn patch_spirv_fragment_perprimitive(frag_path: &Path, mesh_path: &Path) -> Result<usize, String> {
+    let frag = spirv_words(&std::fs::read(frag_path).map_err(|e| e.to_string())?)
+        .ok_or("fragment artifact is not valid SPIR-V")?;
+    let mesh = spirv_words(&std::fs::read(mesh_path).map_err(|e| e.to_string())?)
+        .ok_or("paired mesh artifact is not valid SPIR-V")?;
+    let locs = mesh_perprimitive_locations(&mesh);
+    if locs.is_empty() {
+        return Ok(0); // mesh emits no per-primitive interface — nothing to match
+    }
+    let targets = frag_input_ids_needing_perprimitive(&frag, &locs);
+    if targets.is_empty() {
+        return Ok(0); // already patched, or no matching fragment input
+    }
+    let patched = spirv_add_perprimitive(&frag, &targets);
+    let mut out = Vec::with_capacity(patched.len() * 4);
+    for w in patched {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    std::fs::write(frag_path, &out).map_err(|e| e.to_string())?;
+    Ok(targets.len())
+}
+
 /// Preprocessor `-D` defines for a target. **Single source of truth** for both the
 /// cache key and the slangc args. Slang's Metal target rejects the
 /// `NonUniformResourceIndex` intrinsic (E36107) that SPIR-V/DXIL need for per-ray
@@ -1497,7 +1720,14 @@ fn main() {
     std::fs::create_dir_all(&cache_dir).unwrap();
     let manifest_path = cache_dir.join("manifest.txt");
     let mut manifest = load_manifest(&manifest_path);
-    let mut base_hash = fnv1a(&slangc_version(&slangc), FNV_OFFSET);
+    // Fold the build-recipe version into every cell key so a change to the codegen recipe
+    // (e.g. the SPIR-V per-primitive patch below) invalidates stale on-disk artifacts, which are
+    // otherwise keyed only on source + slangc version. Bump on any post-compile bytecode edit.
+    const BUILD_RECIPE_VERSION: u32 = 2;
+    let mut base_hash = fnv1a(
+        &BUILD_RECIPE_VERSION.to_le_bytes(),
+        fnv1a(&slangc_version(&slangc), FNV_OFFSET),
+    );
     for inc in SHARED_INCLUDES {
         if let Ok(bytes) = std::fs::read(shader_dir.join(inc)) {
             base_hash = fnv1a(&bytes, base_hash);
@@ -1684,6 +1914,20 @@ fn main() {
                 .expect("every cache miss was queued for compilation in the pre-pass");
 
             if outcome.success {
+                // Vulkan mesh→fragment per-primitive interface fix (Slang codegen gap): patch the
+                // freshly-compiled fragment SPIR-V in place, driven by its paired mesh module. Cache
+                // hits above serve the already-patched on-disk artifact, so this runs on miss only.
+                if *target == "spirv"
+                    && let Some(mesh_key) = spirv_perprimitive_mesh_pair(job.key)
+                {
+                    let mesh_path = cache_dir.join(format!("{mesh_key}.{ext}"));
+                    if let Err(e) = patch_spirv_fragment_perprimitive(&ck.out_path, &mesh_path) {
+                        panic!(
+                            "SPIR-V per-primitive patch failed for {} [{}]: {e}",
+                            job.src, job.entry
+                        );
+                    }
+                }
                 emit_some(&mut generated, job.key, suffix, &ck.out_path);
                 manifest.insert(ck.artifact_name, ck.key_hash);
                 cache_compiled += 1;
