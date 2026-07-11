@@ -477,7 +477,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 76, // 60-byte core + clustered light bufs (grid, index, light, count)
+            push_constant_size: 84, // 60-byte core + clustered light bufs (16) + ao_multibounce + spec_occlusion (see pbr_push)
             bindless: true,
             uniform_buffer: true,
             depth_test: false,

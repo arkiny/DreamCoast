@@ -1145,7 +1145,8 @@ impl GdfSystem {
             indirect: false,
         })?);
         // Mirror-feedback flags (zero-seeded; the visibility pass clears after each merge).
-        let marks = device.create_storage_buffer(&StorageBufferDesc {
+        // Host-visible: the zero seed below is a CPU write (same reason as card_corr / card_res_feedback).
+        let marks = device.create_storage_buffer_host(&StorageBufferDesc {
             size: (num_cards as u64) * 4,
             stride: 4,
             indirect: false,
