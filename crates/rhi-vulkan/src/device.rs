@@ -228,6 +228,13 @@ impl DeviceShared {
                 phys_features.shader_int64 != 0 && probe_vk12.shader_buffer_int64_atomics != 0;
             let has_mesh_shader =
                 mesh_ext_supported && probe_mesh.mesh_shader != 0 && probe_mesh.task_shader != 0;
+            // 16-bit arithmetic: the fp16-packed TAAU history, the memoryless transient chain, and
+            // the reflect/cache half-precision math emit SPIR-V Float16 (Vulkan-1.2 `shaderFloat16`)
+            // and Int16 (`shaderInt16`, base features) capabilities. Probe both and enable only when
+            // supported so devices without them still create a valid logical device (Metal `half` and
+            // DXIL native-16bit are handled by their own backends and need no parallel gate here).
+            let has_shader_float16 = probe_vk12.shader_float16 != 0;
+            let has_shader_int16 = phys_features.shader_int16 != 0;
             let max_anisotropy = if aniso_req > 1.0 && phys_features.sampler_anisotropy != 0 {
                 aniso_req.min(phys_limits.max_sampler_anisotropy)
             } else {
@@ -258,7 +265,9 @@ impl DeviceShared {
                 .descriptor_binding_storage_buffer_update_after_bind(true)
                 .buffer_device_address(has_raytracing)
                 // Phase 14: 64-bit buffer atomics for the SW-raster visibility buffer.
-                .shader_buffer_int64_atomics(has_atomic_int64);
+                .shader_buffer_int64_atomics(has_atomic_int64)
+                // fp16 arithmetic (TAAU history / memoryless transients / reflect-cache half math).
+                .shader_float16(has_shader_float16);
             // SV_VertexID full-screen-triangle shaders (triangle/post/blur) compile
             // to SPIR-V using the DrawParameters capability.
             let mut features11 =
@@ -281,7 +290,9 @@ impl DeviceShared {
                 // 1b: only requested + supported when P_ANISO opts in (else false = unchanged).
                 .sampler_anisotropy(max_anisotropy > 1.0)
                 // Phase 14: the Int64 type used by the visibility-buffer atomicMax / u64 store.
-                .shader_int64(has_atomic_int64);
+                .shader_int64(has_atomic_int64)
+                // 16-bit ints paired with the fp16 arithmetic above (SPIR-V Int16 capability).
+                .shader_int16(has_shader_int16);
             // RT feature structs (Phase 8) — only chained when the extensions are
             // enabled, else validation rejects the unsupported feature structs.
             let mut accel_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
