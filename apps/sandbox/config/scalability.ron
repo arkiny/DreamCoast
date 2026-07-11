@@ -248,6 +248,12 @@
                 // band gets its grazing-aware witness (chromeball band 96 -> 63 vs hybrid 63,
                 // PT 22 /255). Software ReflectMode only (the HWRT fetch has its own gate).
                 reflect_hit_fetch: true,
+                // F4 importance-sampled final gather (march path, P_GI_VOLUME=0; inert on the
+                // default volume-GI path). Measured (chromeball raw GI, frame-pair delta):
+                // p99 233 -> 75, >150/255 outliers 1.20% -> 0.92%, per-pixel signal coverage
+                // visibly denser; unbiased (converged lit identical, 80.62 lum both); fence
+                // A/B 36.30 vs 36.16 ms (free). 0.5 is the sweep knee (0.75 regresses mean).
+                gi_importance: 0.5,
             ),
             groups: (
                 resolution: 1,

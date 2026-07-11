@@ -1289,6 +1289,10 @@ mod tests {
             apple.reflect_hit_fetch,
             "Apple reflect_hit_fetch on (SW compact screen-color-at-hit for the contact band)"
         );
+        assert_eq!(
+            apple.gi_importance, 0.5,
+            "Apple gi_importance (F4 MIS gather on the march path; measured firefly-tail win)"
+        );
         assert!(
             !apple.cache_capture_occl
                 && !apple.cache_occl_route
