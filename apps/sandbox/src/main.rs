@@ -1108,26 +1108,38 @@ struct App {
     /// Lossless cache/GI dirty-skip (docs/lossless-opt-ledger.md A2): the view-independent
     /// surface-cache relight (and world-irradiance volume) is a temporally-accumulated EMA that
     /// reaches a fixpoint once the lighting (sun/sky) + geometry stop changing. `cache_epoch` is a
-    /// hash of that invariant state; a change re-arms convergence. The freeze then arms on MEASURED
-    /// convergence (the relight's mean EMA step below `cache_conv_eps` for `cache_conv_k` frames — see
-    /// the GPU `InterlockedAdd` probe), NOT a frame count: multibounce converges at scene-dependent
-    /// rates, so a fixed count locked an unconverged cache on IntelSponza. Once converged, re-lighting
-    /// produces the SAME value it holds — we freeze the relight (skip the dispatch, don't advance the
-    /// ping-pong) and consumers keep reading it. Image-identical (a converged EMA == its fixpoint).
+    /// hash of that invariant state; a change re-arms convergence. The freeze then arms on a
+    /// backend-deterministic convergence horizon (`cache_freeze_passes` full amortization passes; see
+    /// that field), NOT the measured EMA step: that step is a stochastic-gather EMA whose noisy value
+    /// dips below eps at backend-divergent frames, which broke DX≡VK. Once past the horizon the cache
+    /// is settled — we freeze the relight (skip the dispatch, don't advance the ping-pong) and
+    /// consumers keep reading it. Image-identical (a settled EMA ≈ its fixpoint).
     /// Camera motion does NOT bump the epoch (the cache is view-independent), so this wins even
     /// while the camera moves — only sun/sky/geometry changes cost a re-converge. Gallery-gated.
     cache_epoch: u64,
     cache_stable_frames: u32,
-    /// A2-fix: consecutive frames the MEASURED cache EMA step stayed below `cache_conv_eps`. The
-    /// relight/reflect-reuse freeze arms only when this reaches `cache_conv_k` — real convergence,
-    /// not a frame-count guess (which locked an unconverged multibounce cache on IntelSponza).
+    /// Consecutive frames the MEASURED cache EMA step stayed below `cache_conv_eps`. DIAGNOSTIC ONLY
+    /// now: the freeze no longer gates on it. The measured step is a fixed-alpha EMA of a stochastic
+    /// gather (an AR(1) process with a permanent variance floor — see sdf_cache_light.slang), so the
+    /// frame its noisy value first dips below eps differs across backends, which broke DX≡VK (DX froze
+    /// at frame 48, VK at frame 8, latching two different noise samples ⇒ ~2.7/ch). The freeze now
+    /// arms on a backend-deterministic horizon (`cache_freeze_passes`); this counter is retained so
+    /// the freeze log can report how settled the measured signal actually was at that horizon.
     cache_conv_stable: u32,
     cache_conv_eps: f32,
-    cache_conv_k: u32,
-    /// A2-fix: the freeze LATCH. Armed once `cache_conv_stable` reaches `cache_conv_k` (measured
-    /// convergence); held until the epoch (sun/sky/geometry) changes. A latch is required because a
-    /// frozen relight stops measuring — without it the missing measurement would immediately
-    /// un-freeze, oscillating. Epoch change clears it so a lighting change re-converges.
+    /// Backend-deterministic freeze horizon, in full amortization passes: the freeze arms once the
+    /// lighting epoch has held for `cache_freeze_passes × cache_relight_period` frames (one pass =
+    /// every card relit once). Every term is backend-independent (an epoch-hash counter, the tier
+    /// period, a constant), so DX and VK freeze at the SAME frame on the SAME converged mean — the
+    /// DX≡VK-stable replacement for the old measured-step trigger (which latched two different noise
+    /// samples at frames 48 vs 8). Default 3 passes sits past the fixed-alpha settling knee (measured
+    /// convergence was ≈1.2 passes); a slow-multibounce scene raises it via `P_CACHE_FREEZE_PASSES`
+    /// rather than encoding a per-scene magic number.
+    cache_freeze_passes: u32,
+    /// A2-fix: the freeze LATCH. Armed once the epoch has held for the `cache_freeze_passes` horizon;
+    /// held until the epoch (sun/sky/geometry) changes. A latch is required because a frozen relight
+    /// stops advancing — without it the freeze condition would re-evaluate on stale state and
+    /// oscillate. Epoch change clears it so a lighting change re-converges.
     cache_frozen: bool,
     cache_dirty_skip: bool,
     /// Cached shadow map (docs/shadow-cache-cold-start.md S1). The legacy directional shadow map is
@@ -3707,11 +3719,14 @@ impl App {
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(0.02),
-            // A2-fix: consecutive below-eps frames required before freezing (debounce). `P_CACHE_CONV_K`.
-            cache_conv_k: std::env::var("P_CACHE_CONV_K")
+            // Backend-deterministic freeze horizon in full amortization passes (see the field doc).
+            // Default 3 passes is past the fixed-alpha settling knee for the physically-lit content
+            // scenes while keeping steady-state relight cost zero. `P_CACHE_FREEZE_PASSES` per scene.
+            cache_freeze_passes: std::env::var("P_CACHE_FREEZE_PASSES")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(6),
+                .unwrap_or(3)
+                .max(1),
             cache_frozen: false,
             // Default-on for content; gallery byte-anchor keeps every-frame relight. `P_CACHE_DIRTY_SKIP=0`
             // forces the legacy always-relight path (perf A/B + the fast-motion worst case).
@@ -6153,10 +6168,10 @@ impl App {
                 self.cache_conv_stable = 0;
                 self.cache_frozen = false;
             }
-            // Arm the freeze latch on MEASURED convergence: while not yet frozen, require the epoch
-            // stable (so the probe reflects the current lighting) AND the mean EMA step below eps for
-            // `cache_conv_k` consecutive frames. Once latched it holds (a frozen relight stops
-            // measuring, so re-evaluating would oscillate) until the epoch changes above.
+            // Arm the freeze latch on a backend-deterministic convergence horizon: while not yet
+            // frozen, require the epoch to have held for `cache_freeze_passes` amortization passes.
+            // Once latched it holds (a frozen relight stops advancing, so re-evaluating would
+            // oscillate) until the epoch changes above.
             //
             // CONVERGE mode (user directive): accumulation stays CONTINUOUS — never freeze. The
             // running-mean + K-cycle jitter reach a bounded equilibrium while relight keeps running
@@ -6164,23 +6179,36 @@ impl App {
             // on this latch) stays off — its stale-tile stagger read as visible crawl the moment the
             // latch first armed on content ("jitter that stops when the camera moves").
             if !self.cache_frozen && self.cache_converge == 0 {
+                // Keep tracking the measured below-eps streak — DIAGNOSTIC ONLY (it no longer gates
+                // the freeze; see the field doc for why a stochastic-gather EMA step is not backend-
+                // stable enough to trigger on).
                 if self.cache_stable_frames >= 2 && cache_conv_delta < self.cache_conv_eps {
                     self.cache_conv_stable = self.cache_conv_stable.saturating_add(1);
                 } else {
                     self.cache_conv_stable = 0;
                 }
+                // Freeze on a backend-deterministic convergence horizon: the lighting epoch has held
+                // for `cache_freeze_passes` amortization passes. `cache_stable_frames`, the relight
+                // period, and the pass constant are all backend-independent, so DX and VK freeze at
+                // the same frame on the same converged mean (DX≡VK-stable, unlike the old measured
+                // trigger that latched two different noise samples at frames 48 vs 8).
+                let freeze_horizon =
+                    self.cache_freeze_passes.saturating_mul(self.cache_relight_period.max(1));
                 if self.scene_cache_captured
                     && !cache_reset_this_frame
-                    && self.cache_conv_stable >= self.cache_conv_k
+                    && self.cache_stable_frames >= freeze_horizon
                 {
                     self.cache_frozen = true;
-                    // Visible confirmation that the measured-convergence latch armed (relight cost
-                    // drops to zero from here until the lighting epoch changes) — the CONVERGE-mode
-                    // warmup cost is bounded by this moment.
+                    // Visible confirmation that the deterministic horizon armed (relight cost drops to
+                    // zero from here until the lighting epoch changes). `step` reports how settled the
+                    // measured signal was at the horizon — a sanity check that the horizon is sized
+                    // past convergence, not a trigger.
                     tracing::info!(
                         frame = self.frame_no,
+                        horizon = freeze_horizon,
                         step = cache_conv_delta,
-                        "surface-cache relight FROZEN (measured convergence)"
+                        below_eps_streak = self.cache_conv_stable,
+                        "surface-cache relight FROZEN (deterministic convergence horizon)"
                     );
                 }
             }
