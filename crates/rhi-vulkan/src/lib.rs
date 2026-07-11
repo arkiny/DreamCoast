@@ -97,6 +97,15 @@ unsafe extern "system" fn debug_callback(
     _user_data: *mut std::ffi::c_void,
 ) -> vk::Bool32 {
     let message = unsafe { CStr::from_ptr((*callback_data).p_message) }.to_string_lossy();
+    // Known-benign validation noise (no VUID): the loader/ICD probes the NV external-image
+    // format entrypoint during physical-device enumeration without our instance ever enabling
+    // VK_NV_external_memory_capabilities (we don't do external-memory interop). It's harmless
+    // but the layer reports it at ERROR severity, which masquerades as a real failure — demote
+    // it to debug so it stays visible under RUST_LOG=debug without alarming a normal run.
+    if message.contains("VK_NV_external_memory_capabilities") {
+        tracing::debug!(target: "vulkan", "{message}");
+        return vk::FALSE;
+    }
     if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
         tracing::error!(target: "vulkan", "{message}");
     } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
