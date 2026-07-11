@@ -259,6 +259,7 @@ impl VulkanTransientHeap {
                     height: 16,
                     format: rhi_types::Format::Rgba8Unorm,
                     storage: false,
+                    memoryless: false,
                 },
                 true,
             )?;

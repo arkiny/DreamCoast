@@ -1007,6 +1007,19 @@ impl MetalDevice {
                 false,
             )
         };
+        if desc.memoryless {
+            // Tile-only (TBDR) transient: written and consumed within one render
+            // pass, never sampled/copied/read back (the render graph derives this
+            // from resource lifetime). `Memoryless` gives it no system-memory
+            // backing — it exists only in tile memory for the pass, saving the
+            // store/load bandwidth. Such a texture must NOT be sampled or used as
+            // a UAV, so it takes only `RenderTarget` usage and is never registered
+            // in the bindless table (see `create_render_target`). Non-Apple
+            // backends never set this flag, so their output is unchanged.
+            td.setUsage(MTLTextureUsage::RenderTarget);
+            td.setStorageMode(MTLStorageMode::Memoryless);
+            return td;
+        }
         let mut usage = MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead;
         if desc.storage {
             // Compute-writable (Phase 7): also gets a storage-image bindless slot in

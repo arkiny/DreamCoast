@@ -22,7 +22,7 @@ use objc2_metal::{
     MTLIndexType, MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLRenderCommandEncoder,
     MTLRenderPassColorAttachmentDescriptor, MTLRenderPassDepthAttachmentDescriptor,
     MTLRenderPassDescriptor, MTLRenderStages, MTLResource, MTLResourceUsage, MTLScissorRect,
-    MTLSize, MTLStoreAction, MTLTexture, MTLViewport,
+    MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLViewport,
 };
 use objc2_quartz_core::CAMetalDrawable;
 use rhi_types::{ClearColor, Extent2D, Rect2D};
@@ -430,7 +430,8 @@ impl MetalCommandBuffer {
         let pass = MTLRenderPassDescriptor::new();
         let attach = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
         attach.setTexture(Some(&target.texture));
-        config_color(&attach, color_clear);
+        let memoryless = target.texture.storageMode() == MTLStorageMode::Memoryless;
+        config_color(&attach, color_clear, memoryless);
         if let Some(d) = depth {
             config_depth(
                 &pass.depthAttachment(),
@@ -457,7 +458,12 @@ impl MetalCommandBuffer {
         for (i, (target, clear)) in targets.iter().enumerate() {
             let attach = unsafe { attachments.objectAtIndexedSubscript(i) };
             attach.setTexture(Some(&target.texture));
-            config_color(&attach, *clear);
+            // A `Memoryless` (tile-only) target has no system-memory backing, so its
+            // contents cannot be stored — Metal requires `DontCare`. The render
+            // graph only marks a target memoryless when no later pass samples it, so
+            // discarding on store is exactly correct (nothing reads it afterward).
+            let memoryless = target.texture.storageMode() == MTLStorageMode::Memoryless;
+            config_color(&attach, *clear, memoryless);
         }
         if let Some(d) = depth {
             config_depth(
@@ -521,7 +527,7 @@ impl MetalCommandBuffer {
         attach.setTexture(Some(&cube.texture));
         attach.setSlice(face as usize);
         attach.setLevel(mip as usize);
-        config_color(&attach, clear);
+        config_color(&attach, clear, false);
         self.start_encoder(&pass);
     }
 
@@ -541,7 +547,7 @@ impl MetalCommandBuffer {
         attach.setTexture(Some(&cube.texture));
         attach.setSlice(face as usize);
         attach.setLevel(mip as usize);
-        config_color(&attach, clear);
+        config_color(&attach, clear, false);
         config_depth(
             &pass.depthAttachment(),
             &depth.texture,
@@ -1128,7 +1134,11 @@ impl MetalCommandBuffer {
 
 /// Configure a color attachment: `Some(clear)` clears it, `None` loads; always
 /// stored (every offscreen/cube/MRT target is read by a later pass).
-fn config_color(attach: &MTLRenderPassColorAttachmentDescriptor, clear: Option<ClearColor>) {
+fn config_color(
+    attach: &MTLRenderPassColorAttachmentDescriptor,
+    clear: Option<ClearColor>,
+    memoryless: bool,
+) {
     match clear {
         Some(c) => {
             attach.setLoadAction(MTLLoadAction::Clear);
@@ -1141,7 +1151,13 @@ fn config_color(attach: &MTLRenderPassColorAttachmentDescriptor, clear: Option<C
         }
         None => attach.setLoadAction(MTLLoadAction::Load),
     }
-    attach.setStoreAction(MTLStoreAction::Store);
+    // A memoryless target cannot be stored (no backing memory); the graph only
+    // marks it so when nothing samples it later, so discard-on-store is correct.
+    attach.setStoreAction(if memoryless {
+        MTLStoreAction::DontCare
+    } else {
+        MTLStoreAction::Store
+    });
 }
 
 /// Configure a depth attachment: always cleared to far (1.0); `store` is `Store`

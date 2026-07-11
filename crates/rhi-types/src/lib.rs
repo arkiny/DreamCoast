@@ -582,6 +582,16 @@ pub struct RenderTargetDesc {
     pub format: Format,
     /// Also create an unordered-access view (compute-writable storage image).
     pub storage: bool,
+    /// Hint that this target is written and consumed entirely within its
+    /// producing render pass and never sampled, copied, or CPU-read afterward —
+    /// so it never needs system-memory backing. On a tile-based deferred GPU
+    /// (Apple Silicon) the backend may allocate it as tile-only memory
+    /// (`MTLStorageModeMemoryless`), avoiding the bandwidth of a system-memory
+    /// round-trip. Backends without tile-only storage (Vulkan, D3D12) ignore
+    /// this and allocate normally, so it is purely a Metal storage-mode hint and
+    /// never changes rendered output. The render graph derives it from resource
+    /// lifetime (a transient no later pass reads); defaults to `false`.
+    pub memoryless: bool,
 }
 
 /// A 3D (volume) texture, created as both a UAV (compute-writable storage volume,

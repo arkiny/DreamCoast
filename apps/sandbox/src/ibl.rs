@@ -272,6 +272,7 @@ impl IblSystem {
             height: BRDF_SIZE,
             format: Format::Rg16Float,
             storage: false,
+            memoryless: false,
         })?;
         let brdf_index = brdf_lut.bindless_index() as i32;
         // Name the persistent IBL resources so GPU captures (RenderDoc/PIX) show

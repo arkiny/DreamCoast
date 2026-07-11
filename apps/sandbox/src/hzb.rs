@@ -160,6 +160,7 @@ impl HzbSystem {
                 height: h,
                 format: Format::R32Float,
                 storage: true,
+                memoryless: false,
             })?;
             target.set_name("hzb_level");
             levels.push(HzbLevel {

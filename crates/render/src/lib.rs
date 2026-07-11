@@ -335,6 +335,7 @@ impl<'a> RenderGraph<'a> {
         scratch.clear();
         let CompileScratch {
             edges,
+            sampled,
             last_writer,
             readers_since,
             indegree,
@@ -434,17 +435,54 @@ impl<'a> RenderGraph<'a> {
         schedule.extend(order.iter().copied().filter(|&i| required[i]));
 
         // Lifetime of each resource over the final schedule (first/last position
-        // that references it). Used by transient aliasing.
-        let mut lifetimes: HashMap<ResourceId, (usize, usize)> =
+        // that references it). Used by transient aliasing. The third field is the
+        // tile-only (memoryless) eligibility — folded into this map (instead of a
+        // parallel set) so `compile()` keeps its irreducible two owned
+        // allocations (see `compile_reuses_scratch_allocations_across_frames`).
+        let mut lifetimes: HashMap<ResourceId, Lifetime> =
             HashMap::with_capacity(self.resources.len());
         for (pos, &pass_idx) in schedule.iter().enumerate() {
             let pass = &self.passes[pass_idx];
             for r in pass.references() {
                 lifetimes
                     .entry(r)
-                    .and_modify(|(_, last)| *last = pos)
-                    .or_insert((pos, pos));
+                    .and_modify(|l| l.last = pos)
+                    .or_insert(Lifetime {
+                        first: pos,
+                        last: pos,
+                        memoryless: false,
+                    });
             }
+        }
+
+        // Tile-only (memoryless) eligibility, derived purely from graph lifetime.
+        // A transient is eligible only if it is written and consumed entirely
+        // within its producing render pass — i.e. NO scheduled pass ever samples
+        // it. That is exactly "the resource never appears in any pass's `reads`
+        // list": if nothing reads it in a later pass, its contents never have to
+        // leave tile memory (no cross-pass sample, no CPU readback, no copy). The
+        // deferred G-buffer + depth are read by the later lighting / SW-RT passes,
+        // so they appear in `reads` and are correctly excluded here.
+        //
+        // Backbuffer (presented), external (app-owned / cross-frame), storage
+        // images (a UAV whose whole purpose is to be sampled by a later pass), and
+        // depth are never eligible: depth is only used cross-pass in this engine,
+        // and a memoryless depth buffer would still be a hazard if any future pass
+        // sampled it — so we keep the criterion to plain, unread color transients.
+        // `sampled` is dense per-resource scratch (reused across frames like the
+        // other scheduling scratch — no per-compile allocation once warm).
+        sampled.resize(self.resources.len(), false);
+        for &pass_idx in &schedule {
+            for &r in &self.passes[pass_idx].reads {
+                sampled[r.0] = true;
+            }
+        }
+        for (&id, life) in lifetimes.iter_mut() {
+            let res = &self.resources[id.0];
+            life.memoryless = res.kind == ResourceKind::Color
+                && !res.backbuffer
+                && !res.storage
+                && !sampled[id.0];
         }
 
         Compiled {
@@ -566,12 +604,15 @@ impl<'a> RenderGraph<'a> {
                 match res.kind {
                     ResourceKind::Color => {
                         if let std::collections::hash_map::Entry::Vacant(e) = color_locs.entry(r) {
+                            let memoryless =
+                                compiled.lifetimes.get(&r).is_some_and(|l| l.memoryless);
                             // Storage images need a dedicated (UAV-capable) allocation;
-                            // only plain color transients alias.
-                            if aliasing && !res.storage {
+                            // memoryless targets need a dedicated (unbacked, un-heapable)
+                            // allocation; only plain, sampled color transients alias.
+                            if aliasing && !res.storage && !memoryless {
                                 e.insert(ColorLoc::Aliased(r));
                             } else {
-                                let desc = render_target_desc(res);
+                                let desc = render_target_desc(res, memoryless);
                                 e.insert(ColorLoc::Pooled(pool.acquire_color(device, desc)?));
                             }
                         }
@@ -732,14 +773,20 @@ impl<'a> RenderGraph<'a> {
             align: u64,
         }
         let mut items = Vec::new();
-        for (&id, &(first, last)) in &compiled.lifetimes {
+        for (&id, &Lifetime { first, last, .. }) in &compiled.lifetimes {
             let res = &self.resources[id.0];
             // Storage images carry a UAV and are not RT-DS-only, so they can't live
-            // in the aliasing heap; they get dedicated pooled allocations.
-            if res.backbuffer || res.kind != ResourceKind::Color || res.storage {
+            // in the aliasing heap; they get dedicated pooled allocations. A
+            // memoryless (tile-only) target has no system-memory backing to place
+            // at a heap offset, so it also bypasses the heap and is pooled.
+            if res.backbuffer
+                || res.kind != ResourceKind::Color
+                || res.storage
+                || compiled.lifetimes.get(&id).is_some_and(|l| l.memoryless)
+            {
                 continue;
             }
-            let desc = render_target_desc(res);
+            let desc = render_target_desc(res, false);
             let req = device.render_target_memory(&desc)?;
             items.push(Item {
                 id,
@@ -1011,12 +1058,13 @@ fn align_up(value: u64, align: u64) -> u64 {
     value.div_ceil(align) * align
 }
 
-fn render_target_desc(res: &Resource) -> RenderTargetDesc {
+fn render_target_desc(res: &Resource, memoryless: bool) -> RenderTargetDesc {
     RenderTargetDesc {
         width: res.extent.width,
         height: res.extent.height,
         format: res.format,
         storage: res.storage,
+        memoryless,
     }
 }
 
@@ -1079,8 +1127,20 @@ impl PassNode<'_> {
 /// lifetimes (first/last schedule position).
 struct Compiled {
     schedule: Vec<usize>,
-    /// First/last schedule position each resource is referenced (drives aliasing).
-    lifetimes: HashMap<ResourceId, (usize, usize)>,
+    /// Per-resource schedule lifetime (drives aliasing) + the tile-only flag.
+    lifetimes: HashMap<ResourceId, Lifetime>,
+}
+
+/// One resource's compiled lifetime: first/last schedule position it is
+/// referenced, plus tile-only (memoryless) eligibility — a color transient no
+/// scheduled pass ever samples. On a tile-based GPU its descriptor gets
+/// `memoryless = true`; it bypasses the aliasing heap (a memoryless texture has
+/// no system-memory backing to place at a heap offset).
+#[derive(Clone, Copy)]
+struct Lifetime {
+    first: usize,
+    last: usize,
+    memoryless: bool,
 }
 
 /// Reusable working storage for [`RenderGraph::compile`]. The graph itself is
@@ -1094,6 +1154,8 @@ struct Compiled {
 #[derive(Default)]
 struct CompileScratch {
     edges: Vec<(usize, usize)>,
+    /// Dense per-resource "some scheduled pass reads it" flags (memoryless derivation).
+    sampled: Vec<bool>,
     last_writer: HashMap<ResourceId, usize>,
     readers_since: HashMap<ResourceId, Vec<usize>>,
     indegree: Vec<usize>,
@@ -1118,6 +1180,7 @@ impl CompileScratch {
     fn clear(&mut self) {
         let Self {
             edges,
+            sampled,
             last_writer,
             readers_since,
             indegree,
@@ -1129,6 +1192,7 @@ impl CompileScratch {
             stack,
         } = self;
         edges.clear();
+        sampled.clear();
         last_writer.clear();
         for v in readers_since.values_mut() {
             v.clear();

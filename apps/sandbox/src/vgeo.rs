@@ -178,6 +178,7 @@ fn make_hzb_levels(device: &Device, extent: Extent2D) -> anyhow::Result<Vec<Vgeo
             height: h,
             format: Format::R32Float,
             storage: true,
+            memoryless: false,
         })?;
         target.set_name("vgeo_hzb_level");
         levels.push(VgeoHzbLevel {
