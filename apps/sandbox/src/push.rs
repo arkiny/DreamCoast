@@ -1133,6 +1133,9 @@ pub(crate) fn gdf_gi_push(
     // F3 (HW-RT high-fidelity path): 0 = off (SW sphere-march, default & byte-identical anchor);
     // 1 = hardware-traced visibility gather against the scene TLAS. Opt-in High tier.
     hwrt: u32,
+    // F4 (importance-sampled final gather): fraction of the gather rays drawn from the sun-steered
+    // irradiance lobe (MIS with the cosine lobe). 0.0 = legacy cosine gather (byte-identical anchor).
+    gi_importance: f32,
 ) -> [u8; 256] {
     let mut pc = [0u8; 256];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -1195,9 +1198,11 @@ pub(crate) fn gdf_gi_push(
     pc[228..232].copy_from_slice(&vol_rgb[0].to_le_bytes());
     pc[232..236].copy_from_slice(&vol_rgb[1].to_le_bytes());
     pc[236..240].copy_from_slice(&vol_rgb[2].to_le_bytes());
-    // F3: HW-RT gather toggle on its own 16-byte row (offset 240..244; 244..256 = padding).
-    // 0 (default) leaves the shader on the SW sphere-march path -> gallery byte-identical.
+    // F3 + F4 share the last 16-byte row: the HW-RT gather toggle at 240..244 (0 = SW march =
+    // gallery byte-identical) and the F4 importance-sampling mix at 244..248 (0.0 = legacy
+    // cosine gather = byte-identical); 248..256 stays padding.
     pc[240..244].copy_from_slice(&hwrt.to_le_bytes());
+    pc[244..248].copy_from_slice(&gi_importance.to_le_bytes());
     pc
 }
 

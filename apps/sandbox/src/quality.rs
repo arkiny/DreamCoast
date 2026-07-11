@@ -242,6 +242,14 @@ pub struct QualityPreset {
     /// hard 3x3 min/max (legacy; forced for the gallery byte-identical anchor). `> 1.5` = variance clamp
     /// with gamma = this value (a wide outlier reject that still converges). Content defaults off.
     pub gi_temporal_clamp: f32,
+    /// F4 importance-sampled final gather (`P_GI_IMPORTANCE`): fraction [0,1] of the `gdf_gi`
+    /// gather rays drawn from a sun-steered incoming-irradiance lobe (MIS mixture with the plain
+    /// cosine lobe, `gdf_bounce.slang` -> `bounce_importance_dir`). Unbiased (each sample divides
+    /// by its mixture pdf) — same spp, lower variance. `0.0` = the legacy cosine gather
+    /// (byte-identical; the gallery is forced to 0.0 at the call site). All tiers default 0.0
+    /// (`serde(default)`) until measured; ~0.5 is the balanced starting point.
+    #[serde(default)]
+    pub gi_importance: f32,
     /// Sponza 1080p-60fps track: amortize the **view-independent** DDGI `gi_volume` update over N
     /// frames (`P_GI_VOLUME_PERIOD`) — update 1 frame in N, the rest bind the persistent last volume
     /// (the multibounce EMA carries it). `1` = every frame (High / gallery quality). `> 1` = cheaper
@@ -623,6 +631,7 @@ pub fn gallery_preset() -> QualityPreset {
         ssr_history_clamp: 0, // off (byte-identical anchor; SSR feedback clamp is opt-in)
         ssr_clamp_gamma: 1.25,
         gi_temporal_clamp: 1.0, // hard 3x3 GI temporal clamp (legacy byte-identical anchor)
+        gi_importance: 0.0,     // legacy cosine gather (byte-identical anchor)
         gi_volume_period: 1,    // every-frame volume update (gallery runs no gi_volume anyway)
         hwrt_reflect: false,    // SW-RT reflection (the gallery has its own path-tracer accel)
         hwrt_reflect_hitlighting: false,
