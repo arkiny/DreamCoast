@@ -4256,12 +4256,23 @@ impl App {
         // `elapsed`, CAPTURE_SEQ step).
         const FIXED_DT: f32 = 1.0 / 60.0;
         const MAX_STEPS: u32 = 5; // backlog cap — avoids the spiral of death after a stall
+        // Adaptation/animation time-step for state that MUST be reproducible in a headless
+        // capture (the "byte-identical by construction" contract above) and MUST NOT lurch on a
+        // frame-time hitch interactively: eye-adaptation (auto-exposure) and the day-night sky.
+        // Feeding raw wall-clock `dt` into them made auto-exposure + `elapsed` converge to a
+        // DIFFERENT value per backend (whole-image DX≡VK divergence, since every capture ran a
+        // different frame-time sequence) and "breathe" as the interactive fps fluctuated — the
+        // shading instability this fixes. Headless → the fixed sim step (deterministic); interactive
+        // → wall-clock clamped to the sim's max step so a stall can't jump the iris/sun.
+        // See docs/gdf-shading-stability.md.
+        let frame_dt = if self.screenshot_mode { FIXED_DT } else { dt.min(1.0 / 30.0) };
         self.prev_angle = self.angle;
         let render_alpha: f32;
         let sim_dt; // step length handed to per-frame GPU sim (particles)
         if self.screenshot_mode {
-            // Unchanged legacy capture path (see above).
-            self.elapsed += dt;
+            // Deterministic capture path: advance `elapsed` by the FIXED step (via `frame_dt`), not
+            // wall-clock, so the day-night sky / atmosphere are byte-identical across backends+runs.
+            self.elapsed += frame_dt;
             sim_dt = dt.clamp(0.0, 1.0 / 30.0);
             render_alpha = 1.0;
             if self.capture_seq.is_some() {
@@ -7298,7 +7309,11 @@ impl App {
         // After lighting (the `hdr` read orders it). `adapt` = 1-exp(-dt·speed) (eye/iris speed).
         if self.auto_exposure {
             let speed = 2.5f32;
-            let adapt = 1.0 - (-dt * speed).exp();
+            // `frame_dt` (deterministic in headless, clamped interactively), NOT raw wall-clock
+            // `dt`: the eye-adaptation rate must not depend on frame time, or the exposure
+            // converges differently per backend (DX≡VK divergence) and lurches with fps (the
+            // brightness "breathing" that read as unstable shading). See docs/gdf-shading-stability.md.
+            let adapt = 1.0 - (-frame_dt * speed).exp();
             self.deferred
                 .record_auto_exposure(&mut graph, hdr, cw, ch, 0.12, adapt, 1.0e-6, 4.0);
         }
