@@ -68,6 +68,31 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
         float cos_theta = max(abs(dot(n, ray.Direction)), 1e-3);
         cone_width += q.CommittedRayT() * cone_spread;
         float lod_base = hit_lod_base(inst, prim, cone_width, cos_theta);
+
+        // Decal (MaterialKind::Decal, params.w = base-color opacity > 0): a coplanar
+        // alpha-blended tint mesh the raster composites over the surface with
+        // `alpha = base_color.a × texture.a` (DecalAlbedo blend). The path tracer does the
+        // same "over" blend stochastically — with probability (1-alpha) the ray passes
+        // through to the surface behind, otherwise the decal is shaded as an opaque diffuse
+        // patch; averaged over samples this is the alpha composite. Content only
+        // (gallery/Cornell have no decals and keep params.w = 0).
+        if (content_instances() && inst.params.w > 0.0)
+        {
+            float dalpha = inst.params.w
+                           * (inst.tex_base != NO_TEXTURE
+                                  ? sample_texture_lod(inst.tex_base, material_uv, lod_base).a
+                                  : 1.0);
+            if (rnd(rng) >= dalpha)
+            {
+                // Pass through: restart the ray just past the decal. Consumes a bounce
+                // (a safety bound on stacked decals); throughput/radiance unchanged.
+                float advance = q.CommittedRayT() + 1e-3;
+                ray.Origin = ray.Origin + ray.Direction * advance;
+                ray.TMax = max(ray.TMax - advance, 0.0);
+                continue;
+            }
+        }
+
         RtMaterialSample mat;
         if (bounce == 0u && content_instances())
         {

@@ -316,7 +316,11 @@ Instance load_content_instance(uint id)
     // tracer reads base_color.a as the emissive scale (the Cornell light), so zero it.
     inst.base_color.a = 0.0;
     float2 mr = asfloat(g.storage_buffers[tbl].Load2(base + 32u));
-    inst.params = float4(mr.x, mr.y, 1.0, 0.0);
+    // params.w carries the decal opacity (build_content_hit_table offset 44): >0 marks a
+    // coplanar alpha-blended tint mesh the path tracer composites stochastically (see
+    // rt_path); the value is the material base-color alpha for the blend. 0 = normal surface.
+    float decal = asfloat(g.storage_buffers[tbl].Load(base + 44u));
+    inst.params = float4(mr.x, mr.y, 1.0, decal);
     // The consolidated record has no normal / emissive map slots (the HWRT hit
     // lighting doesn't need them); the oracle shades with the geometric normal.
     inst.tex_normal = NO_TEXTURE;

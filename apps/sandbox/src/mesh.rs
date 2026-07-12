@@ -187,7 +187,18 @@ pub(crate) fn build_content_hit_table(
         records.extend_from_slice(&m.metallic.to_le_bytes());
         records.extend_from_slice(&m.roughness.to_le_bytes());
         records.extend_from_slice(&0f32.to_le_bytes()); // ao (unused for now)
-        records.extend_from_slice(&0u32.to_le_bytes()); // pad → 48 B
+        // params.w: decal opacity (0 = not a decal). A `MaterialKind::Decal` drawable is a
+        // coplanar alpha-blended tint mesh (the raster's deferred decal pass); the path tracer
+        // reads this to composite it stochastically over the surface behind instead of treating
+        // it as an opaque hit. Store the material's base-color alpha here — the raster's
+        // DecalAlbedo blend uses `base_color.a × texture.a`, so the path tracer needs this factor
+        // (the base_color.a slot in the record itself is reused as the emissive scale downstream).
+        let decal = if m.kind == dreamcoast_asset::MaterialKind::Decal {
+            m.base_color[3]
+        } else {
+            0.0f32
+        };
+        records.extend_from_slice(&decal.to_le_bytes()); // → 48 B
     }
     let vtx = device.create_storage_buffer_init(
         &StorageBufferDesc {
