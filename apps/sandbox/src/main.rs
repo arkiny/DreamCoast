@@ -4767,6 +4767,10 @@ impl App {
                     // Keep the input bindings discoverable — the fly camera captures the mouse,
                     // so the M latch is how you reach this window's widgets at all.
                     ui.text_disabled("Tab: fly/orbit | M: mouse lock toggle | Alt: hold-release");
+                    ui.text(format!(
+                        "CAM_EYE={:.2},{:.2},{:.2} CAM_TARGET={:.2},{:.2},{:.2}",
+                        eye.x, eye.y, eye.z, focus.x, focus.y, focus.z
+                    ));
                     ui.text(format!("scene: {} objects + ground", scene.len()));
                     // Stage D: streaming chunk readout (world mode). Fly (WASD) across the
                     // chunk row to stream them in/out.
@@ -5090,9 +5094,13 @@ impl App {
                         }
                     }
 
-                    if rt.has_path() && rt.has_scene() {
+                    if rt.has_path() && (rt.has_scene() || rt.has_content_pt()) {
                         if ui.collapsing_header("Ray tracing (Phase 8)", TreeNodeFlags::empty()) {
-                            ui.checkbox("Path trace (inline ray query)", path_trace);
+                            // Live raster↔PT switch: unchecked = raster, checked = the HW path
+                            // tracer (content scene uses the live camera). Available whenever the
+                            // path-trace pipeline + a traceable scene exist (RT-capable device),
+                            // so no `P8_PATHTRACE` launch flag is needed to flip it on.
+                            ui.checkbox("Path trace (off = raster)", path_trace);
                             if *path_trace {
                                 ui.checkbox("  - debug: instance + shadow viz", rt_debug);
                                 if !*rt_debug {
