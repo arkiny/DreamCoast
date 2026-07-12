@@ -192,15 +192,14 @@ impl DeviceShared {
                         .any(|e| e.extension_name_as_c_str() == Ok(name))
                 });
 
-            // 1b: opt-in anisotropic filtering for the wrap sampler (grazing material surfaces —
-            // floor tiles viewed obliquely). `P_ANISO=<N>` enables it, clamped to the device's
-            // maxSamplerAnisotropy; unset (or <=1) keeps it OFF so the sampler + device feature are
-            // created exactly as before => byte-identical and no DX≡VK risk by default. Anisotropy
-            // is driver-dependent, so this is opt-in only (see docs/qhd-perf.md Stage 9).
+            // 1b: anisotropic filtering for the wrap sampler (grazing material surfaces — floor
+            // tiles viewed obliquely collapse to stripes under trilinear-only minification).
+            // Default 16 (clamped to the device's maxSamplerAnisotropy): the correct production
+            // baseline on every platform. `P_ANISO=1` restores the isotropic sampler for an A/B.
             let aniso_req = std::env::var("P_ANISO")
                 .ok()
                 .and_then(|s| s.trim().parse::<f32>().ok())
-                .unwrap_or(1.0);
+                .unwrap_or(16.0);
             let phys_features = raw_inst.get_physical_device_features(instance.physical_device);
             let phys_limits = raw_inst
                 .get_physical_device_properties(instance.physical_device)

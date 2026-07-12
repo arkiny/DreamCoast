@@ -2,9 +2,9 @@
   "backend_note": "SHAs authored on the maintainer's box; exact match is the strict gate, pixel tolerance is the portable fallback.",
   "configs": {
     "gallery": {
-      "desc": "gallery anchor (default scene, byte-identity invariant)",
+      "desc": "gallery anchor (default scene, byte-identity invariant; default anisotropy 16)",
       "env": {},
-      "sha256": "af70c1a5c8db49661d2c7926140c1309c28fda04c82cc1ab8aa6638d588b2b74"
+      "sha256": "65d04ceca2c4dbffa0637858fc7fd0a26f4afb53f4e33412f73cb8898a668207"
     },
     "sponza_gdf_ao": {
       "desc": "content: distance-field AO (DEBUG_VIEW=9)",

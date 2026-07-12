@@ -68,7 +68,48 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
         float cos_theta = max(abs(dot(n, ray.Direction)), 1e-3);
         cone_width += q.CommittedRayT() * cone_spread;
         float lod_base = hit_lod_base(inst, prim, cone_width, cos_theta);
-        RtMaterialSample mat = sample_material(inst, material_uv, lod_base);
+
+        // Decal (MaterialKind::Decal, params.w = base-color opacity > 0): a coplanar
+        // alpha-blended tint mesh the raster composites over the surface with
+        // `alpha = base_color.a × texture.a` (DecalAlbedo blend). The path tracer does the
+        // same "over" blend stochastically — with probability (1-alpha) the ray passes
+        // through to the surface behind, otherwise the decal is shaded as an opaque diffuse
+        // patch; averaged over samples this is the alpha composite. Content only
+        // (gallery/Cornell have no decals and keep params.w = 0).
+        if (content_instances() && inst.params.w > 0.0)
+        {
+            float dalpha = inst.params.w
+                           * (inst.tex_base != NO_TEXTURE
+                                  ? sample_texture_lod(inst.tex_base, material_uv, lod_base).a
+                                  : 1.0);
+            if (rnd(rng) >= dalpha)
+            {
+                // Pass through: restart the ray just past the decal. Consumes a bounce
+                // (a safety bound on stacked decals); throughput/radiance unchanged.
+                float advance = q.CommittedRayT() + 1e-3;
+                ray.Origin = ray.Origin + ray.Direction * advance;
+                ray.TMax = max(ray.TMax - advance, 0.0);
+                continue;
+            }
+        }
+
+        RtMaterialSample mat;
+        if (bounce == 0u && content_instances())
+        {
+            // Primary hit: anisotropic texture filtering so grazing floor tiles keep
+            // their across-view joints instead of the isotropic ray-cone LOD's smear
+            // (see hit_uv_grads). Content only; bounces stay on the cheap cone LOD
+            // (diffuse/rough — anisotropy invisible there). RNG stream unchanged.
+            float3x3 o2w = (float3x3)q.CommittedObjectToWorld3x4();
+            float2 ddx_uv;
+            float2 ddy_uv;
+            hit_uv_grads(inst, prim, o2w, cone_width, n, ray.Direction, ddx_uv, ddy_uv);
+            mat = sample_material_grad(inst, material_uv, ddx_uv, ddy_uv);
+        }
+        else
+        {
+            mat = sample_material(inst, material_uv, lod_base);
+        }
         n = hit_shading_normal(inst, prim, bary, n, material_uv, lod_base);
         float3 hit = ray.Origin + ray.Direction * q.CommittedRayT();
         float3 v = -ray.Direction;
@@ -94,8 +135,11 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
                 sray.Direction = wl;
                 sray.TMin = 0.001;
                 sray.TMax = 10000.0;
+                // Mask 0xFE excludes decal instances (mask bit 0x01, see build_content_accel):
+                // decals are surface tints, not occluders, so they must not cast a shadow (the
+                // raster's deferred decals don't). Non-decals (mask 0xFF) are still shadow-tested.
                 RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
-                sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, sray);
+                sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFE, sray);
                 sq.Proceed();
                 if (sq.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
                     radiance += throughput * eval_bsdf(n, v, wl, surf) * pc.sun.w * ndl;

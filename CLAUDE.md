@@ -56,6 +56,11 @@ at runtime (`--backend`), so all three must accept the same RHI calls. The desig
 **Backend parity is a hard rule.** Every change must produce byte-near-identical output on
 Vulkan and D3D12 (verified on an RTX 2070 SUPER); the bar is **DX≡VK ≤ 0.001 avg/channel**.
 A divergence is a bug, usually in cross-backend layout (e.g. push-constant alignment, Y-flip).
+**One documented exception:** anisotropic filtering on the wrap sampler (default `P_ANISO=16`)
+is driver-dependent, so DX and VK diverge by ~0.4 avg/channel on grazing textured surfaces
+(measured 0.427; see docs/qhd-perf.md Stage 9). This is the correct production baseline — the
+isotropic sampler collapsed grazing floor tiles to stripes — not a bug; `P_ANISO=1` restores
+byte-identity for a strict cross-backend A/B. Keep the ≤ 0.001 bar for everything else.
 
 **Single-source shaders.** Author once in `crates/shader/shaders/*.slang`; `crates/shader/
 build.rs` compiles each to SPIR-V + DXIL + metallib and generates accessor fns

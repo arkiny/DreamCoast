@@ -1,5 +1,19 @@
 # MAC (Metal) VERIFICATION PROMPT — A2/A3 measured-convergence cache fix (commit 0b56606)
 
+> **SUPERSEDED (2026-07-13, commit `2039342`).** The *measured*-convergence trigger
+> below (`cache_conv_k` below-eps frames on the GPU `InterlockedAdd` probe) was
+> replaced by a **backend-deterministic freeze horizon**: the relight now freezes
+> once the lighting epoch has held for `cache_freeze_passes × cache_relight_period`
+> frames (`P_CACHE_FREEZE_PASSES`, default 3). Reason: the measured EMA step is a
+> stochastic-gather AR(1) signal whose first below-eps frame differs per backend
+> (DX froze at 48, VK at 8 ⇒ ~2.7/ch DX≡VK gap). The horizon's terms are all
+> backend-independent, so DX/VK/Metal freeze at the **same** frame. The
+> `InterlockedAdd` probe is kept as a diagnostic only. **Metal-verified** (`9b0dacd`
+> pull, Apple M3): freeze arms at exactly `frame = passes × period`
+> (gallery 3, tier-default 192), step bit-identical run-to-run, gallery byte-anchor
+> 0.000, Sponza frozen 0.035 avg/ch. The measured-probe verification steps below are
+> retained for historical context.
+
 Paste into a fresh Claude Code session on the Mac. Goal: verify commit `0b56606`
 ("fix(cache): freeze A2/A3 on MEASURED convergence") is correct + lossless on Metal.
 It was authored + verified on Windows (DX/VK); Metal needs its own pass because the

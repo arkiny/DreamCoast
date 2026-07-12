@@ -545,14 +545,15 @@ impl MetalInstance {
         // Two shared trilinear samplers matching Vulkan/D3D12: `samp` (CLAMP — cubes,
         // volumes, G-buffer) and `samp_wrap` (REPEAT — tiling material textures).
         // 1b: opt-in anisotropic filtering for the wrap sampler (grazing material surfaces).
-        // `P_ANISO=<N>` (clamped to Metal's [1,16]) sets maxAnisotropy on the wrap sampler; unset
-        // (or <=1) keeps maxAnisotropy 1 => byte-identical and no DX≡VK risk by default. Driver-
-        // dependent filtering => opt-in only (see docs/qhd-perf.md Stage 9).
+        // `P_ANISO=<N>` (clamped to Metal's [1,16]) sets maxAnisotropy on the wrap sampler.
+        // Default 16: grazing material surfaces (floor tiles viewed obliquely) collapse to stripes
+        // under trilinear-only minification, so anisotropic filtering is the correct production
+        // baseline on every platform. `P_ANISO=1` restores the isotropic sampler for an A/B.
         let aniso = std::env::var("P_ANISO")
             .ok()
             .and_then(|s| s.trim().parse::<f32>().ok())
             .map(|v| (v.round() as usize).clamp(1, 16))
-            .unwrap_or(1);
+            .unwrap_or(16);
         let make_sampler = |mode: MTLSamplerAddressMode, max_aniso: usize| {
             let sd = MTLSamplerDescriptor::new();
             sd.setMinFilter(MTLSamplerMinMagFilter::Linear);

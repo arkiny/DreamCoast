@@ -412,14 +412,25 @@ impl RtSystem {
                 },
             })
             .collect();
+        // Instance masks route which rays may hit which geometry. Decals are surface tints,
+        // not occluders — in the raster they only blend into the G-buffer albedo and cast no
+        // shadow. In the path tracer the decal quad sits (slightly) in front of its host
+        // surface, so a shadow ray that treats it as opaque geometry darkens the surface behind
+        // it (the "decal shadow" board artifact). Give decals a distinct mask bit (0x01 only) so
+        // shadow rays (traced with mask 0xFE) skip them, while camera/GI rays (mask 0xFF) still
+        // hit them for the stochastic-alpha tint. Non-decals keep 0xFF (hit by every ray).
         let instances: Vec<TlasInstance> = drawables
             .iter()
             .enumerate()
-            .map(|(i, d)| TlasInstance {
-                blas_index: index_of[&d.mesh],
-                transform: mat4_to_3x4(d.world),
-                custom_index: i as u32,
-                mask: 0xFF,
+            .map(|(i, d)| {
+                let is_decal =
+                    materials.get(d.material).kind == dreamcoast_asset::MaterialKind::Decal;
+                TlasInstance {
+                    blas_index: index_of[&d.mesh],
+                    transform: mat4_to_3x4(d.world),
+                    custom_index: i as u32,
+                    mask: if is_decal { 0x01 } else { 0xFF },
+                }
             })
             .collect();
         let started = std::time::Instant::now();

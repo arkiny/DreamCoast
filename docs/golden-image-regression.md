@@ -25,13 +25,19 @@ via the release `sandbox --backend metal --screenshot-clean`:
 Each render is compared two ways:
 
 1. **SHA-256 (exact).** The renderer is deterministic run-to-run on a given
-   box/backend, so a byte-identical hash is the strict pass. Verified: gallery
-   and both content configs are byte-identical across repeated runs on the
-   Apple-Silicon box.
+   box/backend for the **gallery** anchor, so a byte-identical hash is the strict
+   pass there. **Caveat (2026-07-13):** the two **content** configs
+   (`sponza_intel`, `WARMUP_FRAMES=64`) are **NOT** byte-stable run-to-run on the
+   Apple-Silicon box — the surface-cache / temporal accumulation carries a ~0.2/ch
+   sub-perceptual residual that reshuffles the low bits every run, so their SHA
+   changes each capture regardless of any code change. The strict-SHA gate is
+   therefore **gallery-only in practice**; content configs need the tolerant path
+   below. (Independent of anisotropy — reproduced with `P_ANISO=1`.)
 2. **Pixel mean/max diff (tolerant).** When a PNG golden is present, an exact
    miss falls back to a per-channel mean/max abs-diff check (`--mean-tol`,
    `--max-tol`). This absorbs small cross-box/cross-backend/driver
-   nondeterminism so the same manifest stays useful off the authoring machine.
+   nondeterminism so the same manifest stays useful off the authoring machine —
+   and is the **only** meaningful gate for the run-to-run-noisy content configs.
 
 ## Golden storage decision
 
@@ -68,6 +74,16 @@ residual improved or neutral, DX≡VK confirmed). Re-authoring the gallery ancho
 without PT verification is a roadmap "do-not" (`gi-fidelity-roadmap.md` §5). For
 content configs, re-author when the scene, camera recipe, or a consumed feature
 legitimately changes, and note why in the commit.
+
+**Rebase log — gallery anchor `af70c1a5…` → `65d04ceca2c4…` (2026-07-13):** default
+wrap-sampler anisotropy went `1` → `16` on all backends (branch
+`fix/default-anisotropy-16`; `docs/qhd-perf.md` Stage 9). The anchor moved because
+some gallery surfaces are wrap-sampled; verified intentional — rendering with
+`P_ANISO=1` reproduces the old anchor `af70c1a5…` byte-for-byte, so the delta is
+purely the anisotropic filter, and the gallery stays run-to-run byte-identical at
+the new default. Content SHAs were **left untouched** (they are run-to-run noisy;
+see the caveat above). Cross-backend DX≡VK re-verification is tracked in
+`docs/windows-verify-anisotropy-default.md`.
 
 ## Next increment (spec)
 
