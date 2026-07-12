@@ -68,7 +68,23 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
         float cos_theta = max(abs(dot(n, ray.Direction)), 1e-3);
         cone_width += q.CommittedRayT() * cone_spread;
         float lod_base = hit_lod_base(inst, prim, cone_width, cos_theta);
-        RtMaterialSample mat = sample_material(inst, material_uv, lod_base);
+        RtMaterialSample mat;
+        if (bounce == 0u && content_instances())
+        {
+            // Primary hit: anisotropic texture filtering so grazing floor tiles keep
+            // their across-view joints instead of the isotropic ray-cone LOD's smear
+            // (see hit_uv_grads). Content only; bounces stay on the cheap cone LOD
+            // (diffuse/rough — anisotropy invisible there). RNG stream unchanged.
+            float3x3 o2w = (float3x3)q.CommittedObjectToWorld3x4();
+            float2 ddx_uv;
+            float2 ddy_uv;
+            hit_uv_grads(inst, prim, o2w, cone_width, n, ray.Direction, ddx_uv, ddy_uv);
+            mat = sample_material_grad(inst, material_uv, ddx_uv, ddy_uv);
+        }
+        else
+        {
+            mat = sample_material(inst, material_uv, lod_base);
+        }
         n = hit_shading_normal(inst, prim, bary, n, material_uv, lod_base);
         float3 hit = ray.Origin + ray.Direction * q.CommittedRayT();
         float3 v = -ray.Direction;

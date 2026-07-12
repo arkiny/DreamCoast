@@ -537,3 +537,120 @@ RtMaterialSample sample_material(Instance inst, float2 uv, float lod_base)
     m.roughness = clamp(m.roughness, 0.02, 1.0);
     return m;
 }
+
+// --- Anisotropic texture filtering for primary hits (SampleGrad) -----------------
+// The ray-cone LOD above is isotropic: at grazing angles it inflates the LOD by
+// 1/cos_theta and over-blurs the whole footprint, collapsing floor tiles into
+// view-aligned smears (the path tracer's counterpart of the raster's no-anisotropy
+// stripes). For the PRIMARY hit we reconstruct the anisotropic footprint instead —
+// the ray-cone disk projected onto the surface is an ellipse whose major axis is
+// stretched 1/cos_theta along the in-plane view direction — map both axes to UV via
+// the triangle's dP/dUV Jacobian, and feed SampleGrad so the hardware anisotropic
+// wrap sampler (`samp_wrap`, maxAnisotropy 16) keeps the across-view tile joints.
+// Content scenes only; the isotropic path stays byte-for-byte for gallery/Cornell.
+float4 sample_texture_grad(uint tex, float2 uv, float2 ddx, float2 ddy)
+{
+    uint width;
+    uint height;
+    g.textures[RT_NONUNIFORM(tex)].GetDimensions(width, height);
+    if (width == 0u || height == 0u)
+        return float4(1, 1, 1, 1);
+    return g.textures[RT_NONUNIFORM(tex)].SampleGrad(g.samp_wrap, uv, ddx, ddy);
+}
+
+// UV-space gradients of the primary-hit footprint. `o2w` rotates the object-space
+// triangle Jacobian into world space so the world footprint maps to UV correctly
+// under instance rotation/scale. `cone_width` = footprint width at the hit.
+void hit_uv_grads(Instance inst, uint prim, float3x3 o2w, float cone_width, float3 n,
+                  float3 dir, out float2 ddx_uv, out float2 ddy_uv)
+{
+    ddx_uv = float2(0, 0);
+    ddy_uv = float2(0, 0);
+    uint tri = (inst.idx_base + prim * 3u) * 4u;
+    uint i0 = g.storage_buffers[inst.idx].Load(tri + 0u);
+    uint i1 = g.storage_buffers[inst.idx].Load(tri + 4u);
+    uint i2 = g.storage_buffers[inst.idx].Load(tri + 8u);
+    float3 p0 = asfloat(g.storage_buffers[inst.vtx].Load3(i0 * 32u + 0u));
+    float3 p1 = asfloat(g.storage_buffers[inst.vtx].Load3(i1 * 32u + 0u));
+    float3 p2 = asfloat(g.storage_buffers[inst.vtx].Load3(i2 * 32u + 0u));
+    float2 uv0 = asfloat(g.storage_buffers[inst.vtx].Load2(i0 * 32u + 24u));
+    float2 uv1 = asfloat(g.storage_buffers[inst.vtx].Load2(i1 * 32u + 24u));
+    float2 uv2 = asfloat(g.storage_buffers[inst.vtx].Load2(i2 * 32u + 24u));
+
+    float3 e1 = mul(o2w, p1 - p0);
+    float3 e2 = mul(o2w, p2 - p0);
+    float2 duv1 = uv1 - uv0;
+    float2 duv2 = uv2 - uv0;
+    float det = duv1.x * duv2.y - duv1.y * duv2.x;
+    if (abs(det) < 1e-12)
+        return;
+    float inv_det = 1.0 / det;
+    float3 dpdu = (e1 * duv2.y - e2 * duv1.y) * inv_det; // world dP/du
+    float3 dpdv = (e2 * duv1.x - e1 * duv2.x) * inv_det; // world dP/dv
+
+    // Ray-cone disk (radius r ⟂ ray) projected onto the surface plane: major axis
+    // along the in-plane view direction stretched 1/cos_theta, minor axis = r.
+    float r = max(cone_width, 0.0) * 0.5;
+    float cos_theta = max(abs(dot(n, dir)), 1e-3);
+    float3 d_proj = dir - n * dot(dir, n);
+    float dlen = length(d_proj);
+    float3 axis_major;
+    float3 axis_minor;
+    if (dlen < 1e-5)
+    {
+        onb(n, axis_major, axis_minor); // head-on: isotropic disk
+        axis_major *= r;
+        axis_minor *= r;
+    }
+    else
+    {
+        float3 t_along = d_proj / dlen;
+        axis_major = t_along * (r / cos_theta);
+        axis_minor = normalize(cross(n, t_along)) * r;
+    }
+
+    // Solve each world footprint axis for its (du,dv) via the Gram matrix of
+    // (dpdu,dpdv); both axes lie in the surface plane, so the solve is exact.
+    float aa = dot(dpdu, dpdu);
+    float ab = dot(dpdu, dpdv);
+    float bb = dot(dpdv, dpdv);
+    float gdet = aa * bb - ab * ab;
+    if (gdet < 1e-20)
+        return;
+    float ginv = 1.0 / gdet;
+    float wa = dot(axis_major, dpdu);
+    float wb = dot(axis_major, dpdv);
+    ddx_uv = float2(wa * bb - wb * ab, aa * wb - ab * wa) * ginv;
+    wa = dot(axis_minor, dpdu);
+    wb = dot(axis_minor, dpdv);
+    ddy_uv = float2(wa * bb - wb * ab, aa * wb - ab * wa) * ginv;
+}
+
+// Material fetch at explicit UV gradients (anisotropic). Mirrors sample_material but
+// draws no RNG, so swapping it in on the primary hit changes only the filtered texel
+// values — the path/lighting and the random stream stay identical.
+RtMaterialSample sample_material_grad(Instance inst, float2 uv, float2 ddx, float2 ddy)
+{
+    RtMaterialSample m;
+    m.base_color = inst.base_color.rgb;
+    if (inst.tex_base != NO_TEXTURE)
+        m.base_color *= sample_texture_grad(inst.tex_base, uv, ddx, ddy).rgb;
+
+    m.metallic = inst.params.x;
+    m.roughness = inst.params.y;
+    if (inst.tex_mr != NO_TEXTURE)
+    {
+        float3 mr = sample_texture_grad(inst.tex_mr, uv, ddx, ddy).rgb;
+        m.roughness *= mr.g;
+        m.metallic *= mr.b;
+    }
+
+    m.ao = inst.params.z;
+    m.emissive = m.base_color * inst.base_color.a;
+    if (inst.tex_emissive != NO_TEXTURE)
+        m.emissive += sample_texture_grad(inst.tex_emissive, uv, ddx, ddy).rgb * inst.base_color.a;
+
+    m.metallic = saturate(m.metallic);
+    m.roughness = clamp(m.roughness, 0.02, 1.0);
+    return m;
+}
