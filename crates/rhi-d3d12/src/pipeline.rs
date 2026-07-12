@@ -283,13 +283,14 @@ fn bindless_static_samplers() -> [D3D12_STATIC_SAMPLER_DESC; 2] {
         RegisterSpace: 1, // inside the shared ParameterBlock
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     };
-    // 1b: opt-in anisotropic filtering for the wrap sampler (grazing material surfaces). `P_ANISO=<N>`
-    // (clamped to D3D12's [1,16]) switches it to ANISOTROPIC; unset (or <=1) keeps the linear filter
-    // => byte-identical and no DX≡VK risk by default. Anisotropy is driver-dependent => opt-in only.
+    // 1b: anisotropic filtering for the wrap sampler (grazing material surfaces — floor tiles viewed
+    // obliquely collapse to stripes under trilinear-only minification). Default 16 (`P_ANISO=<N>`
+    // clamped to D3D12's [1,16]) switches it to ANISOTROPIC: the correct production baseline on every
+    // platform. `P_ANISO=1` restores the linear filter for an A/B.
     let aniso = std::env::var("P_ANISO")
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
-        .unwrap_or(1.0);
+        .unwrap_or(16.0);
     let wrap = if aniso > 1.0 {
         D3D12_STATIC_SAMPLER_DESC {
             Filter: D3D12_FILTER_ANISOTROPIC,
