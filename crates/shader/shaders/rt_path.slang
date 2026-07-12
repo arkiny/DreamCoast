@@ -135,8 +135,11 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
                 sray.Direction = wl;
                 sray.TMin = 0.001;
                 sray.TMax = 10000.0;
+                // Mask 0xFE excludes decal instances (mask bit 0x01, see build_content_accel):
+                // decals are surface tints, not occluders, so they must not cast a shadow (the
+                // raster's deferred decals don't). Non-decals (mask 0xFF) are still shadow-tested.
                 RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
-                sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFF, sray);
+                sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFE, sray);
                 sq.Proceed();
                 if (sq.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
                     radiance += throughput * eval_bsdf(n, v, wl, surf) * pc.sun.w * ndl;
