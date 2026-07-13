@@ -870,11 +870,16 @@ impl GdfSystem {
     /// `atlas_dim` as the SDF atlas — packed by `AlbedoAtlas::pack_like`), the per-mesh albedo
     /// atlas is installed and the shader reads hit colour from it (per-mesh precision). `None`
     /// keeps the dense grid as the colour source.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn install_mesh_sdf(
         &mut self,
         device: &Device,
         atlas_bytes: &[u8],
         atlas_dim: [u32; 3],
+        // Voxel format of `atlas_bytes` (and the albedo channels): `R32Float`, or `R16Float`
+        // for the compact storage path (F2 S2b, `P11_ATLAS_F16`). The shader samples either
+        // through the same `Texture3D<float>` slot — only the upload bytes differ.
+        atlas_format: Format,
         build: &crate::mesh_sdf::MeshSdfBuild,
         albedo_atlas: Option<[&[u8]; 3]>,
         // Detail-replace (`P11_SDF_DETAIL_REPLACE` / tier `sdf_detail_replace`): where any
@@ -890,7 +895,7 @@ impl GdfSystem {
                 width: atlas_dim[0],
                 height: atlas_dim[1],
                 depth: atlas_dim[2],
-                format: Format::R32Float,
+                format: atlas_format,
             },
             atlas_bytes,
         )?;
@@ -901,7 +906,7 @@ impl GdfSystem {
                     width: atlas_dim[0],
                     height: atlas_dim[1],
                     depth: atlas_dim[2],
-                    format: Format::R32Float,
+                    format: atlas_format,
                 };
                 Some([
                     device.create_volume_init(&vd, ch[0])?,

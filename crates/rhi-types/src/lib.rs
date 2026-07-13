@@ -95,6 +95,10 @@ pub enum Format {
     Rg16Float,
     /// 32-bit float R (single-channel; signed distance fields, Phase 11).
     R32Float,
+    /// 16-bit float R (single-channel; compact volume storage — the per-mesh SDF atlas,
+    /// F2 S2b). Distances are mesh-local and scaled per instance (`dist_scale`), so half
+    /// precision holds the march bound to ~0.05 % of the stored value.
+    R16Float,
     /// 32-bit float depth.
     Depth32Float,
     /// BC1 (DXT1) block-compressed RGB, sRGB. 8 bytes / 4×4 block (Phase 12 M3).

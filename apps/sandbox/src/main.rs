@@ -2341,12 +2341,25 @@ impl App {
                 } else {
                     None
                 };
+                // F2 S2b: compact f16 atlas storage. Distances are mesh-local and read through
+                // the per-instance `dist_scale`, so half precision holds the march bound to
+                // ~2^-11 of the stored value — measured PT-residual-neutral (phase doc §3).
+                // `P11_ATLAS_F16=0` restores the f32 upload (A/B seam; bytes only, no shader
+                // change). Content-only like the whole per-mesh path.
+                let atlas_f16 = quality::env_bool("P11_ATLAS_F16", true);
+                let (atlas_format, atlas_bytes) = if atlas_f16 {
+                    (Format::R16Float, atlas.to_le_bytes_f16())
+                } else {
+                    (Format::R32Float, atlas.to_le_bytes())
+                };
+                let voxel_bytes = if atlas_f16 { 2 } else { 4 };
                 info!(
-                    "per-mesh SDF direct sample: atlas {}x{}x{} ({:.1} MB), {} instances, {}^3 cell grid{}",
+                    "per-mesh SDF direct sample: atlas {}x{}x{} ({:.1} MB, {}), {} instances, {}^3 cell grid{}",
                     atlas.dim[0],
                     atlas.dim[1],
                     atlas.dim[2],
-                    (atlas.voxels.len() * 4) as f32 / 1.0e6,
+                    (atlas.voxels.len() * voxel_bytes) as f32 / 1.0e6,
+                    if atlas_f16 { "f16" } else { "f32" },
                     build.instance_count,
                     res,
                     if albedo_atlas.is_some() {
@@ -2356,19 +2369,28 @@ impl App {
                     },
                 );
                 let alb_ch = albedo_atlas.as_ref().map(|a| {
-                    [
-                        a.channel_le_bytes(0),
-                        a.channel_le_bytes(1),
-                        a.channel_le_bytes(2),
-                    ]
+                    if atlas_f16 {
+                        [
+                            a.channel_le_bytes_f16(0),
+                            a.channel_le_bytes_f16(1),
+                            a.channel_le_bytes_f16(2),
+                        ]
+                    } else {
+                        [
+                            a.channel_le_bytes(0),
+                            a.channel_le_bytes(1),
+                            a.channel_le_bytes(2),
+                        ]
+                    }
                 });
                 let alb_ref = alb_ch
                     .as_ref()
                     .map(|c| [c[0].as_slice(), c[1].as_slice(), c[2].as_slice()]);
                 gdf.install_mesh_sdf(
                     &device,
-                    &atlas.to_le_bytes(),
+                    &atlas_bytes,
                     atlas.dim,
+                    atlas_format,
                     &build,
                     alb_ref,
                     quality::env_bool("P11_SDF_DETAIL_REPLACE", base.sdf_detail_replace),

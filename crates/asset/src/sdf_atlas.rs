@@ -232,6 +232,54 @@ impl SdfAtlas {
         }
         out
     }
+
+    /// The atlas voxels as little-endian IEEE binary16 bytes (`Format::R16Float` upload) —
+    /// the compact storage path (F2 S2b). Distances are mesh-local (metres, bounded by the
+    /// mesh diagonal), so half precision holds the sphere-march bound to ~2^-11 of the
+    /// stored value; the per-instance `dist_scale` is applied at sample time unchanged.
+    pub fn to_le_bytes_f16(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.voxels.len() * 2);
+        for v in &self.voxels {
+            out.extend_from_slice(&f32_to_f16_bits(*v).to_le_bytes());
+        }
+        out
+    }
+}
+
+/// One f32 → IEEE-754 binary16 bit pattern, round-to-nearest-even. Pure integer ops —
+/// deterministic and backend/platform-independent (the f16 atlas bytes are part of the
+/// run-to-run byte-identity gate). Overflow clamps to the largest finite half (±65504)
+/// instead of infinity so a downstream `min()` union always sees a finite distance;
+/// the SDF bake never produces values near that range.
+pub fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let man = bits & 0x007f_ffff;
+
+    if exp == 255 {
+        // Inf / NaN (not produced by the bake; preserved for correctness).
+        return sign | 0x7c00 | (((man != 0) as u16) << 9);
+    }
+    let e = exp - 112; // re-bias 127 -> 15
+    if e >= 31 {
+        return sign | 0x7bff; // clamp to max finite half
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign; // underflows to signed zero
+        }
+        // Subnormal half: restore the implicit leading 1, shift into place, RNE.
+        let m = man | 0x0080_0000;
+        let shift = (14 - e) as u32; // 13 mantissa bits dropped + (1 - e) extra
+        let halfway = 1u32 << (shift - 1);
+        let rounded = (m + halfway - 1 + ((m >> shift) & 1)) >> shift;
+        return sign | rounded as u16;
+    }
+    // Normal: drop 13 mantissa bits with round-half-to-even; a mantissa carry
+    // propagates into the exponent via the addition below.
+    let m = (man + 0x0fff + ((man >> 13) & 1)) >> 13;
+    sign | (((e as u32) << 10) + m) as u16
 }
 
 /// Trilinearly resample one `src_dim³` channel to `new_dim³` over the *same* normalized
@@ -367,6 +415,16 @@ impl AlbedoAtlas {
         let mut out = Vec::with_capacity(self.channels[c].len() * 4);
         for v in &self.channels[c] {
             out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// Channel `c` as little-endian binary16 bytes (`Format::R16Float`, F2 S2b). Albedo is
+    /// [0,1] colour — half precision is ~3 decimal digits there, far past display precision.
+    pub fn channel_le_bytes_f16(&self, c: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.channels[c].len() * 2);
+        for v in &self.channels[c] {
+            out.extend_from_slice(&f32_to_f16_bits(*v).to_le_bytes());
         }
         out
     }
@@ -553,6 +611,69 @@ pub fn analyze_bricks(meshes: &[SdfVolume], margin: f32) -> BrickAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reference binary16 → f32 (test-only), for round-trip checks of `f32_to_f16_bits`.
+    fn f16_bits_to_f32(h: u16) -> f32 {
+        let sign = ((h >> 15) & 1) as u32;
+        let exp = ((h >> 10) & 0x1f) as u32;
+        let man = (h & 0x3ff) as u32;
+        let bits = if exp == 0 {
+            if man == 0 {
+                sign << 31
+            } else {
+                // Subnormal: value = man * 2^-24.
+                return (if sign == 1 { -1.0 } else { 1.0 }) * man as f32 * (-24f32).exp2();
+            }
+        } else if exp == 31 {
+            (sign << 31) | 0x7f80_0000 | (man << 13)
+        } else {
+            (sign << 31) | ((exp + 112) << 23) | (man << 13)
+        };
+        f32::from_bits(bits)
+    }
+
+    /// Exactly-representable values must convert losslessly; everything in the SDF's
+    /// working range must round-trip within half-precision epsilon (2^-11 relative).
+    #[test]
+    fn f16_conversion_roundtrip() {
+        for v in [0.0f32, -0.0, 1.0, -1.0, 0.5, -2.0, 65504.0, -65504.0, 0.25] {
+            assert_eq!(f16_bits_to_f32(f32_to_f16_bits(v)), v, "exact {v}");
+        }
+        // Signed-zero encodings.
+        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits(-0.0), 0x8000);
+        // Working-range values (mesh-local distances, metres): relative error <= 2^-11.
+        let mut v = 1e-3f32;
+        while v < 100.0 {
+            for s in [v, -v] {
+                let rt = f16_bits_to_f32(f32_to_f16_bits(s));
+                assert!(
+                    (rt - s).abs() <= s.abs() * (2f32).powi(-11) + 1e-7,
+                    "{s} -> {rt}"
+                );
+            }
+            v *= 1.7;
+        }
+        // Overflow clamps to the largest finite half (never Inf — min() unions stay finite).
+        assert_eq!(f32_to_f16_bits(1e9), 0x7bff);
+        assert_eq!(f32_to_f16_bits(-1e9), 0xfbff);
+    }
+
+    /// The f16 byte stream is exactly the per-voxel conversion of the f32 stream, half the
+    /// size, and deterministic across calls.
+    #[test]
+    fn f16_bytes_match_voxels() {
+        let mesh = ramp_volume(8, [-1.0; 3], [1.0; 3], -0.37);
+        let atlas = SdfAtlas::pack(std::slice::from_ref(&mesh));
+        let b32 = atlas.to_le_bytes();
+        let b16 = atlas.to_le_bytes_f16();
+        assert_eq!(b16.len() * 2, b32.len());
+        assert_eq!(b16, atlas.to_le_bytes_f16(), "deterministic");
+        for (i, v) in atlas.voxels.iter().enumerate() {
+            let got = u16::from_le_bytes([b16[i * 2], b16[i * 2 + 1]]);
+            assert_eq!(got, f32_to_f16_bits(*v), "voxel {i}");
+        }
+    }
 
     /// A `dim³` `SdfVolume` over `[min,max]` whose voxel value is a deterministic function of
     /// its voxel index, so the atlas round-trip can be checked exactly.

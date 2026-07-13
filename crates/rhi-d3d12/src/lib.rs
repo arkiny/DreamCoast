@@ -66,6 +66,7 @@ fn to_dxgi_format(format: Format) -> DXGI_FORMAT {
         Format::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
         Format::Rg16Float => DXGI_FORMAT_R16G16_FLOAT,
         Format::R32Float => DXGI_FORMAT_R32_FLOAT,
+        Format::R16Float => DXGI_FORMAT_R16_FLOAT,
         Format::Depth32Float => DXGI_FORMAT_D32_FLOAT,
         Format::Bc1Srgb => DXGI_FORMAT_BC1_UNORM_SRGB,
         Format::Bc1Unorm => DXGI_FORMAT_BC1_UNORM,
@@ -88,6 +89,7 @@ fn to_dxgi_swapchain_format(format: Format) -> DXGI_FORMAT {
         Format::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
         Format::Rg16Float => DXGI_FORMAT_R16G16_FLOAT,
         Format::R32Float => DXGI_FORMAT_R32_FLOAT,
+        Format::R16Float => DXGI_FORMAT_R16_FLOAT,
         Format::Depth32Float => DXGI_FORMAT_D32_FLOAT,
         Format::Bc1Srgb
         | Format::Bc1Unorm

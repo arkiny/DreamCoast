@@ -66,6 +66,7 @@ fn to_vk_format(format: rhi_types::Format) -> vk::Format {
         rhi_types::Format::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         rhi_types::Format::Rg16Float => vk::Format::R16G16_SFLOAT,
         rhi_types::Format::R32Float => vk::Format::R32_SFLOAT,
+        rhi_types::Format::R16Float => vk::Format::R16_SFLOAT,
         rhi_types::Format::Depth32Float => vk::Format::D32_SFLOAT,
         rhi_types::Format::Bc1Srgb => vk::Format::BC1_RGB_SRGB_BLOCK,
         rhi_types::Format::Bc1Unorm => vk::Format::BC1_RGB_UNORM_BLOCK,
