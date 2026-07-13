@@ -884,6 +884,14 @@ struct App {
     /// black — the interior multibounce hole. Off for the gallery so the legacy zero-add keeps the
     /// byte-identical anchor.
     cache_gather_fallback: bool,
+    /// F1 Stage 3 page-pool streaming: all drawables' world AABBs + representative albedos, kept so
+    /// `GdfSystem::stream_residency` can re-own the fixed card slots from the LIVE camera each frame
+    /// (build a newly-admitted drawable's 6 cards in place). Empty unless `P11_CACHE_STREAM`.
+    stream_obj_aabb: Vec<([f32; 3], [f32; 3])>,
+    stream_obj_albedo: Vec<[f32; 3]>,
+    /// F1 Stage 3: set by `stream_residency` when this frame re-owned any slot, so the frame loop
+    /// records a dirty re-capture of just the changed cards.
+    stream_recapture: bool,
     /// Capture occlusion invalidation (`P_CACHE_CAPTURE_OCCL`, tier `cache_capture_occl`): card
     /// texels whose capture hit an occluder store invalid instead of a wrong witness.
     cache_capture_occl: bool,
@@ -1958,6 +1966,10 @@ impl App {
         // gallery, an imported glTF, or a level (Sponza). `fuse_scene` + the Stage A grid
         // bake + the clipmap make this affordable. World streaming stays out of scope (no
         // single AABB). The gallery is byte-identical (same fuse → same bake → same cards).
+        // F1 Stage 3: the drawable directory the page-pool streaming keeps (filled below only when
+        // `P11_CACHE_STREAM` is on — `obj_aabb`/`obj_albedo` are scoped inside the bake block).
+        let mut stream_obj_aabb: Vec<([f32; 3], [f32; 3])> = Vec::new();
+        let mut stream_obj_albedo: Vec<[f32; 3]> = Vec::new();
         let build_scene_gdf = !world_mode && gdf.has_gdf_trace() && !world.draw_list().is_empty();
         if build_scene_gdf {
             let fused = fuse::fuse_scene(&world, &mesh_registry, &material_registry);
@@ -2441,7 +2453,10 @@ impl App {
                 // it may run on ANY scene (the gallery included) without moving the byte anchor,
                 // which is exactly how the plumbing is verified. Default off keeps every scene on the
                 // legacy path.
-                let cache_pool = quality::env_bool("P11_CACHE_POOL", false);
+                // F1 Stage 3 page-pool streaming (`P11_CACHE_STREAM`, opt-in, content only). Implies
+                // the pool. The fixed card slots are re-owned from the live camera each frame.
+                let cache_stream = !gallery_scene && quality::env_bool("P11_CACHE_STREAM", false);
+                let cache_pool = cache_stream || quality::env_bool("P11_CACHE_POOL", false);
                 let card_res: Option<Vec<u32>> = if !cache_pool
                     && !gallery_scene
                     && quality::env_bool("P11_CACHE_ADAPTIVE_RES", base.cache_adaptive_res)
@@ -2465,9 +2480,21 @@ impl App {
                     card_res.as_deref(),
                     // Track C card grid: pick-identical lookup acceleration (tier default +
                     // `P_CACHE_GRID` override; content only — the gallery keeps the legacy scan).
-                    !gallery_scene && quality::env_bool("P_CACHE_GRID", base.cache_grid),
+                    // Disabled under streaming: the grid maps cells → card indices from the initial
+                    // card positions, which go stale as slots are re-owned (the consumer full-scans).
+                    !gallery_scene
+                        && !cache_stream
+                        && quality::env_bool("P_CACHE_GRID", base.cache_grid),
                     cache_pool,
+                    cache_stream,
                 )?;
+                // F1 Stage 3: seed the streaming slot ownership from the initial residency + keep the
+                // drawable directory so the frame loop can re-own slots from the live camera.
+                if cache_stream {
+                    gdf.init_stream(&residency.resident);
+                    stream_obj_aabb = obj_aabb.clone();
+                    stream_obj_albedo = obj_albedo.clone();
+                }
                 // C1 mesh-triangle capture (opt-in): consolidated content geometry (the same
                 // layout as the HWRT hit-lighting table, built independently of RT capability)
                 // + the card→drawable instance map (table row + world→object 3x4 per resident
@@ -3659,6 +3686,9 @@ impl App {
             cache_hwrt_shadow,
             cache_hwrt_gather,
             cache_gather_fallback,
+            stream_obj_aabb,
+            stream_obj_albedo,
+            stream_recapture: false,
             cache_capture_occl,
             cache_occl_route,
             reflect_probe_valid,
@@ -4576,6 +4606,20 @@ impl App {
                 );
             }
             scene = streaming.build_scene();
+        }
+        // F1 Stage 3 — page-pool streaming: re-own the fixed card slots from the LIVE camera so the
+        // surface cache follows the view (a drawable the camera approaches gets a card; one it leaves
+        // frees its slot). A change flags a dirty re-capture below. Content streaming only (the
+        // directory is empty otherwise); in screenshot mode the camera is fixed, so the residency is
+        // static and this is a no-op (byte-identical) unless a CAPTURE_SEQ / fly path moves it.
+        self.stream_recapture = false;
+        if !self.stream_obj_aabb.is_empty() {
+            let card_cam = fuse::CardCamera::from_look(eye, focus);
+            self.stream_recapture = self.gdf.stream_residency(
+                &self.stream_obj_aabb,
+                &self.stream_obj_albedo,
+                &card_cam,
+            )?;
         }
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
         let proj_noflip = Mat4::perspective_rh(
@@ -6119,13 +6163,16 @@ impl App {
         let scene_cache_ext = match (cache_active, scene_gdf_ext) {
             (true, Some(gdf_ext)) => {
                 let ext = graph.import_external("scene_cache");
-                if !self.scene_cache_captured {
+                // F1 Stage 3: the initial capture traces every card (dirty_only = false); a streaming
+                // frame that re-owned slots re-captures ONLY the changed cards (dirty_only = true).
+                if !self.scene_cache_captured || self.stream_recapture {
                     self.gdf.record_cache_capture(
                         &mut graph,
                         gdf_ext,
                         scene_albedo_ext,
                         ext,
                         self.cache_capture_occl,
+                        self.scene_cache_captured && self.stream_recapture,
                     );
                     self.scene_cache_captured = true;
                 }

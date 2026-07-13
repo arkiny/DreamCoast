@@ -132,6 +132,19 @@ pub(crate) struct GdfSystem {
     /// Host-visible because Stage 3 reads it on the CPU (and a device-local buffer's contents are
     /// NULL on Metal). `None` ⇒ no pool / no LRU clock.
     card_touched: Option<StorageBuffer>,
+    /// F1 Stage 3 — page-pool streaming (`P11_CACHE_STREAM`). When active, the fixed card slots are
+    /// re-owned each frame from the LIVE camera: `stream_slot_draw[k]` is the drawable whose 6 cards
+    /// occupy drawable-slot k (`u32::MAX` = free). Each frame `stream_residency` recomputes the
+    /// target residency (live camera), overwrites the freed slots' card geometry in place (host
+    /// write to `cards` / `card_src_albedo`, so both are host-visible under streaming), and marks the
+    /// changed cards in `slot_dirty` so the capture pass re-traces only those. `false`/empty ⇒ the
+    /// static one-shot residency (Stages 0-2).
+    stream: bool,
+    stream_slot_draw: Vec<u32>,
+    /// F1 Stage 3 — per-card re-capture flag (host-visible u32/card, streaming only). 1 = the card's
+    /// geometry changed this frame (a newly-admitted drawable), so the capture pass re-traces it;
+    /// 0 = keep the existing atlas texels. Written only on frames that change residency.
+    slot_dirty: Option<StorageBuffer>,
     /// C2b: per-card desired-resolution feedback (host-visible u32/card). The reflection's cone
     /// sampler InterlockedMax-es the pow2 resolution each footprint wanted; the host reads it
     /// back once (`P11_CACHE_RES_FEEDBACK` frame) and re-layouts the adaptive atlas around what
@@ -566,6 +579,9 @@ impl GdfSystem {
             cache_res_min: 0,
             card_slot_map: None,
             card_touched: None,
+            stream: false,
+            stream_slot_draw: Vec::new(),
+            slot_dirty: None,
             card_res_feedback: None,
             cache_pos: None,
             cache_albedo: None,
@@ -1102,6 +1118,10 @@ impl GdfSystem {
         // card slots addressed through a reverse slot_to_card table (streaming/LRU foundation).
         // Overrides `card_res` (the pool uses uniform slots). Stage 1 uploads the identity map.
         pool: bool,
+        // F1 Stage 3 page-pool streaming (`P11_CACHE_STREAM`): make the card geometry + source
+        // albedo host-writable so `stream_residency` can re-own slots in place each frame, and
+        // allocate the per-card `slot_dirty` re-capture flag. Implies `pool`.
+        stream: bool,
     ) -> anyhow::Result<()> {
         if self.cache_capture_pipeline.is_none() || num_cards == 0 {
             return Ok(());
@@ -1112,6 +1132,9 @@ impl GdfSystem {
         self.cache_layout = None;
         self.card_slot_map = None;
         self.card_touched = None;
+        self.stream = stream;
+        self.stream_slot_draw = Vec::new();
+        self.slot_dirty = None;
         self.cache_res_max = self.card_tile;
         self.cache_res_min = self.card_tile;
         let (total_texels, mip_total) = if pool {
@@ -1152,26 +1175,61 @@ impl GdfSystem {
             )
         };
         self.cache_total_texels = total_texels;
-        self.cards = Some(device.create_storage_buffer_init(
-            &StorageBufferDesc {
+        // F1 Stage 3: under streaming the card geometry is re-owned in place each frame, so it must
+        // be host-writable; otherwise it is a static device-local buffer (unchanged path).
+        self.cards = Some(if stream {
+            let b = device.create_storage_buffer_host(&StorageBufferDesc {
                 size: cards.len() as u64,
                 stride: 16,
                 indirect: false,
-            },
-            cards,
-        )?);
+            })?;
+            b.write(cards)?;
+            b
+        } else {
+            device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: cards.len() as u64,
+                    stride: 16,
+                    indirect: false,
+                },
+                cards,
+            )?
+        });
         // C: the per-card source-albedo buffer (content only); the capture reads it instead
         // of the per-voxel albedo volume. Absent ⇒ the legacy volume path (gallery anchor).
         self.card_src_albedo = match card_albedo {
-            Some(bytes) if !bytes.is_empty() => Some(device.create_storage_buffer_init(
-                &StorageBufferDesc {
+            Some(bytes) if !bytes.is_empty() => Some(if stream {
+                let b = device.create_storage_buffer_host(&StorageBufferDesc {
                     size: bytes.len() as u64,
                     stride: 4,
                     indirect: false,
-                },
-                bytes,
-            )?),
+                })?;
+                b.write(bytes)?;
+                b
+            } else {
+                device.create_storage_buffer_init(
+                    &StorageBufferDesc {
+                        size: bytes.len() as u64,
+                        stride: 4,
+                        indirect: false,
+                    },
+                    bytes,
+                )?
+            }),
             _ => None,
+        };
+        // F1 Stage 3: per-card re-capture flag (host-visible, zero-seeded). Bound to the capture
+        // pass only on streaming re-capture frames (the initial capture traces every card).
+        self.slot_dirty = if stream {
+            let sd = device.create_storage_buffer_host(&StorageBufferDesc {
+                size: (num_cards as u64) * 4,
+                stride: 4,
+                indirect: false,
+            })?;
+            sd.write(&vec![0u8; num_cards as usize * 4])?;
+            Some(sd)
+        } else {
+            None
         };
         // Per-texel atlases (pos / albedo / radiance ping-pong / MIP pyramid). The pyramid only
         // exists with the generator pipeline (content); the gallery / GI consumers never read it.
@@ -1240,6 +1298,118 @@ impl GdfSystem {
             self.build_card_grid(device, cards)?;
         }
         Ok(())
+    }
+
+    /// F1 Stage 3: seed the streaming slot ownership from the initial residency (drawable indices
+    /// in draw-list order, one per drawable-slot). Call once, right after `build_surface_cache` with
+    /// `stream = true`, so `stream_residency` knows which drawable each of the fixed slots holds.
+    pub(crate) fn init_stream(&mut self, resident: &[usize]) {
+        if self.stream {
+            self.stream_slot_draw = resident.iter().map(|&d| d as u32).collect();
+        }
+    }
+
+    /// F1 Stage 3 — page-pool streaming. Re-own the fixed card slots from the LIVE camera: recompute
+    /// the target residency, evict slots holding a now-non-target drawable, admit newly-relevant
+    /// drawables into the freed slots (overwriting their 6 cards in place), and mark the changed
+    /// cards dirty so the capture pass re-traces only them. Deterministic (pure `select_card_residency`
+    /// with an ascending slot/admit assignment). Returns `true` when any slot changed (the caller then
+    /// records a dirty re-capture); `false` (no change) leaves the atlas untouched. The pool budget
+    /// is the current card count, so a within-budget scene never streams (target == all drawables).
+    pub(crate) fn stream_residency(
+        &mut self,
+        drawable_aabb: &[([f32; 3], [f32; 3])],
+        drawable_albedo: &[[f32; 3]],
+        cam: &crate::fuse::CardCamera,
+    ) -> anyhow::Result<bool> {
+        if !self.stream || self.cards.is_none() || self.stream_slot_draw.is_empty() {
+            return Ok(false);
+        }
+        use std::collections::HashSet;
+        // Pool budget = the current card count: `select_card_residency` picks exactly this many
+        // drawables by camera-relevance priority, so the resident set fits the fixed slots exactly.
+        let residency = crate::fuse::select_card_residency(drawable_aabb, cam, self.num_cards);
+        let target: Vec<u32> = residency.resident.iter().map(|&d| d as u32).collect();
+        let target_set: HashSet<u32> = target.iter().copied().collect();
+        let current_set: HashSet<u32> = self
+            .stream_slot_draw
+            .iter()
+            .copied()
+            .filter(|&d| d != u32::MAX)
+            .collect();
+        // Evictable slots: hold a drawable no longer in the target (or already free). Ascending.
+        let free_slots: Vec<usize> = (0..self.stream_slot_draw.len())
+            .filter(|&k| {
+                let d = self.stream_slot_draw[k];
+                d == u32::MAX || !target_set.contains(&d)
+            })
+            .collect();
+        // Admits: target drawables not currently in any slot. Ascending (deterministic).
+        let mut admits: Vec<u32> = target
+            .iter()
+            .copied()
+            .filter(|d| !current_set.contains(d))
+            .collect();
+        admits.sort_unstable();
+        if admits.is_empty() {
+            return Ok(false);
+        }
+        let mut changed_slots: Vec<usize> = Vec::new();
+        for (i, &d) in admits.iter().enumerate() {
+            let Some(slot) = free_slots.get(i).copied() else {
+                break; // no more free slots (target already ⊆ slots) — should not happen
+            };
+            self.stream_slot_draw[slot] = d;
+            changed_slots.push(slot);
+        }
+        if changed_slots.is_empty() {
+            return Ok(false);
+        }
+        // Rebuild the full card geometry + source albedo from the new slot ownership. Cheap
+        // (one drawable-slot per entry); only `changed_slots` differ from the previous frame, so the
+        // unchanged slots' bytes — and thus their captured atlas — stay valid.
+        let n_slots = self.stream_slot_draw.len();
+        let mut cards_bytes: Vec<u8> = Vec::with_capacity(n_slots * 6 * 64);
+        let mut alb_bytes: Vec<u8> = Vec::with_capacity(n_slots * 6 * 12);
+        for &d in &self.stream_slot_draw {
+            if d == u32::MAX {
+                // A free slot emits a degenerate (all-zero) card block: `dot(normal, n) == 0` fails
+                // the acceptance test, so it never matches a hit.
+                cards_bytes.extend_from_slice(&[0u8; 6 * 64]);
+                alb_bytes.extend_from_slice(&[0u8; 6 * 12]);
+            } else {
+                crate::fuse::append_drawable_cards(
+                    drawable_aabb[d as usize],
+                    drawable_albedo[d as usize],
+                    &mut cards_bytes,
+                    &mut alb_bytes,
+                );
+            }
+        }
+        self.cards.as_ref().unwrap().write(&cards_bytes)?;
+        if let Some(alb) = &self.card_src_albedo {
+            alb.write(&alb_bytes)?;
+        }
+        // slot_dirty: 1 for each changed slot's 6 cards, 0 elsewhere.
+        let num_cards = self.num_cards as usize;
+        let mut dirty = vec![0u8; num_cards * 4];
+        for &slot in &changed_slots {
+            for f in 0..6 {
+                let card = slot * 6 + f;
+                if card < num_cards {
+                    dirty[card * 4] = 1;
+                }
+            }
+        }
+        if let Some(sd) = &self.slot_dirty {
+            sd.write(&dirty)?;
+        }
+        tracing::debug!(
+            "surface cache stream: {} slots re-owned ({} resident)",
+            changed_slots.len(),
+            target.len()
+        );
+        Ok(true)
     }
 
     /// Track C prerequisite: build the card-lookup acceleration grid (see the field docs on
@@ -2175,6 +2345,9 @@ impl GdfSystem {
         // captured an OCCLUDER — store it invalid instead of a wrong witness. Needs the C1 mesh
         // tables (no-op without them).
         occl_invalidate: bool,
+        // F1 Stage 3: re-trace only the cards flagged in `slot_dirty` (a streaming re-capture). The
+        // initial full capture passes `false` (sentinel ⇒ trace every card).
+        dirty_only: bool,
     ) {
         let vol = self.scene_gdf.as_ref().expect("scene gdf volume");
         let pipe = self
@@ -2182,6 +2355,16 @@ impl GdfSystem {
             .as_ref()
             .expect("cache capture pipeline");
         let cards = self.cards.as_ref().expect("cards").storage_index();
+        // F1 Stage 3: bind the per-card re-capture flag only on a streaming re-capture (sentinel ⇒
+        // the initial capture traces every card).
+        let slot_dirty_idx = if dirty_only {
+            self.slot_dirty
+                .as_ref()
+                .map(|b| b.storage_index())
+                .unwrap_or(u32::MAX)
+        } else {
+            u32::MAX
+        };
         let cpos = self.cache_pos.as_ref().expect("cache pos").storage_index();
         let calb = self
             .cache_albedo
@@ -2269,6 +2452,7 @@ impl GdfSystem {
                     diag,
                     card_albedo_index,
                     mesh,
+                    slot_dirty_idx,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
                 Ok(())

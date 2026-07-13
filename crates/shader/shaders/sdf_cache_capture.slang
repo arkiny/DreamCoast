@@ -41,6 +41,13 @@ struct CacheCapturePush
     uint mesh_idx;
     uint mesh_table;
     uint mesh_card_inst;
+    // F1 Stage 3 — page-pool streaming re-capture. When bound (`slot_dirty != 0xFFFFFFFF`) only
+    // cards flagged 1 in this buffer are re-traced (a slot the live camera just re-owned); the rest
+    // early-out, keeping their captured atlas. The initial full capture passes the sentinel.
+    uint slot_dirty;
+    uint pad_s0;
+    uint pad_s1;
+    uint pad_s2;
 };
 
 [[vk::push_constant]]
@@ -124,6 +131,10 @@ void cacheMain(uint3 tid: SV_DispatchThreadID)
     uint sm12 = (pc.tile >> 17) & 0xFFFu;
     uint sc_slotmap = sm12 == 0u ? 0xFFFFFFFFu : sm12 - 1u;
     uint card = layout_find_card(sc_layout, t, tile0, pc.num_cards, sc_slotmap);
+    // F1 Stage 3: streaming re-capture only re-traces the cards the live camera just re-owned; the
+    // rest keep their existing atlas texels (the initial capture passes the sentinel = trace all).
+    if (pc.slot_dirty != 0xFFFFFFFFu && g.storage_buffers[pc.slot_dirty].Load(card * 4u) == 0u)
+        return;
     uint2 lay = card_layout(sc_layout, card, tile0);
     uint res = lay.y;
     uint local = t - lay.x;

@@ -737,8 +737,10 @@ pub(crate) fn cache_capture_push(
     card_albedo_index: u32,
     // C1 mesh-triangle capture: (vtx, idx, table, card_inst) bindless indices; all u32::MAX = off.
     mesh: [u32; 4],
-) -> [u8; 96] {
-    let mut pc = [0u8; 96];
+    // F1 Stage 3 streaming re-capture flag buffer (0xFFFFFFFF = off ⇒ trace every card).
+    slot_dirty: u32,
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
     let u = [
         cards_index,
         cache_pos_index,
@@ -770,6 +772,8 @@ pub(crate) fn cache_capture_push(
     for (i, v) in mesh.iter().enumerate() {
         pc[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
+    // F1 Stage 3 streaming re-capture flag (byte 96; the initial capture passes 0xFFFFFFFF).
+    pc[96..100].copy_from_slice(&slot_dirty.to_le_bytes());
     pc
 }
 
