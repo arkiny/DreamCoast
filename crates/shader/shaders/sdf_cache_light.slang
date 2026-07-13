@@ -164,7 +164,10 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     // C2a: variable-tile texel→card mapping (sentinel = the exact legacy `t / tile²`).
     uint lay8 = (pc.tile >> 8) & 0xFFu;
     uint sc_layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
-    uint card = layout_find_card(sc_layout, t, max(pc.tile & 0xFFu, 1u), pc.num_cards);
+    // F1 Stage 1: page-pool reverse-table index (bits 17..28 +1; 0 = no pool).
+    uint sm12 = (pc.tile >> 17) & 0xFFFu;
+    uint sc_slotmap = sm12 == 0u ? 0xFFFFFFFFu : sm12 - 1u;
+    uint card = layout_find_card(sc_layout, t, max(pc.tile & 0xFFu, 1u), pc.num_cards, sc_slotmap);
     // Stage D2b: camera-visibility priority. On-screen cards relight at the base budget period;
     // off-screen cards relight HIDDEN_MULT× less often (most of a dense scene's cards are out of
     // any one view, and they don't affect the current image — 레퍼런스 엔진 SW GI's visibility/staleness

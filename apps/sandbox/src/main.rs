@@ -2434,7 +2434,16 @@ impl App {
                 // C2a adaptive card resolution (opt-in): redistribute the SAME texel budget as
                 // the uniform atlas by camera relevance — near/large cards up to 64², far/small
                 // down to 8² — so the cache carries detail where reflections actually read it.
-                let card_res: Option<Vec<u32>> = if !gallery_scene
+                // F1 Stage 1 — surface-cache page pool (`P11_CACHE_POOL`, opt-in, default off). A
+                // fixed pool of uniform card slots + a reverse slot_to_card table (the streaming/LRU
+                // foundation). It overrides the adaptive-res atlas (the pool uses uniform slots), and
+                // with Stage 1's identity map it reproduces the uniform arithmetic bit-for-bit — so
+                // it may run on ANY scene (the gallery included) without moving the byte anchor,
+                // which is exactly how the plumbing is verified. Default off keeps every scene on the
+                // legacy path.
+                let cache_pool = quality::env_bool("P11_CACHE_POOL", false);
+                let card_res: Option<Vec<u32>> = if !cache_pool
+                    && !gallery_scene
                     && quality::env_bool("P11_CACHE_ADAPTIVE_RES", base.cache_adaptive_res)
                 {
                     Some(fuse::assign_card_res(
@@ -2457,6 +2466,7 @@ impl App {
                     // Track C card grid: pick-identical lookup acceleration (tier default +
                     // `P_CACHE_GRID` override; content only — the gallery keeps the legacy scan).
                     !gallery_scene && quality::env_bool("P_CACHE_GRID", base.cache_grid),
+                    cache_pool,
                 )?;
                 // C1 mesh-triangle capture (opt-in): consolidated content geometry (the same
                 // layout as the HWRT hit-lighting table, built independently of RT capability)

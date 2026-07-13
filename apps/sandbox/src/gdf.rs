@@ -116,6 +116,16 @@ pub(crate) struct GdfSystem {
     /// mipgen dispatch grid; min drives the card-grid tolerance dilation (largest texel).
     cache_res_max: u32,
     cache_res_min: u32,
+    /// F1 Stage 1 — surface-cache page pool (`P11_CACHE_POOL`). The atlas becomes a fixed pool of
+    /// uniform card slots addressed through a reverse `slot_to_card` table (one u32 per slot): a
+    /// per-texel pass maps `texel → slot = texel / tile² → slot_to_card[slot] = card`, so the
+    /// card↔slot mapping can be arbitrary (the streaming/LRU foundation), unlike the ascending-base
+    /// binary search `layout_find_card` uses for the adaptive atlas. `None` ⇒ no pool (uniform or
+    /// adaptive layout, byte-identical legacy path). Stage 1 uploads the IDENTITY map (slot = card,
+    /// POOL_SLOTS = num_cards), which reproduces the uniform arithmetic bit-for-bit; Stage 3 makes
+    /// the map dynamic. The reverse-table bindless index rides `tile` bits 17..28 (+1; bit 16 is
+    /// the capture occlusion flag) into the capture + relight passes.
+    card_slot_map: Option<StorageBuffer>,
     /// C2b: per-card desired-resolution feedback (host-visible u32/card). The reflection's cone
     /// sampler InterlockedMax-es the pow2 resolution each footprint wanted; the host reads it
     /// back once (`P11_CACHE_RES_FEEDBACK` frame) and re-layouts the adaptive atlas around what
@@ -548,6 +558,7 @@ impl GdfSystem {
             cache_total_texels: 0,
             cache_res_max: 0,
             cache_res_min: 0,
+            card_slot_map: None,
             card_res_feedback: None,
             cache_pos: None,
             cache_albedo: None,
@@ -1080,6 +1091,10 @@ impl GdfSystem {
         // override) so the tier table stays the single source of truth; the grid build is still
         // gated so the two extra bindless slots are only consumed when the consumer exists.
         build_grid: bool,
+        // F1 Stage 1 page pool (`P11_CACHE_POOL`): allocate the atlas as a fixed pool of uniform
+        // card slots addressed through a reverse slot_to_card table (streaming/LRU foundation).
+        // Overrides `card_res` (the pool uses uniform slots). Stage 1 uploads the identity map.
+        pool: bool,
     ) -> anyhow::Result<()> {
         if self.cache_capture_pipeline.is_none() || num_cards == 0 {
             return Ok(());
@@ -1088,9 +1103,29 @@ impl GdfSystem {
         // C2a: build the per-card layout (base, res, mip_base) + the atlas totals. Uniform mode
         // keeps the exact legacy sizes so everything downstream is byte-identical.
         self.cache_layout = None;
+        self.card_slot_map = None;
         self.cache_res_max = self.card_tile;
         self.cache_res_min = self.card_tile;
-        let (total_texels, mip_total) = if let Some(resv) = card_res {
+        let (total_texels, mip_total) = if pool {
+            // F1 Stage 1: uniform-slot page pool. Materialize a uniform layout (every slot res =
+            // tile, so base = slot·tile², mip_base = slot·mip_stride) — the forward card→base lookup
+            // becomes a table read — and upload the reverse slot_to_card table so the per-texel
+            // passes resolve texel→card through it. POOL_SLOTS = num_cards with the IDENTITY map
+            // (slot = card), which reproduces the uniform arithmetic bit-for-bit; Stage 3 caps the
+            // pool and makes the map dynamic (demand admission + LRU eviction).
+            let resv = vec![self.card_tile; num_cards as usize];
+            let totals = self.upload_card_layout(device, &resv)?;
+            let slot_to_card: Vec<u8> = (0..num_cards).flat_map(|c| c.to_le_bytes()).collect();
+            self.card_slot_map = Some(device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: slot_to_card.len() as u64,
+                    stride: 4,
+                    indirect: false,
+                },
+                &slot_to_card,
+            )?);
+            totals
+        } else if let Some(resv) = card_res {
             debug_assert_eq!(resv.len() as u32, num_cards);
             self.upload_card_layout(device, resv)?
         } else {
@@ -1460,13 +1495,20 @@ impl GdfSystem {
 
     /// C2a: `tile` with the adaptive layout index packed into bits 8..15 (+1; 0 = uniform).
     /// This is the value every cache consumer receives — the shared sampler / per-texel passes
-    /// unpack it, and the sentinel collapses to the exact legacy arithmetic.
+    /// unpack it, and the sentinel collapses to the exact legacy arithmetic. F1 Stage 1 additionally
+    /// packs the page-pool reverse-table index into bits 17..28 (+1; 0 = no pool; bit 16 is the
+    /// capture occlusion flag), read only by the capture + relight per-texel passes.
     fn tile_packed(&self) -> u32 {
         self.card_tile
             | self
                 .cache_layout
                 .as_ref()
                 .map(|b| (b.storage_index() + 1) << 8)
+                .unwrap_or(0)
+            | self
+                .card_slot_map
+                .as_ref()
+                .map(|b| (b.storage_index() + 1) << 17)
                 .unwrap_or(0)
     }
 

@@ -120,7 +120,10 @@ void cacheMain(uint3 tid: SV_DispatchThreadID)
     uint lay8 = (pc.tile >> 8) & 0xFFu;
     uint sc_layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
     uint tile0 = pc.tile & 0xFFu;
-    uint card = layout_find_card(sc_layout, t, tile0, pc.num_cards);
+    // F1 Stage 1: page-pool reverse-table index (bits 17..28 +1; 0 = no pool; bit 16 is occlusion).
+    uint sm12 = (pc.tile >> 17) & 0xFFFu;
+    uint sc_slotmap = sm12 == 0u ? 0xFFFFFFFFu : sm12 - 1u;
+    uint card = layout_find_card(sc_layout, t, tile0, pc.num_cards, sc_slotmap);
     uint2 lay = card_layout(sc_layout, card, tile0);
     uint res = lay.y;
     uint local = t - lay.x;
