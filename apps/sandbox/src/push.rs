@@ -187,8 +187,8 @@ pub(crate) const CDL_NEUTRAL: ([f32; 3], [f32; 3], [f32; 3]) =
     ([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
 
 /// Pack the tonemap push block (112 bytes): hdr_index + mode + flip_y + exposure (16) +
-/// sharpen + inv_w + inv_h + bloom_index (16) + bloom_intensity + grade_on + exposure_buf
-/// + pad (16) + cdl_slope float4 (16) + cdl_offset float4 (16) + cdl_power float4 (16) +
+/// sharpen + inv_w + inv_h + bloom_index (16) + bloom_intensity + grade_on + exposure_buf +
+/// pad (16) + cdl_slope float4 (16) + cdl_offset float4 (16) + cdl_power float4 (16) +
 /// lut_index + lut_size + pad + pad (16). `exposure_buf == u32::MAX` uses the constant
 /// `exposure` (byte-identical anchor); otherwise the adapted auto-exposure is read from it.
 ///
