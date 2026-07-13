@@ -126,6 +126,12 @@ pub(crate) struct GdfSystem {
     /// the map dynamic. The reverse-table bindless index rides `tile` bits 17..28 (+1; bit 16 is
     /// the capture occlusion flag) into the capture + relight passes.
     card_slot_map: Option<StorageBuffer>,
+    /// F1 Stage 2 — page-pool LRU clock (host-visible u32/card, pool only). The visibility pass
+    /// stamps the current frame on every on-screen card; Stage 3 reads it back and evicts by
+    /// `frame - touched[c]` (staleness), so a card a mirror is still reflecting off-screen survives.
+    /// Host-visible because Stage 3 reads it on the CPU (and a device-local buffer's contents are
+    /// NULL on Metal). `None` ⇒ no pool / no LRU clock.
+    card_touched: Option<StorageBuffer>,
     /// C2b: per-card desired-resolution feedback (host-visible u32/card). The reflection's cone
     /// sampler InterlockedMax-es the pow2 resolution each footprint wanted; the host reads it
     /// back once (`P11_CACHE_RES_FEEDBACK` frame) and re-layouts the adaptive atlas around what
@@ -559,6 +565,7 @@ impl GdfSystem {
             cache_res_max: 0,
             cache_res_min: 0,
             card_slot_map: None,
+            card_touched: None,
             card_res_feedback: None,
             cache_pos: None,
             cache_albedo: None,
@@ -1104,6 +1111,7 @@ impl GdfSystem {
         // keeps the exact legacy sizes so everything downstream is byte-identical.
         self.cache_layout = None;
         self.card_slot_map = None;
+        self.card_touched = None;
         self.cache_res_max = self.card_tile;
         self.cache_res_min = self.card_tile;
         let (total_texels, mip_total) = if pool {
@@ -1124,6 +1132,15 @@ impl GdfSystem {
                 },
                 &slot_to_card,
             )?);
+            // F1 Stage 2 — LRU clock (host-visible for the Stage 3 CPU readback). Zero-seeded (a
+            // never-seen card reads touched = 0, so it is maximally stale until first stamped).
+            let touched = device.create_storage_buffer_host(&StorageBufferDesc {
+                size: (num_cards as u64) * 4,
+                stride: 4,
+                indirect: false,
+            })?;
+            touched.write(&vec![0u8; num_cards as usize * 4])?;
+            self.card_touched = Some(touched);
             totals
         } else if let Some(resv) = card_res {
             debug_assert_eq!(resv.len() as u32, num_cards);
@@ -1748,6 +1765,8 @@ impl GdfSystem {
         // Lit-calibration probe (None = off). Selects the calib permutation (TLAS occlusion
         // ray — the caller guarantees a bound TLAS).
         calib: Option<CacheCalibArgs>,
+        // F1 Stage 2: current frame counter — the LRU-clock timestamp stamped on on-screen cards.
+        frame: u32,
     ) -> Option<ResourceId> {
         let calib = match (&self.cache_vis_calib_pipeline, calib) {
             (Some(_), Some(c)) => Some(c),
@@ -1763,6 +1782,12 @@ impl GdfSystem {
         let out = self.card_vis.as_ref()?.storage_index();
         let marks = self
             .card_marks
+            .as_ref()
+            .map(|b| b.storage_index())
+            .unwrap_or(u32::MAX);
+        // F1 Stage 2: the page-pool LRU clock (pool only; sentinel = no clock).
+        let touched = self
+            .card_touched
             .as_ref()
             .map(|b| b.storage_index())
             .unwrap_or(u32::MAX);
@@ -1802,7 +1827,7 @@ impl GdfSystem {
                 let cmd = ctx.cmd();
                 cmd.bind_compute_pipeline(pipe);
                 cmd.push_constants_compute(&cache_vis_push(
-                    &planes, cards, out, num_cards, marks, calib_bufs,
+                    &planes, cards, out, num_cards, marks, calib_bufs, touched, frame,
                 ));
                 // Calib permutation: one thread per PROBE (64/card, lane 0 doubles as the
                 // frustum/marks thread) so the occlusion rays run in parallel.
@@ -2060,10 +2085,16 @@ impl GdfSystem {
                     .as_ref()
                     .map(|b| b.storage_index())
                     .unwrap_or(u32::MAX);
+                // F1 Stage 2: page-pool LRU clock (pool only; sentinel = no clock).
+                let touched = self
+                    .card_touched
+                    .as_ref()
+                    .map(|b| b.storage_index())
+                    .unwrap_or(u32::MAX);
                 cmd.bind_compute_pipeline(vis_pipe);
                 // No lit-calibration on the async queue (cross-queue lit-history read).
                 cmd.push_constants_compute(&cache_vis_push(
-                    &planes, cards, vis_out, num_cards, marks, None,
+                    &planes, cards, vis_out, num_cards, marks, None, touched, frame,
                 ));
                 cmd.dispatch(num_cards.div_ceil(64), 1, 1);
                 cmd.storage_buffer_barrier_compute(vis_buf); // visibility write -> relight read

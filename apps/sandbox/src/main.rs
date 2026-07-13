@@ -6285,6 +6285,7 @@ impl App {
                             &mut graph,
                             frustum_planes(cull_view_proj),
                             calib,
+                            self.frame_no as u32,
                         )
                     } else {
                         None

@@ -1371,6 +1371,7 @@ pub(crate) fn gdf_atrous_push(
 /// Pack the Stage D2b surface-cache visibility push block (112 bytes): 6 frustum planes
 /// (96, xyz inward normal + w) + (cards_index, out_index, num_cards, pad) uints (96..112).
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cache_vis_push(
     planes: &[[f32; 4]; 6],
     cards_index: u32,
@@ -1392,8 +1393,11 @@ pub(crate) fn cache_vis_push(
         (u32, u32),
         u32,
     )>,
-) -> [u8; 224] {
-    let mut pc = [0u8; 224];
+    // F1 Stage 2 — page-pool LRU clock (0xFFFFFFFF = off) + the current frame timestamp.
+    touched_index: u32,
+    frame: u32,
+) -> [u8; 232] {
+    let mut pc = [0u8; 232];
     for (i, p) in planes.iter().enumerate() {
         for (j, v) in p.iter().enumerate() {
             let o = i * 16 + j * 4;
@@ -1434,6 +1438,9 @@ pub(crate) fn cache_vis_push(
     pc[212..216].copy_from_slice(&w.to_le_bytes());
     pc[216..220].copy_from_slice(&h.to_le_bytes());
     pc[220..224].copy_from_slice(&flip.to_le_bytes());
+    // F1 Stage 2 — page-pool LRU clock + frame timestamp.
+    pc[224..228].copy_from_slice(&touched_index.to_le_bytes());
+    pc[228..232].copy_from_slice(&frame.to_le_bytes());
     pc
 }
 
