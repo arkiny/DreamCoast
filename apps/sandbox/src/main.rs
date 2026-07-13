@@ -1100,6 +1100,11 @@ struct App {
     /// so a demagnified far reflection reads a coarse averaged level (smooth) instead of stair-
     /// stepped mip0 blocks. Content default on; `P11_REFLECT_MIP=0` falls back to mip0 bilinear.
     reflect_mip: bool,
+    /// F1 Stage 4 — GI card-MIP parity (`P11_GI_MIP`, content default on): the diffuse GI gather
+    /// reads the surface-cache radiance MIP pyramid at a ray-cone level (like the reflection path)
+    /// instead of a single mip0 texel, so distant GI hits stop speckling. Off for the gallery (the
+    /// GI gather passes the mip sentinel ⇒ mip0 nearest ⇒ byte-identical anchor).
+    gi_card_mip: bool,
     /// Firefly clamp: bound the per-sample radiance in the reflection source / composite / GI
     /// gather so a bright specular pixel can't become a speckle. Off => unbounded (pre-clamp).
     firefly_clamp: bool,
@@ -3127,6 +3132,8 @@ impl App {
         // reflection then reads a coarse averaged surface-cache MIP (smooth) rather than mip0 blocks.
         // `P11_REFLECT_MIP=0` opts out (mip0 bilinear = the pre-MIP path).
         let reflect_mip = reflect_cache && quality::env_bool("P11_REFLECT_MIP", true);
+        // F1 Stage 4: GI card-MIP parity (content only; the gallery keeps mip0 nearest).
+        let gi_card_mip = !gallery_scene && quality::env_bool("P11_GI_MIP", true);
         // Firefly clamp on by default (P11_FIREFLY_CLAMP=0 to disable / compare).
         let firefly_clamp = quality::env_bool("P11_FIREFLY_CLAMP", base.firefly_clamp);
         // C8d: roughness above which screen-mirror SSR stops contributing (GDF takes over). Gallery
@@ -3751,6 +3758,7 @@ impl App {
             surface_cache,
             reflect_cache,
             reflect_mip,
+            gi_card_mip,
             firefly_clamp,
             reflect_max_roughness,
             ssr_stochastic,
@@ -6385,20 +6393,36 @@ impl App {
         // radiance at a hit (instead of a per-ray re-light). `None` => per-ray. Split so the
         // reflection cache (C8g, default) is independent of the heavier per-ray GI cache (opt-in).
         let cache_read = self.gdf.surface_cache_read();
-        let gi_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
-            Some(ext) if self.surface_cache => {
-                cache_read.map(|(c, p, r, n, t)| ([c, p, r, n, t], ext))
+        // Cone-LOD: generate the surface-cache radiance MIP pyramid from the freshly-lit mip0, so a
+        // demagnified far reflection — or a distant GI hit (F1 Stage 4) — reads a coarse averaged
+        // level (smooth) instead of stair-stepped mip0 blocks. Ordered after the relight; returns a
+        // handle the consumers read after. `None` (no pyramid) → the mip0 path. Computed BEFORE the
+        // GI tuple so GI can carry the pyramid index + depend on this pass.
+        let cache_mip_ext: Option<ResourceId> = match (scene_cache_lit_ext, cache_read) {
+            (Some(lit), Some((_, _, rad, _, _)))
+                if (self.reflect_cache && self.reflect_mip) || self.gi_card_mip =>
+            {
+                self.gdf.record_cache_mipgen(&mut graph, lit, rad)
             }
             _ => None,
         };
-        // Reflection cone-LOD: generate the surface-cache radiance MIP pyramid from the freshly-lit
-        // mip0, so a demagnified far reflection reads a coarse averaged level (smooth) instead of
-        // stair-stepped mip0 blocks. Ordered after the relight; returns a handle the reflection reads
-        // after. `None` (no pyramid / reflect_cache off) → the reflection keeps the mip0 bilinear path.
-        let cache_mip_ext: Option<ResourceId> = match (scene_cache_lit_ext, cache_read) {
-            (Some(lit), Some((_, _, rad, _, _))) if self.reflect_cache && self.reflect_mip => {
-                self.gdf.record_cache_mipgen(&mut graph, lit, rad)
-            }
+        let gi_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
+            Some(ext) if self.surface_cache => cache_read.map(|(c, p, r, n, t)| {
+                // F1 Stage 4: pack the radiance MIP-pyramid index into num_cards bits 16..31 (+1;
+                // 0 = off) so the GI gather reads a ray-cone level. Depend on the mipgen output (which
+                // transitively depends on the relight) so GI runs after the pyramid is written. Only
+                // when the count fits in 16 bits; the gallery keeps mip off (byte-identical).
+                match (
+                    self.gi_card_mip,
+                    cache_mip_ext,
+                    self.gdf.reflect_cache_mip_info(),
+                ) {
+                    (true, Some(mext), Some((pyr, _))) if n < 0x1_0000 => {
+                        ([c, p, r, n | ((pyr + 1) << 16), t], mext)
+                    }
+                    _ => ([c, p, r, n, t], ext),
+                }
+            }),
             _ => None,
         };
         // Track C card grid (opt-in `P_CACHE_GRID`, built at cache-build time): pack the grid's
