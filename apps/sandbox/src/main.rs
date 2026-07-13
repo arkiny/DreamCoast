@@ -878,6 +878,12 @@ struct App {
     /// TLAS cache gather (`P_CACHE_HWRT_GATHER`, tier `cache_hwrt_gather`): the relight's indirect
     /// rays trace exact triangles — the leak-prone GDF march inflates the gathered bounce.
     cache_hwrt_gather: bool,
+    /// F1 Stage 0 surface-cache virtualization fallback (`P11_GATHER_FALLBACK`, content default on):
+    /// re-light a relight-gather hit that carries no card (a coarse-fallback drawable over the card
+    /// budget, or an LRU-evicted page) with the dense-field direct-sun term instead of contributing
+    /// black — the interior multibounce hole. Off for the gallery so the legacy zero-add keeps the
+    /// byte-identical anchor.
+    cache_gather_fallback: bool,
     /// Capture occlusion invalidation (`P_CACHE_CAPTURE_OCCL`, tier `cache_capture_occl`): card
     /// texels whose capture hit an occluder store invalid instead of a wrong witness.
     cache_capture_occl: bool,
@@ -2678,6 +2684,10 @@ impl App {
         // TLAS gather rides the same permutation (see the tier-knob doc).
         let cache_hwrt_gather =
             cache_hwrt_shadow && quality::env_bool("P_CACHE_HWRT_GATHER", base.cache_hwrt_gather);
+        // F1 Stage 0: dense-field fallback for card-less relight-gather hits. Content default on;
+        // never for the gallery (keeps the byte-identical anchor via the legacy zero-add).
+        let cache_gather_fallback =
+            !gallery_scene && quality::env_bool("P11_GATHER_FALLBACK", true);
         // Capture occlusion invalidation (see the tier-knob doc; needs the C1 mesh tables —
         // the shader no-ops without them).
         let cache_capture_occl = quality::env_bool("P_CACHE_CAPTURE_OCCL", base.cache_capture_occl);
@@ -3638,6 +3648,7 @@ impl App {
             cache_sky_occlude,
             cache_hwrt_shadow,
             cache_hwrt_gather,
+            cache_gather_fallback,
             cache_capture_occl,
             cache_occl_route,
             reflect_probe_valid,
@@ -6200,8 +6211,9 @@ impl App {
                 // period, and the pass constant are all backend-independent, so DX and VK freeze at
                 // the same frame on the same converged mean (DX≡VK-stable, unlike the old measured
                 // trigger that latched two different noise samples at frames 48 vs 8).
-                let freeze_horizon =
-                    self.cache_freeze_passes.saturating_mul(self.cache_relight_period.max(1));
+                let freeze_horizon = self
+                    .cache_freeze_passes
+                    .saturating_mul(self.cache_relight_period.max(1));
                 if self.scene_cache_captured
                     && !cache_reset_this_frame
                     && self.cache_stable_frames >= freeze_horizon
@@ -6303,6 +6315,7 @@ impl App {
                         gi::GiSystem::ao_params(scene_aabb_min, scene_aabb_max),
                         self.cache_hwrt_shadow,
                         self.cache_hwrt_gather,
+                        self.cache_gather_fallback,
                     );
                     self.scene_cache_reset = false;
                 }
@@ -8422,6 +8435,7 @@ impl App {
                     self.cache_gather_firefly(),
                     self.sky_gain,
                     self.sky_wb,
+                    self.cache_gather_fallback,
                 );
                 ccmd.end()?;
                 let cur = (self.frame_no % 2) as usize;

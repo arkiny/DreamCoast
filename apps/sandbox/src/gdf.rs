@@ -1819,6 +1819,10 @@ impl GdfSystem {
         // TLAS gather (requires `hwrt_shadow`): the indirect rays trace exact triangles instead
         // of the leak-prone GDF march.
         hwrt_gather: bool,
+        // F1 Stage 0 (flags bit1): re-light a gather hit that carries no card with the dense-field
+        // direct-sun fallback instead of contributing black (surface-cache virtualization). Host
+        // gates this off for the gallery so the legacy zero-add keeps the byte-identical anchor.
+        gather_fallback: bool,
     ) {
         // Stage D2b: feed the per-card visibility buffer index to the shader (sentinel = off =
         // uniform period). When present, declare it as a read so the graph barriers the relight
@@ -1926,7 +1930,7 @@ impl GdfSystem {
                     skyvis_index,
                     skyvis_tint,
                     skyvis_min_occ,
-                    u32::from(hwrt_shadow && hwrt_gather),
+                    u32::from(hwrt_shadow && hwrt_gather) | (u32::from(gather_fallback) << 1),
                     ao_params,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);
@@ -1963,6 +1967,8 @@ impl GdfSystem {
         gather_firefly: f32,
         sky_gain: f32,
         sky_wb: [f32; 3],
+        // F1 Stage 0 (flags bit1): dense-field direct-sun fallback for card-less gather hits.
+        gather_fallback: bool,
     ) {
         // The volume itself is transitioned by the async-queue setup; assert it exists.
         let _vol = self.scene_gdf.as_ref().expect("scene gdf volume");
@@ -2073,7 +2079,7 @@ impl GdfSystem {
             u32::MAX,
             0.0,
             0.0,
-            0,
+            u32::from(gather_fallback) << 1,
             (0.0, 0.0, 0.0, 0.0),
         ));
         cmd.dispatch(num_texels.div_ceil(64), 1, 1);
