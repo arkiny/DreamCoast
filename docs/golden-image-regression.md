@@ -85,16 +85,28 @@ the new default. Content SHAs were **left untouched** (they are run-to-run noisy
 see the caveat above). Cross-backend DX≡VK re-verification is tracked in
 `docs/windows-verify-anisotropy-default.md`.
 
-## Next increment (spec)
+## Content PT-residual configs (F6 Part B)
 
-**Content path-tracer parity automation.** Extend the manifest so each content
-config can additionally render a matched `P8_PATHTRACE=1` capture from the *same*
-camera and run `rt-compare.py` between the raster and PT captures, recording the
-avg/over-8/over-32 residual as a per-config **budget** in the manifest. The gate
-becomes "residual ≤ recorded budget (improved or neutral)", turning today's
-qualitative content-PT check into a quantitative, regressable one — the F6
-"content PT residual automation" bullet. This reuses the same capture harness
-(add a `pt: true` flag + a `residual_budget` field per config) and the existing
-`rt-compare` math; keep PT captures deterministic (fixed sample count / seed) and
-gitignore the PT PNGs the same way.
-```
+A config with `pt: True` in the CONFIGS recipe is a **budget-gated raster-vs-
+path-tracer residual pair**, not a SHA golden: the runner renders the recipe
+twice from the same fixed camera (raster, then `P8_PATHTRACE=1`), runs
+`rt-compare.py --lit-mask=<lit_eps> --json`, and passes iff
+`masked_avg <= residual_budget` (improved-or-neutral). The lit mask (PT luma >
+`lit_eps`, default 8) restricts the metric to pixels the path tracer actually
+reaches within its bounce budget — the PT-dim remainder (a GI-reach property
+the raster's approximate GI lifts; F4 territory) is tracked as
+`pt_black_frac` but never gated. `pt_black_frac >= 0.9` fails loudly (the
+crushed-exposure trap). Full rationale + the capture-recipe invariants
+(AUTO_EXPOSURE=1 / RENDER_SCALE=1 / WARMUP_FRAMES=192, EV100 stripped):
+`docs/phase-f6b-content-pt-residual-plan.md`.
+
+| config               | camera                          | gates |
+|-----------------------|---------------------------------|-------|
+| `sponza_pt_sunlit`    | atrium courtyard, upward (S2)   | `masked_avg <= residual_budget` (primary fidelity gate) |
+| `sponza_pt_interior`  | interior colonnade (F1 lineage) | same, tolerant budget (high `pt_black_frac` by construction) |
+
+Budgets are seeded by `--update` as `measured + 0.3` (`PT_BUDGET_MARGIN`,
+validated against the measured two-run spread) and only move DOWN on a
+verified improvement. **Do not hand-edit `manifest.json`** — `--update`
+rebuilds each selected entry wholesale from the CONFIGS recipe + the fresh
+measurement, so the recipe in `golden-image.py` is the single source of truth.

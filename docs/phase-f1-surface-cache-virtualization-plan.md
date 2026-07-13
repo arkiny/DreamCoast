@@ -128,7 +128,10 @@
   서사보다 가시 영향 **작음**. 주 가치 = 정확성 + Stage 3 방출 시맨틱 선결.
 - 콘텐츠 PT 잔차는 이 콜로네이드 카메라에서 **측정 무효**: PT 레퍼런스가 노출 불일치·near-black
   (mean-lum 26.8 vs raster 72.2 — 문서화된 실내 PT 트랩) → 49/ch는 전역 노출 차이. ON vs OFF는 중립
-  (49.736 vs 49.757). **후속: 하늘/햇빛 보이는 카메라 or F6 노출 매칭 필요.**
+  (49.736 vs 49.757). **후속: 하늘/햇빛 보이는 카메라 or F6 노출 매칭 필요.** → **해소(F6 Part B,
+  2026-07-13)**: lit-마스크 잔차 + sunlit 아트리움 카메라가 `golden-image.py` `sponza_pt_*` config로
+  랜딩([phase-f6b-content-pt-residual-plan.md](phase-f6b-content-pt-residual-plan.md) — F1 스트리밍
+  ON/OFF 회고 정량화 포함).
 - DX≡VK: Metal 검증, Windows 동결(배치 추가).
 
 ### Stage 1 — 고정 페이지 풀 + 카드→페이지 인디렉션 (실행 스펙 확정)

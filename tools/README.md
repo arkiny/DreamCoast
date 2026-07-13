@@ -62,8 +62,14 @@ side-by-side montage (`raster | path tracer | amplified diff`) plus per-pixel
 error stats — used to track the rasterizer's approximation error.
 
 ```bash
-python tools/rt-compare.py RASTER.png PATHTRACER.png OUT_MONTAGE.png [--amp N]
+python tools/rt-compare.py RASTER.png PATHTRACER.png OUT_MONTAGE.png \
+    [--amp N] [--lit-mask[=EPS]] [--json]
 ```
+
+`--lit-mask[=EPS]` (default 8) additionally reports the residual over PT-lit
+pixels only (`masked_avg` — the content fidelity gate `golden-image.py`
+consumes) plus `pt_black_frac` coverage; `--json` appends a machine-readable
+`RTCOMPARE_JSON` line. Both are opt-in — the default output is unchanged.
 
 ### RenderDoc MCP — graphics debugging from `.rdc` captures
 Three scripts wire [`renderdoc-mcp`](https://github.com/Linkingooo/renderdoc-mcp)

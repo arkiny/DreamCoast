@@ -18,6 +18,38 @@
       },
       "sha256": "d372ba8cec5e103c7171231a3aca07ab798c04be0b0360cdd5bbeb052c7c240b"
     },
+    "sponza_pt_interior": {
+      "desc": "content: raster-vs-PT lit-masked residual, interior colonnade (tolerant gate)",
+      "env": {
+        "AUTO_EXPOSURE": "1",
+        "CAM_EYE": "-14,2,0",
+        "CAM_TARGET": "14,2,0",
+        "LEVEL": "sponza_intel",
+        "RENDER_SCALE": "1",
+        "WARMUP_FRAMES": "192"
+      },
+      "lit_eps": 8,
+      "pt": true,
+      "pt_black_frac": 0.5023,
+      "residual_budget": 34.65,
+      "residual_measured": 34.3504
+    },
+    "sponza_pt_sunlit": {
+      "desc": "content: raster-vs-PT lit-masked residual, sunlit atrium (primary fidelity gate)",
+      "env": {
+        "AUTO_EXPOSURE": "1",
+        "CAM_EYE": "0,2,0",
+        "CAM_TARGET": "-12,9,0",
+        "LEVEL": "sponza_intel",
+        "RENDER_SCALE": "1",
+        "WARMUP_FRAMES": "192"
+      },
+      "lit_eps": 8,
+      "pt": true,
+      "pt_black_frac": 0.1709,
+      "residual_budget": 30.9,
+      "residual_measured": 30.6005
+    },
     "sponza_sc_viz": {
       "desc": "content: surface-cache viz (P_SC_VIZ)",
       "env": {

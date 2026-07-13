@@ -14,6 +14,17 @@ against a stored golden two ways:
        cross-box / cross-backend / driver nondeterminism that a raw hash cannot,
        so the same manifest stays useful off the golden-authoring machine. A
        config passes tolerantly if mean <= --mean-tol and max <= --max-tol.
+    3. **PT residual budget (F6 Part B).** A config with ``pt: True`` renders
+       TWICE from the same fixed camera — raster, then ``P8_PATHTRACE=1`` — and
+       gates on the **lit-masked** raster-vs-path-tracer residual from
+       ``rt-compare.py --lit-mask --json`` (``masked_avg <= residual_budget``,
+       improved-or-neutral). The lit mask (PT luma > ``lit_eps``) excludes the
+       PT-dim region that light paths within the bounce budget cannot reach (a
+       GI-reach property the raster's approximate GI lifts — F4 territory, not
+       actionable here); ``pt_black_frac`` is reported for coverage, never
+       gated. There is no SHA/PNG golden for these configs — the budget IS the
+       regression. Budgets are seeded from measurement (--update) and only
+       re-baselined downward on a verified improvement.
 
 A config's exact-SHA match is authoritative on the golden-authoring box; the
 pixel tolerance is the portable fallback and is only evaluated when a PNG golden
@@ -60,6 +71,10 @@ MANIFEST = GOLDEN_DIR / "manifest.json"
 # The gallery anchor uses the default scene (no LEVEL) -- it is the invariant
 # byte-identity gate from CLAUDE.md and must match `af70c1a5...`.
 #
+# THIS LIST IS THE SINGLE SOURCE for every non-measured manifest field: --update
+# rebuilds each selected entry wholesale from the recipe here plus the fresh
+# measurement, so do not hand-edit manifest.json (edits are overwritten).
+#
 # Content configs render the interior colonnade of the content scene from a
 # fixed camera with a 64-frame warmup so caches converge to a stable image:
 #   - sponza_sc_viz : the high-res surface-cache visualization (P_SC_VIZ)
@@ -71,10 +86,43 @@ CONTENT_CAM = {
     "CAM_EYE": "-14,2,0",
     "CAM_TARGET": "14,2,0",
 }
+# PT-residual capture recipe (F6 Part B). Differences from CONTENT_CAM are all
+# load-bearing:
+#   - AUTO_EXPOSURE=1, no EV100: the PT reference carries raw radiance and is
+#     exposed at the tonemap from the SAME adapted-exposure buffer the raster
+#     lighting bakes in (F6 Part A) -- a fixed EV100 crushes interiors to black
+#     (the documented content-PT trap). EV100/EXPOSURE are also STRIPPED from
+#     the inherited shell env for pt configs (they still perturb the raster's
+#     firefly clamps under AE).
+#   - RENDER_SCALE=1: the content tier defaults to a 0.67x internal resolution
+#     with TAAU, whose per-frame sub-pixel jitter is folded into the projection
+#     the PT rays consume -- native scale keeps the PT camera truly fixed and
+#     the accumulation at capture resolution.
+#   - WARMUP_FRAMES=192: the auto-exposure EMA adapts on wall-clock dt, so the
+#     fast raster capture needs ~192 frames to converge the metered exposure to
+#     the same fixed point the slow PT capture reaches almost immediately; the
+#     PT side banks (warmup+1) x path_spp=8 ~= 1544 spp of accumulation, which
+#     also sinks the Monte-Carlo noise floor under the lit-mask epsilon.
+PT_CAM_BASE = {
+    "LEVEL": "sponza_intel",
+    "AUTO_EXPOSURE": "1",
+    "RENDER_SCALE": "1",
+    "WARMUP_FRAMES": "192",
+}
+# Env vars a pt config must NOT inherit from the calling shell (fixed-exposure
+# trap + firefly-clamp perturbation; see PT_CAM_BASE).
+PT_ENV_STRIP = ("EV100", "EXPOSURE")
+# Budget seeding margin (abs, per channel): covers the content captures'
+# run-to-run nondeterminism (~0.2/ch surface-cache low-bit reshuffle, measured
+# 0.035-0.047/ch on prior content residuals) plus the AE-trajectory jitter.
+# Validated against a measured two-run spread when the budgets were seeded; a
+# budget only moves DOWN on a verified improvement (re-run --update and note
+# the measured value in the commit).
+PT_BUDGET_MARGIN = 0.3
 CONFIGS = [
     {
         "name": "gallery",
-        "desc": "gallery anchor (default scene, byte-identity invariant)",
+        "desc": "gallery anchor (default scene, byte-identity invariant; default anisotropy 16)",
         "env": {},
         "requires_asset": None,
     },
@@ -89,6 +137,27 @@ CONFIGS = [
         "desc": "content: distance-field AO (DEBUG_VIEW=9)",
         "env": {**CONTENT_CAM, "DEBUG_VIEW": "9"},
         "requires_asset": "assets/IntelSponza",
+    },
+    {
+        "name": "sponza_pt_sunlit",
+        "desc": "content: raster-vs-PT lit-masked residual, sunlit atrium (primary fidelity gate)",
+        # Camera seeded by measurement: courtyard center looking up the atrium --
+        # lowest pt_black_frac of the 3-candidate sweep (0.19 vs 0.52/0.39; see
+        # docs/phase-f6b-content-pt-residual-plan.md).
+        "env": {**PT_CAM_BASE, "CAM_EYE": "0,2,0", "CAM_TARGET": "-12,9,0"},
+        "requires_asset": "assets/IntelSponza",
+        "pt": True,
+        "lit_eps": 8,
+    },
+    {
+        "name": "sponza_pt_interior",
+        "desc": "content: raster-vs-PT lit-masked residual, interior colonnade (tolerant gate)",
+        # The long-standing content measurement camera (F1 continuity); high
+        # pt_black_frac by construction, so the mask carries fewer samples.
+        "env": {**PT_CAM_BASE, "CAM_EYE": "-14,2,0", "CAM_TARGET": "14,2,0"},
+        "requires_asset": "assets/IntelSponza",
+        "pt": True,
+        "lit_eps": 8,
     },
 ]
 
@@ -113,10 +182,15 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def render(cfg: dict, backend: str, out: Path) -> None:
+def render(cfg: dict, backend: str, out: Path, extra_env=None) -> None:
     """Run one headless capture into `out`."""
     env = dict(os.environ)
+    if cfg.get("pt"):
+        for k in PT_ENV_STRIP:
+            env.pop(k, None)
     env.update(cfg["env"])
+    if extra_env:
+        env.update(extra_env)
     cmd = [
         str(sandbox_bin()),
         "--backend",
@@ -128,6 +202,84 @@ def render(cfg: dict, backend: str, out: Path) -> None:
     if res.returncode != 0 or not out.exists():
         sys.stderr.write(res.stderr[-2000:])
         sys.exit(f"[{cfg['name']}] capture failed (exit {res.returncode})")
+
+
+def rt_compare(raster: Path, pt: Path, montage: Path, lit_eps: float) -> dict:
+    """Run tools/rt-compare.py with the lit mask and return its JSON metrics.
+
+    Subprocess + the RTCOMPARE_JSON line is the stable contract -- the human-
+    readable lines belong to other consumers (they regex the default output)
+    and are not parsed here.
+    """
+    cmd = [
+        sys.executable,
+        str(TOOLS_DIR / "rt-compare.py"),
+        str(raster),
+        str(pt),
+        str(montage),
+        f"--lit-mask={lit_eps:g}",
+        "--json",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    for line in res.stdout.splitlines():
+        if line.startswith("RTCOMPARE_JSON "):
+            return json.loads(line[len("RTCOMPARE_JSON ") :])
+    # No JSON line: PIL missing, zero lit pixels, or size mismatch -- surface
+    # rt-compare's own message, this is a FAIL not a skip.
+    raise RuntimeError(
+        f"rt-compare produced no metrics (exit {res.returncode}): "
+        + (res.stdout + res.stderr).strip()[-500:]
+    )
+
+
+def check_pt(cfg: dict, backend: str, work: Path, manifest: dict, update: bool):
+    """Render the raster+PT pair for a `pt: True` config and gate the lit-masked
+    residual against the recorded budget. Returns a report row."""
+    name = cfg["name"]
+    raster_out = work / f"{name}_raster.png"
+    pt_out = work / f"{name}_pt.png"
+    montage = work / f"{name}_montage.png"
+    render(cfg, backend, raster_out)
+    render(cfg, backend, pt_out, extra_env={"P8_PATHTRACE": "1"})
+    try:
+        m = rt_compare(raster_out, pt_out, montage, float(cfg.get("lit_eps", 8)))
+    except RuntimeError as e:
+        return (name, "FAIL", str(e), False)
+
+    # A near-empty lit mask means the metric has no sample to stand on; the
+    # usual cause is a crushed PT exposure (the AUTO_EXPOSURE trap).
+    if m["pt_black_frac"] >= 0.9:
+        return (
+            name,
+            "FAIL",
+            f"pt_black_frac {m['pt_black_frac']:.2f} -- lit mask nearly empty; "
+            "check AUTO_EXPOSURE=1 in the recipe",
+            False,
+        )
+
+    detail = (
+        f"masked_avg {m['masked_avg']:.3f}  pt_black {m['pt_black_frac'] * 100:.1f}%  "
+        f"lit_mean r/pt {m['lit_mean_raster']:.1f}/{m['lit_mean_pt']:.1f}"
+    )
+    if update:
+        manifest["configs"][name] = {
+            "desc": cfg["desc"],
+            "env": cfg["env"],
+            "pt": True,
+            "lit_eps": cfg.get("lit_eps", 8),
+            "residual_budget": round(m["masked_avg"] + PT_BUDGET_MARGIN, 2),
+            "residual_measured": m["masked_avg"],
+            "pt_black_frac": m["pt_black_frac"],
+        }
+        return (name, "UPDATED", detail, True)
+
+    golden = manifest["configs"].get(name)
+    if not golden or "residual_budget" not in golden:
+        return (name, "NO-GOLDEN", "run with --update to seed the budget", False)
+    budget = golden["residual_budget"]
+    if m["masked_avg"] <= budget:
+        return (name, "PASS", f"{detail}  <= budget {budget}", True)
+    return (name, "FAIL", f"{detail}  OVER budget {budget}", False)
 
 
 def pixel_diff(a: Path, b: Path):
@@ -206,6 +358,16 @@ def main() -> int:
             rows.append((name, "SKIP", f"missing asset {req}"))
             continue
 
+        # PT-residual configs (F6 Part B): budget-gated raster-vs-PT pair, no SHA.
+        if cfg.get("pt"):
+            row_name, status, detail, ok = check_pt(
+                cfg, args.backend, work, manifest, args.update
+            )
+            rows.append((row_name, status, detail))
+            if not ok:
+                all_pass = False
+            continue
+
         out = work / f"{name}.png"
         render(cfg, args.backend, out)
         got = sha256(out)
@@ -263,7 +425,7 @@ def main() -> int:
 
     if args.update:
         print("goldens updated. Review + commit tools/goldens/manifest.json.")
-        return 0
+        return 0 if all_pass else 1
     if all_pass:
         print("ALL PASS")
         return 0

@@ -80,7 +80,8 @@
 **게이트:** 각 항목 PT 잔차 개선/중립, 갤러리 불변.
 
 ### F6 — 검증·견고성 인프라 (가로지름)
-- **콘텐츠 PT 잔차 자동화** — 현재 PT는 갤러리 전용; 콘텐츠 씬에도 고정 카메라 PT 대조 파이프(정성→정량).
+- **콘텐츠 PT 잔차 자동화** — ✅ Part A(PT 자동노출) + Part B(lit-마스크 잔차 게이트, `golden-image.py`
+  `sponza_pt_*` config — [phase-f6b-content-pt-residual-plan.md](phase-f6b-content-pt-residual-plan.md)).
 - **DX≡VK 해제 시** 전 F 페이즈 Windows 재검증(현재 동결·보류).
 - **골든이미지 회귀 CI**(양 백엔드 매트릭스, 결정적 시드) — 표면캐시/GI 셔머 회귀 자동 포착.
 
