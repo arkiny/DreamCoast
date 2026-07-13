@@ -213,6 +213,33 @@ capture-once 래치 → per-슬롯 dirty 마스크; `relayout_from_feedback` wai
 ③ freeze 래치가 정적 카드 가정 → 재캡처 시 epoch/freeze 재-arm ④ 부분 재캡처의 결정론(dirty 순서) ⑤ 카드
 grid를 6·N에 맞춰 재빌드(정적 or 증분). **DX≡VK 미검증(Windows 동결) + 런타임 거동 변경 → 신중한 검증 필수.**
 
+---
+
+### Stage 3 최종 실행 설계(B) — 구현 중 확정 (프리미티브 `append_drawable_cards` 랜딩 `<refactor>`)
+
+구현을 시작하며 (C)전-디렉토리 방식보다 **(B)per-slot 오버라이트**가 훨씬 저위험·검증가능임을 확정. 소비자·grid
+변경 불필요.
+
+- **핵심 단순화:** `select_card_residency(live_cam, budget=POOL)`가 이미 우선순위로 **정확히 POOL개** 선택 →
+  스트리밍 = 순수 **집합 차분**(evict=current∖target, admit=target∖current, 슬롯 재배정). budget=POOL이므로
+  방출이 승인분만큼 정확히 슬롯을 비움 → **GPU LRU readback(Stage 2 card_touched) 불필요**(첫 컷). card_touched는
+  "미러-가시 오프스크린 카드 보존" 리파인먼트로 후속.
+- **cards/card_src_albedo host-writable**(스트리밍 시). admit drawable d → `append_drawable_cards`로 6카드(384B)
+  빌드 → `cards[slot·6·64..]` host-write + albedo. **소비자·per-texel 패스 무변**(cards[slot] in-place, num_cards=POOL 고정).
+- **부분 재캡처:** `slot_dirty[card]`(host-visible u32). stream 변화 카드=dirty. capture 패스: `dirty[card]==0 →
+  skip`(sentinel=전부=초기). relight: `dirty[card] → reset EMA + clear`(1프레임 reset 후 EMA 수렴, 기존 reset 패턴).
+  capture는 stream 변화 프레임에만 재기록(비변화 프레임 무비용).
+- **App 상태:** `obj_aabb`/`obj_albedo` 저장(현재 `App::new` 지역, main.rs:1971) + `frame()` 라이브 `(focus,eye)`
+  (main.rs:4491-4527) → `CardCamera` → `gdf.stream_residency(...)`. **주의: screenshot 모드는 카메라 고정 →
+  정적 residency → 바이트 동일. 동적 스트리밍은 CAPTURE_SEQ/인터랙티브에서만 발현 → 검증은 CAPTURE_SEQ 필요.**
+- **push 변경:** capture(+slot_dirty idx), relight(+slot_dirty idx). Metal 검증, DX≡VK 보류.
+- **결정론:** admit 슬롯 배정을 결정론적 순서(freed 슬롯 오름차순)로. select_card_residency는 이미 pure f64.
+- **freeze:** 스트림 변화 시 freeze 재-arm(정적 카드 가정 깨짐) — epoch 리셋 or 변화 프레임에 freeze 해제.
+
+**게이트:** 풀/스트림 OFF 전 씬 바이트 동일. 스트림 ON screenshot(고정 카메라)=정적 residency 바이트 동일.
+CAPTURE_SEQ 이동 카메라: coarse-fallback 카운트 근접 draw→0 수렴 관측 + 팝 없음 + 결정론. clippy/fmt.
+**남은 구현:** gdf `stream_residency` 메서드(~80줄), slot_dirty capture/relight 셰이더, main.rs 배선, App 상태.
+
 ### Stage 4 — GI 카드-mip 패리티 + 원거리 저해상 승인 (기존 인프라 재사용·선택)
 **왜:** 풀 예산으로 더 많은 draw 수용 + GI cone 정합.
 **변경:** (a) GI 게더에 기존 cone-LOD mip 파이프(`card_mip_sample`) 배선(현재 센티넬 →
