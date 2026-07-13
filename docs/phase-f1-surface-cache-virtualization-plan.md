@@ -250,7 +250,36 @@ grid를 6·N에 맞춰 재빌드(정적 or 증분). **DX≡VK 미검증(Windows 
 CAPTURE_SEQ 이동 카메라: coarse-fallback 카운트 근접 draw→0 수렴 관측 + 팝 없음 + 결정론. clippy/fmt.
 **남은 구현:** gdf `stream_residency` 메서드(~80줄), slot_dirty capture/relight 셰이더, main.rs 배선, App 상태.
 
-### Stage 4 — GI 카드-mip 패리티 + 원거리 저해상 승인 (기존 인프라 재사용·선택)
+### Stage 4 완료 — 검증 결과 ✅ 커밋 `a6d49d3`
+`P11_GI_MIP` opt-in(콘텐츠, 기본 on). GI 게더가 반사와 동일 cone-LOD로 라디언스 mip 피라미드를 읽음
+(원거리 GI 스펙클↓). **접근(중요):** `sample_surface_cache_cone` **무변경**(갤러리 앵커가 극도로 FP-민감 —
+공유 핫함수 바이트코드 변경이 앵커를 흔듦). bs_shade_hit가 num_cards bits 16..31에서 피라미드 인덱스 언팩→
+**기존 반사 cone_mode 경로 재사용**(small extra_tol), sample_radius는 bs_trace_bounce의 ray t + HWRT
+CommittedRayT에서. mip-off(갤러리)는 **원본 호출 그대로**(else 브랜치)→바이트 동일. main.rs가 GI tuple의
+그래프 의존을 mipgen 출력으로(relight 후행 보장). **함정 기록: 첫 시도(cone 직접 편집)는 갤러리 0.003/ch
+이동→revert.** 검증: 갤러리 앵커 동일, GI mip 결정론적 engage(ON-vs-OFF 0.041 vs run-to-run 0.022),
+Stage 3+4 공존, clippy/fmt clean. **이득 정직: near-cards 카메라에선 작음(원거리 GI 스펙클용).**
+
+---
+
+## ✅ F1 완료 (Stages 0–4, 전 단계 검증·커밋)
+
+| Stage | 커밋 | 핵심 |
+|---|---|---|
+| 0 | `2ceb5f6` | relight 게더 검정-add 폴백 수정 |
+| 1 | `6d86a68` | 고정 페이지 풀 + 역방향 slot_to_card (strict SHA 증명) |
+| 2 | `9a9f6bc`→`d8fe879` | card_touched LRU 시계 |
+| 3 | `d76f861` | **스트리밍 코어 — residency가 라이브 카메라 추종** |
+| 4 | `a6d49d3` | GI 카드-mip 패리티 |
+
+전 커밋: 갤러리 앵커 `65d04ceca2c4dbff` strict 불변, clippy/fmt clean, Metal 검증, **DX≡VK Windows 재검증
+보류**(동결). 정직 결론: 정적 이미지 이득은 작음(측정); **실질 가치 = 라이브 카메라 추종 스트리밍 + 메모리
+상한(스케일/견고성)**. Stage 4(b) 원거리 저해상 승인은 균일-슬롯 풀 결정으로 미착수(size-class 필요).
+
+**후속 배치(문서화):** DX≡VK Windows 재검증; card_touched 미러-가시 방출; 우선순위 방출; grid-over-slots
+(스트리밍 시 반사 grid 가속 복원); freeze-latch 재-arm 튜닝; PT 노출 매칭(콘텐츠 잔차 정량화).
+
+### Stage 4 (원설계) — GI 카드-mip 패리티 + 원거리 저해상 승인 (기존 인프라 재사용·선택)
 **왜:** 풀 예산으로 더 많은 draw 수용 + GI cone 정합.
 **변경:** (a) GI 게더에 기존 cone-LOD mip 파이프(`card_mip_sample`) 배선(현재 센티넬 →
 sample_radius 계산 + pyramid 인덱스 plumb). (b) 원거리 승인 카드는 `assign_card_res`(∝ext/dist)로 저해상
