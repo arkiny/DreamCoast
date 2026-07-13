@@ -374,6 +374,15 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
         float3 bent = float3(0.0, 0.0, 0.0);
         if (all(uvw >= 0.0) && all(uvw <= 1.0))
         {
+            // F4 fine mode is self-describing (dh == 2*dw): the sky-vis volumes pack a camera-
+            // anchored fine level above the coarse half — the cache relight keeps the COARSE
+            // level (the same convention as the reflection consumers this increment); remap y
+            // into the coarse half with the voxel-center clamp so trilinear never crosses the
+            // level seam. Single-level volumes skip the remap — byte-for-byte legacy math.
+            uint dw, dh, dd;
+            g.volumes[pc.skyvis_index].GetDimensions(dw, dh, dd);
+            if (dh == dw * 2u)
+                uvw.y = (0.5 + uvw.y * (float(dw) - 1.0)) / float(dh);
             float sc[4];
             [unroll]
             for (int k = 0; k < 4; k++)

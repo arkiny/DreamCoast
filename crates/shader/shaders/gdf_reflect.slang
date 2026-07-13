@@ -265,6 +265,15 @@ float3 sample_gi_irradiance(uint base, float3 p, float3 n)
     if (!(all(uvw >= 0.0) && all(uvw <= 1.0)))
         return float3(0.0, 0.0, 0.0);
     uvw = saturate(uvw);
+    // F4 fine mode is self-describing: a double-height volume (dh == 2*dw) packs a camera-
+    // anchored fine level above the coarse one. Reflections keep the COARSE level this increment
+    // (fine fall-through is a measured follow-up): remap y into the coarse half with the
+    // voxel-center clamp so trilinear never crosses the level seam. Single-level volumes skip
+    // the remap — byte-for-byte legacy math.
+    uint dw, dh, dd;
+    g.volumes[base].GetDimensions(dw, dh, dd);
+    if (dh == dw * 2u)
+        uvw.y = (0.5 + uvw.y * (float(dw) - 1.0)) / float(dh);
     float3 c[4];
     [unroll]
     for (int k = 0; k < 4; k++)
@@ -299,12 +308,17 @@ float3 sample_gi_irradiance_valid(uint base, float3 p, float3 n)
         return float3(0.0, 0.0, 0.0);
     uint dw, dh, dd;
     g.volumes[base].GetDimensions(dw, dh, dd);
-    float3 dims = float3(float(dw), float(dh), float(dd));
+    // F4 fine mode (dh == 2*dw): the manual trilinear works in the LOGICAL (per-level) grid —
+    // reflections keep the coarse level this increment, whose rows are y ∈ [0, dw), so probe
+    // positions and clamped loads never touch the fine half. Single-level volumes have
+    // ldh == dh — byte-for-byte legacy math.
+    uint ldh = (dh == dw * 2u) ? dw : dh;
+    float3 dims = float3(float(dw), float(ldh), float(dd));
     float3 f = saturate(uvw) * dims - 0.5;
     float3 f0 = floor(f);
     float3 fr = f - f0;
     int3 i0 = int3(f0);
-    int3 imax = int3(int(dw) - 1, int(dh) - 1, int(dd) - 1);
+    int3 imax = int3(int(dw) - 1, int(ldh) - 1, int(dd) - 1);
     float3 c[4];
     [unroll]
     for (int k = 0; k < 4; k++)

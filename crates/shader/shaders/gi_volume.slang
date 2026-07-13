@@ -48,6 +48,8 @@ struct GiVolumePush
     uint4 clip;          // x = clipmap descriptor index, y = level count
     float4 params;       // x = spp, y = ray max dist, z = sky fill, w = EMA alpha
     float4 ground;       // xyz analytic ground albedo, w = surface bias
+    float4 fine_min;     // F4: xyz fine-level world min, w = fine_active (0 = single level)
+    float4 fine_max;     // F4: xyz fine-level world max (fine half packed at y ∈ [dims.y, 2*dims.y))
 };
 
 [[vk::push_constant]]
@@ -126,6 +128,63 @@ void read_coeffs_scalar(uint base, float3 p, out float c[4])
         c[k] = g.volumes[base + uint(k)].SampleLevel(g.samp, uvw, 0.0).x;
 }
 
+// F4 fine mode: both levels live in one volume of height 2*dims.y — map a world position to the
+// finest containing level's half (fine box first, the clipmap containment convention), keeping
+// every tap >= half a texel inside that half so trilinear never crosses the level seam (the same
+// voxel-center clamp SdfVolume::sample uses). `inside` is false only when p is outside BOTH boxes
+// (the caller returns zeros, matching the legacy out-of-box behaviour). Called ONLY when
+// fine_active (the legacy functions above stay the untouched single-level instruction stream).
+float3 gv_level_uvw(float3 p, out bool inside)
+{
+    float dh2 = 2.0 * float(pc.dims.y);
+    if (all(p >= pc.fine_min.xyz) && all(p <= pc.fine_max.xyz))
+    {
+        inside = true;
+        float3 t = saturate((p - pc.fine_min.xyz) / (pc.fine_max.xyz - pc.fine_min.xyz));
+        return float3(t.x, (0.5 + t.y * (float(pc.dims.y) - 1.0)) / dh2 + 0.5, t.z);
+    }
+    float3 t = (p - pc.aabb_min.xyz) / (pc.aabb_max.xyz - pc.aabb_min.xyz);
+    if (any(t < 0.0) || any(t > 1.0))
+    {
+        inside = false;
+        return float3(0.0, 0.0, 0.0);
+    }
+    inside = true;
+    t = saturate(t);
+    return float3(t.x, (0.5 + t.y * (float(pc.dims.y) - 1.0)) / dh2, t.z);
+}
+
+// F4: trilinear read of the 12 SH volumes at an ALREADY-REMAPPED fine-mode uvw (gv_level_uvw, or
+// a probe's own texel centre for the EMA history). `inside == false` returns zeros.
+void read_coeffs_fine(uint base, float3 uvw, bool inside, out float3 c[4])
+{
+    [unroll]
+    for (int k = 0; k < 4; k++)
+        c[k] = float3(0.0, 0.0, 0.0);
+    if (!inside)
+        return;
+    [unroll]
+    for (int ch = 0; ch < 3; ch++)
+    {
+        [unroll]
+        for (int k = 0; k < 4; k++)
+            c[k][ch] = g.volumes[base + uint(ch * 4 + k)].SampleLevel(g.samp, uvw, 0.0).x;
+    }
+}
+
+// F4: scalar (sky-visibility) variant of read_coeffs_fine.
+void read_coeffs_scalar_fine(uint base, float3 uvw, bool inside, out float c[4])
+{
+    [unroll]
+    for (int k = 0; k < 4; k++)
+        c[k] = 0.0;
+    if (!inside)
+        return;
+    [unroll]
+    for (int k = 0; k < 4; k++)
+        c[k] = g.volumes[base + uint(k)].SampleLevel(g.samp, uvw, 0.0).x;
+}
+
 // Cosine-weighted hemispherical average radiance in direction n, reconstructed from the SH
 // radiance coefficients (the clamped-cosine convolution: A0/PI = 1, A1/PI = 2/3). For an
 // isotropic field (only the band-0 coeff) this returns exactly the omnidirectional mean, so it
@@ -151,12 +210,22 @@ float3 uniform_sphere(inout uint rng)
 [numthreads(4, 4, 4)]
 void csMain(uint3 tid: SV_DispatchThreadID)
 {
-    if (tid.x >= pc.dims.x || tid.y >= pc.dims.y || tid.z >= pc.dims.z)
+    // F4: fine mode processes a second (camera-anchored) level packed in the volume's upper
+    // half. When fine_active == 0 these expressions reduce to the legacy values exactly
+    // (levels == 1, level == 0, lid == tid, lvl_* == aabb_* — arithmetic-identical float math,
+    // and the tid.y bound `dims.y * 1` equals the legacy bound).
+    bool fine_on = pc.fine_min.w > 0.5;
+    uint levels = fine_on ? 2u : 1u;
+    if (tid.x >= pc.dims.x || tid.y >= pc.dims.y * levels || tid.z >= pc.dims.z)
         return;
+    uint level = tid.y / pc.dims.y; // 0 = coarse (scene box), 1 = fine (camera box)
+    uint3 lid = uint3(tid.x, tid.y % pc.dims.y, tid.z);
+    float3 lvl_min = level == 0u ? pc.aabb_min.xyz : pc.fine_min.xyz;
+    float3 lvl_max = level == 0u ? pc.aabb_max.xyz : pc.fine_max.xyz;
 
-    // Probe world position = voxel centre mapped through the volume AABB.
-    float3 uvw = (float3(tid) + 0.5) / float3(pc.dims.xyz);
-    float3 probe = lerp(pc.aabb_min.xyz, pc.aabb_max.xyz, uvw);
+    // Probe world position = voxel centre mapped through the level's AABB.
+    float3 uvw = (float3(lid) + 0.5) / float3(pc.dims.xyz);
+    float3 probe = lerp(lvl_min, lvl_max, uvw);
 
     uint spp = uint(max(pc.params.x, 1.0));
     uint seed = (tid.x * 1973u + tid.y * 9277u + tid.z * 26699u + pc.dims.w * 51059u) | 1u;
@@ -214,7 +283,16 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             // stored irradiance (E) re-enters as albedo*indirect (the ×PI to irradiance cancels
             // the BRDF 1/PI), matching the old scalar probe's energy.
             float3 cprev[4];
-            read_coeffs(read_base, hp, cprev);
+            // F4 fine mode: read the finest level containing the hit (fine-first fall-through);
+            // the OFF path keeps the exact legacy call (untouched instruction stream).
+            if (fine_on)
+            {
+                bool cin;
+                float3 cuvw = gv_level_uvw(hp, cin);
+                read_coeffs_fine(read_base, cuvw, cin, cprev);
+            }
+            else
+                read_coeffs(read_base, hp, cprev);
             float3 indirect = eval_irradiance(cprev, hn);
             radiance = alb * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / GV_PI) + alb * indirect;
         }
@@ -250,15 +328,29 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // EMA with the previous frame (per coefficient; reset on the first frame / re-alloc).
     if (pc.read_rgb.w == 0u)
     {
+        // F4 fine mode: the EMA history must read the probe's OWN level — a coarse probe whose
+        // world position falls inside the fine box must NOT blend the fine half into its history
+        // (finest-first containment is for consumers, not the self-EMA). The probe's own texel
+        // centre in the packed volume is exact from tid, preserving the legacy semantic (the
+        // legacy read at `probe` lands on the probe's own texel centre too).
+        float3 puvw = float3((float(tid.x) + 0.5) / float(pc.dims.x),
+                             (float(tid.y) + 0.5) / (float(pc.dims.y) * float(levels)),
+                             (float(tid.z) + 0.5) / float(pc.dims.z));
         float3 prev[4];
-        read_coeffs(read_base, probe, prev);
+        if (fine_on)
+            read_coeffs_fine(read_base, puvw, true, prev);
+        else
+            read_coeffs(read_base, probe, prev);
         [unroll]
         for (int i = 0; i < 4; i++)
             c[i] = lerp(prev[i], c[i], pc.params.w);
         if (pc.read_rgb.y != 0xFFFFFFFFu)
         {
             float svprev[4];
-            read_coeffs_scalar(pc.read_rgb.y, probe, svprev);
+            if (fine_on)
+                read_coeffs_scalar_fine(pc.read_rgb.y, puvw, true, svprev);
+            else
+                read_coeffs_scalar(pc.read_rgb.y, probe, svprev);
             [unroll]
             for (int i = 0; i < 4; i++)
                 sv[i] = lerp(svprev[i], sv[i], pc.params.w);

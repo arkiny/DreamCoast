@@ -1373,7 +1373,8 @@ impl App {
         // scene GDF). See `gdf.rs`. The scene GDF is registered after the scene is built.
         let mut gdf = GdfSystem::new(&device, backend, compute_supported)?;
         // Stage C GDF-lighting consumers (C2 AO, C3 GI, C4 denoise). See `gi.rs`.
-        let gi = GiSystem::new(&device, backend, compute_supported)?;
+        // `mut`: the F4 fine-level AABB is installed after the scene AABB + camera are known.
+        let mut gi = GiSystem::new(&device, backend, compute_supported)?;
         // Screen-space near-field AO (composed with the GDF AO). See `gtao.rs`.
         let gtao = gtao::GtaoSystem::new(&device, backend, compute_supported)?;
         // PR-4 (render-pipeline re-baseline track): the sky/atmosphere composite slot
@@ -2894,6 +2895,41 @@ impl App {
         // the legacy march); `P_GI_VOLUME=0` forces the march back.
         let gi_volume =
             quality::env_bool("P_GI_VOLUME", !gallery_scene) && gdf_gi && gi.has_gi_volume();
+        // F4 (hierarchical radiance cache, first increment): opt-in camera-anchored FINE level
+        // for the SH irradiance volume (`P_GI_VOL_CLIP=1`, content only via the `gi_volume`
+        // gate). The AABB is resolved ONCE here from the initial camera — the static-capture
+        // parity target (re-centering/toroidal reuse is a documented follow-up) — with the same
+        // eye precedence as the surface-card reference camera (`CAM_EYE` → authored level view →
+        // orbit framing). Half-extent = scene max axis / 6, clamped to [4, 12] m: fine enough to
+        // beat the coarse ~1.1 m spacing, small enough that 32³ probes stay dense.
+        if gi_volume && quality::env_bool("P_GI_VOL_CLIP", false) {
+            let (amin, amax) = gdf.scene_aabb();
+            let eye = match (parse_vec3_env("CAM_EYE"), level_view) {
+                (Some(e), _) => e,
+                (None, Some((e, _))) => e,
+                (None, None) => {
+                    scene_center + Vec3::new(scene_radius * 1.6, scene_radius * 0.55, 0.0)
+                }
+            };
+            let ext = (amax[0] - amin[0])
+                .max(amax[1] - amin[1])
+                .max(amax[2] - amin[2]);
+            let half = (ext / 6.0).clamp(4.0, 12.0);
+            let mn = [eye.x - half, eye.y - half, eye.z - half];
+            let mx = [eye.x + half, eye.y + half, eye.z + half];
+            gi.set_gi_fine_box(&device, mn, mx)?;
+            info!(
+                "GI volume fine level (P_GI_VOL_CLIP): box [{:.1}, {:.1}, {:.1}]..[{:.1}, {:.1}, \
+                 {:.1}] half {half} m — probe spacing {:.2} m",
+                mn[0],
+                mn[1],
+                mn[2],
+                mx[0],
+                mx[1],
+                mx[2],
+                2.0 * half / gi::GI_VOL_DIM as f32
+            );
+        }
         // 레퍼런스식 indoor skylight occlusion knobs (only effective on the volume GI path, content):
         // `P_SKYVIS_TINT` = neutral OcclusionTint leak as a fraction of the occluded skylight
         // luminance (the occluded floor keeps brightness but loses the blue cast); `P_SKYVIS_MIN_OCC`

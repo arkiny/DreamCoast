@@ -34,7 +34,8 @@ const WRC_GRID: u32 = 16;
 const WRC_OCT: u32 = 8;
 
 /// World-space directional-irradiance volume (radiance-cache) probe-grid resolution.
-const GI_VOL_DIM: u32 = 32;
+/// `pub(crate)`: main.rs derives the F4 fine-level probe spacing from it (single source).
+pub(crate) const GI_VOL_DIM: u32 = 32;
 
 /// SH band-0/1 coefficient count per probe channel-set: 4 coeffs × RGB = 12 R32F volumes per
 /// ping-pong slot (slot index = channel*4 + coeff). Allocated contiguously so the shaders take
@@ -93,6 +94,17 @@ pub(crate) struct GiSystem {
     /// ping-pong = 8 volumes), filled in the same `gi_volume` pass. Contiguous per slot (base only).
     gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2],
     gi_vol_frame: u32,
+    /// F4 (hierarchical radiance cache, first increment): opt-in camera-anchored FINE level for
+    /// the SH volumes (`P_GI_VOL_CLIP`). The fine level is packed into the SAME volumes by
+    /// doubling their HEIGHT (coarse half y∈[0,GI_VOL_DIM), fine half y∈[GI_VOL_DIM,2*GI_VOL_DIM))
+    /// — zero new bindless slots; consumers detect fine mode from the volume height.
+    gi_vol_fine: bool,
+    /// F4: the fine-level world AABB `(min, max)`, installed once at load from the initial camera
+    /// (the static-capture parity target; re-centering/toroidal reuse is a documented follow-up).
+    gi_fine_box: Option<([f32; 3], [f32; 3])>,
+    /// F4: the tiny fine-AABB storage buffer (2×float4: min.xyz+0, max.xyz+0) the per-pixel GI
+    /// pass reads — `GiPush` sits at its 256-byte push cap, so the box rides a storage buffer.
+    gi_fine_buf: Option<StorageBuffer>,
 }
 
 impl GiSystem {
@@ -176,7 +188,7 @@ impl GiSystem {
             dreamcoast_shader::gi_volume_cs_dxil,
             dreamcoast_shader::gi_volume_cs_metallib,
             "gi_volume",
-            160,
+            192, // +32B: F4 fine-level AABB rows (fine_min.xyz + active, fine_max.xyz).
         )?;
         let sp_trace_pipeline = compute(
             dreamcoast_shader::screen_probe_trace_cs_spirv,
@@ -227,10 +239,21 @@ impl GiSystem {
         // `base + channel*4 + coeff`, so only the base index is pushed.
         let mut gi_vol: [[Option<Volume>; GI_VOL_SH]; 2] = Default::default();
         let mut gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2] = Default::default();
+        // F4: opt-in camera-anchored fine level (`P_GI_VOL_CLIP`), read once here so the volume
+        // allocation below can double its height. Unset/0 = OFF = the legacy single-level layout.
+        let gi_vol_fine = crate::quality::env_bool("P_GI_VOL_CLIP", false);
         if gi_vol_pipeline.is_some() {
             let vd = VolumeDesc {
                 width: GI_VOL_DIM,
-                height: GI_VOL_DIM,
+                // F4: the fine level is packed along +Y (coarse half y∈[0,GI_VOL_DIM), fine half
+                // y∈[GI_VOL_DIM,2*GI_VOL_DIM)) and sampled with a half-height remap so the two
+                // levels never bleed (voxel-center clamp inside each half — the same clamp
+                // SdfVolume::sample uses). OFF keeps the exact legacy single-level allocation.
+                height: if gi_vol_fine {
+                    GI_VOL_DIM * 2
+                } else {
+                    GI_VOL_DIM
+                },
                 depth: GI_VOL_DIM,
                 format: Format::R32Float,
             };
@@ -276,6 +299,9 @@ impl GiSystem {
             gi_vol,
             gi_skyvis,
             gi_vol_frame: 0,
+            gi_vol_fine,
+            gi_fine_box: None,
+            gi_fine_buf: None,
             sp_trace_pipeline,
             sp_integrate_pipeline,
             sp_filter_pipeline,
@@ -306,6 +332,39 @@ impl GiSystem {
     /// Advance the volume ping-pong (end-of-frame, after submit), like the denoiser counter.
     pub(crate) fn advance_gi_volume(&mut self) {
         self.gi_vol_frame = self.gi_vol_frame.saturating_add(1);
+    }
+
+    /// F4: install the camera-anchored fine-level AABB (computed once at load — the static-capture
+    /// parity target; re-centering/toroidal reuse is a documented follow-up). Also uploads the tiny
+    /// AABB storage buffer the per-pixel GI pass reads (GiPush is at its 256-byte cap). No-op
+    /// unless fine mode (`P_GI_VOL_CLIP`) doubled the volume height at construction.
+    pub(crate) fn set_gi_fine_box(
+        &mut self,
+        device: &Device,
+        mn: [f32; 3],
+        mx: [f32; 3],
+    ) -> anyhow::Result<()> {
+        if !self.gi_vol_fine {
+            return Ok(());
+        }
+        // 32 bytes = fine_min.xyz + pad, fine_max.xyz + pad (two float4 rows, Load4-friendly).
+        let mut bytes = [0u8; 32];
+        for (i, v) in mn.iter().enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (i, v) in mx.iter().enumerate() {
+            bytes[16 + i * 4..16 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        self.gi_fine_buf = Some(device.create_storage_buffer_init(
+            &StorageBufferDesc {
+                size: 32,
+                stride: 16,
+                indirect: false,
+            },
+            &bytes,
+        )?);
+        self.gi_fine_box = Some((mn, mx));
+        Ok(())
     }
 
     /// The PREVIOUS (completed) frame's sky-visibility SH base, for consumers recorded BEFORE this
@@ -359,6 +418,12 @@ impl GiSystem {
         let skyvis_write_base = sv_w[0].as_ref()?.storage_index();
         let diag = Self::diag(aabb_min, aabb_max);
         let reset = u32::from(self.gi_vol_frame == 0);
+        // F4: the camera-anchored fine level — active only when fine mode allocated the double-
+        // height volumes AND the box was installed. The update then writes BOTH halves (the
+        // shader derives the level from tid.y); inactive keeps the exact legacy single dispatch.
+        let fine = self.gi_vol_fine.then_some(self.gi_fine_box).flatten();
+        let (fine_min, fine_max) = fine.unwrap_or(([0.0; 3], [0.0; 3]));
+        let fine_active = if fine.is_some() { 1.0 } else { 0.0 };
         let vol_ext = graph.import_external("gi_volume_w");
         let mut reads = vec![scene_gdf_ext];
         if let Some((_, ext)) = albedo {
@@ -422,9 +487,19 @@ impl GiSystem {
                     alpha,    // EMA alpha
                     ground_albedo,
                     diag * 0.01, // surface bias
+                    fine_min,    // F4 fine-level world min ([0;3] when inactive)
+                    fine_active, // F4: 1.0 = update both levels, 0.0 = legacy single level
+                    fine_max,    // F4 fine-level world max
                 ));
                 let g = GI_VOL_DIM.div_ceil(4);
-                cmd.dispatch(g, g, g);
+                // F4: the fine level doubles the dispatch height (the shader maps tid.y's upper
+                // half onto the fine box); inactive keeps the legacy cubic dispatch.
+                let gy = if fine.is_some() {
+                    (GI_VOL_DIM * 2).div_ceil(4)
+                } else {
+                    g
+                };
+                cmd.dispatch(g, gy, g);
                 // Transition the just-written volumes back to sampled so the GI pass can read them.
                 for ch in wv.iter().flatten() {
                     cmd.volume_to_sampled(ch);
@@ -870,6 +945,17 @@ impl GiSystem {
         let (vol_r, vol_g) = gi_volume
             .map(|(rb, sb, _)| (rb, sb))
             .unwrap_or((u32::MAX, u32::MAX));
+        // F4: the fine-level AABB storage buffer is bound ONLY on the volume-sampling path (the
+        // ray-march/gallery path never reads the slot). 0xFFFFFFFF keeps the shader on its legacy
+        // single-level volume branch — the untouched instruction stream.
+        let fine_buf = if gi_volume.is_some() {
+            self.gi_fine_buf
+                .as_ref()
+                .map(|b| b.storage_index())
+                .unwrap_or(u32::MAX)
+        } else {
+            u32::MAX
+        };
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
         let mut storage_writes = vec![out];
         if let Some(sv) = skyvis_out {
@@ -941,6 +1027,8 @@ impl GiSystem {
                     // F4: importance-sampling mix (0.0 = legacy cosine gather = gallery anchor). No
                     // effect on the volume-sampling branch, which reads the SH field, not rays.
                     gi_importance,
+                    // F4: fine-level AABB storage buffer (volume path only; 0xFFFFFFFF = off).
+                    fine_buf,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

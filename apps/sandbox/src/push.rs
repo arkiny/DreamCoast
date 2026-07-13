@@ -1145,6 +1145,10 @@ pub(crate) fn gdf_gi_push(
     // F4 (importance-sampled final gather): fraction of the gather rays drawn from the sun-steered
     // irradiance lobe (MIS with the cosine lobe). 0.0 = legacy cosine gather (byte-identical anchor).
     gi_importance: f32,
+    // F4 (hierarchical radiance cache): storage-buffer index of the camera-anchored fine-level
+    // AABB (2×float4: min.xyz+0, max.xyz+0) the volume-sampling branch reads. 0xFFFFFFFF = single
+    // level (the legacy volume branch, an untouched instruction stream).
+    fine_buf: u32,
 ) -> [u8; 256] {
     let mut pc = [0u8; 256];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -1209,15 +1213,19 @@ pub(crate) fn gdf_gi_push(
     pc[236..240].copy_from_slice(&vol_rgb[2].to_le_bytes());
     // F3 + F4 share the last 16-byte row: the HW-RT gather toggle at 240..244 (0 = SW march =
     // gallery byte-identical) and the F4 importance-sampling mix at 244..248 (0.0 = legacy
-    // cosine gather = byte-identical); 248..256 stays padding.
+    // cosine gather = byte-identical); +248 = F4 fine-AABB storage-buffer index (0xFFFFFFFF =
+    // off = the legacy single-level volume branch); 252..256 stays padding.
     pc[240..244].copy_from_slice(&hwrt.to_le_bytes());
     pc[244..248].copy_from_slice(&gi_importance.to_le_bytes());
+    pc[248..252].copy_from_slice(&fine_buf.to_le_bytes());
     pc
 }
 
-/// Pack the GI irradiance-volume (DDGI-lite) update push block (160 bytes): aabb_min(+ground_y),
+/// Pack the GI irradiance-volume (DDGI-lite) update push block (192 bytes): aabb_min(+ground_y),
 /// aabb_max(+dist_clamp), sun(+intensity), dims(+frame), read_rgb(+reset), write_rgb, albedo_rgb,
-/// clip(desc,count), params(spp,ray_max,sky_fill,alpha), ground(xyz albedo, w bias). See gi_volume.slang.
+/// clip(desc,count), params(spp,ray_max,sky_fill,alpha), ground(xyz albedo, w bias), then the F4
+/// fine-level rows: fine_min(xyz, w = fine_active — 0 = single level = legacy) + fine_max(xyz).
+/// See gi_volume.slang.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gi_volume_push(
     aabb_min: [f32; 3],
@@ -1240,8 +1248,11 @@ pub(crate) fn gi_volume_push(
     alpha: f32,
     ground_albedo: [f32; 3],
     bias: f32,
-) -> [u8; 160] {
-    let mut pc = [0u8; 160];
+    fine_min: [f32; 3],
+    fine_active: f32,
+    fine_max: [f32; 3],
+) -> [u8; 192] {
+    let mut pc = [0u8; 192];
     let put3 = |pc: &mut [u8], o: usize, v: [f32; 3]| {
         for (i, x) in v.iter().enumerate() {
             pc[o + i * 4..o + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
@@ -1273,6 +1284,11 @@ pub(crate) fn gi_volume_push(
     pc[140..144].copy_from_slice(&alpha.to_le_bytes());
     put3(&mut pc, 144, ground_albedo);
     pc[156..160].copy_from_slice(&bias.to_le_bytes());
+    // F4 camera-anchored fine level: world AABB + active flag (fine_min.w). 0 = single level —
+    // the shader's expressions then reduce to the legacy values exactly. 188..192 stays zero.
+    put3(&mut pc, 160, fine_min);
+    pc[172..176].copy_from_slice(&fine_active.to_le_bytes());
+    put3(&mut pc, 176, fine_max);
     pc
 }
 

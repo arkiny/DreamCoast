@@ -75,8 +75,10 @@ struct GiPush
     // keeps the shader on the SEPARATE legacy loop below (the gallery byte-identical anchor).
     // Shares F3's 16-byte row (hwrt at +240, this at +244 — mirrors the host packer).
     float gi_importance;
-    uint pad_hwrt1;         // 16-byte row padding (keeps the block a multiple of 16 across backends)
-    uint pad_hwrt2;
+    uint gi_fine_buf;       // F4 — storage-buffer index of the fine-level AABB (2×float4:
+                            // min.xyz+0, max.xyz+0); 0xFFFFFFFF = single level (legacy path
+                            // untouched).
+    uint pad_hwrt2;         // 16-byte row padding (keeps the block a multiple of 16 across backends)
 };
 
 // Real SH band-0/1 basis normalisation (matches gi_volume.slang).
@@ -150,6 +152,82 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // existing temporal + a-trous denoiser unchanged.
     if (pc.vol_r != 0xFFFFFFFFu)
     {
+        // F4 (hierarchical radiance cache, first increment): camera-anchored FINE level, packed
+        // into the SAME volumes by doubling their height (coarse half y∈[0,h/2), fine half
+        // y∈[h/2,h)). A SEPARATE leading block — not a parameterized rewrite of the body below —
+        // so the single-level path keeps its exact legacy instruction stream (the gi_importance
+        // separate-loop precedent). Finest-first containment: the fine box answers when it holds
+        // the pixel, else the scene box (else e = 0, as legacy); the y remap keeps every tap
+        // >= half a texel inside its half so trilinear never crosses the level seam (mirrors
+        // gv_level_uvw in gi_volume.slang).
+        if (pc.gi_fine_buf != 0xFFFFFFFFu)
+        {
+            float3 fmin = asfloat(g.storage_buffers[pc.gi_fine_buf].Load4(0)).xyz;
+            float3 fmax = asfloat(g.storage_buffers[pc.gi_fine_buf].Load4(16)).xyz;
+            // Logical (per-level) grid height = physical height / 2 (fine mode is only entered
+            // with the double-height allocation; derived, not hardcoded, from the bound volume).
+            uint fdw, fdh, fdd;
+            g.volumes[pc.vol_r].GetDimensions(fdw, fdh, fdd);
+            float ldim = float(fdh / 2u);
+            bool fine = all(world_pos >= fmin) && all(world_pos <= fmax);
+            float3 cuvw = (world_pos - GDF_MIN) / (GDF_MAX - GDF_MIN);
+            bool inside = fine || (all(cuvw >= 0.0) && all(cuvw <= 1.0));
+            float3 uvw = float3(0.0, 0.0, 0.0);
+            float3 e = float3(0.0, 0.0, 0.0);
+            if (inside)
+            {
+                float3 t = fine ? saturate((world_pos - fmin) / (fmax - fmin)) : saturate(cuvw);
+                float y = (0.5 + t.y * (ldim - 1.0)) / float(fdh);
+                uvw = float3(t.x, fine ? y + 0.5 : y, t.z);
+                // Same E(n) reconstruction as the legacy body — only the uvw mapping differs.
+                float3 c[4];
+                [unroll]
+                for (int k = 0; k < 4; k++)
+                    c[k] = float3(0.0, 0.0, 0.0);
+                [unroll]
+                for (int ch = 0; ch < 3; ch++)
+                {
+                    [unroll]
+                    for (int k = 0; k < 4; k++)
+                        c[k][ch] =
+                            g.volumes[pc.vol_r + uint(ch * 4 + k)].SampleLevel(g.samp, uvw, 0.0).x;
+                }
+                e = c[0] * SH_C0
+                    + (2.0 / 3.0)
+                          * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]);
+                e = max(e, float3(0.0, 0.0, 0.0));
+            }
+            g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
+
+            // Sky-visibility + bent normal: the SAME reconstruction as the legacy body at the
+            // remapped uvw (the sky-vis volumes share the packed two-level layout).
+            if (pc.vol_g != 0xFFFFFFFFu && pc.vol_b != 0xFFFFFFFFu)
+            {
+                float v = 1.0;
+                float3 bent = float3(0.0, 0.0, 0.0);
+                if (inside)
+                {
+                    float sc[4];
+                    [unroll]
+                    for (int k = 0; k < 4; k++)
+                        sc[k] = g.volumes[pc.vol_g + uint(k)].SampleLevel(g.samp, uvw, 0.0).x;
+                    v = sc[0] * SH_C0
+                        + (2.0 / 3.0)
+                              * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2] + SH_C1 * n.x * sc[3]);
+                    v = saturate(v);
+                    if ((pc.flip_y & 2u) != 0u)
+                    {
+                        float3 b = float3(sc[3], sc[1], sc[2]);
+                        float bl = length(b);
+                        if (bl > 1e-5)
+                            bent = b / bl;
+                    }
+                }
+                g.storage_images[pc.vol_b][tid.xy] = float4(v, bent);
+            }
+            return;
+        }
+
         float3 uvw = (world_pos - GDF_MIN) / (GDF_MAX - GDF_MIN);
         float3 e = float3(0.0, 0.0, 0.0);
         if (all(uvw >= 0.0) && all(uvw <= 1.0))
