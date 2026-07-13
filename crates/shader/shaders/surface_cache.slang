@@ -58,8 +58,13 @@ uint card_mip_base(uint layout, uint c, uint tile)
 }
 // texel index -> card, via binary search on the layout's ascending `base` column (the per-texel
 // passes dispatch one thread per REAL atlas texel). Legacy: t / tile².
-uint layout_find_card(uint layout, uint t, uint tile, uint num_cards)
+// F1 Stage 1: when a page-pool reverse table is bound (`slot_map != sentinel`) the atlas is a fixed
+// pool of uniform tile² slots, so texel → slot = t/tile² → slot_to_card[slot] = card. The mapping is
+// arbitrary (the streaming/LRU foundation) — the ascending-base search below does NOT hold for it.
+uint layout_find_card(uint layout, uint t, uint tile, uint num_cards, uint slot_map)
 {
+    if (slot_map != 0xFFFFFFFFu)
+        return g.storage_buffers[slot_map].Load((t / max(tile * tile, 1u)) * 4u);
     if (layout == 0xFFFFFFFFu)
         return t / max(tile * tile, 1u);
     uint lo = 0u;

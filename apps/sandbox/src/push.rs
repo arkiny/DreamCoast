@@ -186,9 +186,11 @@ pub(crate) fn prefilter_push(
 pub(crate) const CDL_NEUTRAL: ([f32; 3], [f32; 3], [f32; 3]) =
     ([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
 
-/// Pack the tonemap push block (96 bytes): hdr_index + mode + flip_y + exposure (16) +
-/// sharpen + inv_w + inv_h + bloom_index (16) + bloom_intensity + grade_on + pad + pad
-/// (16) + cdl_slope float4 (16) + cdl_offset float4 (16) + cdl_power float4 (16).
+/// Pack the tonemap push block (112 bytes): hdr_index + mode + flip_y + exposure (16) +
+/// sharpen + inv_w + inv_h + bloom_index (16) + bloom_intensity + grade_on + exposure_buf +
+/// pad (16) + cdl_slope float4 (16) + cdl_offset float4 (16) + cdl_power float4 (16) +
+/// lut_index + lut_size + pad + pad (16). `exposure_buf == u32::MAX` uses the constant
+/// `exposure` (byte-identical anchor); otherwise the adapted auto-exposure is read from it.
 ///
 /// PR-5 added the bloom composite slot + the ASC-CDL color-grading hook. `bloom_index ==
 /// u32::MAX` skips the bloom add; `grade_on == 0` skips grading. Each CDL vector is a
@@ -207,6 +209,7 @@ pub(crate) fn post_push(
     bloom_index: u32,
     bloom_intensity: f32,
     grade_on: u32,
+    exposure_buf: u32,
     cdl_slope: [f32; 3],
     cdl_offset: [f32; 3],
     cdl_power: [f32; 3],
@@ -224,7 +227,9 @@ pub(crate) fn post_push(
     pc[28..32].copy_from_slice(&bloom_index.to_le_bytes());
     pc[32..36].copy_from_slice(&bloom_intensity.to_le_bytes());
     pc[36..40].copy_from_slice(&grade_on.to_le_bytes());
-    // pc[40..48]: pad0/pad1 to the float4 boundary.
+    // pc[40..44] = exposure_buf (auto-exposure buffer bindless index; MAX = use constant);
+    // pc[44..48] = pad1 to the float4 boundary.
+    pc[40..44].copy_from_slice(&exposure_buf.to_le_bytes());
     for (i, v) in cdl_slope.iter().enumerate() {
         pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -732,8 +737,10 @@ pub(crate) fn cache_capture_push(
     card_albedo_index: u32,
     // C1 mesh-triangle capture: (vtx, idx, table, card_inst) bindless indices; all u32::MAX = off.
     mesh: [u32; 4],
-) -> [u8; 96] {
-    let mut pc = [0u8; 96];
+    // F1 Stage 3 streaming re-capture flag buffer (0xFFFFFFFF = off ⇒ trace every card).
+    slot_dirty: u32,
+) -> [u8; 112] {
+    let mut pc = [0u8; 112];
     let u = [
         cards_index,
         cache_pos_index,
@@ -765,6 +772,8 @@ pub(crate) fn cache_capture_push(
     for (i, v) in mesh.iter().enumerate() {
         pc[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
+    // F1 Stage 3 streaming re-capture flag (byte 96; the initial capture passes 0xFFFFFFFF).
+    pc[96..100].copy_from_slice(&slot_dirty.to_le_bytes());
     pc
 }
 
@@ -1366,6 +1375,7 @@ pub(crate) fn gdf_atrous_push(
 /// Pack the Stage D2b surface-cache visibility push block (112 bytes): 6 frustum planes
 /// (96, xyz inward normal + w) + (cards_index, out_index, num_cards, pad) uints (96..112).
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cache_vis_push(
     planes: &[[f32; 4]; 6],
     cards_index: u32,
@@ -1387,8 +1397,11 @@ pub(crate) fn cache_vis_push(
         (u32, u32),
         u32,
     )>,
-) -> [u8; 224] {
-    let mut pc = [0u8; 224];
+    // F1 Stage 2 — page-pool LRU clock (0xFFFFFFFF = off) + the current frame timestamp.
+    touched_index: u32,
+    frame: u32,
+) -> [u8; 232] {
+    let mut pc = [0u8; 232];
     for (i, p) in planes.iter().enumerate() {
         for (j, v) in p.iter().enumerate() {
             let o = i * 16 + j * 4;
@@ -1429,6 +1442,9 @@ pub(crate) fn cache_vis_push(
     pc[212..216].copy_from_slice(&w.to_le_bytes());
     pc[216..220].copy_from_slice(&h.to_le_bytes());
     pc[220..224].copy_from_slice(&flip.to_le_bytes());
+    // F1 Stage 2 — page-pool LRU clock + frame timestamp.
+    pc[224..228].copy_from_slice(&touched_index.to_le_bytes());
+    pc[228..232].copy_from_slice(&frame.to_le_bytes());
     pc
 }
 

@@ -1387,13 +1387,29 @@ impl DeferredRenderer {
         cdl_offset: [f32; 3],
         cdl_power: [f32; 3],
         lut: Option<(ResourceId, u32)>,
+        // Auto-exposure: when true (raw-radiance PT/SW-RT paths under AUTO_EXPOSURE), the shader
+        // reads the adapted exposure from the AE buffer instead of the constant `exposure`, so the
+        // path-traced view auto-exposes like the rasterized lighting does. Off = constant (anchor).
+        ae_exposure: bool,
     ) {
+        let exposure_buf = if ae_exposure {
+            self.exposure_buf
+                .as_ref()
+                .map(|b| b.storage_index())
+                .unwrap_or(u32::MAX)
+        } else {
+            u32::MAX
+        };
         let mut reads = vec![src];
         if let Some(b) = bloom {
             reads.push(b);
         }
         if let Some((l, _)) = lut {
             reads.push(l);
+        }
+        if exposure_buf != u32::MAX {
+            // Sequence the tonemap after the auto-exposure resolve's write of this external buffer.
+            reads.push(graph.import_external("exposure_buf"));
         }
         graph.add_pass(
             PassInfo {
@@ -1421,6 +1437,7 @@ impl DeferredRenderer {
                     bloom_index,
                     bloom_intensity,
                     grade_on,
+                    exposure_buf,
                     cdl_slope,
                     cdl_offset,
                     cdl_power,
@@ -1475,7 +1492,8 @@ impl DeferredRenderer {
                     0.0,
                     u32::MAX, // no bloom
                     0.0,
-                    0, // grading off
+                    0,        // grading off
+                    u32::MAX, // no auto-exposure buffer (constant exposure)
                     s,
                     o,
                     p,

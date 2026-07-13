@@ -304,49 +304,67 @@ pub(crate) fn build_surface_cards(
     // One linear-albedo float3 (12 B) per card, same card order — the capture stamps the
     // drawable's true material color onto its 6 cards (C).
     let mut card_albedo: Vec<u8> = Vec::with_capacity(keep.len() * 6 * 12);
+    for &i in keep {
+        append_drawable_cards(
+            drawable_aabb[i],
+            drawable_albedo[i],
+            &mut cards,
+            &mut card_albedo,
+        );
+    }
+    (cards, card_albedo, residency)
+}
+
+/// Append one drawable's 6 axis-aligned cards (64 B each, one per AABB face) + the parallel
+/// per-card albedo (12 B each) to the given buffers, in the exact byte layout
+/// [`build_surface_cards`] emits. Factored out so the F1 Stage 3 page-pool streaming can rebuild a
+/// single drawable-slot's 6 cards in place when the live camera admits a new drawable, without
+/// rebuilding the whole card buffer. `cards` grows by 384 B, `card_albedo` by 72 B.
+pub(crate) fn append_drawable_cards(
+    aabb: ([f32; 3], [f32; 3]),
+    albedo: [f32; 3],
+    cards: &mut Vec<u8>,
+    card_albedo: &mut Vec<u8>,
+) {
     let push4 = |v: [f32; 3], w: f32, buf: &mut Vec<u8>| {
         for c in v {
             buf.extend_from_slice(&c.to_le_bytes());
         }
         buf.extend_from_slice(&w.to_le_bytes());
     };
-    for &i in keep {
-        let (omin, omax) = drawable_aabb[i];
-        let alb = drawable_albedo[i];
-        let center = [
-            (omin[0] + omax[0]) * 0.5,
-            (omin[1] + omax[1]) * 0.5,
-            (omin[2] + omax[2]) * 0.5,
-        ];
-        let half = [
-            (omax[0] - omin[0]) * 0.5,
-            (omax[1] - omin[1]) * 0.5,
-            (omax[2] - omin[2]) * 0.5,
-        ];
-        for axis in 0..3 {
-            for &sign in &[1.0f32, -1.0] {
-                let mut normal = [0.0f32; 3];
-                normal[axis] = sign;
-                let mut fc = center;
-                fc[axis] = if sign > 0.0 { omax[axis] } else { omin[axis] };
-                let t1 = (axis + 1) % 3;
-                let t2 = (axis + 2) % 3;
-                let mut u_axis = [0.0f32; 3];
-                u_axis[t1] = half[t1];
-                let mut v_axis = [0.0f32; 3];
-                v_axis[t2] = half[t2];
-                let depth = (omax[axis] - omin[axis]).max(1e-4);
-                push4(fc, depth, &mut cards);
-                push4(normal, 0.0, &mut cards);
-                push4(u_axis, 0.0, &mut cards);
-                push4(v_axis, 0.0, &mut cards);
-                for c in alb {
-                    card_albedo.extend_from_slice(&c.to_le_bytes());
-                }
+    let (omin, omax) = aabb;
+    let center = [
+        (omin[0] + omax[0]) * 0.5,
+        (omin[1] + omax[1]) * 0.5,
+        (omin[2] + omax[2]) * 0.5,
+    ];
+    let half = [
+        (omax[0] - omin[0]) * 0.5,
+        (omax[1] - omin[1]) * 0.5,
+        (omax[2] - omin[2]) * 0.5,
+    ];
+    for axis in 0..3 {
+        for &sign in &[1.0f32, -1.0] {
+            let mut normal = [0.0f32; 3];
+            normal[axis] = sign;
+            let mut fc = center;
+            fc[axis] = if sign > 0.0 { omax[axis] } else { omin[axis] };
+            let t1 = (axis + 1) % 3;
+            let t2 = (axis + 2) % 3;
+            let mut u_axis = [0.0f32; 3];
+            u_axis[t1] = half[t1];
+            let mut v_axis = [0.0f32; 3];
+            v_axis[t2] = half[t2];
+            let depth = (omax[axis] - omin[axis]).max(1e-4);
+            push4(fc, depth, cards);
+            push4(normal, 0.0, cards);
+            push4(u_axis, 0.0, cards);
+            push4(v_axis, 0.0, cards);
+            for c in albedo {
+                card_albedo.extend_from_slice(&c.to_le_bytes());
             }
         }
     }
-    (cards, card_albedo, residency)
 }
 
 /// C2a — distance-driven per-card resolution assignment. Desired texel density is proportional

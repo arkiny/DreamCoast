@@ -319,7 +319,10 @@ fn mesh_perprimitive_locations(mesh: &[u32]) -> std::collections::HashSet<u32> {
             }
         }
     });
-    perprim.iter().filter_map(|id| id_loc.get(id).copied()).collect()
+    perprim
+        .iter()
+        .filter_map(|id| id_loc.get(id).copied())
+        .collect()
 }
 
 /// Fragment `Input` variable ids sitting at one of `locs` that are not already `PerPrimitiveEXT`.
@@ -388,7 +391,10 @@ fn spirv_add_perprimitive(frag: &[u32], targets: &[u32]) -> Vec<u32> {
     let new_cap: Vec<u32> = if has_cap {
         vec![]
     } else {
-        vec![(2 << 16) | SPV_OP_CAPABILITY as u32, SPV_CAP_MESH_SHADING_EXT]
+        vec![
+            (2 << 16) | SPV_OP_CAPABILITY as u32,
+            SPV_CAP_MESH_SHADING_EXT,
+        ]
     };
     let new_ext: Vec<u32> = if has_ext {
         vec![]
@@ -401,13 +407,16 @@ fn spirv_add_perprimitive(frag: &[u32], targets: &[u32]) -> Vec<u32> {
     };
     let mut new_dec: Vec<u32> = Vec::with_capacity(targets.len() * 3);
     for &t in targets {
-        new_dec.extend_from_slice(&[(3 << 16) | SPV_OP_DECORATE as u32, t, SPV_DECOR_PERPRIMITIVE_EXT]);
+        new_dec.extend_from_slice(&[
+            (3 << 16) | SPV_OP_DECORATE as u32,
+            t,
+            SPV_DECOR_PERPRIMITIVE_EXT,
+        ]);
     }
 
     // Boundaries are monotonic (cap_end <= ext_at <= dec_at); splice in order. No new <id>s are
     // introduced (decorations reference existing ids), so the header's id-bound is unchanged.
-    let mut out =
-        Vec::with_capacity(frag.len() + new_cap.len() + new_ext.len() + new_dec.len());
+    let mut out = Vec::with_capacity(frag.len() + new_cap.len() + new_ext.len() + new_dec.len());
     out.extend_from_slice(&frag[..cap_end]);
     out.extend_from_slice(&new_cap);
     out.extend_from_slice(&frag[cap_end..ext_at]);

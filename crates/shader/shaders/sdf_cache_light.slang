@@ -164,7 +164,10 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
     // C2a: variable-tile texel→card mapping (sentinel = the exact legacy `t / tile²`).
     uint lay8 = (pc.tile >> 8) & 0xFFu;
     uint sc_layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
-    uint card = layout_find_card(sc_layout, t, max(pc.tile & 0xFFu, 1u), pc.num_cards);
+    // F1 Stage 1: page-pool reverse-table index (bits 17..28 +1; 0 = no pool).
+    uint sm12 = (pc.tile >> 17) & 0xFFFu;
+    uint sc_slotmap = sm12 == 0u ? 0xFFFFFFFFu : sm12 - 1u;
+    uint card = layout_find_card(sc_layout, t, max(pc.tile & 0xFFu, 1u), pc.num_cards, sc_slotmap);
     // Stage D2b: camera-visibility priority. On-screen cards relight at the base budget period;
     // off-screen cards relight HIDDEN_MULT× less often (most of a dense scene's cards are out of
     // any one view, and they don't affect the current image — 레퍼런스 엔진 SW GI's visibility/staleness
@@ -314,15 +317,32 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
         }
         if (hit)
         {
+            float3 nq = geo_normal(qhit);
             bool cache_hit;
             // Track C: the gather's card lookup goes through the acceleration grid when the
             // host built one (identical results — superset + ascending order; see the helper).
             uint gc8 = pc.gdf_sampled & 0xFFu;
             uint gp8 = (pc.gdf_sampled >> 8) & 0xFFu;
             float3 s = sample_surface_cache_grid(
-                qhit, geo_normal(qhit), pc.cards_index, pc.cache_pos_index, pc.cache_rad_read,
+                qhit, nq, pc.cards_index, pc.cache_pos_index, pc.cache_rad_read,
                 pc.num_cards, pc.tile, 0.0, gc8 == 0u ? 0xFFFFFFFFu : gc8 - 1u,
                 gp8 == 0u ? 0xFFFFFFFFu : gp8 - 1u, cache_hit);
+            // F1 Stage 0 — surface-cache virtualization fallback. When the gather ray hits a surface
+            // that carries NO card (a coarse-fallback drawable over the card budget, or an
+            // LRU-evicted page once streaming lands), the cache lookup returns float3(0). Adding that
+            // zero drops all multibounce contribution from non-resident geometry to BLACK — the real
+            // interior lighting hole. Instead approximate the hit's outgoing radiance with the SAME
+            // dense-field direct-sun re-light this shader gives the texel's own point
+            // (albedo/PI · sun_i·ndl·shadow); the occluded-SH term supplies skylight, exactly as in
+            // the texel's own `direct_irr` decomposition, so there is no double count. Content-only
+            // (flags bit1 = `gather_fallback`, host-gated off for the gallery ⇒ legacy zero-add ⇒
+            // byte-identical anchor). This is also the correct degrade for an evicted page.
+            if (!cache_hit && (pc.flags & 2u) != 0u)
+            {
+                float ndlq = max(dot(nq, sun_dir), 0.0);
+                float shq = ndlq > 0.0 ? sun_shadow(qhit + nq * 0.004, sun_dir) : 1.0;
+                s = cm_albedo(light_clip(), qhit, 0.7) * (sun_i * ndlq * shq * (1.0 / PI));
+            }
             indirect += clamp_firefly(s, pc.gather_firefly);
         }
         if (!hit)

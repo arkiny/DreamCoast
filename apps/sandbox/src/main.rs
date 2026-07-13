@@ -878,6 +878,20 @@ struct App {
     /// TLAS cache gather (`P_CACHE_HWRT_GATHER`, tier `cache_hwrt_gather`): the relight's indirect
     /// rays trace exact triangles — the leak-prone GDF march inflates the gathered bounce.
     cache_hwrt_gather: bool,
+    /// F1 Stage 0 surface-cache virtualization fallback (`P11_GATHER_FALLBACK`, content default on):
+    /// re-light a relight-gather hit that carries no card (a coarse-fallback drawable over the card
+    /// budget, or an LRU-evicted page) with the dense-field direct-sun term instead of contributing
+    /// black — the interior multibounce hole. Off for the gallery so the legacy zero-add keeps the
+    /// byte-identical anchor.
+    cache_gather_fallback: bool,
+    /// F1 Stage 3 page-pool streaming: all drawables' world AABBs + representative albedos, kept so
+    /// `GdfSystem::stream_residency` can re-own the fixed card slots from the LIVE camera each frame
+    /// (build a newly-admitted drawable's 6 cards in place). Empty unless `P11_CACHE_STREAM`.
+    stream_obj_aabb: Vec<([f32; 3], [f32; 3])>,
+    stream_obj_albedo: Vec<[f32; 3]>,
+    /// F1 Stage 3: set by `stream_residency` when this frame re-owned any slot, so the frame loop
+    /// records a dirty re-capture of just the changed cards.
+    stream_recapture: bool,
     /// Capture occlusion invalidation (`P_CACHE_CAPTURE_OCCL`, tier `cache_capture_occl`): card
     /// texels whose capture hit an occluder store invalid instead of a wrong witness.
     cache_capture_occl: bool,
@@ -1086,6 +1100,11 @@ struct App {
     /// so a demagnified far reflection reads a coarse averaged level (smooth) instead of stair-
     /// stepped mip0 blocks. Content default on; `P11_REFLECT_MIP=0` falls back to mip0 bilinear.
     reflect_mip: bool,
+    /// F1 Stage 4 — GI card-MIP parity (`P11_GI_MIP`, content default on): the diffuse GI gather
+    /// reads the surface-cache radiance MIP pyramid at a ray-cone level (like the reflection path)
+    /// instead of a single mip0 texel, so distant GI hits stop speckling. Off for the gallery (the
+    /// GI gather passes the mip sentinel ⇒ mip0 nearest ⇒ byte-identical anchor).
+    gi_card_mip: bool,
     /// Firefly clamp: bound the per-sample radiance in the reflection source / composite / GI
     /// gather so a bright specular pixel can't become a speckle. Off => unbounded (pre-clamp).
     firefly_clamp: bool,
@@ -1952,6 +1971,10 @@ impl App {
         // gallery, an imported glTF, or a level (Sponza). `fuse_scene` + the Stage A grid
         // bake + the clipmap make this affordable. World streaming stays out of scope (no
         // single AABB). The gallery is byte-identical (same fuse → same bake → same cards).
+        // F1 Stage 3: the drawable directory the page-pool streaming keeps (filled below only when
+        // `P11_CACHE_STREAM` is on — `obj_aabb`/`obj_albedo` are scoped inside the bake block).
+        let mut stream_obj_aabb: Vec<([f32; 3], [f32; 3])> = Vec::new();
+        let mut stream_obj_albedo: Vec<[f32; 3]> = Vec::new();
         let build_scene_gdf = !world_mode && gdf.has_gdf_trace() && !world.draw_list().is_empty();
         if build_scene_gdf {
             let fused = fuse::fuse_scene(&world, &mesh_registry, &material_registry);
@@ -2428,7 +2451,19 @@ impl App {
                 // C2a adaptive card resolution (opt-in): redistribute the SAME texel budget as
                 // the uniform atlas by camera relevance — near/large cards up to 64², far/small
                 // down to 8² — so the cache carries detail where reflections actually read it.
-                let card_res: Option<Vec<u32>> = if !gallery_scene
+                // F1 Stage 1 — surface-cache page pool (`P11_CACHE_POOL`, opt-in, default off). A
+                // fixed pool of uniform card slots + a reverse slot_to_card table (the streaming/LRU
+                // foundation). It overrides the adaptive-res atlas (the pool uses uniform slots), and
+                // with Stage 1's identity map it reproduces the uniform arithmetic bit-for-bit — so
+                // it may run on ANY scene (the gallery included) without moving the byte anchor,
+                // which is exactly how the plumbing is verified. Default off keeps every scene on the
+                // legacy path.
+                // F1 Stage 3 page-pool streaming (`P11_CACHE_STREAM`, opt-in, content only). Implies
+                // the pool. The fixed card slots are re-owned from the live camera each frame.
+                let cache_stream = !gallery_scene && quality::env_bool("P11_CACHE_STREAM", false);
+                let cache_pool = cache_stream || quality::env_bool("P11_CACHE_POOL", false);
+                let card_res: Option<Vec<u32>> = if !cache_pool
+                    && !gallery_scene
                     && quality::env_bool("P11_CACHE_ADAPTIVE_RES", base.cache_adaptive_res)
                 {
                     Some(fuse::assign_card_res(
@@ -2450,8 +2485,21 @@ impl App {
                     card_res.as_deref(),
                     // Track C card grid: pick-identical lookup acceleration (tier default +
                     // `P_CACHE_GRID` override; content only — the gallery keeps the legacy scan).
-                    !gallery_scene && quality::env_bool("P_CACHE_GRID", base.cache_grid),
+                    // Disabled under streaming: the grid maps cells → card indices from the initial
+                    // card positions, which go stale as slots are re-owned (the consumer full-scans).
+                    !gallery_scene
+                        && !cache_stream
+                        && quality::env_bool("P_CACHE_GRID", base.cache_grid),
+                    cache_pool,
+                    cache_stream,
                 )?;
+                // F1 Stage 3: seed the streaming slot ownership from the initial residency + keep the
+                // drawable directory so the frame loop can re-own slots from the live camera.
+                if cache_stream {
+                    gdf.init_stream(&residency.resident);
+                    stream_obj_aabb = obj_aabb.clone();
+                    stream_obj_albedo = obj_albedo.clone();
+                }
                 // C1 mesh-triangle capture (opt-in): consolidated content geometry (the same
                 // layout as the HWRT hit-lighting table, built independently of RT capability)
                 // + the card→drawable instance map (table row + world→object 3x4 per resident
@@ -2678,6 +2726,10 @@ impl App {
         // TLAS gather rides the same permutation (see the tier-knob doc).
         let cache_hwrt_gather =
             cache_hwrt_shadow && quality::env_bool("P_CACHE_HWRT_GATHER", base.cache_hwrt_gather);
+        // F1 Stage 0: dense-field fallback for card-less relight-gather hits. Content default on;
+        // never for the gallery (keeps the byte-identical anchor via the legacy zero-add).
+        let cache_gather_fallback =
+            !gallery_scene && quality::env_bool("P11_GATHER_FALLBACK", true);
         // Capture occlusion invalidation (see the tier-knob doc; needs the C1 mesh tables —
         // the shader no-ops without them).
         let cache_capture_occl = quality::env_bool("P_CACHE_CAPTURE_OCCL", base.cache_capture_occl);
@@ -3080,6 +3132,8 @@ impl App {
         // reflection then reads a coarse averaged surface-cache MIP (smooth) rather than mip0 blocks.
         // `P11_REFLECT_MIP=0` opts out (mip0 bilinear = the pre-MIP path).
         let reflect_mip = reflect_cache && quality::env_bool("P11_REFLECT_MIP", true);
+        // F1 Stage 4: GI card-MIP parity (content only; the gallery keeps mip0 nearest).
+        let gi_card_mip = !gallery_scene && quality::env_bool("P11_GI_MIP", true);
         // Firefly clamp on by default (P11_FIREFLY_CLAMP=0 to disable / compare).
         let firefly_clamp = quality::env_bool("P11_FIREFLY_CLAMP", base.firefly_clamp);
         // C8d: roughness above which screen-mirror SSR stops contributing (GDF takes over). Gallery
@@ -3638,6 +3692,10 @@ impl App {
             cache_sky_occlude,
             cache_hwrt_shadow,
             cache_hwrt_gather,
+            cache_gather_fallback,
+            stream_obj_aabb,
+            stream_obj_albedo,
+            stream_recapture: false,
             cache_capture_occl,
             cache_occl_route,
             reflect_probe_valid,
@@ -3700,6 +3758,7 @@ impl App {
             surface_cache,
             reflect_cache,
             reflect_mip,
+            gi_card_mip,
             firefly_clamp,
             reflect_max_roughness,
             ssr_stochastic,
@@ -4555,6 +4614,20 @@ impl App {
                 );
             }
             scene = streaming.build_scene();
+        }
+        // F1 Stage 3 — page-pool streaming: re-own the fixed card slots from the LIVE camera so the
+        // surface cache follows the view (a drawable the camera approaches gets a card; one it leaves
+        // frees its slot). A change flags a dirty re-capture below. Content streaming only (the
+        // directory is empty otherwise); in screenshot mode the camera is fixed, so the residency is
+        // static and this is a no-op (byte-identical) unless a CAPTURE_SEQ / fly path moves it.
+        self.stream_recapture = false;
+        if !self.stream_obj_aabb.is_empty() {
+            let card_cam = fuse::CardCamera::from_look(eye, focus);
+            self.stream_recapture = self.gdf.stream_residency(
+                &self.stream_obj_aabb,
+                &self.stream_obj_albedo,
+                &card_cam,
+            )?;
         }
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
         let proj_noflip = Mat4::perspective_rh(
@@ -6098,13 +6171,16 @@ impl App {
         let scene_cache_ext = match (cache_active, scene_gdf_ext) {
             (true, Some(gdf_ext)) => {
                 let ext = graph.import_external("scene_cache");
-                if !self.scene_cache_captured {
+                // F1 Stage 3: the initial capture traces every card (dirty_only = false); a streaming
+                // frame that re-owned slots re-captures ONLY the changed cards (dirty_only = true).
+                if !self.scene_cache_captured || self.stream_recapture {
                     self.gdf.record_cache_capture(
                         &mut graph,
                         gdf_ext,
                         scene_albedo_ext,
                         ext,
                         self.cache_capture_occl,
+                        self.scene_cache_captured && self.stream_recapture,
                     );
                     self.scene_cache_captured = true;
                 }
@@ -6200,8 +6276,9 @@ impl App {
                 // period, and the pass constant are all backend-independent, so DX and VK freeze at
                 // the same frame on the same converged mean (DX≡VK-stable, unlike the old measured
                 // trigger that latched two different noise samples at frames 48 vs 8).
-                let freeze_horizon =
-                    self.cache_freeze_passes.saturating_mul(self.cache_relight_period.max(1));
+                let freeze_horizon = self
+                    .cache_freeze_passes
+                    .saturating_mul(self.cache_relight_period.max(1));
                 if self.scene_cache_captured
                     && !cache_reset_this_frame
                     && self.cache_stable_frames >= freeze_horizon
@@ -6263,6 +6340,7 @@ impl App {
                             &mut graph,
                             frustum_planes(cull_view_proj),
                             calib,
+                            self.frame_no as u32,
                         )
                     } else {
                         None
@@ -6303,6 +6381,7 @@ impl App {
                         gi::GiSystem::ao_params(scene_aabb_min, scene_aabb_max),
                         self.cache_hwrt_shadow,
                         self.cache_hwrt_gather,
+                        self.cache_gather_fallback,
                     );
                     self.scene_cache_reset = false;
                 }
@@ -6314,20 +6393,36 @@ impl App {
         // radiance at a hit (instead of a per-ray re-light). `None` => per-ray. Split so the
         // reflection cache (C8g, default) is independent of the heavier per-ray GI cache (opt-in).
         let cache_read = self.gdf.surface_cache_read();
-        let gi_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
-            Some(ext) if self.surface_cache => {
-                cache_read.map(|(c, p, r, n, t)| ([c, p, r, n, t], ext))
+        // Cone-LOD: generate the surface-cache radiance MIP pyramid from the freshly-lit mip0, so a
+        // demagnified far reflection — or a distant GI hit (F1 Stage 4) — reads a coarse averaged
+        // level (smooth) instead of stair-stepped mip0 blocks. Ordered after the relight; returns a
+        // handle the consumers read after. `None` (no pyramid) → the mip0 path. Computed BEFORE the
+        // GI tuple so GI can carry the pyramid index + depend on this pass.
+        let cache_mip_ext: Option<ResourceId> = match (scene_cache_lit_ext, cache_read) {
+            (Some(lit), Some((_, _, rad, _, _)))
+                if (self.reflect_cache && self.reflect_mip) || self.gi_card_mip =>
+            {
+                self.gdf.record_cache_mipgen(&mut graph, lit, rad)
             }
             _ => None,
         };
-        // Reflection cone-LOD: generate the surface-cache radiance MIP pyramid from the freshly-lit
-        // mip0, so a demagnified far reflection reads a coarse averaged level (smooth) instead of
-        // stair-stepped mip0 blocks. Ordered after the relight; returns a handle the reflection reads
-        // after. `None` (no pyramid / reflect_cache off) → the reflection keeps the mip0 bilinear path.
-        let cache_mip_ext: Option<ResourceId> = match (scene_cache_lit_ext, cache_read) {
-            (Some(lit), Some((_, _, rad, _, _))) if self.reflect_cache && self.reflect_mip => {
-                self.gdf.record_cache_mipgen(&mut graph, lit, rad)
-            }
+        let gi_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
+            Some(ext) if self.surface_cache => cache_read.map(|(c, p, r, n, t)| {
+                // F1 Stage 4: pack the radiance MIP-pyramid index into num_cards bits 16..31 (+1;
+                // 0 = off) so the GI gather reads a ray-cone level. Depend on the mipgen output (which
+                // transitively depends on the relight) so GI runs after the pyramid is written. Only
+                // when the count fits in 16 bits; the gallery keeps mip off (byte-identical).
+                match (
+                    self.gi_card_mip,
+                    cache_mip_ext,
+                    self.gdf.reflect_cache_mip_info(),
+                ) {
+                    (true, Some(mext), Some((pyr, _))) if n < 0x1_0000 => {
+                        ([c, p, r, n | ((pyr + 1) << 16), t], mext)
+                    }
+                    _ => ([c, p, r, n, t], ext),
+                }
+            }),
             _ => None,
         };
         // Track C card grid (opt-in `P_CACHE_GRID`, built at cache-build time): pack the grid's
@@ -8094,18 +8189,19 @@ impl App {
         // The rasterized HDR already bakes exposure into the lighting pass; the
         // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
         // exposure here before the filmic curve (else the bright sky + sun blow out).
-        let tm_exposure = if pt_active
+        let raw_radiance_src = pt_active
             || sdf_out.is_some()
             || gdf_trace_out.is_some()
             || scene_gdf_out.is_some()
             || reflect_out.is_some()
             || hybrid_out.is_some()
-            || cache_out.is_some()
-        {
-            self.exposure
-        } else {
-            1.0
-        };
+            || cache_out.is_some();
+        let tm_exposure = if raw_radiance_src { self.exposure } else { 1.0 };
+        // Raw-radiance sources (path tracer / SW-RT viz) are exposed at the tonemap; under
+        // AUTO_EXPOSURE, read the adapted exposure from the AE buffer there too so the view
+        // auto-exposes like the rasterized lighting (which bakes it into `hdr` upstream). The
+        // main-lit raster path already carries the adapted exposure, so it stays on tm=1.0.
+        let ae_exposure = raw_radiance_src && self.auto_exposure;
         // QHD/UHD: sharpen only when the TAAU upscale produced this frame (recover crispness lost
         // in temporal upsampling); native/debug paths get 0 = byte-identical.
         let (sharpen, inv_w, inv_h) = if taau_active && taau_out.is_some() {
@@ -8157,6 +8253,7 @@ impl App {
             cdl_offset,
             cdl_power,
             tonemap_lut,
+            ae_exposure,
         );
 
         // PR-9 View Family (`docs/view-family.md`): render a SECOND view in the same frame against
@@ -8420,6 +8517,7 @@ impl App {
                     self.cache_gather_firefly(),
                     self.sky_gain,
                     self.sky_wb,
+                    self.cache_gather_fallback,
                 );
                 ccmd.end()?;
                 let cur = (self.frame_no % 2) as usize;

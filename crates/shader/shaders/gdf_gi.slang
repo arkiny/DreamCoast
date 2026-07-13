@@ -258,7 +258,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
             {
                 float3 hp = origin + dir * q.CommittedRayT();
-                b = bs_shade_hit(bs, hp, bs_scene_normal(bs, hp));
+                b = bs_shade_hit(bs, hp, bs_scene_normal(bs, hp), q.CommittedRayT());
             }
             // Firefly clamp per sample (before averaging), matching the SW path.
             float m = max(b.r, max(b.g, b.b));

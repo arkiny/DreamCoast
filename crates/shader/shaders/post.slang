@@ -40,7 +40,12 @@ struct PushConstants
     // power 1 -> exact identity. `grade_on` gates it so the neutral case is not even
     // evaluated (a pure no-op, no pow() rounding) -> byte-identical anchor.
     uint grade_on;    // 0 = grading disabled (identity), 1 = apply CDL
-    uint pad0;
+    // Auto-exposure buffer (bindless storage index): when != 0xFFFFFFFF the exposure applied
+    // below is read from this buffer's element 0 (the adapted exposure the AE resolve wrote)
+    // instead of the constant `exposure`. Used by the raw-radiance paths (path tracer / SW-RT)
+    // so they auto-expose like the rasterized lighting does; 0xFFFFFFFF keeps the constant
+    // (byte-identical anchor — the gallery is fixed-exposure).
+    uint exposure_buf;
     uint pad1;
     // Each CDL vector is a full float4 row (never float3 + trailing scalar) to dodge the
     // HLSL/SPIR-V vs. MSL push-constant packing divergence (a scalar after a float3
@@ -123,8 +128,13 @@ float4 fsMain(VSOutput input) : SV_Target
     }
     // Camera exposure before the filmic curve. The rasterized HDR already bakes
     // exposure into the lighting pass (so it passes 1.0 here); the path-traced
-    // output carries raw scene radiance and is exposed at this stage instead.
-    float3 exposed = hdr * pc.exposure;
+    // output carries raw scene radiance and is exposed at this stage instead. When an
+    // auto-exposure buffer is bound (raw-radiance paths under AUTO_EXPOSURE), read the
+    // adapted exposure from it so the PT/SW-RT view auto-exposes like the raster lighting.
+    float exposure = pc.exposure;
+    if (pc.exposure_buf != 0xFFFFFFFFu)
+        exposure = asfloat(g.storage_buffers[pc.exposure_buf].Load(0u));
+    float3 exposed = hdr * exposure;
     float3 color;
     if (pc.lut_index != 0xFFFFFFFFu)
     {

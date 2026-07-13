@@ -228,13 +228,40 @@ float bs_gi_shadow(BounceScene bs, float3 origin, float3 dir)
 // both produce the same GI regardless of how the hit was found. When the surface cache is bound the
 // radiance is the hit's cached (multibounce) radiance (a direct lookup, no per-ray re-light); on a
 // cache MISS (e.g. the analytic ground) it falls back to the per-ray coloured sun re-light.
-float3 bs_shade_hit(BounceScene bs, float3 p, float3 hn)
+float3 bs_shade_hit(BounceScene bs, float3 p, float3 hn, float hit_dist)
 {
     if (bs.cache.x != 0xFFFFFFFFu)
     {
+        // F1 Stage 4: the num_cards slot carries the radiance MIP-pyramid index in its high 16 bits
+        // (0 = off) so a distant GI hit reads a coarse averaged level — card-MIP parity with the
+        // reflection cone path, killing far-card speckle. Content only; the gallery packs 0, taking
+        // the ELSE branch below (the exact pre-Stage-4 call) so the byte anchor is preserved.
+        uint mip_pyr = bs.cache.w >> 16u;
         bool cached = false;
-        float3 r = sample_surface_cache(p, hn, bs.cache.x, bs.cache.y, bs.cache.z, bs.cache.w,
-                                        bs.cache_tile, 0.0, cached);
+        float3 r;
+        if (mip_pyr != 0u)
+        {
+            // Content GI card-MIP: route through the shared reflection cone path (multi-card cone-MIP
+            // accumulation, unchanged) with a small extra_tol so cone_mode engages. The cone footprint
+            // grows with the bounce distance (a wide cosine lobe) → coarser level for farther hits.
+            uint nc = bs.cache.w & 0xFFFFu;
+            float sample_radius = 0.05 + hit_dist * 0.08;
+            uint tile_edge = bs.cache_tile & 0xFFu;
+            uint lay8 = (bs.cache_tile >> 8) & 0xFFu;
+            uint layout = lay8 == 0u ? 0xFFFFFFFFu : lay8 - 1u;
+            uint max_mip = firstbithigh(max(tile_edge, 1u));
+            float3 alb_u = float3(0.0, 0.0, 0.0);
+            bool occl_u = false;
+            r = sample_surface_cache_cone(p, hn, bs.cache.x, bs.cache.y, bs.cache.z, nc, tile_edge,
+                                          0.02, sample_radius, mip_pyr - 1u, max_mip, 0xFFFFFFFFu,
+                                          0xFFFFFFFFu, layout, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                                          0xFFFFFFFFu, 0u, alb_u, cached, occl_u);
+        }
+        else
+        {
+            r = sample_surface_cache(p, hn, bs.cache.x, bs.cache.y, bs.cache.z, bs.cache.w,
+                                     bs.cache_tile, 0.0, cached);
+        }
         if (cached)
             return r;
     }
@@ -267,7 +294,7 @@ float3 bs_trace_bounce(BounceScene bs, float3 origin, float3 dir, out float esca
         {
             escaped = 0.0;
             float3 hn = bs_scene_normal(bs, p);
-            return bs_shade_hit(bs, p, hn);
+            return bs_shade_hit(bs, p, hn, t);
         }
         // cone-trace LOD: raise the step floor with distance (cone_k=0 => max(d,0.01) legacy).
         t += max(d, max(0.01, bs.cone_k * t));

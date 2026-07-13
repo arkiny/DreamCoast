@@ -37,6 +37,11 @@ struct CacheVisPush
     uint width;              // lit-history pixel dims
     uint height;
     uint flip_y;             // bit0: Vulkan Y convention (matches gdf_reflect's history fetch)
+    // F1 Stage 2 — page-pool LRU clock. When bound (`touched_index != 0xFFFFFFFF`) every on-screen
+    // card records the current `frame` here; Stage 3 evicts by `frame - touched[c]` (frames since a
+    // card was last on screen / mirror-reflected), so a card a mirror is still reading survives.
+    uint touched_index;      // 1 uint / card (0xFFFFFFFF = off = no LRU clock, legacy)
+    uint frame;              // current frame counter (the touched timestamp)
 };
 
 [[vk::push_constant]]
@@ -165,6 +170,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         g.storage_buffers[pc.marks_index].Store(c * 4u, 0u);
     }
     g.storage_buffers[pc.out_index].Store(c * 4u, visible);
+
+    // F1 Stage 2 — page-pool LRU clock: stamp the current frame on every on-screen card (mirror
+    // reads count via `visible == 2`). One thread per card, so a plain store (no atomic). A card
+    // that goes off-screen keeps its last-seen frame, so Stage 3 evicts by staleness.
+    if (pc.touched_index != 0xFFFFFFFFu && visible != 0u)
+        g.storage_buffers[pc.touched_index].Store(c * 4u, pc.frame);
 
 #ifdef CACHE_VIS_CALIB
     calib_probe(c, 0u); // lane 0 contributes its probe too (lanes 1..63 returned early above)
