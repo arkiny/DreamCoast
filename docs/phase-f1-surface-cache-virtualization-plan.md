@@ -112,14 +112,24 @@
 > **결정론(run-to-run)** → **DX≡VK**(Windows 동결 → Metal 검증 + 명시 보류) → `PROFILE_GPU` 비용.
 > heavy=opt-in seam, 단일소스, 상표명 금지.
 
-### Stage 0 — coarse-fallback 다중바운스 검정-add 폴백 수정 (선결·저위험)
+### Stage 0 — coarse-fallback 다중바운스 검정-add 폴백 수정 (선결·저위험) ✅ 커밋 `2ceb5f6`
 **왜:** F1 전제("구멍 없음")의 실제 최대 구멍이자, LRU 방출의 올바른 시맨틱(방출→dense-field-lit).
-**변경:** `sdf_cache_light.slang:314-328` — `cache_hit==false`일 때 `bs_shade_hit`와 동형의 dense-field
-analytic 재조명(sun·shadow + sky-fill, `bs_albedo_at` voxel albedo) 값을 `indirect`에 더한다(0 대신).
-단일소스: 폴백 재조명을 공유 헬퍼로 뽑아 게더/`bs_shade_hit`가 공유.
-**게이트:** 콘텐츠 PT 잔차 **개선**(실내 다중바운스 밝기↑, 정확도↑) / 갤러리 바이트 동일(within-budget →
-coarse-fallback 없음 → 무변). opt-out `P11_GATHER_FALLBACK=0`.
-**측정:** `LEVEL=sponza_intel_chromeball` 실내 각도 raster vs PT 잔차, before/after; 갤러리 SHA.
+**변경(구현):** `sdf_cache_light.slang` 게더 `if(hit)` — `!cache_hit && (flags&2)`일 때 이 셰이더가
+텍셀 자기점에 주는 것과 **동형의 direct-sun 재조명**(`cm_albedo(qhit)/PI · sun_i·ndl·shadow`)을 더한다.
+스카이라이트는 기존 occluded-SH 항이 담당(이 셰이더의 direct/skylight 분해와 일치 → unoccluded sky_fill
+없음·이중계상 없음). flags bit1(`gather_fallback`)은 host가 **콘텐츠에서만** 세팅(`P11_GATHER_FALLBACK`
+기본 on; 갤러리 off) → 레거시 zero-add로 바이트 앵커 보존. sync·async 리코더 양쪽 배선.
+**검증(Metal, release):**
+- 갤러리 앵커 `65d04ceca2c4…` **불변**(콘텐츠 전용 게이트). PASS.
+- 콘텐츠 run-to-run tolerant 0.035/ch(선존 비결정 — OFF 경로도 동일 분산 → Stage 0 효과 아님).
+- **정직한 크기**: 강제 극한 예산(16 레지던트/449, 432 coarse)에서도 뷰티 델타 **0.134/ch, mean-lum
+  65.9→66.0**(방향 정상·아티팩트 없음). 다중바운스 구멍은 **2차항**(1차 GI는 `bs_shade_hit`가 coarse
+  표면을 analytic으로 이미 조명; 실내 coarse는 대개 그림자라 direct-only ≈ 실제 기여) — 로드맵의 "구멍"
+  서사보다 가시 영향 **작음**. 주 가치 = 정확성 + Stage 3 방출 시맨틱 선결.
+- 콘텐츠 PT 잔차는 이 콜로네이드 카메라에서 **측정 무효**: PT 레퍼런스가 노출 불일치·near-black
+  (mean-lum 26.8 vs raster 72.2 — 문서화된 실내 PT 트랩) → 49/ch는 전역 노출 차이. ON vs OFF는 중립
+  (49.736 vs 49.757). **후속: 하늘/햇빛 보이는 카메라 or F6 노출 매칭 필요.**
+- DX≡VK: Metal 검증, Windows 동결(배치 추가).
 
 ### Stage 1 — 고정 페이지 풀 + 카드→페이지 인디렉션 (기능 무변 리팩터)
 **왜:** 아틀라스 크기를 레지던트 카드 수에서 분리하는 메커니즘 도입.
