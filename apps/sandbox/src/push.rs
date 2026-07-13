@@ -186,9 +186,11 @@ pub(crate) fn prefilter_push(
 pub(crate) const CDL_NEUTRAL: ([f32; 3], [f32; 3], [f32; 3]) =
     ([1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
 
-/// Pack the tonemap push block (96 bytes): hdr_index + mode + flip_y + exposure (16) +
-/// sharpen + inv_w + inv_h + bloom_index (16) + bloom_intensity + grade_on + pad + pad
-/// (16) + cdl_slope float4 (16) + cdl_offset float4 (16) + cdl_power float4 (16).
+/// Pack the tonemap push block (112 bytes): hdr_index + mode + flip_y + exposure (16) +
+/// sharpen + inv_w + inv_h + bloom_index (16) + bloom_intensity + grade_on + exposure_buf
+/// + pad (16) + cdl_slope float4 (16) + cdl_offset float4 (16) + cdl_power float4 (16) +
+/// lut_index + lut_size + pad + pad (16). `exposure_buf == u32::MAX` uses the constant
+/// `exposure` (byte-identical anchor); otherwise the adapted auto-exposure is read from it.
 ///
 /// PR-5 added the bloom composite slot + the ASC-CDL color-grading hook. `bloom_index ==
 /// u32::MAX` skips the bloom add; `grade_on == 0` skips grading. Each CDL vector is a
@@ -207,6 +209,7 @@ pub(crate) fn post_push(
     bloom_index: u32,
     bloom_intensity: f32,
     grade_on: u32,
+    exposure_buf: u32,
     cdl_slope: [f32; 3],
     cdl_offset: [f32; 3],
     cdl_power: [f32; 3],
@@ -224,7 +227,9 @@ pub(crate) fn post_push(
     pc[28..32].copy_from_slice(&bloom_index.to_le_bytes());
     pc[32..36].copy_from_slice(&bloom_intensity.to_le_bytes());
     pc[36..40].copy_from_slice(&grade_on.to_le_bytes());
-    // pc[40..48]: pad0/pad1 to the float4 boundary.
+    // pc[40..44] = exposure_buf (auto-exposure buffer bindless index; MAX = use constant);
+    // pc[44..48] = pad1 to the float4 boundary.
+    pc[40..44].copy_from_slice(&exposure_buf.to_le_bytes());
     for (i, v) in cdl_slope.iter().enumerate() {
         pc[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
     }

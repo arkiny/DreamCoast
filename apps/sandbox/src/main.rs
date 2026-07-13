@@ -8094,18 +8094,19 @@ impl App {
         // The rasterized HDR already bakes exposure into the lighting pass; the
         // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
         // exposure here before the filmic curve (else the bright sky + sun blow out).
-        let tm_exposure = if pt_active
+        let raw_radiance_src = pt_active
             || sdf_out.is_some()
             || gdf_trace_out.is_some()
             || scene_gdf_out.is_some()
             || reflect_out.is_some()
             || hybrid_out.is_some()
-            || cache_out.is_some()
-        {
-            self.exposure
-        } else {
-            1.0
-        };
+            || cache_out.is_some();
+        let tm_exposure = if raw_radiance_src { self.exposure } else { 1.0 };
+        // Raw-radiance sources (path tracer / SW-RT viz) are exposed at the tonemap; under
+        // AUTO_EXPOSURE, read the adapted exposure from the AE buffer there too so the view
+        // auto-exposes like the rasterized lighting (which bakes it into `hdr` upstream). The
+        // main-lit raster path already carries the adapted exposure, so it stays on tm=1.0.
+        let ae_exposure = raw_radiance_src && self.auto_exposure;
         // QHD/UHD: sharpen only when the TAAU upscale produced this frame (recover crispness lost
         // in temporal upsampling); native/debug paths get 0 = byte-identical.
         let (sharpen, inv_w, inv_h) = if taau_active && taau_out.is_some() {
@@ -8157,6 +8158,7 @@ impl App {
             cdl_offset,
             cdl_power,
             tonemap_lut,
+            ae_exposure,
         );
 
         // PR-9 View Family (`docs/view-family.md`): render a SECOND view in the same frame against
