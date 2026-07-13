@@ -2060,7 +2060,7 @@ impl App {
                 struct BakeSpec {
                     mvtx: Vec<u8>,
                     midx: Vec<u8>,
-                    dim: u32,
+                    dims: [u32; 3],
                     mn: [f32; 3],
                     mx: [f32; 3],
                     albedo: Option<([f32; 3], usize)>, // (material colour, triangle count)
@@ -2091,7 +2091,7 @@ impl App {
                         specs.push(BakeSpec {
                             mvtx: dreamcoast_asset::sdf::encode_vertices_fused(&cpu.vertices),
                             midx: dreamcoast_asset::sdf::encode_indices(&cpu.indices),
-                            dim: dreamcoast_asset::sdf::mesh_sdf_dim(mn, mx),
+                            dims: dreamcoast_asset::sdf::mesh_sdf_dims(mn, mx),
                             mn,
                             mx,
                             albedo,
@@ -2123,7 +2123,7 @@ impl App {
                     |i, slot| {
                         let s = &specs[i];
                         let (mut vol, _) = dreamcoast_asset::cook::load_or_bake_mesh_sdf(
-                            &s.mvtx, &s.midx, s.dim, s.mn, s.mx, &cache_dir,
+                            &s.mvtx, &s.midx, s.dims, s.mn, s.mx, &cache_dir,
                         );
                         // Mostly-negative DF ⇒ globally-inverted normals (open space read as "inside"):
                         // negate so the sign is correct (removes compose poisoning + spurious AO/GI floor
@@ -2146,7 +2146,7 @@ impl App {
                                 &s.mvtx,
                                 &s.midx,
                                 &tri_albedo,
-                                s.dim,
+                                s.dims,
                                 s.mn,
                                 s.mx,
                                 &cache_dir,
@@ -2188,7 +2188,7 @@ impl App {
                 let (sdf_vol, sdf_outcome) = dreamcoast_asset::cook::load_or_bake_scene_sdf(
                     &fused_v,
                     &fused_i,
-                    sdf_dim,
+                    [sdf_dim; 3],
                     amin,
                     amax,
                     &app::cooked_cache_dir(),
@@ -2216,7 +2216,7 @@ impl App {
                 &fused_v,
                 &fused_i,
                 &tri_albedo,
-                sdf_dim,
+                [sdf_dim; 3],
                 amin,
                 amax,
                 &app::cooked_cache_dir(),
@@ -2266,7 +2266,7 @@ impl App {
                         dreamcoast_asset::cook::load_or_bake_scene_sdf(
                             &fused_v,
                             &fused_i,
-                            sdf_dim,
+                            [sdf_dim; 3],
                             *lmin,
                             *lmax,
                             &app::cooked_cache_dir(),
@@ -2279,7 +2279,7 @@ impl App {
                         &fused_v,
                         &fused_i,
                         &tri_albedo,
-                        sdf_dim,
+                        [sdf_dim; 3],
                         *lmin,
                         *lmax,
                         &app::cooked_cache_dir(),

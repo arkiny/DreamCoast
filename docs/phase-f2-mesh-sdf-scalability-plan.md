@@ -4,6 +4,20 @@
 > [gi-fidelity-phases.md](gi-fidelity-phases.md) F2. 실측 프로브는 S1 분석 프리미티브의 의도된
 > 사용(수치는 §2에 보존, 프로브 코드는 미커밋).
 
+## S2a 검증 결과 (랜딩 커밋)
+
+- **아틀라스 217×306×215: f16 28.6 MB / f32 57.1 MB** — 원점(cubic cap32 f32) 71.0 → S2b 35.5 →
+  **S2a+S2b 28.6 MB (×0.40)**, 동시에 per-axis 캡 48로 롱축 해상도 +50%(32→48), 얇은 축은 목표
+  0.05 m 유지(과해상 제거가 재원). `P11_ATLAS_F16=0` A/B 확인.
+- **갤러리 앵커 PASS. 콘텐츠 PT budget PASS**: sunlit 30.629 ≤ 30.9(중립, +0.03),
+  **interior 34.155 ≤ 34.65 — 기준선 34.350 대비 −0.20 실측 개선**(커튼·근접 지오가 per-axis
+  해상도 수혜 — 예상 방향 그대로).
+- `P_SC_VIZ` 시각: 카드 등록 건강(구멍/체커보드 없음). 워크스페이스 테스트 전부 PASS(asset 82종
+  포함, per-axis 클램프 유닛테스트 추가). clippy/fmt clean.
+- 쿡: dims가 캐시 키에 해시되므로 **1회 자동 재쿡**(per-mesh ~30 s 병렬 + 씬 SDF/albedo 레벨 수 분,
+  이후 캐시 히트). dcasset SDF/albedo 청크는 dims[3] 인코딩(구 파일은 키 불일치로 자연 무효).
+- 샘플러/셰이더 **무변경**(uvw bias/scale는 원래 축별) — 배선은 CPU 측 뿐.
+
 ## S2b 검증 결과 (랜딩 커밋)
 
 - **메모리: 71.0 → 35.5 MB (×0.50)** — `per-mesh SDF direct sample: atlas 274x238x272 (35.5 MB,

@@ -9,7 +9,7 @@ use crate::dcasset;
 use crate::sdf::{self, AlbedoVolumes, SdfVolume};
 
 /// Load the scene's signed-distance field as cooked data, baking + caching on a
-/// miss. The invalidation key is a content hash of `(fused_vtx, fused_idx, dim,
+/// miss. The invalidation key is a content hash of `(fused_vtx, fused_idx, dims,
 /// aabb)` — any change re-bakes.
 ///
 /// The cook is pure CPU, so the bytes are deterministic and backend-independent;
@@ -18,7 +18,7 @@ use crate::sdf::{self, AlbedoVolumes, SdfVolume};
 pub fn load_or_bake_scene_sdf(
     fused_vtx: &[u8],
     fused_idx: &[u8],
-    dim: u32,
+    dims: [u32; 3],
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     cache_dir: &Path,
@@ -28,7 +28,9 @@ pub fn load_or_bake_scene_sdf(
     let mut key = dcasset::hash_begin();
     key = dcasset::hash_update(key, fused_vtx);
     key = dcasset::hash_update(key, fused_idx);
-    key = dcasset::hash_update(key, &dim.to_le_bytes());
+    for d in dims {
+        key = dcasset::hash_update(key, &d.to_le_bytes());
+    }
     for c in aabb_min.iter().chain(aabb_max.iter()) {
         key = dcasset::hash_update(key, &c.to_le_bytes());
     }
@@ -44,7 +46,7 @@ pub fn load_or_bake_scene_sdf(
         return (vol, LoadOutcome::CacheHit);
     }
 
-    let vol = sdf::bake_sdf_from_fused(fused_vtx, fused_idx, dim, aabb_min, aabb_max);
+    let vol = sdf::bake_sdf_from_fused(fused_vtx, fused_idx, dims, aabb_min, aabb_max);
     if let Err(e) = write_atomic(&cache_file, &dcasset::write_sdf(&vol, key)) {
         tracing_warn(&format!(
             "failed to write cooked scene SDF {}: {e}",
@@ -60,12 +62,12 @@ pub fn load_or_bake_scene_sdf(
 /// mesh, in any level or scene, resolves to the *same* cache file (bake once, share
 /// everywhere). `mesh_vtx`/`mesh_idx` are the fused 32-byte / u32 bytes
 /// (`sdf::encode_vertices_fused` / `encode_indices`); `dim`/`aabb` come from
-/// `sdf::mesh_sdf_dim` / `mesh_local_aabb_padded`. Pure CPU → deterministic, VK≡DX by
+/// `sdf::mesh_sdf_dims` / `mesh_local_aabb_padded`. Pure CPU → deterministic, VK≡DX by
 /// construction, like the scene SDF.
 pub fn load_or_bake_mesh_sdf(
     mesh_vtx: &[u8],
     mesh_idx: &[u8],
-    dim: u32,
+    dims: [u32; 3],
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     cache_dir: &Path,
@@ -73,7 +75,9 @@ pub fn load_or_bake_mesh_sdf(
     let mut key = dcasset::hash_begin();
     key = dcasset::hash_update(key, mesh_vtx);
     key = dcasset::hash_update(key, mesh_idx);
-    key = dcasset::hash_update(key, &dim.to_le_bytes());
+    for d in dims {
+        key = dcasset::hash_update(key, &d.to_le_bytes());
+    }
     for c in aabb_min.iter().chain(aabb_max.iter()) {
         key = dcasset::hash_update(key, &c.to_le_bytes());
     }
@@ -89,7 +93,7 @@ pub fn load_or_bake_mesh_sdf(
         return (vol, LoadOutcome::CacheHit);
     }
 
-    let vol = sdf::bake_sdf_from_fused(mesh_vtx, mesh_idx, dim, aabb_min, aabb_max);
+    let vol = sdf::bake_sdf_from_fused(mesh_vtx, mesh_idx, dims, aabb_min, aabb_max);
     if let Err(e) = write_atomic(&cache_file, &dcasset::write_sdf(&vol, key)) {
         tracing_warn(&format!(
             "failed to write cooked mesh SDF {}: {e}",
@@ -107,7 +111,7 @@ pub fn load_or_bake_scene_albedo(
     fused_vtx: &[u8],
     fused_idx: &[u8],
     tri_albedo: &[u8],
-    dim: u32,
+    dims: [u32; 3],
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     cache_dir: &Path,
@@ -116,7 +120,9 @@ pub fn load_or_bake_scene_albedo(
     key = dcasset::hash_update(key, fused_vtx);
     key = dcasset::hash_update(key, fused_idx);
     key = dcasset::hash_update(key, tri_albedo);
-    key = dcasset::hash_update(key, &dim.to_le_bytes());
+    for d in dims {
+        key = dcasset::hash_update(key, &d.to_le_bytes());
+    }
     for c in aabb_min.iter().chain(aabb_max.iter()) {
         key = dcasset::hash_update(key, &c.to_le_bytes());
     }
@@ -128,13 +134,13 @@ pub fn load_or_bake_scene_albedo(
         && header.source_hash == key
         && header.cook_params_hash == dcasset::cook_params_hash()
         && let Ok((_, vol)) = dcasset::read_albedo(&bytes)
-        && vol.dim == dim
+        && vol.dims == dims
     {
         return (vol, LoadOutcome::CacheHit);
     }
 
     let vol =
-        sdf::bake_albedo_from_fused(fused_vtx, fused_idx, tri_albedo, dim, aabb_min, aabb_max);
+        sdf::bake_albedo_from_fused(fused_vtx, fused_idx, tri_albedo, dims, aabb_min, aabb_max);
     if let Err(e) = write_atomic(&cache_file, &dcasset::write_albedo(&vol, key)) {
         tracing_warn(&format!(
             "failed to write cooked scene albedo {}: {e}",
@@ -148,14 +154,14 @@ pub fn load_or_bake_scene_albedo(
 /// miss (gi-fidelity-phases.md, F5 S1 — the per-mesh companion to [`load_or_bake_mesh_sdf`]).
 /// The key is a content hash of the mesh's **local** geometry + its per-triangle albedo + grid
 /// — no world transform — so the cache is shared across every instance / level, and a colour
-/// change re-bakes. `mesh_vtx`/`mesh_idx`/`dim`/`aabb` are the **same** the paired mesh-SDF
-/// cook uses (`sdf::mesh_sdf_dim` / `mesh_local_aabb_padded`), so the albedo tile aligns 1:1
+/// change re-bakes. `mesh_vtx`/`mesh_idx`/`dims`/`aabb` are the **same** the paired mesh-SDF
+/// cook uses (`sdf::mesh_sdf_dims` / `mesh_local_aabb_padded`), so the albedo tile aligns 1:1
 /// with the SDF tile. Pure CPU → deterministic, VK≡DX by construction.
 pub fn load_or_bake_mesh_albedo(
     mesh_vtx: &[u8],
     mesh_idx: &[u8],
     tri_albedo: &[u8],
-    dim: u32,
+    dims: [u32; 3],
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     cache_dir: &Path,
@@ -164,7 +170,9 @@ pub fn load_or_bake_mesh_albedo(
     key = dcasset::hash_update(key, mesh_vtx);
     key = dcasset::hash_update(key, mesh_idx);
     key = dcasset::hash_update(key, tri_albedo);
-    key = dcasset::hash_update(key, &dim.to_le_bytes());
+    for d in dims {
+        key = dcasset::hash_update(key, &d.to_le_bytes());
+    }
     for c in aabb_min.iter().chain(aabb_max.iter()) {
         key = dcasset::hash_update(key, &c.to_le_bytes());
     }
@@ -176,12 +184,12 @@ pub fn load_or_bake_mesh_albedo(
         && header.source_hash == key
         && header.cook_params_hash == dcasset::cook_params_hash()
         && let Ok((_, vol)) = dcasset::read_albedo(&bytes)
-        && vol.dim == dim
+        && vol.dims == dims
     {
         return (vol, LoadOutcome::CacheHit);
     }
 
-    let vol = sdf::bake_albedo_from_fused(mesh_vtx, mesh_idx, tri_albedo, dim, aabb_min, aabb_max);
+    let vol = sdf::bake_albedo_from_fused(mesh_vtx, mesh_idx, tri_albedo, dims, aabb_min, aabb_max);
     if let Err(e) = write_atomic(&cache_file, &dcasset::write_albedo(&vol, key)) {
         tracing_warn(&format!(
             "failed to write cooked mesh albedo {}: {e}",
@@ -225,13 +233,13 @@ mod tests {
         ];
         let indices = [0u32, 1, 2];
         let (mn, mx) = sdf::mesh_local_aabb_padded(&verts);
-        let dim = sdf::mesh_sdf_dim(mn, mx);
+        let dims = sdf::mesh_sdf_dims(mn, mx);
         let vtx = sdf::encode_vertices_fused(&verts);
         let idx = sdf::encode_indices(&indices);
 
-        let (a, o1) = load_or_bake_mesh_sdf(&vtx, &idx, dim, mn, mx, &dir);
+        let (a, o1) = load_or_bake_mesh_sdf(&vtx, &idx, dims, mn, mx, &dir);
         assert_eq!(o1, LoadOutcome::Cooked, "first call bakes");
-        let (b, o2) = load_or_bake_mesh_sdf(&vtx, &idx, dim, mn, mx, &dir);
+        let (b, o2) = load_or_bake_mesh_sdf(&vtx, &idx, dims, mn, mx, &dir);
         assert_eq!(
             o2,
             LoadOutcome::CacheHit,

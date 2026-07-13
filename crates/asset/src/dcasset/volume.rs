@@ -31,10 +31,14 @@ pub fn read_albedo(bytes: &[u8]) -> Result<(Header, AlbedoVolumes), EngineError>
     Ok((header, decode_albedo(&mut r)?))
 }
 
-/// Encode the SDF chunk payload: `dim`, `aabb_min`, `aabb_max`, then the voxels.
+/// Encode the SDF chunk payload: `dims[3]` (per-axis, F2 S2a), `aabb_min`, `aabb_max`,
+/// then the voxels. Old cubic chunks (single `dim`) are never decoded against this
+/// codec — the cook cache key hashes the dims, so a dims change resolves to a new file.
 fn encode_sdf(vol: &SdfVolume) -> Vec<u8> {
     let mut w = Writer::default();
-    w.u32(vol.dim);
+    for d in vol.dims {
+        w.u32(d);
+    }
     for c in vol.aabb_min {
         w.f32(c);
     }
@@ -47,30 +51,33 @@ fn encode_sdf(vol: &SdfVolume) -> Vec<u8> {
     w.buf
 }
 
-/// Decode an SDF chunk payload, validating the voxel count against `dim³`.
+/// Decode an SDF chunk payload, validating the voxel count against `dims`.
 fn decode_sdf(r: &mut Reader) -> Result<SdfVolume, EngineError> {
-    let dim = r.u32()?;
+    let dims = [r.u32()?, r.u32()?, r.u32()?];
     let aabb_min = [r.f32()?, r.f32()?, r.f32()?];
     let aabb_max = [r.f32()?, r.f32()?, r.f32()?];
-    let count = (dim as usize)
-        .checked_pow(3)
-        .ok_or_else(|| EngineError::Asset("dcasset: sdf dim overflow".into()))?;
+    let count = (dims[0] as usize)
+        .checked_mul(dims[1] as usize)
+        .and_then(|n| n.checked_mul(dims[2] as usize))
+        .ok_or_else(|| EngineError::Asset("dcasset: sdf dims overflow".into()))?;
     let mut voxels = Vec::with_capacity(count);
     for _ in 0..count {
         voxels.push(r.f32()?);
     }
     Ok(SdfVolume {
-        dim,
+        dims,
         aabb_min,
         aabb_max,
         voxels,
     })
 }
 
-/// Encode the albedo chunk payload: `dim`, then the R, G, B channels in order.
+/// Encode the albedo chunk payload: `dims[3]`, then the R, G, B channels in order.
 fn encode_albedo(vol: &AlbedoVolumes) -> Vec<u8> {
     let mut w = Writer::default();
-    w.u32(vol.dim);
+    for d in vol.dims {
+        w.u32(d);
+    }
     for ch in &vol.channels {
         for &v in ch {
             w.f32(v);
@@ -79,12 +86,13 @@ fn encode_albedo(vol: &AlbedoVolumes) -> Vec<u8> {
     w.buf
 }
 
-/// Decode an albedo chunk payload (`dim` + three `dim³` channels).
+/// Decode an albedo chunk payload (`dims[3]` + three `dims`-sized channels).
 fn decode_albedo(r: &mut Reader) -> Result<AlbedoVolumes, EngineError> {
-    let dim = r.u32()?;
-    let count = (dim as usize)
-        .checked_pow(3)
-        .ok_or_else(|| EngineError::Asset("dcasset: albedo dim overflow".into()))?;
+    let dims = [r.u32()?, r.u32()?, r.u32()?];
+    let count = (dims[0] as usize)
+        .checked_mul(dims[1] as usize)
+        .and_then(|n| n.checked_mul(dims[2] as usize))
+        .ok_or_else(|| EngineError::Asset("dcasset: albedo dims overflow".into()))?;
     let mut channels = [
         Vec::with_capacity(count),
         Vec::with_capacity(count),
@@ -95,7 +103,7 @@ fn decode_albedo(r: &mut Reader) -> Result<AlbedoVolumes, EngineError> {
             ch.push(r.f32()?);
         }
     }
-    Ok(AlbedoVolumes { dim, channels })
+    Ok(AlbedoVolumes { dims, channels })
 }
 
 #[cfg(test)]
@@ -105,7 +113,7 @@ mod tests {
     #[test]
     fn sdf_chunk_roundtrip() {
         let vol = SdfVolume {
-            dim: 2,
+            dims: [2, 2, 2],
             aabb_min: [-1.0, 0.0, 0.5],
             aabb_max: [1.0, 2.0, 1.5],
             voxels: vec![-0.3, 0.1, 0.0, 0.7, -0.5, 0.2, 0.9, -0.1],
@@ -113,7 +121,7 @@ mod tests {
         let bytes = write_sdf(&vol, 0xabc);
         let (header, decoded) = read_sdf(&bytes).expect("decode");
         assert_eq!(header.source_hash, 0xabc);
-        assert_eq!(decoded.dim, 2);
+        assert_eq!(decoded.dims, [2, 2, 2]);
         assert_eq!(decoded.aabb_min, vol.aabb_min);
         assert_eq!(decoded.aabb_max, vol.aabb_max);
         assert_eq!(decoded.voxels, vol.voxels);
@@ -122,7 +130,7 @@ mod tests {
     #[test]
     fn albedo_chunk_roundtrip() {
         let vol = AlbedoVolumes {
-            dim: 2,
+            dims: [2, 2, 2],
             channels: [
                 vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
                 vec![1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3],
@@ -132,7 +140,7 @@ mod tests {
         let bytes = write_albedo(&vol, 0x5151);
         let (header, decoded) = read_albedo(&bytes).expect("decode");
         assert_eq!(header.source_hash, 0x5151);
-        assert_eq!(decoded.dim, 2);
+        assert_eq!(decoded.dims, [2, 2, 2]);
         assert_eq!(decoded.channels, vol.channels);
     }
 }

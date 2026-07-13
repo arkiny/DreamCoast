@@ -162,7 +162,9 @@ pub(crate) fn compose_sdf_level(
     });
 
     SdfVolume {
-        dim,
+        // The composed level is a cubic scene grid (dim per axis) — only the per-mesh
+        // fields it samples are anisotropic (F2 S2a).
+        dims: [dim; 3],
         aabb_min: level_min,
         aabb_max: level_max,
         voxels,

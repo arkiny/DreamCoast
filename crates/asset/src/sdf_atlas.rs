@@ -27,14 +27,14 @@
 
 use crate::sdf::{AlbedoVolumes, SdfVolume};
 
-/// One packed tile: where a mesh's `dim³` field lives in the atlas, plus the mesh's local AABB
-/// (so the sampler can form the mesh-local normalized coordinate `t`).
+/// One packed tile: where a mesh's `dims`-sized field lives in the atlas, plus the mesh's
+/// local AABB (so the sampler can form the mesh-local normalized coordinate `t`).
 #[derive(Clone, Debug)]
 pub struct AtlasTile {
     /// Inner-block origin in atlas voxels (the mesh's voxel `0` — past the gutter).
     pub origin: [u32; 3],
-    /// Inner cube edge (voxels) = the mesh's `SdfVolume::dim`.
-    pub dim: u32,
+    /// Inner block edge per axis (voxels) = the mesh's `SdfVolume::dims` (F2 S2a).
+    pub dims: [u32; 3],
     /// The mesh's padded local AABB (matches the source `SdfVolume`).
     pub aabb_min: [f32; 3],
     pub aabb_max: [f32; 3],
@@ -57,33 +57,34 @@ pub struct SdfAtlas {
 /// adjacent tile.
 const GUTTER: u32 = 1;
 
-/// Trilinearly resample `src` to a `new_dim³` cube over the *same* AABB (a box downsample when
-/// `new_dim < src.dim`). Averaging signed distances preserves the zero-isosurface to first order,
-/// so a coarser tile still resolves a mesh's thin features (whose voxel size is set by the tight
-/// AABB, not the cube dim) while shedding over-resolution on the long axes. Deterministic.
-fn resample(src: &SdfVolume, new_dim: u32) -> SdfVolume {
-    let n = new_dim.max(1);
-    let mut voxels = vec![0.0f32; (n * n * n) as usize];
+/// Trilinearly resample `src` to `new_dims` over the *same* AABB (a box downsample on any
+/// axis where `new_dims[a] < src.dims[a]`). Averaging signed distances preserves the
+/// zero-isosurface to first order, so a coarser tile still resolves a mesh's thin features
+/// (whose voxel size is set by the tight AABB) while shedding long-axis over-resolution.
+/// Deterministic.
+fn resample(src: &SdfVolume, new_dims: [u32; 3]) -> SdfVolume {
+    let n = [new_dims[0].max(1), new_dims[1].max(1), new_dims[2].max(1)];
+    let mut voxels = vec![0.0f32; (n[0] * n[1] * n[2]) as usize];
     let ext = [
         src.aabb_max[0] - src.aabb_min[0],
         src.aabb_max[1] - src.aabb_min[1],
         src.aabb_max[2] - src.aabb_min[2],
     ];
-    let inv = 1.0 / n as f32;
-    for z in 0..n {
-        for y in 0..n {
-            for x in 0..n {
+    let inv = [1.0 / n[0] as f32, 1.0 / n[1] as f32, 1.0 / n[2] as f32];
+    for z in 0..n[2] {
+        for y in 0..n[1] {
+            for x in 0..n[0] {
                 let p = [
-                    src.aabb_min[0] + ext[0] * (x as f32 + 0.5) * inv,
-                    src.aabb_min[1] + ext[1] * (y as f32 + 0.5) * inv,
-                    src.aabb_min[2] + ext[2] * (z as f32 + 0.5) * inv,
+                    src.aabb_min[0] + ext[0] * (x as f32 + 0.5) * inv[0],
+                    src.aabb_min[1] + ext[1] * (y as f32 + 0.5) * inv[1],
+                    src.aabb_min[2] + ext[2] * (z as f32 + 0.5) * inv[2],
                 ];
-                voxels[(x + n * (y + n * z)) as usize] = src.sample(p);
+                voxels[(x + n[0] * (y + n[1] * z)) as usize] = src.sample(p);
             }
         }
     }
     SdfVolume {
-        dim: n,
+        dims: n,
         aabb_min: src.aabb_min,
         aabb_max: src.aabb_max,
         voxels,
@@ -96,20 +97,27 @@ impl SdfAtlas {
         Self::pack_capped(meshes, u32::MAX)
     }
 
-    /// Pack `meshes`, first downsampling any whose `dim > max_dim` to `max_dim³` (a memory cap:
-    /// the atlas is dense `dim³` tiles, so a lower cap trims the largest meshes — whose extra
-    /// resolution is low-frequency and covered by the coarse dense field — for a large saving).
-    /// `max_dim = u32::MAX` packs at native resolution. Deterministic.
+    /// Pack `meshes`, first downsampling any axis whose `dims[a] > max_dim` to `max_dim`
+    /// (a memory cap on the largest tiles — their extra resolution is low-frequency and
+    /// covered by the coarse dense field). `max_dim = u32::MAX` packs at native
+    /// resolution. Deterministic.
     pub fn pack_capped(meshes: &[SdfVolume], max_dim: u32) -> SdfAtlas {
         // Downsample over-cap tiles up front, then pack exactly (borrow the capped set).
         let capped: Vec<SdfVolume> = meshes
             .iter()
             .map(|m| {
-                if m.dim > max_dim {
-                    resample(m, max_dim)
+                if m.dims.iter().any(|&d| d > max_dim) {
+                    resample(
+                        m,
+                        [
+                            m.dims[0].min(max_dim),
+                            m.dims[1].min(max_dim),
+                            m.dims[2].min(max_dim),
+                        ],
+                    )
                 } else {
                     SdfVolume {
-                        dim: m.dim,
+                        dims: m.dims,
                         aabb_min: m.aabb_min,
                         aabb_max: m.aabb_max,
                         voxels: m.voxels.clone(),
@@ -130,43 +138,61 @@ impl SdfAtlas {
             };
         }
 
-        // Footprint side (voxels) of each tile including the gutter on both sides.
-        let side = |m: &SdfVolume| m.dim + 2 * GUTTER;
-        let max_side = meshes.iter().map(side).max().unwrap();
+        // Footprint sides (voxels) of each tile per axis, including the gutter on both sides.
+        let sides = |m: &SdfVolume| {
+            [
+                m.dims[0] + 2 * GUTTER,
+                m.dims[1] + 2 * GUTTER,
+                m.dims[2] + 2 * GUTTER,
+            ]
+        };
+        let max_side = meshes
+            .iter()
+            .flat_map(|m| sides(m).into_iter())
+            .max()
+            .unwrap();
         // Roughly cubic atlas: a square X/Z footprint sized so the shelf grows to ~its own
         // extent in Y. Bump 15 % for shelf waste and clamp up to the largest single tile.
-        let total: u64 = meshes.iter().map(|m| (side(m) as u64).pow(3)).sum();
+        let total: u64 = meshes
+            .iter()
+            .map(|m| {
+                let s = sides(m);
+                s[0] as u64 * s[1] as u64 * s[2] as u64
+            })
+            .sum();
         let foot = ((total as f64).cbrt() * 1.15).ceil() as u32;
         let foot = foot.max(max_side);
 
-        // 3D shelf placement: advance X within a Z-row (row depth = tallest tile in the row),
+        // 3D shelf placement: advance X within a Z-row (row depth = deepest tile in the row),
         // wrap to a new Z-row, then a new Y-layer (layer height = tallest tile in the layer).
+        // Per-axis tile sides (F2 S2a): X-advance uses the tile's own width; the row/layer
+        // extents track the max depth/height seen, exactly as the cubic shelf did.
         let mut tiles = Vec::with_capacity(meshes.len());
         let (mut x, mut y, mut z) = (0u32, 0u32, 0u32);
         let (mut row_depth, mut layer_height) = (0u32, 0u32);
         let mut atlas_w = 0u32;
         let mut atlas_d = 0u32;
         for m in meshes {
-            let s = side(m);
-            if x + s > foot && x > 0 {
+            let s = sides(m);
+            if x + s[0] > foot && x > 0 {
                 x = 0;
                 z += row_depth;
                 row_depth = 0;
             }
-            if z + s > foot && z > 0 {
+            if z + s[2] > foot && z > 0 {
                 z = 0;
                 y += layer_height;
                 layer_height = 0;
             }
             tiles.push(AtlasTile {
                 origin: [x + GUTTER, y + GUTTER, z + GUTTER],
-                dim: m.dim,
+                dims: m.dims,
                 aabb_min: m.aabb_min,
                 aabb_max: m.aabb_max,
             });
-            x += s;
-            row_depth = row_depth.max(s);
-            layer_height = layer_height.max(s);
+            x += s[0];
+            row_depth = row_depth.max(s[2]);
+            layer_height = layer_height.max(s[1]);
             atlas_w = atlas_w.max(x);
             atlas_d = atlas_d.max(z + row_depth);
         }
@@ -179,23 +205,23 @@ impl SdfAtlas {
         let (ax, ay) = (dim[0] as usize, dim[1] as usize);
         let mut voxels = vec![0.0f32; ax * ay * dim[2] as usize];
         for (m, t) in meshes.iter().zip(&tiles) {
-            let d = m.dim as i32;
+            let d = [m.dims[0] as i32, m.dims[1] as i32, m.dims[2] as i32];
             let base = [
                 t.origin[0] as i32 - GUTTER as i32,
                 t.origin[1] as i32 - GUTTER as i32,
                 t.origin[2] as i32 - GUTTER as i32,
             ];
-            let s = side(m) as i32;
-            for fz in 0..s {
-                let mz = (fz - GUTTER as i32).clamp(0, d - 1);
+            let s = sides(m);
+            for fz in 0..s[2] as i32 {
+                let mz = (fz - GUTTER as i32).clamp(0, d[2] - 1);
                 let az = (base[2] + fz) as usize;
-                for fy in 0..s {
-                    let my = (fy - GUTTER as i32).clamp(0, d - 1);
+                for fy in 0..s[1] as i32 {
+                    let my = (fy - GUTTER as i32).clamp(0, d[1] - 1);
                     let ay_ = (base[1] + fy) as usize;
-                    for fx in 0..s {
-                        let mx = (fx - GUTTER as i32).clamp(0, d - 1);
+                    for fx in 0..s[0] as i32 {
+                        let mx = (fx - GUTTER as i32).clamp(0, d[0] - 1);
                         let ax_ = (base[0] + fx) as usize;
-                        let src = (mx + d * (my + d * mz)) as usize;
+                        let src = (mx + d[0] * (my + d[1] * mz)) as usize;
                         voxels[ax_ + ax * (ay_ + ay * az)] = m.voxels[src];
                     }
                 }
@@ -216,9 +242,9 @@ impl SdfAtlas {
             t.origin[2] as f32 / a[2],
         ];
         let scale = [
-            t.dim as f32 / a[0],
-            t.dim as f32 / a[1],
-            t.dim as f32 / a[2],
+            t.dims[0] as f32 / a[0],
+            t.dims[1] as f32 / a[1],
+            t.dims[2] as f32 / a[2],
         ];
         (bias, scale)
     }
@@ -282,13 +308,13 @@ pub fn f32_to_f16_bits(v: f32) -> u16 {
     sign | (((e as u32) << 10) + m) as u16
 }
 
-/// Trilinearly resample one `src_dim³` channel to `new_dim³` over the *same* normalized
-/// `[0,1]³` box (voxel-center clamp addressing, the GPU convention). Used to match an albedo
-/// tile to the SDF tile's (possibly capped) `dim` so a single UVW mapping addresses both.
-/// Deterministic; a box downsample when `new_dim < src_dim`, identity when equal.
-fn resample_channel(src: &[f32], src_dim: u32, new_dim: u32) -> Vec<f32> {
-    let sd = src_dim.max(1);
-    let n = new_dim.max(1);
+/// Trilinearly resample one `src_dims`-sized channel to `new_dims` over the *same*
+/// normalized `[0,1]³` box (voxel-center clamp addressing, the GPU convention). Used to
+/// match an albedo tile to the SDF tile's (possibly capped) dims so a single UVW mapping
+/// addresses both. Deterministic; a box downsample on shrinking axes, identity when equal.
+fn resample_channel(src: &[f32], src_dims: [u32; 3], new_dims: [u32; 3]) -> Vec<f32> {
+    let sd = [src_dims[0].max(1), src_dims[1].max(1), src_dims[2].max(1)];
+    let n = [new_dims[0].max(1), new_dims[1].max(1), new_dims[2].max(1)];
     if sd == n {
         return src.to_vec();
     }
@@ -296,20 +322,20 @@ fn resample_channel(src: &[f32], src_dim: u32, new_dim: u32) -> Vec<f32> {
         // Continuous voxel-center coord, clamped (matches SdfVolume::sample / the GPU sampler).
         let mut g = [0.0f32; 3];
         for a in 0..3 {
-            g[a] = (t[a] * sd as f32 - 0.5).clamp(0.0, sd as f32 - 1.0);
+            g[a] = (t[a] * sd[a] as f32 - 0.5).clamp(0.0, sd[a] as f32 - 1.0);
         }
         let i0 = [g[0] as u32, g[1] as u32, g[2] as u32];
         let i1 = [
-            (i0[0] + 1).min(sd - 1),
-            (i0[1] + 1).min(sd - 1),
-            (i0[2] + 1).min(sd - 1),
+            (i0[0] + 1).min(sd[0] - 1),
+            (i0[1] + 1).min(sd[1] - 1),
+            (i0[2] + 1).min(sd[2] - 1),
         ];
         let f = [
             g[0] - i0[0] as f32,
             g[1] - i0[1] as f32,
             g[2] - i0[2] as f32,
         ];
-        let at = |x: u32, y: u32, z: u32| src[(x + sd * (y + sd * z)) as usize];
+        let at = |x: u32, y: u32, z: u32| src[(x + sd[0] * (y + sd[1] * z)) as usize];
         let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
         let c00 = lerp(at(i0[0], i0[1], i0[2]), at(i1[0], i0[1], i0[2]), f[0]);
         let c10 = lerp(at(i0[0], i1[1], i0[2]), at(i1[0], i1[1], i0[2]), f[0]);
@@ -317,17 +343,17 @@ fn resample_channel(src: &[f32], src_dim: u32, new_dim: u32) -> Vec<f32> {
         let c11 = lerp(at(i0[0], i1[1], i1[2]), at(i1[0], i1[1], i1[2]), f[0]);
         lerp(lerp(c00, c10, f[1]), lerp(c01, c11, f[1]), f[2])
     };
-    let inv = 1.0 / n as f32;
-    let mut out = vec![0.0f32; (n * n * n) as usize];
-    for z in 0..n {
-        for y in 0..n {
-            for x in 0..n {
+    let inv = [1.0 / n[0] as f32, 1.0 / n[1] as f32, 1.0 / n[2] as f32];
+    let mut out = vec![0.0f32; (n[0] * n[1] * n[2]) as usize];
+    for z in 0..n[2] {
+        for y in 0..n[1] {
+            for x in 0..n[0] {
                 let t = [
-                    (x as f32 + 0.5) * inv,
-                    (y as f32 + 0.5) * inv,
-                    (z as f32 + 0.5) * inv,
+                    (x as f32 + 0.5) * inv[0],
+                    (y as f32 + 0.5) * inv[1],
+                    (z as f32 + 0.5) * inv[2],
                 ];
-                out[(x + n * (y + n * z)) as usize] = sample(t);
+                out[(x + n[0] * (y + n[1] * z)) as usize] = sample(t);
             }
         }
     }
@@ -364,17 +390,17 @@ impl AlbedoAtlas {
         let mut channels = [vec![0.0f32; n], vec![0.0f32; n], vec![0.0f32; n]];
 
         for (i, tile) in sdf_atlas.tiles.iter().enumerate() {
-            let d = tile.dim;
-            // The per-channel source at the tile's dim (resampled from the albedo's native dim,
-            // exactly as the SDF tile was capped), or the neutral fallback when absent.
+            let d = tile.dims;
+            // The per-channel source at the tile's dims (resampled from the albedo's native
+            // dims, exactly as the SDF tile was capped), or the neutral fallback when absent.
             let src: [Vec<f32>; 3] = match albedos.get(i) {
                 Some(a) => [
-                    resample_channel(&a.channels[0], a.dim, d),
-                    resample_channel(&a.channels[1], a.dim, d),
-                    resample_channel(&a.channels[2], a.dim, d),
+                    resample_channel(&a.channels[0], a.dims, d),
+                    resample_channel(&a.channels[1], a.dims, d),
+                    resample_channel(&a.channels[2], a.dims, d),
                 ],
                 None => {
-                    let m = (d * d * d) as usize;
+                    let m = (d[0] * d[1] * d[2]) as usize;
                     [
                         vec![fallback[0]; m],
                         vec![fallback[1]; m],
@@ -382,23 +408,27 @@ impl AlbedoAtlas {
                     ]
                 }
             };
-            let di = d as i32;
+            let di = [d[0] as i32, d[1] as i32, d[2] as i32];
             let base = [
                 tile.origin[0] as i32 - GUTTER as i32,
                 tile.origin[1] as i32 - GUTTER as i32,
                 tile.origin[2] as i32 - GUTTER as i32,
             ];
-            let s = (d + 2 * GUTTER) as i32;
-            for fz in 0..s {
-                let mz = (fz - GUTTER as i32).clamp(0, di - 1);
+            let s = [
+                (d[0] + 2 * GUTTER) as i32,
+                (d[1] + 2 * GUTTER) as i32,
+                (d[2] + 2 * GUTTER) as i32,
+            ];
+            for fz in 0..s[2] {
+                let mz = (fz - GUTTER as i32).clamp(0, di[2] - 1);
                 let az = (base[2] + fz) as usize;
-                for fy in 0..s {
-                    let my = (fy - GUTTER as i32).clamp(0, di - 1);
+                for fy in 0..s[1] {
+                    let my = (fy - GUTTER as i32).clamp(0, di[1] - 1);
                     let ay_ = (base[1] + fy) as usize;
-                    for fx in 0..s {
-                        let mx = (fx - GUTTER as i32).clamp(0, di - 1);
+                    for fx in 0..s[0] {
+                        let mx = (fx - GUTTER as i32).clamp(0, di[0] - 1);
                         let ax_ = (base[0] + fx) as usize;
-                        let sidx = (mx + di * (my + di * mz)) as usize;
+                        let sidx = (mx + di[0] * (my + di[1] * mz)) as usize;
                         let aidx = ax_ + ax * (ay_ + ay * az);
                         for c in 0..3 {
                             channels[c][aidx] = src[c][sidx];
@@ -451,20 +481,19 @@ pub const BRICK_DIM: u32 = 8;
 /// through (within a distance band) versus empty. Deterministic — a pure function of the field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrickOccupancy {
-    /// The mesh's `SdfVolume::dim`.
-    pub dim: u32,
-    /// Brick-grid resolution per axis = `dim.div_ceil(BRICK_DIM)` (same on all axes since the
-    /// field is cubic).
-    pub bricks_per_axis: u32,
-    /// One flag per brick, `bidx = bx + bricks_per_axis*(by + bricks_per_axis*bz)`: `true` if the
-    /// brick is occupied (holds a voxel with `|distance| < band`), `false` if empty.
+    /// The mesh's `SdfVolume::dims`.
+    pub dims: [u32; 3],
+    /// Brick-grid resolution per axis = `dims[a].div_ceil(BRICK_DIM)`.
+    pub bricks_per_axis: [u32; 3],
+    /// One flag per brick, `bidx = bx + bpa[0]*(by + bpa[1]*bz)`: `true` if the brick is
+    /// occupied (holds a voxel with `|distance| < band`), `false` if empty.
     pub occupied: Vec<bool>,
 }
 
 impl BrickOccupancy {
-    /// Total brick count (`bricks_per_axis³`).
+    /// Total brick count (`bpa[0]*bpa[1]*bpa[2]`).
     pub fn brick_count(&self) -> u32 {
-        self.bricks_per_axis * self.bricks_per_axis * self.bricks_per_axis
+        self.bricks_per_axis[0] * self.bricks_per_axis[1] * self.bricks_per_axis[2]
     }
 
     /// How many bricks are occupied.
@@ -481,9 +510,8 @@ impl BrickOccupancy {
 /// controls how many voxels of shell around the zero-isosurface are kept resident; a band of a
 /// few voxels captures the trilinear neighbourhood the sampler actually reads.
 pub fn brick_band_for(vol: &SdfVolume, margin: f32) -> f32 {
-    let dim = vol.dim.max(1) as f32;
     let voxel_edge = (0..3)
-        .map(|a| (vol.aabb_max[a] - vol.aabb_min[a]).abs() / dim)
+        .map(|a| (vol.aabb_max[a] - vol.aabb_min[a]).abs() / vol.dims[a].max(1) as f32)
         .fold(0.0f32, f32::max);
     margin * voxel_edge.max(f32::MIN_POSITIVE)
 }
@@ -497,20 +525,24 @@ pub fn brick_band_for(vol: &SdfVolume, margin: f32) -> f32 {
 /// within the band marks the whole brick occupied — conservative, so the surface is never
 /// dropped from residency.
 pub fn classify_bricks(vol: &SdfVolume, band: f32) -> BrickOccupancy {
-    let dim = vol.dim;
-    let bpa = dim.div_ceil(BRICK_DIM).max(1);
-    let mut occupied = vec![false; (bpa * bpa * bpa) as usize];
-    let at = |x: u32, y: u32, z: u32| vol.voxels[(x + dim * (y + dim * z)) as usize];
-    for bz in 0..bpa {
-        for by in 0..bpa {
-            for bx in 0..bpa {
+    let dims = vol.dims;
+    let bpa = [
+        dims[0].div_ceil(BRICK_DIM).max(1),
+        dims[1].div_ceil(BRICK_DIM).max(1),
+        dims[2].div_ceil(BRICK_DIM).max(1),
+    ];
+    let mut occupied = vec![false; (bpa[0] * bpa[1] * bpa[2]) as usize];
+    let at = |x: u32, y: u32, z: u32| vol.voxels[(x + dims[0] * (y + dims[1] * z)) as usize];
+    for bz in 0..bpa[2] {
+        for by in 0..bpa[1] {
+            for bx in 0..bpa[0] {
                 let mut hit = false;
                 let z0 = bz * BRICK_DIM;
-                let z1 = ((bz + 1) * BRICK_DIM).min(dim);
+                let z1 = ((bz + 1) * BRICK_DIM).min(dims[2]);
                 let y0 = by * BRICK_DIM;
-                let y1 = ((by + 1) * BRICK_DIM).min(dim);
+                let y1 = ((by + 1) * BRICK_DIM).min(dims[1]);
                 let x0 = bx * BRICK_DIM;
-                let x1 = ((bx + 1) * BRICK_DIM).min(dim);
+                let x1 = ((bx + 1) * BRICK_DIM).min(dims[0]);
                 'scan: for z in z0..z1 {
                     for y in y0..y1 {
                         for x in x0..x1 {
@@ -521,12 +553,12 @@ pub fn classify_bricks(vol: &SdfVolume, band: f32) -> BrickOccupancy {
                         }
                     }
                 }
-                occupied[(bx + bpa * (by + bpa * bz)) as usize] = hit;
+                occupied[(bx + bpa[0] * (by + bpa[1] * bz)) as usize] = hit;
             }
         }
     }
     BrickOccupancy {
-        dim,
+        dims,
         bricks_per_axis: bpa,
         occupied,
     }
@@ -590,7 +622,7 @@ pub fn analyze_bricks(meshes: &[SdfVolume], margin: f32) -> BrickAnalysis {
         total_bricks += occ.brick_count() as u64;
         let occ_n = occ.occupied_count() as u64;
         occupied_bricks += occ_n;
-        dense_bytes += (m.dim as u64).pow(3) * 4;
+        dense_bytes += m.voxel_count() as u64 * 4;
         sparse_bytes += occ_n * brick_payload;
     }
     let occupied_fraction = if total_bricks == 0 {
@@ -681,7 +713,7 @@ mod tests {
         let n = (dim * dim * dim) as usize;
         let voxels = (0..n).map(|i| seed + i as f32 * 0.01).collect();
         SdfVolume {
-            dim,
+            dims: [dim; 3],
             aabb_min: min,
             aabb_max: max,
             voxels,
@@ -726,8 +758,14 @@ mod tests {
         let big = ramp_volume(48, [-1.0; 3], [1.0; 3], 0.0);
         let small = ramp_volume(12, [0.0; 3], [1.0; 3], 3.0);
         let atlas = SdfAtlas::pack_capped(&[big, small], 16);
-        assert_eq!(atlas.tiles[0].dim, 16, "large tile downsampled to the cap");
-        assert_eq!(atlas.tiles[1].dim, 12, "small tile left at native dim");
+        assert_eq!(
+            atlas.tiles[0].dims, [16; 3],
+            "large tile downsampled to the cap"
+        );
+        assert_eq!(
+            atlas.tiles[1].dims, [12; 3],
+            "small tile left at native dim"
+        );
     }
 
     #[test]
@@ -748,12 +786,12 @@ mod tests {
             }
         }
         let src = SdfVolume {
-            dim,
+            dims: [dim; 3],
             aabb_min: mn,
             aabb_max: mx,
             voxels,
         };
-        let ds = resample(&src, 16);
+        let ds = resample(&src, [16; 3]);
         // A voxel center in the coarse grid maps to the same world x → same value.
         for i in 0..16usize {
             // row y=z=0, so the linear index is just i
@@ -793,9 +831,9 @@ mod tests {
         let (ax, ay, az) = (atlas.dim[0], atlas.dim[1], atlas.dim[2]);
         let mut used = vec![false; (ax * ay * az) as usize];
         for t in &atlas.tiles {
-            for dz in 0..t.dim + 2 * GUTTER {
-                for dy in 0..t.dim + 2 * GUTTER {
-                    for dx in 0..t.dim + 2 * GUTTER {
+            for dz in 0..t.dims[2] + 2 * GUTTER {
+                for dy in 0..t.dims[1] + 2 * GUTTER {
+                    for dx in 0..t.dims[0] + 2 * GUTTER {
                         let x = t.origin[0] - GUTTER + dx;
                         let y = t.origin[1] - GUTTER + dy;
                         let z = t.origin[2] - GUTTER + dz;
@@ -826,7 +864,7 @@ mod tests {
             }
         }
         SdfVolume {
-            dim,
+            dims: [dim; 3],
             aabb_min: [0.0; 3],
             aabb_max: [1.0; 3],
             voxels,
@@ -843,7 +881,7 @@ mod tests {
         // voxel_edge = 1/16 = 0.0625; band = 1.5 voxels = 0.09375 in normalized units.
         let band = brick_band_for(&vol, 1.5);
         let occ = classify_bricks(&vol, band);
-        assert_eq!(occ.bricks_per_axis, 2);
+        assert_eq!(occ.bricks_per_axis, [2; 3]);
         assert_eq!(occ.brick_count(), 8);
         // The surface at x≈0.30 lives in the low-x bricks (voxels x=0..7 span 0.03..0.47), and
         // band 0.094 reaches those bricks only. All 4 low-x bricks (by,bz any) are occupied; the
@@ -868,7 +906,7 @@ mod tests {
         let vol = plane_field(dim, 0.5);
         let band = brick_band_for(&vol, 2.0); // ~2 voxels
         let occ = classify_bricks(&vol, band);
-        assert_eq!(occ.bricks_per_axis, 3);
+        assert_eq!(occ.bricks_per_axis, [3; 3]);
         // The middle x-brick (bx=1, voxels x=8..15, centers 0.354..0.646) straddles x=0.5 → all
         // 9 of its (by,bz) entries occupied; the outer x-bricks are far → empty.
         let mut mid = 0;
@@ -895,13 +933,13 @@ mod tests {
     fn band_scales_with_voxel_size() {
         // Two fields, same dim but 2× AABB extent → 2× voxel edge → 2× band for the same margin.
         let small = SdfVolume {
-            dim: 8,
+            dims: [8; 3],
             aabb_min: [0.0; 3],
             aabb_max: [1.0; 3],
             voxels: vec![0.0; 512],
         };
         let big = SdfVolume {
-            dim: 8,
+            dims: [8; 3],
             aabb_min: [0.0; 3],
             aabb_max: [2.0; 3],
             voxels: vec![0.0; 512],
@@ -1049,8 +1087,8 @@ mod tests {
             let band = brick_band_for(m, 2.0);
             let occ = classify_bricks(m, band);
             eprintln!(
-                "  mesh[{i}] dim={} bricks/axis={} occupied {}/{}",
-                m.dim,
+                "  mesh[{i}] dims={:?} bricks/axis={:?} occupied {}/{}",
+                m.dims,
                 occ.bricks_per_axis,
                 occ.occupied_count(),
                 occ.brick_count(),
@@ -1112,7 +1150,7 @@ mod tests {
                 .collect::<Vec<f32>>()
         };
         AlbedoVolumes {
-            dim,
+            dims: [dim; 3],
             channels: [ch(0.0), ch(0.11), ch(0.29)],
         }
     }
@@ -1205,7 +1243,7 @@ mod tests {
                             bias[2] + t[2] * scale[2],
                         ];
                         for c in 0..3 {
-                            let want = channel_sample(&a.channels[c], a.dim, t);
+                            let want = channel_sample(&a.channels[c], a.dims[0], t);
                             let got = albedo_sample(&alb_atlas, c, uvw);
                             assert!(
                                 (got - want).abs() < 1e-4,
@@ -1225,7 +1263,7 @@ mod tests {
         let big_sdf = ramp_volume(48, [-1.0; 3], [1.0; 3], 0.0);
         let big_alb = ramp_albedo(48, 7.0);
         let sdf_atlas = SdfAtlas::pack_capped(std::slice::from_ref(&big_sdf), 16);
-        assert_eq!(sdf_atlas.tiles[0].dim, 16, "SDF tile capped to 16");
+        assert_eq!(sdf_atlas.tiles[0].dims, [16; 3], "SDF tile capped to 16");
         let alb_atlas =
             AlbedoAtlas::pack_like(&sdf_atlas, std::slice::from_ref(&big_alb), [0.5; 3]);
         // A center sample must read the albedo resampled to 16³ (not the native 48³), matching
@@ -1237,7 +1275,7 @@ mod tests {
             bias[1] + t[1] * scale[1],
             bias[2] + t[2] * scale[2],
         ];
-        let capped = resample_channel(&big_alb.channels[0], big_alb.dim, 16);
+        let capped = resample_channel(&big_alb.channels[0], big_alb.dims, [16; 3]);
         let want = channel_sample(&capped, 16, t);
         let got = albedo_sample(&alb_atlas, 0, uvw);
         assert!((got - want).abs() < 1e-4, "capped albedo {got} vs {want}");

@@ -17,16 +17,23 @@
 
 use crate::MeshVertex;
 
-/// A baked signed-distance volume: `dim³` R32F voxels over `[aabb_min, aabb_max]`.
+/// A baked signed-distance volume: `dims[0]·dims[1]·dims[2]` R32F voxels over
+/// `[aabb_min, aabb_max]`. Per-axis dims (F2 S2a): the voxel count follows each axis'
+/// extent, so a thin wall no longer spends a full cube edge across its 0.2 m axis.
 pub struct SdfVolume {
-    pub dim: u32,
+    pub dims: [u32; 3],
     pub aabb_min: [f32; 3],
     pub aabb_max: [f32; 3],
-    /// `dim³` signed distances, `idx = x + dim*(y + dim*z)`.
+    /// `dims[0]*dims[1]*dims[2]` signed distances, `idx = x + dims[0]*(y + dims[1]*z)`.
     pub voxels: Vec<f32>,
 }
 
 impl SdfVolume {
+    /// Total voxel count (`dims[0]*dims[1]*dims[2]`).
+    pub fn voxel_count(&self) -> usize {
+        self.dims[0] as usize * self.dims[1] as usize * self.dims[2] as usize
+    }
+
     /// The voxels as little-endian f32 bytes — the layout the GPU volume upload
     /// (`Device::create_volume_init`) and the `.dcasset` SDF chunk both store.
     pub fn to_le_bytes(&self) -> Vec<u8> {
@@ -38,14 +45,14 @@ impl SdfVolume {
     }
 
     /// Trilinear sample at a point in the volume's own world space (`[aabb_min, aabb_max]`),
-    /// matching the GPU `SampleLevel` convention: voxel centers at `(i+0.5)/dim`, clamp-to-
-    /// edge outside the center grid. Used by the per-mesh→clipmap compositor
+    /// matching the GPU `SampleLevel` convention: voxel centers at `(i+0.5)/dims[a]`, clamp-
+    /// to-edge outside the center grid. Used by the per-mesh→clipmap compositor
     /// (per-mesh-distance-fields.md, S1) to read a mesh's local DF at a world voxel mapped
     /// into the mesh's local frame. The caller decides containment; this never returns NaN.
     pub fn sample(&self, p: [f32; 3]) -> f32 {
-        let dim = self.dim as f32;
         let mut g = [0.0f32; 3]; // continuous voxel-center coords
         for a in 0..3 {
+            let dim = self.dims[a] as f32;
             let ext = self.aabb_max[a] - self.aabb_min[a];
             let t = if ext > 0.0 {
                 (p[a] - self.aabb_min[a]) / ext
@@ -58,9 +65,9 @@ impl SdfVolume {
         }
         let i0 = [g[0] as u32, g[1] as u32, g[2] as u32];
         let i1 = [
-            (i0[0] + 1).min(self.dim - 1),
-            (i0[1] + 1).min(self.dim - 1),
-            (i0[2] + 1).min(self.dim - 1),
+            (i0[0] + 1).min(self.dims[0] - 1),
+            (i0[1] + 1).min(self.dims[1] - 1),
+            (i0[2] + 1).min(self.dims[2] - 1),
         ];
         let f = [
             g[0] - i0[0] as f32,
@@ -68,7 +75,7 @@ impl SdfVolume {
             g[2] - i0[2] as f32,
         ];
         let at = |x: u32, y: u32, z: u32| -> f32 {
-            self.voxels[(x + self.dim * (y + self.dim * z)) as usize]
+            self.voxels[(x + self.dims[0] * (y + self.dims[1] * z)) as usize]
         };
         let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
         let c00 = lerp(at(i0[0], i0[1], i0[2]), at(i1[0], i0[1], i0[2]), f[0]);
@@ -405,7 +412,7 @@ impl TriGrid {
 /// Grouped so the per-slab worker takes a single borrow (and to keep the argument
 /// count sane).
 struct BakeCtx<'a> {
-    dim: u32,
+    dims: [u32; 3],
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
     positions: &'a [[f32; 3]],
@@ -418,7 +425,7 @@ struct BakeCtx<'a> {
 /// Extracted so the bake can run the slabs across threads.
 fn bake_slab(out: &mut [f32], z0: u32, z1: u32, ctx: &BakeCtx) {
     let BakeCtx {
-        dim,
+        dims,
         aabb_min,
         aabb_max,
         positions,
@@ -427,17 +434,21 @@ fn bake_slab(out: &mut [f32], z0: u32, z1: u32, ctx: &BakeCtx) {
         grid,
     } = *ctx;
     let tri_count = indices.len() / 3;
-    let inv_dim = 1.0 / dim as f32;
+    let inv = [
+        1.0 / dims[0] as f32,
+        1.0 / dims[1] as f32,
+        1.0 / dims[2] as f32,
+    ];
     // Per-thread visit stamps so the grid query tests each triangle once per voxel.
     let mut visited = vec![0u32; tri_count];
     let mut stamp = 0u32;
     for z in z0..z1 {
-        for y in 0..dim {
-            for x in 0..dim {
+        for y in 0..dims[1] {
+            for x in 0..dims[0] {
                 let t = [
-                    (x as f32 + 0.5) * inv_dim,
-                    (y as f32 + 0.5) * inv_dim,
-                    (z as f32 + 0.5) * inv_dim,
+                    (x as f32 + 0.5) * inv[0],
+                    (y as f32 + 0.5) * inv[1],
+                    (z as f32 + 0.5) * inv[2],
                 ];
                 let p = [
                     aabb_min[0] + (aabb_max[0] - aabb_min[0]) * t[0],
@@ -464,21 +475,21 @@ fn bake_slab(out: &mut [f32], z0: u32, z1: u32, ctx: &BakeCtx) {
                     ];
                     sign_d = if dot(hit.dp, n) < 0.0 { -1.0 } else { 1.0 };
                 }
-                let local = ((z - z0) * dim * dim + y * dim + x) as usize;
+                let local = ((z - z0) * dims[0] * dims[1] + y * dims[0] + x) as usize;
                 out[local] = hit.dist * sign_d;
             }
         }
     }
 }
 
-/// Bake a `dim³` signed-distance volume over `[aabb_min, aabb_max]` from the fused
-/// 32-byte vertex buffer (`pos`@0, `normal`@12) and u32 index buffer — the same
-/// bytes the GPU bake reads. Brute force O(voxels·triangles), parallelized over Z
-/// slabs (one-time cook; the result is cached as a `.dcasset` SDF chunk).
+/// Bake a `dims[0]·dims[1]·dims[2]` signed-distance volume over `[aabb_min, aabb_max]`
+/// from the fused 32-byte vertex buffer (`pos`@0, `normal`@12) and u32 index buffer —
+/// the same bytes the GPU bake reads. Brute force O(voxels·triangles), parallelized
+/// over Z slabs (one-time cook; the result is cached as a `.dcasset` SDF chunk).
 pub fn bake_sdf_from_fused(
     vtx_bytes: &[u8],
     idx_bytes: &[u8],
-    dim: u32,
+    dims: [u32; 3],
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
 ) -> SdfVolume {
@@ -495,8 +506,8 @@ pub fn bake_sdf_from_fused(
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
 
-    let slab = dim * dim;
-    let mut voxels = vec![0.0_f32; (slab * dim) as usize];
+    let slab = dims[0] * dims[1];
+    let mut voxels = vec![0.0_f32; (slab * dims[2]) as usize];
 
     // Stage A: one acceleration grid over the bake AABB, built once and shared by every
     // slab thread (read-only) — the per-voxel search is then O(near cells), not O(tris).
@@ -507,12 +518,12 @@ pub fn bake_sdf_from_fused(
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(dim as usize)
+        .min(dims[2] as usize)
         .max(1);
-    let per = dim.div_ceil(threads as u32);
+    let per = dims[2].div_ceil(threads as u32);
 
     let ctx = BakeCtx {
-        dim,
+        dims,
         aabb_min,
         aabb_max,
         positions: &positions,
@@ -524,8 +535,8 @@ pub fn bake_sdf_from_fused(
         let mut rest = voxels.as_mut_slice();
         let mut z0 = 0u32;
         let ctx = &ctx;
-        while z0 < dim {
-            let z1 = (z0 + per).min(dim);
+        while z0 < dims[2] {
+            let z1 = (z0 + per).min(dims[2]);
             let take = ((z1 - z0) * slab) as usize;
             let (head, tail) = rest.split_at_mut(take.min(rest.len()));
             rest = tail;
@@ -535,7 +546,7 @@ pub fn bake_sdf_from_fused(
     });
 
     SdfVolume {
-        dim,
+        dims,
         aabb_min,
         aabb_max,
         voxels,
@@ -547,8 +558,9 @@ pub fn bake_sdf_from_fused(
 /// the nearest triangle. Used by the GI / reflection re-lighting to recover surface
 /// colour at a ray hit.
 pub struct AlbedoVolumes {
-    pub dim: u32,
-    /// `[r, g, b]`, each `dim³` values in `idx = x + dim*(y + dim*z)` order.
+    pub dims: [u32; 3],
+    /// `[r, g, b]`, each `dims[0]*dims[1]*dims[2]` values in
+    /// `idx = x + dims[0]*(y + dims[1]*z)` order.
     pub channels: [Vec<f32>; 3],
 }
 
@@ -568,7 +580,7 @@ impl AlbedoVolumes {
 /// identical to [`bake_slab`] so the winner matches the distance field's.
 fn bake_albedo_slab(out: &mut [f32], z0: u32, z1: u32, ctx: &BakeCtx, tri_albedo: &[[f32; 3]]) {
     let BakeCtx {
-        dim,
+        dims,
         aabb_min,
         aabb_max,
         positions,
@@ -577,16 +589,20 @@ fn bake_albedo_slab(out: &mut [f32], z0: u32, z1: u32, ctx: &BakeCtx, tri_albedo
         ..
     } = *ctx;
     let tri_count = indices.len() / 3;
-    let inv_dim = 1.0 / dim as f32;
+    let inv = [
+        1.0 / dims[0] as f32,
+        1.0 / dims[1] as f32,
+        1.0 / dims[2] as f32,
+    ];
     let mut visited = vec![0u32; tri_count];
     let mut stamp = 0u32;
     for z in z0..z1 {
-        for y in 0..dim {
-            for x in 0..dim {
+        for y in 0..dims[1] {
+            for x in 0..dims[0] {
                 let t = [
-                    (x as f32 + 0.5) * inv_dim,
-                    (y as f32 + 0.5) * inv_dim,
-                    (z as f32 + 0.5) * inv_dim,
+                    (x as f32 + 0.5) * inv[0],
+                    (y as f32 + 0.5) * inv[1],
+                    (z as f32 + 0.5) * inv[2],
                 ];
                 let p = [
                     aabb_min[0] + (aabb_max[0] - aabb_min[0]) * t[0],
@@ -603,7 +619,7 @@ fn bake_albedo_slab(out: &mut [f32], z0: u32, z1: u32, ctx: &BakeCtx, tri_albedo
                 } else {
                     [0.7, 0.7, 0.7]
                 };
-                let local = (((z - z0) * dim * dim + y * dim + x) * 3) as usize;
+                let local = (((z - z0) * dims[0] * dims[1] + y * dims[0] + x) * 3) as usize;
                 out[local] = albedo[0];
                 out[local + 1] = albedo[1];
                 out[local + 2] = albedo[2];
@@ -620,7 +636,7 @@ pub fn bake_albedo_from_fused(
     vtx_bytes: &[u8],
     idx_bytes: &[u8],
     tri_albedo_bytes: &[u8],
-    dim: u32,
+    dims: [u32; 3],
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
 ) -> AlbedoVolumes {
@@ -647,10 +663,10 @@ pub fn bake_albedo_from_fused(
         })
         .collect();
 
-    let slab = dim * dim;
+    let slab = dims[0] * dims[1];
     // RGB interleaved (3 floats / voxel) so the parallel split stays one contiguous
     // output; deinterleaved into channels afterwards.
-    let mut interleaved = vec![0.0_f32; (slab * dim * 3) as usize];
+    let mut interleaved = vec![0.0_f32; (slab * dims[2] * 3) as usize];
     // Stage A: the same acceleration grid as the SDF bake (built from the identical
     // fused geometry), so the nearest-triangle winner — hence each voxel's albedo — is
     // byte-identical with the brute scan.
@@ -658,11 +674,11 @@ pub fn bake_albedo_from_fused(
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(dim as usize)
+        .min(dims[2] as usize)
         .max(1);
-    let per = dim.div_ceil(threads as u32);
+    let per = dims[2].div_ceil(threads as u32);
     let ctx = BakeCtx {
-        dim,
+        dims,
         aabb_min,
         aabb_max,
         positions: &positions,
@@ -675,8 +691,8 @@ pub fn bake_albedo_from_fused(
         let mut z0 = 0u32;
         let ctx = &ctx;
         let tri_albedo = &tri_albedo;
-        while z0 < dim {
-            let z1 = (z0 + per).min(dim);
+        while z0 < dims[2] {
+            let z1 = (z0 + per).min(dims[2]);
             let take = ((z1 - z0) * slab * 3) as usize;
             let (head, tail) = rest.split_at_mut(take.min(rest.len()));
             rest = tail;
@@ -685,7 +701,7 @@ pub fn bake_albedo_from_fused(
         }
     });
 
-    let n = (slab * dim) as usize;
+    let n = (slab * dims[2]) as usize;
     let mut channels = [
         Vec::with_capacity(n),
         Vec::with_capacity(n),
@@ -696,7 +712,7 @@ pub fn bake_albedo_from_fused(
         channels[1].push(voxel[1]);
         channels[2].push(voxel[2]);
     }
-    AlbedoVolumes { dim, channels }
+    AlbedoVolumes { dims, channels }
 }
 
 // --- Per-mesh distance fields (per-mesh-distance-fields.md, Stage S0) ---------------
@@ -710,26 +726,30 @@ pub fn bake_albedo_from_fused(
 // these into the camera clipmap; this module is just the bake + grid sizing.
 
 /// Target voxel edge (metres) for a per-mesh SDF — a per-mesh "resolution scale".
-/// The voxel count scales with mesh extent, clamped to [`MESH_SDF_MIN_DIM`,
-/// `MESH_SDF_MAX_DIM`]: 0.05 m gives fine local detail; tiny meshes clamp up, large flat
-/// ones clamp down (a big wall at the cap is still fine — it has no thin features).
+/// Each axis' voxel count scales with that axis' extent, clamped to
+/// [`MESH_SDF_MIN_DIM`, `MESH_SDF_MAX_DIM`]: 0.05 m gives fine local detail; tiny axes
+/// clamp up, long axes clamp down (a big wall's long axis at the cap is still fine — it
+/// has no thin features there, and the coarse dense field covers the low frequency).
 pub const MESH_SDF_TARGET_VOXEL: f32 = 0.05;
-/// Minimum per-mesh grid edge (small meshes still get a usable field).
+/// Minimum per-mesh grid edge per axis (small meshes still get a usable field).
 pub const MESH_SDF_MIN_DIM: u32 = 8;
-/// Maximum per-mesh grid edge. Capped low (`dim³` cost, and there are *many* unique meshes
-/// in a non-instanced scene): a thin sheet's thin axis is already resolved by its *tight*
-/// padded AABB even at this dim, so a higher cap only burns bake time for no color gain.
+/// Maximum per-mesh grid edge per axis. Capped low (there are *many* unique meshes in a
+/// non-instanced scene): a thin sheet's thin axis is resolved by its own small extent,
+/// so a higher cap only burns bake time and atlas bytes for no visible gain.
 pub const MESH_SDF_MAX_DIM: u32 = 48;
 
-/// Cubic voxel-grid edge for a mesh of the given **padded** local extent: the longest
-/// axis / the target voxel size, clamped. Cubic `dim` keeps the `idx = x + dim*(y +
-/// dim*z)` layout the volume upload + `.dcasset` use; a non-cubic AABB just yields
-/// anisotropic voxels (the thin axis ends up over-resolved, which is what we want).
-pub fn mesh_sdf_dim(aabb_min: [f32; 3], aabb_max: [f32; 3]) -> u32 {
-    let longest = (0..3)
-        .map(|a| aabb_max[a] - aabb_min[a])
-        .fold(0.0f32, f32::max);
-    ((longest / MESH_SDF_TARGET_VOXEL).ceil() as u32).clamp(MESH_SDF_MIN_DIM, MESH_SDF_MAX_DIM)
+/// Per-axis voxel-grid dims for a mesh of the given **padded** local extent: each axis'
+/// extent / the target voxel size, clamped (F2 S2a). The old cubic grid spent a full
+/// cube edge across every axis, over-resolving a thin wall's 0.2 m axis ~50× (voxels
+/// are `extent/dim` per axis); per-axis dims keep voxels near-uniform at
+/// [`MESH_SDF_TARGET_VOXEL`] instead, so the same atlas budget carries a higher
+/// long-axis cap (probe table: phase-f2-mesh-sdf-scalability-plan.md §2).
+pub fn mesh_sdf_dims(aabb_min: [f32; 3], aabb_max: [f32; 3]) -> [u32; 3] {
+    let dim = |a: usize| {
+        let ext = (aabb_max[a] - aabb_min[a]).max(0.0);
+        ((ext / MESH_SDF_TARGET_VOXEL).ceil() as u32).clamp(MESH_SDF_MIN_DIM, MESH_SDF_MAX_DIM)
+    };
+    [dim(0), dim(1), dim(2)]
 }
 
 /// A mesh's local AABB, padded 10 % per axis (≥0.05 m) so the zero-isosurface isn't
@@ -777,26 +797,26 @@ pub fn encode_indices(indices: &[u32]) -> Vec<u8> {
     out
 }
 
-/// Bake a mesh's local-space SDF: pick the size-scaled cubic grid over the mesh's padded
-/// local AABB, then run the shared deterministic bake. The returned volume's
+/// Bake a mesh's local-space SDF: pick the size-scaled per-axis grid over the mesh's
+/// padded local AABB, then run the shared deterministic bake. The returned volume's
 /// `aabb_min/max` are the padded local bounds the runtime composites with.
 pub fn bake_mesh_sdf(vertices: &[MeshVertex], indices: &[u32]) -> SdfVolume {
     let (mn, mx) = mesh_local_aabb_padded(vertices);
-    let dim = mesh_sdf_dim(mn, mx);
+    let dims = mesh_sdf_dims(mn, mx);
     let vtx = encode_vertices_fused(vertices);
     let idx = encode_indices(indices);
-    bake_sdf_from_fused(&vtx, &idx, dim, mn, mx)
+    bake_sdf_from_fused(&vtx, &idx, dims, mn, mx)
 }
 
 /// Bake a mesh's local-space **albedo** volumes (gi-fidelity-phases.md, F5 S1) over the
-/// *exact same* grid as [`bake_mesh_sdf`] — the size-scaled cubic `dim` on the mesh's padded
+/// *exact same* grid as [`bake_mesh_sdf`] — the size-scaled per-axis `dims` on the mesh's padded
 /// local AABB — so the albedo tile aligns 1:1 with the SDF tile in the atlas and a single
 /// tile UVW mapping addresses both. `tri_albedo_bytes` is the per-triangle linear albedo
 /// (12 B / triangle, same order as `indices`), mirroring the dense `bake_albedo_from_fused`
 /// but bounded to this one mesh's frame so a hit reads the mesh's own colour at its own
 /// resolution instead of the coarse whole-scene albedo grid (which blurs across meshes).
 ///
-/// `dim`/`aabb` match `bake_mesh_sdf` by construction (both call `mesh_sdf_dim` /
+/// `dims`/`aabb` match `bake_mesh_sdf` by construction (both call `mesh_sdf_dims` /
 /// `mesh_local_aabb_padded`), so the SDF atlas's `tile_uvw` is the albedo atlas's too.
 pub fn bake_mesh_albedo(
     vertices: &[MeshVertex],
@@ -804,10 +824,10 @@ pub fn bake_mesh_albedo(
     tri_albedo_bytes: &[u8],
 ) -> AlbedoVolumes {
     let (mn, mx) = mesh_local_aabb_padded(vertices);
-    let dim = mesh_sdf_dim(mn, mx);
+    let dims = mesh_sdf_dims(mn, mx);
     let vtx = encode_vertices_fused(vertices);
     let idx = encode_indices(indices);
-    bake_albedo_from_fused(&vtx, &idx, tri_albedo_bytes, dim, mn, mx)
+    bake_albedo_from_fused(&vtx, &idx, tri_albedo_bytes, dims, mn, mx)
 }
 
 #[cfg(test)]
@@ -842,7 +862,7 @@ mod tests {
 
     #[inline]
     fn at(vol: &SdfVolume, x: u32, y: u32, z: u32) -> f32 {
-        vol.voxels[(x + vol.dim * (y + vol.dim * z)) as usize] as _
+        vol.voxels[(x + vol.dims[0] * (y + vol.dims[1] * z)) as usize] as _
     }
 
     fn vert(pos: [f32; 3], normal: [f32; 3]) -> MeshVertex {
@@ -854,13 +874,22 @@ mod tests {
     }
 
     #[test]
-    fn mesh_sdf_dim_scales_and_clamps() {
-        // Tiny mesh clamps to the floor; huge mesh clamps to the ceiling; a mid mesh is
-        // longest_axis / target_voxel.
-        assert_eq!(mesh_sdf_dim([0.0; 3], [0.01, 0.01, 0.01]), MESH_SDF_MIN_DIM);
-        assert_eq!(mesh_sdf_dim([0.0; 3], [100.0, 1.0, 1.0]), MESH_SDF_MAX_DIM);
-        // 2 m longest / 0.05 = 40 voxels.
-        assert_eq!(mesh_sdf_dim([0.0; 3], [2.0, 0.5, 0.1]), 40);
+    fn mesh_sdf_dims_scale_and_clamp_per_axis() {
+        // Tiny mesh clamps every axis to the floor; a huge axis clamps to the ceiling
+        // while its short axes clamp to the floor (the F2 S2a win: no cubic coupling).
+        assert_eq!(
+            mesh_sdf_dims([0.0; 3], [0.01, 0.01, 0.01]),
+            [MESH_SDF_MIN_DIM; 3]
+        );
+        assert_eq!(
+            mesh_sdf_dims([0.0; 3], [100.0, 1.0, 1.0]),
+            [MESH_SDF_MAX_DIM, 20, 20]
+        );
+        // 2 m / 0.05 = 40; 0.5 m = 10; 0.1 m clamps up to the floor.
+        assert_eq!(
+            mesh_sdf_dims([0.0; 3], [2.0, 0.5, 0.1]),
+            [40, 10, MESH_SDF_MIN_DIM]
+        );
     }
 
     #[test]
@@ -897,16 +926,16 @@ mod tests {
         let vol = bake_mesh_sdf(&verts, &indices);
         // Centre column in XY; the sheet sits at world z = 0, between two adjacent Z
         // voxels. Find the sign flip and confirm the straddling values are small.
-        let c = vol.dim / 2;
+        let c = vol.dims[0] / 2;
         let mut flipped = false;
-        for z in 0..vol.dim - 1 {
+        for z in 0..vol.dims[2] - 1 {
             let below = at(&vol, c, c, z);
             let above = at(&vol, c, c, z + 1);
             if below < 0.0 && above > 0.0 {
                 flipped = true;
                 // Both straddling voxels are within ~one voxel of the sheet (z extent is
                 // 0.1 m over `dim` voxels), i.e. the thin sheet is finely resolved.
-                let vox = 0.1 / vol.dim as f32;
+                let vox = 0.1 / vol.dims[2] as f32;
                 assert!(
                     below.abs() < 2.0 * vox && above.abs() < 2.0 * vox,
                     "straddling SDF should be sub-voxel: {below} {above} (vox {vox})"
@@ -923,7 +952,7 @@ mod tests {
     fn sphere_field_matches_analytic() {
         let (vtx, idx) = sphere_fused();
         let dim = 32;
-        let vol = bake_sdf_from_fused(&vtx, &idx, dim, [0.0; 3], [1.0; 3]);
+        let vol = bake_sdf_from_fused(&vtx, &idx, [dim; 3], [0.0; 3], [1.0; 3]);
         assert_eq!(vol.voxels.len(), (dim * dim * dim) as usize);
 
         // Centre voxel (≈ world 0.5): inside, distance ≈ -radius (0.3). Faceting makes
@@ -946,8 +975,8 @@ mod tests {
     #[test]
     fn bake_is_deterministic() {
         let (vtx, idx) = sphere_fused();
-        let a = bake_sdf_from_fused(&vtx, &idx, 16, [0.0; 3], [1.0; 3]);
-        let b = bake_sdf_from_fused(&vtx, &idx, 16, [0.0; 3], [1.0; 3]);
+        let a = bake_sdf_from_fused(&vtx, &idx, [16; 3], [0.0; 3], [1.0; 3]);
+        let b = bake_sdf_from_fused(&vtx, &idx, [16; 3], [0.0; 3], [1.0; 3]);
         assert_eq!(a.voxels, b.voxels, "two CPU bakes must be byte-identical");
     }
 
@@ -965,8 +994,8 @@ mod tests {
             }
         }
         let dim = 16;
-        let alb = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, dim, [0.0; 3], [1.0; 3]);
-        assert_eq!(alb.dim, dim);
+        let alb = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, [dim; 3], [0.0; 3], [1.0; 3]);
+        assert_eq!(alb.dims, [dim; 3]);
         for (ch, (channel, &expected)) in alb.channels.iter().zip(&colour).enumerate() {
             assert_eq!(channel.len(), (dim * dim * dim) as usize);
             assert!(
@@ -981,8 +1010,8 @@ mod tests {
         let (vtx, idx) = sphere_fused();
         let tri_count = idx.len() / 4 / 3;
         let tri_albedo: Vec<u8> = (0..tri_count * 12).map(|i| (i % 251) as u8).collect();
-        let a = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, 12, [0.0; 3], [1.0; 3]);
-        let b = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, 12, [0.0; 3], [1.0; 3]);
+        let a = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, [12; 3], [0.0; 3], [1.0; 3]);
+        let b = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, [12; 3], [0.0; 3], [1.0; 3]);
         assert_eq!(a.channels, b.channels);
     }
 
@@ -1167,7 +1196,7 @@ mod tests {
         let dim = 24;
         let amin = [0.0f32, 0.1, 0.2];
         let amax = [1.1f32, 0.9, 1.0];
-        let grid = bake_sdf_from_fused(&vtx, &idx, dim, amin, amax);
+        let grid = bake_sdf_from_fused(&vtx, &idx, [dim; 3], amin, amax);
         let brute = brute_sdf(&vtx, &idx, dim, amin, amax);
         assert_eq!(
             grid.voxels, brute,
@@ -1181,7 +1210,7 @@ mod tests {
         let dim = 24;
         let amin = [0.0f32, 0.1, 0.2];
         let amax = [1.1f32, 0.9, 1.0];
-        let grid = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, dim, amin, amax);
+        let grid = bake_albedo_from_fused(&vtx, &idx, &tri_albedo, [dim; 3], amin, amax);
         let brute = brute_albedo(&vtx, &idx, &tri_albedo, dim, amin, amax);
         assert_eq!(
             grid.channels, brute,
@@ -1266,7 +1295,7 @@ mod tests {
 
         let dim = 48;
         let t0 = Instant::now();
-        let grid = bake_sdf_from_fused(&vtx, &idx, dim, amin, amax);
+        let grid = bake_sdf_from_fused(&vtx, &idx, [dim; 3], amin, amax);
         let grid_ms = t0.elapsed().as_secs_f64() * 1e3;
         eprintln!("grid bake (parallel) {dim}^3: {grid_ms:.0} ms");
 

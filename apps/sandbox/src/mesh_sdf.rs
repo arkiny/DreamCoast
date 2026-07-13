@@ -194,7 +194,7 @@ mod tests {
     fn unit_mesh(dim: u32) -> SdfVolume {
         let n = (dim * dim * dim) as usize;
         SdfVolume {
-            dim,
+            dims: [dim; 3],
             aabb_min: [-1.0; 3],
             aabb_max: [1.0; 3],
             voxels: vec![0.0; n],
@@ -252,7 +252,7 @@ mod tests {
     fn spanning_instance_is_in_every_cell() {
         // A large mesh whose padded AABB covers the whole grid.
         let big = SdfVolume {
-            dim: 8,
+            dims: [8; 3],
             aabb_min: [-10.0; 3],
             aabb_max: [10.0; 3],
             voxels: vec![0.0; 512],
