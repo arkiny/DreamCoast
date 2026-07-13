@@ -30,9 +30,9 @@
       },
       "lit_eps": 8,
       "pt": true,
-      "pt_black_frac": 0.5023,
-      "residual_budget": 34.65,
-      "residual_measured": 34.3504
+      "pt_black_frac": 0.4061,
+      "residual_budget": 32.83,
+      "residual_measured": 32.5285
     },
     "sponza_pt_sunlit": {
       "desc": "content: raster-vs-PT lit-masked residual, sunlit atrium (primary fidelity gate)",
@@ -46,9 +46,9 @@
       },
       "lit_eps": 8,
       "pt": true,
-      "pt_black_frac": 0.1709,
-      "residual_budget": 30.9,
-      "residual_measured": 30.6005
+      "pt_black_frac": 0.1056,
+      "residual_budget": 29.15,
+      "residual_measured": 28.8476
     },
     "sponza_sc_viz": {
       "desc": "content: surface-cache viz (P_SC_VIZ)",

@@ -2934,10 +2934,16 @@ impl App {
         // `P_SKYVIS_TINT` = neutral OcclusionTint leak as a fraction of the occluded skylight
         // luminance (the occluded floor keeps brightness but loses the blue cast); `P_SKYVIS_MIN_OCC`
         // = min sky-visibility floor (=1.0 disables the occlusion entirely → SH-L1 baseline).
+        // Default 0.3, PT-calibrated (phase-f6c doc): the old 0.5 floor over-compensated for the
+        // GI volume's missing multibounce and left interiors ~1.6x brighter than the path-traced
+        // reference in LIT regions; 0.3 is the sweep point whose lit-region colour cast also
+        // matches PT (mean B-R ~ -1.0). Going below ~0.25 turns the raster cooler than the
+        // reference (the neutral floor is what keeps the cast at PT's warmth), so further
+        // reduction is gated on improving the sky-vis field itself, not this constant.
         let skyvis_tint = std::env::var("P_SKYVIS_TINT")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.5)
+            .unwrap_or(0.3)
             .clamp(0.0, 1.0);
         let skyvis_min_occ = std::env::var("P_SKYVIS_MIN_OCC")
             .ok()
