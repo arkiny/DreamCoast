@@ -131,13 +131,37 @@
   (49.736 vs 49.757). **후속: 하늘/햇빛 보이는 카메라 or F6 노출 매칭 필요.**
 - DX≡VK: Metal 검증, Windows 동결(배치 추가).
 
-### Stage 1 — 고정 페이지 풀 + 카드→페이지 인디렉션 (기능 무변 리팩터)
-**왜:** 아틀라스 크기를 레지던트 카드 수에서 분리하는 메커니즘 도입.
-**변경:** `gdf.rs alloc_cache_texel_buffers`/`upload_card_layout` — 아틀라스를 **고정 P 슬롯 풀**로 할당,
-`cache_layout.base`를 슬롯 인디렉션으로. 초기엔 **레지던트 카드 = 슬롯 1:1 identity** → 출력 무변.
-소비자 `card_layout()` 인디렉션 경유(1곳). 그리드는 오름차순 슬롯 순서 유지.
-**게이트:** **전 씬 바이트 동일**(레지던트 ≤ 풀이면 no-op 리팩터). 결정론/DX≡VK 자명.
-**측정:** 갤러리 + sponza 모두 SHA 불변, 메모리 리포트(풀 상한 고정 확인).
+### Stage 1 — 고정 페이지 풀 + 카드→페이지 인디렉션 (실행 스펙 확정)
+**왜:** 아틀라스 크기를 레지던트 카드 수에서 분리 + 임의 카드↔슬롯 매핑(스트리밍 발판).
+
+**설계 결정 (코드 조사 근거):**
+- **역방향 테이블이 핵심.** 현행 `layout_find_card`(`surface_cache.slang:61-77`)는 **오름차순 base 컬럼
+  이진탐색** — 스트리밍이 임의 슬롯을 할당하면 base 비오름차순 → 깨짐. 풀은 **`slot_to_card[POOL]` 역방향
+  테이블**로: per-texel 패스가 `t → slot=t/tile² → slot_to_card[slot]=card`(O(1), 임의 매핑 OK). 샘플러는
+  forward `card_layout[c].base = slot·tile²`(O(1)). 둘 다 임의 매핑 지원.
+- **균일 슬롯**(res=tile). 가변 슬롯 풀+LRU는 단편화 지옥 → 참조 엔진처럼 고정 페이지. 콘텐츠의 적응형
+  가변해상(현행 C2a)은 풀-ON에서 균일로 바뀜(→ 콘텐츠 바이트 비동일, tolerant/PT로 측정). Stage 4가
+  cone-LOD mip + 승인 선택으로 거리기반 해상 재도입.
+- **opt-in `P11_CACHE_POOL`**(콘텐츠 전용, 기본 off). OFF = 현행 경로 무손상(균일/적응형) → **전 씬 바이트
+  동일**. 갤러리는 항상 OFF.
+- **비트 팩 주의(수정됨):** capture는 `pc.tile` **bit16**을 occlusion-invalidation으로 이미 씀
+  (`sdf_cache_capture.slang:242`, `0x10000`). 따라서 tile 상위비트 재사용은 **bit17..28**만
+  (slot_map 11b + pool flag 1b). 반사 tuple의 tile 재팩과도 무관(별도 워드). **대안(더 안전):** per-texel
+  패스에 전용 push 필드 `pool_info` 추가(4 패커 변경, 트레일링 스칼라로 정렬 안전, 256B VK 한계 확인).
+  → **DX≡VK 검증 불가(Windows 동결)이므로 전용 필드 쪽이 비트충돌 리스크 없어 권장.**
+
+**변경 지점:**
+- `gdf.rs`: 필드 `card_slot_map: Option<StorageBuffer>`; `build_surface_cache`에 풀 분기(아틀라스
+  `POOL·tile²` 고정, layout base=slot·tile²·res=tile·mip_base=slot·mip_stride, `slot_to_card` identity 업로드);
+  `card_slot_map_index()`; `tile_packed`에 slot_map+pool 팩.
+- `surface_cache.slang`: `layout_find_card`에 pool 분기(역방향 테이블); 4 per-texel 패스(capture/light/
+  mipgen/view) main에서 tile 상위비트 언팩 → 전달.
+- `main.rs`: `P11_CACHE_POOL` opt-in; 풀 시 `card_res=None`(균일 슬롯).
+
+**게이트:** 풀 OFF = **전 씬 바이트 동일**(갤러리 `65d04ceca2c4…` 포함). 풀 ON(콘텐츠) = pool-OFF 대비
+functional parity(tolerant, uniform↔adaptive 해상 차이만) + PT 중립 + 결정론 + 메모리 상한 고정 리포트.
+**측정:** 풀 OFF 전 config SHA 불변; 풀 ON identity 매핑이 uniform-res 콘텐츠와 근사(res 차만); POOL 슬롯 수
+고정 확인.
 
 ### Stage 2 — 데맨드 피드백: GI+반사가 이번 프레임 실제 샘플한 카드 마킹
 **왜:** LRU 시계 + 레지던시 요청 집합의 입력.
