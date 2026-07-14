@@ -422,6 +422,12 @@ impl GiSystem {
         frame: u32,
         spp: u32,
         alpha: f32,
+        // Slab amortization: update only z slices [z_offset, z_offset + z_count) this frame. The
+        // caller walks the slabs so every texel refreshes once per period at a FLAT per-frame
+        // cost — the old whole-grid burst every Nth frame spiked the frame time and pumped the
+        // wall-clock auto-exposure into visible flicker. (0, GI_VOL_DIM) = legacy full update.
+        z_offset: u32,
+        z_count: u32,
     ) -> Option<ResourceId> {
         let pipe = self.gi_vol_pipeline.as_ref()?;
         let read = ((self.gi_vol_frame + 1) % 2) as usize;
@@ -495,7 +501,8 @@ impl GiSystem {
                     sun_intensity,
                     [GI_VOL_DIM, GI_VOL_DIM, GI_VOL_DIM],
                     frame,
-                    [read_base, skyvis_read_base, 0], // x = radiance SH base, y = sky-vis SH base
+                    // x = radiance SH base, y = sky-vis SH base, z = slab z-slice offset.
+                    [read_base, skyvis_read_base, z_offset],
                     reset,
                     [write_base, skyvis_write_base, 0], // x = radiance SH base, y = sky-vis SH base
                     albedo_idx,
@@ -506,7 +513,13 @@ impl GiSystem {
                     sky_gain, // sky gain -> procedural_sky fill at bounce hits (was flat 0.4)
                     alpha,    // EMA alpha
                     ground_albedo,
-                    diag * 0.01, // surface bias
+                    // Ray-start bias 0.05 — 2.5x the march's minimum step, same absolute-metre
+                    // family as the shader's other epsilons (hit 0.003, min step 0.02). The old
+                    // diag*0.01 (~0.4 on sponza) was larger than a thin wall, so near-wall probe
+                    // rays STARTED on the far side of the geometry — inflating sky-visibility
+                    // and importing wrong-side radiance (interior gate −0.84 measured from this
+                    // alone, docs/phase-gi-volume-leak-plan.md §10).
+                    0.05,
                     fine_min,    // F4 fine-level world min ([0;3] when inactive)
                     fine_active, // F4: 1.0 = update both levels, 0.0 = legacy single level
                     fine_max,    // F4 fine-level world max
@@ -519,7 +532,12 @@ impl GiSystem {
                 } else {
                     g
                 };
-                cmd.dispatch(g, gy, g);
+                // Slab amortization: only this frame's z-slab (the shader offsets tid.z).
+                cmd.dispatch(
+                    g,
+                    gy,
+                    z_count.min(GI_VOL_DIM.saturating_sub(z_offset)).div_ceil(4),
+                );
                 // Transition the just-written volumes back to sampled so the GI pass can read them.
                 for ch in wv.iter().flatten() {
                     cmd.volume_to_sampled(ch);

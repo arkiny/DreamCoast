@@ -865,6 +865,13 @@ struct App {
     /// interior receiver stops interpolating toward the in-wall probes' near-zero SH (E dilution)
     /// and the sky-vis/bent field stops smearing across walls. Volume path only; off = anchor.
     gi_vol_occ: bool,
+    /// Rays per probe for the DDGI volume update (`P_GI_VOLUME_SPP`, default 16), SEPARATE from
+    /// the per-pixel `gi_spp`: the 32^3 update is amortized (period 4) and tiny next to the
+    /// screen-res GI pass, so it affords a higher count. 16 (vs the old shared 4-8) halves the
+    /// per-update estimator noise the EMA field breathes with — the live full-grid field made
+    /// that breathing visible as per-mesh shimmer through the un-denoised sky-vis and the
+    /// cache-relight snapshots. Multiples of 8 also enable octant-stratified rays (gi_volume.slang).
+    gi_volume_spp: u32,
     /// 레퍼런스식 indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
     /// directional sky-visibility): neutral leak fraction (`P_SKYVIS_TINT`) + min-occlusion floor
     /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
@@ -2940,16 +2947,18 @@ impl App {
         // `P_SKYVIS_TINT` = neutral OcclusionTint leak as a fraction of the occluded skylight
         // luminance (the occluded floor keeps brightness but loses the blue cast); `P_SKYVIS_MIN_OCC`
         // = min sky-visibility floor (=1.0 disables the occlusion entirely → SH-L1 baseline).
-        // Default 0.3, PT-calibrated (phase-f6c doc): the old 0.5 floor over-compensated for the
-        // GI volume's missing multibounce and left interiors ~1.6x brighter than the path-traced
-        // reference in LIT regions; 0.3 is the sweep point whose lit-region colour cast also
-        // matches PT (mean B-R ~ -1.0). Going below ~0.25 turns the raster cooler than the
-        // reference (the neutral floor is what keeps the cast at PT's warmth), so further
-        // reduction is gated on improving the sky-vis field itself, not this constant.
+        // Default 0.15 (GI-volume-leak phase re-sweep). The earlier 0.5→0.3 calibration (F6C)
+        // was unknowingly fitted against a broken field: the Metal gi_volume dispatch updated
+        // only a quarter of the probe grid, so most interiors read the ZERO-INIT sky-visibility
+        // (V=0) and this floor replaced their entire skylight. With the full grid live, the
+        // sky-fill occlusion at hits, and the honest ray-start bias, the re-sweep basin sits at
+        // 0.15 (masked_avg + lit-mean ratio + crop B−R jointly; docs/phase-gi-volume-leak-plan.md
+        // §10d). Further reduction is still gated on the remaining interior blue excess (the
+        // ambient-specular sky leak, plan §6).
         let skyvis_tint = std::env::var("P_SKYVIS_TINT")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.3)
+            .unwrap_or(0.15)
             .clamp(0.0, 1.0);
         let skyvis_min_occ = std::env::var("P_SKYVIS_MIN_OCC")
             .ok()
@@ -2966,6 +2975,13 @@ impl App {
         // docs/phase-gi-volume-leak-plan.md §3). Opt-in while its PT/crop effect is measured;
         // volume path only (the ray-march path never reads the field).
         let gi_vol_occ = quality::env_bool("P_GI_VOL_OCC", false) && gi_volume;
+        // Volume-update rays per probe (see the App field doc): its own knob, decoupled from the
+        // screen-GI `gi_spp` the two used to share.
+        let gi_volume_spp = std::env::var("P_GI_VOLUME_SPP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(16)
+            .clamp(1, 64);
         // Deferred-parity cache skylight (see the App field doc): tier-driven, env-overridable,
         // and only meaningful with the volume-GI path (the SH sky-visibility volumes it reads).
         let cache_sky_occlude =
@@ -3333,7 +3349,14 @@ impl App {
                 .unwrap_or(0)
                 .min(64)
         };
-        let gi_stable = !gallery_scene && std::env::var_os("P_GI_STABLE").is_some();
+        // Default ON for content since the full-grid dispatch fix: with the whole 32^3 field
+        // live, per-cycle trace jitter made the EMA field breathe visibly (frame-to-frame diff
+        // 0.42 vs 0.07 with the jitter pinned — per-mesh shimmer through the un-denoised
+        // sky-vis and the cache-relight snapshots). The reference radiance cache disables trace
+        // jitter for exactly this reason; per-probe seed hashing keeps the fixed sets spatially
+        // decorrelated, and octant stratification (gi_volume.slang) keeps each set's coverage
+        // honest. `P_GI_STABLE=0` restores jittered tracing for A/B.
+        let gi_stable = !gallery_scene && quality::env_bool("P_GI_STABLE", true);
         // CONVERGE mode deliberately does NOT touch the cost parameters (spp / relight period /
         // visibility feedback) — raising them (spp×K + period 2 + hidden-off) measured 360 ms/frame
         // on Sponza-M3, unplayable. Determinism alone (fixed directions) makes every relight
@@ -3676,10 +3699,15 @@ impl App {
             sky_gain,
             sky_wb,
             auto_exposure,
+            // The geometric-series compensation assumes the GI term is a SINGLE bounce (its
+            // 1/(1-albedo·k) restores the missing tail — pbr.slang). The volume path feeds its
+            // own previous frame back at every hit (true infinite bounce), so boosting it
+            // double-counts: default 0 whenever the volume is the GI source, 0.6 only for the
+            // single-bounce ray-march path.
             gi_multibounce: std::env::var("P_GI_MULTIBOUNCE")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(if gallery_scene { 0.0 } else { 0.6 }),
+                .unwrap_or(if gallery_scene || gi_volume { 0.0 } else { 0.6 }),
             point_lights_on,
             clustered_lights,
             clustered_brute,
@@ -3762,6 +3790,7 @@ impl App {
                 .unwrap_or(base.gi_volume_period as u64)
                 .max(1),
             gi_vol_occ,
+            gi_volume_spp,
             skyvis_tint,
             skyvis_min_occ,
             cache_sky_occlude,
@@ -6745,46 +6774,51 @@ impl App {
                 // 레퍼런스 엔진 GI-fidelity: update + bind the world irradiance volume (DDGI-lite). The update
                 // propagates last frame's volume into hits (multibounce), so deep interiors fill in
                 // over frames. When bound, the GI pass samples the volume instead of marching.
-                let gi_volume_arg =
-                    if self.gi_volume && !self.frame_no.is_multiple_of(self.gi_volume_period) {
-                        // Amortized skip: bind the persistent last-updated DDGI volume (the multibounce
-                        // EMA carries it); import_external orders the GI sample after it with no write.
-                        self.gi.gi_volume_sampled().map(|(rad_base, skyvis_base)| {
-                            (rad_base, skyvis_base, graph.import_external("gi_volume_w"))
-                        })
-                    } else if self.gi_volume {
-                        self.gi
-                            .record_gi_volume(
-                                &mut graph,
-                                vol,
-                                ext,
-                                scene_aabb_min,
-                                scene_aabb_max,
-                                self.sun_dir,
-                                self.sun_intensity,
-                                self.sky_gain,
-                                scene_clip,
-                                &scene_clip_vols,
-                                scene_albedo,
-                                crate::GROUND_ALBEDO,
-                                // C0-fix (`P_GI_STABLE`): a FIXED jitter index ⇒ every probe traces
-                                // the same deterministic direction set each update (the reference
-                                // radiance cache disables trace jitter for stability), so a static
-                                // scene's volume is an idempotent overwrite = a fixed point instead
-                                // of a fixed-alpha EMA over fresh per-frame noise (never settles).
-                                if self.gi_stable {
-                                    0
-                                } else {
-                                    self.frame_no as u32
-                                },
-                                self.gi_spp,
-                                0.1,
-                            )
-                            .zip(self.gi.gi_volume_sampled())
-                            .map(|(vext, (rad_base, skyvis_base))| (rad_base, skyvis_base, vext))
-                    } else {
-                        None
-                    };
+                // Slab amortization: instead of the old whole-grid burst 1 frame in N + skip
+                // (the burst spiked the frame time and pumped the wall-clock auto-exposure into
+                // visible flicker), update dims.z/period z-slices EVERY frame — flat cost, every
+                // texel still refreshes once per period, and the ping-pong advances at the end
+                // of each full cycle so the EMA history stays one complete cycle behind.
+                // period = 1 is the legacy full-grid-every-frame update, bit for bit.
+                let gi_vol_period = (self.gi_volume_period as u32).clamp(1, gi::GI_VOL_DIM);
+                let gi_vol_slab = gi::GI_VOL_DIM.div_ceil(gi_vol_period);
+                let gi_volume_arg = if self.gi_volume {
+                    self.gi
+                        .record_gi_volume(
+                            &mut graph,
+                            vol,
+                            ext,
+                            scene_aabb_min,
+                            scene_aabb_max,
+                            self.sun_dir,
+                            self.sun_intensity,
+                            self.sky_gain,
+                            scene_clip,
+                            &scene_clip_vols,
+                            scene_albedo,
+                            crate::GROUND_ALBEDO,
+                            // C0-fix (`P_GI_STABLE`): a FIXED jitter index ⇒ every probe traces
+                            // the same deterministic direction set each update (the reference
+                            // radiance cache disables trace jitter for stability), so a static
+                            // scene's volume is an idempotent overwrite = a fixed point instead
+                            // of a fixed-alpha EMA over fresh per-frame noise (never settles).
+                            // Slab mode folds the cycle out of the seed so a slab retraces the
+                            // same directions each cycle, not each frame.
+                            if self.gi_stable {
+                                0
+                            } else {
+                                (self.frame_no / self.gi_volume_period.max(1)) as u32
+                            },
+                            self.gi_volume_spp,
+                            0.1,
+                            (self.frame_no as u32 % gi_vol_period) * gi_vol_slab,
+                            gi_vol_slab,
+                        )
+                        .zip(self.gi.gi_volume_sampled())
+                        .map(|(vext, (rad_base, skyvis_base))| (rad_base, skyvis_base, vext))
+                } else {
+                    None
+                };
                 gi_reflect_arg = gi_volume_arg; // expose to the later reflection pass (same handle)
                 let (traced, skyvis) = self.gi.record_gi(
                     &mut graph,
@@ -8706,10 +8740,14 @@ impl App {
             self.gdf.advance_cache();
         }
         // 레퍼런스 엔진 GI-fidelity: advance the world irradiance volume ping-pong (next frame reads this).
-        // Only on frames we actually updated the volume (amortization: skipped frames keep reading
-        // the same last-written slot, so the ping-pong must not advance past it).
-        if self.gi_volume && self.frame_no.is_multiple_of(self.gi_volume_period) {
-            self.gi.advance_gi_volume();
+        // Slab amortization: advance the ping-pong only when a full slab cycle completes (every
+        // texel of the write slot has been refreshed), so the EMA history the next cycle reads is
+        // one COMPLETE cycle behind — mid-cycle frames keep writing into the same slot.
+        if self.gi_volume {
+            let period = self.gi_volume_period.max(1);
+            if self.frame_no % period == period - 1 {
+                self.gi.advance_gi_volume();
+            }
         }
         // QHD/UHD TAAU: advance the history ping-pong (next frame reprojects this frame's).
         if taau_active {

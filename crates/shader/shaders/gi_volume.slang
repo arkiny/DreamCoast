@@ -41,7 +41,11 @@ struct GiVolumePush
     float4 sun;          // xyz direction toward the sun, w = intensity
     uint4 dims;          // x,y,z = probe grid resolution, w = frame (RNG)
     uint4 read_rgb;      // x = sampled base of the previous radiance SH volumes; y = sampled base of
-                         // the previous sky-vis SH volumes (0xFFFFFFFF = sky-vis off); w = reset
+                         // the previous sky-vis SH volumes (0xFFFFFFFF = sky-vis off); z = z-slice
+                         // offset of this dispatch's slab (cost amortization: the host updates
+                         // dims.z/period slices per frame so every texel refreshes once per period
+                         // at a FLAT per-frame cost — a whole-grid burst every Nth frame perturbed
+                         // the wall-clock auto-exposure into visible luma pumping); w = reset
     uint4 write_rgb;     // x = storage base of the radiance SH volumes; y = storage base of the
                          // sky-vis SH volumes written this frame
     uint4 albedo_rgb;    // sampled volumes[] indices of the per-voxel albedo (R,G,B); x=0xFFFFFFFF = constant
@@ -206,10 +210,27 @@ float3 uniform_sphere(inout uint rng)
     return float3(r * cos(a), z, r * sin(a));
 }
 
+// Octant-stratified sphere direction: sample `s` is folded into octant `s % 8` (uniform within
+// the octant). With spp a multiple of 8 every octant gets the same sample count, so the plain
+// `4pi/spp` Monte-Carlo weight below stays EXACTLY correct (stratification changes variance,
+// not the estimator) while killing the octant-level luck that made the EMA field breathe —
+// the per-mesh shimmer the live full-grid field exposed. Callers gate on `spp % 8 == 0`.
+float3 stratified_sphere(uint s, inout uint rng)
+{
+    float3 u = uniform_sphere(rng);
+    float3 a = float3(abs(u.x), abs(u.y), abs(u.z));
+    return float3((s & 1u) != 0u ? -a.x : a.x, (s & 2u) != 0u ? -a.y : a.y,
+                  (s & 4u) != 0u ? -a.z : a.z);
+}
+
 [shader("compute")]
 [numthreads(4, 4, 4)]
 void csMain(uint3 tid: SV_DispatchThreadID)
 {
+    // Slab amortization: this dispatch covers z slices [read_rgb.z, read_rgb.z + gz*4); offset
+    // the thread id so every downstream tid use (probe position, EMA texel, writes) is exact.
+    // A zero offset with the full dispatch is the legacy whole-grid update, bit for bit.
+    tid.z += pc.read_rgb.z;
     // F4: fine mode processes a second (camera-anchored) level packed in the volume's upper
     // half. When fine_active == 0 these expressions reduce to the legacy values exactly
     // (levels == 1, level == 0, lid == tid, lvl_* == aabb_* — arithmetic-identical float math,
@@ -240,9 +261,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 sh2 = float3(0.0, 0.0, 0.0);
     float3 sh3 = float3(0.0, 0.0, 0.0);
     float sv0 = 0.0, sv1 = 0.0, sv2 = 0.0, sv3 = 0.0;
+    // Octant-stratified when spp is a multiple of 8 (equal per-octant counts keep the 4pi/spp
+    // estimator exact); odd spp keeps the legacy plain-uniform draw.
+    bool strat = (spp & 7u) == 0u;
     for (uint s = 0; s < spp; s++)
     {
-        float3 dir = uniform_sphere(seed);
+        float3 dir = strat ? stratified_sphere(s, seed) : uniform_sphere(seed);
         float t = bias;
         bool hit = false;
         float3 hp = probe;
