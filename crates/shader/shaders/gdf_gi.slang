@@ -176,6 +176,108 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             bool fine = all(world_pos >= fmin) && all(world_pos <= fmax);
             float3 cuvw = (world_pos - GDF_MIN) / (GDF_MAX - GDF_MIN);
             bool inside = fine || (all(cuvw >= 0.0) && all(cuvw <= 1.0));
+            // F4B increment 1 (`P_GI_VOL_OCC` inside fine mode): the occupancy-weighted manual
+            // trilinear below (the coarse-only block) was unreachable in fine mode — this block
+            // returns first — so opting into the fine level silently DISABLED the occupancy
+            // weighting (worth −0.77 on the interior PT gate, measured on the working field).
+            // Port it here on the containment-SELECTED level's logical grid: same corner
+            // occupancy test, same weights across radiance/sky-vis/bent, loads offset into the
+            // fine half when the fine box answers. A SEPARATE sub-block so the `vol_occ == 0`
+            // path below keeps its exact legacy instruction stream.
+            if (pc.vol_occ != 0u)
+            {
+                float3 lmin = fine ? fmin : GDF_MIN;
+                float3 lmax = fine ? fmax : GDF_MAX;
+                float3 e_occ = float3(0.0, 0.0, 0.0);
+                float v_occ = 1.0; // outside both boxes: no occlusion info (legacy semantics)
+                float3 bent_occ = float3(0.0, 0.0, 0.0);
+                if (inside)
+                {
+                    ClipMap occ_clip;
+                    occ_clip.desc = pc.clip_desc;
+                    occ_clip.count = pc.clip_count;
+                    float3 dims = float3(float(fdw), ldim, float(fdd));
+                    float3 lext = lmax - lmin;
+                    float3 t = fine ? saturate((world_pos - fmin) / (fmax - fmin))
+                                    : saturate(cuvw);
+                    float3 f = t * dims - 0.5;
+                    float3 fl = floor(f);
+                    float3 fr = f - fl;
+                    int3 i0 = int3(fl);
+                    int3 imax = int3(int(fdw) - 1, int(fdh / 2u) - 1, int(fdd) - 1);
+                    int yoff = fine ? int(fdh / 2u) : 0; // physical row offset of the level
+                    float3 c[4];
+                    float sc[4];
+                    [unroll]
+                    for (int k = 0; k < 4; k++)
+                    {
+                        c[k] = float3(0.0, 0.0, 0.0);
+                        sc[k] = 0.0;
+                    }
+                    float wsum = 0.0;
+                    [loop]
+                    for (int ci = 0; ci < 8; ci++)
+                    {
+                        int3 off = int3(ci & 1, (ci >> 1) & 1, (ci >> 2) & 1);
+                        float3 fw = lerp(float3(1.0, 1.0, 1.0) - fr, fr, float3(off));
+                        float w = fw.x * fw.y * fw.z;
+                        if (w <= 1e-4)
+                            continue;
+                        int3 ip = clamp(i0 + off, int3(0, 0, 0), imax);
+                        float3 probe = lmin + ((float3(ip) + 0.5) / dims) * lext;
+                        if (min(cm_geo_inside(occ_clip, probe, pc.aabb_max.w),
+                                probe.y - GROUND_Y)
+                            <= 0.0)
+                            continue; // occupied probe — not a witness, exclude it
+                        int4 lp = int4(ip.x, ip.y + yoff, ip.z, 0);
+                        [unroll]
+                        for (int ch = 0; ch < 3; ch++)
+                        {
+                            [unroll]
+                            for (int k = 0; k < 4; k++)
+                                c[k][ch] += w * g.volumes[pc.vol_r + uint(ch * 4 + k)].Load(lp).x;
+                        }
+                        if (pc.vol_g != 0xFFFFFFFFu)
+                        {
+                            [unroll]
+                            for (int k = 0; k < 4; k++)
+                                sc[k] += w * g.volumes[pc.vol_g + uint(k)].Load(lp).x;
+                        }
+                        wsum += w;
+                    }
+                    if (wsum > 1e-4)
+                    {
+                        float rw = 1.0 / wsum;
+                        e_occ = (c[0] * SH_C0
+                                 + (2.0 / 3.0)
+                                       * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2]
+                                          + SH_C1 * n.x * c[3]))
+                                * rw;
+                        e_occ = max(e_occ, float3(0.0, 0.0, 0.0));
+                        if (pc.vol_g != 0xFFFFFFFFu)
+                        {
+                            v_occ = saturate((sc[0] * SH_C0
+                                              + (2.0 / 3.0)
+                                                    * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2]
+                                                       + SH_C1 * n.x * sc[3]))
+                                             * rw);
+                            if ((pc.flip_y & 2u) != 0u)
+                            {
+                                float3 b = float3(sc[3], sc[1], sc[2]);
+                                float bl = length(b);
+                                if (bl > 1e-5)
+                                    bent_occ = b / bl;
+                            }
+                        }
+                    }
+                    else
+                        v_occ = 0.0; // fully enclosed — dark, and no sky reaches it either
+                }
+                g.storage_images[pc.out_index][tid.xy] = float4(e_occ, 1.0);
+                if (pc.vol_g != 0xFFFFFFFFu && pc.vol_b != 0xFFFFFFFFu)
+                    g.storage_images[pc.vol_b][tid.xy] = float4(v_occ, bent_occ);
+                return;
+            }
             float3 uvw = float3(0.0, 0.0, 0.0);
             float3 e = float3(0.0, 0.0, 0.0);
             if (inside)
