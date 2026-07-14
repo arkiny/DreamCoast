@@ -40,7 +40,12 @@ Each render is compared two ways:
    speckles). Fixed twice over: screenshot mode now adapts the AE EMA on
    `FIXED_DT` (frame-counted deterministic, which also removes the AE-trajectory
    jitter from the `pt` configs), and the content recipes pin `AUTO_EXPOSURE=0`
-   (a fixed-EV regression capture should not meter at all).
+   (a fixed-EV regression capture should not meter at all). Measured post-fix:
+   `sponza_gdf_ao` byte-exact 6/6 captures across rebuilds and GPU contention;
+   `sponza_sc_viz` byte-exact 7/8 with one capture off by a SINGLE pixel × 1 LSB
+   — a second-order residual (suspect: surface-cache feedback/readback timing),
+   absorbed by the tolerant path below and deferred until the F4B increments
+   re-baseline sc_viz anyway.
 2. **Pixel mean/max diff (tolerant).** When a PNG golden is present, an exact
    miss falls back to a per-channel mean/max abs-diff check (`--mean-tol`,
    `--max-tol`). This absorbs small cross-box/cross-backend/driver
