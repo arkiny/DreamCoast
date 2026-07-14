@@ -113,11 +113,18 @@ impl GiSystem {
         backend: BackendKind,
         compute_supported: bool,
     ) -> anyhow::Result<Self> {
+        // `threads_per_group` MUST match the shader's `[numthreads(...)]`: Vulkan/D3D12 bake the
+        // group size into the bytecode and ignore this field, but METAL dispatches with exactly
+        // this value — a mismatch silently executes the wrong thread grid (the gi_volume update
+        // ran as 8x8x1 over a 4x4x4 shader for months, covering only z-slices 0..7 of the 32^3
+        // probe grid, so 3/4 of the irradiance/sky-vis field stayed zero-init on Apple — the
+        // deep-interior E deficit the GI-volume-leak phase measured back to this line).
         let compute = |spirv: fn() -> Option<&'static [u8]>,
                        dxil: fn() -> Option<&'static [u8]>,
                        metallib: fn() -> Option<&'static [u8]>,
                        name: &str,
-                       pcsize: u32|
+                       pcsize: u32,
+                       tg: [u32; 3]|
          -> anyhow::Result<Option<ComputePipeline>> {
             if !compute_supported {
                 return Ok(None);
@@ -130,7 +137,7 @@ impl GiSystem {
                     push_constant_size: pcsize,
                     bindless: true,
                     uniform_buffer: false,
-                    threads_per_group: [8, 8, 1],
+                    threads_per_group: tg,
                 },
             )?))
         };
@@ -140,6 +147,7 @@ impl GiSystem {
             dreamcoast_shader::gdf_ao_cs_metallib,
             "gdf_ao",
             160,
+            [8, 8, 1],
         )?;
         let gi_pipeline = compute(
             dreamcoast_shader::gdf_gi_cs_spirv,
@@ -147,6 +155,7 @@ impl GiSystem {
             dreamcoast_shader::gdf_gi_cs_metallib,
             "gdf_gi",
             256, // +16B row: F3 `hwrt` @240 + F4 `gi_importance` @244 (0 = the legacy anchors).
+            [8, 8, 1],
         )?;
         // F3: the HW-RT permutation, built only on RT-capable devices (its inline RayQuery /
         // acceleration-structure use can't be created without RT support). Bound in place of
@@ -158,6 +167,7 @@ impl GiSystem {
                 dreamcoast_shader::gdf_gi_hwrt_cs_metallib,
                 "gdf_gi_hwrt",
                 256,
+                [8, 8, 1],
             )?
         } else {
             None
@@ -168,6 +178,7 @@ impl GiSystem {
             dreamcoast_shader::gdf_gi_upsample_cs_metallib,
             "gdf_gi_upsample",
             128,
+            [8, 8, 1],
         )?;
         let temporal_pipeline = compute(
             dreamcoast_shader::gdf_temporal_cs_spirv,
@@ -175,6 +186,7 @@ impl GiSystem {
             dreamcoast_shader::gdf_temporal_cs_metallib,
             "gdf_temporal",
             192,
+            [8, 8, 1],
         )?;
         let atrous_pipeline = compute(
             dreamcoast_shader::gdf_atrous_cs_spirv,
@@ -182,13 +194,15 @@ impl GiSystem {
             dreamcoast_shader::gdf_atrous_cs_metallib,
             "gdf_atrous",
             112,
+            [8, 8, 1],
         )?;
         let gi_vol_pipeline = compute(
             dreamcoast_shader::gi_volume_cs_spirv,
             dreamcoast_shader::gi_volume_cs_dxil,
             dreamcoast_shader::gi_volume_cs_metallib,
             "gi_volume",
-            192, // +32B: F4 fine-level AABB rows (fine_min.xyz + active, fine_max.xyz).
+            192,       // +32B: F4 fine-level AABB rows (fine_min.xyz + active, fine_max.xyz).
+            [4, 4, 4], // MUST match gi_volume.slang [numthreads(4,4,4)] — Metal dispatches this
         )?;
         let sp_trace_pipeline = compute(
             dreamcoast_shader::screen_probe_trace_cs_spirv,
@@ -196,6 +210,7 @@ impl GiSystem {
             dreamcoast_shader::screen_probe_trace_cs_metallib,
             "screen_probe_trace",
             240, // ProbeTracePush = 240B (wrc_atlas/grid/oct/pad0 row @224); matches screen_probe_trace_push.
+            [8, 8, 1],
         )?;
         let sp_integrate_pipeline = compute(
             dreamcoast_shader::screen_probe_integrate_cs_spirv,
@@ -203,6 +218,7 @@ impl GiSystem {
             dreamcoast_shader::screen_probe_integrate_cs_metallib,
             "screen_probe_integrate",
             128,
+            [8, 8, 1],
         )?;
         let sp_filter_pipeline = compute(
             dreamcoast_shader::screen_probe_filter_cs_spirv,
@@ -210,6 +226,7 @@ impl GiSystem {
             dreamcoast_shader::screen_probe_filter_cs_metallib,
             "screen_probe_filter",
             128,
+            [8, 8, 1],
         )?;
         let sp_irradiance_pipeline = compute(
             dreamcoast_shader::screen_probe_irradiance_cs_spirv,
@@ -217,6 +234,7 @@ impl GiSystem {
             dreamcoast_shader::screen_probe_irradiance_cs_metallib,
             "screen_probe_irradiance",
             32,
+            [8, 8, 1],
         )?;
         let wrc_pipeline = compute(
             dreamcoast_shader::wrc_update_cs_spirv,
@@ -224,6 +242,7 @@ impl GiSystem {
             dreamcoast_shader::wrc_update_cs_metallib,
             "wrc_update",
             128,
+            [8, 8, 1],
         )?;
         let wrc_view_pipeline = compute(
             dreamcoast_shader::wrc_view_cs_spirv,
@@ -231,6 +250,7 @@ impl GiSystem {
             dreamcoast_shader::wrc_view_cs_metallib,
             "wrc_view",
             192,
+            [8, 8, 1],
         )?;
         // 24 R32F volumes: ping-pong [read|write] × 12 SH coefficients. Empty (zero) at start = no
         // fill until the update converges; the lighting falls back gracefully (e = 0). Allocated
@@ -906,6 +926,12 @@ impl GiSystem {
         // (currently the gallery scene only). Ignored on the volume path (that samples the field).
         // Default false keeps the SW march -> gallery byte-identical.
         hwrt: bool,
+        // GI-volume-leak increment A (`P_GI_VOL_OCC`, opt-in): occupancy-weighted manual trilinear
+        // on the volume-sampling path — probes whose centre sits inside geometry are excluded from
+        // the interpolation and the weights renormalised (the reflection fallback's
+        // sample_gi_irradiance_valid pattern, applied to E, sky-vis and the bent normal alike).
+        // Only meaningful with `gi_volume`; false = hardware trilinear (byte-identical anchor).
+        vol_occ: bool,
         // Returns `(gi_image, skyvis_image)`; the sky-vis image (indoor skylight occlusion) is only
         // produced on the volume path (None on the ray-march/gallery path).
     ) -> (ResourceId, Option<ResourceId>) {
@@ -1029,6 +1055,8 @@ impl GiSystem {
                     gi_importance,
                     // F4: fine-level AABB storage buffer (volume path only; 0xFFFFFFFF = off).
                     fine_buf,
+                    // Occupancy-weighted volume consumption (volume path only; 0 = legacy).
+                    u32::from(vol_occ),
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

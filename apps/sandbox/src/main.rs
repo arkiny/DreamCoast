@@ -859,6 +859,12 @@ struct App {
     /// it). `1` = every frame (byte-identical default). Higher = cheaper `gi_volume` (the VK
     /// view-independent floor), slower GI convergence — fine for a mostly-static world.
     gi_volume_period: u64,
+    /// GI-volume-leak increment A (`P_GI_VOL_OCC`, opt-in): occupancy-weighted manual trilinear on
+    /// the volume consumption — probes whose centre sits inside geometry are excluded and the
+    /// weights renormalised (the reflection fallback's sample_gi_irradiance_valid pattern), so an
+    /// interior receiver stops interpolating toward the in-wall probes' near-zero SH (E dilution)
+    /// and the sky-vis/bent field stops smearing across walls. Volume path only; off = anchor.
+    gi_vol_occ: bool,
     /// 레퍼런스식 indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
     /// directional sky-visibility): neutral leak fraction (`P_SKYVIS_TINT`) + min-occlusion floor
     /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
@@ -2956,6 +2962,10 @@ impl App {
         // Default on for content (the sky-vis image is content-only → gallery byte-identical anyway);
         // `P_BENT_NORMAL=0` zeroes the bent normal for A/B (pbr then falls back to the scalar path).
         let bent_normal = quality::env_bool("P_BENT_NORMAL", true);
+        // GI-volume occupancy-weighted consumption (increment A of the GI-volume-leak phase,
+        // docs/phase-gi-volume-leak-plan.md §3). Opt-in while its PT/crop effect is measured;
+        // volume path only (the ray-march path never reads the field).
+        let gi_vol_occ = quality::env_bool("P_GI_VOL_OCC", false) && gi_volume;
         // Deferred-parity cache skylight (see the App field doc): tier-driven, env-overridable,
         // and only meaningful with the volume-GI path (the SH sky-visibility volumes it reads).
         let cache_sky_occlude =
@@ -3751,6 +3761,7 @@ impl App {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(base.gi_volume_period as u64)
                 .max(1),
+            gi_vol_occ,
             skyvis_tint,
             skyvis_min_occ,
             cache_sky_occlude,
@@ -6808,6 +6819,8 @@ impl App {
                     // F3: HW-RT gather only on the ray-march path (the volume path samples the field,
                     // not rays). Default off (`P_HWRT_GI` unset) -> SW march -> gallery byte-identical.
                     self.hwrt_gi && gi_volume_arg.is_none(),
+                    // Increment A: occupancy-weighted volume consumption (volume path only).
+                    self.gi_vol_occ,
                 );
                 gi_skyvis_out = skyvis;
                 // M3-C: denoise at the GI TRACE res (before the bilateral upsample), then upsample

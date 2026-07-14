@@ -1149,6 +1149,9 @@ pub(crate) fn gdf_gi_push(
     // AABB (2×float4: min.xyz+0, max.xyz+0) the volume-sampling branch reads. 0xFFFFFFFF = single
     // level (the legacy volume branch, an untouched instruction stream).
     fine_buf: u32,
+    // GI-volume occupancy-weighted consumption (`P_GI_VOL_OCC`): 0 = hardware trilinear (legacy,
+    // byte-identical anchor); 1 = manual 2x2x2 trilinear excluding probes inside geometry.
+    vol_occ: u32,
 ) -> [u8; 256] {
     let mut pc = [0u8; 256];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -1214,10 +1217,12 @@ pub(crate) fn gdf_gi_push(
     // F3 + F4 share the last 16-byte row: the HW-RT gather toggle at 240..244 (0 = SW march =
     // gallery byte-identical) and the F4 importance-sampling mix at 244..248 (0.0 = legacy
     // cosine gather = byte-identical); +248 = F4 fine-AABB storage-buffer index (0xFFFFFFFF =
-    // off = the legacy single-level volume branch); 252..256 stays padding.
+    // off = the legacy single-level volume branch); +252 = the occupancy-weighted volume
+    // consumption toggle (0 = hardware trilinear = byte-identical, rides the former pad).
     pc[240..244].copy_from_slice(&hwrt.to_le_bytes());
     pc[244..248].copy_from_slice(&gi_importance.to_le_bytes());
     pc[248..252].copy_from_slice(&fine_buf.to_le_bytes());
+    pc[252..256].copy_from_slice(&vol_occ.to_le_bytes());
     pc
 }
 

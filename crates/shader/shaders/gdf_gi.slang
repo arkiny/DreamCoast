@@ -78,7 +78,11 @@ struct GiPush
     uint gi_fine_buf;       // F4 — storage-buffer index of the fine-level AABB (2×float4:
                             // min.xyz+0, max.xyz+0); 0xFFFFFFFF = single level (legacy path
                             // untouched).
-    uint pad_hwrt2;         // 16-byte row padding (keeps the block a multiple of 16 across backends)
+    uint vol_occ;           // GI-volume occupancy-weighted consumption (`P_GI_VOL_OCC`, opt-in):
+                            // 0 = hardware trilinear (legacy, byte-identical anchor); 1 = manual
+                            // 2x2x2 trilinear excluding probes whose centre sits inside geometry
+                            // (the reflection fallback's sample_gi_irradiance_valid pattern).
+                            // Rides the former pad slot, so 0 keeps the block layout unchanged.
 };
 
 // Real SH band-0/1 basis normalisation (matches gi_volume.slang).
@@ -225,6 +229,113 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 }
                 g.storage_images[pc.vol_b][tid.xy] = float4(v, bent);
             }
+            return;
+        }
+
+        // GI-volume-leak increment A (`P_GI_VOL_OCC`, opt-in): occupancy-weighted manual
+        // trilinear consumption. The hardware trilinear below mixes in probes whose voxel centre
+        // sits INSIDE geometry — their SH is ~0 and not a witness of this receiver's radiance, so
+        // an interior receiver near a wall interpolates toward black and the field under-delivers
+        // the real bounce energy (the measured F3-vs-PT deep-crop deficit,
+        // docs/phase-gi-volume-leak-plan.md §1b). Port of the reflection fallback's
+        // sample_gi_irradiance_valid (gdf_reflect.slang): re-do the trilinear by hand over the
+        // 2x2x2 probe corners, weight each by its occupancy (probe centre in open space) and
+        // renormalise. The SAME weights filter the radiance SH, the sky-vis SH and the bent
+        // normal — one grid, one defect, one fix. Every corner enclosed -> E 0 and sky-vis 0
+        // (a fully enclosed sliver is genuinely dark, the reflection precedent's accepted
+        // falloff). A SEPARATE block (the F4 fine-level precedent above) so the OFF path below
+        // keeps its exact legacy instruction stream. Coarse level only: this branch is behind
+        // the fine block, and a double-height (F4) volume without an installed fine box remaps
+        // to the coarse half like sample_gi_irradiance_valid.
+        if (pc.vol_occ != 0u)
+        {
+            float3 vext = GDF_MAX - GDF_MIN;
+            float3 vuvw = (world_pos - GDF_MIN) / vext;
+            float3 e = float3(0.0, 0.0, 0.0);
+            float v = 1.0; // outside the volume: no occlusion info (legacy semantics)
+            float3 bent = float3(0.0, 0.0, 0.0);
+            if (all(vuvw >= 0.0) && all(vuvw <= 1.0))
+            {
+                ClipMap occ_clip;
+                occ_clip.desc = pc.clip_desc;
+                occ_clip.count = pc.clip_count;
+                uint dw, dh, dd;
+                g.volumes[pc.vol_r].GetDimensions(dw, dh, dd);
+                uint ldh = (dh == dw * 2u) ? dw : dh;
+                float3 dims = float3(float(dw), float(ldh), float(dd));
+                float3 f = saturate(vuvw) * dims - 0.5;
+                float3 fl = floor(f);
+                float3 fr = f - fl;
+                int3 i0 = int3(fl);
+                int3 imax = int3(int(dw) - 1, int(ldh) - 1, int(dd) - 1);
+                float3 c[4];
+                float sc[4];
+                [unroll]
+                for (int k = 0; k < 4; k++)
+                {
+                    c[k] = float3(0.0, 0.0, 0.0);
+                    sc[k] = 0.0;
+                }
+                float wsum = 0.0;
+                [loop]
+                for (int ci = 0; ci < 8; ci++)
+                {
+                    int3 off = int3(ci & 1, (ci >> 1) & 1, (ci >> 2) & 1);
+                    float3 fw = lerp(float3(1.0, 1.0, 1.0) - fr, fr, float3(off));
+                    float w = fw.x * fw.y * fw.z;
+                    if (w <= 1e-4)
+                        continue;
+                    int3 ip = clamp(i0 + off, int3(0, 0, 0), imax);
+                    float3 probe = GDF_MIN + ((float3(ip) + 0.5) / dims) * vext;
+                    if (min(cm_geo_inside(occ_clip, probe, pc.aabb_max.w), probe.y - GROUND_Y)
+                        <= 0.0)
+                        continue; // occupied probe — not a witness, exclude it
+                    [unroll]
+                    for (int ch = 0; ch < 3; ch++)
+                    {
+                        [unroll]
+                        for (int k = 0; k < 4; k++)
+                            c[k][ch] +=
+                                w * g.volumes[pc.vol_r + uint(ch * 4 + k)].Load(int4(ip, 0)).x;
+                    }
+                    if (pc.vol_g != 0xFFFFFFFFu)
+                    {
+                        [unroll]
+                        for (int k = 0; k < 4; k++)
+                            sc[k] += w * g.volumes[pc.vol_g + uint(k)].Load(int4(ip, 0)).x;
+                    }
+                    wsum += w;
+                }
+                if (wsum > 1e-4)
+                {
+                    float rw = 1.0 / wsum;
+                    e = (c[0] * SH_C0
+                         + (2.0 / 3.0)
+                               * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]))
+                        * rw;
+                    e = max(e, float3(0.0, 0.0, 0.0));
+                    if (pc.vol_g != 0xFFFFFFFFu)
+                    {
+                        v = saturate((sc[0] * SH_C0
+                                      + (2.0 / 3.0)
+                                            * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2]
+                                               + SH_C1 * n.x * sc[3]))
+                                     * rw);
+                        if ((pc.flip_y & 2u) != 0u)
+                        {
+                            float3 b = float3(sc[3], sc[1], sc[2]);
+                            float bl = length(b);
+                            if (bl > 1e-5)
+                                bent = b / bl;
+                        }
+                    }
+                }
+                else
+                    v = 0.0; // fully enclosed — dark, and no sky reaches it either
+            }
+            g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
+            if (pc.vol_g != 0xFFFFFFFFu && pc.vol_b != 0xFFFFFFFFu)
+                g.storage_images[pc.vol_b][tid.xy] = float4(v, bent);
             return;
         }
 

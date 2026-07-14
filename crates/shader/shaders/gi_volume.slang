@@ -294,6 +294,31 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             else
                 read_coeffs(read_base, hp, cprev);
             float3 indirect = eval_irradiance(cprev, hn);
+            // Occlude the sky fill by the PREVIOUS frame's sky-visibility V(hn) at the hit
+            // (single source with the deferred skylight occlusion — no new state): a hit deep
+            // inside an enclosed interior must not receive the open-sky fill. Before the
+            // full-grid dispatch fix this term looked minor (3/4 of the probes never ran);
+            // on the working field it flooded every interior with sky-blue E (crop B-R +12
+            // vs the reference's -0.6). The reset frame (no history) and a missing sky-vis
+            // binding fall back to V = 1 — the unoccluded legacy term, so the EMA bootstrap
+            // starts bright and converges down instead of crushing to black.
+            if (pc.read_rgb.y != 0xFFFFFFFFu && pc.read_rgb.w == 0u)
+            {
+                float svprev[4];
+                if (fine_on)
+                {
+                    bool sin_;
+                    float3 suvw = gv_level_uvw(hp, sin_);
+                    read_coeffs_scalar_fine(pc.read_rgb.y, suvw, sin_, svprev);
+                }
+                else
+                    read_coeffs_scalar(pc.read_rgb.y, hp, svprev);
+                float hv = svprev[0] * SH_C0
+                           + (2.0 / 3.0)
+                                 * (SH_C1 * hn.y * svprev[1] + SH_C1 * hn.z * svprev[2]
+                                    + SH_C1 * hn.x * svprev[3]);
+                sky_fill *= saturate(hv);
+            }
             radiance = alb * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / GV_PI) + alb * indirect;
         }
         else
