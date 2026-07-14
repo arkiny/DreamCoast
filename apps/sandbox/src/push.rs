@@ -1749,6 +1749,11 @@ pub(crate) fn gdf_reflect_push(
     // stops receiving the unoccluded blue sky (single source with the deferred skylight
     // occlusion). u32::MAX = off -> V = 1 (legacy). Rides flip_y bits 8..14.
     gi_skyvis_base: u32,
+    // F4B: storage-buffer index of the fine-level AABB (the same 32 B buffer gdf_gi reads —
+    // single source, so the recentering consumer-disable window covers reflections too). The
+    // sample helpers then fall through finest-first instead of pinning the coarse half.
+    // u32::MAX = off -> the coarse-half remap (legacy). Rides flip_y bits 15..26.
+    gi_fine_buf: u32,
     material_index: u32,
     aabb_min: [f32; 3],
     aabb_max: [f32; 3],
@@ -1799,9 +1804,22 @@ pub(crate) fn gdf_reflect_push(
     pc[116..120].copy_from_slice(&height.to_le_bytes());
     // Pack the GI-volume bases into flip_y's upper bits (shader reads bit0 for the Y-flip,
     // bits 1..7 for the radiance base, bits 8..14 for the sky-vis base). Encode (base+1) so
-    // 0 = off; volumes[] has 64 entries so 7 bits per base never truncate.
+    // 0 = off; volumes[] has 64 entries so 7 bits per VOLUME base never truncate. The fine-
+    // level AABB buffer is different: it indexes the 2048-entry storage-buffer table and is
+    // allocated after the scene's per-mesh buffers (well past 127 on real content), so it
+    // gets 12 bits at 15..26 — asserted, not masked, so a table growth can't silently alias.
     let enc = |b: u32| if b == u32::MAX { 0 } else { (b + 1) & 0x7F };
-    let flip_packed = (flip_y & 1) | (enc(gi_vol_base) << 1) | (enc(gi_skyvis_base) << 8);
+    debug_assert!(
+        gi_fine_buf == u32::MAX || gi_fine_buf + 1 < (1 << 12),
+        "gi_fine_buf storage index {gi_fine_buf} exceeds the 12-bit flip_y encoding"
+    );
+    let enc_fine = if gi_fine_buf == u32::MAX {
+        0
+    } else {
+        (gi_fine_buf + 1) & 0xFFF
+    };
+    let flip_packed =
+        (flip_y & 1) | (enc(gi_vol_base) << 1) | (enc(gi_skyvis_base) << 8) | (enc_fine << 15);
     pc[120..124].copy_from_slice(&flip_packed.to_le_bytes());
     pc[124..128].copy_from_slice(&material_index.to_le_bytes());
     for (i, v) in aabb_min.iter().enumerate() {

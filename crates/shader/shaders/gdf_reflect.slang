@@ -253,6 +253,23 @@ float refl_shadow(float3 origin, float3 dir, float maxt)
 static const float SH_C0 = 0.2820947918; // sqrt(1/(4*pi))
 static const float SH_C1 = 0.4886025119; // sqrt(3/(4*pi))
 
+// F4B: the fine-level AABB storage buffer riding flip_y bits 15..26 (base+1, 12 bits — this
+// indexes the 2048-entry storage-buffer table, NOT the 64-entry volumes[] the 7-bit bases
+// use; 0 = off). The SAME 32 B buffer gdf_gi reads, so the recentering consumer-disable
+// window (an inverted box) turns the fall-through off here too. Returns false when off —
+// the callers then keep their coarse-half remap, the legacy path.
+bool gi_fine_box(out float3 fmin, out float3 fmax)
+{
+    fmin = float3(0.0, 0.0, 0.0);
+    fmax = float3(0.0, 0.0, 0.0);
+    uint fb = (pc.flip_y >> 15) & 0xFFFu;
+    if (fb == 0u)
+        return false;
+    fmin = asfloat(g.storage_buffers[fb - 1u].Load4(0)).xyz;
+    fmax = asfloat(g.storage_buffers[fb - 1u].Load4(16)).xyz;
+    return true;
+}
+
 // Reference-engine reflection technique: sample the world-space directional-irradiance volume
 // (radiance cache, the 12 SH coeff volumes contiguous from `base`, updated in gi_volume.slang with
 // multibounce) at a reflection HIT and reconstruct the cosine-weighted hemispherical irradiance
@@ -266,14 +283,23 @@ float3 sample_gi_irradiance(uint base, float3 p, float3 n)
         return float3(0.0, 0.0, 0.0);
     uvw = saturate(uvw);
     // F4 fine mode is self-describing: a double-height volume (dh == 2*dw) packs a camera-
-    // anchored fine level above the coarse one. Reflections keep the COARSE level this increment
-    // (fine fall-through is a measured follow-up): remap y into the coarse half with the
-    // voxel-center clamp so trilinear never crosses the level seam. Single-level volumes skip
-    // the remap — byte-for-byte legacy math.
+    // anchored fine level above the coarse one. F4B: finest-first fall-through — when the fine
+    // box is live (flip_y bits 15..26) and holds the hit, sample the fine half (voxel-centre
+    // clamp mirrors gv_level_uvw); else the coarse half, the legacy remap. Single-level
+    // volumes skip both — byte-for-byte legacy math.
     uint dw, dh, dd;
     g.volumes[base].GetDimensions(dw, dh, dd);
     if (dh == dw * 2u)
-        uvw.y = (0.5 + uvw.y * (float(dw) - 1.0)) / float(dh);
+    {
+        float3 fmin, fmax;
+        if (gi_fine_box(fmin, fmax) && all(p >= fmin) && all(p <= fmax))
+        {
+            float3 t = saturate((p - fmin) / (fmax - fmin));
+            uvw = float3(t.x, (0.5 + t.y * (float(dw) - 1.0)) / float(dh) + 0.5, t.z);
+        }
+        else
+            uvw.y = (0.5 + uvw.y * (float(dw) - 1.0)) / float(dh);
+    }
     float3 c[4];
     [unroll]
     for (int k = 0; k < 4; k++)
@@ -307,7 +333,17 @@ float sample_sky_vis(uint base, float3 p, float3 n)
     uint dw, dh, dd;
     g.volumes[base].GetDimensions(dw, dh, dd);
     if (dh == dw * 2u)
-        uvw.y = (0.5 + uvw.y * (float(dw) - 1.0)) / float(dh);
+    {
+        // F4B finest-first fall-through (see sample_gi_irradiance).
+        float3 fmin, fmax;
+        if (gi_fine_box(fmin, fmax) && all(p >= fmin) && all(p <= fmax))
+        {
+            float3 t = saturate((p - fmin) / (fmax - fmin));
+            uvw = float3(t.x, (0.5 + t.y * (float(dw) - 1.0)) / float(dh) + 0.5, t.z);
+        }
+        else
+            uvw.y = (0.5 + uvw.y * (float(dw) - 1.0)) / float(dh);
+    }
     float c0 = g.volumes[base].SampleLevel(g.samp, uvw, 0.0).x;
     float c1 = g.volumes[base + 1u].SampleLevel(g.samp, uvw, 0.0).x;
     float c2 = g.volumes[base + 2u].SampleLevel(g.samp, uvw, 0.0).x;
@@ -333,7 +369,17 @@ float sample_sky_vis_dir(uint base, float3 p, float3 dir)
     uint dw, dh, dd;
     g.volumes[base].GetDimensions(dw, dh, dd);
     if (dh == dw * 2u)
-        uvw.y = (0.5 + uvw.y * (float(dw) - 1.0)) / float(dh);
+    {
+        // F4B finest-first fall-through (see sample_gi_irradiance).
+        float3 fmin, fmax;
+        if (gi_fine_box(fmin, fmax) && all(p >= fmin) && all(p <= fmax))
+        {
+            float3 t = saturate((p - fmin) / (fmax - fmin));
+            uvw = float3(t.x, (0.5 + t.y * (float(dw) - 1.0)) / float(dh) + 0.5, t.z);
+        }
+        else
+            uvw.y = (0.5 + uvw.y * (float(dw) - 1.0)) / float(dh);
+    }
     float c0 = g.volumes[base].SampleLevel(g.samp, uvw, 0.0).x;
     float c1 = g.volumes[base + 1u].SampleLevel(g.samp, uvw, 0.0).x;
     float c2 = g.volumes[base + 2u].SampleLevel(g.samp, uvw, 0.0).x;
@@ -360,13 +406,26 @@ float3 sample_gi_irradiance_valid(uint base, float3 p, float3 n)
         return float3(0.0, 0.0, 0.0);
     uint dw, dh, dd;
     g.volumes[base].GetDimensions(dw, dh, dd);
-    // F4 fine mode (dh == 2*dw): the manual trilinear works in the LOGICAL (per-level) grid —
-    // reflections keep the coarse level this increment, whose rows are y ∈ [0, dw), so probe
-    // positions and clamped loads never touch the fine half. Single-level volumes have
-    // ldh == dh — byte-for-byte legacy math.
+    // F4 fine mode (dh == 2*dw): the manual trilinear works in the LOGICAL (per-level) grid.
+    // F4B finest-first: when the fine box is live and holds the query, the level box/extent
+    // switch to it and the loads offset into the fine half; else the coarse rows y ∈ [0, dw)
+    // (legacy). Single-level volumes have ldh == dh — byte-for-byte legacy math.
     uint ldh = (dh == dw * 2u) ? dw : dh;
+    float3 lmin = GDF_MIN;
+    float3 lext = ext;
+    int yoff = 0;
+    if (dh == dw * 2u)
+    {
+        float3 fmin, fmax;
+        if (gi_fine_box(fmin, fmax) && all(p >= fmin) && all(p <= fmax))
+        {
+            lmin = fmin;
+            lext = fmax - fmin;
+            yoff = int(ldh);
+        }
+    }
     float3 dims = float3(float(dw), float(ldh), float(dd));
-    float3 f = saturate(uvw) * dims - 0.5;
+    float3 f = saturate((p - lmin) / lext) * dims - 0.5;
     float3 f0 = floor(f);
     float3 fr = f - f0;
     int3 i0 = int3(f0);
@@ -385,15 +444,16 @@ float3 sample_gi_irradiance_valid(uint base, float3 p, float3 n)
         if (w <= 1e-4)
             continue;
         int3 ip = clamp(i0 + off, int3(0, 0, 0), imax);
-        float3 probe = GDF_MIN + ((float3(ip) + 0.5) / dims) * ext;
+        float3 probe = lmin + ((float3(ip) + 0.5) / dims) * lext;
         if (scene_occ(probe) <= 0.0)
             continue; // occupied probe — exclude it from the interpolation
+        int4 lp = int4(ip.x, ip.y + yoff, ip.z, 0);
         [unroll]
         for (int ch = 0; ch < 3; ch++)
         {
             [unroll]
             for (int k = 0; k < 4; k++)
-                c[k][ch] += w * g.volumes[base + uint(ch * 4 + k)].Load(int4(ip, 0)).x;
+                c[k][ch] += w * g.volumes[base + uint(ch * 4 + k)].Load(lp).x;
         }
         wsum += w;
     }

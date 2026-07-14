@@ -1103,10 +1103,12 @@ impl ReflectSystem {
         frame: u32,
         albedo: Option<(&'a [Volume; 3], ResourceId)>,
         cache: Option<([u32; 5], ResourceId)>,
-        // GI irradiance volume (radiance cache): (radiance_base, skyvis_base, write-order handle),
-        // same tuple the GI pass gets. Sampled at reflection hits for the GI-lit indirect term so
-        // shadowed reflected surfaces aren't black. `None` (gallery) -> legacy analytic fill.
-        gi_volume: Option<(u32, u32, ResourceId)>,
+        // GI irradiance volume (radiance cache): (radiance_base, skyvis_base, fine-AABB storage
+        // buffer or u32::MAX, write-order handle), same tuple the GI pass gets. Sampled at
+        // reflection hits for the GI-lit indirect term so shadowed reflected surfaces aren't
+        // black; the fine buffer opens the finest-first fall-through in the sample helpers
+        // (F4B). `None` (gallery) -> legacy analytic fill.
+        gi_volume: Option<(u32, u32, u32, ResourceId)>,
         // IBL diffuse-irradiance cube index (physical-units skylight). For content (gi_volume present)
         // it rides the shader-unused `sky_fill` push slot; a reflected uncovered/shadowed surface and
         // an escaped (sky) ray floor to this instead of near-black. `u32::MAX` / gallery -> legacy.
@@ -1179,13 +1181,14 @@ impl ReflectSystem {
         if let Some((_, ext)) = cache {
             reads.push(ext);
         }
-        if let Some((_, _, ext)) = gi_volume {
+        if let Some((_, _, _, ext)) = gi_volume {
             reads.push(ext); // barrier the reflection sample after this frame's volume update
         }
         // vol_r = radiance SH base; vol_g = sky-vis SH base (the fallback occludes its skylight
         // top-up / miss-sky by V — single source with the deferred skylight occlusion).
-        let gi_vol_base = gi_volume.map(|(rb, _, _)| rb).unwrap_or(u32::MAX);
-        let gi_skyvis_base = gi_volume.map(|(_, sb, _)| sb).unwrap_or(u32::MAX);
+        let gi_vol_base = gi_volume.map(|(rb, ..)| rb).unwrap_or(u32::MAX);
+        let gi_skyvis_base = gi_volume.map(|(_, sb, ..)| sb).unwrap_or(u32::MAX);
+        let gi_fine_buf = gi_volume.map(|(_, _, fb, _)| fb).unwrap_or(u32::MAX);
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
         // A3: order this frame's skip-buffer writes (imported external; read is last frame's slot,
         // covered by the frame fence, so it isn't graph-tracked — same pattern as refl_accum).
@@ -1249,6 +1252,7 @@ impl ReflectSystem {
                     flip_y,
                     gi_vol_base, // GI irradiance volume base (u32::MAX = off, legacy fill)
                     gi_skyvis_base,
+                    gi_fine_buf, // F4B fine-AABB buffer (u32::MAX = coarse-half remap, legacy)
                     material_index,
                     aabb_min,
                     aabb_max,
@@ -1317,7 +1321,7 @@ impl ReflectSystem {
         frame: u32,
         albedo: Option<(&'a [Volume; 3], ResourceId)>,
         cache: Option<([u32; 5], ResourceId)>,
-        gi_volume: Option<(u32, u32, ResourceId)>,
+        gi_volume: Option<(u32, u32, u32, ResourceId)>,
         irradiance_index: u32,
         clip: (u32, u32),
         clip_vols: &'a [&'a Volume],
@@ -1467,11 +1471,12 @@ impl ReflectSystem {
         if let Some((_, ext)) = cache {
             reads.push(ext);
         }
-        if let Some((_, _, ext)) = gi_volume {
+        if let Some((_, _, _, ext)) = gi_volume {
             reads.push(ext);
         }
-        let gi_vol_base = gi_volume.map(|(rb, _, _)| rb).unwrap_or(u32::MAX);
-        let gi_skyvis_base = gi_volume.map(|(_, sb, _)| sb).unwrap_or(u32::MAX);
+        let gi_vol_base = gi_volume.map(|(rb, ..)| rb).unwrap_or(u32::MAX);
+        let gi_skyvis_base = gi_volume.map(|(_, sb, ..)| sb).unwrap_or(u32::MAX);
+        let gi_fine_buf = gi_volume.map(|(_, _, fb, _)| fb).unwrap_or(u32::MAX);
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
         graph.add_compute_pass(
             ComputePassInfo {
@@ -1531,6 +1536,7 @@ impl ReflectSystem {
                     flip_y,
                     gi_vol_base,
                     gi_skyvis_base,
+                    gi_fine_buf, // F4B fine-AABB buffer (u32::MAX = coarse-half remap, legacy)
                     material_index,
                     aabb_min,
                     aabb_max,

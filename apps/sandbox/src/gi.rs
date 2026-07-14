@@ -385,6 +385,20 @@ impl GiSystem {
         self.gi_vol_fine && self.gi_fine_box.is_some()
     }
 
+    /// F4B: the fine-level AABB storage-buffer index for consumers outside this module (the
+    /// reflection fall-through) — the SAME 32 B buffer the per-pixel GI pass reads, so the
+    /// recentering consumer-disable window (an inverted box) covers every consumer at once.
+    /// `u32::MAX` when fine mode is off (consumers keep their coarse-half remap).
+    pub(crate) fn gi_fine_buf_index(&self) -> u32 {
+        if !self.gi_fine_installed() {
+            return u32::MAX;
+        }
+        self.gi_fine_buf
+            .as_ref()
+            .map(|b| b.storage_index())
+            .unwrap_or(u32::MAX)
+    }
+
     /// The PREVIOUS (completed) frame's sky-visibility SH base, for consumers recorded BEFORE this
     /// frame's volume update — the surface-cache relight's deferred-parity skylight. That slot was
     /// transitioned back to sampled at the end of its update and is not written this frame, so it

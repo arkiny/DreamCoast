@@ -6725,7 +6725,8 @@ impl App {
         // Hoisted out of the GI match arm so the reflection pass (recorded later, out of that arm's
         // scope) can sample the SAME radiance-cache volume + reuse its exact write-order handle for
         // the GI-lit indirect term at reflection hits. `None` unless the volume GI path runs.
-        let mut gi_reflect_arg: Option<(u32, u32, ResourceId)> = None;
+        // F4B tuple: (radiance base, sky-vis base, fine-AABB storage buffer or MAX, write handle).
+        let mut gi_reflect_arg: Option<(u32, u32, u32, ResourceId)> = None;
         let gdf_gi_out = match (self.gdf_gi, scene_gdf_vol, scene_gdf_ext) {
             (true, Some(vol), Some(ext)) if self.screen_probe => {
                 // Screen-space radiance probes (P1+): per-tile probe trace into an octahedral
@@ -6878,7 +6879,11 @@ impl App {
                             gi_y_offset,
                         )
                         .zip(self.gi.gi_volume_sampled())
-                        .map(|(vext, (rad_base, skyvis_base))| (rad_base, skyvis_base, vext))
+                        .map(|(vext, (rad_base, skyvis_base))| {
+                            // F4B: the fine-AABB buffer index rides the tuple so every consumer
+                            // (per-pixel GI, reflections) shares the ONE buffer + disable window.
+                            (rad_base, skyvis_base, self.gi.gi_fine_buf_index(), vext)
+                        })
                 } else {
                     None
                 };
@@ -6912,7 +6917,8 @@ impl App {
                     self.gdf_cone_k,
                     // F4: importance-sampled gather mix (0.0 on the gallery = legacy cosine anchor).
                     self.gi_importance,
-                    gi_volume_arg,
+                    // record_gi keeps the 3-tuple (it reads the fine buf from its own state).
+                    gi_volume_arg.map(|(r, s, _, e)| (r, s, e)),
                     // F3: HW-RT gather only on the ray-march path (the volume path samples the field,
                     // not rays). Default off (`P_HWRT_GI` unset) -> SW march -> gallery byte-identical.
                     self.hwrt_gi && gi_volume_arg.is_none(),
