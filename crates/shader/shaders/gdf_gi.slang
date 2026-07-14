@@ -120,6 +120,140 @@ BounceScene gi_bounce_scene()
     return bs;
 }
 
+
+// F4B edge-fade helpers: ONE level's volume consumption, parameterized by the level box and
+// its physical row placement in the double-height volume (fine_half). Two variants mirroring
+// the two consumption paths (hardware trilinear / occupancy-weighted manual trilinear) —
+// kept in lockstep with the single-level blocks in csMain. `v` is meaningful only when
+// pc.vol_g is bound (callers guard the write); `bent` is unit-length or zero (the scalar
+// fallback), gated on the P_BENT_NORMAL flip bit like the legacy paths.
+void gv_level_hw(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half, uint fdh,
+                 out float3 e, out float v, out float3 bent)
+{
+    e = float3(0.0, 0.0, 0.0);
+    v = 1.0;
+    bent = float3(0.0, 0.0, 0.0);
+    float ldim = float(fdh / 2u);
+    float3 t = saturate((wp - lmin) / (lmax - lmin));
+    float y = (0.5 + t.y * (ldim - 1.0)) / float(fdh);
+    float3 uvw = float3(t.x, fine_half ? y + 0.5 : y, t.z);
+    float3 c[4];
+    [unroll]
+    for (int k = 0; k < 4; k++)
+        c[k] = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (int ch = 0; ch < 3; ch++)
+    {
+        [unroll]
+        for (int k = 0; k < 4; k++)
+            c[k][ch] = g.volumes[pc.vol_r + uint(ch * 4 + k)].SampleLevel(g.samp, uvw, 0.0).x;
+    }
+    e = max(c[0] * SH_C0
+                + (2.0 / 3.0) * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]),
+            float3(0.0, 0.0, 0.0));
+    if (pc.vol_g != 0xFFFFFFFFu)
+    {
+        float sc[4];
+        [unroll]
+        for (int k = 0; k < 4; k++)
+            sc[k] = g.volumes[pc.vol_g + uint(k)].SampleLevel(g.samp, uvw, 0.0).x;
+        v = saturate(sc[0] * SH_C0
+                     + (2.0 / 3.0)
+                           * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2] + SH_C1 * n.x * sc[3]));
+        if ((pc.flip_y & 2u) != 0u)
+        {
+            float3 b = float3(sc[3], sc[1], sc[2]);
+            float bl = length(b);
+            if (bl > 1e-5)
+                bent = b / bl;
+        }
+    }
+}
+
+// Occupancy-weighted variant (lockstep with the coarse-only block in csMain and the
+// reflection helper sample_gi_irradiance_valid).
+void gv_level_occ(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half, uint fdw,
+                  uint fdh, uint fdd, out float3 e, out float v, out float3 bent)
+{
+    e = float3(0.0, 0.0, 0.0);
+    v = 1.0;
+    bent = float3(0.0, 0.0, 0.0);
+    ClipMap occ_clip;
+    occ_clip.desc = pc.clip_desc;
+    occ_clip.count = pc.clip_count;
+    float3 dims = float3(float(fdw), float(fdh / 2u), float(fdd));
+    float3 lext = lmax - lmin;
+    float3 f = saturate((wp - lmin) / lext) * dims - 0.5;
+    float3 fl = floor(f);
+    float3 fr = f - fl;
+    int3 i0 = int3(fl);
+    int3 imax = int3(int(fdw) - 1, int(fdh / 2u) - 1, int(fdd) - 1);
+    int yoff = fine_half ? int(fdh / 2u) : 0;
+    float3 c[4];
+    float sc[4];
+    [unroll]
+    for (int k = 0; k < 4; k++)
+    {
+        c[k] = float3(0.0, 0.0, 0.0);
+        sc[k] = 0.0;
+    }
+    float wsum = 0.0;
+    [loop]
+    for (int ci = 0; ci < 8; ci++)
+    {
+        int3 off = int3(ci & 1, (ci >> 1) & 1, (ci >> 2) & 1);
+        float3 fw = lerp(float3(1.0, 1.0, 1.0) - fr, fr, float3(off));
+        float w = fw.x * fw.y * fw.z;
+        if (w <= 1e-4)
+            continue;
+        int3 ip = clamp(i0 + off, int3(0, 0, 0), imax);
+        float3 probe = lmin + ((float3(ip) + 0.5) / dims) * lext;
+        if (min(cm_geo_inside(occ_clip, probe, pc.aabb_max.w), probe.y - GROUND_Y) <= 0.0)
+            continue; // occupied probe — not a witness, exclude it
+        int4 lp = int4(ip.x, ip.y + yoff, ip.z, 0);
+        [unroll]
+        for (int ch = 0; ch < 3; ch++)
+        {
+            [unroll]
+            for (int k = 0; k < 4; k++)
+                c[k][ch] += w * g.volumes[pc.vol_r + uint(ch * 4 + k)].Load(lp).x;
+        }
+        if (pc.vol_g != 0xFFFFFFFFu)
+        {
+            [unroll]
+            for (int k = 0; k < 4; k++)
+                sc[k] += w * g.volumes[pc.vol_g + uint(k)].Load(lp).x;
+        }
+        wsum += w;
+    }
+    if (wsum > 1e-4)
+    {
+        float rw = 1.0 / wsum;
+        e = max((c[0] * SH_C0
+                 + (2.0 / 3.0)
+                       * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]))
+                    * rw,
+                float3(0.0, 0.0, 0.0));
+        if (pc.vol_g != 0xFFFFFFFFu)
+        {
+            v = saturate((sc[0] * SH_C0
+                          + (2.0 / 3.0)
+                                * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2]
+                                   + SH_C1 * n.x * sc[3]))
+                         * rw);
+            if ((pc.flip_y & 2u) != 0u)
+            {
+                float3 b = float3(sc[3], sc[1], sc[2]);
+                float bl = length(b);
+                if (bl > 1e-5)
+                    bent = b / bl;
+            }
+        }
+    }
+    else
+        v = 0.0; // fully enclosed — dark, and no sky reaches it either
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void csMain(uint3 tid: SV_DispatchThreadID)
@@ -168,169 +302,64 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         {
             float3 fmin = asfloat(g.storage_buffers[pc.gi_fine_buf].Load4(0)).xyz;
             float3 fmax = asfloat(g.storage_buffers[pc.gi_fine_buf].Load4(16)).xyz;
-            // Logical (per-level) grid height = physical height / 2 (fine mode is only entered
-            // with the double-height allocation; derived, not hardcoded, from the bound volume).
+            // F4B edge-fade margin (world metres, third buffer row; 0 = hard containment,
+            // the F4 first-increment behaviour).
+            float fade_m = asfloat(g.storage_buffers[pc.gi_fine_buf].Load(32));
             uint fdw, fdh, fdd;
             g.volumes[pc.vol_r].GetDimensions(fdw, fdh, fdd);
-            float ldim = float(fdh / 2u);
             bool fine = all(world_pos >= fmin) && all(world_pos <= fmax);
             float3 cuvw = (world_pos - GDF_MIN) / (GDF_MAX - GDF_MIN);
-            bool inside = fine || (all(cuvw >= 0.0) && all(cuvw <= 1.0));
-            // F4B increment 1 (`P_GI_VOL_OCC` inside fine mode): the occupancy-weighted manual
-            // trilinear below (the coarse-only block) was unreachable in fine mode — this block
-            // returns first — so opting into the fine level silently DISABLED the occupancy
-            // weighting (worth −0.77 on the interior PT gate, measured on the working field).
-            // Port it here on the containment-SELECTED level's logical grid: same corner
-            // occupancy test, same weights across radiance/sky-vis/bent, loads offset into the
-            // fine half when the fine box answers. A SEPARATE sub-block so the `vol_occ == 0`
-            // path below keeps its exact legacy instruction stream.
-            if (pc.vol_occ != 0u)
+            bool cin = all(cuvw >= 0.0) && all(cuvw <= 1.0);
+            // F4B edge-fade: the fine weight ramps 0->1 over the boundary band (smoothstep of
+            // the world distance to the nearest box face) so the level hand-off has no hard
+            // seam; outside the band the single-level cost is unchanged.
+            float wf = 0.0;
+            if (fine)
             {
-                float3 lmin = fine ? fmin : GDF_MIN;
-                float3 lmax = fine ? fmax : GDF_MAX;
-                float3 e_occ = float3(0.0, 0.0, 0.0);
-                float v_occ = 1.0; // outside both boxes: no occlusion info (legacy semantics)
-                float3 bent_occ = float3(0.0, 0.0, 0.0);
-                if (inside)
-                {
-                    ClipMap occ_clip;
-                    occ_clip.desc = pc.clip_desc;
-                    occ_clip.count = pc.clip_count;
-                    float3 dims = float3(float(fdw), ldim, float(fdd));
-                    float3 lext = lmax - lmin;
-                    float3 t = fine ? saturate((world_pos - fmin) / (fmax - fmin))
-                                    : saturate(cuvw);
-                    float3 f = t * dims - 0.5;
-                    float3 fl = floor(f);
-                    float3 fr = f - fl;
-                    int3 i0 = int3(fl);
-                    int3 imax = int3(int(fdw) - 1, int(fdh / 2u) - 1, int(fdd) - 1);
-                    int yoff = fine ? int(fdh / 2u) : 0; // physical row offset of the level
-                    float3 c[4];
-                    float sc[4];
-                    [unroll]
-                    for (int k = 0; k < 4; k++)
-                    {
-                        c[k] = float3(0.0, 0.0, 0.0);
-                        sc[k] = 0.0;
-                    }
-                    float wsum = 0.0;
-                    [loop]
-                    for (int ci = 0; ci < 8; ci++)
-                    {
-                        int3 off = int3(ci & 1, (ci >> 1) & 1, (ci >> 2) & 1);
-                        float3 fw = lerp(float3(1.0, 1.0, 1.0) - fr, fr, float3(off));
-                        float w = fw.x * fw.y * fw.z;
-                        if (w <= 1e-4)
-                            continue;
-                        int3 ip = clamp(i0 + off, int3(0, 0, 0), imax);
-                        float3 probe = lmin + ((float3(ip) + 0.5) / dims) * lext;
-                        if (min(cm_geo_inside(occ_clip, probe, pc.aabb_max.w),
-                                probe.y - GROUND_Y)
-                            <= 0.0)
-                            continue; // occupied probe — not a witness, exclude it
-                        int4 lp = int4(ip.x, ip.y + yoff, ip.z, 0);
-                        [unroll]
-                        for (int ch = 0; ch < 3; ch++)
-                        {
-                            [unroll]
-                            for (int k = 0; k < 4; k++)
-                                c[k][ch] += w * g.volumes[pc.vol_r + uint(ch * 4 + k)].Load(lp).x;
-                        }
-                        if (pc.vol_g != 0xFFFFFFFFu)
-                        {
-                            [unroll]
-                            for (int k = 0; k < 4; k++)
-                                sc[k] += w * g.volumes[pc.vol_g + uint(k)].Load(lp).x;
-                        }
-                        wsum += w;
-                    }
-                    if (wsum > 1e-4)
-                    {
-                        float rw = 1.0 / wsum;
-                        e_occ = (c[0] * SH_C0
-                                 + (2.0 / 3.0)
-                                       * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2]
-                                          + SH_C1 * n.x * c[3]))
-                                * rw;
-                        e_occ = max(e_occ, float3(0.0, 0.0, 0.0));
-                        if (pc.vol_g != 0xFFFFFFFFu)
-                        {
-                            v_occ = saturate((sc[0] * SH_C0
-                                              + (2.0 / 3.0)
-                                                    * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2]
-                                                       + SH_C1 * n.x * sc[3]))
-                                             * rw);
-                            if ((pc.flip_y & 2u) != 0u)
-                            {
-                                float3 b = float3(sc[3], sc[1], sc[2]);
-                                float bl = length(b);
-                                if (bl > 1e-5)
-                                    bent_occ = b / bl;
-                            }
-                        }
-                    }
-                    else
-                        v_occ = 0.0; // fully enclosed — dark, and no sky reaches it either
-                }
-                g.storage_images[pc.out_index][tid.xy] = float4(e_occ, 1.0);
-                if (pc.vol_g != 0xFFFFFFFFu && pc.vol_b != 0xFFFFFFFFu)
-                    g.storage_images[pc.vol_b][tid.xy] = float4(v_occ, bent_occ);
-                return;
+                float3 dm = min(world_pos - fmin, fmax - world_pos);
+                float d_edge = min(dm.x, min(dm.y, dm.z));
+                wf = fade_m > 0.0 ? smoothstep(0.0, fade_m, d_edge) : 1.0;
             }
-            float3 uvw = float3(0.0, 0.0, 0.0);
             float3 e = float3(0.0, 0.0, 0.0);
-            if (inside)
+            float v = 1.0;
+            float3 bent = float3(0.0, 0.0, 0.0);
+            if (fine || cin)
             {
-                float3 t = fine ? saturate((world_pos - fmin) / (fmax - fmin)) : saturate(cuvw);
-                float y = (0.5 + t.y * (ldim - 1.0)) / float(fdh);
-                uvw = float3(t.x, fine ? y + 0.5 : y, t.z);
-                // Same E(n) reconstruction as the legacy body — only the uvw mapping differs.
-                float3 c[4];
-                [unroll]
-                for (int k = 0; k < 4; k++)
-                    c[k] = float3(0.0, 0.0, 0.0);
-                [unroll]
-                for (int ch = 0; ch < 3; ch++)
+                bool want_f = wf > 0.0;
+                bool want_c = wf < 1.0 && cin;
+                float3 ef = float3(0.0, 0.0, 0.0), ec = float3(0.0, 0.0, 0.0);
+                float vf = 1.0, vc = 1.0;
+                float3 bf = float3(0.0, 0.0, 0.0), bc = float3(0.0, 0.0, 0.0);
+                if (pc.vol_occ != 0u)
                 {
-                    [unroll]
-                    for (int k = 0; k < 4; k++)
-                        c[k][ch] =
-                            g.volumes[pc.vol_r + uint(ch * 4 + k)].SampleLevel(g.samp, uvw, 0.0).x;
+                    if (want_f)
+                        gv_level_occ(world_pos, n, fmin, fmax, true, fdw, fdh, fdd, ef, vf, bf);
+                    if (want_c)
+                        gv_level_occ(world_pos, n, GDF_MIN, GDF_MAX, false, fdw, fdh, fdd, ec,
+                                     vc, bc);
                 }
-                e = c[0] * SH_C0
-                    + (2.0 / 3.0)
-                          * (SH_C1 * n.y * c[1] + SH_C1 * n.z * c[2] + SH_C1 * n.x * c[3]);
-                e = max(e, float3(0.0, 0.0, 0.0));
+                else
+                {
+                    if (want_f)
+                        gv_level_hw(world_pos, n, fmin, fmax, true, fdh, ef, vf, bf);
+                    if (want_c)
+                        gv_level_hw(world_pos, n, GDF_MIN, GDF_MAX, false, fdh, ec, vc, bc);
+                }
+                // Blend: fine-only where the coarse box cannot answer, else the fade weight.
+                float t = !want_f ? 0.0 : (want_c ? wf : 1.0);
+                e = lerp(ec, ef, t);
+                v = lerp(vc, vf, t);
+                // E/V are linear in the SH coefficients (reconstruct-then-lerp is exact); the
+                // bent normal is NOT — renormalize the lerp (opposing bents shrink toward zero
+                // and correctly land on the scalar-fallback zero-vector path; the opt-in
+                // spec_occlusion consumer takes a raw dot of this, pbr.slang bent_unit).
+                bent = lerp(bc, bf, t);
+                float bl = length(bent);
+                bent = bl > 1e-5 ? bent / bl : float3(0.0, 0.0, 0.0);
             }
             g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
-
-            // Sky-visibility + bent normal: the SAME reconstruction as the legacy body at the
-            // remapped uvw (the sky-vis volumes share the packed two-level layout).
             if (pc.vol_g != 0xFFFFFFFFu && pc.vol_b != 0xFFFFFFFFu)
-            {
-                float v = 1.0;
-                float3 bent = float3(0.0, 0.0, 0.0);
-                if (inside)
-                {
-                    float sc[4];
-                    [unroll]
-                    for (int k = 0; k < 4; k++)
-                        sc[k] = g.volumes[pc.vol_g + uint(k)].SampleLevel(g.samp, uvw, 0.0).x;
-                    v = sc[0] * SH_C0
-                        + (2.0 / 3.0)
-                              * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2] + SH_C1 * n.x * sc[3]);
-                    v = saturate(v);
-                    if ((pc.flip_y & 2u) != 0u)
-                    {
-                        float3 b = float3(sc[3], sc[1], sc[2]);
-                        float bl = length(b);
-                        if (bl > 1e-5)
-                            bent = b / bl;
-                    }
-                }
                 g.storage_images[pc.vol_b][tid.xy] = float4(v, bent);
-            }
             return;
         }
 

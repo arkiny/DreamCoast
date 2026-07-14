@@ -358,17 +358,26 @@ impl GiSystem {
         if !self.gi_vol_fine {
             return Ok(());
         }
-        // 32 bytes = fine_min.xyz + pad, fine_max.xyz + pad (two float4 rows, Load4-friendly).
-        let mut bytes = [0u8; 32];
+        // 48 bytes = fine_min.xyz + pad, fine_max.xyz + pad (two float4 rows, Load4-friendly),
+        // then the F4B edge-fade margin in world metres at +32 (`P_GI_FINE_FADE` fraction of
+        // the half-extent, default 0.15; 0 disables the fade = the hard-containment seam).
+        let fade_frac = std::env::var("P_GI_FINE_FADE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.15)
+            .clamp(0.0, 0.5);
+        let half = (mx[0] - mn[0]) * 0.5;
+        let mut bytes = [0u8; 48];
         for (i, v) in mn.iter().enumerate() {
             bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         for (i, v) in mx.iter().enumerate() {
             bytes[16 + i * 4..16 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
+        bytes[32..36].copy_from_slice(&(fade_frac * half).to_le_bytes());
         self.gi_fine_buf = Some(device.create_storage_buffer_init(
             &StorageBufferDesc {
-                size: 32,
+                size: 48,
                 stride: 16,
                 indirect: false,
             },
