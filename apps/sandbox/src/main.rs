@@ -7512,9 +7512,15 @@ impl App {
         );
         // Auto-exposure metering: read this frame's lit HDR, adapt the exposure for next frame.
         // After lighting (the `hdr` read orders it). `adapt` = 1-exp(-dt·speed) (eye/iris speed).
+        // Headless capture adapts on FIXED_DT, not wall-clock dt: a real-dt EMA makes the
+        // metering trajectory (and so every exposed pixel during the adaptation window)
+        // wall-clock dependent, which breaks the screenshot mode's frame-counted determinism
+        // contract — the TAAU history then bakes the run-to-run transient into the capture
+        // (the content golden gdf_ao/sc_viz SHA flicker). Interactive keeps the real-dt iris.
         if self.auto_exposure {
             let speed = 2.5f32;
-            let adapt = 1.0 - (-dt * speed).exp();
+            let ae_dt = if self.screenshot_mode { FIXED_DT } else { dt };
+            let adapt = 1.0 - (-ae_dt * speed).exp();
             self.deferred
                 .record_auto_exposure(&mut graph, hdr, cw, ch, 0.12, adapt, 1.0e-6, 4.0);
         }

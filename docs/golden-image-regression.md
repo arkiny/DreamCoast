@@ -19,25 +19,32 @@ via the release `sandbox --backend metal --screenshot-clean`:
 | config          | recipe                                                                 | what it guards |
 |-----------------|------------------------------------------------------------------------|----------------|
 | `gallery`       | default scene (no env)                                                  | the byte-identity **anchor** `af70c1a5…` (CLAUDE.md invariant gate) |
-| `sponza_sc_viz` | `LEVEL=sponza_intel EV100=11 WARMUP_FRAMES=64 CAM_EYE=-14,2,0 CAM_TARGET=14,2,0 P_SC_VIZ=1` | content surface-cache view (F1/F5 consumers) |
+| `sponza_sc_viz` | `LEVEL=sponza_intel EV100=11 AUTO_EXPOSURE=0 WARMUP_FRAMES=64 CAM_EYE=-14,2,0 CAM_TARGET=14,2,0 P_SC_VIZ=1` | content surface-cache view (F1/F5 consumers) |
 | `sponza_gdf_ao` | …same camera… `DEBUG_VIEW=9`                                            | content distance-field AO (F2 consumers)     |
 
 Each render is compared two ways:
 
 1. **SHA-256 (exact).** The renderer is deterministic run-to-run on a given
-   box/backend for the **gallery** anchor, so a byte-identical hash is the strict
-   pass there. **Caveat (2026-07-13):** the two **content** configs
-   (`sponza_intel`, `WARMUP_FRAMES=64`) are **NOT** byte-stable run-to-run on the
-   Apple-Silicon box — the surface-cache / temporal accumulation carries a ~0.2/ch
-   sub-perceptual residual that reshuffles the low bits every run, so their SHA
-   changes each capture regardless of any code change. The strict-SHA gate is
-   therefore **gallery-only in practice**; content configs need the tolerant path
-   below. (Independent of anisotropy — reproduced with `P_ANISO=1`.)
+   box/backend, so a byte-identical hash is the strict pass — for the **content**
+   configs too. **History (resolved 2026-07-14):** the content configs were
+   byte-unstable run-to-run for a while (isolated pixels up to ~36/255 in
+   `sponza_gdf_ao`, the ~0.2/ch low-bit reshuffle in `sponza_sc_viz`). The root
+   cause was **not** the surface cache, GDF-AO atomics, or denoiser history (the
+   AO pass is a pure function; the async relight queue is not even active in
+   screenshot mode): auto-exposure defaults ON for non-gallery scenes even under
+   a fixed `EV100`, and its metering EMA adapted on **wall-clock dt**
+   (`adapt = 1-exp(-dt·2.5)`), so the exposure trajectory over the warmup
+   differed every run. The content tier's TAAU (64-frame running-mean history at
+   0.67× render scale) integrated that transient into the frame-64 capture, and
+   its neighborhood clip amplified it at high-contrast edges (the far-door
+   speckles). Fixed twice over: screenshot mode now adapts the AE EMA on
+   `FIXED_DT` (frame-counted deterministic, which also removes the AE-trajectory
+   jitter from the `pt` configs), and the content recipes pin `AUTO_EXPOSURE=0`
+   (a fixed-EV regression capture should not meter at all).
 2. **Pixel mean/max diff (tolerant).** When a PNG golden is present, an exact
    miss falls back to a per-channel mean/max abs-diff check (`--mean-tol`,
    `--max-tol`). This absorbs small cross-box/cross-backend/driver
-   nondeterminism so the same manifest stays useful off the authoring machine —
-   and is the **only** meaningful gate for the run-to-run-noisy content configs.
+   nondeterminism so the same manifest stays useful off the authoring machine.
 
 ## Golden storage decision
 

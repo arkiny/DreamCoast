@@ -84,7 +84,9 @@ cargo clippy --all-targets -- -D warnings
 
 ## Out of scope
 
-- Content goldens `sponza_sc_viz` / `sponza_gdf_ao` are run-to-run non-deterministic
-  under the strict-SHA gate (a pre-existing surface-cache/temporal residual, ~0.2/ch,
-  independent of anisotropy) — do **not** treat their SHA mismatch as an aniso
-  regression. See `docs/golden-image-regression.md`.
+- Content goldens `sponza_sc_viz` / `sponza_gdf_ao` were run-to-run non-deterministic
+  under the strict-SHA gate when this plan was written (root-caused 2026-07-14 to the
+  wall-clock-dt auto-exposure EMA, independent of anisotropy, and fixed — the recipes
+  now pin `AUTO_EXPOSURE=0` and screenshot mode adapts on `FIXED_DT`). Their SHAs
+  were reseeded with the fix; a mismatch on the Windows box is expected cross-box
+  variance, not an aniso regression. See `docs/golden-image-regression.md`.

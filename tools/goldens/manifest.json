@@ -9,6 +9,7 @@
     "sponza_gdf_ao": {
       "desc": "content: distance-field AO (DEBUG_VIEW=9)",
       "env": {
+        "AUTO_EXPOSURE": "0",
         "CAM_EYE": "-14,2,0",
         "CAM_TARGET": "14,2,0",
         "DEBUG_VIEW": "9",
@@ -16,7 +17,7 @@
         "LEVEL": "sponza_intel",
         "WARMUP_FRAMES": "64"
       },
-      "sha256": "1a87d7ae39b8df0b19cef2e2a5323a9e7310654323a42c70e441db90fc33a479"
+      "sha256": "98be9a9eed98adba962eabfff6bc62d4d558cb1f47d9e2e206e5d93cc8cac4d2"
     },
     "sponza_pt_interior": {
       "desc": "content: raster-vs-PT lit-masked residual, interior colonnade (tolerant gate)",
@@ -53,6 +54,7 @@
     "sponza_sc_viz": {
       "desc": "content: surface-cache viz (P_SC_VIZ)",
       "env": {
+        "AUTO_EXPOSURE": "0",
         "CAM_EYE": "-14,2,0",
         "CAM_TARGET": "14,2,0",
         "EV100": "11",
@@ -60,7 +62,7 @@
         "P_SC_VIZ": "1",
         "WARMUP_FRAMES": "64"
       },
-      "sha256": "d4afc4154fc31752392eaa4a204956a57c0e3fab26e6340be98b25711002ddaa"
+      "sha256": "b73a707521510537a4e89f29a409a1a5f58edbdde6595c80a82208b255602ff9"
     }
   }
 }

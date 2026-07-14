@@ -79,9 +79,17 @@ MANIFEST = GOLDEN_DIR / "manifest.json"
 # fixed camera with a 64-frame warmup so caches converge to a stable image:
 #   - sponza_sc_viz : the high-res surface-cache visualization (P_SC_VIZ)
 #   - sponza_gdf_ao : the distance-field AO debug view (DEBUG_VIEW=9)
+# AUTO_EXPOSURE=0 is load-bearing for the strict SHA gate: auto-exposure defaults
+# ON for non-gallery scenes even under a fixed EV100, and its metering EMA used to
+# adapt on wall-clock dt — the run-to-run trajectory difference during the
+# adaptation window is what the content tier's TAAU history baked into the capture
+# (the historical gdf_ao/sc_viz SHA flicker, up to ~36/255 at high-contrast edges).
+# The engine now adapts on FIXED_DT in screenshot mode, but a fixed-EV regression
+# capture should not meter at all; with AE off these configs are byte-stable.
 CONTENT_CAM = {
     "LEVEL": "sponza_intel",
     "EV100": "11",
+    "AUTO_EXPOSURE": "0",
     "WARMUP_FRAMES": "64",
     "CAM_EYE": "-14,2,0",
     "CAM_TARGET": "14,2,0",
@@ -112,9 +120,11 @@ PT_CAM_BASE = {
 # Env vars a pt config must NOT inherit from the calling shell (fixed-exposure
 # trap + firefly-clamp perturbation; see PT_CAM_BASE).
 PT_ENV_STRIP = ("EV100", "EXPOSURE")
-# Budget seeding margin (abs, per channel): covers the content captures'
-# run-to-run nondeterminism (~0.2/ch surface-cache low-bit reshuffle, measured
-# 0.035-0.047/ch on prior content residuals) plus the AE-trajectory jitter.
+# Budget seeding margin (abs, per channel). Historically this absorbed the
+# content captures' run-to-run spread, whose actual root cause was the
+# auto-exposure EMA adapting on wall-clock dt (fixed 2026-07-14: screenshot mode
+# adapts on FIXED_DT, so same-box captures are now frame-deterministic); the
+# margin is kept for cross-box/driver variance and future content drift.
 # Validated against a measured two-run spread when the budgets were seeded; a
 # budget only moves DOWN on a verified improvement (re-run --update and note
 # the measured value in the commit).
