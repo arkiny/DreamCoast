@@ -2960,10 +2960,17 @@ impl App {
         // sky-visibility gating (which removed the blue the old tint was balancing against),
         // the sweep's colour anchor lands exactly at 0.2: crop B−R −0.62 vs the path-traced
         // reference's −0.58, on a flat masked_avg basin (docs/phase-gi-volume-leak-plan.md §14).
+        // F4B: the tint is a crutch for GI the field can't supply, so its calibration is
+        // per-field — opting into the fine level (`P_GI_VOL_CLIP=1`) feeds real near-camera E
+        // and the all-anchor sweep on the completed fine stack landed 0.15 (crop B−R −0.60 vs
+        // the reference's −0.58, EV11 deep crop 40.9→35.4 toward the reference). The fine
+        // DEFAULT stays off: officially no tint passes both PT budgets on the fine stack
+        // (docs/phase-f4b-hierarchical-cache-plan.md §5 판정 기록).
+        let gi_fine_want = gi_volume && quality::env_bool("P_GI_VOL_CLIP", false);
         let skyvis_tint = std::env::var("P_SKYVIS_TINT")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.2)
+            .unwrap_or(if gi_fine_want { 0.15 } else { 0.2 })
             .clamp(0.0, 1.0);
         let skyvis_min_occ = std::env::var("P_SKYVIS_MIN_OCC")
             .ok()
