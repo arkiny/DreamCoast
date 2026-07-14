@@ -1256,6 +1256,10 @@ pub(crate) fn gi_volume_push(
     fine_min: [f32; 3],
     fine_active: f32,
     fine_max: [f32; 3],
+    // F4B recentering: 1.0 = the fine half's EMA history is invalid this super-cycle (the box
+    // just moved) — the update writes the fine level fresh and its hit reads skip the fine
+    // containment. 0 = normal (and the byte the pre-F4B packing left at zero).
+    fine_reset: f32,
 ) -> [u8; 192] {
     let mut pc = [0u8; 192];
     let put3 = |pc: &mut [u8], o: usize, v: [f32; 3]| {
@@ -1290,10 +1294,12 @@ pub(crate) fn gi_volume_push(
     put3(&mut pc, 144, ground_albedo);
     pc[156..160].copy_from_slice(&bias.to_le_bytes());
     // F4 camera-anchored fine level: world AABB + active flag (fine_min.w). 0 = single level —
-    // the shader's expressions then reduce to the legacy values exactly. 188..192 stays zero.
+    // the shader's expressions then reduce to the legacy values exactly. fine_max.w carries the
+    // F4B recenter reset flag (0 = the legacy zero byte).
     put3(&mut pc, 160, fine_min);
     pc[172..176].copy_from_slice(&fine_active.to_le_bytes());
     put3(&mut pc, 176, fine_max);
+    pc[188..192].copy_from_slice(&fine_reset.to_le_bytes());
     pc
 }
 

@@ -143,7 +143,11 @@ void read_coeffs_scalar(uint base, float3 p, out float c[4])
 float3 gv_level_uvw(float3 p, out bool inside)
 {
     float dh2 = 2.0 * float(pc.dims.y);
-    if (all(p >= pc.fine_min.xyz) && all(p <= pc.fine_max.xyz))
+    // F4B recentering (fine_max.w): while the box reconverges, the previous slot's fine half
+    // holds OLD-box data — reading it at new-box coordinates would pollute the multibounce /
+    // B2 sky-vis hit terms, so the containment falls through to the coarse level for the
+    // window. 0 = the legacy finest-first behaviour, bit for bit.
+    if (pc.fine_max.w < 0.5 && all(p >= pc.fine_min.xyz) && all(p <= pc.fine_max.xyz))
     {
         inside = true;
         float3 t = saturate((p - pc.fine_min.xyz) / (pc.fine_max.xyz - pc.fine_min.xyz));
@@ -393,24 +397,32 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         float3 puvw = float3((float(tid.x) + 0.5) / float(pc.dims.x),
                              (float(tid.y) + 0.5) / (float(pc.dims.y) * float(levels)),
                              (float(tid.z) + 0.5) / float(pc.dims.z));
-        float3 prev[4];
-        if (fine_on)
-            read_coeffs_fine(read_base, puvw, true, prev);
-        else
-            read_coeffs(read_base, probe, prev);
-        [unroll]
-        for (int i = 0; i < 4; i++)
-            c[i] = lerp(prev[i], c[i], pc.params.w);
-        if (pc.read_rgb.y != 0xFFFFFFFFu)
+        // F4B recentering: a fine-level probe's own history is OLD-box data while the box
+        // reconverges (fine_max.w) — skip BOTH blends (radiance AND sky-vis: the B2 gating and
+        // the deferred skylight both consume the sky-vis half) and write this cycle's estimate
+        // fresh, exactly like the global reset. Coarse probes blend as normal.
+        bool fine_ema_reset = level == 1u && pc.fine_max.w > 0.5;
+        if (!fine_ema_reset)
         {
-            float svprev[4];
+            float3 prev[4];
             if (fine_on)
-                read_coeffs_scalar_fine(pc.read_rgb.y, puvw, true, svprev);
+                read_coeffs_fine(read_base, puvw, true, prev);
             else
-                read_coeffs_scalar(pc.read_rgb.y, probe, svprev);
+                read_coeffs(read_base, probe, prev);
             [unroll]
             for (int i = 0; i < 4; i++)
-                sv[i] = lerp(svprev[i], sv[i], pc.params.w);
+                c[i] = lerp(prev[i], c[i], pc.params.w);
+            if (pc.read_rgb.y != 0xFFFFFFFFu)
+            {
+                float svprev[4];
+                if (fine_on)
+                    read_coeffs_scalar_fine(pc.read_rgb.y, puvw, true, svprev);
+                else
+                    read_coeffs_scalar(pc.read_rgb.y, probe, svprev);
+                [unroll]
+                for (int i = 0; i < 4; i++)
+                    sv[i] = lerp(svprev[i], sv[i], pc.params.w);
+            }
         }
     }
     [unroll]

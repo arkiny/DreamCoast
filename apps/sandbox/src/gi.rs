@@ -99,12 +99,30 @@ pub(crate) struct GiSystem {
     /// doubling their HEIGHT (coarse half y∈[0,GI_VOL_DIM), fine half y∈[GI_VOL_DIM,2*GI_VOL_DIM))
     /// — zero new bindless slots; consumers detect fine mode from the volume height.
     gi_vol_fine: bool,
-    /// F4: the fine-level world AABB `(min, max)`, installed once at load from the initial camera
-    /// (the static-capture parity target; re-centering/toroidal reuse is a documented follow-up).
+    /// F4: the fine-level world AABB `(min, max)` the UPDATE dispatch traces — installed at load
+    /// from the initial camera, and re-anchored by the F4B recentering state machine below.
     gi_fine_box: Option<([f32; 3], [f32; 3])>,
-    /// F4: the tiny fine-AABB storage buffer (2×float4: min.xyz+0, max.xyz+0) the per-pixel GI
-    /// pass reads — `GiPush` sits at its 256-byte push cap, so the box rides a storage buffer.
-    gi_fine_buf: Option<StorageBuffer>,
+    /// F4B: the fine-AABB storage buffers CONSUMERS read (fine box rows + the edge-fade margin;
+    /// `GiPush` sits at its 256-byte push cap, so the box rides a storage buffer). A 2-slot ring:
+    /// recenter transitions write the INACTIVE slot and flip `gi_fine_buf_live`, so in-flight
+    /// frames keep reading a stable buffer (flips are >= one super-cycle apart, far beyond the
+    /// frames-in-flight window). During a recenter window the live slot holds an INVERTED box
+    /// (min > max — containment can never pass), which cleanly parks every consumer (per-pixel
+    /// GI + the reflection fall-through, same buffer) on the coarse level.
+    gi_fine_buf: [Option<StorageBuffer>; 2],
+    gi_fine_buf_live: usize,
+    /// F4B recentering state: 0 = Steady, 1 = Reconverging (the update traces the NEW box with
+    /// the fine-half EMA reset; consumers parked), 2 = Settling (EMA live again; consumers still
+    /// parked — they read the slot being WRITTEN this super-cycle, and the OTHER slot's fine
+    /// half is only fully rewritten after one more cycle). Transitions happen ONLY at super-
+    /// cycle boundaries so a level refresh is never split across two boxes.
+    gi_fine_state: u32,
+    /// F4B: this frame's fine-half EMA reset flag (`fine_max.w` in the update push).
+    gi_fine_reset: bool,
+    /// F4B: armed recenter target (voxel-snapped), applied at the next super-cycle boundary.
+    gi_fine_pending: Option<([f32; 3], [f32; 3])>,
+    /// F4B: the edge-fade margin (world metres) — kept for recenter buffer rewrites.
+    gi_fine_margin: f32,
 }
 
 impl GiSystem {
@@ -312,7 +330,12 @@ impl GiSystem {
             gi_vol_frame: 0,
             gi_vol_fine,
             gi_fine_box: None,
-            gi_fine_buf: None,
+            gi_fine_buf: [None, None],
+            gi_fine_buf_live: 0,
+            gi_fine_state: 0,
+            gi_fine_reset: false,
+            gi_fine_pending: None,
+            gi_fine_margin: 0.0,
             sp_trace_pipeline,
             sp_integrate_pipeline,
             sp_filter_pipeline,
@@ -367,6 +390,26 @@ impl GiSystem {
             .unwrap_or(0.15)
             .clamp(0.0, 0.5);
         let half = (mx[0] - mn[0]) * 0.5;
+        self.gi_fine_margin = fade_frac * half;
+        // Both ring slots start on the real box (host-visible: recenter transitions rewrite
+        // the inactive slot in place and flip).
+        for slot in 0..2 {
+            self.gi_fine_buf[slot] = Some(device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: 48,
+                    stride: 16,
+                    indirect: false,
+                },
+                &Self::fine_buf_bytes(mn, mx, self.gi_fine_margin),
+            )?);
+        }
+        self.gi_fine_buf_live = 0;
+        self.gi_fine_box = Some((mn, mx));
+        Ok(())
+    }
+
+    /// The 48-byte consumer-buffer image of a fine box (two Load4 rows + the fade margin).
+    fn fine_buf_bytes(mn: [f32; 3], mx: [f32; 3], margin: f32) -> [u8; 48] {
         let mut bytes = [0u8; 48];
         for (i, v) in mn.iter().enumerate() {
             bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
@@ -374,16 +417,92 @@ impl GiSystem {
         for (i, v) in mx.iter().enumerate() {
             bytes[16 + i * 4..16 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
-        bytes[32..36].copy_from_slice(&(fade_frac * half).to_le_bytes());
-        self.gi_fine_buf = Some(device.create_storage_buffer_init(
-            &StorageBufferDesc {
-                size: 48,
-                stride: 16,
-                indirect: false,
-            },
-            &bytes,
-        )?);
-        self.gi_fine_box = Some((mn, mx));
+        bytes[32..36].copy_from_slice(&margin.to_le_bytes());
+        bytes
+    }
+
+    /// F4B: write a fine-box image into the INACTIVE ring slot and flip the live index —
+    /// in-flight frames keep reading the old slot (flips are >= one super-cycle apart).
+    fn flip_fine_buf(&mut self, mn: [f32; 3], mx: [f32; 3], margin: f32) -> anyhow::Result<()> {
+        let next = (self.gi_fine_buf_live + 1) % 2;
+        if let Some(buf) = self.gi_fine_buf[next].as_ref() {
+            buf.write(&Self::fine_buf_bytes(mn, mx, margin))?;
+            self.gi_fine_buf_live = next;
+        }
+        Ok(())
+    }
+
+    /// F4B camera recentering (EMA reconverge — docs/phase-f4b-hierarchical-cache-plan.md §8).
+    /// Called once per frame AFTER the volume advance decision with this frame's camera eye and
+    /// whether a super-cycle just completed. Dead-zone: the eye leaving `half*0.5` (per axis)
+    /// of the box centre arms a recenter to the eye snapped onto the fine VOXEL lattice (so a
+    /// future toroidal upgrade can reuse history). All state transitions land on super-cycle
+    /// boundaries so a level refresh is never split across two boxes:
+    ///
+    /// Steady --(armed)--> Reconverging (update = new box + fine-half EMA reset; consumers get
+    /// an inverted box = coarse fallback) --(1 advance)--> Settling (EMA live; consumers still
+    /// parked — the slot they read next cycle has the OTHER slot's stale fine half)
+    /// --(1 advance)--> Steady (consumers re-enabled on the new box).
+    ///
+    /// A re-arm during Reconverging/Settling restarts the window with the newer target (the
+    /// dead-zone keeps that rare). A fixed camera never leaves the dead-zone, so the static
+    /// capture paths are untouched — the gate-recipe invariant.
+    pub(crate) fn gi_fine_recenter(
+        &mut self,
+        eye: [f32; 3],
+        cycle_end: bool,
+    ) -> anyhow::Result<()> {
+        if !self.gi_fine_installed() {
+            return Ok(());
+        }
+        let (mn, mx) = self.gi_fine_box.unwrap();
+        let half = (mx[0] - mn[0]) * 0.5;
+        let c = [
+            (mn[0] + mx[0]) * 0.5,
+            (mn[1] + mx[1]) * 0.5,
+            (mn[2] + mx[2]) * 0.5,
+        ];
+        let dead = half * 0.5;
+        if (eye[0] - c[0]).abs() > dead
+            || (eye[1] - c[1]).abs() > dead
+            || (eye[2] - c[2]).abs() > dead
+        {
+            // Snap the target centre onto the fine voxel lattice anchored at the CURRENT box.
+            let vox = 2.0 * half / GI_VOL_DIM as f32;
+            let snap = |e: f32, o: f32| o + ((e - o) / vox).round() * vox;
+            let nc = [snap(eye[0], c[0]), snap(eye[1], c[1]), snap(eye[2], c[2])];
+            self.gi_fine_pending = Some((
+                [nc[0] - half, nc[1] - half, nc[2] - half],
+                [nc[0] + half, nc[1] + half, nc[2] + half],
+            ));
+        }
+        if !cycle_end {
+            return Ok(());
+        }
+        if let Some((nmn, nmx)) = self.gi_fine_pending.take() {
+            // (Re-)enter Reconverging: the update traces the new box with the fine-half EMA
+            // reset; consumers park on the coarse level via the inverted box.
+            self.gi_fine_box = Some((nmn, nmx));
+            self.gi_fine_reset = true;
+            self.gi_fine_state = 1;
+            self.flip_fine_buf([f32::MAX; 3], [f32::MIN; 3], 0.0)?;
+            return Ok(());
+        }
+        match self.gi_fine_state {
+            1 => {
+                // One full new-box refresh has landed; the EMA history read next cycle is that
+                // fully-rewritten slot, so the blend is safe again. Consumers stay parked: the
+                // slot THEY read next cycle is the other one, whose fine half is still stale.
+                self.gi_fine_reset = false;
+                self.gi_fine_state = 2;
+            }
+            2 => {
+                let (bmn, bmx) = self.gi_fine_box.unwrap();
+                self.flip_fine_buf(bmn, bmx, self.gi_fine_margin)?;
+                self.gi_fine_state = 0;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -402,7 +521,7 @@ impl GiSystem {
         if !self.gi_fine_installed() {
             return u32::MAX;
         }
-        self.gi_fine_buf
+        self.gi_fine_buf[self.gi_fine_buf_live]
             .as_ref()
             .map(|b| b.storage_index())
             .unwrap_or(u32::MAX)
@@ -477,6 +596,13 @@ impl GiSystem {
         let fine = self.gi_vol_fine.then_some(self.gi_fine_box).flatten();
         let (fine_min, fine_max) = fine.unwrap_or(([0.0; 3], [0.0; 3]));
         let fine_active = if fine.is_some() { 1.0 } else { 0.0 };
+        // F4B recentering: while the box reconverges, the fine half's EMA history and the hit
+        // reads' fine containment are invalid (old-box data at new-box coordinates).
+        let fine_reset = if fine.is_some() && self.gi_fine_reset {
+            1.0
+        } else {
+            0.0
+        };
         let vol_ext = graph.import_external("gi_volume_w");
         let mut reads = vec![scene_gdf_ext];
         if let Some((_, ext)) = albedo {
@@ -551,6 +677,7 @@ impl GiSystem {
                     fine_min,    // F4 fine-level world min ([0;3] when inactive)
                     fine_active, // F4: 1.0 = update both levels, 0.0 = legacy single level
                     fine_max,    // F4 fine-level world max
+                    fine_reset,  // F4B: 1.0 = fine-half EMA/hit reads invalid (recentering)
                 ));
                 let g = GI_VOL_DIM.div_ceil(4);
                 // F4B: the dispatch always covers ONE level's rows — fine mode selects the
@@ -1017,7 +1144,7 @@ impl GiSystem {
         // ray-march/gallery path never reads the slot). 0xFFFFFFFF keeps the shader on its legacy
         // single-level volume branch — the untouched instruction stream.
         let fine_buf = if gi_volume.is_some() {
-            self.gi_fine_buf
+            self.gi_fine_buf[self.gi_fine_buf_live]
                 .as_ref()
                 .map(|b| b.storage_index())
                 .unwrap_or(u32::MAX)

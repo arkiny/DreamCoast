@@ -4757,11 +4757,29 @@ impl App {
         // Diagnostic camera override: `CAM_EYE="x,y,z"` (+ optional `CAM_TARGET`) places
         // the camera at a fixed pose for headless inspection of any scene (e.g. flying
         // inside an imported environment like Sponza). Applies before streaming so it
-        // can also drive chunk loading.
+        // can also drive chunk loading. F4B motion metrology: `CAM_EYE_END="x,y,z"` (opt-in)
+        // lerps the eye CAM_EYE -> CAM_EYE_END across the CAPTURE_SEQ window — a deterministic
+        // (frame-counted) translation that can drive the fine-box recentering in a headless
+        // capture, which no other headless path can (the fly camera is disabled in screenshot
+        // mode and CAM_EYE alone is static). Unset = the exact legacy static pose.
         let (focus, eye) = match (parse_vec3_env("CAM_EYE"), parse_vec3_env("CAM_TARGET")) {
             (Some(e), Some(t)) => (t, e),
             (Some(e), None) => (focus, e),
             _ => (focus, eye),
+        };
+        let eye = match (
+            parse_vec3_env("CAM_EYE"),
+            parse_vec3_env("CAM_EYE_END"),
+            self.capture_seq,
+        ) {
+            (Some(e0), Some(e1), Some(n)) if self.screenshot_mode && n > 1 => {
+                // `warmup` is the headless warmup resolved above — the camera sits at CAM_EYE
+                // through it (stable AE/history), then translates across the capture window.
+                let t =
+                    (self.frame_no.saturating_sub(warmup) as f32 / (n - 1) as f32).clamp(0.0, 1.0);
+                e0.lerp(e1, t)
+            }
+            _ => eye,
         };
 
         // Stage D: stream chunks in/out around the camera, then rebuild the draw list
@@ -8829,9 +8847,15 @@ impl App {
         // stretches it to the 2×period super-cycle covering both interleaved levels).
         if self.gi_volume {
             let (_, _, gi_cycle) = self.gi_volume_schedule();
-            if self.frame_no % gi_cycle == gi_cycle - 1 {
+            let gi_cycle_end = self.frame_no % gi_cycle == gi_cycle - 1;
+            if gi_cycle_end {
                 self.gi.advance_gi_volume();
             }
+            // F4B camera recentering (fine mode only, no-op otherwise): dead-zone detection
+            // every frame, state transitions only on super-cycle boundaries — a fixed camera
+            // never leaves the dead-zone, so the static capture paths stay untouched.
+            self.gi
+                .gi_fine_recenter([eye.x, eye.y, eye.z], gi_cycle_end)?;
         }
         // QHD/UHD TAAU: advance the history ping-pong (next frame reprojects this frame's).
         if taau_active {
