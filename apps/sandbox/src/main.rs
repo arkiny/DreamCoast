@@ -2947,18 +2947,18 @@ impl App {
         // `P_SKYVIS_TINT` = neutral OcclusionTint leak as a fraction of the occluded skylight
         // luminance (the occluded floor keeps brightness but loses the blue cast); `P_SKYVIS_MIN_OCC`
         // = min sky-visibility floor (=1.0 disables the occlusion entirely → SH-L1 baseline).
-        // Default 0.15 (GI-volume-leak phase re-sweep). The earlier 0.5→0.3 calibration (F6C)
+        // Default 0.2 (GI-volume-leak phase, final sweep). The earlier 0.5→0.3 calibration (F6C)
         // was unknowingly fitted against a broken field: the Metal gi_volume dispatch updated
         // only a quarter of the probe grid, so most interiors read the ZERO-INIT sky-visibility
         // (V=0) and this floor replaced their entire skylight. With the full grid live, the
-        // sky-fill occlusion at hits, and the honest ray-start bias, the re-sweep basin sits at
-        // 0.15 (masked_avg + lit-mean ratio + crop B−R jointly; docs/phase-gi-volume-leak-plan.md
-        // §10d). Further reduction is still gated on the remaining interior blue excess (the
-        // ambient-specular sky leak, plan §6).
+        // hit sky-fill occlusion, the honest ray-start bias, and the reflection fallback's
+        // sky-visibility gating (which removed the blue the old tint was balancing against),
+        // the sweep's colour anchor lands exactly at 0.2: crop B−R −0.62 vs the path-traced
+        // reference's −0.58, on a flat masked_avg basin (docs/phase-gi-volume-leak-plan.md §14).
         let skyvis_tint = std::env::var("P_SKYVIS_TINT")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.15)
+            .unwrap_or(0.2)
             .clamp(0.0, 1.0);
         let skyvis_min_occ = std::env::var("P_SKYVIS_MIN_OCC")
             .ok()
@@ -2972,9 +2972,11 @@ impl App {
         // `P_BENT_NORMAL=0` zeroes the bent normal for A/B (pbr then falls back to the scalar path).
         let bent_normal = quality::env_bool("P_BENT_NORMAL", true);
         // GI-volume occupancy-weighted consumption (increment A of the GI-volume-leak phase,
-        // docs/phase-gi-volume-leak-plan.md §3). Opt-in while its PT/crop effect is measured;
-        // volume path only (the ray-march path never reads the field).
-        let gi_vol_occ = quality::env_bool("P_GI_VOL_OCC", false) && gi_volume;
+        // docs/phase-gi-volume-leak-plan.md §3). Default ON for content since the full-grid
+        // dispatch fix: on the working field, excluding in-wall probes from the interpolation
+        // is worth −0.77 on the interior PT gate (it was unmeasurable on the broken quarter
+        // field). `P_GI_VOL_OCC=0` restores the hardware trilinear; volume path only.
+        let gi_vol_occ = quality::env_bool("P_GI_VOL_OCC", true) && gi_volume;
         // Volume-update rays per probe (see the App field doc): its own knob, decoupled from the
         // screen-GI `gi_spp` the two used to share.
         let gi_volume_spp = std::env::var("P_GI_VOLUME_SPP")

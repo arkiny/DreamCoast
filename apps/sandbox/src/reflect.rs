@@ -1182,8 +1182,10 @@ impl ReflectSystem {
         if let Some((_, _, ext)) = gi_volume {
             reads.push(ext); // barrier the reflection sample after this frame's volume update
         }
-        // vol_r = radiance SH base (the reflection only needs the irradiance set, not sky-vis).
+        // vol_r = radiance SH base; vol_g = sky-vis SH base (the fallback occludes its skylight
+        // top-up / miss-sky by V — single source with the deferred skylight occlusion).
         let gi_vol_base = gi_volume.map(|(rb, _, _)| rb).unwrap_or(u32::MAX);
+        let gi_skyvis_base = gi_volume.map(|(_, sb, _)| sb).unwrap_or(u32::MAX);
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
         // A3: order this frame's skip-buffer writes (imported external; read is last frame's slot,
         // covered by the frame fence, so it isn't graph-tracked — same pattern as refl_accum).
@@ -1246,6 +1248,7 @@ impl ReflectSystem {
                     ch,
                     flip_y,
                     gi_vol_base, // GI irradiance volume base (u32::MAX = off, legacy fill)
+                    gi_skyvis_base,
                     material_index,
                     aabb_min,
                     aabb_max,
@@ -1468,6 +1471,7 @@ impl ReflectSystem {
             reads.push(ext);
         }
         let gi_vol_base = gi_volume.map(|(rb, _, _)| rb).unwrap_or(u32::MAX);
+        let gi_skyvis_base = gi_volume.map(|(_, sb, _)| sb).unwrap_or(u32::MAX);
         let cache_idx = cache.map(|(idx, _)| idx).unwrap_or([u32::MAX; 5]);
         graph.add_compute_pass(
             ComputePassInfo {
@@ -1526,6 +1530,7 @@ impl ReflectSystem {
                     rh,
                     flip_y,
                     gi_vol_base,
+                    gi_skyvis_base,
                     material_index,
                     aabb_min,
                     aabb_max,

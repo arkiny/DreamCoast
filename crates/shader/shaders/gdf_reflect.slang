@@ -290,6 +290,58 @@ float3 sample_gi_irradiance(uint base, float3 p, float3 n)
     return max(e, float3(0.0, 0.0, 0.0));
 }
 
+// Cosine-lobe sky-visibility V(n) from the GI volume's 4 scalar sky-vis SH volumes — the SAME
+// reconstruction the deferred consumption uses (gdf_gi.slang), coarse level on F4 double-height
+// volumes. 1.0 when unbound or outside the box (no occlusion info -> legacy unoccluded). The
+// reflection fallback multiplies its skylight top-up and miss-sky by this so an ENCLOSED
+// reflected surface / a ray escaping from deep inside stops receiving the full unoccluded blue
+// sky the deferred pass would never give that region (single-source skylight occlusion).
+float sample_sky_vis(uint base, float3 p, float3 n)
+{
+    if (base == 0xFFFFFFFFu)
+        return 1.0;
+    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
+    if (!(all(uvw >= 0.0) && all(uvw <= 1.0)))
+        return 1.0;
+    uvw = saturate(uvw);
+    uint dw, dh, dd;
+    g.volumes[base].GetDimensions(dw, dh, dd);
+    if (dh == dw * 2u)
+        uvw.y = (0.5 + uvw.y * (float(dw) - 1.0)) / float(dh);
+    float c0 = g.volumes[base].SampleLevel(g.samp, uvw, 0.0).x;
+    float c1 = g.volumes[base + 1u].SampleLevel(g.samp, uvw, 0.0).x;
+    float c2 = g.volumes[base + 2u].SampleLevel(g.samp, uvw, 0.0).x;
+    float c3 = g.volumes[base + 3u].SampleLevel(g.samp, uvw, 0.0).x;
+    return saturate(c0 * SH_C0
+                    + (2.0 / 3.0) * (SH_C1 * n.y * c1 + SH_C1 * n.z * c2 + SH_C1 * n.x * c3));
+}
+
+// Directional variant for a SPECULAR escape direction: the band-1 reconstruction of the
+// visibility FUNCTION itself (no clamped-cosine convolution — a mirror ray asks "does THIS
+// direction reach sky", not "how much sky does a diffuse lobe see"). Still SH-L1 soft, but a
+// legitimate directional path through an opening keeps most of its sky where the cosine lobe
+// over-punished it (measured: the cosine gate fixed the colour cast but overdarkened the
+// gates by ~2 — this variant is the sharpest estimate the stored field affords).
+float sample_sky_vis_dir(uint base, float3 p, float3 dir)
+{
+    if (base == 0xFFFFFFFFu)
+        return 1.0;
+    float3 uvw = (p - GDF_MIN) / (GDF_MAX - GDF_MIN);
+    if (!(all(uvw >= 0.0) && all(uvw <= 1.0)))
+        return 1.0;
+    uvw = saturate(uvw);
+    uint dw, dh, dd;
+    g.volumes[base].GetDimensions(dw, dh, dd);
+    if (dh == dw * 2u)
+        uvw.y = (0.5 + uvw.y * (float(dw) - 1.0)) / float(dh);
+    float c0 = g.volumes[base].SampleLevel(g.samp, uvw, 0.0).x;
+    float c1 = g.volumes[base + 1u].SampleLevel(g.samp, uvw, 0.0).x;
+    float c2 = g.volumes[base + 2u].SampleLevel(g.samp, uvw, 0.0).x;
+    float c3 = g.volumes[base + 3u].SampleLevel(g.samp, uvw, 0.0).x;
+    return saturate(c0 * SH_C0
+                    + SH_C1 * (dir.y * c1 + dir.z * c2 + dir.x * c3));
+}
+
 // Validity-weighted probe interpolation (reference radiance-cache style; cache_tile bit13,
 // opt-in): the hardware trilinear above mixes in probes whose voxel centre sits INSIDE
 // geometry — their SH is ~0 and not a witness of the query's radiance, so a contact gap
@@ -511,11 +563,14 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // Background: reflect nothing — show the sky along the view ray (so the viz reads as
     // the scene; C7 only consumes this for shaded pixels anyway).
     float sy = (pc.flip_y & 1u) != 0u ? 1.0 : -1.0;
-    // GI irradiance volume base index packed into flip_y's spare bits (bit0 = Y-flip; the 240-byte
-    // push is full, D3D12 root budget forbids growing it). Encoded as (base+1)<<1 so 0 = off.
-    uint vol_pack = pc.flip_y >> 1;
+    // GI volume base indices packed into flip_y's spare bits (bit0 = Y-flip; the 240-byte push
+    // is full, D3D12 root budget forbids growing it). bits 1..7 = radiance SH base+1, bits
+    // 8..14 = sky-visibility SH base+1 (7 bits each — volumes[] has 64 entries); 0 = off.
+    uint vol_pack = (pc.flip_y >> 1) & 0x7Fu;
     bool vol_on = vol_pack != 0u;
     uint vol_base = vol_on ? (vol_pack - 1u) : 0xFFFFFFFFu;
+    uint sv_pack = (pc.flip_y >> 8) & 0x7Fu;
+    uint sv_base = sv_pack != 0u ? (sv_pack - 1u) : 0xFFFFFFFFu;
     // Contact-gap routing flags (cache_tile bits 12..13 — the max_mip nibble is 8..11 and the
     // mip index starts at 16, so these ride free; the gallery packs a bare tile = both off).
     // bit12 (`P_CACHE_OCCL_ROUTE`): a cache miss whose query saw an occluder-witness texel
@@ -1115,8 +1170,10 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                                       : float3(0.0, 0.0, 0.0);
                     hl_alb = alb;
                     hl_fallback = alb * ((sun_i * ndl * sh) * (1.0 / GGX_PI) + e);
+                    // Same V occlusion as the SW fallback's skylight top-up (single source).
                     if (has_irr)
-                        hl_sky = g.cubes[irr_idx].SampleLevel(g.samp, nw, 0.0).rgb * alb;
+                        hl_sky = g.cubes[irr_idx].SampleLevel(g.samp, nw, 0.0).rgb * alb
+                                 * sample_sky_vis(sv_base, hp, nw);
                     hl_have = true; // combine after the cache cone below (do NOT finalize here)
                 }
             }
@@ -1270,8 +1327,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     // TRAPPED endpoint (see the march) is enclosed by construction — no sky there;
                     // same for an occluder-witness cache miss (bit12: the capture PROVED the point
                     // sits under an occluder, so the unoccluded top-up is exactly the bright bowl).
+                    // Occluded by the hit's sky-visibility V(hn): the "e is ~0 where the cache is
+                    // cold" rationale for an UNOCCLUDED top-up predates the full-grid volume fix —
+                    // with the field live, the unoccluded cube here was the reflection channel's
+                    // interior blue flood (the deferred pass gives the same surface irradiance*V).
                     if (has_irr && !trapped && !occluded)
-                        color += g.cubes[irr_idx].SampleLevel(g.samp, hn, 0.0).rgb * hit_albedo;
+                        color += g.cubes[irr_idx].SampleLevel(g.samp, hn, 0.0).rgb * hit_albedo
+                                 * sample_sky_vis(sv_base, hp, hn);
                 }
                 else
                 {
@@ -1294,8 +1356,13 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             // the tiny unscaled procedural gradient (which metered to ~black in a lux-lit scene, leaving
             // black speckle holes). The irradiance cube is cosine-convolved (≈π·radiance), so /π brings it
             // back to a directional sky radiance. Gallery keeps the legacy gradient (byte-identical).
+            // Occluded by V at the RAY ORIGIN toward the escape direction: a ray that "escapes"
+            // from a deeply enclosed origin is overwhelmingly a field leak (thin-wall tunnel /
+            // step exhaustion), and the sky-vis lobe around `dir` is the honest availability
+            // estimate — open-sky reflections (V ~ 1 toward the opening) keep their full sky.
             if (has_irr)
-                color = g.cubes[irr_idx].SampleLevel(g.samp, dir, 0.0).rgb * (1.0 / GGX_PI);
+                color = g.cubes[irr_idx].SampleLevel(g.samp, dir, 0.0).rgb * (1.0 / GGX_PI)
+                        * sample_sky_vis_dir(sv_base, p, dir);
             else
                 color = sky(dir, sun_dir, sun_i, false);
         }
