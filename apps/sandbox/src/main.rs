@@ -872,6 +872,11 @@ struct App {
     /// that breathing visible as per-mesh shimmer through the un-denoised sky-vis and the
     /// cache-relight snapshots. Multiples of 8 also enable octant-stratified rays (gi_volume.slang).
     gi_volume_spp: u32,
+    /// F4B: volume EMA alpha override (`P_GI_VOLUME_ALPHA`; 0 = auto). Auto resolves per frame
+    /// to 0.2 when the fine level is live (the interleaved schedule halves per-level refreshes,
+    /// so the stronger blend restores the 192-frame convergence budget) and the long-standing
+    /// 0.1 single-level. The stable direction set makes the static fixed point alpha-independent.
+    gi_volume_alpha: f32,
     /// 레퍼런스식 indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
     /// directional sky-visibility): neutral leak fraction (`P_SKYVIS_TINT`) + min-occlusion floor
     /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
@@ -2984,6 +2989,20 @@ impl App {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(16)
             .clamp(1, 64);
+        // F4B: volume EMA alpha (`P_GI_VOLUME_ALPHA`). With the stable deterministic direction
+        // set the static-scene fixed point is ALPHA-INDEPENDENT (the converged update is an
+        // idempotent overwrite; alpha only damps the multibounce/B2 feedback iteration), so a
+        // higher alpha is pure convergence speed. The fine level's interleaved schedule halves
+        // the per-level refresh count within a fixed warmup, so fine mode defaults to 0.2 —
+        // (0.8)^24 ~= 0.5% residual at the 192-frame recipe vs 8% at the coarse default 0.1 —
+        // while the coarse-only path keeps the long-standing 0.1 (its 48 refreshes already
+        // converge to 0.6%). Measured on the interior EV11 trajectory: 192-frame interleaved
+        // state was +5 luma / +2 B-R off its own fixed point at alpha 0.1.
+        let gi_volume_alpha = std::env::var("P_GI_VOLUME_ALPHA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0) // 0 = auto: 0.2 in fine mode, 0.1 single-level (resolved per frame)
+            .clamp(0.0, 1.0);
         // Deferred-parity cache skylight (see the App field doc): tier-driven, env-overridable,
         // and only meaningful with the volume-GI path (the SH sky-visibility volumes it reads).
         let cache_sky_occlude =
@@ -3793,6 +3812,7 @@ impl App {
                 .max(1),
             gi_vol_occ,
             gi_volume_spp,
+            gi_volume_alpha,
             skyvis_tint,
             skyvis_min_occ,
             cache_sky_occlude,
@@ -4032,6 +4052,33 @@ impl App {
                 .and_then(|s| s.parse::<f32>().ok())
                 .unwrap_or(40.0);
             max_ray / self.exposure.max(1e-6)
+        }
+    }
+
+    /// F4B: the GI-volume slab schedule for this frame, derived ONCE from the clamped period so
+    /// the dispatch, the ping-pong advance and the (P_GI_STABLE=0) jitter divisor can never
+    /// disagree (the pre-F4B code clamped the period at the dispatch but not at the advance/
+    /// jitter — harmless while period <= 32, but a latent divergence the interleave must not
+    /// inherit). Returns `(z_slab_index, y_offset, cycle_len)`:
+    /// - fine OFF: the legacy walk — slab `frame % P`, coarse rows, advance every P frames.
+    /// - fine ON (level-interleaved slabs): even frames update a coarse z-slab, odd frames the
+    ///   SAME z-slab of the fine half (y_offset = GI_VOL_DIM), slab index `(frame >> 1) % P` —
+    ///   per-frame cost stays the single-level slab and every texel of BOTH levels refreshes
+    ///   once per `2P` super-cycle, at whose end the ping-pong advances.
+    fn gi_volume_schedule(&self) -> (u32, u32, u64) {
+        let period = (self.gi_volume_period as u32).clamp(1, gi::GI_VOL_DIM) as u64;
+        if self.gi.gi_fine_installed() {
+            (
+                ((self.frame_no >> 1) % period) as u32,
+                if self.frame_no & 1 == 0 {
+                    0
+                } else {
+                    gi::GI_VOL_DIM
+                },
+                period * 2,
+            )
+        } else {
+            ((self.frame_no % period) as u32, 0, period)
         }
     }
 
@@ -6784,6 +6831,9 @@ impl App {
                 // period = 1 is the legacy full-grid-every-frame update, bit for bit.
                 let gi_vol_period = (self.gi_volume_period as u32).clamp(1, gi::GI_VOL_DIM);
                 let gi_vol_slab = gi::GI_VOL_DIM.div_ceil(gi_vol_period);
+                // F4B: single-source schedule — (z-slab index, level y-offset, cycle length).
+                // Fine mode interleaves one level per frame at the single-level slab cost.
+                let (gi_slab_idx, gi_y_offset, gi_cycle) = self.gi_volume_schedule();
                 let gi_volume_arg = if self.gi_volume {
                     self.gi
                         .record_gi_volume(
@@ -6805,16 +6855,27 @@ impl App {
                             // scene's volume is an idempotent overwrite = a fixed point instead
                             // of a fixed-alpha EMA over fresh per-frame noise (never settles).
                             // Slab mode folds the cycle out of the seed so a slab retraces the
-                            // same directions each cycle, not each frame.
+                            // same directions each cycle (the fine super-cycle, when live), not
+                            // each frame.
                             if self.gi_stable {
                                 0
                             } else {
-                                (self.frame_no / self.gi_volume_period.max(1)) as u32
+                                (self.frame_no / gi_cycle) as u32
                             },
                             self.gi_volume_spp,
-                            0.1,
-                            (self.frame_no as u32 % gi_vol_period) * gi_vol_slab,
+                            // F4B EMA alpha: env override, else auto — 0.2 in fine mode (the
+                            // interleave halves per-level refreshes; the stronger blend restores
+                            // the recipe-warmup convergence), 0.1 single-level (legacy).
+                            if self.gi_volume_alpha > 0.0 {
+                                self.gi_volume_alpha
+                            } else if self.gi.gi_fine_installed() {
+                                0.2
+                            } else {
+                                0.1
+                            },
+                            gi_slab_idx * gi_vol_slab,
                             gi_vol_slab,
+                            gi_y_offset,
                         )
                         .zip(self.gi.gi_volume_sampled())
                         .map(|(vext, (rad_base, skyvis_base))| (rad_base, skyvis_base, vext))
@@ -8750,10 +8811,12 @@ impl App {
         // 레퍼런스 엔진 GI-fidelity: advance the world irradiance volume ping-pong (next frame reads this).
         // Slab amortization: advance the ping-pong only when a full slab cycle completes (every
         // texel of the write slot has been refreshed), so the EMA history the next cycle reads is
-        // one COMPLETE cycle behind — mid-cycle frames keep writing into the same slot.
+        // one COMPLETE cycle behind — mid-cycle frames keep writing into the same slot. F4B: the
+        // cycle length comes from the SAME single-source schedule the dispatch uses (fine mode
+        // stretches it to the 2×period super-cycle covering both interleaved levels).
         if self.gi_volume {
-            let period = self.gi_volume_period.max(1);
-            if self.frame_no % period == period - 1 {
+            let (_, _, gi_cycle) = self.gi_volume_schedule();
+            if self.frame_no % gi_cycle == gi_cycle - 1 {
                 self.gi.advance_gi_volume();
             }
         }

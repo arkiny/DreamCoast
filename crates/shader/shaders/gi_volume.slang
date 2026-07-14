@@ -47,7 +47,9 @@ struct GiVolumePush
                          // at a FLAT per-frame cost — a whole-grid burst every Nth frame perturbed
                          // the wall-clock auto-exposure into visible luma pumping); w = reset
     uint4 write_rgb;     // x = storage base of the radiance SH volumes; y = storage base of the
-                         // sky-vis SH volumes written this frame
+                         // sky-vis SH volumes written this frame; z = tid.y offset of this
+                         // dispatch's level (F4B level-interleaved slabs: 0 = coarse rows,
+                         // dims.y = the fine half; 0 with a full-height dispatch = legacy)
     uint4 albedo_rgb;    // sampled volumes[] indices of the per-voxel albedo (R,G,B); x=0xFFFFFFFF = constant
     uint4 clip;          // x = clipmap descriptor index, y = level count
     float4 params;       // x = spp, y = ray max dist, z = sky fill, w = EMA alpha
@@ -231,6 +233,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // the thread id so every downstream tid use (probe position, EMA texel, writes) is exact.
     // A zero offset with the full dispatch is the legacy whole-grid update, bit for bit.
     tid.z += pc.read_rgb.z;
+    // F4B level-interleaved slabs: a fine-mode dispatch covers ONE level per frame (write_rgb.z
+    // = 0 selects the coarse rows, GI_VOL_DIM the fine half), so the per-frame cost stays the
+    // single-level slab instead of doubling. Applied BEFORE the guard/seed/probe/EMA reads so
+    // the offset tid.y reproduces the exact physical texel (and thus the exact deterministic
+    // direction set) the old double-height dispatch gave that probe. Zero = legacy, bit for bit.
+    tid.y += pc.write_rgb.z;
     // F4: fine mode processes a second (camera-anchored) level packed in the volume's upper
     // half. When fine_active == 0 these expressions reduce to the legacy values exactly
     // (levels == 1, level == 0, lid == tid, lvl_* == aabb_* — arithmetic-identical float math,

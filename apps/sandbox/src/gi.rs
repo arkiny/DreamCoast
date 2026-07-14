@@ -378,6 +378,13 @@ impl GiSystem {
         Ok(())
     }
 
+    /// F4B: true when fine mode is live (double-height volumes allocated AND the camera box
+    /// installed) — the caller's slab schedule then interleaves one level per frame and the
+    /// ping-pong advance stretches to the 2×period super-cycle.
+    pub(crate) fn gi_fine_installed(&self) -> bool {
+        self.gi_vol_fine && self.gi_fine_box.is_some()
+    }
+
     /// The PREVIOUS (completed) frame's sky-visibility SH base, for consumers recorded BEFORE this
     /// frame's volume update — the surface-cache relight's deferred-parity skylight. That slot was
     /// transitioned back to sampled at the end of its update and is not written this frame, so it
@@ -419,6 +426,12 @@ impl GiSystem {
         // wall-clock auto-exposure into visible flicker. (0, GI_VOL_DIM) = legacy full update.
         z_offset: u32,
         z_count: u32,
+        // F4B level-interleaved slabs: tid.y offset of this frame's level (0 = coarse rows,
+        // GI_VOL_DIM = the fine half). The dispatch always covers ONE level's rows, so fine
+        // mode costs the same per frame as the single-level update — the caller alternates
+        // levels and stretches the ping-pong advance to the 2×period super-cycle. 0 with fine
+        // mode off = the legacy schedule, bit for bit.
+        y_offset: u32,
     ) -> Option<ResourceId> {
         let pipe = self.gi_vol_pipeline.as_ref()?;
         let read = ((self.gi_vol_frame + 1) % 2) as usize;
@@ -495,7 +508,8 @@ impl GiSystem {
                     // x = radiance SH base, y = sky-vis SH base, z = slab z-slice offset.
                     [read_base, skyvis_read_base, z_offset],
                     reset,
-                    [write_base, skyvis_write_base, 0], // x = radiance SH base, y = sky-vis SH base
+                    // x/y = storage bases, z = the level's tid.y offset (F4B interleave).
+                    [write_base, skyvis_write_base, y_offset],
                     albedo_idx,
                     clip.0,
                     clip.1,
@@ -516,17 +530,13 @@ impl GiSystem {
                     fine_max,    // F4 fine-level world max
                 ));
                 let g = GI_VOL_DIM.div_ceil(4);
-                // F4: the fine level doubles the dispatch height (the shader maps tid.y's upper
-                // half onto the fine box); inactive keeps the legacy cubic dispatch.
-                let gy = if fine.is_some() {
-                    (GI_VOL_DIM * 2).div_ceil(4)
-                } else {
-                    g
-                };
-                // Slab amortization: only this frame's z-slab (the shader offsets tid.z).
+                // F4B: the dispatch always covers ONE level's rows — fine mode selects the
+                // level via the tid.y offset (write_rgb.z) instead of doubling the height, so
+                // the per-frame cost stays the single-level slab. Slab amortization: only this
+                // frame's z-slab (the shader offsets tid.z).
                 cmd.dispatch(
                     g,
-                    gy,
+                    g,
                     z_count.min(GI_VOL_DIM.saturating_sub(z_offset)).div_ceil(4),
                 );
                 // Transition the just-written volumes back to sampled so the GI pass can read them.
