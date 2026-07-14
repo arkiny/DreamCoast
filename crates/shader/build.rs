@@ -678,6 +678,119 @@ struct Job {
     key: &'static str,
 }
 
+/// Single source for host `threads_per_group`: parse each compute Job entry's
+/// `[numthreads(x, y, z)]` out of the .slang source and emit a lookup table. Vulkan/D3D12 bake
+/// the group size into the bytecode and ignore the pipeline-desc value, but METAL dispatches
+/// with exactly the desc value — a host literal that drifts from the shader silently executes
+/// the wrong thread grid there (the gi_volume update ran 8x8x1 over a 4x4x4 shader for months,
+/// leaving 3/4 of the GI field zero-init on Apple). Hosts resolve the size from this table
+/// instead of repeating the literal. Identifier arguments (e.g. a `#define`d group constant)
+/// are resolved by scanning every shader for `#define <ident> <int>`.
+fn emit_compute_group_sizes(generated: &mut String, shader_dir: &std::path::Path) {
+    use std::collections::HashMap;
+    // #define <ident> <int> across all shader sources (group-size constants live in includes).
+    let mut defines: HashMap<String, u32> = HashMap::new();
+    let mut sources: HashMap<&'static str, String> = HashMap::new();
+    for job in JOBS {
+        if job.stage != "compute" {
+            continue;
+        }
+        sources.entry(job.src).or_insert_with(|| {
+            std::fs::read_to_string(shader_dir.join(job.src)).unwrap_or_default()
+        });
+    }
+    for entry in std::fs::read_dir(shader_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("slang") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        for line in text.lines() {
+            let Some(rest) = line.trim().strip_prefix("#define ") else {
+                continue;
+            };
+            let mut it = rest.split_whitespace();
+            if let (Some(name), Some(val)) = (it.next(), it.next())
+                && let Ok(v) = val.parse::<u32>()
+            {
+                defines.insert(name.to_string(), v);
+            }
+        }
+    }
+    let resolve = |tok: &str| -> Option<u32> {
+        let tok = tok.trim();
+        tok.parse::<u32>()
+            .ok()
+            .or_else(|| defines.get(tok).copied())
+    };
+    let mut rows = String::new();
+    for job in JOBS {
+        if job.stage != "compute" {
+            continue;
+        }
+        let src = &sources[job.src];
+        // The attribute block immediately precedes `void <entry>(`; take the LAST
+        // `[numthreads(...)]` before that position so multi-entry files resolve per entry.
+        let needle = format!("void {}(", job.entry);
+        let Some(entry_pos) = src.find(&needle) else {
+            panic!(
+                "group-size parse: entry `{}` not found in {}",
+                job.entry, job.src
+            );
+        };
+        let head = &src[..entry_pos];
+        let Some(attr_pos) = head.rfind("[numthreads(") else {
+            panic!(
+                "group-size parse: no [numthreads] before `{}` in {}",
+                job.entry, job.src
+            );
+        };
+        let args = &head[attr_pos + "[numthreads(".len()..];
+        let args = &args[..args.find(")]").unwrap_or_else(|| {
+            panic!("group-size parse: unterminated [numthreads] in {}", job.src)
+        })];
+        let dims: Vec<u32> = args
+            .split(',')
+            .map(|t| {
+                resolve(t).unwrap_or_else(|| {
+                    panic!("group-size parse: unresolved token `{t}` in {}", job.src)
+                })
+            })
+            .collect();
+        assert_eq!(
+            dims.len(),
+            3,
+            "group-size parse: {} `{}`",
+            job.src,
+            job.entry
+        );
+        rows.push_str(&format!(
+            "    (\"{}\", [{}u32, {}, {}]),\n",
+            job.key, dims[0], dims[1], dims[2]
+        ));
+    }
+    generated.push_str(
+        "/// (accessor key, [numthreads x,y,z]) for every compute shader — parsed from the\n\
+         /// .slang source at build time. The host MUST use this for `threads_per_group`\n\
+         /// (Metal dispatches with the desc value; a drifted literal silently runs the wrong\n\
+         /// thread grid there).\n",
+    );
+    generated.push_str("pub const COMPUTE_GROUP_SIZES: &[(&str, [u32; 3])] = &[\n");
+    generated.push_str(&rows);
+    generated.push_str("];\n");
+    generated.push_str(
+        "/// Group size for a compute accessor key (e.g. \"gdf_gi_cs\"). Panics on an unknown\n\
+         /// key — a missing table entry is a build-system bug, not a runtime condition.\n\
+         pub fn compute_group_size(key: &str) -> [u32; 3] {\n    COMPUTE_GROUP_SIZES\n        \
+         .iter()\n        .find(|(k, _)| *k == key)\n        .map(|(_, v)| *v)\n        \
+         .unwrap_or_else(|| panic!(\"no group size for compute shader key `{key}`\"))\n}\n",
+    );
+}
+
 const JOBS: &[Job] = &[
     Job {
         src: "triangle.slang",
@@ -1692,6 +1805,7 @@ fn main() {
     std::fs::create_dir_all(shader_tool_home.join(".cache")).unwrap();
 
     let mut generated = String::new();
+    emit_compute_group_sizes(&mut generated, &shader_dir);
 
     let Some(slangc) = find_slangc(&manifest_dir) else {
         println!(

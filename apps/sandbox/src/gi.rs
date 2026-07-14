@@ -123,8 +123,7 @@ impl GiSystem {
                        dxil: fn() -> Option<&'static [u8]>,
                        metallib: fn() -> Option<&'static [u8]>,
                        name: &str,
-                       pcsize: u32,
-                       tg: [u32; 3]|
+                       pcsize: u32|
          -> anyhow::Result<Option<ComputePipeline>> {
             if !compute_supported {
                 return Ok(None);
@@ -137,7 +136,12 @@ impl GiSystem {
                     push_constant_size: pcsize,
                     bindless: true,
                     uniform_buffer: false,
-                    threads_per_group: tg,
+                    // Single source: the shader's own [numthreads], parsed at build time
+                    // (dreamcoast_shader::COMPUTE_GROUP_SIZES). Metal dispatches with this
+                    // value, so a hand-written literal that drifts from the shader silently
+                    // runs the wrong thread grid there — the gi_volume 8x8x1-over-4x4x4
+                    // mismatch left 3/4 of the GI field zero-init for months.
+                    threads_per_group: dreamcoast_shader::compute_group_size(&format!("{name}_cs")),
                 },
             )?))
         };
@@ -147,7 +151,6 @@ impl GiSystem {
             dreamcoast_shader::gdf_ao_cs_metallib,
             "gdf_ao",
             160,
-            [8, 8, 1],
         )?;
         let gi_pipeline = compute(
             dreamcoast_shader::gdf_gi_cs_spirv,
@@ -155,7 +158,6 @@ impl GiSystem {
             dreamcoast_shader::gdf_gi_cs_metallib,
             "gdf_gi",
             256, // +16B row: F3 `hwrt` @240 + F4 `gi_importance` @244 (0 = the legacy anchors).
-            [8, 8, 1],
         )?;
         // F3: the HW-RT permutation, built only on RT-capable devices (its inline RayQuery /
         // acceleration-structure use can't be created without RT support). Bound in place of
@@ -167,7 +169,6 @@ impl GiSystem {
                 dreamcoast_shader::gdf_gi_hwrt_cs_metallib,
                 "gdf_gi_hwrt",
                 256,
-                [8, 8, 1],
             )?
         } else {
             None
@@ -178,7 +179,6 @@ impl GiSystem {
             dreamcoast_shader::gdf_gi_upsample_cs_metallib,
             "gdf_gi_upsample",
             128,
-            [8, 8, 1],
         )?;
         let temporal_pipeline = compute(
             dreamcoast_shader::gdf_temporal_cs_spirv,
@@ -186,7 +186,6 @@ impl GiSystem {
             dreamcoast_shader::gdf_temporal_cs_metallib,
             "gdf_temporal",
             192,
-            [8, 8, 1],
         )?;
         let atrous_pipeline = compute(
             dreamcoast_shader::gdf_atrous_cs_spirv,
@@ -194,15 +193,13 @@ impl GiSystem {
             dreamcoast_shader::gdf_atrous_cs_metallib,
             "gdf_atrous",
             112,
-            [8, 8, 1],
         )?;
         let gi_vol_pipeline = compute(
             dreamcoast_shader::gi_volume_cs_spirv,
             dreamcoast_shader::gi_volume_cs_dxil,
             dreamcoast_shader::gi_volume_cs_metallib,
             "gi_volume",
-            192,       // +32B: F4 fine-level AABB rows (fine_min.xyz + active, fine_max.xyz).
-            [4, 4, 4], // MUST match gi_volume.slang [numthreads(4,4,4)] — Metal dispatches this
+            192, // +32B: F4 fine-level AABB rows (fine_min.xyz + active, fine_max.xyz).
         )?;
         let sp_trace_pipeline = compute(
             dreamcoast_shader::screen_probe_trace_cs_spirv,
@@ -210,7 +207,6 @@ impl GiSystem {
             dreamcoast_shader::screen_probe_trace_cs_metallib,
             "screen_probe_trace",
             240, // ProbeTracePush = 240B (wrc_atlas/grid/oct/pad0 row @224); matches screen_probe_trace_push.
-            [8, 8, 1],
         )?;
         let sp_integrate_pipeline = compute(
             dreamcoast_shader::screen_probe_integrate_cs_spirv,
@@ -218,7 +214,6 @@ impl GiSystem {
             dreamcoast_shader::screen_probe_integrate_cs_metallib,
             "screen_probe_integrate",
             128,
-            [8, 8, 1],
         )?;
         let sp_filter_pipeline = compute(
             dreamcoast_shader::screen_probe_filter_cs_spirv,
@@ -226,7 +221,6 @@ impl GiSystem {
             dreamcoast_shader::screen_probe_filter_cs_metallib,
             "screen_probe_filter",
             128,
-            [8, 8, 1],
         )?;
         let sp_irradiance_pipeline = compute(
             dreamcoast_shader::screen_probe_irradiance_cs_spirv,
@@ -234,7 +228,6 @@ impl GiSystem {
             dreamcoast_shader::screen_probe_irradiance_cs_metallib,
             "screen_probe_irradiance",
             32,
-            [8, 8, 1],
         )?;
         let wrc_pipeline = compute(
             dreamcoast_shader::wrc_update_cs_spirv,
@@ -242,7 +235,6 @@ impl GiSystem {
             dreamcoast_shader::wrc_update_cs_metallib,
             "wrc_update",
             128,
-            [8, 8, 1],
         )?;
         let wrc_view_pipeline = compute(
             dreamcoast_shader::wrc_view_cs_spirv,
@@ -250,7 +242,6 @@ impl GiSystem {
             dreamcoast_shader::wrc_view_cs_metallib,
             "wrc_view",
             192,
-            [8, 8, 1],
         )?;
         // 24 R32F volumes: ping-pong [read|write] × 12 SH coefficients. Empty (zero) at start = no
         // fill until the update converges; the lighting falls back gracefully (e = 0). Allocated
