@@ -16,7 +16,7 @@
         "LEVEL": "sponza_intel",
         "WARMUP_FRAMES": "64"
       },
-      "sha256": "d372ba8cec5e103c7171231a3aca07ab798c04be0b0360cdd5bbeb052c7c240b"
+      "sha256": "1a87d7ae39b8df0b19cef2e2a5323a9e7310654323a42c70e441db90fc33a479"
     },
     "sponza_pt_interior": {
       "desc": "content: raster-vs-PT lit-masked residual, interior colonnade (tolerant gate)",
@@ -60,7 +60,7 @@
         "P_SC_VIZ": "1",
         "WARMUP_FRAMES": "64"
       },
-      "sha256": "e29b14bc1739de801e88b7ea3f5035b789a4cfa5974cf7ba3398ba28ac89b537"
+      "sha256": "d4afc4154fc31752392eaa4a204956a57c0e3fab26e6340be98b25711002ddaa"
     }
   }
 }
