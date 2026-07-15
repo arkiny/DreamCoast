@@ -550,7 +550,17 @@ impl ReflectSystem {
     /// same buffer SSR reprojects into), for the HWRT reflection's screen-color-at-hit. `0x7FFFFFFF`
     /// = no history bound (the shader then keeps the surface-cache shading). Capped to 31 bits since
     /// it rides the reflection push's march-cap field (bit 31 is the content flag).
+    ///
+    /// The sentinel is ALSO returned until the first history write has completed
+    /// (`lit_hist_frame == 0`): the ring buffers are device-allocated with undefined contents, so
+    /// a frame-0 fetch would read undefined memory — usually zero pages, occasionally recycled
+    /// non-zero, which seeded the intermittent content-golden low-bit flake through the
+    /// fetch → lit → lit-history → calibration → relight chain. There is no history on the first
+    /// frame by definition; the shader's existing no-history path is the correct semantics.
     pub(crate) fn lit_hist_read_index(&self) -> u32 {
+        if self.lit_hist_frame == 0 {
+            return 0x7FFF_FFFF;
+        }
         let read = ((self.lit_hist_frame + 1) % 2) as usize;
         self.lit_hist[read]
             .as_ref()

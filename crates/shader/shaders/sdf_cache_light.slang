@@ -327,6 +327,15 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
                 qhit, nq, pc.cards_index, pc.cache_pos_index, pc.cache_rad_read,
                 pc.num_cards, pc.tile, 0.0, gc8 == 0u ? 0xFFFFFFFFu : gc8 - 1u,
                 gp8 == 0u ? 0xFFFFFFFFu : gp8 - 1u, cache_hit);
+            // Reset frame (first relight / atlas re-alloc): the read ring slot has never been
+            // written — its contents are undefined memory, and a carded hit would gather it as
+            // bounce light (the intermittent content-golden 1-LSB flake: usually the pages
+            // arrive zeroed, occasionally recycled non-zero). There IS no bounce history yet,
+            // so a carded hit contributes zero — exactly the temporal blend's own reset rule
+            // below, and bit-identical to the zero-page behavior the goldens were seeded from.
+            // The no-card fallback beneath stays live (it never reads the ring).
+            if (cache_hit && pc.reset != 0u)
+                s = float3(0.0, 0.0, 0.0);
             // F1 Stage 0 — surface-cache virtualization fallback. When the gather ray hits a surface
             // that carries NO card (a coarse-fallback drawable over the card budget, or an
             // LRU-evicted page once streaming lands), the cache lookup returns float3(0). Adding that
