@@ -217,7 +217,7 @@ impl GiSystem {
             dreamcoast_shader::gi_volume_cs_dxil,
             dreamcoast_shader::gi_volume_cs_metallib,
             "gi_volume",
-            192, // +32B: F4 fine-level AABB rows (fine_min.xyz + active, fine_max.xyz).
+            196, // 192 (F4 fine rows) + 4: the E-oracle repair-seam flag word.
         )?;
         let sp_trace_pipeline = compute(
             dreamcoast_shader::screen_probe_trace_cs_spirv,
@@ -574,6 +574,8 @@ impl GiSystem {
         // levels and stretches the ping-pong advance to the 2×period super-cycle. 0 with fine
         // mode off = the legacy schedule, bit for bit.
         y_offset: u32,
+        // E-oracle repair seam (bit0 `P_GI_READ_OFFSET`, bit1 `P_GI_SUN_HARDVIS`); 0 = legacy.
+        repair_flags: u32,
     ) -> Option<ResourceId> {
         let pipe = self.gi_vol_pipeline.as_ref()?;
         let read = ((self.gi_vol_frame + 1) % 2) as usize;
@@ -674,10 +676,11 @@ impl GiSystem {
                     // and importing wrong-side radiance (interior gate −0.84 measured from this
                     // alone, docs/phase-gi-volume-leak-plan.md §10).
                     0.05,
-                    fine_min,    // F4 fine-level world min ([0;3] when inactive)
-                    fine_active, // F4: 1.0 = update both levels, 0.0 = legacy single level
-                    fine_max,    // F4 fine-level world max
-                    fine_reset,  // F4B: 1.0 = fine-half EMA/hit reads invalid (recentering)
+                    fine_min,     // F4 fine-level world min ([0;3] when inactive)
+                    fine_active,  // F4: 1.0 = update both levels, 0.0 = legacy single level
+                    fine_max,     // F4 fine-level world max
+                    fine_reset,   // F4B: 1.0 = fine-half EMA/hit reads invalid (recentering)
+                    repair_flags, // E-oracle repair seam bits (0 = legacy estimator)
                 ));
                 let g = GI_VOL_DIM.div_ceil(4);
                 // F4B: the dispatch always covers ONE level's rows — fine mode selects the

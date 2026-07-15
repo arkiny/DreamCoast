@@ -56,6 +56,9 @@ struct GiVolumePush
     float4 ground;       // xyz analytic ground albedo, w = surface bias
     float4 fine_min;     // F4: xyz fine-level world min, w = fine_active (0 = single level)
     float4 fine_max;     // F4: xyz fine-level world max (fine half packed at y ∈ [dims.y, 2*dims.y))
+    uint flags;          // E-oracle repair seam: bit0 = feedback reads offset one voxel toward
+                         // the ray side (no cross-wall import), bit1 = intersection-only sun
+                         // visibility (no near-miss penumbra). 0 = the exact legacy estimator.
 };
 
 [[vk::push_constant]]
@@ -90,7 +93,12 @@ float gv_shadow(float3 o, float3 d)
         float h = scene_occ(o + d * t);
         if (h < 0.003)
             return 0.0;
-        res = min(res, 16.0 * h / t);
+        // Near-miss penumbra: k=16 emulates a ~3.6° cone — ~13× the physical sun's angular
+        // radius, and the coarse field already fattens thin blockers into their own penumbra.
+        // `P_GI_SUN_HARDVIS` (flags bit1) keeps only the real-intersection kill above: measured
+        // +4.3 lit-mean E on the interior oracle row (36.4 → 40.7 vs the reference 48.8).
+        if ((pc.flags & 2u) == 0u)
+            res = min(res, 16.0 * h / t);
         t += clamp(h, 0.02, 0.4);
         if (t > maxt)
             break;
@@ -319,16 +327,24 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             // stored irradiance (E) re-enters as albedo*indirect (the ×PI to irradiance cancels
             // the BRDF 1/PI), matching the old scalar probe's energy.
             float3 cprev[4];
+            // `P_GI_READ_OFFSET` (flags bit0): the hit sits ON geometry, so a plain trilinear
+            // feedback read straddles the wall and imports the far side's radiance — a transport
+            // path the reference doesn't have (measured feedback gain ×2.2 vs the ~1.25 a
+            // closed room's albedo supports, most of it sky-blue). Reading one voxel toward the
+            // ray side keeps the footprint on the hemisphere the ray actually came from.
+            float3 hp_read = hp;
+            if ((pc.flags & 1u) != 0u)
+                hp_read = hp + hn * ((pc.aabb_max.xyz - pc.aabb_min.xyz) * (1.0 / 32.0));
             // F4 fine mode: read the finest level containing the hit (fine-first fall-through);
             // the OFF path keeps the exact legacy call (untouched instruction stream).
             if (fine_on)
             {
                 bool cin;
-                float3 cuvw = gv_level_uvw(hp, cin);
+                float3 cuvw = gv_level_uvw(hp_read, cin);
                 read_coeffs_fine(read_base, cuvw, cin, cprev);
             }
             else
-                read_coeffs(read_base, hp, cprev);
+                read_coeffs(read_base, hp_read, cprev);
             float3 indirect = eval_irradiance(cprev, hn);
             // Occlude the sky fill by the PREVIOUS frame's sky-visibility V(hn) at the hit
             // (single source with the deferred skylight occlusion — no new state): a hit deep
@@ -341,14 +357,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             if (pc.read_rgb.y != 0xFFFFFFFFu && pc.read_rgb.w == 0u)
             {
                 float svprev[4];
+                // The sky-vis feedback read shares the wall-straddling geometry — same offset.
                 if (fine_on)
                 {
                     bool sin_;
-                    float3 suvw = gv_level_uvw(hp, sin_);
+                    float3 suvw = gv_level_uvw(hp_read, sin_);
                     read_coeffs_scalar_fine(pc.read_rgb.y, suvw, sin_, svprev);
                 }
                 else
-                    read_coeffs_scalar(pc.read_rgb.y, hp, svprev);
+                    read_coeffs_scalar(pc.read_rgb.y, hp_read, svprev);
                 float hv = svprev[0] * SH_C0
                            + (2.0 / 3.0)
                                  * (SH_C1 * hn.y * svprev[1] + SH_C1 * hn.z * svprev[2]

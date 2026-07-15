@@ -1263,8 +1263,12 @@ pub(crate) fn gi_volume_push(
     // just moved) — the update writes the fine level fresh and its hit reads skip the fine
     // containment. 0 = normal (and the byte the pre-F4B packing left at zero).
     fine_reset: f32,
-) -> [u8; 192] {
-    let mut pc = [0u8; 192];
+    // E-oracle repair seam: bit0 = feedback reads offset one voxel toward the ray side (stop
+    // importing energy across walls), bit1 = intersection-only sun visibility (drop the k=16
+    // near-miss penumbra — ~13x the sun's angular radius). 0 = the exact legacy estimator.
+    flags: u32,
+) -> [u8; 196] {
+    let mut pc = [0u8; 196];
     let put3 = |pc: &mut [u8], o: usize, v: [f32; 3]| {
         for (i, x) in v.iter().enumerate() {
             pc[o + i * 4..o + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
@@ -1303,6 +1307,7 @@ pub(crate) fn gi_volume_push(
     pc[172..176].copy_from_slice(&fine_active.to_le_bytes());
     put3(&mut pc, 176, fine_max);
     pc[188..192].copy_from_slice(&fine_reset.to_le_bytes());
+    pc[192..196].copy_from_slice(&flags.to_le_bytes());
     pc
 }
 

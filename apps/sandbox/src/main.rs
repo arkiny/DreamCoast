@@ -877,6 +877,9 @@ struct App {
     /// so the stronger blend restores the 192-frame convergence budget) and the long-standing
     /// 0.1 single-level. The stable direction set makes the static fixed point alpha-independent.
     gi_volume_alpha: f32,
+    /// E-oracle repair seam bits for the volume update (bit0 `P_GI_READ_OFFSET` feedback-read
+    /// offset, bit1 `P_GI_SUN_HARDVIS` intersection-only sun visibility); 0 = legacy estimator.
+    gi_repair_flags: u32,
     /// 레퍼런스식 indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
     /// directional sky-visibility): neutral leak fraction (`P_SKYVIS_TINT`) + min-occlusion floor
     /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
@@ -3029,6 +3032,16 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(0.0) // 0 = auto: 0.2 in fine mode, 0.1 single-level (resolved per frame)
             .clamp(0.0, 1.0);
+        // E-oracle repair seam (docs/phase-e-oracle-plan.md §2d-e). bit0 `P_GI_READ_OFFSET`:
+        // the update's multibounce/sky-vis feedback reads sit ON geometry, so plain trilinear
+        // straddles the wall and imports the far side's radiance (measured feedback gain ×2.2
+        // vs the 1/(1−albedo) ≈ 1.25 a closed room supports); offsetting the read one voxel
+        // along the hit normal keeps it on the ray's side. bit1 `P_GI_SUN_HARDVIS`: drop
+        // gv_shadow's k=16 near-miss penumbra (a ~3.6° cone — ~13× the physical sun's angular
+        // radius, and the coarse field already fattens thin blockers); real intersections
+        // still return 0. Both default OFF (byte-inert legacy) until the calibration commit.
+        let gi_repair_flags = u32::from(quality::env_bool("P_GI_READ_OFFSET", false))
+            | (u32::from(quality::env_bool("P_GI_SUN_HARDVIS", false)) << 1);
         // Deferred-parity cache skylight (see the App field doc): tier-driven, env-overridable,
         // and only meaningful with the volume-GI path (the SH sky-visibility volumes it reads).
         let cache_sky_occlude =
@@ -3839,6 +3852,7 @@ impl App {
             gi_vol_occ,
             gi_volume_spp,
             gi_volume_alpha,
+            gi_repair_flags,
             skyvis_tint,
             skyvis_tint_v0,
             skyvis_min_occ,
@@ -6923,6 +6937,7 @@ impl App {
                             gi_slab_idx * gi_vol_slab,
                             gi_vol_slab,
                             gi_y_offset,
+                            self.gi_repair_flags,
                         )
                         .zip(self.gi.gi_volume_sampled())
                         .map(|(vext, (rad_base, skyvis_base))| {
