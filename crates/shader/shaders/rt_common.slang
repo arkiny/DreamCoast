@@ -32,7 +32,10 @@ struct PushConstants
     uint frame;             // accumulation frame (0 = first, clears the sum)
     uint width;
     uint height;
-    uint flip_y;            // bit0: 1 = Vulkan (Y down); bit1: 1 = Cornell box mode
+    uint flip_y;            // bit0: 1 = Vulkan (Y down); bit1: 1 = Cornell box mode; bit2: E-oracle
+                            // view (P8_PT_EVIEW — cosine-hemisphere irradiance at the primary hit,
+                            // scene-bounce only: a bounce-1 sky escape contributes 0, matching the
+                            // GI volume's stored-E convention; docs/phase-e-oracle-plan.md)
     uint spp;               // samples per dispatch
     float4 sky;             // x = sky_gain (sun:sky ratio), yzw = sky white balance (per-channel)
 };

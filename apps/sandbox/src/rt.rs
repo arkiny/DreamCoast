@@ -638,8 +638,12 @@ impl RtSystem {
         // External resource so the graph orders the accumulation write (and inserts a
         // barrier before the next frame's read).
         let accum_ext = graph.import_external("rt_accum");
-        // bit0 = Vulkan Y-flip, bit1 = Cornell env mode (no sun, black bg).
-        let flip = flip_y | if use_cornell { 2 } else { 0 };
+        // bit0 = Vulkan Y-flip, bit1 = Cornell env mode (no sun, black bg), bit2 = the
+        // E-oracle irradiance view (`P8_PT_EVIEW=1`, debug-only; docs/phase-e-oracle-plan.md).
+        let e_view = std::env::var("P8_PT_EVIEW")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let flip = flip_y | if use_cornell { 2 } else { 0 } | if e_view { 4 } else { 0 };
         let frame_idx = self.accum_frame;
         graph.add_compute_pass(
             ComputePassInfo {

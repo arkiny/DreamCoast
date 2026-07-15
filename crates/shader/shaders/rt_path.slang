@@ -21,7 +21,7 @@
 // Trace a single path and return its radiance. `cornell` switches to an enclosed
 // box lit only by emissive surfaces (black background, no sun).
 float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool cornell,
-             inout uint rng)
+             bool e_view, inout uint rng)
 {
     float3 radiance = float3(0, 0, 0);
     float3 throughput = float3(1, 1, 1);
@@ -43,7 +43,11 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
         if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
         {
             // Sun disk only on the primary ray; bounces get the sun analytically.
-            if (!cornell)
+            // E-oracle: a bounce-1 sky escape carries no SCENE radiance — the GI volume's
+            // miss = 0 convention (the IBL supplies direct sky separately). Deeper bounces
+            // keep the sky: a hit surface's own shading includes its skylight, exactly as
+            // the volume's hit-point sky_fill term does.
+            if (!cornell && !(e_view && bounce == 1u))
                 radiance += throughput * sky(ray.Direction, sun_dir, pc.sun.w, bounce == 0u);
             break;
         }
@@ -91,6 +95,21 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
                 ray.TMax = max(ray.TMax - advance, 0.0);
                 continue;
             }
+        }
+
+        // E-oracle primary hit: skip this surface's emissive/direct/BSDF entirely — draw ONE
+        // cosine-weighted direction about the geometric normal and continue. From bounce 1 on
+        // the path is a standard PT estimate of the incoming scene radiance L_in, and the
+        // cosine draw makes the progressive mean exactly E(n) at the primary surface (the
+        // same Monte-Carlo estimator gdf_gi's march uses), in the volume's pre-albedo,
+        // pre-exposure units. Debug-mode only; the flag is never set on the gate/anchor paths.
+        if (e_view && bounce == 0u)
+        {
+            ray.Origin = ray.Origin + ray.Direction * q.CommittedRayT() + n * 0.002;
+            ray.Direction = cosine_hemisphere(n, rng);
+            ray.TMin = 0.001;
+            ray.TMax = 10000.0;
+            continue;
         }
 
         RtMaterialSample mat;
@@ -182,6 +201,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         return;
 
     bool cornell = (pc.flip_y & 2u) != 0u;
+    bool e_view = (pc.flip_y & 4u) != 0u;
     float sy = (pc.flip_y & 1u) != 0u ? 1.0 : -1.0;
     uint pixel = tid.y * pc.width + tid.x;
 
@@ -198,7 +218,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         float2 ndc = float2(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * sy);
         float3 dir = primary_ray_dir(ndc);
         float cone_spread = primary_cone_spread(ndc);
-        sum += trace(pc.cam_pos.xyz, dir, cone_spread, sun_dir, cornell, rng);
+        sum += trace(pc.cam_pos.xyz, dir, cone_spread, sun_dir, cornell, e_view, rng);
     }
     sum /= float(pc.spp);
 
