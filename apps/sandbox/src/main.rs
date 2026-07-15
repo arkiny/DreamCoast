@@ -2932,7 +2932,15 @@ impl App {
             let ext = (amax[0] - amin[0])
                 .max(amax[1] - amin[1])
                 .max(amax[2] - amin[2]);
-            let half = (ext / 6.0).clamp(4.0, 12.0);
+            // F4B3: `P_GI_FINE_HALF` (metres) overrides the derived half-extent — the official
+            // box-half sweep lever (a smaller box densifies the probe spacing 2*half/32 AND
+            // shrinks the fine-covered screen area; the recenter dead-zone, voxel snap and
+            // fade margin all derive from the installed box, so they track automatically).
+            let half = std::env::var("P_GI_FINE_HALF")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|h| h.clamp(2.0, 16.0))
+                .unwrap_or((ext / 6.0).clamp(4.0, 12.0));
             let mn = [eye.x - half, eye.y - half, eye.z - half];
             let mx = [eye.x + half, eye.y + half, eye.z + half];
             gi.set_gi_fine_box(&device, mn, mx)?;
