@@ -59,6 +59,7 @@ struct CacheLightPush
     float ao_strength;    // exponential occlusion strength
     float ao_bias;        // surface offset before the march
     float ao_floor;       // remap floor: deep contacts keep >= this fraction of the ambient
+    float skyvis_tint_v0; // aperture shaping of the tint leak (same value as the deferred; 0 = flat)
 };
 
 [[vk::push_constant]]
@@ -441,7 +442,11 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
             ao = exp(-pc.ao_strength * max(occ, 0.0));
             ao = pc.ao_floor + (1.0 - pc.ao_floor) * ao;
         }
-        indirect += (E * (vis * dot_factor) + (pc.skyvis_tint * lum) * (1.0 - vis)) * ao;
+        // Aperture-shaped leak (lockstep with the deferred occlude_sky_diffuse_bent).
+        float leak = 1.0 - vis;
+        if (pc.skyvis_tint_v0 > 0.0)
+            leak *= saturate(saturate(v) / pc.skyvis_tint_v0);
+        indirect += (E * (vis * dot_factor) + (pc.skyvis_tint * lum) * leak) * ao;
     }
     // Legacy skylight-visibility FLOOR (matches the old deferred `occlude_sky_diffuse` MinOcclusion):
     // an enclosed interior face whose gather rays rarely escape still receives a floor of the sky

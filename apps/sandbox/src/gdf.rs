@@ -389,7 +389,7 @@ impl GdfSystem {
             dreamcoast_shader::sdf_cache_light_cs_dxil,
             dreamcoast_shader::sdf_cache_light_cs_metallib,
             "sdf_cache_light",
-            192,
+            196,
             [64, 1, 1],
         )?;
         // HWRT-shadow relight permutation (RT-capable devices only; see the field doc).
@@ -400,7 +400,7 @@ impl GdfSystem {
                 dreamcoast_shader::sdf_cache_light_hwrt_cs_dxil,
                 dreamcoast_shader::sdf_cache_light_hwrt_cs_metallib,
                 "sdf_cache_light_hwrt",
-                192,
+                196,
                 [64, 1, 1],
             )?
         } else {
@@ -2051,6 +2051,7 @@ impl GdfSystem {
         sky_wb: [f32; 3],
         skyvis_index: u32,
         skyvis_tint: f32,
+        skyvis_tint_v0: f32,
         skyvis_min_occ: f32,
         // GDF-AO params (reach, strength, bias, floor) for the parity skylight — the same
         // `GiSystem::ao_params` the screen-space AO uses (only read in sky-occlusion mode).
@@ -2171,6 +2172,7 @@ impl GdfSystem {
                     sky_wb,
                     skyvis_index,
                     skyvis_tint,
+                    skyvis_tint_v0,
                     skyvis_min_occ,
                     u32::from(hwrt_shadow && hwrt_gather) | (u32::from(gather_fallback) << 1),
                     ao_params,
@@ -2326,6 +2328,7 @@ impl GdfSystem {
             // are only read in sky-occlusion mode, so they ride along as zeros.)
             u32::MAX,
             0.0,
+            0.0, // tint v0 (parity skylight off on this path)
             0.0,
             u32::from(gather_fallback) << 1,
             (0.0, 0.0, 0.0, 0.0),

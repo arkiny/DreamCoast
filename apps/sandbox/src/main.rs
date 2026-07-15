@@ -882,6 +882,8 @@ struct App {
     /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
     /// no-op sentinel image so it stays byte-identical.
     skyvis_tint: f32,
+    /// Aperture shaping of the tint leak (`P_SKYVIS_TINT_V0`; 0 = flat legacy leak).
+    skyvis_tint_v0: f32,
     skyvis_min_occ: f32,
     /// Deferred-parity cache skylight (`P_CACHE_SKY_OCCLUDE`, tier `cache_sky_occlude`): the
     /// surface-cache relight takes its skylight from the SAME SH sky-visibility occlusion the
@@ -2980,6 +2982,15 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(if gi_fine_want { 0.15 } else { 0.2 })
             .clamp(0.0, 1.0);
+        // Interior-bias root phase: aperture shaping of the tint leak (`P_SKYVIS_TINT_V0`,
+        // metres of sky-visibility — the leak ramps 0->full over V in [0, v0]). 0 = the flat
+        // legacy leak. The EV11 attribution measured the flat leak overfilling the fully-
+        // enclosed deep crop 2.24x the reference while the lit-region fill is load-bearing.
+        let skyvis_tint_v0 = std::env::var("P_SKYVIS_TINT_V0")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
         let skyvis_min_occ = std::env::var("P_SKYVIS_MIN_OCC")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
@@ -3829,6 +3840,7 @@ impl App {
             gi_volume_spp,
             gi_volume_alpha,
             skyvis_tint,
+            skyvis_tint_v0,
             skyvis_min_occ,
             cache_sky_occlude,
             cache_hwrt_shadow,
@@ -6561,6 +6573,7 @@ impl App {
                             u32::MAX
                         },
                         self.skyvis_tint,
+                        self.skyvis_tint_v0,
                         self.skyvis_min_occ,
                         // The same AO params the screen-space GDF AO uses — the parity skylight
                         // is occluded by the identical formula (only read in sky-occlusion mode).
@@ -7593,6 +7606,7 @@ impl App {
             swrt_reflect_out,
             gi_skyvis_out,
             self.skyvis_tint,
+            self.skyvis_tint_v0,
             self.skyvis_min_occ,
             globals_offset,
             self.flip_y,
@@ -8593,6 +8607,7 @@ impl App {
                 None,
                 None,
                 self.skyvis_tint,
+                self.skyvis_tint_v0,
                 self.skyvis_min_occ,
                 second.globals_offset,
                 self.flip_y,

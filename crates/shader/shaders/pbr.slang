@@ -62,6 +62,13 @@ struct PushConstants
     uint cluster_light_count; // number of lights in cluster_light_buf (dbg heatmap normalisation)
     uint ao_multibounce; // 1 = albedo-tinted multi-bounce AO on the diffuse ambient (opt-in); 0 = off
     uint spec_occlusion; // 1 = bent-normal cone-cone occlusion on the prefilter-cube specular (opt-in)
+    // Interior-bias root phase: aperture shaping of the neutral OcclusionTint leak. The flat
+    // (1-V)-proportional leak puts its energy where V ~= 0 — exactly the fully-enclosed regions
+    // the path-traced reference keeps dark (the EV11 deep crop measured 2.24x the reference),
+    // while the raster's REAL deficit sits in partially-occluded lit surfaces. Shaping the leak
+    // by saturate(V / v0) zeroes it in enclosed cavities (a real skylight leak scales with the
+    // aperture) and keeps it where V is middling. 0 = the flat legacy leak, byte-identical.
+    float skyvis_tint_v0;
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -200,7 +207,11 @@ float3 occlude_sky_diffuse_bent(float3 n, float sky_vis, float3 bent, uint irr_c
     float lum = dot(irradiance, float3(0.2126, 0.7152, 0.0722));
     // Occluded fraction -> neutral OcclusionTint leak (as in the scalar path); the direction bias
     // is carried by `dot_factor` on the visible fraction. bent = 0 => dot_factor = 1 => identical.
-    return irradiance * (vis * dot_factor) + (pc.skyvis_tint * lum) * (1.0 - vis);
+    // Aperture-shaped leak (skyvis_tint_v0 > 0): zero in fully-enclosed regions, full above v0.
+    float leak = 1.0 - vis;
+    if (pc.skyvis_tint_v0 > 0.0)
+        leak *= saturate(saturate(sky_vis) / pc.skyvis_tint_v0);
+    return irradiance * (vis * dot_factor) + (pc.skyvis_tint * lum) * leak;
 }
 
 float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float metallic,
@@ -268,7 +279,11 @@ float3 ambient_ibl(float3 n, float3 v, float3 world_pos, float3 albedo, float me
     {
         float so = spec_occlusion_bent(sky_bent, sky_vis, reflect(-v, n), roughness);
         float lum = dot(specular, float3(0.2126, 0.7152, 0.0722));
-        specular = specular * so + (pc.skyvis_tint * lum) * (1.0 - so); // neutral leak (reference ExtraIndirectSpecular)
+        // Same aperture shaping as the diffuse leak (lockstep; dead on content — has_swrt).
+        float leak_s = 1.0 - so;
+        if (pc.skyvis_tint_v0 > 0.0)
+            leak_s *= saturate(saturate(sky_vis) / pc.skyvis_tint_v0);
+        specular = specular * so + (pc.skyvis_tint * lum) * leak_s; // neutral leak (reference ExtraIndirectSpecular)
     }
 
     // AO (material + GDF far-field) attenuates only the DIFFUSE ambient. The traced SW-RT

@@ -887,11 +887,12 @@ pub(crate) fn cache_light_push(
     sky_wb: [f32; 3],
     skyvis_index: u32,
     skyvis_tint: f32,
+    skyvis_tint_v0: f32,
     skyvis_min_occ: f32,
     flags: u32,
     ao_params: (f32, f32, f32, f32),
-) -> [u8; 192] {
-    let mut pc = [0u8; 192];
+) -> [u8; 196] {
+    let mut pc = [0u8; 196];
     let u = [
         cards_index,
         cache_pos_index,
@@ -961,6 +962,8 @@ pub(crate) fn cache_light_push(
     pc[180..184].copy_from_slice(&ao_params.1.to_le_bytes());
     pc[184..188].copy_from_slice(&ao_params.2.to_le_bytes());
     pc[188..192].copy_from_slice(&ao_params.3.to_le_bytes());
+    // Aperture shaping of the tint leak (offset 192; same value as the deferred, 0 = flat).
+    pc[192..196].copy_from_slice(&skyvis_tint_v0.to_le_bytes());
     pc
 }
 
