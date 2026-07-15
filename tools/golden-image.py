@@ -271,6 +271,11 @@ def check_pt(cfg: dict, backend: str, work: Path, manifest: dict, update: bool):
         f"masked_avg {m['masked_avg']:.3f}  pt_black {m['pt_black_frac'] * 100:.1f}%  "
         f"lit_mean r/pt {m['lit_mean_raster']:.1f}/{m['lit_mean_pt']:.1f}"
     )
+    # F6D shadow decomposition (bias = signed uniform offset, scatter = per-pixel MAD
+    # about it): reported + recorded for trend tracking, NEVER gated — the gate below
+    # stays masked_avg <= budget (docs/phase-f6d-residual-decomposition-plan.md).
+    if "masked_bias" in m:
+        detail += f"  bias {m['masked_bias']:+.2f}/scatter {m['masked_scatter']:.2f}"
     if update:
         manifest["configs"][name] = {
             "desc": cfg["desc"],
@@ -280,6 +285,9 @@ def check_pt(cfg: dict, backend: str, work: Path, manifest: dict, update: bool):
             "residual_budget": round(m["masked_avg"] + PT_BUDGET_MARGIN, 2),
             "residual_measured": m["masked_avg"],
             "pt_black_frac": m["pt_black_frac"],
+            # F6D shadow metrics (informational; no budget).
+            "residual_bias": m.get("masked_bias"),
+            "residual_scatter": m.get("masked_scatter"),
         }
         return (name, "UPDATED", detail, True)
 

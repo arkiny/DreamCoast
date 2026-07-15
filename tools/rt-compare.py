@@ -81,6 +81,10 @@ def main() -> int:
     # Lit-mask accumulators (only touched when --lit-mask is given).
     m_total = 0
     m_hist = [0] * 256
+    # F6D bias/scatter decomposition: per-channel SIGNED delta histograms over the lit
+    # pixels (delta + 255 -> bin 0..510). One pass; the channel mean (bias) and the mean
+    # absolute deviation around it (scatter) both come from the histogram afterwards.
+    m_shist = [[0] * 511 for _ in range(3)]
     lit_count = 0
     lit_luma_r = 0.0
     lit_luma_p = 0.0
@@ -105,6 +109,7 @@ def main() -> int:
                     for c in range(3):
                         m_total += d[c]
                         m_hist[d[c]] += 1
+                        m_shist[c][r0[c] - r1[c] + 255] += 1
                     da[x, y] = tuple(min(255, int(v * amp)) for v in d)
                 else:
                     da[x, y] = MASKED_OUT_COLOR
@@ -160,6 +165,26 @@ def main() -> int:
         )
         print(f"masked avg abs diff / channel: {masked_avg:.3f}  (lit pixels only)")
         print(f"masked channels off by >8: {masked_over8:.2f}%   off by >32: {masked_over32:.2f}%")
+        # F6D decomposition (docs/phase-f6d-residual-decomposition-plan.md §1): bias = the
+        # signed per-channel mean delta (a uniform exposure/energy offset — perceptually
+        # homogeneous and calibratable), scatter = the mean absolute deviation around each
+        # channel's own mean (the per-pixel structural disagreement no scalar lever
+        # reduces). |bias| <= masked_avg <= |bias| + scatter. Shadow metrics: reported and
+        # recorded, never gated here (the gate stays masked_avg <= budget).
+        biases = []
+        scatters = []
+        for c in range(3):
+            csum = sum(cnt * (b - 255) for b, cnt in enumerate(m_shist[c]))
+            cmean = csum / lit_count
+            cmad = sum(cnt * abs((b - 255) - cmean) for b, cnt in enumerate(m_shist[c]))
+            biases.append(cmean)
+            scatters.append(cmad / lit_count)
+        masked_bias = sum(biases) / 3.0
+        masked_scatter = sum(scatters) / 3.0
+        print(
+            f"masked bias (signed mean): {masked_bias:+.3f}   "
+            f"scatter (MAD about mean): {masked_scatter:.3f}"
+        )
         # Mean lit luma per side: a multiplicative exposure mismatch between the
         # captures shows up here directly (structure-independent sanity check).
         print(f"lit mean luma: raster {mean_r:.1f}   pt {mean_p:.1f}")
@@ -172,6 +197,8 @@ def main() -> int:
                 "masked_over32": round(masked_over32, 3),
                 "lit_mean_raster": round(mean_r, 2),
                 "lit_mean_pt": round(mean_p, 2),
+                "masked_bias": round(masked_bias, 4),
+                "masked_scatter": round(masked_scatter, 4),
             }
         )
     if want_json:
