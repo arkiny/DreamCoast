@@ -3039,8 +3039,13 @@ impl App {
         // along the hit normal keeps it on the ray's side. bit1 `P_GI_SUN_HARDVIS`: drop
         // gv_shadow's k=16 near-miss penumbra (a ~3.6° cone — ~13× the physical sun's angular
         // radius, and the coarse field already fattens thin blockers); real intersections
-        // still return 0. Both default OFF (byte-inert legacy) until the calibration commit.
-        let gi_repair_flags = u32::from(quality::env_bool("P_GI_READ_OFFSET", false))
+        // still return 0. Calibration verdict (plan §2f): the read offset is default ON —
+        // sunlit gate 27.952 → 27.684 with scatter ALSO down, interior bias −1.2 at a neutral
+        // masked_avg. The sun-visibility repair stays a knob: E-domain-correct (lit-mean E
+        // 36.4 → 40.7 vs the reference 48.8) but display-adverse — it re-opens the empty tint
+        // window (sunlit over-brightens at 0.2, scatter eats the bias gain below it), the same
+        // bias→scatter wall that blocks the fine default.
+        let gi_repair_flags = u32::from(quality::env_bool("P_GI_READ_OFFSET", true))
             | (u32::from(quality::env_bool("P_GI_SUN_HARDVIS", false)) << 1);
         // Deferred-parity cache skylight (see the App field doc): tier-driven, env-overridable,
         // and only meaningful with the volume-GI path (the SH sky-visibility volumes it reads).
