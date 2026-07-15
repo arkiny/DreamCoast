@@ -1,6 +1,7 @@
 # F6D 계획서 — PT 잔차 메트릭의 바이어스/산포 분해 (도구 전용)
 
-> 상태: **진행 중** (2026-07-15). F6 검증 인프라 트랙. 동기 =
+> 상태: **완료 — 도구 랜딩·재판정 §4에 기록(분해 게이트도 fine 차단을 확인, 필드-품질 목표
+> 수치 확보)** (2026-07-15). F6 검증 인프라 트랙. 동기 =
 > [phase-f4b-hierarchical-cache-plan.md](phase-f4b-hierarchical-cache-plan.md) §5 +
 > [phase-f4b2](phase-f4b2-mb-boost-probe-plan.md)·[phase-f4b3](phase-f4b3-box-half-probe-plan.md)
 > 기각 판정 — masked_avg가 서로 다른 두 오차 유형(균일 오프셋 vs per-pixel 불일치)을 합산해
@@ -65,6 +66,34 @@ s_c(i) = raster_c(i) − pt_c(i):
 - 게이트 정책 **제안**(적용은 별도 결정): 예) masked_avg 유지 + scatter 상한 병기, 또는
   bias/scatter 개별 budget. 제안 기준: 갤러리·기존 그린 구성이 전부 그린으로 남을 것.
 - 필드-품질 페이즈(후속)의 목표 수치: fine이 통과하려면 scatter를 얼마나 줄여야 하는가.
+
+### 재판정 결과 (2026-07-15 — 정의 커밋 `ffa2d84` 이후 측정, 4-구성 분해)
+
+| 구성 | masked_avg | **bias** | **scatter** |
+|---|---|---|---|
+| coarse sunlit | 27.952 | +4.82 | 28.27 |
+| fine sunlit (CLIP=1, t0.15) | 29.080 | **−0.34** | 29.08 |
+| coarse interior | 31.608 | **+18.13** | 28.19 |
+| fine interior | 31.627 | +10.67 | 30.38 |
+
+(fine 쌍은 같은-설정 신선 캡처 — 공식 masked_avg를 소수 3자리 재현. 합성 자기검증 3종 정확,
+기존 지표 회귀 불변.)
+
+1. **가설 정량 확증**: fine은 bias를 sunlit −5.16(사실상 0)·interior −7.46 소거하고 scatter를
+   +0.81/+2.19 추가한다 — F4B의 "바이어스→산포 전환"이 수치로 분리됐다.
+2. **산포 페데스탈**: 4 구성이 공유하는 ~28의 산포 바닥(수렴 PT의 MC 노이즈 + AA/TAAU/텍스처
+   샘플링 차이) — masked_avg의 대부분은 이 페데스탈이고, 구성별 레버는 그 위의 소량이다.
+   interior coarse만 bias(+18.1)가 페데스탈에 필적 — F6C "lit 갭"의 정체이자 잔여 최대 레버.
+3. **재판정(사전 등록 §0-3의 발동)**: bias/scatter를 coarse에서 시드한 분리 게이트를 가정해도
+   fine은 scatter에서 양쪽 FAIL(29.08>28.27+0.3, 30.38>28.19+0.3) — **분해 게이트도 기본 ON을
+   차단한다.** fine의 이득은 bias-형, 비용은 scatter-형이며, 구조를 존중하는 게이트일수록
+   산포 증가에 민감한 것이 옳다.
+4. **게이트 정책 제안(적용은 별도 결정·이 페이즈는 섀도 기록만)**: masked_avg budget 유지 +
+   `residual_bias`/`residual_scatter` 매니페스트 병기(--update가 기록). 장기적으로 scatter
+   budget을 제2 게이트로 승격하면 "바이어스를 산포로 바꾸는" 부류의 회귀를 명시적으로 잡는다.
+5. **필드-품질 페이즈의 목표 수치(이 페이즈의 실용 산출물)**: fine이 scatter-중립이 되려면
+   **sunlit −0.81·interior −2.19의 scatter 감축**이 필요하다. 리드 = 복셀 블록화(F4B diff에서
+   시각 확인)·트라이리니어 보간 차수·SH 대역 — 32³ 예산 트레이드는 별도 페이즈.
 
 ## 5. 비목표
 
