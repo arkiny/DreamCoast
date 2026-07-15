@@ -700,9 +700,11 @@ float4 fsMain(VSOutput input) : SV_Target
     // scene geometry; weight it by the diffuse albedo (× 1-metallic) and add it to the
     // ambient — the scene-bounce term IBL·AO can't capture. Absent -> 0.
     float3 gi = float3(0.0);
+    float3 gi_e = float3(0.0); // E(n) before receiver albedo / multi-bounce boost (debug view 15)
     if (pc.gdf_gi_index != NO_TEXTURE)
     {
         float3 e = g.textures[pc.gdf_gi_index].Sample(g.samp, input.uv).rgb;
+        gi_e = e;
         gi = (1.0 - metallic) * albedo * e;
         // Multi-bounce energy compensation (레퍼런스 엔진 DistantIlluminationRescale / Jimenez): the GDF GI is
         // a SINGLE bounce, so it misses the infinite-bounce energy that fills interiors. In an
@@ -718,7 +720,8 @@ float4 fsMain(VSOutput input) : SV_Target
     // Debug views (counts.y): 1 albedo, 2 normal, 3 metallic, 4 roughness,
     // 5 world pos, 6 AO, 7 direct light, 8 IBL ambient, 9 GDF AO, 10 GDF GI,
     // 11 light-count heatmap, 12 reflection buffer (the raw SW-RT reflected radiance sampled at
-    // this pixel — what a mirror here would show; 0 where no reflection is bound). 0 = lit.
+    // this pixel — what a mirror here would show; 0 where no reflection is bound),
+    // 13 sky visibility, 14 bent normal, 15 raw GI E(n) (oracle domain). 0 = lit.
     int dbg = globals.counts.y;
     if (dbg == 1) color = albedo;
     else if (dbg == 2) color = n * 0.5 + 0.5;
@@ -750,6 +753,10 @@ float4 fsMain(VSOutput input) : SV_Target
     else if (dbg == 13) color = float3(sky_vis);           // directional sky visibility V(n)
     else if (dbg == 14)                                    // bent normal (unoccluded avg dir); gray = none
         color = length(sky_bent) > 1e-4 ? (normalize(sky_bent) * 0.5 + 0.5) : float3(0.5);
+    // 15: raw GDF GI E(n) — the GI image before the receiver albedo and multi-bounce boost.
+    // Same physical quantity as the PT E-view (P8_PT_EVIEW), so the two are directly
+    // comparable; view 10 is albedo-weighted and NOT oracle-comparable.
+    else if (dbg == 15) color = gi_e * exposure;
 
     // PR-7 CSM cascade-index overlay (csm_params.y): tint the lit color by which cascade
     // shades each pixel so the split boundaries are inspectable. Only active with CSM on.
