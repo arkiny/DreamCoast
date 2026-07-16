@@ -2918,14 +2918,17 @@ impl App {
         // the legacy march); `P_GI_VOLUME=0` forces the march back.
         let gi_volume =
             quality::env_bool("P_GI_VOLUME", !gallery_scene) && gdf_gi && gi.has_gi_volume();
-        // F4 (hierarchical radiance cache, first increment): opt-in camera-anchored FINE level
-        // for the SH irradiance volume (`P_GI_VOL_CLIP=1`, content only via the `gi_volume`
-        // gate). The AABB is resolved ONCE here from the initial camera — the static-capture
-        // parity target (re-centering/toroidal reuse is a documented follow-up) — with the same
-        // eye precedence as the surface-card reference camera (`CAM_EYE` → authored level view →
-        // orbit framing). Half-extent = scene max axis / 6, clamped to [4, 12] m: fine enough to
-        // beat the coarse ~1.1 m spacing, small enough that 32³ probes stay dense.
-        if gi_volume && quality::env_bool("P_GI_VOL_CLIP", false) {
+        // F4 (hierarchical radiance cache): camera-anchored FINE level for the SH irradiance
+        // volume (`P_GI_VOL_CLIP`, content only via the `gi_volume` gate). Default ON since the
+        // F6E block-domain re-adjudication (docs/phase-f6e-scatter-tolerant-gate-plan.md §4c):
+        // interior block64 28.115 → 26.996 with the sunlit gate holding and its bias collapsing
+        // to ~0 — the old per-pixel gate was billing the fine structure as scatter. The AABB is
+        // resolved ONCE here from the initial camera, with the same eye precedence as the
+        // surface-card reference camera (`CAM_EYE` → authored level view → orbit framing);
+        // recentering (F4B) reconverges it on camera motion. Half-extent = scene max axis / 6,
+        // clamped to [4, 12] m: fine enough to beat the coarse ~1.1 m spacing, small enough
+        // that 32³ probes stay dense.
+        if gi_volume && quality::env_bool("P_GI_VOL_CLIP", true) {
             let (amin, amax) = gdf.scene_aabb();
             let eye = match (parse_vec3_env("CAM_EYE"), level_view) {
                 (Some(e), _) => e,
@@ -2974,12 +2977,12 @@ impl App {
         // the sweep's colour anchor lands exactly at 0.2: crop B−R −0.62 vs the path-traced
         // reference's −0.58, on a flat masked_avg basin (docs/phase-gi-volume-leak-plan.md §14).
         // F4B: the tint is a crutch for GI the field can't supply, so its calibration is
-        // per-field — opting into the fine level (`P_GI_VOL_CLIP=1`) feeds real near-camera E
-        // and the all-anchor sweep on the completed fine stack landed 0.15 (crop B−R −0.60 vs
-        // the reference's −0.58, EV11 deep crop 40.9→35.4 toward the reference). The fine
-        // DEFAULT stays off: officially no tint passes both PT budgets on the fine stack
-        // (docs/phase-f4b-hierarchical-cache-plan.md §5 판정 기록).
-        let gi_fine_want = gi_volume && quality::env_bool("P_GI_VOL_CLIP", false);
+        // per-field — the fine level feeds real near-camera E and the all-anchor sweep on the
+        // completed fine stack landed 0.15 (crop B−R −0.60 vs the reference's −0.58, EV11 deep
+        // crop 40.9→35.4 toward the reference). Fine defaults ON since the F6E block-domain
+        // re-adjudication un-blocked it (the per-pixel gate's FAIL was sub-block scatter, not
+        // misallocation — docs/phase-f6e-scatter-tolerant-gate-plan.md §4c).
+        let gi_fine_want = gi_volume && quality::env_bool("P_GI_VOL_CLIP", true);
         let skyvis_tint = std::env::var("P_SKYVIS_TINT")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())

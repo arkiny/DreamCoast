@@ -286,12 +286,20 @@ def check_pt(cfg: dict, backend: str, work: Path, manifest: dict, update: bool):
     if "masked_bias" in m:
         detail += f"  bias {m['masked_bias']:+.2f}/scatter {m['masked_scatter']:.2f}"
     if update:
+        # Down-only ratchet, enforced: a re-seed may lower a budget (verified
+        # improvement) or leave it, never raise it — a config whose measured value
+        # drifted up re-seeds against the OLD budget and keeps failing until the
+        # regression is fixed or the trade is explicitly re-adjudicated.
+        old = manifest["configs"].get(name, {})
+        budget = round(m["block64_avg"] + PT_BUDGET_MARGIN, 2)
+        if "block64_budget" in old:
+            budget = min(budget, old["block64_budget"])
         manifest["configs"][name] = {
             "desc": cfg["desc"],
             "env": cfg["env"],
             "pt": True,
             "lit_eps": cfg.get("lit_eps", 8),
-            "block64_budget": round(m["block64_avg"] + PT_BUDGET_MARGIN, 2),
+            "block64_budget": budget,
             "block64_measured": m["block64_avg"],
             "pt_black_frac": m["pt_black_frac"],
             # Shadow metrics (informational; no budget): the retired per-pixel gate,

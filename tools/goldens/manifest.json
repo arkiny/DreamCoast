@@ -20,11 +20,11 @@
       "sha256": "98be9a9eed98adba962eabfff6bc62d4d558cb1f47d9e2e206e5d93cc8cac4d2"
     },
     "sponza_pt_interior": {
-      "block16_avg": 30.3054,
-      "block32_avg": 29.4566,
-      "block64_budget": 28.41,
-      "block64_dark": 64.3725,
-      "block64_measured": 28.1147,
+      "block16_avg": 29.7593,
+      "block32_avg": 28.6532,
+      "block64_budget": 27.47,
+      "block64_dark": 62.0609,
+      "block64_measured": 27.1695,
       "desc": "content: raster-vs-PT lit-masked residual, interior colonnade (tolerant gate)",
       "env": {
         "AUTO_EXPOSURE": "1",
@@ -35,18 +35,18 @@
         "WARMUP_FRAMES": "192"
       },
       "lit_eps": 8,
-      "masked_avg": 31.6075,
+      "masked_avg": 31.3397,
       "pt": true,
-      "pt_black_frac": 0.3569,
-      "residual_bias": 16.9177,
-      "residual_scatter": 28.9647
+      "pt_black_frac": 0.3293,
+      "residual_bias": 11.596,
+      "residual_scatter": 30.1645
     },
     "sponza_pt_sunlit": {
-      "block16_avg": 23.0759,
-      "block32_avg": 21.3133,
-      "block64_budget": 19.2,
-      "block64_dark": 43.2633,
-      "block64_measured": 18.9013,
+      "block16_avg": 23.5106,
+      "block32_avg": 21.5261,
+      "block64_budget": 19.1,
+      "block64_dark": 42.9088,
+      "block64_measured": 18.7988,
       "desc": "content: raster-vs-PT lit-masked residual, sunlit atrium (primary fidelity gate)",
       "env": {
         "AUTO_EXPOSURE": "1",
@@ -57,11 +57,11 @@
         "WARMUP_FRAMES": "192"
       },
       "lit_eps": 8,
-      "masked_avg": 27.6844,
+      "masked_avg": 28.425,
       "pt": true,
-      "pt_black_frac": 0.0891,
-      "residual_bias": 5.1787,
-      "residual_scatter": 27.9848
+      "pt_black_frac": 0.0686,
+      "residual_bias": -0.2111,
+      "residual_scatter": 28.4328
     },
     "sponza_sc_viz": {
       "desc": "content: surface-cache viz (P_SC_VIZ)",
@@ -74,7 +74,7 @@
         "P_SC_VIZ": "1",
         "WARMUP_FRAMES": "64"
       },
-      "sha256": "8ebd623652c7da161207af2a60e5bd0a042cea8f0a1d6d5c4356b94b5116b40f"
+      "sha256": "6a8b1ef0a3ed818156b9df56e72cde6a809500e955df61e4a66f4fe3cca24160"
     }
   }
 }
