@@ -88,6 +88,13 @@ def main() -> int:
     lit_count = 0
     lit_luma_r = 0.0
     lit_luma_p = 0.0
+    # F6E block-mean accumulators (only touched when --lit-mask is given): per-16px-block
+    # channel sums of both sides. Coarser block sizes (32/64) aggregate these afterwards.
+    BW = (w + 15) // 16
+    BH = (h + 15) // 16
+    b_rsum = [[[0.0] * 3 for _ in range(BW)] for _ in range(BH)]
+    b_psum = [[[0.0] * 3 for _ in range(BW)] for _ in range(BH)]
+    b_cnt = [[0] * BW for _ in range(BH)]
     for y in range(h):
         for x in range(w):
             r0 = ra[x, y]
@@ -101,6 +108,12 @@ def main() -> int:
             if lit_eps is None:
                 da[x, y] = tuple(min(255, int(v * amp)) for v in d)
             else:
+                brs = b_rsum[y >> 4][x >> 4]
+                bps = b_psum[y >> 4][x >> 4]
+                for c in range(3):
+                    brs[c] += r0[c]
+                    bps[c] += r1[c]
+                b_cnt[y >> 4][x >> 4] += 1
                 luma_p = LUMA[0] * r1[0] + LUMA[1] * r1[1] + LUMA[2] * r1[2]
                 if luma_p > lit_eps:
                     lit_count += 1
@@ -188,6 +201,49 @@ def main() -> int:
         # Mean lit luma per side: a multiplicative exposure mismatch between the
         # captures shows up here directly (structure-independent sanity check).
         print(f"lit mean luma: raster {mean_r:.1f}   pt {mean_p:.1f}")
+        # F6E block-mean residual (docs/phase-f6e-scatter-tolerant-gate-plan.md §3B, shadow
+        # only): compare the two sides as N-px block means. Energy misallocation at the
+        # scale the GI representation can express survives block averaging; sub-block
+        # structural misalignment (which masked_scatter bills in full) cancels out.
+        # `dark` = the raster's mean block luma over PT-dark blocks — the flat-fill
+        # overfill the lit mask cannot see.
+        for nblk in (16, 32, 64):
+            f = nblk >> 4
+            lit_sum = 0.0
+            lit_blocks = 0
+            dark_sum = 0.0
+            dark_blocks = 0
+            for by in range(0, BH, f):
+                for bx in range(0, BW, f):
+                    cnt = 0
+                    rs = [0.0] * 3
+                    ps = [0.0] * 3
+                    for oy in range(f):
+                        for ox in range(f):
+                            if by + oy < BH and bx + ox < BW:
+                                cnt += b_cnt[by + oy][bx + ox]
+                                for c in range(3):
+                                    rs[c] += b_rsum[by + oy][bx + ox][c]
+                                    ps[c] += b_psum[by + oy][bx + ox][c]
+                    if cnt == 0:
+                        continue
+                    rm = [v / cnt for v in rs]
+                    pm = [v / cnt for v in ps]
+                    luma_pb = LUMA[0] * pm[0] + LUMA[1] * pm[1] + LUMA[2] * pm[2]
+                    if luma_pb > lit_eps:
+                        lit_blocks += 1
+                        lit_sum += sum(abs(rm[c] - pm[c]) for c in range(3)) / 3.0
+                    else:
+                        dark_blocks += 1
+                        dark_sum += LUMA[0] * rm[0] + LUMA[1] * rm[1] + LUMA[2] * rm[2]
+            blk_avg = lit_sum / lit_blocks if lit_blocks else 0.0
+            blk_dark = dark_sum / dark_blocks if dark_blocks else 0.0
+            print(
+                f"block{nblk}: lit avg abs diff {blk_avg:.3f} ({lit_blocks} blocks)   "
+                f"dark raster luma {blk_dark:.3f} ({dark_blocks} blocks)"
+            )
+            metrics[f"block{nblk}_avg"] = round(blk_avg, 4)
+            metrics[f"block{nblk}_dark"] = round(blk_dark, 4)
         metrics.update(
             {
                 "lit_eps": lit_eps,
