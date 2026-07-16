@@ -20,11 +20,11 @@
       "sha256": "98be9a9eed98adba962eabfff6bc62d4d558cb1f47d9e2e206e5d93cc8cac4d2"
     },
     "sponza_pt_interior": {
-      "block16_avg": 29.7017,
-      "block32_avg": 28.5473,
-      "block64_budget": 27.3,
-      "block64_dark": 65.2217,
-      "block64_measured": 26.9964,
+      "block16_avg": 29.3864,
+      "block32_avg": 28.2031,
+      "block64_budget": 26.84,
+      "block64_dark": 65.2503,
+      "block64_measured": 26.5406,
       "desc": "content: raster-vs-PT lit-masked residual, interior colonnade (tolerant gate)",
       "env": {
         "AUTO_EXPOSURE": "1",
@@ -35,18 +35,18 @@
         "WARMUP_FRAMES": "192"
       },
       "lit_eps": 8,
-      "masked_avg": 31.4464,
+      "masked_avg": 31.104,
       "pt": true,
-      "pt_black_frac": 0.3264,
-      "residual_bias": 10.0143,
-      "residual_scatter": 30.4736
+      "pt_black_frac": 0.3299,
+      "residual_bias": 11.2593,
+      "residual_scatter": 29.877
     },
     "sponza_pt_sunlit": {
-      "block16_avg": 23.8302,
-      "block32_avg": 21.8638,
+      "block16_avg": 23.7698,
+      "block32_avg": 21.8275,
       "block64_budget": 19.2,
-      "block64_dark": 43.2431,
-      "block64_measured": 19.1422,
+      "block64_dark": 44.6739,
+      "block64_measured": 19.1012,
       "desc": "content: raster-vs-PT lit-masked residual, sunlit atrium (primary fidelity gate)",
       "env": {
         "AUTO_EXPOSURE": "1",
@@ -57,11 +57,11 @@
         "WARMUP_FRAMES": "192"
       },
       "lit_eps": 8,
-      "masked_avg": 28.7432,
+      "masked_avg": 28.6366,
       "pt": true,
-      "pt_black_frac": 0.0697,
-      "residual_bias": -0.0326,
-      "residual_scatter": 28.7736
+      "pt_black_frac": 0.071,
+      "residual_bias": 0.3722,
+      "residual_scatter": 28.7039
     },
     "sponza_sc_viz": {
       "desc": "content: surface-cache viz (P_SC_VIZ)",
@@ -74,7 +74,7 @@
         "P_SC_VIZ": "1",
         "WARMUP_FRAMES": "64"
       },
-      "sha256": "dd97d55757645253a0c083b70470117ee52f6d2c60ec794b47e286226693df73"
+      "sha256": "102f141e23e1dc06c3e262df5a4d259322100dc241035d743fc78b62a856414f"
     }
   }
 }

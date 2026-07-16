@@ -3052,14 +3052,16 @@ impl App {
         // bias→scatter wall that blocks the fine default.
         let gi_repair_flags = u32::from(quality::env_bool("P_GI_READ_OFFSET", true))
             | (u32::from(quality::env_bool("P_GI_SUN_HARDVIS", false)) << 1);
-        // F6F: gv_shadow penumbra cone slope. 0 = the shader-side reference-derived value
-        // (cot of the path tracer's sun angular radius, ~50 — single source: sky_common's
-        // SUN_COS_MAX); >0 = explicit. Default 16.0 = the legacy slope (byte-inert) until
-        // the F6F calibration commit (docs/phase-f6f-sun-penumbra-plan.md).
+        // F6F: gv_shadow penumbra cone slope. Default 0 = the shader-side reference-derived
+        // value (cot of the path tracer's sun angular radius, ~50 — single source:
+        // sky_common's SUN_COS_MAX); >0 = explicit override (16 = the legacy ~3.6° cone,
+        // ×3.1 the reference sun — it read a ray passing 10 cm from geometry 5 m out as 68%
+        // shadowed). Calibration verdict (plan §4): the matched slope improves BOTH gates
+        // over the fine baseline (sunlit 19.142→19.101, interior 26.996→26.541).
         let gi_sun_k = std::env::var("P_GI_SUN_K")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(16.0)
+            .unwrap_or(0.0)
             .clamp(0.0, 1024.0);
         // Deferred-parity cache skylight (see the App field doc): tier-driven, env-overridable,
         // and only meaningful with the volume-GI path (the SH sky-visibility volumes it reads).
