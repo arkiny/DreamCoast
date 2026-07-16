@@ -16,9 +16,8 @@ static const uint NO_TEXTURE = 0xFFFFFFFFu;
 // RR_START_BOUNCE bounces a path survives with probability ~ its throughput.
 static const uint MAX_BOUNCES = 8u;
 static const uint RR_START_BOUNCE = 3u;
-// The sun is a finite disk light (not a delta direction) so shadows have a soft
-// penumbra. `SUN_COS_MAX` is the cosine of its angular radius (~1.1 degrees).
-static const float SUN_COS_MAX = 0.9998;
+// The sun disk constants (`SUN_COS_MAX` / `SUN_PENUMBRA_K`) live in sky_common.slang —
+// single-sourced with the GI volume's soft-shadow cone slope (F6F).
 
 // Push constants shared by both path-tracer entry points.
 struct PushConstants

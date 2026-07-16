@@ -1264,11 +1264,14 @@ pub(crate) fn gi_volume_push(
     // containment. 0 = normal (and the byte the pre-F4B packing left at zero).
     fine_reset: f32,
     // E-oracle repair seam: bit0 = feedback reads offset one voxel toward the ray side (stop
-    // importing energy across walls), bit1 = intersection-only sun visibility (drop the k=16
-    // near-miss penumbra — ~13x the sun's angular radius). 0 = the exact legacy estimator.
+    // importing energy across walls), bit1 = intersection-only sun visibility (the k→∞
+    // diagnostic end point). 0 = the exact legacy estimator.
     flags: u32,
-) -> [u8; 196] {
-    let mut pc = [0u8; 196];
+    // F6F: gv_shadow penumbra cone slope — 0 = the shader's reference-derived SUN_PENUMBRA_K
+    // (single source with the path tracer's sun disk), >0 = explicit (16.0 = legacy).
+    sun_k: f32,
+) -> [u8; 200] {
+    let mut pc = [0u8; 200];
     let put3 = |pc: &mut [u8], o: usize, v: [f32; 3]| {
         for (i, x) in v.iter().enumerate() {
             pc[o + i * 4..o + i * 4 + 4].copy_from_slice(&x.to_le_bytes());
@@ -1308,6 +1311,7 @@ pub(crate) fn gi_volume_push(
     put3(&mut pc, 176, fine_max);
     pc[188..192].copy_from_slice(&fine_reset.to_le_bytes());
     pc[192..196].copy_from_slice(&flags.to_le_bytes());
+    pc[196..200].copy_from_slice(&sun_k.to_le_bytes());
     pc
 }
 

@@ -880,6 +880,8 @@ struct App {
     /// E-oracle repair seam bits for the volume update (bit0 `P_GI_READ_OFFSET` feedback-read
     /// offset, bit1 `P_GI_SUN_HARDVIS` intersection-only sun visibility); 0 = legacy estimator.
     gi_repair_flags: u32,
+    /// F6F: gv_shadow penumbra cone slope (`P_GI_SUN_K`; 0 = reference-derived ~50, 16 = legacy).
+    gi_sun_k: f32,
     /// 레퍼런스식 indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
     /// directional sky-visibility): neutral leak fraction (`P_SKYVIS_TINT`) + min-occlusion floor
     /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
@@ -3050,6 +3052,15 @@ impl App {
         // bias→scatter wall that blocks the fine default.
         let gi_repair_flags = u32::from(quality::env_bool("P_GI_READ_OFFSET", true))
             | (u32::from(quality::env_bool("P_GI_SUN_HARDVIS", false)) << 1);
+        // F6F: gv_shadow penumbra cone slope. 0 = the shader-side reference-derived value
+        // (cot of the path tracer's sun angular radius, ~50 — single source: sky_common's
+        // SUN_COS_MAX); >0 = explicit. Default 16.0 = the legacy slope (byte-inert) until
+        // the F6F calibration commit (docs/phase-f6f-sun-penumbra-plan.md).
+        let gi_sun_k = std::env::var("P_GI_SUN_K")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(16.0)
+            .clamp(0.0, 1024.0);
         // Deferred-parity cache skylight (see the App field doc): tier-driven, env-overridable,
         // and only meaningful with the volume-GI path (the SH sky-visibility volumes it reads).
         let cache_sky_occlude =
@@ -3861,6 +3872,7 @@ impl App {
             gi_volume_spp,
             gi_volume_alpha,
             gi_repair_flags,
+            gi_sun_k,
             skyvis_tint,
             skyvis_tint_v0,
             skyvis_min_occ,
@@ -6946,6 +6958,7 @@ impl App {
                             gi_vol_slab,
                             gi_y_offset,
                             self.gi_repair_flags,
+                            self.gi_sun_k,
                         )
                         .zip(self.gi.gi_volume_sampled())
                         .map(|(vext, (rad_base, skyvis_base))| {

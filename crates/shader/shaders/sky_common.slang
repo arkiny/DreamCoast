@@ -13,6 +13,16 @@
 #ifndef SKY_COMMON_INCLUDED
 #define SKY_COMMON_INCLUDED
 
+// The sun is a finite disk light (not a delta direction) so shadows have a soft
+// penumbra. `SUN_COS_MAX` is the cosine of its angular radius (~1.1 degrees; the
+// path tracer's NEE samples this cone). `SUN_PENUMBRA_K` is the matching sphere-
+// traced soft-shadow cone slope, k = cot(angular radius) ≈ 50 — the penumbra factor
+// `k·h/t` reaches full light exactly at the disk's edge, so a sphere-traced shadow
+// and the reference's cone-sampled shadow agree on penumbra width (F6F). Defined
+// here (not rt_common) so the GI volume's `gv_shadow` shares the ONE sun geometry.
+static const float SUN_COS_MAX = 0.9998;
+static const float SUN_PENUMBRA_K = SUN_COS_MAX / sqrt(1.0 - SUN_COS_MAX * SUN_COS_MAX);
+
 static const float ATM_PI = 3.14159265359;
 static const float PLANET_R = 6360.0; // km
 static const float ATMOS_R = 6460.0;  // km (100 km atmosphere)

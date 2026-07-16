@@ -59,6 +59,9 @@ struct GiVolumePush
     uint flags;          // E-oracle repair seam: bit0 = feedback reads offset one voxel toward
                          // the ray side (no cross-wall import), bit1 = intersection-only sun
                          // visibility (no near-miss penumbra). 0 = the exact legacy estimator.
+    float sun_k;         // F6F: gv_shadow penumbra cone slope — 0 = the reference-derived
+                         // SUN_PENUMBRA_K (single source with the path tracer's sun disk),
+                         // >0 = explicit override (`P_GI_SUN_K`; 16 = the legacy slope).
 };
 
 [[vk::push_constant]]
@@ -87,18 +90,21 @@ float3 scene_normal(float3 p)
 
 float gv_shadow(float3 o, float3 d)
 {
+    // F6F: penumbra cone slope. The legacy 16 emulates a ~3.6° cone — ×3.1 the REFERENCE
+    // sun's angular radius (SUN_COS_MAX, ~1.15°), so a ray passing 10 cm from geometry 5 m
+    // out read 68% shadowed. sun_k = 0 selects the reference-matched SUN_PENUMBRA_K (~50,
+    // single source with the path tracer's sampled sun disk); `P_GI_SUN_HARDVIS` (flags
+    // bit1) is the k→∞ end point (intersection kill only — kept for diagnostics; it
+    // over-injects on the sunlit gate, F6E §4c).
+    float k = pc.sun_k > 0.0 ? pc.sun_k : SUN_PENUMBRA_K;
     float res = 1.0, t = 0.05, maxt = pc.params.y;
     for (int i = 0; i < 32; i++)
     {
         float h = scene_occ(o + d * t);
         if (h < 0.003)
             return 0.0;
-        // Near-miss penumbra: k=16 emulates a ~3.6° cone — ~13× the physical sun's angular
-        // radius, and the coarse field already fattens thin blockers into their own penumbra.
-        // `P_GI_SUN_HARDVIS` (flags bit1) keeps only the real-intersection kill above: measured
-        // +4.3 lit-mean E on the interior oracle row (36.4 → 40.7 vs the reference 48.8).
         if ((pc.flags & 2u) == 0u)
-            res = min(res, 16.0 * h / t);
+            res = min(res, k * h / t);
         t += clamp(h, 0.02, 0.4);
         if (t > maxt)
             break;

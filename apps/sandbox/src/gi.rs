@@ -217,7 +217,7 @@ impl GiSystem {
             dreamcoast_shader::gi_volume_cs_dxil,
             dreamcoast_shader::gi_volume_cs_metallib,
             "gi_volume",
-            196, // 192 (F4 fine rows) + 4: the E-oracle repair-seam flag word.
+            200, // 192 (F4 fine rows) + 4 (E-oracle repair flags) + 4 (F6F sun_k slope).
         )?;
         let sp_trace_pipeline = compute(
             dreamcoast_shader::screen_probe_trace_cs_spirv,
@@ -576,6 +576,8 @@ impl GiSystem {
         y_offset: u32,
         // E-oracle repair seam (bit0 `P_GI_READ_OFFSET`, bit1 `P_GI_SUN_HARDVIS`); 0 = legacy.
         repair_flags: u32,
+        // F6F: gv_shadow penumbra cone slope (`P_GI_SUN_K`; 0 = reference-derived, 16 = legacy).
+        sun_k: f32,
     ) -> Option<ResourceId> {
         let pipe = self.gi_vol_pipeline.as_ref()?;
         let read = ((self.gi_vol_frame + 1) % 2) as usize;
@@ -681,6 +683,7 @@ impl GiSystem {
                     fine_max,     // F4 fine-level world max
                     fine_reset,   // F4B: 1.0 = fine-half EMA/hit reads invalid (recentering)
                     repair_flags, // E-oracle repair seam bits (0 = legacy estimator)
+                    sun_k,        // F6F penumbra cone slope (0 = reference-derived)
                 ));
                 let g = GI_VOL_DIM.div_ceil(4);
                 // F4B: the dispatch always covers ONE level's rows — fine mode selects the
