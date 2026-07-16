@@ -268,9 +268,12 @@ impl GiSystem {
         // `base + channel*4 + coeff`, so only the base index is pushed.
         let mut gi_vol: [[Option<Volume>; GI_VOL_SH]; 2] = Default::default();
         let mut gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2] = Default::default();
-        // F4: opt-in camera-anchored fine level (`P_GI_VOL_CLIP`), read once here so the volume
-        // allocation below can double its height. Unset/0 = OFF = the legacy single-level layout.
-        let gi_vol_fine = crate::quality::env_bool("P_GI_VOL_CLIP", false);
+        // F4: camera-anchored fine level (`P_GI_VOL_CLIP`), read once here so the volume
+        // allocation below can double its height; 0 = the legacy single-level layout. Default
+        // ON in lockstep with main.rs's consumption sites — when THIS site lagged at false,
+        // the "fine default ON" landing silently ran coarse storage under the fine-conditional
+        // tint (F6F plan §2b post-mortem): every default read of one knob must agree.
+        let gi_vol_fine = crate::quality::env_bool("P_GI_VOL_CLIP", true);
         if gi_vol_pipeline.is_some() {
             let vd = VolumeDesc {
                 width: GI_VOL_DIM,
