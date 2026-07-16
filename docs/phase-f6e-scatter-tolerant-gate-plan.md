@@ -1,6 +1,9 @@
 # F6E 계획서 — masked_avg 산포 관용화: 게이트 메트릭 정책 논의
 
-> 상태: **논의 — 정책 결정 대기** (2026-07-16). 동기 = E-오라클 페이즈
+> 상태: **B안 채택·게이트 랜딩** (2026-07-16, 사용자 승인) — block64_avg가 주 게이트
+> (예산 interior 28.41 / sunlit 19.2 시드, 하향 래칫 유지), masked_avg·bias·scatter·
+> block16/32·dark는 섀도. 후속 = fine·hardvis 재심 + tint 재캘리브(§4b 하단). 동기 =
+> E-오라클 페이즈
 > ([phase-e-oracle-plan.md](phase-e-oracle-plan.md) §2f)가 세 번째로 같은 벽에 부딪힘:
 > **E-도메인(물리)에서 레퍼런스에 근접하는 수리가 디스플레이 게이트에서 벌점**을 받는
 > bias→scatter 전환 문제. 게이트 정책 변경은 이전 페이즈들에서 명시적 비목표였으므로

@@ -14,17 +14,21 @@ against a stored golden two ways:
        cross-box / cross-backend / driver nondeterminism that a raw hash cannot,
        so the same manifest stays useful off the golden-authoring machine. A
        config passes tolerantly if mean <= --mean-tol and max <= --max-tol.
-    3. **PT residual budget (F6 Part B).** A config with ``pt: True`` renders
-       TWICE from the same fixed camera — raster, then ``P8_PATHTRACE=1`` — and
-       gates on the **lit-masked** raster-vs-path-tracer residual from
-       ``rt-compare.py --lit-mask --json`` (``masked_avg <= residual_budget``,
-       improved-or-neutral). The lit mask (PT luma > ``lit_eps``) excludes the
-       PT-dim region that light paths within the bounce budget cannot reach (a
-       GI-reach property the raster's approximate GI lifts — F4 territory, not
-       actionable here); ``pt_black_frac`` is reported for coverage, never
-       gated. There is no SHA/PNG golden for these configs — the budget IS the
-       regression. Budgets are seeded from measurement (--update) and only
-       re-baselined downward on a verified improvement.
+    3. **PT residual budget (F6 Part B, F6E gate).** A config with ``pt: True``
+       renders TWICE from the same fixed camera — raster, then
+       ``P8_PATHTRACE=1`` — and gates on the **lit-masked 64-px block-mean**
+       raster-vs-path-tracer residual from ``rt-compare.py --lit-mask --json``
+       (``block64_avg <= block64_budget``, improved-or-neutral). Block means
+       measure energy allocation at the scale the GI representation can
+       express; the retired per-pixel ``masked_avg`` billed sub-block
+       misalignment in full (a ~28 scatter pedestal) and is kept as a shadow
+       metric with the F6D bias/scatter decomposition
+       (docs/phase-f6e-scatter-tolerant-gate-plan.md). The lit mask (PT luma >
+       ``lit_eps``) excludes the PT-dim region that light paths within the
+       bounce budget cannot reach; ``pt_black_frac`` is reported for coverage,
+       never gated. There is no SHA/PNG golden for these configs — the budget
+       IS the regression. Budgets are seeded from measurement (--update) and
+       only re-baselined downward on a verified improvement.
 
 A config's exact-SHA match is authoritative on the golden-authoring box; the
 pixel tolerance is the portable fallback and is only evaluated when a PNG golden
@@ -267,13 +271,18 @@ def check_pt(cfg: dict, backend: str, work: Path, manifest: dict, update: bool):
             False,
         )
 
+    # F6E gate (docs/phase-f6e-scatter-tolerant-gate-plan.md §4b): the gated residual is
+    # the 64-px BLOCK-MEAN lit residual — energy misallocation at the scale the GI
+    # representation can express. Per-pixel masked_avg punished sub-block structural
+    # misalignment in full (a ~28 scatter pedestal on both gates), which blocked
+    # E-domain-correct repairs while favouring flat fills; it is now a SHADOW metric,
+    # as are the F6D bias/scatter decomposition, the finer block sizes, and the
+    # (AE-confounded) dark track.
     detail = (
-        f"masked_avg {m['masked_avg']:.3f}  pt_black {m['pt_black_frac'] * 100:.1f}%  "
+        f"block64 {m['block64_avg']:.3f}  pt_black {m['pt_black_frac'] * 100:.1f}%  "
         f"lit_mean r/pt {m['lit_mean_raster']:.1f}/{m['lit_mean_pt']:.1f}"
     )
-    # F6D shadow decomposition (bias = signed uniform offset, scatter = per-pixel MAD
-    # about it): reported + recorded for trend tracking, NEVER gated — the gate below
-    # stays masked_avg <= budget (docs/phase-f6d-residual-decomposition-plan.md).
+    detail += f"  masked_avg {m['masked_avg']:.2f}"
     if "masked_bias" in m:
         detail += f"  bias {m['masked_bias']:+.2f}/scatter {m['masked_scatter']:.2f}"
     if update:
@@ -282,20 +291,25 @@ def check_pt(cfg: dict, backend: str, work: Path, manifest: dict, update: bool):
             "env": cfg["env"],
             "pt": True,
             "lit_eps": cfg.get("lit_eps", 8),
-            "residual_budget": round(m["masked_avg"] + PT_BUDGET_MARGIN, 2),
-            "residual_measured": m["masked_avg"],
+            "block64_budget": round(m["block64_avg"] + PT_BUDGET_MARGIN, 2),
+            "block64_measured": m["block64_avg"],
             "pt_black_frac": m["pt_black_frac"],
-            # F6D shadow metrics (informational; no budget).
+            # Shadow metrics (informational; no budget): the retired per-pixel gate,
+            # the F6D decomposition, the finer blocks and the dark track.
+            "masked_avg": m["masked_avg"],
             "residual_bias": m.get("masked_bias"),
             "residual_scatter": m.get("masked_scatter"),
+            "block16_avg": m.get("block16_avg"),
+            "block32_avg": m.get("block32_avg"),
+            "block64_dark": m.get("block64_dark"),
         }
         return (name, "UPDATED", detail, True)
 
     golden = manifest["configs"].get(name)
-    if not golden or "residual_budget" not in golden:
+    if not golden or "block64_budget" not in golden:
         return (name, "NO-GOLDEN", "run with --update to seed the budget", False)
-    budget = golden["residual_budget"]
-    if m["masked_avg"] <= budget:
+    budget = golden["block64_budget"]
+    if m["block64_avg"] <= budget:
         return (name, "PASS", f"{detail}  <= budget {budget}", True)
     return (name, "FAIL", f"{detail}  OVER budget {budget}", False)
 
