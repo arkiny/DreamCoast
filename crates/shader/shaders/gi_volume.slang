@@ -58,7 +58,10 @@ struct GiVolumePush
     float4 fine_max;     // F4: xyz fine-level world max (fine half packed at y ∈ [dims.y, 2*dims.y))
     uint flags;          // E-oracle repair seam: bit0 = feedback reads offset one voxel toward
                          // the ray side (no cross-wall import), bit1 = intersection-only sun
-                         // visibility (no near-miss penumbra). 0 = the exact legacy estimator.
+                         // visibility (no near-miss penumbra); bit2 = unsigned-safe hit epsilon
+                         // (F6I: an |d| sheet band can be stepped over by the 0.02 m min step —
+                         // eps 0.012 makes a perpendicular crossing mathematically un-skippable,
+                         // 0.012 + 0.012 > 0.02). 0 = the exact legacy estimator.
     float sun_k;         // F6F: gv_shadow penumbra cone slope — 0 = the reference-derived
                          // SUN_PENUMBRA_K (single source with the path tracer's sun disk),
                          // >0 = explicit override (`P_GI_SUN_K`; 16 = the legacy slope).
@@ -101,7 +104,7 @@ float gv_shadow(float3 o, float3 d)
     for (int i = 0; i < 32; i++)
     {
         float h = scene_occ(o + d * t);
-        if (h < 0.003)
+        if (h < ((pc.flags & 4u) != 0u ? 0.012 : 0.003))
             return 0.0;
         if ((pc.flags & 2u) == 0u)
             res = min(res, k * h / t);
@@ -300,7 +303,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         {
             float3 p = probe + dir * t;
             float d = scene_march(p);
-            if (d < 0.003)
+            if (d < ((pc.flags & 4u) != 0u ? 0.012 : 0.003))
             {
                 hp = p;
                 hit = true;

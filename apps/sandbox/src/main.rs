@@ -3065,8 +3065,14 @@ impl App {
         // 36.4 → 40.7 vs the reference 48.8) but display-adverse — it re-opens the empty tint
         // window (sunlit over-brightens at 0.2, scatter eats the bias gain below it), the same
         // bias→scatter wall that blocks the fine default.
+        // F6I (flags bit2): with unsigned sheet bands (P_SDF_OPEN_UNSIGNED) the volume march
+        // and sun-shadow march need the tunnel-proof hit epsilon — |d| has no sign crossing,
+        // so the 0.02 m min step can hop a thin curtain band and flood cloth-shadowed regions
+        // with phantom sun-lit E. Tied to the SAME knob so the legacy signed path is untouched.
+        let sdf_open_unsigned = quality::env_bool("P_SDF_OPEN_UNSIGNED", false);
         let gi_repair_flags = u32::from(quality::env_bool("P_GI_READ_OFFSET", true))
-            | (u32::from(quality::env_bool("P_GI_SUN_HARDVIS", false)) << 1);
+            | (u32::from(quality::env_bool("P_GI_SUN_HARDVIS", false)) << 1)
+            | (u32::from(sdf_open_unsigned) << 2);
         // F6F: gv_shadow penumbra cone slope. Default 0 = the shader-side reference-derived
         // value (cot of the path tracer's sun angular radius, ~50 — single source:
         // sky_common's SUN_COS_MAX); >0 = explicit override (16 = the legacy ~3.6° cone,
