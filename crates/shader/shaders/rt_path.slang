@@ -21,7 +21,7 @@
 // Trace a single path and return its radiance. `cornell` switches to an enclosed
 // box lit only by emissive surfaces (black background, no sun).
 float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool cornell,
-             bool e_view, inout uint rng)
+             bool e_view, bool v_view, inout uint rng)
 {
     float3 radiance = float3(0, 0, 0);
     float3 throughput = float3(1, 1, 1);
@@ -47,6 +47,14 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
             // miss = 0 convention (the IBL supplies direct sky separately). Deeper bounces
             // keep the sky: a hit surface's own shading includes its skylight, exactly as
             // the volume's hit-point sky_fill term does.
+            // V-oracle (F6H): the bounce-1 sky escape IS the tally — 1, exactly the volume's
+            // sky-visibility projection (vis = hit ? 0 : 1); the progressive mean is the
+            // cosine-weighted V(n) the deferred skylight needs at this surface.
+            if (v_view && bounce == 1u)
+            {
+                radiance = float3(1.0, 1.0, 1.0);
+                break;
+            }
             if (!cornell && !(e_view && bounce == 1u))
                 radiance += throughput * sky(ray.Direction, sun_dir, pc.sun.w, bounce == 0u);
             break;
@@ -103,7 +111,7 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
         // cosine draw makes the progressive mean exactly E(n) at the primary surface (the
         // same Monte-Carlo estimator gdf_gi's march uses), in the volume's pre-albedo,
         // pre-exposure units. Debug-mode only; the flag is never set on the gate/anchor paths.
-        if (e_view && bounce == 0u)
+        if ((e_view || v_view) && bounce == 0u)
         {
             ray.Origin = ray.Origin + ray.Direction * q.CommittedRayT() + n * 0.002;
             ray.Direction = cosine_hemisphere(n, rng);
@@ -111,6 +119,9 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
             ray.TMax = 10000.0;
             continue;
         }
+        // V-oracle: a bounce-1 GEOMETRY hit is occlusion — tally 0 and terminate (no shading).
+        if (v_view && bounce == 1u)
+            break;
 
         RtMaterialSample mat;
         if (bounce == 0u && content_instances())
@@ -202,6 +213,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 
     bool cornell = (pc.flip_y & 2u) != 0u;
     bool e_view = (pc.flip_y & 4u) != 0u;
+    bool v_view = (pc.flip_y & 8u) != 0u;
     float sy = (pc.flip_y & 1u) != 0u ? 1.0 : -1.0;
     uint pixel = tid.y * pc.width + tid.x;
 
@@ -218,7 +230,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         float2 ndc = float2(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * sy);
         float3 dir = primary_ray_dir(ndc);
         float cone_spread = primary_cone_spread(ndc);
-        sum += trace(pc.cam_pos.xyz, dir, cone_spread, sun_dir, cornell, e_view, rng);
+        sum += trace(pc.cam_pos.xyz, dir, cone_spread, sun_dir, cornell, e_view, v_view, rng);
     }
     sum /= float(pc.spp);
 

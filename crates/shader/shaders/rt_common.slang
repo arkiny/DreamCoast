@@ -32,7 +32,10 @@ struct PushConstants
     uint width;
     uint height;
     uint flip_y;            // bit0: 1 = Vulkan (Y down); bit1: 1 = Cornell box mode; bit2: E-oracle
-                            // view (P8_PT_EVIEW — cosine-hemisphere irradiance at the primary hit,
+                            // view; bit3: V-oracle view (P8_PT_VVIEW — cosine-weighted sky
+                            // visibility at the primary hit, the volume's vis = hit ? 0 : 1
+                            // projection ray-traced; F6H). bit2 (P8_PT_EVIEW — cosine-hemisphere
+                            // irradiance at the primary hit,
                             // scene-bounce only: a bounce-1 sky escape contributes 0, matching the
                             // GI volume's stored-E convention; docs/phase-e-oracle-plan.md)
     uint spp;               // samples per dispatch
