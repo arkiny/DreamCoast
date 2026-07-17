@@ -29,6 +29,9 @@
 #include "sky_common.slang"
 
 static const float GV_PI = 3.14159265359;
+// F6I: average opacity of ONE unresolved surface band for the partial-occlusion march
+// (open-mesh seam only). Swept in the E/lit/V oracle domain; see the march comment.
+static const float GV_TAU = 0.4;
 
 // Real SH band-0/1 basis normalisation: Y0 = sqrt(1/4pi), Y1 = sqrt(3/4pi)*{y,z,x}.
 static const float SH_C0 = 0.2820947918; // sqrt(1/(4*pi))
@@ -255,6 +258,81 @@ float3 stratified_sphere(uint s, inout uint rng)
 }
 
 [shader("compute")]
+
+// Shade a march band/hit point: direct sun (soft-shadowed) + the V-gated sky fill +
+// the previous frame's stored irradiance (multibounce), returning the outgoing
+// radiance toward the probe. Shared by the legacy binary march and the F6I
+// partial-occlusion march (both pass the same quantities; pc supplies the rest).
+float3 gv_shade_hit(float3 hp, float3 sun_dir, uint read_base, bool fine_on)
+{
+    float3 hn = scene_normal(hp);
+    float ndl = max(dot(hn, sun_dir), 0.0);
+    float sh = ndl > 0.0 ? gv_shadow(hp + hn * 0.02, sun_dir) : 1.0;
+    bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp);
+    float3 alb = is_ground ? pc.ground.xyz : albedo_at(hp);
+    // Sky fill at the bounce hit: the ACTUAL procedural-sky radiance in the hit's
+    // upper hemisphere (single source of truth with the IBL capture / path tracer /
+    // sdf_cache_light), NOT a flat pre-photometric constant. `pc.params.z` now carries
+    // the sky gain (was the old flat fill value); sun intensity is `pc.sun.w`. This is
+    // the fix for interiors reading near-black: the old constant was ~5 orders of
+    // magnitude below the lux-scaled sun, so occluded/bounce-lit geometry lost all fill.
+    float3 sky_fill = procedural_sky(hn, sun_dir, pc.sun.w, pc.params.z, false)
+                      * (0.5 + 0.5 * hn.y);
+    // Multibounce: the hit surface re-emits its own indirect irradiance, read
+    // DIRECTIONALLY from the previous-frame SH volume in the hit's normal direction.
+    // The DIRECT sun + sky fill are irradiance, so they get the albedo/PI BRDF; the
+    // stored irradiance (E) re-enters as albedo*indirect (the ×PI to irradiance cancels
+    // the BRDF 1/PI), matching the old scalar probe's energy.
+    float3 cprev[4];
+    // `P_GI_READ_OFFSET` (flags bit0): the hit sits ON geometry, so a plain trilinear
+    // feedback read straddles the wall and imports the far side's radiance — a transport
+    // path the reference doesn't have (measured feedback gain ×2.2 vs the ~1.25 a
+    // closed room's albedo supports, most of it sky-blue). Reading one voxel toward the
+    // ray side keeps the footprint on the hemisphere the ray actually came from.
+    float3 hp_read = hp;
+    if ((pc.flags & 1u) != 0u)
+        hp_read = hp + hn * ((pc.aabb_max.xyz - pc.aabb_min.xyz) * (1.0 / 32.0));
+    // F4 fine mode: read the finest level containing the hit (fine-first fall-through);
+    // the OFF path keeps the exact legacy call (untouched instruction stream).
+    if (fine_on)
+    {
+        bool cin;
+        float3 cuvw = gv_level_uvw(hp_read, cin);
+        read_coeffs_fine(read_base, cuvw, cin, cprev);
+    }
+    else
+        read_coeffs(read_base, hp_read, cprev);
+    float3 indirect = eval_irradiance(cprev, hn);
+    // Occlude the sky fill by the PREVIOUS frame's sky-visibility V(hn) at the hit
+    // (single source with the deferred skylight occlusion — no new state): a hit deep
+    // inside an enclosed interior must not receive the open-sky fill. Before the
+    // full-grid dispatch fix this term looked minor (3/4 of the probes never ran);
+    // on the working field it flooded every interior with sky-blue E (crop B-R +12
+    // vs the reference's -0.6). The reset frame (no history) and a missing sky-vis
+    // binding fall back to V = 1 — the unoccluded legacy term, so the EMA bootstrap
+    // starts bright and converges down instead of crushing to black.
+    if (pc.read_rgb.y != 0xFFFFFFFFu && pc.read_rgb.w == 0u)
+    {
+        float svprev[4];
+        // The sky-vis feedback read shares the wall-straddling geometry — same offset.
+        if (fine_on)
+        {
+            bool sin_;
+            float3 suvw = gv_level_uvw(hp_read, sin_);
+            read_coeffs_scalar_fine(pc.read_rgb.y, suvw, sin_, svprev);
+        }
+        else
+            read_coeffs_scalar(pc.read_rgb.y, hp_read, svprev);
+        float hv = svprev[0] * SH_C0
+                   + (2.0 / 3.0)
+                         * (SH_C1 * hn.y * svprev[1] + SH_C1 * hn.z * svprev[2]
+                            + SH_C1 * hn.x * svprev[3]);
+        sky_fill *= saturate(hv);
+    }
+    return alb * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / GV_PI) + alb * indirect;
+}
+
+
 [numthreads(4, 4, 4)]
 void csMain(uint3 tid: SV_DispatchThreadID)
 {
@@ -304,112 +382,86 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     for (uint s = 0; s < spp; s++)
     {
         float3 dir = strat ? stratified_sphere(s, seed) : uniform_sphere(seed);
-        float t = bias;
-        bool hit = false;
-        float3 hp = probe;
-        for (int i = 0; i < 48; i++)
+        float3 radiance = float3(0.0, 0.0, 0.0);
+        float vis;
+        if ((pc.flags & 4u) != 0u)
         {
-            float3 p = probe + dir * t;
-            float d = scene_march(p);
-            if (d < ((pc.flags & 4u) != 0u ? 0.012 : 0.003))
+            // F6I partial-occlusion march (the open-mesh seam): the content field
+            // cannot resolve sub-voxel structure, so a surface band is a PARTIAL
+            // occluder — a binary march must either leak through band holes (the sun
+            // and sky floods, plan 2h/2i) or over-block the upward hemisphere (the V
+            // collapse). Instead: each outside->inside band transition sheds
+            // (1 - GV_TAU) of the remaining transmittance into that surface's shading
+            // and carries GV_TAU onward; the sky visibility is the transmittance that
+            // survives to escape. GV_TAU is the honest average opacity of one
+            // unresolved band (swept in the E/lit/V domain).
+            float T = 1.0;
+            float t = bias;
+            bool was_in = false;
+            bool shaded = false;
+            for (int i = 0; i < 48; i++)
             {
-                hp = p;
-                hit = true;
-                break;
-            }
-            t += max(d, 0.02);
-            if (t > maxt)
-                break;
-        }
-        // Incoming radiance L(dir) arriving at the probe along this ray.
-        float3 radiance;
-        if (hit)
-        {
-            float3 hn = scene_normal(hp);
-            float ndl = max(dot(hn, sun_dir), 0.0);
-            float sh = ndl > 0.0 ? gv_shadow(hp + hn * 0.02, sun_dir) : 1.0;
-            bool is_ground = (hp.y - GROUND_Y) < geo_inside(hp);
-            float3 alb = is_ground ? pc.ground.xyz : albedo_at(hp);
-            // Sky fill at the bounce hit: the ACTUAL procedural-sky radiance in the hit's
-            // upper hemisphere (single source of truth with the IBL capture / path tracer /
-            // sdf_cache_light), NOT a flat pre-photometric constant. `pc.params.z` now carries
-            // the sky gain (was the old flat fill value); sun intensity is `pc.sun.w`. This is
-            // the fix for interiors reading near-black: the old constant was ~5 orders of
-            // magnitude below the lux-scaled sun, so occluded/bounce-lit geometry lost all fill.
-            float3 sky_fill = procedural_sky(hn, sun_dir, pc.sun.w, pc.params.z, false)
-                              * (0.5 + 0.5 * hn.y);
-            // Multibounce: the hit surface re-emits its own indirect irradiance, read
-            // DIRECTIONALLY from the previous-frame SH volume in the hit's normal direction.
-            // The DIRECT sun + sky fill are irradiance, so they get the albedo/PI BRDF; the
-            // stored irradiance (E) re-enters as albedo*indirect (the ×PI to irradiance cancels
-            // the BRDF 1/PI), matching the old scalar probe's energy.
-            float3 cprev[4];
-            // `P_GI_READ_OFFSET` (flags bit0): the hit sits ON geometry, so a plain trilinear
-            // feedback read straddles the wall and imports the far side's radiance — a transport
-            // path the reference doesn't have (measured feedback gain ×2.2 vs the ~1.25 a
-            // closed room's albedo supports, most of it sky-blue). Reading one voxel toward the
-            // ray side keeps the footprint on the hemisphere the ray actually came from.
-            float3 hp_read = hp;
-            if ((pc.flags & 1u) != 0u)
-                hp_read = hp + hn * ((pc.aabb_max.xyz - pc.aabb_min.xyz) * (1.0 / 32.0));
-            // F4 fine mode: read the finest level containing the hit (fine-first fall-through);
-            // the OFF path keeps the exact legacy call (untouched instruction stream).
-            if (fine_on)
-            {
-                bool cin;
-                float3 cuvw = gv_level_uvw(hp_read, cin);
-                read_coeffs_fine(read_base, cuvw, cin, cprev);
-            }
-            else
-                read_coeffs(read_base, hp_read, cprev);
-            float3 indirect = eval_irradiance(cprev, hn);
-            // Occlude the sky fill by the PREVIOUS frame's sky-visibility V(hn) at the hit
-            // (single source with the deferred skylight occlusion — no new state): a hit deep
-            // inside an enclosed interior must not receive the open-sky fill. Before the
-            // full-grid dispatch fix this term looked minor (3/4 of the probes never ran);
-            // on the working field it flooded every interior with sky-blue E (crop B-R +12
-            // vs the reference's -0.6). The reset frame (no history) and a missing sky-vis
-            // binding fall back to V = 1 — the unoccluded legacy term, so the EMA bootstrap
-            // starts bright and converges down instead of crushing to black.
-            if (pc.read_rgb.y != 0xFFFFFFFFu && pc.read_rgb.w == 0u)
-            {
-                float svprev[4];
-                // The sky-vis feedback read shares the wall-straddling geometry — same offset.
-                if (fine_on)
+                float3 p = probe + dir * t;
+                float d = scene_march(p);
+                // Radiance keeps the LEGACY first-hit semantics (12 mm, tunnel-proof with
+                // the 0.02 in-band crawl): a thick wall's "partial" band transparency is a
+                // resolution artifact, and shading anything beyond the first surface
+                // re-imports the sun/sky floods (measured: tau-weighted accumulation AND
+                // first-encounter-at-band both land E ~82, plan 2j).
+                if (!shaded && d < 0.012)
                 {
-                    bool sin_;
-                    float3 suvw = gv_level_uvw(hp_read, sin_);
-                    read_coeffs_scalar_fine(pc.read_rgb.y, suvw, sin_, svprev);
+                    radiance = gv_shade_hit(p, sun_dir, read_base, fine_on);
+                    shaded = true;
                 }
-                else
-                    read_coeffs_scalar(pc.read_rgb.y, hp_read, svprev);
-                float hv = svprev[0] * SH_C0
-                           + (2.0 / 3.0)
-                                 * (SH_C1 * hn.y * svprev[1] + SH_C1 * hn.z * svprev[2]
-                                    + SH_C1 * hn.x * svprev[3]);
-                sky_fill *= saturate(hv);
+                // Sky VISIBILITY marches on as transmittance: for the upward hemisphere the
+                // unresolved cloth/rail layer really is a partial occluder — each
+                // outside->inside band transition keeps GV_TAU of the remaining
+                // transmittance (V 62.6 -> 82.6 at tau 0.4).
+                bool in_band = d < 0.2;
+                if (in_band && !was_in)
+                    T *= GV_TAU;
+                if (shaded && T < 0.05)
+                {
+                    T = 0.0;
+                    break;
+                }
+                was_in = in_band;
+                t += in_band ? 0.02 : max(d, 0.02);
+                if (t > maxt)
+                    break;
             }
-            radiance = alb * (pc.sun.w * ndl * sh + sky_fill) * (1.0 / GV_PI) + alb * indirect;
+            vis = T < 0.05 ? 0.0 : T;
         }
         else
         {
-            // Sky-escape contributes 0 to the stored indirect, matching the per-pixel march
-            // (`gdf_gi.slang trace_bounce`): the deferred IBL diffuse already supplies the
-            // (AO-occluded) sky, so adding the sky here too would double-count it AND flood the
-            // directional irradiance with blue — drowning the coloured scene bounce (e.g. a red
-            // curtain) the volume exists to propagate. The volume now carries ONLY scene radiance
-            // (single-source sky = IBL). The hemispheric `sky_fill` at HITS stays: that is the sky
-            // bouncing off a surface, a legitimate indirect term the march also keeps.
-            radiance = float3(0.0, 0.0, 0.0);
+            float t = bias;
+            bool hit = false;
+            float3 hp = probe;
+            for (int i = 0; i < 48; i++)
+            {
+                float3 p = probe + dir * t;
+                float d = scene_march(p);
+                if (d < 0.003)
+                {
+                    hp = p;
+                    hit = true;
+                    break;
+                }
+                t += max(d, 0.02);
+                if (t > maxt)
+                    break;
+            }
+            if (hit)
+                radiance = gv_shade_hit(hp, sun_dir, read_base, fine_on);
+            vis = hit ? 0.0 : 1.0;
         }
         // Project L(dir) onto the band-0/1 SH basis.
         sh0 += radiance * SH_C0;
         sh1 += radiance * (SH_C1 * dir.y);
         sh2 += radiance * (SH_C1 * dir.z);
         sh3 += radiance * (SH_C1 * dir.x);
-        // Sky-visibility: 1 if this ray escaped to sky, 0 if it hit geometry — projected the same
-        // way so a receiver reconstructs the cosine-weighted hemispherical sky visibility V(n).
-        float vis = hit ? 0.0 : 1.0;
+        // Sky-visibility: the surviving transmittance (legacy: 1 on escape, 0 on hit) —
+        // projected the same way so a receiver reconstructs the cosine-weighted V(n).
         sv0 += vis * SH_C0;
         sv1 += vis * (SH_C1 * dir.y);
         sv2 += vis * (SH_C1 * dir.z);
