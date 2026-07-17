@@ -768,6 +768,127 @@ pub fn mesh_open_fraction(index_bytes: &[u8]) -> f32 {
     boundary as f32 / edges.len() as f32
 }
 
+/// Robust in/out re-sign for OPEN meshes (F6J): the closest-triangle sign paints
+/// half-spaces "inside" behind open sheets, and no |d|-side strategy can express a
+/// perforated shell (the F6I frontier). Instead, vote the sign per voxel with THREE
+/// axis-aligned crossing parities: along each axis column, count triangle crossings
+/// below the voxel centre — odd = that axis votes "inside" — and take the majority.
+/// A sheet's back half-space gets one odd vote (the axis crossing the sheet) and two
+/// even votes -> outside (the phantom dies); a solid wall's interior is crossed once
+/// from every side -> inside (the zero-crossing survives). Magnitudes keep |d|.
+/// Degenerate projections (triangles edge-on to an axis) are skipped — the other
+/// axes cover them, and the majority absorbs stragglers.
+pub fn parity_resign(vol: &mut SdfVolume, vtx_bytes: &[u8], idx_bytes: &[u8]) {
+    let [dx, dy, dz] = vol.dims;
+    let dims = [dx as usize, dy as usize, dz as usize];
+    let n = dims[0] * dims[1] * dims[2];
+    let tri_count = idx_bytes.len() / 12;
+    if n == 0 || tri_count == 0 {
+        return;
+    }
+    let idx_at =
+        |i: usize| u32::from_le_bytes(idx_bytes[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+    let pos = |v: usize| read_vec3(vtx_bytes, v * VTX_STRIDE);
+    let ext = [
+        vol.aabb_max[0] - vol.aabb_min[0],
+        vol.aabb_max[1] - vol.aabb_min[1],
+        vol.aabb_max[2] - vol.aabb_min[2],
+    ];
+    let vox = [
+        ext[0] / dims[0] as f32,
+        ext[1] / dims[1] as f32,
+        ext[2] / dims[2] as f32,
+    ];
+    // votes[i] bit a = axis a's parity for voxel i (built from sorted column crossings).
+    let mut votes = vec![0u8; n];
+    for axis in 0..3usize {
+        let (a1, a2) = ((axis + 1) % 3, (axis + 2) % 3);
+        if vox[a1] <= 0.0 || vox[a2] <= 0.0 || vox[axis] <= 0.0 {
+            continue;
+        }
+        // Crossing depths along `axis`, per (a1, a2) column.
+        let cols = dims[a1] * dims[a2];
+        let mut crossings: Vec<Vec<f32>> = vec![Vec::new(); cols];
+        for t in 0..tri_count {
+            let p0 = pos(idx_at(t * 3));
+            let p1 = pos(idx_at(t * 3 + 1));
+            let p2 = pos(idx_at(t * 3 + 2));
+            // Projected 2D triangle in the (a1, a2) plane.
+            let q0 = [p0[a1], p0[a2]];
+            let q1 = [p1[a1], p1[a2]];
+            let q2 = [p2[a1], p2[a2]];
+            let det = (q1[0] - q0[0]) * (q2[1] - q0[1]) - (q2[0] - q0[0]) * (q1[1] - q0[1]);
+            if det.abs() < 1e-12 {
+                continue; // edge-on to this axis: the other axes vote
+            }
+            let inv = 1.0 / det;
+            // Column index ranges the projected AABB touches.
+            // Deterministic sub-voxel jitter: authored geometry sits at round
+            // coordinates, so exact voxel centres land on shared quad edges and
+            // double-count (even parity). Fixed irrational offsets break every such
+            // tie identically on every machine (the bake stays a deterministic cook).
+            let jit = [0.0f32, 0.257_896, 0.413_729];
+            let centre =
+                |a: usize, i: usize, j: f32| vol.aabb_min[a] + (i as f32 + 0.5 + j) * vox[a];
+            let col_range = |a: usize, lo: f32, hi: f32| -> (usize, usize) {
+                let s = ((lo - vol.aabb_min[a]) / vox[a] - 0.5).ceil().max(0.0) as usize;
+                let e = ((hi - vol.aabb_min[a]) / vox[a] - 0.5).floor();
+                if e < 0.0 {
+                    return (1, 0);
+                }
+                (s, (e as usize).min(dims[a] - 1))
+            };
+            let (i1s, i1e) =
+                col_range(a1, q0[0].min(q1[0]).min(q2[0]), q0[0].max(q1[0]).max(q2[0]));
+            let (i2s, i2e) =
+                col_range(a2, q0[1].min(q1[1]).min(q2[1]), q0[1].max(q1[1]).max(q2[1]));
+            for i2 in i2s..=i2e.min(dims[a2].saturating_sub(1)) {
+                for i1 in i1s..=i1e.min(dims[a1].saturating_sub(1)) {
+                    let c = [centre(a1, i1, jit[1]), centre(a2, i2, jit[2])];
+                    // Barycentric point-in-triangle in the projected plane.
+                    let w1 =
+                        ((c[0] - q0[0]) * (q2[1] - q0[1]) - (c[1] - q0[1]) * (q2[0] - q0[0])) * inv;
+                    let w2 =
+                        ((c[1] - q0[1]) * (q1[0] - q0[0]) - (c[0] - q0[0]) * (q1[1] - q0[1])) * inv;
+                    if w1 < 0.0 || w2 < 0.0 || w1 + w2 > 1.0 {
+                        continue;
+                    }
+                    let h = p0[axis] + w1 * (p1[axis] - p0[axis]) + w2 * (p2[axis] - p0[axis]);
+                    crossings[i1 + dims[a1] * i2].push(h);
+                }
+            }
+        }
+        // Walk each column: parity at a voxel centre = crossings strictly below it.
+        for i2 in 0..dims[a2] {
+            for i1 in 0..dims[a1] {
+                let col = &mut crossings[i1 + dims[a1] * i2];
+                if col.is_empty() {
+                    continue;
+                }
+                col.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mut k = 0usize;
+                for ia in 0..dims[axis] {
+                    let zc = vol.aabb_min[axis] + (ia as f32 + 0.5) * vox[axis];
+                    while k < col.len() && col[k] < zc {
+                        k += 1;
+                    }
+                    if k & 1 == 1 {
+                        let mut c3 = [0usize; 3];
+                        c3[axis] = ia;
+                        c3[a1] = i1;
+                        c3[a2] = i2;
+                        votes[c3[0] + dims[0] * (c3[1] + dims[1] * c3[2])] |= 1 << axis;
+                    }
+                }
+            }
+        }
+    }
+    for (v, &vote) in vol.voxels.iter_mut().zip(votes.iter()) {
+        let a = v.abs();
+        *v = if vote.count_ones() >= 2 { -a } else { a };
+    }
+}
+
 /// Re-sign a baked field whose closest-triangle sign is contaminated (non-watertight
 /// meshes paint half-spaces "inside" — F6H/F6I): flood-fill AIR from the tile boundary
 /// (the bake padding guarantees the boundary shell is air) through cells with
@@ -1011,6 +1132,103 @@ mod tests {
             normal,
             uv: [0.0, 0.0],
         }
+    }
+
+    fn parity_vtx(ps: &[[f32; 3]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for p in ps {
+            for c in p {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+            out.extend_from_slice(&[0u8; 20]); // normal + uv padding (32-byte stride)
+        }
+        out
+    }
+
+    fn parity_idx(is: &[u32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in is {
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn parity_resign_box_interior_negative_air_positive() {
+        // A closed box [0.4,1.2]^3 in a 16^3 tile over [0,1.6]^3, with GARBAGE signs
+        // (everything positive): the 3-axis parity majority restores inside/outside.
+        let (b0, b1) = (0.4f32, 1.2f32);
+        let v = [
+            [b0, b0, b0],
+            [b1, b0, b0],
+            [b1, b1, b0],
+            [b0, b1, b0],
+            [b0, b0, b1],
+            [b1, b0, b1],
+            [b1, b1, b1],
+            [b0, b1, b1],
+        ];
+        let quads: [[u32; 4]; 6] = [
+            [0, 1, 2, 3],
+            [4, 5, 6, 7],
+            [0, 1, 5, 4],
+            [2, 3, 7, 6],
+            [0, 3, 7, 4],
+            [1, 2, 6, 5],
+        ];
+        let mut idx = Vec::new();
+        for q in quads {
+            idx.extend_from_slice(&[q[0], q[1], q[2], q[0], q[2], q[3]]);
+        }
+        let dims = [16u32, 16, 16];
+        let voxels = vec![0.1f32; 16 * 16 * 16]; // garbage: all "outside"
+        let mut vol = SdfVolume {
+            dims,
+            aabb_min: [0.0; 3],
+            aabb_max: [1.6; 3],
+            voxels,
+        };
+        parity_resign(&mut vol, &parity_vtx(&v), &parity_idx(&idx));
+        let at = |x: usize, y: usize, z: usize| vol.voxels[x + 16 * (y + 16 * z)];
+        assert!(at(8, 8, 8) < 0.0, "box interior must vote inside");
+        assert!(at(1, 8, 8) > 0.0, "air outside stays positive");
+        assert!(at(14, 14, 14) > 0.0, "far corner air stays positive");
+    }
+
+    #[test]
+    fn parity_resign_open_sheet_back_half_space_positive() {
+        // A single open quad at x = 0.8 with the classic contamination (back half
+        // negative): only the x axis sees a crossing -> 1/3 votes -> outside
+        // everywhere; the phantom half-space dies.
+        let v = [
+            [0.8f32, 0.2, 0.2],
+            [0.8, 1.4, 0.2],
+            [0.8, 1.4, 1.4],
+            [0.8, 0.2, 1.4],
+        ];
+        let idx = [0u32, 1, 2, 0, 2, 3];
+        let dims = [16u32, 16, 16];
+        let mut voxels = vec![0.0f32; 16 * 16 * 16];
+        for z in 0..16usize {
+            for y in 0..16usize {
+                for x in 0..16usize {
+                    let wx = (x as f32 + 0.5) * 0.1;
+                    let sign = if wx > 0.8 { -1.0 } else { 1.0 };
+                    voxels[x + 16 * (y + 16 * z)] = sign * (wx - 0.8).abs().max(0.01);
+                }
+            }
+        }
+        let mut vol = SdfVolume {
+            dims,
+            aabb_min: [0.0; 3],
+            aabb_max: [1.6; 3],
+            voxels,
+        };
+        parity_resign(&mut vol, &parity_vtx(&v), &parity_idx(&idx));
+        assert!(
+            vol.voxels.iter().all(|&d| d > 0.0),
+            "an open sheet must have no interior"
+        );
     }
 
     #[test]
