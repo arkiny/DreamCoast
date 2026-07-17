@@ -744,6 +744,30 @@ pub const MESH_SDF_MAX_DIM: u32 = 48;
 /// are `extent/dim` per axis); per-axis dims keep voxels near-uniform at
 /// [`MESH_SDF_TARGET_VOXEL`] instead, so the same atlas budget carries a higher
 /// long-axis cap (probe table: phase-f2-mesh-sdf-scalability-plan.md §2).
+/// Fraction of a mesh's unique edges with exactly ONE incident triangle (boundary
+/// edges). 0 for a watertight mesh; an open sheet (cloth, banner) approaches its
+/// perimeter/area ratio. A mesh with a significant open fraction cannot carry a
+/// meaningful inside/outside sign — its closest-triangle sign paints the entire
+/// half-space behind the sheet "inside" (F6H).
+pub fn mesh_open_fraction(index_bytes: &[u8]) -> f32 {
+    use std::collections::HashMap;
+    let mut edges: HashMap<(u32, u32), u32> = HashMap::with_capacity(index_bytes.len() / 4);
+    let idx = |i: usize| u32::from_le_bytes(index_bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    let tri_count = index_bytes.len() / 12;
+    for t in 0..tri_count {
+        let tri = [idx(t * 3), idx(t * 3 + 1), idx(t * 3 + 2)];
+        for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            let key = (a.min(b), a.max(b));
+            *edges.entry(key).or_insert(0) += 1;
+        }
+    }
+    if edges.is_empty() {
+        return 0.0;
+    }
+    let boundary = edges.values().filter(|&&c| c == 1).count();
+    boundary as f32 / edges.len() as f32
+}
+
 pub fn mesh_sdf_dims(aabb_min: [f32; 3], aabb_max: [f32; 3]) -> [u32; 3] {
     let dim = |a: usize| {
         let ext = (aabb_max[a] - aabb_min[a]).max(0.0);

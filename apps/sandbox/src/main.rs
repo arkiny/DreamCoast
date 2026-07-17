@@ -2154,6 +2154,21 @@ impl App {
                         // Mostly-negative DF ⇒ globally-inverted normals (open space read as "inside"):
                         // negate so the sign is correct (removes compose poisoning + spurious AO/GI floor
                         // blotches). The 60 % threshold only flips clearly-inverted meshes.
+                        // F6H (`P_SDF_OPEN_UNSIGNED`): a non-watertight mesh bakes half-space
+                        // signs — an open sheet's closest-triangle sign paints the whole half-
+                        // space behind it "inside", and dozens of curtain/banner AABBs composed
+                        // that into phantom solid filling the atrium air (the sky-visibility
+                        // field read ~0 where the reference sees ~0.9; the 50%-negative census
+                        // is the fingerprint, invisible to the 60% auto-flip below). Such a
+                        // field cannot carry a sign: take |d| — an unsigned shell still stops
+                        // the march at the surface band, and the space behind stays open.
+                        let open_unsigned = crate::quality::env_bool("P_SDF_OPEN_UNSIGNED", false)
+                            && dreamcoast_asset::sdf::mesh_open_fraction(&s.midx) > 0.05;
+                        if open_unsigned {
+                            for v in &mut vol.voxels {
+                                *v = v.abs();
+                            }
+                        }
                         let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count();
                         if neg * 5 > vol.voxels.len() * 3 {
                             for v in &mut vol.voxels {
