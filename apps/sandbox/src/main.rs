@@ -2163,8 +2163,17 @@ impl App {
                         // field cannot carry a sign: take |d| — an unsigned shell still stops
                         // the march at the surface band, and the space behind stays open.
                         let open_frac = dreamcoast_asset::sdf::mesh_open_fraction(&s.midx);
+                        // F6I refinement: unsigned+erosion is for true SHEETS only (thin
+                        // min-axis — cloth, banners). Thick perforated shells (the roof, the
+                        // arcade walls) keep their bake sign: their closest-triangle sign is
+                        // sound away from opening rims, while |d| made them translucent to
+                        // every march (plan 2b — the sun flooded through the 0.9 m roof).
+                        let min_ext = (s.mx[0] - s.mn[0])
+                            .min(s.mx[1] - s.mn[1])
+                            .min(s.mx[2] - s.mn[2]);
                         let open_unsigned = crate::quality::env_bool("P_SDF_OPEN_UNSIGNED", false)
-                            && open_frac > 0.05;
+                            && open_frac > 0.05
+                            && min_ext < 0.5;
                         if open_unsigned {
                             // F6I erosion: |d| alone loses the zero-crossing — a band thinner
                             // than the ATLAS voxel never dips below the march epsilon, so big
