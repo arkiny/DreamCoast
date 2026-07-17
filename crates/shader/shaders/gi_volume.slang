@@ -104,7 +104,15 @@ float gv_shadow(float3 o, float3 d)
     for (int i = 0; i < 32; i++)
     {
         float h = scene_occ(o + d * t);
-        if (h < ((pc.flags & 4u) != 0u ? 0.012 : 0.003))
+        // F6I: unresolved-band sun occlusion (bit2 = the open-mesh seam). The content
+        // field blurs sub-voxel structure, so eroded sheet bands have HOLES a 12 mm
+        // kill slips through — the sun lit nearly the whole interior floor (footprint
+        // audit, plan 2g). Passing within 0.2 m of the band IS passing through
+        // unresolved geometry at this resolution: killing there lands the E total at
+        // x1.10 of the reference (26.0 vs 23.71; band 0.1 -> 44, 0.3 -> 24) with the
+        // sky-visibility march untouched. The residual blue skew is the sky_fill
+        // share and belongs to the next spectral unit, not this band.
+        if (h < ((pc.flags & 4u) != 0u ? 0.2 : 0.003))
             return 0.0;
         if ((pc.flags & 2u) == 0u)
             res = min(res, k * h / t);
