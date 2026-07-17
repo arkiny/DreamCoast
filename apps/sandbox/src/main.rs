@@ -2163,38 +2163,42 @@ impl App {
                         // field cannot carry a sign: take |d| — an unsigned shell still stops
                         // the march at the surface band, and the space behind stays open.
                         let open_frac = dreamcoast_asset::sdf::mesh_open_fraction(&s.midx);
-                        // F6I refinement: unsigned+erosion is for true SHEETS only (thin
-                        // min-axis — cloth, banners). Thick perforated shells (the roof, the
-                        // arcade walls) keep their bake sign: their closest-triangle sign is
-                        // sound away from opening rims, while |d| made them translucent to
-                        // every march (plan 2b — the sun flooded through the 0.9 m roof).
-                        let min_ext = (s.mx[0] - s.mn[0])
-                            .min(s.mx[1] - s.mn[1])
-                            .min(s.mx[2] - s.mn[2]);
-                        let open_unsigned = crate::quality::env_bool("P_SDF_OPEN_UNSIGNED", false)
+                        // F6I flood-resign (`P_SDF_OPEN_UNSIGNED` seam): a non-watertight
+                        // mesh's closest-triangle sign paints half-spaces "inside" (the V
+                        // phantom), while plain |d| loses the sub-voxel zero-crossing and made
+                        // the roof translucent to the sun (plan 2b/2c — the shell dilemma).
+                        // Flood-filling air from the padded tile boundary re-signs the phantom
+                        // air positive and preserves true wall interiors negative; a sheet
+                        // with no enclosed volume floods all-positive, which we detect and
+                        // erode by half its thin-axis atlas voxel so the band stays detectable
+                        // by the marches at any sampling resolution.
+                        if crate::quality::env_bool("P_SDF_OPEN_UNSIGNED", false)
                             && open_frac > 0.05
-                            && min_ext < 0.5;
-                        if open_unsigned {
-                            // F6I erosion: |d| alone loses the zero-crossing — a band thinner
-                            // than the ATLAS voxel never dips below the march epsilon, so big
-                            // open shells (the 40 m roof, open 63%) turned TRANSPARENT and the
-                            // sun flooded the interior (plan 2). Eroding by half the thin-axis
-                            // atlas voxel restores a detectable crossing at any resolution:
-                            // the sheet fattens to ~its voxel (the honest representation) while
-                            // the far half-space stays open.
-                            let cap = std::env::var("P11_ATLAS_MAX_DIM")
-                                .ok()
-                                .and_then(|v| v.trim().parse::<u32>().ok())
-                                .map(|d| d.clamp(dreamcoast_asset::sdf::MESH_SDF_MIN_DIM, 48))
-                                .unwrap_or(32);
-                            let mut erode = f32::MAX;
+                        {
+                            let mut vox_min = f32::MAX;
                             for a in 0..3 {
                                 let ext = (s.mx[a] - s.mn[a]).max(1e-4);
-                                let ad = s.dims[a].min(cap).max(1) as f32;
-                                erode = erode.min(0.5 * ext / ad);
+                                vox_min = vox_min.min(ext / s.dims[a].max(1) as f32);
                             }
-                            for v in &mut vol.voxels {
-                                *v = v.abs() - erode;
+                            dreamcoast_asset::sdf::flood_resign(&mut vol, 0.75 * vox_min);
+                            let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count();
+                            if neg * 200 < vol.voxels.len() {
+                                // No enclosed volume at this resolution = a sheet: erode so
+                                // the |d| band reaches the march epsilon (F6I plan 2b).
+                                let cap = std::env::var("P11_ATLAS_MAX_DIM")
+                                    .ok()
+                                    .and_then(|v| v.trim().parse::<u32>().ok())
+                                    .map(|d| d.clamp(dreamcoast_asset::sdf::MESH_SDF_MIN_DIM, 48))
+                                    .unwrap_or(32);
+                                let mut erode = f32::MAX;
+                                for a in 0..3 {
+                                    let ext = (s.mx[a] - s.mn[a]).max(1e-4);
+                                    let ad = s.dims[a].min(cap).max(1) as f32;
+                                    erode = erode.min(0.5 * ext / ad);
+                                }
+                                for v in &mut vol.voxels {
+                                    *v -= erode;
+                                }
                             }
                         }
                         let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count();

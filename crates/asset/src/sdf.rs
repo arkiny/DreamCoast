@@ -768,6 +768,122 @@ pub fn mesh_open_fraction(index_bytes: &[u8]) -> f32 {
     boundary as f32 / edges.len() as f32
 }
 
+/// Re-sign a baked field whose closest-triangle sign is contaminated (non-watertight
+/// meshes paint half-spaces "inside" — F6H/F6I): flood-fill AIR from the tile boundary
+/// (the bake padding guarantees the boundary shell is air) through cells with
+/// `|d| >= band`, treating the surface band (`|d| < band`) as the only barrier — the
+/// phantom sign boundaries sit in open air where `|d|` is large, so the flood crosses
+/// and re-signs them. Reached cells become `+|d|`; unreached cells (true wall
+/// interiors, sealed cavities) become `-|d|`; band cells stay positive when they touch
+/// reached air (the outside skin) and go negative otherwise (the inside skin), which
+/// preserves a detectable zero-crossing for thick shells at any sampling resolution.
+/// A sheet with no enclosed volume floods around its open rim and comes out all-
+/// positive — the caller detects that (negative fraction ~0) and applies the
+/// resolution-honest erosion instead. `band` ~ 0.75x the smallest voxel edge.
+pub fn flood_resign(vol: &mut SdfVolume, band: f32) {
+    let [dx, dy, dz] = vol.dims;
+    let (dx, dy, dz) = (dx as usize, dy as usize, dz as usize);
+    let n = dx * dy * dz;
+    if n == 0 {
+        return;
+    }
+    let idx = |x: usize, y: usize, z: usize| x + dx * (y + dy * z);
+    let mut reached = vec![false; n];
+    let mut queue = std::collections::VecDeque::new();
+    // Seed every boundary cell that is clear of the surface band.
+    for z in 0..dz {
+        for y in 0..dy {
+            for x in 0..dx {
+                if x == 0 || y == 0 || z == 0 || x == dx - 1 || y == dy - 1 || z == dz - 1 {
+                    let i = idx(x, y, z);
+                    if vol.voxels[i].abs() >= band && !reached[i] {
+                        reached[i] = true;
+                        queue.push_back((x, y, z));
+                    }
+                }
+            }
+        }
+    }
+    while let Some((x, y, z)) = queue.pop_front() {
+        let push =
+            |x: usize,
+             y: usize,
+             z: usize,
+             reached: &mut Vec<bool>,
+             queue: &mut std::collections::VecDeque<(usize, usize, usize)>| {
+                let i = idx(x, y, z);
+                if !reached[i] && vol.voxels[i].abs() >= band {
+                    reached[i] = true;
+                    queue.push_back((x, y, z));
+                }
+            };
+        if x > 0 {
+            push(x - 1, y, z, &mut reached, &mut queue);
+        }
+        if x + 1 < dx {
+            push(x + 1, y, z, &mut reached, &mut queue);
+        }
+        if y > 0 {
+            push(x, y - 1, z, &mut reached, &mut queue);
+        }
+        if y + 1 < dy {
+            push(x, y + 1, z, &mut reached, &mut queue);
+        }
+        if z > 0 {
+            push(x, y, z - 1, &mut reached, &mut queue);
+        }
+        if z + 1 < dz {
+            push(x, y, z + 1, &mut reached, &mut queue);
+        }
+    }
+    // Band cells: positive iff they touch reached air (the outside skin).
+    let mut band_pos = vec![false; n];
+    for z in 0..dz {
+        for y in 0..dy {
+            for x in 0..dx {
+                let i = idx(x, y, z);
+                if vol.voxels[i].abs() < band {
+                    let mut touch = false;
+                    let mut probe = |x: usize, y: usize, z: usize| {
+                        if reached[idx(x, y, z)] {
+                            touch = true;
+                        }
+                    };
+                    if x > 0 {
+                        probe(x - 1, y, z);
+                    }
+                    if x + 1 < dx {
+                        probe(x + 1, y, z);
+                    }
+                    if y > 0 {
+                        probe(x, y - 1, z);
+                    }
+                    if y + 1 < dy {
+                        probe(x, y + 1, z);
+                    }
+                    if z > 0 {
+                        probe(x, y, z - 1);
+                    }
+                    if z + 1 < dz {
+                        probe(x, y, z + 1);
+                    }
+                    band_pos[i] = touch;
+                }
+            }
+        }
+    }
+    for i in 0..n {
+        let a = vol.voxels[i].abs();
+        vol.voxels[i] = if a >= band {
+            if reached[i] { a } else { -a }
+        } else if band_pos[i] {
+            a
+        } else {
+            -a
+        };
+    }
+}
+
 pub fn mesh_sdf_dims(aabb_min: [f32; 3], aabb_max: [f32; 3]) -> [u32; 3] {
     let dim = |a: usize| {
         let ext = (aabb_max[a] - aabb_min[a]).max(0.0);
@@ -895,6 +1011,90 @@ mod tests {
             normal,
             uv: [0.0, 0.0],
         }
+    }
+
+    #[test]
+    fn flood_resign_sheet_uncontaminates_both_sides() {
+        // A zero-thickness sheet at x = 0.8 in a 16^3 tile over [0, 1.6]^3, with the
+        // classic contamination: the whole back half-space baked negative. The flood
+        // goes around the open rim -> everything re-signs positive (the caller then
+        // erodes for band detectability).
+        let dims = [16u32, 16, 16];
+        let mut voxels = vec![0.0f32; 16 * 16 * 16];
+        for z in 0..16usize {
+            for y in 0..16usize {
+                for x in 0..16usize {
+                    let wx = (x as f32 + 0.5) * 0.1;
+                    let d = (wx - 0.8).abs();
+                    let sign = if wx > 0.8 { -1.0 } else { 1.0 }; // contaminated back side
+                    voxels[x + 16 * (y + 16 * z)] = sign * d;
+                }
+            }
+        }
+        let mut vol = SdfVolume {
+            dims,
+            aabb_min: [0.0; 3],
+            aabb_max: [1.6; 3],
+            voxels,
+        };
+        flood_resign(&mut vol, 0.075);
+        assert!(
+            vol.voxels.iter().all(|&d| d >= 0.0),
+            "sheet must flood all-positive"
+        );
+    }
+
+    #[test]
+    fn flood_resign_thick_wall_keeps_interior_negative() {
+        // A thick finite plate (box [0.6,1.0]x[0.3,1.3]x[0.3,1.3] — clear of the tile
+        // boundary, as the bake padding guarantees) with the back air contaminated
+        // negative: after the flood the back air re-signs positive (the flood goes
+        // around the plate) while the plate interior stays negative (the
+        // zero-crossing survives at any resolution).
+        let dims = [16u32, 16, 16];
+        let bmin = [0.6f32, 0.3, 0.3];
+        let bmax = [1.0f32, 1.3, 1.3];
+        let mut voxels = vec![0.0f32; 16 * 16 * 16];
+        for z in 0..16usize {
+            for y in 0..16usize {
+                for x in 0..16usize {
+                    let w = [
+                        (x as f32 + 0.5) * 0.1,
+                        (y as f32 + 0.5) * 0.1,
+                        (z as f32 + 0.5) * 0.1,
+                    ];
+                    // Exact box SDF (negative inside).
+                    let mut out2 = 0.0f32;
+                    let mut inner = f32::MIN;
+                    for a in 0..3 {
+                        let q = (bmin[a] - w[a]).max(w[a] - bmax[a]);
+                        if q > 0.0 {
+                            out2 += q * q;
+                        }
+                        inner = inner.max(q);
+                    }
+                    let d = if out2 > 0.0 { out2.sqrt() } else { inner };
+                    // Contaminate: the half-space behind the plate reads negative.
+                    let sign = if d < 0.0 || w[0] >= 1.0 { -1.0 } else { 1.0 };
+                    voxels[x + 16 * (y + 16 * z)] = sign * d.abs();
+                }
+            }
+        }
+        let mut vol = SdfVolume {
+            dims,
+            aabb_min: [0.0; 3],
+            aabb_max: [1.6; 3],
+            voxels,
+        };
+        flood_resign(&mut vol, 0.075);
+        let at = |x: usize| vol.voxels[x + 16 * (8 + 16 * 8)];
+        assert!(
+            at(14) > 0.0,
+            "back air must re-sign positive, got {}",
+            at(14)
+        );
+        assert!(at(1) > 0.0, "front air stays positive");
+        assert!(at(7) < 0.0, "plate interior stays negative, got {}", at(7));
     }
 
     #[test]
