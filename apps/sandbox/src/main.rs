@@ -2162,11 +2162,30 @@ impl App {
                         // is the fingerprint, invisible to the 60% auto-flip below). Such a
                         // field cannot carry a sign: take |d| — an unsigned shell still stops
                         // the march at the surface band, and the space behind stays open.
+                        let open_frac = dreamcoast_asset::sdf::mesh_open_fraction(&s.midx);
                         let open_unsigned = crate::quality::env_bool("P_SDF_OPEN_UNSIGNED", false)
-                            && dreamcoast_asset::sdf::mesh_open_fraction(&s.midx) > 0.05;
+                            && open_frac > 0.05;
                         if open_unsigned {
+                            // F6I erosion: |d| alone loses the zero-crossing — a band thinner
+                            // than the ATLAS voxel never dips below the march epsilon, so big
+                            // open shells (the 40 m roof, open 63%) turned TRANSPARENT and the
+                            // sun flooded the interior (plan 2). Eroding by half the thin-axis
+                            // atlas voxel restores a detectable crossing at any resolution:
+                            // the sheet fattens to ~its voxel (the honest representation) while
+                            // the far half-space stays open.
+                            let cap = std::env::var("P11_ATLAS_MAX_DIM")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<u32>().ok())
+                                .map(|d| d.clamp(dreamcoast_asset::sdf::MESH_SDF_MIN_DIM, 48))
+                                .unwrap_or(32);
+                            let mut erode = f32::MAX;
+                            for a in 0..3 {
+                                let ext = (s.mx[a] - s.mn[a]).max(1e-4);
+                                let ad = s.dims[a].min(cap).max(1) as f32;
+                                erode = erode.min(0.5 * ext / ad);
+                            }
                             for v in &mut vol.voxels {
-                                *v = v.abs();
+                                *v = v.abs() - erode;
                             }
                         }
                         let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count();
