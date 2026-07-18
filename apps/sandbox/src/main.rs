@@ -1081,6 +1081,9 @@ struct App {
     /// JITTER_TRACE_DIRECTION 0, "we want stable lighting"); a static scene's volume becomes an
     /// idempotent overwrite = fixed point. `P_GI_STABLE=1` (content only).
     gi_stable: bool,
+    /// F6K: direction-set rotation count under stable mode (1 = legacy pinned set;
+    /// K>1 = deterministic K-cycle rotation — variance ÷K, captures stay deterministic).
+    gi_dir_sets: u32,
     /// SSR resolve history neighbourhood clamp (breaks the mirror lit-history feedback oscillation a
     /// plain EMA only low-passes): 0 = off (byte-identical), 1 = variance clamp (mean ± γ·σ). Gallery
     /// forced 0. `P_SSR_HISTORY_CLAMP` / `P_SSR_CLAMP_GAMMA` override.
@@ -3491,6 +3494,17 @@ impl App {
         // decorrelated, and octant stratification (gi_volume.slang) keeps each set's coverage
         // honest. `P_GI_STABLE=0` restores jittered tracing for A/B.
         let gi_stable = !gallery_scene && quality::env_bool("P_GI_STABLE", true);
+        // F6K (`P_GI_DIR_SETS`): deterministic direction-set ROTATION under stable mode.
+        // Pinning the jitter to one set freezes each probe's 16-ray Monte-Carlo variance
+        // into SPATIAL mottle (the honest stack's blocker — plan 2l: probe-grid blotches
+        // = scatter ~36 made visible). Rotating through K sets on a fixed schedule keeps
+        // every capture deterministic (the index is frame-derived) while the EMA averages
+        // K× the directions — variance ÷K at zero per-frame cost. 1 = the legacy pin.
+        let gi_dir_sets = std::env::var("P_GI_DIR_SETS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1)
+            .clamp(1, 64);
         // CONVERGE mode deliberately does NOT touch the cost parameters (spp / relight period /
         // visibility feedback) — raising them (spp×K + period 2 + hidden-off) measured 360 ms/frame
         // on Sponza-M3, unplayable. Determinism alone (fixed directions) makes every relight
@@ -3983,6 +3997,7 @@ impl App {
             cache_res_feedback_frame,
             cache_converge,
             gi_stable,
+            gi_dir_sets,
             ssr_history_clamp,
             ssr_clamp_gamma,
             gi_temporal_clamp,
@@ -6994,7 +7009,8 @@ impl App {
                             // same directions each cycle (the fine super-cycle, when live), not
                             // each frame.
                             if self.gi_stable {
-                                0
+                                // F6K: K-cycle deterministic rotation (1 = the legacy pin).
+                                (self.frame_no / gi_cycle) as u32 % self.gi_dir_sets.max(1)
                             } else {
                                 (self.frame_no / gi_cycle) as u32
                             },
