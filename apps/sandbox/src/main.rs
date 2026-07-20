@@ -3077,8 +3077,12 @@ impl App {
         // F6M: gdf_gi/gdf_ao viewer-facing normal flip — the same two-sided contract pbr shades
         // with (`two_sided = !is_gallery`), so back-face pixels of thin double-sided geometry
         // (leaf cards, cloth folds) reconstruct V/E/bent and march AO in the hemisphere the
-        // lighting actually uses. Content only; `P_GDF_FACING_FLIP=0` = raw-normal legacy A/B.
-        let gdf_facing_flip = quality::env_bool("P_GDF_FACING_FLIP", true) && !gallery_scene;
+        // lighting actually uses. DEFAULT OFF: physically correct, but the sealed sky/tint
+        // calibration is fitted to the raw-normal equilibrium — flipping regressed both PT
+        // budget gates (interior bias +22.9; plan §2c), the F6H-unsigned class of failure.
+        // Re-judge with the probabilistic-occupancy recalibration (plan §4). The hero banner
+        // recipe opts in (level.rs). `P_GDF_FACING_FLIP=1` = the contract path.
+        let gdf_facing_flip = quality::env_bool("P_GDF_FACING_FLIP", false) && !gallery_scene;
         // GI-volume occupancy-weighted consumption (increment A of the GI-volume-leak phase,
         // docs/phase-gi-volume-leak-plan.md §3). Default ON for content since the full-grid
         // dispatch fix: on the working field, excluding in-wall probes from the interpolation
