@@ -112,6 +112,17 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 world_pos = hpos.xyz / hpos.w;
 
     float3 n = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, uv, 0.0).xyz);
+    // Two-sided facing contract (F6M, flip_y bit1 = content scenes): orient toward the viewer
+    // exactly as the lighting pass does (pbr.slang `pc.two_sided`), or a back-face pixel of
+    // thin double-sided geometry (leaf card, cloth fold) marches its AO cone INTO the sheet
+    // and pins at the floor. Same-pixel near-plane unprojection (standard-Z: 0 = near) = a
+    // point toward the camera on this pixel's view ray, so no camera position in the push.
+    if ((pc.flip_y & 2u) != 0u)
+    {
+        float4 hnear = mul(pc.inv_view_proj, float4(ndc, 0.0, 1.0));
+        if (dot(n, hnear.xyz / hnear.w - world_pos) < 0.0)
+            n = -n;
+    }
 
     // Offset along the normal by the bias so the surface's own voxel doesn't
     // self-occlude through trilinear/voxelisation error.

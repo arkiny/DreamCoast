@@ -18,6 +18,43 @@
 
 // MAX_BOUNCES / RR_START_BOUNCE / SUN_COS_MAX live in rt_common.slang.
 
+// F6M: cap on cutout-texel pass-throughs per ray/shadow query. A dense canopy crossing
+// can graze dozens of `alphaMode: MASK` leaf cards; each pass-through is a full
+// re-traversal, so the cap bounds the cost (budget exhausted => treat as opaque —
+// biases dark, never leaks light).
+static const uint MASK_MAX_SKIPS = 32u;
+
+// F6M: sun-shadow visibility with the raster's MASK cutout contract — a transparent
+// leaf texel must not block the sun (with opaque cards the whole cypress self-shadowed
+// into a black blob in the reference). The TLAS is opaque, so instead of candidate
+// iteration each committed cutout hit restarts the query just beyond the texel.
+// Consumes no RNG: non-MASK scenes keep bit-identical sampling streams.
+bool sun_blocked(RayDesc sray)
+{
+    for (uint i = 0; i <= MASK_MAX_SKIPS; i++)
+    {
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
+        sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFE, sray);
+        sq.Proceed();
+        if (sq.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+            return false;
+        uint prim = sq.CommittedPrimitiveIndex();
+        Instance inst;
+        if (!load_valid_instance(sq.CommittedInstanceID(), prim, inst))
+            return true; // malformed hit — treat as an occluder
+        if (!(content_instances() && inst.params.z > 0.0 && inst.tex_base != NO_TEXTURE))
+            return true; // opaque material
+        float2 suv = hit_uv(inst, prim, sq.CommittedTriangleBarycentrics());
+        // LOD 0: the cutoff needs the authored mask, not a mip-averaged alpha.
+        if (sample_texture_lod(inst.tex_base, suv, 0.0).a >= inst.params.z)
+            return true; // opaque texel of a MASK material
+        float advance = sq.CommittedRayT() + 1e-3;
+        sray.Origin = sray.Origin + sray.Direction * advance;
+        sray.TMax = max(sray.TMax - advance, 0.0);
+    }
+    return true; // skip budget exhausted — conservatively opaque
+}
+
 // Trace a single path and return its radiance. `cornell` switches to an enclosed
 // box lit only by emissive surfaces (black background, no sun).
 float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool cornell,
@@ -28,6 +65,8 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
     // Ray-cone footprint: width 0 at the camera, grows by t*spread each segment;
     // the spread widens on glossy/diffuse bounces so indirect hits use coarse mips.
     float cone_width = 0.0;
+    // F6M: per-path budget of MASK cutout pass-throughs (see MASK_MAX_SKIPS).
+    uint mask_skips = 0u;
 
     RayDesc ray;
     ray.Origin = origin;
@@ -80,6 +119,27 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
         float cos_theta = max(abs(dot(n, ray.Direction)), 1e-3);
         cone_width += q.CommittedRayT() * cone_spread;
         float lod_base = hit_lod_base(inst, prim, cone_width, cos_theta);
+
+        // alphaMode MASK (params.z = cutoff > 0): the raster's G-buffer/shadow passes
+        // discard cutout texels, so the reference must pass through them too — with
+        // opaque cards the cypress canopy rendered as a black blob (no light between
+        // leaves, F6M). Restart just past the texel WITHOUT consuming a bounce (a
+        // cutout texel is not a surface; bounce-keyed logic like the V/E-oracle
+        // bounce-1 tally must see the real geometry). Deterministic test, no RNG:
+        // sampling streams stay bit-identical for every non-MASK path. LOD 0 sample:
+        // the cutoff needs the authored mask, not a mip-averaged alpha that would
+        // dissolve the canopy at distance.
+        if (content_instances() && inst.params.z > 0.0 && inst.tex_base != NO_TEXTURE
+            && mask_skips < MASK_MAX_SKIPS
+            && sample_texture_lod(inst.tex_base, material_uv, 0.0).a < inst.params.z)
+        {
+            mask_skips++;
+            float advance = q.CommittedRayT() + 1e-3;
+            ray.Origin = ray.Origin + ray.Direction * advance;
+            ray.TMax = max(ray.TMax - advance, 0.0);
+            bounce--; // uint wrap at 0 is re-incremented by the loop — same bounce resumes
+            continue;
+        }
 
         // Decal (MaterialKind::Decal, params.w = base-color opacity > 0): a coplanar
         // alpha-blended tint mesh the raster composites over the surface with
@@ -167,11 +227,9 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
                 sray.TMax = 10000.0;
                 // Mask 0xFE excludes decal instances (mask bit 0x01, see build_content_accel):
                 // decals are surface tints, not occluders, so they must not cast a shadow (the
-                // raster's deferred decals don't). Non-decals (mask 0xFF) are still shadow-tested.
-                RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> sq;
-                sq.TraceRayInline(g.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xFE, sray);
-                sq.Proceed();
-                if (sq.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+                // raster's deferred decals don't). Non-decals (mask 0xFF) are still shadow-tested,
+                // with the MASK cutout contract applied per texel (F6M, see sun_blocked).
+                if (!sun_blocked(sray))
                     radiance += throughput * eval_bsdf(n, v, wl, surf) * pc.sun.w * ndl;
             }
         }

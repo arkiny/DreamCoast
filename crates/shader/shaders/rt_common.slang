@@ -55,7 +55,8 @@ struct Instance
     uint tex_base;     // base-color texture (NO_TEXTURE if absent)
     uint tex_mr;       // metallic-roughness texture (g = roughness, b = metallic)
     float4 base_color; // rgb base color, a = emissive scale
-    float4 params;     // x metallic, y roughness, z ao, w unused
+    float4 params;     // x metallic, y roughness, z MASK alpha cutoff (content; 0 = opaque),
+                       // w decal opacity (content; 0 = not a decal)
     uint tex_normal;   // tangent-space normal map
     uint tex_emissive; // emissive texture
     uint prim_count;   // triangle count (for closest-hit PrimitiveIndex bounds check)

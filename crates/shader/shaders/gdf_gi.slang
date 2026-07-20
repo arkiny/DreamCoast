@@ -321,6 +321,19 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 world_pos = hpos.xyz / hpos.w;
 
     float3 n = normalize(g.textures[pc.normal_index].SampleLevel(g.samp, uv, 0.0).xyz);
+    // Two-sided facing contract (F6M, flip_y bit2 = content scenes): the G-buffer stores the
+    // raw rasterized normal and the lighting pass orients it toward the viewer
+    // (pbr.slang `pc.two_sided`). This pass must reconstruct V/E/bent in the SAME hemisphere
+    // the lighting shades, or every back-face pixel of thin double-sided geometry (leaf
+    // cards, cloth folds) reads sky-vis/irradiance pointing INTO the surface. Same-pixel
+    // near-plane unprojection (standard-Z: 0 = near) gives a point toward the camera on
+    // this pixel's view ray, so no camera position is needed in the push.
+    if ((pc.flip_y & 4u) != 0u)
+    {
+        float4 hnear = mul(pc.inv_view_proj, float4(ndc, 0.0, 1.0));
+        if (dot(n, hnear.xyz / hnear.w - world_pos) < 0.0)
+            n = -n;
+    }
 
     // Directional-irradiance volume mode (radiance cache): instead of marching per-pixel rays,
     // sample the world-space SH volume (updated in gi_volume.slang with multibounce) and

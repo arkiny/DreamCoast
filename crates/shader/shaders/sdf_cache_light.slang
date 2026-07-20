@@ -402,17 +402,30 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
                                * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2] + SH_C1 * n.x * sc[3]));
             // The band-1 SH vector is the bent normal (visibility-weighted average unoccluded
             // direction); basis maps sc1→y, sc2→z, sc3→x (same recovery as gdf_gi).
+            // F6L validity contract (F6M port): a real non-negative V(ω) satisfies
+            // |band-1| <= sqrt(3)·band-0, so magnitude = direction confidence — a converged-dark
+            // cell's pure-noise band-1 fades to the bent-free contract instead of being
+            // renormalized into a full-strength random bent (the pre-F6L black-box bug, which
+            // survived here after gdf_gi was repaired). Physically-valid cells keep |bent| = 1
+            // and the exact legacy math below — byte-identical where the bound holds.
             float3 bv = float3(sc[3], sc[1], sc[2]);
-            if (dot(bv, bv) > 1e-8)
-                bent = normalize(bv);
+            float bl = length(bv);
+            if (bl > 1e-5)
+                bent = (bv / bl) * saturate(1.7320508 * sc[0] / bl);
         }
         float3 skyN = n;
         float dot_factor = 1.0;
-        if (dot(bent, bent) > 1e-8)
+        float bconf = length(bent);
+        if (bconf > 1e-4)
         {
+            float3 nb = bent / bconf;
             float w = v; // open -> surface normal, corner -> bent (reference weighting)
-            skyN = normalize(lerp(bent, n, w));
-            dot_factor = max(lerp(dot(bent, n), 1.0, w), 0.0);
+            float3 skyN_b = normalize(lerp(nb, n, w));
+            float df_b = max(lerp(dot(nb, n), 1.0, w), 0.0);
+            // |bent| = validity: fade toward the bent-free contract exactly as
+            // pbr.slang's occlude_sky_diffuse_bent does (skyN = n, dot_factor = 1).
+            skyN = normalize(lerp(n, skyN_b, saturate(bconf)));
+            dot_factor = lerp(1.0, df_b, saturate(bconf));
         }
         float3 E = g.cubes[pc.irradiance_index].SampleLevel(g.samp, skyN, 0.0).rgb;
         float vis = lerp(v, 1.0, pc.skyvis_min_occ);

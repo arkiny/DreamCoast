@@ -841,6 +841,10 @@ struct App {
     /// sky-vis band-1 vector (the DFAO bent normal) into the sky-vis image so the lighting samples
     /// the diffuse skylight along it. Only affects the content sky-vis path; gallery byte-identical.
     bent_normal: bool,
+    /// F6M viewer-facing normal flip for gdf_gi/gdf_ao (`P_GDF_FACING_FLIP`, default on for
+    /// content): match pbr's two-sided shading contract so back-face pixels of double-sided
+    /// geometry reconstruct V/E/bent and march AO in the shaded hemisphere. Gallery = off.
+    gdf_facing_flip: bool,
     /// Multi-bounce AO (`P_AO_MULTIBOUNCE`, default off): recolour the scalar diffuse AO by the
     /// albedo so cavities keep the surface's own bounced colour (reference AOMultiBounce) instead of
     /// darkening flat. Opt-in because it changes any AO<1 pixel (incl. the gallery); off = anchor.
@@ -3070,6 +3074,11 @@ impl App {
         // Default on for content (the sky-vis image is content-only → gallery byte-identical anyway);
         // `P_BENT_NORMAL=0` zeroes the bent normal for A/B (pbr then falls back to the scalar path).
         let bent_normal = quality::env_bool("P_BENT_NORMAL", true);
+        // F6M: gdf_gi/gdf_ao viewer-facing normal flip — the same two-sided contract pbr shades
+        // with (`two_sided = !is_gallery`), so back-face pixels of thin double-sided geometry
+        // (leaf cards, cloth folds) reconstruct V/E/bent and march AO in the hemisphere the
+        // lighting actually uses. Content only; `P_GDF_FACING_FLIP=0` = raw-normal legacy A/B.
+        let gdf_facing_flip = quality::env_bool("P_GDF_FACING_FLIP", true) && !gallery_scene;
         // GI-volume occupancy-weighted consumption (increment A of the GI-volume-leak phase,
         // docs/phase-gi-volume-leak-plan.md §3). Default ON for content since the full-grid
         // dispatch fix: on the working field, excluding in-wall probes from the interpolation
@@ -3950,6 +3959,7 @@ impl App {
             hwrt_fullres,
             hwrt_hitlighting,
             bent_normal,
+            gdf_facing_flip,
             ao_multibounce,
             spec_occlusion,
             gi_volume,
@@ -6842,7 +6852,11 @@ impl App {
                     inv_view_proj,
                     aw,
                     ah,
-                    self.flip_y,
+                    // bit1 = viewer-facing normal flip (F6M): match pbr's two-sided shading
+                    // contract on content scenes; the gallery shades single-sided
+                    // (`two_sided = !is_gallery`) and keeps its byte-identical anchor.
+                    // `P_GDF_FACING_FLIP=0` restores the raw-normal legacy for A/B.
+                    self.flip_y | if self.gdf_facing_flip { 2 } else { 0 },
                     scene_clip,
                     &scene_clip_vols,
                 );
@@ -7078,9 +7092,14 @@ impl App {
                     gw,
                     gh,
                     // bit1 = write the bent normal into the sky-vis image (P_BENT_NORMAL); bit0 is
-                    // the clip-space Y flip. gdf_gi only masks bit0 for reconstruction, so bit1 is
-                    // a safe side channel with zero push growth.
-                    self.flip_y | if self.bent_normal { 2 } else { 0 },
+                    // the clip-space Y flip. gdf_gi only masks bit0 for reconstruction, so the
+                    // upper bits are a safe side channel with zero push growth. bit2 = viewer-
+                    // facing normal flip (F6M): match pbr's two-sided shading contract on content
+                    // scenes (`two_sided = !is_gallery`); gallery stays byte-identical.
+                    // `P_GDF_FACING_FLIP=0` restores the raw-normal legacy for A/B.
+                    self.flip_y
+                        | if self.bent_normal { 2 } else { 0 }
+                        | if self.gdf_facing_flip { 4 } else { 0 },
                     self.gi_spp,
                     self.frame_no as u32,
                     scene_albedo,

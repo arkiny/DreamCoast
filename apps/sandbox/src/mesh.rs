@@ -186,7 +186,12 @@ pub(crate) fn build_content_hit_table(
         }
         records.extend_from_slice(&m.metallic.to_le_bytes());
         records.extend_from_slice(&m.roughness.to_le_bytes());
-        records.extend_from_slice(&0f32.to_le_bytes()); // ao (unused for now)
+        // params.z: alpha-test cutoff for `alphaMode: MASK` materials (0 = opaque, no test).
+        // The raster's G-buffer/shadow passes discard cutout texels (foliage leaf cards); the
+        // path tracer must pass through them too or the reference renders the cypress canopy
+        // as an opaque black blob (F6M — every ray type alpha-tests against this cutoff).
+        // This slot previously carried a constant-0 "ao" no consumer read.
+        records.extend_from_slice(&m.alpha_cutoff.to_le_bytes());
         // params.w: decal opacity (0 = not a decal). A `MaterialKind::Decal` drawable is a
         // coplanar alpha-blended tint mesh (the raster's deferred decal pass); the path tracer
         // reads this to composite it stochastically over the surface behind instead of treating
