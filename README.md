@@ -3,7 +3,7 @@
 > A from-scratch Rust graphics engine on raw **Vulkan + D3D12 + Metal** — built as a
 > human–AI pair-programming experiment.
 
-![Sponza rendered in DreamCoast with screen-space radiance probe global illumination](docs/media/sponza.png)
+![Sponza rendered in-engine in DreamCoast — software-ray-traced reflections, radiance-cache volume GI, and auto-exposed skylight, captured from the real-time deferred pipeline](docs/media/sponza.png)
 
 DreamCoast is a custom renderer layered directly on **raw Vulkan (`ash`)**, **raw
 Direct3D 12 (`windows-rs`)**, and **raw Metal (`objc2`)** behind one hand-rolled,
