@@ -146,6 +146,8 @@ pub(crate) struct VgeoSystem {
 /// The extra pipelines the HW/SW binning path needs (only built when `P14_VGEO_BIN` + mesh shaders).
 struct BinPipelines {
     cut_bin: ComputePipeline,
+    /// Single-thread HW indirect-args fixup (1-D count -> 2-D grid; see `VGEO_HW_GRID_X`).
+    args_fixup: ComputePipeline,
     hwvis: MeshPipeline,
 }
 
@@ -197,6 +199,16 @@ fn make_hzb_levels(device: &Device, extent: Extent2D) -> anyhow::Result<Vec<Vgeo
 
 /// Bytes per instance-table record — mirrors `SceneInstance` in `vgeo_scene_common.slang`.
 const INSTANCE_STRIDE: usize = 256;
+
+/// HW mesh-draw grid X stride — MUST match `vgeo_scene_common.slang::VGEO_HW_GRID_X`. Indirect
+/// mesh dispatch caps at 65,535 threadgroups PER DIMENSION (Metal drawMeshThreadgroups and D3D12
+/// DispatchMesh alike): a 1-D `(count, 1, 1)` grid silently dropped the ENTIRE HW draw once the
+/// visible HW-cluster count crossed 65,535 (measured: sponza_hero at native 2560x1440 binned
+/// 68,520 HW clusters — every wall/curtain vanished; 55,638 at 1080p rendered fine). The
+/// `csBinArgsFixup` pass folds the cut's flat count into an `(x <= GRID_X, y, 1)` grid; the last
+/// row can overshoot by < GRID_X threadgroups, so `hw_list` is allocated with GRID_X slots of
+/// sentinel slack for those reads.
+const VGEO_HW_GRID_X: usize = 32768;
 
 /// Pack the 160-B scene-cut push shared by `csCutScene`/`csCutSceneBin` (single-phase) and
 /// `csCutSceneP1` (two-phase phase 1). `status_i`/`bin_enabled` occupy bytes 152..160, which the
@@ -511,6 +523,14 @@ impl VgeoSystem {
                     160,
                     [64, 1, 1],
                 )?;
+                let args_fixup = compute(
+                    dreamcoast_shader::vgeo_scene_cut_fixup_cs_spirv,
+                    dreamcoast_shader::vgeo_scene_cut_fixup_cs_dxil,
+                    dreamcoast_shader::vgeo_scene_cut_fixup_cs_metallib,
+                    "csBinArgsFixup",
+                    4,
+                    [1, 1, 1],
+                )?;
                 let (hms, hfs) = match backend {
                     BackendKind::Vulkan => (
                         dreamcoast_shader::vgeo_scene_hwvis_ms_spirv(),
@@ -552,7 +572,11 @@ impl VgeoSystem {
                 tracing::info!(
                     "P14_VGEO_BIN: HW/SW binning enabled (split at {bin_px}px diameter)"
                 );
-                Some(BinPipelines { cut_bin, hwvis })
+                Some(BinPipelines {
+                    cut_bin,
+                    args_fixup,
+                    hwvis,
+                })
             }
         } else {
             None
@@ -818,8 +842,12 @@ impl VgeoSystem {
             let cap_work = need_work.next_power_of_two();
             let (hw_list, hw_args) = if binning {
                 (
-                    Some(host((cap_work * 4) as u64, 4, false)?),
-                    Some(host(12, 4, true)?),
+                    // + VGEO_HW_GRID_X sentinel slack: the fixed-up 2-D grid's last row can
+                    // overshoot the appended count by < GRID_X threadgroups (see the const).
+                    Some(host(((cap_work + VGEO_HW_GRID_X) * 4) as u64, 4, false)?),
+                    // 16 B: {x, y, 1} dispatch args + the raw count at offset 12 (the fixup
+                    // preserves it there for the VGEO_BIN_STATS readback).
+                    Some(host(16, 4, true)?),
                 )
             } else {
                 (None, None)
@@ -862,6 +890,31 @@ impl VgeoSystem {
         // Reset the counters to the indirect grid `{0,1,1}` (the cut bumps `.x`) and sentinel-clear
         // the visible list(s) to `0xFFFFFFFF` (the fixed-count raster skips unfilled slots). Only
         // the `work_count` region is used, but clearing the full capacity is cheap + simple.
+        // Diagnostics (`VGEO_BIN_STATS=1`, VGEO_HZB_STATS precedent): read LAST frame's bin
+        // counters before the reset. The HW raw count lives at args offset 12 — the fixup pass
+        // rewrites offsets 0..12 into the 2-D dispatch grid (see `VGEO_HW_GRID_X`).
+        if std::env::var_os("VGEO_BIN_STATS").is_some() {
+            let sw = {
+                let mut b = [0u8; 4];
+                s.sw_args.read_into(&mut b).ok();
+                u32::from_le_bytes(b)
+            };
+            let hw = s
+                .hw_args
+                .as_ref()
+                .map(|buf| {
+                    let mut b = [0u8; 16];
+                    buf.read_into(&mut b).ok();
+                    u32::from_le_bytes([b[12], b[13], b[14], b[15]])
+                })
+                .unwrap_or(0);
+            tracing::info!(
+                sw,
+                hw,
+                work = s.cap_work,
+                "VGEO_BIN_STATS: last-frame bin counts"
+            );
+        }
         let args0: Vec<u8> = [0u32, 1, 1].iter().flat_map(|w| w.to_le_bytes()).collect();
         let sentinel = vec![0xFFu8; s.cap_work * 4];
         s.sw_args.write(&args0)?;
@@ -871,8 +924,13 @@ impl VgeoSystem {
         s.p2_args.write(&args0)?;
         s.p2_list.write(&sentinel)?;
         if let (Some(hl), Some(ha)) = (&s.hw_list, &s.hw_args) {
-            ha.write(&args0)?;
-            hl.write(&sentinel)?;
+            let hw_args0: Vec<u8> = [0u32, 1, 1, 0]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            ha.write(&hw_args0)?;
+            let hw_sentinel = vec![0xFFu8; (s.cap_work + VGEO_HW_GRID_X) * 4];
+            hl.write(&hw_sentinel)?;
         }
         Ok(work_count)
     }
@@ -897,11 +955,26 @@ impl VgeoSystem {
         w: u32,
         h: u32,
     ) {
-        let hwvis = &self
-            .bin
-            .as_ref()
-            .expect("record_hwvis requires binning")
-            .hwvis;
+        let bin = self.bin.as_ref().expect("record_hwvis requires binning");
+        let hwvis = &bin.hwvis;
+        let args_fixup = &bin.args_fixup;
+        // Fold the cut's flat HW count into a dimension-capped 2-D dispatch grid (see
+        // `VGEO_HW_GRID_X`) — a 1-D grid past 65,535 threadgroups drops the whole draw.
+        let hw_args_index = hw_args_buf.storage_index();
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "vgeo_bin_args_fixup",
+                storage_writes: vec![hw_args_ext],
+                reads: vec![],
+            },
+            move |ctx| {
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(args_fixup);
+                cmd.push_constants_compute(&hw_args_index.to_le_bytes());
+                cmd.dispatch(1, 1, 1);
+                Ok(())
+            },
+        );
         let scratch = graph.create_color("vgeo_hwvis_scratch", crate::GB_ALBEDO_FMT, extent);
         graph.add_pass_with_storage_writes(
             PassInfo {

@@ -1704,6 +1704,12 @@ const JOBS: &[Job] = &[
         key: "vgeo_scene_cut_p2_cs",
     },
     Job {
+        src: "vgeo_scene_cut.slang",
+        entry: "csBinArgsFixup",
+        stage: "compute",
+        key: "vgeo_scene_cut_fixup_cs",
+    },
+    Job {
         src: "vgeo_scene_raster.slang",
         entry: "csClearScene",
         stage: "compute",

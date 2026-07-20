@@ -40,13 +40,25 @@ struct PrimOut
 [numthreads(128, 1, 1)]
 [outputtopology("triangle")]
 void meshMain(
-    uint gid: SV_GroupID,
+    uint3 gid: SV_GroupID,
     uint lane: SV_GroupThreadID,
     indices uint3 tris[MAX_TRIS],
     primitives PrimOut prims[MAX_TRIS],
     vertices VertexOut verts[MAX_VERTS])
 {
-    uint t = g.storage_buffers[pc.hw_list].Load(gid * 4);
+    // 2-D grid flattening (see VGEO_HW_GRID_X): the indirect args fold the HW count into an
+    // (x <= GRID_X, y, 1) grid because mesh dispatch caps at 65,535 threadgroups PER DIMENSION
+    // — the old 1-D `(count, 1, 1)` grid dropped the whole draw past that (native-res sponza).
+    // y == 1 reproduces the legacy `gid.x` indexing exactly. The last row can overshoot the
+    // count by < GRID_X; those slots read the sentinel-cleared tail of hw_list (the Rust side
+    // allocates GRID_X slots of slack) and emit nothing.
+    uint flat = gid.y * VGEO_HW_GRID_X + gid.x;
+    uint t = g.storage_buffers[pc.hw_list].Load(flat * 4);
+    if (t == 0xFFFFFFFFu)
+    {
+        SetMeshOutputCounts(0, 0);
+        return;
+    }
     uint2 w = loadWork(pc.work_buf, t);
     InstanceData inst = loadInstance(pc.inst_buf, w.x);
     uint cull_backface = (inst.mr.z != 0.0) ? 1u : 0u;

@@ -93,3 +93,14 @@ float sceneEdge(float2 a, float2 b, float2 p)
 {
     return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
 }
+
+// HW mesh-draw grid X stride. Indirect mesh dispatch limits are 65,535 threadgroups PER
+// DIMENSION (Metal drawMeshThreadgroups and D3D12 DispatchMesh alike) — a 1-D
+// `(count, 1, 1)` grid silently drops the ENTIRE draw once the visible HW-cluster count
+// crosses 65,535 (measured on Metal: sponza_hero at native 2560x1440 binned 68,520 HW
+// clusters and every HW cluster vanished; 55,638 at 1080p rendered fine). The cut still
+// appends with a flat counter; `csBinArgsFixup` folds it into an `(x <= GRID_X, y, 1)`
+// grid and `vgeo_scene_hwvis` flattens `gid.y * VGEO_HW_GRID_X + gid.x` back to the list
+// index. MUST match `vgeo.rs::VGEO_HW_GRID_X` (the Rust side sizes the hw_list overshoot
+// slack with it).
+static const uint VGEO_HW_GRID_X = 32768;

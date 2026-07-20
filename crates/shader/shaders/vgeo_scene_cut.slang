@@ -325,3 +325,38 @@ void csCutSceneP2(uint3 tid: SV_DispatchThreadID)
     g.storage_buffers[pc2.p2_list].Store(slot * 4, t);
     status.Store(t * 4, STATUS_DRAWN);
 }
+
+// ── HW indirect-args fixup (single thread, after the cut, before the HW mesh draw). ──
+// Mesh dispatch caps at 65,535 threadgroups PER DIMENSION (Metal drawMeshThreadgroups and
+// D3D12 DispatchMesh alike); the cut's flat `InterlockedAdd` count exceeded that on real
+// content (native-res sponza_hero: 68,520 HW clusters) and the ENTIRE draw was dropped.
+// Fold the count into an (x <= VGEO_HW_GRID_X, y, 1) grid; `vgeo_scene_hwvis` flattens
+// `gid.y * VGEO_HW_GRID_X + gid.x` back. count <= GRID_X keeps y = 1 and x = count — the
+// exact legacy grid. The raw count is preserved at byte offset 12 (diagnostics: the
+// VGEO_BIN_STATS readback), which the 16-B args buffer carries after the 12-B dispatch args.
+
+struct FixupPush
+{
+    uint args_buf; // 0: the HW indirect-args buffer {x, y, 1, raw_count}
+};
+
+[[vk::push_constant]]
+ConstantBuffer<FixupPush> pcf : register(b0, space0);
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void csBinArgsFixup(uint3 tid: SV_DispatchThreadID)
+{
+    RWByteAddressBuffer args = g.storage_buffers[pcf.args_buf];
+    uint count = args.Load(0);
+    uint x = count;
+    uint y = 1;
+    if (count > VGEO_HW_GRID_X)
+    {
+        x = VGEO_HW_GRID_X;
+        y = (count + VGEO_HW_GRID_X - 1) / VGEO_HW_GRID_X;
+    }
+    args.Store(0, x);
+    args.Store(4, y);
+    args.Store(12, count);
+}
