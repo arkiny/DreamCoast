@@ -115,7 +115,8 @@ no-op). 갤러리 bent==0 계약 불변.
 
 **배너 재현 레시피(레벨 카메라 베이크)**:
 `AUTO_EXPOSURE=1 AO_STRENGTH=1.0 AO_FLOOR=0.6 P_SKYVIS_BENT_FLOOR=0.25
-WARMUP_FRAMES=192 LEVEL=sponza_hero ./target/release/sandbox --backend metal
---screenshot-clean hero.png` (2560×1440 → 1920×1080 다운스케일).
+RENDER_SCALE=1 WARMUP_FRAMES=192 LEVEL=sponza_hero ./target/release/sandbox --backend metal
+--screenshot-clean hero.png` (네이티브 2560×1440 → 1920×1080 다운스케일 — TAAU 재구성 없는
+정지-샷 슈퍼샘플; vgeo 2-D 메시-그리드 수리가 전제).
 
 비목표: 얼룩(심 스택 scatter ~36)의 해소 — 그건 여전히 확률적-점유 트랙(§0 ①)의 몫.

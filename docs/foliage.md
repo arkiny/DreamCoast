@@ -81,7 +81,7 @@ New Sponza **ivy growth** 팩(`pkg_b_ivy`) 추가. **사이프러스와 다름**
 (`docs/media/sponza.png`) 교체용 히어로: 역방향 콜로네이드(사자 끝→입구 방향, ivy가 전경 아치를 덮고
 사이프러스가 신랑 중앙, 색 커튼이 양옆)를 레벨 카메라에 베이크. 재현(F6L 레시피 — level.rs 주석이
 단일 소스): `AUTO_EXPOSURE=1 AO_STRENGTH=1.0 AO_FLOOR=0.6 P_SKYVIS_BENT_FLOOR=0.25
-WARMUP_FRAMES=192 LEVEL=sponza_hero … --screenshot-clean hero.png` (2560×1440 렌더 → 1920×1080
+RENDER_SCALE=1 WARMUP_FRAMES=192 LEVEL=sponza_hero … --screenshot-clean hero.png` (2560×1440 렌더 → 1920×1080
 다운스케일). 구 레시피(EV100=12, 커밋 `895b4e0`)는 F6 재캘리브 이후 저노출.
 
 ## 후속

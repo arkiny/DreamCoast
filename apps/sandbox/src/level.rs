@@ -650,8 +650,11 @@ pub(crate) fn sponza_hero_level() -> LevelData {
         // crushed dark, and the low-V bent floor so the canopy's enclosed cells don't read as a
         // dark box on the drapes behind; docs/phase-f6l-trapped-probe-fill-plan.md §4):
         //   AUTO_EXPOSURE=1 AO_STRENGTH=1.0 AO_FLOOR=0.6 P_SKYVIS_BENT_FLOOR=0.25 \
-        //     WARMUP_FRAMES=192 LEVEL=sponza_hero \
+        //     RENDER_SCALE=1 WARMUP_FRAMES=192 LEVEL=sponza_hero \
         //     ./target/release/sandbox --backend metal --screenshot-clean hero.png
+        // RENDER_SCALE=1 = native-res still (no TAAU reconstruction — visibly sharper lace/
+        // stone/foliage; the 1440p->1080p downscale supersamples the aliasing away). Native
+        // needed the vgeo 2-D mesh-grid fix (the 65,535-threadgroup dispatch cap).
         camera: Camera {
             position: [-10.5, 3.7, 0.0],
             target: [9.0, 4.2, 0.0],
