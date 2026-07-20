@@ -32,6 +32,23 @@ static const float GV_PI = 3.14159265359;
 // F6I: average opacity of ONE unresolved surface band for the partial-occlusion march
 // (open-mesh seam only). Swept in the E/lit/V oracle domain; see the march comment.
 static const float GV_TAU = 0.4;
+// F6L trapped-probe fill: a probe embedded in dense canopy sees leaves at cm range in every
+// direction — its estimate is a structurally dark pocket (shadowed sun, dead sky term,
+// self-reinforcing dark multibounce), and the consumer's witness-renormalised trilinear
+// CONCENTRATES those cells onto receivers behind the canopy as a hard voxel-scale black box
+// (the sponza_hero cypress/curtain). Two fingerprints gate the fill:
+//   1. dead cell: mean sphere visibility < GV_FILL_VMAX AND own band-0 luminance under
+//      GV_FILL_EREL of the neighbour mean (enclosed-but-lit interiors share V≈0 but keep a
+//      healthy E — untouched);
+//   2. embedded cell: > GV_FILL_NEARFRAC of the rays hit within half a voxel — the "probe
+//      inside unresolved-density geometry" signature. Open probes near a wall/floor cap at
+//      ~50% near-hits (half the sphere escapes), so they never match.
+// A matching cell is replaced by the mean of its previous-frame face neighbours; neighbours
+// whose connecting midpoint sits inside geometry are rejected, so wall/pillar-embedded cells
+// find no donors and keep their dark value (the sliver semantics the occupancy gate wants).
+static const float GV_FILL_VMAX = 0.02;
+static const float GV_FILL_EREL = 0.05;
+static const float GV_FILL_NEARFRAC = 0.9;
 
 // Real SH band-0/1 basis normalisation: Y0 = sqrt(1/4pi), Y1 = sqrt(3/4pi)*{y,z,x}.
 static const float SH_C0 = 0.2820947918; // sqrt(1/(4*pi))
@@ -376,6 +393,10 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float3 sh2 = float3(0.0, 0.0, 0.0);
     float3 sh3 = float3(0.0, 0.0, 0.0);
     float sv0 = 0.0, sv1 = 0.0, sv2 = 0.0, sv3 = 0.0;
+    // F6L: near-hit census for the embedded-cell fingerprint (see the constant block).
+    uint near_hits = 0u;
+    float near_r = 0.5 * dot(lvl_max - lvl_min, float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0))
+                   / float(pc.dims.x);
     // Octant-stratified when spp is a multiple of 8 (equal per-octant counts keep the 4pi/spp
     // estimator exact); odd spp keeps the legacy plain-uniform draw.
     bool strat = (spp & 7u) == 0u;
@@ -412,6 +433,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 {
                     radiance = gv_shade_hit(p, sun_dir, read_base, fine_on);
                     shaded = true;
+                    if (t < near_r)
+                        near_hits++;
                 }
                 // Sky VISIBILITY marches on as transmittance: for the upward hemisphere the
                 // unresolved cloth/rail layer really is a partial occluder — each
@@ -452,7 +475,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     break;
             }
             if (hit)
+            {
                 radiance = gv_shade_hit(hp, sun_dir, read_base, fine_on);
+                if (t < near_r)
+                    near_hits++;
+            }
             vis = hit ? 0.0 : 1.0;
         }
         // Project L(dir) onto the band-0/1 SH basis.
@@ -471,6 +498,69 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     float kw = (4.0 * GV_PI) / float(spp);
     float3 c[4] = { sh0 * kw, sh1 * kw, sh2 * kw, sh3 * kw };
     float sv[4] = { sv0 * kw, sv1 * kw, sv2 * kw, sv3 * kw };
+
+    // F6L (flags bit3, `P_GI_TRAPPED_FILL`): trapped-probe fill — see the constant block for
+    // the fingerprint. A matching probe replaces THIS frame's radiance estimate with the mean
+    // of its 6 same-level face neighbours read from the completed previous slot (point reads
+    // at texel centres — no cross-threadgroup hazard, deterministic), then the normal EMA
+    // proceeds, so the cell converges to its neighbourhood over slab cycles (one shell inward
+    // per cycle). A neighbour whose connecting midpoint sits INSIDE geometry is rejected: a
+    // probe sealed in a thick wall keeps its dark cell (no through-wall import) while porous
+    // canopy admits the fill. Sky-visibility stays untouched — V≈0 inside canopy is true, and
+    // the black-box term is the consumer's E read. Skipped on the reset frame (no history).
+    bool fill_applied = false;
+    bool embedded = float(near_hits) > GV_FILL_NEARFRAC * float(spp);
+    if ((pc.flags & 8u) != 0u && pc.read_rgb.w == 0u
+        && (embedded || sv[0] * SH_C0 < GV_FILL_VMAX))
+    {
+        float3 navg[4] = { float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0),
+                           float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0) };
+        float nw = 0.0;
+        int level_y0 = int(level * pc.dims.y);
+        for (int a = 0; a < 6; a++)
+        {
+            int3 off = int3(a == 0 ? 1 : (a == 1 ? -1 : 0), a == 2 ? 1 : (a == 3 ? -1 : 0),
+                            a == 4 ? 1 : (a == 5 ? -1 : 0));
+            int3 nt = int3(tid) + off;
+            if (nt.x < 0 || nt.x >= int(pc.dims.x) || nt.z < 0 || nt.z >= int(pc.dims.z)
+                || nt.y < level_y0 || nt.y >= level_y0 + int(pc.dims.y))
+                continue;
+            float3 nlid = float3(nt) - float3(0.0, float(level_y0), 0.0);
+            float3 nprobe = lerp(lvl_min, lvl_max, (nlid + 0.5) / float3(pc.dims.xyz));
+            if (scene_occ((probe + nprobe) * 0.5) <= 0.0)
+                continue;
+            // Generic texel-centre read of the full-height volume (reduces to the single-level
+            // layout when fine is off — levels == 1).
+            float3 nuvw = (float3(nt) + 0.5)
+                          / float3(float(pc.dims.x), float(pc.dims.y) * float(levels),
+                                   float(pc.dims.z));
+            float3 nc[4];
+            read_coeffs_fine(read_base, nuvw, true, nc);
+            [unroll]
+            for (int k = 0; k < 4; k++)
+                navg[k] += nc[k];
+            nw += 1.0;
+        }
+        float lum_own = dot(max(c[0] * SH_C0, 0.0), float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0));
+        float lum_n = nw > 0.0
+                          ? dot(max((navg[0] / nw) * SH_C0, 0.0),
+                                float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0))
+                          : 0.0;
+        // An embedded cell fills whenever a donor exists (its own estimate is the artifact);
+        // a dead cell additionally requires the relative-E fingerprint (see constants).
+        if (nw > 0.0 && (embedded || lum_own < GV_FILL_EREL * lum_n))
+        {
+            [unroll]
+            for (int k = 0; k < 4; k++)
+                c[k] = navg[k] / nw;
+            // The fill BYPASSES the radiance EMA below: the dead cell's own history is ~0, so
+            // blending would throttle the recovery to alpha per refresh (~1000 frames to
+            // converge — the box visibly persists). The neighbour average is already the
+            // temporally-converged field, and with the pinned direction set (P_GI_STABLE
+            // default) the classification is deterministic per refresh — no flicker path.
+            fill_applied = true;
+        }
+    }
 
     // EMA with the previous frame (per coefficient; reset on the first frame / re-alloc).
     if (pc.read_rgb.w == 0u)
@@ -495,9 +585,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 read_coeffs_fine(read_base, puvw, true, prev);
             else
                 read_coeffs(read_base, probe, prev);
-            [unroll]
-            for (int i = 0; i < 4; i++)
-                c[i] = lerp(prev[i], c[i], pc.params.w);
+            if (!fill_applied)
+            {
+                [unroll]
+                for (int i = 0; i < 4; i++)
+                    c[i] = lerp(prev[i], c[i], pc.params.w);
+            }
             if (pc.read_rgb.y != 0xFFFFFFFFu)
             {
                 float svprev[4];

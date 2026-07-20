@@ -890,6 +890,9 @@ struct App {
     /// Aperture shaping of the tint leak (`P_SKYVIS_TINT_V0`; 0 = flat legacy leak).
     skyvis_tint_v0: f32,
     skyvis_min_occ: f32,
+    /// F6L banner knob (`P_SKYVIS_BENT_FLOOR`; 0 = off/default = the landed validity
+    /// contract): low-V bent floor blend — the sponza_hero banner recipe uses 0.25.
+    skyvis_bent_floor: f32,
     /// Deferred-parity cache skylight (`P_CACHE_SKY_OCCLUDE`, tier `cache_sky_occlude`): the
     /// surface-cache relight takes its skylight from the SAME SH sky-visibility occlusion the
     /// deferred lighting applies, instead of the legacy sky-on-miss + unoccluded IBL floor (whose
@@ -3054,6 +3057,13 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        // F6L banner knob: low-V bent floor blend (0 = off = the landed validity contract;
+        // the sponza_hero banner recipe uses 0.25 — plan §4, gate-excluded by default).
+        let skyvis_bent_floor = std::env::var("P_SKYVIS_BENT_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
         // Bent-normal skylight: the GI pass writes the unoccluded average direction (the SH sky-vis
         // band-1 vector = the DFAO bent normal) into the sky-vis image so the lighting can sample the
         // diffuse skylight ALONG it (directional indoor occlusion) instead of the scalar V multiply.
@@ -3105,9 +3115,20 @@ impl App {
         // so the 0.02 m min step can hop a thin curtain band and flood cloth-shadowed regions
         // with phantom sun-lit E. Tied to the SAME knob so the legacy signed path is untouched.
         let sdf_open_unsigned = quality::env_bool("P_SDF_OPEN_UNSIGNED", false);
+        // F6L (flags bit3): trapped/embedded-probe fill + the all-rejected consumption
+        // fallbacks (gdf_gi vol_occ bit1, gdf_reflect flip_y bit27) — cells matching the F6I
+        // §0 "probe-trapped" fingerprint (V≈0 ∧ relative-E≈0, or >90% near-hits = embedded in
+        // unresolved-density geometry) refill from their previous-frame face neighbours,
+        // midpoint-occlusion-gated so thick walls never import light; consumers stop returning
+        // hard black when every trilinear corner is occupancy-rejected. DEFAULT OFF: honest
+        // E-side repairs, but the sunlit gate reads +0.23 block over the sealed budget with
+        // them on (canopy cells the reference keeps dark get brightened) — needs its own
+        // calibration pass before a default flip (plan §4). The hero black-box itself was the
+        // bent-normal noise (fixed unconditionally in pbr.slang — SKYVIS_BENT_MIN_V).
         let gi_repair_flags = u32::from(quality::env_bool("P_GI_READ_OFFSET", true))
             | (u32::from(quality::env_bool("P_GI_SUN_HARDVIS", false)) << 1)
-            | (u32::from(sdf_open_unsigned) << 2);
+            | (u32::from(sdf_open_unsigned) << 2)
+            | (u32::from(quality::env_bool("P_GI_TRAPPED_FILL", false)) << 3);
         // F6F: gv_shadow penumbra cone slope. Default 0 = the shader-side reference-derived
         // value (cot of the path tracer's sun angular radius, ~50 — single source:
         // sky_common's SUN_COS_MAX); >0 = explicit override (16 = the legacy ~3.6° cone,
@@ -3945,6 +3966,7 @@ impl App {
             skyvis_tint,
             skyvis_tint_v0,
             skyvis_min_occ,
+            skyvis_bent_floor,
             cache_sky_occlude,
             cache_hwrt_shadow,
             cache_hwrt_gather,
@@ -7076,7 +7098,11 @@ impl App {
                     // not rays). Default off (`P_HWRT_GI` unset) -> SW march -> gallery byte-identical.
                     self.hwrt_gi && gi_volume_arg.is_none(),
                     // Increment A: occupancy-weighted volume consumption (volume path only).
-                    self.gi_vol_occ,
+                    // F6L bit1 (all-rejected -> ungated fallback) rides only on top of bit0 —
+                    // the shader's occ block is gated on the whole field being nonzero, so a
+                    // bare bit1 would wrongly enable the manual path with gating still applied.
+                    u32::from(self.gi_vol_occ)
+                        | (u32::from(self.gi_vol_occ) & (self.gi_repair_flags >> 3)) << 1,
                 );
                 gi_skyvis_out = skyvis;
                 // M3-C: denoise at the GI TRACE res (before the bilateral upsample), then upsample
@@ -7364,7 +7390,9 @@ impl App {
                     self.sun_intensity,
                     rw,
                     rh,
-                    self.flip_y,
+                    // F6L: flip_y bit27 = the ungated fallback of the validity-weighted
+                    // GI-volume read (rides `P_GI_TRAPPED_FILL`, gi_repair_flags bit3).
+                    self.flip_y | ((self.gi_repair_flags >> 3 & 1) << 27),
                     // Frame-VARYING GGX jitter: a different reflection ray each frame so the temporal
                     // resolve actually ACCUMULATES (real convergence of the glossy lobe / near-mirror),
                     // not just a spatial gather of one fixed sample. This is now the default for content
@@ -7595,7 +7623,7 @@ impl App {
                             self.sun_intensity,
                             qw,
                             qh,
-                            self.flip_y,
+                            self.flip_y | ((self.gi_repair_flags >> 3 & 1) << 27),
                             self.frame_no as u32,
                             scene_albedo,
                             reflect_cache_arg,
@@ -7715,6 +7743,7 @@ impl App {
             self.skyvis_tint,
             self.skyvis_tint_v0,
             self.skyvis_min_occ,
+            self.skyvis_bent_floor,
             globals_offset,
             self.flip_y,
             // Two-sided shading for imported scenes (single-sided walls seen from inside);
@@ -8219,7 +8248,7 @@ impl App {
                 self.sun_intensity,
                 cw,
                 ch,
-                self.flip_y,
+                self.flip_y | ((self.gi_repair_flags >> 3 & 1) << 27),
                 // Content: fixed frame (0) → stable GGX jitter; gallery: real frame (anchor).
                 if self.is_gallery {
                     self.frame_no as u32
@@ -8315,7 +8344,7 @@ impl App {
                     self.sun_intensity,
                     cw,
                     ch,
-                    self.flip_y,
+                    self.flip_y | ((self.gi_repair_flags >> 3 & 1) << 27),
                     // Content: fixed frame (0) → temporally stable GGX jitter (no reflection
                     // sparkle). Gallery: real frame → byte-identical legacy anchor.
                     if self.is_gallery {
@@ -8716,6 +8745,7 @@ impl App {
                 self.skyvis_tint,
                 self.skyvis_tint_v0,
                 self.skyvis_min_occ,
+                self.skyvis_bent_floor,
                 second.globals_offset,
                 self.flip_y,
                 !self.is_gallery,

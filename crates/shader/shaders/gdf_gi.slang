@@ -78,7 +78,10 @@ struct GiPush
     uint gi_fine_buf;       // F4 — storage-buffer index of the fine-level AABB (2×float4:
                             // min.xyz+0, max.xyz+0); 0xFFFFFFFF = single level (legacy path
                             // untouched).
-    uint vol_occ;           // GI-volume occupancy-weighted consumption (`P_GI_VOL_OCC`, opt-in):
+    uint vol_occ;           // bit0: GI-volume occupancy-weighted consumption (`P_GI_VOL_OCC`);
+                            // bit1 (F6L, `P_GI_TRAPPED_FILL`): all-corners-rejected cells fall
+                            // back to the ungated trilinear instead of hard black.
+                            // Legacy meaning of the whole field:
                             // 0 = hardware trilinear (legacy, byte-identical anchor); 1 = manual
                             // 2x2x2 trilinear excluding probes whose centre sits inside geometry
                             // (the reflection fallback's sample_gi_irradiance_valid pattern).
@@ -165,7 +168,7 @@ void gv_level_hw(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half, 
             float3 b = float3(sc[3], sc[1], sc[2]);
             float bl = length(b);
             if (bl > 1e-5)
-                bent = b / bl;
+                bent = (b / bl) * saturate(1.7320508 * sc[0] / bl);
         }
     }
 }
@@ -198,6 +201,22 @@ void gv_level_occ(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half,
         sc[k] = 0.0;
     }
     float wsum = 0.0;
+    // F6L (vol_occ bit1): parallel UNGATED accumulation. When every corner is rejected the
+    // gated result had no witnesses and fell to hard black — on a VISIBLE surface that verdict
+    // is a field-resolution artifact (a dense canopy bakes as a solid blob and swallows whole
+    // cells), not a sealed sliver. The fallback is the plain trilinear of the STORED field,
+    // whose trapped cells the injector fill (gi_volume.slang flags bit3) refills from
+    // occlusion-safe neighbours — a truly sealed sliver is rejected by BOTH layers and stays
+    // dark, preserving the wall-sliver semantics this gate was built for.
+    float3 cu[4];
+    float scu[4];
+    [unroll]
+    for (int k = 0; k < 4; k++)
+    {
+        cu[k] = float3(0.0, 0.0, 0.0);
+        scu[k] = 0.0;
+    }
+    float wu = 0.0;
     [loop]
     for (int ci = 0; ci < 8; ci++)
     {
@@ -208,23 +227,45 @@ void gv_level_occ(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half,
             continue;
         int3 ip = clamp(i0 + off, int3(0, 0, 0), imax);
         float3 probe = lmin + ((float3(ip) + 0.5) / dims) * lext;
-        if (min(cm_geo_inside(occ_clip, probe, pc.aabb_max.w), probe.y - GROUND_Y) <= 0.0)
-            continue; // occupied probe — not a witness, exclude it
+        bool witness =
+            min(cm_geo_inside(occ_clip, probe, pc.aabb_max.w), probe.y - GROUND_Y) > 0.0;
         int4 lp = int4(ip.x, ip.y + yoff, ip.z, 0);
         [unroll]
         for (int ch = 0; ch < 3; ch++)
         {
             [unroll]
             for (int k = 0; k < 4; k++)
-                c[k][ch] += w * g.volumes[pc.vol_r + uint(ch * 4 + k)].Load(lp).x;
+            {
+                float cv = g.volumes[pc.vol_r + uint(ch * 4 + k)].Load(lp).x;
+                cu[k][ch] += w * cv;
+                if (witness)
+                    c[k][ch] += w * cv;
+            }
         }
         if (pc.vol_g != 0xFFFFFFFFu)
         {
             [unroll]
             for (int k = 0; k < 4; k++)
-                sc[k] += w * g.volumes[pc.vol_g + uint(k)].Load(lp).x;
+            {
+                float sv = g.volumes[pc.vol_g + uint(k)].Load(lp).x;
+                scu[k] += w * sv;
+                if (witness)
+                    sc[k] += w * sv;
+            }
         }
-        wsum += w;
+        wu += w;
+        if (witness)
+            wsum += w;
+    }
+    if (wsum <= 1e-4 && (pc.vol_occ & 2u) != 0u && wu > 1e-4)
+    {
+        [unroll]
+        for (int k = 0; k < 4; k++)
+        {
+            c[k] = cu[k];
+            sc[k] = scu[k];
+        }
+        wsum = wu;
     }
     if (wsum > 1e-4)
     {
@@ -246,7 +287,7 @@ void gv_level_occ(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half,
                 float3 b = float3(sc[3], sc[1], sc[2]);
                 float bl = length(b);
                 if (bl > 1e-5)
-                    bent = b / bl;
+                    bent = (b / bl) * saturate(1.7320508 * sc[0] / bl);
             }
         }
     }
@@ -349,13 +390,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 float t = !want_f ? 0.0 : (want_c ? wf : 1.0);
                 e = lerp(ec, ef, t);
                 v = lerp(vc, vf, t);
-                // E/V are linear in the SH coefficients (reconstruct-then-lerp is exact); the
-                // bent normal is NOT — renormalize the lerp (opposing bents shrink toward zero
-                // and correctly land on the scalar-fallback zero-vector path; the opt-in
-                // spec_occlusion consumer takes a raw dot of this, pbr.slang bent_unit).
+                // E/V are linear in the SH coefficients (reconstruct-then-lerp is exact). The
+                // bent is direction × validity (F6L) — a PLAIN lerp is now the right blend: the
+                // magnitude carries confidence, agreeing levels keep it, opposing bents shrink
+                // toward zero and land on the consumers' bent-free contract. Renormalizing here
+                // would resurrect a full-strength direction from two low-confidence inputs.
                 bent = lerp(bc, bf, t);
-                float bl = length(bent);
-                bent = bl > 1e-5 ? bent / bl : float3(0.0, 0.0, 0.0);
             }
             g.storage_images[pc.out_index][tid.xy] = float4(e, 1.0);
             if (pc.vol_g != 0xFFFFFFFFu && pc.vol_b != 0xFFFFFFFFu)
@@ -408,6 +448,17 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     sc[k] = 0.0;
                 }
                 float wsum = 0.0;
+                // F6L (vol_occ bit1): all-corners-rejected -> ungated-trilinear fallback,
+                // lockstep with gv_level_occ above (see that comment for the rationale).
+                float3 cu[4];
+                float scu[4];
+                [unroll]
+                for (int k = 0; k < 4; k++)
+                {
+                    cu[k] = float3(0.0, 0.0, 0.0);
+                    scu[k] = 0.0;
+                }
+                float wu = 0.0;
                 [loop]
                 for (int ci = 0; ci < 8; ci++)
                 {
@@ -418,24 +469,45 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                         continue;
                     int3 ip = clamp(i0 + off, int3(0, 0, 0), imax);
                     float3 probe = GDF_MIN + ((float3(ip) + 0.5) / dims) * vext;
-                    if (min(cm_geo_inside(occ_clip, probe, pc.aabb_max.w), probe.y - GROUND_Y)
-                        <= 0.0)
-                        continue; // occupied probe — not a witness, exclude it
+                    bool witness =
+                        min(cm_geo_inside(occ_clip, probe, pc.aabb_max.w), probe.y - GROUND_Y)
+                        > 0.0;
                     [unroll]
                     for (int ch = 0; ch < 3; ch++)
                     {
                         [unroll]
                         for (int k = 0; k < 4; k++)
-                            c[k][ch] +=
-                                w * g.volumes[pc.vol_r + uint(ch * 4 + k)].Load(int4(ip, 0)).x;
+                        {
+                            float cv = g.volumes[pc.vol_r + uint(ch * 4 + k)].Load(int4(ip, 0)).x;
+                            cu[k][ch] += w * cv;
+                            if (witness)
+                                c[k][ch] += w * cv;
+                        }
                     }
                     if (pc.vol_g != 0xFFFFFFFFu)
                     {
                         [unroll]
                         for (int k = 0; k < 4; k++)
-                            sc[k] += w * g.volumes[pc.vol_g + uint(k)].Load(int4(ip, 0)).x;
+                        {
+                            float sv = g.volumes[pc.vol_g + uint(k)].Load(int4(ip, 0)).x;
+                            scu[k] += w * sv;
+                            if (witness)
+                                sc[k] += w * sv;
+                        }
                     }
-                    wsum += w;
+                    wu += w;
+                    if (witness)
+                        wsum += w;
+                }
+                if (wsum <= 1e-4 && (pc.vol_occ & 2u) != 0u && wu > 1e-4)
+                {
+                    [unroll]
+                    for (int k = 0; k < 4; k++)
+                    {
+                        c[k] = cu[k];
+                        sc[k] = scu[k];
+                    }
+                    wsum = wu;
                 }
                 if (wsum > 1e-4)
                 {
@@ -457,7 +529,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                             float3 b = float3(sc[3], sc[1], sc[2]);
                             float bl = length(b);
                             if (bl > 1e-5)
-                                bent = b / bl;
+                                bent = (b / bl) * saturate(1.7320508 * sc[0] / bl);
                         }
                     }
                 }
@@ -521,15 +593,26 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 // The band-1 SH vector IS the bent normal: sc[k] = Σ V(ω)·(SH_C1·ω_axis), so the
                 // vector (sc3, sc1, sc2) = ∫ V(ω)·ω dω = the visibility-weighted average unoccluded
                 // direction (the reference DFAO Σ ConeVisibility·ConeDir, recovered for free from
-                // coefficients we already sample). SH basis maps sc1→y, sc2→z, sc3→x. Written
-                // unit-length; the scalar V above stays the occlusion strength (as the reference
-                // keeps SkyVisibility separate from the normalized bent direction).
+                // coefficients we already sample). SH basis maps sc1→y, sc2→z, sc3→x. The scalar V
+                // above stays the occlusion strength (as the reference keeps SkyVisibility separate
+                // from the bent direction).
+                // F6L: written DIRECTION × VALIDITY, no longer plain unit-length. Plain
+                // normalization destroys the magnitude, and with it the only signal separating a
+                // genuine direction from estimator noise: a real non-negative V(ω) satisfies
+                // |band-1| <= sqrt(3)·band-0 (equality at a point aperture), while a converged-dark
+                // cell has band-0 ~= 0 under pure-noise band-1 — normalizing that noise into a
+                // full-strength random bent painted voxel-sharp dark boxes on enclosed receivers
+                // (the sponza_hero cypress/curtain). validity = saturate(sqrt(3)·c0/|b|) is 1 for
+                // every physically-possible direction (genuine small-V cells keep their EXACT
+                // legacy unit bent — the PT gates measured real signal there) and -> 0 only where
+                // the bound is violated; consumers treat magnitude as confidence and fade to their
+                // bent-free contract. Scale-free (any common factor on sc cancels), no tuned knob.
                 if ((pc.flip_y & 2u) != 0u)
                 {
                     float3 b = float3(sc[3], sc[1], sc[2]);
                     float bl = length(b);
                     if (bl > 1e-5)
-                        bent = b / bl;
+                        bent = (b / bl) * saturate(1.7320508 * sc[0] / bl);
                 }
             }
             g.storage_images[pc.vol_b][tid.xy] = float4(v, bent);

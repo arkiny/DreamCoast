@@ -646,8 +646,11 @@ pub(crate) fn sponza_hero_level() -> LevelData {
         // Hero framing: the reverse colonnade — stand near the lion end and look back up the nave
         // toward the bright entrance, so the ivy drapes over the foreground arch (top centre), the
         // cypress stands mid-nave, and the coloured drapes line the receding colonnade symmetrically.
-        // Banner render (richer exposure + lighter AO so the dense canopy isn't crushed dark):
-        //   EV100=12 AO_STRENGTH=1.0 AO_FLOOR=0.6 LEVEL=sponza_hero \
+        // Banner render (F6L recipe — in-game auto-exposure, lighter AO so the dense canopy isn't
+        // crushed dark, and the low-V bent floor so the canopy's enclosed cells don't read as a
+        // dark box on the drapes behind; docs/phase-f6l-trapped-probe-fill-plan.md §4):
+        //   AUTO_EXPOSURE=1 AO_STRENGTH=1.0 AO_FLOOR=0.6 P_SKYVIS_BENT_FLOOR=0.25 \
+        //     WARMUP_FRAMES=192 LEVEL=sponza_hero \
         //     ./target/release/sandbox --backend metal --screenshot-clean hero.png
         camera: Camera {
             position: [-10.5, 3.7, 0.0],

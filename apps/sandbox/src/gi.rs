@@ -1108,8 +1108,11 @@ impl GiSystem {
         // on the volume-sampling path — probes whose centre sits inside geometry are excluded from
         // the interpolation and the weights renormalised (the reflection fallback's
         // sample_gi_irradiance_valid pattern, applied to E, sky-vis and the bent normal alike).
-        // Only meaningful with `gi_volume`; false = hardware trilinear (byte-identical anchor).
-        vol_occ: bool,
+        // Only meaningful with `gi_volume`; 0 = hardware trilinear (byte-identical anchor).
+        // Bitfield since F6L: bit0 = the gating above, bit1 (`P_GI_TRAPPED_FILL`) = all-corners-
+        // rejected cells fall back to the ungated trilinear instead of hard black (the dense-
+        // canopy black-box class; docs/phase-f6l-trapped-probe-fill-plan.md).
+        vol_occ: u32,
         // Returns `(gi_image, skyvis_image)`; the sky-vis image (indoor skylight occlusion) is only
         // produced on the volume path (None on the ray-march/gallery path).
     ) -> (ResourceId, Option<ResourceId>) {
@@ -1234,7 +1237,7 @@ impl GiSystem {
                     // F4: fine-level AABB storage buffer (volume path only; 0xFFFFFFFF = off).
                     fine_buf,
                     // Occupancy-weighted volume consumption (volume path only; 0 = legacy).
-                    u32::from(vol_occ),
+                    vol_occ,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
                 Ok(())

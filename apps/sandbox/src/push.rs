@@ -1836,8 +1836,13 @@ pub(crate) fn gdf_reflect_push(
     } else {
         (gi_fine_buf + 1) & 0xFFF
     };
-    let flip_packed =
-        (flip_y & 1) | (enc(gi_vol_base) << 1) | (enc(gi_skyvis_base) << 8) | (enc_fine << 15);
+    // Bit27 (F6L, `P_GI_TRAPPED_FILL`): all-corners-rejected cells in the validity-weighted
+    // GI-volume read fall back to the ungated trilinear instead of hard black — the caller
+    // ORs it into `flip_y` and it must survive the packing (bits 28..31 stay reserved).
+    let flip_packed = (flip_y & 0x0800_0001)
+        | (enc(gi_vol_base) << 1)
+        | (enc(gi_skyvis_base) << 8)
+        | (enc_fine << 15);
     pc[120..124].copy_from_slice(&flip_packed.to_le_bytes());
     pc[124..128].copy_from_slice(&material_index.to_le_bytes());
     for (i, v) in aabb_min.iter().enumerate() {

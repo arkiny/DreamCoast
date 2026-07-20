@@ -69,6 +69,13 @@ struct PushConstants
     // by saturate(V / v0) zeroes it in enclosed cavities (a real skylight leak scales with the
     // aperture) and keeps it where V is middling. 0 = the flat legacy leak, byte-identical.
     float skyvis_tint_v0;
+    // F6L banner knob (`P_SKYVIS_BENT_FLOOR`, default 0 = the landed validity contract,
+    // byte-layout append): > 0 replaces the low-V bent response with the smooth floor blend —
+    // skyN fades to the surface normal and dot_factor to THIS floor below mean-V 1%. The
+    // 0.25 floor (the noise-direction expectation E[max(cos,0)]) measured as the visually
+    // clean variant for the sponza_hero banner but +0.5 sunlit block over the sealed budget,
+    // so it stays a recipe knob, not a default (docs/phase-f6l-trapped-probe-fill-plan.md §4).
+    float skyvis_bent_floor;
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -157,6 +164,14 @@ float3 ao_multi_bounce(float3 base_color, float ao)
 // the prefilter-cube specular: a traced SW-RT reflection already resolves occlusion along its ray
 // (per the reflection track), so occluding it again would double-count.
 static const float SPEC_PI = 3.14159265359;
+// F6L bent-normal contract: the producer (gdf_gi) writes DIRECTION × VALIDITY, where validity
+// = saturate(sqrt(3)·V₀/|band-1|) — 1 for every physically-possible direction (a non-negative
+// V(ω) obeys |band-1| <= sqrt(3)·band-0, equality at a point aperture) and -> 0 where the
+// coefficients are pure estimator noise (a converged-dark cell: band-0 ~= 0 under nonzero
+// band-1). Consumers read |bent| as confidence and fade to their bent-free contract; a
+// genuine bent keeps |bent| = 1 and the EXACT legacy math. Normalizing noise into a
+// full-strength random direction painted voxel-sharp dark boxes on enclosed receivers
+// (the sponza_hero cypress/curtain).
 
 // Overlap fraction of two cones separated by `angle_between` (reference ApproximateConeConeIntersection).
 float approx_cone_cone_intersection(float arc0, float arc1, float angle_between)
@@ -165,18 +180,22 @@ float approx_cone_cone_intersection(float arc0, float arc1, float angle_between)
     return smoothstep(0.0, 1.0, 1.0 - saturate((angle_between - diff) / (arc0 + arc1 - diff)));
 }
 
-// Specular occlusion in [0,1] from the (unit) bent normal, its sky visibility V, the mirror
-// reflection direction, and roughness. bent length < eps (gallery / no producer) -> 1 (no-op).
-float spec_occlusion_bent(float3 bent_unit, float sky_vis, float3 mirror, float roughness)
+// Specular occlusion in [0,1] from the (validity-scaled) bent normal, its sky visibility V,
+// the mirror reflection direction, and roughness. bent length < eps (gallery / no producer /
+// noise-invalid) -> 1 (no-op).
+float spec_occlusion_bent(float3 bent, float sky_vis, float3 mirror, float roughness)
 {
-    if (length(bent_unit) < 1e-4)
+    float bl = length(bent);
+    if (bl < 1e-4)
         return 1.0; // no bent normal => no directional occlusion (byte-identical anchor)
     float unoccluded_angle = saturate(sky_vis) * SPEC_PI; // bent-normal cone half-angle (= length·PI)
     float refl_cone_angle = max(roughness, 0.1) * SPEC_PI; // glossy reflection lobe half-angle
-    float angle_between = acos(clamp(dot(bent_unit, normalize(mirror)), -1.0, 1.0));
+    float angle_between = acos(clamp(dot(bent / bl, normalize(mirror)), -1.0, 1.0));
     float occ = approx_cone_cone_intersection(refl_cone_angle, unoccluded_angle, angle_between);
     // Near-fully-occluded: the bent direction is unreliable, so fade to shadowed (reference).
     occ = lerp(0.0, occ, saturate((unoccluded_angle - 0.1) / 0.2));
+    // F6L: |bent| = validity — a noise-direction cone must not occlude; fade to the no-op.
+    occ = lerp(1.0, occ, saturate(bl));
     // MinOcclusion floor (shared with the diffuse path): =1 disables it -> occ 1, no-op.
     return lerp(occ, 1.0, pc.skyvis_min_occ);
 }
@@ -199,8 +218,28 @@ float3 occlude_sky_diffuse_bent(float3 n, float sky_vis, float3 bent, uint irr_c
     {
         float3 nb = bent / bl;
         float w = saturate(sky_vis); // BentNormalWeightFactor: open -> surface normal, corner -> bent
-        skyN = normalize(lerp(nb, n, w));
-        dot_factor = max(lerp(dot(nb, n), 1.0, w), 0.0); // never subtract light (full-sphere bent guard)
+        float3 skyN_b = normalize(lerp(nb, n, w));
+        float df_b = max(lerp(dot(nb, n), 1.0, w), 0.0); // never subtract light (full-sphere bent guard)
+        // F6L: |bent| = the producer's validity (see the contract at SPEC_PI). A genuine
+        // direction has |bent| = 1 and keeps the exact legacy math; a noise-invalid one fades
+        // per-pixel to the bent-free contract (skyN = n, dot_factor = 1 — the same path a zero
+        // bent takes), which is what the receiver would have done had the producer written
+        // nothing. This kills the cell-quantized random dot_factor (the black box) without
+        // touching a single physically-valid cell — the PT gates measured real directional
+        // signal in genuinely-dark-but-open cells, so validity, not V, is the discriminator.
+        if (pc.skyvis_bent_floor > 0.0)
+        {
+            // Banner-knob path (see the push field): V-floor blend, dot_factor floored.
+            float rv = saturate(saturate(sky_vis) / 0.01);
+            skyN = normalize(lerp(n, skyN_b, rv));
+            dot_factor = lerp(pc.skyvis_bent_floor, df_b, rv);
+        }
+        else
+        {
+            float rel = saturate(bl);
+            skyN = normalize(lerp(n, skyN_b, rel));
+            dot_factor = lerp(1.0, df_b, rel);
+        }
     }
     float3 irradiance = g.cubes[irr_cube].SampleLevel(g.samp, skyN, 0.0).rgb;
     float vis = lerp(saturate(sky_vis), 1.0, pc.skyvis_min_occ);

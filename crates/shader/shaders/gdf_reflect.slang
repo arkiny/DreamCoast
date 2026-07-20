@@ -435,6 +435,18 @@ float3 sample_gi_irradiance_valid(uint base, float3 p, float3 n)
     for (int k = 0; k < 4; k++)
         c[k] = float3(0.0, 0.0, 0.0);
     float wsum = 0.0;
+    // F6L (flip_y bit27): parallel UNGATED accumulation — when every corner is rejected the
+    // hard-black return painted a voxel-sharp black box on receivers whose cells a dense
+    // canopy's GDF blob swallows (the sponza_hero cypress/curtain, ambient-specular term).
+    // The fallback reads the STORED field instead; its embedded/trapped cells are refilled by
+    // the injector fill (gi_volume.slang flags bit3) from occlusion-safe neighbours, while a
+    // genuine contact-gap sliver's stored cells stay near-dark — the measured contact-gap
+    // falloff this gate was built for survives through BOTH layers.
+    float3 cu[4];
+    [unroll]
+    for (int k = 0; k < 4; k++)
+        cu[k] = float3(0.0, 0.0, 0.0);
+    float wu = 0.0;
     [loop]
     for (int ci = 0; ci < 8; ci++)
     {
@@ -445,17 +457,30 @@ float3 sample_gi_irradiance_valid(uint base, float3 p, float3 n)
             continue;
         int3 ip = clamp(i0 + off, int3(0, 0, 0), imax);
         float3 probe = lmin + ((float3(ip) + 0.5) / dims) * lext;
-        if (scene_occ(probe) <= 0.0)
-            continue; // occupied probe — exclude it from the interpolation
+        bool witness = scene_occ(probe) > 0.0;
         int4 lp = int4(ip.x, ip.y + yoff, ip.z, 0);
         [unroll]
         for (int ch = 0; ch < 3; ch++)
         {
             [unroll]
             for (int k = 0; k < 4; k++)
-                c[k][ch] += w * g.volumes[base + uint(ch * 4 + k)].Load(lp).x;
+            {
+                float cv = g.volumes[base + uint(ch * 4 + k)].Load(lp).x;
+                cu[k][ch] += w * cv;
+                if (witness)
+                    c[k][ch] += w * cv;
+            }
         }
-        wsum += w;
+        wu += w;
+        if (witness)
+            wsum += w;
+    }
+    if (wsum <= 1e-4 && (pc.flip_y & 0x8000000u) != 0u && wu > 1e-4)
+    {
+        [unroll]
+        for (int k = 0; k < 4; k++)
+            c[k] = cu[k];
+        wsum = wu;
     }
     if (wsum <= 1e-4)
         return float3(0.0, 0.0, 0.0); // fully enclosed — genuinely dark

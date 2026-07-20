@@ -477,7 +477,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 88, // 60-byte core + clustered bufs (16) + ao_multibounce + spec_occlusion + tint v0 (see pbr_push)
+            push_constant_size: 92, // 60-byte core + clustered bufs (16) + ao_multibounce + spec_occlusion + tint v0 + bent floor (see pbr_push)
             bindless: true,
             uniform_buffer: true,
             depth_test: false,
@@ -1216,6 +1216,8 @@ impl DeferredRenderer {
         // Aperture shaping of the tint leak (0 = flat legacy; see pbr.slang skyvis_tint_v0).
         skyvis_tint_v0: f32,
         skyvis_min_occ: f32,
+        // F6L banner knob (`P_SKYVIS_BENT_FLOOR`, 0 = off/default): low-V bent floor blend.
+        skyvis_bent_floor: f32,
         globals_offset: u64,
         flip_y: u32,
         two_sided: bool,
@@ -1303,6 +1305,7 @@ impl DeferredRenderer {
                     skyvis_tint,
                     skyvis_tint_v0,
                     skyvis_min_occ,
+                    skyvis_bent_floor,
                     [cl_grid, cl_index, cl_light, cl_count],
                     ao_multibounce as u32,
                     spec_occlusion as u32,
@@ -1583,13 +1586,15 @@ fn pbr_push(
     skyvis_tint: f32,
     skyvis_tint_v0: f32,
     skyvis_min_occ: f32,
+    // F6L banner knob (`P_SKYVIS_BENT_FLOOR`, 0 = off/default): low-V bent floor blend.
+    skyvis_bent_floor: f32,
     // Clustered light bufs: [grid_buf, index_buf, light_buf, light_count]. grid_buf == u32::MAX
     // (0xFFFFFFFF) selects the brute-force point-light loop (byte-identical anchor).
     cluster: [u32; 4],
     ao_multibounce: u32,
     spec_occlusion: u32,
-) -> [u8; 88] {
-    let mut pc = [0u8; 88];
+) -> [u8; 92] {
+    let mut pc = [0u8; 92];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1611,6 +1616,7 @@ fn pbr_push(
     pc[76..80].copy_from_slice(&ao_multibounce.to_le_bytes());
     pc[80..84].copy_from_slice(&spec_occlusion.to_le_bytes());
     pc[84..88].copy_from_slice(&skyvis_tint_v0.to_le_bytes());
+    pc[88..92].copy_from_slice(&skyvis_bent_floor.to_le_bytes());
     pc
 }
 
