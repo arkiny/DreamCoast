@@ -453,6 +453,18 @@ float4 sample_texture_lod(uint tex, float2 uv, float lod_base)
     return g.textures[RT_NONUNIFORM(tex)].SampleLevel(g.samp, uv, lod);
 }
 
+// F6M: base-texture alpha at TRUE mip 0 for the MASK cutout test. NOT sample_texture_lod —
+// its third argument is the ray-cone log term to which it ADDS 0.5*log2(w*h), so passing
+// 0.0 lands on the COARSEST mip, whose mip-averaged alpha sits below any sane cutoff and
+// silently dissolves the whole canopy (measured: the cypress and grass vanished from
+// primary rays). The cutout needs the authored mask texels, i.e. mip 0. The raster's test
+// also multiplies base_color_factor.a, but the content record reuses base_color.a as the
+// emissive scale — glTF MASK materials author factor.a = 1, so texture alpha alone matches.
+float sample_mask_alpha(uint tex, float2 uv)
+{
+    return g.textures[RT_NONUNIFORM(tex)].SampleLevel(g.samp, uv, 0.0).a;
+}
+
 float3 hit_shading_normal(Instance inst, uint prim, float2 bary, float3 geom_n, float2 uv,
                           float lod_base)
 {

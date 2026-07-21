@@ -45,8 +45,8 @@ bool sun_blocked(RayDesc sray)
         if (!(content_instances() && inst.params.z > 0.0 && inst.tex_base != NO_TEXTURE))
             return true; // opaque material
         float2 suv = hit_uv(inst, prim, sq.CommittedTriangleBarycentrics());
-        // LOD 0: the cutoff needs the authored mask, not a mip-averaged alpha.
-        if (sample_texture_lod(inst.tex_base, suv, 0.0).a >= inst.params.z)
+        // Mip 0: the cutoff needs the authored mask, not a mip-averaged alpha.
+        if (sample_mask_alpha(inst.tex_base, suv) >= inst.params.z)
             return true; // opaque texel of a MASK material
         float advance = sq.CommittedRayT() + 1e-3;
         sray.Origin = sray.Origin + sray.Direction * advance;
@@ -126,12 +126,12 @@ float3 trace(float3 origin, float3 dir, float cone_spread, float3 sun_dir, bool 
         // leaves, F6M). Restart just past the texel WITHOUT consuming a bounce (a
         // cutout texel is not a surface; bounce-keyed logic like the V/E-oracle
         // bounce-1 tally must see the real geometry). Deterministic test, no RNG:
-        // sampling streams stay bit-identical for every non-MASK path. LOD 0 sample:
-        // the cutoff needs the authored mask, not a mip-averaged alpha that would
-        // dissolve the canopy at distance.
+        // sampling streams stay bit-identical for every non-MASK path. Mip-0 sample
+        // (sample_mask_alpha): the cutoff needs the authored mask — a mip-averaged
+        // alpha sits below the cutoff and dissolves the canopy wholesale.
         if (content_instances() && inst.params.z > 0.0 && inst.tex_base != NO_TEXTURE
             && mask_skips < MASK_MAX_SKIPS
-            && sample_texture_lod(inst.tex_base, material_uv, 0.0).a < inst.params.z)
+            && sample_mask_alpha(inst.tex_base, material_uv) < inst.params.z)
         {
             mask_skips++;
             float advance = q.CommittedRayT() + 1e-3;
