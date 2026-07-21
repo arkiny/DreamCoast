@@ -17,14 +17,14 @@
         "LEVEL": "sponza_intel",
         "WARMUP_FRAMES": "64"
       },
-      "sha256": "98be9a9eed98adba962eabfff6bc62d4d558cb1f47d9e2e206e5d93cc8cac4d2"
+      "sha256": "7c2d75b9ecf5b3084b471bd119d1545c185b97db0306420dd150f25085c7a7b5"
     },
     "sponza_pt_interior": {
-      "block16_avg": 29.3864,
-      "block32_avg": 28.2031,
-      "block64_budget": 26.84,
-      "block64_dark": 65.2503,
-      "block64_measured": 26.5406,
+      "block16_avg": 29.6006,
+      "block32_avg": 28.359,
+      "block64_budget": 27.21,
+      "block64_dark": 64.5118,
+      "block64_measured": 26.9078,
       "desc": "content: raster-vs-PT lit-masked residual, interior colonnade (tolerant gate)",
       "env": {
         "AUTO_EXPOSURE": "1",
@@ -35,18 +35,18 @@
         "WARMUP_FRAMES": "192"
       },
       "lit_eps": 8,
-      "masked_avg": 31.104,
+      "masked_avg": 31.5238,
       "pt": true,
-      "pt_black_frac": 0.3299,
-      "residual_bias": 11.2593,
-      "residual_scatter": 29.877
+      "pt_black_frac": 0.3088,
+      "residual_bias": 8.8854,
+      "residual_scatter": 30.7646
     },
     "sponza_pt_sunlit": {
-      "block16_avg": 23.7698,
-      "block32_avg": 21.8275,
-      "block64_budget": 19.2,
-      "block64_dark": 44.6739,
-      "block64_measured": 19.1012,
+      "block16_avg": 25.2782,
+      "block32_avg": 23.3133,
+      "block64_budget": 20.74,
+      "block64_dark": 41.5667,
+      "block64_measured": 20.4375,
       "desc": "content: raster-vs-PT lit-masked residual, sunlit atrium (primary fidelity gate)",
       "env": {
         "AUTO_EXPOSURE": "1",
@@ -57,11 +57,11 @@
         "WARMUP_FRAMES": "192"
       },
       "lit_eps": 8,
-      "masked_avg": 28.6366,
+      "masked_avg": 30.0812,
       "pt": true,
-      "pt_black_frac": 0.071,
-      "residual_bias": 0.3722,
-      "residual_scatter": 28.7039
+      "pt_black_frac": 0.0601,
+      "residual_bias": -4.0226,
+      "residual_scatter": 29.5756
     },
     "sponza_sc_viz": {
       "desc": "content: surface-cache viz (P_SC_VIZ)",
@@ -74,7 +74,7 @@
         "P_SC_VIZ": "1",
         "WARMUP_FRAMES": "64"
       },
-      "sha256": "e618f374d6a376f7af55cdd1ec6409a9457e3b7ba5ddba1ad84bfcd0ba2c310a"
+      "sha256": "8769d3e2ec257b5439e72e8eac052ef908fcd3aa268f501dd2ecca3364d00e62"
     }
   }
 }
