@@ -62,6 +62,13 @@ pub struct D3d12CommandBuffer {
     // Whether the currently-bound compute pipeline feeds push constants via the ring
     // (root CBV) vs inline 32-bit root constants. Set by `bind_compute_pipeline`.
     push_via_cbv: Cell<bool>,
+    // Declared push sizes of the currently-bound compute/graphics pipeline (u32::MAX =
+    // unknown, assert disabled). A push larger than the declared size is undefined on
+    // D3D12 — the root signature only reserves `size/4` 32-bit constants, so the tail
+    // DWORDs silently never reach the shader while Vulkan/Metal happily accept them
+    // (the F1 Stage-3 surface-cache corruption). Debug-assert at every push site.
+    push_size_compute: Cell<u32>,
+    push_size_graphics: Cell<u32>,
     // Whether the (single, always-`srv_heap`) shader-visible descriptor heap has been
     // bound since the last `begin`. `SetDescriptorHeaps` can force a pipeline flush on
     // some drivers, so we set it once per recording (on the first bindless bind) instead
@@ -109,6 +116,8 @@ impl D3d12CommandBuffer {
                 push_ring,
                 push_ring_offset: Cell::new(0),
                 push_via_cbv: Cell::new(false),
+                push_size_compute: Cell::new(u32::MAX),
+                push_size_graphics: Cell::new(u32::MAX),
                 heaps_bound: Cell::new(false),
             })
         }
@@ -630,6 +639,7 @@ impl D3d12CommandBuffer {
             self.list
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         }
+        self.push_size_graphics.set(pipeline.push_size());
     }
 
     pub fn draw(&self, vertex_count: u32, instance_count: u32) {
@@ -758,6 +768,7 @@ impl D3d12CommandBuffer {
         // Route the next `push_constants_compute` to the ring (root CBV) or inline
         // 32-bit constants, matching how this pipeline's root signature was built.
         self.push_via_cbv.set(pipeline.push_via_cbv());
+        self.push_size_compute.set(pipeline.push_size());
     }
 
     /// Dispatch the bound compute pipeline over `(x, y, z)` thread groups.
@@ -770,6 +781,13 @@ impl D3d12CommandBuffer {
     /// budget are copied into the per-frame upload ring and bound as a root CBV — the
     /// same bytes reach `b0` either way, so the shader output is identical.
     pub fn push_constants_compute(&self, data: &[u8]) {
+        debug_assert!(
+            data.len() as u32 <= self.push_size_compute.get(),
+            "push_constants_compute: {} bytes exceed the bound pipeline's declared \
+             push_constant_size {} — the root signature drops the tail DWORDs on D3D12",
+            data.len(),
+            self.push_size_compute.get()
+        );
         if self.push_via_cbv.get() {
             let va = self.upload_push_cbv(data);
             unsafe { self.list.SetComputeRootConstantBufferView(1, va) };
@@ -815,6 +833,9 @@ impl D3d12CommandBuffer {
                 self.list.cast().expect("CommandList4 (DXR available)");
             list4.SetPipelineState1(pipeline.state_object());
         }
+        // RT pipelines don't carry a declared push size here — disarm the compute assert
+        // so a stale compute-bind value can't false-fire on `push_constants_rt`.
+        self.push_size_compute.set(u32::MAX);
     }
 
     /// Upload root (push) constants for the bound RT pipeline (param 1) — same root
@@ -882,6 +903,13 @@ impl D3d12CommandBuffer {
 
     /// Upload root (push) constants for the bound bindless pipeline (param 1).
     pub fn push_constants(&self, data: &[u8]) {
+        debug_assert!(
+            data.len() as u32 <= self.push_size_graphics.get(),
+            "push_constants: {} bytes exceed the bound pipeline's declared \
+             push_constant_size {} — the root signature drops the tail DWORDs on D3D12",
+            data.len(),
+            self.push_size_graphics.get()
+        );
         unsafe {
             self.list.SetGraphicsRoot32BitConstants(
                 1,
@@ -954,6 +982,7 @@ impl D3d12CommandBuffer {
             }
             self.list.SetPipelineState(pipeline.pso());
         }
+        self.push_size_graphics.set(pipeline.push_size());
     }
 
     /// Draw `(x, y, z)` mesh threadgroups of the bound mesh pipeline (`DispatchMesh`, requires
@@ -971,6 +1000,13 @@ impl D3d12CommandBuffer {
     /// Mesh-pipeline push constants (param 1 = `b0`), same inline-32-bit-constants path as the
     /// graphics push (mesh push blocks are small enough to never need the root-CBV spill).
     pub fn push_constants_mesh(&self, data: &[u8]) {
+        debug_assert!(
+            data.len() as u32 <= self.push_size_graphics.get(),
+            "push_constants_mesh: {} bytes exceed the bound pipeline's declared \
+             push_constant_size {} — the root signature drops the tail DWORDs on D3D12",
+            data.len(),
+            self.push_size_graphics.get()
+        );
         unsafe {
             self.list.SetGraphicsRoot32BitConstants(
                 1,

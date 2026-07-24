@@ -370,7 +370,12 @@ impl GdfSystem {
             dreamcoast_shader::sdf_cache_capture_cs_dxil,
             dreamcoast_shader::sdf_cache_capture_cs_metallib,
             "sdf_cache_capture",
-            96,
+            // MUST match `push::cache_capture_push`'s 112 bytes (F1 Stage 3 appended the
+            // `slot_dirty` index): D3D12 builds the root signature from THIS size, and pushing a
+            // larger blob than declared is undefined — the tail DWORDs never reach the shader
+            // (the Windows-verify DX-only surface-cache corruption). VK/Metal are permissive, so
+            // only D3D12 catches a mismatch.
+            112,
             [64, 1, 1],
         )?;
         let cache_view_pipeline = compute(
@@ -424,7 +429,10 @@ impl GdfSystem {
             dreamcoast_shader::sdf_cache_visibility_cs_dxil,
             dreamcoast_shader::sdf_cache_visibility_cs_metallib,
             "sdf_cache_visibility",
-            224,
+            // MUST match `push::cache_vis_push`'s 232 bytes (F1 Stage 2 appended the LRU
+            // `touched_index` + `frame`): a smaller declaration drops the tail DWORDs on
+            // D3D12 (root-signature budget) and violates VUID 10069 on Vulkan.
+            232,
             [64, 1, 1],
         )?;
         // Lit-calibration permutation (TLAS occlusion probe — RT-capable devices only).
@@ -435,7 +443,8 @@ impl GdfSystem {
                 dreamcoast_shader::sdf_cache_visibility_calib_cs_dxil,
                 dreamcoast_shader::sdf_cache_visibility_calib_cs_metallib,
                 "sdf_cache_visibility_calib",
-                224,
+                // Same 232-byte contract as the base visibility pipeline above.
+                232,
                 [64, 1, 1],
             )?
         } else {

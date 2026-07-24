@@ -64,6 +64,10 @@ pub struct D3d12GraphicsPipeline {
     pso: ID3D12PipelineState,
     bindless: bool,
     uniform_buffer: bool,
+    /// Declared `push_constant_size` — the root signature's 32-bit-constant count is built
+    /// from this, so a push larger than it is undefined (the tail DWORDs silently never
+    /// reach the shader). Kept for the debug assert in `push_constants*`.
+    push_size: u32,
 }
 
 impl D3d12GraphicsPipeline {
@@ -163,6 +167,7 @@ impl D3d12GraphicsPipeline {
                 pso,
                 bindless: desc.bindless,
                 uniform_buffer: desc.uniform_buffer,
+                push_size: desc.push_constant_size,
             })
         }
     }
@@ -181,6 +186,11 @@ impl D3d12GraphicsPipeline {
 
     pub(crate) fn uses_uniform(&self) -> bool {
         self.uniform_buffer
+    }
+
+    /// Declared push-constant block size in bytes (root-signature 32-bit-constant budget).
+    pub(crate) fn push_size(&self) -> u32 {
+        self.push_size
     }
 }
 
@@ -426,6 +436,8 @@ pub struct D3d12ComputePipeline {
     /// `true` ⇒ push constants bind as a root CBV (param 1) fed from the command
     /// buffer's upload ring, not inline 32-bit constants. See [`compute_push_via_cbv`].
     push_via_cbv: bool,
+    /// Declared `push_constant_size` (see [`D3d12GraphicsPipeline::push_size`]).
+    push_size: u32,
 }
 
 /// A mesh-shader pipeline (Phase 14 virtual geometry Track B): an SM6.5 `MS`+`PS` (optionally
@@ -438,6 +450,8 @@ pub struct D3d12MeshPipeline {
     pso: ID3D12PipelineState,
     bindless: bool,
     uniform_buffer: bool,
+    /// Declared `push_constant_size` (see [`D3d12GraphicsPipeline::push_size`]).
+    push_size: u32,
 }
 
 /// One aligned subobject in a `D3D12_PIPELINE_STATE_STREAM`. D3D12 requires each subobject to be
@@ -562,6 +576,7 @@ impl D3d12MeshPipeline {
                 pso,
                 bindless: desc.bindless,
                 uniform_buffer: desc.uniform_buffer,
+                push_size: desc.push_constant_size,
             })
         }
     }
@@ -580,6 +595,11 @@ impl D3d12MeshPipeline {
 
     pub(crate) fn uses_uniform(&self) -> bool {
         self.uniform_buffer
+    }
+
+    /// Declared push-constant block size in bytes (root-signature 32-bit-constant budget).
+    pub(crate) fn push_size(&self) -> u32 {
+        self.push_size
     }
 }
 
@@ -678,6 +698,7 @@ impl D3d12ComputePipeline {
                 bindless: desc.bindless,
                 uniform_buffer: desc.uniform_buffer,
                 push_via_cbv: compute_push_via_cbv(desc),
+                push_size: desc.push_constant_size,
             })
         }
     }
@@ -702,6 +723,11 @@ impl D3d12ComputePipeline {
     /// rather than set as inline 32-bit root constants. See [`compute_push_via_cbv`].
     pub(crate) fn push_via_cbv(&self) -> bool {
         self.push_via_cbv
+    }
+
+    /// Declared push-constant block size in bytes (root-signature 32-bit-constant budget).
+    pub(crate) fn push_size(&self) -> u32 {
+        self.push_size
     }
 }
 
