@@ -54,20 +54,26 @@ void meshMain(
     // allocates GRID_X slots of slack) and emit nothing.
     uint flat = gid.y * VGEO_HW_GRID_X + gid.x;
     uint t = g.storage_buffers[pc.hw_list].Load(flat * 4);
-    if (t == 0xFFFFFFFFu)
+    // DXC's DXIL validator requires exactly ONE static `SetMeshOutputCounts` call site (SPIR-V
+    // and Metal accept a second call on the sentinel branch), so the sentinel tail-slot early-out
+    // must flow zero counts through the single shared call below — no dedicated `(0,0)` call. The
+    // sentinel guard also keeps the loads from indexing the work/record buffers with 0xFFFFFFFF.
+    bool live = t != 0xFFFFFFFFu;
+    uint2 w = uint2(0, 0);
+    uint4 rec = uint4(0, 0, 0, 0);
+    if (live)
     {
-        SetMeshOutputCounts(0, 0);
-        return;
+        w = loadWork(pc.work_buf, t);
+        rec = g.storage_buffers[pc.rec_buf].Load4(w.y * 96);
     }
-    uint2 w = loadWork(pc.work_buf, t);
-    InstanceData inst = loadInstance(pc.inst_buf, w.x);
-    uint cull_backface = (inst.mr.z != 0.0) ? 1u : 0u;
-
-    uint4 rec = g.storage_buffers[pc.rec_buf].Load4(w.y * 96);
     // Clamp counts to the declared output maxima before SetMeshOutputCounts (NVIDIA VK mesh-shader
     // needs a static bound or the draw emits nothing — see vgeo_hwvis.slang / vgeo_cluster.slang).
     uint voff = rec.x, vcount = min(rec.y, MAX_VERTS), toff = rec.z, tcount = min(rec.w, MAX_TRIS);
     SetMeshOutputCounts(vcount, tcount);
+    if (!live)
+        return;
+    InstanceData inst = loadInstance(pc.inst_buf, w.x);
+    uint cull_backface = (inst.mr.z != 0.0) ? 1u : 0u;
 
     if (lane < vcount)
     {
