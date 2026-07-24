@@ -425,17 +425,19 @@ impl GiSystem {
             .clamp(0.0, 0.5);
         let half = (mx[0] - mn[0]) * 0.5;
         self.gi_fine_margin = fade_frac * half;
-        // Both ring slots start on the real box (host-visible: recenter transitions rewrite
-        // the inactive slot in place and flip).
+        // Both ring slots start on the real box. MUST be host-visible (`_host`, not `_init`):
+        // recenter transitions rewrite the inactive slot in place and flip. `_init` buffers are
+        // DEVICE_LOCAL on Vulkan — the first camera-driven recenter then kills the frame with a
+        // host-write error (D3D12/Metal happened to accept it, so Metal-side verification and
+        // every fixed-camera capture missed it).
         for slot in 0..2 {
-            self.gi_fine_buf[slot] = Some(device.create_storage_buffer_init(
-                &StorageBufferDesc {
-                    size: 48,
-                    stride: 16,
-                    indirect: false,
-                },
-                &Self::fine_buf_bytes(mn, mx, self.gi_fine_margin),
-            )?);
+            let buf = device.create_storage_buffer_host(&StorageBufferDesc {
+                size: 48,
+                stride: 16,
+                indirect: false,
+            })?;
+            buf.write(&Self::fine_buf_bytes(mn, mx, self.gi_fine_margin))?;
+            self.gi_fine_buf[slot] = Some(buf);
         }
         self.gi_fine_buf_live = 0;
         self.gi_fine_box = Some((mn, mx));
