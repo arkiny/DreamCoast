@@ -61,3 +61,6 @@ Temporary Items
 
 # Claude Code harness state (agent worktrees, session data)
 .claude/
+
+# Cached path-tracer references for the golden runner (big, regenerable)
+tools/goldens/ptcache/

@@ -68,6 +68,17 @@ TOOLS_DIR = Path(__file__).resolve().parent
 REPO = TOOLS_DIR.parent
 GOLDEN_DIR = TOOLS_DIR / "goldens"
 MANIFEST = GOLDEN_DIR / "manifest.json"
+# Cached PT references (gitignored, big). The PT capture is ~15 min per config and dominated
+# the runner, but the PT image is a PURE FUNCTION of the capture recipe + the path-tracer
+# sources -- a raster-side change (the common iteration) cannot alter it. So cache it keyed by
+# exactly those inputs and re-render only when they change (or with --pt-refresh).
+PT_CACHE_DIR = GOLDEN_DIR / "ptcache"
+PT_SOURCES = [
+    "crates/shader/shaders/rt_path.slang",
+    "crates/shader/shaders/rt_common.slang",
+    "crates/shader/shaders/rt_trace.slang",
+    "crates/shader/shaders/rt_pipeline.slang",
+]
 
 # --- Capture manifest ---------------------------------------------------------
 # Each config is a fixed-camera, deterministic headless capture. `env` extends
@@ -246,7 +257,25 @@ def rt_compare(raster: Path, pt: Path, montage: Path, lit_eps: float) -> dict:
     )
 
 
-def check_pt(cfg: dict, backend: str, work: Path, manifest: dict, update: bool):
+def pt_cache_key(cfg: dict, backend: str) -> str:
+    """Identity of a cached PT reference: the capture recipe (env + backend) plus the
+    path-tracer sources. Anything that can change the PT image is in here; anything NOT in
+    here (raster shaders, lighting, TAAU, ...) provably cannot, so the cache is safe to reuse."""
+    h = hashlib.sha256()
+    h.update(cfg["name"].encode())
+    h.update(backend.encode())
+    for k in sorted(cfg["env"]):
+        h.update(f"{k}={cfg['env'][k]}".encode())
+    h.update(b"P8_PATHTRACE=1")
+    for rel in PT_SOURCES:
+        f = REPO / rel
+        h.update(f.read_bytes() if f.exists() else b"<missing>")
+    return h.hexdigest()
+
+
+def check_pt(
+    cfg: dict, backend: str, work: Path, manifest: dict, update: bool, pt_refresh: bool = False
+):
     """Render the raster+PT pair for a `pt: True` config and gate the lit-masked
     residual against the recorded budget. Returns a report row."""
     name = cfg["name"]
@@ -254,7 +283,23 @@ def check_pt(cfg: dict, backend: str, work: Path, manifest: dict, update: bool):
     pt_out = work / f"{name}_pt.png"
     montage = work / f"{name}_montage.png"
     render(cfg, backend, raster_out)
-    render(cfg, backend, pt_out, extra_env={"P8_PATHTRACE": "1"})
+    # PT reference: reuse the cache when the recipe + path-tracer sources are unchanged.
+    key = pt_cache_key(cfg, backend)
+    cached_png = PT_CACHE_DIR / f"{name}.png"
+    cached_key = PT_CACHE_DIR / f"{name}.key"
+    pt_cached = (
+        not pt_refresh
+        and cached_png.exists()
+        and cached_key.exists()
+        and cached_key.read_text().strip() == key
+    )
+    if pt_cached:
+        pt_out.write_bytes(cached_png.read_bytes())
+    else:
+        render(cfg, backend, pt_out, extra_env={"P8_PATHTRACE": "1"})
+        PT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cached_png.write_bytes(pt_out.read_bytes())
+        cached_key.write_text(key)
     try:
         m = rt_compare(raster_out, pt_out, montage, float(cfg.get("lit_eps", 8)))
     except RuntimeError as e:
@@ -283,6 +328,7 @@ def check_pt(cfg: dict, backend: str, work: Path, manifest: dict, update: bool):
         f"lit_mean r/pt {m['lit_mean_raster']:.1f}/{m['lit_mean_pt']:.1f}"
     )
     detail += f"  masked_avg {m['masked_avg']:.2f}"
+    detail += "  [pt cached]" if pt_cached else "  [pt rendered]"
     if "masked_bias" in m:
         detail += f"  bias {m['masked_bias']:+.2f}/scatter {m['masked_scatter']:.2f}"
     if update:
@@ -368,6 +414,11 @@ def main() -> int:
     ap.add_argument("--mean-tol", type=float, default=0.5, help="tolerant mean abs-diff/ch")
     ap.add_argument("--max-tol", type=int, default=16, help="tolerant max abs-diff/ch")
     ap.add_argument("--workdir", default=None, help="render scratch dir (default: system temp)")
+    ap.add_argument(
+        "--pt-refresh",
+        action="store_true",
+        help="force re-rendering the cached PT references (use after a path-tracer change)",
+    )
     args = ap.parse_args()
 
     work = (
@@ -401,7 +452,7 @@ def main() -> int:
         # PT-residual configs (F6 Part B): budget-gated raster-vs-PT pair, no SHA.
         if cfg.get("pt"):
             row_name, status, detail, ok = check_pt(
-                cfg, args.backend, work, manifest, args.update
+                cfg, args.backend, work, manifest, args.update, args.pt_refresh
             )
             rows.append((row_name, status, detail))
             if not ok:

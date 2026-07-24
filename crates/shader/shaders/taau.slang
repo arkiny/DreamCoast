@@ -346,6 +346,24 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         // hides the jitter and resolves sub-pixel detail. alpha floors at 1/max_hist (len capped).
         len = min(hist_len + 1.0, pc.params.y);
         float alpha = 1.0 / len;
+        // Luminance anti-flicker (Lottes/Karis) — OPT-IN via flip_y bit2 (`P_TAAU_ANTIFLICKER`),
+        // default OFF so the sealed content baseline (sc_viz / gdf_ao goldens, which capture at the
+        // TAAU tier res) stays byte-identical; the PT gate runs RENDER_SCALE=1 (TAAU off) so it
+        // cannot measure this, hence no quality gate exists to justify a default flip yet.
+        // What it fixes: a sub-pixel BRIGHT APERTURE — a door's sky-gaps, a window grille — flips
+        // the current sample bright↔dark each jittered frame; because it's a bright CLUSTER the
+        // YCoCg variance box can't clamp it, so it shimmers as dense speckle. When the current luma
+        // diverges from the (stable) clipped history, damp the new sample's weight so the flip
+        // averages toward the converged value (a stable anti-aliased edge) instead of popping.
+        // Measured: door HF 5.19 → 3.67 (below the jitter-off 3.92 baseline).
+        if ((pc.flip_y & 4u) != 0u)
+        {
+            float lc = luma(cur);
+            float lh = luma(hist_rgb);
+            float d = abs(lc - lh) / max(max(lc, lh), 0.2);
+            float flick_w = saturate(1.0 - d);
+            alpha *= flick_w * flick_w; // low weight to a divergent (flickering) sample; 1 if stable
+        }
         accum = lerp(hist_rgb, cur, alpha);
     }
     else

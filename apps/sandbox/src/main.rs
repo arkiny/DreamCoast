@@ -897,6 +897,16 @@ struct App {
     /// F6L banner knob (`P_SKYVIS_BENT_FLOOR`; 0 = off/default = the landed validity
     /// contract): low-V bent floor blend — the sponza_hero banner recipe uses 0.25.
     skyvis_bent_floor: f32,
+    /// F6O (`P_SKYVIS_PP`, default 0 = off): cosine-hemisphere rays per pixel for the per-pixel
+    /// sky-visibility pass. > 0 replaces the probe-resolution volume V feeding the DEFERRED
+    /// skylight occlusion with a per-pixel GDF trace (the "검은 Block" root fix); the volume keeps
+    /// producing for the world-space consumers (surface cache, reflections). 0 = the volume path
+    /// (byte-identical anchor — the pass is not recorded).
+    skyvis_pp_spp: u32,
+    /// F6O per-pixel sky-vis trace resolution divisor (`P_SKYVIS_DIV`, default 4). The per-pixel
+    /// GDF hemisphere march is expensive (~1.6 ms/ray/full-frame on M3), so trace at 1/div then
+    /// joint-bilateral upsample to full res (mirrors gdf_ao's ao_res_div). 1 = full-res trace.
+    skyvis_pp_div: u32,
     /// Deferred-parity cache skylight (`P_CACHE_SKY_OCCLUDE`, tier `cache_sky_occlude`): the
     /// surface-cache relight takes its skylight from the SAME SH sky-visibility occlusion the
     /// deferred lighting applies, instead of the legacy sky-on-miss + unoccluded IBL floor (whose
@@ -1264,6 +1274,14 @@ struct App {
     /// resolve all reproject history sub-pixel-accurately (B1/B2), so the jitter resolves into sharp
     /// detail instead of shimmer. Only active when TAAU is (cw<sw); `P_TAAU_JITTER=0` forces it off.
     taau_jitter: bool,
+    /// TAAU luminance anti-flicker (`P_TAAU_ANTIFLICKER`, default OFF). Damps the blend weight of
+    /// a sample whose luma diverges from the (clipped) history — kills the bright sub-pixel
+    /// aperture shimmer (door sky-gaps, window grilles) the YCoCg variance box cannot clamp
+    /// because it is a bright CLUSTER, not an outlier. Measured: door HF 5.19 → 3.67 (below the
+    /// jitter-off 3.92 baseline). Default OFF because it alters the sealed content TAAU baseline
+    /// (sc_viz / gdf_ao goldens) and the PT gate runs RENDER_SCALE=1 (TAAU off), so no quality
+    /// gate can justify a default flip yet.
+    taau_antiflicker: bool,
     /// `P_TAAU_FORCE=1`: run TAAU even at native resolution (internal == output) — i.e. temporal
     /// anti-aliasing (jitter + accumulation, no upscale). Opt-in so the default native path stays
     /// byte-identical (TAAU off when render==output).
@@ -3068,6 +3086,18 @@ impl App {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        // F6O per-pixel sky-visibility ray count (0 = off = volume path = byte-identical anchor).
+        let skyvis_pp_spp = std::env::var("P_SKYVIS_PP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(64);
+        // F6O per-pixel sky-vis trace res divisor (default 4 = quarter res + bilateral upsample).
+        let skyvis_pp_div = std::env::var("P_SKYVIS_DIV")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(4)
+            .clamp(1, 8);
         // Bent-normal skylight: the GI pass writes the unoccluded average direction (the SH sky-vis
         // band-1 vector = the DFAO bent normal) into the sky-vis image so the lighting can sample the
         // diffuse skylight ALONG it (directional indoor occlusion) instead of the scalar V multiply.
@@ -3981,6 +4011,8 @@ impl App {
             skyvis_tint_v0,
             skyvis_min_occ,
             skyvis_bent_floor,
+            skyvis_pp_spp,
+            skyvis_pp_div,
             cache_sky_occlude,
             cache_hwrt_shadow,
             cache_hwrt_gather,
@@ -4121,6 +4153,7 @@ impl App {
             tonemap_aces,
             tonemap_lut_size,
             taau_jitter: quality::env_bool("P_TAAU_JITTER", true),
+            taau_antiflicker: quality::env_bool("P_TAAU_ANTIFLICKER", false),
             taau_force: quality::env_bool("P_TAAU_FORCE", false),
             taa_mip_bias: std::env::var("TAA_MIP_BIAS")
                 .ok()
@@ -6114,6 +6147,12 @@ impl App {
             self.gi
                 .prepare_denoise(&self.device, cw.div_ceil(gdiv), ch.div_ceil(gdiv), key)?;
         }
+        // F6O: (re)allocate the per-pixel sky-vis temporal history at the low trace res.
+        if self.skyvis_pp_spp > 0 {
+            let sdiv = self.skyvis_pp_div.max(1);
+            self.gi
+                .prepare_skyvis_temporal(&self.device, cw.div_ceil(sdiv), ch.div_ceil(sdiv))?;
+        }
         // P4: (re)allocate the world radiance cache atlas for the scene's clipmap level count.
         if self.wrc || self.wrc_viz {
             let levels = self.gdf.clip_descriptor().map(|(_, c)| c).unwrap_or(1);
@@ -6883,6 +6922,78 @@ impl App {
                 } else {
                     ao_traced
                 })
+            }
+            _ => None,
+        };
+        // F6O: per-pixel sky-visibility for the DEFERRED skylight occlusion. Off (`P_SKYVIS_PP=0`)
+        // → not recorded, the deferred pass keeps sampling the probe-resolution volume V (anchor).
+        // On → per-pixel GDF trace at full res (silhouette-crisp), replacing only the deferred
+        // `skyvis`; the volume still runs for the surface-cache / reflection world-space consumers.
+        // Trace + temporal accumulate the per-pixel sky-vis EARLY; the spatial denoise (which
+        // blends in the smooth volume V at far distance) runs LATER, once record_gi has produced
+        // `gi_skyvis_out`. Carry the accumulated image + its low-res dims to that point.
+        let skyvis_accum: Option<(ResourceId, u32, u32, Extent2D)> = match (
+            self.skyvis_pp_spp > 0 && self.gi.has_skyvis_pp(),
+            scene_gdf_vol,
+            scene_gdf_ext,
+        ) {
+            (true, Some(vol), Some(ext)) => {
+                // Trace at 1/div (the hemisphere march is expensive) + joint-bilateral upsample,
+                // mirroring the gdf_ao res-divisor path. gdf_skyvis samples the G-buffer by
+                // normalized UV, so a coarser extent traces correctly with no shader change.
+                let sdiv = self.skyvis_pp_div.max(1);
+                let (sw, sh) = (cw.div_ceil(sdiv), ch.div_ceil(sdiv));
+                let s_extent = if sdiv > 1 {
+                    Extent2D::new(sw, sh)
+                } else {
+                    extent
+                };
+                let traced = self.gi.record_skyvis(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    s_extent,
+                    inv_view_proj,
+                    sw,
+                    sh,
+                    self.flip_y | if self.gdf_facing_flip { 2 } else { 0 },
+                    self.skyvis_pp_spp,
+                    self.frame_no as u32,
+                    scene_clip,
+                    &scene_clip_vols,
+                    // Visibility escape needs far fewer march steps than a lighting bounce: the
+                    // cone_k LOD grows the step with distance, so ~24 steps reach the scene
+                    // diagonal. Capping here is a big cost win (the march dominates the pass).
+                    self.gi_max_steps.min(24),
+                    self.gdf_cone_k.max(0.5),
+                );
+                // Temporal accumulation (reproject prev V via prev_view_proj, world-pos-validated
+                // EMA) converges the few-ray noise toward the true V — this is what removes the
+                // door/opening sparkle+speckle. Then a cheap low-res spatial denoise cleans the
+                // residual and strips the temporal `.a` to bent 0; the deferred does the edge-aware
+                // 2x2 upscale. All at the low trace res (cheap).
+                let accumulated = self.gi.record_skyvis_temporal(
+                    &mut graph,
+                    traced,
+                    g_depth,
+                    g_normal,
+                    s_extent,
+                    inv_view_proj,
+                    self.prev_view_proj,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    sw,
+                    sh,
+                    // bit1 = sub-pixel bilinear history fetch when TAAU jitter is active (the B2
+                    // contract the GI/reflection temporals use); degenerates to flip_y when jitter
+                    // is off, so native/static anchors are unaffected. (Fable F6O review.)
+                    temporal_flip,
+                );
+                Some((accumulated, sw, sh, s_extent))
             }
             _ => None,
         };
@@ -7752,6 +7863,21 @@ impl App {
             }
             _ => None,
         };
+        // F6O: spatial denoise of the accumulated per-pixel sky-vis, blending in the smooth volume
+        // V (now produced) at far distance to kill undersampled thin-geometry speckle. Runs here so
+        // `gi_skyvis_out` is available. Off → None → deferred keeps the volume V (byte anchor).
+        let skyvis_pp_out = skyvis_accum.map(|(acc, sw, sh, se)| {
+            self.gi.record_skyvis_denoise(
+                &mut graph,
+                acc,
+                g_position,
+                gi_skyvis_out,
+                [eye.x, eye.y, eye.z],
+                se,
+                sw,
+                sh,
+            )
+        });
         self.deferred.record_lighting(
             &mut graph,
             hdr,
@@ -7762,7 +7888,12 @@ impl App {
             ssao_out,
             gdf_gi_out,
             swrt_reflect_out,
-            gi_skyvis_out,
+            // F6O: the per-pixel sky-vis image supersedes the probe-volume V for the deferred
+            // skylight when `P_SKYVIS_PP>0`; else the volume path (byte-identical anchor).
+            skyvis_pp_out.or(gi_skyvis_out),
+            // Edge-aware upscale only for the low-res per-pixel producer; the volume V is full-res
+            // and keeps the plain-bilinear byte-identical anchor.
+            skyvis_pp_out.is_some(),
             self.skyvis_tint,
             self.skyvis_tint_v0,
             self.skyvis_min_occ,
@@ -8489,7 +8620,14 @@ impl App {
                 ch,
                 inv_view_proj,
                 self.prev_view_proj_taau,
-                self.flip_y,
+                // bit2 = luminance anti-flicker (`P_TAAU_ANTIFLICKER`, default OFF): damps the
+                // blend weight of a sample whose luma diverges from the history, killing the
+                // bright sub-pixel-aperture shimmer (door sky-gaps, window grilles) that the
+                // YCoCg box can't clamp because it is a bright CLUSTER. Default OFF keeps the
+                // sealed content baseline (sc_viz / gdf_ao capture at the TAAU tier res) byte-
+                // identical — the PT gate runs RENDER_SCALE=1 (TAAU off) so it cannot measure
+                // this, i.e. no quality gate exists yet to justify flipping the default.
+                self.flip_y | if self.taau_antiflicker { 4 } else { 0 },
                 self.scene_radius * 2.0,
                 taau_jitter_uv,
                 false,
@@ -8765,6 +8903,7 @@ impl App {
                 None,
                 None,
                 None,
+                false, // F6O skyvis_edge_aware (no skyvis in the PiP inset)
                 self.skyvis_tint,
                 self.skyvis_tint_v0,
                 self.skyvis_min_occ,
@@ -8995,6 +9134,10 @@ impl App {
         // frame's view-projection for the next frame's temporal reprojection.
         if gi_denoise_active {
             self.gi.advance_denoise();
+        }
+        // F6O: advance the sky-vis temporal ping-pong so next frame reprojects this frame's write.
+        if self.skyvis_pp_spp > 0 {
+            self.gi.advance_skyvis_temporal();
         }
         // P4: advance the world radiance cache ping-pong so next frame reads this frame's write.
         if self.wrc || self.wrc_viz {

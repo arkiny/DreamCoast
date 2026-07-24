@@ -1295,6 +1295,21 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gdf_ao_cs",
     },
+    // F6O: per-pixel sky-visibility (V) — replaces the probe-resolution volume V for the
+    // deferred skylight occlusion (docs/phase-f6o-per-pixel-skyvis-plan.md).
+    Job {
+        src: "gdf_skyvis.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_skyvis_cs",
+    },
+    // F6O: low-res spatial denoise of the per-pixel sky-vis V (edge-aware, runs at trace res).
+    Job {
+        src: "gdf_skyvis_denoise.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_skyvis_denoise_cs",
+    },
     // Screen-space (HBAO-lite) near-field AO, composed with the GDF AO; + its bilateral blur.
     Job {
         src: "gtao.slang",

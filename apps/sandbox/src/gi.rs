@@ -17,9 +17,10 @@ use rhi::{
 use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
-    gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_gi_upsample_push, gdf_temporal_push,
-    gi_volume_push, screen_probe_filter_push, screen_probe_integrate_push,
-    screen_probe_irradiance_push, screen_probe_trace_push, wrc_update_push, wrc_view_push,
+    gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_gi_upsample_push, gdf_skyvis_denoise_push,
+    gdf_skyvis_push, gdf_temporal_push, gi_volume_push, screen_probe_filter_push,
+    screen_probe_integrate_push, screen_probe_irradiance_push, screen_probe_trace_push,
+    wrc_update_push, wrc_view_push,
 };
 
 /// Screen-space radiance probe density: one probe per `SP_DOWNSAMPLE`x`SP_DOWNSAMPLE` screen
@@ -48,6 +49,8 @@ const GI_SKYVIS_SH: usize = 4;
 
 pub(crate) struct GiSystem {
     ao_pipeline: Option<ComputePipeline>, // C2 GDF ambient occlusion
+    skyvis_pipeline: Option<ComputePipeline>, // F6O per-pixel sky-visibility (V)
+    skyvis_denoise_pipeline: Option<ComputePipeline>, // F6O low-res sky-vis spatial denoise
     gi_pipeline: Option<ComputePipeline>, // C3 GDF 1-bounce diffuse GI (SW march — the default)
     /// F3: the `gdf_gi_hwrt` permutation (hardware-ray-traced gather compiled in). Built only on
     /// RT-capable devices; bound in place of `gi_pipeline` when HW-RT GI is opted in. The default
@@ -66,6 +69,14 @@ pub(crate) struct GiSystem {
     gi_denoise_frame: u32,
     /// Lighting/quality key; a change (sun, spp, …) resets the accumulation.
     gi_denoise_key: Option<u64>,
+    /// F6O sky-vis temporal accumulation history (ping-pong, at the LOW trace res): `skyvis_hist`
+    /// (rgb = accumulated V, a = length) + `skyvis_pos` (xyz = world point, w = valid). Sky-vis V
+    /// is pure geometric visibility (view/sun-independent), so only camera motion + resolution
+    /// change reset it — the reprojection + world-position disocclusion handle the rest.
+    skyvis_hist: [Option<StorageBuffer>; 2],
+    skyvis_pos: [Option<StorageBuffer>; 2],
+    skyvis_temporal_extent: (u32, u32),
+    skyvis_temporal_frame: u32,
     /// GI-fidelity track: world-space directional-irradiance volume (radiance cache). Update
     /// pipeline + 24 R32F volumes (ping-pong [read|write] × 12 SH coefficients). Allocated
     /// contiguously per slot so only the base bindless index is passed to the shaders.
@@ -169,6 +180,20 @@ impl GiSystem {
             dreamcoast_shader::gdf_ao_cs_metallib,
             "gdf_ao",
             160,
+        )?;
+        let skyvis_pipeline = compute(
+            dreamcoast_shader::gdf_skyvis_cs_spirv,
+            dreamcoast_shader::gdf_skyvis_cs_dxil,
+            dreamcoast_shader::gdf_skyvis_cs_metallib,
+            "gdf_skyvis",
+            160,
+        )?;
+        let skyvis_denoise_pipeline = compute(
+            dreamcoast_shader::gdf_skyvis_denoise_cs_spirv,
+            dreamcoast_shader::gdf_skyvis_denoise_cs_dxil,
+            dreamcoast_shader::gdf_skyvis_denoise_cs_metallib,
+            "gdf_skyvis_denoise",
+            48,
         )?;
         let gi_pipeline = compute(
             dreamcoast_shader::gdf_gi_cs_spirv,
@@ -317,12 +342,18 @@ impl GiSystem {
         }
         Ok(Self {
             ao_pipeline,
+            skyvis_pipeline,
+            skyvis_denoise_pipeline,
             gi_pipeline,
             gi_hwrt_pipeline,
             upsample_pipeline,
             temporal_pipeline,
             atrous_pipeline,
             gi_hist: [None, None],
+            skyvis_hist: [None, None],
+            skyvis_pos: [None, None],
+            skyvis_temporal_extent: (0, 0),
+            skyvis_temporal_frame: 0,
             gi_pos: [None, None],
             gi_denoise_extent: (0, 0),
             gi_denoise_frame: 0,
@@ -714,6 +745,9 @@ impl GiSystem {
     pub(crate) fn has_ao(&self) -> bool {
         self.ao_pipeline.is_some()
     }
+    pub(crate) fn has_skyvis_pp(&self) -> bool {
+        self.skyvis_pipeline.is_some()
+    }
     pub(crate) fn has_gi(&self) -> bool {
         self.gi_pipeline.is_some()
     }
@@ -1051,6 +1085,265 @@ impl GiSystem {
                     clip.1,
                 ));
                 cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
+    /// F6O: per-pixel sky-visibility (V). For every shaded pixel it casts `spp` cosine-hemisphere
+    /// rays into the scene GDF (the same march `record_gi` uses) and writes the escaped fraction —
+    /// the cosine-weighted V the deferred skylight occlusion (`occlude_sky_diffuse_bent`) wants,
+    /// but per-PIXEL instead of the probe-resolution volume (whose grid quantizes V into the
+    /// camera-shifting "검은 Block"). Scalar-only increment 1: output `float4(V, 0, 0, 1)` → the
+    /// consumer's bent-free scalar path. Returns the sky-vis image (feeds the deferred `skyvis`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_skyvis<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        scene_gdf: &'a Volume,
+        scene_gdf_ext: ResourceId,
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        depth: ResourceId,
+        normal: ResourceId,
+        extent: Extent2D,
+        inv_view_proj: [f32; 16],
+        cw: u32,
+        ch: u32,
+        flip_y: u32,
+        spp: u32,
+        frame: u32,
+        clip: (u32, u32),
+        clip_vols: &'a [&'a Volume],
+        max_steps: u32,
+        cone_k: f32,
+    ) -> ResourceId {
+        let svp = self.skyvis_pipeline.as_ref().expect("gdf skyvis pipeline");
+        let out = graph.create_storage_image("gdf_skyvis", HDR_FORMAT, extent);
+        let sampled = scene_gdf.sampled_index();
+        let diag = Self::diag(aabb_min, aabb_max);
+        let bias = diag * 0.004; // match record_gi's surface start bias
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "gdf_skyvis",
+                storage_writes: vec![out],
+                reads: vec![depth, normal, scene_gdf_ext],
+            },
+            move |ctx| {
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.volume_to_sampled(scene_gdf);
+                for v in clip_vols {
+                    cmd.volume_to_sampled(v);
+                }
+                let _ = sampled;
+                cmd.bind_compute_pipeline(svp);
+                cmd.push_constants_compute(&gdf_skyvis_push(
+                    &inv_view_proj,
+                    aabb_min,
+                    0.0, // world ground plane at y = 0
+                    aabb_max,
+                    diag, // GDF sample distance clamp
+                    depth_index,
+                    normal_index,
+                    out_index,
+                    flip_y,
+                    cw,
+                    ch,
+                    spp,
+                    frame,
+                    diag, // ray max distance (visibility reach = scene diagonal)
+                    bias, // ray start bias along the ray
+                    bias, // surface push along the normal (self-occlusion guard)
+                    cone_k,
+                    max_steps,
+                    clip.0,
+                    clip.1,
+                ));
+                cmd.dispatch(cw.div_ceil(8), ch.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
+    /// F6O: (re)allocate the sky-vis temporal history buffers to the LOW trace res. Call once per
+    /// frame before `record_skyvis_temporal`. A resolution change reallocates + resets the counter.
+    pub(crate) fn prepare_skyvis_temporal(
+        &mut self,
+        device: &Device,
+        sw: u32,
+        sh: u32,
+    ) -> anyhow::Result<()> {
+        if self.skyvis_denoise_pipeline.is_none() || self.temporal_pipeline.is_none() {
+            return Ok(());
+        }
+        if self.skyvis_temporal_extent != (sw, sh) {
+            device.wait_idle()?;
+            let make = || -> anyhow::Result<Option<StorageBuffer>> {
+                Ok(Some(device.create_storage_buffer(&StorageBufferDesc {
+                    size: (sw as u64) * (sh as u64) * 16,
+                    stride: 16,
+                    indirect: false,
+                })?))
+            };
+            self.skyvis_hist = [make()?, make()?];
+            self.skyvis_pos = [make()?, make()?];
+            self.skyvis_temporal_extent = (sw, sh);
+            self.skyvis_temporal_frame = 0;
+        }
+        Ok(())
+    }
+
+    /// Bump the sky-vis temporal counter (end-of-frame, after submit) so next frame reprojects
+    /// history and swaps the ping-pong buffers.
+    pub(crate) fn advance_skyvis_temporal(&mut self) {
+        self.skyvis_temporal_frame = self.skyvis_temporal_frame.saturating_add(1);
+    }
+
+    /// F6O: temporal accumulation of the noisy per-pixel sky-vis V (reproject prev V via
+    /// `prev_view_proj`, world-position-validated EMA). Reuses the generic `gdf_temporal` shader
+    /// with the sky-vis history buffers. `raw` is the traced V (V in .r); returns the accumulated
+    /// V image (still V in .r — the low-res denoise strips the temporal `.a` to bent 0 next).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_skyvis_temporal<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        raw: ResourceId,
+        depth: ResourceId,
+        normal: ResourceId,
+        extent: Extent2D,
+        inv_view_proj: [f32; 16],
+        prev_view_proj: [f32; 16],
+        aabb_min: [f32; 3],
+        aabb_max: [f32; 3],
+        sw: u32,
+        sh: u32,
+        flip_y: u32,
+    ) -> ResourceId {
+        let tempp = self.temporal_pipeline.as_ref().expect("temporal pipeline");
+        let frame = self.skyvis_temporal_frame;
+        let reset = u32::from(frame == 0);
+        let read = ((frame + 1) % 2) as usize;
+        let write = (frame % 2) as usize;
+        let hist_r = self.skyvis_hist[read]
+            .as_ref()
+            .expect("sv hist r")
+            .storage_index();
+        let hist_w = self.skyvis_hist[write]
+            .as_ref()
+            .expect("sv hist w")
+            .storage_index();
+        let pos_r = self.skyvis_pos[read]
+            .as_ref()
+            .expect("sv pos r")
+            .storage_index();
+        let pos_w = self.skyvis_pos[write]
+            .as_ref()
+            .expect("sv pos w")
+            .storage_index();
+        let hist_w_ext = graph.import_external("skyvis_hist_w");
+        let pos_w_ext = graph.import_external("skyvis_pos_w");
+        let diag = Self::diag(aabb_min, aabb_max);
+        let reject_dist = diag * 0.01;
+        // Faster convergence than the GI's 64 so the door/opening residual resolves in ~1 s of
+        // stillness instead of ~2 s (sky-vis V is geometric — a moderate history stays smooth).
+        let max_hist = 32.0_f32;
+        let out = graph.create_storage_image("gdf_skyvis_tmp", HDR_FORMAT, extent);
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "gdf_skyvis_temporal",
+                storage_writes: vec![out, hist_w_ext, pos_w_ext],
+                reads: vec![raw, depth, normal],
+            },
+            move |ctx| {
+                let raw_index = ctx.sampled_index(raw);
+                let depth_index = ctx.sampled_index(depth);
+                let normal_index = ctx.sampled_index(normal);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(tempp);
+                cmd.push_constants_compute(&gdf_temporal_push(
+                    &inv_view_proj,
+                    &prev_view_proj,
+                    raw_index,
+                    depth_index,
+                    normal_index,
+                    out_index,
+                    hist_r,
+                    hist_w,
+                    pos_r,
+                    pos_w,
+                    sw,
+                    sh,
+                    flip_y,
+                    reset,
+                    reject_dist,
+                    max_hist,
+                    1.0 / max_hist,
+                    0.0, // temporal clamp OFF: let the EMA converge (V is geometric, no fireflies)
+                ));
+                cmd.dispatch(sw.div_ceil(8), sh.div_ceil(8), 1);
+                Ok(())
+            },
+        );
+        out
+    }
+
+    /// F6O: edge-aware spatial denoise of the per-pixel sky-vis V, run at the TRACE resolution
+    /// (1/div) so the wide 5x5 kernel is ~div^2 cheaper than the same kernel inline in the full-res
+    /// lighting pass. `src` is the raw traced V; `position` is the full-res world-pos G-buffer
+    /// (sampled at low-res UVs for the edge-stop). Returns the denoised low-res V image.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_skyvis_denoise<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        src: ResourceId,
+        position: ResourceId,
+        // Smooth probe-volume sky-vis V (blended in at far distance to kill undersampled thin-
+        // geometry speckle); `None` → per-pixel only (no distance blend).
+        vol: Option<ResourceId>,
+        cam_pos: [f32; 3],
+        extent: Extent2D,
+        sw: u32,
+        sh: u32,
+    ) -> ResourceId {
+        let dp = self
+            .skyvis_denoise_pipeline
+            .as_ref()
+            .expect("gdf skyvis denoise pipeline");
+        let out = graph.create_storage_image("gdf_skyvis_dn", HDR_FORMAT, extent);
+        let mut reads = vec![src, position];
+        if let Some(v) = vol {
+            reads.push(v);
+        }
+        graph.add_compute_pass(
+            ComputePassInfo {
+                name: "gdf_skyvis_denoise",
+                storage_writes: vec![out],
+                reads,
+            },
+            move |ctx| {
+                let src_index = ctx.sampled_index(src);
+                let position_index = ctx.sampled_index(position);
+                let vol_index = vol.map(|v| ctx.sampled_index(v)).unwrap_or(u32::MAX);
+                let out_index = ctx.storage_index(out);
+                let cmd = ctx.cmd();
+                cmd.bind_compute_pipeline(dp);
+                cmd.push_constants_compute(&gdf_skyvis_denoise_push(
+                    src_index,
+                    position_index,
+                    out_index,
+                    sw,
+                    sh,
+                    vol_index,
+                    cam_pos,
+                ));
+                cmd.dispatch(sw.div_ceil(8), sh.div_ceil(8), 1);
                 Ok(())
             },
         );

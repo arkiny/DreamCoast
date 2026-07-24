@@ -1212,6 +1212,10 @@ impl DeferredRenderer {
         gdf_gi: Option<ResourceId>,
         reflect: Option<ResourceId>,
         skyvis: Option<ResourceId>,
+        // F6O: sky-vis image is the low-res per-pixel producer → set bit31 of skyvis_index so pbr
+        // uses the edge-aware joint-bilateral upscale (false = the full-res volume V = plain
+        // bilinear = byte-identical anchor).
+        skyvis_edge_aware: bool,
         skyvis_tint: f32,
         // Aperture shaping of the tint leak (0 = flat legacy; see pbr.slang skyvis_tint_v0).
         skyvis_tint_v0: f32,
@@ -1281,7 +1285,9 @@ impl DeferredRenderer {
                 let ssao_index = ssao.map(|s| ctx.sampled_index(s)).unwrap_or(u32::MAX);
                 let gi_index = gdf_gi.map(|gi| ctx.sampled_index(gi)).unwrap_or(u32::MAX);
                 let reflect_index = reflect.map(|r| ctx.sampled_index(r)).unwrap_or(u32::MAX);
-                let skyvis_index = skyvis.map(|s| ctx.sampled_index(s)).unwrap_or(u32::MAX);
+                let skyvis_index = skyvis
+                    .map(|s| ctx.sampled_index(s) | if skyvis_edge_aware { 0x8000_0000 } else { 0 })
+                    .unwrap_or(u32::MAX);
                 // Clustered light bufs: their storage indices are stable (persistent buffers),
                 // so pass them straight through; `NO_TEXTURE` grid buf disables the path.
                 let (cl_grid, cl_index, cl_light, cl_count) = match cluster {

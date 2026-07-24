@@ -723,9 +723,55 @@ float4 fsMain(VSOutput input) : SV_Target
     float3 sky_bent = float3(0.0, 0.0, 0.0);
     if (pc.skyvis_index != NO_TEXTURE)
     {
-        float4 sv = g.textures[pc.skyvis_index].Sample(g.samp, input.uv);
-        sky_vis = saturate(sv.r);
-        sky_bent = sv.gba;
+        // F6O: bit31 of skyvis_index flags the per-pixel (low-res) producer, which needs an
+        // EDGE-AWARE upscale; the volume producer (bit31 clear) keeps the plain bilinear Sample —
+        // byte-identical to the pre-F6O anchor (the content goldens sample the volume V here).
+        bool edge_aware = (pc.skyvis_index & 0x80000000u) != 0u;
+        uint sidx = pc.skyvis_index & 0x7FFFFFFFu;
+        if (edge_aware)
+        {
+            // The per-pixel sky-vis is traced at 1/div and NOISE-denoised at that low res by the
+            // gdf_skyvis_denoise pass; the only job here is a cheap edge-aware UPSCALE to full res.
+            // A plain bilinear fetch would bleed the open-sky V across silhouettes (thin bars /
+            // depth edges → blue skylight on occluded stone), so do a 2x2 joint-bilateral with a
+            // world-position edge-stop. Cheap (4 low-res taps); the wide noise kernel lives in the
+            // low-res pass, not here (a 5x5 at full Retina res cost ~8 ms). Falls back to plain
+            // bilinear when every tap is edge-rejected.
+            uint svw, svh;
+            g.textures[sidx].GetDimensions(svw, svh);
+            float2 res = float2(svw, svh);
+            float2 fp = input.uv * res - 0.5;
+            float2 i0 = floor(fp);
+            float2 fr = fp - i0;
+            float4 sv0 = g.textures[sidx].Sample(g.samp, input.uv);
+            float vsum = 0.0;
+            float wsum = 0.0;
+            [unroll]
+            for (int dy = 0; dy < 2; dy++)
+            {
+                [unroll]
+                for (int dx = 0; dx < 2; dx++)
+                {
+                    float2 tuv = (i0 + float2(dx, dy) + 0.5) / res;
+                    float bw = (dx == 0 ? 1.0 - fr.x : fr.x) * (dy == 0 ? 1.0 - fr.y : fr.y);
+                    float tv = g.textures[sidx].SampleLevel(g.samp, tuv, 0.0).r;
+                    float3 twp = g.textures[pc.position_index].SampleLevel(g.samp, tuv, 0.0).xyz;
+                    float3 dp = twp - world_pos;
+                    float ew = exp(-dot(dp, dp) * 4.0); // world-pos edge-stop (~0.5 m falloff)
+                    float ww = bw * ew;
+                    vsum += tv * ww;
+                    wsum += ww;
+                }
+            }
+            sky_vis = saturate(wsum > 1e-4 ? vsum / wsum : sv0.r);
+            sky_bent = sv0.gba;
+        }
+        else
+        {
+            float4 sv = g.textures[sidx].Sample(g.samp, input.uv);
+            sky_vis = saturate(sv.r);
+            sky_bent = sv.gba;
+        }
     }
 
     // `ambient_ibl` already applied the GDF far-field AO to the DIFFUSE ambient and left the traced

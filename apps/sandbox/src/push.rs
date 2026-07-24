@@ -1105,6 +1105,89 @@ pub(crate) fn gdf_ao_push(
     pc
 }
 
+/// Pack the F6O per-pixel sky-visibility push (160 bytes): inv_view_proj (64) +
+/// aabb_min.xyz/ground_y (16) + aabb_max.xyz/sample_clamp (16) + (depth, normal, out, flip_y)
+/// (16) + (width, height, spp, frame) (16) + (ray_max, march_bias, normal_offset, cone_k) (16) +
+/// (max_steps, clip_desc, clip_count, pad) (16). Mirrors `SkyvisPush` in gdf_skyvis.slang.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gdf_skyvis_push(
+    inv_view_proj: &[f32; 16],
+    aabb_min: [f32; 3],
+    ground_y: f32,
+    aabb_max: [f32; 3],
+    sample_clamp: f32,
+    depth_index: u32,
+    normal_index: u32,
+    out_index: u32,
+    flip_y: u32,
+    width: u32,
+    height: u32,
+    spp: u32,
+    frame: u32,
+    ray_max: f32,
+    march_bias: f32,
+    normal_offset: f32,
+    cone_k: f32,
+    max_steps: u32,
+    clip_desc: u32,
+    clip_count: u32,
+) -> [u8; 160] {
+    let mut pc = [0u8; 160];
+    for (i, v) in inv_view_proj.iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in aabb_min.iter().enumerate() {
+        pc[64 + i * 4..68 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[76..80].copy_from_slice(&ground_y.to_le_bytes()); // aabb_min.w
+    for (i, v) in aabb_max.iter().enumerate() {
+        pc[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[92..96].copy_from_slice(&sample_clamp.to_le_bytes()); // aabb_max.w
+    pc[96..100].copy_from_slice(&depth_index.to_le_bytes());
+    pc[100..104].copy_from_slice(&normal_index.to_le_bytes());
+    pc[104..108].copy_from_slice(&out_index.to_le_bytes());
+    pc[108..112].copy_from_slice(&flip_y.to_le_bytes());
+    pc[112..116].copy_from_slice(&width.to_le_bytes());
+    pc[116..120].copy_from_slice(&height.to_le_bytes());
+    pc[120..124].copy_from_slice(&spp.to_le_bytes());
+    pc[124..128].copy_from_slice(&frame.to_le_bytes());
+    pc[128..132].copy_from_slice(&ray_max.to_le_bytes());
+    pc[132..136].copy_from_slice(&march_bias.to_le_bytes());
+    pc[136..140].copy_from_slice(&normal_offset.to_le_bytes());
+    pc[140..144].copy_from_slice(&cone_k.to_le_bytes());
+    pc[144..148].copy_from_slice(&max_steps.to_le_bytes());
+    pc[148..152].copy_from_slice(&clip_desc.to_le_bytes());
+    pc[152..156].copy_from_slice(&clip_count.to_le_bytes());
+    pc
+}
+
+/// Pack the F6O sky-vis denoise push (48 bytes): src, position, out, width, height, vol (+ pad) +
+/// cam_pos float4 (for the distance blend to the volume V).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gdf_skyvis_denoise_push(
+    src_index: u32,
+    position_index: u32,
+    out_index: u32,
+    width: u32,
+    height: u32,
+    vol_index: u32,
+    cam_pos: [f32; 3],
+) -> [u8; 48] {
+    let mut pc = [0u8; 48];
+    pc[0..4].copy_from_slice(&src_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&position_index.to_le_bytes());
+    pc[8..12].copy_from_slice(&out_index.to_le_bytes());
+    pc[12..16].copy_from_slice(&width.to_le_bytes());
+    pc[16..20].copy_from_slice(&height.to_le_bytes());
+    pc[20..24].copy_from_slice(&vol_index.to_le_bytes());
+    // pc[24..32]: pad to the float4 boundary.
+    for (i, v) in cam_pos.iter().enumerate() {
+        pc[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc
+}
+
 /// Pack the Phase 11 Stage C3 GDF-GI push block (256 bytes): inv_view_proj (64) +
 /// sun dir+intensity (16) + (depth, normal, gdf_sampled, out) (16) + (width, height,
 /// flip_y, spp) (16) + (frame, albedo_rgb) (16) + aabb_min.xyz/ground_y (16) +
