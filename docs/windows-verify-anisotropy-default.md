@@ -1,5 +1,14 @@
 # WINDOWS (D3D12/Vulkan) VERIFICATION PROMPT — default anisotropy 16 (branch `fix/default-anisotropy-16`)
 
+> **STATUS: DONE (2026-07-25).** Verified on main `639f4ff` + the Windows fix batch — results,
+> the measured aniso contribution (+1.65/ch on the cloth-heavy content scene; gallery +0.002),
+> and the warmup-convergence measurement caveat are recorded in
+> [windows-verify-f1-f6-batch.md](windows-verify-f1-f6-batch.md) / `qhd-perf.md` Stage 9.
+> Note: step 3's "expect ≤ 0.001" was optimistic — the gallery floor is 0.004/ch (pre-existing
+> at 9b0dacd, aniso-independent), and the content scene needs `WARMUP_FRAMES=256+` before any
+> cross-backend comparison is meaningful (the default 3-frame warmup measures amortized-
+> convergence transients, ~17/ch even at the old baseline).
+
 Paste into a fresh Claude Code session on the Windows RTX 2070 SUPER box. Goal:
 confirm the wrap-sampler anisotropy default change (`P_ANISO` 1 → **16** on all
 three backends) is correct on D3D12 + Vulkan, and **quantify the DX≡VK divergence**

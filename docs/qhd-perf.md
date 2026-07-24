@@ -252,7 +252,13 @@ sampler / DX `FILTER_ANISOTROPIC` MaxAnisotropy / Metal maxAnisotropy, 각 백�
 **wrap 샘플러 이방성 표면 ~0.4/ch 예외** 문서화; 그 외 전부 ≤0.001 유지. `P_ANISO=1`이 엄격
 크로스백엔드 A/B용 seam. **1a(mip bias)는 여전히 패리티 안전한 원경 선명 레버**, 1b(이방성)는 grazing 담당.
 fmt+clippy 클린, Metal 검증: 바닥 타일 복원 + gallery run-to-run byte-identical.
-⚠️ **Windows 재검증 필요**: DX≡VK 0.427 수치는 기존 측정값 — RTX2070S에서 기본 16으로 재확인 권장.
+✅ **Windows 재검증 완료 (2026-07-25, RTX 2070 SUPER)** — [windows-verify-f1-f6-batch.md](windows-verify-f1-f6-batch.md):
+갤러리 aniso16 DX≡VK **0.006/ch** (`P_ANISO=1` 0.004 — 잔차는 aniso 무관 선존, max~5). 콘텐츠
+(sponza_intel_chromeball, AE=0, **WARMUP_FRAMES=1024 수렴 후**): aniso16 2.73/ch vs `P_ANISO=1`
+1.08/ch → **aniso16 기여 ≈ +1.65/ch (직물-위주 씬)** — 구 0.427은 다른 씬 기준이라 예외 문구는
+"grazing/직물 표면 수 /ch급, 씬 의존"으로 읽을 것. 바닥 타일 정상(스트라이프 없음), `P_ANISO=1`
+seam 동작 확인. 주의: 콘텐츠 DX≡VK 비교는 워밍업 수렴 필수(기본 3프레임 비교는 상각-수렴 과도를
+측정 — 동 문서 §3).
 
 ## Stage 6 — async-compute 캐시 relight 오버랩 (VK 헤드룸, 2026-06-28)
 

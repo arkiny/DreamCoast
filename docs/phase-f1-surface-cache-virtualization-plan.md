@@ -279,8 +279,13 @@ Stage 3+4 공존, clippy/fmt clean. **이득 정직: near-cards 카메라에선 
 보류**(동결). 정직 결론: 정적 이미지 이득은 작음(측정); **실질 가치 = 라이브 카메라 추종 스트리밍 + 메모리
 상한(스케일/견고성)**. Stage 4(b) 원거리 저해상 승인은 균일-슬롯 풀 결정으로 미착수(size-class 필요).
 
-**후속 배치(문서화):** DX≡VK Windows 재검증; card_touched 미러-가시 방출; 우선순위 방출; grid-over-slots
-(스트리밍 시 반사 grid 가속 복원); freeze-latch 재-arm 튜닝; PT 노출 매칭(콘텐츠 잔차 정량화).
+**후속 배치(문서화):** ~~DX≡VK Windows 재검증~~ **완료 (2026-07-25,
+[windows-verify-f1-f6-batch.md](windows-verify-f1-f6-batch.md))** — Windows 전용 버그 4건 수정
+(capture push 96→112·vis 224→232 root-sig UB = DX 서피스캐시 오염, F4B fine-buf `_init`
+host-write = VK 카메라 이동 즉사 등); 수정 후 갤러리 풀 ON/OFF 투명·스트림 양 백엔드 결정론 동작.
+남은 후속: card_touched 미러-가시 방출; 우선순위 방출; grid-over-slots
+(스트리밍 시 반사 grid 가속 복원); freeze-latch 재-arm 튜닝; PT 노출 매칭(콘텐츠 잔차 정량화);
+Stage 0/4 개별 ON/OFF Windows A/B.
 
 ### Stage 4 (원설계) — GI 카드-mip 패리티 + 원거리 저해상 승인 (기존 인프라 재사용·선택)
 **왜:** 풀 예산으로 더 많은 draw 수용 + GI cone 정합.
