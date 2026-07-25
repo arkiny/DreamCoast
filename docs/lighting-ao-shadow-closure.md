@@ -146,6 +146,30 @@ box) 재시도 금지(F6N/F6O 기각), 봉인된 sky-chain 재개 금지(F6I 원
 | `RENDER_SCALE=0.6667`(TAAU) | 43.7 | 26.6 | 77.0 | 내부해상도 레버 확인 |
 | VK 교차 | door 94.5 / nave 89.2 | 19~20 | — | gdf_reflect는 **DX가 VK보다 느림**(역전, DX 병리 의심) |
 
+### 4c. High 티어 실측 + 자동 티어링 갭 (2026-07-25 추가)
+
+"RTX 2070 SUPER 정도면 High가 기본값이어야 하지 않나?"라는 물음을 실측으로 종결.
+동일 레시피(door, 1920×1080, settle 60 + 62프레임, DX):
+
+| 티어 | gpu_total | fps |
+|---|---:|---:|
+| **Med** (현행 기본값, 승격 후) | **19.29 ms** | **51.8** |
+| **High** (`RENDER_QUALITY=high`) | **157.08 ms** | **6.4** |
+
+**High는 8.1× 느리다 — 이 GPU에서도 실사용 불가.** High가 "좋은 GPU용 티어"가 아니라
+**최적화 웨이브를 한 번도 받지 못한 무거운 레거시 티어**이기 때문이다: `render_scale` 1.0
+(TAAU 자체가 비활성), `gi_spp` 16, `cache_relight_period` 1, `cache_relight_spp` 8,
+`ao_res_div` 1, `reflect_res_div` 2, `gi_volume_period` 1, 그리고 **`cache_grid` 부재**
+(serde 기본 false = §3b-1이 "2694 카드에서 30 ms+"로 지목한 O(num_cards) 히트당 스캔이
+그대로 살아 있음). 본 배치의 Med 승격 스택(cache_grid·gi_volume spp/period 재배치·
+reflect 이코노미)이 High에는 전혀 반영되지 않았다.
+
+**구조적 갭 (신규 기록)**: 자동 티어 선택에 **GPU 성능 사다리가 없다** — quality.rs
+`device_default()`는 `Apple GPU → Apple 티어 / 그 외 전부 → Med` 이분법이라 2070 SUPER든
+4090이든 GTX 1050이든 동일하게 Med를 받는다. Med가 현재 유일하게 튜닝·측정된 콘텐츠
+티어이므로 **오늘 기준으로는 이 기본값이 옳지만**, 상위 GPU가 남는 성능을 못 쓰고 하위
+GPU가 과부하를 받는 구조는 그대로다. 별도 페이즈(§6-5) 대상.
+
 ## 4b. 수정 진행 로그
 
 - **P1 랜딩** (Med 승격: rs 0.6667+TAAU / reflect_res_div 4 / cache_grid on /
@@ -202,6 +226,11 @@ box) 재시도 금지(F6N/F6O 기각), 봉인된 sky-chain 재개 금지(F6I 원
 4. Metal에서 이번 배치 재검증 (Med는 non-Apple 티어라 Apple 출력 불변이어야 하나,
    gi_volume 리셰이프/가드는 공용 셰이더 — Mac 골든 러너로 확인 필요).
 5. 헤더 호이스트의 교차백엔드-안전판(값 전달식) — 측정된 부정 결과 기록 있음(§4b).
+6. **GPU 성능 기반 자동 티어링 + High/Low 티어 최적화** (§4c, 2026-07-25 신규): 현재
+   자동 선택은 Apple/그-외 이분법뿐이고 High는 측정 결과 6.4 fps로 실사용 불가. 두 갈래를
+   한 페이즈로 — ① 어댑터 성능 신호(VRAM·유닛 수·벤더 등급)로 Low/Med/High 자동 배정
+   ② High에 Med의 승격 스택(cache_grid 등)을 반영해 "상위 GPU가 실제로 쓸 수 있는" 티어로
+   재정의. 그전까지 상위 GPU는 남는 성능을 못 쓰고, `RENDER_QUALITY=high`는 함정이다.
 
 ## 7. 설계 결정 — 프리즈 금지 (2026-07-25 사용자 지시, §5b 리버트)
 
