@@ -11,6 +11,7 @@
 #include "bindless.slang"
 #include "clipmap.slang"
 #include "surface_cache.slang"
+#include "skyvis_sh.slang"
 #include "sky_common.slang"
 
 static const float PI = 3.14159265359;
@@ -54,6 +55,9 @@ struct CacheLightPush
     float skyvis_min_occ; // min sky-visibility floor (lerp V toward 1; same value as the deferred)
     uint flags;           // bit0: TLAS gather (CACHE_HWRT_SHADOW permutation only) — the indirect
                           // rays trace exact triangles instead of the leak-prone GDF march
+                          // bit1: dense-field direct-sun fallback for card-less gather hits (F1)
+                          // bit2: F6P bent contract + directionless OcclusionTint leak, in
+                          //       lockstep with pbr.slang (`P_SKYVIS_BENT_FIX`; 0 = legacy bytes)
     float ao_reach;       // GDF-AO march reach (the SAME GiSystem::ao_params the screen AO uses —
                           // the parity skylight is occluded by the identical formula)
     float ao_strength;    // exponential occlusion strength
@@ -402,16 +406,16 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
                                * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2] + SH_C1 * n.x * sc[3]));
             // The band-1 SH vector is the bent normal (visibility-weighted average unoccluded
             // direction); basis maps sc1→y, sc2→z, sc3→x (same recovery as gdf_gi).
-            // F6L validity contract (F6M port): a real non-negative V(ω) satisfies
-            // |band-1| <= sqrt(3)·band-0, so magnitude = direction confidence — a converged-dark
-            // cell's pure-noise band-1 fades to the bent-free contract instead of being
-            // renormalized into a full-strength random bent (the pre-F6L black-box bug, which
-            // survived here after gdf_gi was repaired). Physically-valid cells keep |bent| = 1
-            // and the exact legacy math below — byte-identical where the bound holds.
-            float3 bv = float3(sc[3], sc[1], sc[2]);
-            float bl = length(bv);
-            if (bl > 1e-5)
-                bent = (bv / bl) * saturate(1.7320508 * sc[0] / bl);
+            // F6P: the shared bent contract (skyvis_sh.slang) — the F6L factor this line used to
+            // carry was provably == 1 (the producer's estimator is a non-negative sum, so the
+            // |band-1| <= sqrt(3)·band-0 bound it tested is a per-sample identity) AND scale-free,
+            // which froze the direction over a whole probe cell. This path is a hardware trilinear
+            // with no per-corner access, so it gets the directionality factor and support = 1; it
+            // reads the COARSE half and feeds cards, not pixels, so the residual probe-scale
+            // quantization here is ~3x wider and an order of magnitude weaker than the deferred's
+            // was. The dominant carrier on this path is the leak below, fixed in lockstep.
+            bool f6p = (pc.flags & 4u) != 0u;
+            bent = skyvis_bent_from_sh(sc[0], float3(sc[3], sc[1], sc[2]), 1.0, !f6p);
         }
         float3 skyN = n;
         float dot_factor = 1.0;
@@ -429,7 +433,16 @@ void lightMain(uint3 tid: SV_DispatchThreadID)
         }
         float3 E = g.cubes[pc.irradiance_index].SampleLevel(g.samp, skyN, 0.0).rgb;
         float vis = lerp(v, 1.0, pc.skyvis_min_occ);
-        float lum = dot(E, float3(0.2126, 0.7152, 0.0722));
+        // F6P: the OcclusionTint leak's luminance follows the SURFACE NORMAL, not the bent normal
+        // — in lockstep with the deferred occlude_sky_diffuse_bent (pbr.slang), which is the whole
+        // point of this block. The occluded fraction is directionless in the reference; steering it
+        // by the unoccluded direction turned probe-cell quantization into brightness quantization.
+        // If these two ever drift, a cached (reflected) surface stops matching the way the deferred
+        // shades that same surface directly.
+        float3 leak_E = ((pc.flags & 4u) != 0u && bconf > 1e-4)
+                            ? g.cubes[pc.irradiance_index].SampleLevel(g.samp, n, 0.0).rgb
+                            : E;
+        float lum = dot(leak_E, float3(0.2126, 0.7152, 0.0722));
         // Deferred-parity contact AO: `ambient_ibl` multiplies its diffuse skylight by the marched
         // GDF AO (Stage C2), so the card's skylight must carry the same factor or a cached
         // (reflected) shadowed surface reads ~1/AO brighter than the deferred shades it directly

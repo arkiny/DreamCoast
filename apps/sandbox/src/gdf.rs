@@ -2075,6 +2075,11 @@ impl GdfSystem {
         // direct-sun fallback instead of contributing black (surface-cache virtualization). Host
         // gates this off for the gallery so the legacy zero-add keeps the byte-identical anchor.
         gather_fallback: bool,
+        // F6P (flags bit2): the shared bent-normal confidence contract + the directionless
+        // OcclusionTint leak, in lockstep with the deferred lighting pass (pbr.slang) — the two
+        // must agree or a cached (reflected) surface stops matching how the deferred shades it
+        // directly. false = the exact pre-F6P bytes (`P_SKYVIS_BENT_FIX=0`).
+        skyvis_bent_fix: bool,
     ) {
         // Stage D2b: feed the per-card visibility buffer index to the shader (sentinel = off =
         // uniform period). When present, declare it as a read so the graph barriers the relight
@@ -2183,7 +2188,9 @@ impl GdfSystem {
                     skyvis_tint,
                     skyvis_tint_v0,
                     skyvis_min_occ,
-                    u32::from(hwrt_shadow && hwrt_gather) | (u32::from(gather_fallback) << 1),
+                    u32::from(hwrt_shadow && hwrt_gather)
+                        | (u32::from(gather_fallback) << 1)
+                        | (u32::from(skyvis_bent_fix) << 2),
                     ao_params,
                 ));
                 cmd.dispatch(num_texels.div_ceil(64), 1, 1);

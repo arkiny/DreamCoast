@@ -164,14 +164,17 @@ float3 ao_multi_bounce(float3 base_color, float ao)
 // the prefilter-cube specular: a traced SW-RT reflection already resolves occlusion along its ray
 // (per the reflection track), so occluding it again would double-count.
 static const float SPEC_PI = 3.14159265359;
-// F6L bent-normal contract: the producer (gdf_gi) writes DIRECTION × VALIDITY, where validity
-// = saturate(sqrt(3)·V₀/|band-1|) — 1 for every physically-possible direction (a non-negative
-// V(ω) obeys |band-1| <= sqrt(3)·band-0, equality at a point aperture) and -> 0 where the
-// coefficients are pure estimator noise (a converged-dark cell: band-0 ~= 0 under nonzero
-// band-1). Consumers read |bent| as confidence and fade to their bent-free contract; a
-// genuine bent keeps |bent| = 1 and the EXACT legacy math. Normalizing noise into a
-// full-strength random direction painted voxel-sharp dark boxes on enclosed receivers
-// (the sponza_hero cypress/curtain).
+// Bent-normal contract: the producer (gdf_gi) writes DIRECTION × CONFIDENCE, and consumers read
+// |bent| as that confidence and fade to their bent-free contract (skyN = n, dot_factor = 1) as it
+// falls; |bent| = 1 keeps the EXACT legacy math. F6L defined confidence as
+// saturate(sqrt(3)·band-0/|band-1|), meant to detect "pure estimator noise" by testing the
+// physical bound |band-1| <= sqrt(3)·band-0. F6P found that test is a TAUTOLOGY — the producer's
+// estimator is a sum of non-negative visibilities, so the bound is a per-sample triangle
+// inequality preserved by every downstream mixer, and the factor was provably 1 everywhere. Worse,
+// it was scale-free, so a lone contributing probe's trilinear weight cancelled and the
+// reconstruction froze into a piecewise-constant field whose steps are probe-cell faces — the
+// hard-edged bright polygons the skylight painted on the sponza_intel vault. The confidence is now
+// directionality × interpolation support; the derivation lives in ONE place, skyvis_sh.slang.
 
 // Overlap fraction of two cones separated by `angle_between` (reference ApproximateConeConeIntersection).
 float approx_cone_cone_intersection(float arc0, float arc1, float angle_between)
@@ -209,13 +212,24 @@ float spec_occlusion_bent(float3 bent, float sky_vis, float3 mirror, float rough
 // Mul = V*DotProductFactor. When `bent` is zero (no producer, gallery, screen-probe path) this
 // reduces EXACTLY to the scalar path (skyN = n, dotFactor = 1: irradiance(n)*V + tint*lum*(1-V),
 // the previous occlude_sky_diffuse) — byte-identical fallback.
+// F6P contract bit — rides `skyvis_index` bit30 (bit31 is the F6O edge-aware flag; bindless slot
+// tables are orders of magnitude below 2^30, so the top two bits are a free side channel with zero
+// push growth). NO_TEXTURE has every bit set, so test the sentinel first — with no sky-vis image
+// there is no bent normal and the flag would be inert anyway, but keep it explicit.
+bool skyvis_f6p()
+{
+    return pc.skyvis_index != NO_TEXTURE && (pc.skyvis_index & 0x40000000u) != 0u;
+}
+
 float3 occlude_sky_diffuse_bent(float3 n, float sky_vis, float3 bent, uint irr_cube)
 {
     float3 skyN = n;
     float dot_factor = 1.0;
+    bool rotated = false;
     float bl = length(bent);
     if (bl > 1e-4)
     {
+        rotated = true;
         float3 nb = bent / bl;
         float w = saturate(sky_vis); // BentNormalWeightFactor: open -> surface normal, corner -> bent
         float3 skyN_b = normalize(lerp(nb, n, w));
@@ -243,7 +257,25 @@ float3 occlude_sky_diffuse_bent(float3 n, float sky_vis, float3 bent, uint irr_c
     }
     float3 irradiance = g.cubes[irr_cube].SampleLevel(g.samp, skyN, 0.0).rgb;
     float vis = lerp(saturate(sky_vis), 1.0, pc.skyvis_min_occ);
-    float lum = dot(irradiance, float3(0.2126, 0.7152, 0.0722));
+    // F6P: the leak stands for the OCCLUDED fraction, so its magnitude must not be steered by the
+    // bent normal — that is the direction of the UNOCCLUDED fraction, and it is the least reliable
+    // quantity in the chain exactly where (V -> 0, an enclosed soffit) it becomes the WHOLE answer:
+    // there `vis * dot_factor ~= 0` kills the first term and this leak IS the indoor skylight. Any
+    // quantization left in the bent direction therefore reappeared as a quantized BRIGHTNESS —
+    // a several-fold step between adjacent probe cells, since a sky irradiance cube differs
+    // several-fold between up and down. The reference keeps the occluded fraction directionless
+    // (SkyDiffuseLookUpAdd = (1 - SkyVisibility) * OcclusionTint — a constant tint, no cube lookup
+    // at all). We keep the luminance form (this engine's tint is "keep the brightness, lose the
+    // blue cast", not a fixed colour) but evaluate it along the SURFACE NORMAL, which is per-pixel
+    // continuous and carries no lattice. Bonus invariant this restores: the leak is now
+    // byte-identical between the bent and bent-free paths (a zero bent already takes skyN = n), so
+    // toggling P_BENT_NORMAL can no longer change the occluded fraction's brightness — which it
+    // never should have. One extra cube fetch, taken only where the bent actually rotated the
+    // lookup; LOD0 on the small irradiance cube.
+    float3 leak_irr = (rotated && skyvis_f6p())
+                          ? g.cubes[irr_cube].SampleLevel(g.samp, n, 0.0).rgb
+                          : irradiance;
+    float lum = dot(leak_irr, float3(0.2126, 0.7152, 0.0722));
     // Occluded fraction -> neutral OcclusionTint leak (as in the scalar path); the direction bias
     // is carried by `dot_factor` on the visible fraction. bent = 0 => dot_factor = 1 => identical.
     // Aperture-shaped leak (skyvis_tint_v0 > 0): zero in fully-enclosed regions, full above v0.
@@ -727,7 +759,7 @@ float4 fsMain(VSOutput input) : SV_Target
         // EDGE-AWARE upscale; the volume producer (bit31 clear) keeps the plain bilinear Sample —
         // byte-identical to the pre-F6O anchor (the content goldens sample the volume V here).
         bool edge_aware = (pc.skyvis_index & 0x80000000u) != 0u;
-        uint sidx = pc.skyvis_index & 0x7FFFFFFFu;
+        uint sidx = pc.skyvis_index & 0x3FFFFFFFu; // bit31 = F6O edge-aware, bit30 = F6P contract
         if (edge_aware)
         {
             // The per-pixel sky-vis is traced at 1/div and NOISE-denoised at that low res by the
@@ -806,7 +838,8 @@ float4 fsMain(VSOutput input) : SV_Target
     // 5 world pos, 6 AO, 7 direct light, 8 IBL ambient, 9 GDF AO, 10 GDF GI,
     // 11 light-count heatmap, 12 reflection buffer (the raw SW-RT reflected radiance sampled at
     // this pixel — what a mirror here would show; 0 where no reflection is bound),
-    // 13 sky visibility, 14 bent normal, 15 raw GI E(n) (oracle domain). 0 = lit.
+    // 13 sky visibility, 14 bent normal, 15 raw GI E(n) (oracle domain),
+    // 16 bent-normal CONFIDENCE |bent| (F6P). 0 = lit.
     int dbg = globals.counts.y;
     if (dbg == 1) color = albedo;
     else if (dbg == 2) color = n * 0.5 + 0.5;
@@ -842,6 +875,11 @@ float4 fsMain(VSOutput input) : SV_Target
     // Same physical quantity as the PT E-view (P8_PT_EVIEW), so the two are directly
     // comparable; view 10 is albedo-weighted and NOT oracle-comparable.
     else if (dbg == 15) color = gi_e * exposure;
+    // 16: |sky_bent| = the producer's CONFIDENCE (directionality x interpolation support), the
+    // quantity the receiver lerps skyN/dot_factor by. Pre-F6P this was provably 1.0 everywhere a
+    // bent existed — a binary field whose steps are probe-cell faces; post-F6P it must show a
+    // continuous ramp to 0 across each lone-contributor cell. The direct visual proof.
+    else if (dbg == 16) color = float3(saturate(length(sky_bent)));
 
     // PR-7 CSM cascade-index overlay (csm_params.y): tint the lit color by which cascade
     // shades each pixel so the split boundaries are inspectable. Only active with CSM on.

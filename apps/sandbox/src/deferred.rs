@@ -1216,6 +1216,10 @@ impl DeferredRenderer {
         // uses the edge-aware joint-bilateral upscale (false = the full-res volume V = plain
         // bilinear = byte-identical anchor).
         skyvis_edge_aware: bool,
+        // F6P (`P_SKYVIS_BENT_FIX` bit1): set bit30 of skyvis_index so pbr evaluates the neutral
+        // OcclusionTint leak's luminance along the SURFACE NORMAL instead of the bent normal.
+        // false = the exact pre-F6P bytes.
+        skyvis_bent_leak_n: bool,
         skyvis_tint: f32,
         // Aperture shaping of the tint leak (0 = flat legacy; see pbr.slang skyvis_tint_v0).
         skyvis_tint_v0: f32,
@@ -1286,7 +1290,11 @@ impl DeferredRenderer {
                 let gi_index = gdf_gi.map(|gi| ctx.sampled_index(gi)).unwrap_or(u32::MAX);
                 let reflect_index = reflect.map(|r| ctx.sampled_index(r)).unwrap_or(u32::MAX);
                 let skyvis_index = skyvis
-                    .map(|s| ctx.sampled_index(s) | if skyvis_edge_aware { 0x8000_0000 } else { 0 })
+                    .map(|s| {
+                        ctx.sampled_index(s)
+                            | if skyvis_edge_aware { 0x8000_0000 } else { 0 }
+                            | if skyvis_bent_leak_n { 0x4000_0000 } else { 0 }
+                    })
                     .unwrap_or(u32::MAX);
                 // Clustered light bufs: their storage indices are stable (persistent buffers),
                 // so pass them straight through; `NO_TEXTURE` grid buf disables the path.

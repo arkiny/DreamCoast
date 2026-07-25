@@ -22,6 +22,7 @@
 #include "bindless.slang"
 #include "clipmap.slang"
 #include "surface_cache.slang"
+#include "skyvis_sh.slang"
 #include "gdf_bounce.slang"
 
 struct GiPush
@@ -165,10 +166,12 @@ void gv_level_hw(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half, 
                            * (SH_C1 * n.y * sc[1] + SH_C1 * n.z * sc[2] + SH_C1 * n.x * sc[3]));
         if ((pc.flip_y & 2u) != 0u)
         {
-            float3 b = float3(sc[3], sc[1], sc[2]);
-            float bl = length(b);
-            if (bl > 1e-5)
-                bent = (b / bl) * saturate(1.7320508 * sc[0] / bl);
+            // F6P (flip_y bit3): shared bent contract. The hardware trilinear hands back only the
+            // FILTERED coefficients, so the per-corner support term is unavailable here (1.0) and
+            // this path gets the directionality fix alone. It is the `P_GI_VOL_OCC=0` A/B seam,
+            // not the shipping consumption — see gv_level_occ below for the real support.
+            bool f6p = (pc.flip_y & 8u) != 0u;
+            bent = skyvis_bent_from_sh(sc[0], float3(sc[3], sc[1], sc[2]), 1.0, !f6p);
         }
     }
 }
@@ -201,6 +204,11 @@ void gv_level_occ(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half,
         sc[k] = 0.0;
     }
     float wsum = 0.0;
+    // F6P: second moment of the band-0 corner values over the WITNESSED set. With sc[0] and wsum
+    // it gives the trilinear footprint's participation ratio (skyvis_sh.slang) — the interpolation
+    // support the scale-free confidence factor threw away, and the reason a lone-contributor cell
+    // reconstructed a bit-exactly constant bent normal. Free: `sv` at k == 0 is already Load()ed.
+    float sq0 = 0.0;
     // F6L (vol_occ bit1): parallel UNGATED accumulation. When every corner is rejected the
     // gated result had no witnesses and fell to hard black — on a VISIBLE surface that verdict
     // is a field-resolution artifact (a dense canopy bakes as a solid blob and swallows whole
@@ -217,6 +225,7 @@ void gv_level_occ(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half,
         scu[k] = 0.0;
     }
     float wu = 0.0;
+    float squ0 = 0.0; // F6P: the ungated second moment, swapped in with scu[] by the F6L fallback
     [loop]
     for (int ci = 0; ci < 8; ci++)
     {
@@ -251,6 +260,12 @@ void gv_level_occ(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half,
                 scu[k] += w * sv;
                 if (witness)
                     sc[k] += w * sv;
+                if (k == 0)
+                {
+                    squ0 += w * sv * sv; // F6P
+                    if (witness)
+                        sq0 += w * sv * sv;
+                }
             }
         }
         wu += w;
@@ -266,6 +281,7 @@ void gv_level_occ(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half,
             sc[k] = scu[k];
         }
         wsum = wu;
+        sq0 = squ0; // F6P: the support must describe the population that actually built sc[]
     }
     if (wsum > 1e-4)
     {
@@ -284,10 +300,15 @@ void gv_level_occ(float3 wp, float3 n, float3 lmin, float3 lmax, bool fine_half,
                          * rw);
             if ((pc.flip_y & 2u) != 0u)
             {
-                float3 b = float3(sc[3], sc[1], sc[2]);
-                float bl = length(b);
-                if (bl > 1e-5)
-                    bent = (b / bl) * saturate(1.7320508 * sc[0] / bl);
+                // F6P (flip_y bit3): this is the SHIPPING consumption on content, and the only
+                // path with per-corner access — so it supplies the real interpolation support.
+                // A uniform neighbourhood gives 1 (legacy behaviour preserved at any absolute
+                // openness); a cell carried by one probe gives that probe's relative trilinear
+                // weight, which is C0 in world position and vanishes at the far face of its
+                // support, so the reconstruction can no longer be piecewise constant.
+                bool f6p = (pc.flip_y & 8u) != 0u;
+                float support = f6p ? skyvis_sh_support(sc[0], sq0, wsum) : 1.0;
+                bent = skyvis_bent_from_sh(sc[0], float3(sc[3], sc[1], sc[2]), support, !f6p);
             }
         }
     }
@@ -461,6 +482,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     sc[k] = 0.0;
                 }
                 float wsum = 0.0;
+                float sq0 = 0.0; // F6P: band-0 second moment (support), lockstep with gv_level_occ
                 // F6L (vol_occ bit1): all-corners-rejected -> ungated-trilinear fallback,
                 // lockstep with gv_level_occ above (see that comment for the rationale).
                 float3 cu[4];
@@ -472,6 +494,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     scu[k] = 0.0;
                 }
                 float wu = 0.0;
+                float squ0 = 0.0; // F6P
                 [loop]
                 for (int ci = 0; ci < 8; ci++)
                 {
@@ -506,6 +529,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                             scu[k] += w * sv;
                             if (witness)
                                 sc[k] += w * sv;
+                            if (k == 0)
+                            {
+                                squ0 += w * sv * sv; // F6P
+                                if (witness)
+                                    sq0 += w * sv * sv;
+                            }
                         }
                     }
                     wu += w;
@@ -521,6 +550,7 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                         sc[k] = scu[k];
                     }
                     wsum = wu;
+                    sq0 = squ0; // F6P
                 }
                 if (wsum > 1e-4)
                 {
@@ -539,10 +569,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                                      * rw);
                         if ((pc.flip_y & 2u) != 0u)
                         {
-                            float3 b = float3(sc[3], sc[1], sc[2]);
-                            float bl = length(b);
-                            if (bl > 1e-5)
-                                bent = (b / bl) * saturate(1.7320508 * sc[0] / bl);
+                            // F6P: real interpolation support (lockstep with gv_level_occ).
+                            bool f6p = (pc.flip_y & 8u) != 0u;
+                            float support =
+                                f6p ? skyvis_sh_support(sc[0], sq0, wsum) : 1.0;
+                            bent = skyvis_bent_from_sh(sc[0], float3(sc[3], sc[1], sc[2]),
+                                                       support, !f6p);
                         }
                     }
                 }
@@ -620,12 +652,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 // legacy unit bent — the PT gates measured real signal there) and -> 0 only where
                 // the bound is violated; consumers treat magnitude as confidence and fade to their
                 // bent-free contract. Scale-free (any common factor on sc cancels), no tuned knob.
+                // F6P: both premises were wrong. The bound is a per-SAMPLE triangle inequality on a
+                // non-negative estimator, so it is never violated and the factor was provably == 1;
+                // and being scale-free is exactly what let one probe's trilinear weight cancel and
+                // freeze the direction over a whole cell. See skyvis_sh.slang for the replacement.
+                // Hardware trilinear here -> support 1.0 (directionality only).
                 if ((pc.flip_y & 2u) != 0u)
                 {
-                    float3 b = float3(sc[3], sc[1], sc[2]);
-                    float bl = length(b);
-                    if (bl > 1e-5)
-                        bent = (b / bl) * saturate(1.7320508 * sc[0] / bl);
+                    bool f6p = (pc.flip_y & 8u) != 0u;
+                    bent = skyvis_bent_from_sh(sc[0], float3(sc[3], sc[1], sc[2]), 1.0, !f6p);
                 }
             }
             g.storage_images[pc.vol_b][tid.xy] = float4(v, bent);

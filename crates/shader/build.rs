@@ -24,7 +24,7 @@ const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
 /// editing any of them recompiles all dependents (they include no per-job tracking otherwise —
 /// an omitted entry silently ships stale bytecode). Keep in sync with the `#include`s under
 /// `shaders/` (a non-JOB `.slang` — or the RT-pipeline root-sig JSON — belongs here).
-const SHARED_INCLUDES: [&str; 15] = [
+const SHARED_INCLUDES: [&str; 16] = [
     "bindless.slang",
     "rt_common.slang",
     "rt_pipeline_metal_rootsig.json",
@@ -34,6 +34,7 @@ const SHARED_INCLUDES: [&str; 15] = [
     "octahedral.slang",
     "sky_common.slang",
     "surface_cache.slang",
+    "skyvis_sh.slang",
     "wrc_common.slang",
     "light_cluster_common.slang",
     "pbr_brdf.slang",

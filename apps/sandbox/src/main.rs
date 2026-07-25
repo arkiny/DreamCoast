@@ -841,6 +841,11 @@ struct App {
     /// sky-vis band-1 vector (the DFAO bent normal) into the sky-vis image so the lighting samples
     /// the diffuse skylight along it. Only affects the content sky-vis path; gallery byte-identical.
     bent_normal: bool,
+    /// F6P bent-normal confidence contract (`P_SKYVIS_BENT_FIX`, default 3 = both halves on).
+    /// bit0 = producer (bent magnitude = directionality x interpolation support), bit1 = consumer
+    /// (the OcclusionTint leak follows the surface normal, not the bent normal). 0 restores the
+    /// exact pre-F6P bytes. See the resolution site for the full rationale.
+    skyvis_bent_fix: u32,
     /// F6M viewer-facing normal flip for gdf_gi/gdf_ao (`P_GDF_FACING_FLIP`, default on for
     /// content): match pbr's two-sided shading contract so back-face pixels of double-sided
     /// geometry reconstruct V/E/bent and march AO in the shaded hemisphere. Gallery = off.
@@ -3148,6 +3153,25 @@ impl App {
         // Default on for content (the sky-vis image is content-only → gallery byte-identical anyway);
         // `P_BENT_NORMAL=0` zeroes the bent normal for A/B (pbr then falls back to the scalar path).
         let bent_normal = quality::env_bool("P_BENT_NORMAL", true);
+        // F6P bent-normal confidence contract. Two independent defects on the same signal, so a
+        // 2-bit mask lets each half be measured alone:
+        //   bit0 PRODUCER (gdf_gi + sdf_cache_light): the bent MAGNITUDE now carries
+        //        directionality x interpolation support instead of a factor that was provably 1
+        //        and scale-free. Kills the piecewise-constant probe-cell plateau in the direction
+        //        field (skyvis_sh.slang has the derivation).
+        //   bit1 CONSUMER (pbr + sdf_cache_light): the neutral OcclusionTint leak's luminance
+        //        follows the SURFACE NORMAL, not the bent normal. Kills the amplifier that turned
+        //        that plateau into a several-fold brightness step — the hard-edged bright polygons
+        //        on curved interior masonry (sponza_intel vault).
+        // A CORRECTNESS fix, so default ON at every RenderQuality tier (the `cache_sky_occlude`
+        // precedent) rather than a tier dial; `P_SKYVIS_BENT_FIX=0` restores the exact pre-F6P
+        // bytes on all seven touched sites for A/B, =1 producer only, =2 consumer only.
+        // Gallery is byte-identical either way: no sky-vis image -> no bent -> both halves inert.
+        let skyvis_bent_fix = std::env::var("P_SKYVIS_BENT_FIX")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3)
+            & 3;
         // F6M: gdf_gi/gdf_ao viewer-facing normal flip — the same two-sided contract pbr shades
         // with (`two_sided = !is_gallery`), so back-face pixels of thin double-sided geometry
         // (leaf cards, cloth folds) reconstruct V/E/bent and march AO in the hemisphere the
@@ -4066,6 +4090,7 @@ impl App {
             hwrt_fullres,
             hwrt_hitlighting,
             bent_normal,
+            skyvis_bent_fix,
             gdf_facing_flip,
             ao_multibounce,
             spec_occlusion,
@@ -6914,6 +6939,9 @@ impl App {
                         self.cache_hwrt_shadow,
                         self.cache_hwrt_gather,
                         self.cache_gather_fallback,
+                        // F6P: both halves ride one bit here — this pass is producer AND consumer
+                        // of the bent normal, and the deferred parity contract needs them together.
+                        self.skyvis_bent_fix != 0,
                     );
                     self.scene_cache_reset = false;
                 }
@@ -7366,9 +7394,13 @@ impl App {
                     // facing normal flip (F6M): match pbr's two-sided shading contract on content
                     // scenes (`two_sided = !is_gallery`); gallery stays byte-identical.
                     // `P_GDF_FACING_FLIP=0` restores the raw-normal legacy for A/B.
+                    // bit3 = F6P producer contract (`P_SKYVIS_BENT_FIX` bit0): the bent magnitude
+                    // carries directionality x interpolation support instead of the provably-1,
+                    // scale-free factor that froze the direction over a whole probe cell.
                     self.flip_y
                         | if self.bent_normal { 2 } else { 0 }
-                        | if self.gdf_facing_flip { 4 } else { 0 },
+                        | if self.gdf_facing_flip { 4 } else { 0 }
+                        | if self.skyvis_bent_fix & 1 != 0 { 8 } else { 0 },
                     self.gi_spp,
                     self.frame_no as u32,
                     scene_albedo,
@@ -8045,9 +8077,18 @@ impl App {
             // F6O: the per-pixel sky-vis image supersedes the probe-volume V for the deferred
             // skylight when `P_SKYVIS_PP>0`; else the volume path (byte-identical anchor).
             skyvis_pp_out.or(gi_skyvis_out),
-            // Edge-aware upscale only for the low-res per-pixel producer; the volume V is full-res
-            // and keeps the plain-bilinear byte-identical anchor.
-            skyvis_pp_out.is_some(),
+            // Edge-aware upscale whenever the bound sky-vis image is BELOW the lighting resolution —
+            // which is a property of the image, not of which producer made it. The F6O per-pixel
+            // producer always is (it traces at 1/`skyvis_pp_div`); the VOLUME producer writes at the
+            // GI trace extent, so it is full-res only while `gi_half_res` is off. The old
+            // `skyvis_pp_out.is_some()` test encoded the second case as "always full-res", which was
+            // true when only the gallery and the full-res tiers existed — every tier that traces GI
+            // at 1/N was silently plain-bilinear-upsampling a 1/N sky-vis, bleeding open-sky V (and
+            // the bent normal) across silhouettes onto occluded stone. `gi_half_res` is off for the
+            // gallery, so the byte-identical anchor is unchanged.
+            skyvis_pp_out.is_some() || (gi_skyvis_out.is_some() && self.gi_half_res),
+            // F6P consumer half: the OcclusionTint leak stops being steered by the bent normal.
+            self.skyvis_bent_fix & 2 != 0,
             self.skyvis_tint,
             self.skyvis_tint_v0,
             self.skyvis_min_occ,
@@ -9068,6 +9109,7 @@ impl App {
                 None,
                 None,
                 false, // F6O skyvis_edge_aware (no skyvis in the PiP inset)
+                false, // F6P leak-follows-n (no skyvis here either → inert)
                 self.skyvis_tint,
                 self.skyvis_tint_v0,
                 self.skyvis_min_occ,
