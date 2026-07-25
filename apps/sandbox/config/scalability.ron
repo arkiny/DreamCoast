@@ -66,6 +66,27 @@
         // redundant 2nd AO — gdf_ao already gives contact AO), `ao_res_div` 2 (half-res AO, a low-
         // frequency term), `gi_volume_period` 4 (amortize the view-independent DDGI update). The
         // gallery PT anchor resolves against `gallery_preset()`, NOT this, so it is unaffected.
+        //
+        // 2026-07-25 lighting-closure promotion (docs/lighting-ao-shadow-closure.md, measured on
+        // RTX 2070 SUPER / sponza_intel 1080p — the first GPU profile of that scene):
+        //   render_scale 0.6667 — internal 720p + TAAU upscale, aligning with the Apple tier and
+        //     the reference engine's default internal-res + temporal upscale. Also the anti-flicker
+        //     carrier: native Med had NO AA at all, which was the measured root of the doorway
+        //     shimmer (primary-visibility aliasing of sub-pixel bright apertures).
+        //   reflect_res_div 4 — quarter-res reflection trace + the existing bilateral upsample
+        //     (Metal-measured "rough content free"; DX≡VK verified in the closure batch).
+        //   cache_grid on — kills the O(num_cards) per-hit surface-cache scan (gdf.rs documents
+        //     30+ ms at 2694 cards); documented result-identical superset + tolerance cap.
+        //   taau_antiflicker on — the F6O luma anti-flicker: door-ROI dolly flicker 5.88 -> 1.96
+        //     avg/ch, bright-pixel std 124.6 -> 53.9 (the shimmer gate F6O asked for now exists:
+        //     tools/seq-stability.py + the closure doc's ratchet numbers).
+        //   gi_volume_period 2 + gi_volume_spp 4 + gi_dir_sets 4 — the same rays-per-frame
+        //     budget laid out over 4x the threads: the spp16 single-thread-per-probe update was
+        //     LATENCY-bound (gi_volume 22.5 -> 11.1 ms DX / 8.5 ms VK), and the F6K direction-set
+        //     rotation keeps full angular coverage integrated across 4 cycles.
+        //   reflect_max_steps 56 + gdf_cone_k 0.06 + reflect_res_div 6 — the Apple-tier march
+        //     economy, DX==VK-measured in the closure batch (P_REFLECT_RES_DIV=4 restores the
+        //     sharper trace if a mirror-heavy scene needs it).
         (
             tier: Med,
             preset: (
@@ -84,12 +105,12 @@
                 gi_half_res: true,
                 cache_relight_spp: 1,
                 gi_max_steps: 24,
-                reflect_max_steps: 96,
+                reflect_max_steps: 56,
                 reflect_half_res: true,
-                render_scale: 1.0,
-                gdf_cone_k: 0.02,
+                render_scale: 0.6667,
+                gdf_cone_k: 0.06,
                 gi_res_div: 3,
-                reflect_res_div: 2,
+                reflect_res_div: 6,
                 ao_res_div: 2,
                 gi_atrous_steps: 2,
                 reflect_history_clamp: 1,
@@ -97,10 +118,14 @@
                 ssr_history_clamp: 0,
                 ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
-                gi_volume_period: 4,
+                gi_volume_period: 2,
+                cache_grid: true,
+                taau_antiflicker: true,
+                gi_volume_spp: 4,
+                gi_dir_sets: 4,
             ),
             groups: (
-                resolution: 2,
+                resolution: 1,
                 global_illumination: 1,
                 reflection: 1,
                 ambient_occlusion: 2,

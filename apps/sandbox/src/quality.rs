@@ -322,6 +322,28 @@ pub struct QualityPreset {
     /// Apple ON (Metal-verified), Low/Med/High after the DX≡VK parity run.
     #[serde(default)]
     pub taau_packed_history: bool,
+    /// TAAU luminance anti-flicker (`P_TAAU_ANTIFLICKER`, F6O): damp the blend weight of a sample
+    /// whose luma diverges from the history — kills the bright sub-pixel-aperture shimmer (door
+    /// sky-gaps, window grilles) the YCoCg box cannot clamp because it is a bright CLUSTER.
+    /// Inert at render_scale 1.0 (TAAU off). Landed default-OFF in F6O for want of a shimmer
+    /// gate; the gate now exists (tools/seq-stability.py + docs/lighting-ao-shadow-closure.md:
+    /// dolly door-ROI flicker 5.88 -> 1.96 avg/ch, bright-pixel std 124.6 -> 53.9, DX and VK),
+    /// so Med (the TAAU-scaled content tier) ships it ON.
+    #[serde(default)]
+    pub taau_antiflicker: bool,
+    /// GI-volume update rays per probe (`P_GI_VOLUME_SPP`). The legacy 16 with one thread per
+    /// probe is LATENCY-bound on the small slab dispatches (16 serial ~100ns marches per
+    /// thread): sponza_intel 1080p measured gi_volume 22.5 ms at spp16/period8 vs 11.1 ms at
+    /// spp4/period2 — the SAME rays-per-frame budget laid out over 4x the threads
+    /// (docs/lighting-ao-shadow-closure.md). With `gi_dir_sets` rotation the EMA still
+    /// integrates the full direction coverage across cycles. 16 = legacy (gallery anchor).
+    #[serde(default = "default_gi_volume_spp")]
+    pub gi_volume_spp: u32,
+    /// F6K deterministic direction-set rotation count (`P_GI_DIR_SETS`): the per-cycle stable
+    /// trace-direction set advances through K sets, so a lower per-update spp keeps full
+    /// angular coverage integrated over K cycles. 1 = the legacy pinned set (gallery anchor).
+    #[serde(default = "default_gi_dir_sets")]
+    pub gi_dir_sets: u32,
     /// Baked ACES tonemap (`P_TONEMAP_ACES`): replace the per-pixel Narkowicz approximation with
     /// a per-frame-baked LUT strip carrying the full ACES 1.3 RRT + sRGB ODT (ported from the
     /// A.M.P.A.S. reference; see `aces.slang`) + the ASC-CDL grade. Production filmic response
@@ -445,6 +467,15 @@ pub struct QualityPreset {
     /// until the DX≡VK parity run.
     #[serde(default)]
     pub cache_sky_occlude: bool,
+}
+
+// Serde defaults for the closure-batch fields: absent RON keys keep the exact legacy behavior
+// (spp 16, one pinned direction set), so Low/High and older on-disk overrides are unchanged.
+fn default_gi_volume_spp() -> u32 {
+    16
+}
+fn default_gi_dir_sets() -> u32 {
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +677,9 @@ pub fn gallery_preset() -> QualityPreset {
         card_mesh_capture: false,
         cache_adaptive_res: false,
         taau_packed_history: false, // legacy 16B+16B history layout (anchor; TAAU off at scale 1)
+        taau_antiflicker: false,    // anchor is native-scale (TAAU off) — keep the table explicit
+        gi_volume_spp: 16,          // legacy update spp (gallery runs no gi_volume anyway)
+        gi_dir_sets: 1,             // legacy pinned direction set (byte-identical anchor)
         tonemap_aces: false,        // legacy per-pixel curve (the byte-identical anchor)
         reflect_compact_div: 0,     // no mirror compaction (full-res trace needs none anyway)
         reflect_compact_hwrt: false, // no HWRT refine (no compaction to refine)
@@ -1125,6 +1159,10 @@ mod tests {
         assert!(!g.cache_adaptive_res, "gallery cache_adaptive_res off");
         assert!(!g.taau_packed_history, "gallery taau_packed_history off");
         assert!(
+            !g.taau_antiflicker,
+            "gallery taau_antiflicker off (native scale, TAAU off — table stays explicit)"
+        );
+        assert!(
             !g.tonemap_aces,
             "gallery tonemap_aces off (legacy curve anchor)"
         );
@@ -1132,25 +1170,20 @@ mod tests {
         assert!(!g.reflect_compact_hwrt, "gallery reflect_compact_hwrt off");
     }
 
-    /// `Med` is the content-default tier. Most fields still match the pre-tier legacy defaults; the
-    /// **Sponza 1080p-60fps retune** (docs/sponza-perf.md, user-approved 2026-07-06) deliberately
-    /// changed three cost knobs — `ssao` off (the redundant 2nd AO; `gdf_ao` already supplies contact
-    /// AO), `ao_res_div` 2 (half-res AO — a low-frequency contact term survives it), and
-    /// `gi_volume_period` 4 (amortize the view-independent DDGI update). The gallery PT anchor is
-    /// unaffected (it resolves against `gallery_preset`, not Med). This test locks the retuned Med so
-    /// a future edit can't silently drift it; the gallery/High quality path keeps the legacy values.
+    /// `Med` is the content-default tier. Two deliberate, measured retunes moved it off the
+    /// pre-tier legacy values — the **Sponza 1080p-60fps retune** (docs/sponza-perf.md,
+    /// user-approved 2026-07-06: `ssao` off, `ao_res_div` 2, `gi_volume_period` 4) and the
+    /// **lighting-closure promotion** (docs/lighting-ao-shadow-closure.md, 2026-07-25, measured
+    /// on RTX 2070 SUPER / sponza_intel 1080p: `render_scale` 0.6667 + TAAU, `reflect_res_div` 4,
+    /// `cache_grid` on, `taau_antiflicker` on — the G1/G3 closure stack; DX≡VK verified in that
+    /// batch). The gallery PT anchor is unaffected (it resolves against `gallery_preset`, not
+    /// Med). This test locks the promoted Med so a future edit can't silently drift it.
     #[test]
     fn med_locks_content_default_baseline() {
         let m = preset(RenderQuality::Med);
         // Unchanged legacy fields.
         assert_eq!(m.gi_spp, 1, "Med gi_spp");
-        assert_eq!(m.render_scale, 1.0, "Med render_scale (native)");
         assert_eq!(m.reflect_max_roughness, 0.5, "Med reflect_max_roughness");
-        assert_eq!(m.reflect_max_steps, 96, "Med reflect_max_steps");
-        assert_eq!(
-            m.reflect_res_div, 2,
-            "Med reflect_res_div (sharp reflections kept)"
-        );
         assert!(m.gdf_ao, "Med gdf_ao");
         // 60fps retune (deliberate; gallery anchor unaffected).
         assert!(
@@ -1158,16 +1191,48 @@ mod tests {
             "Med ssao OFF (redundant 2nd AO removed; 60fps retune)"
         );
         assert_eq!(m.ao_res_div, 2, "Med ao_res_div half-res (60fps retune)");
+        // Lighting-closure promotion (deliberate; docs/lighting-ao-shadow-closure.md).
         assert_eq!(
-            m.gi_volume_period, 4,
-            "Med gi_volume_period amortized (60fps retune)"
+            m.render_scale, 0.6667,
+            "Med render_scale 0.6667 + TAAU (closure promotion — perf + anti-aliasing carrier)"
+        );
+        assert_eq!(
+            m.reflect_res_div, 6,
+            "Med reflect_res_div Apple-parity trace res (closure promotion; P_REFLECT_RES_DIV=4 escape)"
+        );
+        assert_eq!(
+            m.reflect_max_steps, 56,
+            "Med reflect_max_steps Apple-parity march economy (closure promotion)"
+        );
+        assert_eq!(
+            m.gdf_cone_k, 0.06,
+            "Med gdf_cone_k Apple-parity cone LOD (closure promotion)"
+        );
+        assert_eq!(
+            m.gi_volume_period, 2,
+            "Med gi_volume_period 2 (closure promotion — spp/period re-layout, same ray budget)"
+        );
+        assert_eq!(
+            m.gi_volume_spp, 4,
+            "Med gi_volume_spp 4 (closure promotion — latency-bound fix, dir-set rotation keeps coverage)"
+        );
+        assert_eq!(
+            m.gi_dir_sets, 4,
+            "Med gi_dir_sets 4 (closure promotion — full coverage over 4 cycles)"
+        );
+        assert!(
+            m.cache_grid,
+            "Med cache_grid ON (kills the O(num_cards) per-hit scan; result-identical superset)"
+        );
+        assert!(
+            m.taau_antiflicker,
+            "Med taau_antiflicker ON (door-shimmer gate passed; docs/lighting-ao-shadow-closure.md)"
         );
         // Reflection-quality v2 knobs stay OFF on Med (serde defaults; the tier is the
         // byte-identical no-regression baseline and DX≡VK for the new shaders is pending).
         assert!(!m.reflect_stochastic, "Med reflect_stochastic off");
         assert_eq!(m.reflect_prefilter, 0.0, "Med reflect_prefilter off");
         assert!(!m.reflect_screen_hit, "Med reflect_screen_hit off");
-        assert!(!m.cache_grid, "Med cache_grid off");
         assert!(!m.card_mesh_capture, "Med card_mesh_capture off");
         assert!(!m.cache_adaptive_res, "Med cache_adaptive_res off");
         assert!(
@@ -1324,7 +1389,9 @@ mod tests {
         expect(
             RenderQuality::Med,
             [
-                (Resolution, 2),
+                // 1: TAAU-scaled internal res (0.6667) since the lighting-closure promotion —
+                // matches the Apple tier's descriptor (docs/lighting-ao-shadow-closure.md).
+                (Resolution, 1),
                 (GlobalIllumination, 1),
                 (Reflection, 1),
                 (AmbientOcclusion, 2),

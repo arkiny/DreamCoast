@@ -3124,7 +3124,7 @@ impl App {
         let gi_volume_spp = std::env::var("P_GI_VOLUME_SPP")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(16)
+            .unwrap_or(base.gi_volume_spp)
             .clamp(1, 64);
         // F4B: volume EMA alpha (`P_GI_VOLUME_ALPHA`). With the stable deterministic direction
         // set the static-scene fixed point is ALPHA-INDEPENDENT (the converged update is an
@@ -3567,7 +3567,7 @@ impl App {
         let gi_dir_sets = std::env::var("P_GI_DIR_SETS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(1)
+            .unwrap_or(base.gi_dir_sets)
             .clamp(1, 64);
         // CONVERGE mode deliberately does NOT touch the cost parameters (spp / relight period /
         // visibility feedback) — raising them (spp×K + period 2 + hidden-off) measured 360 ms/frame
@@ -4153,7 +4153,11 @@ impl App {
             tonemap_aces,
             tonemap_lut_size,
             taau_jitter: quality::env_bool("P_TAAU_JITTER", true),
-            taau_antiflicker: quality::env_bool("P_TAAU_ANTIFLICKER", false),
+            // Tier-driven since the lighting-closure batch: the shimmer gate F6O asked for now
+            // exists (tools/seq-stability.py + docs/lighting-ao-shadow-closure.md), and Med ships
+            // this ON with its TAAU scale. `base` is `gallery_preset()` for the gallery, so the
+            // anchor stays OFF structurally; `P_TAAU_ANTIFLICKER` still overrides either way.
+            taau_antiflicker: quality::env_bool("P_TAAU_ANTIFLICKER", base.taau_antiflicker),
             taau_force: quality::env_bool("P_TAAU_FORCE", false),
             taa_mip_bias: std::env::var("TAA_MIP_BIAS")
                 .ok()
@@ -7923,7 +7927,17 @@ impl App {
         // (the content golden gdf_ao/sc_viz SHA flicker). Interactive keeps the real-dt iris.
         if self.auto_exposure {
             let speed = 2.5f32;
-            let ae_dt = if self.screenshot_mode { FIXED_DT } else { dt };
+            // Interactive keeps the real-dt iris, but BOUNDS the per-frame adaptation step at a
+            // 30fps-equivalent dt: on a frame hitch (or a below-30fps GPU bill) an unbounded
+            // `dt` makes `adapt` jump toward 1 and the exposure staircases visibly — measured as
+            // the dominant whole-image flicker while moving through sponza_intel (13.2 -> 1.2
+            // avg/ch adjacent-frame diff with AE off; docs/lighting-ao-shadow-closure.md §3a).
+            // At >= 30fps the clamp is a no-op, so normal-play iris behavior is unchanged.
+            let ae_dt = if self.screenshot_mode {
+                FIXED_DT
+            } else {
+                dt.min(1.0 / 30.0)
+            };
             let adapt = 1.0 - (-ae_dt * speed).exp();
             self.deferred
                 .record_auto_exposure(&mut graph, hdr, cw, ch, 0.12, adapt, 1.0e-6, 4.0);
@@ -8620,13 +8634,14 @@ impl App {
                 ch,
                 inv_view_proj,
                 self.prev_view_proj_taau,
-                // bit2 = luminance anti-flicker (`P_TAAU_ANTIFLICKER`, default OFF): damps the
-                // blend weight of a sample whose luma diverges from the history, killing the
-                // bright sub-pixel-aperture shimmer (door sky-gaps, window grilles) that the
-                // YCoCg box can't clamp because it is a bright CLUSTER. Default OFF keeps the
-                // sealed content baseline (sc_viz / gdf_ao capture at the TAAU tier res) byte-
-                // identical — the PT gate runs RENDER_SCALE=1 (TAAU off) so it cannot measure
-                // this, i.e. no quality gate exists yet to justify flipping the default.
+                // bit2 = luminance anti-flicker (`P_TAAU_ANTIFLICKER`): damps the blend weight
+                // of a sample whose luma diverges from the history, killing the bright
+                // sub-pixel-aperture shimmer (door sky-gaps, window grilles) that the YCoCg box
+                // can't clamp because it is a bright CLUSTER. Tier-driven (`taau_antiflicker`)
+                // since the lighting-closure batch: the shimmer gate F6O wanted now exists
+                // (tools/seq-stability.py; docs/lighting-ao-shadow-closure.md measured dolly
+                // door-ROI flicker 5.88 -> 1.96 avg/ch on DX and VK), so Med ships it ON; the
+                // gallery preset keeps it OFF (native scale, TAAU inactive anyway).
                 self.flip_y | if self.taau_antiflicker { 4 } else { 0 },
                 self.scene_radius * 2.0,
                 taau_jitter_uv,
