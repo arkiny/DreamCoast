@@ -1849,22 +1849,6 @@ impl GdfSystem {
     /// the result renormalised (the mip0 bilinear rule, propagated up the pyramid via a per-texel
     /// coverage in `.w`). Ordered after the relight (`lit_ext`) via the graph; returns a write
     /// handle to chain the reflection read after. `None` without the pyramid / pipeline.
-    /// Frozen-frame binding (lighting-closure wave 2): while the relight is settled the lit
-    /// mip0 hasn't changed (the cache ping-pong is pinned), so the persistent pyramid is still
-    /// exact — regenerating it every frame measured 2.2-2.4 ms of pure waste on the
-    /// sponza_intel nave/atrium profiles. Consumers read by bindless index; this returns only
-    /// the external handle for graph ordering. Mirrors `record_cache_mipgen`'s gates so `Some`
-    /// keeps meaning "pyramid live" for the index-packing sites.
-    pub(crate) fn cache_mipgen_bind_only<'a>(
-        &'a self,
-        graph: &mut RenderGraph<'a>,
-    ) -> Option<ResourceId> {
-        self.cache_mipgen_pipeline.as_ref()?;
-        self.cache_rad_mips.as_ref()?;
-        self.cache_pos.as_ref()?;
-        Some(graph.import_external("cache_rad_mips"))
-    }
-
     pub(crate) fn record_cache_mipgen<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,

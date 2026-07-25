@@ -863,22 +863,6 @@ struct App {
     /// it). `1` = every frame (byte-identical default). Higher = cheaper `gi_volume` (the VK
     /// view-independent floor), slower GI convergence — fine for a mostly-static world.
     gi_volume_period: u64,
-    /// Lighting-closure wave 2 — the volume's own frame counter: advances ONLY on frames that
-    /// actually record the update, so the slab schedule, the per-cycle stable-jitter divisor and
-    /// the ping-pong advance all resume exactly where a freeze paused them (frozen frames don't
-    /// exist for the volume's clock).
-    gi_vol_clock: u64,
-    /// Completed full update cycles while (cache settled && fine box steady) — the freeze
-    /// horizon census. Reset to 0 whenever either condition drops.
-    gi_vol_cycles_settled: u32,
-    /// `P_GI_VOLUME_FREEZE` (default on for content): once the surface-cache freeze latch holds
-    /// (same lighting epoch contract), the fine box is steady and >= 2 full cycles completed
-    /// settled, SKIP the volume update entirely — the deterministic direction set + idempotent
-    /// overwrite make further updates exact rewrites of the pinned read slot (the frozen-relight
-    /// contract extended to the volume). Camera movement unfreezes via the recenter dead-zone.
-    gi_vol_freeze: bool,
-    /// One-shot log latch for the freeze transition (parity with the relight freeze log).
-    gi_vol_frozen_latch: bool,
     /// GI-volume-leak increment A (`P_GI_VOL_OCC`, opt-in): occupancy-weighted manual trilinear on
     /// the volume consumption — probes whose centre sits inside geometry are excluded and the
     /// weights renormalised (the reflection fallback's sample_gi_irradiance_valid pattern), so an
@@ -4013,10 +3997,6 @@ impl App {
             ao_multibounce,
             spec_occlusion,
             gi_volume,
-            gi_vol_clock: 0,
-            gi_vol_cycles_settled: 0,
-            gi_vol_freeze: !gallery_scene && quality::env_bool("P_GI_VOLUME_FREEZE", true),
-            gi_vol_frozen_latch: false,
             gi_volume_period: std::env::var("P_GI_VOLUME_PERIOD")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -4291,12 +4271,10 @@ impl App {
     ///   once per `2P` super-cycle, at whose end the ping-pong advances.
     fn gi_volume_schedule(&self) -> (u32, u32, u64) {
         let period = (self.gi_volume_period as u32).clamp(1, gi::GI_VOL_DIM) as u64;
-        // Wave 2: keyed on the volume's OWN clock (advances only on recorded frames), so a
-        // freeze pause resumes the slab walk / level interleave exactly where it stopped.
         if self.gi.gi_fine_installed() {
             (
-                ((self.gi_vol_clock >> 1) % period) as u32,
-                if self.gi_vol_clock & 1 == 0 {
+                ((self.frame_no >> 1) % period) as u32,
+                if self.frame_no & 1 == 0 {
                     0
                 } else {
                     gi::GI_VOL_DIM
@@ -4304,7 +4282,7 @@ impl App {
                 period * 2,
             )
         } else {
-            ((self.gi_vol_clock % period) as u32, 0, period)
+            ((self.frame_no % period) as u32, 0, period)
         }
     }
 
@@ -6806,15 +6784,7 @@ impl App {
             (Some(lit), Some((_, _, rad, _, _)))
                 if (self.reflect_cache && self.reflect_mip) || self.gi_card_mip =>
             {
-                // Wave 2: a settled relight leaves mip0 (the pinned read slot) unchanged, so
-                // the persistent pyramid is still exact — regenerating it measured 2.2-2.4 ms
-                // of pure waste per frame on the sponza_intel nave/atrium profiles. Bind-only
-                // keeps the index-packing sites' "pyramid live" contract.
-                if cache_settled {
-                    self.gdf.cache_mipgen_bind_only(&mut graph)
-                } else {
-                    self.gdf.record_cache_mipgen(&mut graph, lit, rad)
-                }
+                self.gdf.record_cache_mipgen(&mut graph, lit, rad)
             }
             _ => None,
         };
@@ -7170,35 +7140,7 @@ impl App {
                 // F4B: single-source schedule — (z-slab index, level y-offset, cycle length).
                 // Fine mode interleaves one level per frame at the single-level slab cost.
                 let (gi_slab_idx, gi_y_offset, gi_cycle) = self.gi_volume_schedule();
-                // Wave 2 freeze: the frozen-relight contract extended to the volume. Once the
-                // cache freeze latch holds (deterministic lighting-epoch horizon), the fine box
-                // is steady (no recenter armed — an armed recenter needs recorded super-cycle
-                // boundaries to apply) and >= 2 full cycles completed settled, further updates
-                // are exact rewrites of the pinned read slot (deterministic per-cycle direction
-                // set + idempotent overwrite) — skip the dispatch, keep the bind. Movement
-                // unfreezes via the recenter dead-zone / stream dirty via the cache epoch.
-                let gi_vol_frozen = self.gi_vol_freeze
-                    && cache_settled
-                    && self.gi.gi_fine_steady()
-                    && self.gi_vol_cycles_settled >= 2;
-                if gi_vol_frozen && !self.gi_vol_frozen_latch {
-                    tracing::info!(
-                        frame = self.frame_no,
-                        clock = self.gi_vol_clock,
-                        "gi_volume update FROZEN (settled epoch + steady fine box)"
-                    );
-                }
-                self.gi_vol_frozen_latch = gi_vol_frozen;
-                let gi_volume_arg = if self.gi_volume && gi_vol_frozen {
-                    // Same consumer tuple as the recorded path — the pinned read slot's bases
-                    // and the shared fine-AABB buffer, with only the dispatch skipped.
-                    self.gi
-                        .gi_volume_bind_only(&mut graph)
-                        .zip(self.gi.gi_volume_sampled())
-                        .map(|(vext, (rad_base, skyvis_base))| {
-                            (rad_base, skyvis_base, self.gi.gi_fine_buf_index(), vext)
-                        })
-                } else if self.gi_volume {
+                let gi_volume_arg = if self.gi_volume {
                     self.gi
                         .record_gi_volume(
                             &mut graph,
@@ -7221,14 +7163,11 @@ impl App {
                             // Slab mode folds the cycle out of the seed so a slab retraces the
                             // same directions each cycle (the fine super-cycle, when live), not
                             // each frame.
-                            // Wave 2: keyed on the volume's own clock (frozen frames don't
-                            // exist for it), so a resume retraces the exact direction set the
-                            // pinned slot was written with — no set-phase jump on unfreeze.
                             if self.gi_stable {
                                 // F6K: K-cycle deterministic rotation (1 = the legacy pin).
-                                (self.gi_vol_clock / gi_cycle) as u32 % self.gi_dir_sets.max(1)
+                                (self.frame_no / gi_cycle) as u32 % self.gi_dir_sets.max(1)
                             } else {
-                                (self.gi_vol_clock / gi_cycle) as u32
+                                (self.frame_no / gi_cycle) as u32
                             },
                             self.gi_volume_spp,
                             // F4B EMA alpha: env override, else auto — 0.2 in fine mode (the
@@ -9249,31 +9188,13 @@ impl App {
         // stretches it to the 2×period super-cycle covering both interleaved levels).
         if self.gi_volume {
             let (_, _, gi_cycle) = self.gi_volume_schedule();
-            // Wave 2: cycle boundaries exist only on RECORDED frames (the volume's own clock);
-            // a frozen frame advances nothing, so the pinned read slot stays byte-stable and
-            // the schedule resumes exactly where the freeze paused it.
-            let frozen = self.gi_vol_frozen_latch;
-            let gi_cycle_end = !frozen && self.gi_vol_clock % gi_cycle == gi_cycle - 1;
+            let gi_cycle_end = self.frame_no % gi_cycle == gi_cycle - 1;
             if gi_cycle_end {
                 self.gi.advance_gi_volume();
-                // Freeze-horizon census: full cycles completed under a settled epoch + steady
-                // fine box. Two clean cycles = every texel of BOTH interleaved levels rewritten
-                // since the last disturbance — the update is provably at its fixed point.
-                if cache_settled && self.gi.gi_fine_steady() {
-                    self.gi_vol_cycles_settled = self.gi_vol_cycles_settled.saturating_add(1);
-                }
-            }
-            if !(cache_settled && self.gi.gi_fine_steady()) {
-                self.gi_vol_cycles_settled = 0;
-            }
-            if !frozen {
-                self.gi_vol_clock = self.gi_vol_clock.wrapping_add(1);
             }
             // F4B camera recentering (fine mode only, no-op otherwise): dead-zone detection
             // every frame, state transitions only on super-cycle boundaries — a fixed camera
-            // never leaves the dead-zone, so the static capture paths stay untouched. An arm
-            // while frozen flips `gi_fine_steady` false, which unfreezes next frame and lets
-            // the boundary apply it (the freeze can never deadlock the state machine).
+            // never leaves the dead-zone, so the static capture paths stay untouched.
             self.gi
                 .gi_fine_recenter([eye.x, eye.y, eye.z], gi_cycle_end)?;
         }

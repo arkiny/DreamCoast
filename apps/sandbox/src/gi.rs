@@ -549,29 +549,6 @@ impl GiSystem {
         self.gi_vol_fine && self.gi_fine_box.is_some()
     }
 
-    /// Steady = no recenter armed, applying, or reconverging. The volume freeze latch
-    /// (lighting-closure wave 2) may only hold while this is true: an ARMED recenter needs
-    /// super-cycle boundaries to apply, and boundaries only happen while the update records —
-    /// a frozen volume would deadlock the state machine, so the caller unfreezes the moment
-    /// the camera leaves the dead-zone.
-    pub(crate) fn gi_fine_steady(&self) -> bool {
-        !self.gi_fine_installed()
-            || (self.gi_fine_state == 0 && self.gi_fine_pending.is_none() && !self.gi_fine_reset)
-    }
-
-    /// Frozen-frame binding (lighting-closure wave 2): the consumers sample the volume by
-    /// bindless index, so a settled frame needs only the external handle for graph ordering —
-    /// every volume already sits in the sampled state from the last recorded frame's trailing
-    /// transitions, and the ping-pong stays pinned (same contract as the frozen surface-cache
-    /// relight). Mirrors `record_gi_volume`'s pipeline gate so `Some` means "volume live".
-    pub(crate) fn gi_volume_bind_only<'a>(
-        &'a self,
-        graph: &mut RenderGraph<'a>,
-    ) -> Option<ResourceId> {
-        self.gi_vol_pipeline.as_ref()?;
-        Some(graph.import_external("gi_volume_w"))
-    }
-
     /// F4B: the fine-level AABB storage-buffer index for consumers outside this module (the
     /// reflection fall-through) — the SAME 32 B buffer the per-pixel GI pass reads, so the
     /// recentering consumer-disable window (an inverted box) covers every consumer at once.
