@@ -166,6 +166,25 @@
         ),
         // Quality: opt-in multibounce surface cache + GDF AO, 2x GI samples, higher reflection
         // roughness cutoff, aesthetic soft shadows (diverges slightly from PT — see docs).
+        //
+        // 60fps wave (docs/phase-high-60fps-plan.md). Before it, High measured **6.5 fps** at 1080p
+        // in sponza_intel (153.8 ms door / 197.7 ms vault) — not the price of High's quality, but the
+        // fact that High had never received an optimization wave: it was still carrying the GALLERY
+        // ANCHOR's settings, whose purpose is byte-identity, not interactivity. Three of them were
+        // load-bearing and none of them buys image quality at this scene scale:
+        //   * `reflect_half_res: false` / `gi_half_res: false` made the tier's OWN `reflect_res_div`
+        //     / `gi_res_div` dead code (they are only consumed when the half-res flag is on —
+        //     main.rs:3714 / :3378), so both traces ran at full internal resolution.
+        //   * `cache_relight_period: 1` is the anchor's "every card every frame" path
+        //     (sdf_cache_light.slang:166). It cost 277 ms (door) / 431 ms (vault) whenever the
+        //     surface cache was not converged — invisible in a static profile only because the
+        //     convergence freeze arms after `cache_freeze_passes` AMORTIZATION passes
+        //     (main.rs:6835), i.e. after 3 frames at period 1.
+        // The frame is 100% GPU-bound (fence-wait 153.587 of frame 155.675), so every change here is
+        // GPU work removed; CPU-side levers were measured to be worth nothing.
+        // MEASURED after (release, tools/perf-profile.py, 62-frame steady state, 1920x1080):
+        //   door  13.044 ms DX / 13.072 ms VK      vault  14.805 ms DX / 15.184 ms VK
+        // = 12-13x, 60 fps met at both cameras on both backends with 1.5 ms of margin.
         (
             tier: High,
             preset: (
@@ -176,28 +195,56 @@
                 ssr_stochastic: false,
                 reflect_max_roughness: 0.6,
                 gdf_ao: true,
-                ssao: true,
+                // The screen-space near-field AO multiplies into the SAME diffuse ambient the GDF
+                // far-field AO already occludes (pbr.slang:708). At this scene's scale the two
+                // overlap; dropping it is the cheapest 2.19 ms in the frame. Med/Low/Apple already
+                // ship it off — High was the only tier paying for both.
+                ssao: false,
                 firefly_clamp: true,
                 shadow_softness: 0.03,
                 shadow_taps: 16,
-                cache_relight_period: 1,
-                gi_half_res: false,
+                // Fixed-budget surface-cache relight: 1/8 of the cards per frame (round-robin,
+                // sdf_cache_light.slang:195), NOT a freeze. `cache_freeze_passes` counts full
+                // amortization PASSES, so the total relight work before convergence is IDENTICAL to
+                // period 1 — only its distribution changes, from 3 catastrophic frames to 24 cheap
+                // ones. Converged quality is therefore bit-unchanged; what improves is frame pacing.
+                // `cache_relight_spp` stays at the High value of 8: in steady state the relight is
+                // skipped entirely so the ray count is free, and during the transient it buys a
+                // cleaner cache. Worst case (a lighting-epoch change re-arms the relight) measured
+                // 50.4 ms at the vault for the ~24 frames of re-convergence — the one number this
+                // wave does NOT fix; see the plan doc's transient section.
+                cache_relight_period: 8,
+                gi_half_res: true,
                 cache_relight_spp: 8,
                 gi_max_steps: 64,
                 reflect_max_steps: 96,
-                reflect_half_res: false,
-                render_scale: 1.0,
-                gdf_cone_k: 0.0,
-                gi_res_div: 2,
-                reflect_res_div: 2,
-                ao_res_div: 1,
+                reflect_half_res: true,
+                // Internal render scale + TAAU (UE's ScreenPercentage lever). 0.90 is the mildest
+                // setting that clears the target; it also gives High the temporal AA it did not have
+                // at render_scale 1.0 (no TAAU pass ran at all), so edge quality is a net gain.
+                render_scale: 0.90,
+                gdf_cone_k: 0.06,
+                gi_res_div: 3,
+                reflect_res_div: 4,
+                ao_res_div: 2,
                 gi_atrous_steps: 2,
                 reflect_history_clamp: 2,
                 reflect_clamp_gamma: 1.25,
                 ssr_history_clamp: 0,
                 ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
-                gi_volume_period: 1,
+                gi_volume_period: 2,
+                cache_grid: true,
+                gi_volume_spp: 1,
+                gi_dir_sets: 16,
+                // High now upscales, so it owns the "TAA is blurry when you move" artifact and needs
+                // the landed motion-sharpness stack (docs/taau-motion-sharpness.md) — without these
+                // the serde defaults would give it the pre-Catmull-Rom bilinear history. Same values
+                // as Med; `gi_dir_sets: 16` (vs Med's 4) keeps High's finer volume-direction rotation.
+                taau_antiflicker: true,
+                taau_catmull_rom: true,
+                taau_clamp_expand: 2.5,
+                taau_sharpen: 0.0,
                 // Deferred-parity cache skylight — see the Med preset for the derivation and the
                 // measured numbers. Kept in lockstep across tiers: it is a CORRECTNESS fix (one
                 // skylight definition shared with the deferred pass), not a quality dial.

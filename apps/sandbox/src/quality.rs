@@ -1411,7 +1411,32 @@ mod tests {
         assert!(high.surface_cache, "High surface_cache on");
         assert_eq!(high.shadow_softness, 0.03, "High shadow_softness");
         assert_eq!(high.reflect_history_clamp, 2, "High reflect_history_clamp");
-        assert_eq!(high.gi_res_div, 2, "High gi_res_div");
+        assert_eq!(high.gi_res_div, 3, "High gi_res_div");
+        // 60fps wave (docs/phase-high-60fps-plan.md). These five are the ones that took High from
+        // 6.5 fps to 64 fps at 1080p, and each is easy to silently revert on a hand edit of the RON:
+        //   * the half-res FLAGS are what make `gi_res_div` / `reflect_res_div` live at all — with
+        //     them off the divisors above/below are dead code and the traces run full-res.
+        //   * `cache_relight_period: 1` is the GALLERY ANCHOR's every-card-every-frame path; at High
+        //     it cost 277-720 ms per frame whenever the surface cache was not converged, hidden
+        //     behind a freeze that arms at frame 3 (= cache_freeze_passes x period).
+        //   * `ssao` double-counts the GDF far-field AO into the same diffuse ambient (pbr.slang).
+        assert!(
+            high.gi_half_res,
+            "High gi_half_res on (gi_res_div is dead without it)"
+        );
+        assert!(
+            high.reflect_half_res,
+            "High reflect_half_res on (reflect_res_div is dead without it)"
+        );
+        assert_eq!(high.reflect_res_div, 4, "High reflect_res_div");
+        assert_eq!(
+            high.cache_relight_period, 8,
+            "High cache_relight_period (fixed-budget amortization, NOT the anchor's 1)"
+        );
+        assert!(
+            !high.ssao,
+            "High ssao off (double-counts the GDF far-field AO)"
+        );
 
         let apple = preset(RenderQuality::Apple);
         assert_eq!(apple.render_scale, 0.67, "Apple render_scale");
