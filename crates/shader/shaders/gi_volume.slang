@@ -71,7 +71,8 @@ struct GiVolumePush
                          // dispatch's level (F4B level-interleaved slabs: 0 = coarse rows,
                          // dims.y = the fine half; 0 with a full-height dispatch = legacy)
     uint4 albedo_rgb;    // sampled volumes[] indices of the per-voxel albedo (R,G,B); x=0xFFFFFFFF = constant
-    uint4 clip;          // x = clipmap descriptor index, y = level count
+    uint4 clip;          // x = clipmap descriptor index, y = level count; z = slab z-slice count
+                         // (upper bound for the rounded-up dispatch tail; 0 = unbounded legacy)
     float4 params;       // x = spp, y = ray max dist, z = sky fill, w = EMA alpha
     float4 ground;       // xyz analytic ground albedo, w = surface bias
     float4 fine_min;     // F4: xyz fine-level world min, w = fine_active (0 = single level)
@@ -350,13 +351,26 @@ float3 gv_shade_hit(float3 hp, float3 sun_dir, uint read_base, bool fine_on)
 }
 
 
-[numthreads(4, 4, 4)]
+// (8,8,1) groups (lighting-closure P2): one z-slice per group. The old (4,4,4) shape packed 2
+// z-layers into each 64-thread group, so a warp mixed probes from different slices (worse cell
+// coherence in the divergent per-mesh candidate loops) and the z dispatch had 4-slice
+// granularity (a period-16 slab of 2 rounded up to 4 — pure tail waste). Same SV_DispatchThreadID
+// mapping over the same tid range = bit-identical output.
+[numthreads(8, 8, 1)]
 void csMain(uint3 tid: SV_DispatchThreadID)
 {
     // Slab amortization: this dispatch covers z slices [read_rgb.z, read_rgb.z + gz*4); offset
     // the thread id so every downstream tid use (probe position, EMA texel, writes) is exact.
     // A zero offset with the full dispatch is the legacy whole-grid update, bit for bit.
     tid.z += pc.read_rgb.z;
+    // Slab upper bound (lighting-closure P2): the dispatch rounds z groups up to 4 slices, so
+    // the tail threads of a non-multiple-of-4 slab used to run the FULL probe update on the
+    // NEXT slab's slices — bit-identical values (the deterministic per-cycle direction set and
+    // the cycle-stable EMA read make the next slab's own pass an exact overwrite) but pure
+    // wasted march+shade work, ~2x the slab bill at gi_volume_period 16. clip.z carries the
+    // exact slab length; 0 = unbounded (the legacy full-height dispatch, bit for bit).
+    if (pc.clip.z != 0u && tid.z >= pc.read_rgb.z + pc.clip.z)
+        return;
     // F4B level-interleaved slabs: a fine-mode dispatch covers ONE level per frame (write_rgb.z
     // = 0 selects the coarse rows, GI_VOL_DIM the fine half), so the per-frame cost stays the
     // single-level slab instead of doubling. Applied BEFORE the guard/seed/probe/EMA reads so

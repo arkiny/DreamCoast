@@ -54,6 +54,12 @@ struct MeshSdfHeader
     uint flags;
 };
 
+// NOTE (lighting-closure P2, measured negative): a per-invocation `static` header cache
+// (load once, register compare after) cut D3D12 gi_volume ~3 ms but REGRESSED Vulkan by ~10 ms
+// (gi_volume 19->29 ms on the sponza_intel door profile) — the SPIR-V Private-storage struct
+// copy did not promote to registers on the NV driver and every cached access paid spill
+// latency. Net negative across backends; reverted. The 8 redundant Load4s per march step stay
+// until a cross-backend-safe hoist exists (e.g. threading the header by value through ms_geo).
 MeshSdfHeader ms_load_header(uint hidx)
 {
     RWByteAddressBuffer b = g.storage_buffers[hidx];

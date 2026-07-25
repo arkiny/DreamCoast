@@ -702,6 +702,9 @@ impl GiSystem {
                     albedo_idx,
                     clip.0,
                     clip.1,
+                    // clip.z = this dispatch's slab length so the shader can drop the rounded-up
+                    // z tail (identical output, ~2x wasted probe work at period 16 without it).
+                    z_count,
                     spp as f32,
                     diag,     // ray max distance = scene diagonal
                     sky_gain, // sky gain -> procedural_sky fill at bounce hits (was flat 0.4)
@@ -721,16 +724,14 @@ impl GiSystem {
                     repair_flags, // E-oracle repair seam bits (0 = legacy estimator)
                     sun_k,        // F6F penumbra cone slope (0 = reference-derived)
                 ));
-                let g = GI_VOL_DIM.div_ceil(4);
+                // (8,8,1) groups: one z-slice per group, so the slab dispatch is EXACT (no
+                // 4-slice rounding tail; the shader's clip.z guard stays as belt-and-braces).
+                let g = GI_VOL_DIM.div_ceil(8);
                 // F4B: the dispatch always covers ONE level's rows — fine mode selects the
                 // level via the tid.y offset (write_rgb.z) instead of doubling the height, so
                 // the per-frame cost stays the single-level slab. Slab amortization: only this
                 // frame's z-slab (the shader offsets tid.z).
-                cmd.dispatch(
-                    g,
-                    g,
-                    z_count.min(GI_VOL_DIM.saturating_sub(z_offset)).div_ceil(4),
-                );
+                cmd.dispatch(g, g, z_count.min(GI_VOL_DIM.saturating_sub(z_offset)).max(1));
                 // Transition the just-written volumes back to sampled so the GI pass can read them.
                 for ch in wv.iter().flatten() {
                     cmd.volume_to_sampled(ch);

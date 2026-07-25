@@ -1333,6 +1333,9 @@ pub(crate) fn gi_volume_push(
     albedo_rgb: [u32; 3],
     clip_desc: u32,
     clip_count: u32,
+    // Slab z-slice count of this dispatch (clip.z): the shader's upper bound for the rounded-up
+    // dispatch tail (lighting-closure P2). 0 = unbounded (legacy full-height dispatch).
+    slab_z_count: u32,
     spp: f32,
     ray_max: f32,
     sky_fill: f32,
@@ -1380,6 +1383,7 @@ pub(crate) fn gi_volume_push(
     put3u(&mut pc, 96, albedo_rgb);
     pc[112..116].copy_from_slice(&clip_desc.to_le_bytes());
     pc[116..120].copy_from_slice(&clip_count.to_le_bytes());
+    pc[120..124].copy_from_slice(&slab_z_count.to_le_bytes());
     pc[128..132].copy_from_slice(&spp.to_le_bytes());
     pc[132..136].copy_from_slice(&ray_max.to_le_bytes());
     pc[136..140].copy_from_slice(&sky_fill.to_le_bytes());
