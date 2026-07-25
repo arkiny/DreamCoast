@@ -2923,9 +2923,23 @@ impl App {
         // three are `P_ASYNC_CACHE`-overridable. In headless screenshot mode a dedicated compute
         // queue also needs `ASYNC_COMPUTE=1` (see `async_compute_supported`).
         let async_default = backend == BackendKind::D3d12 && !gallery_scene;
+        // Deferred-parity cache skylight needs the SYNC relight: `record_cache_async` cannot read
+        // the sky-visibility SH volumes, which the GRAPHICS queue rewrites every frame, so it
+        // hard-codes the sentinel (see `GdfSystem::record_cache_async`) and silently falls back to
+        // the legacy UNOCCLUDED sky-on-miss + `skylight_floor` path. With `skylight_floor` at its
+        // content default of 1.0 those two terms sum to `E·esc + E·(1-esc) = E` — the escape
+        // fraction cancels, so every cached texel takes the FULL open-sky irradiance no matter how
+        // enclosed it is, while the deferred pass gives the same surface `E·V·dot_factor·ao·kd`.
+        // Reflections read the cache and direct pixels read the deferred, so the reflected copy of
+        // a surface carried a systematically stronger, bluer skylight (measured on the Intel-Sponza
+        // chromeball crop: B-R bias +40.0 vs the path tracer's +7.0). Routing to the sync relight
+        // is the same trade `cache_lit_calib` below already makes for the same cross-queue reason;
+        // it costs the ~1.2ms D3D12 overlap only while the parity skylight is on.
+        let sky_occlude_want = quality::env_bool("P_CACHE_SKY_OCCLUDE", base.cache_sky_occlude);
         let async_cache_on = async_compute_supported
             && gdf.has_cache_lighting()
-            && quality::env_bool("P_ASYNC_CACHE", async_default);
+            && quality::env_bool("P_ASYNC_CACHE", async_default)
+            && !sky_occlude_want;
         gdf.set_cache_async(async_cache_on);
         // Lit-calibration feedback: needs the content TLAS (occlusion probe), the sync relight
         // (the async ring's cross-queue radiance has no safe read here), and the uniform atlas

@@ -51,6 +51,10 @@
                 ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
                 gi_volume_period: 4,
+                // Deferred-parity cache skylight — see the Med preset for the derivation and the
+                // measured numbers. Kept in lockstep across tiers: it is a CORRECTNESS fix (one
+                // skylight definition shared with the deferred pass), not a quality dial.
+                cache_sky_occlude: true,
             ),
             groups: (
                 resolution: 0,
@@ -137,6 +141,19 @@
                 taau_catmull_rom: true,
                 taau_clamp_expand: 2.5,
                 taau_sharpen: 0.0,
+                // Deferred-parity cache skylight — one skylight definition for both pipelines.
+                // The legacy path it replaces (per-ray sky-on-miss + the `skylight_floor` = 1.0
+                // IBL top-up) sums to `E·esc + E·(1-esc) = E`: the escape fraction cancels, so a
+                // cached texel took the FULL open-sky irradiance regardless of enclosure, while
+                // the deferred gives the same surface `E·V·dot_factor·ao·kd`. Since reflections
+                // read the cache and direct pixels read the deferred, every reflected surface
+                // carried a stronger, bluer skylight than its direct view. Measured on the
+                // Intel-Sponza chromeball crop (DX, 192-frame warmup): B-R bias +40.0 -> +0.4
+                // against the path tracer's +7.0, crop residual vs PT 73.0 -> 63.0, with the
+                // reflected floor's energy preserved (luma 122.0 -> 117.9, PT 100.1).
+                // NOTE: this forces the SYNC relight (see `async_cache_on` in main.rs) — the
+                // async-compute path cannot read the sky-visibility SH volumes.
+                cache_sky_occlude: true,
             ),
             groups: (
                 resolution: 1,
@@ -181,6 +198,10 @@
                 ssr_clamp_gamma: 1.25,
                 gi_temporal_clamp: 0.0,
                 gi_volume_period: 1,
+                // Deferred-parity cache skylight — see the Med preset for the derivation and the
+                // measured numbers. Kept in lockstep across tiers: it is a CORRECTNESS fix (one
+                // skylight definition shared with the deferred pass), not a quality dial.
+                cache_sky_occlude: true,
             ),
             groups: (
                 resolution: 2,
