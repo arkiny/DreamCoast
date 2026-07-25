@@ -1342,6 +1342,16 @@ impl VulkanDevice {
     pub fn wait_idle(&self) -> Result<(), EngineError> {
         unsafe { self.shared.device.device_wait_idle().map_err(vk_err) }
     }
+
+    /// Bindless storage-image table stats: `(in_use, high_water)` slot counts.
+    /// Diagnostic — a leak shows as an `in_use` count that never returns to its
+    /// baseline after a transient-target reclaim (the table asserts at
+    /// `STORAGE_IMAGE_COUNT`); `high_water` only ever grows.
+    pub fn storage_image_slots(&self) -> (u32, u32) {
+        let hwm = self.shared.storage_image_next.load(Ordering::Relaxed);
+        let free = self.shared.storage_image_free.lock().unwrap().len() as u32;
+        (hwm - free, hwm)
+    }
 }
 
 /// The device's async-compute queue (Phase 7).

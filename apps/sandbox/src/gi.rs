@@ -731,7 +731,11 @@ impl GiSystem {
                 // level via the tid.y offset (write_rgb.z) instead of doubling the height, so
                 // the per-frame cost stays the single-level slab. Slab amortization: only this
                 // frame's z-slab (the shader offsets tid.z).
-                cmd.dispatch(g, g, z_count.min(GI_VOL_DIM.saturating_sub(z_offset)).max(1));
+                cmd.dispatch(
+                    g,
+                    g,
+                    z_count.min(GI_VOL_DIM.saturating_sub(z_offset)).max(1),
+                );
                 // Transition the just-written volumes back to sampled so the GI pass can read them.
                 for ch in wv.iter().flatten() {
                     cmd.volume_to_sampled(ch);

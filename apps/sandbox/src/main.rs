@@ -1311,6 +1311,26 @@ struct App {
     frame_no: u64,
     f2_prev: bool,
     needs_recreate: bool,
+    /// The internal render extent the pooled transients were last built for.
+    /// `ResourcePool` reuses by exact desc (extent included), so when the per-frame
+    /// render extent moves (render-scale slider / quality tier / `RENDER_RES`) the
+    /// old extent's targets are never matched again — and never dropped — leaking
+    /// their bindless storage-image/SRV slots until the table overflows. When the
+    /// frame's extent diverges from this latch, the pools are reclaimed exactly like
+    /// a window resize (see [`Self::reclaim_scaled_transients`]). `(0, 0)` = not yet
+    /// latched (startup).
+    pool_render_extent: (u32, u32),
+    /// `DIAG_SLOTS=1`: log the bindless storage-image slot counts whenever they
+    /// change — the leak counter for the transient-reclaim paths (resize + render
+    /// scale). Steady state is silent; a leak climbs monotonically.
+    diag_slots: bool,
+    /// Last logged `(in_use, high_water)` (see `diag_slots`).
+    diag_slots_last: (u32, u32),
+    /// `DIAG_SCALE_CYCLE=<n>`: ping-pong `render_scale` across a fixed ladder every
+    /// `n` frames — a deterministic, headless-capable regression harness for the
+    /// render-scale transient reclaim (pairs with `DIAG_SLOTS`; the unreclaimed pool
+    /// formerly overflowed the 256-slot storage-image table after ~20 steps).
+    diag_scale_cycle: Option<u64>,
     last: Instant,
     elapsed: f32,
     angle: f32,
@@ -4173,6 +4193,13 @@ impl App {
             frame_no: 0,
             f2_prev: false,
             needs_recreate: false,
+            pool_render_extent: (0, 0),
+            diag_slots: quality::env_bool("DIAG_SLOTS", false),
+            diag_slots_last: (u32::MAX, u32::MAX),
+            diag_scale_cycle: std::env::var("DIAG_SCALE_CYCLE")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&n| n > 0),
             last: Instant::now(),
             elapsed: 0.0,
             // Fixed view in screenshot mode for reproducible output; `DIAG_ANGLE`
@@ -4317,6 +4344,55 @@ impl App {
             .unwrap_or(self.swap_format_cached)
     }
 
+    /// The internal (scene) render extent for output extent `(sw, sh)`: the
+    /// `RENDER_RES` absolute override wins, else `render_scale` fractions the output
+    /// (64 px floor), else native (byte-identical). Single source for the per-frame
+    /// graph extent AND the scale-change transient reclaim — they must agree or the
+    /// reclaim would miss (leak) or over-fire (churn).
+    fn render_extent_for(&self, sw: u32, sh: u32) -> (u32, u32) {
+        match self.render_res {
+            Some(r) => r, // absolute override (headless QHD/UHD measurement)
+            None if (self.render_scale - 1.0).abs() < 1e-4 => (sw, sh), // native
+            None => (
+                ((sw as f32 * self.render_scale).round() as u32).max(64),
+                ((sh as f32 * self.render_scale).round() as u32).max(64),
+            ),
+        }
+    }
+
+    /// Reclaim the pooled transient targets when the *render* extent changed without
+    /// a window resize (render-scale slider / quality-tier switch / `RENDER_RES`).
+    /// `ResourcePool` reuses by exact desc, so the old extent's targets would stay
+    /// cached forever — never reused, never dropped — leaking their bindless
+    /// storage-image/SRV slots until the 256-slot table overflowed. The window-resize
+    /// path already reclaims via `recreate_swapchain`; this is the *same* reclaim for
+    /// the scale path. Under the RHI thread the worker is joined first: the record
+    /// thread has no per-slot fence guarantee of its own, so dropping targets while
+    /// the worker may still translate a list referencing them would be a
+    /// use-after-free — join + idle makes the drops safe (mirrors
+    /// [`Self::recreate_threaded`]), then the worker respawns.
+    fn reclaim_scaled_transients(&mut self, cw: u32, ch: u32) -> anyhow::Result<()> {
+        if self.pool_render_extent == (cw, ch) {
+            return Ok(());
+        }
+        // `(0, 0)` = startup: nothing pooled yet, just latch.
+        if self.pool_render_extent != (0, 0) {
+            let threaded = self.rhi_thread.is_some();
+            if let Some(rhi) = self.rhi_thread.take() {
+                self.reclaim_rhi_objects(rhi.join());
+            }
+            self.device.wait_idle()?;
+            for p in &mut self.pools {
+                p.clear();
+            }
+            if threaded {
+                self.spawn_rhi_thread()?;
+            }
+        }
+        self.pool_render_extent = (cw, ch);
+        Ok(())
+    }
+
     /// Run the render loop until the window closes (or, in screenshot mode, every
     /// requested capture is saved).
     /// Derive the per-pass reflection booleans from the UI-facing `reflect_mode` (the single
@@ -4437,6 +4513,10 @@ impl App {
         for p in &mut self.pools {
             p.clear(); // transient extents changed; drop cached targets
         }
+        // The resize just reclaimed every pooled transient; latch the render extent so
+        // the scale-change reclaim in `frame` doesn't immediately re-idle for the same
+        // event.
+        self.pool_render_extent = self.render_extent_for(ww, wh);
         let count = self.swapchain().image_count();
         self.render_finished = build_render_finished(&self.device, count)?;
         self.swap_extent_cached = self.swapchain().extent_2d();
@@ -4535,6 +4615,27 @@ impl App {
                 self.recreate_swapchain(ww, wh)?;
             }
         }
+        // DIAG_SCALE_CYCLE harness: drive `render_scale` deterministically (see the
+        // field doc) so the scale-change reclaim can be regression-tested headless. A
+        // triangle sweep 1.0 → 0.34 → 1.0 in 32 steps: every step lands on a distinct
+        // internal extent, mimicking a drag of the UI render-scale slider (a fresh
+        // extent per tick — the case that overflowed the storage-image table). A
+        // coarse repeating ladder would saturate the pool at a few cached sets and
+        // mask the leak.
+        if let Some(period) = self.diag_scale_cycle {
+            const STEPS: u64 = 32;
+            let k = self.frame_no / period % (2 * STEPS);
+            let t = if k <= STEPS { k } else { 2 * STEPS - k } as f32 / STEPS as f32;
+            self.render_scale = (1.0 - 0.66 * t).clamp(0.3333, 1.0);
+        }
+        // Render-scale / RENDER_RES change without a resize: reclaim the pooled
+        // transients before this frame realizes targets at the new extent (same
+        // reclamation as the resize path — see the fn doc).
+        {
+            let e = self.swap_extent();
+            let (cw, ch) = self.render_extent_for(e.width, e.height);
+            self.reclaim_scaled_transients(cw, ch)?;
+        }
 
         // Wait for this frame slot's previous submission to finish BEFORE the acquire
         // below. The acquire reuses `image_available[fif]`, and Vulkan forbids
@@ -4583,14 +4684,7 @@ impl App {
             let e = self.swap_extent();
             (e.width, e.height)
         };
-        let (cw, ch) = match self.render_res {
-            Some(r) => r, // absolute override (headless QHD/UHD measurement)
-            None if (self.render_scale - 1.0).abs() < 1e-4 => (sw, sh), // native (byte-identical)
-            None => (
-                ((sw as f32 * self.render_scale).round() as u32).max(64),
-                ((sh as f32 * self.render_scale).round() as u32).max(64),
-            ),
-        };
+        let (cw, ch) = self.render_extent_for(sw, sh);
         // HZB (PR-8): the Hi-Z pyramid must match the scene-depth (render) extent. Rebuild
         // it here if the render extent changed (RENDER_RES / render_scale / window resize).
         // `device` and `hzb` are disjoint fields, so borrow them independently.
@@ -9245,6 +9339,20 @@ impl App {
                 signal,
             )? {
                 self.needs_recreate = true;
+            }
+        }
+        // DIAG_SLOTS: bindless storage-image slot leak counter, logged only on change
+        // (steady state is silent). A reclaim leak shows as a monotonically climbing
+        // in-use count — the table overflow formerly panicked at 256 after ~20
+        // render-scale steps.
+        if self.diag_slots {
+            let slots = self.device.storage_image_slots();
+            if slots != self.diag_slots_last {
+                self.diag_slots_last = slots;
+                info!(
+                    "[slots] storage-image: {} in use, high-water {} (frame {})",
+                    slots.0, slots.1, self.frame_no
+                );
             }
         }
         self.fif = (self.fif + 1) % FRAMES_IN_FLIGHT;

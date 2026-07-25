@@ -132,3 +132,7 @@ The scene/engine targets a future general-purpose game, so:
   5 world-pos, 6 AO, 7 direct, 8 IBL ambient, 9 GDF AO, 10 GDF GI).
 - `SHADOW_SOFTNESS=<f>` / `SOFT_SHADOWS=0` — opt-in PCSS-lite soft shadows (default hard PCF).
 - `P8_PATHTRACE=1` — render the ground-truth path tracer (same camera) for parity diffs.
+- `DIAG_SLOTS=1` — log bindless storage-image slot counts (in-use / high-water) on change;
+  the leak counter for the transient-reclaim paths (window resize + render-scale change).
+- `DIAG_SCALE_CYCLE=<n>` — sweep `render_scale` 1.0→0.34→1.0 (32 steps, one per `n` frames,
+  each a distinct extent) — deterministic headless repro of a render-scale slider drag.

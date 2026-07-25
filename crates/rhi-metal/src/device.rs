@@ -746,6 +746,16 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Bindless storage-image table stats: `(in_use, high_water)` slot counts.
+    /// Diagnostic — a leak shows as an `in_use` count that never returns to its
+    /// baseline after a transient-target reclaim (the table asserts at
+    /// `STORAGE_IMAGE_COUNT`); `high_water` only ever grows.
+    pub fn storage_image_slots(&self) -> (u32, u32) {
+        let hwm = self.shared.storage_img_next.get();
+        let free = self.shared.storage_img_free.borrow().len() as u32;
+        (hwm - free, hwm)
+    }
+
     // ---- Implemented in later milestones (M2+) -----------------------------
 
     pub fn create_graphics_pipeline(

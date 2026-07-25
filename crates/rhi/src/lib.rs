@@ -1050,6 +1050,21 @@ impl Device {
         }
     }
 
+    /// Bindless storage-image table stats: `(in_use, high_water)` slot counts.
+    /// Diagnostic — a leak shows as an `in_use` count that never returns to its
+    /// baseline after a transient-target reclaim (the sandbox's `DIAG_SLOTS`
+    /// counter reads this per frame).
+    pub fn storage_image_slots(&self) -> (u32, u32) {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(d) => d.storage_image_slots(),
+            #[cfg(windows)]
+            Self::D3d12(d) => d.storage_image_slots(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(d) => d.storage_image_slots(),
+        }
+    }
+
     /// The backend this device dispatches to.
     pub fn backend(&self) -> BackendKind {
         match self {

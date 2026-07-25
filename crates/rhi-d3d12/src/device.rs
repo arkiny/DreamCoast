@@ -1055,6 +1055,16 @@ impl D3d12Device {
     pub fn wait_idle(&self) -> Result<(), EngineError> {
         self.shared.wait_idle()
     }
+
+    /// Bindless storage-image table stats: `(in_use, high_water)` slot counts.
+    /// Diagnostic — a leak shows as an `in_use` count that never returns to its
+    /// baseline after a transient-target reclaim (the table asserts at
+    /// `STORAGE_IMAGE_COUNT`); `high_water` only ever grows.
+    pub fn storage_image_slots(&self) -> (u32, u32) {
+        let hwm = self.shared.storage_image_next.get();
+        let free = self.shared.storage_image_free.borrow().len() as u32;
+        (hwm - free, hwm)
+    }
 }
 
 /// The device's async-compute (COMPUTE-type) queue (Phase 7).
