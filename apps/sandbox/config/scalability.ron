@@ -123,6 +123,20 @@
                 taau_antiflicker: true,
                 gi_volume_spp: 4,
                 gi_dir_sets: 4,
+                // TAAU motion sharpness (docs/taau-motion-sharpness.md): this tier upscales, so it
+                // owns the "TAA is blurry when you move" artifact. Root cause = the history is
+                // resampled once per moving frame and a bilinear kernel is a low-pass, so inside the
+                // accumulation loop the softening compounds. Catmull-Rom fixes the kernel; the two
+                // companions follow from it — the post-sharpen is retired (it re-synthesized edges
+                // and amplified noise; the resample now recovers the real detail) and the clamp box
+                // widens a notch (a sharper history lands outside a tight box more often).
+                // Measured, 1080p door dolly, DX and VK: motion gradient energy +43%, lag residual
+                // vs a converged still -6%, with the G3 shimmer ratchet HELD (ROI flicker 2.18/2.13
+                // <= 2.2, bright std 47/44 <= 60). The velocity-gated history cap is deliberately
+                // NOT enabled — measured negative on an upsampler (see quality.rs).
+                taau_catmull_rom: true,
+                taau_clamp_expand: 2.5,
+                taau_sharpen: 0.0,
             ),
             groups: (
                 resolution: 1,

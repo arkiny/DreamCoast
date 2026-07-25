@@ -16,6 +16,29 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{fxaa_push, taau_push};
 
+/// Motion-sharpness policy (the TAAU motion-blur fix). Grouped so the tier knobs travel together
+/// and `record` keeps one argument for the whole feature rather than three loose scalars.
+///
+/// The blur it addresses is structural, not a tuning miss: the history is resampled once per frame
+/// of camera motion, and any resample kernel is a low-pass, so inside the accumulation feedback
+/// loop the softening compounds with the history length.
+///
+/// The shipping fix is `catmull_rom` — a sharper resample kernel. The obvious second lever, cutting
+/// the number of accumulated resamples while moving, is here but OFF: measured negative, because in
+/// a TAA-*U* the history is the upsampling reconstruction rather than mere anti-aliasing. See
+/// docs/taau-motion-sharpness.md §4.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MotionSharpness {
+    /// Catmull-Rom history resample instead of bilinear (`P_TAAU_CATMULL_ROM`).
+    pub catmull_rom: bool,
+    /// Screen motion, in OUTPUT pixels/frame, at which a pixel counts as fully moving.
+    /// `0` (every tier's default) disables the velocity gate — byte-identical to the pre-gate path.
+    pub ramp_px: f32,
+    /// History-length cap for a fully-moving pixel (the static cap stays the pass's own
+    /// `max_hist`). Inert while `ramp_px` is 0.
+    pub max_hist: f32,
+}
+
 pub(crate) struct TaauSystem {
     pipeline: Option<ComputePipeline>,
     /// Decima FXAA→TAA pre-pass: spatial edge AA on the current frame before temporal accumulation.
@@ -192,6 +215,7 @@ impl TaauSystem {
         force_reset: bool,
         velocity: Option<ResourceId>,
         clamp_expand: f32,
+        motion: MotionSharpness,
     ) -> ResourceId {
         let pipe = self.pipeline.as_ref().expect("taau pipeline");
         let frame = self.frame;
@@ -270,6 +294,9 @@ impl TaauSystem {
                     jitter_uv,
                     velocity_index,
                     u32::from(packed),
+                    motion.ramp_px,
+                    motion.max_hist,
+                    u32::from(motion.catmull_rom),
                 ));
                 cmd.dispatch(ow.div_ceil(8), oh.div_ceil(8), 1);
                 Ok(())

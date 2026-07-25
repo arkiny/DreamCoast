@@ -1584,9 +1584,10 @@ pub(crate) fn fxaa_push(in_index: u32, out_index: u32, width: u32, height: u32) 
     pc
 }
 
-/// Pack the QHD/UHD TAAU push block (208 bytes): inv_view_proj (64) + prev_view_proj (64) +
+/// Pack the QHD/UHD TAAU push block (240 bytes): inv_view_proj (64) + prev_view_proj (64) +
 /// 13 uints (hdr, depth, out, hist_r/w, pos_r/w, out_w/h, in_w/h, flip, reset) at 128..180 +
-/// params float4 (reject_dist, max_hist, min_alpha) at the next 16-byte row (192).
+/// params float4 (reject_dist, max_hist, gamma, clamp_expand) at the next 16-byte row (192) +
+/// jitter float4 (jitter.xy, motion_ramp_px, motion_max_hist) at 208 + the tail uints at 224.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn taau_push(
     inv_view_proj: &[f32; 16],
@@ -1611,6 +1612,9 @@ pub(crate) fn taau_push(
     jitter_uv: [f32; 2],
     velocity_index: u32,
     packed_hist: u32,
+    motion_ramp_px: f32,
+    motion_max_hist: f32,
+    taau_flags: u32,
 ) -> [u8; 240] {
     let mut pc = [0u8; 240];
     for (i, v) in inv_view_proj.iter().enumerate() {
@@ -1645,11 +1649,17 @@ pub(crate) fn taau_push(
     // float4 jitter (xy = current jitter in UV) at the next 16-byte row.
     pc[208..212].copy_from_slice(&jitter_uv[0].to_le_bytes());
     pc[212..216].copy_from_slice(&jitter_uv[1].to_le_bytes());
+    // jitter.zw = the motion-sharpness policy: the screen-motion ramp in OUTPUT pixels (0 = policy
+    // off = byte-identical) and the history-length cap a fully-moving pixel is held to.
+    pc[216..220].copy_from_slice(&motion_ramp_px.to_le_bytes());
+    pc[220..224].copy_from_slice(&motion_max_hist.to_le_bytes());
     // velocity target index (PR-2) at the next 16-byte row; 0xFFFFFFFF = absent (camera-only
     // reprojection, byte-identical to the pre-velocity path).
     pc[224..228].copy_from_slice(&velocity_index.to_le_bytes());
     // fp16-packed history flag (0 = legacy 16B hist + 16B pos layout, the byte-identical anchor).
     pc[228..232].copy_from_slice(&packed_hist.to_le_bytes());
+    // taau_flags: bit0 = Catmull-Rom history resample (0 = bilinear, the byte-identical anchor).
+    pc[232..236].copy_from_slice(&taau_flags.to_le_bytes());
     pc
 }
 

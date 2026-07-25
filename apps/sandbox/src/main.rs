@@ -1282,6 +1282,16 @@ struct App {
     /// (sc_viz / gdf_ao goldens) and the PT gate runs RENDER_SCALE=1 (TAAU off), so no quality
     /// gate can justify a default flip yet.
     taau_antiflicker: bool,
+    /// TAAU motion-sharpness policy (`P_TAAU_CATMULL_ROM` / `P_TAAU_MOTION_RAMP` /
+    /// `P_TAAU_MOTION_HIST`, tier-driven). The fix for "TAA is blurry when the camera moves": a
+    /// Catmull-Rom history resample instead of the bilinear one, whose low-pass compounds once per
+    /// moving frame inside the accumulation loop. See `taau::MotionSharpness` and
+    /// docs/taau-motion-sharpness.md.
+    taau_motion: taau::MotionSharpness,
+    /// TSR-style TAAU clamp-box expansion (tier `taau_clamp_expand`, `P_TAAU_CLAMP_EXPAND`).
+    taau_clamp_expand: f32,
+    /// Post-upscale sharpen strength for TAAU frames (tier `taau_sharpen`, `P_TAAU_SHARPEN`).
+    taau_sharpen: f32,
     /// `P_TAAU_FORCE=1`: run TAAU even at native resolution (internal == output) — i.e. temporal
     /// anti-aliasing (jitter + accumulation, no upscale). Opt-in so the default native path stays
     /// byte-identical (TAAU off when render==output).
@@ -3352,6 +3362,35 @@ impl App {
         // ping-pong dominates the taau pass at Retina-class output. Content-only (TAAU itself
         // only runs when upscaling; the gallery renders at scale 1). `P_TAAU_PACKED` overrides.
         let taau_packed = quality::env_bool("P_TAAU_PACKED", base.taau_packed_history);
+        // TAAU motion sharpness — the resample kernel + the (default-off) velocity-gated history cap.
+        // Tier-driven (Med, the tier that upscales, ships the Catmull-Rom resample on); each knob has
+        // an env override for A/B sweeps, and `P_TAAU_MOTION_RAMP=0` disables the velocity gate.
+        let taau_motion = taau::MotionSharpness {
+            catmull_rom: quality::env_bool("P_TAAU_CATMULL_ROM", base.taau_catmull_rom),
+            ramp_px: std::env::var("P_TAAU_MOTION_RAMP")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(base.taau_motion_ramp_px)
+                .max(0.0),
+            max_hist: std::env::var("P_TAAU_MOTION_HIST")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(base.taau_motion_max_hist)
+                .max(1.0),
+        };
+        // The two companions of the resample kernel. Both come from the preset table (so the gallery
+        // anchor is pinned there, not by a per-call-site `if gallery` the way `render_scale` once
+        // was) and both keep an env override for A/B sweeps.
+        let taau_clamp_expand = std::env::var("P_TAAU_CLAMP_EXPAND")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(base.taau_clamp_expand)
+            .max(0.0);
+        let taau_sharpen = std::env::var("P_TAAU_SHARPEN")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(base.taau_sharpen)
+            .max(0.0);
         // Baked ACES tonemap LUT (production filmic curve; see aces.slang / tonemap_lut.slang).
         // `P_TONEMAP_ACES` overrides the tier; `P_TONEMAP_LUT_SIZE` tunes the LUT resolution.
         let tonemap_aces = quality::env_bool("P_TONEMAP_ACES", base.tonemap_aces);
@@ -4178,6 +4217,9 @@ impl App {
             // this ON with its TAAU scale. `base` is `gallery_preset()` for the gallery, so the
             // anchor stays OFF structurally; `P_TAAU_ANTIFLICKER` still overrides either way.
             taau_antiflicker: quality::env_bool("P_TAAU_ANTIFLICKER", base.taau_antiflicker),
+            taau_motion,
+            taau_clamp_expand,
+            taau_sharpen,
             taau_force: quality::env_bool("P_TAAU_FORCE", false),
             taa_mip_bias: std::env::var("TAA_MIP_BIAS")
                 .ok()
@@ -8743,16 +8785,12 @@ impl App {
                 velocity_target,
                 // TSR-style clamp-box expansion: widens the variance box ∝ local contrast so a static
                 // high-contrast edge's converged history isn't re-clipped each frame under jitter (the
-                // dominant upsampling shimmer). 0 for the gallery (byte-identical anchor); content
-                // defaults to 1.0, `P_TAAU_CLAMP_EXPAND` tunes.
-                if self.is_gallery {
-                    0.0
-                } else {
-                    std::env::var("P_TAAU_CLAMP_EXPAND")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(2.0)
-                },
+                // dominant upsampling shimmer). Tier-driven (`taau_clamp_expand`) — the gallery preset
+                // pins 0 = tight box = the byte-identical anchor.
+                self.taau_clamp_expand,
+                // Motion-sharpness: the Catmull-Rom history resample (+ the default-off velocity
+                // gate). Tier-driven; the gallery preset pins it off = the bilinear path bit-for-bit.
+                self.taau_motion,
             ))
         } else {
             None
@@ -8842,9 +8880,12 @@ impl App {
         // main-lit raster path already carries the adapted exposure, so it stays on tm=1.0.
         let ae_exposure = raw_radiance_src && self.auto_exposure;
         // QHD/UHD: sharpen only when the TAAU upscale produced this frame (recover crispness lost
-        // in temporal upsampling); native/debug paths get 0 = byte-identical.
+        // in temporal upsampling); native/debug paths get 0 = byte-identical. Tier-driven
+        // (`taau_sharpen`): it re-synthesizes an edge rather than recovering detail, so on a tier
+        // whose resolve reconstructs properly (`taau_catmull_rom`) it is pure noise amplification
+        // and the tier turns it off — see quality.rs for the measured trade.
         let (sharpen, inv_w, inv_h) = if taau_active && taau_out.is_some() {
-            (0.25, 1.0 / sw as f32, 1.0 / sh as f32)
+            (self.taau_sharpen, 1.0 / sw as f32, 1.0 / sh as f32)
         } else {
             (0.0, 0.0, 0.0)
         };

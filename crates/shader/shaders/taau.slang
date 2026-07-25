@@ -36,10 +36,15 @@ struct TaauPush
     uint reset;              // 1 = ignore history
     float4 params;           // x = reject distance, y = max history, z = variance gamma, w unused
     float4 jitter;           // xy = current frame's jitter in UV (add to the stable UV to sample)
+                             // z = motion ramp in output px (0 = motion policy off), w = motion history cap
     uint velocity_index;     // sampled: RG16Float per-pixel motion vector, or 0xFFFFFFFF = absent
     uint packed_hist;        // 1 = fp16-packed history, no pos buffer (see the packed helpers)
-    uint pad1, pad2;         // 16-byte align the tail
+    uint taau_flags;         // bit0: 1 = Catmull-Rom history resample (else bilinear)
+    uint pad2;               // 16-byte align the tail
 };
+
+// Motion-sharpness policy bit (see `fetch_history_catmull_rom` / the motion gate in csMain).
+static const uint TAAU_FLAG_CATMULL_ROM = 1u;
 
 [[vk::push_constant]]
 ConstantBuffer<TaauPush> pc : register(b0, space0);
@@ -162,6 +167,117 @@ void fetch_history_bilinear(float2 puv, float3 world_pos, out float3 out_rgb, ou
     }
 }
 
+// ---- Catmull-Rom history resample (TAAU_FLAG_CATMULL_ROM) -----------------------------------
+// The motion-blur root cause: with a bilinear history fetch, EVERY frame of camera motion
+// re-samples the accumulated image at a new sub-pixel phase, and a bilinear kernel is a low-pass.
+// Applied once it is invisible; applied once per frame into a feedback loop with blend weight
+// alpha, the steady-state response is the low-pass raised to ~1/alpha — which is why a 64-frame
+// history goes soft the instant the camera moves while a converged still frame stays sharp
+// (measured: door dolly gradient energy 3.98 static -> 1.92 moving, and NEITHER the anti-flicker
+// nor the clamp-expansion knob moved it). Catmull-Rom is the industry-standard fix: a bicubic
+// interpolating kernel whose negative outer lobes restore the high frequencies bilinear drops.
+//
+// The 5-bilinear-tap trick every engine uses needs a hardware sampler; this history lives in a
+// raw storage buffer, so the taps are manual point loads: the separable 4x4 support minus its 4
+// corners (weight products of the two outer lobes — the standard corner-cut), i.e. 12 taps,
+// renormalized by the retained weight.
+//
+// Robustness: CR is only taken when ALL 12 taps hold a real prior surface. A partially-valid
+// footprint (silhouette, sky edge) would have to renormalize over a subset of a kernel with
+// NEGATIVE weights — unstable, and exactly where CR would ring anyway — so those pixels fall
+// back to the (validity-renormalizing) bilinear fetch verbatim. The result is clamped to the
+// component-wise min/max of the taps: no new extrema means no ringing halo, while the kernel's
+// sharpening (which comes from the weight distribution, not from overshoot) is preserved.
+// `out_len` stays bilinear — the history length is an accumulation counter, not an image.
+float4 catmull_rom_weights(float f)
+{
+    // Basis for the offsets {-1, 0, 1, 2}; sums to 1 for every f, w = (0,1,0,0) at f = 0.
+    float f2 = f * f;
+    float f3 = f2 * f;
+    return 0.5 * float4(-f3 + 2.0 * f2 - f, 3.0 * f3 - 5.0 * f2 + 2.0,
+                        -3.0 * f3 + 4.0 * f2 + f, f3 - f2);
+}
+
+// Load one history texel; returns false when the texel is out of bounds or holds no real prior
+// surface. Packed layout folds validity into the length; the unpacked layout keeps it in `pos.w`
+// (loaded as the single dword it is — the other three are never read).
+bool hist_tap(int2 p, out float3 rgb, out float len)
+{
+    rgb = float3(0, 0, 0);
+    len = 0.0;
+    if (p.x < 0 || p.y < 0 || p.x >= int(pc.out_width) || p.y >= int(pc.out_height))
+        return false;
+    uint pidx = uint(p.y) * pc.out_width + uint(p.x);
+    if (pc.packed_hist != 0u)
+    {
+        float4 ph = hist_load_packed(pc.hist_read, pidx);
+        rgb = ph.rgb;
+        len = ph.a;
+        return ph.a > 0.5;
+    }
+    if (asfloat(g.storage_buffers[pc.pos_read].Load(pidx * 16u + 12u)) <= 0.5)
+        return false;
+    float4 ph = asfloat(g.storage_buffers[pc.hist_read].Load4(pidx * 16u));
+    rgb = ph.rgb;
+    len = ph.a;
+    return true;
+}
+
+void fetch_history_catmull_rom(float2 puv, out float3 out_rgb, out float out_len)
+{
+    out_rgb = float3(0, 0, 0);
+    out_len = 0.0;
+    float2 res = float2(pc.out_width, pc.out_height);
+    float2 sp = puv * res - 0.5; // same texel-center convention as the bilinear fetch
+    float2 base = floor(sp);
+    float2 f = sp - base;
+    float4 wx = catmull_rom_weights(f.x);
+    float4 wy = catmull_rom_weights(f.y);
+
+    float3 rgb_sum = float3(0, 0, 0);
+    float3 lo = float3(1e30, 1e30, 1e30);
+    float3 hi = float3(-1e30, -1e30, -1e30);
+    // The inner 2x2 (offsets 0,1 on both axes) doubles as the bilinear fallback + the length.
+    float3 bil_rgb = float3(0, 0, 0);
+    float len_sum = 0.0;
+    float wsum = 0.0;
+    float bilsum = 0.0;
+    bool all_valid = true;
+    [unroll] for (int j = 0; j < 4; j++)
+    {
+        [unroll] for (int i = 0; i < 4; i++)
+        {
+            // Corner-cut: skip the four taps whose weight is the product of both outer lobes.
+            if ((i == 0 || i == 3) && (j == 0 || j == 3))
+                continue;
+            float3 rgb;
+            float len;
+            if (!hist_tap(int2(base) + int2(i - 1, j - 1), rgb, len))
+            {
+                all_valid = false;
+                continue;
+            }
+            float w = wx[i] * wy[j];
+            rgb_sum += w * rgb;
+            wsum += w;
+            lo = min(lo, rgb);
+            hi = max(hi, rgb);
+            if (i >= 1 && i <= 2 && j >= 1 && j <= 2)
+            {
+                // Bilinear weights over the inner 2x2 (the same footprint the bilinear fetch uses).
+                float bw = (i == 1 ? 1.0 - f.x : f.x) * (j == 1 ? 1.0 - f.y : f.y);
+                bil_rgb += bw * rgb;
+                len_sum += bw * len;
+                bilsum += bw;
+            }
+        }
+    }
+    if (bilsum <= 1e-3)
+        return; // no usable history in the footprint at all
+    out_len = len_sum / bilsum;
+    out_rgb = all_valid && abs(wsum) > 1e-3 ? clamp(rgb_sum / wsum, lo, hi) : bil_rgb / bilsum;
+}
+
 float3 reconstruct(float2 cuv, float depth, float sy)
 {
     float2 ndc = float2(cuv.x * 2.0 - 1.0, (cuv.y * 2.0 - 1.0) * sy);
@@ -282,16 +398,6 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // highlight, not a spark. The gallery (params.w == 0) keeps the raw input → byte-identical anchor.
     if (pc.params.w > 0.0)
         cur = ycocg_to_rgb(clip_aabb(box_min, box_max, rgb_to_ycocg(cur)));
-    // Reference-engine (TSR) anti-flicker clamp-error: a tight μ±γσ box RE-CLIPS the converged history
-    // every frame on a static high-contrast edge — the sub-pixel jitter shifts the low-res neighborhood
-    // statistics, so the shifting box snaps the (stable) history to a different face each frame = the
-    // dominant upsampling shimmer. Widen the box by a fraction of its OWN size (∝ local contrast, so
-    // flat areas — where the box is tiny — barely move and don't ghost), letting static detail
-    // CONVERGE. `params.w` = 0 (gallery) is exact byte-identical; content passes the expansion factor.
-    float3 clamp_err = (box_max - box_min) * pc.params.w;
-    box_min -= clamp_err;
-    box_max += clamp_err;
-
     // World point of THIS pixel (validation + storage) and of the closest neighbor (reprojection
     // motion — closest-depth dilation so silhouettes fetch the foreground history).
     float3 world_pos = reconstruct(cuv, depth, sy);
@@ -303,6 +409,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 
     float3 hist_rgb = float3(0, 0, 0);
     float hist_len = 0.0;
+    // Where this pixel's surface sat last frame, on the stable output grid. `prev_uv == uv` when the
+    // reprojection produced nothing usable (reset / off-screen), which reads as zero motion — inert,
+    // because there is then no history for the motion policy to weigh anyway.
+    float2 prev_uv = uv;
+    bool cr = (pc.taau_flags & TAAU_FLAG_CATMULL_ROM) != 0u;
     if (pc.reset == 0u)
     {
         // When the PR-2 motion-vector target is bound, prefer per-pixel velocity reprojection
@@ -315,7 +426,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         {
             if (all(vuv >= 0.0) && all(vuv <= 1.0))
             {
-                fetch_history_bilinear(vuv, world_pos, hist_rgb, hist_len);
+                prev_uv = vuv;
+                if (cr)
+                    fetch_history_catmull_rom(vuv, hist_rgb, hist_len);
+                else
+                    fetch_history_bilinear(vuv, world_pos, hist_rgb, hist_len);
             }
         }
         else
@@ -327,12 +442,38 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                 float2 puv = float2(pndc.x * 0.5 + 0.5, pndc.y * sy * 0.5 + 0.5);
                 if (all(puv >= 0.0) && all(puv <= 1.0) && pndc.z >= 0.0 && pndc.z <= 1.0)
                 {
-                    // Sub-pixel-accurate (bilinear) history reprojection — see fetch_history_bilinear.
-                    fetch_history_bilinear(puv, world_pos, hist_rgb, hist_len);
+                    // Sub-pixel-accurate history reprojection — see fetch_history_bilinear /
+                    // fetch_history_catmull_rom.
+                    prev_uv = puv;
+                    if (cr)
+                        fetch_history_catmull_rom(puv, hist_rgb, hist_len);
+                    else
+                        fetch_history_bilinear(puv, world_pos, hist_rgb, hist_len);
                 }
             }
         }
     }
+
+    // Velocity gate (`jitter.z` = ramp in output px; 0 = OFF, which is the shipping default —
+    // see the measured negative result on the history cap below). This pixel's screen motion in
+    // OUTPUT pixels per frame, jitter-free on both reprojection paths (`uv` is the stable grid,
+    // `prev_view_proj` / the motion vector are both unjittered) and per-pixel, so parallax is
+    // respected: a near pillar sweeping past reads as moving while the distant nave behind it does not.
+    float motion_px = length((uv - prev_uv) * float2(pc.out_width, pc.out_height));
+    float motion_w = pc.jitter.z > 0.0 ? saturate(motion_px / pc.jitter.z) : 0.0;
+
+    // Reference-engine (TSR) anti-flicker clamp-error: a tight μ±γσ box RE-CLIPS the converged history
+    // every frame on a static high-contrast edge — the sub-pixel jitter shifts the low-res neighborhood
+    // statistics, so the shifting box snaps the (stable) history to a different face each frame = the
+    // dominant upsampling shimmer. Widen the box by a fraction of its OWN size (∝ local contrast, so
+    // flat areas — where the box is tiny — barely move and don't ghost), letting static detail
+    // CONVERGE. `params.w` = 0 (gallery) is exact byte-identical; content passes the expansion factor.
+    // NOT motion-gated: retiring the expansion while moving was measured to make the door ROI flicker
+    // WORSE (2.32 -> 2.66 avg/ch), because the shimmer this box fights is itself a moving-camera
+    // artifact — the sub-pixel aperture flips coverage as the view slides, not while it sits still.
+    float3 clamp_err = (box_max - box_min) * pc.params.w;
+    box_min -= clamp_err;
+    box_max += clamp_err;
 
     float3 accum;
     float len;
@@ -344,7 +485,18 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         hist_rgb = ycocg_to_rgb(hist_y);
         // Straight EMA: the clip rejects stale (camera-moved) history, so long, stable accumulation
         // hides the jitter and resolves sub-pixel detail. alpha floors at 1/max_hist (len capped).
-        len = min(hist_len + 1.0, pc.params.y);
+        // Motion-gated history cap (`jitter.w`) — the classic "responsive TAA" weight: shorten the
+        // history in proportion to this pixel's motion so a moving pixel is dominated by the current,
+        // un-resampled sample. **Measured NEGATIVE here and therefore OFF by default** (ramp 0):
+        // this pass is TAA-U, and in an upsampler the history is not merely anti-aliasing, it IS the
+        // reconstruction — the full-res detail exists only as the accumulation of jittered low-res
+        // frames. Cutting the history to 8 frames throws that reconstruction away, and both metrics
+        // agreed: motion gradient energy 2.88 -> 2.74 (LESS sharp, the opposite of the intent) and
+        // the lag residual against a converged still at the same pose 16.1 -> 20.9 (worse). The knob
+        // is kept because it is the right lever for a NON-upsampling temporal pass (`P_TAAU_FORCE=1`
+        // at native res, where the history carries no resolution), not for the upscale path.
+        // `motion_w == 0` yields `min(hist_len + 1, params.y)` bit-exactly.
+        len = min(hist_len + 1.0, lerp(pc.params.y, pc.jitter.w, motion_w));
         float alpha = 1.0 / len;
         // Luminance anti-flicker (Lottes/Karis) — OPT-IN via flip_y bit2 (`P_TAAU_ANTIFLICKER`),
         // default OFF so the sealed content baseline (sc_viz / gdf_ao goldens, which capture at the
@@ -362,6 +514,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
             float lh = luma(hist_rgb);
             float d = abs(lc - lh) / max(max(lc, lh), 0.2);
             float flick_w = saturate(1.0 - d);
+            // NOT motion-gated. Releasing the damping while the camera moves looks like the obvious
+            // "it only costs responsiveness on a moving pixel" win, but the artifact it was measured
+            // against is itself a DOLLY artifact (the closure batch's door-ROI numbers are all from a
+            // moving camera — a still frame was already at 0.026 avg/ch before this existed), so
+            // releasing it under motion simply undoes the fix: ROI flicker 2.21 -> 2.66 avg/ch and
+            // bright-pixel std 47 -> 72 when it was tried. Left unconditional.
             alpha *= flick_w * flick_w; // low weight to a divergent (flickering) sample; 1 if stable
         }
         accum = lerp(hist_rgb, cur, alpha);

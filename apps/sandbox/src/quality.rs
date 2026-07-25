@@ -331,6 +331,48 @@ pub struct QualityPreset {
     /// so Med (the TAAU-scaled content tier) ships it ON.
     #[serde(default)]
     pub taau_antiflicker: bool,
+    /// TAAU Catmull-Rom history resample (`P_TAAU_CATMULL_ROM`). The history is resampled once per
+    /// frame of camera motion and any resample kernel is a low-pass, so inside the accumulation
+    /// feedback loop a bilinear fetch compounds into the "TAA is blurry when you move" artifact
+    /// (measured on the door dolly: gradient energy 3.98 converged-static -> 1.92 moving, while the
+    /// anti-flicker and clamp-expansion knobs moved it by ~1% — this is the actual root cause).
+    /// Catmull-Rom's negative outer lobes restore what bilinear drops. Costs 4 -> 12 history taps
+    /// (the buffer holds no hardware sampler, so the 5-bilinear-tap trick is unavailable; the
+    /// corner-cut 12-tap point gather is the buffer-side equivalent). Off = bilinear (anchor).
+    #[serde(default)]
+    pub taau_catmull_rom: bool,
+    /// Velocity-gated TAAU history cap: the screen motion in OUTPUT px/frame at which a pixel counts
+    /// as fully moving (`P_TAAU_MOTION_RAMP`), above which its history length is capped to
+    /// `taau_motion_max_hist` — the classic "responsive TAA" weight. **Measured negative on the
+    /// upscale path and therefore 0 (off) on every tier**: in a TAA-*U* the history IS the
+    /// reconstruction (full-res detail exists only as accumulated jittered low-res frames), so a
+    /// short history is *less* sharp in motion, not more (gradient energy 2.88 -> 2.74, lag residual
+    /// 16.1 -> 20.9). Retained as the correct lever for a non-upsampling temporal pass
+    /// (`P_TAAU_FORCE=1` at native res). See docs/taau-motion-sharpness.md.
+    #[serde(default)]
+    pub taau_motion_ramp_px: f32,
+    /// History-length cap for a fully-moving pixel (`P_TAAU_MOTION_HIST`); the static cap stays the
+    /// pass's own `max_hist`. Inert while `taau_motion_ramp_px` is 0 (the default on every tier).
+    #[serde(default = "default_taau_motion_max_hist")]
+    pub taau_motion_max_hist: f32,
+    /// TSR-style TAAU clamp-box expansion (`P_TAAU_CLAMP_EXPAND`): widens the YCoCg variance box by
+    /// this fraction of its own size so a converged history is not re-clipped every frame as the
+    /// jitter shifts the low-res neighbourhood statistics (the dominant upsampling shimmer). Trades
+    /// a little ghost persistence for that stability. `0` = tight box = the byte-identical gallery
+    /// anchor; content shipped 2.0 before the motion-sharpness batch. A Catmull-Rom history is
+    /// sharper and so lands outside the box marginally more often, which is why the tier that
+    /// enables `taau_catmull_rom` also widens this a notch (2.5: door-ROI flicker 2.21 -> 2.18
+    /// avg/ch for +1.4% lag residual).
+    #[serde(default = "default_taau_clamp_expand")]
+    pub taau_clamp_expand: f32,
+    /// Post-upscale sharpen strength applied at the tonemap when TAAU produced the frame
+    /// (`P_TAAU_SHARPEN`). It exists to re-crisp what temporal upsampling softened — but it
+    /// re-synthesizes an edge rather than recovering detail, so it amplifies whatever noise the
+    /// resolve left. With `taau_catmull_rom` recovering the detail properly it is a bad trade and
+    /// the tier turns it off: measured on the door dolly, 0.25 -> 0 costs 5% gradient energy and
+    /// buys 11% ROI flicker (2.45 -> 2.21 avg/ch). 0.25 = the legacy strength (other tiers).
+    #[serde(default = "default_taau_sharpen")]
+    pub taau_sharpen: f32,
     /// GI-volume update rays per probe (`P_GI_VOLUME_SPP`). The legacy 16 with one thread per
     /// probe is LATENCY-bound on the small slab dispatches (16 serial ~100ns marches per
     /// thread): sponza_intel 1080p measured gi_volume 22.5 ms at spp16/period8 vs 11.1 ms at
@@ -476,6 +518,19 @@ fn default_gi_volume_spp() -> u32 {
 }
 fn default_gi_dir_sets() -> u32 {
     1
+}
+/// The motion history cap is inert until `taau_motion_ramp_px` turns the gate on, so an absent
+/// RON key just carries a sane cap rather than 0 (which would mean "no history at all in motion").
+fn default_taau_motion_max_hist() -> f32 {
+    8.0
+}
+/// Absent keys keep the pre-motion-sharpness content values these two were hard-coded to, so every
+/// tier that does not opt into the Catmull-Rom resample renders exactly as before.
+fn default_taau_clamp_expand() -> f32 {
+    2.0
+}
+fn default_taau_sharpen() -> f32 {
+    0.25
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +733,11 @@ pub fn gallery_preset() -> QualityPreset {
         cache_adaptive_res: false,
         taau_packed_history: false, // legacy 16B+16B history layout (anchor; TAAU off at scale 1)
         taau_antiflicker: false,    // anchor is native-scale (TAAU off) — keep the table explicit
+        taau_catmull_rom: false,    // bilinear history resample (anchor; TAAU off at scale 1)
+        taau_motion_ramp_px: 0.0,   // velocity-gated history cap off (measured negative; anchor)
+        taau_motion_max_hist: 8.0,  // inert while the ramp is 0 — keep the table explicit
+        taau_clamp_expand: 0.0,     // tight variance box = the byte-identical anchor
+        taau_sharpen: 0.25,         // unused (TAAU off at scale 1); legacy value for completeness
         gi_volume_spp: 16,          // legacy update spp (gallery runs no gi_volume anyway)
         gi_dir_sets: 1,             // legacy pinned direction set (byte-identical anchor)
         tonemap_aces: false,        // legacy per-pixel curve (the byte-identical anchor)
@@ -1069,6 +1129,30 @@ mod tests {
             "{label}: reflect_glossy_spp {} out of 0..=32",
             p.reflect_glossy_spp
         );
+        // TAAU motion sharpness. The clamp-box expansion is a fraction of the box's own size —
+        // beyond a few box-widths the anti-ghost has no box left to clip against; the sharpen is a
+        // tonemap-tail strength; the motion ramp is a screen-pixel distance and its history cap a
+        // frame count the shader `lerp`s the static cap toward (so it must not exceed it).
+        assert!(
+            (0.0..=8.0).contains(&p.taau_clamp_expand),
+            "{label}: taau_clamp_expand {} out of 0..=8",
+            p.taau_clamp_expand
+        );
+        assert!(
+            (0.0..=2.0).contains(&p.taau_sharpen),
+            "{label}: taau_sharpen {} out of 0..=2",
+            p.taau_sharpen
+        );
+        assert!(
+            (0.0..=64.0).contains(&p.taau_motion_ramp_px),
+            "{label}: taau_motion_ramp_px {} out of 0..=64",
+            p.taau_motion_ramp_px
+        );
+        assert!(
+            (1.0..=64.0).contains(&p.taau_motion_max_hist),
+            "{label}: taau_motion_max_hist {} out of 1..=64",
+            p.taau_motion_max_hist
+        );
     }
 
     /// Every tier's `preset()` resolves within the validated ranges its consumers clamp to.
@@ -1168,6 +1252,20 @@ mod tests {
         );
         assert_eq!(g.reflect_compact_div, 0, "gallery reflect_compact_div off");
         assert!(!g.reflect_compact_hwrt, "gallery reflect_compact_hwrt off");
+        // TAAU motion sharpness: the anchor renders at native scale so the pass never runs, but the
+        // table stays explicit — and `taau_clamp_expand` 0 is load-bearing (a tight variance box is
+        // what makes the anchor byte-identical; it used to be pinned by an `if is_gallery` at the
+        // call site, which is exactly the class of bug this table exists to prevent).
+        assert!(!g.taau_catmull_rom, "gallery taau_catmull_rom off");
+        assert_eq!(
+            g.taau_clamp_expand, 0.0,
+            "gallery taau_clamp_expand 0 (tight box = byte-identical anchor)"
+        );
+        assert_eq!(g.taau_sharpen, 0.25, "gallery taau_sharpen legacy strength");
+        assert_eq!(
+            g.taau_motion_ramp_px, 0.0,
+            "gallery taau_motion_ramp_px 0 (velocity gate off)"
+        );
     }
 
     /// `Med` is the content-default tier. Two deliberate, measured retunes moved it off the
@@ -1227,6 +1325,29 @@ mod tests {
         assert!(
             m.taau_antiflicker,
             "Med taau_antiflicker ON (door-shimmer gate passed; docs/lighting-ao-shadow-closure.md)"
+        );
+        // TAAU motion-sharpness batch (docs/taau-motion-sharpness.md, 2026-07-25, RTX 2070 SUPER /
+        // sponza_intel 1080p door dolly): the three ship together — Catmull-Rom recovers the detail
+        // the bilinear history resample was low-passing away, which then makes the post-sharpen a
+        // net loss (it re-synthesized edges and amplified noise) and asks the clamp box for one
+        // extra notch (a sharper history lands outside a tight box more often). Measured +43% DX /
+        // +40% VK motion gradient energy with the G3 shimmer ratchet held.
+        assert!(
+            m.taau_catmull_rom,
+            "Med taau_catmull_rom ON (motion-sharpness batch; docs/taau-motion-sharpness.md)"
+        );
+        assert_eq!(
+            m.taau_clamp_expand, 2.5,
+            "Med taau_clamp_expand 2.5 (matched to the Catmull-Rom history)"
+        );
+        assert_eq!(
+            m.taau_sharpen, 0.0,
+            "Med taau_sharpen off (Catmull-Rom recovers detail; the sharpen only amplified noise)"
+        );
+        assert_eq!(
+            m.taau_motion_ramp_px, 0.0,
+            "Med velocity-gated history cap OFF (measured negative on an upsampler — the history \
+             IS the reconstruction; see docs/taau-motion-sharpness.md)"
         );
         // Reflection-quality v2 knobs stay OFF on Med (serde defaults; the tier is the
         // byte-identical no-regression baseline and DX≡VK for the new shaders is pending).
