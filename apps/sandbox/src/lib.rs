@@ -1,4 +1,13 @@
-//! Sandbox: the playground executable.
+//! Sandbox: the playground application — **and the engine library**.
+//!
+//! There is no separate engine binary: the render path, the frame loop and the scene
+//! assembly all live here. So this crate builds as a **library** with a thin `sandbox`
+//! binary on top (`src/main.rs` = `main_entry(GameConfig::default())`), and a game app
+//! links the library, installs [`GameHooks`], and drives gameplay without forking the
+//! render path (`docs/game-framework-plan.md` §2). The public surface is deliberately
+//! small: [`main_entry`] / [`launch`], [`GameConfig`], [`GameHooks`], [`CameraPose`],
+//! [`App::set_hooks`] / [`App::run`], plus re-exports of the crates those signatures
+//! mention. Everything else stays crate-private.
 //!
 //! Builds a deferred-PBR render graph each frame: a G-buffer fill pass
 //! rasterizes the glTF mesh (or procedural cube fallback) into four MRT targets
@@ -12,14 +21,42 @@
 //! The per-feature GPU work lives in focused bundles (`deferred`, `ibl`, `rt`,
 //! `gdf`, `particle`, `cull`); `App` owns those bundles plus the device / swapchain
 //! / per-frame sync, with `App::new` doing setup and `App::frame` running one frame
-//! of the loop. `run()` shrinks to window + device bring-up + `App::new` + the loop.
+//! of the loop. [`launch`] shrinks to window + device bring-up + `App::new` + the loop.
+//!
+//! A game binary is then roughly:
+//!
+//! ```no_run
+//! use sandbox::{CameraPose, GameConfig, GameHooks, glam::Vec3, platform::Input, scene::World};
+//!
+//! #[derive(Default)]
+//! struct Dungeon {
+//!     player: Vec3,
+//! }
+//!
+//! impl GameHooks for Dungeon {
+//!     fn fixed_update(&mut self, _world: &mut World, _input: &Input, dt: f32) {
+//!         self.player.x += dt; // game simulation, one fixed step
+//!     }
+//!     fn camera(&mut self, _alpha: f32) -> Option<CameraPose> {
+//!         // Top-down follow camera, tilted off vertical (world +Y is up).
+//!         Some(CameraPose::look_at(self.player + Vec3::new(0.0, 12.0, 8.0), self.player))
+//!     }
+//! }
+//!
+//! fn main() -> anyhow::Result<()> {
+//!     sandbox::main_entry(GameConfig {
+//!         level: Some("sponza".into()),
+//!         hooks: Some(Box::new(Dungeon::default())),
+//!     })
+//! }
+//! ```
 
 use std::time::Instant;
 
 use dreamcoast_asset::MeshData;
 use dreamcoast_core::glam::{Mat4, Quat, Vec3};
 use dreamcoast_core::init_logging;
-use dreamcoast_gui::{Gui, imgui};
+use dreamcoast_gui::Gui;
 use dreamcoast_platform::Window;
 use dreamcoast_render::{GraphProfiler, PassInfo, RenderGraph, ResourceId, ResourcePool};
 use rhi::{
@@ -45,6 +82,7 @@ mod fuse;
 mod gdf;
 mod gi;
 mod gtao;
+pub mod hooks;
 mod hzb;
 mod ibl;
 mod level;
@@ -84,6 +122,28 @@ use reflect::*;
 use registry::{GpuMesh, MaterialDesc, MaterialRegistry, MeshRegistry, build_scene};
 use rt::*;
 use smoketest::*;
+
+pub use hooks::{CameraPose, GameHooks};
+
+// Re-exports so a downstream game crate can spell the hook signatures (`World`,
+// `Input`, `imgui::Ui`, `glam` vectors) without re-deriving this crate's exact
+// dependency versions. Single source: they are this crate's own dependencies.
+pub use dreamcoast_core::glam;
+pub use dreamcoast_gui::imgui;
+pub use dreamcoast_platform as platform;
+pub use dreamcoast_scene as scene;
+
+/// How the application is brought up. `default()` is exactly the stock sandbox (the
+/// byte-identical golden/gallery path); a game overrides the fields it needs.
+#[derive(Default)]
+pub struct GameConfig {
+    /// Level to load, as the `.level` stem the `LEVEL` env var takes (e.g. `sponza`).
+    /// `None` = resolve the scene from the environment as before (`WORLD` / `LEVEL` /
+    /// `SCENE_GLTF` / the procedural gallery). An explicit value wins over `LEVEL`.
+    pub level: Option<String>,
+    /// Game callbacks. `None` = no injection at all (bit-for-bit the stock frame).
+    pub hooks: Option<Box<dyn GameHooks>>,
+}
 
 const FRAMES_IN_FLIGHT: usize = 2;
 // CPU/GPU-bound diagnosis (`PROFILE_CPU`): microseconds spent in the per-frame fence wait (blocking
@@ -340,7 +400,10 @@ fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+/// Process entry point: install logging, size the job-system pool, then [`launch`].
+/// The `sandbox` binary is `main_entry(GameConfig::default())`; a game binary passes
+/// its own config (level + hooks) and gets the identical bring-up.
+pub fn main_entry(config: GameConfig) -> anyhow::Result<()> {
     // `--log-file <path>` mirrors logs to a file (the logging layer reads the env
     // var). It's a CLI flag, not just the env var, because GPU capture launchers
     // (RenderDoc's UI env editor) mangle environment values but pass command-line
@@ -364,14 +427,28 @@ fn main() -> anyhow::Result<()> {
     // Log any fatal error before it propagates: under a GPU capture tool
     // (RenderDoc) stdout/stderr are redirected away, so a bare `Err` return would
     // vanish. With `DREAMCOAST_LOG_FILE` set this lands the real cause in the file.
-    let result = run();
+    let result = launch(config);
     if let Err(e) = &result {
         tracing::error!("fatal: {e:?}");
     }
     result
 }
 
-fn run() -> anyhow::Result<()> {
+/// Window + device bring-up, scene load, then the frame loop. Assumes logging and the
+/// job system are already initialized (see [`main_entry`], which does both).
+pub fn launch(config: GameConfig) -> anyhow::Result<()> {
+    match build_app(config)? {
+        Some(mut app) => app.run(),
+        // A bring-up smoketest flag (`--clear/triangle/mesh-test`, …) consumed the run.
+        None => Ok(()),
+    }
+}
+
+/// Bring up window + device and build the [`App`] for `config`, without running the
+/// loop — the public constructor for an embedder that wants to touch the app between
+/// construction and [`App::run`] (e.g. [`App::set_hooks`]). Returns `Ok(None)` when a
+/// bring-up smoketest CLI flag ran instead of the full application.
+pub fn build_app(config: GameConfig) -> anyhow::Result<Option<App>> {
     let backend = select_backend();
     info!("requested backend: {backend:?}");
 
@@ -474,47 +551,53 @@ fn run() -> anyhow::Result<()> {
                 .nth(1)
         })
     {
-        return loading::run_capture(&device, backend, &swapchain, &path);
+        loading::run_capture(&device, backend, &swapchain, &path)?;
+        return Ok(None);
     }
 
     // M0 backend bring-up: a minimal acquire→clear→present loop that needs no
     // pipelines or shaders. The Metal backend defaults through this until the
     // triangle/PBR milestones implement pipelines.
     if clear_test_enabled() {
-        return run_clear_test(&mut window, &device, &mut swapchain);
+        run_clear_test(&mut window, &device, &mut swapchain)?;
+        return Ok(None);
     }
 
     // M2 backend bring-up: clear + a single hardcoded-triangle pipeline (no vertex
     // buffers, push constants, or bindless). Validates pipeline creation + draw.
     if triangle_test_enabled() {
-        return run_triangle_test(backend, &mut window, &device, &mut swapchain);
+        run_triangle_test(backend, &mut window, &device, &mut swapchain)?;
+        return Ok(None);
     }
 
     // M3 backend bring-up: textured bindless mesh (depth-tested) + an ImGui overlay.
     // Exercises the bindless argument buffer, sampled textures, depth, and ImGui on
     // the Metal backend; cross-backend like the other *_test loops.
     if mesh_test_enabled() {
-        return run_mesh_test(
+        run_mesh_test(
             backend,
             &mut window,
             &device,
             &mut swapchain,
             &model,
             model_radius,
-        );
+        )?;
+        return Ok(None);
     }
 
     // Phase 14 (virtual geometry) M0 capability smokes. `--atomic64-test` is headless
     // (compute + CPU readback); `--mesh-shader-test` draws one mesh-shader triangle.
     if atomic64_test_enabled() {
-        return run_atomic64_test(backend, &device);
+        run_atomic64_test(backend, &device)?;
+        return Ok(None);
     }
     if mesh_shader_test_enabled() {
-        return run_mesh_shader_test(backend, &mut window, &device, &mut swapchain);
+        run_mesh_shader_test(backend, &mut window, &device, &mut swapchain)?;
+        return Ok(None);
     }
     // Phase 14 M1e: load the COOKED LOD DAG and render the meshlet debug view (per-cluster colour).
     if vgeo_test_enabled() {
-        return run_vgeo_test(
+        run_vgeo_test(
             backend,
             &mut window,
             &device,
@@ -523,11 +606,12 @@ fn run() -> anyhow::Result<()> {
             &model_ref,
             &cache_dir,
             compress_tex,
-        );
+        )?;
+        return Ok(None);
     }
     // Phase 14 M2: render the cooked clusters on the GPU via a mesh shader.
     if vgeo_mesh_test_enabled() {
-        return run_vgeo_mesh(
+        run_vgeo_mesh(
             backend,
             &mut window,
             &device,
@@ -536,10 +620,11 @@ fn run() -> anyhow::Result<()> {
             &model_ref,
             &cache_dir,
             compress_tex,
-        );
+        )?;
+        return Ok(None);
     }
 
-    let mut app = App::new(
+    Ok(Some(App::new(
         window,
         instance,
         device,
@@ -550,14 +635,19 @@ fn run() -> anyhow::Result<()> {
         screenshot_mode,
         captures,
         validation_on,
-    )?;
-    app.run()
+        config,
+    )?))
 }
 
 /// The full deferred-PBR application: owns the device / swapchain / per-frame sync
 /// and every feature bundle, plus the UI + loop state. `new` does setup; `frame`
 /// runs one iteration of the render loop.
-struct App {
+///
+/// Public so an embedder (a game binary) can build it via [`build_app`], install
+/// [`GameHooks`] with [`App::set_hooks`], and drive it with [`App::run`]. Every field
+/// stays crate-private — the supported game surface is the hook trait, not the
+/// renderer's internals.
+pub struct App {
     // Window + device bring-up. `_instance` is kept alive only so the device (and
     // the window-derived surface) outlive it.
     window: Window,
@@ -1336,6 +1426,10 @@ struct App {
     /// Latched pointer-lock release (M toggles): keeps the cursor free for the settings UI
     /// without holding the Option/Alt chord; the fly look pauses while released.
     cursor_released: bool,
+
+    /// Game-injection seam (`hooks.rs`). `None` (the default, and every headless
+    /// golden recipe) = the frame loop takes exactly its pre-seam paths.
+    hooks: Option<Box<dyn GameHooks>>,
 }
 
 const VK_F2: u16 = 0x71;
@@ -1378,6 +1472,7 @@ impl App {
         screenshot_mode: bool,
         captures: Vec<Capture>,
         validation_on: bool,
+        config: GameConfig,
     ) -> anyhow::Result<Self> {
         // `P14_VGEO` routes every eligible opaque static object through virtual geometry (the
         // `VgeoSystem` is built below from the mesh registry). Resolved after `gallery_scene` and
@@ -1520,10 +1615,12 @@ impl App {
         let cube = dreamcoast_asset::unit_cube();
         // Scene-mode env vars (precedence: WORLD > LEVEL > SCENE_GLTF > gallery).
         let world_mode = std::env::var_os("WORLD").is_some();
+        // A `GameConfig::level` from the embedder wins over the env var (a game names its
+        // own level); unset falls back to the existing `LEVEL` seam.
         let level_select = if world_mode {
             None
         } else {
-            std::env::var("LEVEL").ok()
+            config.level.clone().or_else(|| std::env::var("LEVEL").ok())
         };
         let scene_gltf_path = if world_mode || level_select.is_some() {
             None
@@ -4191,7 +4288,13 @@ impl App {
             tab_prev: false,
             m_prev: false,
             cursor_released: false,
+            hooks: config.hooks,
         })
+    }
+
+    /// Install (or replace, with `None`) the game callbacks. See [`GameHooks`].
+    pub fn set_hooks(&mut self, hooks: Option<Box<dyn GameHooks>>) {
+        self.hooks = hooks;
     }
 
     /// The graphics queue (inline path). Panics if the RHI thread owns it.
@@ -4335,7 +4438,8 @@ impl App {
             hw_compact && self.reflect_screen_want && self.cache_sky_occlude;
     }
 
-    fn run(&mut self) -> anyhow::Result<()> {
+    /// Run the frame loop until the window closes (or a headless capture completes).
+    pub fn run(&mut self) -> anyhow::Result<()> {
         // M4 B3: opt into the separate RHI (submit) thread. Default off = the inline
         // single-thread path (byte-identical). Async-compute paths stay on the inline
         // path, so the worker is only spawned for the normal submit config.
@@ -4691,6 +4795,12 @@ impl App {
                 // camera motion. No-op when no entity carries `Spin` / `AnimationPlayer`.
                 dreamcoast_scene::advance_spin(&mut self.world, FIXED_DT);
                 dreamcoast_scene::advance_animation(&mut self.world, FIXED_DT);
+                // The capture path's deterministic sim step: one game step per captured
+                // frame, so a CAPTURE_SEQ dump of a game scene advances reproducibly.
+                // No-op (and byte-identical) with no hooks installed.
+                if let Some(h) = self.hooks.as_mut() {
+                    h.fixed_update(&mut self.world, self.window.input(), FIXED_DT);
+                }
             }
             self.prev_angle = self.angle; // no interpolation when capturing
         } else {
@@ -4705,6 +4815,13 @@ impl App {
                 // deterministic). No-op when nothing carries `Spin` / `AnimationPlayer`.
                 dreamcoast_scene::advance_spin(&mut self.world, FIXED_DT);
                 dreamcoast_scene::advance_animation(&mut self.world, FIXED_DT);
+                // Game simulation step (M0 seam): runs after the built-in advances and
+                // before this frame's transform propagation, so writes to
+                // `LocalTransform` land in the draw list built below. No-op (and
+                // byte-identical) with no hooks installed.
+                if let Some(h) = self.hooks.as_mut() {
+                    h.fixed_update(&mut self.world, self.window.input(), FIXED_DT);
+                }
             }
             if steps == MAX_STEPS {
                 // Stalled longer than the cap: drop the backlog rather than chasing it.
@@ -4876,6 +4993,23 @@ impl App {
             morph::patch_scene(&self.morphed, &mut scene, &mut prev_scene, fif);
         }
 
+        // Game camera hook (M0 seam): resolved once, here, so the built-in cameras can be
+        // skipped entirely when it takes over. `None` (no hooks, or a hook that declines
+        // this frame) leaves every branch below exactly as it was. The pose is applied
+        // AFTER the orbit/fly resolve and BEFORE the headless `CAM_EYE*` diagnostics, which
+        // therefore still override it for a capture.
+        let hook_pose: Option<CameraPose> = self
+            .hooks
+            .as_mut()
+            .and_then(|h| h.camera(render_alpha))
+            .filter(|p| p.position.is_finite() && p.forward() != Vec3::ZERO);
+        // Vertical FOV for this frame's primary view. The hook may override it; unset
+        // keeps the 60° the scene projection, the view descriptor, the shadow-cascade fit
+        // and the SSAO projection scale have always used (one value, four consumers).
+        let fov_y_rad = hook_pose
+            .and_then(|p| p.fov_y_radians)
+            .unwrap_or(60f32.to_radians());
+
         // Orbiting camera framing the whole sample scene — or, in single-object
         // diagnostic mode, a tight orbit centred on one scene object so it can be
         // inspected from every side (azimuth = self.angle, elevation = diag_pitch).
@@ -4923,8 +5057,11 @@ impl App {
         // captures stay in Orbit for the gallery baseline; world mode (Stage D) is the
         // exception — it flies even headless (static at `WORLD_CAM`) so streaming can be
         // positioned and captured.
+        // A game camera hook supersedes the fly camera for the frame (and skips its input
+        // handling, so the game owns the mouse/WASD it is reading itself).
         let fly_active = self.cam_mode == camera::CameraMode::Fly
-            && (!self.screenshot_mode || self.streaming.is_some());
+            && (!self.screenshot_mode || self.streaming.is_some())
+            && hook_pose.is_none();
         let (focus, eye) = if fly_active {
             // Base speed ~walking pace for a scene of this size (Sponza radius ~24 m ->
             // ~3.5 m/s; Shift sprints 4x, wheel adjusts). The old 0.8x seed moved ~19 m/s
@@ -4946,6 +5083,15 @@ impl App {
             (fly.focus(), fly.position)
         } else {
             (focus, eye)
+        };
+        // Apply the game camera pose (resolved above). Everything downstream — streaming,
+        // the surface-cache card camera, the view/projection matrices, and the end-of-frame
+        // `prev_view_proj*` latch that motion vectors and the TAAU/denoiser history
+        // reproject through — derives from this single `(focus, eye)`, so an overridden
+        // camera stays temporally consistent with no extra bookkeeping.
+        let (focus, eye) = match hook_pose {
+            Some(p) => (p.focus(), p.position),
+            None => (focus, eye),
         };
         // Diagnostic camera override: `CAM_EYE="x,y,z"` (+ optional `CAM_TARGET`) places
         // the camera at a fixed pose for headless inspection of any scene (e.g. flying
@@ -5002,7 +5148,7 @@ impl App {
         }
         let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
         let proj_noflip = Mat4::perspective_rh(
-            60f32.to_radians(),
+            fov_y_rad,
             cw as f32 / ch as f32,
             CLUSTER_Z_NEAR,
             CLUSTER_Z_FAR,
@@ -5067,7 +5213,7 @@ impl App {
             eye,
             focus,
             cw as f32 / ch as f32,
-            60f32.to_radians(),
+            fov_y_rad,
             CLUSTER_Z_NEAR,
             CLUSTER_Z_FAR,
             self.backend,
@@ -5709,6 +5855,13 @@ impl App {
                         }
                     }
                 });
+
+            // Game UI hook (M0 seam): drawn after — and outside — the engine debug window,
+            // so a game HUD is a sibling of it rather than nested inside it. No-op with no
+            // hooks installed, and never reached by `--screenshot-clean` (no ImGui frame).
+            if let Some(h) = self.hooks.as_mut() {
+                h.draw_ui(ui, &self.world);
+            }
         }
 
         // This slot's previous submission is complete (waited on its fence above), so
@@ -5921,7 +6074,7 @@ impl App {
 
         // PR-7 CSM: fit N cascades to the view frustum when the seam is on (single source of
         // all shadow matrices/splits). The perspective params match the scene camera above
-        // (fov 60deg, near 0.05, far 100.0) so the cascades tile the depth range the view
+        // (same `fov_y_rad`, near 0.05, far 100.0) so the cascades tile the depth range the view
         // samples. Empty on the legacy path (byte-identical anchor).
         let csm_slots = if self.csm.enabled {
             csm::compute_cascades(
@@ -5929,7 +6082,7 @@ impl App {
                 &csm::ViewCamera {
                     eye,
                     target: focus,
-                    fov_y_rad: 60f32.to_radians(),
+                    fov_y_rad,
                     aspect: cw as f32 / ch as f32,
                     near: 0.05,
                     far: 100.0,
@@ -6998,7 +7151,7 @@ impl App {
             _ => None,
         };
         // Screen-space near-field AO (HBAO-lite), composed with the GDF AO in the lighting pass.
-        // proj_scale = 0.5/tan(fovY/2) with the fixed 60° vertical FOV (perspective_rh above).
+        // proj_scale = 0.5/tan(fovY/2) from the frame's vertical FOV (perspective_rh above).
         let ssao_out = if self.ssao {
             self.gtao.record(
                 &mut graph,
@@ -7013,7 +7166,7 @@ impl App {
                 self.ssao_params[0],
                 self.ssao_params[1],
                 self.ssao_params[2],
-                0.5 / (30f32.to_radians().tan()),
+                0.5 / ((fov_y_rad * 0.5).tan()),
                 self.ssao_params[3],
             )
         } else {
