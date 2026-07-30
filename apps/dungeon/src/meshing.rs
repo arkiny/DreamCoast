@@ -417,15 +417,29 @@ fn planar_uv(pos: [f32; 3], normal: [f32; 3], scale: f32) -> [f32; 2] {
     }
 }
 
-/// Append one quad as two triangles.
+/// Append one quad as two triangles, **wound counter-clockwise about its own normal**.
 ///
-/// **Winding matches the engine's own mesh producers** (`crates/asset/src/primitives.rs`
-/// `unit_cube` / `axis_box`): corners are given in the order those builders use, indexed
-/// `[0,1,2, 2,3,0]`, which puts the right-hand cross product of the first triangle
-/// *opposite* the shading normal. Raster culling is disabled on every backend, so this
-/// is a consistency contract rather than a visibility one — but consistency is exactly
-/// what a downstream consumer that does care (a two-sided-off pass, a ray-tracing hit
-/// shader deriving a geometric normal) would rely on.
+/// Both triangles satisfy `cross(p1 - p0, p2 - p0) · normal > 0`, i.e. the glTF
+/// front-face convention, which is what every consumer that cares about facing assumes:
+///
+/// * the **virtual-geometry G-buffer producer** (`P14_VGEO`, *default on* for content
+///   scenes) backface-culls single-sided materials per triangle, with `area > 0` in
+///   screen-pixel space meaning "back". A quad wound the other way is culled — it
+///   vanishes from the G-buffer while still being lit, shadowed and in the distance
+///   field, which reads as a hole in the floor rather than as a winding bug;
+/// * a ray-tracing hit shader deriving a geometric normal, and any future pass that
+///   turns culling on, agree with the shading normal instead of opposing it.
+///
+/// The corner order the callers pass is the *outward* order for the face (`+X`, `-X`,
+/// … as named at each call site), so the flip lives here, once: the emitted triangles
+/// are `[0,2,1]` and `[0,3,2]`.
+///
+/// **Not** the order `crates/asset/src/primitives.rs` `unit_cube` uses — it indexes its
+/// (identically ordered) corners `[0,1,2, 2,3,0]`, which winds *opposite* its shading
+/// normals. That is invisible in the fixed-function path (raster culling is off on every
+/// backend) and it is why this module originally copied it, but it is not invisible to
+/// the vgeo producer. See the M1 report: the engine's own `cube`/`ground` procedural
+/// assets have the same problem, and fixing them is an engine-track change.
 fn push_quad(mesh: &mut ChunkMesh, corners: [[f32; 3]; 4], normal: [f32; 3], uv_scale: f32) {
     let base = mesh.vertices.len() as u32;
     for pos in corners {
@@ -436,7 +450,7 @@ fn push_quad(mesh: &mut ChunkMesh, corners: [[f32; 3]; 4], normal: [f32; 3], uv_
         });
     }
     mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+        .extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
 }
 
 // ---------------------------------------------------------------------------------
@@ -800,8 +814,16 @@ mod tests {
         }
     }
 
+    /// Floors lie on the floor plane facing up, ceilings on the ceiling plane facing
+    /// down — and **every emitted triangle is wound counter-clockwise about its own
+    /// normal** (the glTF front-face convention).
+    ///
+    /// The winding half is the load-bearing one: the virtual-geometry producer
+    /// backface-culls single-sided materials per triangle, so a quad wound the other way
+    /// is simply absent from the G-buffer. This asserts on the *emitted indices*, not on
+    /// the corner order, because the indices are what the rasterizer sees.
     #[test]
-    fn floors_face_up_and_winding_matches_the_engine_convention() {
+    fn floors_face_up_and_every_triangle_is_front_facing() {
         let grid = generate(42, &DungeonParams::default());
         let chunks = mesh_chunks(
             &grid,
@@ -826,14 +848,14 @@ mod tests {
                     }
                     _ => {}
                 }
-                // `crates/asset/src/primitives.rs` orders its quad corners so the first
-                // triangle's right-hand cross product opposes the shading normal; every
-                // quad we emit must agree, or the two producers would disagree about
-                // front faces the moment anything stops being two-sided.
-                let g = cross(sub(quad[1].pos, quad[0].pos), sub(quad[2].pos, quad[0].pos));
+            }
+            for tri in c.indices.chunks_exact(3) {
+                let p = |i: usize| c.vertices[tri[i] as usize].pos;
+                let n = c.vertices[tri[0] as usize].normal;
+                let g = cross(sub(p(1), p(0)), sub(p(2), p(0)));
                 assert!(
-                    dot(g, n) < 0.0,
-                    "winding disagrees with primitives.rs for normal {n:?}"
+                    dot(g, n) > 0.0,
+                    "triangle {tri:?} is wound backwards for normal {n:?}"
                 );
             }
         }
