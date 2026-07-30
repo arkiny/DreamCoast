@@ -330,7 +330,9 @@ pub(crate) fn ground_mesh(half: f32, y: f32) -> MeshData {
             v(half, half, 1.0, 1.0),
             v(-half, half, 0.0, 1.0),
         ],
-        indices: vec![0, 1, 2, 0, 2, 3],
+        // CCW about the +Y normal (winding must agree with the shading normal for
+        // single-sided consumers like the vgeo backface cull).
+        indices: vec![0, 2, 1, 0, 3, 2],
         material: dreamcoast_asset::Material::default(),
     }
 }
