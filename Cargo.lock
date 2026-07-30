@@ -318,6 +318,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dreamcoast-game"
+version = "0.0.0"
+dependencies = [
+ "dreamcoast-platform",
+ "glam",
+ "ron",
+ "serde",
+]
+
+[[package]]
 name = "dreamcoast-gui"
 version = "0.0.0"
 dependencies = [
