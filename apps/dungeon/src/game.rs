@@ -15,11 +15,10 @@
 use dreamcoast_game::input::{ActionState, BindingsConfig, InputSnapshot};
 use glam::{Vec2, Vec3};
 use sandbox::imgui;
-use sandbox::platform::Input;
-use sandbox::scene::{Entity, LocalTransform, MeshInstance, World};
+use sandbox::scene::{Entity, LocalTransform, Name, World};
 use sandbox::{CameraPose, GameHooks};
 
-use crate::level::{GROUND_HALF, PLAYER_RADIUS, PLAYER_SPAWN};
+use crate::level::{GROUND_HALF, PLAYER_NAME, PLAYER_RADIUS, PLAYER_SPAWN};
 
 /// Gameplay actions. The physical keys live in `config/bindings.ron` (data), so a
 /// rebind never touches this file.
@@ -120,19 +119,18 @@ impl DungeonGame {
         })
     }
 
-    /// Identify the player placeholder in a freshly loaded level.
+    /// Identify the player placeholder in a freshly loaded level, by the scene-graph
+    /// name the level authored on it ([`PLAYER_NAME`]).
     ///
-    /// Entities instantiated from a `.level` procedural asset carry no `Name` (only
-    /// imported glTF roots get one), so there is nothing to look up by. The stable
-    /// identity available today is the authored spawn transform: the placeholder is
-    /// the renderable whose local translation is [`PLAYER_SPAWN`]. `level.rs` writes
-    /// that transform from the same constant, so the two cannot drift.
+    /// Both sides read the same constant, so a renamed or moved placeholder cannot
+    /// silently break the lookup — which the previous spawn-transform match could: it
+    /// identified the player as "the renderable standing where the player starts", so a
+    /// second entity placed at the spawn, or a spawn that moved, quietly took over.
     fn find_player(world: &World) -> Option<Entity> {
         world
-            .query2::<MeshInstance, LocalTransform>()
-            .into_iter()
-            .find(|(_, _, local)| local.translation.abs_diff_eq(PLAYER_SPAWN, 1e-4))
-            .map(|(entity, _, _)| entity)
+            .iter::<Name>()
+            .find(|(_, name)| name.0 == PLAYER_NAME)
+            .map(|(entity, _)| entity)
     }
 
     /// Re-resolve the player after a level (re)load, seeding the sim state from the
@@ -187,32 +185,27 @@ impl DungeonGame {
     }
 
     /// Where the player *is* this rendered frame: the two latest fixed-step positions
-    /// blended by the frame's interpolation factor.
-    ///
-    /// Note the engine draws the placeholder mesh from its ECS transform, which only
-    /// the fixed step writes — so the mesh sits at the last simulated position while
-    /// this reports the sub-step one. They differ by at most one step of travel
-    /// (~14 cm at sprint), and closing it would need a per-frame hook that can write
-    /// the ECS — which the M0 seam deliberately does not expose (an M1 question).
+    /// blended by the frame's interpolation factor. The camera, the HUD readout and the
+    /// placeholder mesh all read this one function, so they cannot disagree.
     fn render_position(&self, alpha: f32) -> Vec3 {
         self.prev_position.lerp(self.position, alpha)
     }
 
-    /// One simulation step against an already-captured input snapshot.
+    /// One simulation step against one frame of input.
     ///
-    /// The hook itself receives the *platform* `Input`, whose key state has no public
-    /// setter, so a test cannot fabricate one. Taking a snapshot here — the framework's
-    /// own testable input type — keeps the whole step exercisable without a window
-    /// (see the tests below) and costs the real path nothing.
+    /// This *is* the hook body — `fixed_update` forwards straight to it — because the
+    /// engine now hands games an `InputSnapshot` rather than the platform `Input` whose
+    /// state has no public setter. So the whole step is exercisable from a test with no
+    /// window, device or swapchain (see below), against the same code the game runs.
     fn simulate(&mut self, world: &mut World, snapshot: &InputSnapshot, dt: f32) {
         // One snapshot per step. Every step of a frame sees the same platform state
         // (the window is pumped once per frame), so an edge is reported on the first
         // step of the frame it happened in and not repeated by the later ones.
         self.input.update(snapshot);
 
-        let Some(player) = self.acquire_player(world) else {
+        if self.acquire_player(world).is_none() {
             return; // level not loaded (or has no placeholder) — nothing to simulate
-        };
+        }
         self.steps += 1;
 
         // Velocity ramp, then integrate position on the ground plane.
@@ -231,11 +224,9 @@ impl DungeonGame {
         }
         self.position.y = PLAYER_RADIUS;
 
-        // Write the sim result into the ECS. This runs before transform propagation,
-        // so it lands in this frame's draw list.
-        if let Some(local) = world.get_mut::<LocalTransform>(player) {
-            local.translation = self.position;
-        }
+        // Note there is no ECS write here: `render_update` is the single writer of the
+        // placeholder's transform, so the mesh draws at the *interpolated* pose the
+        // camera is using and the two can never disagree.
 
         // The camera follows a smoothed trail behind the player, advanced on the same
         // fixed step so the filter is framerate-independent.
@@ -245,8 +236,28 @@ impl DungeonGame {
 }
 
 impl GameHooks for DungeonGame {
-    fn fixed_update(&mut self, world: &mut World, input: &Input, dt: f32) {
-        self.simulate(world, &InputSnapshot::capture(input), dt);
+    fn fixed_update(&mut self, world: &mut World, input: &InputSnapshot, dt: f32) {
+        self.simulate(world, input, dt);
+    }
+
+    /// Push the *rendered* player position onto the placeholder's transform, once per
+    /// frame, right before the draw list is built.
+    ///
+    /// Without this the mesh draws at the last simulated pose while the camera is
+    /// already at the interpolated one, so at high frame rates the player visibly trails
+    /// the view by up to a step of travel (~14 cm at sprint). Both now read
+    /// [`Self::render_position`] with the same `alpha`, so they move as one.
+    ///
+    /// Visual-only, per the hook contract: nothing here feeds back into the simulation —
+    /// the next `fixed_update` integrates from `self.position`, never from the ECS.
+    fn render_update(&mut self, world: &mut World, alpha: f32) {
+        let Some(player) = self.player.filter(|&e| world.is_alive(e)) else {
+            return;
+        };
+        let rendered = self.render_position(alpha);
+        if let Some(local) = world.get_mut::<LocalTransform>(player) {
+            local.translation = rendered;
+        }
     }
 
     fn camera(&mut self, alpha: f32) -> Option<CameraPose> {
@@ -289,15 +300,15 @@ impl GameHooks for DungeonGame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sandbox::scene::{MaterialHandle, MeshHandle};
+    use sandbox::scene::{MaterialHandle, MeshHandle, MeshInstance};
 
     const W: u16 = 0x57;
     const SHIFT: u16 = 0x10;
     const FIXED_DT: f32 = 1.0 / 60.0;
 
-    /// A stand-in for the loaded level: a floor entity plus the player placeholder at
-    /// the authored spawn, both renderable — i.e. exactly what the level loader
-    /// produces (and, notably, with no `Name` on either).
+    /// A stand-in for the loaded level: an unnamed floor entity plus the *named* player
+    /// placeholder at the authored spawn — i.e. exactly what the level loader produces
+    /// from `level.rs` now that the placement carries a name.
     fn test_world() -> World {
         let mut world = World::new();
         let renderable = |i: u32| MeshInstance::new(MeshHandle(i), MaterialHandle(i));
@@ -305,11 +316,24 @@ mod tests {
             .spawn_node()
             .with(renderable(0))
             .with(LocalTransform::default());
-        world.spawn_node().with(renderable(1)).with(LocalTransform {
-            translation: PLAYER_SPAWN,
-            ..LocalTransform::default()
-        });
         world
+            .spawn_node()
+            .named(PLAYER_NAME)
+            .with(renderable(1))
+            .with(LocalTransform {
+                translation: PLAYER_SPAWN,
+                ..LocalTransform::default()
+            });
+        world
+    }
+
+    /// Advance the game the way the frame loop does: whole fixed steps, then the
+    /// once-per-frame presentation pass that writes the visual transform.
+    fn frame(game: &mut DungeonGame, world: &mut World, input: &InputSnapshot, steps: u32) {
+        for _ in 0..steps {
+            game.simulate(world, input, FIXED_DT);
+        }
+        game.render_update(world, 1.0);
     }
 
     /// The bindings file must resolve — a typo in it is a startup failure, so catch it
@@ -319,16 +343,15 @@ mod tests {
         assert!(DungeonGame::new().is_ok());
     }
 
-    /// The whole fixed step, end to end: the placeholder is identified in a level-like
-    /// world, held input accelerates it, and the result lands on its ECS transform.
+    /// The whole frame, end to end: the placeholder is identified by name in a
+    /// level-like world, held input accelerates it, and the result lands on its ECS
+    /// transform.
     #[test]
     fn a_held_key_moves_the_player_entity_in_the_ecs() {
         let mut game = DungeonGame::new().unwrap();
         let mut world = test_world();
         let held = InputSnapshot::default().with_key(W, true);
-        for _ in 0..30 {
-            game.simulate(&mut world, &held, FIXED_DT);
-        }
+        frame(&mut game, &mut world, &held, 30);
         let player = game.player.expect("placeholder identified from the level");
         let moved = world.get::<LocalTransform>(player).unwrap().translation;
         assert!(moved.z < PLAYER_SPAWN.z - 1.0, "walked away from camera");
@@ -347,14 +370,61 @@ mod tests {
         let held = InputSnapshot::default()
             .with_key(W, true)
             .with_key(SHIFT, true);
-        for _ in 0..600 {
+        frame(&mut game, &mut world, &held, 600);
+        assert_eq!(game.position.z, -(GROUND_HALF - PLAYER_RADIUS));
+        frame(&mut game, &mut world, &InputSnapshot::default(), 60);
+        assert!(game.speed() < 0.01, "velocity ramps back down to rest");
+    }
+
+    /// An unnamed placeholder is not the player, however suggestively it is placed —
+    /// the lookup is by name, not by "whatever stands at the spawn".
+    #[test]
+    fn an_unnamed_entity_at_the_spawn_is_not_the_player() {
+        let mut game = DungeonGame::new().unwrap();
+        let mut world = World::new();
+        world
+            .spawn_node()
+            .with(MeshInstance::new(MeshHandle(0), MaterialHandle(0)))
+            .with(LocalTransform {
+                translation: PLAYER_SPAWN,
+                ..LocalTransform::default()
+            });
+        frame(
+            &mut game,
+            &mut world,
+            &InputSnapshot::default().with_key(W, true),
+            30,
+        );
+        assert!(game.player.is_none());
+        assert_eq!(game.steps, 0, "no player, no simulation");
+    }
+
+    /// The presentation pass is what moves the mesh, and it moves it to the *rendered*
+    /// (interpolated) position — the same one the camera and the HUD read — not to the
+    /// last simulated one. Mid-step, that is a real difference.
+    #[test]
+    fn render_update_writes_the_interpolated_pose() {
+        let mut game = DungeonGame::new().unwrap();
+        let mut world = test_world();
+        let held = InputSnapshot::default().with_key(W, true);
+        for _ in 0..30 {
             game.simulate(&mut world, &held, FIXED_DT);
         }
-        assert_eq!(game.position.z, -(GROUND_HALF - PLAYER_RADIUS));
-        for _ in 0..60 {
-            game.simulate(&mut world, &InputSnapshot::default(), FIXED_DT);
-        }
-        assert!(game.speed() < 0.01, "velocity ramps back down to rest");
+        let player = game.player.unwrap();
+        // Simulation alone leaves the mesh where the level authored it.
+        assert_eq!(
+            world.get::<LocalTransform>(player).unwrap().translation,
+            PLAYER_SPAWN
+        );
+
+        game.render_update(&mut world, 0.5);
+        let drawn = world.get::<LocalTransform>(player).unwrap().translation;
+        let expected = game.prev_position.lerp(game.position, 0.5);
+        assert_eq!(drawn, expected);
+        assert!(
+            drawn.z > game.position.z && drawn.z < game.prev_position.z,
+            "the drawn pose sits strictly between the two sim states"
+        );
     }
 
     /// Holding "forward" must move the placeholder toward -Z and ramp up, not teleport.

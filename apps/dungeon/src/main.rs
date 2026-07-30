@@ -12,18 +12,48 @@
 //! ```text
 //! cargo run -p dungeon
 //! cargo run -p dungeon -- --screenshot-clean tmp/dungeon.png
+//!
+//! # M1 static-geometry injection proof: a runtime-GENERATED room, entering the scene
+//! # as a real asset file so it collects the per-mesh SDF / GDF / GI / reflection bakes.
+//! # `DEBUG_VIEW=9` renders distance-field AO — the generated walls and pillars
+//! # occluding there is the proof that the bake saw them (see `level.rs`).
+//! cargo run -p dungeon --release -- --generated-room --screenshot-clean tmp/room_ao.png
 //! ```
 
 mod game;
 mod level;
+// Landed ahead of their consumer: the M1 integration step swaps `level::room_meshes`
+// for the real generator+mesher output. Until then the modules are test-only (each
+// carries its own `#![allow(dead_code)]`).
+mod meshing;
+mod procgen;
+
+/// Whether `--generated-room` was passed: load the generated-geometry level instead of
+/// the walking skeleton. Parsed here rather than in the engine — unknown arguments pass
+/// through the engine's own scan untouched, so a game is free to add its own.
+fn generated_room_requested() -> bool {
+    std::env::args().skip(1).any(|a| a == "--generated-room")
+}
 
 fn main() -> anyhow::Result<()> {
-    // The level is authored in code (see `level.rs`) and written where the engine's
-    // loader looks. Doing it before bring-up means a fresh checkout needs no extra step.
-    level::ensure_level_file()?;
+    // Logging first: level generation below runs *before* engine bring-up, and its
+    // report (mesh/triangle counts, generation time) is exactly what the M1 risk gate
+    // wants to read — so it has to reach the same log stream the engine uses.
+    sandbox::init_logging();
+
+    // Levels are authored in code (see `level.rs`) and written where the engine's loader
+    // is pointed. Doing it before bring-up means a fresh checkout needs no extra step.
+    let level = if generated_room_requested() {
+        level::ensure_generated_room()?
+    } else {
+        level::ensure_level_file()?
+    };
 
     sandbox::main_entry(sandbox::GameConfig {
-        level: Some(level::LEVEL_NAME.to_owned()),
+        level: Some(level.to_owned()),
+        // This game keeps its levels in its own directory, so the engine's built-in
+        // `.level` files are neither written into it nor listed in its hot-swap menu.
+        levels_dir: Some(level::GENERATED_DIR.into()),
         hooks: Some(Box::new(game::DungeonGame::new()?)),
     })
 }
