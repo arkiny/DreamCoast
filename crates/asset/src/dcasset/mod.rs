@@ -53,7 +53,8 @@ pub const MAGIC: [u8; 8] = *b"DCASSET\0";
 /// v7: Morton spatial clusterizer (tight per-cluster bounds/cones) — changes every cluster page.
 /// v8: baked vertex-animation cache (`CHUNK_VCACHE`, Track B) — cooked `.abc` / `.usda` caches.
 /// v9: `CHUNK_LEVEL` carries a baked-deform entity list (declarative vertex-cache placements).
-pub const VERSION: u32 = 9;
+/// v10: `CHUNK_LEVEL` entities carry an optional scene-graph `name` (gameplay lookup key).
+pub const VERSION: u32 = 10;
 
 // Chunk type tags (directory `type` field). Stable across versions; new payloads
 // get new tags. Unknown tags are skipped by the readers (forward compatibility).

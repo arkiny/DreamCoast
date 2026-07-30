@@ -58,6 +58,16 @@ pub struct Entity {
     /// Logical asset key — the same stable reference the mesh cook is keyed on
     /// (e.g. `assets/model.glb`), resolved to a `.dcasset` at load.
     pub asset: String,
+    /// Optional scene-graph name for this placement, surfaced at load as the runtime's
+    /// `Name` component so gameplay can find the entity it authored (`"player"`,
+    /// `"exit_door"`) instead of matching on a spawn transform.
+    ///
+    /// It names the *placement*, not the asset: two entities may share an `asset` and
+    /// carry different names. `None` keeps the loader's existing behavior (an imported
+    /// glTF root is still named after its asset key; a procedural entity gets no name).
+    /// `#[serde(default)]` keeps pre-name `.level` RON forward-compatible.
+    #[serde(default)]
+    pub name: Option<String>,
     /// World transform, column-major (`glam::Mat4::to_cols_array` order).
     pub transform: [f32; 16],
     /// Optional per-instance material override (else the asset's own material).
@@ -158,6 +168,7 @@ mod tests {
             entities: vec![
                 Entity {
                     asset: "assets/Lantern.glb".into(),
+                    name: None,
                     transform: [
                         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0,
                         1.0,
@@ -166,6 +177,7 @@ mod tests {
                 },
                 Entity {
                     asset: "sphere".into(),
+                    name: Some("player".into()),
                     transform: [0.0; 16],
                     material_override: Some(MaterialOverride {
                         base_color_factor: [0.95, 0.64, 0.54, 1.0],
@@ -206,5 +218,23 @@ mod tests {
         )"#;
         let parsed: LevelData = ron::from_str(text).expect("parse without deforms");
         assert!(parsed.deforms.is_empty());
+    }
+
+    /// A `.level` authored before entity names (the shipped built-ins) still parses —
+    /// the field defaults to `None`, so no entity gains a scene-graph name.
+    #[test]
+    fn ron_entity_without_name_defaults_none() {
+        let text = r#"(
+            entities: [(
+                asset: "sphere",
+                transform: (1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1),
+                material_override: None,
+            )],
+            lights: [],
+            camera: (position: (0, 1, 3), target: (0, 0, 0), fov_y_deg: 45, znear: 0.05, zfar: 100),
+            environment: (sun_dir: (-0.4, -1, -0.3), sun_intensity: 3, sky_white_balance: (1, 1, 1)),
+        )"#;
+        let parsed: LevelData = ron::from_str(text).expect("parse without entity names");
+        assert_eq!(parsed.entities[0].name, None);
     }
 }

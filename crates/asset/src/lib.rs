@@ -14,6 +14,9 @@ pub mod dcasset;
 /// FBX import via ufbx (Phase 13 Stage E), gated behind the `fbx` feature.
 #[cfg(feature = "fbx")]
 pub mod fbx;
+/// Binary glTF **writer** — runtime-generated geometry entering the cooked-asset
+/// pipeline as a real file (see the module docs for why that is the injection path).
+pub mod glb;
 pub mod gltf_scene;
 pub mod level;
 pub mod level_graph;
@@ -29,6 +32,7 @@ pub mod vgeo;
 
 #[cfg(feature = "fbx")]
 pub use fbx::load_fbx_scene;
+pub use glb::{GlbMaterial, GlbMesh, save_glb, write_glb};
 pub use gltf_scene::{
     AlphaMode, ChannelData, GltfAnimation, GltfChannel, GltfMaterial, GltfNode, GltfPrimitive,
     GltfScene, GltfSkin, Interpolation, MaterialKind, MorphTarget, classify_material,

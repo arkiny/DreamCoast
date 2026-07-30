@@ -80,7 +80,8 @@ fn encode_level(level: &LevelData) -> Vec<u8> {
     for v in env.sky_white_balance {
         w.f32(v);
     }
-    // Deforms (v9). Appended last so a pre-v9 chunk is a strict prefix of this layout.
+    // Deforms (v9). Appended after the environment so a pre-v9 chunk is a strict prefix
+    // of this layout.
     w.u32(level.deforms.len() as u32);
     for d in &level.deforms {
         w.str(&d.source);
@@ -98,6 +99,15 @@ fn encode_level(level: &LevelData) -> Vec<u8> {
             }
             None => w.u32(0),
         }
+    }
+    // Entity names (v10). Appended as a trailing parallel block — not interleaved into
+    // the entity records — so a pre-v10 chunk stays a strict prefix of this layout and
+    // the same "read what is there, default the rest" decode works for both. Written
+    // unconditionally (one length + one string per entity, empty = unnamed) so the
+    // encoding is a pure function of the level, not of which entities happen to be named.
+    w.u32(level.entities.len() as u32);
+    for e in &level.entities {
+        w.str(e.name.as_deref().unwrap_or(""));
     }
     w.buf
 }
@@ -125,6 +135,9 @@ fn decode_level(r: &mut Reader) -> Result<LevelData, EngineError> {
         };
         entities.push(Entity {
             asset,
+            // Filled from the v10 trailing name block below; a pre-v10 chunk has none,
+            // which leaves every entity unnamed (the old behavior exactly).
+            name: None,
             transform,
             material_override,
         });
@@ -190,6 +203,21 @@ fn decode_level(r: &mut Reader) -> Result<LevelData, EngineError> {
         });
     }
 
+    // Entity names (v10). A v9 chunk ends at the deform block, so the count read is EOF ⇒
+    // zero names ⇒ every entity keeps the `None` set above (an old shipped `.dcasset`
+    // decodes cleanly). The VERSION gate re-cooks a stale cache from RON regardless, so
+    // this only matters for the source-absent shipped path. An empty string is the
+    // encoding of "unnamed", not a name.
+    let name_count = r.u32().unwrap_or(0);
+    for i in 0..name_count as usize {
+        let name = r.str()?;
+        if let Some(e) = entities.get_mut(i)
+            && !name.is_empty()
+        {
+            e.name = Some(name);
+        }
+    }
+
     Ok(LevelData {
         entities,
         lights,
@@ -209,6 +237,7 @@ mod tests {
             entities: vec![
                 Entity {
                     asset: "assets/model.glb".into(),
+                    name: None,
                     transform: [
                         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 3.0, 4.0,
                         1.0,
@@ -221,6 +250,7 @@ mod tests {
                 },
                 Entity {
                     asset: "assets/sphere".into(),
+                    name: Some("player".into()),
                     transform: [0.0; 16],
                     material_override: None,
                 },
@@ -275,7 +305,47 @@ mod tests {
         let (header, decoded) = read_level(&bytes).expect("decode");
         assert_eq!(header.source_hash, 0x1e7e1);
         assert_eq!(decoded, level);
+        assert_eq!(decoded.entities[1].name.as_deref(), Some("player"));
         // Deterministic.
         assert_eq!(write_level(&level, 0x1e7e1), bytes);
+    }
+
+    /// A **v9** chunk (written before entity names existed) still decodes: the trailing
+    /// name block is simply absent, so every entity reads back unnamed and nothing else
+    /// shifts. Built by lopping the v10 block off an all-unnamed payload — with names
+    /// `None` that block is exactly `u32 count` + one empty `str` (a bare `u32 0`) per
+    /// entity, so the remainder *is* the v9 byte layout.
+    #[test]
+    fn pre_name_chunk_decodes_with_no_names() {
+        let mut level = LevelData {
+            entities: vec![
+                Entity {
+                    asset: "assets/model.glb".into(),
+                    name: None,
+                    transform: [0.0; 16],
+                    material_override: None,
+                },
+                Entity {
+                    asset: "sphere".into(),
+                    name: None,
+                    transform: [1.0; 16],
+                    material_override: None,
+                },
+            ],
+            ..LevelData::default()
+        };
+        let payload = encode_level(&level);
+        let v9_len = payload.len() - (4 + 4 * level.entities.len());
+        let v9 = write_single_chunk(CHUNK_LEVEL, &payload[..v9_len], 0xbeef);
+
+        let (_, decoded) = read_level(&v9).expect("decode a pre-name chunk");
+        assert_eq!(decoded, level);
+
+        // And the same level *with* a name is not silently equal to the v9 read — the
+        // block is what carries it.
+        level.entities[0].name = Some("door".into());
+        let (_, named) = read_level(&write_level(&level, 0xbeef)).expect("decode");
+        assert_eq!(named.entities[0].name.as_deref(), Some("door"));
+        assert_eq!(named.entities[1].name, None);
     }
 }

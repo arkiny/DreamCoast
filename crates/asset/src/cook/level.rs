@@ -77,6 +77,7 @@ mod tests {
         LevelData {
             entities: vec![Entity {
                 asset: "assets/Sponza/Sponza.gltf".into(),
+                name: None,
                 transform: [
                     1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
                 ],
