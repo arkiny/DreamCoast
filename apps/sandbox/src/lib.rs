@@ -26,7 +26,9 @@
 //! A game binary is then roughly:
 //!
 //! ```no_run
-//! use sandbox::{CameraPose, GameConfig, GameHooks, glam::Vec3, platform::Input, scene::World};
+//! use sandbox::{
+//!     CameraPose, GameConfig, GameHooks, glam::Vec3, platform::InputSnapshot, scene::World,
+//! };
 //!
 //! #[derive(Default)]
 //! struct Dungeon {
@@ -34,7 +36,7 @@
 //! }
 //!
 //! impl GameHooks for Dungeon {
-//!     fn fixed_update(&mut self, _world: &mut World, _input: &Input, dt: f32) {
+//!     fn fixed_update(&mut self, _world: &mut World, _input: &InputSnapshot, dt: f32) {
 //!         self.player.x += dt; // game simulation, one fixed step
 //!     }
 //!     fn camera(&mut self, _alpha: f32) -> Option<CameraPose> {
@@ -47,6 +49,7 @@
 //!     sandbox::main_entry(GameConfig {
 //!         level: Some("sponza".into()),
 //!         hooks: Some(Box::new(Dungeon::default())),
+//!         ..GameConfig::default()
 //!     })
 //! }
 //! ```
@@ -55,7 +58,6 @@ use std::time::Instant;
 
 use dreamcoast_asset::MeshData;
 use dreamcoast_core::glam::{Mat4, Quat, Vec3};
-use dreamcoast_core::init_logging;
 use dreamcoast_gui::Gui;
 use dreamcoast_platform::Window;
 use dreamcoast_render::{GraphProfiler, PassInfo, RenderGraph, ResourceId, ResourcePool};
@@ -137,10 +139,25 @@ pub use dreamcoast_scene as scene;
 /// byte-identical golden/gallery path); a game overrides the fields it needs.
 #[derive(Default)]
 pub struct GameConfig {
-    /// Level to load, as the `.level` stem the `LEVEL` env var takes (e.g. `sponza`).
-    /// `None` = resolve the scene from the environment as before (`WORLD` / `LEVEL` /
-    /// `SCENE_GLTF` / the procedural gallery). An explicit value wins over `LEVEL`.
+    /// Level to load. Two forms, distinguished by shape:
+    ///
+    /// * a **stem** (`"sponza"`) — matched case-insensitively against the `.level`
+    ///   files in [`Self::levels_dir`], exactly as the `LEVEL` env var always has; or
+    /// * an **explicit path** (anything containing a path separator or ending in
+    ///   `.level`, absolute or relative to the working directory) — used as given, so a
+    ///   game can load a level it generated outside the engine's own directory.
+    ///
+    /// A name that resolves to nothing is a hard error naming what *is* available; it
+    /// used to fall back to the first level found, which made a typo look like the
+    /// wrong scene loading. `None` = resolve the scene from the environment as before
+    /// (`WORLD` / `LEVEL` / `SCENE_GLTF` / the procedural gallery). An explicit value
+    /// wins over `LEVEL`.
     pub level: Option<String>,
+    /// Directory the stem form searches, and the hot-swap dropdown lists. `None` =
+    /// the engine's own `apps/sandbox/levels` (relative to the working directory),
+    /// which is also the only directory the built-in `.level` files are written into —
+    /// a game pointing this elsewhere gets its own levels and nothing else.
+    pub levels_dir: Option<std::path::PathBuf>,
     /// Game callbacks. `None` = no injection at all (bit-for-bit the stock frame).
     pub hooks: Option<Box<dyn GameHooks>>,
 }
@@ -400,10 +417,12 @@ fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
     }
 }
 
-/// Process entry point: install logging, size the job-system pool, then [`launch`].
-/// The `sandbox` binary is `main_entry(GameConfig::default())`; a game binary passes
-/// its own config (level + hooks) and gets the identical bring-up.
-pub fn main_entry(config: GameConfig) -> anyhow::Result<()> {
+/// Install the engine's logging (and panic hook), honoring `--log-file`. Idempotent.
+///
+/// [`main_entry`] calls this itself, so a plain game never needs to. Call it *first*
+/// when the game does work before bring-up — generating a level, cooking assets — and
+/// wants those logs in the same stream (and the same `--log-file`) as the engine's.
+pub fn init_logging() {
     // `--log-file <path>` mirrors logs to a file (the logging layer reads the env
     // var). It's a CLI flag, not just the env var, because GPU capture launchers
     // (RenderDoc's UI env editor) mangle environment values but pass command-line
@@ -411,6 +430,13 @@ pub fn main_entry(config: GameConfig) -> anyhow::Result<()> {
     if let Some(path) = log_file_path() {
         unsafe { std::env::set_var("DREAMCOAST_LOG_FILE", path) };
     }
+    dreamcoast_core::init_logging();
+}
+
+/// Process entry point: install logging, size the job-system pool, then [`launch`].
+/// The `sandbox` binary is `main_entry(GameConfig::default())`; a game binary passes
+/// its own config (level + hooks) and gets the identical bring-up.
+pub fn main_entry(config: GameConfig) -> anyhow::Result<()> {
     init_logging();
     // Size the job-system worker pool from the machine's core count before any
     // parallel work (propagate / parallel record / morph) touches the global pool.
@@ -1659,7 +1685,14 @@ impl App {
             .ok()
             .map(|s| s != "0")
             .unwrap_or(vgeo_mode == 1 && !gallery_scene);
-        let levels_dir = std::path::PathBuf::from("apps/sandbox/levels");
+        // Level directory: the game's own if it named one, else the engine's. The
+        // built-in `.level` files are engine content, so they are only materialized in
+        // the engine's directory — a game with its own does not get them dumped into it.
+        let builtin_levels = config.levels_dir.is_none();
+        let levels_dir = config
+            .levels_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(level::DEFAULT_LEVELS_DIR));
         // Content scenes (levels / glTF imports / worlds) carry large multi-material assets —
         // e.g. Sponza + foliage needs ~7.8 GB of uncompressed textures, right at an 8 GB card's
         // edge (Vulkan OOMs where D3D12's VRAM oversubscription barely fits). Block-compress
@@ -1704,16 +1737,17 @@ impl App {
             );
             streaming = Some(world::Streaming::new(graph, levels_dir.clone()));
         } else if let Some(select) = &level_select {
-            // Stage C: load a declarative level (auto-writing the built-in levels first).
-            level_paths = level::ensure_level_files(&levels_dir)?;
-            current_level = level_paths
-                .iter()
-                .position(|p| {
-                    std::path::Path::new(p)
-                        .file_stem()
-                        .is_some_and(|s| s.eq_ignore_ascii_case(select))
-                })
-                .unwrap_or(0);
+            // Stage C: load a declarative level (writing the engine's built-in ones
+            // first, when this is the engine's own directory).
+            level_paths = if builtin_levels {
+                level::ensure_level_files(&levels_dir)?
+            } else {
+                level::discover_level_files(&levels_dir)?
+            };
+            // A stem matches the directory listing; an explicit path loads as given. A
+            // miss errors here (naming what is available) instead of silently loading
+            // whatever happened to sort first.
+            current_level = level::resolve_selection(select, &levels_dir, &mut level_paths)?;
             // Stage E: load through the cook (RON → cooked .dcasset, cache-keyed).
             let level = level::load(std::path::Path::new(&level_paths[current_level]))?;
             level_view = level::level_camera(&level);
@@ -4772,6 +4806,13 @@ impl App {
         // `elapsed`, CAPTURE_SEQ step).
         const FIXED_DT: f32 = 1.0 / 60.0;
         const MAX_STEPS: u32 = 5; // backlog cap — avoids the spiral of death after a stall
+        // One input capture per frame (the window pumps once), so every fixed step of
+        // this frame sees identical state and an edge is reported by exactly one step.
+        // Only taken when a game is installed — the stock sandbox never touches it.
+        let game_input = self
+            .hooks
+            .is_some()
+            .then(|| dreamcoast_platform::InputSnapshot::capture(self.window.input()));
         self.prev_angle = self.angle;
         let render_alpha: f32;
         let sim_dt; // step length handed to per-frame GPU sim (particles)
@@ -4798,8 +4839,8 @@ impl App {
                 // The capture path's deterministic sim step: one game step per captured
                 // frame, so a CAPTURE_SEQ dump of a game scene advances reproducibly.
                 // No-op (and byte-identical) with no hooks installed.
-                if let Some(h) = self.hooks.as_mut() {
-                    h.fixed_update(&mut self.world, self.window.input(), FIXED_DT);
+                if let (Some(h), Some(input)) = (self.hooks.as_mut(), game_input.as_ref()) {
+                    h.fixed_update(&mut self.world, input, FIXED_DT);
                 }
             }
             self.prev_angle = self.angle; // no interpolation when capturing
@@ -4819,8 +4860,8 @@ impl App {
                 // before this frame's transform propagation, so writes to
                 // `LocalTransform` land in the draw list built below. No-op (and
                 // byte-identical) with no hooks installed.
-                if let Some(h) = self.hooks.as_mut() {
-                    h.fixed_update(&mut self.world, self.window.input(), FIXED_DT);
+                if let (Some(h), Some(input)) = (self.hooks.as_mut(), game_input.as_ref()) {
+                    h.fixed_update(&mut self.world, input, FIXED_DT);
                 }
             }
             if steps == MAX_STEPS {
@@ -4927,6 +4968,16 @@ impl App {
             .as_ref()
             .map(|c| c.include_ui)
             .unwrap_or(true);
+
+        // Game presentation pass (M1 seam): once per rendered frame, after the fixed
+        // steps and before propagation, so a game can write the *interpolated* visual
+        // pose its `camera` hook is already using — closing the sub-step lag between a
+        // character mesh (last simulated pose) and the camera following it. Visual-only
+        // by contract (see `GameHooks::render_update`). No-op (and byte-identical) with
+        // no hooks installed, and inert in capture mode where `render_alpha` is 1.0.
+        if let Some(h) = self.hooks.as_mut() {
+            h.render_update(&mut self.world, render_alpha);
+        }
 
         // Re-derive world transforms from the (possibly just-animated) locals via the
         // parallel ECS pass, then materialize the draw list. For a static scene this

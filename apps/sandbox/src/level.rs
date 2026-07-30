@@ -181,7 +181,12 @@ pub(crate) fn build_level(
             let imported = instantiate_gltf(world, gscene, handles);
             let root = world.spawn();
             world.insert(root, local_from_cols(&place.to_cols_array()));
-            world.insert(root, Name(ent.asset.clone()));
+            // The placement's authored name when it has one, else the asset key (the
+            // long-standing default). Gameplay looks entities up by this.
+            world.insert(
+                root,
+                Name(ent.name.clone().unwrap_or_else(|| ent.asset.clone())),
+            );
             world.insert(imported, Parent(root));
             if let Some((lmin, lmax)) = gltf_bounds(gscene) {
                 expand_bounds(&mut bmin, &mut bmax, place, lmin, lmax);
@@ -200,10 +205,17 @@ pub(crate) fn build_level(
             expand_bounds(&mut bmin, &mut bmax, place, lmin, lmax);
             let mesh_handle = meshes.upload(device, &mesh)?;
             let material = materials.add(desc_from_override(ent.material_override));
-            world
+            let node = world
                 .spawn_node()
                 .with(MeshInstance::new(mesh_handle, material))
                 .with(local_from_cols(&place.to_cols_array()));
+            // A procedural placement carries no name by default (unlike a glTF root,
+            // which is named after its asset) — naming every `cube` "cube" would be
+            // noise. An authored name is the level saying "gameplay needs this one",
+            // and with none the entity is built exactly as it always was.
+            if let Some(name) = &ent.name {
+                node.named(name.clone());
+            }
         }
     }
 
@@ -274,6 +286,106 @@ fn deform_label(source: &str, index: usize) -> String {
         .unwrap_or_else(|| format!("deform{index}"))
 }
 
+/// The engine's own level directory, relative to the working directory. It is where
+/// the built-in `.level` files are materialized, and the default
+/// [`crate::GameConfig::levels_dir`]. A game that ships its own levels points that
+/// field elsewhere; the built-ins are then not written at all (they are engine content,
+/// not the game's).
+pub(crate) const DEFAULT_LEVELS_DIR: &str = "apps/sandbox/levels";
+
+/// Discover the `.level` files in `dir` (sorted, cwd-relative paths as written).
+pub(crate) fn discover_level_files(dir: &Path) -> anyhow::Result<Vec<String>> {
+    if !dir.is_dir() {
+        return Err(anyhow::anyhow!(
+            "levels directory '{}' does not exist (resolved against the working directory {})",
+            dir.display(),
+            std::env::current_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".into()),
+        ));
+    }
+    let mut paths: Vec<String> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "level"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+/// A level stem for display / matching (the file name without `.level`).
+fn level_stem(path: &str) -> &str {
+    Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+}
+
+/// Whether a `GameConfig::level` / `LEVEL` value is an explicit **path** rather than a
+/// stem: it names a directory component, or it spells the extension out.
+///
+/// Both forms have to keep working — the golden runner and every existing recipe pass
+/// bare stems (`LEVEL=sponza_intel`), while a game that generates its level needs to
+/// point at a file the engine's directory knows nothing about.
+fn is_explicit_path(select: &str) -> bool {
+    select.contains('/')
+        || select.contains('\\')
+        || Path::new(select)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("level"))
+}
+
+/// Resolve a level selector against the discovered list, returning the index into it.
+///
+/// An explicit path that is not already in the list is appended (so it participates in
+/// the hot-swap dropdown like any other level). A miss — a stem that matches nothing, or
+/// a path that does not exist — is an **error**, not a silent fall back to index 0: a
+/// mistyped level used to load a different scene and look like a rendering bug.
+pub(crate) fn resolve_selection(
+    select: &str,
+    dir: &Path,
+    discovered: &mut Vec<String>,
+) -> anyhow::Result<usize> {
+    if is_explicit_path(select) {
+        let path = Path::new(select);
+        if !path.is_file() {
+            return Err(anyhow::anyhow!(
+                "level file '{}' not found (paths resolve against the working directory {})",
+                path.display(),
+                std::env::current_dir()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|_| "<unknown>".into()),
+            ));
+        }
+        // Same file reached by a different spelling (`./x.level` vs `x.level`) must not
+        // list twice, so compare canonicalized paths and keep the existing entry.
+        let canonical = path.canonicalize().ok();
+        if let Some(i) = discovered.iter().position(|p| {
+            p == select || (canonical.is_some() && Path::new(p).canonicalize().ok() == canonical)
+        }) {
+            return Ok(i);
+        }
+        discovered.push(select.to_owned());
+        return Ok(discovered.len() - 1);
+    }
+    discovered
+        .iter()
+        .position(|p| level_stem(p).eq_ignore_ascii_case(select))
+        .ok_or_else(|| {
+            let names: Vec<&str> = discovered.iter().map(|p| level_stem(p)).collect();
+            anyhow::anyhow!(
+                "no level named '{select}' in '{}' (available: {}). Pass a path \
+                 (containing '/' or ending in .level) to load one from elsewhere.",
+                dir.display(),
+                if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(", ")
+                },
+            )
+        })
+}
+
 /// Discover the `.level` files in `dir`, writing the built-in levels first if missing
 /// (so the files exist for hot-swap + hand editing). Returns the sorted path list.
 pub(crate) fn ensure_level_files(dir: &Path) -> anyhow::Result<Vec<String>> {
@@ -301,13 +413,7 @@ pub(crate) fn ensure_level_files(dir: &Path) -> anyhow::Result<Vec<String>> {
             builder().save_ron(&path)?;
         }
     }
-    let mut paths: Vec<String> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "level"))
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    paths.sort();
-    Ok(paths)
+    discover_level_files(dir)
 }
 
 /// A column-major translation + uniform-scale transform as a `[f32; 16]`.
@@ -324,6 +430,7 @@ fn trs(x: f32, y: f32, z: f32, s: f32) -> [f32; 16] {
 fn ground_entity(half: f32) -> LevelEntity {
     LevelEntity {
         asset: "ground".into(),
+        name: None,
         transform: trs(0.0, 0.0, 0.0, half),
         material_override: Some(MaterialOverride {
             base_color_factor: [0.8, 0.8, 0.8, 1.0],
@@ -343,11 +450,13 @@ pub(crate) fn gallery_level() -> LevelData {
             LevelEntity {
                 // The 6 cm avocado scaled up to ~1 m to sit with the procedural spheres.
                 asset: "assets/model.glb".into(),
+                name: None,
                 transform: trs(0.0, 0.0, 0.0, 18.0),
                 material_override: None,
             },
             LevelEntity {
                 asset: "sphere".into(),
+                name: None,
                 transform: trs(-1.7, 0.75, 0.5, 0.75),
                 material_override: Some(MaterialOverride {
                     base_color_factor: [0.95, 0.96, 0.97, 1.0],
@@ -357,6 +466,7 @@ pub(crate) fn gallery_level() -> LevelData {
             },
             LevelEntity {
                 asset: "sphere".into(),
+                name: None,
                 transform: trs(1.9, 0.5, -0.4, 0.5),
                 material_override: Some(MaterialOverride {
                     base_color_factor: [0.95, 0.64, 0.54, 1.0],
@@ -366,6 +476,7 @@ pub(crate) fn gallery_level() -> LevelData {
             },
             LevelEntity {
                 asset: "cube".into(),
+                name: None,
                 transform: trs(0.0, 0.45, -2.0, 0.45),
                 material_override: Some(MaterialOverride {
                     base_color_factor: [0.85, 0.25, 0.2, 1.0],
@@ -388,6 +499,7 @@ pub(crate) fn lanterns_level() -> LevelData {
     // The Lantern is authored at ~26 m; scale it to a ~4 m street-lamp size.
     let lantern = |x: f32| LevelEntity {
         asset: "assets/Lantern.glb".into(),
+        name: None,
         transform: trs(x, 0.0, 0.0, 0.15),
         material_override: None,
     };
@@ -419,6 +531,7 @@ pub(crate) fn sponza_level() -> LevelData {
     LevelData {
         entities: vec![LevelEntity {
             asset: "assets/Sponza/Sponza.gltf".into(),
+            name: None,
             transform: trs(0.0, 0.0, 0.0, 1.0),
             material_override: None,
         }],
@@ -501,6 +614,7 @@ pub(crate) fn sponza_intel_level() -> LevelData {
         entities: vec![
             LevelEntity {
                 asset: "assets/IntelSponza/main_sponza/NewSponza_Main_glTF_003.gltf".into(),
+                name: None,
                 transform: identity,
                 material_override: None,
             },
@@ -508,6 +622,7 @@ pub(crate) fn sponza_intel_level() -> LevelData {
                 // The curtains/drapes pack — authored in the same world space as the main
                 // building, so an identity transform overlays them in the arcades.
                 asset: "assets/IntelSponza/pkg_a_curtains/NewSponza_Curtains_glTF.gltf".into(),
+                name: None,
                 transform: identity,
                 material_override: None,
             },
@@ -557,11 +672,13 @@ pub(crate) fn sponza_trees_level() -> LevelData {
         entities: vec![
             LevelEntity {
                 asset: "assets/IntelSponza/main_sponza/NewSponza_Main_glTF_003.gltf".into(),
+                name: None,
                 transform: identity,
                 material_override: None,
             },
             LevelEntity {
                 asset: "assets/IntelSponza/pkg_a_curtains/NewSponza_Curtains_glTF.gltf".into(),
+                name: None,
                 transform: identity,
                 material_override: None,
             },
@@ -570,6 +687,7 @@ pub(crate) fn sponza_trees_level() -> LevelData {
                 // so identity stands it in the nave centre (X≈Z≈0, base at Y≈0). Its `LeafSpring`
                 // leaves are alpha-tested cutouts (base-color alpha = leaf shape).
                 asset: "assets/IntelSponza/pkg_c_trees/NewSponza_CypressTree_glTF.gltf".into(),
+                name: None,
                 transform: identity,
                 material_override: None,
             },
@@ -612,16 +730,19 @@ pub(crate) fn sponza_hero_level() -> LevelData {
         entities: vec![
             LevelEntity {
                 asset: "assets/IntelSponza/main_sponza/NewSponza_Main_glTF_003.gltf".into(),
+                name: None,
                 transform: identity,
                 material_override: None,
             },
             LevelEntity {
                 asset: "assets/IntelSponza/pkg_a_curtains/NewSponza_Curtains_glTF.gltf".into(),
+                name: None,
                 transform: identity,
                 material_override: None,
             },
             LevelEntity {
                 asset: "assets/IntelSponza/pkg_c_trees/NewSponza_CypressTree_glTF.gltf".into(),
+                name: None,
                 transform: identity,
                 material_override: None,
             },
@@ -629,6 +750,7 @@ pub(crate) fn sponza_hero_level() -> LevelData {
                 // The ivy growth pack — modelled leaf geometry (OPAQUE, no alpha mask), authored
                 // climbing the arcade at the lion end (X≈-7, Y≈4–18) in the shared world space.
                 asset: "assets/IntelSponza/pkg_b_ivy/NewSponza_IvyGrowth_glTF.gltf".into(),
+                name: None,
                 transform: identity,
                 material_override: None,
             },
@@ -675,5 +797,111 @@ pub(crate) fn sponza_hero_level() -> LevelData {
             sky_white_balance: [1.2, 1.05, 0.8],
         },
         deforms: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A self-cleaning scratch directory holding some empty `.level` files.
+    struct Levels(std::path::PathBuf);
+    impl Levels {
+        fn new(tag: &str, names: &[&str]) -> Self {
+            let id = format!("{:?}", std::thread::current().id());
+            let id: String = id.chars().filter(|c| c.is_alphanumeric()).collect();
+            let dir = std::env::temp_dir().join(format!("dc-levels-{tag}-{id}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for n in names {
+                std::fs::write(dir.join(n), "()").unwrap();
+            }
+            Self(dir)
+        }
+        fn discovered(&self) -> Vec<String> {
+            discover_level_files(&self.0).unwrap()
+        }
+    }
+    impl Drop for Levels {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The form every existing recipe uses (`LEVEL=sponza_intel`) keeps working, and is
+    /// case-insensitive as it always was.
+    #[test]
+    fn a_stem_selects_by_file_name() {
+        let dir = Levels::new("stem", &["gallery.level", "sponza_intel.level"]);
+        let mut paths = dir.discovered();
+        let i = resolve_selection("sponza_intel", &dir.0, &mut paths).unwrap();
+        assert_eq!(level_stem(&paths[i]), "sponza_intel");
+        let j = resolve_selection("GALLERY", &dir.0, &mut paths).unwrap();
+        assert_eq!(level_stem(&paths[j]), "gallery");
+        // Resolution must not perturb the discovered list.
+        assert_eq!(paths.len(), 2);
+    }
+
+    /// A stem that matches nothing is an error naming what *is* there — not a silent
+    /// load of whichever level sorted first (the M0 gap this closes).
+    #[test]
+    fn an_unknown_stem_is_a_loud_error() {
+        let dir = Levels::new("miss", &["gallery.level", "sponza.level"]);
+        let mut paths = dir.discovered();
+        let err = resolve_selection("spnoza", &dir.0, &mut paths)
+            .expect_err("a typo must not resolve")
+            .to_string();
+        assert!(err.contains("spnoza"), "{err}");
+        assert!(err.contains("gallery") && err.contains("sponza"), "{err}");
+    }
+
+    /// An explicit path loads a level from outside the levels directory (how a game
+    /// loads one it generated) and joins the hot-swap list.
+    #[test]
+    fn an_explicit_path_loads_from_anywhere() {
+        let dir = Levels::new("path", &["gallery.level"]);
+        let outside = Levels::new("path-gen", &["dungeon.level"]);
+        let generated = outside.0.join("dungeon.level");
+        let select = generated.to_string_lossy().into_owned();
+
+        let mut paths = dir.discovered();
+        let i = resolve_selection(&select, &dir.0, &mut paths).unwrap();
+        assert_eq!(paths.len(), 2, "the generated level joins the list");
+        assert_eq!(paths[i], select);
+        // Resolving the same path again reuses the entry instead of duplicating it.
+        assert_eq!(resolve_selection(&select, &dir.0, &mut paths).unwrap(), i);
+        assert_eq!(paths.len(), 2);
+    }
+
+    /// A path that does not exist errors rather than falling back to a real level.
+    #[test]
+    fn a_missing_path_is_a_loud_error() {
+        let dir = Levels::new("path-miss", &["gallery.level"]);
+        let mut paths = dir.discovered();
+        let err = resolve_selection("does/not/exist.level", &dir.0, &mut paths)
+            .expect_err("a missing file must not resolve")
+            .to_string();
+        assert!(err.contains("does/not/exist.level"), "{err}");
+        assert_eq!(paths.len(), 1);
+    }
+
+    /// The two selector shapes: anything with a separator or a `.level` extension is a
+    /// path, everything else is a stem. (`sponza_intel` must NOT read as a path.)
+    #[test]
+    fn selector_shape_distinguishes_path_from_stem() {
+        assert!(is_explicit_path("cache/generated/dungeon.level"));
+        assert!(is_explicit_path("dungeon.level"));
+        assert!(is_explicit_path("/abs/dungeon.level"));
+        assert!(is_explicit_path("levels/dungeon"));
+        assert!(!is_explicit_path("sponza_intel"));
+        assert!(!is_explicit_path("gallery"));
+    }
+
+    /// A missing levels directory reports itself instead of silently listing nothing.
+    #[test]
+    fn a_missing_levels_dir_is_a_loud_error() {
+        let missing = std::env::temp_dir().join("dc-levels-definitely-absent-xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(discover_level_files(&missing).is_err());
     }
 }

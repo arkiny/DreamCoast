@@ -7,7 +7,8 @@
 //!
 //! | hook | when | what it may do |
 //! |------|------|----------------|
-//! | [`GameHooks::fixed_update`] | inside the fixed-step sim loop, after `advance_spin`/`advance_animation`, **before** transform propagation | mutate the ECS `World` (game simulation) |
+//! | [`GameHooks::fixed_update`] | inside the fixed-step sim loop, after `advance_spin`/`advance_animation` | mutate the ECS `World` (game simulation) |
+//! | [`GameHooks::render_update`] | once per rendered frame, after the sim loop, **before** transform propagation | write *visual-only* interpolated transforms |
 //! | [`GameHooks::camera`] | at camera resolve, before the view/projection matrices are built | replace the Orbit/Fly pose for this frame |
 //! | [`GameHooks::draw_ui`] | inside the ImGui frame, after the debug window closes | draw game UI/HUD |
 //!
@@ -20,7 +21,7 @@
 
 use dreamcoast_core::glam::{Quat, Vec3};
 use dreamcoast_gui::imgui;
-use dreamcoast_platform::Input;
+use dreamcoast_platform::InputSnapshot;
 use dreamcoast_scene::World;
 
 /// A camera pose a game hands back to the frame loop, replacing the built-in
@@ -127,16 +128,49 @@ pub trait GameHooks {
     /// `LocalTransform` written here is picked up by this frame's draw list.
     ///
     /// May run zero, one, or several times per rendered frame (the loop consumes
-    /// whole steps from an accumulator, capped against a stall backlog). `input` is
-    /// the platform input snapshot for the frame; edge detection across steps is the
-    /// game's business (the same snapshot is seen by every step of a frame).
+    /// whole steps from an accumulator, capped against a stall backlog).
+    ///
+    /// `input` is **one frame** of platform state, captured once before the loop, so
+    /// every step of a frame sees the same snapshot and edge detection across steps is
+    /// the game's business. It is an [`InputSnapshot`] rather than the live
+    /// `platform::Input` on purpose: `Input`'s setters are crate-private, so a game
+    /// could not build one — a snapshot it can, which is what lets a whole fixed step
+    /// be exercised in a unit test with no window, device, or swapchain.
     ///
     /// Headless capture (`--screenshot[-clean]`) bypasses the accumulator to stay
     /// frame-counted and byte-identical; there this runs once per captured frame on
     /// the `CAPTURE_SEQ` path (which is the capture path's deterministic sim step)
     /// and not at all for a single static capture.
-    fn fixed_update(&mut self, world: &mut World, input: &Input, dt: f32) {
+    fn fixed_update(&mut self, world: &mut World, input: &InputSnapshot, dt: f32) {
         let _ = (world, input, dt);
+    }
+
+    /// One *rendered* frame's presentation pass: called once per frame after the
+    /// fixed-step loop has consumed whatever whole steps were due, and immediately
+    /// **before** transform propagation and draw-list assembly — so what it writes is
+    /// what this frame draws.
+    ///
+    /// Its reason to exist is the gap between simulation rate and frame rate.
+    /// [`Self::fixed_update`] leaves the ECS holding the *last simulated* pose, while
+    /// [`Self::camera`] returns a pose interpolated by `alpha`; at 1/60 s steps and
+    /// sprint speed those differ by a step of travel (~14 cm), which reads as the world
+    /// sliding under a lagging character. This hook is where a game closes that: write
+    /// `prev.lerp(current, alpha)` into the visual `LocalTransform`s.
+    ///
+    /// **Contract: visual-only.** `alpha` is a render-time quantity, so anything
+    /// derived from it is presentation, not state. Simulation state must live in the
+    /// implementor and advance solely in `fixed_update`; a value that this hook writes
+    /// and the next `fixed_update` reads back would make the simulation depend on the
+    /// frame rate — the exact coupling the fixed step exists to prevent. (Writing an
+    /// interpolated `LocalTransform` is safe precisely because the next step recomputes
+    /// it from the game's own `prev`/`current`, never from the ECS.)
+    ///
+    /// `alpha` is the same `[0, 1)` factor `camera` receives — the fraction of a fixed
+    /// step not yet simulated — so the mesh and the camera interpolate in lockstep. In
+    /// headless capture mode it is exactly `1.0` (the capture path is frame-counted, not
+    /// interpolated), which makes this hook a no-op there by construction.
+    fn render_update(&mut self, world: &mut World, alpha: f32) {
+        let _ = (world, alpha);
     }
 
     /// Resolve this frame's camera. `Some` replaces the built-in Orbit/Fly pose for
