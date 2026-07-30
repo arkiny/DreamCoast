@@ -12,22 +12,35 @@
 //! the renderer owns — that handle indirection is the seam that keeps the scene
 //! free of GPU types. The renderer turns a [`draw_list::Drawable`] list into actual
 //! draw calls.
+//!
+//! Around the entity storage sit the three pieces gameplay code needs but the
+//! renderer does not: [`Resources`] (typed world singletons), [`Events`] (a
+//! double-buffered message channel) and [`Commands`] (a deferred structural-change
+//! buffer, the sanctioned way to spawn/despawn from a parallel system). All three
+//! preserve the crate's determinism rule — ordered replay, insertion-ordered
+//! iteration — because the draw list's stability depends on it.
 
 mod animation;
+mod commands;
 mod components;
 mod draw_list;
 mod ecs;
+mod events;
 mod gltf_instance;
 mod node;
+mod resources;
 mod schedule;
 mod transform;
 
 pub use animation::{AnimationClip, AnimationPlayer, MorphWeights, advance_animation};
+pub use commands::{CommandTarget, Commands, DeferredEntity};
 pub use components::{MaterialHandle, MeshHandle, MeshInstance, Name};
 pub use draw_list::Drawable;
 pub use ecs::{Entity, World, WorldCell};
+pub use events::Events;
 pub use gltf_instance::{instantiate_gltf, instantiate_gltf_mapped};
 pub use node::NodeRef;
+pub use resources::Resources;
 pub use schedule::{Access, SystemSchedule};
 pub use transform::{
     Children, LocalTransform, Parent, Spin, WorldTransform, advance_spin, propagate_transforms,
