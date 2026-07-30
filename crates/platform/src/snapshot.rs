@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use super::keys::key_name;
+use crate::keys::key_name;
 
 /// Mouse buttons the platform layer tracks: left, right, middle.
 pub const MOUSE_BUTTON_COUNT: usize = 3;
@@ -12,11 +12,17 @@ pub const KEY_COUNT: usize = 256;
 
 /// One frame of keyboard + mouse state, detached from the window.
 ///
-/// This is the framework's **test seam**. `dreamcoast_platform::Input` can only be
-/// filled by a real window's event pump, so everything downstream of this type
-/// consumes snapshots instead: gameplay code takes `&InputSnapshot`, and tests
-/// build the frames they want by hand ([`InputSnapshot::default`] plus the
-/// `with_*` builders) with no window, device, or swapchain in sight.
+/// This is the engine's **input test seam**. [`crate::Input`] can only be filled by a
+/// real window's event pump (its setters are crate-private), so everything downstream
+/// of it consumes snapshots instead: gameplay code takes `&InputSnapshot`, and tests
+/// build the frames they want by hand ([`InputSnapshot::default`] plus the `with_*`
+/// builders) with no window, device, or swapchain in sight.
+///
+/// It lives in the **platform** crate, next to the `Input` it captures, because that
+/// is the layer that defines the key/button encoding — so a consumer that only wants
+/// "one frame of input" (e.g. the engine's game-hook signature) does not have to
+/// depend on the game framework to name the type. `dreamcoast_game::input`
+/// re-exports it, so gameplay code can keep importing it from there.
 ///
 /// It is also the frame boundary. The platform state mutates while messages are
 /// pumped; a snapshot is taken once per frame and stays still for the whole
@@ -50,7 +56,7 @@ impl InputSnapshot {
     ///
     /// Call once per frame, after the window has pumped its messages and before
     /// the simulation step runs.
-    pub fn capture(input: &dreamcoast_platform::Input) -> Self {
+    pub fn capture(input: &crate::Input) -> Self {
         let mut keys = [false; KEY_COUNT];
         for (vk, slot) in keys.iter_mut().enumerate() {
             *slot = input.key_down(vk as u16);
@@ -249,7 +255,7 @@ mod tests {
     fn captures_the_platform_default_state() {
         // `Input`'s setters are crate-private, so an untouched default is the only
         // state constructible from outside — enough to pin the field wiring.
-        let platform = dreamcoast_platform::Input::default();
+        let platform = crate::Input::default();
         let snap = InputSnapshot::capture(&platform);
         assert_eq!(snap, InputSnapshot::default());
     }

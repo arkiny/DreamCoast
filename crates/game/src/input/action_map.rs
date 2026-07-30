@@ -5,8 +5,8 @@ use std::hash::Hash;
 
 use glam::Vec2;
 
-use super::snapshot::InputSnapshot;
 use super::source::{BindingError, InputSource};
+use dreamcoast_platform::InputSnapshot;
 
 /// Bindings from game actions to the physical inputs that trigger them.
 ///

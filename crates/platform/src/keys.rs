@@ -12,6 +12,10 @@
 //! but never come back out of [`key_name`], so a config round-trips to one
 //! canonical spelling.
 //!
+//! It lives in the platform crate because the VK space is this layer's own encoding
+//! (both window backends produce it, and [`crate::InputSnapshot`] is indexed by it);
+//! `dreamcoast_game::input::keys` re-exports it for binding configs.
+//!
 //! **Platform note:** the macOS window translates the full ANSI US layout into this
 //! VK space (`crates/platform/src/window_macos.rs`), so names resolve identically on
 //! both platforms. Keys with no Win32 equivalent (the `fn` key, JIS-only keys, keypad

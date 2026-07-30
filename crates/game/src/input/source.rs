@@ -2,8 +2,8 @@
 
 use std::fmt;
 
-use super::keys::{key_name, key_vk};
-use super::snapshot::InputSnapshot;
+use dreamcoast_platform::InputSnapshot;
+use dreamcoast_platform::keys::{key_name, key_vk};
 
 /// Which way the wheel turned. The wheel has no held state, so it is exposed as a
 /// pair of momentary sources: each is "active" only on the frame the wheel moved

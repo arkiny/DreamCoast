@@ -69,11 +69,16 @@
 
 mod action_map;
 mod bindings;
-pub mod keys;
-mod snapshot;
 mod source;
 
 pub use action_map::{ActionMap, ActionState};
 pub use bindings::BindingsConfig;
-pub use snapshot::{InputSnapshot, KEY_COUNT, MOUSE_BUTTON_COUNT};
 pub use source::{BindingError, InputSource, WheelDirection};
+
+// The frame snapshot and the key-name table live in the **platform** crate: they
+// describe one frame of `dreamcoast_platform::Input` and the VK space that layer
+// defines, so an engine API can name them without depending on this crate (the
+// sandbox's `GameHooks::fixed_update` takes an `&InputSnapshot`). Re-exported here
+// so gameplay code still gets its whole input vocabulary from one module.
+pub use dreamcoast_platform::keys;
+pub use dreamcoast_platform::{InputSnapshot, KEY_COUNT, MOUSE_BUTTON_COUNT};

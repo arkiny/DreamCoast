@@ -16,3 +16,4 @@
 //! later milestones and are not stubbed out ahead of time.
 
 pub mod input;
+pub mod physics;
