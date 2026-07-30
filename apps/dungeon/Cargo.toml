@@ -1,0 +1,24 @@
+[package]
+name = "dungeon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The engine, linked as a library: the render path, the frame loop and the scene
+# assembly stay in `sandbox`; this app only injects gameplay through `GameHooks`.
+# A path dep (not `workspace.dependencies`) because apps are not shared crates.
+sandbox = { path = "../sandbox" }
+# The reusable game framework (input action mapping today; physics/anim/camera later).
+dreamcoast-game.workspace = true
+# The declarative level model — this game authors its `.level` from code so the
+# spawn/extent constants gameplay reads are the same ones the level is built from.
+dreamcoast-asset.workspace = true
+glam.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Parsing the level back in the round-trip test (the engine's own level RON stack).
+ron.workspace = true

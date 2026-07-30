@@ -1,0 +1,15 @@
+// Dungeon input bindings (`dreamcoast_game::input::BindingsConfig`).
+//
+// Action names must match `crate::game::Action`; source names are the key names in
+// `dreamcoast_game::input::keys` ("W", "Shift", "Space", "Mouse1", …). This file is
+// embedded at build time, so it is also the shipped default.
+//
+// Modifiers are bound by their generic name (`Shift`, not `LShift`): neither window
+// backend reports the sided codes, matching Win32's own `WM_KEYDOWN` behaviour.
+(actions: {
+    "MoveForward": ["W", "Up"],
+    "MoveBack": ["S", "Down"],
+    "MoveLeft": ["A", "Left"],
+    "MoveRight": ["D", "Right"],
+    "Sprint": ["Shift"],
+})

@@ -16,6 +16,7 @@ members = [
     "crates/scene",
     "crates/game",
     "apps/sandbox",
+    "apps/dungeon",
 ]
 
 [workspace.package]

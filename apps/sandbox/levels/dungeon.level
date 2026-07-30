@@ -1,0 +1,76 @@
+(
+    entities: [
+        (
+            asset: "ground",
+            transform: (20.0, 0.0, 0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+            material_override: Some((
+                base_color_factor: (0.34, 0.33, 0.31, 1.0),
+                metallic: 0.0,
+                roughness: 0.9,
+            )),
+        ),
+        (
+            asset: "sphere",
+            transform: (0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 0.0, 1.0),
+            material_override: Some((
+                base_color_factor: (0.8, 0.28, 0.18, 1.0),
+                metallic: 0.0,
+                roughness: 0.45,
+            )),
+        ),
+        (
+            asset: "cube",
+            transform: (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -6.0, 1.0, -6.0, 1.0),
+            material_override: Some((
+                base_color_factor: (0.45, 0.47, 0.52, 1.0),
+                metallic: 0.0,
+                roughness: 0.75,
+            )),
+        ),
+        (
+            asset: "cube",
+            transform: (1.5, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 7.5, 1.5, -1.0, 1.0),
+            material_override: Some((
+                base_color_factor: (0.52, 0.44, 0.36, 1.0),
+                metallic: 0.0,
+                roughness: 0.75,
+            )),
+        ),
+        (
+            asset: "cube",
+            transform: (2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 1.0, 2.0, -11.0, 1.0),
+            material_override: Some((
+                base_color_factor: (0.38, 0.4, 0.46, 1.0),
+                metallic: 0.0,
+                roughness: 0.75,
+            )),
+        ),
+    ],
+    lights: [
+        (
+            kind: Directional,
+            vec: (-0.55, -0.75, -0.35),
+            color: (1.0, 0.96, 0.9),
+            intensity: 3.5,
+        ),
+        (
+            kind: Point,
+            vec: (7.5, 3.4, 1.2),
+            color: (1.0, 0.62, 0.28),
+            intensity: 12.0,
+        ),
+    ],
+    camera: (
+        position: (0.0, 10.329824, 6.8829174),
+        target: (0.0, 0.5, 0.0),
+        fov_y_deg: 60.0,
+        znear: 0.05,
+        zfar: 100.0,
+    ),
+    environment: (
+        sun_dir: (-0.55, -0.75, -0.35),
+        sun_intensity: 3.5,
+        sky_white_balance: (1.0, 1.0, 1.0),
+    ),
+    deforms: [],
+)

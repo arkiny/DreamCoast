@@ -383,6 +383,19 @@ name = "dreamcoast-shader"
 version = "0.0.0"
 
 [[package]]
+name = "dungeon"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "dreamcoast-asset",
+ "dreamcoast-game",
+ "glam",
+ "ron",
+ "sandbox",
+ "tracing",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
