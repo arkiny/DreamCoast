@@ -12,12 +12,13 @@
 //! but never come back out of [`key_name`], so a config round-trips to one
 //! canonical spelling.
 //!
-//! **Platform caveat (honest):** the macOS window only translates the hardware key
-//! codes the engine currently queries (WASD/QE, Shift, Option, M, Tab, Escape,
-//! F2); unmapped keys pass through with their *hardware* code and therefore land
-//! on the wrong VK slot. Naming a key here is correct on Windows today and needs a
-//! wider translation table in `crates/platform/src/window_macos.rs` before it is
-//! correct on macOS.
+//! **Platform note:** the macOS window translates the full ANSI US layout into this
+//! VK space (`crates/platform/src/window_macos.rs`), so names resolve identically on
+//! both platforms. Keys with no Win32 equivalent (the `fn` key, JIS-only keys, keypad
+//! `=`) are dropped rather than aliased onto a wrong slot, and — matching Win32's
+//! `WM_KEYDOWN` — the sided `LShift`/`RShift`/`LCtrl`/`RCtrl`/`LAlt`/`RAlt` codes
+//! (0xA0..0xA5) are never produced by either window; bind the generic `Shift`/`Ctrl`/
+//! `Alt` instead. macOS Command arrives as `VK_LWIN`/`VK_RWIN` (0x5B/0x5C).
 
 /// Canonical named keys (one entry per code — this table is also the reverse map).
 ///
@@ -44,6 +45,36 @@ pub const NAMED_KEYS: &[(&str, u16)] = &[
     ("Down", 0x28),
     ("Insert", 0x2D),
     ("Delete", 0x2E),
+    ("LWin", 0x5B),
+    ("RWin", 0x5C),
+    ("Numpad0", 0x60),
+    ("Numpad1", 0x61),
+    ("Numpad2", 0x62),
+    ("Numpad3", 0x63),
+    ("Numpad4", 0x64),
+    ("Numpad5", 0x65),
+    ("Numpad6", 0x66),
+    ("Numpad7", 0x67),
+    ("Numpad8", 0x68),
+    ("Numpad9", 0x69),
+    ("NumpadMultiply", 0x6A),
+    ("NumpadAdd", 0x6B),
+    ("NumpadSubtract", 0x6D),
+    ("NumpadDecimal", 0x6E),
+    ("NumpadDivide", 0x6F),
+    ("NumLock", 0x90),
+    ("Semicolon", 0xBA),
+    ("Equals", 0xBB),
+    ("Comma", 0xBC),
+    ("Minus", 0xBD),
+    ("Period", 0xBE),
+    ("Slash", 0xBF),
+    ("Grave", 0xC0),
+    ("LBracket", 0xDB),
+    ("Backslash", 0xDC),
+    ("RBracket", 0xDD),
+    ("Quote", 0xDE),
+    ("IntlBackslash", 0xE2),
     ("LShift", 0xA0),
     ("RShift", 0xA1),
     ("LCtrl", 0xA2),
@@ -69,6 +100,13 @@ pub const KEY_ALIASES: &[(&str, u16)] = &[
     ("ArrowDown", 0x28),
     ("Ins", 0x2D),
     ("Del", 0x2E),
+    ("LCmd", 0x5B),
+    ("RCmd", 0x5C),
+    ("NumpadEnter", 0x0D),
+    ("Plus", 0xBB),
+    ("Tilde", 0xC0),
+    ("Backquote", 0xC0),
+    ("Apostrophe", 0xDE),
     ("LeftShift", 0xA0),
     ("RightShift", 0xA1),
     ("LeftCtrl", 0xA2),
