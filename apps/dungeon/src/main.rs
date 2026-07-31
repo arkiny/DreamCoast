@@ -46,6 +46,7 @@ mod game;
 mod level;
 mod meshing;
 mod procgen;
+mod rigs;
 
 use procgen::DungeonParams;
 
