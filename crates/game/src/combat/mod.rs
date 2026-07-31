@@ -94,7 +94,7 @@ mod hit;
 pub use attack::{
     AttackEvent, AttackEvents, AttackPhase, AttackSpec, AttackState, ComboChain, MAX_ATTACK_EVENTS,
 };
-pub use class::{ClassDef, CombatError, DodgeDef};
+pub use class::{ClassDef, CombatError, DodgeDef, WARRIOR_CLASS_RON};
 pub use damage::{DamageEvent, DeathEvent, apply_damage_events, tick_iframes};
 pub use health::{BodyCircle, Health, IFrames, Team};
 pub use hit::resolve_arc_hits;

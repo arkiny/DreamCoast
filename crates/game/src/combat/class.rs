@@ -248,13 +248,18 @@ impl ClassDef {
     }
 }
 
+/// The shipped warrior class file, exported so games can consume the fixture without
+/// an `include_str!` across the workspace by relative path (the same rationale as
+/// [`crate::anim::WARRIOR_ANIM_RON`]). Kept byte-parseable and value-identical to
+/// [`ClassDef::warrior`] by `fixture_matches_the_builtin_warrior`.
+pub const WARRIOR_CLASS_RON: &str = include_str!("../../assets/warrior.ron");
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The shipped example file. Kept byte-parseable and value-identical to
-    /// [`ClassDef::warrior`] by `fixture_matches_the_builtin_warrior`.
-    const WARRIOR_RON: &str = include_str!("../../assets/warrior.ron");
+    /// The shipped example file (see [`WARRIOR_CLASS_RON`]).
+    const WARRIOR_RON: &str = WARRIOR_CLASS_RON;
 
     #[test]
     fn warrior_baseline_is_valid_and_tuned_as_documented() {

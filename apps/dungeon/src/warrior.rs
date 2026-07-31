@@ -1198,10 +1198,8 @@ mod tests {
         assert_eq!(w.facing(), Vec2::new(0.0, 1.0));
         assert_eq!(w.facing_radians(), 0.0, "+Z is a yaw of zero");
         // And through the class-file seam.
-        let from_file = WarriorController::from_class_ron(include_str!(
-            "../../../crates/game/assets/warrior.ron"
-        ))
-        .unwrap();
+        let from_file =
+            WarriorController::from_class_ron(dreamcoast_game::combat::WARRIOR_CLASS_RON).unwrap();
         assert_eq!(from_file.chain(), w.chain());
     }
 
