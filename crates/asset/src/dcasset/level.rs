@@ -109,6 +109,14 @@ fn encode_level(level: &LevelData) -> Vec<u8> {
     for e in &level.entities {
         w.str(e.name.as_deref().unwrap_or(""));
     }
+    // Light ranges (v11). Same trailing-parallel-block pattern as the entity names above,
+    // for the same reason: a pre-v11 chunk stays a strict prefix of this layout. Written
+    // unconditionally (one float per light, 0 = no cutoff) so the encoding is a pure
+    // function of the level.
+    w.u32(level.lights.len() as u32);
+    for l in &level.lights {
+        w.f32(l.range);
+    }
     w.buf
 }
 
@@ -160,6 +168,9 @@ fn decode_level(r: &mut Reader) -> Result<LevelData, EngineError> {
             vec: vec3(r)?,
             color: vec3(r)?,
             intensity: r.f32()?,
+            // Filled from the v11 trailing range block below; a pre-v11 chunk has none,
+            // which leaves every light at 0 = no cutoff (the old behavior exactly).
+            range: 0.0,
         });
     }
 
@@ -218,6 +229,16 @@ fn decode_level(r: &mut Reader) -> Result<LevelData, EngineError> {
         }
     }
 
+    // Light ranges (v11). A v10 chunk ends at the name block, so this count read is EOF ⇒
+    // zero ranges ⇒ every light keeps the `0.0` (no cutoff) set above.
+    let range_count = r.u32().unwrap_or(0);
+    for i in 0..range_count as usize {
+        let range = r.f32()?;
+        if let Some(l) = lights.get_mut(i) {
+            l.range = range;
+        }
+    }
+
     Ok(LevelData {
         entities,
         lights,
@@ -261,12 +282,14 @@ mod tests {
                     vec: [-0.4, -1.0, -0.3],
                     color: [1.0, 0.95, 0.9],
                     intensity: 3.0,
+                    range: 0.0,
                 },
                 Light {
                     kind: LightKind::Point,
                     vec: [1.0, 2.0, 3.0],
                     color: [0.5, 0.6, 1.0],
                     intensity: 8.0,
+                    range: 11.5,
                 },
             ],
             camera: Camera {
@@ -312,9 +335,10 @@ mod tests {
 
     /// A **v9** chunk (written before entity names existed) still decodes: the trailing
     /// name block is simply absent, so every entity reads back unnamed and nothing else
-    /// shifts. Built by lopping the v10 block off an all-unnamed payload — with names
-    /// `None` that block is exactly `u32 count` + one empty `str` (a bare `u32 0`) per
-    /// entity, so the remainder *is* the v9 byte layout.
+    /// shifts. Built by lopping the v10 (names) and v11 (light ranges) blocks off an
+    /// all-unnamed, light-free payload — with names `None` the name block is exactly
+    /// `u32 count` + one empty `str` (a bare `u32 0`) per entity, and with no lights the
+    /// range block is a bare `u32 0`, so the remainder *is* the v9 byte layout.
     #[test]
     fn pre_name_chunk_decodes_with_no_names() {
         let mut level = LevelData {
@@ -335,7 +359,8 @@ mod tests {
             ..LevelData::default()
         };
         let payload = encode_level(&level);
-        let v9_len = payload.len() - (4 + 4 * level.entities.len());
+        assert!(level.lights.is_empty(), "range block must be a bare count");
+        let v9_len = payload.len() - 4 - (4 + 4 * level.entities.len());
         let v9 = write_single_chunk(CHUNK_LEVEL, &payload[..v9_len], 0xbeef);
 
         let (_, decoded) = read_level(&v9).expect("decode a pre-name chunk");
@@ -347,5 +372,41 @@ mod tests {
         let (_, named) = read_level(&write_level(&level, 0xbeef)).expect("decode");
         assert_eq!(named.entities[0].name.as_deref(), Some("door"));
         assert_eq!(named.entities[1].name, None);
+    }
+
+    /// A **v10** chunk (written before point-light `range`) still decodes: the trailing
+    /// range block is absent, so every light reads back at `range = 0.0` — which the
+    /// renderer reads as "no cutoff", the pre-range falloff exactly. Built by lopping the
+    /// v11 block (a `u32 count` + one `f32` per light) off a v11 payload.
+    #[test]
+    fn pre_range_chunk_decodes_with_zero_ranges() {
+        let level = LevelData {
+            lights: vec![
+                Light {
+                    kind: LightKind::Directional,
+                    vec: [0.0, -1.0, 0.0],
+                    color: [1.0; 3],
+                    intensity: 2.0,
+                    range: 0.0,
+                },
+                Light {
+                    kind: LightKind::Point,
+                    vec: [1.0, 2.0, 3.0],
+                    color: [1.0, 0.5, 0.25],
+                    intensity: 8.0,
+                    range: 9.5,
+                },
+            ],
+            ..LevelData::default()
+        };
+        let payload = encode_level(&level);
+        let v10_len = payload.len() - (4 + 4 * level.lights.len());
+        let v10 = write_single_chunk(CHUNK_LEVEL, &payload[..v10_len], 0xbeef);
+        let (_, decoded) = read_level(&v10).expect("decode a pre-range chunk");
+        assert!(decoded.lights.iter().all(|l| l.range == 0.0));
+
+        // And a v11 chunk round-trips the authored range — the block is what carries it.
+        let (_, fresh) = read_level(&write_level(&level, 0xbeef)).expect("decode");
+        assert_eq!(fresh.lights[1].range, 9.5);
     }
 }

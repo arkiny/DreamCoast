@@ -144,10 +144,10 @@ void csBuildClusters(uint3 tid: SV_DispatchThreadID)
     for (uint li = 0; li < pc.light_count; ++li)
     {
         Light L = load_light(lights, li);
-        // Sphere-vs-AABB: closest point on the AABB to the light centre within radius?
-        float3 closest = clamp(L.position, aabb_min, aabb_max);
-        float3 d = closest - L.position;
-        if (dot(d, d) <= L.radius * L.radius)
+        // Sphere-vs-AABB (or unconditional for a light with no authored cutoff). The test
+        // lives beside `point_attenuation` in the common header so producer and consumer
+        // cannot drift — see `light_overlaps_aabb`.
+        if (light_overlaps_aabb(L, aabb_min, aabb_max))
         {
             if (count < MAX_LIGHTS_PER_CLUSTER)
             {

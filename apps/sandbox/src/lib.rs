@@ -324,13 +324,20 @@ struct LevelLighting {
     /// The directional (sun) light's RGB color — drives the analytic sun tint so a level can author
     /// a warm sun (e.g. `[1.0, 0.96, 0.9]`). White `[1,1,1]` if the level has no directional light.
     sun_color: [f32; 3],
-    point_pos: [[f32; 4]; 4],
-    point_color: [[f32; 4]; 4],
-    point_count: i32,
+    /// Every point light the level authors, in authored order — **unbounded** (R1). The first
+    /// four also fit the `Globals` UBO arrays for the legacy brute-force path; a level that
+    /// authors more than four is routed through the clustered light buffer instead (see
+    /// `frame`'s `clustered` decision). Order is load-bearing: both paths accumulate in this
+    /// order, which is what makes them bit-identical.
+    points: Vec<ClusterLight>,
 }
 
 /// Build a [`LevelLighting`] from a level's environment + lights: the environment sun
-/// (overridden by an explicit directional light), and up to 4 point lights.
+/// (overridden by an explicit directional light), and **every** authored point light.
+///
+/// The old 4-light truncation here was the R1 cap (docs/game-framework-plan.md §5): it lived
+/// on the consumption side, because `LevelData::lights` was already unbounded. Point lights
+/// past the `Globals` UBO's four slots now go to the clustered light buffer.
 fn level_lighting(level: &dreamcoast_asset::LevelData) -> LevelLighting {
     use dreamcoast_asset::level::LightKind;
     // A level authors a directional light's `vec` as the direction the light *travels*
@@ -341,9 +348,7 @@ fn level_lighting(level: &dreamcoast_asset::LevelData) -> LevelLighting {
     let mut sun_dir = toward_sun(env.sun_dir);
     let mut sun_intensity = env.sun_intensity;
     let mut sun_color = [1.0f32, 1.0, 1.0];
-    let mut point_pos = [[0.0f32; 4]; 4];
-    let mut point_color = [[0.0f32; 4]; 4];
-    let mut count = 0usize;
+    let mut points = Vec::new();
     for l in &level.lights {
         match l.kind {
             LightKind::Directional => {
@@ -351,22 +356,72 @@ fn level_lighting(level: &dreamcoast_asset::LevelData) -> LevelLighting {
                 sun_intensity = l.intensity;
                 sun_color = l.color;
             }
-            LightKind::Point if count < 4 => {
-                point_pos[count] = [l.vec[0], l.vec[1], l.vec[2], 0.0];
-                point_color[count] = [l.color[0], l.color[1], l.color[2], l.intensity];
-                count += 1;
-            }
-            LightKind::Point => {}
+            LightKind::Point => points.push(ClusterLight {
+                position: l.vec,
+                // `range <= 0` = no cutoff (the pre-range authored default), which the shader's
+                // `point_attenuation` reads as plain inverse-square — so a level authored before
+                // the field existed shades exactly as it did. See `Light::range`.
+                radius: l.range.max(0.0),
+                color: l.color,
+                intensity: l.intensity,
+            }),
         }
     }
     LevelLighting {
         sun_dir,
         sun_intensity,
         sun_color,
-        point_pos,
-        point_color,
-        point_count: count as i32,
+        points,
     }
+}
+
+/// Hard cap on point lights submitted to the GPU in one frame (R1). Well above the
+/// 10-30 torches a generated dungeon floor carries, and comfortably inside the cluster
+/// index list (`MAX_LIGHTS_PER_CLUSTER` = 128 lights may overlap in any one froxel, which
+/// only a pathological pile-up reaches). Past the cap the lights FARTHEST from the camera
+/// are dropped and a one-time warning is logged — the nearest lights are the ones whose
+/// omission would be visible, and a distance rule is stable frame to frame (no popping
+/// beyond the cap boundary itself).
+const MAX_SCENE_LIGHTS: usize = 256;
+
+/// Select at most [`MAX_SCENE_LIGHTS`] of `lights` — the nearest to `eye` — **restoring the
+/// authored order** among the survivors.
+///
+/// Re-sorting by original index matters: the deferred pass accumulates point lights in list
+/// order, so a camera-distance ordering would make the shaded result depend on where the
+/// camera stands (floating-point addition is not associative) and flicker as the camera
+/// moves. Selecting by distance but accumulating in authored order keeps the frame
+/// deterministic. Under the cap this is a no-op that clones nothing.
+fn cap_scene_lights(lights: &mut Vec<ClusterLight>, eye: [f32; 3]) {
+    if lights.len() <= MAX_SCENE_LIGHTS {
+        return;
+    }
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[lights] {} point lights exceeds the {MAX_SCENE_LIGHTS} cap — dropping the farthest \
+             from the camera. Reduce the light count or raise MAX_SCENE_LIGHTS.",
+            lights.len()
+        );
+    }
+    let d2 = |l: &ClusterLight| {
+        let (dx, dy, dz) = (
+            l.position[0] - eye[0],
+            l.position[1] - eye[1],
+            l.position[2] - eye[2],
+        );
+        dx * dx + dy * dy + dz * dz
+    };
+    let mut order: Vec<usize> = (0..lights.len()).collect();
+    order.sort_by(|&a, &b| {
+        d2(&lights[a])
+            .partial_cmp(&d2(&lights[b]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b)) // ties -> authored order, so the selection is deterministic
+    });
+    order.truncate(MAX_SCENE_LIGHTS);
+    order.sort_unstable();
+    *lights = order.into_iter().map(|i| lights[i]).collect();
 }
 
 /// Per-frame globals, mirrored by `Globals` in pbr.slang. All members are 16-byte
@@ -865,8 +920,11 @@ pub struct App {
     /// ~0.6 content). Written to `globals.probe_box_max.w`; see pbr.slang. `P_GI_MULTIBOUNCE`.
     gi_multibounce: f32,
     point_lights_on: bool,
-    /// Clustered light culling on (PR-6, `CLUSTERED_LIGHTS=1`). Off = brute-force loop.
-    clustered_lights: bool,
+    /// Clustered light culling override (`CLUSTERED_LIGHTS`). `None` (the default) = automatic:
+    /// engage the froxel path only when the frame carries more point lights than the `Globals`
+    /// UBO's four slots (R1). `Some(true)` forces it on at any light count (the A/B tool);
+    /// `Some(false)` forces the legacy brute-force loop and truncates to four lights.
+    clustered_lights: Option<bool>,
     /// A/B baseline (`CLUSTERED_BRUTE=1`): upload the light buffer but loop all lights (no
     /// froxel list) — for profiling clustered vs brute-force on the same light set.
     clustered_brute: bool,
@@ -2282,10 +2340,14 @@ impl App {
         // On by default; `NO_POINT_LIGHTS=1` disables them (the path tracer has no
         // point lights, so a fair raster-vs-ground-truth comparison turns these off).
         let point_lights_on = std::env::var_os("NO_POINT_LIGHTS").is_none();
-        // Clustered light culling (PR-6): opt-in seam. Default off = the brute-force point-light
-        // loop (byte-identical anchor); on routes lighting through the froxel light list. Only
-        // when the cluster compute system built (compute available).
-        let clustered_lights = std::env::var_os("CLUSTERED_LIGHTS").is_some() && cluster.is_some();
+        // Clustered light culling seam (PR-6 infrastructure; R1 policy). UNSET = automatic: the
+        // froxel path engages only for a frame carrying more point lights than the `Globals` UBO's
+        // four slots, so every ≤4-light scene (all golden configs) stays on the untouched
+        // brute-force loop and is byte-identical. `CLUSTERED_LIGHTS=1` forces it on at any light
+        // count (the equivalence A/B); `=0` forces it off (fallback seam, truncates to 4).
+        let clustered_lights = std::env::var("CLUSTERED_LIGHTS")
+            .ok()
+            .map(|v| !matches!(v.trim(), "" | "0" | "false" | "off"));
         // A/B baseline (`CLUSTERED_BRUTE=1`): upload the same light buffer but loop ALL lights in
         // the shader (no froxel list) so brute-force vs clustered PROFILE_GPU can be compared on the
         // identical light set at scale. Implies the clustered light upload path (needs the buffer).
@@ -5508,33 +5570,87 @@ impl App {
         // code-default sun + two coloured point lights (preserved exactly = byte-identical).
         let r = self.model_radius;
         let point_intensity = r * r * 8.0;
-        let (mut sun_dir, sun_intensity, point_count, point_pos, point_color) =
-            match &self.level_lighting {
-                Some(ll) => (
-                    ll.sun_dir,
-                    ll.sun_intensity,
-                    ll.point_count,
-                    ll.point_pos,
-                    ll.point_color,
-                ),
-                None => (
-                    self.sun_dir,
-                    self.sun_intensity,
-                    2,
-                    [
-                        [r * 2.0, r * 1.5, 0.0, 0.0],
-                        [-r * 2.0, r * 1.0, r * 1.5, 0.0],
-                        [0.0, 0.0, 0.0, 0.0],
-                        [0.0, 0.0, 0.0, 0.0],
-                    ],
-                    [
-                        [1.0, 0.35, 0.2, point_intensity],
-                        [0.3, 0.5, 1.0, point_intensity],
-                        [0.0, 0.0, 0.0, 0.0],
-                        [0.0, 0.0, 0.0, 0.0],
-                    ],
-                ),
-            };
+        let (mut sun_dir, sun_intensity, mut scene_lights) = match &self.level_lighting {
+            Some(ll) => (ll.sun_dir, ll.sun_intensity, ll.points.clone()),
+            None => (
+                self.sun_dir,
+                self.sun_intensity,
+                // The gallery's two code-default lights. `radius: 0.0` = no cutoff = the exact
+                // historical inverse-square falloff, so the byte anchor is untouched.
+                vec![
+                    ClusterLight {
+                        position: [r * 2.0, r * 1.5, 0.0],
+                        radius: 0.0,
+                        color: [1.0, 0.35, 0.2],
+                        intensity: point_intensity,
+                    },
+                    ClusterLight {
+                        position: [-r * 2.0, r * 1.0, r * 1.5],
+                        radius: 0.0,
+                        color: [0.3, 0.5, 1.0],
+                        intensity: point_intensity,
+                    },
+                ],
+            ),
+        };
+        if !self.point_lights_on {
+            scene_lights.clear();
+        }
+        // Deterministic stress spawner (PR-6 scale proof / R1 cost measurement): `TEST_LIGHTS=N`
+        // appends N finite-radius point lights on a fixed grid. Appended AFTER the authored
+        // lights so their indices — and therefore the accumulation order of the authored ones —
+        // are unchanged.
+        if self.test_lights > 0 {
+            scene_lights.extend(test_light_grid(
+                self.test_lights,
+                self.scene_center,
+                self.scene_radius,
+            ));
+        }
+        cap_scene_lights(&mut scene_lights, [eye.x, eye.y, eye.z]);
+        // R1 seam. The `Globals` UBO carries four point lights; anything past that has to ride
+        // the clustered light buffer. The default is therefore **automatic**: a scene with more
+        // lights than the UBO holds engages clustered culling, and a scene that fits keeps the
+        // legacy brute-force path *bit-exactly* (not "within tolerance" — it is literally the
+        // same code path, untouched). Every golden config is at or under four lights, so the
+        // battery gates the legacy path exactly as before.
+        //
+        // `CLUSTERED_LIGHTS=1` forces the clustered path on for any light count (the A/B tool
+        // that proves the two paths agree); `CLUSTERED_LIGHTS=0` forces it off (the scalability
+        // rule's fallback seam), which truncates to four lights with a warning.
+        //
+        // `CLUSTERED_BRUTE=1` outranks the automatic decision: it is the profiling baseline that
+        // shades every light from the same storage buffer with no froxel list, so auto-engaging
+        // the froxel path would silently measure the thing it exists to be measured against.
+        let clustered = !self.clustered_brute
+            && match self.clustered_lights {
+                Some(forced) => forced,
+                None => scene_lights.len() > 4,
+            }
+            && self.cluster.is_some();
+        // The brute-force-over-storage baseline shades every uploaded light, so it is not subject
+        // to the UBO's four-light cap either — only a genuinely unavailable/disabled cluster
+        // system is.
+        if !clustered && !self.clustered_brute && scene_lights.len() > 4 {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[lights] {} point lights but clustered culling is unavailable/off — only the \
+                     first 4 are lit (the Globals UBO cap).",
+                    scene_lights.len()
+                );
+            }
+        }
+        // The four UBO slots the legacy path shades. `point_pos[i].w` is the influence radius
+        // (0 = no cutoff), read by the same `point_attenuation` the clustered path uses.
+        let point_count = scene_lights.len().min(4) as i32;
+        let mut point_pos = [[0.0f32; 4]; 4];
+        let mut point_color = [[0.0f32; 4]; 4];
+        for (i, l) in scene_lights.iter().take(4).enumerate() {
+            point_pos[i] = [l.position[0], l.position[1], l.position[2], l.radius];
+            point_color[i] = [l.color[0], l.color[1], l.color[2], l.intensity];
+        }
 
         // Time-of-day: arc the sun across the sky from elapsed time. The atmosphere + IBL
         // already recapture per frame (`realtime_env`), and `maybe_capture` re-marches the sky
@@ -5686,7 +5802,9 @@ impl App {
             ],
             ambient: [self.ambient, self.ambient, self.ambient, self.exposure],
             counts: [
-                if self.point_lights_on { point_count } else { 0 },
+                // `point_lights_on` was already applied when `scene_lights` was assembled
+                // (it clears the list), so this is just the UBO-path light count.
+                point_count,
                 self.debug_view as i32,
                 (PREFILTER_MIPS - 1) as i32, // prefilter max LOD
                 self.shadows_on as i32,
@@ -5785,42 +5903,21 @@ impl App {
         self.deferred
             .write_globals(globals_offset, globals_bytes(&globals))?;
 
-        // Clustered light culling (PR-6): assemble this frame's point-light list and upload it
-        // to the cluster/light buffer, returning the bindless indices the build + lighting passes
-        // read. Done BEFORE the graph is built (host write + possible realloc mutate `self.cluster`;
-        // the graph then borrows it immutably for the record closures).
+        // Clustered light culling: upload this frame's point-light list (assembled above, already
+        // capped and in authored order) to the cluster/light buffer, returning the bindless indices
+        // the build + lighting passes read. Done BEFORE the graph is built (host write + possible
+        // realloc mutate `self.cluster`; the graph then borrows it immutably for the record
+        // closures).
         //
-        // Parity note: the scene's authored point lights get an EFFECTIVELY INFINITE radius so
-        // every cluster bins them — the shader then accumulates the SAME lights in the SAME order
-        // as the brute-force loop (which applies no distance cutoff), so the result is byte-identical
-        // for scenes with few lights. The deterministic TEST_LIGHTS stress grid gets a finite radius
-        // (that's where per-cluster culling actually pays off).
-        let cluster_indices: Option<(u32, u32, u32, u32)> = if let (true, Some(cluster_sys)) = (
-            self.clustered_lights || self.clustered_brute,
-            self.cluster.as_mut(),
-        ) {
-            let mut lights: Vec<ClusterLight> = Vec::new();
-            let n = if self.point_lights_on {
-                point_count as usize
-            } else {
-                0
-            };
-            for i in 0..n.min(4) {
-                lights.push(ClusterLight {
-                    position: [point_pos[i][0], point_pos[i][1], point_pos[i][2]],
-                    radius: CLUSTER_Z_FAR * 4.0, // "infinite": covers the whole frustum
-                    color: [point_color[i][0], point_color[i][1], point_color[i][2]],
-                    intensity: point_color[i][3],
-                });
-            }
-            if self.test_lights > 0 {
-                lights.extend(test_light_grid(
-                    self.test_lights,
-                    self.scene_center,
-                    self.scene_radius,
-                ));
-            }
-            Some(cluster_sys.upload(&self.device, fif, &lights)?)
+        // Parity note: a light's radius is its authored `range`, and `0` = no cutoff. An
+        // uncut light is binned into EVERY cluster, so the shader accumulates the same lights in
+        // the same order as the brute-force loop — byte-identical, which is what the
+        // `CLUSTERED_LIGHTS=1` A/B proves. A light with a finite range is culled out of exactly
+        // those froxels where its windowed falloff is already 0, so that stays exact too.
+        let cluster_indices: Option<(u32, u32, u32, u32)> = if let (true, Some(cluster_sys)) =
+            (clustered || self.clustered_brute, self.cluster.as_mut())
+        {
+            Some(cluster_sys.upload(&self.device, fif, &scene_lights)?)
         } else {
             None
         };
@@ -7555,7 +7652,7 @@ impl App {
         // lighting pass (which reads them) sequences after it. `None` = brute-force point loop.
         let cluster_lighting = match (cluster_indices, self.cluster.as_ref()) {
             (Some((grid_idx, index_idx, light_idx, light_count)), Some(cluster_sys))
-                if self.clustered_lights =>
+                if clustered =>
             {
                 let (grid_ext, index_ext) = ClusterSystem::import(&mut graph);
                 let view_z_row = [view.x_axis.z, view.y_axis.z, view.z_axis.z, view.w_axis.z];

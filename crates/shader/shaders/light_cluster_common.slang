@@ -25,7 +25,7 @@
 #define CLUSTER_BUILD_GROUP 64
 
 // A point light, packed as two float4 (32 bytes) in the light storage buffer:
-//   [0..16)  position.xyz, radius (influence cutoff, world units)
+//   [0..16)  position.xyz, radius (influence cutoff, world units; <= 0 = no cutoff)
 //   [16..32) color.rgb,    intensity (candela — matches pbr's photometric point path)
 struct Light
 {
@@ -34,6 +34,46 @@ struct Light
     float3 color;
     float intensity;
 };
+
+// Point-light distance attenuation — the SINGLE SOURCE for every point-light consumer
+// (the brute-force `globals.point_pos[]` UBO loop, the clustered froxel loop, and the
+// clustered brute-force A/B). A light moved between those paths must shade identically,
+// which is only guaranteed if they all call this.
+//
+//  - `radius <= 0` => pure inverse-square `1/d²`, bit-for-bit the pre-range expression.
+//    That is the default every authored light carries, so the golden anchors are exactly
+//    the historical image.
+//  - `radius > 0`  => the same inverse-square, windowed by `(1 - (d/r)^4)^2` so the
+//    contribution reaches EXACTLY zero at `d = r` with a smooth (C1) approach — no visible
+//    cutoff edge. This is what makes clustered culling sound: a froxel that fails the
+//    sphere-vs-AABB test contains only pixels with `d > r`, whose contribution is exactly
+//    +0.0, so culling the light out of that froxel is not an approximation.
+float point_attenuation(float dist, float radius)
+{
+    float atten = 1.0 / max(dist * dist, 1e-4);
+    if (radius > 0.0)
+    {
+        float t2 = saturate(dist / radius);
+        t2 = t2 * t2;
+        float w = saturate(1.0 - t2 * t2);
+        atten *= w * w;
+    }
+    return atten;
+}
+
+// Does this light's sphere of influence overlap a cluster's world-space AABB? The froxel
+// binning's only culling test — kept here beside `point_attenuation` because the two are a
+// contract: this may only reject a cluster when `point_attenuation` is exactly 0 for every
+// point in it. A light with no authored cutoff (`radius <= 0`) influences every pixel, so
+// it is binned into every cluster (correct, but no culling payoff — author a range).
+bool light_overlaps_aabb(Light L, float3 aabb_min, float3 aabb_max)
+{
+    if (L.radius <= 0.0)
+        return true;
+    float3 closest = clamp(L.position, aabb_min, aabb_max);
+    float3 d = closest - L.position;
+    return dot(d, d) <= L.radius * L.radius;
+}
 
 Light load_light(RWByteAddressBuffer buf, uint i)
 {

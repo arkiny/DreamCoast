@@ -516,6 +516,7 @@ pub(crate) fn lanterns_level() -> LevelData {
             vec: [-0.4, -1.0, -0.3],
             color: [1.0, 0.95, 0.9],
             intensity: 3.0,
+            range: 0.0,
         }],
         camera: Camera::default(),
         environment: Environment::default(),
@@ -549,24 +550,28 @@ pub(crate) fn sponza_level() -> LevelData {
                 vec: [-0.3, -0.9, -0.2],
                 color: [1.0, 0.96, 0.9],
                 intensity: 4.0,
+                range: 0.0,
             },
             Light {
                 kind: LightKind::Point,
                 vec: [1.0, 1.2, -2.0],
                 color: [1.0, 0.6, 0.3], // warm, near the camera in the nave
                 intensity: 50.0,
+                range: 0.0,
             },
             Light {
                 kind: LightKind::Point,
                 vec: [8.0, 1.5, -3.0],
                 color: [1.0, 0.6, 0.3], // warm, down the nave
                 intensity: 60.0,
+                range: 0.0,
             },
             Light {
                 kind: LightKind::Point,
                 vec: [-4.0, 1.5, 3.0],
                 color: [0.4, 0.5, 1.0], // cool fill across the courtyard
                 intensity: 40.0,
+                range: 0.0,
             },
         ],
         // The iconic Sponza atrium angle: standing in the open courtyard looking down
@@ -636,6 +641,7 @@ pub(crate) fn sponza_intel_level() -> LevelData {
             vec: [-0.3, -0.9, -0.2],
             color: [1.0, 0.96, 0.9],
             intensity: 100000.0,
+            range: 0.0,
         }],
         // Down the colonnade toward the lion: stand back in the +X nave and look -X at the
         // lion-head relief end. Z = 0 is the corridor centre (the column rows sit at Z ~ ±3.1),
@@ -697,6 +703,7 @@ pub(crate) fn sponza_trees_level() -> LevelData {
             vec: [-0.3, -0.9, -0.2],
             color: [1.0, 0.96, 0.9],
             intensity: 100000.0,
+            range: 0.0,
         }],
         // Down the colonnade centred on the cypress: the same nave view as `sponza_intel`, but
         // here the tree stands ~7 m ahead at the corridor centre (X≈Z≈0) so its trunk, canopy
@@ -764,6 +771,7 @@ pub(crate) fn sponza_hero_level() -> LevelData {
             vec: [-0.3, -0.9, -0.2],
             color: [1.0, 0.96, 0.9],
             intensity: 100000.0,
+            range: 0.0,
         }],
         // Hero framing: the reverse colonnade — stand near the lion end and look back up the nave
         // toward the bright entrance, so the ivy drapes over the foreground arch (top centre), the
