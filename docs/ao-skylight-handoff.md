@@ -18,7 +18,7 @@ GTAO의 **멀티바운스 항**과 **스페큘러 오클루전**을 도입한다
 - **메모리 읽기 (필독)**: `dreamcoast-permesh-df-plan.md`(SH-L1 sky-vis + indoor skylight occlusion 배경 —
   핵심), `dreamcoast-gdf-ao-flicker.md`(GDF AO 깊이 load/store 픽스), `dreamcoast-gi-fidelity-and-macos-perf.md`,
   `dreamcoast-reflection-gi-fix.md`(반사 트랙 — bent normal은 스페큘러 오클루전과도 연결), `dreamcoast-no-trademark-names.md`.
-- **게이트**: gallery 골든 `af70c1a5`가 항상 byte-identical
+- **게이트**: gallery 골든이 항상 byte-identical(현행 앵커는 [golden-image-regression.md](golden-image-regression.md))
   (`python3 tools/golden-image.py --only gallery --backend metal`). 경로-트레이서 패리티
   (`P8_PATHTRACE=1` 캡처 vs 라스터, `tools/rt-compare.py`)가 라이팅 변경의 정식 성공 지표. DX≡VK Windows 후속.
 
@@ -81,7 +81,7 @@ bent normal로 샘플되는 지점을 file:line + 코드로 뽑아오게 한다.
    (bent normal = 더 국소적·정확; SH volume = 저주파·캐시). 이중 계산 회피.
 
 ### 게이트 / 검증
-- **gallery `af70c1a5` byte-identical 필수** — 모든 신규 경로는 content-only(gi_volume/AO on) seam,
+- **gallery byte-identical 필수**(현행 앵커는 [golden-image-regression.md](golden-image-regression.md)) — 모든 신규 경로는 content-only(gi_volume/AO on) seam,
   gallery는 스칼라·표면-노멀·no-op 레거시 유지.
 - **경로-트레이서 패리티**가 핵심 지표: AO+스카이라이트는 diffuse 앰비언트의 방향성이라 PT와 비교해야
   물리적 정확도를 안다. `sponza_intel`/`sponza_intel_chromeball`에서 실내 그늘/크레비스의 스카이라이트

@@ -4,7 +4,7 @@
 > ~20 knobs (currently resolved twice — at construction and in the UI live-swap — each with a
 > hand-coded gallery-legacy force + clamp) behind a **single source-of-truth resolver** with a
 > **structural gallery-lock**, expose it **live in the test scene UI**, and organize the knobs into
-> **UE-style scalability groups**. Byte-identical gates (`gallery af70c1a5`, `Med sponza 1ee08a3a`)
+> **UE-style scalability groups**. Byte-identical gates (the gallery anchor — current value in [golden-image-regression.md](golden-image-regression.md) — and `Med sponza 1ee08a3a`)
 > must hold throughout — the whole point is that they become *impossible* to break by accident.
 
 ## Problems with the current system (quality.rs + main.rs)
@@ -29,7 +29,7 @@ let base = if gallery { quality::gallery_preset() } else { quality::preset(tier)
 // per knob (main.rs):
 let knob = env_override.unwrap_or(base.knob).clamp(lo, hi);
 ```
-- **Gallery-lock is structural.** The gallery (the byte-identical path-tracer anchor `af70c1a5…`)
+- **Gallery-lock is structural.** The gallery (the byte-identical path-tracer anchor — see [golden-image-regression.md](golden-image-regression.md))
   resolves against a fixed [`gallery_preset()`](../apps/sandbox/src/quality.rs) — the single table of
   each knob's legacy value that used to be scattered as per-site `if gallery_scene { <legacy> }`. A
   newly added tier knob takes its gallery value from that one table and can no longer silently drift
@@ -117,7 +117,7 @@ serde/`ron` stack the `.level` loader uses).
   omits a tier falls back to that tier's embedded entry, so both functions stay total.
 - **Gallery-lock stays structural AND compiled-in.** [`gallery_preset()`](../apps/sandbox/src/quality.rs)
   is deliberately **NOT** data-driven — it remains hard-coded Rust, so a stray edit to the RON file
-  can never silently move the byte-identical path-tracer anchor (`af70c1a5…`). Only the tier presets
+  can never silently move the byte-identical path-tracer anchor ([golden-image-regression.md](golden-image-regression.md)). Only the tier presets
   (`preset()`) and `groups()` are data-sourced. The `gallery_preset_locks_legacy_anchor` guardrail
   test is unchanged.
 - **Env precedence unchanged.** The fine `P_*`/`P11_*`/`SHADOW_*`/`RENDER_SCALE`/`SG_*` env knobs
@@ -132,7 +132,7 @@ serde/`ron` stack the `.level` loader uses).
   §4 range/`groups`/Med-legacy tests continue to pass unchanged against the data-sourced tables.
 
 ## Gates (every step)
-`gallery af70c1a5` + `Med sponza 1ee08a3a` byte-identical + determinism + `clippy -D` + Intel
+gallery anchor ([golden-image-regression.md](golden-image-regression.md)) + `Med sponza 1ee08a3a` byte-identical + determinism + `clippy -D` + Intel
 Sponza ≥60fps (cool). The refactor is behavior-preserving by construction: `resolve()` must emit the
 exact current values. VK/D3D12 unaffected (Metal-measured; the tier logic is backend-agnostic Rust).
 

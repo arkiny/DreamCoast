@@ -42,7 +42,7 @@ PR-3은 레퍼런스 디퍼드 렌더러의 canonical 하이브리드 해법 —
 ## 3. opt-in 시임 / 비용
 
 - 투명 오브젝트가 **0개면 `record`가 패스를 추가하지 않는다** → 비용 0, 디폴트 출력 **바이트 동일**
-  (갤러리 앵커 `af70c1a5…` 유지).
+  (갤러리 앵커 유지 — 현행 값은 [golden-image-regression.md](golden-image-regression.md)).
 - **`P_TRANSLUCENT_TEST=1`** — 반투명 예시 애셋이 아직 없으므로 갤러리에 유리 같은 반투명 평면 2장을
   스폰(살짝 기울여 겹치게 배치, alpha 0.4). 겹침 정렬·depth 가림·포그 상호작용 검증용.
 - **부수효과(§2 표 #21):** Phase-7 파티클/GPU-컬링 draw가 종전 **톤맵 후 LDR**에 그려지던 문제를,
@@ -76,8 +76,8 @@ PR-3은 레퍼런스 디퍼드 렌더러의 canonical 하이브리드 해법 —
 ## 7. 검증 (Metal)
 
 - clippy `-D warnings` 클린 + fmt.
-- 디폴트 갤러리 골든 앵커 sha256 == `af70c1a5c8db49661d2c7926140c1309c28fda04c82cc1ab8aa6638d588b2b74`
-  바이트 동일(투명 0개 → 패스 미스케줄).
+- 디폴트 갤러리 골든 앵커 바이트 동일(현행 sha는 [golden-image-regression.md](golden-image-regression.md);
+  투명 0개 → 패스 미스케줄).
 - `P_TRANSLUCENT_TEST=1`: 반투명 평면 너머 뒤 오브젝트가 알파 블렌드로 비침, 겹친 두 장의 근접 장이
   위, 불투명 뒤 가려짐(depth-test).
 - `P_TRANSLUCENT_TEST=1 P_HEIGHT_FOG=1`: 투명이 포그 낀 배경 위에 올라감(순서 정합).
