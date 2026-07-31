@@ -325,8 +325,28 @@ pub fn dungeon_level_data(grid: &TileGrid, asset: &str, grunt_spawns: &[Vec2]) -
 /// The level stem for a seed. One file per seed keeps a replayed seed a pure cache hit
 /// (nothing is rewritten, so nothing re-cooks) and makes the engine's hot-swap dropdown
 /// a list of the dungeons you have generated.
+///
+/// Floors key by seed and nothing else, because a floor *is* a seed
+/// ([`crate::game::floor_seed`]): descending re-derives one, so a floor already visited
+/// on this machine — this run's or an earlier one's — writes bytes that are already
+/// there and re-cooks nothing.
 pub fn dungeon_level_name(seed: u64) -> String {
     format!("dungeon_{seed}")
+}
+
+/// The selector a *running* game hands [`sandbox::GameHooks::next_level`] for a seed:
+/// the `.level`'s cwd-relative path, forward-slashed.
+///
+/// A path rather than the stem [`ensure_dungeon`] returns, because the two resolve
+/// differently at runtime: a stem is matched against the levels the engine *discovered
+/// at bring-up*, and a floor written after that was not there to discover, so it would
+/// resolve only by the accident of having been played before. An explicit path is
+/// registered on the spot (`sandbox::level::resolve_selection`) and is therefore the
+/// only spelling that is correct for a floor the game just generated.
+pub fn dungeon_level_selector(seed: u64) -> String {
+    generated_path(&format!("{}.level", dungeon_level_name(seed)))
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Mesh `grid`, write it as a `.glb` + a `.level` referencing it, and return the level
@@ -863,6 +883,38 @@ mod tests {
         assert_eq!(
             dreamcoast_asset::write_glb(&meshes, &materials).unwrap(),
             dreamcoast_asset::write_glb(&meshes, &materials).unwrap()
+        );
+    }
+
+    /// A floor is named by its seed, and the *running* game asks for it by path.
+    ///
+    /// The two spellings are not interchangeable at runtime — a stem resolves only
+    /// against the levels the engine discovered at bring-up, and a floor generated after
+    /// that was not among them — so the selector must stay an explicit, forward-slashed
+    /// path inside the generated directory, whatever the platform.
+    #[test]
+    fn a_floor_is_named_by_its_seed_and_selected_by_path() {
+        assert_eq!(dungeon_level_name(20260731), "dungeon_20260731");
+        let selector = dungeon_level_selector(20260731);
+        assert_eq!(selector, "cache/generated/dungeon_20260731.level");
+        assert!(!selector.contains('\\'), "{selector}");
+        // What `sandbox::level::resolve_selection` calls an explicit path: it contains a
+        // separator *and* ends in `.level`, so it is registered rather than looked up.
+        assert!(selector.contains('/') && selector.ends_with(".level"));
+        assert!(selector.starts_with(GENERATED_DIR));
+
+        // Different floors of one run are different files; the same floor revisited is
+        // the same file (which is what makes a revisit a pure cache hit).
+        let (a, b) = (
+            crate::game::floor_seed(20260731, 1),
+            crate::game::floor_seed(20260731, 2),
+        );
+        assert_ne!(dungeon_level_selector(a), dungeon_level_selector(b));
+        assert_eq!(dungeon_level_selector(b), dungeon_level_selector(b));
+        assert_eq!(
+            dungeon_level_selector(a),
+            dungeon_level_selector(20260731),
+            "floor 1 is the run seed's own level — the one every recipe names"
         );
     }
 

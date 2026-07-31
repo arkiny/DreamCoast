@@ -17,4 +17,5 @@
     "Sprint": ["Shift"],
     "Attack": ["Mouse1", "J"],
     "Dodge": ["Space"],
+    "Restart": ["R"],
 })

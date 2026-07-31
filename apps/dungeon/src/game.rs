@@ -31,13 +31,25 @@
 //! against that same instance here — so what you walk into is what was meshed, with no
 //! second generate() call to drift.
 //!
-//! The one way to break that pairing is the engine's **level hot-swap dropdown**: it
-//! lists every `dungeon_<seed>.level` this machine has generated, and picking a
-//! different one loads new geometry while this grid stays the old dungeon. The
-//! characters are re-acquired and re-snapped to free space (see
-//! [`DungeonGame::acquire`]), but it will be free space *of the previous floor*.
-//! Swapping floors properly is M3's progression work (generate → write → load → hand the
-//! game the new grid); until then, a seed change means a restart with `--seed`.
+//! # The run: floors, descent and restart
+//!
+//! A **run is a seed**, and a floor is a seed derived from it ([`floor_seed`]) — floor 1
+//! *is* the run seed, so `--seed 12345` still means the dungeon it always meant. Walking
+//! onto the exit tile generates the next floor by the same road `main` took for the
+//! first (generate → mesh → `.glb` + `.level`), then asks the engine for it through
+//! [`GameHooks::next_level`]; the world is rebuilt wholesale and the cast re-resolves out
+//! of the new one ([`DungeonGame::acquire`]). Hit points carry down and monsters get one
+//! more per floor ([`grunts_for_floor`]), which is the run's pressure. Dying ends it, and
+//! `R` starts the same seed over from floor 1. [`Progression`] is the state machine, and
+//! [`DungeonGame::install`] is what a floor change costs.
+//!
+//! The pairing between the grid and the geometry survives all of that because a floor's
+//! geometry is meshed from the grid instance the game is about to play, in that order,
+//! every time. The one way to break it is still the engine's **level hot-swap dropdown**:
+//! picking a level by hand loads geometry the game did not ask for, and this grid stays
+//! whatever floor it was on. The characters are re-acquired and re-snapped to free space,
+//! but it will be free space *of the previous floor* — and, since that level is not a
+//! continuation of the run, the warrior is rebuilt rather than carried.
 //!
 //! # Fixed-step discipline, and the single-writer rule
 //!
@@ -96,6 +108,9 @@ enum Action {
     Sprint,
     Attack,
     Dodge,
+    /// Start the run again from the first floor. Only read while the warrior is dead —
+    /// see [`DungeonGame::restart_requested`].
+    Restart,
 }
 
 impl Action {
@@ -109,6 +124,7 @@ impl Action {
             "Sprint" => Self::Sprint,
             "Attack" => Self::Attack,
             "Dodge" => Self::Dodge,
+            "Restart" => Self::Restart,
             _ => return None,
         })
     }
@@ -161,6 +177,157 @@ const TAP_ENV: &str = "DUNGEON_TAP";
 /// Default monster population of a floor. Six is a floor that is dangerous in twos and
 /// threes without ever putting more than [`ai::MAX_GRUNTS`] on one A* workspace.
 pub const DEFAULT_GRUNTS: usize = 6;
+
+/// The floor a run starts on. Floors are 1-based because they are shown to the player.
+pub const FIRST_FLOOR: u32 = 1;
+
+/// Seconds between the exit tile latching and the floor actually changing.
+///
+/// The transition is not instant for two reasons, one of each kind: the player needs to
+/// see *why* the world is about to vanish (the HUD counts this down), and the next floor
+/// is generated, meshed and written at the start of this window — so the one-off cost of
+/// building it lands under a banner that already says something is happening rather than
+/// as an unexplained hitch. 0.6 s is long enough to read and short enough that walking
+/// onto the exit still feels like the thing that did it.
+const DESCEND_GRACE: f32 = 0.6;
+
+/// The seed of floor `floor` of the run seeded `run_seed`.
+///
+/// **Floor 1 is the run seed itself**, unmixed. That is not a special case for its own
+/// sake: a run *is* its seed, `--seed 12345` has always meant "play the dungeon 12345
+/// generates", and every capture recipe, bug report and golden the game already has
+/// names a dungeon that way. Making floor 1 anything else would silently retire all of
+/// them. Deeper floors are the same seed pushed through splitmix64's finalizer — the
+/// mixer [`crate::procgen::Rng::new`] already trusts to turn a counter into an
+/// uncorrelated state — after adding `floor × 2^64/φ`:
+///
+/// ```text
+/// floor 1 → run_seed
+/// floor n → mix(run_seed + n · 0x9E37_79B9_7F4A_7C15)
+/// ```
+///
+/// So the whole run is a pure function of one `u64`: floor 7 of seed 12345 is the same
+/// dungeon on every machine and every day, and two runs that differ in seed differ on
+/// every floor (the additive step keeps neighbouring floors of one run, and identical
+/// floors of neighbouring runs, from landing on the same avalanche input).
+pub fn floor_seed(run_seed: u64, floor: u32) -> u64 {
+    if floor <= FIRST_FLOOR {
+        return run_seed;
+    }
+    let mut z = run_seed.wrapping_add(u64::from(floor).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Floor `floor` of the run seeded `run_seed`, generated.
+///
+/// The one place a floor's grid comes from — `main` builds the first one with it and the
+/// game builds every later one with it, so "the dungeon you start in" and "the dungeon
+/// you descend into" cannot drift apart by a parameter.
+pub fn floor_grid(run_seed: u64, floor: u32) -> TileGrid {
+    crate::procgen::generate(
+        floor_seed(run_seed, floor),
+        &crate::procgen::DungeonParams::default(),
+    )
+}
+
+/// How many monsters a floor gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Population {
+    /// The default: [`grunts_for_floor`], which scales gently with depth.
+    PerFloor,
+    /// `--grunts <n>`: this many on every floor, whatever the depth. An explicit count
+    /// is an instruction, not a starting point — a capture recipe that asks for twelve
+    /// monsters must still get twelve on floor three.
+    Fixed(usize),
+}
+
+impl Population {
+    /// The count this policy puts on `floor`.
+    pub fn count(self, floor: u32) -> usize {
+        match self {
+            Self::PerFloor => grunts_for_floor(floor),
+            Self::Fixed(n) => n,
+        }
+    }
+}
+
+/// The default monster count of floor `floor`: one more monster per floor descended,
+/// capped at what one A* workspace is sized for.
+///
+/// `DEFAULT_GRUNTS + (floor − 1)`, not `DEFAULT_GRUNTS + floor`, so **floor 1 is exactly
+/// the floor this game has always shipped** — the same six monsters every existing
+/// capture and recipe was recorded against (see [`floor_seed`] for the same argument
+/// about the geometry). The cap is [`ai::MAX_GRUNTS`] rather than a number of its own:
+/// the pathfinder's workspace is what makes twelve the ceiling, so that is where the
+/// ceiling should be read from. Floors 7 and deeper are therefore equally populated and
+/// get their difficulty from their layout alone — a deliberate v1 limit, not a plateau
+/// anyone should read as finished.
+pub fn grunts_for_floor(floor: u32) -> usize {
+    let extra = floor.saturating_sub(FIRST_FLOOR) as usize;
+    (DEFAULT_GRUNTS + extra).min(ai::MAX_GRUNTS)
+}
+
+/// How a floor becomes a level the engine can load: mesh the grid, write the `.glb` +
+/// `.level` pair, and return the selector [`GameHooks::next_level`] hands back.
+///
+/// A function pointer rather than a direct call to [`crate::level::ensure_dungeon`] so
+/// the progression state machine is exercisable without a filesystem — the tests install
+/// one that writes nothing and returns the path the real one would have. Nothing else
+/// about the transition changes between the two, which is the point: what the tests
+/// drive is the shipping machine with its one side effect stubbed.
+type FloorWriter = fn(&TileGrid, &[Vec2]) -> anyhow::Result<String>;
+
+/// The shipping [`FloorWriter`]: the same road `main` puts floor 1 on (generator → glb +
+/// level → the engine's ordinary level load), taken at runtime for floor `n`.
+fn write_floor(grid: &TileGrid, spawns: &[Vec2]) -> anyhow::Result<String> {
+    crate::level::ensure_dungeon(grid, spawns)?;
+    Ok(crate::level::dungeon_level_selector(grid.seed()))
+}
+
+/// A floor that has been generated and written but is not being played yet.
+struct NextFloor {
+    floor: u32,
+    grid: TileGrid,
+    spawns: Vec<Vec2>,
+    /// What [`GameHooks::next_level`] will return — an explicit path, see
+    /// [`crate::level::dungeon_level_selector`].
+    level: String,
+    /// Whether the warrior starts this floor new. A descent carries the run's hit points
+    /// down (that is the run's pressure); a restart is a new run and does not.
+    fresh_warrior: bool,
+}
+
+/// Where the run is between floors.
+///
+/// The transition spans several frames and two owners — the game generates the floor,
+/// the engine rebuilds the world — so "which half has happened" is a state, not a pair
+/// of booleans that can disagree:
+///
+/// ```text
+///  Playing ──exit tile──→ Descending{grace, next} ──grace out──→ Handoff{level}
+///     ↑                                                              │ next_level()
+///     └────────── acquire() resolves the rebuilt cast ──── Awaiting ←─┘  (exactly once)
+/// ```
+///
+/// `Handoff` is the single-shot latch: the level is *taken* out of it when the hook
+/// reports it, so a floor cannot be requested twice however many frames pass before the
+/// engine gets to the swap. `Awaiting` is the "the world is not mine yet" state — see
+/// [`DungeonGame::simulate`] for why nothing is simulated in `Handoff` and why `Awaiting`
+/// resolves through the ordinary cast acquisition.
+enum Progression {
+    /// Playing a floor.
+    Playing,
+    /// The exit is underfoot and the next floor is already built; this is the grace the
+    /// HUD counts down.
+    Descending { left: f32, next: Box<NextFloor> },
+    /// The next floor is installed in the game and its level is waiting to be handed to
+    /// the engine.
+    Handoff { level: String },
+    /// Handed over. The engine is rebuilding the world; the cast re-resolves out of it.
+    Awaiting,
+}
 
 /// How far from the entry a monster may spawn, metres of *walking* (see
 /// [`ai::spawn_points`]). Twelve metres is past the first doorway on every floor the
@@ -346,7 +513,33 @@ pub struct DungeonGame {
     input: ActionState<Action>,
     /// The dungeon: geometry source (already meshed, before bring-up) and collision
     /// world (right here). One instance, so the two cannot disagree.
+    ///
+    /// Replaced wholesale when the run descends ([`DungeonGame::install`]) — the pairing
+    /// survives because the replacement is meshed from *this* grid before its level is
+    /// handed over, exactly as `main` does for the first one.
     grid: TileGrid,
+
+    // --- The run ----------------------------------------------------------------------
+    /// The run's identity: every floor's seed is derived from it ([`floor_seed`]), so one
+    /// `u64` reproduces the whole descent.
+    run_seed: u64,
+    /// Which floor is being played, 1-based.
+    floor: u32,
+    /// How many monsters a floor gets.
+    population: Population,
+    /// Where the run is between floors.
+    progression: Progression,
+    /// How a generated floor becomes a loadable level (stubbed in tests).
+    writer: FloorWriter,
+    /// Whether the next cast acquisition starts the warrior fresh. True for a level this
+    /// game did not ask for (bring-up, the engine's hot-swap dropdown — neither is a
+    /// continuation of anything) and for a restart; false for a descent, which is what
+    /// carries hit points down.
+    reset_warrior: bool,
+    /// Whether this game's grid is a floor of a seeded run at all. False for the
+    /// `--generated-room` injection harness, whose grid is a fixture rather than a floor:
+    /// descending or restarting out of it would generate a dungeon nobody asked for.
+    floors_enabled: bool,
     /// Input sources forced down over a step window (see [`HOLD_ENV`]); empty in a
     /// normal run.
     forced: Vec<Hold>,
@@ -394,8 +587,8 @@ pub struct DungeonGame {
     /// previous/current pair for interpolation.
     prev_focus: Vec3,
     focus: Vec3,
-    /// Latched once the player's circle first touches the exit tile. Progression to the
-    /// next floor is M3; this detects and surfaces it.
+    /// Latched once the player's circle first touches the exit tile — what starts the
+    /// descent, and what stops it starting twice on one floor.
     exit_reached: bool,
     /// Fixed steps simulated so far — a cheap "is the sim actually running" readout, and
     /// the clock [`TAP_ENV`] schedules against.
@@ -422,7 +615,14 @@ impl DungeonGame {
     /// a second [`ai::spawn_points`] call would be a second source of truth: the level
     /// writer places `grunt_<i>` at point `i` ([`Self::grunt_spawns`]) and the simulation
     /// starts brain `i` there.
-    pub fn new(grid: TileGrid, grunts: usize) -> anyhow::Result<Self> {
+    ///
+    /// `grid` is **floor 1** of the run, so its seed *is* the run seed ([`floor_seed`]
+    /// is the identity there) and no second parameter is needed to say so. Every deeper
+    /// floor is derived from it.
+    pub fn new(grid: TileGrid, population: Population) -> anyhow::Result<Self> {
+        let run_seed = grid.seed();
+        let floor = FIRST_FLOOR;
+        let grunts = population.count(floor);
         let bindings = BindingsConfig::from_ron(DEFAULT_BINDINGS)
             .map_err(|e| anyhow::anyhow!("dungeon bindings: {e}"))?;
         let map = bindings
@@ -445,6 +645,13 @@ impl DungeonGame {
         Ok(Self {
             input: ActionState::new(map),
             grid,
+            run_seed,
+            floor,
+            population,
+            progression: Progression::Playing,
+            writer: write_floor,
+            reset_warrior: true,
+            floors_enabled: true,
             forced: held_sources_from_env(),
             taps: taps_from_env(),
             warrior: WarriorController::new(),
@@ -485,6 +692,168 @@ impl DungeonGame {
         &self.grunt_spawns
     }
 
+    /// Turn floor progression off: this game's grid is a fixture, not floor 1 of a run.
+    ///
+    /// The `--generated-room` injection harness is the one caller. Its room has no exit
+    /// (entry and exit are the same tile, so the latch never fires) but it *can* be died
+    /// in, and a restart there would generate and load a real dungeon — which would
+    /// destroy the one thing the harness exists to show. Off is the honest state: there
+    /// are no floors here to progress through.
+    pub fn without_floors(mut self) -> Self {
+        self.floors_enabled = false;
+        self
+    }
+
+    /// Generate, mesh and write floor `floor` of this run — everything the transition
+    /// needs, done *before* the world it belongs to is asked for.
+    ///
+    /// Deliberately eager: the whole cost of a floor (generation, greedy meshing, the
+    /// `.glb` write, the level RON) is paid here, at the start of the descent grace,
+    /// rather than on the frame the level is handed over. Re-descending into a seed
+    /// already on this machine writes nothing at all — the writer is content-conditional
+    /// and the floor's bytes are a pure function of its seed.
+    fn build_floor(&self, floor: u32, fresh_warrior: bool) -> anyhow::Result<NextFloor> {
+        let started = Instant::now();
+        let grid = floor_grid(self.run_seed, floor);
+        let spawns = ai::spawn_points(
+            &grid,
+            self.population.count(floor),
+            GRUNT_MIN_SPAWN_DISTANCE,
+            grid.seed(),
+        );
+        let level = (self.writer)(&grid, &spawns)?;
+        tracing::info!(
+            "dungeon: floor {floor} of run {} ready — seed {}, {} grunts, level '{level}' \
+             ({:.1} ms)",
+            self.run_seed,
+            grid.seed(),
+            spawns.len(),
+            started.elapsed().as_secs_f64() * 1e3,
+        );
+        Ok(NextFloor {
+            floor,
+            grid,
+            spawns,
+            level,
+            fresh_warrior,
+        })
+    }
+
+    /// Make `next` the floor being played, and ask for its world.
+    ///
+    /// Everything scoped to a floor is dropped here rather than carried: the cast (its
+    /// entities belong to a world that is about to stop existing), the monster brains and
+    /// their spawn list, the A* workspace (sized to the old grid), the exit latch and the
+    /// combat queues. What survives is the *run* — the warrior (unless this is a restart:
+    /// see [`NextFloor::fresh_warrior`]), the step clock and the cost readouts.
+    ///
+    /// The cast is cleared **here**, not by testing the cached entity: a rebuilt `World`
+    /// restarts its generation counters, so a stale `Entity` can pass `is_alive` in the
+    /// new world by landing on a recycled slot. The transition knows the world is going
+    /// away; that knowledge is more reliable than any probe of it.
+    fn install(&mut self, next: NextFloor) {
+        self.floor = next.floor;
+        self.grid = next.grid;
+        self.grunt_spawns = next.spawns;
+        self.finder = Pathfinder::new();
+        self.cast = None;
+        self.exit_reached = false;
+        self.damage.clear();
+        self.deaths.clear();
+        self.reset_warrior = next.fresh_warrior;
+        self.player_state = WarriorState::Idle;
+
+        // The spawn the *level* authors is the entry tile, and `acquire` will snap the
+        // player onto it through `nearest_free` when the world arrives. These are the
+        // same point, set now so the camera is already looking at the new floor rather
+        // than at where the old one used to be.
+        let spawn = collision::player_spawn_local(&self.grid);
+        self.prev_pos = spawn;
+        self.pos = spawn;
+        let focus = collision::to_world(&self.grid, spawn, CAMERA_FOCUS_Y);
+        self.prev_focus = focus;
+        self.focus = focus;
+
+        self.progression = Progression::Handoff { level: next.level };
+    }
+
+    /// Start the descent: build the next floor and hold it for the grace window.
+    ///
+    /// A failure to build is loud and *non-fatal*: the run stays on the floor it is on
+    /// (the exit stays latched, so it does not retry every step and flood the log). The
+    /// alternative — dying on an `unwrap` because a disk was full — would lose a run for
+    /// a reason that has nothing to do with the game.
+    fn begin_descent(&mut self) {
+        if !self.floors_enabled || !matches!(self.progression, Progression::Playing) {
+            return;
+        }
+        let floor = self.floor + 1;
+        match self.build_floor(floor, false) {
+            Ok(next) => {
+                self.progression = Progression::Descending {
+                    left: DESCEND_GRACE,
+                    next: Box::new(next),
+                }
+            }
+            Err(e) => tracing::error!(
+                "dungeon: cannot build floor {floor}: {e:#} — staying on floor {}",
+                self.floor
+            ),
+        }
+    }
+
+    /// Advance the descent grace, and install the next floor when it runs out.
+    fn tick_progression(&mut self, dt: f32) {
+        let Progression::Descending { left, .. } = &mut self.progression else {
+            return;
+        };
+        *left -= dt;
+        if *left > 0.0 {
+            return;
+        }
+        let Progression::Descending { next, .. } =
+            std::mem::replace(&mut self.progression, Progression::Playing)
+        else {
+            unreachable!("just matched Descending");
+        };
+        tracing::info!(
+            "dungeon: descending to floor {} with {:.0}/{:.0} hit points",
+            next.floor,
+            self.warrior.health().current,
+            self.warrior.health().max,
+        );
+        self.install(*next);
+    }
+
+    /// Whether this step's input asks for a restart. Only a dead run may: R is not a
+    /// panic button that throws away a floor mid-fight.
+    fn restart_requested(&self) -> bool {
+        self.floors_enabled
+            && self.warrior.is_dead()
+            && self.input.just_pressed(Action::Restart)
+            && matches!(self.progression, Progression::Playing)
+    }
+
+    /// Start the run again: the same seed, from the first floor, with a warrior that has
+    /// its hit points back.
+    ///
+    /// The *same* seed on purpose — a run is its seed, and a death that re-rolled the
+    /// dungeon would make "try that again" impossible. `--seed` is how you ask for a
+    /// different one.
+    fn restart(&mut self) {
+        match self.build_floor(FIRST_FLOOR, true) {
+            Ok(next) => {
+                tracing::info!(
+                    "dungeon: restarting run {} from floor {FIRST_FLOOR} after {} steps",
+                    self.run_seed,
+                    self.steps,
+                );
+                self.install(next);
+            }
+            Err(e) => tracing::error!("dungeon: cannot restart run {}: {e:#}", self.run_seed),
+        }
+    }
+
     /// Identify a level entity by the scene-graph name the level authored on it.
     ///
     /// Both sides read the same constant, so a renamed or moved character cannot
@@ -509,6 +878,11 @@ impl DungeonGame {
     /// believed: the level writer places the character on exactly this point, but a
     /// hot-swapped or hand-edited level need not, and starting the simulation inside rock
     /// is the one state the mover cannot be asked to fix mid-stride.
+    ///
+    /// This is also where a **floor transition finishes**: the descent cleared the cast
+    /// and asked for a new world, and the run resumes on the step this finds the new
+    /// world's player. The warrior is rebuilt or kept according to `reset_warrior` —
+    /// which is the whole of the carry-over rule, in one branch.
     fn acquire(&mut self, world: &mut World) -> bool {
         if let Some(cast) = &self.cast
             && world.is_alive(cast.player)
@@ -555,7 +929,8 @@ impl DungeonGame {
 
         let views = vec![GruntView::default(); grunts.len()];
         tracing::info!(
-            "dungeon: cast acquired — player #{} ({} clips), {} grunts",
+            "dungeon: cast acquired on floor {} — player #{} ({} clips), {} grunts",
+            self.floor,
             player.index(),
             player_anim.clips.len(),
             grunts.len(),
@@ -568,7 +943,17 @@ impl DungeonGame {
             grunt_anims,
             grunt_views: views,
         });
-        self.warrior = WarriorController::new();
+        // A new run gets a new warrior; a descent keeps the one that walked down the
+        // stairs, hit points and all. `reset_warrior` returns to its default afterwards
+        // so an *unrequested* reload (the engine's hot-swap dropdown) is a fresh start
+        // again — nothing about that level is a continuation of this run.
+        if self.reset_warrior {
+            self.warrior = WarriorController::new();
+        }
+        self.reset_warrior = true;
+        if matches!(self.progression, Progression::Awaiting) {
+            self.progression = Progression::Playing;
+        }
         self.prev_pos = start;
         self.pos = start;
         self.prev_yaw = self.warrior.facing_radians();
@@ -766,6 +1151,26 @@ impl DungeonGame {
         let started = Instant::now();
         self.stage_input(snapshot);
 
+        // -- 1b. the run's own transitions -------------------------------------------------
+        // A dead run restarts on demand, before anything else this step decides anything.
+        if self.restart_requested() {
+            self.restart();
+        }
+        // The descent grace runs down at the *top* of a step, so the floor it installs is
+        // installed before anything reads the grid — the alternative (ticking it at the
+        // end, next to the exit detection that starts it) would swap the grid out from
+        // under a step that had already taken the cast out of `self`, and put it back.
+        self.tick_progression(dt);
+        // Between floors the grid is already the *next* floor's and the world is still
+        // the previous floor's, so there is nothing here that could be simulated
+        // coherently. `Handoff` is that gap — one frame at most, since the engine polls
+        // the hook and swaps before it runs a fixed step (`sandbox::App::frame`). By
+        // `Awaiting` the world is the new one, and the acquisition below resolves out of
+        // it, which is what ends the transition.
+        if matches!(self.progression, Progression::Handoff { .. }) {
+            return;
+        }
+
         if !self.acquire(world) {
             return; // level not loaded (or has no player) — nothing to simulate
         }
@@ -926,7 +1331,12 @@ impl DungeonGame {
         }
     }
 
-    /// Exit detection (this milestone surfaces it; M3 makes it progression).
+    /// Exit detection, and the start of the descent it now means.
+    ///
+    /// The latch is what keeps this a *transition* rather than a repeated event: a player
+    /// standing on the exit tile touches it on every step of the grace, and only the
+    /// first one counts. A grid whose exit is its entry (the injection harness, the
+    /// hand-built test arenas) has no exit to reach.
     fn detect_exit(&mut self, dt: f32) {
         if self.exit_reached
             || self.grid.exit() == self.grid.entry()
@@ -941,6 +1351,7 @@ impl DungeonGame {
             self.steps,
             self.steps as f64 * f64::from(dt),
         );
+        self.begin_descent();
     }
 
     /// Book this step's cost, and complain once if the sim is eating the frame.
@@ -1032,6 +1443,25 @@ impl GameHooks for DungeonGame {
         self.cast = Some(cast);
     }
 
+    /// Hand over the next floor's level — **exactly once per transition**.
+    ///
+    /// The level is *taken* out of the `Handoff` state, so however many frames pass
+    /// before the engine gets to the swap (and however many times it polls), one descent
+    /// asks for one load. The selector is an explicit path to a file this game wrote
+    /// moments ago; the engine registers it on the spot (see
+    /// [`crate::level::dungeon_level_selector`]). If it fails to load, that error
+    /// propagates out of the frame loop and the process stops — which is the right
+    /// failure for "the floor I just generated cannot be read".
+    fn next_level(&mut self) -> Option<String> {
+        let Progression::Handoff { level } = &mut self.progression else {
+            return None;
+        };
+        let level = std::mem::take(level);
+        self.progression = Progression::Awaiting;
+        tracing::info!("dungeon: floor {} — loading '{level}'", self.floor);
+        Some(level)
+    }
+
     fn camera(&mut self, alpha: f32) -> Option<CameraPose> {
         // Blend the two latest sim states — the hook must return the *rendered* pose;
         // the frame loop does not interpolate it. Smoothing itself happened on the
@@ -1051,6 +1481,7 @@ impl GameHooks for DungeonGame {
             .size([360.0, 340.0], imgui::Condition::FirstUseEver)
             .build(|| {
                 self.draw_vitals(ui);
+                self.draw_progress(ui);
                 ui.separator();
                 self.draw_combat(ui);
                 ui.separator();
@@ -1061,7 +1492,7 @@ impl GameHooks for DungeonGame {
                     "sim step  {:.3} ms  peak {:.3} ms  ({} steps)",
                     self.sim_ms, self.sim_ms_peak, self.steps
                 ));
-                ui.text_disabled("WASD move, Shift sprint, LMB/J attack, Space dodge");
+                ui.text_disabled("WASD move, Shift sprint, LMB/J attack, Space dodge, R restart");
             });
     }
 }
@@ -1089,8 +1520,41 @@ impl DungeonGame {
 
         if self.warrior.is_dead() {
             ui.text_colored([0.92, 0.26, 0.24, 1.0], "YOU DIED");
-            // Restart is M3's; saying so here is better than a banner that looks broken.
-            ui.text_disabled("restart is not implemented yet (M3)");
+            if self.floors_enabled {
+                ui.text_colored(
+                    [0.85, 0.85, 0.85, 1.0],
+                    format!(
+                        "press R to restart run {} from floor {FIRST_FLOOR}",
+                        self.run_seed
+                    ),
+                );
+            } else {
+                ui.text_disabled("this harness level has no run to restart");
+            }
+        }
+    }
+
+    /// Where the run is: the floor, and whatever transition is under way.
+    ///
+    /// The hit-point bar above is the other half of the carry-over story — it does not
+    /// refill on a descent, and this line is what says which descent it survived.
+    fn draw_progress(&self, ui: &imgui::Ui) {
+        ui.text(format!(
+            "run       seed {}   floor {}",
+            self.run_seed, self.floor
+        ));
+        match &self.progression {
+            Progression::Playing => {}
+            Progression::Descending { left, next } => ui.text_colored(
+                [0.95, 0.85, 0.45, 1.0],
+                // ASCII only: the overlay's font has no glyph for an arrow or an
+                // ellipsis, and imgui draws a missing glyph as a question mark.
+                format!("descending {:.1} s -> floor {}", left.max(0.0), next.floor),
+            ),
+            Progression::Handoff { .. } | Progression::Awaiting => ui.text_colored(
+                [0.95, 0.85, 0.45, 1.0],
+                format!("loading floor {}...", self.floor),
+            ),
         }
     }
 
@@ -1131,7 +1595,7 @@ impl DungeonGame {
     /// Seed, position, tile, exit — the M1 readouts, kept.
     fn draw_world(&self, ui: &imgui::Ui, world: &World) {
         ui.text(format!(
-            "seed      {}   {}x{} tiles, {} rooms",
+            "floor     seed {}   {}x{} tiles, {} rooms",
             self.grid.seed(),
             self.grid.width(),
             self.grid.height(),
@@ -1189,6 +1653,7 @@ mod tests {
     const A: u16 = 0x41;
     const D: u16 = 0x44;
     const J: u16 = 0x4A;
+    const R: u16 = 0x52;
     const SPACE: u16 = 0x20;
     const SHIFT: u16 = 0x10;
     const FIXED_DT: f32 = 1.0 / 60.0;
@@ -1201,8 +1666,20 @@ mod tests {
 
     /// A game on `grid` with no monsters — the M1 shape, for the properties that are
     /// about the mover and the level rather than about a fight.
+    ///
+    /// Progression is real (the state machine under test is the shipping one) but its
+    /// one side effect is not: [`stub_writer`] stands in for the level writer, so a test
+    /// that walks onto an exit generates a floor without meshing or writing anything.
     fn game(grid: TileGrid) -> DungeonGame {
-        DungeonGame::new(grid, 0).unwrap()
+        let mut g = DungeonGame::new(grid, Population::Fixed(0)).unwrap();
+        g.writer = stub_writer;
+        g
+    }
+
+    /// A [`FloorWriter`] that writes nothing and returns exactly the selector the real
+    /// one would have (`crate::level::write_floor` → `dungeon_level_selector`).
+    pub(super) fn stub_writer(grid: &TileGrid, _spawns: &[Vec2]) -> anyhow::Result<String> {
+        Ok(crate::level::dungeon_level_selector(grid.seed()))
     }
 
     /// A stand-in for the loaded level: an unnamed geometry entity plus every character
@@ -1262,6 +1739,7 @@ mod tests {
             Action::Sprint,
             Action::Attack,
             Action::Dodge,
+            Action::Restart,
         ] {
             assert!(
                 !g.input.map().sources(action).is_empty(),
@@ -1274,6 +1752,17 @@ mod tests {
             .input
             .update(&InputSnapshot::default().with_key(J, true));
         assert!(keyboard_only.input.just_pressed(Action::Attack));
+
+        // M3's restart is on R, and it is an edge like the other two buttons: holding it
+        // through the death banner must ask once, not once a step.
+        keyboard_only
+            .input
+            .update(&InputSnapshot::default().with_key(R, true));
+        assert!(keyboard_only.input.just_pressed(Action::Restart));
+        keyboard_only
+            .input
+            .update(&InputSnapshot::default().with_key(R, true));
+        assert!(!keyboard_only.input.just_pressed(Action::Restart));
     }
 
     /// `DUNGEON_HOLD` / `DUNGEON_TAP` are what make the headless capture drivable, so
@@ -1632,27 +2121,395 @@ mod tests {
     fn touching_the_exit_latches_the_flag() {
         let grid = dungeon(3);
         let (ex, ez) = grid.exit();
-        let exit_world = grid.exit_world();
-        let mut g = game(grid);
+        let mut g = walking_to_the_exit_of(grid);
+        let mut world = exit_world(&g);
+        frame(&mut g, &mut world, &InputSnapshot::default(), 1);
+        assert!(!g.exit_reached, "not on the exit yet");
+        assert_ne!(g.player_tile(), (ex, ez));
+        assert!(matches!(g.progression, Progression::Playing));
 
+        // Far enough to arrive, not so far that the grace runs out (that is the next
+        // test's subject): the latch and the descent it starts are what is asserted here.
+        frame(
+            &mut g,
+            &mut world,
+            &InputSnapshot::default().with_key(W, true),
+            25,
+        );
+        assert!(g.exit_reached, "walking onto the exit sets the flag");
+        assert!(
+            matches!(g.progression, Progression::Descending { .. }),
+            "the exit starts the descent"
+        );
+    }
+
+    /// A game on `grid` whose player will be placed one tile south of the exit, with the
+    /// floor writer stubbed — the fixture the progression tests walk.
+    fn walking_to_the_exit_of(grid: TileGrid) -> DungeonGame {
+        game(grid)
+    }
+
+    /// A level-shaped world with the player authored one tile *south* of `g`'s exit, so
+    /// holding W walks onto it.
+    fn exit_world(g: &DungeonGame) -> World {
+        let exit = g.grid().exit_world();
         let mut world = World::new();
         spawn_like_the_level_loader(
             &mut world,
             &g.warrior_rig,
             PLAYER_NAME,
-            Vec3::new(exit_world.x, CHARACTER_Y, exit_world.z + TILE_SIZE),
+            Vec3::new(exit.x, CHARACTER_Y, exit.z + TILE_SIZE),
         );
-        frame(&mut g, &mut world, &InputSnapshot::default(), 1);
-        assert!(!g.exit_reached, "not on the exit yet");
-        assert_ne!(g.player_tile(), (ex, ez));
+        world
+    }
 
-        frame(
-            &mut g,
-            &mut world,
-            &InputSnapshot::default().with_key(W, true),
-            60,
+    // -- the run: floors, descent, death and restart -----------------------------------
+
+    /// **Floor 1 is the run seed, unmixed** — the property every existing capture recipe,
+    /// golden and bug report depends on — and every deeper floor is a different dungeon,
+    /// reproducibly.
+    #[test]
+    fn floor_one_is_the_run_seed_and_deeper_floors_diverge() {
+        for run in [0u64, 1, 3, 12345, crate::DEFAULT_SEED, u64::MAX] {
+            assert_eq!(floor_seed(run, FIRST_FLOOR), run, "run {run}");
+            // Floor 0 does not exist, but a derivation that panicked or wrapped into a
+            // different dungeon for it would be a trap for the day one is asked for.
+            assert_eq!(floor_seed(run, 0), run, "run {run}");
+
+            let seeds: Vec<u64> = (1..=8).map(|f| floor_seed(run, f)).collect();
+            let unique: std::collections::BTreeSet<u64> = seeds.iter().copied().collect();
+            assert_eq!(unique.len(), seeds.len(), "run {run}: two floors collide");
+            // Deterministic: the same run and floor is the same dungeon, always.
+            assert_eq!(
+                seeds,
+                (1..=8).map(|f| floor_seed(run, f)).collect::<Vec<_>>()
+            );
+        }
+
+        // Two runs differ on *every* floor — an additive step would otherwise let run
+        // `s` floor 2 land on run `s+1` floor 1 and so on down the descent.
+        for floor in 1..=8 {
+            assert_ne!(floor_seed(7, floor), floor_seed(8, floor), "floor {floor}");
+        }
+
+        // And the grid really is the one the seed generates through the ordinary path:
+        // `main` and the game must not be able to disagree about floor 1.
+        let legacy = generate(crate::DEFAULT_SEED, &DungeonParams::default());
+        let first = floor_grid(crate::DEFAULT_SEED, FIRST_FLOOR);
+        assert_eq!(first.seed(), legacy.seed());
+        assert_eq!(first.to_ascii(), legacy.to_ascii(), "floor 1 moved");
+        assert_ne!(
+            floor_grid(crate::DEFAULT_SEED, 2).to_ascii(),
+            legacy.to_ascii(),
+            "floor 2 is the same dungeon over again"
         );
-        assert!(g.exit_reached, "walking onto the exit sets the flag");
+    }
+
+    /// The population rule: one more monster per floor, capped by what one A* workspace
+    /// is sized for — and floor 1 still the six the game has always fielded.
+    #[test]
+    fn the_monster_count_scales_with_depth_and_stops_at_the_pathfinder_cap() {
+        assert_eq!(grunts_for_floor(FIRST_FLOOR), DEFAULT_GRUNTS);
+        assert_eq!(grunts_for_floor(2), DEFAULT_GRUNTS + 1);
+        assert_eq!(grunts_for_floor(6), 11);
+        assert_eq!(grunts_for_floor(7), ai::MAX_GRUNTS);
+        assert_eq!(grunts_for_floor(500), ai::MAX_GRUNTS, "the cap holds");
+        for floor in 1..40 {
+            assert!(grunts_for_floor(floor) <= ai::MAX_GRUNTS);
+            assert!(grunts_for_floor(floor + 1) >= grunts_for_floor(floor));
+        }
+
+        // The policy is what `--grunts` overrides: pinned means pinned, at any depth.
+        assert_eq!(Population::PerFloor.count(3), grunts_for_floor(3));
+        assert_eq!(Population::Fixed(2).count(3), 2);
+        assert_eq!(Population::Fixed(0).count(9), 0);
+        // A default game is the per-floor policy on floor 1 = the shipped floor.
+        let g = DungeonGame::new(dungeon(3), Population::PerFloor).unwrap();
+        assert_eq!(g.floor, FIRST_FLOOR);
+        assert_eq!(g.run_seed, 3);
+        assert_eq!(g.grunt_spawns().len(), DEFAULT_GRUNTS);
+    }
+
+    /// **The transition, step by step.** Walking onto the exit starts a grace; the grace
+    /// installs the next floor; the hook offers that floor's level *once*; and the run
+    /// only starts playing again when the rebuilt world's cast has been resolved.
+    #[test]
+    fn the_descent_is_a_graced_single_shot_handoff() {
+        let mut g = walking_to_the_exit_of(dungeon(3));
+        let mut world = exit_world(&g);
+        let held = InputSnapshot::default().with_key(W, true);
+        assert!(g.next_level().is_none(), "nothing to load while playing");
+
+        // Walk on. The grace starts the frame the exit latches, and the next floor is
+        // built there and then (the stub writer stands in for the meshing).
+        let mut steps_in_grace = 0;
+        for _ in 0..600 {
+            g.simulate(&mut world, &held, FIXED_DT);
+            match &g.progression {
+                Progression::Descending { left, next } => {
+                    steps_in_grace += 1;
+                    assert!(*left <= DESCEND_GRACE && *left > -FIXED_DT);
+                    assert_eq!(next.floor, 2);
+                    assert_eq!(next.grid.seed(), floor_seed(3, 2));
+                    assert!(g.next_level().is_none(), "not until the grace is out");
+                    // Still playing the floor it is standing on.
+                    assert_eq!(g.floor, FIRST_FLOOR);
+                    assert_eq!(g.grid().seed(), 3);
+                }
+                Progression::Handoff { .. } => break,
+                Progression::Playing => assert_eq!(steps_in_grace, 0),
+                Progression::Awaiting => unreachable!("nothing has been handed over"),
+            }
+        }
+        assert!(
+            matches!(g.progression, Progression::Handoff { .. }),
+            "the grace never ran out"
+        );
+        // The grace is a time, not a step count: ~0.6 s of fixed steps, ±the step the
+        // exit was touched on.
+        let expected = (DESCEND_GRACE / FIXED_DT).round() as i32;
+        assert!(
+            (steps_in_grace - expected).abs() <= 1,
+            "graced for {steps_in_grace} steps, expected ~{expected}"
+        );
+
+        // The floor is already installed: new grid, new spawns, no cast, latch cleared.
+        assert_eq!(g.floor, 2);
+        assert_eq!(g.grid().seed(), floor_seed(3, 2));
+        assert_eq!(g.grunt_spawns().len(), 0, "this fixture fields no monsters");
+        assert!(g.cast.is_none(), "the old world's entities are gone");
+        assert!(!g.exit_reached, "the new floor's exit has not been reached");
+        assert_eq!(g.player_tile(), g.grid().entry(), "placed on the new entry");
+
+        // ...and nothing is simulated until the world catches up.
+        let steps = g.steps;
+        g.simulate(&mut world, &held, FIXED_DT);
+        assert_eq!(g.steps, steps, "simulated against a world it has left");
+
+        // The handoff itself: once, with the new floor's own level path.
+        assert_eq!(
+            g.next_level().as_deref(),
+            Some(crate::level::dungeon_level_selector(floor_seed(3, 2)).as_str())
+        );
+        assert!(matches!(g.progression, Progression::Awaiting));
+        for _ in 0..3 {
+            assert!(g.next_level().is_none(), "one descent, one load");
+        }
+
+        // The engine rebuilds the world; the next step resolves the cast out of it and
+        // the run is playing again.
+        world = test_world(&g);
+        g.simulate(&mut world, &InputSnapshot::default(), FIXED_DT);
+        assert!(matches!(g.progression, Progression::Playing));
+        assert_eq!(g.steps, steps + 1);
+    }
+
+    /// Drive `g` through one descent the way the frame loop does: fixed steps until the
+    /// hook asks for a level, the wholesale world rebuild that request causes, then the
+    /// step that re-resolves the cast out of it. Returns the level that was requested.
+    fn take_the_stairs(g: &mut DungeonGame, world: &mut World) -> String {
+        let held = InputSnapshot::default().with_key(W, true);
+        for _ in 0..900 {
+            g.simulate(world, &held, FIXED_DT);
+            if let Some(level) = g.next_level() {
+                // What the engine does: a new `World`, built from the level the game
+                // just wrote — every cached `Entity` now belongs to a world that is gone.
+                *world = test_world(g);
+                g.simulate(world, &InputSnapshot::default(), FIXED_DT);
+                return level;
+            }
+        }
+        panic!("no transition after fifteen seconds of walking at the exit");
+    }
+
+    /// **After the swap**: the cast re-resolves out of the *new* world — player on the
+    /// new floor's entry, one brain per new spawn point, in its own body.
+    #[test]
+    fn the_cast_re_resolves_on_the_new_floor() {
+        let mut g = DungeonGame::new(dungeon(3), Population::PerFloor).unwrap();
+        g.writer = stub_writer;
+        // Start next to the exit rather than at the entry: this is about the arrival.
+        let mut world = exit_world(&g);
+        let before = g.cast.as_ref().map(|c| c.player);
+        assert!(before.is_none());
+
+        take_the_stairs(&mut g, &mut world);
+
+        assert_eq!(g.floor, 2);
+        assert!(matches!(g.progression, Progression::Playing));
+        let cast = g.cast.as_ref().expect("re-resolved out of the new world");
+        assert!(
+            world.is_alive(cast.player),
+            "the player is a new-world entity"
+        );
+        assert_eq!(
+            world.get::<Name>(cast.player).unwrap().0,
+            PLAYER_NAME,
+            "resolved by name, as on the first floor"
+        );
+
+        // Standing on the new floor's entry, in free space — through `nearest_free`, the
+        // same snap the first floor gets.
+        assert_eq!(g.player_tile(), g.grid().entry());
+        assert!(!collision::collision(g.grid()).circle_overlaps(g.pos, PLAYER_RADIUS));
+
+        // One monster per spawn point of the new floor, each brain in its own body, each
+        // standing where the level put it.
+        assert_eq!(g.grunt_spawns().len(), grunts_for_floor(2));
+        assert_eq!(cast.grunts.len(), g.grunt_spawns.len());
+        assert_eq!(cast.grunt_anims.len(), cast.grunts.len());
+        assert_eq!(cast.grunt_views.len(), cast.grunts.len());
+        for (i, grunt) in cast.grunts.iter().enumerate() {
+            assert_eq!(grunt.position(), g.grunt_spawns[i], "grunt {i} misplaced");
+            assert_eq!(
+                world.get::<Name>(cast.grunt_anims[i].root).unwrap().0,
+                grunt_name(i),
+                "brain {i} is driving another monster's body"
+            );
+            assert!(world.is_alive(grunt.entity()));
+        }
+
+        // The floor's own geometry is what is being collided against now.
+        assert_eq!(g.grid().seed(), floor_seed(3, 2));
+        assert!(g.grid().all_walkable_reachable());
+    }
+
+    /// **Hit points carry down the stairs.** That is the run's pressure — a floor is not
+    /// a checkpoint — and the one thing a descent deliberately does *not* reset.
+    #[test]
+    fn hit_points_carry_across_a_descent_and_a_restart_returns_them() {
+        let mut g = walking_to_the_exit_of(dungeon(3));
+        let mut world = exit_world(&g);
+        frame(&mut g, &mut world, &InputSnapshot::default(), 1);
+
+        let max = g.warrior.health().max;
+        g.warrior.take_damage([IncomingHit {
+            amount: 37.0,
+            direction: Vec2::Y,
+            stagger: 0.0,
+        }]);
+        let hurt = g.warrior.health().current;
+        assert_eq!(hurt, max - 37.0);
+
+        take_the_stairs(&mut g, &mut world);
+        assert_eq!(g.floor, 2);
+        assert_eq!(
+            g.warrior.health().current,
+            hurt,
+            "the descent healed the warrior"
+        );
+        assert_eq!(g.warrior.health().max, max);
+
+        // A restart is the other half of the rule: a new run gets a whole warrior.
+        g.warrior.kill();
+        assert!(g.warrior.is_dead());
+        restart(&mut g, &mut world);
+        assert_eq!(g.warrior.health().current, max, "restart kept the wounds");
+        assert!(!g.warrior.is_dead());
+    }
+
+    /// Press R, then run the transition it asks for. Returns the requested level.
+    fn restart(g: &mut DungeonGame, world: &mut World) -> String {
+        let r = InputSnapshot::default().with_key(R, true);
+        g.simulate(world, &r, FIXED_DT);
+        let level = g.next_level().expect("R asks for the first floor");
+        *world = test_world(g);
+        g.simulate(world, &InputSnapshot::default(), FIXED_DT);
+        level
+    }
+
+    /// **Death, then R**: the same run, from the top — floor 1, its own seed, a whole
+    /// warrior — and R does nothing at all while the warrior is alive.
+    #[test]
+    fn a_dead_run_restarts_on_the_first_floor_of_the_same_seed() {
+        let mut g = walking_to_the_exit_of(dungeon(3));
+        let mut world = exit_world(&g);
+        take_the_stairs(&mut g, &mut world);
+        assert_eq!(g.floor, 2);
+
+        // Alive, R is not a panic button: it must not throw the floor away mid-run.
+        let r = InputSnapshot::default().with_key(R, true);
+        g.simulate(&mut world, &r, FIXED_DT);
+        assert!(!g.restart_requested());
+        assert!(g.next_level().is_none(), "R restarted a living run");
+        assert_eq!(g.floor, 2);
+
+        // Dead, it is the only way out.
+        g.warrior.kill();
+        g.simulate(&mut world, &InputSnapshot::default(), FIXED_DT);
+        let level = restart(&mut g, &mut world);
+
+        assert_eq!(g.run_seed, 3, "a restart re-rolled the run");
+        assert_eq!(g.floor, FIRST_FLOOR);
+        assert_eq!(g.grid().seed(), 3, "floor 1 is the run seed");
+        assert_eq!(level, crate::level::dungeon_level_selector(3));
+        assert_eq!(g.warrior.health().current, g.warrior.health().max);
+        assert!(!g.exit_reached);
+        assert!(matches!(g.progression, Progression::Playing));
+        assert_eq!(g.player_tile(), g.grid().entry());
+        assert!(g.cast.is_some(), "the cast came back with the first floor");
+    }
+
+    /// The harness level (`--generated-room`) is a fixture, not a run: dying in it may
+    /// not generate a dungeon nobody asked for.
+    #[test]
+    fn the_injection_harness_has_no_floors_to_progress_through() {
+        let mut g = DungeonGame::new(crate::level::room_collision_grid(), Population::Fixed(0))
+            .unwrap()
+            .without_floors();
+        g.writer = |_, _| panic!("the harness must never build a floor");
+        let mut world = test_world(&g);
+        frame(&mut g, &mut world, &InputSnapshot::default(), 1);
+
+        g.warrior.kill();
+        for _ in 0..4 {
+            g.simulate(
+                &mut world,
+                &InputSnapshot::default().with_key(R, true),
+                FIXED_DT,
+            );
+            g.simulate(&mut world, &InputSnapshot::default(), FIXED_DT);
+        }
+        assert!(g.next_level().is_none(), "the harness asked for a level");
+        assert!(matches!(g.progression, Progression::Playing));
+
+        // Its room has no exit to walk onto either: an ASCII fixture with no `X` leaves
+        // the exit on the default (0, 0), which in every one of them is the solid corner
+        // of the wall ring — so the descent cannot start even before the flag is
+        // consulted, in this harness or in the hand-built test arenas.
+        assert!(g.grid().is_solid(0, 0));
+        assert_eq!(g.grid().exit(), (0, 0));
+        assert_ne!(g.grid().exit(), g.grid().entry());
+    }
+
+    /// A level swap the game did **not** ask for — the engine's hot-swap dropdown — is
+    /// not a continuation of the run: the warrior is rebuilt rather than carried.
+    ///
+    /// The cast is cleared by hand here for the reason `install` clears it: a rebuilt
+    /// `World` restarts its generation counters, so a stale `Entity` can pass `is_alive`
+    /// against a recycled slot in the new one. What is under test is the branch, not the
+    /// detection.
+    #[test]
+    fn an_unrequested_level_swap_starts_a_fresh_warrior() {
+        let mut g = walking_to_the_exit_of(dungeon(3));
+        let mut world = test_world(&g);
+        frame(&mut g, &mut world, &InputSnapshot::default(), 1);
+        g.warrior.take_damage([IncomingHit {
+            amount: 25.0,
+            direction: Vec2::Y,
+            stagger: 0.0,
+        }]);
+        assert!(g.warrior.health().current < g.warrior.health().max);
+
+        g.cast = None;
+        world = test_world(&g);
+        g.simulate(&mut world, &InputSnapshot::default(), FIXED_DT);
+        assert_eq!(
+            g.warrior.health().current,
+            g.warrior.health().max,
+            "an unrequested level carried the run's wounds into it"
+        );
+        assert_eq!(g.floor, FIRST_FLOOR, "and it is not a floor of this run");
     }
 
     // -- the fight ---------------------------------------------------------------------
@@ -1678,7 +2535,7 @@ mod tests {
             "#........#",
             "##########",
         ]);
-        let mut g = DungeonGame::new(grid, 0).unwrap();
+        let mut g = game(grid);
         let spawn = collision::player_spawn_local(g.grid());
         // 1.5 m ahead along +Z (the rigs' forward, and the warrior's rest facing): inside
         // the opener's 1.9 m reach and inside the grunt's 1.6 m commit range.
@@ -1889,7 +2746,7 @@ mod tests {
     /// floor would otherwise hide until a twelve-monster one.
     #[test]
     fn a_full_floor_simulates_inside_the_step_budget() {
-        let mut g = DungeonGame::new(dungeon(3), DEFAULT_GRUNTS).unwrap();
+        let mut g = DungeonGame::new(dungeon(3), Population::Fixed(DEFAULT_GRUNTS)).unwrap();
         assert_eq!(
             g.grunt_spawns().len(),
             DEFAULT_GRUNTS,
@@ -2008,6 +2865,173 @@ mod capture_scout {
         }
     }
 
+    /// A seed whose **stairs are walkable blind** — the recipe an M3 capture needs.
+    ///
+    /// A descent capture has to reach the exit with `DUNGEON_HOLD`, which is a held
+    /// direction and not a route, so the useful seeds are the ones where some held
+    /// combination happens to arrive. This sweeps seeds × combinations against the real
+    /// simulation and prints the ones that get there alive, with the step the exit
+    /// latches and the step the next floor is asked for — which is exactly what
+    /// `WARMUP_FRAMES` then needs (the capture path runs one sim step per frame).
+    ///
+    /// ```text
+    /// STAIRS=0-64 cargo test -p dungeon stairs -- --nocapture
+    /// ```
+    #[test]
+    fn stairs() {
+        let Ok(spec) = std::env::var("STAIRS") else {
+            return;
+        };
+        let (lo, hi) = spec
+            .split_once('-')
+            .unwrap_or((spec.as_str(), spec.as_str()));
+        let (lo, hi): (u64, u64) = (lo.parse().unwrap(), hi.parse().unwrap());
+        const SHIFT: u16 = 0x10;
+        let combos: [(&str, &[u16]); 8] = [
+            ("W", &[0x57]),
+            ("S", &[0x53]),
+            ("A", &[0x41]),
+            ("D", &[0x44]),
+            ("W,A", &[0x57, 0x41]),
+            ("W,D", &[0x57, 0x44]),
+            ("S,A", &[0x53, 0x41]),
+            ("S,D", &[0x53, 0x44]),
+        ];
+        for seed in lo..=hi {
+            for (name, keys) in combos {
+                let mut g =
+                    DungeonGame::new(floor_grid(seed, FIRST_FLOOR), Population::PerFloor).unwrap();
+                g.writer = super::tests::stub_writer;
+                let mut world = super::tests::test_world(&g);
+                let mut snap = InputSnapshot::default();
+                for vk in keys.iter().chain(&[SHIFT]) {
+                    snap.set_key(*vk, true);
+                }
+                let mut latched = None;
+                for step in 0..1200u32 {
+                    g.simulate(&mut world, &snap, 1.0 / 60.0);
+                    if latched.is_none() && g.exit_reached {
+                        latched = Some(step);
+                    }
+                    if let Some(level) = g.next_level() {
+                        println!(
+                            "seed {seed} hold {name},Shift: exit at step {}, floor 2 requested \
+                             at step {step} ('{level}'), {:.0} hp left",
+                            latched.unwrap_or(step),
+                            g.warrior.health().current,
+                        );
+                        break;
+                    }
+                    if g.warrior.is_dead() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same recipe for a seed whose stairs are *not* reachable blind — which is most
+    /// of them, dungeons being corridors.
+    ///
+    /// Walks the grid's own BFS route from the entry to the exit, steering with the four
+    /// movement keys, and prints the [`HOLD_ENV`] spec that reproduces the walk: a
+    /// windowed hold per leg. The route is the map's, the steering is the game's, and the
+    /// output is a string a headless capture takes verbatim.
+    ///
+    /// ```text
+    /// STAIRS_ROUTE=20260731 cargo test -p dungeon stairs_route -- --nocapture
+    /// ```
+    #[test]
+    fn stairs_route() {
+        let Ok(spec) = std::env::var("STAIRS_ROUTE") else {
+            return;
+        };
+        let seed: u64 = spec.trim().parse().expect("STAIRS_ROUTE=<seed>");
+        let mut g = DungeonGame::new(floor_grid(seed, FIRST_FLOOR), Population::PerFloor).unwrap();
+        g.writer = super::tests::stub_writer;
+        let mut world = super::tests::test_world(&g);
+
+        // The route: downhill on the exit's own BFS field, from the spawn tile.
+        let grid = g.grid().clone();
+        let field = grid.bfs_distances(grid.exit());
+        let at = |(x, z): (i32, i32)| field[(z * grid.width() + x) as usize];
+        let mut tile = collision::tile_of(collision::player_spawn_local(&grid));
+        let mut route: Vec<Vec2> = Vec::new();
+        while at(tile) > 0 && route.len() < 4096 {
+            let next = grid
+                .neighbors4(tile.0, tile.1)
+                .filter(|&(x, z)| grid.is_walkable(x, z))
+                .min_by_key(|&t| at(t))
+                .expect("a walkable neighbour on a connected floor");
+            tile = next;
+            route.push(collision::to_collision(
+                &grid,
+                grid.tile_center(tile.0, tile.1),
+            ));
+        }
+
+        const W: u16 = 0x57;
+        const S: u16 = 0x53;
+        const A: u16 = 0x41;
+        const D: u16 = 0x44;
+        let mut leg = 0usize;
+        // (key name, first step, last step) as the walk produces them.
+        let mut held: Vec<(&'static str, u32, u32)> = Vec::new();
+        let push =
+            |name: &'static str, step: u32, held: &mut Vec<(&'static str, u32, u32)>| match held
+                .last_mut()
+            {
+                Some(last) if last.0 == name && last.2 + 1 == step => last.2 = step,
+                _ => held.push((name, step, step)),
+            };
+        for step in 0..2400u32 {
+            while leg < route.len() && route[leg].distance(g.pos) < 0.6 {
+                leg += 1;
+            }
+            let mut snap = InputSnapshot::default();
+            if let Some(&target) = route.get(leg) {
+                let d = target - g.pos;
+                // Collision space is world XZ, and W walks toward -y (see
+                // `warrior_input`), so the mapping is the input layer's own, backwards.
+                if d.x > 0.4 {
+                    snap.set_key(D, true);
+                    push("D", step, &mut held);
+                } else if d.x < -0.4 {
+                    snap.set_key(A, true);
+                    push("A", step, &mut held);
+                }
+                if d.y < -0.4 {
+                    snap.set_key(W, true);
+                    push("W", step, &mut held);
+                } else if d.y > 0.4 {
+                    snap.set_key(S, true);
+                    push("S", step, &mut held);
+                }
+            }
+            g.simulate(&mut world, &snap, 1.0 / 60.0);
+            if let Some(level) = g.next_level() {
+                let spec: Vec<String> = held
+                    .iter()
+                    .map(|(k, a, b)| format!("{k}@{a}-{b}"))
+                    .collect();
+                println!("seed {seed}: floor 2 ('{level}') requested at step {step}");
+                println!("DUNGEON_HOLD={}", spec.join(","));
+                println!(
+                    "exit latched around step {}, {:.0} hp left, {} legs",
+                    step.saturating_sub((DESCEND_GRACE / (1.0 / 60.0)) as u32),
+                    g.warrior.health().current,
+                    route.len(),
+                );
+                return;
+            }
+            if g.warrior.is_dead() {
+                println!("seed {seed}: died at step {step} on the way to the stairs");
+                return;
+            }
+        }
+        println!("seed {seed}: never reached the stairs");
+    }
+
     #[test]
     fn choreograph() {
         let Ok(spec) = std::env::var("CHOREO") else {
@@ -2022,7 +3046,11 @@ mod capture_scout {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_GRUNTS);
-        let mut g = DungeonGame::new(generate(seed, &DungeonParams::default()), grunts).unwrap();
+        let mut g = DungeonGame::new(
+            generate(seed, &DungeonParams::default()),
+            Population::Fixed(grunts),
+        )
+        .unwrap();
         let mut world = super::tests::test_world(&g);
         let until: u32 = std::env::var("HOLD_UNTIL")
             .ok()
