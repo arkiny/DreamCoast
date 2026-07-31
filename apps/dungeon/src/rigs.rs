@@ -55,12 +55,13 @@
 //!
 //! # Props
 //!
-//! [`potion`] is the odd one out: a **prop**, not a character — three boxes, no joints
-//! that ever rotate and no clips at all. It lives here anyway because it is the same
-//! authoring road (box meshes → [`save_glb_scene`] → the engine's importer), and giving
-//! a two-material static flask its own module would duplicate [`BoxMesh`], the winding
-//! convention and the write-if-different plumbing for 36 triangles. What *uses* it —
-//! placement, pickup, the inventory — is [`crate::items`].
+//! [`potion`] and [`torch`] are the odd ones out: **props**, not characters — a handful of
+//! boxes each, no joints that ever rotate and no clips at all. They live here anyway
+//! because it is the same authoring road (box meshes → [`save_glb_scene`] → the engine's
+//! importer), and giving a two-material static flask its own module would duplicate
+//! [`BoxMesh`], the winding convention and the write-if-different plumbing for 36
+//! triangles. What *uses* them is elsewhere: the flask's placement, pickup and inventory
+//! are [`crate::items`]; the torch's placement and its point light are [`crate::level`].
 
 // Authoring surface: a few exported clip markers and helpers are read by the tests and
 // by future tuning rather than by the game loop, so this module keeps the allowance the
@@ -107,6 +108,8 @@ pub const WARRIOR_RIG: &str = "warrior";
 pub const GRUNT_RIG: &str = "grunt";
 /// See [`WARRIOR_RIG`]. The health-potion prop ([`potion`]), placed by [`crate::items`].
 pub const POTION_PROP: &str = "potion";
+/// See [`WARRIOR_RIG`]. The wall-torch prop ([`torch`]), placed by [`crate::level`].
+pub const TORCH_PROP: &str = "torch";
 
 /// Warrior clip names, in authoring order.
 pub const WARRIOR_CLIPS: [&str; 8] = [
@@ -2164,6 +2167,142 @@ pub fn potion() -> Rig {
     }
 }
 
+// --- The wall torch (a prop, and the anchor of a point light) -------------------------
+
+/// Height of the flame's **centre** above the floor, metres.
+///
+/// Exported because it is two things at once and they must not drift: the middle of the
+/// flame box authored below, and the height [`crate::level`] hangs this torch's point
+/// light at. A light 20 cm above the fire it is supposed to be is a light whose shadows
+/// point the wrong way, and nothing but a shared constant prevents it.
+///
+/// 1.6 m is eye level on the 1.66 m warrior ([`WARRIOR_HEIGHT`]) and well under the 4 m
+/// wall top, so the torch lights the *floor* and the lower wall — the band a top-down
+/// camera can see — instead of washing out the wall caps.
+pub const TORCH_FLAME_Y: f32 = 1.62;
+
+/// How far the flame's centre stands out from the prop's origin along its facing axis,
+/// metres.
+///
+/// The prop is authored with its back plate on the wall and its origin *at* the wall
+/// (see [`torch`]), so this is the whole reach of the bracket. [`crate::level`] offsets
+/// the point light by exactly this, which is what puts the light in the fire rather than
+/// inside the masonry behind it — a point light buried in a wall lights nothing but the
+/// wall's own back faces.
+pub const TORCH_FLAME_REACH: f32 = 0.13;
+
+/// Half-width of the widest part of the torch, metres — its footprint against the wall.
+///
+/// Read by [`crate::level`]'s placement so the prop's own geometry decides how far off
+/// the wall it has to stand, rather than a number copied into the placer.
+pub const TORCH_HALF_WIDTH: f32 = 0.085;
+
+/// Torch material slots, in write order.
+const MAT_TORCH_IRON: usize = 0;
+const MAT_TORCH_FLAME: usize = 1;
+
+/// The torch's two surfaces: a dark iron bracket and a bright warm flame.
+///
+/// **There is no emissive channel to use.** The generated-asset writer's material
+/// ([`GlbMaterial`]) carries `base_color_factor`, `metallic`, `roughness` and
+/// `double_sided` and nothing else — the importer's own `MeshMaterial` does have an
+/// `emissive_factor`, but `write_glb`/`save_glb_scene` never authors one, so a generated
+/// `.glb` cannot ship emission without a change in `crates/asset` (out of this wave's
+/// scope). The substitute is a **bright warm dielectric at full roughness**: it has no
+/// specular lobe to break up, so it reads as a flat luminous patch, and the torch's own
+/// point light stands just outside it ([`TORCH_FLAME_REACH`]), which lights the box's
+/// faces at a grazing angle and makes it the brightest thing in the room by ordinary
+/// shading. What it will *not* do is glow when the light is off (`NO_POINT_LIGHTS=1`) or
+/// when a floor's torches fall past the renderer's point-light budget — then it is simply
+/// a pale box, which is the honest failure.
+fn torch_materials() -> Vec<GlbMaterial> {
+    vec![
+        GlbMaterial {
+            name: "torch_iron".into(),
+            base_color_factor: [0.09, 0.08, 0.075, 1.0],
+            metallic: 0.7,
+            roughness: 0.55,
+            double_sided: false,
+        },
+        GlbMaterial {
+            name: "torch_flame".into(),
+            base_color_factor: [1.0, 0.78, 0.42, 1.0],
+            metallic: 0.0,
+            roughness: 1.0,
+            double_sided: false,
+        },
+    ]
+}
+
+/// A wall torch: a back plate, a short arm and a flame, standing on y = 0.
+///
+/// **Authored against the wall, facing +Z.** The origin sits on the floor *at the wall
+/// face*, the plate hugs it (−Z), and the arm and flame reach out into the room along +Z
+/// — the same "forward is +Z" convention the two characters use, so one yaw about Y aims
+/// a torch at any of the four wall faces ([`crate::level::torch_points`] computes it).
+///
+/// Three boxes in two meshes (the plate and the arm share the iron material, so they
+/// share a mesh and the draw) on three nodes: a transform-only root for the level's
+/// placement wrapper, plus one node per material. 36 triangles. As with [`potion`] there
+/// are no clips — a flicker would have to be a light animation, not a mesh one, and the
+/// level format has no channel for it yet.
+pub fn torch() -> Rig {
+    // Plate against the wall, arm out of it, flame at the arm's end — each span starts
+    // where the last one ended along +Z, so the reach is the geometry's and not an
+    // arithmetic coincidence.
+    const PLATE_HALF_X: f32 = 0.07;
+    const PLATE_BOTTOM: f32 = 1.30;
+    const PLATE_TOP: f32 = 1.74;
+    const PLATE_DEPTH: f32 = 0.06;
+    const ARM_HALF: f32 = 0.035;
+    const FLAME_HALF: f32 = TORCH_HALF_WIDTH;
+    const FLAME_HALF_HEIGHT: f32 = 0.10;
+    // The flame box is centred on the exported height and the exported reach, which is
+    // what makes those two constants describe this geometry rather than approximate it.
+    const FLAME_BACK: f32 = TORCH_FLAME_REACH - FLAME_HALF;
+    const FLAME_FRONT: f32 = TORCH_FLAME_REACH + FLAME_HALF;
+
+    let mut b = RigBuilder::new();
+    let root = b.joint("torch_root", None, [0.0, 0.0, 0.0]);
+    b.bone(
+        "torch_bracket",
+        root,
+        [0.0, 0.0, 0.0],
+        MAT_TORCH_IRON,
+        &[
+            // Back plate: flush with the wall, tall enough to read as a fixture rather
+            // than as a floating flame when the light is off.
+            (
+                [-PLATE_HALF_X, PLATE_BOTTOM, -PLATE_DEPTH],
+                [PLATE_HALF_X, PLATE_TOP, 0.0],
+            ),
+            // Arm: from the plate to the back of the flame.
+            (
+                [-ARM_HALF, TORCH_FLAME_Y - ARM_HALF, 0.0],
+                [ARM_HALF, TORCH_FLAME_Y + ARM_HALF, FLAME_BACK],
+            ),
+        ],
+    );
+    b.bone(
+        "torch_flame",
+        root,
+        [0.0, TORCH_FLAME_Y, 0.0],
+        MAT_TORCH_FLAME,
+        &[(
+            [-FLAME_HALF, -FLAME_HALF_HEIGHT, FLAME_BACK],
+            [FLAME_HALF, FLAME_HALF_HEIGHT, FLAME_FRONT],
+        )],
+    );
+
+    Rig {
+        name: TORCH_PROP,
+        nodes: b.nodes,
+        meshes: b.meshes,
+        materials: torch_materials(),
+        animations: Vec::new(),
+    }
+}
+
 // --- Files ---------------------------------------------------------------------------
 
 /// Path of a rig's `.glb` inside the generated-asset directory.
@@ -2171,7 +2310,7 @@ pub fn rig_asset_path(name: &str) -> PathBuf {
     Path::new(crate::level::GENERATED_DIR).join(format!("{name}.glb"))
 }
 
-/// Author both characters **and the potion prop** and write them next to the generated
+/// Author both characters **and the two props** and write them next to the generated
 /// levels, rewriting only what changed.
 ///
 /// The same road the dungeon geometry takes (`crate::level`): a real file, cooked and
@@ -2179,13 +2318,13 @@ pub fn rig_asset_path(name: &str) -> PathBuf {
 /// written paths — placing them in a level and driving their clips is the integrator's
 /// job, not this module's.
 ///
-/// The prop rides in this one call rather than a parallel `ensure_props` on purpose: the
+/// The props ride in this one call rather than a parallel `ensure_props` on purpose: the
 /// caller's contract is "author everything the level about to be written references,
 /// before writing it", and a second entry point is a second thing to forget.
 pub fn ensure_rigs() -> anyhow::Result<Vec<PathBuf>> {
     let started = std::time::Instant::now();
     let mut paths = Vec::new();
-    for rig in [warrior(), grunt(), potion()] {
+    for rig in [warrior(), grunt(), potion(), torch()] {
         let path = rig_asset_path(rig.name);
         let wrote = save_glb_scene(
             &path,
@@ -2263,10 +2402,11 @@ mod tests {
         for (rig, clips) in [
             (warrior(), WARRIOR_CLIPS.as_slice()),
             (grunt(), GRUNT_CLIPS.as_slice()),
-            // The prop takes the same road with an empty clip list: a glTF with no
+            // The props take the same road with an empty clip list: a glTF with no
             // animation block still has to survive the importer, because that is exactly
             // what the level loader will hand it.
             (potion(), [].as_slice()),
+            (torch(), [].as_slice()),
         ] {
             let scene = round_trip(&rig, &dir);
             let what = rig.name;
@@ -2580,27 +2720,32 @@ mod tests {
         }
     }
 
-    /// The potion prop stands on the floor at the size it advertises, is wound the same
-    /// way as everything else, and carries no clips.
+    /// A prop's shape, checked the way a prop can be: two materials on their own nodes
+    /// hanging off one placement root, no clips, consistent winding. Returns the rig's
+    /// world-space bounds so each prop's own dimensions can be asserted by its own test.
     ///
-    /// Same three properties the characters are held to, asserted separately because a
-    /// prop has no hips and no gait to hang them off.
-    #[test]
-    fn the_potion_prop_is_grounded_outward_facing_and_static() {
-        let rig = potion();
-        assert!(rig.animations.is_empty(), "a prop authors no clips");
-        assert_eq!(rig.meshes.len(), 2, "one mesh per material");
-        assert_eq!(rig.materials.len(), 2);
+    /// Shared rather than duplicated because these are the properties the *writer and the
+    /// importer* care about — a prop that fails any of them is broken in the same way
+    /// whatever it depicts.
+    fn assert_prop_and_measure(rig: &Rig) -> (Vec3, Vec3) {
+        let what = rig.name;
+        assert!(rig.animations.is_empty(), "{what}: a prop authors no clips");
+        assert_eq!(rig.meshes.len(), 2, "{what}: one mesh per material");
+        assert_eq!(rig.materials.len(), 2, "{what}");
 
         let names: BTreeSet<&str> = rig.nodes.iter().map(|n| n.name.as_str()).collect();
-        assert_eq!(names.len(), rig.nodes.len(), "node names are unique");
+        assert_eq!(
+            names.len(),
+            rig.nodes.len(),
+            "{what}: node names are unique"
+        );
         assert!(
             rig.nodes[0].parent.is_none(),
-            "node 0 is the placement root"
+            "{what}: node 0 is the placement root"
         );
         assert!(
             rig.nodes[1..].iter().all(|n| n.parent == Some(0)),
-            "every part hangs off the root"
+            "{what}: every part hangs off the root"
         );
 
         let mut min = Vec3::splat(f32::MAX);
@@ -2625,15 +2770,26 @@ mod tests {
                     .map(|&i| Vec3::from(rig.meshes[mesh].vertices[i as usize].pos))
                     .collect();
                 let geometric = (p[1] - p[0]).cross(p[2] - p[0]);
-                assert!(geometric.length() > 1e-9, "degenerate triangle");
+                assert!(geometric.length() > 1e-9, "{what}: degenerate triangle");
                 let authored = Vec3::from(rig.meshes[mesh].vertices[tri[0] as usize].normal);
                 assert!(
                     geometric.normalize().dot(authored) > 0.99,
-                    "potion/{}: face winding disagrees with its normal",
+                    "{what}/{}: face winding disagrees with its normal",
                     rig.meshes[mesh].name
                 );
             }
         }
+        (min, max)
+    }
+
+    /// The potion prop stands on the floor at the size it advertises, is wound the same
+    /// way as everything else, and carries no clips.
+    ///
+    /// Same three properties the characters are held to, asserted separately because a
+    /// prop has no hips and no gait to hang them off.
+    #[test]
+    fn the_potion_prop_is_grounded_outward_facing_and_static() {
+        let (min, max) = assert_prop_and_measure(&potion());
         assert_eq!(min.y, 0.0, "the flask stands on y = 0");
         assert!(
             (max.y - POTION_HEIGHT).abs() < 1e-6,
@@ -2646,6 +2802,72 @@ mod tests {
             "the advertised half-width is the real one"
         );
         assert_eq!(min.x.min(min.z), -POTION_HALF_WIDTH);
+    }
+
+    /// The torch hangs **behind its own origin and reaches in front of it**, which is the
+    /// whole of its placement contract: `crate::level` puts the origin on the wall face
+    /// and yaws the prop so +Z is the room, so anything at −Z is inside the masonry (fine,
+    /// it is a plate) and anything at +Z is the part that has to clear the wall.
+    ///
+    /// The two exported constants are asserted against the geometry they describe, because
+    /// they are what the point light is positioned from: a flame that drifted off
+    /// `TORCH_FLAME_Y` would take its light with it.
+    #[test]
+    fn the_torch_prop_is_wall_mounted_and_its_flame_matches_the_exported_light_anchor() {
+        let rig = torch();
+        let (min, max) = assert_prop_and_measure(&rig);
+        assert!(
+            rig.triangles() <= 48,
+            "{} triangles is more than a wall bracket needs",
+            rig.triangles()
+        );
+
+        // Nothing is on the floor: the whole prop hangs at torch height.
+        assert!(min.y > 1.0, "the torch hangs, it does not stand ({min})");
+        assert!(max.y < 2.0, "and it stays under the wall cap ({max})");
+        // Behind the origin is the mounting plate; in front is the arm and the flame.
+        assert!(min.z < 0.0 && max.z > 0.0, "{min} .. {max}");
+        assert!(
+            max.z > TORCH_FLAME_REACH,
+            "the flame does not reach its advertised {TORCH_FLAME_REACH} m"
+        );
+        assert!(
+            max.x.max(-min.x) <= TORCH_HALF_WIDTH + 1e-6,
+            "wider than the advertised {TORCH_HALF_WIDTH} m half-width ({min} .. {max})"
+        );
+
+        // The flame's own box is centred on the exported anchor, in both axes the light
+        // is placed from.
+        let flame_node = rig
+            .nodes
+            .iter()
+            .position(|n| n.name == "torch_flame")
+            .expect("the flame is its own node");
+        let mesh = &rig.meshes[rig.nodes[flame_node]
+            .mesh
+            .expect("the flame carries geometry")];
+        let base = Vec3::from(rig.nodes[flame_node].translation);
+        let (mut fmin, mut fmax) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for v in &mesh.vertices {
+            let p = base + Vec3::from(v.pos);
+            fmin = fmin.min(p);
+            fmax = fmax.max(p);
+        }
+        let centre = (fmin + fmax) * 0.5;
+        assert!(
+            (centre.y - TORCH_FLAME_Y).abs() < 1e-6,
+            "the flame's centre is at {} m, not the exported {TORCH_FLAME_Y}",
+            centre.y
+        );
+        assert!(
+            (centre.z - TORCH_FLAME_REACH).abs() < 1e-6,
+            "the flame reaches {} m, not the exported {TORCH_FLAME_REACH}",
+            centre.z
+        );
+        // A flame that is not the brightest surface on the prop is not a flame.
+        let flame = &rig.materials[MAT_TORCH_FLAME].base_color_factor;
+        let iron = &rig.materials[MAT_TORCH_IRON].base_color_factor;
+        assert!(flame[0] > iron[0] * 5.0 && flame[0] >= flame[1] && flame[1] > flame[2]);
     }
 
     /// The whole M2 road in one test: written glTF → imported scene → ECS sub-tree →
@@ -2712,6 +2934,7 @@ mod tests {
             (warrior(), warrior()),
             (grunt(), grunt()),
             (potion(), potion()),
+            (torch(), torch()),
         ] {
             let bytes = |r: &Rig| {
                 dreamcoast_asset::glb::write_glb_scene(

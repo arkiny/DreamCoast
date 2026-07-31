@@ -67,11 +67,12 @@ use std::path::{Path, PathBuf};
 
 use dreamcoast_asset::level::{Camera, Entity, Environment, Light, LightKind};
 use dreamcoast_asset::{GlbMaterial, GlbMesh, LevelData, MeshVertex};
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
 
 use crate::collision::{CHARACTER_Y, player_spawn, to_world};
+use crate::items;
 use crate::meshing::{ChunkMesh, MeshParams, mesh_chunks, mesh_stats};
-use crate::procgen::TileGrid;
+use crate::procgen::{ROOM_NONE, Rng, TILE_SIZE, TileGrid};
 use crate::rigs;
 
 /// Where this game's generated levels + assets are written, relative to the working
@@ -108,6 +109,16 @@ const SUN_INTENSITY: f32 = 3.5;
 /// Height of the torch above the floor, metres — eye level, well under the 4 m ceiling
 /// line so it lights the walls around the spawn rather than the wall tops.
 const TORCH_HEIGHT: f32 = 2.4;
+
+/// A torch's influence radius, metres — the distance at which its light reaches zero
+/// (`Light::range`). Roughly a room-and-a-bit at this intensity, which is the look a torch
+/// wants: a pool of warm light with dark between the pools.
+///
+/// A finite range is what lets the renderer's clustered light culling drop this torch from
+/// the froxels it cannot reach — a torch left at the `0.0` default means "no cutoff", which
+/// is still correct but has to be shaded for every pixel on screen. With a floor carrying
+/// 10-30 torches, that difference is the whole cost of the feature.
+const TORCH_RANGE: f32 = 10.0;
 
 /// A column-major translation + uniform-scale transform, the form `Entity::transform`
 /// takes (`glam::Mat4::to_cols_array` order).
@@ -166,23 +177,316 @@ fn character_entities(grid: &TileGrid, grunt_spawns: &[Vec2]) -> Vec<Entity> {
     out
 }
 
-/// This game's sun + one torch, the torch placed at `torch` (the spawn, so the room the
-/// player opens their eyes in is lit from inside rather than only by the sky).
-fn lights(torch: Vec3) -> Vec<Light> {
+/// The sun every level here shares.
+fn sun() -> Light {
+    Light {
+        kind: LightKind::Directional,
+        vec: SUN_DIR,
+        color: [1.0, 0.96, 0.90],
+        intensity: SUN_INTENSITY,
+        range: 0.0, // ignored for a directional light
+    }
+}
+
+/// The harness room's sun + one torch at `torch` (its spawn, so the room the player opens
+/// their eyes in is lit from inside rather than only by the sky).
+///
+/// The **dungeon** does not use this — its light comes from the torches its own walls
+/// carry ([`torch_lights`]). The harness keeps a single hand-placed point light because it
+/// is a fixture whose whole job is to be minimal and unchanging: a torch ring on it would
+/// be a second thing to explain when a bake looks wrong (see the module docs).
+fn room_lights(torch: Vec3) -> Vec<Light> {
     vec![
-        Light {
-            kind: LightKind::Directional,
-            vec: SUN_DIR,
-            color: [1.0, 0.96, 0.90],
-            intensity: SUN_INTENSITY,
-        },
+        sun(),
         Light {
             kind: LightKind::Point,
             vec: [torch.x, TORCH_HEIGHT, torch.z],
             color: [1.0, 0.62, 0.28],
             intensity: 8.0,
+            // Deliberately *not* [`TORCH_RANGE`]: `0.0` is "no cutoff", which is the
+            // falloff this fixture has always been lit by, and the harness's whole value
+            // is that it does not change under you (see the module docs). A range would
+            // buy culling for one light — nothing — and cost the comparison.
+            range: 0.0,
         },
     ]
+}
+
+// --- Torches ---------------------------------------------------------------------------
+
+/// A wall torch: where it hangs and which way it faces.
+///
+/// A named pair rather than `(Vec2, f32)` because the angle is the half a caller can get
+/// backwards without the compiler noticing — a torch yawed 180° puts its flame inside the
+/// masonry and its light behind the wall. See [`Self::yaw`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Torch {
+    /// Where the bracket meets the wall, **collision space** (the space
+    /// [`crate::collision`] defines and the simulation runs in). A hair off the wall face
+    /// — see [`TORCH_WALL_GAP`].
+    pub pos: Vec2,
+    /// Rotation about +Y that aims the prop, radians.
+    ///
+    /// [`rigs::torch`] is authored facing **+Z with its plate behind it**, the same
+    /// "forward is +Z" convention the characters use, so this is the yaw of the direction
+    /// pointing **away from the wall, into the room** — the direction the flame reaches.
+    /// The wall itself is at `-facing`. Always an exact multiple of π/2: the walls are
+    /// axis-aligned, so there is nothing to round.
+    pub yaw: f32,
+}
+
+impl Torch {
+    /// The unit direction the flame reaches, collision space (`.x` = world X, `.y` =
+    /// world Z) — the +Z of the authored prop, turned by [`Self::yaw`].
+    pub fn facing(&self) -> Vec2 {
+        let (sin, cos) = self.yaw.sin_cos();
+        Vec2::new(sin, cos)
+    }
+
+    /// Where this torch's flame burns, collision space — [`rigs::TORCH_FLAME_REACH`] out
+    /// from the bracket along [`Self::facing`]. The point light hangs here.
+    pub fn flame(&self) -> Vec2 {
+        self.pos + self.facing() * rigs::TORCH_FLAME_REACH
+    }
+}
+
+/// Gap between the wall face and the torch's origin, metres.
+///
+/// Small but not zero. Zero would put the mounting plate's front face exactly on the wall
+/// plane, which is a z-fight; this backs it off by more than any depth precision this
+/// scene has while leaving the bracket reading as bolted on. It is also what keeps the
+/// prop out of the walkable centre: the far side of the flame ends up
+/// `TORCH_WALL_GAP + TORCH_FLAME_REACH + TORCH_HALF_WIDTH` ≈ 0.3 m from the wall, inside
+/// the 0.4 m the player's own body radius already forbids, so a torch never narrows a
+/// corridor. Torches carry **no collision at all** — the grid is the collision world and
+/// a decoration does not get a tile.
+const TORCH_WALL_GAP: f32 = 0.08;
+
+/// Minimum distance between a room's torch and any torch already placed, metres.
+///
+/// Rooms do not overlap, so this is not what makes them one-per-room (the placement loop
+/// does); it is what stops a room torch landing on the doorway a corridor torch already
+/// lights.
+const TORCH_ROOM_SPACING: f32 = 6.0;
+
+/// Minimum distance between corridor torches, metres — about six tiles
+/// ([`TILE_SIZE`] = 2 m), which is roughly one pool of light reaching the next.
+const TORCH_CORRIDOR_SPACING: f32 = 12.0;
+
+/// Ceiling on a floor's torch count.
+///
+/// A budget, not a rule: the generator's biggest floors place well under this (a default
+/// 64x64 dungeon comes out in the twenties), so the cap is only ever reached by a
+/// hand-authored grid of pathological shape. It exists because every torch is a point
+/// light and an unbounded light list is the one way this decoration could become a
+/// performance problem rather than a lighting one.
+const MAX_TORCHES: usize = 64;
+
+/// Warm firelight. Deliberately more saturated than the potion's cap or the sun: the
+/// dungeon's own palette is grey stone under a pale sun, so the torch is the only warm
+/// thing in it and that contrast is what makes a lit room read as *lit* rather than as
+/// brighter.
+const TORCH_COLOR: [f32; 3] = [1.0, 0.60, 0.25];
+
+/// Radiant intensity of one torch, on this level's own arbitrary scale (the same one
+/// [`SUN_INTENSITY`] is authored against). Bright enough to carry a 4 m room from one
+/// wall, dim enough that two of them do not blow the auto-exposure the moment the player
+/// walks between them.
+const TORCH_INTENSITY: f32 = 7.0;
+
+/// The placement seed for a floor's torches, derived from the dungeon's own seed.
+///
+/// Decorrelated from the raw `grid.seed()` the monsters run on and from
+/// [`items::potion_seed`], for the reason that function documents: the placers share
+/// shuffling machinery, and two of them fed the same seed walk the same rooms in the same
+/// order. A different odd word, applied once — still a pure function of the seed, so a
+/// replayed seed relights the same walls.
+pub fn torch_seed(dungeon_seed: u64) -> u64 {
+    dungeon_seed ^ 0xD1B5_4A32_D192_ED03
+}
+
+/// Scene-graph name of the `i`-th torch (`torch_0`, `torch_1`, …).
+///
+/// Positional like [`grunt_name`] and `items::potion_name`. Nothing in gameplay looks a
+/// torch up — it is decoration — but a level whose entities are all named is a level whose
+/// entity list can be read, and the uniqueness the other two rely on is a property of the
+/// whole file.
+pub fn torch_name(index: usize) -> String {
+    format!("torch_{index}")
+}
+
+/// Which wall a torch on tile `(x, z)` hangs on, and where that puts it — or `None` when
+/// the tile touches no wall at all.
+///
+/// The four faces are tried in a fixed order and the first solid one wins:
+///
+/// 1. **−Z first** — the camera looks down the +Z axis (`crate::game::camera_offset`), so
+///    a torch on a room's far wall faces the camera and its flame is the visible side. A
+///    torch on the near (+Z) wall is seen from behind, through its own mounting plate.
+/// 2. then **+X**, **−X** — the side walls, both seen at a useful angle.
+/// 3. **+Z last**, taken only when nothing else is solid.
+///
+/// A fixed order rather than a random one: the choice is a *view* decision, and the seed's
+/// job is to move torches around the floor, not to sometimes hide one.
+fn mount(grid: &TileGrid, x: i32, z: i32) -> Option<Torch> {
+    // (toward the wall, in tiles) in preference order.
+    const FACES: [(i32, i32); 4] = [(0, -1), (1, 0), (-1, 0), (0, 1)];
+    let (dx, dz) = FACES
+        .into_iter()
+        .find(|&(dx, dz)| grid.is_solid(x + dx, z + dz))?;
+    let toward_wall = Vec2::new(dx as f32, dz as f32);
+    let centre = dreamcoast_game::physics::tile_center(x, z, TILE_SIZE);
+    // Facing is away from the wall; the prop's authored +Z, turned by `yaw`, is it.
+    let facing = -toward_wall;
+    Some(Torch {
+        pos: centre + toward_wall * (TILE_SIZE * 0.5 - TORCH_WALL_GAP),
+        yaw: facing.x.atan2(facing.y),
+    })
+}
+
+/// Every wall-adjacent walkable tile of a rectangle, in scan order.
+fn wall_adjacent_tiles(grid: &TileGrid, x0: i32, z0: i32, w: i32, h: i32) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    for z in z0..z0 + h {
+        for x in x0..x0 + w {
+            // Doors are the one-tile gaps between rooms and corridors; a bracket in one
+            // stands in the doorway the player walks through, which is the only place in
+            // this dungeon where 0.3 m of clearance is actually noticeable.
+            if grid.is_walkable(x, z)
+                && grid.get(x, z) != crate::procgen::Tile::Door
+                && mount(grid, x, z).is_some()
+            {
+                out.push((x, z));
+            }
+        }
+    }
+    out
+}
+
+/// Where a floor's torches hang: **one per room, plus one every few tiles of corridor**.
+///
+/// The rules, in the order they are applied:
+///
+/// 1. **On the wall.** Only tiles that touch solid rock are candidates, and the torch is
+///    placed against that rock ([`mount`]) rather than at the tile's centre — a torch in
+///    the middle of the floor is a campfire.
+/// 2. **One per room**, chosen from that room's wall tiles in a shuffled (seeded) order,
+///    so replaying a seed relights the same wall and a different seed moves it. A room
+///    whose only candidate is within [`TORCH_ROOM_SPACING`] of a torch already placed
+///    tries the next candidate rather than doubling up.
+/// 3. **Corridors every [`TORCH_CORRIDOR_SPACING`]**, walked in scan order (not shuffled:
+///    an even spacing along a corridor is exactly what a random pick would spoil), which
+///    leaves short corridors between two lit rooms dark and long ones punctuated.
+/// 4. **Never a doorway**, and never more than [`MAX_TORCHES`].
+///
+/// Deterministic in `(grid, rng_seed)` and nothing else. Returns **collision-space**
+/// placements; [`torch_entities`] and [`torch_lights`] are the two seams that turn them
+/// into world space, and they are the only consumers — a torch is decoration, so nothing
+/// in the simulation ever sees this list.
+pub fn torch_points(grid: &TileGrid, rng_seed: u64) -> Vec<Torch> {
+    let mut out: Vec<Torch> = Vec::new();
+    let mut rng = Rng::new(rng_seed);
+
+    for room in grid.rooms() {
+        if out.len() >= MAX_TORCHES {
+            return out;
+        }
+        let mut tiles = wall_adjacent_tiles(grid, room.x, room.z, room.w, room.h);
+        if tiles.is_empty() {
+            continue;
+        }
+        rng.shuffle(&mut tiles);
+        for (x, z) in tiles {
+            let Some(torch) = mount(grid, x, z) else {
+                continue;
+            };
+            if crowds(torch.pos, &out, TORCH_ROOM_SPACING) {
+                continue;
+            }
+            out.push(torch);
+            break;
+        }
+    }
+
+    for z in 0..grid.height() {
+        for x in 0..grid.width() {
+            if out.len() >= MAX_TORCHES {
+                return out;
+            }
+            // Corridors only — a room's torch was chosen above, from the whole room.
+            if grid.room_id_at(x, z) != ROOM_NONE
+                || !grid.is_walkable(x, z)
+                || grid.get(x, z) == crate::procgen::Tile::Door
+            {
+                continue;
+            }
+            let Some(torch) = mount(grid, x, z) else {
+                continue;
+            };
+            if crowds(torch.pos, &out, TORCH_CORRIDOR_SPACING) {
+                continue;
+            }
+            out.push(torch);
+        }
+    }
+    out
+}
+
+/// Whether `point` is within `spacing` metres of any placed torch.
+fn crowds(point: Vec2, placed: &[Torch], spacing: f32) -> bool {
+    let spacing_sq = spacing * spacing;
+    placed
+        .iter()
+        .any(|t| (t.pos - point).length_squared() < spacing_sq)
+}
+
+/// The floor's torches as `.level` entities — the prop, placed and yawed.
+///
+/// Named [`torch_name`]`(i)` at index `i`, at the prop's authored metre scale, with no
+/// material override (the loader ignores overrides for glTF assets and the prop carries
+/// its own two materials — as for the characters and the flask).
+fn torch_entities(grid: &TileGrid, torches: &[Torch]) -> Vec<Entity> {
+    let asset = rig_asset_key(rigs::TORCH_PROP);
+    torches
+        .iter()
+        .enumerate()
+        .map(|(i, torch)| Entity {
+            asset: asset.clone(),
+            name: Some(torch_name(i)),
+            transform: Mat4::from_rotation_translation(
+                Quat::from_rotation_y(torch.yaw),
+                to_world(grid, torch.pos, 0.0),
+            )
+            .to_cols_array(),
+            material_override: None,
+        })
+        .collect()
+}
+
+/// One point light per torch, in the flame.
+///
+/// **All of them**, however many that is — the data describes the dungeon, and what gets
+/// drawn is the renderer's call. Writing fewer lights than the floor has, or reordering
+/// them so the "important" ones survive a truncation, would be the game lying about its
+/// own scene to fit a limit it does not own.
+///
+/// What the game *does* owe the renderer is a [`TORCH_RANGE`]: a light with no cutoff has
+/// to be binned into every froxel, so an honest radius is the difference between clustered
+/// culling paying for itself and costing what the brute-force loop cost.
+fn torch_lights(grid: &TileGrid, torches: &[Torch]) -> Vec<Light> {
+    torches
+        .iter()
+        .map(|torch| {
+            let at = to_world(grid, torch.flame(), rigs::TORCH_FLAME_Y);
+            Light {
+                kind: LightKind::Point,
+                vec: at.to_array(),
+                color: TORCH_COLOR,
+                intensity: TORCH_INTENSITY,
+                range: TORCH_RANGE,
+            }
+        })
+        .collect()
 }
 
 /// The sky the sun above agrees with (one source for direct light and the IBL/GI ambient).
@@ -303,9 +607,23 @@ pub fn dungeon_meshes(grid: &TileGrid) -> (Vec<GlbMesh>, Vec<GlbMaterial>) {
 }
 
 /// The level that places a generated dungeon: the `.glb` at identity (it is authored in
-/// world space), the warrior on the entry tile, and one grunt per spawn point.
-pub fn dungeon_level_data(grid: &TileGrid, asset: &str, grunt_spawns: &[Vec2]) -> LevelData {
+/// world space), the warrior on the entry tile, one grunt per spawn point, one flask per
+/// potion point, and the floor's torches — props and their point lights together.
+///
+/// `grunt_spawns` and `potions` are both the game's own lists, threaded in rather than
+/// recomputed, for the reason [`ensure_dungeon`] gives: the simulation and the level must
+/// agree by construction, not by two calls to a deterministic function. The **torches**
+/// are the exception and are derived here from the grid, because nothing simulates them —
+/// they are decoration with one producer and two consumers ([`torch_entities`] and
+/// [`torch_lights`]), both of them in this function.
+pub fn dungeon_level_data(
+    grid: &TileGrid,
+    asset: &str,
+    grunt_spawns: &[Vec2],
+    potions: &[Vec2],
+) -> LevelData {
     let spawn = player_spawn(grid);
+    let torches = torch_points(grid, torch_seed(grid.seed()));
     let mut entities = vec![Entity {
         asset: asset.into(),
         name: Some("dungeon".into()),
@@ -313,9 +631,18 @@ pub fn dungeon_level_data(grid: &TileGrid, asset: &str, grunt_spawns: &[Vec2]) -
         material_override: None,
     }];
     entities.extend(character_entities(grid, grunt_spawns));
+    entities.extend(items::potion_level_entities(
+        grid,
+        potions,
+        &items::potion_asset_key(),
+    ));
+    entities.extend(torch_entities(grid, &torches));
+
+    let mut lights = vec![sun()];
+    lights.extend(torch_lights(grid, &torches));
     LevelData {
         entities,
-        lights: lights(spawn),
+        lights,
         camera: rest_camera(spawn),
         environment: environment(),
         deforms: Vec::new(),
@@ -358,14 +685,18 @@ pub fn dungeon_level_selector(seed: u64) -> String {
 /// seed twice and hoping. `grunt_spawns` is threaded the same way — the game's own list,
 /// not a second [`crate::ai::spawn_points`] call.
 ///
-/// **[`rigs::ensure_rigs`] must have run first**: the level references the two character
-/// `.glb`s by path, and the engine's loader resolves them at load time. `crate::main`
+/// **[`rigs::ensure_rigs`] must have run first**: the level references the character and
+/// prop `.glb`s by path, and the engine's loader resolves them at load time. `crate::main`
 /// owns that ordering (the same way it owns "generate before mesh").
 ///
 /// One `.level` per seed, but its *contents* also carry the grunt count, so replaying a
 /// seed with a different `--grunts` rewrites the level (a cheap re-cook of the RON) and
 /// leaves the far larger geometry `.glb` untouched.
-pub fn ensure_dungeon(grid: &TileGrid, grunt_spawns: &[Vec2]) -> anyhow::Result<String> {
+pub fn ensure_dungeon(
+    grid: &TileGrid,
+    grunt_spawns: &[Vec2],
+    potions: &[Vec2],
+) -> anyhow::Result<String> {
     let started = std::time::Instant::now();
     let (meshes, materials) = dungeon_meshes(grid);
     let stats = mesh_stats(&mesh_chunks(grid, &MeshParams::default()));
@@ -395,10 +726,18 @@ pub fn ensure_dungeon(grid: &TileGrid, grunt_spawns: &[Vec2]) -> anyhow::Result<
     // The level references the asset by the same cwd-relative string the engine resolves
     // and keys its cook cache on, so the key stays stable across runs and machines.
     let asset_key = asset.to_string_lossy().replace('\\', "/");
-    write_level_if_changed(
-        &generated_path(&format!("{name}.level")),
-        &dungeon_level_data(grid, &asset_key, grunt_spawns),
-    )?;
+    let level = dungeon_level_data(grid, &asset_key, grunt_spawns, potions);
+    // The torch count is read back off the level rather than re-derived: `torch_points`
+    // ran once, inside the writer, and a second call to report on the first is exactly
+    // the drift this module exists to avoid. Every point light in a dungeon is a torch.
+    tracing::info!(
+        "dungeon: floor population — {} grunts, {} potions, {} torches ({} entities)",
+        grunt_spawns.len(),
+        potions.len(),
+        level.lights.len() - 1,
+        level.entities.len(),
+    );
+    write_level_if_changed(&generated_path(&format!("{name}.level")), &level)?;
     Ok(name)
 }
 
@@ -542,7 +881,7 @@ pub fn room_level_data(asset: &str) -> LevelData {
     entities.extend(character_entities(&grid, &[]));
     LevelData {
         entities,
-        lights: lights(spawn),
+        lights: room_lights(spawn),
         camera: rest_camera(spawn),
         environment: environment(),
         deforms: Vec::new(),
@@ -786,7 +1125,7 @@ mod tests {
     #[test]
     fn dungeon_level_places_the_player_on_the_spawn() {
         let grid = test_grid(3);
-        let level = dungeon_level_data(&grid, "cache/generated/dungeon_3.glb", &[]);
+        let level = dungeon_level_data(&grid, "cache/generated/dungeon_3.glb", &[], &[]);
         assert!(level.entities[0].asset.ends_with(".glb"));
         assert_eq!(level.entities[0].transform, identity());
 
@@ -813,6 +1152,11 @@ mod tests {
     /// This is the seam the whole monster wiring rests on: `ai::spawn_points` chooses,
     /// the writer places, and `game::acquire` re-pairs brain `i` with `grunt_<i>`. A
     /// reordering anywhere in that chain puts a brain in someone else's body.
+    ///
+    /// The **flasks ride the same seam** — `items::potion_spawn_points` chooses,
+    /// `items::potion_level_entities` places `potion_<i>`, and `game::ItemWorld` collects
+    /// potion `i` — so they are spliced in here with the real placer's output, which is
+    /// also what pins the entity *order* the two lists sit in.
     #[test]
     fn spawn_points_round_trip_into_level_entities() {
         use crate::ai::{GRUNT_RADIUS, spawn_points};
@@ -822,10 +1166,23 @@ mod tests {
             let grid = test_grid(seed);
             let spawns = spawn_points(&grid, 6, 12.0, grid.seed());
             assert!(!spawns.is_empty(), "seed {seed}: no room for any monster");
+            let potions = crate::items::potion_spawn_points(
+                &grid,
+                3,
+                crate::items::potion_seed(seed),
+                &spawns,
+                crate::items::MIN_POTION_SPACING,
+            );
+            assert!(!potions.is_empty(), "seed {seed}: no room for any potion");
+            let torches = torch_points(&grid, torch_seed(grid.seed()));
 
-            let level = dungeon_level_data(&grid, "cache/generated/x.glb", &spawns);
-            // [geometry, player, grunt_0 ..]
-            assert_eq!(level.entities.len(), 2 + spawns.len(), "seed {seed}");
+            let level = dungeon_level_data(&grid, "cache/generated/x.glb", &spawns, &potions);
+            // [geometry, player, grunt_0 .., potion_0 .., torch_0 ..]
+            assert_eq!(
+                level.entities.len(),
+                2 + spawns.len() + potions.len() + torches.len(),
+                "seed {seed}"
+            );
 
             let grunt_asset = rig_asset_key(rigs::GRUNT_RIG);
             for (i, &local) in spawns.iter().enumerate() {
@@ -850,6 +1207,24 @@ mod tests {
                 );
             }
 
+            // The flasks come next, in placement order and by the same positional rule.
+            let potion_asset = crate::items::potion_asset_key();
+            for (i, &local) in potions.iter().enumerate() {
+                let entity = &level.entities[2 + spawns.len() + i];
+                assert_eq!(
+                    entity.name.as_deref(),
+                    Some(crate::items::potion_name(i).as_str()),
+                    "seed {seed}"
+                );
+                assert_eq!(entity.asset, potion_asset, "seed {seed}: potion {i} asset");
+                let placed = Mat4::from_cols_array(&entity.transform).w_axis.truncate();
+                assert_eq!(
+                    to_collision(&grid, placed),
+                    local,
+                    "seed {seed}: potion {i}"
+                );
+            }
+
             // The names are unique, so the lookup that pairs them cannot collide.
             let names: BTreeSet<&str> = level
                 .entities
@@ -858,9 +1233,192 @@ mod tests {
                 .collect();
             assert_eq!(names.len(), level.entities.len(), "seed {seed}");
 
+            // One point light per torch, and no other point light in a dungeon: the sun
+            // is the only other entry.
+            assert_eq!(level.lights.len(), 1 + torches.len(), "seed {seed}");
+            assert_eq!(level.lights[0].kind, LightKind::Directional, "seed {seed}");
+            assert!(
+                level.lights[1..].iter().all(|l| l.kind == LightKind::Point),
+                "seed {seed}"
+            );
+
             let parsed: LevelData = ron::from_str(&level.to_ron().unwrap()).unwrap();
             assert_eq!(parsed, level, "seed {seed}: level RON round-trip");
         }
+    }
+
+    /// **Every torch hangs on a real wall, and the same seed hangs it on the same one.**
+    ///
+    /// The placement rules, checked against the generator's own floors rather than a
+    /// fixture: a torch that missed its wall is a flame floating in a corridor, and one
+    /// placed off the seed is a dungeon that relights itself every run.
+    #[test]
+    fn torches_hang_on_walls_deterministically() {
+        use crate::procgen::Tile;
+        for seed in [1u64, 3, 7, 11, 20260731] {
+            let grid = test_grid(seed);
+            let torches = torch_points(&grid, torch_seed(seed));
+            assert!(!torches.is_empty(), "seed {seed}: a floor with no torches");
+            assert!(torches.len() <= MAX_TORCHES, "seed {seed}");
+            assert_eq!(
+                torches,
+                torch_points(&grid, torch_seed(seed)),
+                "seed {seed}: placement is not deterministic"
+            );
+
+            let mut rooms_lit: BTreeSet<u16> = BTreeSet::new();
+            for (i, torch) in torches.iter().enumerate() {
+                let (x, z) = crate::collision::tile_of(torch.pos);
+                assert!(
+                    grid.is_walkable(x, z),
+                    "seed {seed}: torch {i} is inside rock at ({x}, {z})"
+                );
+                assert_ne!(
+                    grid.get(x, z),
+                    Tile::Door,
+                    "seed {seed}: torch {i} in a door"
+                );
+
+                // Axis-aligned facing, and the wall it faces away from is really solid.
+                let facing = torch.facing();
+                assert!(
+                    (facing.length() - 1.0).abs() < 1e-6
+                        && (facing.x.abs() + facing.y.abs() - 1.0).abs() < 1e-6,
+                    "seed {seed}: torch {i} faces {facing}, which is not a wall normal"
+                );
+                let (wx, wz) = (x - facing.x.round() as i32, z - facing.y.round() as i32);
+                assert!(
+                    grid.is_solid(wx, wz),
+                    "seed {seed}: torch {i} hangs on air at ({wx}, {wz})"
+                );
+
+                // The bracket sits against that wall and the flame clears it — both still
+                // inside the torch's own (walkable) tile, so neither is in the masonry.
+                assert_eq!(
+                    crate::collision::tile_of(torch.flame()),
+                    (x, z),
+                    "seed {seed}: torch {i}'s flame left its tile"
+                );
+                let out_of_wall = (torch.pos
+                    - dreamcoast_game::physics::tile_center(x, z, TILE_SIZE))
+                .dot(-facing);
+                assert!(
+                    (out_of_wall - (TILE_SIZE * 0.5 - TORCH_WALL_GAP)).abs() < 1e-5,
+                    "seed {seed}: torch {i} is not on its wall face"
+                );
+
+                if let Some(room) = grid.room_at(x, z) {
+                    assert!(
+                        rooms_lit.insert(room.id),
+                        "seed {seed}: room {} got two torches",
+                        room.id
+                    );
+                }
+            }
+
+            // Nothing crowds anything: the loosest of the two spacing rules holds
+            // everywhere, and the corridor rule holds between corridor torches.
+            for (i, a) in torches.iter().enumerate() {
+                for b in &torches[i + 1..] {
+                    assert!(
+                        a.pos.distance(b.pos) >= TORCH_ROOM_SPACING,
+                        "seed {seed}: two torches {} m apart",
+                        a.pos.distance(b.pos)
+                    );
+                }
+            }
+
+            // Every room the generator made that has a wall to hang one on got one — the
+            // rule the entry room's light now depends on (there is no spawn torch any more).
+            assert_eq!(
+                rooms_lit.len(),
+                grid.rooms().len(),
+                "seed {seed}: a room was left dark"
+            );
+            let entry_room = grid.room_id_at(grid.entry().0, grid.entry().1);
+            assert!(
+                rooms_lit.contains(&entry_room),
+                "seed {seed}: the player wakes up in the dark"
+            );
+        }
+
+        // A different seed relights different walls.
+        let grid = test_grid(3);
+        assert_ne!(
+            torch_points(&grid, torch_seed(3)),
+            torch_points(&grid, torch_seed(4)),
+            "the seed does not move the torches"
+        );
+        // ...and the derivation is decorrelated from the two placers it shares machinery
+        // with, which is the whole reason it exists.
+        assert_ne!(torch_seed(3), 3);
+        assert_ne!(torch_seed(3), crate::items::potion_seed(3));
+    }
+
+    /// **A torch becomes a prop and a light that agree with each other.**
+    ///
+    /// The two consumers of one placement: the entity is yawed so its authored +Z is the
+    /// direction the flame reaches, and the point light sits in that flame — not in the
+    /// wall behind it, which is where an unrotated or back-to-front placement would put it.
+    #[test]
+    fn every_torch_writes_a_prop_and_a_light_that_agree() {
+        let grid = test_grid(7);
+        let torches = torch_points(&grid, torch_seed(grid.seed()));
+        let level = dungeon_level_data(&grid, "x.glb", &[], &[]);
+
+        // [geometry, player, torch_0 ..] — no grunts, no potions in this fixture.
+        let props = &level.entities[2..];
+        assert_eq!(props.len(), torches.len());
+        assert_eq!(level.lights.len(), 1 + torches.len());
+
+        let asset = rig_asset_key(rigs::TORCH_PROP);
+        for (i, torch) in torches.iter().enumerate() {
+            let entity = &props[i];
+            assert_eq!(entity.name.as_deref(), Some(torch_name(i).as_str()));
+            assert_eq!(entity.asset, asset);
+            let m = Mat4::from_cols_array(&entity.transform);
+
+            // Placed on the floor, at the bracket.
+            let placed = m.w_axis.truncate();
+            assert_eq!(placed.y, 0.0, "torch {i} does not stand on the floor plane");
+            assert_eq!(to_collision(&grid, placed), torch.pos, "torch {i}");
+
+            // Yawed so the prop's authored forward is the direction the flame reaches.
+            let forward = m.transform_vector3(Vec3::Z);
+            let facing = torch.facing();
+            assert!(
+                (forward - Vec3::new(facing.x, 0.0, facing.y)).length() < 1e-5,
+                "torch {i} faces {forward}, expected {facing}"
+            );
+
+            // And the light is in the fire: at the flame's height, out of the wall.
+            let light = level.lights[1 + i];
+            assert_eq!(light.kind, LightKind::Point);
+            let at = Vec3::from(light.vec);
+            assert_eq!(at.y, rigs::TORCH_FLAME_Y, "torch {i} light height");
+            // The world round trip is a translation by the grid origin, so the recovered
+            // point is the flame to within the f32 rounding that costs.
+            assert!(
+                to_collision(&grid, at).distance(torch.flame()) < 1e-4,
+                "torch {i} light at {at}, expected the flame at {}",
+                torch.flame()
+            );
+            assert!(
+                !grid.is_solid_at_world(at),
+                "torch {i}'s light is inside the wall it hangs on"
+            );
+            assert_eq!(light.color, TORCH_COLOR);
+            assert_eq!(light.intensity, TORCH_INTENSITY);
+            // A finite range is what the clustered path culls against; `0.0` would mean
+            // "no cutoff" and put every torch in every froxel.
+            assert_eq!(light.range, TORCH_RANGE, "torch {i} has no range");
+            assert!(light.range > 0.0);
+        }
+
+        // The harness level is untouched by all of this: one hand-placed light, no torches.
+        let room = room_level_data("cache/generated/dungeon_room.glb");
+        assert_eq!(room.lights.len(), 2, "the harness grew a torch ring");
+        assert!(room.entities.iter().all(|e| !e.asset.contains("torch")));
     }
 
     /// The monster count is level *content*, so two counts on one seed are two different
@@ -875,8 +1433,12 @@ mod tests {
         assert!(many.len() > few.len());
         assert_eq!(&many[..few.len()], &few[..], "the list only grows");
 
-        let a = dungeon_level_data(&grid, "x.glb", &few).to_ron().unwrap();
-        let b = dungeon_level_data(&grid, "x.glb", &many).to_ron().unwrap();
+        let a = dungeon_level_data(&grid, "x.glb", &few, &[])
+            .to_ron()
+            .unwrap();
+        let b = dungeon_level_data(&grid, "x.glb", &many, &[])
+            .to_ron()
+            .unwrap();
         assert_ne!(a, b);
         // Same seed, same geometry bytes, whatever the population.
         let (meshes, materials) = dungeon_meshes(&grid);

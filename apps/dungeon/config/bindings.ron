@@ -17,5 +17,6 @@
     "Sprint": ["Shift"],
     "Attack": ["Mouse1", "J"],
     "Dodge": ["Space"],
+    "Drink": ["Q"],
     "Restart": ["R"],
 })

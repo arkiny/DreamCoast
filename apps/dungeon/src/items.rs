@@ -400,6 +400,18 @@ impl ItemWorld {
         self.positions.get(id as usize).copied()
     }
 
+    /// Every placed potion's position, in order — the list this world was built from.
+    ///
+    /// Handed back rather than kept by the caller as well, so "where the flasks are" has
+    /// one owner: the integrator threads the same slice into the level writer, which
+    /// places `potion_<i>` at index `i` ([`potion_level_entities`]). A second copy in the
+    /// game and a first copy here is exactly how a flask ends up drawn where it cannot be
+    /// picked up. Positions never change — a taken potion keeps its spot and reports
+    /// itself taken.
+    pub fn positions(&self) -> &[Vec2] {
+        &self.positions
+    }
+
     /// How many are still on the ground.
     pub fn remaining(&self) -> usize {
         self.potions.iter().filter(|p| !p.taken).count()

@@ -95,6 +95,30 @@ impl ChildIndex {
     fn children_of(&self, entity: Entity) -> &[Entity] {
         self.by_parent.get(&entity).map_or(&[], Vec::as_slice)
     }
+
+    /// Every entity in the sub-tree rooted at `root`, `root` included.
+    ///
+    /// The same walk [`subtree_names`] does, without the naming: what a caller wants when
+    /// it has to touch *all* of a level entity's parts rather than find one of them — a
+    /// picked-up potion, whose visual is the two mesh nodes the prop's `.glb` became under
+    /// its placement wrapper ([`crate::game`] strips their `MeshInstance`).
+    ///
+    /// Cycle-safe by the same `seen` list, and in the same (parent-before-child, otherwise
+    /// unspecified) order: the callers here all apply the *same* operation to every entity,
+    /// so order is not observable.
+    pub fn subtree(&self, root: Entity) -> Vec<Entity> {
+        let mut seen = vec![root];
+        let mut queue = vec![root];
+        while let Some(entity) = queue.pop() {
+            for &child in self.children_of(entity) {
+                if !seen.contains(&child) {
+                    seen.push(child);
+                    queue.push(child);
+                }
+            }
+        }
+        seen
+    }
 }
 
 /// One character instance's rig nodes, resolved to the entities the level built.
@@ -389,10 +413,17 @@ pub(crate) mod fixture {
     pub(crate) fn import(rig: &Rig) -> &'static dreamcoast_asset::GltfScene {
         static WARRIOR: OnceLock<dreamcoast_asset::GltfScene> = OnceLock::new();
         static GRUNT: OnceLock<dreamcoast_asset::GltfScene> = OnceLock::new();
-        let slot = if rig.name == crate::rigs::WARRIOR_RIG {
-            &WARRIOR
-        } else {
-            &GRUNT
+        static POTION: OnceLock<dreamcoast_asset::GltfScene> = OnceLock::new();
+        static TORCH: OnceLock<dreamcoast_asset::GltfScene> = OnceLock::new();
+        // One slot per authored asset, matched by name: a shared fallback slot would hand
+        // a caller the *first* rig that ever landed in it, so a potion fixture would come
+        // back as a grunt and the test would pass against the wrong sub-tree.
+        let slot = match rig.name {
+            crate::rigs::WARRIOR_RIG => &WARRIOR,
+            crate::rigs::GRUNT_RIG => &GRUNT,
+            crate::rigs::POTION_PROP => &POTION,
+            crate::rigs::TORCH_PROP => &TORCH,
+            other => unreachable!("no fixture slot for the '{other}' asset"),
         };
         slot.get_or_init(|| round_trip(rig))
     }

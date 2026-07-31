@@ -137,10 +137,12 @@ fn main() -> anyhow::Result<()> {
     // engine's loader tries to cook one).
     rigs::ensure_rigs()?;
 
-    // The game owns the grid *and* the monster spawn list; writing the level *borrows*
-    // both. That ordering is the single-instance guarantee in code form — there is no
-    // second `generate()` or `spawn_points()` call to drift, and no way to mesh one
-    // dungeon and play another.
+    // The game owns the grid *and* the two placement lists (monsters, potions); writing
+    // the level *borrows* all three. That ordering is the single-instance guarantee in
+    // code form — there is no second `generate()`, `spawn_points()` or
+    // `potion_spawn_points()` call to drift, and no way to mesh one dungeon and play
+    // another. (Torches are the exception and are derived inside the writer: nothing
+    // simulates them, so the level is their only consumer — see `level::torch_points`.)
     let (game, level) = if generated_room_requested() {
         // The injection harness is a room, not an encounter: no monsters (see
         // `level::room_level_data`), and no run to descend through or restart.
@@ -163,7 +165,7 @@ fn main() -> anyhow::Result<()> {
         // because it is the only one that has to exist before the engine comes up.
         let grid = game::floor_grid(seed, game::FIRST_FLOOR);
         let game = game::DungeonGame::new(grid, population)?;
-        let level = level::ensure_dungeon(game.grid(), game.grunt_spawns())?;
+        let level = level::ensure_dungeon(game.grid(), game.grunt_spawns(), game.potion_spawns())?;
         (game, level)
     };
 

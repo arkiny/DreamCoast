@@ -83,12 +83,13 @@ use dreamcoast_game::combat::{
 use dreamcoast_game::input::{ActionState, BindingsConfig, InputSnapshot, InputSource};
 use glam::{Quat, Vec2, Vec3};
 use sandbox::imgui;
-use sandbox::scene::{Entity, Events, LocalTransform, Name, World};
+use sandbox::scene::{Entity, Events, LocalTransform, MeshInstance, Name, World};
 use sandbox::{CameraPose, GameHooks};
 
 use crate::ai::{self, GruntBrain, GruntClass, GruntState, PlayerView};
 use crate::characters::{ChildIndex, ClipSample, ClipSet, RigBinding};
 use crate::collision::{self, CHARACTER_Y, PLAYER_RADIUS};
+use crate::items::{self, Inventory, ItemWorld};
 use crate::level::{PLAYER_NAME, grunt_name};
 use crate::pathing::Pathfinder;
 use crate::procgen::{Tile, TileGrid};
@@ -108,6 +109,9 @@ enum Action {
     Sprint,
     Attack,
     Dodge,
+    /// Drink a carried potion. An **edge**, like the other two buttons: holding Q must not
+    /// empty the pocket in three steps.
+    Drink,
     /// Start the run again from the first floor. Only read while the warrior is dead —
     /// see [`DungeonGame::restart_requested`].
     Restart,
@@ -124,6 +128,7 @@ impl Action {
             "Sprint" => Self::Sprint,
             "Attack" => Self::Attack,
             "Dodge" => Self::Dodge,
+            "Drink" => Self::Drink,
             "Restart" => Self::Restart,
             _ => return None,
         })
@@ -269,6 +274,32 @@ pub fn grunts_for_floor(floor: u32) -> usize {
     (DEFAULT_GRUNTS + extra).min(ai::MAX_GRUNTS)
 }
 
+/// Where floor `floor`'s flasks lie, collision space.
+///
+/// The one place a floor's potions come from — `new` builds the first floor's with it and
+/// [`DungeonGame::build_floor`] builds every later one, exactly as [`floor_grid`] is the
+/// one place a floor's grid comes from. Every rule in it belongs to [`crate::items`]; what
+/// is decided *here* is the two arguments that module deliberately refuses to invent:
+///
+/// * the **count** is the floor's ([`items::potions_for_floor`]), so a deeper floor is a
+///   little better supplied;
+/// * the **exclusion list** is this floor's monster spawns, so a flask is never loot the
+///   player cannot take without taking the fight. It is the game's own list, threaded in
+///   rather than recomputed — a second `ai::spawn_points` call is a second source of
+///   truth even when it is deterministic.
+///
+/// The player's own spawn needs no exclusion: `potion_spawn_points` never places in the
+/// entry room at all.
+fn floor_potions(grid: &TileGrid, floor: u32, grunt_spawns: &[Vec2]) -> Vec<Vec2> {
+    items::potion_spawn_points(
+        grid,
+        items::potions_for_floor(floor),
+        items::potion_seed(grid.seed()),
+        grunt_spawns,
+        items::MIN_POTION_SPACING,
+    )
+}
+
 /// How a floor becomes a level the engine can load: mesh the grid, write the `.glb` +
 /// `.level` pair, and return the selector [`GameHooks::next_level`] hands back.
 ///
@@ -277,12 +308,17 @@ pub fn grunts_for_floor(floor: u32) -> usize {
 /// one that writes nothing and returns the path the real one would have. Nothing else
 /// about the transition changes between the two, which is the point: what the tests
 /// drive is the shipping machine with its one side effect stubbed.
-type FloorWriter = fn(&TileGrid, &[Vec2]) -> anyhow::Result<String>;
+///
+/// The two placement lists (monsters, potions) are **arguments** rather than something
+/// the writer derives, because the game is what owns them: brain `i` and `grunt_<i>`, and
+/// [`ItemWorld`] potion `i` and `potion_<i>`, are the same object seen from two sides, and
+/// a writer that re-derived either would be a second source of truth for it.
+type FloorWriter = fn(&TileGrid, &[Vec2], &[Vec2]) -> anyhow::Result<String>;
 
 /// The shipping [`FloorWriter`]: the same road `main` puts floor 1 on (generator → glb +
 /// level → the engine's ordinary level load), taken at runtime for floor `n`.
-fn write_floor(grid: &TileGrid, spawns: &[Vec2]) -> anyhow::Result<String> {
-    crate::level::ensure_dungeon(grid, spawns)?;
+fn write_floor(grid: &TileGrid, spawns: &[Vec2], potions: &[Vec2]) -> anyhow::Result<String> {
+    crate::level::ensure_dungeon(grid, spawns, potions)?;
     Ok(crate::level::dungeon_level_selector(grid.seed()))
 }
 
@@ -291,6 +327,9 @@ struct NextFloor {
     floor: u32,
     grid: TileGrid,
     spawns: Vec<Vec2>,
+    /// Where this floor's flasks lie, collision space — the list the level was written
+    /// from and the one [`ItemWorld`] will be built on.
+    potions: Vec<Vec2>,
     /// What [`GameHooks::next_level`] will return — an explicit path, see
     /// [`crate::level::dungeon_level_selector`].
     level: String,
@@ -571,6 +610,20 @@ pub struct DungeonGame {
     /// One A* workspace for the whole floor (see [`Pathfinder`]).
     finder: Pathfinder,
 
+    // --- The loot ---------------------------------------------------------------------
+    /// This floor's flasks: the same list the level was written from, so potion `i` here
+    /// is `potion_<i>` there. Replaced with the floor ([`Self::install`]) — a collected
+    /// flask does not follow the player down the stairs, the *potion* does.
+    items: ItemWorld,
+    /// What the player is carrying. **Survives a descent** (that is the point of picking
+    /// one up on floor 2 and drinking it on floor 4) and is emptied only by a restart,
+    /// with the fresh warrior it belongs to.
+    inventory: Inventory,
+    /// How many torches [`crate::level`] hung on this floor — a HUD readout, not a
+    /// simulation input. Latched when the floor is installed rather than recomputed per
+    /// frame, and zero on a level this game did not author ([`Self::without_floors`]).
+    torches: usize,
+
     // --- The combat channels ----------------------------------------------------------
     damage: Events<DamageEvent>,
     deaths: Events<DeathEvent>,
@@ -639,6 +692,12 @@ impl DungeonGame {
                 grunt_spawns.len(),
             );
         }
+        // The floor's flasks, chosen here for the same reason the monsters are: the level
+        // writer places `potion_<i>` at point `i` ([`Self::potion_spawns`]) and
+        // [`ItemWorld`] collects point `i`. One list, two readers.
+        let potions = floor_potions(&grid, floor, &grunt_spawns);
+        let torches =
+            crate::level::torch_points(&grid, crate::level::torch_seed(grid.seed())).len();
 
         let spawn = collision::player_spawn_local(&grid);
         let focus = collision::to_world(&grid, spawn, CAMERA_FOCUS_Y);
@@ -663,6 +722,9 @@ impl DungeonGame {
             grunt_class: GruntClass::grunt(),
             grunt_spawns,
             finder: Pathfinder::new(),
+            items: ItemWorld::new(&potions),
+            inventory: Inventory::new(),
+            torches,
             damage: Events::new(),
             deaths: Events::new(),
             warrior_rig: rigs::warrior(),
@@ -692,6 +754,16 @@ impl DungeonGame {
         &self.grunt_spawns
     }
 
+    /// This floor's potion points, collision space — what the level writer places
+    /// `potion_<i>` at, and what this game collects them by.
+    ///
+    /// Read straight out of [`ItemWorld`] rather than kept alongside it: the runtime and
+    /// the level must describe the same flasks, and the cheapest way to guarantee that is
+    /// to have only one list.
+    pub fn potion_spawns(&self) -> &[Vec2] {
+        self.items.positions()
+    }
+
     /// Turn floor progression off: this game's grid is a fixture, not floor 1 of a run.
     ///
     /// The `--generated-room` injection harness is the one caller. Its room has no exit
@@ -701,6 +773,11 @@ impl DungeonGame {
     /// are no floors here to progress through.
     pub fn without_floors(mut self) -> Self {
         self.floors_enabled = false;
+        // The harness level is written by `ensure_generated_room`, which authors one
+        // hand-placed light and no torch props at all — so the count derived from its
+        // fixture grid in `new` describes a floor that was never written. Zero is what is
+        // actually in that level.
+        self.torches = 0;
         self
     }
 
@@ -721,19 +798,22 @@ impl DungeonGame {
             GRUNT_MIN_SPAWN_DISTANCE,
             grid.seed(),
         );
-        let level = (self.writer)(&grid, &spawns)?;
+        let potions = floor_potions(&grid, floor, &spawns);
+        let level = (self.writer)(&grid, &spawns, &potions)?;
         tracing::info!(
-            "dungeon: floor {floor} of run {} ready — seed {}, {} grunts, level '{level}' \
-             ({:.1} ms)",
+            "dungeon: floor {floor} of run {} ready — seed {}, {} grunts, {} potions, \
+             level '{level}' ({:.1} ms)",
             self.run_seed,
             grid.seed(),
             spawns.len(),
+            potions.len(),
             started.elapsed().as_secs_f64() * 1e3,
         );
         Ok(NextFloor {
             floor,
             grid,
             spawns,
+            potions,
             level,
             fresh_warrior,
         })
@@ -753,6 +833,9 @@ impl DungeonGame {
     /// away; that knowledge is more reliable than any probe of it.
     fn install(&mut self, next: NextFloor) {
         self.floor = next.floor;
+        self.torches =
+            crate::level::torch_points(&next.grid, crate::level::torch_seed(next.grid.seed()))
+                .len();
         self.grid = next.grid;
         self.grunt_spawns = next.spawns;
         self.finder = Pathfinder::new();
@@ -762,6 +845,11 @@ impl DungeonGame {
         self.deaths.clear();
         self.reset_warrior = next.fresh_warrior;
         self.player_state = WarriorState::Idle;
+
+        // The flasks belong to the floor and are replaced with it. What the player is
+        // *carrying* belongs to the run, so it is not touched here — `acquire` empties the
+        // pocket in the one branch that builds a new warrior to hold it.
+        self.items = ItemWorld::new(&next.potions);
 
         // The spawn the *level* authors is the entry tile, and `acquire` will snap the
         // player onto it through `nearest_free` when the world arrives. These are the
@@ -947,8 +1035,14 @@ impl DungeonGame {
         // stairs, hit points and all. `reset_warrior` returns to its default afterwards
         // so an *unrequested* reload (the engine's hot-swap dropdown) is a fresh start
         // again — nothing about that level is a continuation of this run.
+        //
+        // The pocket goes with the warrior, in the same branch: a run that carried two
+        // flasks down four floors has them until it *ends*, and a warrior built fresh has
+        // never picked one up. Doing it here rather than in `install` is what makes that
+        // one rule instead of two — the hot-swap path never reaches `install`.
         if self.reset_warrior {
             self.warrior = WarriorController::new();
+            self.inventory = Inventory::new();
         }
         self.reset_warrior = true;
         if matches!(self.progression, Progression::Awaiting) {
@@ -1255,6 +1349,12 @@ impl DungeonGame {
         self.damage.update();
         self.deaths.update();
 
+        // -- 6b. the loot ----------------------------------------------------------------
+        // After damage, so a step that kills the player does not also let the corpse pocket
+        // the flask it slid onto; before presentation, so the flask a pickup empties is
+        // hidden on the same step the HUD count goes up.
+        self.collect_and_drink(world);
+
         // -- 7. presentation -------------------------------------------------------------
         self.pose_player(world, &mut cast, &out);
         self.pose_grunts(world, &mut cast);
@@ -1272,6 +1372,70 @@ impl DungeonGame {
 
         self.cast = Some(cast);
         self.record_cost(started);
+    }
+
+    /// The item half of a step: collect whatever the player is standing on, and drink if
+    /// this step's input asked for it.
+    ///
+    /// **Both halves are refused to a corpse.** A dead warrior is not offered the drink
+    /// (the controller would refuse the heal anyway, but the potion would still be spent —
+    /// [`Inventory::drink`] says so), and is not ticked against the flasks at all: a body
+    /// sliding onto one must not pocket it.
+    ///
+    /// The pickup rule itself lives in [`ItemWorld::tick`], which takes the inventory so
+    /// that a full pocket leaves the flask standing. What is left here is the half that
+    /// module deliberately does not do: making the *visual* go away.
+    fn collect_and_drink(&mut self, world: &mut World) {
+        if self.warrior.is_dead() {
+            return;
+        }
+        for event in self.items.tick(self.pos, &mut self.inventory) {
+            tracing::info!(
+                "dungeon: picked up {} at step {} — carrying {}/{}",
+                event.name(),
+                self.steps,
+                event.carried,
+                self.items.def().max_carry,
+            );
+            Self::hide_entity(world, &event.name());
+        }
+        if self.input.just_pressed(Action::Drink)
+            && let Some(heal) = self.items.drink(&mut self.inventory)
+        {
+            let restored = self.warrior.heal(heal);
+            tracing::info!(
+                "dungeon: drank a potion at step {} — {restored:.0} hit points restored, \
+                 {} left",
+                self.steps,
+                self.inventory.potions,
+            );
+        }
+    }
+
+    /// Make the level entity called `name` — and everything under it — stop drawing.
+    ///
+    /// A collected flask is *hidden*, not despawned: the entity is the level's, its
+    /// sub-tree is what the loader built for the prop's `.glb`, and removing the
+    /// [`MeshInstance`] from all of it takes it out of the draw list while leaving the
+    /// hierarchy the loader owns intact. Despawning would leave a hole in a structure this
+    /// game did not build and cannot rebuild — and there is nothing to gain: a floor has
+    /// at most a handful of flasks, and the draw is gone either way.
+    ///
+    /// This is [`Self::retire_corpse`]'s pattern (drop the components that make a thing
+    /// participate, keep the thing) applied to a drawable instead of a combatant. Nothing
+    /// re-shows it, because nothing puts a collected potion back.
+    fn hide_entity(world: &mut World, name: &str) {
+        let Some(root) = Self::find_named(world, name) else {
+            // A level that has no such entity is a level written by a different build —
+            // the pickup still counted (the rule is the simulation's), there is simply
+            // nothing to hide.
+            tracing::warn!("dungeon: level has no '{name}' to hide");
+            return;
+        };
+        let index = ChildIndex::build(world);
+        for entity in index.subtree(root) {
+            world.remove::<MeshInstance>(entity);
+        }
     }
 
     /// A dead monster stops being a body: it keeps its (zeroed) [`Health`] as the record
@@ -1492,7 +1656,9 @@ impl GameHooks for DungeonGame {
                     "sim step  {:.3} ms  peak {:.3} ms  ({} steps)",
                     self.sim_ms, self.sim_ms_peak, self.steps
                 ));
-                ui.text_disabled("WASD move, Shift sprint, LMB/J attack, Space dodge, R restart");
+                ui.text_disabled(
+                    "WASD move, Shift sprint, LMB/J attack, Space dodge, Q drink, R restart",
+                );
             });
     }
 }
@@ -1517,6 +1683,22 @@ impl DungeonGame {
             .overlay_text(format!("{:.0} / {:.0}", health.current, health.max))
             .build(ui);
         bar.end();
+
+        // The pocket, right under the bar it refills: the two numbers are read together
+        // ("can I afford this fight?"), so they are shown together. Greyed at zero, which
+        // is the state where Q does nothing.
+        let def = self.items.def();
+        let carried = self.inventory.potions;
+        let line = format!(
+            "potions   {carried} / {}   ({} on this floor)",
+            def.max_carry,
+            self.items.remaining()
+        );
+        if carried == 0 {
+            ui.text_disabled(line);
+        } else {
+            ui.text_colored([0.86, 0.36, 0.38, 1.0], line);
+        }
 
         if self.warrior.is_dead() {
             ui.text_colored([0.92, 0.26, 0.24, 1.0], "YOU DIED");
@@ -1601,6 +1783,15 @@ impl DungeonGame {
             self.grid.height(),
             self.grid.rooms().len()
         ));
+        // The torch count is a *data* readout: it is how many point lights this floor's
+        // `.level` carries, not how many the renderer drew. When those two disagree the
+        // budget is the renderer's to report — see `crate::level::torch_lights`.
+        ui.text_disabled(format!(
+            "torches   {} placed ({} potions, {} left)",
+            self.torches,
+            self.items.potions().len(),
+            self.items.remaining(),
+        ));
         match &self.cast {
             // A single static headless capture never runs a sim step (the capture path
             // is frame-counted), so "not resolved" is the expected reading there;
@@ -1653,6 +1844,7 @@ mod tests {
     const A: u16 = 0x41;
     const D: u16 = 0x44;
     const J: u16 = 0x4A;
+    const Q: u16 = 0x51;
     const R: u16 = 0x52;
     const SPACE: u16 = 0x20;
     const SHIFT: u16 = 0x10;
@@ -1678,7 +1870,11 @@ mod tests {
 
     /// A [`FloorWriter`] that writes nothing and returns exactly the selector the real
     /// one would have (`crate::level::write_floor` → `dungeon_level_selector`).
-    pub(super) fn stub_writer(grid: &TileGrid, _spawns: &[Vec2]) -> anyhow::Result<String> {
+    pub(super) fn stub_writer(
+        grid: &TileGrid,
+        _spawns: &[Vec2],
+        _potions: &[Vec2],
+    ) -> anyhow::Result<String> {
         Ok(crate::level::dungeon_level_selector(grid.seed()))
     }
 
@@ -1706,7 +1902,28 @@ mod tests {
                 collision::to_world(grid, spawn, CHARACTER_Y),
             );
         }
+        // The flasks, from the same list the level writer places `potion_<i>` from — so a
+        // test pickup hides the entity the shipping game would have hidden.
+        let potion_rig = crate::rigs::potion();
+        for (i, &at) in game.potion_spawns().iter().enumerate() {
+            spawn_like_the_level_loader(
+                &mut world,
+                &potion_rig,
+                &items::potion_name(i),
+                collision::to_world(grid, at, items::POTION_Y),
+            );
+        }
         world
+    }
+
+    /// Every entity in `name`'s sub-tree that still draws.
+    fn drawn_parts(world: &World, name: &str) -> usize {
+        let root = DungeonGame::find_named(world, name).expect("the level placed it");
+        ChildIndex::build(world)
+            .subtree(root)
+            .into_iter()
+            .filter(|&e| world.get::<MeshInstance>(e).is_some())
+            .count()
     }
 
     /// Advance the game the way the frame loop does: whole fixed steps, then the
@@ -1739,6 +1956,7 @@ mod tests {
             Action::Sprint,
             Action::Attack,
             Action::Dodge,
+            Action::Drink,
             Action::Restart,
         ] {
             assert!(
@@ -2457,7 +2675,7 @@ mod tests {
         let mut g = DungeonGame::new(crate::level::room_collision_grid(), Population::Fixed(0))
             .unwrap()
             .without_floors();
-        g.writer = |_, _| panic!("the harness must never build a floor");
+        g.writer = |_, _, _| panic!("the harness must never build a floor");
         let mut world = test_world(&g);
         frame(&mut g, &mut world, &InputSnapshot::default(), 1);
 
@@ -2510,6 +2728,250 @@ mod tests {
             "an unrequested level carried the run's wounds into it"
         );
         assert_eq!(g.floor, FIRST_FLOOR, "and it is not a floor of this run");
+    }
+
+    // -- the loot ----------------------------------------------------------------------
+
+    // What the shipping `FloorWriter` was handed, per call, on this test's thread.
+    //
+    // A `FloorWriter` is a plain `fn` pointer (deliberately — see the type's docs), so a
+    // recording stub cannot capture; thread-local state is what is left, and it is correct
+    // rather than merely convenient here because the harness runs each test on its own
+    // thread.
+    thread_local! {
+        static WRITTEN: std::cell::RefCell<Vec<(u64, usize, Vec<Vec2>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// [`stub_writer`] that also books what it was asked to write.
+    fn recording_writer(
+        grid: &TileGrid,
+        spawns: &[Vec2],
+        potions: &[Vec2],
+    ) -> anyhow::Result<String> {
+        WRITTEN.with(|w| {
+            w.borrow_mut()
+                .push((grid.seed(), spawns.len(), potions.to_vec()))
+        });
+        stub_writer(grid, spawns, potions)
+    }
+
+    fn written() -> Vec<(u64, usize, Vec<Vec2>)> {
+        WRITTEN.with(|w| w.borrow().clone())
+    }
+
+    /// **The potion list threads from the game into the level, on every floor.**
+    ///
+    /// The seam the whole pickup rests on: the game chooses the points, the writer places
+    /// `potion_<i>` at point `i`, and [`ItemWorld`] collects point `i`. If the two ever
+    /// diverge the player walks through a flask that is not there and stands next to one
+    /// that cannot be picked up — which is invisible in a unit test of either half.
+    #[test]
+    fn potion_points_thread_into_every_floor_the_run_writes() {
+        WRITTEN.with(|w| w.borrow_mut().clear());
+        let mut g = DungeonGame::new(dungeon(3), Population::PerFloor).unwrap();
+        g.writer = recording_writer;
+
+        // Floor 1 is `main`'s to write, so what is asserted here is that the game's own
+        // list is the floor's rule — that is what `main` hands the writer.
+        let floor1 = g.potion_spawns().to_vec();
+        assert_eq!(
+            floor1,
+            floor_potions(g.grid(), FIRST_FLOOR, g.grunt_spawns()),
+            "floor 1's potions are not the floor's own"
+        );
+        assert_eq!(
+            floor1.len(),
+            items::potions_for_floor(FIRST_FLOOR) as usize,
+            "seed 3 has room for the whole floor's flasks"
+        );
+        assert_eq!(g.items.remaining(), floor1.len());
+
+        // Descend. The floor is built and written up front, potions and all.
+        let mut world = exit_world(&g);
+        take_the_stairs(&mut g, &mut world);
+        assert_eq!(g.floor, 2);
+        let calls = written();
+        assert_eq!(calls.len(), 1, "one descent, one write");
+        let (seed, grunts, floor2) = calls[0].clone();
+        assert_eq!(seed, floor_seed(3, 2));
+        assert_eq!(grunts, grunts_for_floor(2));
+        assert_eq!(
+            floor2,
+            floor_potions(g.grid(), 2, g.grunt_spawns()),
+            "the floor was written from a different list than the rule produces"
+        );
+        assert_eq!(
+            g.potion_spawns(),
+            floor2,
+            "the runtime is collecting a different floor's flasks"
+        );
+        assert_ne!(floor1, floor2, "floor 2 reused floor 1's placement");
+        // ...and every one of them really is in the world the engine rebuilt.
+        for i in 0..floor2.len() {
+            assert!(
+                DungeonGame::find_named(&world, &items::potion_name(i)).is_some(),
+                "the level has no potion_{i}"
+            );
+        }
+
+        // A restart is the other half: floor 1 again, and its own list again.
+        g.warrior.kill();
+        g.simulate(&mut world, &InputSnapshot::default(), FIXED_DT);
+        restart(&mut g, &mut world);
+        let calls = written();
+        assert_eq!(calls.len(), 2, "the restart wrote one floor");
+        assert_eq!(calls[1].0, 3, "a restart re-rolled the run");
+        assert_eq!(calls[1].2, floor1, "floor 1 came back a different floor");
+        assert_eq!(g.potion_spawns(), floor1);
+        assert_eq!(g.items.remaining(), floor1.len(), "the flasks came back");
+    }
+
+    /// An arena with one flask a stride north of the spawn — near enough that holding W
+    /// walks onto it, far enough that the first step does not.
+    fn with_one_flask() -> (DungeonGame, World, Vec2) {
+        let mut g = game(TileGrid::from_rows(&[
+            "##########",
+            "#........#",
+            "#........#",
+            "#........#",
+            "#...E....#",
+            "#........#",
+            "#........#",
+            "#........#",
+            "#........#",
+            "##########",
+        ]));
+        let spawn = collision::player_spawn_local(g.grid());
+        // Collision space is world XZ, and W walks toward -y (see `warrior_input`).
+        let at = spawn + Vec2::new(0.0, -1.5);
+        g.items = ItemWorld::new(&[at]);
+        let world = test_world(&g);
+        (g, world, at)
+    }
+
+    /// **Walking over a flask pockets it and takes it out of the draw list.**
+    ///
+    /// The integrator's half of the pickup: `items` decides *that* it was collected, this
+    /// is what makes the flask stop being drawn. Hidden, not despawned — the entity is the
+    /// level's and its sub-tree is the loader's.
+    #[test]
+    fn walking_over_a_flask_pockets_it_and_hides_the_level_entity() {
+        let (mut g, mut world, at) = with_one_flask();
+        let held = InputSnapshot::default().with_key(W, true);
+        frame(&mut g, &mut world, &InputSnapshot::default(), 1);
+
+        let parts = drawn_parts(&world, "potion_0");
+        assert!(parts > 0, "the flask was never drawn to begin with");
+        assert_eq!(g.inventory.potions, 0);
+        assert!(!g.items.is_taken(0));
+
+        for _ in 0..90 {
+            g.simulate(&mut world, &held, FIXED_DT);
+            if g.inventory.potions > 0 {
+                break;
+            }
+        }
+        assert_eq!(g.inventory.potions, 1, "walked past the flask");
+        assert!(g.items.is_taken(0));
+        assert_eq!(g.items.remaining(), 0);
+        assert!(
+            g.pos.distance(at) <= items::PICKUP_RADIUS,
+            "collected from {} m away",
+            g.pos.distance(at)
+        );
+
+        // The entity survives; only its geometry is gone, all of it.
+        let root = DungeonGame::find_named(&world, "potion_0").expect("still in the level");
+        assert!(world.is_alive(root), "the flask was despawned, not hidden");
+        assert_eq!(drawn_parts(&world, "potion_0"), 0, "the flask still draws");
+        // ...and nothing else lost its geometry with it.
+        assert!(drawn_parts(&world, PLAYER_NAME) > 0, "hid the player too");
+
+        // Standing on it forever does not pocket a second one.
+        frame(&mut g, &mut world, &held, 30);
+        assert_eq!(g.inventory.potions, 1);
+    }
+
+    /// **Q drinks, and the hit points land on the real warrior.**
+    ///
+    /// End to end through the shipping controller — the heal amount comes out of the same
+    /// [`items::PotionDef`] the pickup was judged against, so this also pins that the two
+    /// cannot drift. A drink is an *edge*, an empty pocket is a no-op, and a corpse may not
+    /// spend a potion it cannot benefit from.
+    #[test]
+    fn q_drinks_a_carried_potion_and_heals_the_warrior() {
+        let (mut g, mut world, _) = with_one_flask();
+        let held = InputSnapshot::default().with_key(W, true);
+        let drink = InputSnapshot::default().with_key(Q, true);
+        let idle = InputSnapshot::default();
+        for _ in 0..90 {
+            g.simulate(&mut world, &held, FIXED_DT);
+            if g.inventory.potions > 0 {
+                break;
+            }
+        }
+        assert_eq!(g.inventory.potions, 1);
+
+        // Hurt it by more than one potion is worth, so the heal is not clipped by the cap.
+        let max = g.warrior.health().max;
+        g.warrior.take_damage([IncomingHit {
+            amount: items::POTION_HEAL + 15.0,
+            direction: Vec2::Y,
+            stagger: 0.0,
+        }]);
+        let hurt = g.warrior.health().current;
+
+        g.simulate(&mut world, &drink, FIXED_DT);
+        assert_eq!(g.inventory.potions, 0, "the potion was not spent");
+        assert_eq!(
+            g.warrior.health().current,
+            hurt + items::POTION_HEAL,
+            "the warrior did not get what the flask reported"
+        );
+        assert!(g.warrior.health().current < max);
+
+        // Holding Q on an empty pocket does nothing, however long it is held.
+        let healed = g.warrior.health().current;
+        for _ in 0..10 {
+            g.simulate(&mut world, &drink, FIXED_DT);
+        }
+        assert_eq!(g.warrior.health().current, healed);
+        assert_eq!(g.inventory.potions, 0);
+
+        // A corpse does not spend one. (Give it a potion by hand: the point is the branch,
+        // not how the pocket got filled.)
+        g.inventory.potions = 1;
+        g.warrior.kill();
+        g.simulate(&mut world, &idle, FIXED_DT);
+        g.simulate(&mut world, &drink, FIXED_DT);
+        assert_eq!(g.inventory.potions, 1, "a corpse drank the last potion");
+        assert!(g.warrior.is_dead());
+    }
+
+    /// **The pocket is the run's, the flasks are the floor's.** Carrying a potion down the
+    /// stairs is the whole point of a cap of three; a restart hands back a warrior who has
+    /// never picked one up.
+    #[test]
+    fn the_pocket_survives_a_descent_and_is_emptied_by_a_restart() {
+        let mut g = walking_to_the_exit_of(dungeon(3));
+        let mut world = exit_world(&g);
+        frame(&mut g, &mut world, &InputSnapshot::default(), 1);
+        g.inventory.potions = 2;
+
+        take_the_stairs(&mut g, &mut world);
+        assert_eq!(g.floor, 2);
+        assert_eq!(g.inventory.potions, 2, "the stairs emptied the pocket");
+        assert_eq!(
+            g.items.remaining(),
+            g.potion_spawns().len(),
+            "the new floor's flasks arrived taken"
+        );
+
+        g.warrior.kill();
+        restart(&mut g, &mut world);
+        assert_eq!(g.inventory.potions, 0, "a new run kept the old run's loot");
+        assert_eq!(g.warrior.health().current, g.warrior.health().max);
     }
 
     // -- the fight ---------------------------------------------------------------------
@@ -2947,29 +3409,135 @@ mod capture_scout {
             return;
         };
         let seed: u64 = spec.trim().parse().expect("STAIRS_ROUTE=<seed>");
-        let mut g = DungeonGame::new(floor_grid(seed, FIRST_FLOOR), Population::PerFloor).unwrap();
-        g.writer = super::tests::stub_writer;
-        let mut world = super::tests::test_world(&g);
+        let (mut g, mut world) = scout_game(seed);
+        let route = bfs_route(g.grid(), g.grid().exit());
+        let legs = route.len();
+        match steer(&mut g, &mut world, &route, 2400, |g| {
+            g.next_level().is_some()
+        }) {
+            Some((hold, step)) => {
+                println!("seed {seed}: floor 2 requested at step {step}");
+                println!("DUNGEON_HOLD={hold}");
+                println!(
+                    "exit latched around step {}, {:.0} hp left, {legs} legs",
+                    step.saturating_sub((DESCEND_GRACE / (1.0 / 60.0)) as u32),
+                    g.warrior.health().current,
+                );
+            }
+            None => println!("seed {seed}: never reached the stairs (or died on the way)"),
+        }
+    }
 
-        // The route: downhill on the exit's own BFS field, from the spawn tile.
+    /// The same tool aimed at a **flask**: the recipe an M3 pickup capture needs.
+    ///
+    /// Walks to the nearest potion of floor `n` and prints the step the pocket fills on,
+    /// which is what `WARMUP_FRAMES` wants — the capture path runs one sim step per frame,
+    /// so frame `f` photographs the state after step `f`, and the HUD's potion count goes
+    /// up on exactly the step printed here.
+    ///
+    /// ```text
+    /// POTION_ROUTE=20260731 cargo test -p dungeon potion_route -- --nocapture
+    /// POTION_ROUTE=20260731 FLOOR=3 cargo test -p dungeon potion_route -- --nocapture
+    /// ```
+    #[test]
+    fn potion_route() {
+        let Ok(spec) = std::env::var("POTION_ROUTE") else {
+            return;
+        };
+        let seed: u64 = spec.trim().parse().expect("POTION_ROUTE=<seed>");
+        let floor: u32 = std::env::var("FLOOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(FIRST_FLOOR);
+        let (mut g, mut world) = scout_game(floor_seed(seed, floor));
+
+        // The nearest flask by *walking* distance, which is the one a route reaches first.
         let grid = g.grid().clone();
-        let field = grid.bfs_distances(grid.exit());
+        let from = grid.bfs_distances(collision::tile_of(collision::player_spawn_local(&grid)));
+        let steps_to = |t: (i32, i32)| from[(t.1 * grid.width() + t.0) as usize];
+        let Some((i, target)) = g
+            .potion_spawns()
+            .iter()
+            .map(|&p| collision::tile_of(p))
+            .enumerate()
+            .filter(|&(_, t)| steps_to(t) != u32::MAX)
+            .min_by_key(|&(_, t)| steps_to(t))
+        else {
+            println!("seed {seed} floor {floor}: no reachable potion");
+            return;
+        };
+        println!(
+            "seed {seed} floor {floor}: {} potions, nearest is potion_{i} at tile {target:?} \
+             ({} tiles away)",
+            g.potion_spawns().len(),
+            steps_to(target),
+        );
+
+        let route = bfs_route(&grid, target);
+        match steer(&mut g, &mut world, &route, 2400, |g| {
+            g.inventory.potions > 0
+        }) {
+            Some((hold, step)) => {
+                println!("seed {seed}: potion_{i} pocketed at step {step}");
+                println!("DUNGEON_HOLD={hold}");
+                println!(
+                    "carrying {}/{}, {:.0} hp left",
+                    g.inventory.potions,
+                    g.items.def().max_carry,
+                    g.warrior.health().current,
+                );
+            }
+            None => println!("seed {seed}: never reached potion_{i} (or died on the way)"),
+        }
+    }
+
+    /// A game on one floor's grid with the writer stubbed, and the level-shaped world that
+    /// goes with it — what every route scout starts from.
+    fn scout_game(floor_seed: u64) -> (DungeonGame, World) {
+        let mut g = DungeonGame::new(
+            crate::procgen::generate(floor_seed, &DungeonParams::default()),
+            Population::PerFloor,
+        )
+        .unwrap();
+        g.writer = super::tests::stub_writer;
+        let world = super::tests::test_world(&g);
+        (g, world)
+    }
+
+    /// The grid's own route from the player's spawn to `target`: downhill on `target`'s BFS
+    /// field, as collision-space waypoints.
+    fn bfs_route(grid: &TileGrid, target: (i32, i32)) -> Vec<Vec2> {
+        let field = grid.bfs_distances(target);
         let at = |(x, z): (i32, i32)| field[(z * grid.width() + x) as usize];
-        let mut tile = collision::tile_of(collision::player_spawn_local(&grid));
-        let mut route: Vec<Vec2> = Vec::new();
+        let mut tile = collision::tile_of(collision::player_spawn_local(grid));
+        let mut route = Vec::new();
         while at(tile) > 0 && route.len() < 4096 {
-            let next = grid
+            tile = grid
                 .neighbors4(tile.0, tile.1)
                 .filter(|&(x, z)| grid.is_walkable(x, z))
                 .min_by_key(|&t| at(t))
                 .expect("a walkable neighbour on a connected floor");
-            tile = next;
             route.push(collision::to_collision(
-                &grid,
+                grid,
                 grid.tile_center(tile.0, tile.1),
             ));
         }
+        route
+    }
 
+    /// Steer `g` along `route` with the four movement keys until `done` fires, and report
+    /// the [`HOLD_ENV`] spec that reproduces the walk together with the step it fired on.
+    ///
+    /// The route is the map's and the steering is the game's, so what comes out is a string
+    /// a headless capture takes verbatim: one windowed hold per leg. `None` means the walk
+    /// ran out of budget or the warrior died on the way.
+    fn steer(
+        g: &mut DungeonGame,
+        world: &mut World,
+        route: &[Vec2],
+        budget: u32,
+        mut done: impl FnMut(&mut DungeonGame) -> bool,
+    ) -> Option<(String, u32)> {
         const W: u16 = 0x57;
         const S: u16 = 0x53;
         const A: u16 = 0x41;
@@ -2984,7 +3552,7 @@ mod capture_scout {
                 Some(last) if last.0 == name && last.2 + 1 == step => last.2 = step,
                 _ => held.push((name, step, step)),
             };
-        for step in 0..2400u32 {
+        for step in 0..budget {
             while leg < route.len() && route[leg].distance(g.pos) < 0.6 {
                 leg += 1;
             }
@@ -3008,28 +3576,20 @@ mod capture_scout {
                     push("S", step, &mut held);
                 }
             }
-            g.simulate(&mut world, &snap, 1.0 / 60.0);
-            if let Some(level) = g.next_level() {
+            g.simulate(world, &snap, 1.0 / 60.0);
+            if done(g) {
                 let spec: Vec<String> = held
                     .iter()
                     .map(|(k, a, b)| format!("{k}@{a}-{b}"))
                     .collect();
-                println!("seed {seed}: floor 2 ('{level}') requested at step {step}");
-                println!("DUNGEON_HOLD={}", spec.join(","));
-                println!(
-                    "exit latched around step {}, {:.0} hp left, {} legs",
-                    step.saturating_sub((DESCEND_GRACE / (1.0 / 60.0)) as u32),
-                    g.warrior.health().current,
-                    route.len(),
-                );
-                return;
+                return Some((spec.join(","), step));
             }
             if g.warrior.is_dead() {
-                println!("seed {seed}: died at step {step} on the way to the stairs");
-                return;
+                println!("died at step {step} on the way");
+                return None;
             }
         }
-        println!("seed {seed}: never reached the stairs");
+        None
     }
 
     #[test]
