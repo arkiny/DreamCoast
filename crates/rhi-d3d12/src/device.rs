@@ -126,8 +126,16 @@ pub(crate) struct DeviceShared {
     // idle. Single-threaded (`Rc`), hence `RefCell` not a lock.
     storage_buffer_next: Cell<u32>,
     storage_buffer_free: RefCell<Vec<u32>>,
+    // Sampled-volume / storage-volume high-water marks + free-lists of slots returned by dropped
+    // volumes, mirroring the storage-image reclaim above. Both tables hold only 64 entries and ONE
+    // content level's distance fields occupy most of them (scene SDF + 3 albedo channels + the
+    // clipmap's finer levels + the per-mesh atlas), so a level hot-swap that rebuilds the static
+    // scene overflowed them within two swaps without this. Safe: a volume only Drops after its
+    // frames retire (the swap idles the GPU and joins the RHI thread first).
     volume_next: Cell<u32>,
+    volume_free: RefCell<Vec<u32>>,
     storage_volume_next: Cell<u32>,
+    storage_volume_free: RefCell<Vec<u32>>,
     // Command signature for indexed indirect draws (`ExecuteIndirect`, Phase 7).
     pub indirect_draw_signature: ID3D12CommandSignature,
     // Command signature for indirect compute dispatch (`ExecuteIndirect` over a
@@ -352,7 +360,9 @@ impl DeviceShared {
                 storage_buffer_next: Cell::new(0),
                 storage_buffer_free: RefCell::new(Vec::new()),
                 volume_next: Cell::new(0),
+                volume_free: RefCell::new(Vec::new()),
                 storage_volume_next: Cell::new(0),
+                storage_volume_free: RefCell::new(Vec::new()),
                 indirect_draw_signature,
                 indirect_dispatch_signature,
                 indirect_dispatch_mesh_signature,
@@ -559,8 +569,17 @@ impl DeviceShared {
     /// Create a `Texture3D` SRV for a volume in the reserved sampled-volume heap
     /// region; returns the 0-based volume index (Phase 11 Stage B).
     pub(crate) fn register_volume(&self, resource: &ID3D12Resource, format: Format) -> u32 {
-        let index = self.volume_next.get();
-        self.volume_next.set(index + 1);
+        // Reuse a freed slot before bumping the high-water mark (see the field docs).
+        let index = self.volume_free.borrow_mut().pop().unwrap_or_else(|| {
+            let i = self.volume_next.get();
+            self.volume_next.set(i + 1);
+            i
+        });
+        assert!(
+            index < VOLUME_COUNT,
+            "bindless sampled-volume table overflow (> {VOLUME_COUNT}); raise VOLUME_COUNT \
+             across bindless.slang + all three backends"
+        );
         let handle = self.cpu_handle(VOLUME_BASE + index);
         let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: to_dxgi_format(format),
@@ -590,8 +609,20 @@ impl DeviceShared {
         format: Format,
         depth: u32,
     ) -> u32 {
-        let index = self.storage_volume_next.get();
-        self.storage_volume_next.set(index + 1);
+        let index = self
+            .storage_volume_free
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| {
+                let i = self.storage_volume_next.get();
+                self.storage_volume_next.set(i + 1);
+                i
+            });
+        assert!(
+            index < STORAGE_VOLUME_COUNT,
+            "bindless storage-volume table overflow (> {STORAGE_VOLUME_COUNT}); raise \
+             STORAGE_VOLUME_COUNT across bindless.slang + all three backends"
+        );
         let handle = self.cpu_handle(STORAGE_VOLUME_BASE + index);
         let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: to_dxgi_format(format),
@@ -667,6 +698,17 @@ impl DeviceShared {
     /// Return a storage-image slot to the free-list (called from `D3d12RenderTarget::drop`).
     pub(crate) fn free_storage_image(&self, index: u32) {
         self.storage_image_free.borrow_mut().push(index);
+    }
+
+    /// Return a sampled-volume slot to the free-list (called from `D3d12Volume::drop`). The
+    /// stale SRV is left in place — no shader indexes a freed slot, and reuse overwrites it.
+    pub(crate) fn free_volume(&self, index: u32) {
+        self.volume_free.borrow_mut().push(index);
+    }
+
+    /// Return a storage-volume (UAV) slot to the free-list (`D3d12Volume::drop`).
+    pub(crate) fn free_storage_volume(&self, index: u32) {
+        self.storage_volume_free.borrow_mut().push(index);
     }
 
     /// Record + submit a one-time command list and wait for completion.

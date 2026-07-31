@@ -191,6 +191,14 @@ pub(crate) struct DeviceShared {
     /// `storage_buf_free`. Without it, recreating storage targets (the per-FIF vgeo HZB pyramid /
     /// transient compute targets on window resize) walked the 64-slot table to overflow.
     storage_img_free: RefCell<Vec<u32>>,
+    /// Free-lists of bindless sampled-volume / storage-volume slots returned by dropped
+    /// volumes, mirroring `storage_img_free`. Both tables hold only **64** entries, and one
+    /// content level's distance fields occupy most of them (scene SDF + 3 albedo channels +
+    /// the clipmap's finer levels + the per-mesh atlas), so a level hot-swap that rebuilt the
+    /// static scene without recycling walked straight off the end of the table — silently, in
+    /// the argument buffer, which is why the bounds are now asserted at registration too.
+    volume_free: RefCell<Vec<u32>>,
+    storage_volume_free: RefCell<Vec<u32>>,
     /// Acceleration structures (TLAS + BLAS) bound via [`MetalDevice::bind_tlas`].
     /// They must be made resident (`useResource`) on the inline path tracer's
     /// compute encoder, since the TLAS is reached indirectly through the bindless
@@ -335,10 +343,30 @@ impl DeviceShared {
     /// the SW ray marcher samples it. The owning `MetalVolume` keeps the texture
     /// alive (the argument buffer just records its 8-byte handle). Phase 11 Stage B.
     fn register_volume(&self, texture: &Retained<ProtocolObject<dyn MTLTexture>>) -> u32 {
-        let index = self.volume_next.get();
-        self.volume_next.set(index + 1);
+        // Reuse a freed slot before bumping the high-water mark (see the field docs).
+        let index = self.volume_free.borrow_mut().pop().unwrap_or_else(|| {
+            let i = self.volume_next.get();
+            self.volume_next.set(i + 1);
+            i
+        });
+        assert!(
+            index < VOLUME_COUNT,
+            "bindless sampled-volume table overflow (> {VOLUME_COUNT}); raise VOLUME_COUNT \
+             across bindless.slang + all three backends"
+        );
         self.write_handle(VOLUME_BASE + index, texture.gpuResourceID());
         index
+    }
+
+    /// Return a sampled-volume slot to the free-list (called from `MetalVolume::drop`).
+    /// Safe: the handoff contract defers the Drop until the referencing frames retire.
+    pub(crate) fn free_volume(&self, index: u32) {
+        self.volume_free.borrow_mut().push(index);
+    }
+
+    /// Return a storage-volume (UAV) slot to the free-list (`MetalVolume::drop`).
+    pub(crate) fn free_storage_volume(&self, index: u32) {
+        self.storage_volume_free.borrow_mut().push(index);
     }
 
     /// Register a 3D volume texture in the bindless storage-volume (UAV) table
@@ -346,8 +374,20 @@ impl DeviceShared {
     /// 0-based index. Made resident with `Read | Write` by `volume_to_storage` before
     /// a bake/merge compute pass writes it. Phase 11 Stage B.
     fn register_storage_volume(&self, texture: &Retained<ProtocolObject<dyn MTLTexture>>) -> u32 {
-        let index = self.storage_volume_next.get();
-        self.storage_volume_next.set(index + 1);
+        let index = self
+            .storage_volume_free
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| {
+                let i = self.storage_volume_next.get();
+                self.storage_volume_next.set(i + 1);
+                i
+            });
+        assert!(
+            index < STORAGE_VOLUME_COUNT,
+            "bindless storage-volume table overflow (> {STORAGE_VOLUME_COUNT}); raise \
+             STORAGE_VOLUME_COUNT across bindless.slang + all three backends"
+        );
         self.write_handle(STORAGE_VOLUME_BASE + index, texture.gpuResourceID());
         index
     }
@@ -597,6 +637,8 @@ impl MetalInstance {
             storage_buffers: RefCell::new(Vec::new()),
             storage_buf_free: RefCell::new(Vec::new()),
             storage_img_free: RefCell::new(Vec::new()),
+            volume_free: RefCell::new(Vec::new()),
+            storage_volume_free: RefCell::new(Vec::new()),
             rt_resident: RefCell::new(Vec::new()),
             rt_tlas: RefCell::new(None),
         });
@@ -1066,6 +1108,7 @@ impl MetalDevice {
         let sampled_index = self.shared.register_volume(&texture);
         let storage_index = self.shared.register_storage_volume(&texture);
         Ok(crate::resources::MetalVolume::new(
+            Rc::clone(&self.shared),
             texture,
             sampled_index,
             storage_index,
@@ -1128,6 +1171,7 @@ impl MetalDevice {
         let sampled_index = self.shared.register_volume(&texture);
         let storage_index = self.shared.register_storage_volume(&texture);
         Ok(crate::resources::MetalVolume::new(
+            Rc::clone(&self.shared),
             texture,
             sampled_index,
             storage_index,

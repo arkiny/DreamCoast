@@ -253,6 +253,8 @@ impl Drop for MetalRenderTarget {
 /// mirror). Residency is toggled per use by `volume_to_storage` / `volume_to_sampled`
 /// (see `command.rs`), so it is never both UAV-resident and sampled-resident.
 pub struct MetalVolume {
+    /// The device, so `drop` can return both bindless volume slots to their free-lists.
+    shared: Rc<DeviceShared>,
     pub(crate) texture: Retained<ProtocolObject<dyn MTLTexture>>,
     sampled_index: u32,
     storage_index: u32,
@@ -260,11 +262,13 @@ pub struct MetalVolume {
 
 impl MetalVolume {
     pub(crate) fn new(
+        shared: Rc<DeviceShared>,
         texture: Retained<ProtocolObject<dyn MTLTexture>>,
         sampled_index: u32,
         storage_index: u32,
     ) -> Self {
         Self {
+            shared,
             texture,
             sampled_index,
             storage_index,
@@ -279,6 +283,17 @@ impl MetalVolume {
     /// `storage_volumes[]` (UAV) bindless index.
     pub fn storage_index(&self) -> u32 {
         self.storage_index
+    }
+}
+
+impl Drop for MetalVolume {
+    /// Return both bindless volume slots. Both tables hold 64 entries and one content
+    /// level's distance fields fill most of them, so without this a level hot-swap
+    /// (`App::load_level` rebuilding the static scene) overflowed them within two swaps.
+    /// Safe: the handoff contract defers the Drop until the referencing frames retire.
+    fn drop(&mut self) {
+        self.shared.free_volume(self.sampled_index);
+        self.shared.free_storage_volume(self.storage_index);
     }
 }
 
