@@ -53,9 +53,10 @@
 //! timing they need is exported as consts here ([`WARRIOR_ATTACK1_HIT_TIME`] and
 //! friends) so the numbers have exactly one home.
 
-// Nothing in the game binary calls this module yet — by design: it is the authoring
-// half of M2, and the integrator wave wires the spawn and the state machine. The tests
-// below exercise every public item.
+// Authoring surface: a few exported clip markers and helpers are read by the tests and
+// by future tuning rather than by the game loop, so this module keeps the allowance the
+// authoring wave gave it. Everything load-bearing (`warrior`, `grunt`, `ensure_rigs`,
+// the `_LEN`/`_HIT_TIME` consts) is now called from `crate::game` and `crate::level`.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -89,6 +90,12 @@ impl Rig {
 // Authored *with* the clips below (each clip's last keyframe is its `_LEN`), so the
 // integrator reads a number that cannot drift from the animation it describes — a hit
 // window transcribed into a state-machine RON would.
+
+/// File stems (and [`Rig::name`]s) of the two shipped rigs — what
+/// [`rig_asset_path`] turns into a `.glb` path and what [`crate::level`] references.
+pub const WARRIOR_RIG: &str = "warrior";
+/// See [`WARRIOR_RIG`].
+pub const GRUNT_RIG: &str = "grunt";
 
 /// Warrior clip names, in authoring order.
 pub const WARRIOR_CLIPS: [&str; 8] = [
@@ -632,7 +639,7 @@ pub fn warrior() -> Rig {
     let animations = warrior_clips(&bones);
 
     Rig {
-        name: "warrior",
+        name: WARRIOR_RIG,
         nodes: b.nodes,
         meshes: b.meshes,
         materials: warrior_materials(),
@@ -1688,7 +1695,7 @@ pub fn grunt() -> Rig {
     let animations = grunt_clips(&bones);
 
     Rig {
-        name: "grunt",
+        name: GRUNT_RIG,
         nodes: b.nodes,
         meshes: b.meshes,
         materials: grunt_materials(),

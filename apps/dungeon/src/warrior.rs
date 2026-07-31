@@ -66,10 +66,11 @@
 //!   fire from it. Terminality is therefore the controller's job, per the fixture's own
 //!   header: [`WarriorController::tick`] stops feeding triggers once dead.
 
-// Compiled into the binary but not yet *called* by it: `game.rs` still runs the M1
-// placeholder mover, and connecting this controller to the ECS, the HUD and the
-// monsters is the integrator wave's job. The tests below exercise every public item, so
-// this silences "never used", not "never checked".
+// The controller is now driven by `game.rs`, but it deliberately exposes a wider
+// read-only surface than the game loop happens to consume — `dodge_time`,
+// `IncomingHit::from_spec`, the class-RON constructor — because it is the *character*,
+// not the character's current caller: a HUD, a replay, a second class file and the tests
+// below each read a different subset. This silences "never used", not "never checked".
 #![allow(dead_code)]
 
 use dreamcoast_game::anim::{AnimError, AnimMachine, Params};
@@ -88,16 +89,18 @@ use crate::rigs::{
     WARRIOR_RUN_LEN,
 };
 
-/// The shipped animation graph — the framework crate's own fixture file, not a copy of
-/// it.
+/// The shipped animation graph — the framework crate's own fixture, re-exported
+/// rather than copied or reached for by path.
 ///
-/// `crates/game` does not (yet) re-export `assets/warrior_anim.ron` as a `pub const`:
-/// it only `include_str!`s it inside its own test module. Rather than duplicate 45
-/// lines of graph into this file — where it would drift the first time either side is
-/// tuned — this reaches across the workspace for the same bytes. **The follow-up worth
-/// doing in the framework crate is a `pub const WARRIOR_ANIM: &str` there**, at which
-/// point this line becomes a re-export and the relative path goes away.
-pub const WARRIOR_ANIM_GRAPH: &str = include_str!("../../../crates/game/assets/warrior_anim.ron");
+/// This used to `include_str!` `../../../crates/game/assets/warrior_anim.ron`: the
+/// right *bytes* (a copy would drift the first time either side is tuned) reached
+/// through the wrong seam — a relative path out of one crate's `src` and into
+/// another's `assets`, which breaks the day either crate moves and which no
+/// `cargo` dependency edge describes. `crates/game` now declares the fixture as
+/// what it always was, API surface
+/// ([`WARRIOR_ANIM_RON`](dreamcoast_game::anim::WARRIOR_ANIM_RON)), so this is a
+/// re-export and the path is gone.
+pub const WARRIOR_ANIM_GRAPH: &str = dreamcoast_game::anim::WARRIOR_ANIM_RON;
 
 /// Turn rate while running, radians per second.
 ///

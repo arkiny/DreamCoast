@@ -45,9 +45,10 @@
 //!   -> render_update: transform = brain.render_position(..)
 //! ```
 
-// As `meshing.rs` and `rigs.rs`: the game loop wires these up in the integration step
-// that follows. Until `game.rs` spawns monsters, nothing the binary reaches calls in here,
-// and the tests are the only consumer.
+// As `crate::warrior`: the brain is wired into `game.rs`, and still exposes more than
+// that one caller reads — `route`, `last_expansions` and the tuning constants are the
+// debug/observability surface the tests and a future overlay use. This silences
+// "never used", not "never checked".
 #![allow(dead_code)]
 
 use dreamcoast_game::anim::{AnimGraphDef, AnimMachine, Params};

@@ -65,13 +65,14 @@
 
 use std::path::{Path, PathBuf};
 
-use dreamcoast_asset::level::{Camera, Entity, Environment, Light, LightKind, MaterialOverride};
+use dreamcoast_asset::level::{Camera, Entity, Environment, Light, LightKind};
 use dreamcoast_asset::{GlbMaterial, GlbMesh, LevelData, MeshVertex};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 
-use crate::collision::{PLAYER_RADIUS, player_spawn};
+use crate::collision::{CHARACTER_Y, player_spawn, to_world};
 use crate::meshing::{ChunkMesh, MeshParams, mesh_chunks, mesh_stats};
 use crate::procgen::TileGrid;
+use crate::rigs;
 
 /// Where this game's generated levels + assets are written, relative to the working
 /// directory. Derived data (gitignored, alongside the cooked-asset cache) — nothing in
@@ -81,10 +82,20 @@ pub const GENERATED_DIR: &str = "cache/generated";
 /// The generated-room proof level's stem — the M1 static-injection harness.
 pub const ROOM_LEVEL_NAME: &str = "dungeon_room";
 
-/// Scene-graph name the player placeholder is authored with. Gameplay finds its entity
-/// by this (`crate::game::DungeonGame::find_player`) rather than by matching a spawn
+/// Scene-graph name the player character is authored with. Gameplay finds its entity by
+/// this (`crate::game::DungeonGame::find_player`) rather than by matching a spawn
 /// transform, so moving the spawn cannot silently break the lookup.
 pub const PLAYER_NAME: &str = "player";
+
+/// Scene-graph name of the `i`-th monster (`grunt_0`, `grunt_1`, …).
+///
+/// Positional, and deliberately so: [`crate::ai::spawn_points`] is a deterministic
+/// function of the seed, this writer places point `i` under this name, and gameplay
+/// re-acquires point `i`'s brain by it. One ordered list, three readers, no matching
+/// heuristic — a monster cannot end up driving a different monster's body.
+pub fn grunt_name(index: usize) -> String {
+    format!("grunt_{index}")
+}
 
 /// Direction the sun *travels* (the level convention the loader negates into a
 /// direction-toward-light). Deliberately low in the sky: a top-down camera reads
@@ -109,27 +120,50 @@ fn identity() -> [f32; 16] {
     Mat4::IDENTITY.to_cols_array()
 }
 
-fn solid(base_color_factor: [f32; 4], roughness: f32) -> Option<MaterialOverride> {
-    Some(MaterialOverride {
-        base_color_factor,
-        metallic: 0.0,
-        roughness,
-    })
+/// A character placement: a rig's `.glb` at `spawn`, at its authored (metre) scale.
+///
+/// The `.glb` path is the same cwd-relative string [`rigs::ensure_rigs`] writes and the
+/// engine cooks against, so the cook key is stable across runs and machines — and,
+/// because six grunts reference one asset, the loader imports and uploads it once and
+/// instantiates it six times (`level::build_level`'s per-asset cache).
+///
+/// No `material_override`: the loader ignores it for glTF assets (it is the procedural
+/// primitives' knob), and the rigs carry their own four/two materials — the plate, the
+/// blade and the crest that make a knight read from 16 m up (see [`crate::rigs`]).
+fn character_entity(asset: &str, name: String, spawn: Vec3) -> Entity {
+    Entity {
+        asset: asset.into(),
+        name: Some(name),
+        transform: trs(spawn, 1.0),
+        material_override: None,
+    }
 }
 
-/// The player placeholder: a unit-radius sphere scaled to the *collision* radius, named
-/// so gameplay can find it. Same placeholder on every level — the player is the same in
-/// each (the rigged warrior is M2).
+/// The cwd-relative asset key for a rig's `.glb`, normalised to forward slashes so the
+/// cook key is identical on every platform.
+fn rig_asset_key(name: &str) -> String {
+    rigs::rig_asset_path(name)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// The player and the monsters, as level entities.
 ///
-/// The visual radius is [`PLAYER_RADIUS`] itself, so the sphere is exactly the circle
-/// the mover resolves: a ball that visibly touches a wall is a ball that is touching it.
-fn player_entity(spawn: Vec3) -> Entity {
-    Entity {
-        asset: "sphere".into(),
-        name: Some(PLAYER_NAME.into()),
-        transform: trs(spawn, PLAYER_RADIUS),
-        material_override: solid([0.80, 0.28, 0.18, 1.0], 0.45),
-    }
+/// `grunt_spawns` is [`crate::ai::spawn_points`]' output in **collision space**; it is
+/// passed in rather than recomputed here for the same reason the grid is
+/// ([`ensure_dungeon`]): the game owns the one list, and a second call to a deterministic
+/// function is still a second source of truth.
+fn character_entities(grid: &TileGrid, grunt_spawns: &[Vec2]) -> Vec<Entity> {
+    let mut out = vec![character_entity(
+        &rig_asset_key(rigs::WARRIOR_RIG),
+        PLAYER_NAME.into(),
+        player_spawn(grid),
+    )];
+    let grunt = rig_asset_key(rigs::GRUNT_RIG);
+    out.extend(grunt_spawns.iter().enumerate().map(|(i, &local)| {
+        character_entity(&grunt, grunt_name(i), to_world(grid, local, CHARACTER_Y))
+    }));
+    out
 }
 
 /// This game's sun + one torch, the torch placed at `torch` (the spawn, so the room the
@@ -269,19 +303,18 @@ pub fn dungeon_meshes(grid: &TileGrid) -> (Vec<GlbMesh>, Vec<GlbMaterial>) {
 }
 
 /// The level that places a generated dungeon: the `.glb` at identity (it is authored in
-/// world space) plus the player placeholder on the entry tile.
-pub fn dungeon_level_data(grid: &TileGrid, asset: &str) -> LevelData {
+/// world space), the warrior on the entry tile, and one grunt per spawn point.
+pub fn dungeon_level_data(grid: &TileGrid, asset: &str, grunt_spawns: &[Vec2]) -> LevelData {
     let spawn = player_spawn(grid);
+    let mut entities = vec![Entity {
+        asset: asset.into(),
+        name: Some("dungeon".into()),
+        transform: identity(),
+        material_override: None,
+    }];
+    entities.extend(character_entities(grid, grunt_spawns));
     LevelData {
-        entities: vec![
-            Entity {
-                asset: asset.into(),
-                name: Some("dungeon".into()),
-                transform: identity(),
-                material_override: None,
-            },
-            player_entity(spawn),
-        ],
+        entities,
         lights: lights(spawn),
         camera: rest_camera(spawn),
         environment: environment(),
@@ -302,8 +335,17 @@ pub fn dungeon_level_name(seed: u64) -> String {
 /// Takes the grid by reference on purpose: the caller (and therefore the game) owns the
 /// one [`TileGrid`] instance, so the geometry written here and the collision the player
 /// walks against are the same dungeon by construction, not by regenerating from the same
-/// seed twice and hoping.
-pub fn ensure_dungeon(grid: &TileGrid) -> anyhow::Result<String> {
+/// seed twice and hoping. `grunt_spawns` is threaded the same way — the game's own list,
+/// not a second [`crate::ai::spawn_points`] call.
+///
+/// **[`rigs::ensure_rigs`] must have run first**: the level references the two character
+/// `.glb`s by path, and the engine's loader resolves them at load time. `crate::main`
+/// owns that ordering (the same way it owns "generate before mesh").
+///
+/// One `.level` per seed, but its *contents* also carry the grunt count, so replaying a
+/// seed with a different `--grunts` rewrites the level (a cheap re-cook of the RON) and
+/// leaves the far larger geometry `.glb` untouched.
+pub fn ensure_dungeon(grid: &TileGrid, grunt_spawns: &[Vec2]) -> anyhow::Result<String> {
     let started = std::time::Instant::now();
     let (meshes, materials) = dungeon_meshes(grid);
     let stats = mesh_stats(&mesh_chunks(grid, &MeshParams::default()));
@@ -335,7 +377,7 @@ pub fn ensure_dungeon(grid: &TileGrid) -> anyhow::Result<String> {
     let asset_key = asset.to_string_lossy().replace('\\', "/");
     write_level_if_changed(
         &generated_path(&format!("{name}.level")),
-        &dungeon_level_data(grid, &asset_key),
+        &dungeon_level_data(grid, &asset_key, grunt_spawns),
     )?;
     Ok(name)
 }
@@ -464,19 +506,22 @@ pub fn room_meshes() -> (Vec<GlbMesh>, Vec<GlbMaterial>) {
 }
 
 /// The level that places the generated room: the `.glb` at identity (it is authored in
-/// world space) plus the player placeholder on the harness grid's entry tile.
+/// world space) plus the warrior on the harness grid's entry tile.
+///
+/// No grunts: the harness exists to test the *static-geometry injection road*, and a
+/// monster in it would be a second thing to explain when a bake looks wrong.
 pub fn room_level_data(asset: &str) -> LevelData {
-    let spawn = player_spawn(&room_collision_grid());
+    let grid = room_collision_grid();
+    let spawn = player_spawn(&grid);
+    let mut entities = vec![Entity {
+        asset: asset.into(),
+        name: Some("room".into()),
+        transform: identity(),
+        material_override: None,
+    }];
+    entities.extend(character_entities(&grid, &[]));
     LevelData {
-        entities: vec![
-            Entity {
-                asset: asset.into(),
-                name: Some("room".into()),
-                transform: identity(),
-                material_override: None,
-            },
-            player_entity(spawn),
-        ],
+        entities,
         lights: lights(spawn),
         camera: rest_camera(spawn),
         environment: environment(),
@@ -610,6 +655,9 @@ fn write_level_if_changed(path: &Path, level: &LevelData) -> anyhow::Result<()> 
 /// mesh never touches an engine registry directly — it becomes a file, and the engine's
 /// ordinary level load cooks it, instantiates it and bakes it like any authored asset.
 /// [`ensure_dungeon`] is the same road with the real generator's meshes on it.
+///
+/// As [`ensure_dungeon`], this places the warrior and so needs [`rigs::ensure_rigs`] to
+/// have run first; `crate::main` calls it for both paths.
 pub fn ensure_generated_room() -> anyhow::Result<&'static str> {
     let (meshes, materials) = room_meshes();
     let asset = room_asset_path();
@@ -714,26 +762,108 @@ mod tests {
     }
 
     /// The dungeon level must reference the generated asset by a path the engine's glTF
-    /// test accepts, and place the player exactly where gameplay will start it.
+    /// test accepts, and place the warrior exactly where gameplay will start it.
     #[test]
     fn dungeon_level_places_the_player_on_the_spawn() {
         let grid = test_grid(3);
-        let level = dungeon_level_data(&grid, "cache/generated/dungeon_3.glb");
+        let level = dungeon_level_data(&grid, "cache/generated/dungeon_3.glb", &[]);
         assert!(level.entities[0].asset.ends_with(".glb"));
         assert_eq!(level.entities[0].transform, identity());
 
         let player = &level.entities[1];
         assert_eq!(player.name.as_deref(), Some(PLAYER_NAME));
+        assert_eq!(player.asset, rig_asset_key(rigs::WARRIOR_RIG));
         let placed = Mat4::from_cols_array(&player.transform).w_axis.truncate();
         assert_eq!(placed, player_spawn(&grid));
+        assert_eq!(placed.y, CHARACTER_Y, "the warrior stands on the floor");
         assert_eq!(
             crate::collision::tile_of(to_collision(&grid, placed)),
             grid.entry(),
-            "the placeholder stands on the entry tile"
+            "the warrior stands on the entry tile"
         );
 
         let parsed: LevelData = ron::from_str(&level.to_ron().unwrap()).unwrap();
         assert_eq!(parsed, level);
+    }
+
+    /// **Spawn points round-trip into the level**, on every seed: one `grunt_<i>` entity
+    /// per point, in order, at that point's world position, referencing the grunt rig —
+    /// and each one standing in free space on a walkable tile.
+    ///
+    /// This is the seam the whole monster wiring rests on: `ai::spawn_points` chooses,
+    /// the writer places, and `game::acquire` re-pairs brain `i` with `grunt_<i>`. A
+    /// reordering anywhere in that chain puts a brain in someone else's body.
+    #[test]
+    fn spawn_points_round_trip_into_level_entities() {
+        use crate::ai::{GRUNT_RADIUS, spawn_points};
+        use crate::collision::collision;
+
+        for seed in [1u64, 3, 7, 11, 20260731] {
+            let grid = test_grid(seed);
+            let spawns = spawn_points(&grid, 6, 12.0, grid.seed());
+            assert!(!spawns.is_empty(), "seed {seed}: no room for any monster");
+
+            let level = dungeon_level_data(&grid, "cache/generated/x.glb", &spawns);
+            // [geometry, player, grunt_0 ..]
+            assert_eq!(level.entities.len(), 2 + spawns.len(), "seed {seed}");
+
+            let grunt_asset = rig_asset_key(rigs::GRUNT_RIG);
+            for (i, &local) in spawns.iter().enumerate() {
+                let entity = &level.entities[2 + i];
+                assert_eq!(entity.name.as_deref(), Some(grunt_name(i).as_str()));
+                assert_eq!(entity.asset, grunt_asset, "seed {seed}: grunt {i} asset");
+                let placed = Mat4::from_cols_array(&entity.transform).w_axis.truncate();
+                assert_eq!(placed, to_world(&grid, local, CHARACTER_Y));
+                // ...and back the other way, which is what `game::acquire` relies on.
+                assert_eq!(to_collision(&grid, placed), local, "seed {seed}: grunt {i}");
+
+                let (tx, tz) = crate::collision::tile_of(local);
+                assert!(grid.is_walkable(tx, tz), "seed {seed}: grunt {i} in rock");
+                assert!(
+                    !collision(&grid).circle_overlaps(local, GRUNT_RADIUS),
+                    "seed {seed}: grunt {i} overlaps geometry"
+                );
+                assert_ne!(
+                    grid.room_id_at(tx, tz),
+                    grid.room_id_at(grid.entry().0, grid.entry().1),
+                    "seed {seed}: grunt {i} spawned in the entry room"
+                );
+            }
+
+            // The names are unique, so the lookup that pairs them cannot collide.
+            let names: BTreeSet<&str> = level
+                .entities
+                .iter()
+                .filter_map(|e| e.name.as_deref())
+                .collect();
+            assert_eq!(names.len(), level.entities.len(), "seed {seed}");
+
+            let parsed: LevelData = ron::from_str(&level.to_ron().unwrap()).unwrap();
+            assert_eq!(parsed, level, "seed {seed}: level RON round-trip");
+        }
+    }
+
+    /// The monster count is level *content*, so two counts on one seed are two different
+    /// files — which is what makes `write_if_changed` rewrite the level (and only the
+    /// level: the geometry `.glb` is untouched) when `--grunts` changes.
+    #[test]
+    fn the_grunt_count_changes_the_level_but_not_the_geometry() {
+        use crate::ai::spawn_points;
+        let grid = test_grid(3);
+        let few = spawn_points(&grid, 2, 12.0, grid.seed());
+        let many = spawn_points(&grid, 6, 12.0, grid.seed());
+        assert!(many.len() > few.len());
+        assert_eq!(&many[..few.len()], &few[..], "the list only grows");
+
+        let a = dungeon_level_data(&grid, "x.glb", &few).to_ron().unwrap();
+        let b = dungeon_level_data(&grid, "x.glb", &many).to_ron().unwrap();
+        assert_ne!(a, b);
+        // Same seed, same geometry bytes, whatever the population.
+        let (meshes, materials) = dungeon_meshes(&grid);
+        assert_eq!(
+            dreamcoast_asset::write_glb(&meshes, &materials).unwrap(),
+            dreamcoast_asset::write_glb(&meshes, &materials).unwrap()
+        );
     }
 
     /// Same seed, byte-identical `.glb` — the property the cook cache (and therefore the

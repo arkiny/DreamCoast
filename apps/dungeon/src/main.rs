@@ -22,14 +22,18 @@
 //! the working directory):
 //!
 //! ```text
-//! cargo run -p dungeon                       # the default seed
+//! cargo run -p dungeon                       # the default seed, 6 monsters
 //! cargo run -p dungeon -- --seed 12345       # any u64
+//! cargo run -p dungeon -- --grunts 12        # any monster count (0 = an empty floor)
 //! cargo run -p dungeon -- --screenshot-clean tmp/dungeon.png
 //!
-//! # Headless, driven: DUNGEON_HOLD holds keys down for a capture sequence, which has
-//! # no keyboard of its own (see `game.rs`).
+//! # Headless, driven: DUNGEON_HOLD holds input sources down for a capture sequence,
+//! # which has no keyboard of its own, and DUNGEON_TAP presses one for a single step
+//! # (an attack is an edge — see `game.rs`).
 //! CAPTURE_SEQ=120 DUNGEON_HOLD=W,Shift cargo run -p dungeon --release -- \
 //!     --screenshot tmp/walk.png
+//! WARMUP_FRAMES=210 CAPTURE_SEQ=2 DUNGEON_HOLD=W DUNGEON_TAP=Mouse1@205 \
+//!     cargo run -p dungeon --release -- --screenshot tmp/swing.png
 //!
 //! # M1 static-geometry injection proof: the minimal runtime-GENERATED room, entering
 //! # the scene as a real asset file so it collects the per-mesh SDF / GDF / GI /
@@ -42,6 +46,7 @@
 //! game add its own flags without the engine knowing about them.
 
 mod ai;
+mod characters;
 mod collision;
 mod game;
 mod level;
@@ -60,22 +65,26 @@ use procgen::DungeonParams;
 /// a golden capture all describe one place. Pass `--seed <u64>` for any other.
 const DEFAULT_SEED: u64 = 20260731;
 
-/// Parse `--seed <u64>`. A malformed or missing value is a hard error — silently
-/// playing a different dungeon than the one asked for is worse than not starting.
-fn seed_from_args() -> anyhow::Result<u64> {
+/// Parse `--<flag> <value>` / `--<flag>=<value>` as a `u64`, or `default` when absent.
+///
+/// A malformed or missing value is a hard error — silently playing a different dungeon
+/// (or a different number of monsters) than the one asked for is worse than not starting.
+/// Unknown flags are skipped here and fall through to the engine's own scan, which is
+/// what lets a game add flags the engine knows nothing about.
+fn u64_arg(flag: &str, default: u64) -> anyhow::Result<u64> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        let value = match arg.strip_prefix("--seed") {
-            Some("") => args.next(),                                 // --seed <n>
-            Some(rest) => rest.strip_prefix('=').map(str::to_owned), // --seed=<n>
+        let value = match arg.strip_prefix(flag) {
+            Some("") => args.next(),                                 // --flag <n>
+            Some(rest) => rest.strip_prefix('=').map(str::to_owned), // --flag=<n>
             None => continue,
         };
-        let value = value.ok_or_else(|| anyhow::anyhow!("--seed needs a value (a u64)"))?;
+        let value = value.ok_or_else(|| anyhow::anyhow!("{flag} needs a value (a u64)"))?;
         return value
             .parse::<u64>()
-            .map_err(|e| anyhow::anyhow!("--seed '{value}': {e}"));
+            .map_err(|e| anyhow::anyhow!("{flag} '{value}': {e}"));
     }
-    Ok(DEFAULT_SEED)
+    Ok(default)
 }
 
 /// Whether `--generated-room` was passed: load the minimal injection-proof level
@@ -103,17 +112,27 @@ fn main() -> anyhow::Result<()> {
     // gate wants to read — so it has to reach the same log stream the engine uses.
     sandbox::init_logging();
 
-    // The game owns the grid; writing the level *borrows* it. That ordering is the
-    // single-instance guarantee in code form — there is no second `generate()` call to
-    // drift, and no way to mesh one dungeon and play another.
+    // The characters, first: both levels below reference the two rig `.glb`s by path, so
+    // they have to exist before a `.level` naming them is written (and long before the
+    // engine's loader tries to cook one).
+    rigs::ensure_rigs()?;
+
+    // The game owns the grid *and* the monster spawn list; writing the level *borrows*
+    // both. That ordering is the single-instance guarantee in code form — there is no
+    // second `generate()` or `spawn_points()` call to drift, and no way to mesh one
+    // dungeon and play another.
     let (game, level) = if generated_room_requested() {
-        let game = game::DungeonGame::new(level::room_collision_grid())?;
+        // The injection harness is a room, not an encounter: no monsters (see
+        // `level::room_level_data`).
+        let game = game::DungeonGame::new(level::room_collision_grid(), 0)?;
         let level = level::ensure_generated_room()?.to_owned();
         (game, level)
     } else {
-        let seed = seed_from_args()?;
-        let game = game::DungeonGame::new(procgen::generate(seed, &DungeonParams::default()))?;
-        let level = level::ensure_dungeon(game.grid())?;
+        let seed = u64_arg("--seed", DEFAULT_SEED)?;
+        let grunts = u64_arg("--grunts", game::DEFAULT_GRUNTS as u64)? as usize;
+        let game =
+            game::DungeonGame::new(procgen::generate(seed, &DungeonParams::default()), grunts)?;
+        let level = level::ensure_dungeon(game.grid(), game.grunt_spawns())?;
         (game, level)
     };
 

@@ -47,6 +47,15 @@ use crate::procgen::{TILE_SIZE, TileGrid};
 /// [`crate::level`]), so what you see is what collides.
 pub const PLAYER_RADIUS: f32 = 0.4;
 
+/// World height a character's *origin* sits at, metres.
+///
+/// Zero, because [`crate::rigs`] authors both rigs with their soles on `y = 0` and
+/// `rig_geometry_is_grounded_and_outward_facing` holds them there. So "place a character"
+/// is "place its origin on the floor plane", with no per-rig offset to keep in sync — the
+/// M1 sphere placeholder needed one (it was placed at its own radius so the ball rested on
+/// the floor) and the rigged characters that replaced it do not.
+pub const CHARACTER_Y: f32 = 0.0;
+
 /// The grid answers the collision layer's only question directly.
 ///
 /// Out-of-bounds is solid — [`TileGrid::get`] already defines it that way, which is
@@ -95,19 +104,23 @@ pub fn tile_of(local: Vec2) -> (i32, i32) {
     physics::world_to_tile(local, TILE_SIZE)
 }
 
-/// Where the player starts: the entry tile's centre, pushed out of any geometry it
-/// happens to touch.
+/// Where the player starts, in **collision space**: the entry tile's centre, pushed out
+/// of any geometry it happens to touch.
 ///
 /// The push matters even though the entry is a room centre: the level file and the
 /// simulation must agree on one spawn, and "centre, then `nearest_free`" is a rule both
-/// can evaluate from the grid alone. [`crate::level`] writes the placeholder here and
+/// can evaluate from the grid alone. [`crate::level`] places the warrior here and
 /// [`crate::game`] starts the simulation here.
-pub fn player_spawn(grid: &TileGrid) -> Vec3 {
+pub fn player_spawn_local(grid: &TileGrid) -> Vec2 {
     let local = to_collision(grid, grid.entry_world());
-    let free = collision(grid)
+    collision(grid)
         .nearest_free(local, PLAYER_RADIUS)
-        .unwrap_or(local);
-    to_world(grid, free, PLAYER_RADIUS)
+        .unwrap_or(local)
+}
+
+/// [`player_spawn_local`] in world space, on the floor ([`CHARACTER_Y`]).
+pub fn player_spawn(grid: &TileGrid) -> Vec3 {
+    to_world(grid, player_spawn_local(grid), CHARACTER_Y)
 }
 
 /// Does a circle in collision space overlap the square of tile `(tx, tz)`?
@@ -206,7 +219,8 @@ mod tests {
             );
             assert_eq!(tile_of(local), grid.entry(), "seed {seed}: spawn tile");
             assert_eq!(grid.get(grid.entry().0, grid.entry().1), Tile::Entry);
-            assert_eq!(spawn.y, PLAYER_RADIUS, "the placeholder rests on the floor");
+            assert_eq!(spawn.y, CHARACTER_Y, "the character stands on the floor");
+            assert_eq!(to_collision(&grid, spawn), player_spawn_local(&grid));
         }
     }
 

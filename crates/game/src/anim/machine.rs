@@ -322,8 +322,9 @@ mod tests {
 
     const DT: f32 = 1.0 / 60.0;
 
-    /// The shipped example graph.
-    const WARRIOR_ANIM: &str = include_str!("../../assets/warrior_anim.ron");
+    /// The shipped example graph — the module's own `pub const`, so the crate's
+    /// tests and a game read the same bytes through the same door.
+    const WARRIOR_ANIM: &str = crate::anim::WARRIOR_ANIM_RON;
 
     fn state(name: &str, clip: &str, looping: bool, length: f32) -> AnimStateDef {
         AnimStateDef {

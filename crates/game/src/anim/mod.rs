@@ -73,3 +73,16 @@ mod params;
 pub use graph::{ANY_STATE, AnimError, AnimGraphDef, AnimStateDef, Condition, TransitionDef};
 pub use machine::{AnimMachine, DEFAULT_CLIP_LENGTH};
 pub use params::Params;
+
+/// The shipped warrior animation graph (`crates/game/assets/warrior_anim.ron`), as
+/// text — the worked example this module is documented against, and the graph
+/// `apps/dungeon`'s warrior actually runs.
+///
+/// Exported as a `pub const` rather than left as a file a consumer reaches for
+/// because both readers want *these bytes*, not a copy of them: the crate's own
+/// tests parse it, and a game builds its [`AnimMachine`] from it. Before this
+/// existed the game `include_str!`d it across the workspace by relative path
+/// (`../../../crates/game/assets/…`), which is a build break waiting for the first
+/// crate that moves. A fixture with two readers is API surface, so it is declared
+/// as API surface.
+pub const WARRIOR_ANIM_RON: &str = include_str!("../../assets/warrior_anim.ron");
