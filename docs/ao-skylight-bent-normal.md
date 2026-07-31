@@ -7,7 +7,7 @@ that direction (not the surface normal) and attenuated by the sky-visibility sca
 multi-bounce energy return and bent-normal specular occlusion.
 
 Trademark-free: the reference engine is cited generically ("reference engine"). All new paths are
-content-only opt-in seams; the gallery golden `af70c1a5` stays byte-identical.
+content-only opt-in seams; the gallery golden stays byte-identical (current anchor: [golden-image-regression.md](golden-image-regression.md)).
 
 ## Key insight (why this is nearly free)
 

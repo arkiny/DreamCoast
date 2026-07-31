@@ -79,7 +79,7 @@ AO · 그림자 · 스카이라이트 오클루전이 **어떻게 계산·합성
    byte-identical seam + PT 잔차 영향 명시.
 
 ## 게이트 / 검증
-- **gallery 골든 `af70c1a5` byte-identical** 필수 — 모든 신규 경로는 content-only(gi_volume/AO on) seam,
+- **gallery 골든 byte-identical** 필수(현행 앵커는 [golden-image-regression.md](golden-image-regression.md)) — 모든 신규 경로는 content-only(gi_volume/AO on) seam,
   갤러리는 스칼라·no-op 레거시 유지. (`python3 tools/golden-image.py --only gallery --backend metal`)
 - **경로-트레이서 패리티**(`P8_PATHTRACE=1` … 단, 콘텐츠 씬은 HW 패스트레이서 BLAS 없음 → 갤러리만 유효.
   콘텐츠는 육안 + 성분 분리 + reference 정합으로 판단). 차폐부 스카이라이트가 물리적으로 옳게 줄어드는지.

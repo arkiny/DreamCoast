@@ -6,7 +6,11 @@ use crate::{Material, MeshData, MeshVertex};
 /// A unit cube centered at the origin with per-face normals and UVs. Fallback
 /// when no glTF file is available.
 pub fn unit_cube() -> MeshData {
-    // The 4 corner positions of each face (CCW).
+    // The 4 corner positions of each face, listed clockwise when viewed along the
+    // outward normal; the index emission below flips them to CCW triangles so the
+    // geometric (winding) normal agrees with the shading normal. Single-sided
+    // consumers (the vgeo producer's per-triangle backface cull) depend on that
+    // agreement — the fixed-function raster path never notices (culling is NONE).
     type Quad = ([f32; 3], [f32; 3], [f32; 3], [f32; 3]);
     const FACES: [Quad; 6] = [
         // +X
@@ -74,7 +78,7 @@ pub fn unit_cube() -> MeshData {
                 uv: UVS[c],
             });
         }
-        indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+        indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
     }
     MeshData {
         vertices,
@@ -93,7 +97,7 @@ fn quad(p: [[f32; 3]; 4], normal: [f32; 3]) -> MeshData {
             v(p[2], [1.0, 1.0]),
             v(p[3], [0.0, 1.0]),
         ],
-        indices: vec![0, 1, 2, 2, 3, 0],
+        indices: vec![0, 2, 1, 0, 3, 2],
         material: Material::default(),
     }
 }
@@ -175,7 +179,7 @@ fn axis_box(min: [f32; 3], max: [f32; 3]) -> MeshData {
                 },
             });
         }
-        indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+        indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
     }
     MeshData {
         vertices,
@@ -308,12 +312,79 @@ pub fn uv_sphere(segments: u32, rings: u32) -> MeshData {
         for s in 0..segments {
             let a = r * stride + s;
             let b = a + stride;
-            indices.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+            // CCW about the outward (radial) normal: with theta advancing +X->+Z and
+            // phi advancing top->bottom, (east x south) points outward.
+            indices.extend_from_slice(&[a, a + 1, b, a + 1, b + 1, b]);
         }
     }
     MeshData {
         vertices,
         indices,
         material: Material::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every triangle's geometric (winding) normal must agree with its vertices'
+    /// shading normal. The fixed-function raster path never notices a violation
+    /// (culling is NONE on all backends), but single-sided consumers — the vgeo
+    /// producer's per-triangle backface cull — drop miswound triangles entirely.
+    fn assert_winding_agrees(mesh: &MeshData, what: &str) {
+        for (t, tri) in mesh.indices.chunks_exact(3).enumerate() {
+            let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+            let p = |i: usize| mesh.vertices[i].pos;
+            let (pa, pb, pc) = (p(a), p(b), p(c));
+            let e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+            let e2 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+            let cross = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            // Average the three shading normals (curved meshes vary per vertex).
+            let n = [
+                mesh.vertices[a].normal[0]
+                    + mesh.vertices[b].normal[0]
+                    + mesh.vertices[c].normal[0],
+                mesh.vertices[a].normal[1]
+                    + mesh.vertices[b].normal[1]
+                    + mesh.vertices[c].normal[1],
+                mesh.vertices[a].normal[2]
+                    + mesh.vertices[b].normal[2]
+                    + mesh.vertices[c].normal[2],
+            ];
+            // Degenerate triangles (the collapsed pole rings of `uv_sphere`) have no
+            // winding to check.
+            let area_sq = cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2];
+            if area_sq <= 1e-12 {
+                continue;
+            }
+            let dot = cross[0] * n[0] + cross[1] * n[1] + cross[2] * n[2];
+            assert!(
+                dot > 0.0,
+                "{what}: triangle {t} winds against its shading normal (dot {dot})"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_cube_winding_agrees_with_normals() {
+        assert_winding_agrees(&unit_cube(), "unit_cube");
+    }
+
+    #[test]
+    fn uv_sphere_winding_agrees_with_normals() {
+        assert_winding_agrees(&uv_sphere(24, 16), "uv_sphere");
+    }
+
+    /// Covers `quad` and `axis_box` through every Cornell call site.
+    #[test]
+    fn cornell_box_winding_agrees_with_normals() {
+        for (i, (mesh, _)) in cornell_box().iter().enumerate() {
+            assert_winding_agrees(mesh, &format!("cornell_box[{i}]"));
+        }
     }
 }

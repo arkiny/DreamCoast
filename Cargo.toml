@@ -14,7 +14,9 @@ members = [
     "crates/asset",
     "crates/render",
     "crates/scene",
+    "crates/game",
     "apps/sandbox",
+    "apps/dungeon",
 ]
 
 [workspace.package]
@@ -38,6 +40,7 @@ dreamcoast-gui = { path = "crates/gui" }
 dreamcoast-asset = { path = "crates/asset" }
 dreamcoast-render = { path = "crates/render" }
 dreamcoast-scene = { path = "crates/scene" }
+dreamcoast-game = { path = "crates/game" }
 
 # External
 windows = "0.62"

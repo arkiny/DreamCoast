@@ -1,0 +1,45 @@
+// Warrior animation graph — the worked example for `game::anim`.
+//
+// State names match the `AttackSpec` names in `warrior.ron`, so the game can
+// drive this graph straight from `AttackEvent::ComboAdvanced` by triggering
+// "attack_<step + 1>". Lengths are the authored fallbacks used before the real
+// clips load; `AnimMachine::set_clip_length` overrides them at runtime.
+//
+// Transition order matters — first match wins. The interrupts (death, hit,
+// dodge, attacks) are declared first so they outrank the locomotion flow below,
+// and each is `interruptible: false` so its blend is always seen in full.
+//
+// `death` is terminal by *controller* convention, not by graph structure: it has
+// no outgoing edge, but the wildcard interrupts above would still fire from it if
+// the game kept feeding triggers. A dead entity's controller stops driving its
+// params (and clears the pending ones), the same way it stops reading input.
+(
+    initial: "idle",
+    states: [
+        (name: "idle",        clip: "idle",        speed: 1.0, looping: true,  length: Some(2.0)),
+        (name: "run",         clip: "run",         speed: 1.0, looping: true,  length: Some(0.8)),
+        (name: "slash_left",  clip: "slash_left",  speed: 1.0, looping: false, length: Some(0.75)),
+        (name: "slash_right", clip: "slash_right", speed: 1.0, looping: false, length: Some(0.82)),
+        (name: "overhead",    clip: "overhead",    speed: 1.0, looping: false, length: Some(1.09)),
+        (name: "dodge",       clip: "dodge",       speed: 1.0, looping: false, length: Some(0.35)),
+        (name: "hit",         clip: "hit",         speed: 1.0, looping: false, length: Some(0.4)),
+        (name: "death",       clip: "death",       speed: 1.0, looping: false, length: Some(1.6)),
+    ],
+    transitions: [
+        (from: "any", to: "death",        condition: Flag("dead"),        fade: 0.15, interruptible: false),
+        (from: "any", to: "hit",          condition: Trigger("hit"),      fade: 0.05, interruptible: false),
+        (from: "any", to: "dodge",        condition: Trigger("dodge"),    fade: 0.05, interruptible: false),
+        (from: "any", to: "slash_left",   condition: Trigger("attack_1"), fade: 0.06, interruptible: false),
+        (from: "any", to: "slash_right",  condition: Trigger("attack_2"), fade: 0.05, interruptible: false),
+        (from: "any", to: "overhead",     condition: Trigger("attack_3"), fade: 0.05, interruptible: false),
+
+        (from: "slash_left",  to: "idle", condition: StateDone,           fade: 0.15),
+        (from: "slash_right", to: "idle", condition: StateDone,           fade: 0.15),
+        (from: "overhead",    to: "idle", condition: StateDone,           fade: 0.18),
+        (from: "dodge",       to: "idle", condition: StateDone,           fade: 0.1),
+        (from: "hit",         to: "idle", condition: StateDone,           fade: 0.1),
+
+        (from: "idle", to: "run",  condition: Flag("moving"),             fade: 0.12),
+        (from: "run",  to: "idle", condition: NotFlag("moving"),          fade: 0.12),
+    ],
+)

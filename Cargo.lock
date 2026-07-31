@@ -318,6 +318,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dreamcoast-game"
+version = "0.0.0"
+dependencies = [
+ "dreamcoast-platform",
+ "dreamcoast-scene",
+ "glam",
+ "ron",
+ "serde",
+]
+
+[[package]]
 name = "dreamcoast-gui"
 version = "0.0.0"
 dependencies = [
@@ -371,6 +382,19 @@ dependencies = [
 [[package]]
 name = "dreamcoast-shader"
 version = "0.0.0"
+
+[[package]]
+name = "dungeon"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "dreamcoast-asset",
+ "dreamcoast-game",
+ "glam",
+ "ron",
+ "sandbox",
+ "tracing",
+]
 
 [[package]]
 name = "either"

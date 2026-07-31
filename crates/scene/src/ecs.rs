@@ -267,6 +267,41 @@ impl World {
             .collect()
     }
 
+    /// Collect `(entity, &A, &B, &C)` for every entity carrying all three — driven
+    /// by `A`'s insertion order, so the result is deterministic like [`query2`](Self::query2).
+    /// Entities missing `B` or `C` are skipped.
+    pub fn query3<A: 'static, B: 'static, C: 'static>(&self) -> Vec<(Entity, &A, &B, &C)> {
+        let (Some(a), Some(b), Some(c)) = (
+            self.storage::<A>(),
+            self.storage::<B>(),
+            self.storage::<C>(),
+        ) else {
+            return Vec::new();
+        };
+        a.iter()
+            .filter_map(|(e, av)| Some((e, av, b.get(e)?, c.get(e)?)))
+            .collect()
+    }
+
+    /// Collect `(entity, &A, &B, &C, &D)` for every entity carrying all four — driven
+    /// by `A`'s insertion order (deterministic). Entities missing any of `B`/`C`/`D`
+    /// are skipped.
+    pub fn query4<A: 'static, B: 'static, C: 'static, D: 'static>(
+        &self,
+    ) -> Vec<(Entity, &A, &B, &C, &D)> {
+        let (Some(a), Some(b), Some(c), Some(d)) = (
+            self.storage::<A>(),
+            self.storage::<B>(),
+            self.storage::<C>(),
+            self.storage::<D>(),
+        ) else {
+            return Vec::new();
+        };
+        a.iter()
+            .filter_map(|(e, av)| Some((e, av, b.get(e)?, c.get(e)?, d.get(e)?)))
+            .collect()
+    }
+
     /// Ensure a storage for component `T` exists. Called single-threaded before a
     /// parallel system schedule so that concurrent [`WorldCell`] writers never need
     /// to create a storage (which would structurally mutate the storage map and
@@ -434,5 +469,102 @@ mod tests {
             .map(|(_, a, b)| (**a, **b))
             .collect();
         assert_eq!(got, vec![(1, 1.5), (3, 3.5)]);
+    }
+
+    #[test]
+    fn query3_skips_entities_missing_a_component() {
+        let mut w = World::new();
+        let a = w.spawn();
+        w.insert(a, 1u32);
+        w.insert(a, 1.5f32);
+        w.insert(a, 1u8);
+        let b = w.spawn();
+        w.insert(b, 2u32);
+        w.insert(b, 2.5f32); // no u8 -> excluded
+        let c = w.spawn();
+        w.insert(c, 3u32);
+        w.insert(c, 3u8); // no f32 -> excluded
+        let d = w.spawn();
+        w.insert(d, 4u32);
+        w.insert(d, 4.5f32);
+        w.insert(d, 4u8);
+        let got: Vec<(u32, f32, u8)> = w
+            .query3::<u32, f32, u8>()
+            .iter()
+            .map(|(_, a, b, c)| (**a, **b, **c))
+            .collect();
+        assert_eq!(got, vec![(1, 1.5, 1), (4, 4.5, 4)]);
+    }
+
+    #[test]
+    fn query3_empty_when_a_storage_is_absent() {
+        let mut w = World::new();
+        let e = w.spawn();
+        w.insert(e, 1u32);
+        w.insert(e, 1.5f32);
+        // No u8 storage was ever created -> no match, no panic.
+        assert!(w.query3::<u32, f32, u8>().is_empty());
+    }
+
+    #[test]
+    fn query3_follows_first_component_insertion_order() {
+        let mut w = World::new();
+        let mut es = Vec::new();
+        for i in 0..4u32 {
+            let e = w.spawn();
+            es.push(e);
+            w.insert(e, i);
+        }
+        // Attach B/C in reverse order: iteration must still follow A's order.
+        for (i, &e) in es.iter().enumerate().rev() {
+            w.insert(e, i as f32);
+            w.insert(e, i as u8);
+        }
+        let order: Vec<u32> = w
+            .query3::<u32, f32, u8>()
+            .iter()
+            .map(|(_, a, ..)| **a)
+            .collect();
+        assert_eq!(order, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn query4_intersects_all_four() {
+        let mut w = World::new();
+        let a = w.spawn();
+        w.insert(a, 1u32);
+        w.insert(a, 1.5f32);
+        w.insert(a, 1u8);
+        w.insert(a, 1i16);
+        let b = w.spawn();
+        w.insert(b, 2u32);
+        w.insert(b, 2.5f32);
+        w.insert(b, 2u8); // no i16 -> excluded
+        let got: Vec<(u32, f32, u8, i16)> = w
+            .query4::<u32, f32, u8, i16>()
+            .iter()
+            .map(|(_, a, b, c, d)| (**a, **b, **c, **d))
+            .collect();
+        assert_eq!(got, vec![(1, 1.5, 1, 1)]);
+    }
+
+    #[test]
+    fn query3_excludes_despawned_entities() {
+        let mut w = World::new();
+        let a = w.spawn();
+        w.insert(a, 1u32);
+        w.insert(a, 1.5f32);
+        w.insert(a, 1u8);
+        let b = w.spawn();
+        w.insert(b, 2u32);
+        w.insert(b, 2.5f32);
+        w.insert(b, 2u8);
+        w.despawn(a);
+        let got: Vec<u32> = w
+            .query3::<u32, f32, u8>()
+            .iter()
+            .map(|(_, a, ..)| **a)
+            .collect();
+        assert_eq!(got, vec![2]);
     }
 }

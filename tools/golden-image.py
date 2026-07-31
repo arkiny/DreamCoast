@@ -8,7 +8,7 @@ against a stored golden two ways:
 
     1. **SHA-256 (exact).** The renderer is deterministic run-to-run on a given
        box/backend (see CLAUDE.md gates), so a byte-identical hash is the strict
-       pass. The gallery anchor (``af70c1a5...``) is the canonical example.
+       pass. The gallery anchor (``2fb9c207...``) is the canonical example.
     2. **Pixel mean/max diff (tolerant).** When a PNG golden exists, we also
        report per-channel mean/max abs diff. This absorbs the small
        cross-box / cross-backend / driver nondeterminism that a raw hash cannot,
@@ -84,7 +84,7 @@ PT_SOURCES = [
 # Each config is a fixed-camera, deterministic headless capture. `env` extends
 # the process environment; `name` is both the golden key and the PNG basename.
 # The gallery anchor uses the default scene (no LEVEL) -- it is the invariant
-# byte-identity gate from CLAUDE.md and must match `af70c1a5...`.
+# byte-identity gate from CLAUDE.md and must match `2fb9c207...`.
 #
 # THIS LIST IS THE SINGLE SOURCE for every non-measured manifest field: --update
 # rebuilds each selected entry wholesale from the recipe here plus the fresh

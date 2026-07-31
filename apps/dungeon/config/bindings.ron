@@ -1,0 +1,22 @@
+// Dungeon input bindings (`dreamcoast_game::input::BindingsConfig`).
+//
+// Action names must match `crate::game::Action`; source names are the key names in
+// `dreamcoast_game::input::keys` ("W", "Shift", "Space", "Mouse1", …). This file is
+// embedded at build time, so it is also the shipped default.
+//
+// Modifiers are bound by their generic name (`Shift`, not `LShift`): neither window
+// backend reports the sided codes, matching Win32's own `WM_KEYDOWN` behaviour.
+// Attack binds the mouse *and* a key: the mouse is what a top-down action game is
+// played with, and "J" is what a headless capture, a keyboard-only machine and a
+// bug report can all reach without one.
+(actions: {
+    "MoveForward": ["W", "Up"],
+    "MoveBack": ["S", "Down"],
+    "MoveLeft": ["A", "Left"],
+    "MoveRight": ["D", "Right"],
+    "Sprint": ["Shift"],
+    "Attack": ["Mouse1", "J"],
+    "Dodge": ["Space"],
+    "Drink": ["Q"],
+    "Restart": ["R"],
+})

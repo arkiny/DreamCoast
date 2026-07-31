@@ -768,6 +768,93 @@ pub fn mesh_open_fraction(index_bytes: &[u8]) -> f32 {
     boundary as f32 / edges.len() as f32
 }
 
+/// Boundary-edge fraction above which a mesh counts as **open** (non-watertight) and its
+/// field can no longer carry a global inside/outside sign. Single source for both the
+/// F6H unsigned seam (`P_SDF_OPEN_UNSIGNED`) and the inversion test
+/// ([`field_is_inverted`]); measured separation is wide (Intel Sponza's one nearly-closed
+/// outlier sits at 0.010, the next open mesh at 0.17, a quad-soup dungeon chunk at 0.80),
+/// so the exact value is not a tuned knob.
+pub const OPEN_MESH_BOUNDARY_FRAC: f32 = 0.05;
+
+/// Fraction of the volume's **outer voxel shell** that reads negative ("inside").
+///
+/// Those voxels are provably outside the source geometry: the bake grid spans the mesh
+/// AABB padded by `max(0.1·extent, 0.05 m)` per axis ([`mesh_local_aabb_padded`]), while
+/// the outermost voxel *centres* sit only half a voxel inside the padded box. With
+/// `dims ∈ [8, 48]` per axis, half a voxel is at most `E/16` of the padded extent `E`,
+/// and the padding is at least `E/12` — so the shell always lies strictly outside the
+/// original AABB (margin ≥ `E/48`), i.e. strictly outside the mesh. For a *closed* mesh
+/// that makes this a ground-truth probe: every shell voxel must read positive, and a
+/// negative majority proves the field's sign is flipped.
+///
+/// For an OPEN mesh the same voxels are outside the triangles but the "solid" side is
+/// undefined (a wall quad's back half-space is legitimately rock), so the census is
+/// descriptive only — see [`field_is_inverted`].
+pub fn outside_shell_neg_frac(vol: &SdfVolume) -> f32 {
+    let [dx, dy, dz] = vol.dims;
+    let (nx, ny, nz) = (dx as usize, dy as usize, dz as usize);
+    if nx == 0 || ny == 0 || nz == 0 {
+        return 0.0;
+    }
+    let mut shell = 0usize;
+    let mut neg = 0usize;
+    for z in 0..nz {
+        for y in 0..ny {
+            // Interior rows are skipped wholesale: only x = 0 / x = nx-1 are on the shell.
+            let edge_row = y == 0 || z == 0 || y == ny - 1 || z == nz - 1;
+            for x in 0..nx {
+                if !edge_row && x != 0 && x != nx - 1 {
+                    continue;
+                }
+                shell += 1;
+                if vol.voxels[x + nx * (y + ny * z)] < 0.0 {
+                    neg += 1;
+                }
+            }
+        }
+    }
+    neg as f32 / shell.max(1) as f32
+}
+
+/// Is this baked field's sign **globally inverted** (open space reading "inside")?
+///
+/// A mesh whose vertex normals point inward bakes an inverted field: the closest-triangle
+/// rule (`dot(p−q, n) < 0 ⇒ negative`) then paints all of open space solid, which poisons
+/// the composite and shows up as spurious AO/GI blotches. That is the only condition this
+/// test is allowed to detect, and it is decided by **provably-outside samples**:
+/// [`outside_shell_neg_frac`] over the padded grid's outer shell.
+///
+/// **Why not a voxel-count majority.** The historical test was "more than 60 % of voxels
+/// negative ⇒ negate". That measures how much of the AABB reads solid, which for a
+/// non-watertight mesh is dominated by half-space contamination (F6H), not by inversion:
+/// an open sheet paints the entire half-space behind it "inside", so the fraction is a
+/// function of where the sheet sits in its own AABB. Procedural content makes that a coin
+/// flip — the dungeon's chunk meshes are soups of single-sided floor/wall quads (no
+/// enclosed volume at all: a boundary flood leaves 0 % of the grid unreached) whose
+/// negative fraction lands anywhere in 0.16 … 0.85 depending on the room layout, so 2–4
+/// chunks per generated dungeon were flipped at random, inverting occlusion for the room
+/// air the quads face. For reference, a *correctly* signed watertight solid fills at most
+/// ≈ 0.58 of its padded grid ((1/1.2)³, the 10 % padding), so the old 0.60 threshold was
+/// separated from a plain solid box by two points of grid discretisation.
+///
+/// **Open meshes are never flipped.** Above [`OPEN_MESH_BOUNDARY_FRAC`] the mesh no longer
+/// bounds an interior, so "inverted" is undefined: the authored normals are the only
+/// statement of which side is solid, and the bake already honours them — the field is
+/// correct on the normal-facing side (the side that is visible and marched) and
+/// contaminated behind. Negating would move the error onto the visible side. The residual
+/// half-space contamination is a *different* defect with its own seam
+/// (`P_SDF_OPEN_UNSIGNED` / [`flood_resign`]); it must not be papered over by a global
+/// sign flip.
+///
+/// A thin open sheet sits at ≈ 50 % negative by construction (one half-space); it is open,
+/// so it is never flipped — a defined, layout-independent answer either way.
+pub fn field_is_inverted(vol: &SdfVolume, open_frac: f32) -> bool {
+    if open_frac > OPEN_MESH_BOUNDARY_FRAC {
+        return false;
+    }
+    outside_shell_neg_frac(vol) > 0.5
+}
+
 /// Robust in/out re-sign for OPEN meshes (F6J): the closest-triangle sign paints
 /// half-spaces "inside" behind open sheets, and no |d|-side strategy can express a
 /// perforated shell (the F6I frontier). Instead, vote the sign per voxel with THREE
@@ -1313,6 +1400,190 @@ mod tests {
         );
         assert!(at(1) > 0.0, "front air stays positive");
         assert!(at(7) < 0.0, "plate interior stays negative, got {}", at(7));
+    }
+
+    /// Watertight axis-aligned box `[-h, h]^3` as 12 triangles over 8 SHARED corner
+    /// vertices (shared so the mesh really is closed by the edge census), each carrying
+    /// the outward radial corner normal. `outward = false` flips both the winding and the
+    /// normals — the "inverted-wound closed mesh" the negate path exists for (the bake
+    /// signs by the closest triangle's averaged normals, so the whole field flips).
+    fn box_mesh(h: f32, outward: bool) -> (Vec<MeshVertex>, Vec<u32>) {
+        let s = if outward { 1.0 } else { -1.0 };
+        let r = 1.0 / 3.0f32.sqrt();
+        let mut verts = Vec::new();
+        for c in 0..8u32 {
+            let sx = if c & 1 == 0 { -1.0 } else { 1.0 };
+            let sy = if c & 2 == 0 { -1.0 } else { 1.0 };
+            let sz = if c & 4 == 0 { -1.0 } else { 1.0 };
+            verts.push(vert(
+                [sx * h, sy * h, sz * h],
+                [s * sx * r, s * sy * r, s * sz * r],
+            ));
+        }
+        // Corner bit layout: bit0 = +x, bit1 = +y, bit2 = +z. Each quad is listed
+        // counter-clockwise seen from outside.
+        let quads: [[u32; 4]; 6] = [
+            [0, 2, 3, 1], // -z
+            [4, 5, 7, 6], // +z
+            [0, 1, 5, 4], // -y
+            [2, 6, 7, 3], // +y
+            [0, 4, 6, 2], // -x
+            [1, 3, 7, 5], // +x
+        ];
+        let mut idx = Vec::new();
+        for q in quads {
+            idx.extend_from_slice(&[q[0], q[1], q[2], q[0], q[2], q[3]]);
+        }
+        if !outward {
+            for t in idx.chunks_exact_mut(3) {
+                t.swap(1, 2);
+            }
+        }
+        (verts, idx)
+    }
+
+    #[test]
+    fn watertight_box_is_not_inverted() {
+        // The case the old voxel-majority test came closest to breaking: a correctly
+        // signed solid fills (1/1.2)^3 ≈ 0.58 of its padded AABB — only 2 points of
+        // margin under the historical 0.60 "negate" threshold.
+        let (verts, idx) = box_mesh(0.5, true);
+        let vol = bake_mesh_sdf(&verts, &idx);
+        let open = mesh_open_fraction(&encode_indices(&idx));
+        assert!(
+            open <= OPEN_MESH_BOUNDARY_FRAC,
+            "closed box, got open {open}"
+        );
+        let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count() as f32 / vol.voxels.len() as f32;
+        assert!(
+            (0.5..0.6).contains(&neg),
+            "solid box fills most of its padded AABB, got {neg}"
+        );
+        assert!(
+            outside_shell_neg_frac(&vol) < 1e-6,
+            "every provably-outside shell voxel must read positive"
+        );
+        assert!(
+            !field_is_inverted(&vol, open),
+            "a correct field must not flip"
+        );
+    }
+
+    #[test]
+    fn inverted_wound_box_is_inverted() {
+        // Same box with flipped normals/winding: open space bakes "inside", so the
+        // provably-outside shell reads negative everywhere and the flip must fire.
+        let (verts, idx) = box_mesh(0.5, false);
+        let vol = bake_mesh_sdf(&verts, &idx);
+        let open = mesh_open_fraction(&encode_indices(&idx));
+        assert!(open <= OPEN_MESH_BOUNDARY_FRAC);
+        assert!(
+            outside_shell_neg_frac(&vol) > 0.99,
+            "an inverted field reads solid on the whole outside shell"
+        );
+        assert!(field_is_inverted(&vol, open), "inverted normals must flip");
+    }
+
+    #[test]
+    fn open_wall_chunk_shell_is_never_inverted() {
+        // A dungeon chunk in miniature: single-sided floor + wall quads (normals into
+        // the room), no enclosed volume. The rock half-spaces behind the quads drive the
+        // negative fraction well past the old 60 % trigger AND put the provably-outside
+        // shell in the majority-negative range — but the field is *correct* on the room
+        // side, so the flip must not fire, whatever the layout.
+        // Two parallel corridors at the chunk's edges with rock between them (the
+        // "solid region exceeds 60 % of the AABB" layout): floors face up, walls face
+        // into their corridor, nothing is closed, nothing has thickness.
+        let (f, wall_h) = (6.0f32, 4.0f32);
+        let mut verts = Vec::new();
+        let mut idx = Vec::new();
+        let mut quad = |c: [[f32; 3]; 4], n: [f32; 3]| {
+            let base = verts.len() as u32;
+            for p in c {
+                verts.push(vert(p, n));
+            }
+            idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        };
+        for (z0, z1) in [(-f, -f + 2.0), (f - 2.0, f)] {
+            quad(
+                [[-f, 0.0, z0], [f, 0.0, z0], [f, 0.0, z1], [-f, 0.0, z1]],
+                [0.0, 1.0, 0.0],
+            );
+            // The corridor's two long walls, each facing the walkable side.
+            quad(
+                [
+                    [-f, 0.0, z0],
+                    [f, 0.0, z0],
+                    [f, wall_h, z0],
+                    [-f, wall_h, z0],
+                ],
+                [0.0, 0.0, 1.0],
+            );
+            quad(
+                [
+                    [-f, 0.0, z1],
+                    [f, 0.0, z1],
+                    [f, wall_h, z1],
+                    [-f, wall_h, z1],
+                ],
+                [0.0, 0.0, -1.0],
+            );
+        }
+        let vol = bake_mesh_sdf(&verts, &idx);
+        let open = mesh_open_fraction(&encode_indices(&idx));
+        assert!(
+            open > OPEN_MESH_BOUNDARY_FRAC,
+            "a quad soup is wide open, got {open}"
+        );
+        let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count() as f32 / vol.voxels.len() as f32;
+        assert!(
+            neg > 0.6,
+            "half-space contamination trips the old majority test, got {neg}"
+        );
+        assert!(
+            !field_is_inverted(&vol, open),
+            "an open shell has no global sign to invert"
+        );
+        // Ground truth: corridor air above a floor quad, on the normal side of every
+        // surface bounding it, reads positive — that is what a flip would destroy.
+        assert!(
+            vol.sample([0.0, 2.0, -f + 1.0]) > 0.0,
+            "corridor air must stay outside"
+        );
+        // ... and the rock between the corridors reads negative, which is correct too.
+        assert!(vol.sample([0.0, 2.0, 0.0]) < 0.0, "rock between corridors");
+    }
+
+    #[test]
+    fn thin_open_sheet_decision_is_stable() {
+        // A curtain proxy: exactly one contaminated half-space ⇒ ≈50 % negative, the
+        // coin-flip the old threshold sat next to. Open ⇒ defined answer: never flip
+        // (the sheet's front side keeps the correct sign; the back is F6H's problem).
+        let verts = [
+            vert([-1.0, -1.0, 0.0], [0.0, 0.0, 1.0]),
+            vert([1.0, -1.0, 0.0], [0.0, 0.0, 1.0]),
+            vert([1.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            vert([-1.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+        ];
+        let idx = [0u32, 1, 2, 0, 2, 3];
+        let vol = bake_mesh_sdf(&verts, &idx);
+        let open = mesh_open_fraction(&encode_indices(&idx));
+        let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count() as f32 / vol.voxels.len() as f32;
+        assert!(
+            (neg - 0.5).abs() < 0.05,
+            "one half-space negative, got {neg}"
+        );
+        assert!(
+            (outside_shell_neg_frac(&vol) - 0.5).abs() < 0.1,
+            "the shell census is a coin flip on a sheet"
+        );
+        assert!(!field_is_inverted(&vol, open), "sheets are never flipped");
+        // And the front side (the normal side) keeps the correct sign — what negating
+        // would have destroyed.
+        assert!(
+            vol.sample([0.0, 0.0, 0.03]) > 0.0,
+            "front of the sheet is air"
+        );
     }
 
     #[test]

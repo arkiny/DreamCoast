@@ -193,7 +193,7 @@ tonemap+grading → (particle/cull draw/ImGui)`.
 - **PR-3 · 투명 패스 슬롯 [M]. ✅ 완료** (Metal 검증, DX≡VK Windows pending). 디퍼드 라이팅+반사+포그
   뒤·post 앞에 정렬 포워드 투명 패스 삽입(depth-test on/write off, G-buffer 미기록, back-to-front
   CPU 정렬 알파 블렌드; 포워드 PBR 라이팅은 디퍼드와 **공유 BRDF 헤더** `pbr_brdf.slang` 재사용).
-  투명 0개면 미스케줄 → 갤러리 앵커 `af70c1a5…` 바이트 동일. opt-in `P_TRANSLUCENT_TEST=1`(테스트
+  투명 0개면 미스케줄 → 갤러리 앵커 바이트 동일([golden-image-regression.md](golden-image-regression.md)). opt-in `P_TRANSLUCENT_TEST=1`(테스트
   유리 평면). **부수효과 정리:** particle/cull draw를 이 HDR 슬롯(톤맵 전)으로 이동 → 톤맵-후 LDR
   드로 제거(둘 다 디폴트-off라 디폴트 출력 불변). OIT/굴절/투명 velocity는 Phase 20.
   상세 [translucency-pass.md](translucency-pass.md).
@@ -230,7 +230,7 @@ tonemap+grading → (particle/cull draw/ImGui)`.
   기능 플래그(`SceneViewFeatures`: taau/velocity/post/screen_space_gi)로 secondary 뷰의 단순화(=temporal
   상태 뷰-수 안전)를 **구조로** 표현. 증명 데모 opt-in `P_SECOND_VIEW=1`: 메인 오빗 뷰 + 상공 오버헤드
   뷰를 같은 프레임에 렌더해 백버퍼 우상단 PiP 인셋으로 합성(`record_tonemap_inset` + 뷰포트 rect).
-  디폴트 단일 뷰 = 골든 앵커 `af70c1a5…` 바이트 동일. 완전 파라미터화·뷰별 히스토리 링·스테레오
+  디폴트 단일 뷰 = 골든 앵커 바이트 동일([golden-image-regression.md](golden-image-regression.md)). 완전 파라미터화·뷰별 히스토리 링·스테레오
   single-pass 인스턴싱은 후속. 상세·검증 수치 [view-family.md](view-family.md). *unblocks:* 실시간 env
   캡처·에디터 다중 뷰포트.
 

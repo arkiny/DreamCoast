@@ -681,8 +681,7 @@ float4 fsMain(VSOutput input) : SV_Target
                 float3 to_light = L.position - world_pos;
                 float dist = length(to_light);
                 float3 l = to_light / max(dist, 1e-4);
-                float atten = 1.0 / max(dist * dist, 1e-4);
-                float3 radiance = L.color * L.intensity * atten;
+                float3 radiance = L.color * L.intensity * point_attenuation(dist, L.radius);
                 lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
             }
             lights_touched = pc.cluster_light_count;
@@ -707,8 +706,7 @@ float4 fsMain(VSOutput input) : SV_Target
                 float3 to_light = L.position - world_pos;
                 float dist = length(to_light);
                 float3 l = to_light / max(dist, 1e-4);
-                float atten = 1.0 / max(dist * dist, 1e-4);
-                float3 radiance = L.color * L.intensity * atten;
+                float3 radiance = L.color * L.intensity * point_attenuation(dist, L.radius);
                 lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
             }
             lights_touched = lcount;
@@ -722,7 +720,10 @@ float4 fsMain(VSOutput input) : SV_Target
             float3 to_light = globals.point_pos[i].xyz - world_pos;
             float dist = length(to_light);
             float3 l = to_light / max(dist, 1e-4);
-            float atten = 1.0 / max(dist * dist, 1e-4);
+            // `point_pos[i].w` is the light's influence radius (0 = no cutoff = the historical
+            // pure inverse-square). Same helper as the clustered paths, so a light shades
+            // identically whichever path carries it — see `point_attenuation`.
+            float atten = point_attenuation(dist, globals.point_pos[i].w);
             float3 radiance = globals.point_color[i].rgb * globals.point_color[i].a * atten;
             lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0);
         }

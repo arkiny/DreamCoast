@@ -353,7 +353,11 @@ impl VulkanVolume {
 }
 
 impl Drop for VulkanVolume {
+    /// Return both bindless volume slots (the 64-entry tables would otherwise overflow after
+    /// two level hot-swaps — see `DeviceShared::volume_free`) and destroy the image.
     fn drop(&mut self) {
+        self.device.free_volume(self.sampled_index);
+        self.device.free_storage_volume(self.storage_index);
         unsafe {
             self.device.device.destroy_image_view(self.view, None);
             self.device.device.destroy_image(self.image, None);

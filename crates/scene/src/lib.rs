@@ -12,22 +12,47 @@
 //! the renderer owns — that handle indirection is the seam that keeps the scene
 //! free of GPU types. The renderer turns a [`draw_list::Drawable`] list into actual
 //! draw calls.
+//!
+//! Around the entity storage sit the three pieces gameplay code needs but the
+//! renderer does not: [`Resources`] (typed world singletons), [`Events`] (a
+//! double-buffered message channel) and [`Commands`] (a deferred structural-change
+//! buffer, the sanctioned way to spawn/despawn from a parallel system). All three
+//! preserve the crate's determinism rule — ordered replay, insertion-ordered
+//! iteration — because the draw list's stability depends on it.
+//!
+//! Animation is split along the same seam: [`sample_clip`] evaluates an
+//! [`AnimationClip`] into an [`AnimPose`], [`blend_poses`] crossfades two poses, and
+//! [`apply_pose`] commits one to the ECS — so gameplay can blend clips rather than
+//! only play one. [`advance_animation`] is that pipeline wired to a looping clock.
 
 mod animation;
+mod commands;
 mod components;
 mod draw_list;
 mod ecs;
+mod events;
 mod gltf_instance;
 mod node;
+mod pose;
+mod resources;
 mod schedule;
 mod transform;
 
-pub use animation::{AnimationClip, AnimationPlayer, MorphWeights, advance_animation};
+pub use animation::{
+    AnimationClip, AnimationPlayer, ClipBuilder, LoopMode, MorphWeights, advance_animation,
+    sample_clip, sample_clip_into,
+};
+pub use commands::{CommandTarget, Commands, DeferredEntity};
 pub use components::{MaterialHandle, MeshHandle, MeshInstance, Name};
 pub use draw_list::Drawable;
+/// glTF keyframe interpolation mode — re-exported because [`ClipBuilder`] takes it.
+pub use dreamcoast_asset::Interpolation;
 pub use ecs::{Entity, World, WorldCell};
+pub use events::Events;
 pub use gltf_instance::{instantiate_gltf, instantiate_gltf_mapped};
 pub use node::NodeRef;
+pub use pose::{AnimPose, PoseEntry, Trs, apply_pose, blend_poses, blend_poses_into};
+pub use resources::Resources;
 pub use schedule::{Access, SystemSchedule};
 pub use transform::{
     Children, LocalTransform, Parent, Spin, WorldTransform, advance_spin, propagate_transforms,

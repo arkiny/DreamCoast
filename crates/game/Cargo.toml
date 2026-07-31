@@ -1,0 +1,18 @@
+[package]
+name = "dreamcoast-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Raw per-frame keyboard/mouse state — the only engine dependency the input
+# module needs (no RHI, no renderer).
+dreamcoast-platform.workspace = true
+# ECS entities/events for the combat components and the damage flow. Still no
+# RHI and no renderer: `scene` is glam-and-data only.
+dreamcoast-scene.workspace = true
+glam.workspace = true
+# Data-driven bindings (`bindings.ron`), same RON stack the `.level` files use.
+serde.workspace = true
+ron.workspace = true

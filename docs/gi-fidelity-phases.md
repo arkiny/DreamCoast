@@ -8,8 +8,8 @@
 
 - **먼저 읽기:** `DreamCoast/CLAUDE.md`(엔지니어링 5원칙), 이 문서, [gi-fidelity-roadmap.md](gi-fidelity-roadmap.md).
 - **불변 게이트(순서대로):** `cargo fmt` → `RUSTFLAGS="-D warnings" cargo clippy -p <크레이트> --all-targets`
-  → **갤러리 바이트 동일** SHA `af70c1a5c8db49661d2c7926140c1309c28fda04c82cc1ab8aa6638d588b2b74`
-  (`./target/release/sandbox --backend metal --screenshot-clean out.png` 후 `shasum -a 256`) →
+  → **갤러리 바이트 동일**(현행 앵커 SHA는 [golden-image-regression.md](golden-image-regression.md)가 단일 소스;
+  `./target/release/sandbox --backend metal --screenshot-clean out.png` 후 `shasum -a 256`) →
   **결정론**(run-to-run 바이트 동일) → (품질 변경 시) **콘텐츠 시각/정성** 검증 → DX≡VK(Windows 동결→보류 명시).
 - **콘텐츠 검증 씬:** `LEVEL=sponza_intel EV100=11 WARMUP_FRAMES=64 CAM_EYE=-14,2,0 CAM_TARGET=14,2,0`
   RELEASE 빌드. 뷰 회귀: `P_SC_VIZ=1`(표면캐시), `DEBUG_VIEW=9/10`(GDF AO/GI).

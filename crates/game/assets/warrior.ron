@@ -1,0 +1,47 @@
+// The warrior baseline in file form — the worked example for `ClassDef`.
+//
+// Value-identical to `ClassDef::warrior()`, which a unit test enforces. Generated
+// by `ClassDef::warrior().to_ron()`; regenerating drops these comments.
+(
+    name: "warrior",
+    max_health: 100.0,
+    move_speed: 4.5,
+    sprint_mult: 1.55,
+    dodge: (
+        distance: 3.2,
+        duration: 0.35,
+        iframes: 0.3,
+    ),
+    combo: [
+        (
+            name: "slash_left",
+            damage: 12.0,
+            range: 1.9,
+            half_angle_rad: 0.9599311,
+            windup: 0.25,
+            active: 0.15,
+            recovery: 0.35,
+            stagger: 0.18,
+        ),
+        (
+            name: "slash_right",
+            damage: 14.0,
+            range: 1.9,
+            half_angle_rad: 0.9599311,
+            windup: 0.28,
+            active: 0.16,
+            recovery: 0.38,
+            stagger: 0.2,
+        ),
+        (
+            name: "overhead",
+            damage: 22.0,
+            range: 2.1,
+            half_angle_rad: 1.134464,
+            windup: 0.34,
+            active: 0.2,
+            recovery: 0.55,
+            stagger: 0.35,
+        ),
+    ],
+)

@@ -18,7 +18,7 @@ via the release `sandbox --backend metal --screenshot-clean`:
 
 | config          | recipe                                                                 | what it guards |
 |-----------------|------------------------------------------------------------------------|----------------|
-| `gallery`       | default scene (no env)                                                  | the byte-identity **anchor** `af70c1a5…` (CLAUDE.md invariant gate) |
+| `gallery`       | default scene (no env)                                                  | the byte-identity **anchor** `2fb9c207ebd4…` (CLAUDE.md invariant gate) |
 | `sponza_sc_viz` | `LEVEL=sponza_intel EV100=11 AUTO_EXPOSURE=0 WARMUP_FRAMES=64 CAM_EYE=-14,2,0 CAM_TARGET=14,2,0 P_SC_VIZ=1` | content surface-cache view (F1/F5 consumers) |
 | `sponza_gdf_ao` | …same camera… `DEBUG_VIEW=9`                                            | content distance-field AO (F2 consumers)     |
 
@@ -96,6 +96,33 @@ purely the anisotropic filter, and the gallery stays run-to-run byte-identical a
 the new default. Content SHAs were **left untouched** (they are run-to-run noisy;
 see the caveat above). Cross-backend DX≡VK re-verification is tracked in
 `docs/windows-verify-anisotropy-default.md`.
+
+**Rebase log — gallery anchor `65d04ceca2c4…` → `2fb9c207ebd4…` (2026-07-31):** `ccbf9dd`
+rewound every procedural primitive (`unit_cube`, `quad`, `axis_box`, `ground_mesh`,
+`uv_sphere`) CCW about its shading normal, so single-sided consumers — the vgeo producer's
+per-triangle backface cull — stop dropping flat geometry (the M1 floorless-dungeon bug). The
+triangle *set* is unchanged; only each triangle's vertex order is permuted. The fixed-function
+raster therefore does not move at all: `DEBUG_VIEW` 1/2/5 (albedo / normal / world-pos), 7
+(direct) and 6/9 (AO — i.e. the baked distance field) are **byte-identical** across the change.
+The anchor moved through the **surface cache's C1 mesh-triangle capture**
+(`sdf_cache_capture.slang`), which walks the raw index buffer: `closest_tri_point(p,a,b,c,bary)`
+and the barycentric attribute blend `u0*bary.x + u1*bary.y + u2*bary.z` are both order-dependent
+under non-associative FP, so a permuted vertex triple reassociates them. Only `DEBUG_VIEW` 8
+(IBL ambient) and 10 (GDF GI) change — 11 px each — plus 13 px in the cache viz, landing as
+**2 pixels of 3 686 400 differing by 1/255** in the final image. Sub-perceptual, and not a
+quality change (the gallery carries no PT gate; content PT budgets were untouched).
+Verified deterministic on **both** sides, so this is a clean re-anchor and not a flake:
+12/12 byte-identical runs at `018cbc6` (reproducing `65d04ce…` exactly, and byte-equal to the
+stored PNG golden) versus 4/4 at `ccbf9dd` and 12/12 at `bb4938f`, all `2fb9c207…`. Commits
+`85419e2`…`bb4938f` are anchor-neutral. Content SHAs (`sponza_sc_viz`, `sponza_gdf_ao`) and both
+PT budgets are **unaffected** — the content scene is glTF geometry, not procedural primitives.
+
+> **Reading the report:** the runner prints `ALL PASS` whenever every config passes *either*
+> strictly or tolerantly, so a `PASS~ mean 0.000 max 1 (sha differs)` gallery row still yields
+> `ALL PASS` at the bottom. The anchor gate is the **per-config** `PASS sha …` line, not the
+> summary. `ccbf9dd`'s own commit message reported the anchor "unchanged" on the strength of the
+> summary line; it had in fact already moved, and the later appearance of intermittency was only
+> the difference between reading the summary and reading the row.
 
 ## Content PT-residual configs (F6 Part B)
 

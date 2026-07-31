@@ -41,7 +41,7 @@ Feed the engine's existing world-space directional-irradiance volume (the radian
 analytic fallback becomes `albedo · ((sun·NdL·shadow)/π + E_indirect)` when the volume is bound.
 
 - **Seam:** the volume is bound only for content (`P_GI_VOLUME` defaults on for non-gallery); the
-  gallery keeps the exact legacy `sky_fill` expression → **byte-identical anchor `af70c1a5`**.
+  gallery keeps the exact legacy `sky_fill` expression → **byte-identical gallery anchor** (current value: [golden-image-regression.md](golden-image-regression.md)).
 - **Packing:** the volume base index rides in the reflect push's `flip_y` spare bits (bit 0 stays the
   Y-flip); the 240-byte push is full and the D3D12 root budget forbids growing it.
 - **Result:** the knight goes from a black silhouette to polished steel that reflects its GI-lit

@@ -85,8 +85,17 @@ pub(crate) struct DeviceShared {
     // (the handoff contract), so no in-flight command reads a reused slot's stale descriptor.
     storage_buffer_next: AtomicU32,
     storage_buffer_free: Mutex<Vec<u32>>,
+    // Sampled-volume (binding 6) / storage-volume (binding 7) high-water marks + free-lists of
+    // slots returned by dropped volumes, mirroring the storage-image reclaim above. Both tables
+    // hold only 64 entries and ONE content level's distance fields occupy most of them (scene SDF
+    // + 3 albedo channels + the clipmap's finer levels + the per-mesh atlas), so a level hot-swap
+    // that rebuilds the static scene overflowed them within two swaps without this. Same safety:
+    // a volume only Drops after its frames retire (the swap `wait_idle`s and joins the RHI thread
+    // first).
     volume_next: AtomicU32,
+    volume_free: Mutex<Vec<u32>>,
     storage_volume_next: AtomicU32,
+    storage_volume_free: Mutex<Vec<u32>>,
     // Per-frame globals (set 1): one UNIFORM_BUFFER_DYNAMIC binding, written once
     // to point at the app's globals buffer; the per-frame slice is selected by a
     // dynamic offset at bind time. Only PBR pipelines bind this set.
@@ -415,7 +424,9 @@ impl DeviceShared {
                 storage_buffer_next: AtomicU32::new(0),
                 storage_buffer_free: Mutex::new(Vec::new()),
                 volume_next: AtomicU32::new(0),
+                volume_free: Mutex::new(Vec::new()),
                 storage_volume_next: AtomicU32::new(0),
+                storage_volume_free: Mutex::new(Vec::new()),
                 globals_pool,
                 globals_layout,
                 globals_set,
@@ -646,10 +657,31 @@ impl DeviceShared {
         self.bindless_free.lock().unwrap().push(index);
     }
 
+    /// Return a sampled-volume slot to the free-list (called from `VulkanVolume::drop`).
+    pub(crate) fn free_volume(&self, index: u32) {
+        self.volume_free.lock().unwrap().push(index);
+    }
+
+    /// Return a storage-volume (UAV) slot to the free-list (`VulkanVolume::drop`).
+    pub(crate) fn free_storage_volume(&self, index: u32) {
+        self.storage_volume_free.lock().unwrap().push(index);
+    }
+
     /// Register a sampled 3D volume view in the bindless table (binding 6),
     /// returning its index in the separate 0-based volume space (Phase 11).
     pub(crate) fn register_volume(&self, view: vk::ImageView) -> u32 {
-        let index = self.volume_next.fetch_add(1, Ordering::Relaxed);
+        // Reuse a freed slot before bumping the high-water mark (see the field docs).
+        let index = self
+            .volume_free
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| self.volume_next.fetch_add(1, Ordering::Relaxed));
+        assert!(
+            index < VOLUME_COUNT,
+            "bindless sampled-volume table overflow (> {VOLUME_COUNT}); raise VOLUME_COUNT \
+             across bindless.slang + all three backends"
+        );
         let image_info = vk::DescriptorImageInfo::default()
             .image_view(view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
@@ -668,7 +700,17 @@ impl DeviceShared {
     /// returning its index in the separate 0-based storage-volume space. Compute
     /// bakes write it (image layout GENERAL).
     pub(crate) fn register_storage_volume(&self, view: vk::ImageView) -> u32 {
-        let index = self.storage_volume_next.fetch_add(1, Ordering::Relaxed);
+        let index = self
+            .storage_volume_free
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| self.storage_volume_next.fetch_add(1, Ordering::Relaxed));
+        assert!(
+            index < STORAGE_VOLUME_COUNT,
+            "bindless storage-volume table overflow (> {STORAGE_VOLUME_COUNT}); raise \
+             STORAGE_VOLUME_COUNT across bindless.slang + all three backends"
+        );
         let image_info = vk::DescriptorImageInfo::default()
             .image_view(view)
             .image_layout(vk::ImageLayout::GENERAL);

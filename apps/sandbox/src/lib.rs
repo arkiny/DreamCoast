@@ -1,0 +1,9493 @@
+//! Sandbox: the playground application — **and the engine library**.
+//!
+//! There is no separate engine binary: the render path, the frame loop and the scene
+//! assembly all live here. So this crate builds as a **library** with a thin `sandbox`
+//! binary on top (`src/main.rs` = `main_entry(GameConfig::default())`), and a game app
+//! links the library, installs [`GameHooks`], and drives gameplay without forking the
+//! render path (`docs/game-framework-plan.md` §2). The public surface is deliberately
+//! small: [`main_entry`] / [`launch`], [`GameConfig`], [`GameHooks`], [`CameraPose`],
+//! [`App::set_hooks`] / [`App::run`], plus re-exports of the crates those signatures
+//! mention. Everything else stays crate-private.
+//!
+//! Builds a deferred-PBR render graph each frame: a G-buffer fill pass
+//! rasterizes the glTF mesh (or procedural cube fallback) into four MRT targets
+//! (albedo, world normal, metallic/roughness/AO, world position) with depth; a
+//! full-screen lighting pass reads the G-buffer and shades it with a
+//! Cook-Torrance BRDF (one directional sun + a few point lights) into a linear
+//! HDR target; a tonemap pass maps that to the backbuffer; and a Dear ImGui
+//! overlay exposes the lighting controls and a G-buffer debug view. Runs on
+//! either backend (`--backend vulkan|d3d12`).
+//!
+//! The per-feature GPU work lives in focused bundles (`deferred`, `ibl`, `rt`,
+//! `gdf`, `particle`, `cull`); `App` owns those bundles plus the device / swapchain
+//! / per-frame sync, with `App::new` doing setup and `App::frame` running one frame
+//! of the loop. [`launch`] shrinks to window + device bring-up + `App::new` + the loop.
+//!
+//! A game binary is then roughly:
+//!
+//! ```no_run
+//! use sandbox::{
+//!     CameraPose, GameConfig, GameHooks, glam::Vec3, platform::InputSnapshot, scene::World,
+//! };
+//!
+//! #[derive(Default)]
+//! struct Dungeon {
+//!     player: Vec3,
+//! }
+//!
+//! impl GameHooks for Dungeon {
+//!     fn fixed_update(&mut self, _world: &mut World, _input: &InputSnapshot, dt: f32) {
+//!         self.player.x += dt; // game simulation, one fixed step
+//!     }
+//!     fn camera(&mut self, _alpha: f32) -> Option<CameraPose> {
+//!         // Top-down follow camera, tilted off vertical (world +Y is up).
+//!         Some(CameraPose::look_at(self.player + Vec3::new(0.0, 12.0, 8.0), self.player))
+//!     }
+//! }
+//!
+//! fn main() -> anyhow::Result<()> {
+//!     sandbox::main_entry(GameConfig {
+//!         level: Some("sponza".into()),
+//!         hooks: Some(Box::new(Dungeon::default())),
+//!         ..GameConfig::default()
+//!     })
+//! }
+//! ```
+
+use std::time::Instant;
+
+use dreamcoast_asset::MeshData;
+use dreamcoast_core::glam::{Mat4, Quat, Vec3};
+use dreamcoast_gui::Gui;
+use dreamcoast_platform::Window;
+use dreamcoast_render::{GraphProfiler, PassInfo, RenderGraph, ResourceId, ResourcePool};
+use rhi::{
+    BackendKind, Buffer, BufferDesc, BufferUsage, CommandBuffer, CommandList, ComputeQueue,
+    DepthBuffer, Device, Extent2D, Fence, Format, Instance, InstanceDesc, PresentMode, QueryHeap,
+    Queue, ReadbackLayout, Recorder, Semaphore, Swapchain, SwapchainDesc, Texture,
+};
+use tracing::info;
+
+mod app;
+mod atmosphere;
+mod camera;
+mod character;
+mod clipmap;
+mod cluster;
+mod compose;
+mod cook_progress;
+mod csm;
+mod cull;
+mod deferred;
+mod deform;
+mod fuse;
+mod gdf;
+mod gi;
+mod gtao;
+pub mod hooks;
+mod hzb;
+mod ibl;
+mod level;
+mod loading;
+mod mesh;
+mod mesh_sdf;
+mod morph;
+mod particle;
+mod postfx;
+mod push;
+mod quality;
+mod reflect;
+mod registry;
+mod rhi_thread;
+mod rt;
+mod skin;
+mod smoketest;
+mod static_scene;
+mod taau;
+mod translucent;
+mod velocity;
+mod vgeo;
+mod view;
+mod world;
+use app::*;
+use cluster::{ClusterLight, ClusterSystem};
+use cull::*;
+use deferred::*;
+use dreamcoast_scene::{LocalTransform, MeshInstance, World};
+use gdf::*;
+use gi::*;
+use hzb::*;
+use ibl::*;
+use mesh::*;
+use particle::*;
+use push::*;
+use reflect::*;
+use registry::{GpuMesh, MaterialDesc, MaterialRegistry, MeshRegistry, build_scene};
+use rt::*;
+use smoketest::*;
+
+pub use hooks::{CameraPose, GameHooks};
+
+// Re-exports so a downstream game crate can spell the hook signatures (`World`,
+// `Input`, `imgui::Ui`, `glam` vectors) without re-deriving this crate's exact
+// dependency versions. Single source: they are this crate's own dependencies.
+pub use dreamcoast_core::glam;
+pub use dreamcoast_gui::imgui;
+pub use dreamcoast_platform as platform;
+pub use dreamcoast_scene as scene;
+
+/// How the application is brought up. `default()` is exactly the stock sandbox (the
+/// byte-identical golden/gallery path); a game overrides the fields it needs.
+#[derive(Default)]
+pub struct GameConfig {
+    /// Level to load. Two forms, distinguished by shape:
+    ///
+    /// * a **stem** (`"sponza"`) — matched case-insensitively against the `.level`
+    ///   files in [`Self::levels_dir`], exactly as the `LEVEL` env var always has; or
+    /// * an **explicit path** (anything containing a path separator or ending in
+    ///   `.level`, absolute or relative to the working directory) — used as given, so a
+    ///   game can load a level it generated outside the engine's own directory.
+    ///
+    /// A name that resolves to nothing is a hard error naming what *is* available; it
+    /// used to fall back to the first level found, which made a typo look like the
+    /// wrong scene loading. `None` = resolve the scene from the environment as before
+    /// (`WORLD` / `LEVEL` / `SCENE_GLTF` / the procedural gallery). An explicit value
+    /// wins over `LEVEL`.
+    pub level: Option<String>,
+    /// Directory the stem form searches, and the hot-swap dropdown lists. `None` =
+    /// the engine's own `apps/sandbox/levels` (relative to the working directory),
+    /// which is also the only directory the built-in `.level` files are written into —
+    /// a game pointing this elsewhere gets its own levels and nothing else.
+    pub levels_dir: Option<std::path::PathBuf>,
+    /// Game callbacks. `None` = no injection at all (bit-for-bit the stock frame).
+    pub hooks: Option<Box<dyn GameHooks>>,
+}
+
+const FRAMES_IN_FLIGHT: usize = 2;
+// CPU/GPU-bound diagnosis (`PROFILE_CPU`): microseconds spent in the per-frame fence wait (blocking
+// on the fif's previous GPU submission) and the whole-frame CPU wall time. wait≈0 ⇒ CPU-bound (the
+// GPU already finished, the CPU is the long pole); wait large ⇒ GPU-bound. Logged in screenshot mode.
+static LAST_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_FRAME_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// CPU record time: frame entry → just before `present` (excludes the display-paced present block),
+// so it isolates the real CPU work (graph build + command recording + submit) from vsync pacing.
+static LAST_CPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Swapchain / backbuffer. UNORM, not sRGB: GPU capture & overlay layers
+// (RenderDoc, OBS, …) force VK_IMAGE_USAGE_STORAGE onto swapchain images, which an
+// sRGB surface format can never support — an sRGB backbuffer makes RenderDoc
+// hard-crash at swapchain creation. The final passes encode sRGB in-shader
+// instead (see `linear_to_srgb` in bindless.slang).
+const COLOR_FORMAT: Format = Format::Bgra8Unorm;
+const DEPTH_FORMAT: Format = Format::Depth32Float;
+const HDR_FORMAT: Format = Format::Rgba16Float; // linear HDR lighting target
+// G-buffer attachment formats.
+const GB_ALBEDO_FMT: Format = Format::Rgba8Unorm;
+const GB_NORMAL_FMT: Format = Format::Rgba16Float;
+const GB_MATERIAL_FMT: Format = Format::Rgba8Unorm;
+const GB_POSITION_FMT: Format = Format::Rgba16Float;
+/// Per-frame globals slice size (256-byte aligned for D3D12 root CBV / Vulkan
+/// dynamic UBO offset). Holds the lighting globals, the light view-projection matrix,
+/// the (PR-6) clustered-lighting view-Z row + froxel params, and the (PR-7) CSM cascade
+/// block (up to 4 cascade view-projections + splits/tiles). 1280 = next 256-aligned size
+/// that fits both blocks; the OFF paths leave their fields zeroed so the shader takes the
+/// legacy branches and the gallery anchor stays byte-identical.
+const GLOBALS_SLICE: u64 = 1280;
+
+/// View-family capacity (render-pipeline re-baseline PR-9, `docs/view-family.md`). The globals
+/// UBO is sub-allocated as `FRAMES_IN_FLIGHT * MAX_VIEWS` slices so each view in a frame gets its
+/// own camera-matrix slice — the per-view offset is `(fif * MAX_VIEWS + view_index) * GLOBALS_SLICE`.
+/// `MAX_VIEWS = 2` covers the current primary + secondary (PiP) proof; bump it (and nothing else)
+/// to allow more simultaneous views (split-screen / stereo / scene-capture probes). The default
+/// single-view path only ever touches slice 0 of each frame, so the anchor stays byte-identical.
+const MAX_VIEWS: u64 = 2;
+
+/// Clustered light culling froxel grid (PR-6). Single source of truth mirrored by
+/// `CLUSTER_X/Y/Z` in `light_cluster_common.slang`. 16×9 tiles matches 16:9; 24
+/// exponential Z slices is the DOOM-2016-era default. Bump for a higher RenderQuality
+/// tier (also grows the grid/index storage buffers via `CLUSTER_COUNT`).
+const CLUSTER_X: u32 = 16;
+const CLUSTER_Y: u32 = 9;
+const CLUSTER_Z: u32 = 24;
+const CLUSTER_COUNT: u32 = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
+/// Max lights binned per cluster (mirrors `MAX_LIGHTS_PER_CLUSTER` in the shader).
+const MAX_LIGHTS_PER_CLUSTER: u32 = 128;
+/// Camera near/far — single source of truth for the scene projection AND the clustered
+/// froxel Z slicing (they must agree so cluster slices span the actual view frustum).
+const CLUSTER_Z_NEAR: f32 = 0.05;
+const CLUSTER_Z_FAR: f32 = 100.0;
+/// Directional shadow map resolution (square).
+const SHADOW_SIZE: u32 = 2048;
+/// The ground plane's linear albedo — the single source of truth shared by the
+/// G-buffer ground draw (direct view) and the SW-RT GI / reflection re-light passes.
+/// The ground is analytic (not in the per-voxel albedo volume), so those passes must
+/// be told its material explicitly; sourcing it here keeps them from drifting (and
+/// stops `albedo_at()` returning the nearest *object's* colour for a floor hit).
+pub(crate) const GROUND_ALBEDO: [f32; 3] = [0.8, 0.8, 0.8];
+/// GPU particle count (Phase 7 fountain demo); 32 bytes each.
+const PARTICLE_COUNT: usize = 4096;
+/// GPU-culling instance grid: `GRID_DIM x GRID_DIM` cube instances (Phase 7).
+const GRID_DIM: u32 = 16;
+const GRID_COUNT: u32 = GRID_DIM * GRID_DIM;
+/// Environment cubemap face resolution (square) and its full mip chain. The
+/// prefilter convolution samples these mips so a roughness lookup needs only
+/// ~32-64 samples instead of hundreds.
+const ENV_SIZE: u32 = 256;
+const ENV_MIPS: u32 = ENV_SIZE.ilog2() + 1;
+/// Diffuse irradiance cubemap face resolution (small — it is very low frequency,
+/// and kept cheap for per-frame real-time capture).
+const IRRADIANCE_SIZE: u32 = 16;
+/// Specular prefilter cubemap face resolution (mip 0) and roughness mip count.
+const PREFILTER_SIZE: u32 = 128;
+const PREFILTER_MIPS: u32 = 5;
+/// BRDF integration LUT resolution.
+const BRDF_SIZE: u32 = 256;
+/// Sentinel for "this material texture is absent — use the scalar factor".
+const NO_TEXTURE: u32 = u32::MAX;
+const MODEL_PATH: &str = "assets/model.glb";
+
+const DEBUG_VIEWS: [&str; 12] = [
+    "Lit",
+    "Albedo",
+    "Normal",
+    "Metallic",
+    "Roughness",
+    "Position",
+    "AO",
+    "Direct",
+    "IBL",
+    "GDF AO",
+    "GDF GI",
+    "Velocity", // 11 — motion vectors (needs P_VELOCITY=1)
+];
+/// DEBUG_VIEW=11 velocity viz amplification: a small NDC motion (a few 1e-3) is scaled into a
+/// visible colour range. Tuned so a spinning object's edge motion is clearly readable.
+const VELOCITY_VIZ_SCALE: f32 = 40.0;
+/// PR-5 motion-blur tunables (single source; ready to become a RenderQuality tier).
+/// `SAMPLES` taps along the velocity vector; `INTENSITY` scales one frame of on-screen
+/// travel (1 = full shutter-open exposure); `MAX_UV` caps the per-pixel streak length in
+/// UV so a very fast object can't smear across the whole frame.
+const MOTION_BLUR_SAMPLES: u32 = 8;
+const MOTION_BLUR_INTENSITY: f32 = 1.0;
+const MOTION_BLUR_MAX_UV: f32 = 0.05;
+const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
+
+/// One materialized drawable in the sample scene: a shared GPU mesh + world
+/// transform + resolved PBR material. Produced from the ECS draw list by
+/// [`registry::build_scene`]; consumed by the rasterizer, RT, and GDF passes.
+#[derive(Clone)]
+pub(crate) struct SceneObject {
+    /// Shared uploaded geometry (vertex/index buffers + counts).
+    pub(crate) mesh: std::rc::Rc<GpuMesh>,
+    pub(crate) transform: Mat4,
+    /// World-space AABB (min, max) for frustum culling — the mesh local AABB transformed by
+    /// `transform` (computed in `build_scene`). Tested against the camera frustum planes.
+    pub(crate) world_aabb: [Vec3; 2],
+    pub(crate) base_color: [f32; 4],
+    pub(crate) metallic: f32,
+    pub(crate) roughness: f32,
+    /// base color, metallic-roughness, normal, emissive bindless indices
+    /// (`NO_TEXTURE` if absent).
+    pub(crate) tex: [u32; 4],
+    /// Alpha-test cutoff for `alphaMode: MASK` (0.0 = opaque, no test). Drives the G-buffer
+    /// cutout discard and the masked-shadow discard from one value.
+    pub(crate) alpha_cutoff: f32,
+    /// Renderer routing tag from material classification (deferred-decal pass split). `Opaque`
+    /// for procedural/level drawables; glTF imports may be `Decal`/`Transparent`.
+    pub(crate) kind: dreamcoast_asset::MaterialKind,
+    /// glTF `doubleSided`: `false` = single-sided (vgeo backface-culls its clusters). Procedural
+    /// drawables pass `true`. Only vgeo consumes it (the mesh fill stays `CULL_NONE`).
+    pub(crate) two_sided: bool,
+    pub(crate) casts_shadow: bool,
+    /// GPU-skinning storage-buffer indices `[joints, weights, palette, joint_count]`
+    /// when this drawable is skinned (animation Stage B.2); `None` = static. Set by the
+    /// per-frame skinning patch; the G-buffer pass draws these with the skinned pipeline
+    /// + the bind-pose vertex buffer (the vertex shader does the deform).
+    pub(crate) skin: Option<[u32; 4]>,
+    /// GPU-morph indices `[deltas, weights, target_count, vertex_count]` when this drawable
+    /// is GPU-morphed (animation Stage C optimization); `None` = not morphed (or CPU-morphed,
+    /// which instead swaps the vertex buffer). Set by the per-frame morph patch; the
+    /// G-buffer/shadow passes draw these with the morph pipeline + the bind-pose buffer.
+    pub(crate) morph: Option<[u32; 4]>,
+    /// Baked vertex-cache **deform** velocity hook: the PREVIOUS-frame position storage-buffer
+    /// bindless index when this drawable is a deform part (`None` = not a deform, or velocity off).
+    /// The G-buffer just draws the current ring VB (`mesh`); only the velocity pass consumes this,
+    /// reading the prev positions to compute per-vertex motion. Set by the deform patch each frame.
+    pub(crate) deform: Option<u32>,
+}
+
+/// A level's lighting (sun + point lights), applied in the `Globals` assembly in
+/// place of the gallery's hardcoded code-default lights. `None` keeps the gallery
+/// defaults (byte-identical baseline).
+struct LevelLighting {
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    /// The directional (sun) light's RGB color — drives the analytic sun tint so a level can author
+    /// a warm sun (e.g. `[1.0, 0.96, 0.9]`). White `[1,1,1]` if the level has no directional light.
+    sun_color: [f32; 3],
+    /// Every point light the level authors, in authored order — **unbounded** (R1). The first
+    /// four also fit the `Globals` UBO arrays for the legacy brute-force path; a level that
+    /// authors more than four is routed through the clustered light buffer instead (see
+    /// `frame`'s `clustered` decision). Order is load-bearing: both paths accumulate in this
+    /// order, which is what makes them bit-identical.
+    points: Vec<ClusterLight>,
+}
+
+/// Build a [`LevelLighting`] from a level's environment + lights: the environment sun
+/// (overridden by an explicit directional light), and **every** authored point light.
+///
+/// The old 4-light truncation here was the R1 cap (docs/game-framework-plan.md §5): it lived
+/// on the consumption side, because `LevelData::lights` was already unbounded. Point lights
+/// past the `Globals` UBO's four slots now go to the clustered light buffer.
+fn level_lighting(level: &dreamcoast_asset::LevelData) -> LevelLighting {
+    use dreamcoast_asset::level::LightKind;
+    // A level authors a directional light's `vec` as the direction the light *travels*
+    // (the glTF convention — "the sun shines down" = a downward vector). The renderer's
+    // `sun_direction` is the direction *toward* the sun, so negate.
+    let toward_sun = |v: [f32; 3]| [-v[0], -v[1], -v[2]];
+    let env = level.environment;
+    let mut sun_dir = toward_sun(env.sun_dir);
+    let mut sun_intensity = env.sun_intensity;
+    let mut sun_color = [1.0f32, 1.0, 1.0];
+    let mut points = Vec::new();
+    for l in &level.lights {
+        match l.kind {
+            LightKind::Directional => {
+                sun_dir = toward_sun(l.vec);
+                sun_intensity = l.intensity;
+                sun_color = l.color;
+            }
+            LightKind::Point => points.push(ClusterLight {
+                position: l.vec,
+                // `range <= 0` = no cutoff (the pre-range authored default), which the shader's
+                // `point_attenuation` reads as plain inverse-square — so a level authored before
+                // the field existed shades exactly as it did. See `Light::range`.
+                radius: l.range.max(0.0),
+                color: l.color,
+                intensity: l.intensity,
+            }),
+        }
+    }
+    LevelLighting {
+        sun_dir,
+        sun_intensity,
+        sun_color,
+        points,
+    }
+}
+
+/// Hard cap on point lights submitted to the GPU in one frame (R1). Well above the
+/// 10-30 torches a generated dungeon floor carries, and comfortably inside the cluster
+/// index list (`MAX_LIGHTS_PER_CLUSTER` = 128 lights may overlap in any one froxel, which
+/// only a pathological pile-up reaches). Past the cap the lights FARTHEST from the camera
+/// are dropped and a one-time warning is logged — the nearest lights are the ones whose
+/// omission would be visible, and a distance rule is stable frame to frame (no popping
+/// beyond the cap boundary itself).
+const MAX_SCENE_LIGHTS: usize = 256;
+
+/// Select at most [`MAX_SCENE_LIGHTS`] of `lights` — the nearest to `eye` — **restoring the
+/// authored order** among the survivors.
+///
+/// Re-sorting by original index matters: the deferred pass accumulates point lights in list
+/// order, so a camera-distance ordering would make the shaded result depend on where the
+/// camera stands (floating-point addition is not associative) and flicker as the camera
+/// moves. Selecting by distance but accumulating in authored order keeps the frame
+/// deterministic. Under the cap this is a no-op that clones nothing.
+fn cap_scene_lights(lights: &mut Vec<ClusterLight>, eye: [f32; 3]) {
+    if lights.len() <= MAX_SCENE_LIGHTS {
+        return;
+    }
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[lights] {} point lights exceeds the {MAX_SCENE_LIGHTS} cap — dropping the farthest \
+             from the camera. Reduce the light count or raise MAX_SCENE_LIGHTS.",
+            lights.len()
+        );
+    }
+    let d2 = |l: &ClusterLight| {
+        let (dx, dy, dz) = (
+            l.position[0] - eye[0],
+            l.position[1] - eye[1],
+            l.position[2] - eye[2],
+        );
+        dx * dx + dy * dy + dz * dz
+    };
+    let mut order: Vec<usize> = (0..lights.len()).collect();
+    order.sort_by(|&a, &b| {
+        d2(&lights[a])
+            .partial_cmp(&d2(&lights[b]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b)) // ties -> authored order, so the selection is deterministic
+    });
+    order.truncate(MAX_SCENE_LIGHTS);
+    order.sort_unstable();
+    *lights = order.into_iter().map(|i| lights[i]).collect();
+}
+
+/// Per-frame globals, mirrored by `Globals` in pbr.slang. All members are 16-byte
+/// vectors so the std140 (Vulkan) and cbuffer (D3D12) layouts agree.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Globals {
+    camera_pos: [f32; 4],
+    sun_direction: [f32; 4],
+    sun_color: [f32; 4],
+    ambient: [f32; 4],
+    counts: [i32; 4], // x point count, y debug view, w shadows enabled
+    point_pos: [[f32; 4]; 4],
+    point_color: [[f32; 4]; 4],
+    light_view_proj: [f32; 16], // world -> light clip (shadow lookup)
+    shadow: [f32; 4],           // x depth bias, y texel size (1 / SHADOW_SIZE)
+    inv_view_proj: [f32; 16],   // clip -> world (skybox ray reconstruction)
+    ibl: [i32; 4],              // x env, y irradiance, z prefilter, w BRDF (-1 = none)
+    probe: [f32; 4],            // xyz reflection-probe capture centre, w parallax on (1) / off (0)
+    probe_box_min: [f32; 4],    // xyz reflection proxy AABB min corner
+    probe_box_max: [f32; 4],    // xyz reflection proxy AABB max corner
+    prev_view_proj: [f32; 16],  // world -> previous clip (Stage C7 SSR history reprojection)
+    // Clustered light culling (PR-6). `cluster_view_z_row` is row 2 of the world->view matrix
+    // (positive linear view depth = -dot(row, [world,1])); `cluster_params` = (z_near, z_far, 0, 0)
+    // for the froxel Z slicing. Unused on the brute-force path (CLUSTERED_LIGHTS off).
+    cluster_view_z_row: [f32; 4],
+    cluster_params: [f32; 4],
+    // --- PR-7 shadow atlas / CSM. All zero on the legacy single-map path (csm_params.x == 0),
+    // which makes the shader take the `light_view_proj` branch → byte-identical anchor.
+    csm_params: [i32; 4], // x cascade count (0 = off), y debug-cascade viz, z tile texels, w atlas texels
+    csm_split: [f32; 4],  // per-cascade view-space far distance (up to MAX_CASCADES)
+    csm_opts: [f32; 4],   // x cross-cascade blend fraction (of the cascade depth range)
+    csm_view_proj: [[f32; 16]; 4], // per-cascade world -> atlas-tile light clip
+    csm_atlas_uv: [[f32; 4]; 4], // per-cascade atlas UV sub-rect: xy offset, zw scale
+}
+
+fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
+    SwapchainDesc {
+        extent,
+        format: COLOR_FORMAT,
+        // `NO_VSYNC=1` runs the presentation uncapped (no display-refresh pacing) so the true
+        // CPU+GPU frame time can be benchmarked past the 60Hz vsync ceiling. Default = Fifo (vsync).
+        present_mode: if std::env::var_os("NO_VSYNC").is_some() {
+            PresentMode::Immediate
+        } else {
+            PresentMode::Fifo
+        },
+        image_count: 3,
+    }
+}
+
+/// Install the engine's logging (and panic hook), honoring `--log-file`. Idempotent.
+///
+/// [`main_entry`] calls this itself, so a plain game never needs to. Call it *first*
+/// when the game does work before bring-up — generating a level, cooking assets — and
+/// wants those logs in the same stream (and the same `--log-file`) as the engine's.
+pub fn init_logging() {
+    // `--log-file <path>` mirrors logs to a file (the logging layer reads the env
+    // var). It's a CLI flag, not just the env var, because GPU capture launchers
+    // (RenderDoc's UI env editor) mangle environment values but pass command-line
+    // arguments through cleanly. SAFE: set once at startup before any threads.
+    if let Some(path) = log_file_path() {
+        unsafe { std::env::set_var("DREAMCOAST_LOG_FILE", path) };
+    }
+    dreamcoast_core::init_logging();
+}
+
+/// Process entry point: install logging, size the job-system pool, then [`launch`].
+/// The `sandbox` binary is `main_entry(GameConfig::default())`; a game binary passes
+/// its own config (level + hooks) and gets the identical bring-up.
+pub fn main_entry(config: GameConfig) -> anyhow::Result<()> {
+    init_logging();
+    // Size the job-system worker pool from the machine's core count before any
+    // parallel work (propagate / parallel record / morph) touches the global pool.
+    // Default = `available_parallelism() - 1` worker threads (the main thread is the
+    // other participant); `JOBS_THREADS=<n>` overrides for benchmarking.
+    let job_threads = std::env::var("JOBS_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    dreamcoast_jobs::init_global(job_threads);
+    info!(
+        "job system: {} worker threads (+ main)",
+        dreamcoast_jobs::global().num_workers()
+    );
+    // Log any fatal error before it propagates: under a GPU capture tool
+    // (RenderDoc) stdout/stderr are redirected away, so a bare `Err` return would
+    // vanish. With `DREAMCOAST_LOG_FILE` set this lands the real cause in the file.
+    let result = launch(config);
+    if let Err(e) = &result {
+        tracing::error!("fatal: {e:?}");
+    }
+    result
+}
+
+/// Window + device bring-up, scene load, then the frame loop. Assumes logging and the
+/// job system are already initialized (see [`main_entry`], which does both).
+pub fn launch(config: GameConfig) -> anyhow::Result<()> {
+    match build_app(config)? {
+        Some(mut app) => app.run(),
+        // A bring-up smoketest flag (`--clear/triangle/mesh-test`, …) consumed the run.
+        None => Ok(()),
+    }
+}
+
+/// Bring up window + device and build the [`App`] for `config`, without running the
+/// loop — the public constructor for an embedder that wants to touch the app between
+/// construction and [`App::run`] (e.g. [`App::set_hooks`]). Returns `Ok(None)` when a
+/// bring-up smoketest CLI flag ran instead of the full application.
+pub fn build_app(config: GameConfig) -> anyhow::Result<Option<App>> {
+    let backend = select_backend();
+    info!("requested backend: {backend:?}");
+
+    // Screenshot mode: `--screenshot[/-clean] <path>` renders a few frames then
+    // captures + exits; otherwise F2 captures interactively.
+    let captures = screenshot_captures();
+    let screenshot_mode = !captures.is_empty();
+
+    // Load the model via the cooked-asset pipeline (Phase 12 M1): a fresh
+    // `.dcasset` loads directly (no glTF parse / texture decode); a miss cooks from
+    // glTF and caches. Falls back to a procedural cube when neither exists. The
+    // source path is resolved relative to the executable (not the cwd) so it loads
+    // when launched from anywhere, not just the repo root.
+    let model_ref = model_path();
+    let model_path = app::resolve_asset_path(&model_ref);
+    let cache_dir = app::cooked_cache_dir();
+    // Phase 12 M3: opt-in BCn texture compression in the cook (default off keeps the
+    // render byte-for-byte; GPU-native so there is no decompression cost at load).
+    // `P12_TEX_COMPRESS=1|fast` → BC1/BC3 (size-first), `=high|bc7` → BC7
+    // (quality-first). Data textures stay uncompressed either way.
+    use dreamcoast_asset::cook::TexCompress;
+    let compress_tex = match std::env::var("P12_TEX_COMPRESS").ok().as_deref() {
+        Some("1") | Some("fast") => TexCompress::Fast,
+        Some("high") | Some("bc7") => TexCompress::High,
+        _ => TexCompress::Off,
+    };
+    let mut model = match dreamcoast_asset::cook::load_cooked(
+        &model_path,
+        &model_ref,
+        &cache_dir,
+        compress_tex,
+    ) {
+        Ok((m, outcome)) => {
+            info!(
+                "loaded {} ({outcome:?}): {} verts, {} indices",
+                model_path.display(),
+                m.vertices.len(),
+                m.indices.len()
+            );
+            m
+        }
+        Err(e) => {
+            info!(
+                "no model at {} ({e}); using procedural cube",
+                model_path.display()
+            );
+            dreamcoast_asset::unit_cube()
+        }
+    };
+    // Normalize the model (recenter on origin, base at y=0, unit bounding radius)
+    // so framing, ground, lights, and the shadow box use model-independent units.
+    let bounds = normalize_on_ground(&mut model);
+    let model_radius = bounds.radius;
+
+    let title = format!("DreamCoast Sandbox — {backend:?}");
+    // The window client size IS the final (present) resolution: render_scale fractions it for the
+    // internal scene render, and the upscale (TAAU / tonemap) reconstructs back to this size.
+    // `WINDOW_RES=WxH` opens at the display size for QHD/UHD output (clamped by the OS work area);
+    // default HD 1280x720 keeps the headless screenshot baselines unchanged.
+    let (win_w, win_h) = std::env::var("WINDOW_RES")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once(['x', 'X', ','])?;
+            Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))
+        })
+        .map(|(w, h)| (w.clamp(320, 7680), h.clamp(240, 4320)))
+        .unwrap_or((1280, 720));
+    let mut window = Window::new(&title, win_w, win_h)?;
+    let (w, h) = window.size();
+
+    // Validation is a launch-time choice (instance-level): on by default, off via
+    // `--no-validation`. In release builds the backend compiles validation out
+    // regardless, so `validation_on` is only meaningful in debug builds.
+    let validation_on = validation_enabled();
+    let instance = Instance::new(
+        backend,
+        &window,
+        &InstanceDesc {
+            app_name: "dreamcoast-sandbox".into(),
+            validation: validation_on,
+        },
+    )?;
+    let device = instance.create_device()?;
+    info!(
+        "device capabilities: async_compute={}, raytracing={}",
+        device.has_async_compute(),
+        device.has_raytracing()
+    );
+
+    let mut swapchain = device.create_swapchain(&swapchain_desc(Extent2D::new(w, h)))?;
+
+    // `--loading-test <path>`: render one loading-bar frame + save it (visual check of the loading
+    // screen without the live window). `LOADING_FRAC=<0..1>` sets the fill.
+    if let Some(path) = std::env::args()
+        .skip(1)
+        .position(|a| a == "--loading-test")
+        .and_then(|_| {
+            std::env::args()
+                .skip_while(|a| a != "--loading-test")
+                .nth(1)
+        })
+    {
+        loading::run_capture(&device, backend, &swapchain, &path)?;
+        return Ok(None);
+    }
+
+    // M0 backend bring-up: a minimal acquire→clear→present loop that needs no
+    // pipelines or shaders. The Metal backend defaults through this until the
+    // triangle/PBR milestones implement pipelines.
+    if clear_test_enabled() {
+        run_clear_test(&mut window, &device, &mut swapchain)?;
+        return Ok(None);
+    }
+
+    // M2 backend bring-up: clear + a single hardcoded-triangle pipeline (no vertex
+    // buffers, push constants, or bindless). Validates pipeline creation + draw.
+    if triangle_test_enabled() {
+        run_triangle_test(backend, &mut window, &device, &mut swapchain)?;
+        return Ok(None);
+    }
+
+    // M3 backend bring-up: textured bindless mesh (depth-tested) + an ImGui overlay.
+    // Exercises the bindless argument buffer, sampled textures, depth, and ImGui on
+    // the Metal backend; cross-backend like the other *_test loops.
+    if mesh_test_enabled() {
+        run_mesh_test(
+            backend,
+            &mut window,
+            &device,
+            &mut swapchain,
+            &model,
+            model_radius,
+        )?;
+        return Ok(None);
+    }
+
+    // Phase 14 (virtual geometry) M0 capability smokes. `--atomic64-test` is headless
+    // (compute + CPU readback); `--mesh-shader-test` draws one mesh-shader triangle.
+    if atomic64_test_enabled() {
+        run_atomic64_test(backend, &device)?;
+        return Ok(None);
+    }
+    if mesh_shader_test_enabled() {
+        run_mesh_shader_test(backend, &mut window, &device, &mut swapchain)?;
+        return Ok(None);
+    }
+    // Phase 14 M1e: load the COOKED LOD DAG and render the meshlet debug view (per-cluster colour).
+    if vgeo_test_enabled() {
+        run_vgeo_test(
+            backend,
+            &mut window,
+            &device,
+            &mut swapchain,
+            &model_path,
+            &model_ref,
+            &cache_dir,
+            compress_tex,
+        )?;
+        return Ok(None);
+    }
+    // Phase 14 M2: render the cooked clusters on the GPU via a mesh shader.
+    if vgeo_mesh_test_enabled() {
+        run_vgeo_mesh(
+            backend,
+            &mut window,
+            &device,
+            &mut swapchain,
+            &model_path,
+            &model_ref,
+            &cache_dir,
+            compress_tex,
+        )?;
+        return Ok(None);
+    }
+
+    Ok(Some(App::new(
+        window,
+        instance,
+        device,
+        swapchain,
+        backend,
+        &model,
+        model_radius,
+        screenshot_mode,
+        captures,
+        validation_on,
+        config,
+    )?))
+}
+
+/// The full deferred-PBR application: owns the device / swapchain / per-frame sync
+/// and every feature bundle, plus the UI + loop state. `new` does setup; `frame`
+/// runs one iteration of the render loop.
+///
+/// Public so an embedder (a game binary) can build it via [`build_app`], install
+/// [`GameHooks`] with [`App::set_hooks`], and drive it with [`App::run`]. Every field
+/// stays crate-private — the supported game surface is the hook trait, not the
+/// renderer's internals.
+pub struct App {
+    // Window + device bring-up. `_instance` is kept alive only so the device (and
+    // the window-derived surface) outlive it.
+    window: Window,
+    _instance: Instance,
+    device: Device,
+    // `queue`/`swapchain` are `None` while the RHI thread owns them (P15_RHI_THREAD,
+    // M4 B3): they're moved into the worker at spawn and reclaimed at join. In the
+    // default inline path they're always `Some` — use [`App::queue`]/[`App::swapchain`].
+    queue: Option<Queue>,
+    compute_queue: ComputeQueue,
+    swapchain: Option<Swapchain>,
+    backend: BackendKind,
+    gui: Gui,
+
+    // Feature bundles (see the per-module docs).
+    deferred: DeferredRenderer,
+    /// Phase 14 renderer integration: virtual geometry as the G-buffer producer (opt-in `P14_VGEO`,
+    /// single-model scope). `None` = the default mesh fill (gallery byte-identical).
+    vgeo: Option<vgeo::VgeoSystem>,
+    /// Two-phase same-frame HZB occlusion for the vgeo producer (docs/phase-14-vgeo-hzb-occlusion):
+    /// default ON for non-gallery when vgeo is active, `P14_VGEO_HZB=0/1` overrides, gallery OFF
+    /// (byte anchor). Only consulted when `vgeo_mode == 1`.
+    vgeo_hzb: bool,
+    /// `P14_VGEO` mode: 0 off, 1 = vgeo producer, 2 = mesh reference (groundless single model) for
+    /// the parity diff.
+    vgeo_mode: u32,
+    gdf: GdfSystem,
+    gi: GiSystem,
+    gtao: gtao::GtaoSystem,
+    /// PR-4 (render-pipeline re-baseline track): the sky/atmosphere composite slot
+    /// (today: opt-in analytic height fog, `P_HEIGHT_FOG`). See `atmosphere.rs`.
+    atmosphere: atmosphere::AtmosphereSystem,
+    /// PR-3 (render-pipeline re-baseline track): the forward translucency slot (sorted
+    /// alpha-blend after opaque lighting + fog, before post). See `translucent.rs`.
+    translucency: translucent::TranslucencySystem,
+    /// Translucent drawables sorted + drawn by the translucency pass. Empty by default
+    /// (the slot then adds no pass → byte-identical). `P_TRANSLUCENT_TEST=1` seeds demo
+    /// glass panes; glTF `Transparent` (BLEND) materials also route here.
+    translucents: Vec<translucent::TranslucentObject>,
+    /// PR-5 (render-pipeline re-baseline track): the ordered post-process nodes —
+    /// motion blur (`P_MOTION_BLUR`), bloom (`P_BLOOM`), and the DoF stub. See
+    /// `postfx.rs` / `docs/post-process-chain.md`.
+    bloom: postfx::BloomSystem,
+    motion_blur: postfx::MotionBlurSystem,
+    dof: postfx::DofSystem,
+    reflect: ReflectSystem,
+    particles: ParticleSystem,
+    cull: CullSystem,
+    /// Clustered light culling (PR-6). `None` where compute is unavailable; the feature
+    /// stays off. Gated on `clustered_lights` (`CLUSTERED_LIGHTS=1`).
+    cluster: Option<ClusterSystem>,
+    /// HZB occlusion culling (PR-8), `None` when compute is unavailable. Layered on
+    /// top of `cull`'s frustum test behind `HZB_CULL=1`.
+    hzb: Option<HzbSystem>,
+    rt: RtSystem,
+    ibl: IblSystem,
+
+    // Scene. The ECS `world` (+ registries) is the single source of truth; the flat
+    // `SceneObject` draw list is materialized from it each frame via `build_scene`.
+    // `_textures` keeps the model's bindless textures alive.
+    _textures: Vec<Texture>,
+    world: World,
+    mesh_registry: MeshRegistry,
+    material_registry: MaterialRegistry,
+    /// CPU-skinned primitives (animation Stage B). Empty unless an imported glTF scene
+    /// has skins; each is re-skinned + uploaded per frame (inline path only).
+    skinned: Vec<skin::SkinnedMesh>,
+    /// Baked vertex-cache deform players (declarative `.level` `deforms` entities — the knight
+    /// `.abc`/`.usda` animation). Each per-fif ring rewrite + drawable swap runs alongside the
+    /// skin-cache update every frame. Rebuilt on a level hot-swap.
+    vcaches: Vec<deform::DeformPlayer>,
+    /// Morph-target primitives (animation Stage C). Empty unless an imported glTF scene
+    /// has morph targets; GPU primitives write a per-frame weights buffer (the VS blends),
+    /// CPU ones re-blend + upload a vertex ring each frame (inline path only).
+    morphed: morph::MorphSet,
+    // Stage C level hot-swap: the discovered `.level` files, the loaded index, and a
+    // pending selection from the UI (applied at the next frame's start). Empty unless
+    // started in level mode (`LEVEL`).
+    level_paths: Vec<String>,
+    // The directory `level_paths` was discovered from — kept so a hook-requested
+    // switch (`GameHooks::next_level`) can resolve stems and register files written
+    // after bring-up (a generated next floor) with the same rules as startup.
+    levels_dir: std::path::PathBuf,
+    current_level: usize,
+    pending_level: Option<usize>,
+    /// `DIAG_LEVEL_SWAP="[frame:]level[,[frame:]level…]"` — a scripted level hot-swap for
+    /// headless verification of the swap path (the interactive route is the UI dropdown,
+    /// the game route is `GameHooks::next_level`; neither is reachable from a capture run).
+    /// Each entry fires once, on its frame (default 1), so a capture recipe can start in one
+    /// level and be captured in another with the normal warmup. Empty ⇒ inert.
+    swap_script: Vec<(u64, String)>,
+    /// Frame at which the deferred RHI-worker respawn after a level hot-swap is due (see
+    /// `load_level`). `None` = nothing pending.
+    rhi_respawn_at: Option<u64>,
+    // Stage D streaming: present in world mode (`WORLD`). Owns the level graph + the
+    // resident chunk arenas; the per-frame draw list comes from it instead of `world`.
+    streaming: Option<world::Streaming>,
+    ground_vbuf: Buffer,
+    ground_ibuf: Buffer,
+    ground_count: u32,
+
+    // Per-frame-in-flight resources + GPU profiler heaps.
+    pools: Vec<ResourcePool>,
+    command_buffers: Vec<CommandBuffer>,
+    image_available: Vec<Semaphore>,
+    in_flight: Vec<Fence>,
+    compute_command_buffers: Vec<CommandBuffer>,
+    compute_done: Vec<Semaphore>,
+    /// Async-compute surface-cache relight: opt-in toggle + the two cross-frame "relight done"
+    /// semaphores (compute frame N signals `cache_done[N%2]`; graphics frame N waits the previous,
+    /// `cache_done[(N-1)%2]`, so the consumer reads of last frame's radiance are GPU-ordered).
+    async_cache_on: bool,
+    cache_done: Vec<Semaphore>,
+    /// Per-fif fence the async relight signals, so its compute command buffer isn't re-recorded
+    /// while still pending (the graphics fence only transitively covers the PREVIOUS frame's
+    /// relight, not this frame's, on the cross-frame path).
+    cache_compute_fence: Vec<Fence>,
+    query_heaps: Vec<QueryHeap>,
+    render_finished: Vec<Semaphore>,
+    /// Phase 15 M4 B3: the RHI (submit) thread. `Some` when `P15_RHI_THREAD` is set —
+    /// it solely owns `queue`/`swapchain`/`command_buffers`/`image_available`/
+    /// `in_flight`/`render_finished` (moved at spawn). The record thread builds a
+    /// `Send` `CommandList` per frame and ships it; the worker acquires + translates +
+    /// submits + presents, overlapping the record thread's next frame (record N+1 ∥
+    /// submit N). `None` = the default single-thread inline path (byte-identical).
+    rhi_thread: Option<rhi_thread::RhiThread>,
+    /// M4 B4: record the render graph's passes in parallel on the job system (each
+    /// pass builds its own IR bucket, concatenated in schedule order). Opt-in
+    /// (`P15_PARALLEL_RECORD`) and only on the threaded path (profiler-free); default
+    /// off = sequential recording (byte-identical).
+    parallel_record: bool,
+    /// Cached swapchain extent/format/readback-layout, kept in sync at construction
+    /// and on resize. The record thread reads these (instead of the swapchain) while
+    /// the RHI thread owns the swapchain.
+    swap_extent_cached: Extent2D,
+    swap_format_cached: Format,
+    readback_layout_cached: ReadbackLayout,
+
+    // Launch-time constants.
+    flip_y: u32,
+    model_radius: f32,
+    scene_radius: f32,
+    /// World-space focus point the orbit camera frames (scene AABB centre at native
+    /// scale; the gallery's legacy focus otherwise).
+    scene_center: Vec3,
+    /// A level's authored camera (eye, target), applied as the initial view when the
+    /// level defines a non-default camera. `None` falls back to the orbit framing.
+    level_view: Option<(Vec3, Vec3)>,
+    /// A level's lighting (sun + point lights), replacing the gallery's code-default
+    /// lights. `None` keeps the gallery defaults (byte-identical).
+    level_lighting: Option<LevelLighting>,
+    /// True only for the hardcoded gallery (its legacy shadow framing is byte-identical;
+    /// other modes frame the shadow box on the scene AABB).
+    is_gallery: bool,
+    screenshot_mode: bool,
+    captures: Vec<Capture>,
+    /// QHD/UHD measurement: `CAPTURE_SEQ=N` dumps N consecutive frames with the camera
+    /// advancing a fixed deterministic step each frame (temporal-stability frame-to-frame
+    /// diff). `None` = the normal fixed-camera capture. Measurement-only (never the parity
+    /// baseline path).
+    capture_seq: Option<u32>,
+    validation_on: bool,
+    async_compute_supported: bool,
+    path_spp: u32,
+    gdf_trace_analytic: bool,
+
+    // UI-controlled lighting / feature state.
+    sun_dir: [f32; 3],
+    sun_intensity: f32,
+    /// Analytic sun RGB tint (the level's directional-light color, or white). Multiplies the direct
+    /// sun in the lighting pass so a warm authored sun reads warm. `SUN_COLOR` env / level override.
+    sun_color: [f32; 3],
+    ambient: f32,
+    exposure: f32,
+    /// Atmosphere inscatter→radiance gain — the sun:sky illuminance ratio knob fed to the env
+    /// capture (`sky.slang`). Legacy 6.0 (gallery anchor); content lowers it so the direct sun
+    /// dominates the sky physically, interiors filled by multibounce GI. `SKY_GAIN` overrides.
+    sky_gain: f32,
+    /// Sky white balance — per-channel gain on the procedural sky radiance fed to the env capture
+    /// (`sky.slang`). Warms/neutralises the IBL + SW-RT GI ambient (the sky-sourced fill) without
+    /// tinting the direct sun. `[1,1,1]` = neutral (no-op). `SKY_WB`/level `sky_white_balance` set it.
+    sky_wb: [f32; 3],
+    /// Physical-camera auto-exposure: meter the lit HDR each frame and adapt the exposure (vs the
+    /// fixed EV100). Opt-in (`AUTO_EXPOSURE`); off → the lighting uses the static `exposure` and is
+    /// byte-identical (the gallery anchor never auto-exposes).
+    auto_exposure: bool,
+    /// 레퍼런스식 multi-bounce energy compensation strength for the GDF GI (0 = off = gallery anchor;
+    /// ~0.6 content). Written to `globals.probe_box_max.w`; see pbr.slang. `P_GI_MULTIBOUNCE`.
+    gi_multibounce: f32,
+    point_lights_on: bool,
+    /// Clustered light culling override (`CLUSTERED_LIGHTS`). `None` (the default) = automatic:
+    /// engage the froxel path only when the frame carries more point lights than the `Globals`
+    /// UBO's four slots (R1). `Some(true)` forces it on at any light count (the A/B tool);
+    /// `Some(false)` forces the legacy brute-force loop and truncates to four lights.
+    clustered_lights: Option<bool>,
+    /// A/B baseline (`CLUSTERED_BRUTE=1`): upload the light buffer but loop all lights (no
+    /// froxel list) — for profiling clustered vs brute-force on the same light set.
+    clustered_brute: bool,
+    /// Deterministic test-light count (`TEST_LIGHTS=N`, PR-6 scale proof). 0 = off.
+    test_lights: u32,
+    shadows_on: bool,
+    shadow_bias: f32,
+    // PCSS-lite penumbra scale (max soft-shadow radius in shadow-map UV); 0 = hard 3x3 PCF.
+    shadow_softness: f32,
+    /// Soft-shadow blocker/PCF tap count, written to `globals.shadow.w` (RenderQuality knob).
+    /// Only the soft path (softness > 0) reads it; the shader clamps to [1, 16].
+    shadow_taps: u32,
+    /// PR-7 shadow atlas / CSM config (opt-in `CSM=1` / `CSM=<N>`). `enabled == false` is the
+    /// legacy single directional map — byte-identical anchor.
+    csm: csm::CsmConfig,
+    /// Cascade-index debug overlay: 1 tints each cascade's coverage by index so the split
+    /// boundaries are visible. Written to `globals.csm_params.y`. Off = 0.
+    csm_debug: bool,
+    /// Active RenderQuality tier (Stage D). The single selector that seeded the knob defaults
+    /// below; shown in the UI. Individual env vars still override per knob.
+    quality: quality::RenderQuality,
+    override_material: bool,
+    metallic_override: f32,
+    roughness_override: f32,
+    debug_view: usize,
+    post_mode: usize,
+    aliasing: bool,
+    /// PR-5 post nodes (opt-in). `bloom_on` = `P_BLOOM`; `motion_blur_on` = `P_MOTION_BLUR`
+    /// (requires `velocity_on`); `dof_on` = `P_DOF` (stub passthrough). `grade_on` +
+    /// `cdl_*` = the ASC-CDL color grade (`P_GRADE`, neutral = byte-identical).
+    bloom_on: bool,
+    motion_blur_on: bool,
+    dof_on: bool,
+    grade_on: bool,
+    cdl_slope: [f32; 3],
+    cdl_offset: [f32; 3],
+    cdl_power: [f32; 3],
+    /// One-time "P_MOTION_BLUR without P_VELOCITY" warning latch (interior-mutable so it
+    /// fires through the graph's `&self` borrow).
+    motion_blur_warned: std::cell::Cell<bool>,
+    /// Depth pre-pass active (pipeline rebaseline PR-1, opt-in `DEPTH_PREPASS=1`): render an
+    /// opaque depth-only pass before the G-buffer so the base pass runs EQUAL-test + write-off
+    /// (Early-Z overdraw elimination) and the screen-space passes sample a completed depth.
+    /// Off by default = the pre-pass-less path (byte-identical golden anchor).
+    depth_prepass: bool,
+    particles_on: bool,
+    async_compute_on: bool,
+    gpu_cull: bool,
+    /// HZB occlusion culling on top of GPU frustum culling (PR-8, `HZB_CULL=1`; needs
+    /// `P7_CULL=1`). Runtime stats of the last cull are read back into `hzb_stats`.
+    hzb_cull: bool,
+    hzb_stats: std::cell::Cell<(u32, u32)>, // (survived, culled_by_occlusion) last frame
+    path_trace: bool,
+    rt_debug: bool,
+    cornell: bool,
+    sdf_trace: bool,
+    volume_test: bool,
+    sdf_bake: bool,
+    sdf_bake_done: bool,
+    gdf_merge: bool,
+    gdf_merge_done: bool,
+    gdf_trace: bool,
+    scene_gdf: bool,
+    /// C2: GDF AO multiplied into the deferred ambient term (the first GDF feature in
+    /// the real render path; C1's `scene_gdf` is a standalone trace viz).
+    gdf_ao: bool,
+    /// Screen-space near-field AO (HBAO-lite), composed with the GDF AO. `SSAO` env / tier.
+    ssao: bool,
+    /// SSAO tuning: world radius (m), intensity, contact bias (m), contrast power.
+    ssao_params: [f32; 4],
+    /// C3: GDF 1-bounce diffuse GI added to the deferred ambient term.
+    gdf_gi: bool,
+    /// F3 (HW-RT high-fidelity path, first increment): route the GI gather rays through the scene
+    /// TLAS via an inline RayQuery (hardware ray tracing) instead of the SW sphere-march. High-tier
+    /// opt-in (`P_HWRT_GI=1`); default off keeps the scalable SW path (gallery byte-identical). This
+    /// first increment returns a hardware-traced VISIBILITY term only (hit lighting is a later
+    /// increment) and requires the BLAS/TLAS built by `rt.rs` (currently the gallery scene only).
+    hwrt_gi: bool,
+    /// Reflection pipeline mode (`quality::ReflectMode`) — the UI-facing single source. Every
+    /// per-pass HWRT reflection boolean below (`hwrt`, `reflect_compact_hwrt`,
+    /// `reflect_compact_screen`) is DERIVED from it each frame (`apply_reflect_mode`), so the UI
+    /// switches the whole pipeline live and the flags can never drift out of a valid combination.
+    reflect_mode: quality::ReflectMode,
+    /// Whether the HWRT reflection substrate exists this run: RT device + content TLAS + the
+    /// consolidated hit table (all built at load whenever the device/scene allow). False locks
+    /// `reflect_mode` to Software for the session.
+    reflect_hw_ready: bool,
+    /// The user/tier screen-fetch intent (`P_REFLECT_COMPACT_SCREEN`), pre-gating: the effective
+    /// `reflect_compact_screen` derives as `Hybrid/Hardware && this && cache_sky_occlude`.
+    reflect_screen_want: bool,
+    /// Phase 16 HWRT hybrid: the MAIN reflection trace goes through the scene BVH instead of the
+    /// GDF sphere-march. DERIVED from `reflect_mode` (Hardware) — do not set directly.
+    hwrt: bool,
+    /// Phase 16 C: `P_HWRT_FULLRES` — trace the HWRT reflection at full resolution (crisp mirror,
+    /// ~4x cost). Armed independently; only active while `hwrt` (Hardware mode) is on.
+    hwrt_fullres: bool,
+    /// Phase 16 E: `P_HWRT_HITLIGHTING` — shade an off-screen reflection HW hit with the real
+    /// material (consolidated geometry + albedo texture + sun/HW-shadow/IBL) instead of the surface
+    /// cache. Armed independently; only consulted by the HWRT paths (Hybrid/Hardware).
+    hwrt_hitlighting: bool,
+    /// Bent-normal skylight: when true (`P_BENT_NORMAL`, default on) the GI pass writes the SH
+    /// sky-vis band-1 vector (the DFAO bent normal) into the sky-vis image so the lighting samples
+    /// the diffuse skylight along it. Only affects the content sky-vis path; gallery byte-identical.
+    bent_normal: bool,
+    /// F6P bent-normal confidence contract (`P_SKYVIS_BENT_FIX`, default 3 = both halves on).
+    /// bit0 = producer (bent magnitude = directionality x interpolation support), bit1 = consumer
+    /// (the OcclusionTint leak follows the surface normal, not the bent normal). 0 restores the
+    /// exact pre-F6P bytes. See the resolution site for the full rationale.
+    skyvis_bent_fix: u32,
+    /// F6M viewer-facing normal flip for gdf_gi/gdf_ao (`P_GDF_FACING_FLIP`, default on for
+    /// content): match pbr's two-sided shading contract so back-face pixels of double-sided
+    /// geometry reconstruct V/E/bent and march AO in the shaded hemisphere. Gallery = off.
+    gdf_facing_flip: bool,
+    /// Multi-bounce AO (`P_AO_MULTIBOUNCE`, default off): recolour the scalar diffuse AO by the
+    /// albedo so cavities keep the surface's own bounced colour (reference AOMultiBounce) instead of
+    /// darkening flat. Opt-in because it changes any AO<1 pixel (incl. the gallery); off = anchor.
+    ao_multibounce: bool,
+    /// Bent-normal specular occlusion (`P_SPEC_OCCLUSION`, default off): cone-cone occlusion of the
+    /// prefilter-CUBE ambient specular by the bent-normal visibility cone (reference
+    /// GetDistanceFieldAOSpecularOcclusion). The SW-RT reflection carries its own ray occlusion so
+    /// it is untouched; active only on the legacy-IBL / cube-specular path. off = anchor.
+    spec_occlusion: bool,
+    /// 레퍼런스 엔진 GI-fidelity: world irradiance volume (DDGI-lite radiance cache). When on, the GI pass
+    /// samples a multibounce-propagating world volume instead of a single-bounce ray march — the
+    /// real fix for deep-interior darkness. Content-only (`P_GI_VOLUME`); gallery forced off.
+    gi_volume: bool,
+    /// Amortize the view-independent DDGI volume update over N frames (`P_GI_VOLUME_PERIOD`): update
+    /// 1 frame in N, the rest bind the persistent last-updated volume (the multibounce EMA carries
+    /// it). `1` = every frame (byte-identical default). Higher = cheaper `gi_volume` (the VK
+    /// view-independent floor), slower GI convergence — fine for a mostly-static world.
+    gi_volume_period: u64,
+    /// GI-volume-leak increment A (`P_GI_VOL_OCC`, opt-in): occupancy-weighted manual trilinear on
+    /// the volume consumption — probes whose centre sits inside geometry are excluded and the
+    /// weights renormalised (the reflection fallback's sample_gi_irradiance_valid pattern), so an
+    /// interior receiver stops interpolating toward the in-wall probes' near-zero SH (E dilution)
+    /// and the sky-vis/bent field stops smearing across walls. Volume path only; off = anchor.
+    gi_vol_occ: bool,
+    /// Rays per probe for the DDGI volume update (`P_GI_VOLUME_SPP`, default 16), SEPARATE from
+    /// the per-pixel `gi_spp`: the 32^3 update is amortized (period 4) and tiny next to the
+    /// screen-res GI pass, so it affords a higher count. 16 (vs the old shared 4-8) halves the
+    /// per-update estimator noise the EMA field breathes with — the live full-grid field made
+    /// that breathing visible as per-mesh shimmer through the un-denoised sky-vis and the
+    /// cache-relight snapshots. Multiples of 8 also enable octant-stratified rays (gi_volume.slang).
+    gi_volume_spp: u32,
+    /// F4B: volume EMA alpha override (`P_GI_VOLUME_ALPHA`; 0 = auto). Auto resolves per frame
+    /// to 0.2 when the fine level is live (the interleaved schedule halves per-level refreshes,
+    /// so the stronger blend restores the 192-frame convergence budget) and the long-standing
+    /// 0.1 single-level. The stable direction set makes the static fixed point alpha-independent.
+    gi_volume_alpha: f32,
+    /// E-oracle repair seam bits for the volume update (bit0 `P_GI_READ_OFFSET` feedback-read
+    /// offset, bit1 `P_GI_SUN_HARDVIS` intersection-only sun visibility); 0 = legacy estimator.
+    gi_repair_flags: u32,
+    /// F6F: gv_shadow penumbra cone slope (`P_GI_SUN_K`; 0 = reference-derived ~50, 16 = legacy).
+    gi_sun_k: f32,
+    /// 레퍼런스식 indoor skylight occlusion (occludes the IBL diffuse skylight by the GI volume's
+    /// directional sky-visibility): neutral leak fraction (`P_SKYVIS_TINT`) + min-occlusion floor
+    /// (`P_SKYVIS_MIN_OCC`). Only active when `gi_volume` is on (content); gallery passes the
+    /// no-op sentinel image so it stays byte-identical.
+    skyvis_tint: f32,
+    /// Aperture shaping of the tint leak (`P_SKYVIS_TINT_V0`; 0 = flat legacy leak).
+    skyvis_tint_v0: f32,
+    skyvis_min_occ: f32,
+    /// F6L banner knob (`P_SKYVIS_BENT_FLOOR`; 0 = off/default = the landed validity
+    /// contract): low-V bent floor blend — the sponza_hero banner recipe uses 0.25.
+    skyvis_bent_floor: f32,
+    /// F6O (`P_SKYVIS_PP`, default 0 = off): cosine-hemisphere rays per pixel for the per-pixel
+    /// sky-visibility pass. > 0 replaces the probe-resolution volume V feeding the DEFERRED
+    /// skylight occlusion with a per-pixel GDF trace (the "검은 Block" root fix); the volume keeps
+    /// producing for the world-space consumers (surface cache, reflections). 0 = the volume path
+    /// (byte-identical anchor — the pass is not recorded).
+    skyvis_pp_spp: u32,
+    /// F6O per-pixel sky-vis trace resolution divisor (`P_SKYVIS_DIV`, default 4). The per-pixel
+    /// GDF hemisphere march is expensive (~1.6 ms/ray/full-frame on M3), so trace at 1/div then
+    /// joint-bilateral upsample to full res (mirrors gdf_ao's ao_res_div). 1 = full-res trace.
+    skyvis_pp_div: u32,
+    /// Deferred-parity cache skylight (`P_CACHE_SKY_OCCLUDE`, tier `cache_sky_occlude`): the
+    /// surface-cache relight takes its skylight from the SAME SH sky-visibility occlusion the
+    /// deferred lighting applies, instead of the legacy sky-on-miss + unoccluded IBL floor (whose
+    /// escape estimate over-injects blue on interior cards — the cache-vs-deferred tone split).
+    /// Needs the volume-GI path; the relight falls back to legacy while the volume has no data.
+    cache_sky_occlude: bool,
+    /// HWRT cache sun shadow (`P_CACHE_HWRT_SHADOW`, tier `cache_hwrt_shadow`): the relight's
+    /// direct-sun visibility traces the content TLAS instead of the GDF march (which closes small
+    /// openings and shadows whole sunlit card regions — the mirror's missing sun shaft).
+    cache_hwrt_shadow: bool,
+    /// TLAS cache gather (`P_CACHE_HWRT_GATHER`, tier `cache_hwrt_gather`): the relight's indirect
+    /// rays trace exact triangles — the leak-prone GDF march inflates the gathered bounce.
+    cache_hwrt_gather: bool,
+    /// F1 Stage 0 surface-cache virtualization fallback (`P11_GATHER_FALLBACK`, content default on):
+    /// re-light a relight-gather hit that carries no card (a coarse-fallback drawable over the card
+    /// budget, or an LRU-evicted page) with the dense-field direct-sun term instead of contributing
+    /// black — the interior multibounce hole. Off for the gallery so the legacy zero-add keeps the
+    /// byte-identical anchor.
+    cache_gather_fallback: bool,
+    /// F1 Stage 3 page-pool streaming: all drawables' world AABBs + representative albedos, kept so
+    /// `GdfSystem::stream_residency` can re-own the fixed card slots from the LIVE camera each frame
+    /// (build a newly-admitted drawable's 6 cards in place). Empty unless `P11_CACHE_STREAM`.
+    stream_obj_aabb: Vec<([f32; 3], [f32; 3])>,
+    stream_obj_albedo: Vec<[f32; 3]>,
+    /// F1 Stage 3: set by `stream_residency` when this frame re-owned any slot, so the frame loop
+    /// records a dirty re-capture of just the changed cards.
+    stream_recapture: bool,
+    /// Capture occlusion invalidation (`P_CACHE_CAPTURE_OCCL`, tier `cache_capture_occl`): card
+    /// texels whose capture hit an occluder store invalid instead of a wrong witness.
+    cache_capture_occl: bool,
+    /// Occluder-witness routing (`P_CACHE_OCCL_ROUTE`, tier `cache_occl_route`): a reflection
+    /// cache miss that saw an invalidated (occluder-witness) texel routes to the dark analytic
+    /// fallback — no unoccluded sky top-up for a point the capture proved enclosed.
+    cache_occl_route: bool,
+    /// Validity-weighted probe interpolation (`P_REFLECT_PROBE_VALID`, tier
+    /// `reflect_probe_valid`): the reflection fallback's GI-volume read excludes probes inside
+    /// geometry and renormalises (reference radiance-cache probe interpolation).
+    reflect_probe_valid: bool,
+    /// Graze-ramp march threshold (`P_REFLECT_GRAZE_EPS`, tier `reflect_graze_eps`): the SW
+    /// reflection march's hit acceptance grows with distance (expand-surface ramp) so tangent
+    /// rays resolve at their first true graze instead of skimming to a bright far card.
+    reflect_graze_eps: bool,
+    /// SW compact screen-color-at-hit (`P_REFLECT_HIT_FETCH`, tier `reflect_hit_fetch`): the
+    /// compacted SW mirror march's hit gets the HWRT hybrid's on-screen lit-history fetch —
+    /// the grazing-aware witness for the contact band the diffuse card cannot provide.
+    reflect_hit_fetch: bool,
+    /// Lit-calibration feedback (`P_CACHE_LIT_CALIB`, tier `cache_lit_calib`): the visibility pass
+    /// probes each on-screen card's lit/cache luminance ratio (TLAS occlusion check) into a
+    /// per-card EMA the reflection sampler applies — pins the mirror's cache family to the lit
+    /// family's tone regardless of which lighting estimator still disagrees.
+    cache_lit_calib: bool,
+    /// PR-4 (render-pipeline re-baseline track): opt-in analytic exponential height fog
+    /// (`P_HEIGHT_FOG=1`), composited in the atmosphere slot after opaque lighting +
+    /// reflections, before TAAU/tonemap. Off by default (byte-identical gallery anchor —
+    /// the slot itself is always present in the graph wiring, but unscheduled when off).
+    height_fog: bool,
+    /// PR-9 (render-pipeline re-baseline track): opt-in second view (`P_SECOND_VIEW=1`). Renders a
+    /// second `view::SceneView` (an overhead camera) in the SAME frame against the SHARED scene
+    /// resources (shadow/CSM/IBL/GDF/cluster run once) and composites it as a picture-in-picture
+    /// inset into the backbuffer. Off by default → single view, byte-identical anchor. See
+    /// `docs/view-family.md`.
+    second_view: bool,
+    /// Height-fog density at world height 0 (`a` in `d(y) = a·exp(-b·y)`, 1/world-unit).
+    /// `P_FOG_DENSITY` overrides; scaled by `scene_radius` at the call site so the default
+    /// reads sensibly across scene scales (unit-cube gallery vs. the larger Sponza level).
+    fog_density: f32,
+    /// Height-fog falloff rate `b` (1/world-unit; larger = fog thins out faster with height).
+    /// `P_FOG_HEIGHT_FALLOFF` overrides; also scaled by `scene_radius`.
+    fog_height_falloff: f32,
+    /// Height-fog inscatter→radiance gain fed to the shared `procedural_sky` (mirrors
+    /// `sky_gain`'s role for the env-cube capture — same single-source atmosphere model,
+    /// not a duplicated constant). `P_FOG_INSCATTER_GAIN` overrides; defaults to `sky_gain`.
+    fog_inscatter_gain: f32,
+    /// C3 hemisphere rays per pixel.
+    gi_spp: u32,
+    /// Stage D2: surface-cache amortized-relight period (round-robin card budget; 1 = legacy
+    /// every-frame, forced for the gallery anchor). Higher = cheaper `sdf_cache_light`.
+    cache_relight_period: u32,
+    /// Stage D2b: drive the relight budget by per-card camera-frustum visibility (off-screen
+    /// cards relit far less). Off for the gallery anchor. Pure perf (on-screen image invariant).
+    cache_feedback: bool,
+    /// Stage D3: surface-cache relight indirect-gather rays/texel (gallery forced to legacy 8).
+    cache_relight_spp: u32,
+    /// Stage D3: C3 GI bounce-ray march step cap (gallery forced to legacy 64).
+    gi_max_steps: u32,
+    /// Stage D3: GGX reflection-ray march step cap (gallery forced to legacy 96).
+    reflect_max_steps: u32,
+    /// P3 (SW-RT GI 레퍼런스급): cone-trace LOD march slope for the SW-RT march loops (gallery forced 0 =
+    /// legacy linear march = byte-identical). Content takes the tier value.
+    gdf_cone_k: f32,
+    /// Stage D3: trace the GGX reflection at half resolution + bilateral upsample (gallery off).
+    reflect_half_res: bool,
+    /// macOS/M3 perf (M3-C): reflection trace divisor when `reflect_half_res` is on (2 = legacy half,
+    /// 4 = quarter). The one lever that cuts `gdf_reflect` (measured resolution-only). `P_REFLECT_RES_DIV`.
+    reflect_res_div: u32,
+    /// B2 mirror compaction: near-mirror pixels re-traced dense at 1/div res via a compacted
+    /// indirect dispatch (0 = off). The sparse trace's upsample cannot reconstruct a mirror
+    /// image, so only those pixels pay for real rays. `P_REFLECT_COMPACT`.
+    reflect_compact_div: u32,
+    /// B2 HWRT refine: the compacted re-trace goes through the scene TLAS + hit lighting (true
+    /// material colours for off-screen mirror content). `P_REFLECT_COMPACT_HWRT`.
+    reflect_compact_hwrt: bool,
+    /// Compact-mirror screen fetch (`P_REFLECT_COMPACT_SCREEN`, tier `reflect_compact_screen`):
+    /// near-pixel-footprint on-screen mirror hits read the full-res lit history; wider footprints
+    /// keep the hybrid cache cone. Only viable with `cache_sky_occlude` unifying the two sources'
+    /// tones (the footprint gate otherwise reads as a material seam — the faebad3 rebaseline).
+    reflect_compact_screen: bool,
+    /// macOS/M3 perf: GDF AO trace divisor (1 = full-res, 2 = half). Traced at 1/div + bilateral
+    /// upsample; the Apple tier uses 2 (gdf_ao is the top pass after quarter-res reflection). `P_AO_RES_DIV`.
+    ao_res_div: u32,
+    /// macOS/M3 perf: à-trous GI-denoise iteration count (2 = legacy, Apple = 1). `P_GI_ATROUS_STEPS`.
+    gi_atrous_steps: u32,
+    /// Stage D1: trace the C3 GI at half resolution + joint-bilateral upsample (1/4 the rays).
+    /// Forced off for the gallery anchor (full-res = byte-identical). Content scenes opt in by tier.
+    gi_half_res: bool,
+    /// P1 (SW-RT GI 레퍼런스급): GI trace divisor when `gi_half_res` is on (2 = half, 4 = quarter probes).
+    gi_res_div: u32,
+    /// Screen-space radiance probe GI: replace the world-volume / ray-march GI consumption with
+    /// per-tile screen probes traced into an octahedral atlas + a per-pixel gather. Content-only
+    /// (`SCREEN_PROBE`); the gallery keeps its current GI path (byte-identical anchor).
+    screen_probe: bool,
+    /// P4 world radiance cache fallback for escaped screen-probe rays (`P_WRC`, on with probes).
+    wrc: bool,
+    /// GI-on-distance-field visualization: march the camera into the GDF and paint hits. Replaces
+    /// the tonemap source. `wrc_viz` = the view pass is active; `sc_viz` = shade from the high-res
+    /// surface cache (`P_SC_VIZ`) instead of the coarse world radiance cache (`P_WRC_VIZ`).
+    wrc_viz: bool,
+    sc_viz: bool,
+    /// Reflection temporal history clamp (0 off / 1 hard / 2 variance; gallery forced 0) + variance γ.
+    reflect_history_clamp: u32,
+    reflect_clamp_gamma: f32,
+    /// Roughness-scaled blur radius (texels) applied to the low-res reflection in the composite to
+    /// smooth its blocky "sparkle" on rough content surfaces (the floor) while keeping the traced
+    /// reflection's correct local colour. `P_REFL_ROUGH_BLUR`; 0 = off, gallery forced to 0.
+    reflect_rough_blur: f32,
+    /// Track A1: run the spatial ratio-estimator resolve (`reflect_resolve.slang`) at trace res
+    /// before the upsample — reconstructs each glossy neighbour's GGX ray and reweights by
+    /// `pdf_p/pdf_q` to sharpen the glossy reflection instead of box-blurring it. `P_REFLECT_RESOLVE`
+    /// (content only; gallery never runs it → anchor untouched). Kernel radius = `reflect_resolve_kernel`.
+    reflect_resolve: bool,
+    reflect_resolve_kernel: f32,
+    /// Track A4: variance-guided reflection denoiser. Enables A4a (per-pixel 2nd-moment accumulation
+    /// in `reflect_temporal`) + A4b (the `reflect_spatial` bilateral pass, post-temporal). `P_REFLECT_
+    /// SPATIAL` (content only; gallery never runs it → anchor untouched). Kernel radius / sample count
+    /// are `reflect_spatial_kernel` / fixed. Off ⇒ temporal keeps out.a = 1.0, byte-identical.
+    reflect_spatial: bool,
+    reflect_spatial_kernel: f32,
+    /// Track A5: blue-noise stochastic reflection — a bundle that enables frame-varying + low-
+    /// discrepancy (blue-noise) GGX jitter + the A1 resolve + the A4 denoiser together, so the
+    /// temporal pass converges the glossy lobe (escaping the fixed-jitter dead end) instead of
+    /// sparkling. `P_REFLECT_STOCHASTIC` (content only; gallery keeps its white inline jitter →
+    /// anchor untouched). Sets `max_steps` bit30 for the SW trace so it draws the blue-noise ray.
+    reflect_stochastic: bool,
+    /// B2' rough-prefilter split: roughness at/above this threshold traces ONE deterministic mirror
+    /// ray and shades it with a roughness-driven cone footprint from the surface-cache MIP pyramid
+    /// (structural noise ZERO) instead of the stochastic 1-ray GGX estimator, which at any reachable
+    /// sample rate leaves residual speckle on wide lobes (reference engine: above RadianceCache.
+    /// MaxRoughness the trace is skipped for the prefiltered probe). `P_REFLECT_PREFILTER=<thresh>`
+    /// (`=1` selects the reference-like default 0.4); 0 = off (content opt-in; gallery never sets
+    /// it → anchor untouched). Rides `max_steps` bits 16..23 on the SW trace.
+    reflect_prefilter: f32,
+    /// B2' glossy sample density: GGX rays per pixel per frame for the stochastic glossy band
+    /// (mirror < roughness < prefilter) — the direct fix for the ~50x undersampling (a denoiser
+    /// cannot average in radiance the rays never sampled). Samples advance the SAME low-discrepancy
+    /// sequence (seq = frame*K + s) and average in the tonemapped denoiser space; the A1 resolve
+    /// reconstructs all K neighbour rays. `P_REFLECT_GLOSSY_SPP=<K>` (1 = legacy single ray, the
+    /// default; content SW trace only). Rides `max_steps` bits 24..29.
+    reflect_glossy_spp: u32,
+    /// B2' screen-hit early-out: per-ray screen-trace prepass in the SW reflection (the `SCREEN_
+    /// HIT` permutation) — a validated on-screen hit reads the previous frame's FULL-RES lit
+    /// radiance and skips the GDF march + surface-cache shade. Both the budget that makes
+    /// `reflect_glossy_spp` affordable (most indoor reflected surfaces are on screen) and a
+    /// strictly better colour (the HWRT screen-color-at-hit sharpness win, SW equivalent).
+    /// `P_REFLECT_SCREEN_HIT=1` (content only; gallery keeps the plain permutation → anchor
+    /// untouched).
+    reflect_screen_hit: bool,
+    /// C2b: one-shot feedback re-layout frame — at this frame the host reads the per-card
+    /// desired-res feedback the reflection recorded, re-normalises to the same texel budget and
+    /// rebuilds the adaptive atlas layout (re-capture + reset relight follow). 0 = off.
+    /// `P11_CACHE_RES_FEEDBACK=<frame>` (`=1` → 64). Requires `P11_CACHE_ADAPTIVE_RES`.
+    cache_res_feedback_frame: u32,
+    /// Track C0-fix: surface-cache relight CONVERGE mode — K-cycle deterministic gather jitter +
+    /// running-mean α=1/(1+N) (reference radiosity NumFramesAccumulated), so a static scene's cache
+    /// actually reaches a fixed point and the measured freeze latch can arm. 0 = legacy (fixed-alpha
+    /// EMA of frame-varying noise = permanent variance floor). `P_CACHE_CONVERGE=<K>` (content only).
+    cache_converge: u32,
+    /// Track C0-fix: GI irradiance-volume STABLE mode — pass a fixed jitter index (0) so each probe
+    /// traces the SAME deterministic direction set every update (reference radiance cache:
+    /// JITTER_TRACE_DIRECTION 0, "we want stable lighting"); a static scene's volume becomes an
+    /// idempotent overwrite = fixed point. `P_GI_STABLE=1` (content only).
+    gi_stable: bool,
+    /// F6K: direction-set rotation count under stable mode (1 = legacy pinned set;
+    /// K>1 = deterministic K-cycle rotation — variance ÷K, captures stay deterministic).
+    gi_dir_sets: u32,
+    /// SSR resolve history neighbourhood clamp (breaks the mirror lit-history feedback oscillation a
+    /// plain EMA only low-passes): 0 = off (byte-identical), 1 = variance clamp (mean ± γ·σ). Gallery
+    /// forced 0. `P_SSR_HISTORY_CLAMP` / `P_SSR_CLAMP_GAMMA` override.
+    ssr_history_clamp: u32,
+    ssr_clamp_gamma: f32,
+    /// GI temporal denoiser history-clamp (gdf_temporal params.w): 0 off (content; fixes shimmer),
+    /// 1 hard (gallery legacy byte-identical), >1.5 variance γ.
+    gi_temporal_clamp: f32,
+    /// F4: importance-sampled final-gather mix [0,1] for `gdf_gi` (fraction of rays steered to the
+    /// sun-lit irradiance lobe; MIS with cosine). 0.0 = legacy cosine gather (gallery byte-identical).
+    gi_importance: f32,
+    /// C4: spatio-temporal denoise of the noisy C3 GI.
+    gi_denoise: bool,
+    /// Previous frame's view-projection (world -> clip) for C4 temporal reprojection.
+    prev_view_proj: [f32; 16],
+    /// Previous frame's camera eye (the lit-calibration probe's occlusion-ray origin).
+    prev_eye: Vec3,
+    /// QHD/UHD TAAU: previous frame's UNJITTERED view-projection (the stable grid the TAAU history
+    /// lives on; the per-frame jitter must not enter the history reprojection).
+    prev_view_proj_taau: [f32; 16],
+    /// C5: screen-space reflections (viz; C7 will composite into lighting).
+    gdf_ssr: bool,
+    /// C6: GDF reflections (off-screen fallback viz; C7 composites SSR→GDF→sky).
+    gdf_reflect: bool,
+    /// C7: hybrid reflection composite (SSR over GDF / sky), viz toward IBL-specular replacement.
+    gdf_hybrid: bool,
+    /// C7c: feed the hybrid composite into the lighting specular (replaces the prefilter-cube
+    /// IBL specular). The toggle that compares legacy captured-cube IBL vs the new SW-RT path.
+    swrt_reflect: bool,
+    /// C8a: use the per-voxel albedo volumes (real surface color) in the GDF GI / reflection
+    /// re-light instead of a constant albedo. Off => achromatic (pre-C8a), for no-reg compare.
+    gdf_color: bool,
+    /// C8b1: viz the captured mesh-card surface-cache atlas (validation of card capture).
+    cache_viz: bool,
+    /// C8b3: GDF GI / reflection consumers sample the lit surface cache (multibounce radiance)
+    /// instead of per-ray re-lighting. Drives the per-frame cache lighting too.
+    surface_cache: bool,
+    /// C8g: use the surface cache as the GDF reflection hit radiance (default on); ground hits
+    /// (no cards) fall back to the per-ray re-light. Cheaper than the full GI cache above.
+    reflect_cache: bool,
+    /// Reflection cone-LOD: sample the surface-cache radiance MIP pyramid by the ray-cone footprint
+    /// so a demagnified far reflection reads a coarse averaged level (smooth) instead of stair-
+    /// stepped mip0 blocks. Content default on; `P11_REFLECT_MIP=0` falls back to mip0 bilinear.
+    reflect_mip: bool,
+    /// F1 Stage 4 — GI card-MIP parity (`P11_GI_MIP`, content default on): the diffuse GI gather
+    /// reads the surface-cache radiance MIP pyramid at a ray-cone level (like the reflection path)
+    /// instead of a single mip0 texel, so distant GI hits stop speckling. Off for the gallery (the
+    /// GI gather passes the mip sentinel ⇒ mip0 nearest ⇒ byte-identical anchor).
+    gi_card_mip: bool,
+    /// Firefly clamp: bound the per-sample radiance in the reflection source / composite / GI
+    /// gather so a bright specular pixel can't become a speckle. Off => unbounded (pre-clamp).
+    firefly_clamp: bool,
+    /// C8d reflection max-roughness threshold: the screen-space mirror SSR (accurate on-screen
+    /// reflection) is used below this roughness and fades to the GDF prefilter above it (the
+    /// mirror can't blur; a stochastic trace goes dark on sharp metals). `P11_REFLECT_MAX_ROUGHNESS`.
+    reflect_max_roughness: f32,
+    /// C8d: SSR trace mode. Default = full-res screen mirror (accurate on-screen reflection).
+    /// `P11_SSR_STOCHASTIC=1` selects the half-res GGX-jittered trace + ratio-estimator resolve
+    /// (the glossy path — cheaper, but it goes dark on sharp metals, so it is not the default).
+    ssr_stochastic: bool,
+    /// Shared bake-once latch for the world scene GDF (C1 trace + C2 AO + C3 GI read it).
+    scene_gdf_baked: bool,
+    /// C8a bake-once latch for the per-voxel albedo volumes (GI + reflection consumers share).
+    scene_albedo_baked: bool,
+    /// C8b1 capture-once latch for the surface cache (static geometry capture).
+    scene_cache_captured: bool,
+    /// C8b2 temporal reset for the cache lighting (true until the first lit frame).
+    scene_cache_reset: bool,
+    /// Lossless cache/GI dirty-skip (docs/lossless-opt-ledger.md A2): the view-independent
+    /// surface-cache relight (and world-irradiance volume) is a temporally-accumulated EMA that
+    /// reaches a fixpoint once the lighting (sun/sky) + geometry stop changing. `cache_epoch` is a
+    /// hash of that invariant state; a change re-arms convergence. The freeze then arms on a
+    /// backend-deterministic convergence horizon (`cache_freeze_passes` full amortization passes; see
+    /// that field), NOT the measured EMA step: that step is a stochastic-gather EMA whose noisy value
+    /// dips below eps at backend-divergent frames, which broke DX≡VK. Once past the horizon the cache
+    /// is settled — we freeze the relight (skip the dispatch, don't advance the ping-pong) and
+    /// consumers keep reading it. Image-identical (a settled EMA ≈ its fixpoint).
+    /// Camera motion does NOT bump the epoch (the cache is view-independent), so this wins even
+    /// while the camera moves — only sun/sky/geometry changes cost a re-converge. Gallery-gated.
+    cache_epoch: u64,
+    cache_stable_frames: u32,
+    /// Consecutive frames the MEASURED cache EMA step stayed below `cache_conv_eps`. DIAGNOSTIC ONLY
+    /// now: the freeze no longer gates on it. The measured step is a fixed-alpha EMA of a stochastic
+    /// gather (an AR(1) process with a permanent variance floor — see sdf_cache_light.slang), so the
+    /// frame its noisy value first dips below eps differs across backends, which broke DX≡VK (DX froze
+    /// at frame 48, VK at frame 8, latching two different noise samples ⇒ ~2.7/ch). The freeze now
+    /// arms on a backend-deterministic horizon (`cache_freeze_passes`); this counter is retained so
+    /// the freeze log can report how settled the measured signal actually was at that horizon.
+    cache_conv_stable: u32,
+    cache_conv_eps: f32,
+    /// Backend-deterministic freeze horizon, in full amortization passes: the freeze arms once the
+    /// lighting epoch has held for `cache_freeze_passes × cache_relight_period` frames (one pass =
+    /// every card relit once). Every term is backend-independent (an epoch-hash counter, the tier
+    /// period, a constant), so DX and VK freeze at the SAME frame on the SAME converged mean — the
+    /// DX≡VK-stable replacement for the old measured-step trigger (which latched two different noise
+    /// samples at frames 48 vs 8). Default 3 passes sits past the fixed-alpha settling knee (measured
+    /// convergence was ≈1.2 passes); a slow-multibounce scene raises it via `P_CACHE_FREEZE_PASSES`
+    /// rather than encoding a per-scene magic number.
+    cache_freeze_passes: u32,
+    /// A2-fix: the freeze LATCH. Armed once the epoch has held for the `cache_freeze_passes` horizon;
+    /// held until the epoch (sun/sky/geometry) changes. A latch is required because a frozen relight
+    /// stops advancing — without it the freeze condition would re-evaluate on stale state and
+    /// oscillate. Epoch change clears it so a lighting change re-converges.
+    cache_frozen: bool,
+    cache_dirty_skip: bool,
+    /// Cached shadow map (docs/shadow-cache-cold-start.md S1). The legacy directional shadow map is
+    /// camera-independent (`light_view_proj` reads only sun + scene bounds), so when the sun and
+    /// geometry are unchanged its re-raster reproduces a bit-identical depth. We render it into an
+    /// **app-owned persistent** depth (one per frame-in-flight, so a moving sun's every-frame write
+    /// never races the previous frame's read) OUTSIDE the render graph, then freeze — skip the
+    /// re-render once `shadow_epoch` (sun + scene bounds, NOT the camera) has held steady past
+    /// `shadow_settle_frames` — and the lighting pass re-samples the persistent depth by bindless
+    /// index. Survives arbitrary camera motion (the VSM benefit); invalidates on sun/geometry
+    /// change. Gallery-gated off (byte-identical anchor); CSM keeps the in-graph transient.
+    shadow_depth: Vec<DepthBuffer>,
+    shadow_epoch: u64,
+    shadow_stable_frames: u32,
+    shadow_settle_frames: u32,
+    shadow_dirty_skip: bool,
+    /// A3 adaptive temporal reflect skip: reuse gdf_reflect's converged radiance for pixels whose
+    /// surface is unchanged (host enables the reuse only once lighting + surface cache are stable).
+    /// `reflect_skip_stagger` re-traces 1/K pixels each frame so nothing goes stale. Gallery-gated.
+    reflect_skip: bool,
+    reflect_skip_stagger: u32,
+    /// CPU frustum culling of the real scene's opaque G-buffer + pre-pass draws (docs/cull-lod-design.md
+    /// S1). Filters `scene[]` by the camera frustum before those passes — image-identical (a fully
+    /// outside-the-frustum object is clipped anyway; the AABB test never culls a visible one). Does NOT
+    /// cull the shadow pass (whole-scene light frustum) or the view-independent GDF passes. Gallery-off.
+    scene_cull: bool,
+    /// Set whenever a frozen (settled) frame skips the ASYNC relight submit. The async path chains a
+    /// binary semaphore frame-to-frame (`cache_done`); a gap consumes it, so the first relight after
+    /// a freeze must use the no-wait (frame-0-style) submit to avoid waiting on a stale semaphore.
+    async_cache_gap: bool,
+    path_trace_pipeline: bool,
+    realtime_env: bool,
+    /// Per-frame dynamic sun (time-of-day): when on, the sun arcs across the sky from
+    /// `elapsed`, so the physical atmosphere + IBL recapture each frame (already per-frame
+    /// via `realtime_env`) visibly drive a moving sky. Off by default (static, deterministic
+    /// screenshots). `TIME_OF_DAY` env / UI toggle. Infrastructure for future time-of-day.
+    time_of_day: bool,
+    multibounce: bool,
+    /// Deprecated legacy captured-cube IBL path (prefilter-cube specular + scene capture).
+    /// Off by default — the SW-RT hybrid reflection + GDF GI are the default ambient.
+    legacy_ibl: bool,
+
+    /// QHD/UHD track: offscreen render extent override (`RENDER_RES=WxH`), decoupled from the
+    /// window/swapchain. `None` => render at the swapchain extent (default, byte-identical).
+    /// The scene passes (g-buffer → GDF → lighting → HDR) render here; tonemap downscales to the
+    /// swapchain backbuffer. Lets headless perf measure true QHD/UHD regardless of display size.
+    render_res: Option<(u32, u32)>,
+    /// QHD/UHD track: internal render scale (fraction of the display extent), the production knob
+    /// for dynamic resolution. `1.0` = native (byte-identical). Ignored when `render_res` (absolute)
+    /// is set. `RENDER_SCALE` env / `quality.rs` tier.
+    render_scale: f32,
+    /// QHD/UHD track: temporal upsampler (TAAU) — reconstructs full-res from jittered low-res
+    /// frames when the internal render extent is smaller than the output. `P_TAAU=0` disables.
+    taau: taau::TaauSystem,
+    taau_on: bool,
+    /// 60fps-margin: fp16-packed TAAU history (8B/px hist + no pos buffer; the history ping-pong
+    /// dominates the taau pass at Retina output). Tier knob `taau_packed_history` / `P_TAAU_PACKED`.
+    taau_packed: bool,
+    /// Baked ACES tonemap: replace the per-pixel Narkowicz curve with a per-frame-baked LUT
+    /// carrying the full ACES 1.3 RRT+ODT (+ the CDL grade). Tier knob `tonemap_aces` /
+    /// `P_TONEMAP_ACES`; the gallery keeps the legacy curve (anchor).
+    tonemap_aces: bool,
+    /// Tonemap-LUT resolution N (strip is N*N x N texels). `P_TONEMAP_LUT_SIZE`, default 48.
+    tonemap_lut_size: u32,
+    /// QHD/UHD: camera sub-pixel jitter for TAAU. Default ON in the upscale path — the jitter is the
+    /// super-sampling signal that reconstructs full-res detail (Halton(2,3), ±0.5px). It is now
+    /// coordinated across every screen-space temporal accumulator: TAAU + GI denoiser + reflection
+    /// resolve all reproject history sub-pixel-accurately (B1/B2), so the jitter resolves into sharp
+    /// detail instead of shimmer. Only active when TAAU is (cw<sw); `P_TAAU_JITTER=0` forces it off.
+    taau_jitter: bool,
+    /// TAAU luminance anti-flicker (`P_TAAU_ANTIFLICKER`, default OFF). Damps the blend weight of
+    /// a sample whose luma diverges from the (clipped) history — kills the bright sub-pixel
+    /// aperture shimmer (door sky-gaps, window grilles) the YCoCg variance box cannot clamp
+    /// because it is a bright CLUSTER, not an outlier. Measured: door HF 5.19 → 3.67 (below the
+    /// jitter-off 3.92 baseline). Default OFF because it alters the sealed content TAAU baseline
+    /// (sc_viz / gdf_ao goldens) and the PT gate runs RENDER_SCALE=1 (TAAU off), so no quality
+    /// gate can justify a default flip yet.
+    taau_antiflicker: bool,
+    /// TAAU motion-sharpness policy (`P_TAAU_CATMULL_ROM` / `P_TAAU_MOTION_RAMP` /
+    /// `P_TAAU_MOTION_HIST`, tier-driven). The fix for "TAA is blurry when the camera moves": a
+    /// Catmull-Rom history resample instead of the bilinear one, whose low-pass compounds once per
+    /// moving frame inside the accumulation loop. See `taau::MotionSharpness` and
+    /// docs/taau-motion-sharpness.md.
+    taau_motion: taau::MotionSharpness,
+    /// TSR-style TAAU clamp-box expansion (tier `taau_clamp_expand`, `P_TAAU_CLAMP_EXPAND`).
+    taau_clamp_expand: f32,
+    /// Post-upscale sharpen strength for TAAU frames (tier `taau_sharpen`, `P_TAAU_SHARPEN`).
+    taau_sharpen: f32,
+    /// `P_TAAU_FORCE=1`: run TAAU even at native resolution (internal == output) — i.e. temporal
+    /// anti-aliasing (jitter + accumulation, no upscale). Opt-in so the default native path stays
+    /// byte-identical (TAAU off when render==output).
+    taau_force: bool,
+    /// QHD/UHD Stage 8: TAA-aware texture LOD bias added when jitter is active (the primary
+    /// distant-texture sharpness lever). Resolved once from `quality::TAA_MIP_BIAS` with a
+    /// `TAA_MIP_BIAS` env override for sweeps. See `quality.rs` for the rationale.
+    taa_mip_bias: f32,
+    /// Velocity (motion-vector) G-buffer channel (pipeline re-baseline PR-2). Owns the opaque
+    /// velocity pass + the DEBUG_VIEW=11 viz. `velocity_on` gates the whole feature (`P_VELOCITY=1`);
+    /// default off = no velocity target, camera-only TAAU reprojection, byte-identical.
+    velocity: velocity::VelocitySystem,
+    velocity_on: bool,
+    /// Single prev-pose source (PR-2): each drawable's PREVIOUS-frame unjittered world transform,
+    /// keyed by the frame's stable draw-list index (deterministic insertion order). The velocity
+    /// pass reads it to compute per-object screen motion for static / Spin / node-animated draws
+    /// (skinning / morph add their prev palette / weights on top). Rebuilt after each frame from the
+    /// current transforms.
+    prev_transforms: Vec<Mat4>,
+    // Profiler UI state.
+    profiler_on: bool,
+    slot_pass_names: Vec<Vec<&'static str>>,
+    gpu_timings: Vec<(&'static str, f32)>,
+
+    // Loop bookkeeping.
+    fif: usize,
+    frame_no: u64,
+    f2_prev: bool,
+    needs_recreate: bool,
+    /// The internal render extent the pooled transients were last built for.
+    /// `ResourcePool` reuses by exact desc (extent included), so when the per-frame
+    /// render extent moves (render-scale slider / quality tier / `RENDER_RES`) the
+    /// old extent's targets are never matched again — and never dropped — leaking
+    /// their bindless storage-image/SRV slots until the table overflows. When the
+    /// frame's extent diverges from this latch, the pools are reclaimed exactly like
+    /// a window resize (see [`Self::reclaim_scaled_transients`]). `(0, 0)` = not yet
+    /// latched (startup).
+    pool_render_extent: (u32, u32),
+    /// `DIAG_SLOTS=1`: log the bindless storage-image slot counts whenever they
+    /// change — the leak counter for the transient-reclaim paths (resize + render
+    /// scale). Steady state is silent; a leak climbs monotonically.
+    diag_slots: bool,
+    /// Last logged `(in_use, high_water)` (see `diag_slots`).
+    diag_slots_last: (u32, u32),
+    /// `DIAG_SCALE_CYCLE=<n>`: ping-pong `render_scale` across a fixed ladder every
+    /// `n` frames — a deterministic, headless-capable regression harness for the
+    /// render-scale transient reclaim (pairs with `DIAG_SLOTS`; the unreclaimed pool
+    /// formerly overflowed the 256-slot storage-image table after ~20 steps).
+    diag_scale_cycle: Option<u64>,
+    last: Instant,
+    elapsed: f32,
+    angle: f32,
+    /// Previous frame's orbit `angle`, kept so the rendered camera can interpolate
+    /// between the last and current fixed-timestep sim states (M2 fixed timestep).
+    prev_angle: f32,
+    /// Leftover real time not yet consumed by a whole fixed sim step. Carries the
+    /// fractional remainder frame-to-frame; `remainder / FIXED_DT` is the render
+    /// interpolation alpha. Interactive only — headless capture bypasses it.
+    sim_accumulator: f32,
+    // Diagnostic: tight orbit centred on one scene object (by index) for inspecting it
+    // from all sides. `None` = normal whole-scene framing. `diag_pitch` = elevation.
+    diag_obj: Option<usize>,
+    diag_pitch: Option<f32>,
+    // Stage 0 free-fly camera. `cam_mode` defaults to Orbit (the screenshot/parity
+    // baseline); Tab toggles to Fly interactively. `fly` is lazily seeded from the
+    // current orbit view on first switch so there is no jump.
+    cam_mode: camera::CameraMode,
+    fly: Option<camera::FlyCamera>,
+    tab_prev: bool,
+    /// Edge detector for the M key (pointer-lock latch toggle).
+    m_prev: bool,
+    /// Latched pointer-lock release (M toggles): keeps the cursor free for the settings UI
+    /// without holding the Option/Alt chord; the fly look pauses while released.
+    cursor_released: bool,
+
+    /// Game-injection seam (`hooks.rs`). `None` (the default, and every headless
+    /// golden recipe) = the frame loop takes exactly its pre-seam paths.
+    hooks: Option<Box<dyn GameHooks>>,
+}
+
+const VK_F2: u16 = 0x71;
+const VK_TAB: u16 = 0x09;
+const VK_M: u16 = 0x4D;
+const SCREENSHOT_WARMUP: u64 = 3;
+// Path-trace screenshots need a long warmup so the static-camera accumulation
+// converges before the frame is captured.
+const PATHTRACE_WARMUP: u64 = 64;
+// GI temporal accumulation likewise needs several frames to converge for a clean
+// screenshot (the camera is held fixed while capturing).
+const GI_DENOISE_WARMUP: u64 = 64;
+/// TAAU sub-pixel jitter sequence length (Halton(2,3)); the history accumulates over this many
+/// jittered frames to reconstruct full-res detail.
+const TAAU_JITTER_LEN: u64 = 8;
+
+/// Halton low-discrepancy sample (1-indexed) for the TAAU jitter sequence — uniform sub-pixel
+/// coverage so the temporal accumulation resolves detail the low-res frame lacks.
+fn halton(mut i: u32, base: u32) -> f32 {
+    let mut f = 1.0_f32;
+    let mut r = 0.0_f32;
+    while i > 0 {
+        f /= base as f32;
+        r += f * (i % base) as f32;
+        i /= base;
+    }
+    r
+}
+
+impl App {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        window: Window,
+        instance: Instance,
+        device: Device,
+        swapchain: Swapchain,
+        backend: BackendKind,
+        model: &MeshData,
+        model_radius: f32,
+        screenshot_mode: bool,
+        captures: Vec<Capture>,
+        validation_on: bool,
+        config: GameConfig,
+    ) -> anyhow::Result<Self> {
+        // `P14_VGEO` routes every eligible opaque static object through virtual geometry (the
+        // `VgeoSystem` is built below from the mesh registry). Resolved after `gallery_scene` and
+        // the device caps are known: **default ON for non-gallery scenes** on a 64-bit-atomics
+        // adapter (the visibility-buffer requirement), OFF for the gallery (the fixed-exposure
+        // byte-identical DX≡VK anchor). `P14_VGEO=0/1` overrides. `None` here = "auto".
+        let vgeo_env: Option<u32> = std::env::var("P14_VGEO").ok().and_then(|s| s.parse().ok());
+        let queue = device.queue();
+        // Phase-7 compute (post blur / GPU particles / GPU culling) is implemented
+        // on all three backends (Metal compute landed in M5).
+        let compute_supported = true;
+
+        // Deferred-PBR backbone (see `deferred.rs`): the shadow / G-buffer / lighting
+        // / tonemap graphics pipelines, the compute post-process pipeline, and the
+        // per-frame globals uniform buffer.
+        let deferred = DeferredRenderer::new(&device, backend, swapchain.format())?;
+
+        let gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
+
+        // ── Slate-style loading screen (docs/loading-screen-thread.md). From HERE the cold cook can
+        // run for minutes (Intel New Sponza), so hand the swapchain to a dedicated thread that
+        // presents a progress bar every frame (D3D12 only — free-threaded queue; VK/Metal/headless
+        // keep the swapchain + terminal bar). Cache format/extent/image-count/readback BEFORE the
+        // move — the cook uses these; the swapchain object is reclaimed by `finish()` after the cook.
+        let swap_extent_cached = swapchain.extent_2d();
+        let swap_format_cached = swapchain.format();
+        let swap_image_count = swapchain.image_count();
+        let readback_layout_cached = device.swapchain_readback_layout(&swapchain);
+        // Shared progress the loading thread renders; the cook bumps it (coarse boundaries here +
+        // fine-grained `PhaseSink` within the parallel cooks). Lives even when no thread runs
+        // (Metal/headless) — the cook's updates are then just harmless no-ops.
+        let loading_state = std::sync::Arc::new(loading::LoadingState::new());
+        let loading = loading::spawn(
+            &device,
+            backend,
+            swapchain,
+            swap_format_cached,
+            swap_extent_cached,
+            std::sync::Arc::clone(&loading_state),
+            screenshot_mode,
+        )?;
+        loading_state.set(0.05);
+
+        // Phase 11 software ray tracing + global distance field (Stage A analytic
+        // trace, Stage B volumes / SDF bake / GDF merge / GDF trace, Stage C1 world
+        // scene GDF). See `gdf.rs`. The scene GDF is registered after the scene is built.
+        let mut gdf = GdfSystem::new(&device, backend, compute_supported)?;
+        // Stage C GDF-lighting consumers (C2 AO, C3 GI, C4 denoise). See `gi.rs`.
+        // `mut`: the F4 fine-level AABB is installed after the scene AABB + camera are known.
+        let mut gi = GiSystem::new(&device, backend, compute_supported)?;
+        // Screen-space near-field AO (composed with the GDF AO). See `gtao.rs`.
+        let gtao = gtao::GtaoSystem::new(&device, backend, compute_supported)?;
+        // PR-4 (render-pipeline re-baseline track): the sky/atmosphere composite slot
+        // (opt-in height fog today). See `atmosphere.rs`.
+        let atmosphere = atmosphere::AtmosphereSystem::new(&device, backend, HDR_FORMAT)?;
+        // PR-3 (render-pipeline re-baseline track): the forward translucency slot. Built
+        // unconditionally (the shader is exercised by every backend's build); the pass is
+        // only recorded when there are translucent objects. See `translucent.rs`.
+        let translucency =
+            translucent::TranslucencySystem::new(&device, backend, HDR_FORMAT, DEPTH_FORMAT)?;
+        // PR-5 post nodes (pipelines always built so all three backends compile the
+        // shaders; the passes are only recorded when the feature flags are on).
+        let bloom = postfx::BloomSystem::new(&device, backend, HDR_FORMAT)?;
+        let motion_blur = postfx::MotionBlurSystem::new(&device, backend, HDR_FORMAT)?;
+        let dof = postfx::DofSystem::new(&device, backend, HDR_FORMAT)?;
+        // Stage C reflection track (C5 SSR; C6/C7 later). See `reflect.rs`.
+        let reflect = ReflectSystem::new(&device, backend, compute_supported)?;
+        // QHD/UHD track: temporal upsampler. See `taau.rs`.
+        let taau = taau::TaauSystem::new(&device, backend, compute_supported)?;
+        // Velocity (motion-vector) channel (pipeline re-baseline PR-2). See `velocity.rs`.
+        let velocity = velocity::VelocitySystem::new(&device, backend)?;
+
+        // GPU particle system (Phase 7): a persistent ping-pong buffer pair advanced
+        // by a compute pass and drawn as instanced billboards (see `particle.rs`).
+        // PR-3 side-effect: the draw now composites in the HDR translucency slot (before
+        // tonemap), not over the tonemapped LDR — so it's built with HDR_FORMAT. Default-off
+        // (`P7_PARTICLES`), so the default gallery/anchor output is unchanged.
+        let particles = ParticleSystem::new(&device, backend, compute_supported, HDR_FORMAT)?;
+
+        // GPU frustum culling (Phase 7): a compute pass tests a cube instance grid
+        // against the frustum and writes an indirect draw; the draw renders only the
+        // visible instances (see `cull.rs`). PR-3 side-effect: draws into the HDR slot
+        // (before tonemap), so built with HDR_FORMAT. Default-off (`P7_CULL`).
+        let cull = CullSystem::new(&device, backend, compute_supported, HDR_FORMAT)?;
+
+        // Clustered light culling (PR-6): a compute pass bins the scene's point lights into a
+        // view-frustum froxel grid so the lighting pass loops only its cluster's lights. `None`
+        // where compute is unavailable; opt-in via `CLUSTERED_LIGHTS=1` (see `cluster.rs`).
+        let cluster = ClusterSystem::new(&device, backend, compute_supported)?;
+
+        // HZB occlusion culling (PR-8): a max-reduced Hi-Z pyramid built from the scene
+        // depth feeds an occlusion-aware variant of the cull compute. Compute-only; the
+        // pyramid is sized to the render extent and resized in-frame if it changes.
+        let hzb = if compute_supported {
+            Some(HzbSystem::new(&device, backend, swap_extent_cached)?)
+        } else {
+            None
+        };
+
+        // Clip-space Y orientation for the full-screen passes (Vulkan = 1, D3D12 /
+        // Metal = 0; both have a Y-up NDC with a top-left framebuffer origin).
+        let flip_y: u32 = match backend {
+            BackendKind::Vulkan => 1,
+            BackendKind::D3d12 => 0,
+            BackendKind::Metal => 0,
+        };
+
+        // Upload material textures for the loaded model (bindless). Base color is
+        // sRGB-encoded; the metallic-roughness and normal maps carry linear data.
+        let mut textures: Vec<Texture> = Vec::new();
+        let base_index = match &model.material.base_color {
+            Some(im) => upload_texture(&device, &mut textures, im, Format::Rgba8Srgb)?,
+            None => {
+                let t = make_checker_texture(&device)?;
+                let i = t.bindless_index();
+                textures.push(t);
+                i
+            }
+        };
+        let mr_index = match &model.material.metallic_roughness {
+            Some(im) => upload_texture(&device, &mut textures, im, Format::Rgba8Unorm)?,
+            None => NO_TEXTURE,
+        };
+        let normal_index = match &model.material.normal {
+            Some(im) => upload_texture(&device, &mut textures, im, Format::Rgba8Unorm)?,
+            None => NO_TEXTURE,
+        };
+        let emissive_index = match &model.material.emissive {
+            Some(im) => upload_texture(&device, &mut textures, im, Format::Rgba8Srgb)?,
+            None => NO_TEXTURE,
+        };
+
+        // Build the scene as ECS entities: the procedural gallery (default), a full
+        // glTF scene (`SCENE_GLTF=<path>`, Stage B), a declarative level (`LEVEL=<name>`,
+        // Stage C), or a streaming world of chunks (`WORLD`, Stage D). A ground plane is
+        // kept separate (it's also the environment-capture geometry). `sphere`/`cube`
+        // are always built — the gallery uses them, and they're cheap.
+        let r = model_radius;
+        let sphere = dreamcoast_asset::uv_sphere(48, 32);
+        let cube = dreamcoast_asset::unit_cube();
+        // Scene-mode env vars (precedence: WORLD > LEVEL > SCENE_GLTF > gallery).
+        let world_mode = std::env::var_os("WORLD").is_some();
+        // A `GameConfig::level` from the embedder wins over the env var (a game names its
+        // own level); unset falls back to the existing `LEVEL` seam.
+        let level_select = if world_mode {
+            None
+        } else {
+            config.level.clone().or_else(|| std::env::var("LEVEL").ok())
+        };
+        let scene_gltf_path = if world_mode || level_select.is_some() {
+            None
+        } else {
+            std::env::var("SCENE_GLTF").ok()
+        };
+        // The gallery is the only scene with the GDF/HW-RT path; glTF + levels + worlds
+        // use the captured-cube IBL (forced via `legacy_ibl` below).
+        let gallery_scene = !world_mode && level_select.is_none() && scene_gltf_path.is_none();
+        // RenderQuality tier (Stage D): `RENDER_QUALITY=low|med|high` (unset => platform default —
+        // an Apple GPU maps to the aggressive `Apple` tier, every other adapter stays on the legacy
+        // `Med` baseline). Resolved HERE, before the level build, because load-time knobs (the
+        // surface-cache card grid / adaptive res / mesh capture) already need the tier; the
+        // per-frame knobs below resolve against the same `base`. The gallery is the byte-identical
+        // path-tracer anchor, so it resolves against the fixed legacy `gallery_preset()` instead of
+        // the active tier — structurally, so a new tier knob can't break the anchor by forgetting a
+        // per-site `if gallery_scene { .. }` force. Each knob is
+        // `env_override.unwrap_or(base.<knob>).clamp(..)`: an explicit `P11_*`/`P_*` env always
+        // wins over the tier. The UI live-swap re-derives from the same `base` (RenderQuality
+        // combo) so the two resolution paths can never drift.
+        let device_info = device.device_info();
+        let quality = quality::RenderQuality::from_env_for_device(&device_info);
+        let base = if gallery_scene {
+            quality::gallery_preset()
+        } else {
+            quality::preset(quality)
+        };
+        // Resolve the virtual-geometry mode now that the scene kind + caps are known (see `vgeo_env`).
+        let vgeo_mode: u32 =
+            vgeo_env.unwrap_or((!gallery_scene && device.capabilities().atomic_int64) as u32);
+        // Two-phase same-frame HZB occlusion (docs/phase-14-vgeo-hzb-occlusion.md): default ON for
+        // non-gallery scenes when the vgeo producer is active, OFF for the gallery byte anchor.
+        // `P14_VGEO_HZB=0/1` overrides. Conservative-by-construction, so ON vs OFF is output-
+        // identical; the gate exists to preserve the gallery anchor and allow disabling.
+        let vgeo_hzb: bool = std::env::var("P14_VGEO_HZB")
+            .ok()
+            .map(|s| s != "0")
+            .unwrap_or(vgeo_mode == 1 && !gallery_scene);
+        // Level directory: the game's own if it named one, else the engine's. The
+        // built-in `.level` files are engine content, so they are only materialized in
+        // the engine's directory — a game with its own does not get them dumped into it.
+        let builtin_levels = config.levels_dir.is_none();
+        let levels_dir = config
+            .levels_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(level::DEFAULT_LEVELS_DIR));
+        // Content scenes (levels / glTF imports / worlds) carry large multi-material assets —
+        // e.g. Sponza + foliage needs ~7.8 GB of uncompressed textures, right at an 8 GB card's
+        // edge (Vulkan OOMs where D3D12's VRAM oversubscription barely fits). Block-compress
+        // their textures by DEFAULT (BC1 colour / BC5 normals, ~4× smaller, GPU-native = no
+        // decompress cost). The gallery anchor stays `Off` (byte-identical regression scene).
+        let content_compress = level::content_tex_compress();
+
+        // Registries own the GPU meshes + material descriptors the scene's handles
+        // point at (P2). Unique geometry uploads once — the two spheres share a handle.
+        let mut mesh_registry = MeshRegistry::new();
+        let mut material_registry = MaterialRegistry::new();
+        let mut world = World::new();
+        // Level-mode hot-swap state: the discovered `.level` files + the loaded index.
+        let mut level_paths: Vec<String> = Vec::new();
+        let mut current_level = 0usize;
+        // Stage D: the streaming manager (world mode only). Chunks load on demand from
+        // the camera, so `world`/registries above stay empty in this mode.
+        let mut streaming: Option<world::Streaming> = None;
+        // World-space AABB of the placed scene (metres), used to frame the camera at the
+        // scene's native scale. `None` keeps the legacy gallery framing.
+        let mut scene_bounds: Option<level::Bounds> = None;
+        let mut gltf_skinned: Vec<skin::SkinnedMesh> = Vec::new();
+        let mut level_vcaches: Vec<deform::DeformPlayer> = Vec::new();
+        let mut gltf_morphed = morph::MorphSet::default();
+        // A level's authored camera (applied as the initial view if non-default).
+        let mut level_view: Option<(Vec3, Vec3)> = None;
+        // A level's lighting, replacing the gallery's code-default sun + point lights.
+        let mut level_lighting_override: Option<LevelLighting> = None;
+        // A level's sky white balance (per-channel sky-radiance gain), captured for the IBL.
+        let mut level_sky_wb: Option<[f32; 3]> = None;
+
+        if world_mode {
+            // Stage D: load the level graph + the level files its chunks reference.
+            level::ensure_level_files(&levels_dir)?;
+            let world_path = world::ensure_world_file(&levels_dir)?;
+            let graph = dreamcoast_asset::LevelGraph::load_ron(&world_path)?;
+            info!(
+                "world '{}': {} chunks, stream_radius {}",
+                world_path.display(),
+                graph.chunks.len(),
+                graph.stream_radius
+            );
+            streaming = Some(world::Streaming::new(graph, levels_dir.clone()));
+        } else if let Some(select) = &level_select {
+            // Stage C: load a declarative level (writing the engine's built-in ones
+            // first, when this is the engine's own directory).
+            level_paths = if builtin_levels {
+                level::ensure_level_files(&levels_dir)?
+            } else {
+                level::discover_level_files(&levels_dir)?
+            };
+            // A stem matches the directory listing; an explicit path loads as given. A
+            // miss errors here (naming what is available) instead of silently loading
+            // whatever happened to sort first.
+            current_level = level::resolve_selection(select, &levels_dir, &mut level_paths)?;
+            // Stage E: load through the cook (RON → cooked .dcasset, cache-keyed).
+            let level = level::load(std::path::Path::new(&level_paths[current_level]))?;
+            level_view = level::level_camera(&level);
+            level_lighting_override = Some(level_lighting(&level));
+            level_sky_wb = Some(level.environment.sky_white_balance);
+            let (bounds, players) = level::build_level(
+                &device,
+                &level,
+                &mut world,
+                &mut mesh_registry,
+                &mut material_registry,
+                &mut textures,
+                Vec3::ZERO,
+                content_compress,
+            )?;
+            scene_bounds = bounds;
+            // Declarative baked-deform players (the level's `deforms` entities). The frame loop
+            // drives every one — no env overlay hack.
+            level_vcaches = players;
+            // Phase 13 Stage E: opt-in skinned/static character overlay (default off →
+            // the level renders byte-unchanged). Verifies the ufbx FBX importer + GPU skin
+            // cache against Intel Sponza. See docs/phase-13-fbx-knight.md.
+            if std::env::var("SPONZA_CHARS").is_ok() {
+                // Animated skinned VoxelCharacter (glTF): exercises the skin-cache + anim
+                // path on top of a level. The glb is authored in metres; clip 1 = "Idle".
+                let (voxel, _) = dreamcoast_asset::cook::load_or_cook_gltf_scene(
+                    std::path::Path::new("assets/VoxelCharacter/glb/f_1.glb"),
+                    "assets/VoxelCharacter/glb/f_1.glb",
+                    &app::cooked_cache_dir(),
+                    content_compress,
+                )?;
+                let anim = std::env::var("CHAR_ANIM")
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(1);
+                character::overlay(
+                    &device,
+                    &mut world,
+                    &mut mesh_registry,
+                    &mut material_registry,
+                    &mut textures,
+                    &voxel,
+                    &character::voxel_placement(),
+                    Some(anim),
+                    "voxel",
+                    &mut gltf_skinned,
+                )?;
+                // Static knight (FBX geometry): proves the ufbx importer end-to-end. Its FBX
+                // carries no skin weights, so it renders its bind pose (no animation).
+                #[cfg(feature = "fbx")]
+                {
+                    let knight = dreamcoast_asset::load_fbx_scene(
+                        "assets/Knight/Knight_USD_002.fbx",
+                        None::<&std::path::Path>,
+                    )?;
+                    character::overlay(
+                        &device,
+                        &mut world,
+                        &mut mesh_registry,
+                        &mut material_registry,
+                        &mut textures,
+                        &knight,
+                        &character::knight_placement(),
+                        None,
+                        "knight",
+                        &mut gltf_skinned,
+                    )?;
+                }
+                #[cfg(not(feature = "fbx"))]
+                info!(
+                    "SPONZA_CHARS: knight needs `--features fbx`; overlaying VoxelCharacter only"
+                );
+            }
+            // Baked vertex-cache deforms (the knight's actual deformation animation) are now
+            // first-class `.level` `deforms` entities — cooked + spawned inside `build_level`
+            // above (see `sponza_knight.level`), not an env overlay.
+        } else if let Some(path) = &scene_gltf_path {
+            // Stage B: import the whole node hierarchy + every primitive/material/image,
+            // through the cooked, block-compressed `.dcasset` (a hit skips glTF parse +
+            // decode + BCn encode). `content_compress` sets the tier.
+            let (gscene, outcome) = dreamcoast_asset::cook::load_or_cook_gltf_scene(
+                std::path::Path::new(path),
+                path,
+                &app::cooked_cache_dir(),
+                content_compress,
+            )?;
+            info!(
+                "glTF scene '{path}' ({outcome:?}): {} nodes, {} primitives, {} materials, {} images",
+                gscene.nodes.len(),
+                gscene.primitive_count(),
+                gscene.materials.len(),
+                gscene.images.len()
+            );
+            let prim_handles = registry::upload_gltf_scene(
+                &device,
+                &gscene,
+                &mut mesh_registry,
+                &mut material_registry,
+                &mut textures,
+            )?;
+            let (imported, node_map) =
+                dreamcoast_scene::instantiate_gltf_mapped(&mut world, &gscene, &prim_handles);
+            // Place at native (1 unit = 1 m) scale under a wrapper root (so the whole
+            // import can be spun/inspected); the camera frames it from its AABB below.
+            let scene_root = world.spawn();
+            world.insert(scene_root, LocalTransform::IDENTITY);
+            world.insert(scene_root, dreamcoast_scene::Name("scene-root".to_owned()));
+            world.insert(imported, dreamcoast_scene::Parent(scene_root));
+            // Optionally spin the import to prove `propagate_transforms` moves the whole
+            // hierarchy (Stage B verification).
+            let spin = std::env::var("GLTF_SPIN")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok());
+            if let (Some(deg), Some(lt)) = (spin, world.get_mut::<LocalTransform>(scene_root)) {
+                lt.rotation = Quat::from_rotation_y(deg.to_radians());
+            }
+            // Animation Stage A: play one of the glTF's clips. `GLTF_ANIM[=<index>]`
+            // (default clip 0) attaches an `AnimationPlayer` whose channels target the
+            // imported node entities; the frame loop's `advance_animation` drives it.
+            // No-op without `GLTF_ANIM` or without node-TRS clips (byte-identical).
+            if let Ok(sel) = std::env::var("GLTF_ANIM") {
+                let idx = sel.trim().parse::<usize>().unwrap_or(0);
+                match gscene.animations.get(idx) {
+                    Some(anim) => {
+                        let clip = dreamcoast_scene::AnimationClip::from_gltf(anim, &node_map);
+                        if clip.is_empty() {
+                            info!("animation: clip {idx} has no node-TRS channels for this scene");
+                        } else {
+                            let dur = clip.duration;
+                            let player = world.spawn();
+                            world.insert(player, dreamcoast_scene::AnimationPlayer::new(clip));
+                            info!(
+                                "animation: playing clip {idx} '{}' ({} channels, {dur:.2}s)",
+                                anim.name.as_deref().unwrap_or("<unnamed>"),
+                                anim.channels.len(),
+                            );
+                        }
+                    }
+                    None => info!(
+                        "animation: no clip {idx} ({} available)",
+                        gscene.animations.len()
+                    ),
+                }
+            }
+            // Animation Stage B: CPU-skin any skinned primitives each frame.
+            gltf_skinned = skin::build_skinned_meshes(
+                &device,
+                &gscene,
+                &prim_handles,
+                &node_map,
+                &mesh_registry,
+            )?;
+            if !gltf_skinned.is_empty() {
+                info!(
+                    "skinning: {} skinned primitive(s) (GPU)",
+                    gltf_skinned.len()
+                );
+            }
+            // Animation Stage C: blend any morph-target primitives each frame (GPU
+            // vertex-pulling where host storage is available, else CPU).
+            gltf_morphed = morph::build_morph_meshes(
+                &device,
+                &gscene,
+                &prim_handles,
+                &node_map,
+                &mesh_registry,
+            )?;
+            if !gltf_morphed.is_empty() {
+                info!(
+                    "morph: {} GPU + {} CPU morph primitive(s)",
+                    gltf_morphed.gpu_count(),
+                    gltf_morphed.cpu_count()
+                );
+            }
+            scene_bounds = registry::gltf_bounds(&gscene);
+        } else {
+            // The procedural gallery (default) — byte-identical to Stage A.
+            let mesh_model = mesh_registry.upload(&device, model)?;
+            let mesh_sphere = mesh_registry.upload(&device, &sphere)?;
+            let mesh_cube = mesh_registry.upload(&device, &cube)?;
+            // The loaded model is textured: its representative GI albedo is the base-color
+            // texture's linear average × factor (the procedural objects use their factor's
+            // RGB). `representative_albedo` is the one definition the fuse later reads.
+            let mat_model = material_registry.add(MaterialDesc {
+                base_color: model.material.base_color_factor,
+                metallic: model.material.metallic_factor,
+                roughness: model.material.roughness_factor,
+                tex: [base_index, mr_index, normal_index, emissive_index],
+                albedo: registry::representative_albedo(
+                    model
+                        .material
+                        .base_color
+                        .as_ref()
+                        .map(|t| t.average_linear()),
+                    model.material.base_color_factor,
+                ),
+                alpha_cutoff: 0.0,
+                kind: dreamcoast_asset::MaterialKind::Opaque,
+                two_sided: true, // procedural gallery material → keep two-sided (byte-identical anchor)
+            });
+            let mat_chrome = material_registry.add(MaterialDesc {
+                base_color: [0.95, 0.96, 0.97, 1.0],
+                metallic: 1.0,
+                roughness: 0.08,
+                tex: [NO_TEXTURE; 4],
+                albedo: registry::representative_albedo(None, [0.95, 0.96, 0.97, 1.0]),
+                alpha_cutoff: 0.0,
+                kind: dreamcoast_asset::MaterialKind::Opaque,
+                two_sided: true, // procedural gallery material → keep two-sided (byte-identical anchor)
+            });
+            let mat_copper = material_registry.add(MaterialDesc {
+                base_color: [0.95, 0.64, 0.54, 1.0],
+                metallic: 1.0,
+                roughness: 0.35,
+                tex: [NO_TEXTURE; 4],
+                albedo: registry::representative_albedo(None, [0.95, 0.64, 0.54, 1.0]),
+                alpha_cutoff: 0.0,
+                kind: dreamcoast_asset::MaterialKind::Opaque,
+                two_sided: true, // procedural gallery material → keep two-sided (byte-identical anchor)
+            });
+            let mat_red = material_registry.add(MaterialDesc {
+                base_color: [0.85, 0.25, 0.2, 1.0],
+                metallic: 0.0,
+                roughness: 0.5,
+                tex: [NO_TEXTURE; 4],
+                albedo: registry::representative_albedo(None, [0.85, 0.25, 0.2, 1.0]),
+                alpha_cutoff: 0.0,
+                kind: dreamcoast_asset::MaterialKind::Opaque,
+                two_sided: true, // procedural gallery material → keep two-sided (byte-identical anchor)
+            });
+            // Spawn order defines the deterministic draw / TLAS-instance order (model,
+            // chrome, copper, cube) — the order the legacy flat list used.
+            let model_e = world
+                .spawn_node()
+                .named("model")
+                .with(MeshInstance::new(mesh_model, mat_model))
+                .with(LocalTransform::IDENTITY)
+                .id();
+            world
+                .spawn_node()
+                .named("chrome-sphere")
+                .with(MeshInstance::new(mesh_sphere, mat_chrome))
+                .with(LocalTransform::trs(
+                    Vec3::new(-r * 1.7, r * 0.75, r * 0.5),
+                    r * 0.75,
+                ));
+            world
+                .spawn_node()
+                .named("copper-sphere")
+                .with(MeshInstance::new(mesh_sphere, mat_copper))
+                .with(LocalTransform::trs(
+                    Vec3::new(r * 1.9, r * 0.5, -r * 0.4),
+                    r * 0.5,
+                ));
+            let cube_e = world
+                .spawn_node()
+                .named("red-cube")
+                .with(MeshInstance::new(mesh_cube, mat_red))
+                .with(LocalTransform::trs(
+                    Vec3::new(0.0, r * 0.45, -r * 2.0),
+                    r * 0.45,
+                ))
+                .id();
+
+            // Phase 15 verification: `P15_SPIN[=<rad/s>]` attaches a `Spin` to the
+            // (asymmetric, so visibly rotating) model + cube. The fixed-timestep
+            // loop advances them each step and the per-frame parallel propagate +
+            // draw renders the motion. Default (unset) = no Spin → byte-identical
+            // gallery, so the parity baseline is untouched.
+            if let Ok(raw) = std::env::var("P15_SPIN") {
+                let speed = raw.parse::<f32>().ok().filter(|s| *s != 0.0).unwrap_or(1.0);
+                world.insert(
+                    model_e,
+                    dreamcoast_scene::Spin {
+                        axis: Vec3::Y,
+                        speed,
+                    },
+                );
+                world.insert(
+                    cube_e,
+                    dreamcoast_scene::Spin {
+                        axis: Vec3::new(0.3, 1.0, 0.0),
+                        speed: speed * 1.5,
+                    },
+                );
+            }
+        }
+        dreamcoast_scene::propagate_transforms_parallel(&mut world, dreamcoast_jobs::global());
+
+        // Materialize the ECS draw list into the flat `SceneObject` list the GPU passes
+        // consume. (Static scene → built once; later stages rebuild on scene change. In
+        // world mode `world` is empty — the per-frame list comes from the streamer.)
+        let mut scene = build_scene(&world, &mesh_registry, &material_registry);
+        // Decal/transparent census. Decals are tinted into the G-buffer by the deferred decal
+        // pass (`record_decals`); transparents still fall back to opaque (track B).
+        {
+            use dreamcoast_asset::MaterialKind;
+            let decals = scene
+                .iter()
+                .filter(|o| o.kind == MaterialKind::Decal)
+                .count();
+            let transparents = scene
+                .iter()
+                .filter(|o| o.kind == MaterialKind::Transparent)
+                .count();
+            if decals + transparents > 0 {
+                info!(
+                    "material kinds: {decals} decal (deferred decal pass), {transparents} \
+                     transparent (opaque fallback) of {} drawables",
+                    scene.len()
+                );
+            }
+        }
+        // Foliage soft edges (opt-in, approach C). By default `Transparent` foliage renders as a
+        // crisp alpha-tested cutout (positive `alpha_cutoff`). `FOLIAGE_HASHED=1` flips that cutoff
+        // NEGATIVE for foliage drawables, which switches gbuffer.slang to a world-space hashed
+        // (stochastic) alpha test; the camera's sub-pixel TAA jitter then resolves the dither into
+        // soft, translucent leaf edges — so pair it with `P_TAAU_FORCE=1` (TAA at native res). The
+        // magnitude is unchanged, so shadows (which use |cutoff|) stay crisp. Default off keeps the
+        // crisp cutout and the byte-identical non-foliage baseline (no `Transparent` is touched).
+        if quality::env_bool("FOLIAGE_HASHED", false) {
+            let mut n = 0;
+            for o in scene.iter_mut() {
+                if o.kind == dreamcoast_asset::MaterialKind::Transparent && o.alpha_cutoff > 0.0 {
+                    o.alpha_cutoff = -o.alpha_cutoff;
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                info!(
+                    "foliage: hashed alpha on {n} transparent drawable(s) — needs TAA \
+                     (P_TAAU_FORCE=1 at native res) to resolve the dither into soft edges"
+                );
+            }
+        }
+        // Frame the camera at the scene's native scale: derive the centre + radius from
+        // the placed-geometry AABB (Sponza fills its real ~20 m, lanterns their ~2 m).
+        // The gallery keeps its exact legacy framing (byte-identical baseline); world
+        // mode has no single AABB (streaming), so it uses a fixed extent.
+        let (scene_center, scene_radius) = match scene_bounds {
+            Some((min, max)) => {
+                let center = (min + max) * 0.5;
+                let radius = (0.5 * (max - min).length()).max(0.5);
+                (center, radius)
+            }
+            None if world_mode => (Vec3::new(0.0, 2.0, 0.0), 28.0),
+            None => (Vec3::new(0.0, r * 0.6, 0.0), r * 3.0), // gallery legacy framing
+        };
+        if let Some((min, max)) = scene_bounds {
+            let s = max - min;
+            info!(
+                "scene bounds (m): size [{:.2}, {:.2}, {:.2}], centre [{:.2}, {:.2}, {:.2}]",
+                s.x, s.y, s.z, scene_center.x, scene_center.y, scene_center.z
+            );
+        }
+        // World mode drives streaming from a free-fly camera. Seed its eye from
+        // `WORLD_CAM="x,y,z"` (default above the chunk row, looking along it) so a
+        // headless capture can position the camera; interactively, WASD flies it.
+        let world_fly = world_mode.then(|| {
+            let eye = parse_vec3_env("WORLD_CAM").unwrap_or(Vec3::new(0.0, 3.0, 9.0));
+            camera::FlyCamera::from_look(eye, Vec3::new(eye.x, 2.0, 0.0), scene_radius * 0.4)
+        });
+        // RT instance-table mesh sources, aligned 1:1 with the draw list (TLAS order).
+        // Only the gallery builds the HW-RT scene accel; glTF/level paths pass nothing
+        // (RtSystem::new skips the table when `build_scene_accel` is false).
+        let scene_meshes: Vec<&MeshData> = if gallery_scene {
+            vec![model, &sphere, &sphere, &cube]
+        } else {
+            Vec::new()
+        };
+
+        // Ground plane (separate handle: also used by the environment capture).
+        let ground = ground_mesh(scene_radius * 1.3, 0.0);
+        let (ground_vbuf, ground_ibuf, ground_count) = upload_mesh(&device, &ground)?;
+
+        // Hardware ray tracing (Phase 8): BLAS/TLAS over the sample scene + ground,
+        // the path tracer's per-instance geometry table, and the alternate Cornell-box
+        // scene — plus the M3/M4/M5 RT pipelines. See `rt.rs`. The sample scene's TLAS
+        // is bound on construction (the startup default). The instance table's mesh
+        // order MUST match the TLAS custom_index order (scene objects, then ground).
+        let mut rt = RtSystem::new(
+            &device,
+            backend,
+            &scene,
+            &scene_meshes,
+            &ground,
+            &ground_vbuf,
+            &ground_ibuf,
+            ground_count,
+            gallery_scene,
+        )?;
+
+        // Phase 16 (HWRT hybrid): the opt-in decision + content accel build is resolved AFTER the
+        // quality tier `base` is known (below), so a tier can enable it and the env vars override —
+        // it's a first-class scalability option, not just a raw env flag.
+
+        // Scalable-GI Stage 0: fuse the opaque draw list into one world-space triangle
+        // soup and register it as the scene GDF (baked once on the graph). Ground is
+        // handled analytically at trace time; disjoint objects give the union SDF via the
+        // closest-triangle sign convention. Geometry + albedo come from the registries
+        // (`fuse::fuse_scene` — the single fuse path), so the same routine fuses the
+        // gallery, an imported glTF scene, or a level. The byte layout matches the legacy
+        // gallery fuse, so the gallery's baked field is byte-identical.
+        //
+        // Stage D: build the scene GDF for ANY non-streaming scene with geometry — the
+        // gallery, an imported glTF, or a level (Sponza). `fuse_scene` + the Stage A grid
+        // bake + the clipmap make this affordable. World streaming stays out of scope (no
+        // single AABB). The gallery is byte-identical (same fuse → same bake → same cards).
+        // The per-level static-scene build (`static_scene.rs`): fuse → per-mesh SDF bakes →
+        // clipmap levels → per-mesh atlas + instance grid → dense albedo volumes → surface-cache
+        // cards + mesh capture. Extracted so `load_level` runs the SAME chain on a hot-swap (it
+        // used to rebuild only the ECS world + registries, leaving every distance-field consumer
+        // reading the previous level's world). `stream_obj_*` = the F1 Stage 3 drawable directory
+        // (filled only under `P11_CACHE_STREAM`).
+        let static_params = static_scene::StaticSceneParams {
+            gallery_scene,
+            world_mode,
+            level_view,
+            scene_center,
+            scene_radius,
+            base: &base,
+            loading_state: &loading_state,
+        };
+        let static_scene::StaticScene {
+            stream_obj_aabb,
+            stream_obj_albedo,
+        } = static_scene::build_gdf_scene(
+            &device,
+            &mut gdf,
+            &world,
+            &mesh_registry,
+            &material_registry,
+            &static_params,
+        )?;
+
+        // One render-graph transient pool per frame-in-flight (reused only after the
+        // frame slot's fence has signaled — no cross-frame hazards).
+        let pools: Vec<ResourcePool> = (0..FRAMES_IN_FLIGHT).map(|_| ResourcePool::new()).collect();
+
+        // Physically-based directional "sun" lighting. Content scenes author the sun in real
+        // photometric units — **illuminance in lux** (clear-sky noon sun ≈ 100,000 lx) — and map
+        // it to display with a physical-camera **EV100** exposure (`exposure = 1/(1.2·2^EV100)`,
+        // sunny-16 ≈ EV15). The gallery keeps its legacy arbitrary 3.0 / 0.6 (the byte-identical
+        // regression anchor — a synthetic test scene, its look is not a target). `SUN_LUX` /
+        // `EV100` override the content values. Because the whole atmosphere scales with the sun
+        // and the exposure compensates, the absolute lux is meaningful (not just relative): it is
+        // what a light meter would read, and EV100 is what a camera would dial.
+        // Direction TO the sun. ONE source of truth, resolved in priority order:
+        //   1. `SUN_DIR="x,y,z"` env — explicit override, always wins.
+        //   2. A loaded level (`.dclevel`) — its authored sun drives the sky/atmosphere/IBL/GI
+        //      *and* the direct lighting + shadows, so the sky's sun, the cast shadows, and the
+        //      shaded surfaces all agree (no drift between the lit image and the visible sun).
+        //      The per-frame direct path reads the same `level_lighting` sun, so this unifies them.
+        //   3. The code default — gallery keeps its overhead [0.4,0.8,0.4] (byte-identical anchor);
+        //      a code-built content scene (e.g. `SCENE_GLTF`) takes the ~68° nave-clearing angle.
+        // (auto-normalized in the push packers). Both direction AND intensity resolve from the SAME
+        // source so the sky's sun, the cast shadows, the direct shading, the IBL/GI, and the camera
+        // exposure all agree — a level's lighting is in physical lux, so it drives every consumer.
+        let sun_dir = parse_vec3_env("SUN_DIR")
+            .map(|v| [v.x, v.y, v.z])
+            .or_else(|| level_lighting_override.as_ref().map(|ll| ll.sun_dir))
+            .unwrap_or(if gallery_scene {
+                [0.4, 0.8, 0.4]
+            } else {
+                // ~68° elevation, slightly off-axis. A narrow nave with ~12 m walls needs a HIGH sun
+                // to clear the walls and put direct light on the floor (a low sun is fully blocked —
+                // the wall shadow covers the whole nave); the slight X/Z tilt gives the columns
+                // raking shadows. The roofed side aisles stay indirect (bounce/ambient) as in reality.
+                [0.3, 0.9, 0.2]
+            });
+        // Sun illuminance (lux). Unified with the direction: `SUN_LUX`/`SUN_INTENSITY` > the loaded
+        // level's directional intensity > the code default. So `self.sun_intensity` (which drives the
+        // sky/atmosphere/IBL capture + the GI/reflection bounce) equals the level's authored sun — no
+        // drift between the direct light and the sky/indirect.
+        let sun_intensity = std::env::var("SUN_LUX")
+            .or_else(|_| std::env::var("SUN_INTENSITY"))
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .or_else(|| level_lighting_override.as_ref().map(|ll| ll.sun_intensity))
+            .unwrap_or(if gallery_scene { 3.0 } else { 100_000.0 })
+            .max(0.0);
+        // Analytic sun tint. Resolved like the direction: `SUN_COLOR="r,g,b"` env wins, else the
+        // loaded level's directional-light color (so a level can author a warm sun — New Sponza's is
+        // [1.0, 0.96, 0.9]), else white. White keeps the gallery/code-default scenes byte-identical;
+        // a warm sun also takes some of the blue out of the daylight read (the sky ambient is blue).
+        let sun_color = parse_vec3_env("SUN_COLOR")
+            .map(|v| [v.x, v.y, v.z])
+            .or_else(|| level_lighting_override.as_ref().map(|ll| ll.sun_color))
+            .unwrap_or([1.0, 1.0, 1.0]);
+        // Sun:sky ratio fed to the env capture (see the `sky_gain` field). Kept at 6.0 by default:
+        // measurement showed that lowering it for "physical sun dominance" darkens open-roof
+        // interiors (Sponza's atrium legitimately receives strong skylight), regressing exactly the
+        // interior brightness we want. It is exposed as the `SKY_GAIN` knob for closed scenes that
+        // want the sun to dominate, with the interior then filled by multibounce GI instead.
+        let sky_gain = std::env::var("SKY_GAIN")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(6.0)
+            .max(0.0);
+        // Sky white balance — a per-channel gain on the procedural sky radiance (env capture), so it
+        // warms/neutralises the IBL + SW-RT GI ambient without tinting the direct sun. Resolved like
+        // the sun: `SKY_WB="r,g,b"` env wins, else the loaded level's `environment.sky_white_balance`,
+        // else neutral `[1,1,1]` (a no-op → byte-identical to the pre-knob capture).
+        let sky_wb = parse_vec3_env("SKY_WB")
+            .map(|v| [v.x, v.y, v.z])
+            .or(level_sky_wb)
+            .unwrap_or([1.0, 1.0, 1.0]);
+        // Physical-camera auto-exposure (see the field). DEFAULT-ON for content scenes: a level
+        // authors its lighting on its own scale (e.g. sponza.level's sun ~4, not lux), so a single
+        // fixed EV100 default cannot expose every level correctly — an interior authored below the
+        // lux scale reads near-black under the sunny-16 default. Metering to the scene's own
+        // luminance is the production-standard, single-source fix that generalises to any level.
+        // Never the gallery (fixed-exposure byte-identical anchor); `AUTO_EXPOSURE=0` opts out.
+        let auto_exposure = quality::env_bool("AUTO_EXPOSURE", !gallery_scene)
+            && !gallery_scene
+            && deferred.exposure_buf_index().is_some();
+        let ambient = 0.04f32;
+        // On by default; `NO_POINT_LIGHTS=1` disables them (the path tracer has no
+        // point lights, so a fair raster-vs-ground-truth comparison turns these off).
+        let point_lights_on = std::env::var_os("NO_POINT_LIGHTS").is_none();
+        // Clustered light culling seam (PR-6 infrastructure; R1 policy). UNSET = automatic: the
+        // froxel path engages only for a frame carrying more point lights than the `Globals` UBO's
+        // four slots, so every ≤4-light scene (all golden configs) stays on the untouched
+        // brute-force loop and is byte-identical. `CLUSTERED_LIGHTS=1` forces it on at any light
+        // count (the equivalence A/B); `=0` forces it off (fallback seam, truncates to 4).
+        let clustered_lights = std::env::var("CLUSTERED_LIGHTS")
+            .ok()
+            .map(|v| !matches!(v.trim(), "" | "0" | "false" | "off"));
+        // A/B baseline (`CLUSTERED_BRUTE=1`): upload the same light buffer but loop ALL lights in
+        // the shader (no froxel list) so brute-force vs clustered PROFILE_GPU can be compared on the
+        // identical light set at scale. Implies the clustered light upload path (needs the buffer).
+        let clustered_brute = std::env::var_os("CLUSTERED_BRUTE").is_some() && cluster.is_some();
+        // Deterministic stress spawner (PR-6 scale proof): `TEST_LIGHTS=N` places N point lights
+        // on a fixed grid across the scene bounds (no animation, fixed layout) so brute-force vs
+        // clustered can be profiled at scale. 0 = off (level/gallery lights only).
+        let test_lights: u32 = std::env::var("TEST_LIGHTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        // RenderQuality tier (Stage D): `RENDER_QUALITY=low|med|high` (unset => platform default).
+        // (`device_info` / `quality` / `base` were resolved before the level build — the load-time
+        // cache knobs needed them; see the tier block after `gallery_scene`.)
+
+        // Phase 16 (HWRT hybrid): opt-in hardware-ray-traced reflections, resolved as a scalability
+        // option — the tier preset drives the default, the env vars override (`env_bool`). `P_HWRT`
+        // builds the CONTENT scene's BLAS/TLAS + consolidated geometry (the gallery uses its own
+        // path-tracer accel) and routes the reflection through the scene TLAS + surface-cache /
+        // screen-color / hit-lighting shading. Requires an RT-capable device + content geometry;
+        // gallery / world-streaming out of scope, so it stays byte-identical there.
+        let hwrt = quality::env_bool("P_HWRT", base.hwrt_reflect)
+            && device.has_raytracing()
+            && !gallery_scene
+            && !world_mode
+            && !world.draw_list().is_empty();
+        // B2 HWRT refine (`P_REFLECT_COMPACT_HWRT`): the compacted near-mirror re-trace goes
+        // through the scene TLAS + hit lighting instead of the GDF march + surface cache — true
+        // material colours for the off-screen content a mirror shows (the cache's simplified
+        // relight is the visible "two colour families"). Needs the same content accel as P_HWRT,
+        // but the per-frame HWRT cost stays bounded by the mirror area (compact list only).
+        let compact_hwrt_want =
+            quality::env_bool("P_REFLECT_COMPACT_HWRT", base.reflect_compact_hwrt)
+                && device.has_raytracing()
+                && !gallery_scene
+                && !world_mode
+                && !world.draw_list().is_empty();
+        // Build the accel whenever the device + scene ALLOW it (not only when a launch knob asks):
+        // the acceleration structures are the substrate the ReflectMode UI switches onto live, so
+        // a Software-tier launch on an RT machine can still flip to Hybrid/Hardware at runtime.
+        // Per-LEVEL state, so `load_level` reruns it (see `static_scene.rs`).
+        static_scene::build_content_accel(
+            &device,
+            &mut rt,
+            &world,
+            &mesh_registry,
+            &material_registry,
+            &static_params,
+        );
+        // The HWRT reflection substrate: TLAS + consolidated hit table, both built above. When
+        // false the mode is locked to Software for the session.
+        let reflect_hw_ready = rt.has_content_scene() && rt.content_hit_indices().is_some();
+        // `P_HWRT_FULLRES` / `P_HWRT_HITLIGHTING`: armed from env/tier independently of the launch
+        // mode (a live switch to Hardware picks them up); only the HWRT paths consult them.
+        let hwrt_fullres = quality::env_bool("P_HWRT_FULLRES", base.hwrt_reflect_fullres);
+        let hwrt_hitlighting = reflect_hw_ready
+            && quality::env_bool("P_HWRT_HITLIGHTING", base.hwrt_reflect_hitlighting);
+        // The launch knobs collapse into the UI-facing mode; the effective per-pass booleans are
+        // (re-)derived from it every frame (`apply_reflect_mode`).
+        let reflect_mode = if reflect_hw_ready {
+            quality::ReflectMode::resolve(hwrt, compact_hwrt_want)
+        } else {
+            quality::ReflectMode::Software
+        };
+        let hwrt = hwrt && reflect_hw_ready;
+        let reflect_compact_hwrt = compact_hwrt_want && reflect_hw_ready;
+        // Compact screen fetch intent (`P_REFLECT_COMPACT_SCREEN`): the effective flag derives as
+        // `Hybrid/Hardware && want && cache_sky_occlude` (resolved below once that knob is known).
+        let reflect_screen_want =
+            quality::env_bool("P_REFLECT_COMPACT_SCREEN", base.reflect_compact_screen);
+        let reflect_compact_screen_want = reflect_compact_hwrt && reflect_screen_want;
+        // HWRT cache sun shadow: TLAS visibility for the relight's direct sun (see the tier-knob
+        // doc). Needs the content TLAS actually built + bound; the relight record falls back to
+        // the GDF-march pipeline without it (non-RT devices, gallery).
+        let cache_hwrt_shadow = quality::env_bool("P_CACHE_HWRT_SHADOW", base.cache_hwrt_shadow)
+            && rt.has_content_scene();
+        // TLAS gather rides the same permutation (see the tier-knob doc).
+        let cache_hwrt_gather =
+            cache_hwrt_shadow && quality::env_bool("P_CACHE_HWRT_GATHER", base.cache_hwrt_gather);
+        // F1 Stage 0: dense-field fallback for card-less relight-gather hits. Content default on;
+        // never for the gallery (keeps the byte-identical anchor via the legacy zero-add).
+        let cache_gather_fallback =
+            !gallery_scene && quality::env_bool("P11_GATHER_FALLBACK", true);
+        // Capture occlusion invalidation (see the tier-knob doc; needs the C1 mesh tables —
+        // the shader no-ops without them).
+        let cache_capture_occl = quality::env_bool("P_CACHE_CAPTURE_OCCL", base.cache_capture_occl);
+        // Occluder-witness routing: inert without the invalidation writing the witnesses.
+        let cache_occl_route =
+            cache_capture_occl && quality::env_bool("P_CACHE_OCCL_ROUTE", base.cache_occl_route);
+        let reflect_probe_valid =
+            quality::env_bool("P_REFLECT_PROBE_VALID", base.reflect_probe_valid);
+        let reflect_graze_eps = quality::env_bool("P_REFLECT_GRAZE_EPS", base.reflect_graze_eps);
+        let reflect_hit_fetch = quality::env_bool("P_REFLECT_HIT_FETCH", base.reflect_hit_fetch);
+
+        info!(
+            "RenderQuality tier: {} (RENDER_QUALITY; GPU \"{}\")",
+            quality.label(),
+            device_info.name
+        );
+        // Pipeline rebaseline PR-1: opt-in depth pre-pass (`DEPTH_PREPASS=1`). Off by default so
+        // the frame graph is identical to the pre-pass-less path (byte-identical golden anchor).
+        let depth_prepass = std::env::var_os("DEPTH_PREPASS").is_some();
+        let particles_on = compute_supported && std::env::var_os("P7_PARTICLES").is_some();
+        // Run the particle sim on the async-compute queue (overlapping graphics) when
+        // a dedicated compute queue exists. Off / unsupported -> the sim runs as a
+        // graph compute pass on the graphics queue (single-queue path), identical out.
+        let async_compute_supported = device.has_async_compute();
+        let async_compute_on = async_compute_supported
+            && (std::env::var_os("ASYNC_COMPUTE").is_some() || !screenshot_mode);
+        // Async-compute surface-cache relight (QHD/UHD track): the resolution-independent
+        // `sdf_cache_light` pass (the biggest cost in the VK frame) runs on the compute queue
+        // overlapping the graphics frame; consumers read the previous frame's radiance (1-frame
+        // latency, hidden by the cache's existing amortization + EMA). Opt-in (`P_ASYNC_CACHE`);
+        // needs a dedicated compute queue + the cache-lighting pipeline. Particles fall back to the
+        // graph sim when this is on (the two would contend for the single compute submission).
+        // Default-ON for D3D12 content: overlapping the view-independent `sdf_cache_light` on the
+        // compute queue is a measured ~1.2ms win on D3D12 (17.6 -> 16.4ms, Sponza 1080p/0.667 Med
+        // = the 60fps line) and image-identical (1-frame-latency relight, hidden by the cache EMA).
+        // Vulkan defaults OFF: measured a net loss there (the GDF compute is already saturated, so
+        // the overlap only contends). The gallery defaults OFF (fixed byte-identical anchor). All
+        // three are `P_ASYNC_CACHE`-overridable. In headless screenshot mode a dedicated compute
+        // queue also needs `ASYNC_COMPUTE=1` (see `async_compute_supported`).
+        let async_default = backend == BackendKind::D3d12 && !gallery_scene;
+        // Deferred-parity cache skylight needs the SYNC relight: `record_cache_async` cannot read
+        // the sky-visibility SH volumes, which the GRAPHICS queue rewrites every frame, so it
+        // hard-codes the sentinel (see `GdfSystem::record_cache_async`) and silently falls back to
+        // the legacy UNOCCLUDED sky-on-miss + `skylight_floor` path. With `skylight_floor` at its
+        // content default of 1.0 those two terms sum to `E·esc + E·(1-esc) = E` — the escape
+        // fraction cancels, so every cached texel takes the FULL open-sky irradiance no matter how
+        // enclosed it is, while the deferred pass gives the same surface `E·V·dot_factor·ao·kd`.
+        // Reflections read the cache and direct pixels read the deferred, so the reflected copy of
+        // a surface carried a systematically stronger, bluer skylight (measured on the Intel-Sponza
+        // chromeball crop: B-R bias +40.0 vs the path tracer's +7.0). Routing to the sync relight
+        // is the same trade `cache_lit_calib` below already makes for the same cross-queue reason;
+        // it costs the ~1.2ms D3D12 overlap only while the parity skylight is on.
+        let sky_occlude_want = quality::env_bool("P_CACHE_SKY_OCCLUDE", base.cache_sky_occlude);
+        let async_cache_on = async_compute_supported
+            && gdf.has_cache_lighting()
+            && quality::env_bool("P_ASYNC_CACHE", async_default)
+            && !sky_occlude_want;
+        gdf.set_cache_async(async_cache_on);
+        // Lit-calibration feedback: needs the content TLAS (occlusion probe), the sync relight
+        // (the async ring's cross-queue radiance has no safe read here), and the uniform atlas
+        // layout (the probe addresses the card's center texel directly).
+        let cache_lit_calib = quality::env_bool("P_CACHE_LIT_CALIB", base.cache_lit_calib)
+            && rt.has_content_scene()
+            && !async_cache_on
+            && gdf.surface_cache_layout().is_none();
+        let gpu_cull = compute_supported && std::env::var_os("P7_CULL").is_some();
+        // HZB occlusion culling (PR-8) is layered on the GPU frustum cull; it requires
+        // P7_CULL (the cull grid it operates on). If HZB_CULL is set without P7_CULL,
+        // log and ignore — the base cull path stays byte-identical (default OFF).
+        let hzb_cull = {
+            let want = std::env::var_os("HZB_CULL").is_some();
+            if want && !gpu_cull {
+                eprintln!(
+                    "[hzb] HZB_CULL=1 ignored: requires P7_CULL=1 (the GPU cull grid it culls). \
+                     Set both to enable occlusion culling."
+                );
+            }
+            want && gpu_cull && hzb.is_some()
+        };
+        // Hardware ray tracing (DXR / VK_KHR) path tracer — the explicit `--raytracing` option
+        // (or the legacy `P8_PATHTRACE` env). Separate from the SW-RT RenderQuality tiers, which
+        // all use the GDF software path; this swaps the whole render for the HW-RT ground truth.
+        let path_trace = rt.has_trace()
+            && (rt.has_scene() || rt.has_content_pt())
+            && crate::app::raytracing_enabled();
+        let rt_debug = device.has_raytracing() && std::env::var_os("P8_RT_DEBUG").is_some();
+        let cornell = rt.has_cornell() && std::env::var_os("P8_CORNELL").is_some();
+        let sdf_trace = gdf.has_sdf_trace() && std::env::var_os("P11_SDF").is_some();
+        let volume_test = gdf.has_volume() && std::env::var_os("P11_VOLUME_TEST").is_some();
+        let sdf_bake = gdf.has_bake() && std::env::var_os("P11_SDF_BAKE").is_some();
+        let gdf_merge = gdf.has_merge() && std::env::var_os("P11_GDF_MERGE").is_some();
+        let gdf_trace = gdf.has_gdf_trace() && std::env::var_os("P11_GDF_TRACE").is_some();
+        let gdf_trace_analytic = std::env::var_os("P11_GDF_ANALYTIC").is_some();
+        // Stage C1: trace the world-space scene GDF from the live camera.
+        let scene_gdf = gdf.has_scene_sdf() && std::env::var_os("P11_SCENE_GDF").is_some();
+        // Stage C2: GDF contact AO into the deferred ambient term. Gallery forced off (byte-
+        // identical anchor); content takes the tier (Med now on — the contact-scale reach fix
+        // makes AO add depth, not crush the interior). `P11_GDF_AO` overrides either way.
+        let gdf_ao =
+            gi.has_ao() && gdf.has_scene_sdf() && quality::env_bool("P11_GDF_AO", base.gdf_ao);
+        // Screen-space near-field AO (HBAO-lite), composed with the GDF AO for crevice/contact
+        // definition the coarse GDF can't resolve. Gallery off (byte-identical anchor); content
+        // takes the tier default (`qp.ssao` — on for Med/High/Low, OFF for the Apple tier where
+        // gdf_ao already covers contact AO and this reclaims the ~13 ms 2nd AO pass). `SSAO`
+        // overrides either way; `SSAO_RADIUS/INTENSITY/BIAS/POWER` tune. World radius 0.5 m (contact
+        // scale), intensity 1.5, bias 2 cm, power 1.5 (contrast).
+        let ssao = compute_supported && quality::env_bool("SSAO", base.ssao);
+        let env_f32 = |name: &str, default: f32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(default)
+        };
+        let ssao_params = [
+            env_f32("SSAO_RADIUS", 0.5),
+            env_f32("SSAO_INTENSITY", 2.0),
+            env_f32("SSAO_BIAS", 0.02),
+            env_f32("SSAO_POWER", 1.5),
+        ];
+        // Deprecate the legacy captured-cube IBL: by default the deferred ambient is the
+        // SW-RT hybrid reflection (specular) + GDF GI (diffuse scene bounce) + sky irradiance.
+        // `P11_LEGACY_IBL` restores the captured-cube path (prefilter-cube specular + scene
+        // capture) for comparison.
+        // Stage D lighting flip: any scene WITH a scene GDF (the gallery and now content
+        // levels/glTF, via the clipmap) uses the SW-RT GDF ambient by default — the camera-
+        // centered clipmap is the default for content. `P11_LEGACY_IBL` restores the captured-
+        // cube IBL (the escape hatch / comparison). Scenes without a scene GDF (world
+        // streaming) always use the IBL.
+        let legacy_ibl = !gdf.has_scene_sdf() || std::env::var_os("P11_LEGACY_IBL").is_some();
+        let swrt_ok = reflect.has_ssr()
+            && reflect.has_gdf_reflect()
+            && reflect.has_composite()
+            && reflect.has_lit_history()
+            && gdf.has_scene_sdf();
+        // Stage C3: GDF 1-bounce diffuse GI — part of the default ambient now (on unless
+        // legacy IBL); `P11_GDF_GI` still force-enables it under legacy.
+        let gdf_gi = gi.has_gi()
+            && gdf.has_scene_sdf()
+            && (!legacy_ibl || std::env::var_os("P11_GDF_GI").is_some());
+        // F3 (HW-RT high-fidelity path, first increment): opt-in `P_HWRT_GI=1`. Requires an RT
+        // device AND a built scene TLAS (rt.rs builds BLAS/TLAS only for the gallery scene today —
+        // the glTF/level path skips it because its per-primitive vertex/index storage buffers would
+        // overflow the 64-slot bindless storage table). Gated here so a content scene without a TLAS
+        // silently stays on the SW march instead of tracing an empty/stale acceleration structure.
+        let hwrt_gi = std::env::var_os("P_HWRT_GI").is_some()
+            && device.has_raytracing()
+            && rt.has_scene()
+            && gdf_gi;
+        // 레퍼런스 엔진 GI-fidelity: the world irradiance volume (DDGI-lite) = our world-space RADIANCE CACHE,
+        // the same idea 레퍼런스 SW-RT GI uses. It replaces the per-pixel 1-spp GI march with a smooth, stable
+        // volume sample — so high-variance lighting (e.g. point lights) doesn't produce the firefly
+        // speckle a single-bounce stochastic march leaves behind (which the temporal denoiser can't
+        // fully clear). Default ON for content, never the gallery (the byte-identical anchor stays on
+        // the legacy march); `P_GI_VOLUME=0` forces the march back.
+        let gi_volume =
+            quality::env_bool("P_GI_VOLUME", !gallery_scene) && gdf_gi && gi.has_gi_volume();
+        // F4 (hierarchical radiance cache): camera-anchored FINE level for the SH irradiance
+        // volume (`P_GI_VOL_CLIP`, content only via the `gi_volume` gate). Default ON since the
+        // F6E block-domain re-adjudication (docs/phase-f6e-scatter-tolerant-gate-plan.md §4c):
+        // interior block64 28.115 → 26.996 with the sunlit gate holding and its bias collapsing
+        // to ~0 — the old per-pixel gate was billing the fine structure as scatter. The AABB is
+        // resolved ONCE here from the initial camera, with the same eye precedence as the
+        // surface-card reference camera (`CAM_EYE` → authored level view → orbit framing);
+        // recentering (F4B) reconverges it on camera motion. Half-extent = scene max axis / 6,
+        // clamped to [4, 12] m: fine enough to beat the coarse ~1.1 m spacing, small enough
+        // that 32³ probes stay dense.
+        static_scene::install_gi_fine_box(
+            &device,
+            &mut gi,
+            &gdf,
+            gi_volume && quality::env_bool("P_GI_VOL_CLIP", true),
+            &static_params,
+        )?;
+        // 레퍼런스식 indoor skylight occlusion knobs (only effective on the volume GI path, content):
+        // `P_SKYVIS_TINT` = neutral OcclusionTint leak as a fraction of the occluded skylight
+        // luminance (the occluded floor keeps brightness but loses the blue cast); `P_SKYVIS_MIN_OCC`
+        // = min sky-visibility floor (=1.0 disables the occlusion entirely → SH-L1 baseline).
+        // Default 0.2 (GI-volume-leak phase, final sweep). The earlier 0.5→0.3 calibration (F6C)
+        // was unknowingly fitted against a broken field: the Metal gi_volume dispatch updated
+        // only a quarter of the probe grid, so most interiors read the ZERO-INIT sky-visibility
+        // (V=0) and this floor replaced their entire skylight. With the full grid live, the
+        // hit sky-fill occlusion, the honest ray-start bias, and the reflection fallback's
+        // sky-visibility gating (which removed the blue the old tint was balancing against),
+        // the sweep's colour anchor lands exactly at 0.2: crop B−R −0.62 vs the path-traced
+        // reference's −0.58, on a flat masked_avg basin (docs/phase-gi-volume-leak-plan.md §14).
+        // F4B: the tint is a crutch for GI the field can't supply, so its calibration is
+        // per-field — the fine level feeds real near-camera E and the all-anchor sweep on the
+        // completed fine stack landed 0.15 (crop B−R −0.60 vs the reference's −0.58, EV11 deep
+        // crop 40.9→35.4 toward the reference). Fine defaults ON since the F6E block-domain
+        // re-adjudication un-blocked it (the per-pixel gate's FAIL was sub-block scatter, not
+        // misallocation — docs/phase-f6e-scatter-tolerant-gate-plan.md §4c).
+        let gi_fine_want = gi_volume && quality::env_bool("P_GI_VOL_CLIP", true);
+        let skyvis_tint = std::env::var("P_SKYVIS_TINT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(if gi_fine_want { 0.15 } else { 0.2 })
+            .clamp(0.0, 1.0);
+        // Interior-bias root phase: aperture shaping of the tint leak (`P_SKYVIS_TINT_V0`,
+        // metres of sky-visibility — the leak ramps 0->full over V in [0, v0]). 0 = the flat
+        // legacy leak. The EV11 attribution measured the flat leak overfilling the fully-
+        // enclosed deep crop 2.24x the reference while the lit-region fill is load-bearing.
+        let skyvis_tint_v0 = std::env::var("P_SKYVIS_TINT_V0")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let skyvis_min_occ = std::env::var("P_SKYVIS_MIN_OCC")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        // F6L banner knob: low-V bent floor blend (0 = off = the landed validity contract;
+        // the sponza_hero banner recipe uses 0.25 — plan §4, gate-excluded by default).
+        let skyvis_bent_floor = std::env::var("P_SKYVIS_BENT_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        // F6O per-pixel sky-visibility ray count (0 = off = volume path = byte-identical anchor).
+        let skyvis_pp_spp = std::env::var("P_SKYVIS_PP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(64);
+        // F6O per-pixel sky-vis trace res divisor (default 4 = quarter res + bilateral upsample).
+        let skyvis_pp_div = std::env::var("P_SKYVIS_DIV")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(4)
+            .clamp(1, 8);
+        // Bent-normal skylight: the GI pass writes the unoccluded average direction (the SH sky-vis
+        // band-1 vector = the DFAO bent normal) into the sky-vis image so the lighting can sample the
+        // diffuse skylight ALONG it (directional indoor occlusion) instead of the scalar V multiply.
+        // Default on for content (the sky-vis image is content-only → gallery byte-identical anyway);
+        // `P_BENT_NORMAL=0` zeroes the bent normal for A/B (pbr then falls back to the scalar path).
+        let bent_normal = quality::env_bool("P_BENT_NORMAL", true);
+        // F6P bent-normal confidence contract. Two independent defects on the same signal, so a
+        // 2-bit mask lets each half be measured alone:
+        //   bit0 PRODUCER (gdf_gi + sdf_cache_light): the bent MAGNITUDE now carries
+        //        directionality x interpolation support instead of a factor that was provably 1
+        //        and scale-free. Kills the piecewise-constant probe-cell plateau in the direction
+        //        field (skyvis_sh.slang has the derivation).
+        //   bit1 CONSUMER (pbr + sdf_cache_light): the neutral OcclusionTint leak's luminance
+        //        follows the SURFACE NORMAL, not the bent normal. Kills the amplifier that turned
+        //        that plateau into a several-fold brightness step — the hard-edged bright polygons
+        //        on curved interior masonry (sponza_intel vault).
+        // A CORRECTNESS fix, so default ON at every RenderQuality tier (the `cache_sky_occlude`
+        // precedent) rather than a tier dial; `P_SKYVIS_BENT_FIX=0` restores the exact pre-F6P
+        // bytes on all seven touched sites for A/B, =1 producer only, =2 consumer only.
+        // Gallery is byte-identical either way: no sky-vis image -> no bent -> both halves inert.
+        let skyvis_bent_fix = std::env::var("P_SKYVIS_BENT_FIX")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3)
+            & 3;
+        // F6M: gdf_gi/gdf_ao viewer-facing normal flip — the same two-sided contract pbr shades
+        // with (`two_sided = !is_gallery`), so back-face pixels of thin double-sided geometry
+        // (leaf cards, cloth folds) reconstruct V/E/bent and march AO in the hemisphere the
+        // lighting actually uses. DEFAULT OFF: physically correct, but the sealed sky/tint
+        // calibration is fitted to the raw-normal equilibrium — flipping regressed both PT
+        // budget gates (interior bias +22.9; plan §2c), the F6H-unsigned class of failure.
+        // Re-judge with the probabilistic-occupancy recalibration (plan §4). The hero banner
+        // recipe opts in (level.rs). `P_GDF_FACING_FLIP=1` = the contract path.
+        let gdf_facing_flip = quality::env_bool("P_GDF_FACING_FLIP", false) && !gallery_scene;
+        // GI-volume occupancy-weighted consumption (increment A of the GI-volume-leak phase,
+        // docs/phase-gi-volume-leak-plan.md §3). Default ON for content since the full-grid
+        // dispatch fix: on the working field, excluding in-wall probes from the interpolation
+        // is worth −0.77 on the interior PT gate (it was unmeasurable on the broken quarter
+        // field). `P_GI_VOL_OCC=0` restores the hardware trilinear; volume path only.
+        let gi_vol_occ = quality::env_bool("P_GI_VOL_OCC", true) && gi_volume;
+        // Volume-update rays per probe (see the App field doc): its own knob, decoupled from the
+        // screen-GI `gi_spp` the two used to share.
+        let gi_volume_spp = std::env::var("P_GI_VOLUME_SPP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.gi_volume_spp)
+            .clamp(1, 64);
+        // F4B: volume EMA alpha (`P_GI_VOLUME_ALPHA`). With the stable deterministic direction
+        // set the static-scene fixed point is ALPHA-INDEPENDENT (the converged update is an
+        // idempotent overwrite; alpha only damps the multibounce/B2 feedback iteration), so a
+        // higher alpha is pure convergence speed. The fine level's interleaved schedule halves
+        // the per-level refresh count within a fixed warmup, so fine mode defaults to 0.2 —
+        // (0.8)^24 ~= 0.5% residual at the 192-frame recipe vs 8% at the coarse default 0.1 —
+        // while the coarse-only path keeps the long-standing 0.1 (its 48 refreshes already
+        // converge to 0.6%). Measured on the interior EV11 trajectory: 192-frame interleaved
+        // state was +5 luma / +2 B-R off its own fixed point at alpha 0.1.
+        let gi_volume_alpha = std::env::var("P_GI_VOLUME_ALPHA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0) // 0 = auto: 0.2 in fine mode, 0.1 single-level (resolved per frame)
+            .clamp(0.0, 1.0);
+        // E-oracle repair seam (docs/phase-e-oracle-plan.md §2d-e). bit0 `P_GI_READ_OFFSET`:
+        // the update's multibounce/sky-vis feedback reads sit ON geometry, so plain trilinear
+        // straddles the wall and imports the far side's radiance (measured feedback gain ×2.2
+        // vs the 1/(1−albedo) ≈ 1.25 a closed room supports); offsetting the read one voxel
+        // along the hit normal keeps it on the ray's side. bit1 `P_GI_SUN_HARDVIS`: drop
+        // gv_shadow's k=16 near-miss penumbra (a ~3.6° cone — ~13× the physical sun's angular
+        // radius, and the coarse field already fattens thin blockers); real intersections
+        // still return 0. Calibration verdict (plan §2f): the read offset is default ON —
+        // sunlit gate 27.952 → 27.684 with scatter ALSO down, interior bias −1.2 at a neutral
+        // masked_avg. The sun-visibility repair stays a knob: E-domain-correct (lit-mean E
+        // 36.4 → 40.7 vs the reference 48.8) but display-adverse — it re-opens the empty tint
+        // window (sunlit over-brightens at 0.2, scatter eats the bias gain below it), the same
+        // bias→scatter wall that blocks the fine default.
+        // F6I (flags bit2): with unsigned sheet bands (P_SDF_OPEN_UNSIGNED) the volume march
+        // and sun-shadow march need the tunnel-proof hit epsilon — |d| has no sign crossing,
+        // so the 0.02 m min step can hop a thin curtain band and flood cloth-shadowed regions
+        // with phantom sun-lit E. Tied to the SAME knob so the legacy signed path is untouched.
+        let sdf_open_unsigned = quality::env_bool("P_SDF_OPEN_UNSIGNED", false);
+        // F6L (flags bit3): trapped/embedded-probe fill + the all-rejected consumption
+        // fallbacks (gdf_gi vol_occ bit1, gdf_reflect flip_y bit27) — cells matching the F6I
+        // §0 "probe-trapped" fingerprint (V≈0 ∧ relative-E≈0, or >90% near-hits = embedded in
+        // unresolved-density geometry) refill from their previous-frame face neighbours,
+        // midpoint-occlusion-gated so thick walls never import light; consumers stop returning
+        // hard black when every trilinear corner is occupancy-rejected. DEFAULT OFF: honest
+        // E-side repairs, but the sunlit gate reads +0.23 block over the sealed budget with
+        // them on (canopy cells the reference keeps dark get brightened) — needs its own
+        // calibration pass before a default flip (plan §4). The hero black-box itself was the
+        // bent-normal noise (fixed unconditionally in pbr.slang — SKYVIS_BENT_MIN_V).
+        let gi_repair_flags = u32::from(quality::env_bool("P_GI_READ_OFFSET", true))
+            | (u32::from(quality::env_bool("P_GI_SUN_HARDVIS", false)) << 1)
+            | (u32::from(sdf_open_unsigned) << 2)
+            | (u32::from(quality::env_bool("P_GI_TRAPPED_FILL", false)) << 3);
+        // F6F: gv_shadow penumbra cone slope. Default 0 = the shader-side reference-derived
+        // value (cot of the path tracer's sun angular radius, ~50 — single source:
+        // sky_common's SUN_COS_MAX); >0 = explicit override (16 = the legacy ~3.6° cone,
+        // ×3.1 the reference sun — it read a ray passing 10 cm from geometry 5 m out as 68%
+        // shadowed). Calibration verdict (plan §4): the matched slope improves BOTH gates
+        // over the fine baseline (sunlit 19.142→19.101, interior 26.996→26.541).
+        let gi_sun_k = std::env::var("P_GI_SUN_K")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1024.0);
+        // Deferred-parity cache skylight (see the App field doc): tier-driven, env-overridable,
+        // and only meaningful with the volume-GI path (the SH sky-visibility volumes it reads).
+        let cache_sky_occlude =
+            quality::env_bool("P_CACHE_SKY_OCCLUDE", base.cache_sky_occlude) && gi_volume;
+        // The compact screen fetch mixes lit-history and cache colours across a footprint gate,
+        // so it requires the parity skylight — without it the gate reads as a material seam
+        // (the exact regression the faebad3 single-source rebaseline removed).
+        let reflect_compact_screen = reflect_compact_screen_want && cache_sky_occlude;
+        // Multi-bounce AO (reference AOMultiBounce): albedo-tinted energy return on the diffuse AO.
+        // Opt-in (default off) — it recolours every AO<1 pixel including the gallery anchor.
+        let ao_multibounce = quality::env_bool("P_AO_MULTIBOUNCE", false);
+        // Bent-normal specular occlusion of the prefilter-cube ambient specular (reference
+        // GetDistanceFieldAOSpecularOcclusion). Opt-in (default off); SW-RT reflection untouched.
+        let spec_occlusion = quality::env_bool("P_SPEC_OCCLUSION", false);
+        // PR-4 (render-pipeline re-baseline track): opt-in analytic height fog. Off by default
+        // (`P_HEIGHT_FOG=1` to enable) so the byte-identical gallery/regression anchors are
+        // untouched — the atmosphere slot exists in the graph wiring unconditionally, but the
+        // pass itself is only added when this is true (see the `run()` call site).
+        let height_fog = quality::env_bool("P_HEIGHT_FOG", false);
+        // PR-9 view family: opt-in second (overhead) view composited as a PiP inset. Off by
+        // default = single view = byte-identical anchor.
+        let second_view = quality::env_bool("P_SECOND_VIEW", false);
+        // Density/falloff default to a gentle, scene-scale-relative haze: `1/scene_radius` puts
+        // the characteristic falloff height and the "full extinction" distance both on the order
+        // of the scene's own size, so the same defaults look sensible on the unit-radius gallery
+        // and a much larger Sponza level alike. `P_FOG_DENSITY`/`P_FOG_HEIGHT_FALLOFF` override.
+        let fog_density = std::env::var("P_FOG_DENSITY")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.15 / scene_radius.max(1e-3))
+            .max(0.0);
+        let fog_height_falloff = std::env::var("P_FOG_HEIGHT_FALLOFF")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1.0 / scene_radius.max(1e-3))
+            .max(0.0);
+        // Inscatter gain defaults to the same sun:sky ratio the env-cube capture uses
+        // (`sky_gain`) — single source, not a duplicated constant. `P_FOG_INSCATTER_GAIN`
+        // overrides independently (e.g. to desaturate/dim the fog relative to the sky).
+        let fog_inscatter_gain = std::env::var("P_FOG_INSCATTER_GAIN")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(sky_gain);
+        // PR-5 (render-pipeline re-baseline track): the ordered post-process nodes. Each is
+        // opt-in; off = no pass recorded = byte-identical anchor. `P_BLOOM=1` enables the
+        // dual-filter bloom, `P_MOTION_BLUR=1` the velocity-along motion blur (requires
+        // `P_VELOCITY=1`), `P_DOF=1` the DoF stub (passthrough placeholder). See `postfx.rs`.
+        let bloom_on = quality::env_bool("P_BLOOM", false);
+        let motion_blur_on = quality::env_bool("P_MOTION_BLUR", false);
+        let dof_on = quality::env_bool("P_DOF", false);
+        // Color grading (ASC CDL: out = (slope*in + offset)^power). `P_GRADE=1` turns on the
+        // hook; the per-channel slope/offset/power come from `P_CDL_SLOPE`/`P_CDL_OFFSET`/
+        // `P_CDL_POWER` ("r,g,b"), defaulting to the neutral identity. Neutral = byte-identical.
+        let grade_on = quality::env_bool("P_GRADE", false);
+        let parse_rgb = |name: &str, default: [f32; 3]| -> [f32; 3] {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| {
+                    let parts: Vec<f32> =
+                        v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                    if parts.len() == 3 {
+                        Some([parts[0], parts[1], parts[2]])
+                    } else if parts.len() == 1 {
+                        Some([parts[0], parts[0], parts[0]])
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(default)
+        };
+        let (cdl_slope, cdl_offset, cdl_power) = push::CDL_NEUTRAL;
+        let cdl_slope = parse_rgb("P_CDL_SLOPE", cdl_slope);
+        let cdl_offset = parse_rgb("P_CDL_OFFSET", cdl_offset);
+        let cdl_power = parse_rgb("P_CDL_POWER", cdl_power);
+        // Stage D3: gallery forced to the legacy 8 (byte-identical anchor); content takes the tier.
+        let gi_spp = std::env::var("P11_GI_SPP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.gi_spp)
+            .clamp(1, 256);
+        // Stage D3: C3 bounce-ray march step cap. Gallery forced to the legacy 64 (byte-identical);
+        // content takes the tier value. `P11_GI_MAX_STEPS` overrides.
+        let gi_max_steps = std::env::var("P11_GI_MAX_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.gi_max_steps)
+            .clamp(1, 256);
+        // Stage D2: surface-cache amortized-relight period. The gallery is the byte-identical
+        // regression anchor, so it is forced to 1 (every-frame relight = legacy) just like the
+        // clipmap level count above; content scenes (Sponza) take the tier default and amortize.
+        // `P11_CACHE_RELIGHT_PERIOD` overrides either way.
+        let cache_relight_period = std::env::var("P11_CACHE_RELIGHT_PERIOD")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.cache_relight_period)
+            .max(1);
+        // Stage D2b: camera-visibility feedback drives the relight budget (off-screen cards relit
+        // far less). Pure perf optimization — invariant for the on-screen image — so default on for
+        // GI-on-distance-field visualization: `P_SC_VIZ=1` shades hits from the high-res surface
+        // cache (2D mesh cards, final lit radiance — like the reference "scene" view); `P_WRC_VIZ=1`
+        // shades from the coarse world radiance cache. Defined here (before `cache_feedback`) because
+        // the surface-cache view forces the visibility gating off (below).
+        let sc_viz = gi.has_wrc_view()
+            && gdf.has_surface_cache()
+            && gdf.has_cache_lighting()
+            && std::env::var_os("P_SC_VIZ").is_some();
+        // content; forced off for the gallery anchor (uniform period = byte-identical). Needs the
+        // visibility pipeline (capability-gated). `P11_CACHE_FEEDBACK` overrides. The surface-cache
+        // VIEW forces it OFF: the camera-visibility priority relights "hidden" cards 8x slower, but
+        // the flyable view's DF march reaches those hidden-card surfaces and would show them stale
+        // (black). Uniform relight fills every card so the view has no dead cards.
+        let cache_feedback = gdf.has_cache_visibility()
+            && !sc_viz
+            && quality::env_bool("P11_CACHE_FEEDBACK", !gallery_scene);
+        // Stage D3: relight gather rays/texel. Gallery forced to the legacy 8 (byte-identical);
+        // content takes the tier value. `P11_CACHE_RELIGHT_SPP` overrides.
+        let cache_relight_spp = std::env::var("P11_CACHE_RELIGHT_SPP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.cache_relight_spp)
+            .max(1);
+        // Stage D1: half-res GI trace + bilateral upsample. Gallery stays full-res (the
+        // byte-identical anchor); content scenes take the tier default. `P11_GI_HALF_RES`
+        // overrides. Needs the upsample pipeline (capability-gated).
+        let gi_half_res =
+            gi.has_upsample() && quality::env_bool("P11_GI_HALF_RES", base.gi_half_res);
+        // P1 (SW-RT GI 레퍼런스급): GI trace-resolution divisor used when `gi_half_res` is on (2 = legacy
+        // half, 4 = quarter = sparser screen-space probes). Only affects content (the gallery traces
+        // full-res). `P_GI_RES_DIV` overrides the tier.
+        let gi_res_div = std::env::var("P_GI_RES_DIV")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.gi_res_div)
+            .clamp(1, 16);
+        // macOS/M3 perf (M3-C): reflection trace-resolution divisor used when `reflect_half_res` is on
+        // (2 = legacy half = the old `div_ceil(2)`, 4 = quarter). Only affects content (the gallery
+        // traces full-res = byte-identical). `P_REFLECT_RES_DIV` overrides the tier.
+        // HQ mode traces the reflection at 1/3 res (vs the Apple tier's 1/6) so the improved card
+        // coverage resolves into a crisp chrome; `P_REFLECT_RES_DIV` still overrides explicitly.
+        let hq_reflect = !gallery_scene && quality::env_bool("P11_REFLECT_HQ", false);
+        let reflect_res_div = std::env::var("P_REFLECT_RES_DIV")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(if hq_reflect { 3 } else { base.reflect_res_div })
+            .clamp(1, 16);
+        // 60fps-margin: fp16-packed TAAU history (8B/px hist, no pos buffer) — the history
+        // ping-pong dominates the taau pass at Retina-class output. Content-only (TAAU itself
+        // only runs when upscaling; the gallery renders at scale 1). `P_TAAU_PACKED` overrides.
+        let taau_packed = quality::env_bool("P_TAAU_PACKED", base.taau_packed_history);
+        // TAAU motion sharpness — the resample kernel + the (default-off) velocity-gated history cap.
+        // Tier-driven (Med, the tier that upscales, ships the Catmull-Rom resample on); each knob has
+        // an env override for A/B sweeps, and `P_TAAU_MOTION_RAMP=0` disables the velocity gate.
+        let taau_motion = taau::MotionSharpness {
+            catmull_rom: quality::env_bool("P_TAAU_CATMULL_ROM", base.taau_catmull_rom),
+            ramp_px: std::env::var("P_TAAU_MOTION_RAMP")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(base.taau_motion_ramp_px)
+                .max(0.0),
+            max_hist: std::env::var("P_TAAU_MOTION_HIST")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(base.taau_motion_max_hist)
+                .max(1.0),
+        };
+        // The two companions of the resample kernel. Both come from the preset table (so the gallery
+        // anchor is pinned there, not by a per-call-site `if gallery` the way `render_scale` once
+        // was) and both keep an env override for A/B sweeps.
+        let taau_clamp_expand = std::env::var("P_TAAU_CLAMP_EXPAND")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(base.taau_clamp_expand)
+            .max(0.0);
+        let taau_sharpen = std::env::var("P_TAAU_SHARPEN")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(base.taau_sharpen)
+            .max(0.0);
+        // Baked ACES tonemap LUT (production filmic curve; see aces.slang / tonemap_lut.slang).
+        // `P_TONEMAP_ACES` overrides the tier; `P_TONEMAP_LUT_SIZE` tunes the LUT resolution.
+        let tonemap_aces = quality::env_bool("P_TONEMAP_ACES", base.tonemap_aces);
+        let tonemap_lut_size = std::env::var("P_TONEMAP_LUT_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(48)
+            .clamp(16, 64);
+        // B2 mirror compaction: near-mirror pixels re-traced dense at 1/div res (0 = off).
+        // `P_REFLECT_COMPACT` overrides the tier.
+        let reflect_compact_div = std::env::var("P_REFLECT_COMPACT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.reflect_compact_div)
+            .clamp(0, 8);
+        // macOS/M3 perf: GDF AO trace-resolution divisor (1 = full-res = byte-identical; 2 = half).
+        // Traced at 1/div then joint-bilateral upsampled; the gallery never runs gdf_ao so the anchor
+        // is unaffected. `P_AO_RES_DIV` overrides the tier.
+        let ao_res_div = std::env::var("P_AO_RES_DIV")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.ao_res_div)
+            .clamp(1, 16);
+        // macOS/M3 perf: à-trous spatial GI-denoise iteration count (2 = legacy byte-identical; the
+        // Apple tier uses 1). The gallery forces the legacy 2 (it runs GI denoise, so the count would
+        // otherwise shift the byte-identical anchor). `P_GI_ATROUS_STEPS` overrides the tier.
+        let gi_atrous_steps = std::env::var("P_GI_ATROUS_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.gi_atrous_steps)
+            .clamp(1, 5);
+        // Screen-space radiance probe GI (P1+): opt-in. Replaces the GI consumption (world-volume
+        // sample / per-pixel ray march) with per-tile screen probes + a per-pixel gather. Default
+        // OFF, so the gallery anchor (no env) stays byte-identical; an explicit `SCREEN_PROBE=1`
+        // turns it on for any scene — including the gallery, so the technique can be measured
+        // against the path-traced ground truth (the only path-traceable scene).
+        let screen_probe = gi.has_screen_probe() && quality::env_bool("SCREEN_PROBE", false);
+        // P4 world radiance cache: an off-screen / far-field / infinite-bounce fallback escaped
+        // screen-probe rays sample. Opt-in (`P_WRC=1`), default OFF: measurement shows it is
+        // inert-to-slightly-negative on our architecture because the full-scene GDF clipmap
+        // already covers all on/off-screen geometry (screen-probe rays hit real geometry instead
+        // of escaping), so the cache's primary role is subsumed. Kept as correct infrastructure
+        // for the multi-bounce-at-hits refinement (docs/world-radiance-cache.md). See the finding.
+        let wrc = screen_probe && gi.has_wrc() && quality::env_bool("P_WRC", false);
+        // `wrc_viz` (the GI-on-DF view pass) is enabled by either source flag; `sc_viz` (defined
+        // earlier, above `cache_feedback`) selects the high-res surface-cache source.
+        let wrc_viz = gi.has_wrc_view() && (std::env::var_os("P_WRC_VIZ").is_some() || sc_viz);
+        // C4 denoise: on by default whenever GI runs (P11_GI_DENOISE=0 to see raw GI).
+        let gi_denoise = gi.has_denoise() && quality::env_bool("P11_GI_DENOISE", base.gi_denoise);
+        // C5 screen-space reflections (viz toggle).
+        let gdf_ssr = reflect.has_ssr() && std::env::var_os("P11_SSR").is_some();
+        // C6 GDF reflections (off-screen fallback viz toggle).
+        let gdf_reflect = reflect.has_gdf_reflect()
+            && gdf.has_scene_sdf()
+            && std::env::var_os("P11_GDF_REFLECT").is_some();
+        // C7 hybrid reflection composite (viz toggle): needs SSR + GDF reflect + composite.
+        let gdf_hybrid = reflect.has_ssr()
+            && reflect.has_gdf_reflect()
+            && reflect.has_composite()
+            && gdf.has_scene_sdf()
+            && std::env::var_os("P11_HYBRID").is_some();
+        // C7c: feed the hybrid composite into the lighting specular — the DEFAULT specular
+        // now (replaces the prefilter-cube IBL); `P11_LEGACY_IBL` falls back to the cube.
+        // Skipped when a full-screen GI-on-DF view replaces the output: the reflection only feeds
+        // the scene HDR that the view discards, so it is ~21 ms of wasted work in that mode.
+        let swrt_reflect = swrt_ok && !legacy_ibl && !wrc_viz;
+        // C8a colored GDF re-light (per-voxel albedo). On by default when the albedo volumes
+        // exist; `P11_GDF_COLOR=0` forces the achromatic constant-albedo path (no-reg compare).
+        let gdf_color = gdf.has_scene_albedo()
+            && std::env::var("P11_GDF_COLOR")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        // C8b1 surface-cache atlas viz (validation toggle).
+        let cache_viz = gdf.has_surface_cache() && std::env::var_os("P11_CACHE_VIZ").is_some();
+        // C8b3 surface-cache consumers (multibounce radiance lookup in GI / reflections).
+        let surface_cache = gdf.has_surface_cache()
+            && gdf.has_cache_lighting()
+            && quality::env_bool("P11_SURFACE_CACHE", base.surface_cache);
+        // C8g: use the surface cache as the GDF REFLECTION hit radiance by default (accurate lit
+        // colour for reflected objects — fixes the grazing avocado smear; ground hits have no
+        // cards and fall back to the per-ray re-light). Cheap (only the per-frame cache-light pass
+        // + a reflect-side lookup); the expensive per-ray GI cache lookup stays opt-in above.
+        // `P11_REFLECT_CACHE=0` disables (reflections then use the C8a per-ray re-light).
+        let reflect_cache = swrt_reflect
+            && gdf.has_surface_cache()
+            && gdf.has_cache_lighting()
+            && quality::env_bool("P11_REFLECT_CACHE", base.reflect_cache);
+        // Reflection cone-LOD MIP: default on when the reflection cache is used; a demagnified far
+        // reflection then reads a coarse averaged surface-cache MIP (smooth) rather than mip0 blocks.
+        // `P11_REFLECT_MIP=0` opts out (mip0 bilinear = the pre-MIP path).
+        let reflect_mip = reflect_cache && quality::env_bool("P11_REFLECT_MIP", true);
+        // F1 Stage 4: GI card-MIP parity (content only; the gallery keeps mip0 nearest).
+        let gi_card_mip = !gallery_scene && quality::env_bool("P11_GI_MIP", true);
+        // Firefly clamp on by default (P11_FIREFLY_CLAMP=0 to disable / compare).
+        let firefly_clamp = quality::env_bool("P11_FIREFLY_CLAMP", base.firefly_clamp);
+        // C8d: roughness above which screen-mirror SSR stops contributing (GDF takes over). Gallery
+        // forced to the legacy 0.5 (byte-identical anchor; a no-op under Med where qp is already 0.5)
+        // so the Apple tier's lower 0.4 cutoff never shifts the gallery's reflections.
+        let reflect_max_roughness = std::env::var("P11_REFLECT_MAX_ROUGHNESS")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(base.reflect_max_roughness);
+        // Stage D3: reflection-ray march step cap. Gallery forced to the legacy 96 (byte-identical);
+        // content takes the tier value. `P11_REFLECT_MAX_STEPS` overrides.
+        let reflect_max_steps = std::env::var("P11_REFLECT_MAX_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.reflect_max_steps)
+            .clamp(1, 256);
+        // P3 (SW-RT GI 레퍼런스급 SW-RT): cone-trace LOD march slope. Gallery forced to 0 (legacy linear
+        // march = byte-identical anchor); content takes the tier value. `P_CONE_K` overrides.
+        let gdf_cone_k = std::env::var("P_CONE_K")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(base.gdf_cone_k)
+            .clamp(0.0, 1.0);
+        // Reflection history clamp permutation (0 off / 1 hard / 2 variance). Gallery forced to 0
+        // (byte-identical legacy resolve = regression anchor); CONTENT defaults to 2 (Salvi/Karis
+        // variance clipping) to suppress glossy-reflection fireflies — the noisy GGX-sampled
+        // reflection of brightly-sunlit nearby geometry that the denoiser otherwise spreads into soft
+        // white "sparkle" blobs on the rough floor. The clamp is gated to sr > 0 (glossy/rough) in
+        // the shader, so near-mirrors (the chrome sphere) are untouched. `P_REFL_CLAMP` +
+        // `P_REFL_CLAMP_GAMMA` override; tight gamma (0.5) is safe because it only bounds the
+        // low-frequency rough lobe's history, never a mirror's high-frequency detail.
+        let reflect_history_clamp = std::env::var("P_REFL_CLAMP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(if gallery_scene {
+                base.reflect_history_clamp
+            } else {
+                2
+            })
+            .min(2);
+        let reflect_clamp_gamma = std::env::var("P_REFL_CLAMP_GAMMA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(if gallery_scene {
+                base.reflect_clamp_gamma
+            } else {
+                0.5
+            })
+            .clamp(0.0, 8.0);
+        // Roughness-scaled reflection blur radius (texels) — smooths the low-res reflection's blocky
+        // sparkle on rough content surfaces. Content default 6.0; gallery forced 0 at the call site.
+        let reflect_rough_blur = std::env::var("P_REFL_ROUGH_BLUR")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(6.0)
+            .clamp(0.0, 32.0);
+        // Track A1: opt-in spatial ratio-estimator resolve of the glossy reflection (content only;
+        // default off so the content sha goldens are unchanged until measured — the gallery never
+        // runs it regardless, keeping the anchor byte-identical). Kernel radius `P_REFLECT_RESOLVE_R`.
+        let reflect_resolve = !gallery_scene && std::env::var_os("P_REFLECT_RESOLVE").is_some();
+        let reflect_resolve_kernel = std::env::var("P_REFLECT_RESOLVE_R")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(2.0)
+            .clamp(1.0, 4.0);
+        // Track A4: variance-guided reflection denoiser (temporal 2nd moment + post-temporal bilateral).
+        // Content opt-in; default off so the content goldens are unchanged and the gallery anchor stays
+        // byte-identical (it never runs the pass). Kernel radius (px) via `P_REFLECT_SPATIAL_R`.
+        let reflect_spatial = !gallery_scene && std::env::var_os("P_REFLECT_SPATIAL").is_some();
+        let reflect_spatial_kernel = std::env::var("P_REFLECT_SPATIAL_R")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(8.0)
+            .clamp(1.0, 16.0);
+        // Track A5: blue-noise stochastic reflection bundle (frame-varying + blue-noise + A1 + A4).
+        // Tier default (Apple runs it; the other tiers keep it off pending DX≡VK) + env override.
+        // The gallery anchor never runs it.
+        let reflect_stochastic =
+            !gallery_scene && quality::env_bool("P_REFLECT_STOCHASTIC", base.reflect_stochastic);
+        // B2' rough-prefilter split threshold. `P_REFLECT_PREFILTER=1` = the reference-like default
+        // (0.4); an explicit fraction in (0,1) tunes it; 0 = off. Unset = tier default (Apple 0.4);
+        // gallery = off (anchor untouched).
+        let reflect_prefilter = if gallery_scene {
+            0.0
+        } else {
+            std::env::var("P_REFLECT_PREFILTER")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|v| if v == 1.0 { 0.4 } else { v.clamp(0.0, 0.996) })
+                .unwrap_or(base.reflect_prefilter)
+        };
+        // B2' glossy sample density: K GGX rays/pixel/frame for the stochastic glossy band.
+        // Unset = tier default (Apple 4 — measured ≈ K=1 cost with prefilter + screen-hit).
+        let reflect_glossy_spp = if gallery_scene {
+            1
+        } else {
+            std::env::var("P_REFLECT_GLOSSY_SPP")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(base.reflect_glossy_spp)
+                .clamp(1, 32)
+        };
+        // B2' screen-hit early-out (see the field docs). Tier default (Apple on) + env override.
+        let reflect_screen_hit =
+            !gallery_scene && quality::env_bool("P_REFLECT_SCREEN_HIT", base.reflect_screen_hit);
+        // C2b: one-shot feedback re-layout frame (see the field docs). Content opt-in.
+        let cache_res_feedback_frame = if gallery_scene {
+            0
+        } else {
+            std::env::var("P11_CACHE_RES_FEEDBACK")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .map(|v| if v == 1 { 64 } else { v })
+                .unwrap_or(0)
+        };
+        // Track C0-fix: static-scene convergence seams (see the field docs). Content opt-in.
+        let cache_converge = if gallery_scene {
+            0
+        } else {
+            std::env::var("P_CACHE_CONVERGE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0)
+                .min(64)
+        };
+        // Default ON for content since the full-grid dispatch fix: with the whole 32^3 field
+        // live, per-cycle trace jitter made the EMA field breathe visibly (frame-to-frame diff
+        // 0.42 vs 0.07 with the jitter pinned — per-mesh shimmer through the un-denoised
+        // sky-vis and the cache-relight snapshots). The reference radiance cache disables trace
+        // jitter for exactly this reason; per-probe seed hashing keeps the fixed sets spatially
+        // decorrelated, and octant stratification (gi_volume.slang) keeps each set's coverage
+        // honest. `P_GI_STABLE=0` restores jittered tracing for A/B.
+        let gi_stable = !gallery_scene && quality::env_bool("P_GI_STABLE", true);
+        // F6K (`P_GI_DIR_SETS`): deterministic direction-set ROTATION under stable mode.
+        // Pinning the jitter to one set freezes each probe's 16-ray Monte-Carlo variance
+        // into SPATIAL mottle (the honest stack's blocker — plan 2l: probe-grid blotches
+        // = scatter ~36 made visible). Rotating through K sets on a fixed schedule keeps
+        // every capture deterministic (the index is frame-derived) while the EMA averages
+        // K× the directions — variance ÷K at zero per-frame cost. 1 = the legacy pin.
+        let gi_dir_sets = std::env::var("P_GI_DIR_SETS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(base.gi_dir_sets)
+            .clamp(1, 64);
+        // CONVERGE mode deliberately does NOT touch the cost parameters (spp / relight period /
+        // visibility feedback) — raising them (spp×K + period 2 + hidden-off) measured 360 ms/frame
+        // on Sponza-M3, unplayable. Determinism alone (fixed directions) makes every relight
+        // idempotent, so the freeze latch arms at the SAME warmup cost the tier already pays; the
+        // convergence horizon is the amortization cadence (visible ≈ period·K frames, off-screen
+        // ×HIDDEN_MULT ≈ tens of seconds) and the steady-state cost after the freeze is ZERO (below
+        // the legacy baseline). Lower `P11_CACHE_RELIGHT_PERIOD` manually to trade FPS for a faster
+        // settle (e.g. a loading-screen warmup).
+        // SSR-resolve history feedback clamp (0 off / 1 variance). Gallery base is 0 (byte-identical
+        // anchor); content tiers default 0 too pending DX=VK verification. `P_SSR_HISTORY_CLAMP` +
+        // `P_SSR_CLAMP_GAMMA` override (set =1 to break the mirror lit-history feedback shimmer).
+        let ssr_history_clamp = std::env::var("P_SSR_HISTORY_CLAMP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            // CONVERGE mode defaults the variance clamp ON — the reference runs the clamp AND the
+            // small-alpha accumulation together (the clamp bounds amplitude, the alpha the rate).
+            .unwrap_or(if cache_converge != 0 {
+                1
+            } else {
+                base.ssr_history_clamp
+            })
+            .min(1);
+        let ssr_clamp_gamma = std::env::var("P_SSR_CLAMP_GAMMA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(base.ssr_clamp_gamma)
+            .clamp(0.0, 8.0);
+        // GI temporal history clamp: gallery forced to 1.0 (hard 3x3 = legacy byte-identical anchor);
+        // content takes the tier (0.0 = off = the static-shimmer fix). `P_GI_TEMPORAL_CLAMP` override.
+        let gi_temporal_clamp = std::env::var("P_GI_TEMPORAL_CLAMP")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(base.gi_temporal_clamp)
+            .clamp(0.0, 16.0);
+        // F4 (importance-sampled final gather): fraction of the gdf_gi gather rays steered toward the
+        // sun-lit incoming-irradiance lobe (MIS with cosine). The gallery lock is structural — the
+        // gallery `base` table pins 0.0 (legacy cosine gather = byte-identical anchor); content takes
+        // the tier value (all tiers 0.0 until measured). `P_GI_IMPORTANCE` overrides.
+        let gi_importance = std::env::var("P_GI_IMPORTANCE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(base.gi_importance)
+            .clamp(0.0, 1.0);
+        // Stage D3: half-res reflection trace + bilateral upsample (reuses the GI upsample).
+        // Gallery forced off (full-res = byte-identical anchor); content takes the tier value.
+        let reflect_half_res =
+            gi.has_upsample() && quality::env_bool("P11_REFLECT_HALF_RES", base.reflect_half_res);
+        // C8d: default to the full-res mirror SSR; opt into the stochastic glossy path to compare.
+        // CONVERGE mode forces the stochastic path: the plain mirror SSR feeds the reprojected
+        // lit-history straight back into lighting with NO temporal blend — a gain-1 feedback map
+        // that visibly oscillates every frame (the reference damps this loop with an α ≈ 1/12
+        // accumulation on the reflection before it enters the composited color).
+        let ssr_stochastic =
+            quality::env_bool("P11_SSR_STOCHASTIC", base.ssr_stochastic) || cache_converge != 0;
+        // Diagnostic single-object orbit: frame one scene object tightly so it can be
+        // inspected from every side. `DIAG_OBJ=<index>` selects it (2 = copper sphere,
+        // 3 = red cube); `DIAG_COPPER=1` / `DIAG_CUBE=1` are shortcuts. `DIAG_ANGLE=<deg>`
+        // pins the orbit azimuth and `DIAG_PITCH=<deg>` the elevation (90 = straight down).
+        let diag_obj = std::env::var("DIAG_OBJ")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .or_else(|| std::env::var_os("DIAG_COPPER").map(|_| 2))
+            .or_else(|| std::env::var_os("DIAG_CUBE").map(|_| 3));
+        let diag_angle = std::env::var("DIAG_ANGLE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .map(f32::to_radians);
+        let diag_pitch = std::env::var("DIAG_PITCH")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .map(f32::to_radians);
+        // Phase 8 M5: `pt_pipeline` is only built when the pipeline was requested, so
+        // its presence alone is the default-on condition.
+        let path_trace_pipeline = rt.has_pt_pipeline();
+
+        let mut command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        let mut image_available = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        let mut in_flight = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        // Async-compute resources: a command buffer on the compute queue per frame,
+        // plus a semaphore the compute submit signals and the graphics submit waits
+        // on. Only used when a dedicated compute queue exists and the toggle is on.
+        let compute_queue = device.compute_queue();
+        let mut compute_command_buffers = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        let mut compute_done = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        // Two cross-frame "cache relight done" semaphores (indexed by frame parity, NOT fif): the
+        // async relight signals one, next frame's graphics waits it (1-frame latency).
+        let cache_done = vec![device.create_semaphore()?, device.create_semaphore()?];
+        // Per-fif compute-completion fences (created signaled, like in_flight) gating reuse of the
+        // async relight's compute command buffer.
+        let mut cache_compute_fence = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        // GPU profiler: one timestamp query heap per frame in flight (read back after
+        // that slot's fence, so the results never stall the GPU). MAX_QUERIES covers
+        // (scheduled passes + 1) boundaries with headroom (Phase 9 M1). Raised 32→128 for the
+        // unified vgeo pass: a full Sponza-class frame (deferred + GDF SW-RT + vgeo scene passes)
+        // now fits, so `PROFILE_GPU` dumps under vgeo instead of overflowing the heap.
+        const MAX_QUERIES: u32 = 128;
+        let mut query_heaps = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        // Cached-shadow (S1) persistent depth: one app-owned SHADOW_SIZE depth per frame-in-flight
+        // (sampleable), rendered OUTSIDE the graph like the IBL env capture. Per-FIF so a moving
+        // sun's write on frame N doesn't clobber the depth frame N-1's lighting is still sampling.
+        let mut shadow_depth = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for _ in 0..FRAMES_IN_FLIGHT {
+            command_buffers.push(device.create_command_buffer()?);
+            image_available.push(device.create_semaphore()?);
+            in_flight.push(device.create_fence(true)?);
+            compute_command_buffers.push(device.create_compute_command_buffer()?);
+            compute_done.push(device.create_semaphore()?);
+            cache_compute_fence.push(device.create_fence(true)?);
+            query_heaps.push(device.create_query_heap(MAX_QUERIES)?);
+            let sd = device.create_depth_buffer(Extent2D::new(SHADOW_SIZE, SHADOW_SIZE))?;
+            sd.set_name("shadow_cache_depth");
+            shadow_depth.push(sd);
+        }
+        // QHD/UHD track: parse the offscreen render-extent override (`RENDER_RES=WxH`).
+        let render_res = std::env::var("RENDER_RES").ok().and_then(|s| {
+            let (a, b) = s.split_once(['x', 'X', ','])?;
+            let w = a.trim().parse::<u32>().ok()?.clamp(320, 7680);
+            let h = b.trim().parse::<u32>().ok()?.clamp(240, 4320);
+            Some((w, h))
+        });
+        // QHD/UHD track: internal render scale (production knob). `RENDER_SCALE` overrides the tier.
+        // The gallery is forced native (1.0) regardless of tier so the byte-identical anchor holds
+        // even when the platform default is the Apple tier (render_scale 0.67) — mirrors the
+        // `if gallery_scene { legacy } else { qp.* }` gate every other tier knob uses.
+        let render_scale = std::env::var("RENDER_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(base.render_scale)
+            // Floor at 1/3 (DLSS "ultra performance" territory): below that even a temporal
+            // reconstruction can't hold up. The TAAU jitter reconstruction (B-track) makes the
+            // 0.4–0.6 range viable, which is what QHD/UHD high-fps needs; 1.0 stays the default
+            // (byte-identical native).
+            .clamp(0.3333, 1.0);
+        let profiler_on = std::env::var("PROFILE_GPU").is_ok();
+        let slot_pass_names: Vec<Vec<&'static str>> = vec![Vec::new(); FRAMES_IN_FLIGHT];
+        let render_finished = build_render_finished(&device, swap_image_count)?;
+
+        // Image-based lighting (see `ibl.rs`): the procedural-sky / capture /
+        // irradiance / prefilter / BRDF pipelines, the ping-pong environment cube
+        // sets, the capture depth and the BRDF LUT (generated once on construction).
+        let ibl = IblSystem::new(&device, backend, &queue, flip_y, sun_dir, sun_intensity)?;
+        // Seed both cube sets once (single-bounce, no previous environment) so the
+        // first multi-bounce frame reads valid data instead of uninitialized memory.
+        let boot_eye = Vec3::new(0.0, model_radius * 0.6, 0.0)
+            + Vec3::new(scene_radius * 1.6, scene_radius * 0.55, 0.0);
+        ibl.seed(
+            &device,
+            &queue,
+            &scene,
+            &ground_vbuf,
+            &ground_ibuf,
+            ground_count,
+            boot_eye,
+            sun_dir,
+            sun_intensity,
+            ambient,
+            flip_y,
+            backend == BackendKind::Vulkan,
+            sky_gain,
+            sky_wb,
+        )?;
+
+        let mut window = window;
+        let _ = window.take_resized();
+        info!("entering render loop");
+
+        // Read before `gdf` is moved into the struct (Phase 12 M2): the cooked SDF /
+        // albedo were uploaded, so their one-time GPU bakes are pre-satisfied.
+        let scene_gdf_cooked = gdf.scene_sdf_is_cooked();
+        let scene_albedo_cooked = gdf.scene_albedo_is_cooked();
+        // (swap_extent_cached / swap_format_cached / readback_layout_cached were snapshotted before
+        // the swapchain moved to the loading thread — see the loading-thread spawn above.)
+
+        // PR-3: seed the translucency slot. `P_TRANSLUCENT_TEST=1` spawns two overlapping
+        // tinted glass panes in the gallery (there is no translucent sample asset yet), to
+        // verify sorted alpha compositing / depth-test occlusion / fog interaction. Empty by
+        // default → the pass adds no work → byte-identical anchor.
+        //
+        let mut translucents: Vec<translucent::TranslucentObject> = Vec::new();
+        if gallery_scene && quality::env_bool("P_TRANSLUCENT_TEST", false) {
+            translucents =
+                translucent::translucent_test_planes(&device, scene_radius, scene_center)?;
+            info!(
+                "P_TRANSLUCENT_TEST: spawned {} translucent glass pane(s)",
+                translucents.len()
+            );
+        }
+        // glTF `Transparent` (BLEND, non-decal) routing skeleton. The census below is where
+        // production BLEND drawables would be lifted OUT of the opaque G-buffer list and turned
+        // into `TranslucentObject`s for this slot — `translucent::TranslucentObject::from_scene`
+        // does the conversion (mesh/transform/material → forward material). It is intentionally
+        // NOT wired to run by default: doing so must also SUPPRESS the object's opaque G-buffer
+        // draw (else it renders twice), and — critically — the foliage path depends on
+        // `Transparent` drawables staying in the opaque G-buffer with a positive `alpha_cutoff`
+        // (crisp cutout / hashed soft edges). So enabling gltf routing is deferred to the Phase
+        // 20 work that also adds the G-buffer suppression; foliage behaviour is unchanged here.
+        // See `docs/translucency-pass.md` (§ glTF routing).
+
+        // Phase 14 renderer integration: when P14_VGEO is on, build a virtual-geometry cluster page
+        // per registered mesh (built from the registry's CPU geometry, matching the uploaded mesh
+        // exactly). Every eligible opaque object then renders as virtual geometry, overlaid on the
+        // mesh-rastered remainder. Any failure logs and falls back to the mesh fill (mode stays set,
+        // but the frame guards on `vgeo.is_some()`).
+        let vgeo = if vgeo_mode > 0 {
+            let (ww, wh) = window.size();
+            let mut sink =
+                loading::PhaseSink::new(std::sync::Arc::clone(&loading_state), 0.70, 0.97);
+            let result = vgeo::VgeoSystem::new(
+                &device,
+                backend,
+                &mesh_registry,
+                Extent2D::new(ww.max(1), wh.max(1)),
+                &app::cooked_cache_dir().join("vgeo"),
+                &mut sink,
+            );
+            match result {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    info!("P14_VGEO disabled ({e}); using the mesh G-buffer fill");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Cook done — stop the loading thread (if any) and reclaim the swapchain for the render
+        // loop. `finish()` joins, so the loading thread's pipeline/command-buffer `Rc` drops complete
+        // before the render loop touches the device (single-owner contract). `Err` = never spawned.
+        loading_state.set(1.0);
+        let swapchain = match loading {
+            Ok(lt) => lt.finish(),
+            Err(sc) => sc,
+        };
+
+        Ok(Self {
+            window,
+            _instance: instance,
+            device,
+            queue: Some(queue),
+            compute_queue,
+            swapchain: Some(swapchain),
+            backend,
+            gui,
+            deferred,
+            vgeo,
+            vgeo_hzb,
+            vgeo_mode,
+            gdf,
+            gi,
+            gtao,
+            atmosphere,
+            translucency,
+            translucents,
+            bloom,
+            motion_blur,
+            dof,
+            reflect,
+            particles,
+            cull,
+            cluster,
+            hzb,
+            rt,
+            ibl,
+            _textures: textures,
+            world,
+            mesh_registry,
+            material_registry,
+            skinned: gltf_skinned,
+            vcaches: level_vcaches,
+            morphed: gltf_morphed,
+            level_paths,
+            levels_dir,
+            current_level,
+            pending_level: None,
+            swap_script: parse_swap_script(),
+            rhi_respawn_at: None,
+            streaming,
+            ground_vbuf,
+            ground_ibuf,
+            // The hardcoded flat ground is a gallery-only code default. Every other mode
+            // brings its own floor (a level's asset geometry, or a "ground" entity — so a
+            // streamed chunk carries its own ground patch). Drawing 0 indices keeps the
+            // buffers valid but renders nothing.
+            ground_count: if gallery_scene { ground_count } else { 0 },
+            pools,
+            command_buffers,
+            image_available,
+            in_flight,
+            compute_command_buffers,
+            compute_done,
+            async_cache_on,
+            cache_done,
+            cache_compute_fence,
+            query_heaps,
+            render_finished,
+            rhi_thread: None,
+            parallel_record: std::env::var_os("P15_PARALLEL_RECORD").is_some(),
+            swap_extent_cached,
+            swap_format_cached,
+            readback_layout_cached,
+            flip_y,
+            model_radius,
+            scene_radius,
+            scene_center,
+            level_view,
+            level_lighting: level_lighting_override,
+            is_gallery: gallery_scene,
+            screenshot_mode,
+            captures,
+            capture_seq: std::env::var("CAPTURE_SEQ")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&n| n > 0),
+            validation_on,
+            async_compute_supported,
+            path_spp: 8,
+            gdf_trace_analytic,
+            sun_dir,
+            sun_intensity,
+            sun_color,
+            ambient,
+            // Camera exposure (pre-filmic, applied as `(ambient+lo)·exposure`). Gallery keeps the
+            // legacy 0.6 (anchor). Content derives it from a physical-camera **EV100** so the lux
+            // sun exposes correctly: `exposure = 1/(1.2·2^EV100)`. Default EV100 ≈ 14 (a touch under
+            // sunny-16 to favour the bounce-lit interior, as a metered interior shot would). `EV100`
+            // sets the stop directly; `EXPOSURE` still overrides the raw multiplier if given.
+            exposure: std::env::var("EXPOSURE")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or_else(|| {
+                    if gallery_scene {
+                        0.6
+                    } else {
+                        let ev100 = std::env::var("EV100")
+                            .ok()
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .unwrap_or(14.0);
+                        ev100_to_exposure(ev100)
+                    }
+                })
+                .max(0.0),
+            sky_gain,
+            sky_wb,
+            auto_exposure,
+            // The geometric-series compensation assumes the GI term is a SINGLE bounce (its
+            // 1/(1-albedo·k) restores the missing tail — pbr.slang). The volume path feeds its
+            // own previous frame back at every hit (true infinite bounce), so boosting it
+            // double-counts: default 0 whenever the volume is the GI source, 0.6 only for the
+            // single-bounce ray-march path.
+            gi_multibounce: std::env::var("P_GI_MULTIBOUNCE")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(if gallery_scene || gi_volume { 0.0 } else { 0.6 }),
+            point_lights_on,
+            clustered_lights,
+            clustered_brute,
+            test_lights,
+            shadows_on: true,
+            shadow_bias: 0.0015,
+            // PCSS-lite soft shadows: an opt-in quality tier (the scalability seam).
+            // Default 0 = hard 3x3 PCF — cheapest AND the closest match to the path
+            // tracer, whose sun disk (SUN_COS_MAX ~1.15deg) is near-sharp, so a wide
+            // penumbra actually diverges from PT. `SHADOW_SOFTNESS=<f>` (or the UI slider)
+            // turns it on; the PT-calibrated factor is ~0.0375, larger = softer/aesthetic.
+            shadow_softness: std::env::var("SHADOW_SOFTNESS")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(base.shadow_softness),
+            // Soft-shadow tap count (RenderQuality knob, written to globals.shadow.w). Only the
+            // soft path reads it; the shader clamps to [1, 16] (POISSON16). `SHADOW_TAPS` overrides.
+            shadow_taps: std::env::var("SHADOW_TAPS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(base.shadow_taps)
+                .clamp(1, 16),
+            // PR-7 CSM/atlas: opt-in via `CSM` (default off = legacy single map = anchor).
+            csm: csm::CsmConfig::from_env(),
+            // `CSM_DEBUG=1` overlays the per-cascade index color so splits are inspectable.
+            csm_debug: std::env::var("CSM_DEBUG").is_ok_and(|v| v != "0"),
+            quality,
+            override_material: false,
+            metallic_override: 1.0,
+            roughness_override: 0.15,
+            debug_view: std::env::var("DEBUG_VIEW")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            post_mode: 0,
+            aliasing: true,
+            bloom_on,
+            motion_blur_on,
+            dof_on,
+            grade_on,
+            cdl_slope,
+            cdl_offset,
+            cdl_power,
+            motion_blur_warned: std::cell::Cell::new(false),
+            depth_prepass,
+            particles_on,
+            async_compute_on,
+            gpu_cull,
+            hzb_cull,
+            hzb_stats: std::cell::Cell::new((0, 0)),
+            path_trace,
+            rt_debug,
+            cornell,
+            sdf_trace,
+            volume_test,
+            sdf_bake,
+            sdf_bake_done: false,
+            gdf_merge,
+            gdf_merge_done: false,
+            gdf_trace,
+            scene_gdf,
+            gdf_ao,
+            ssao,
+            ssao_params,
+            gdf_gi,
+            hwrt_gi,
+            hwrt,
+            reflect_mode,
+            reflect_hw_ready,
+            reflect_screen_want,
+            hwrt_fullres,
+            hwrt_hitlighting,
+            bent_normal,
+            skyvis_bent_fix,
+            gdf_facing_flip,
+            ao_multibounce,
+            spec_occlusion,
+            gi_volume,
+            gi_volume_period: std::env::var("P_GI_VOLUME_PERIOD")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(base.gi_volume_period as u64)
+                .max(1),
+            gi_vol_occ,
+            gi_volume_spp,
+            gi_volume_alpha,
+            gi_repair_flags,
+            gi_sun_k,
+            skyvis_tint,
+            skyvis_tint_v0,
+            skyvis_min_occ,
+            skyvis_bent_floor,
+            skyvis_pp_spp,
+            skyvis_pp_div,
+            cache_sky_occlude,
+            cache_hwrt_shadow,
+            cache_hwrt_gather,
+            cache_gather_fallback,
+            stream_obj_aabb,
+            stream_obj_albedo,
+            stream_recapture: false,
+            cache_capture_occl,
+            cache_occl_route,
+            reflect_probe_valid,
+            reflect_graze_eps,
+            reflect_hit_fetch,
+            cache_lit_calib,
+            height_fog,
+            second_view,
+            fog_density,
+            fog_height_falloff,
+            fog_inscatter_gain,
+            gi_spp,
+            cache_relight_period,
+            cache_feedback,
+            cache_relight_spp,
+            gi_max_steps,
+            reflect_max_steps,
+            gdf_cone_k,
+            reflect_half_res,
+            reflect_res_div,
+            reflect_compact_div,
+            reflect_compact_hwrt,
+            reflect_compact_screen,
+            ao_res_div,
+            gi_atrous_steps,
+            gi_half_res,
+            gi_res_div,
+            screen_probe,
+            wrc,
+            wrc_viz,
+            sc_viz,
+            reflect_history_clamp,
+            reflect_clamp_gamma,
+            reflect_rough_blur,
+            reflect_resolve,
+            reflect_resolve_kernel,
+            reflect_spatial,
+            reflect_spatial_kernel,
+            reflect_stochastic,
+            reflect_prefilter,
+            reflect_glossy_spp,
+            reflect_screen_hit,
+            cache_res_feedback_frame,
+            cache_converge,
+            gi_stable,
+            gi_dir_sets,
+            ssr_history_clamp,
+            ssr_clamp_gamma,
+            gi_temporal_clamp,
+            gi_importance,
+            gi_denoise,
+            prev_view_proj: Mat4::IDENTITY.to_cols_array(),
+            prev_eye: Vec3::ZERO,
+            prev_view_proj_taau: Mat4::IDENTITY.to_cols_array(),
+            gdf_ssr,
+            gdf_reflect,
+            gdf_hybrid,
+            swrt_reflect,
+            gdf_color,
+            cache_viz,
+            surface_cache,
+            reflect_cache,
+            reflect_mip,
+            gi_card_mip,
+            firefly_clamp,
+            reflect_max_roughness,
+            ssr_stochastic,
+            // Phase 12 M2: a cooked SDF was uploaded into the scene GDF, so the
+            // one-time GPU bake is already satisfied — latch it as baked.
+            scene_gdf_baked: scene_gdf_cooked,
+            scene_albedo_baked: scene_albedo_cooked,
+            scene_cache_captured: false,
+            scene_cache_reset: true,
+            cache_epoch: 0,
+            cache_stable_frames: 0,
+            cache_conv_stable: 0,
+            // A2-fix: the max per-channel EMA radiance step (in the scene's radiance units) under
+            // which the cache is treated as converged. Tuned so a genuinely-settled cache passes and
+            // a still-propagating multibounce (IntelSponza's coloured drapes) does not. `P_CACHE_CONV_EPS`.
+            cache_conv_eps: std::env::var("P_CACHE_CONV_EPS")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.02),
+            // Backend-deterministic freeze horizon in full amortization passes (see the field doc).
+            // Default 3 passes is past the fixed-alpha settling knee for the physically-lit content
+            // scenes while keeping steady-state relight cost zero. `P_CACHE_FREEZE_PASSES` per scene.
+            cache_freeze_passes: std::env::var("P_CACHE_FREEZE_PASSES")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(3)
+                .max(1),
+            cache_frozen: false,
+            // Default-on for content; gallery byte-anchor keeps every-frame relight. `P_CACHE_DIRTY_SKIP=0`
+            // forces the legacy always-relight path (perf A/B + the fast-motion worst case).
+            cache_dirty_skip: !gallery_scene && quality::env_bool("P_CACHE_DIRTY_SKIP", true),
+            shadow_depth,
+            shadow_epoch: 0,
+            shadow_stable_frames: 0,
+            // The cached legacy map is EXACT the first frame after any change (no EMA to converge,
+            // unlike the surface cache) — a small settle only guards ordering. It is floored to
+            // FRAMES_IN_FLIGHT at the skip site so every per-FIF persistent depth is primed before
+            // any freeze. `P_SHADOW_SETTLE` overrides.
+            shadow_settle_frames: std::env::var("P_SHADOW_SETTLE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(FRAMES_IN_FLIGHT as u32),
+            // Default-on for content; gallery keeps the every-frame in-graph raster (byte-identical
+            // anchor). `P_SHADOW_DIRTY_SKIP=0` forces the legacy always-render path (perf A/B + the
+            // image-identical gate).
+            shadow_dirty_skip: !gallery_scene && quality::env_bool("P_SHADOW_DIRTY_SKIP", true),
+            reflect_skip: !gallery_scene && quality::env_bool("P_REFLECT_SKIP", true),
+            // Staggered re-trace floor: 1/K pixels re-march each frame even when "converged", so any
+            // un-modeled change (future dynamic content) can't stay stale longer than K frames. K=0
+            // disables the floor (max skip). `P_REFLECT_SKIP_STAGGER` overrides.
+            reflect_skip_stagger: std::env::var("P_REFLECT_SKIP_STAGGER")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(8),
+            scene_cull: !gallery_scene && quality::env_bool("SCENE_CULL", true),
+            async_cache_gap: false,
+            path_trace_pipeline,
+            realtime_env: true,
+            time_of_day: std::env::var_os("TIME_OF_DAY").is_some(),
+            multibounce: true,
+            legacy_ibl,
+            render_res,
+            render_scale,
+            taau,
+            taau_on: quality::env_bool("P_TAAU", true),
+            taau_packed,
+            tonemap_aces,
+            tonemap_lut_size,
+            taau_jitter: quality::env_bool("P_TAAU_JITTER", true),
+            // Tier-driven since the lighting-closure batch: the shimmer gate F6O asked for now
+            // exists (tools/seq-stability.py + docs/lighting-ao-shadow-closure.md), and Med ships
+            // this ON with its TAAU scale. `base` is `gallery_preset()` for the gallery, so the
+            // anchor stays OFF structurally; `P_TAAU_ANTIFLICKER` still overrides either way.
+            taau_antiflicker: quality::env_bool("P_TAAU_ANTIFLICKER", base.taau_antiflicker),
+            taau_motion,
+            taau_clamp_expand,
+            taau_sharpen,
+            taau_force: quality::env_bool("P_TAAU_FORCE", false),
+            taa_mip_bias: std::env::var("TAA_MIP_BIAS")
+                .ok()
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .unwrap_or(quality::TAA_MIP_BIAS),
+            velocity,
+            velocity_on: quality::env_bool("P_VELOCITY", false),
+            prev_transforms: Vec::new(),
+            profiler_on,
+            slot_pass_names,
+            gpu_timings: Vec::new(),
+            fif: 0,
+            frame_no: 0,
+            f2_prev: false,
+            needs_recreate: false,
+            pool_render_extent: (0, 0),
+            diag_slots: quality::env_bool("DIAG_SLOTS", false),
+            diag_slots_last: (u32::MAX, u32::MAX),
+            diag_scale_cycle: std::env::var("DIAG_SCALE_CYCLE")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&n| n > 0),
+            last: Instant::now(),
+            elapsed: 0.0,
+            // Fixed view in screenshot mode for reproducible output; `DIAG_ANGLE`
+            // overrides it (degrees) for capturing the chosen object from a fixed side.
+            angle: diag_angle.unwrap_or(if screenshot_mode { 0.7 } else { 0.0 }),
+            prev_angle: diag_angle.unwrap_or(if screenshot_mode { 0.7 } else { 0.0 }),
+            sim_accumulator: 0.0,
+            diag_obj,
+            diag_pitch,
+            // Non-gallery scenes (level / glTF / world) start in the free-fly camera: static at
+            // the authored pose, then WASD + Q/E (down/up) move and right-mouse-drag looks. The
+            // gallery keeps the auto-orbit demo view. Tab toggles between the two. Headless captures
+            // ignore this (fly is gated off in screenshot mode -> the fixed parity pose).
+            cam_mode: if gallery_scene {
+                camera::CameraMode::Orbit
+            } else {
+                camera::CameraMode::Fly
+            },
+            fly: world_fly,
+            tab_prev: false,
+            m_prev: false,
+            cursor_released: false,
+            hooks: config.hooks,
+        })
+    }
+
+    /// Install (or replace, with `None`) the game callbacks. See [`GameHooks`].
+    pub fn set_hooks(&mut self, hooks: Option<Box<dyn GameHooks>>) {
+        self.hooks = hooks;
+    }
+
+    /// The graphics queue (inline path). Panics if the RHI thread owns it.
+    fn queue(&self) -> &Queue {
+        self.queue
+            .as_ref()
+            .expect("queue is owned by the RHI thread")
+    }
+
+    /// The IBL diffuse-irradiance cube's bindless index (`0xFFFFFFFF` when no IBL is bound), for the
+    /// surface-cache / reflection skylight-floor fill. Same cube the deferred pass samples for its
+    /// IBL diffuse ambient — so a reflected/cached shadowed surface floors to the same skylight.
+    fn irradiance_cube_index(&self) -> u32 {
+        let i = self.ibl.lighting_indices()[1];
+        if i < 0 { u32::MAX } else { i as u32 }
+    }
+
+    /// Minimum sky-visibility floor for the surface-cache relight (`sdf_cache_light`): an enclosed
+    /// interior face whose gather rays rarely escape still receives this fraction of the sky
+    /// irradiance, matching the deferred pass's `occlude_sky_diffuse` MinOcclusion so REFLECTED
+    /// shadowed surfaces don't crush to black. `0` for the gallery anchor (byte-identical); content
+    /// defaults to `1.0`, overridable via `P_REFLECT_SKYFILL`.
+    ///
+    /// Why 1.0 (was 0.6): the cache gather's sky-on-miss shrinks as the surface cache FILLS (more rays
+    /// hit cached surfaces than escape to sky), so over the warm-up the reflected surfaces lose their
+    /// skylight and drift to a muddy, over-warm multibounce equilibrium — the chrome ball's edges
+    /// visibly "stain" from clean sky-blue toward brown as the cache converges. The primary deferred
+    /// pass gives every surface the FULL occluded IBL-diffuse skylight, so a floor below 1.0 makes the
+    /// reflected copy of a surface systematically dimmer/warmer than the surface renders directly. A
+    /// floor of 1.0 restores that parity — reflected surfaces keep the sky term the primary gives them
+    /// (measured: whole-scene brightness essentially unchanged, few fully-enclosed faces; the ball's
+    /// grazing edge stops browning). `occlude_sky_diffuse` still occludes below the floor for genuinely
+    /// enclosed geometry via the per-ray gather, so this isn't a flat ambient add.
+    fn cache_skylight_floor(&self) -> f32 {
+        if self.is_gallery {
+            0.0
+        } else {
+            std::env::var("P_REFLECT_SKYFILL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0)
+        }
+    }
+
+    /// Per-sample firefly clamp for the surface-cache indirect gather (`sdf_cache_light`), in physical
+    /// radiance units. The reference engine's LumenRadiosity clamps each hemisphere sample to
+    /// `MaxRayIntensity · OneOverPreExposure` at the source; a single bright, frame-varying gather ray
+    /// otherwise pops as a moving sparkle and keeps the relight EMA above its convergence-freeze
+    /// epsilon (so the cache never settles). Our exposure maps physical→~1, so the physical ceiling is
+    /// `MaxRayIntensity / exposure`. `0` for the gallery (byte-identical); `P_CACHE_FIREFLY` tunes the
+    /// intensity (default 40, the reference default).
+    fn cache_gather_firefly(&self) -> f32 {
+        if self.is_gallery {
+            0.0
+        } else {
+            let max_ray = std::env::var("P_CACHE_FIREFLY")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(40.0);
+            max_ray / self.exposure.max(1e-6)
+        }
+    }
+
+    /// F4B: the GI-volume slab schedule for this frame, derived ONCE from the clamped period so
+    /// the dispatch, the ping-pong advance and the (P_GI_STABLE=0) jitter divisor can never
+    /// disagree (the pre-F4B code clamped the period at the dispatch but not at the advance/
+    /// jitter — harmless while period <= 32, but a latent divergence the interleave must not
+    /// inherit). Returns `(z_slab_index, y_offset, cycle_len)`:
+    /// - fine OFF: the legacy walk — slab `frame % P`, coarse rows, advance every P frames.
+    /// - fine ON (level-interleaved slabs): even frames update a coarse z-slab, odd frames the
+    ///   SAME z-slab of the fine half (y_offset = GI_VOL_DIM), slab index `(frame >> 1) % P` —
+    ///   per-frame cost stays the single-level slab and every texel of BOTH levels refreshes
+    ///   once per `2P` super-cycle, at whose end the ping-pong advances.
+    fn gi_volume_schedule(&self) -> (u32, u32, u64) {
+        let period = (self.gi_volume_period as u32).clamp(1, gi::GI_VOL_DIM) as u64;
+        if self.gi.gi_fine_installed() {
+            (
+                ((self.frame_no >> 1) % period) as u32,
+                if self.frame_no & 1 == 0 {
+                    0
+                } else {
+                    gi::GI_VOL_DIM
+                },
+                period * 2,
+            )
+        } else {
+            ((self.frame_no % period) as u32, 0, period)
+        }
+    }
+
+    /// The swapchain (inline path). Panics if the RHI thread owns it.
+    fn swapchain(&self) -> &Swapchain {
+        self.swapchain
+            .as_ref()
+            .expect("swapchain is owned by the RHI thread")
+    }
+
+    /// Mutable swapchain (inline path / resize). Panics if the RHI thread owns it.
+    fn swapchain_mut(&mut self) -> &mut Swapchain {
+        self.swapchain
+            .as_mut()
+            .expect("swapchain is owned by the RHI thread")
+    }
+
+    /// Swapchain extent — from the live swapchain when inline, else the cached value
+    /// (the RHI thread owns the swapchain).
+    fn swap_extent(&self) -> Extent2D {
+        self.swapchain
+            .as_ref()
+            .map(|s| s.extent_2d())
+            .unwrap_or(self.swap_extent_cached)
+    }
+
+    /// Swapchain format — live when inline, else cached (RHI thread owns it).
+    fn swap_format(&self) -> Format {
+        self.swapchain
+            .as_ref()
+            .map(|s| s.format())
+            .unwrap_or(self.swap_format_cached)
+    }
+
+    /// The internal (scene) render extent for output extent `(sw, sh)`: the
+    /// `RENDER_RES` absolute override wins, else `render_scale` fractions the output
+    /// (64 px floor), else native (byte-identical). Single source for the per-frame
+    /// graph extent AND the scale-change transient reclaim — they must agree or the
+    /// reclaim would miss (leak) or over-fire (churn).
+    fn render_extent_for(&self, sw: u32, sh: u32) -> (u32, u32) {
+        match self.render_res {
+            Some(r) => r, // absolute override (headless QHD/UHD measurement)
+            None if (self.render_scale - 1.0).abs() < 1e-4 => (sw, sh), // native
+            None => (
+                ((sw as f32 * self.render_scale).round() as u32).max(64),
+                ((sh as f32 * self.render_scale).round() as u32).max(64),
+            ),
+        }
+    }
+
+    /// Reclaim the pooled transient targets when the *render* extent changed without
+    /// a window resize (render-scale slider / quality-tier switch / `RENDER_RES`).
+    /// `ResourcePool` reuses by exact desc, so the old extent's targets would stay
+    /// cached forever — never reused, never dropped — leaking their bindless
+    /// storage-image/SRV slots until the 256-slot table overflowed. The window-resize
+    /// path already reclaims via `recreate_swapchain`; this is the *same* reclaim for
+    /// the scale path. Under the RHI thread the worker is joined first: the record
+    /// thread has no per-slot fence guarantee of its own, so dropping targets while
+    /// the worker may still translate a list referencing them would be a
+    /// use-after-free — join + idle makes the drops safe (mirrors
+    /// [`Self::recreate_threaded`]), then the worker respawns.
+    fn reclaim_scaled_transients(&mut self, cw: u32, ch: u32) -> anyhow::Result<()> {
+        if self.pool_render_extent == (cw, ch) {
+            return Ok(());
+        }
+        // `(0, 0)` = startup: nothing pooled yet, just latch.
+        if self.pool_render_extent != (0, 0) {
+            let threaded = self.rhi_thread.is_some();
+            if let Some(rhi) = self.rhi_thread.take() {
+                self.reclaim_rhi_objects(rhi.join());
+            }
+            self.device.wait_idle()?;
+            for p in &mut self.pools {
+                p.clear();
+            }
+            if threaded {
+                self.spawn_rhi_thread()?;
+            }
+        }
+        self.pool_render_extent = (cw, ch);
+        Ok(())
+    }
+
+    /// Run the render loop until the window closes (or, in screenshot mode, every
+    /// requested capture is saved).
+    /// Derive the per-pass reflection booleans from the UI-facing `reflect_mode` (the single
+    /// source). Runs every frame right after the UI: idempotent, and the availability gate
+    /// (`reflect_hw_ready`) keeps env/UI-selected states valid on every device.
+    fn apply_reflect_mode(&mut self) {
+        if !self.reflect_hw_ready {
+            self.reflect_mode = quality::ReflectMode::Software;
+        }
+        let (hw_main, hw_compact) = match self.reflect_mode {
+            quality::ReflectMode::Software => (false, false),
+            quality::ReflectMode::Hybrid => (false, true),
+            quality::ReflectMode::Hardware => (true, true),
+        };
+        self.hwrt = hw_main;
+        self.reflect_compact_hwrt = hw_compact;
+        // The screen fetch mixes lit-history and cache colours across the footprint gate, so it
+        // additionally requires the parity skylight (tone-matched sources — the cfdf2f4 seam).
+        self.reflect_compact_screen =
+            hw_compact && self.reflect_screen_want && self.cache_sky_occlude;
+    }
+
+    /// Run the frame loop until the window closes (or a headless capture completes).
+    pub fn run(&mut self) -> anyhow::Result<()> {
+        // M4 B3: opt into the separate RHI (submit) thread. Default off = the inline
+        // single-thread path (byte-identical). Async-compute paths stay on the inline
+        // path, so the worker is only spawned for the normal submit config.
+        if std::env::var_os("P15_RHI_THREAD").is_some() {
+            if self.async_cache_on || self.particles_on {
+                info!(
+                    "P15_RHI_THREAD ignored: async-compute (cache/particle) paths use the \
+                     inline submitter"
+                );
+            } else {
+                self.spawn_rhi_thread()?;
+            }
+        }
+        // Debug: trigger one RenderDoc frame capture (RDOC_CAPTURE=1, under
+        // `renderdoccmd capture`). No-op when not running under RenderDoc.
+        #[cfg(windows)]
+        let mut rdoc = std::env::var_os("RDOC_CAPTURE")
+            .and_then(|_| renderdoc::RenderDoc::<renderdoc::V141>::new().ok());
+        #[cfg(windows)]
+        let mut rdoc_triggered = false;
+        while !self.window.should_close() {
+            #[cfg(windows)]
+            if let Some(rd) = rdoc.as_mut()
+                && !rdoc_triggered
+                && self.frame_no >= 2
+            {
+                rd.trigger_capture();
+                rdoc_triggered = true;
+                info!("RenderDoc: frame capture triggered");
+            }
+            if !self.frame()? {
+                break;
+            }
+        }
+        // Reclaim the boundary objects from the worker before shutdown so they (and
+        // device-idle/teardown) run single-threaded again.
+        if let Some(rhi) = self.rhi_thread.take() {
+            self.reclaim_rhi_objects(rhi.join());
+        }
+        self.device.wait_idle()?;
+        info!("shutting down");
+        Ok(())
+    }
+
+    /// Move the boundary objects (queue/swapchain/per-fif command buffers + frame
+    /// fences/semaphores) into a freshly spawned RHI thread, plus persistent per-fif
+    /// readback buffers it copies captures into (created here, dropped on the record
+    /// thread at reclaim — never on the worker).
+    fn spawn_rhi_thread(&mut self) -> anyhow::Result<()> {
+        let layout = self.readback_layout_cached;
+        let fif = self.command_buffers.len();
+        let mut readback = Vec::with_capacity(fif);
+        for _ in 0..fif {
+            readback.push(self.device.create_buffer(&BufferDesc {
+                size: layout.size,
+                usage: BufferUsage::Readback,
+            })?);
+        }
+        let objects = rhi_thread::ThreadObjects {
+            queue: self.queue.take().expect("queue present before spawn"),
+            swapchain: self
+                .swapchain
+                .take()
+                .expect("swapchain present before spawn"),
+            command_buffers: std::mem::take(&mut self.command_buffers),
+            image_available: std::mem::take(&mut self.image_available),
+            in_flight: std::mem::take(&mut self.in_flight),
+            render_finished: std::mem::take(&mut self.render_finished),
+            readback,
+            readback_layout: layout,
+        };
+        self.rhi_thread = Some(rhi_thread::RhiThread::spawn(objects));
+        info!("P15_RHI_THREAD: render-graph \u{2194} RHI thread split active");
+        Ok(())
+    }
+
+    /// Put the worker's reclaimed objects back into `self` (after `join`). The
+    /// readback buffers in `o` drop here, on the record thread (Rc-safe).
+    fn reclaim_rhi_objects(&mut self, o: rhi_thread::ThreadObjects) {
+        self.queue = Some(o.queue);
+        self.swapchain = Some(o.swapchain);
+        self.command_buffers = o.command_buffers;
+        self.image_available = o.image_available;
+        self.in_flight = o.in_flight;
+        self.render_finished = o.render_finished;
+    }
+
+    /// Recreate the swapchain (resize) on the inline path: idle, recreate, drop
+    /// cached transients, rebuild the per-image present semaphores, and refresh the
+    /// extent/format/readback-layout caches.
+    fn recreate_swapchain(&mut self, ww: u32, wh: u32) -> anyhow::Result<()> {
+        self.device.wait_idle()?;
+        self.swapchain_mut()
+            .recreate(&swapchain_desc(Extent2D::new(ww, wh)))?;
+        for p in &mut self.pools {
+            p.clear(); // transient extents changed; drop cached targets
+        }
+        // The resize just reclaimed every pooled transient; latch the render extent so
+        // the scale-change reclaim in `frame` doesn't immediately re-idle for the same
+        // event.
+        self.pool_render_extent = self.render_extent_for(ww, wh);
+        let count = self.swapchain().image_count();
+        self.render_finished = build_render_finished(&self.device, count)?;
+        self.swap_extent_cached = self.swapchain().extent_2d();
+        self.swap_format_cached = self.swapchain().format();
+        self.readback_layout_cached = self.device.swapchain_readback_layout(self.swapchain());
+        self.needs_recreate = false;
+        Ok(())
+    }
+
+    /// Resize under the RHI thread: reclaim the objects (join), recreate inline, then
+    /// respawn the worker (which rebuilds its readback buffers for the new size).
+    fn recreate_threaded(&mut self, ww: u32, wh: u32) -> anyhow::Result<()> {
+        let rhi = self.rhi_thread.take().expect("rhi thread present");
+        self.reclaim_rhi_objects(rhi.join());
+        self.recreate_swapchain(ww, wh)?;
+        self.spawn_rhi_thread()
+    }
+
+    /// Hot-swap to level `idx` (Stage C / M3): rebuild the ECS world + registries +
+    /// textures from the level file **and re-run the per-level static-scene bake chain**
+    /// (`static_scene.rs`) so the distance fields, the surface cache, the ray-tracing
+    /// scene and the virtual-geometry pages describe the level that is now on screen.
+    ///
+    /// Ordering + lifetime: the RHI worker is joined first when it runs (it owns the
+    /// queue/swapchain and is mid-translate at this point, so `wait_idle` alone would
+    /// neither drain it nor stop it racing the resource creation below), then the GPU
+    /// is idled so the frames that referenced the old resources have retired before
+    /// their handles drop. Everything the bake chain writes is an `Option`/`Vec` field
+    /// that the rebuild replaces, so the previous level's GPU objects drop exactly once,
+    /// here, on the record thread.
+    fn load_level(&mut self, idx: usize) -> anyhow::Result<()> {
+        let t_swap = Instant::now();
+        // Drain the submit thread the same way a resize does (`recreate_threaded`). A pending
+        // respawn from an earlier swap counts as "threaded" — otherwise two swaps close
+        // together would retire the worker permanently.
+        let rhi_was_threaded = self.rhi_thread.is_some() || self.rhi_respawn_at.is_some();
+        self.rhi_respawn_at = None;
+        if let Some(rhi) = self.rhi_thread.take() {
+            self.reclaim_rhi_objects(rhi.join());
+        }
+        self.device.wait_idle()?;
+        let path = self.level_paths[idx].clone();
+        let level = level::load(std::path::Path::new(&path))?;
+        self.level_view = level::level_camera(&level);
+        self.level_lighting = Some(level_lighting(&level));
+        let mut world = World::new();
+        let mut mesh_registry = MeshRegistry::new();
+        let mut material_registry = MaterialRegistry::new();
+        let mut textures: Vec<Texture> = Vec::new();
+        let (bounds, players) = level::build_level(
+            &self.device,
+            &level,
+            &mut world,
+            &mut mesh_registry,
+            &mut material_registry,
+            &mut textures,
+            Vec3::ZERO,
+            level::content_tex_compress(),
+        )?;
+        dreamcoast_scene::propagate_transforms_parallel(&mut world, dreamcoast_jobs::global());
+        self.world = world;
+        self.mesh_registry = mesh_registry;
+        self.material_registry = material_registry;
+        self._textures = textures;
+        // Swap in the new level's deform players (drops the previous level's).
+        self.vcaches = players;
+        self.current_level = idx;
+        // Re-frame the camera for the new level's native-scale bounds.
+        if let Some((min, max)) = bounds {
+            self.scene_center = (min + max) * 0.5;
+            self.scene_radius = (0.5 * (max - min).length()).max(0.5);
+        }
+        // The sun is per-LEVEL state too: it is the single source the sky, the shadows,
+        // the direct shading, the IBL/GI and the exposure all read (see `App::new`), so a
+        // swap that left it on the previous level's authored sun lit the new geometry from
+        // the wrong direction with the wrong intensity. Same precedence as startup — an
+        // explicit env override always wins, else the level's authored value.
+        if let Some(ll) = &self.level_lighting {
+            let (sun_dir, sun_intensity, sun_color) = (ll.sun_dir, ll.sun_intensity, ll.sun_color);
+            self.sun_dir = parse_vec3_env("SUN_DIR")
+                .map(|v| [v.x, v.y, v.z])
+                .unwrap_or(sun_dir);
+            self.sun_intensity = std::env::var("SUN_LUX")
+                .or_else(|_| std::env::var("SUN_INTENSITY"))
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(sun_intensity)
+                .max(0.0);
+            self.sun_color = parse_vec3_env("SUN_COLOR")
+                .map(|v| [v.x, v.y, v.z])
+                .unwrap_or(sun_color);
+        }
+        self.sky_wb = parse_vec3_env("SKY_WB")
+            .map(|v| [v.x, v.y, v.z])
+            .unwrap_or(level.environment.sky_white_balance);
+        // Re-run the per-level static build (see the doc comment above).
+        self.rebuild_static_scene()?;
+        info!(
+            "hot-swapped to level '{path}' ({} entities) in {:.0} ms",
+            level.entities.len(),
+            t_swap.elapsed().as_secs_f32() * 1000.0
+        );
+        // Respawning the submit worker is deferred past the next `FRAMES_IN_FLIGHT` frames
+        // rather than done here. A swap invalidates every PER-FIF scratch allocation in the
+        // renderer (the virtual-geometry instance/work buffers are the live example: grow-only
+        // per fif, so fif 0 reallocates in this frame and fif 1 in the next one, sized to the
+        // new scene). Creating a GPU resource on the record thread while the worker is
+        // translating a frame breaks the single-owner handoff — on Metal the worker's bindless
+        // residency scan holds a `RefCell` borrow of the storage-buffer slots, and the record
+        // thread's `create_storage_buffer` panics on it (observed: `lanterns` →`sponza_intel`
+        // under `P15_RHI_THREAD=1` with virtual geometry on). Running those few frames on the
+        // inline submit path costs nothing measurable and closes the window deterministically.
+        if rhi_was_threaded {
+            self.rhi_respawn_at = Some(self.frame_no + FRAMES_IN_FLIGHT as u64 + 1);
+        }
+        Ok(())
+    }
+
+    /// Re-run the per-level static-scene bake chain against the world/registries now in
+    /// `self`, in the SAME order `App::new` runs it (`static_scene.rs`), then invalidate
+    /// the one-shot per-scene state the frame loop latches (the GPU bake / capture flags,
+    /// the surface-cache convergence, the virtual-geometry pages).
+    ///
+    /// Callers must have drained the GPU + the submit thread first; `load_level` does.
+    fn rebuild_static_scene(&mut self) -> anyhow::Result<()> {
+        // The tier `base` is re-derived (not stored) so a live RenderQuality change in the
+        // UI applies to the next level exactly as it would to a fresh launch.
+        let base = if self.is_gallery {
+            quality::gallery_preset()
+        } else {
+            quality::preset(self.quality)
+        };
+        // A hot-swap has no loading screen (it is a live frame-loop event), so the cook's
+        // progress sink writes to a throw-away state.
+        let loading_state = std::sync::Arc::new(loading::LoadingState::new());
+        let params = static_scene::StaticSceneParams {
+            gallery_scene: self.is_gallery,
+            // A streamed world never hot-swaps a level (the streamer owns its chunks).
+            world_mode: false,
+            level_view: self.level_view,
+            scene_center: self.scene_center,
+            scene_radius: self.scene_radius,
+            base: &base,
+            loading_state: &loading_state,
+        };
+        let built = static_scene::build_gdf_scene(
+            &self.device,
+            &mut self.gdf,
+            &self.world,
+            &self.mesh_registry,
+            &self.material_registry,
+            &params,
+        )?;
+        self.stream_obj_aabb = built.stream_obj_aabb;
+        self.stream_obj_albedo = built.stream_obj_albedo;
+        static_scene::build_content_accel(
+            &self.device,
+            &mut self.rt,
+            &self.world,
+            &self.mesh_registry,
+            &self.material_registry,
+            &params,
+        );
+        static_scene::install_gi_fine_box(
+            &self.device,
+            &mut self.gi,
+            &self.gdf,
+            self.gi_volume && quality::env_bool("P_GI_VOL_CLIP", true),
+            &params,
+        )?;
+        // Virtual geometry pages are baked per registered mesh, and `page_for` keys on the
+        // `Rc<GpuMesh>` ADDRESS — after the old registry drops, a new mesh can be allocated
+        // at a recycled address and would inherit an unrelated page. So the system is
+        // rebuilt with the pages (never left stale) whenever the mode is on.
+        if self.vgeo_mode > 0 {
+            let (ww, wh) = self.window.size();
+            // Dropping first releases the old pages/visibility buffers before the new ones
+            // allocate (a 20-floor descent must not stack 20 page sets).
+            self.vgeo = None;
+            let mut sink = loading::PhaseSink::new(std::sync::Arc::clone(&loading_state), 0.0, 1.0);
+            match vgeo::VgeoSystem::new(
+                &self.device,
+                self.backend,
+                &self.mesh_registry,
+                Extent2D::new(ww.max(1), wh.max(1)),
+                &app::cooked_cache_dir().join("vgeo"),
+                &mut sink,
+            ) {
+                Ok(v) => self.vgeo = Some(v),
+                Err(e) => info!("P14_VGEO disabled on swap ({e}); using the mesh G-buffer fill"),
+            }
+        }
+        // One-shot per-scene state the frame loop latches: re-arm it for the new field.
+        // (`scene_*_baked` start "done" when the cook supplied the volume, exactly as in
+        // `App::new`; the surface cache must re-capture and its relight must restart.)
+        self.scene_gdf_baked = self.gdf.scene_sdf_is_cooked();
+        self.scene_albedo_baked = self.gdf.scene_albedo_is_cooked();
+        self.scene_cache_captured = false;
+        self.scene_cache_reset = true;
+        self.stream_recapture = false;
+        self.cache_epoch = 0;
+        self.cache_stable_frames = 0;
+        self.cache_frozen = false;
+        self.shadow_epoch = 0;
+        self.shadow_stable_frames = 0;
+        Ok(())
+    }
+
+    /// One iteration of the render loop. Returns `false` when the loop should stop
+    /// (screenshot mode done); `true` to continue (including the skip-this-frame
+    /// cases — zero-size window, failed acquire).
+    fn frame(&mut self) -> anyhow::Result<bool> {
+        let _t_cpu = Instant::now(); // CPU record timer (stored right before present)
+        // Apply a pending level hot-swap requested from the UI last frame.
+        if let Some(idx) = self.pending_level.take() {
+            self.load_level(idx)?;
+        }
+        // A game-requested switch (floor progression, restart). No-op (and
+        // byte-identical) with no hooks installed. Resolution shares the startup
+        // rules, so an explicit path the game just wrote is registered on the spot.
+        if let Some(sel) = self.hooks.as_mut().and_then(|h| h.next_level()) {
+            let idx = level::resolve_selection(&sel, &self.levels_dir, &mut self.level_paths)?;
+            self.load_level(idx)?;
+        }
+        // Deferred post-swap respawn of the submit worker (see `load_level`).
+        if let Some(f) = self.rhi_respawn_at
+            && self.frame_no >= f
+        {
+            self.rhi_respawn_at = None;
+            self.spawn_rhi_thread()?;
+        }
+        // `DIAG_LEVEL_SWAP` (see the field): scripted swaps so a headless capture can
+        // exercise the hot-swap path. Inert unless the env var is set.
+        while let Some(i) = self
+            .swap_script
+            .iter()
+            .position(|(f, _)| *f == self.frame_no)
+        {
+            let (_, sel) = self.swap_script.remove(i);
+            let idx = level::resolve_selection(&sel, &self.levels_dir, &mut self.level_paths)?;
+            self.load_level(idx)?;
+        }
+        // Pump Win32 messages ONCE per frame. A second pump_events here re-ran begin_frame (which
+        // latches frame_start_pos = current cursor pos and clears the wheel) AFTER the first pump had
+        // already drained every WM_MOUSEMOVE — so mouse_delta()/wheel collapsed to 0 every frame and
+        // right-mouse look (and wheel speed) silently did nothing, while held keys (WASD) still worked.
+        self.window.pump_events();
+        if self.window.take_resized() {
+            self.needs_recreate = true;
+        }
+        // The worker flags an out-of-date swapchain (present/acquire) here so the
+        // resize below runs on the record thread (it owns the swapchain after join).
+        if let Some(rhi) = &self.rhi_thread
+            && rhi.take_recreate()
+        {
+            self.needs_recreate = true;
+        }
+        let (ww, wh) = self.window.size();
+        if ww == 0 || wh == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            return Ok(true);
+        }
+        if self.needs_recreate {
+            if self.rhi_thread.is_some() {
+                self.recreate_threaded(ww, wh)?;
+            } else {
+                self.recreate_swapchain(ww, wh)?;
+            }
+        }
+        // DIAG_SCALE_CYCLE harness: drive `render_scale` deterministically (see the
+        // field doc) so the scale-change reclaim can be regression-tested headless. A
+        // triangle sweep 1.0 → 0.34 → 1.0 in 32 steps: every step lands on a distinct
+        // internal extent, mimicking a drag of the UI render-scale slider (a fresh
+        // extent per tick — the case that overflowed the storage-image table). A
+        // coarse repeating ladder would saturate the pool at a few cached sets and
+        // mask the leak.
+        if let Some(period) = self.diag_scale_cycle {
+            const STEPS: u64 = 32;
+            let k = self.frame_no / period % (2 * STEPS);
+            let t = if k <= STEPS { k } else { 2 * STEPS - k } as f32 / STEPS as f32;
+            self.render_scale = (1.0 - 0.66 * t).clamp(0.3333, 1.0);
+        }
+        // Render-scale / RENDER_RES change without a resize: reclaim the pooled
+        // transients before this frame realizes targets at the new extent (same
+        // reclamation as the resize path — see the fn doc).
+        {
+            let e = self.swap_extent();
+            let (cw, ch) = self.render_extent_for(e.width, e.height);
+            self.reclaim_scaled_transients(cw, ch)?;
+        }
+
+        // Wait for this frame slot's previous submission to finish BEFORE the acquire
+        // below. The acquire reuses `image_available[fif]`, and Vulkan forbids
+        // acquiring with a semaphore that still has a pending wait from that earlier
+        // submit (VUID-vkAcquireNextImageKHR-semaphore-01779). This is the standard
+        // frames-in-flight order: wait → reset → acquire → record → submit.
+        //
+        // M4 B3: when the RHI thread owns the swapchain it does wait+acquire itself;
+        // the record half is backbuffer-relative (the IR carries no image index), so
+        // it needs none here. `image_index` is then only used on the inline submit
+        // path (the threaded path ships the IR and lets the worker resolve it).
+        let fif = self.fif;
+        let image_index = if self.rhi_thread.is_some() {
+            0
+        } else {
+            let _t_wait = Instant::now();
+            self.in_flight[fif].wait()?;
+            // Acquire the drawable up front: its *actual* pixel size is the single
+            // source of truth for this whole frame (ImGui display size, camera aspect,
+            // render extent, viewport). A failed acquire skips here, BEFORE the ImGui
+            // frame is started, so NewFrame/Render stay balanced. NOTE: `nextDrawable`
+            // blocks here until the compositor releases a drawable — the 60Hz frame pace
+            // in windowed mode — so fold it into the "wait" so `cpu-record` isolates the
+            // true compute (record minus fence-wait minus this acquire-pacing block).
+            let img = match self
+                .swapchain()
+                .acquire_next_image(&self.image_available[fif])?
+            {
+                Some(i) => i,
+                None => {
+                    self.needs_recreate = true;
+                    return Ok(true);
+                }
+            };
+            LAST_WAIT_US.store(
+                _t_wait.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            img
+        };
+        // The swapchain (display) extent presents the final image; the *render* extent is where
+        // the scene passes run. They are equal by default (byte-identical), but `RENDER_RES`
+        // decouples them so headless can render the scene at QHD/UHD offscreen and the tonemap
+        // downscales to the (display-bound) swapchain backbuffer. QHD/UHD perf track.
+        let (sw, sh) = {
+            let e = self.swap_extent();
+            (e.width, e.height)
+        };
+        let (cw, ch) = self.render_extent_for(sw, sh);
+        // HZB (PR-8): the Hi-Z pyramid must match the scene-depth (render) extent. Rebuild
+        // it here if the render extent changed (RENDER_RES / render_scale / window resize).
+        // `device` and `hzb` are disjoint fields, so borrow them independently.
+        if self.hzb_cull {
+            let App { device, hzb, .. } = self;
+            if let Some(hzb) = hzb {
+                hzb.resize(device, Extent2D::new(cw, ch))?;
+            }
+        }
+        // QHD/UHD track: TAAU is active when the scene renders below the output resolution (upscale)
+        // and isn't a path-trace/debug capture. It jitters the camera + reconstructs full-res from
+        // history. When render == output (default), it's inactive (byte-identical).
+        // TAAU runs when the scene renders below the output (upscale), or — with P_TAAU_FORCE — at
+        // native (internal == output) as plain temporal AA (jitter + accumulation, no upscale).
+        let taau_active = self.taau_on
+            && self.taau.has_taau()
+            && cw <= sw
+            && ch <= sh
+            && (cw < sw || ch < sh || self.taau_force);
+        // One-time readout of the resolved resolution path so it's obvious at a glance what the
+        // scene is actually rendering at vs the output (and whether TAAU upscaling is even on).
+        if self.frame_no == 0 {
+            let pct = if sw > 0 {
+                100.0 * cw as f32 / sw as f32
+            } else {
+                100.0
+            };
+            info!(
+                "render: internal {}x{} -> output {}x{} ({:.1}% scale, {}x area), TAAU={}, jitter={}",
+                cw,
+                ch,
+                sw,
+                sh,
+                pct,
+                if cw > 0 {
+                    (sw as f32 / cw as f32).powi(2)
+                } else {
+                    1.0
+                },
+                if taau_active { "on" } else { "off (native)" },
+                if taau_active && self.taau_jitter {
+                    "on"
+                } else {
+                    "off"
+                },
+            );
+        }
+        // When TAAU runs with sub-pixel jitter, the jitter IS the anti-aliasing (super-sampling
+        // reconstruction); the spatial FXAA pre-pass then only blurs and — because it smooths each
+        // jittered frame's edges differently — adds temporal variance, so it is skipped in the
+        // jitter path. The non-jittered upscale (no temporal reconstruction) keeps FXAA to soften
+        // the bilinear aliasing.
+        let taau_jitter_active = taau_active && self.taau_jitter;
+        // B2: when the camera is sub-pixel jittered, the screen-space temporal passes (GI denoiser,
+        // reflection resolve) must reproject history with sub-pixel (bilinear) accuracy or the
+        // jitter blurs/destabilizes their accumulation. bit1 of the flip word selects that path in
+        // gdf_temporal/reflect_temporal; cleared (no jitter) = integer-floor fetch = byte-identical
+        // to the legacy path. Computed once here, applied at both call sites.
+        // bit2 (content only): the reflection temporal resolve reprojects the VIRTUAL IMAGE (the
+        // reflected point at the hit distance) instead of the surface, so a mirror reflection stays
+        // stable under camera motion instead of swimming. Gallery keeps the surface reproject
+        // (byte-identical). Applied only to near-mirrors in-shader (sr == 0).
+        let temporal_flip = self.flip_y
+            | if taau_jitter_active { 2 } else { 0 }
+            | if self.is_gallery { 0 } else { 4 };
+
+        let now = Instant::now();
+        let dt = (now - self.last).as_secs_f32();
+        self.last = now;
+        LAST_FRAME_US.store((dt * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
+
+        // --- Fixed-timestep simulation (M2) ---------------------------------------
+        // The sim advances in whole `FIXED_DT` steps so motion is framerate-
+        // independent and deterministic given the same dt sequence; the renderer
+        // interpolates between the previous and current sim state by `render_alpha`.
+        // **Headless capture is byte-identical by construction**: it is already
+        // frame-counted and deterministic, so it bypasses the accumulator entirely
+        // and keeps the exact legacy per-frame advance (fixed angle, real-dt
+        // `elapsed`, CAPTURE_SEQ step).
+        const FIXED_DT: f32 = 1.0 / 60.0;
+        const MAX_STEPS: u32 = 5; // backlog cap — avoids the spiral of death after a stall
+        // One input capture per frame (the window pumps once), so every fixed step of
+        // this frame sees identical state and an edge is reported by exactly one step.
+        // Only taken when a game is installed — the stock sandbox never touches it.
+        let game_input = self
+            .hooks
+            .is_some()
+            .then(|| dreamcoast_platform::InputSnapshot::capture(self.window.input()));
+        self.prev_angle = self.angle;
+        let render_alpha: f32;
+        let sim_dt; // step length handed to per-frame GPU sim (particles)
+        if self.screenshot_mode {
+            // Unchanged legacy capture path (see above).
+            self.elapsed += dt;
+            sim_dt = dt.clamp(0.0, 1.0 / 30.0);
+            render_alpha = 1.0;
+            if self.capture_seq.is_some() {
+                // CAPTURE_SEQ: advance the camera a fixed deterministic step per frame so the
+                // dumped sequence exercises the temporal passes under motion (stability diff).
+                // `CAPTURE_SEQ_STEP` (radians/frame, default 0.015) tunes it; 0 = static (a
+                // shimmer/convergence test — the sequence should diff to ~0 when stable).
+                let step = std::env::var("CAPTURE_SEQ_STEP")
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(0.015);
+                self.angle += step;
+                // Advance animated objects one deterministic step per captured frame
+                // so a CAPTURE_SEQ dump shows (reproducible) object motion, not just
+                // camera motion. No-op when no entity carries `Spin` / `AnimationPlayer`.
+                dreamcoast_scene::advance_spin(&mut self.world, FIXED_DT);
+                dreamcoast_scene::advance_animation(&mut self.world, FIXED_DT);
+                // The capture path's deterministic sim step: one game step per captured
+                // frame, so a CAPTURE_SEQ dump of a game scene advances reproducibly.
+                // No-op (and byte-identical) with no hooks installed.
+                if let (Some(h), Some(input)) = (self.hooks.as_mut(), game_input.as_ref()) {
+                    h.fixed_update(&mut self.world, input, FIXED_DT);
+                }
+            }
+            self.prev_angle = self.angle; // no interpolation when capturing
+        } else {
+            self.sim_accumulator += dt;
+            let mut steps = 0u32;
+            while self.sim_accumulator >= FIXED_DT && steps < MAX_STEPS {
+                self.sim_accumulator -= FIXED_DT;
+                steps += 1;
+                self.elapsed += FIXED_DT;
+                self.angle += FIXED_DT * 0.6;
+                // Animated objects advance one fixed step (framerate-independent,
+                // deterministic). No-op when nothing carries `Spin` / `AnimationPlayer`.
+                dreamcoast_scene::advance_spin(&mut self.world, FIXED_DT);
+                dreamcoast_scene::advance_animation(&mut self.world, FIXED_DT);
+                // Game simulation step (M0 seam): runs after the built-in advances and
+                // before this frame's transform propagation, so writes to
+                // `LocalTransform` land in the draw list built below. No-op (and
+                // byte-identical) with no hooks installed.
+                if let (Some(h), Some(input)) = (self.hooks.as_mut(), game_input.as_ref()) {
+                    h.fixed_update(&mut self.world, input, FIXED_DT);
+                }
+            }
+            if steps == MAX_STEPS {
+                // Stalled longer than the cap: drop the backlog rather than chasing it.
+                self.sim_accumulator = 0.0;
+            }
+            render_alpha = self.sim_accumulator / FIXED_DT;
+            // Particles step by the sim time actually consumed this frame (0 when no
+            // whole step elapsed → they hold still, the correct fixed-step behavior).
+            sim_dt = steps as f32 * FIXED_DT;
+        }
+        // Rendered orbit angle interpolates between the last and current sim step.
+        let render_angle = self.prev_angle + (self.angle - self.prev_angle) * render_alpha;
+
+        // Stage 0: Tab toggles the free-fly camera (interactive only — never during a
+        // headless capture, so the parity baseline stays the fixed orbit). Re-seed the
+        // fly camera from the current orbit view each time it is entered.
+        if !self.screenshot_mode {
+            let tab = self.window.input().key_down(VK_TAB);
+            if tab && !self.tab_prev {
+                self.cam_mode = match self.cam_mode {
+                    camera::CameraMode::Orbit => camera::CameraMode::Fly,
+                    camera::CameraMode::Fly => camera::CameraMode::Orbit,
+                };
+                if self.cam_mode == camera::CameraMode::Fly {
+                    self.fly = None; // force re-seed from the orbit view below
+                }
+            }
+            self.tab_prev = tab;
+            // Pointer lock: capture the cursor while flying so the free look never stops at a
+            // screen edge (raw deltas keep flowing). Two release paths: HOLD Option/Alt for a
+            // momentary peek, or TAP M to LATCH the release — working the settings UI (mode
+            // radios, sliders) needs a persistent cursor without holding a chord. The look
+            // pauses while released (`look_enabled` keys off the capture below).
+            let m = self.window.input().key_down(VK_M);
+            if m && !self.m_prev {
+                self.cursor_released = !self.cursor_released;
+            }
+            self.m_prev = m;
+            let alt_ui = self.window.input().key_down(0x12); // VK_MENU
+            let capture =
+                self.cam_mode == camera::CameraMode::Fly && !alt_ui && !self.cursor_released;
+            self.window.set_cursor_captured(capture);
+        }
+
+        // Path-trace + GI-denoise screenshots need a long warmup so the static-camera
+        // accumulation converges before the frame is captured.
+        let warmup = if self.path_trace && !self.rt_debug {
+            PATHTRACE_WARMUP
+        } else if (self.gdf_gi && self.gi_denoise && self.gi.has_denoise())
+            || self.cache_viz
+            || self.surface_cache
+            || self.reflect_cache
+            || taau_active
+            || self.gi_volume
+            || self.auto_exposure
+            || self.wrc
+            || self.wrc_viz
+            || (self.swrt_reflect && self.reflect.has_reflect_temporal())
+        {
+            // The surface cache / stochastic GGX reflection accrue a sample per frame + temporally
+            // accumulate, like the GI denoiser — warm them up before the static screenshot.
+            GI_DENOISE_WARMUP
+        } else {
+            SCREENSHOT_WARMUP
+        };
+        // `WARMUP_FRAMES=<n>` overrides the headless warmup — e.g. to let an amortized cache
+        // (surface-cache re-light) fully converge before the capture.
+        let warmup = std::env::var("WARMUP_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(warmup);
+
+        // Decide whether this frame produces a screenshot: a scheduled capture in
+        // screenshot mode (after warmup), or an F2 rising edge interactively.
+        let f2 = self.window.input().key_down(VK_F2);
+        let f2_pressed = f2 && !self.f2_prev;
+        self.f2_prev = f2;
+        let capture_this_frame: Option<Capture> = if self.screenshot_mode {
+            match self.capture_seq {
+                // CAPTURE_SEQ: frames [warmup, warmup+N) each dump to `<path>.NNNN.png`.
+                Some(n) => self
+                    .frame_no
+                    .checked_sub(warmup)
+                    .filter(|&i| i < n as u64)
+                    .map(|i| Capture {
+                        path: seq_capture_path(&self.captures[0].path, i),
+                        include_ui: self.captures[0].include_ui,
+                    }),
+                None => self
+                    .frame_no
+                    .checked_sub(warmup)
+                    .and_then(|i| self.captures.get(i as usize).cloned()),
+            }
+        } else if f2_pressed {
+            Some(Capture {
+                path: interactive_screenshot_path(),
+                include_ui: true,
+            })
+        } else {
+            None
+        };
+        let include_ui = capture_this_frame
+            .as_ref()
+            .map(|c| c.include_ui)
+            .unwrap_or(true);
+
+        // Game presentation pass (M1 seam): once per rendered frame, after the fixed
+        // steps and before propagation, so a game can write the *interpolated* visual
+        // pose its `camera` hook is already using — closing the sub-step lag between a
+        // character mesh (last simulated pose) and the camera following it. Visual-only
+        // by contract (see `GameHooks::render_update`). No-op (and byte-identical) with
+        // no hooks installed, and inert in capture mode where `render_alpha` is 1.0.
+        if let Some(h) = self.hooks.as_mut() {
+            h.render_update(&mut self.world, render_alpha);
+        }
+
+        // Re-derive world transforms from the (possibly just-animated) locals via the
+        // parallel ECS pass, then materialize the draw list. For a static scene this
+        // recomputes identical matrices (byte-identical), so the gallery baseline is
+        // unaffected; for animated objects it pushes their new pose to the draw list.
+        // World/streaming mode keeps its own path (the world is empty here).
+        let mut scene = if self.streaming.is_some() {
+            Vec::new()
+        } else {
+            dreamcoast_scene::propagate_transforms_parallel(
+                &mut self.world,
+                dreamcoast_jobs::global(),
+            );
+            build_scene(&self.world, &self.mesh_registry, &self.material_registry)
+        };
+
+        // Velocity (PR-2) single prev-pose source: seed each drawable's previous transform from
+        // last frame's stored transforms (same stable draw-list order). A newly-appeared drawable
+        // (or first frame) has no history → default (identity + current), i.e. zero object motion.
+        // Skinning / morph overwrite their entries with the prev palette / weights below. Built
+        // only when velocity is on (else an empty vec — no per-frame cost on the default path).
+        let mut prev_scene: Vec<velocity::PrevPose> = if self.velocity_on {
+            scene
+                .iter()
+                .enumerate()
+                .map(|(i, obj)| velocity::PrevPose {
+                    transform: self
+                        .prev_transforms
+                        .get(i)
+                        .copied()
+                        .unwrap_or(obj.transform),
+                    skin_palette: 0,
+                    morph_weights: 0,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Animation Stage B: CPU-skin the skinned primitives and swap each skinned
+        // drawable to this frame-in-flight's vertex buffer. Inline path only — the
+        // per-frame vertex write relies on this slot's fence having been waited at
+        // frame start (the RHI thread defers that wait; skinning + P15_RHI_THREAD is
+        // not supported in B.1).
+        if !self.skinned.is_empty() && self.rhi_thread.is_none() {
+            skin::update_palettes(&mut self.skinned, &self.world, fif)?;
+            skin::patch_scene(&self.skinned, &mut scene, &mut prev_scene, fif);
+        }
+        // Baked vertex-cache playback: rewrite THIS frame-in-flight's ring buffer to the
+        // current frame and swap each drawable to it (double-buffered, real-time-safe).
+        // Like skinning it relies on this slot's frame-start fence wait, so it's inline-path
+        // only (not P15_RHI_THREAD). Independent of `skinned`.
+        if self.rhi_thread.is_none() {
+            for vc in self.vcaches.iter_mut() {
+                vc.update(fif, FIXED_DT)?;
+                vc.patch_scene(&mut scene, fif);
+            }
+        }
+        // Animation Stage C: blend morph targets (GPU = write the per-frame weights
+        // buffer; CPU = re-blend the vertex ring) + patch this frame's drawables. Inline
+        // path only (the per-frame storage/vertex write relies on the frame-start fence).
+        if !self.morphed.is_empty() && self.rhi_thread.is_none() {
+            morph::apply_morph(&mut self.morphed, &self.world, fif)?;
+            morph::patch_scene(&self.morphed, &mut scene, &mut prev_scene, fif);
+        }
+
+        // Game camera hook (M0 seam): resolved once, here, so the built-in cameras can be
+        // skipped entirely when it takes over. `None` (no hooks, or a hook that declines
+        // this frame) leaves every branch below exactly as it was. The pose is applied
+        // AFTER the orbit/fly resolve and BEFORE the headless `CAM_EYE*` diagnostics, which
+        // therefore still override it for a capture.
+        let hook_pose: Option<CameraPose> = self
+            .hooks
+            .as_mut()
+            .and_then(|h| h.camera(render_alpha))
+            .filter(|p| p.position.is_finite() && p.forward() != Vec3::ZERO);
+        // Vertical FOV for this frame's primary view. The hook may override it; unset
+        // keeps the 60° the scene projection, the view descriptor, the shadow-cascade fit
+        // and the SSAO projection scale have always used (one value, four consumers).
+        let fov_y_rad = hook_pose
+            .and_then(|p| p.fov_y_radians)
+            .unwrap_or(60f32.to_radians());
+
+        // Orbiting camera framing the whole sample scene — or, in single-object
+        // diagnostic mode, a tight orbit centred on one scene object so it can be
+        // inspected from every side (azimuth = self.angle, elevation = diag_pitch).
+        let (focus, eye) = if let Some(oi) = self.diag_obj.filter(|&i| i < scene.len()) {
+            let center = scene[oi].transform.w_axis.truncate();
+            let radius = scene[oi].transform.x_axis.truncate().length(); // uniform scale
+            let dist = radius * 4.5;
+            let pitch = self.diag_pitch.unwrap_or(0.18); // slight elevation by default
+            let (sp, cp) = (pitch.sin(), pitch.cos());
+            let eye =
+                center + dist * Vec3::new(cp * render_angle.cos(), sp, cp * render_angle.sin());
+            (center, eye)
+        } else if let Some((eye, target)) = self.level_view {
+            // A level's authored camera (e.g. the Sponza demo angle). Headless captures
+            // hold it fixed (the byte-identical parity baseline); interactively, orbit it
+            // around the level focus so the scene can be inspected from any side. Seeded
+            // from the authored camera so `self.angle == 0` reproduces it exactly (no jump
+            // on launch), then the per-frame `self.angle += dt*0.6` spins it. Tab still
+            // switches to the free-fly camera (seeded from this resolved pose) below.
+            if self.screenshot_mode {
+                (target, eye)
+            } else {
+                let offset = eye - target;
+                let rh = (offset.x * offset.x + offset.z * offset.z).sqrt();
+                let base = offset.z.atan2(offset.x);
+                let a = base + render_angle;
+                (
+                    target,
+                    target + Vec3::new(rh * a.cos(), offset.y, rh * a.sin()),
+                )
+            }
+        } else {
+            let focus = self.scene_center;
+            let dist = self.scene_radius * 1.6;
+            let eye = focus
+                + Vec3::new(
+                    render_angle.cos() * dist,
+                    self.scene_radius * 0.55,
+                    render_angle.sin() * dist,
+                );
+            (focus, eye)
+        };
+        // Stage 0: in fly mode, override the orbit framing with the free camera. Seed
+        // it from the orbit view on first entry so the switch is seamless. Headless
+        // captures stay in Orbit for the gallery baseline; world mode (Stage D) is the
+        // exception — it flies even headless (static at `WORLD_CAM`) so streaming can be
+        // positioned and captured.
+        // A game camera hook supersedes the fly camera for the frame (and skips its input
+        // handling, so the game owns the mouse/WASD it is reading itself).
+        let fly_active = self.cam_mode == camera::CameraMode::Fly
+            && (!self.screenshot_mode || self.streaming.is_some())
+            && hook_pose.is_none();
+        let (focus, eye) = if fly_active {
+            // Base speed ~walking pace for a scene of this size (Sponza radius ~24 m ->
+            // ~3.5 m/s; Shift sprints 4x, wheel adjusts). The old 0.8x seed moved ~19 m/s
+            // indoors — unusable for close inspection.
+            let seed_speed = self.scene_radius * 0.15;
+            // Free look on plain mouse move. While the pointer is captured the UI can't be
+            // hovered (the cursor is frozen), so look is unconditional; un-captured (Option/Alt
+            // held for UI, or platforms without the lock) it defers to ImGui's mouse claim.
+            // The M latch is a full UI mode: no look at all while released (otherwise the view
+            // would still spin whenever the pointer strays off the settings window).
+            let look_enabled = (self.window.input().captured() || !self.gui.want_capture_mouse())
+                && !self.cursor_released;
+            let fly = self
+                .fly
+                .get_or_insert_with(|| camera::FlyCamera::from_look(eye, focus, seed_speed));
+            if !self.screenshot_mode {
+                fly.update(self.window.input(), dt, look_enabled);
+            }
+            (fly.focus(), fly.position)
+        } else {
+            (focus, eye)
+        };
+        // Apply the game camera pose (resolved above). Everything downstream — streaming,
+        // the surface-cache card camera, the view/projection matrices, and the end-of-frame
+        // `prev_view_proj*` latch that motion vectors and the TAAU/denoiser history
+        // reproject through — derives from this single `(focus, eye)`, so an overridden
+        // camera stays temporally consistent with no extra bookkeeping.
+        let (focus, eye) = match hook_pose {
+            Some(p) => (p.focus(), p.position),
+            None => (focus, eye),
+        };
+        // Diagnostic camera override: `CAM_EYE="x,y,z"` (+ optional `CAM_TARGET`) places
+        // the camera at a fixed pose for headless inspection of any scene (e.g. flying
+        // inside an imported environment like Sponza). Applies before streaming so it
+        // can also drive chunk loading. F4B motion metrology: `CAM_EYE_END="x,y,z"` (opt-in)
+        // lerps the eye CAM_EYE -> CAM_EYE_END across the CAPTURE_SEQ window — a deterministic
+        // (frame-counted) translation that can drive the fine-box recentering in a headless
+        // capture, which no other headless path can (the fly camera is disabled in screenshot
+        // mode and CAM_EYE alone is static). Unset = the exact legacy static pose.
+        let (focus, eye) = match (parse_vec3_env("CAM_EYE"), parse_vec3_env("CAM_TARGET")) {
+            (Some(e), Some(t)) => (t, e),
+            (Some(e), None) => (focus, e),
+            _ => (focus, eye),
+        };
+        let eye = match (
+            parse_vec3_env("CAM_EYE"),
+            parse_vec3_env("CAM_EYE_END"),
+            self.capture_seq,
+        ) {
+            (Some(e0), Some(e1), Some(n)) if self.screenshot_mode && n > 1 => {
+                // `warmup` is the headless warmup resolved above — the camera sits at CAM_EYE
+                // through it (stable AE/history), then translates across the capture window.
+                let t =
+                    (self.frame_no.saturating_sub(warmup) as f32 / (n - 1) as f32).clamp(0.0, 1.0);
+                e0.lerp(e1, t)
+            }
+            _ => eye,
+        };
+
+        // Stage D: stream chunks in/out around the camera, then rebuild the draw list
+        // from the resident chunks (each chunk's transforms already include its origin).
+        if let Some(streaming) = &mut self.streaming {
+            if streaming.update(&self.device, eye)? {
+                info!(
+                    "streaming: resident chunks {:?}",
+                    streaming.loaded_indices()
+                );
+            }
+            scene = streaming.build_scene();
+        }
+        // F1 Stage 3 — page-pool streaming: re-own the fixed card slots from the LIVE camera so the
+        // surface cache follows the view (a drawable the camera approaches gets a card; one it leaves
+        // frees its slot). A change flags a dirty re-capture below. Content streaming only (the
+        // directory is empty otherwise); in screenshot mode the camera is fixed, so the residency is
+        // static and this is a no-op (byte-identical) unless a CAPTURE_SEQ / fly path moves it.
+        self.stream_recapture = false;
+        if !self.stream_obj_aabb.is_empty() {
+            let card_cam = fuse::CardCamera::from_look(eye, focus);
+            self.stream_recapture = self.gdf.stream_residency(
+                &self.stream_obj_aabb,
+                &self.stream_obj_albedo,
+                &card_cam,
+            )?;
+        }
+        let view = Mat4::look_at_rh(eye, focus, Vec3::Y);
+        let proj_noflip = Mat4::perspective_rh(
+            fov_y_rad,
+            cw as f32 / ch as f32,
+            CLUSTER_Z_NEAR,
+            CLUSTER_Z_FAR,
+        );
+        let mut proj = proj_noflip;
+        if self.backend == BackendKind::Vulkan {
+            proj.y_axis.y *= -1.0; // Vulkan clip-space Y points down
+        }
+        // The unjittered (but Y-flipped) view-proj — the stable grid the TAAU history lives on.
+        let view_proj_stable = proj * view;
+        // B1 (CONVERGE): bit-exact static camera this frame — the unjittered view-proj matches
+        // last frame's. Compared pre-jitter so TAAU sub-pixel jitter still counts as static (the
+        // temporal accumulators reproject it away); any real move/rotate breaks equality.
+        let camera_static =
+            self.frame_no > 0 && view_proj_stable.to_cols_array() == self.prev_view_proj_taau;
+        // QHD/UHD TAAU: sub-pixel camera jitter (Halton(2,3)) so successive low-res frames sample
+        // different sub-pixel positions; the TAAU history reconstructs full-res detail from them.
+        // Applied to the scene projection only (cull_view_proj stays unjittered = stable culling);
+        // the GI/reflect denoisers reproject in world space, so the consistent jitter cancels.
+        let mut taau_jitter_uv = [0.0f32, 0.0f32];
+        if taau_active && self.taau_jitter {
+            let j = ((self.frame_no % TAAU_JITTER_LEN) + 1) as u32;
+            let jx = (halton(j, 2) - 0.5) * 2.0 / cw as f32; // NDC offset (±1 px in internal res)
+            let jy = (halton(j, 3) - 0.5) * 2.0 / ch as f32;
+            // clip.xy += offset * clip.w  ⇒  row0/row1 += offset * row3 (row3 = (0,0,-1,0) RH).
+            // Negate Y on Vulkan so the screen-space jitter direction matches D3D12 (DX≡VK).
+            let sy = if self.backend == BackendKind::Vulkan {
+                -1.0
+            } else {
+                1.0
+            };
+            proj.z_axis.x -= jx;
+            proj.z_axis.y -= jy * sy;
+            // UV-space shift the jitter gives the on-screen content, so the TAAU can sample the
+            // internal frame at `uv + jitter_uv` to fetch the content that landed on the stable
+            // output pixel. Working it through both conventions (jitter NDC shift -> rendered
+            // screen UV -> the shader's reconstruct() UV->NDC, which uses sy = flip_y?1:-1):
+            //   Δuv.x = +jx/2,  Δuv.y = -jy/2   — identical on D3D12 AND Vulkan (the two Y flips
+            // cancel to a single net negation). The previous +jy/2 left a ~1px vertical
+            // reprojection error, so the history fetch missed and the jitter degraded to shimmer.
+            taau_jitter_uv = [jx * 0.5, -jy * 0.5];
+        }
+        let view_proj = proj * view;
+        // Frustum culling uses the Y-flip-free matrix so the visible set (and the
+        // indirect draw count) is identical on both backends.
+        let cull_view_proj = proj_noflip * view;
+        // Camera basis in world space (for billboarding the GPU particles).
+        let inv_view = view.inverse();
+        let cam_right = inv_view.x_axis.truncate();
+        let cam_up = inv_view.y_axis.truncate();
+        // For reconstructing background view rays (skybox) in the lighting pass.
+        let inv_view_proj = view_proj.inverse().to_cols_array();
+
+        // PR-9 view family: the PRIMARY view descriptor. It captures the same view-dependent
+        // camera math the passes below consume (the passes still read the individual locals for
+        // the byte-identical baseline; the descriptor is the structural single-source that the
+        // second view mirrors). `full()` = the complete feature set = the legacy single-view path.
+        // Jitter/stable/prev matrices are folded in so `primary_view` documents the whole
+        // per-view temporal state in one place.
+        let mut primary_view = view::SceneView::build(
+            0,
+            eye,
+            focus,
+            cw as f32 / ch as f32,
+            fov_y_rad,
+            CLUSTER_Z_NEAR,
+            CLUSTER_Z_FAR,
+            self.backend,
+            (fif as u64 * MAX_VIEWS) * GLOBALS_SLICE,
+            self.prev_view_proj,
+            view::SceneViewFeatures::full(),
+        );
+        // Fold this frame's jittered view-projection + jitter UV into the descriptor (the primary
+        // view is the one that carries TAAU sub-pixel jitter; the secondary view has none).
+        primary_view.view_proj = view_proj;
+        primary_view.jitter_uv = taau_jitter_uv;
+        debug_assert_eq!(
+            primary_view.globals_offset,
+            (fif as u64 * MAX_VIEWS) * GLOBALS_SLICE
+        );
+        debug_assert!(primary_view.features.taau && primary_view.features.post);
+
+        // Skip the whole ImGui frame (NewFrame/Render must stay balanced) when
+        // capturing a clean screenshot.
+        if include_ui {
+            let validation_on = self.validation_on;
+            let backend = self.backend;
+            let path_spp = self.path_spp;
+            // ImGui's display size, mouse hit-testing and clip rects all live in WINDOW
+            // (backbuffer) pixels — the UI pass renders into the swapchain backbuffer
+            // `(sw,sh)`, and `input.mouse_position()` returns client-area pixels in that
+            // same space. With an internal render scale `(cw,ch)` decoupled from the
+            // window, using the internal extent here stretched the UI vertices to the
+            // backbuffer while leaving the mouse + scissor in the smaller space — widgets
+            // were clipped away when dragged and the hit-test was off. Always feed the
+            // output extent so all three agree (cw==sw on the default path = unchanged).
+            let ui = self
+                .gui
+                .new_frame(dt, [sw as f32, sh as f32], self.window.input());
+            let has_auto_exposure = self.deferred.exposure_buf_index().is_some();
+            let App {
+                gdf,
+                gi,
+                reflect,
+                rt,
+                debug_view,
+                sun_dir,
+                sun_intensity,
+                ambient,
+                exposure,
+                auto_exposure,
+                point_lights_on,
+                shadows_on,
+                shadow_bias,
+                shadow_softness,
+                shadow_taps,
+                quality,
+                override_material,
+                metallic_override,
+                roughness_override,
+                realtime_env,
+                time_of_day,
+                multibounce,
+                legacy_ibl,
+                post_mode,
+                aliasing,
+                bloom_on,
+                motion_blur_on,
+                dof_on,
+                grade_on,
+                particles_on,
+                async_compute_on,
+                gpu_cull,
+                hzb_cull,
+                hzb_stats,
+                path_trace,
+                rt_debug,
+                cornell,
+                path_trace_pipeline,
+                sdf_trace,
+                volume_test,
+                sdf_bake,
+                sdf_bake_done,
+                gdf_merge,
+                gdf_merge_done,
+                gdf_trace,
+                scene_gdf,
+                gdf_ao,
+                gdf_gi,
+                gi_spp,
+                gi_max_steps,
+                cache_relight_period,
+                cache_relight_spp,
+                gi_half_res,
+                gi_res_div,
+                reflect_history_clamp,
+                reflect_clamp_gamma,
+                gi_temporal_clamp,
+                gi_denoise,
+                reflect_max_steps,
+                reflect_res_div,
+                reflect_half_res,
+                reflect_mode,
+                reflect_hw_ready,
+                hwrt_hitlighting,
+                hwrt_fullres,
+                ao_res_div,
+                gi_atrous_steps,
+                gdf_cone_k,
+                render_scale,
+                gdf_ssr,
+                gdf_reflect,
+                gdf_hybrid,
+                swrt_reflect,
+                gdf_color,
+                cache_viz,
+                surface_cache,
+                reflect_cache,
+                firefly_clamp,
+                reflect_max_roughness,
+                ssr_stochastic,
+                reflect_stochastic,
+                reflect_prefilter,
+                reflect_glossy_spp,
+                reflect_screen_hit,
+                profiler_on,
+                gpu_timings,
+                async_compute_supported,
+                level_paths,
+                current_level,
+                pending_level,
+                streaming,
+                is_gallery,
+                ..
+            } = self;
+            let async_compute_supported = *async_compute_supported;
+            ui.window("DreamCoast")
+                .size([320.0, 320.0], imgui::Condition::FirstUseEver)
+                .build(|| {
+                    ui.text(format!("backend: {backend:?}"));
+                    ui.text(format!(
+                        "{:.1} FPS ({:.2} ms)",
+                        1.0 / dt.max(1e-4),
+                        dt * 1000.0
+                    ));
+                    // Keep the input bindings discoverable — the fly camera captures the mouse,
+                    // so the M latch is how you reach this window's widgets at all.
+                    ui.text_disabled("Tab: fly/orbit | M: mouse lock toggle | Alt: hold-release");
+                    ui.text(format!(
+                        "CAM_EYE={:.2},{:.2},{:.2} CAM_TARGET={:.2},{:.2},{:.2}",
+                        eye.x, eye.y, eye.z, focus.x, focus.y, focus.z
+                    ));
+                    ui.text(format!("scene: {} objects + ground", scene.len()));
+                    // Stage D: streaming chunk readout (world mode). Fly (WASD) across the
+                    // chunk row to stream them in/out.
+                    if let Some(s) = streaming.as_ref() {
+                        let loaded = s.loaded_indices();
+                        ui.text(format!(
+                            "world: {}/{} chunks (r={:.0})",
+                            loaded.len(),
+                            s.chunk_count(),
+                            s.stream_radius()
+                        ));
+                        let names: Vec<&str> = loaded.iter().map(|&i| s.chunk_name(i)).collect();
+                        ui.text(format!("  loaded: [{}]", names.join(", ")));
+                    }
+                    // Stage C: level hot-swap dropdown (level mode only). Selecting a level
+                    // requests a rebuild applied at the next frame's start (deferred so the
+                    // GPU can idle first). The file names (stems) label the entries.
+                    if !level_paths.is_empty() {
+                        let names: Vec<&str> = level_paths
+                            .iter()
+                            .map(|p| {
+                                std::path::Path::new(p)
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or(p)
+                            })
+                            .collect();
+                        let mut sel = *current_level;
+                        if ui.combo_simple_string("level", &mut sel, &names)
+                            && sel != *current_level
+                        {
+                            *pending_level = Some(sel);
+                        }
+                    }
+                    // RenderQuality tier (Stage D): switching re-applies the preset to the live
+                    // knobs below (capability-gated). A manual pick supersedes any startup env
+                    // override — the env seam only seeds the initial state. The graph is rebuilt
+                    // every frame, so the new tier takes effect immediately.
+                    // The `apple` platform tier is auto-selected on Apple GPUs (not via env); it is
+                    // listed here so the live tier displays correctly and a manual re-pick works.
+                    let mut tier_idx = match *quality {
+                        quality::RenderQuality::Low => 0usize,
+                        quality::RenderQuality::Med => 1,
+                        quality::RenderQuality::High => 2,
+                        quality::RenderQuality::Apple => 3,
+                    };
+                    if ui.combo_simple_string(
+                        "RenderQuality",
+                        &mut tier_idx,
+                        &["low", "med", "high", "apple"],
+                    ) {
+                        let nq = [
+                            quality::RenderQuality::Low,
+                            quality::RenderQuality::Med,
+                            quality::RenderQuality::High,
+                            quality::RenderQuality::Apple,
+                        ][tier_idx];
+                        *quality = nq;
+                        // Re-derive each knob from the SAME base the construction path uses: the
+                        // gallery resolves against the fixed legacy `gallery_preset()`, content
+                        // against the tier — so the gallery-lock is structural (no scattered
+                        // `if *is_gallery` here) and the two resolution paths can never drift.
+                        // Capability gates stay so a tier can't enable a feature the device lacks.
+                        let base = if *is_gallery {
+                            quality::gallery_preset()
+                        } else {
+                            quality::preset(nq)
+                        };
+                        *gi_spp = base.gi_spp.clamp(1, 256);
+                        *cache_relight_period = base.cache_relight_period.max(1);
+                        *gi_half_res = gi.has_upsample() && base.gi_half_res;
+                        *gi_res_div = base.gi_res_div.clamp(1, 16);
+                        *reflect_history_clamp = base.reflect_history_clamp.min(2);
+                        *reflect_clamp_gamma = base.reflect_clamp_gamma;
+                        *gi_temporal_clamp = base.gi_temporal_clamp;
+                        *gi_denoise = gi.has_denoise() && base.gi_denoise;
+                        *reflect_cache = *swrt_reflect
+                            && gdf.has_surface_cache()
+                            && gdf.has_cache_lighting()
+                            && base.reflect_cache;
+                        *surface_cache = gdf.has_surface_cache()
+                            && gdf.has_cache_lighting()
+                            && base.surface_cache;
+                        *ssr_stochastic = base.ssr_stochastic;
+                        *reflect_max_roughness = base.reflect_max_roughness;
+                        *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && base.gdf_ao;
+                        *firefly_clamp = base.firefly_clamp;
+                        *shadow_softness = base.shadow_softness;
+                        *shadow_taps = base.shadow_taps.clamp(1, 16);
+                        // Reflection-quality v2 per-frame knobs (the load-time cache knobs —
+                        // grid / adaptive res / mesh capture — are fixed at level build). The
+                        // record paths carry their own capability gates (pipeline presence,
+                        // lit-history sentinel), so a tier can't enable what the device lacks.
+                        *reflect_stochastic = base.reflect_stochastic;
+                        *reflect_prefilter = base.reflect_prefilter;
+                        *reflect_glossy_spp = base.reflect_glossy_spp.clamp(1, 32);
+                        *reflect_screen_hit = base.reflect_screen_hit;
+                    }
+                    ui.text(format!(
+                        "validation: {}",
+                        if validation_on { "on" } else { "off" }
+                    ));
+                    ui.separator();
+
+                    // Sample browser: each technique group is a collapsing section,
+                    // so the sandbox reads as a catalog of techniques rather than a
+                    // flat wall of toggles. Core groups default open.
+                    use imgui::TreeNodeFlags;
+                    let open = TreeNodeFlags::DEFAULT_OPEN;
+
+                    // Live scalability panel (docs/scalability-system.md): the individual knobs the
+                    // RenderQuality tier resolves, exposed as live sliders/toggles. The render graph
+                    // rebuilds every frame, so a change here takes effect immediately — no restart.
+                    // The gallery scene is the byte-identical path-tracer-parity anchor, so its
+                    // controls are disabled here (the headless screenshot path has no UI at all and
+                    // is unaffected regardless; this is purely to stop an interactive session from
+                    // perturbing the anchor image by hand).
+                    if ui.collapsing_header("Scalability", open) {
+                        if *is_gallery {
+                            ui.text_disabled(
+                                "gallery scene: scalability knobs locked (byte-identical anchor)",
+                            );
+                        }
+                        // Coarse scalability-group profile of the active tier (read-only): the six
+                        // 0-3 group levels this tier corresponds to (quality::ScalabilityGroup). A
+                        // glance-level summary; the fine sliders below are the precise controls.
+                        ui.text(format!("tier '{}' group levels:", quality.label()));
+                        for (g, lvl) in quality::groups(*quality) {
+                            ui.same_line();
+                            ui.text_disabled(format!("{}={}", g.label(), lvl));
+                        }
+                        ui.disabled(*is_gallery, || {
+                            ui.slider("Render scale", 0.33, 1.0, render_scale);
+                            *render_scale = render_scale.clamp(0.3333, 1.0);
+                            if ui.slider("GI res divisor", 1u32, 8, gi_res_div) {
+                                *gi_res_div = (*gi_res_div).clamp(1, 8);
+                            }
+                            if ui.slider("Reflect res divisor", 1u32, 8, reflect_res_div) {
+                                *reflect_res_div = (*reflect_res_div).clamp(1, 8);
+                            }
+                            if ui.slider("AO res divisor", 1u32, 4, ao_res_div) {
+                                *ao_res_div = (*ao_res_div).clamp(1, 4);
+                            }
+                            if ui.slider("GI a-trous steps", 1u32, 5, gi_atrous_steps) {
+                                *gi_atrous_steps = (*gi_atrous_steps).clamp(1, 5);
+                            }
+                            if ui.slider("GI samples/px", 1u32, 32, gi_spp) {
+                                *gi_spp = (*gi_spp).clamp(1, 256);
+                            }
+                            if ui.slider("GI max march steps", 8u32, 128, gi_max_steps) {
+                                *gi_max_steps = (*gi_max_steps).clamp(1, 256);
+                            }
+                            if ui.slider("Reflect max march steps", 8u32, 256, reflect_max_steps) {
+                                *reflect_max_steps = (*reflect_max_steps).clamp(1, 256);
+                            }
+                            if ui.slider("Cache relight period", 1u32, 256, cache_relight_period) {
+                                *cache_relight_period = (*cache_relight_period).max(1);
+                            }
+                            ui.slider("Reflect max roughness", 0.0, 1.0, reflect_max_roughness);
+                            ui.slider("GDF cone-trace slope", 0.0, 0.2, gdf_cone_k);
+                            *gdf_cone_k = gdf_cone_k.clamp(0.0, 1.0);
+                            ui.slider("Shadow softness (0=hard)", 0.0, 0.1, shadow_softness);
+                            if ui.slider("Shadow taps", 1u32, 16, shadow_taps) {
+                                *shadow_taps = (*shadow_taps).clamp(1, 16);
+                            }
+
+                            ui.checkbox("Stochastic SSR", ssr_stochastic);
+                            if ui.checkbox("GI half-res trace", gi_half_res) {
+                                *gi_half_res = gi.has_upsample() && *gi_half_res;
+                            }
+                            if ui.checkbox("Reflect half-res trace", reflect_half_res) {
+                                *reflect_half_res = gi.has_upsample() && *reflect_half_res;
+                            }
+                            // Reflection pipeline mode — the UI-facing single source; every
+                            // per-pass HWRT boolean derives from it each frame
+                            // (`apply_reflect_mode`), so the switch is live and the flags can
+                            // never drift into an invalid combination. Software = GDF march +
+                            // surface cache; Hybrid = SW broad phase + HWRT near-mirror refine
+                            // (cost bounded by the mirror area); Hardware = every reflection ray
+                            // on the TLAS.
+                            ui.text("Reflection pipeline:");
+                            if *reflect_hw_ready {
+                                ui.radio_button(
+                                    "Software (GDF)",
+                                    reflect_mode,
+                                    quality::ReflectMode::Software,
+                                );
+                                ui.radio_button(
+                                    "Hybrid (HW near-mirror)",
+                                    reflect_mode,
+                                    quality::ReflectMode::Hybrid,
+                                );
+                                ui.radio_button(
+                                    "Hardware (full HW trace)",
+                                    reflect_mode,
+                                    quality::ReflectMode::Hardware,
+                                );
+                                if *reflect_mode != quality::ReflectMode::Software {
+                                    ui.checkbox("  Hit Lighting (off-screen)", hwrt_hitlighting);
+                                }
+                                if *reflect_mode == quality::ReflectMode::Hardware {
+                                    ui.checkbox("  Full-res mirror (~4x cost)", hwrt_fullres);
+                                }
+                            } else {
+                                ui.text("  Software only (needs an RT device + content scene)");
+                            }
+                            if ui.checkbox("GDF ambient occlusion", gdf_ao) {
+                                *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && *gdf_ao;
+                            }
+                            ui.checkbox("Firefly clamp", firefly_clamp);
+                            if ui.checkbox("GI denoise", gi_denoise) {
+                                *gi_denoise = gi.has_denoise() && *gi_denoise;
+                            }
+
+                            let mut clamp_idx = (*reflect_history_clamp).min(2) as usize;
+                            if ui.combo_simple_string(
+                                "Reflect history clamp",
+                                &mut clamp_idx,
+                                &["off", "hard", "variance"],
+                            ) {
+                                *reflect_history_clamp = clamp_idx as u32;
+                            }
+
+                            if ui.button("Reset to tier default") {
+                                let base = if *is_gallery {
+                                    quality::gallery_preset()
+                                } else {
+                                    quality::preset(*quality)
+                                };
+                                *render_scale = base.render_scale.clamp(0.3333, 1.0);
+                                *gi_res_div = base.gi_res_div.clamp(1, 16);
+                                *reflect_res_div = base.reflect_res_div.clamp(1, 16);
+                                *ao_res_div = base.ao_res_div.clamp(1, 16);
+                                *gi_atrous_steps = base.gi_atrous_steps.clamp(1, 5);
+                                *gi_spp = base.gi_spp.clamp(1, 256);
+                                *gi_max_steps = base.gi_max_steps.clamp(1, 256);
+                                *reflect_max_steps = base.reflect_max_steps.clamp(1, 256);
+                                *cache_relight_period = base.cache_relight_period.max(1);
+                                *cache_relight_spp = base.cache_relight_spp.max(1);
+                                *reflect_max_roughness = base.reflect_max_roughness;
+                                *gdf_cone_k = base.gdf_cone_k.clamp(0.0, 1.0);
+                                *shadow_softness = base.shadow_softness;
+                                *shadow_taps = base.shadow_taps.clamp(1, 16);
+                                *ssr_stochastic = base.ssr_stochastic;
+                                *gi_half_res = gi.has_upsample() && base.gi_half_res;
+                                *reflect_half_res = gi.has_upsample() && base.reflect_half_res;
+                                *gdf_ao = gi.has_ao() && gdf.has_scene_sdf() && base.gdf_ao;
+                                *firefly_clamp = base.firefly_clamp;
+                                *gi_denoise = gi.has_denoise() && base.gi_denoise;
+                                *reflect_history_clamp = base.reflect_history_clamp.min(2);
+                                *reflect_clamp_gamma = base.reflect_clamp_gamma;
+                                *gi_temporal_clamp = base.gi_temporal_clamp;
+                                *reflect_cache = *swrt_reflect
+                                    && gdf.has_surface_cache()
+                                    && gdf.has_cache_lighting()
+                                    && base.reflect_cache;
+                                *surface_cache = gdf.has_surface_cache()
+                                    && gdf.has_cache_lighting()
+                                    && base.surface_cache;
+                            }
+                        });
+                    }
+
+                    if ui.collapsing_header("Lighting", open) {
+                        ui.combo_simple_string("Debug view", debug_view, &DEBUG_VIEWS);
+                        ui.input_float3("Sun dir", sun_dir).build();
+                        ui.slider("Sun intensity", 0.0, 32.0, sun_intensity);
+                        ui.slider("Ambient", 0.0, 0.5, ambient);
+                        ui.slider("Exposure", 0.1, 4.0, exposure);
+                        if has_auto_exposure {
+                            ui.checkbox("Auto exposure", auto_exposure);
+                        }
+                        ui.checkbox("Point lights", point_lights_on);
+                        ui.checkbox("Shadows", shadows_on);
+                        ui.slider("Shadow bias", 0.0, 0.01, shadow_bias);
+                        ui.slider("Shadow softness (0=hard)", 0.0, 0.1, shadow_softness);
+                    }
+
+                    if ui.collapsing_header("Material override", TreeNodeFlags::empty()) {
+                        ui.checkbox("Override material", override_material);
+                        ui.slider("Metallic", 0.0, 1.0, metallic_override);
+                        ui.slider("Roughness", 0.0, 1.0, roughness_override);
+                    }
+
+                    if ui.collapsing_header("IBL / Environment", TreeNodeFlags::empty()) {
+                        ui.checkbox("Legacy captured-cube IBL (deprecated)", legacy_ibl);
+                        if *legacy_ibl {
+                            ui.text_disabled("  - prefilter-cube specular + scene capture");
+                            ui.checkbox("Real-time env capture", realtime_env);
+                            ui.checkbox("Time-of-day (dynamic sun)", time_of_day);
+                            ui.checkbox("Multi-bounce reflections", multibounce);
+                        } else {
+                            ui.text_disabled("  - default: SW-RT specular + GDF GI diffuse");
+                        }
+                        ui.combo_simple_string("Post effect", post_mode, &POST_EFFECTS);
+                        ui.checkbox("Transient aliasing", aliasing);
+                        // PR-5 ordered post nodes.
+                        ui.checkbox("Bloom (P_BLOOM)", bloom_on);
+                        ui.checkbox("Motion blur (P_MOTION_BLUR)", motion_blur_on);
+                        ui.checkbox("DoF stub (P_DOF)", dof_on);
+                        ui.checkbox("Color grade (P_GRADE)", grade_on);
+                    }
+
+                    if ui.collapsing_header("Compute / GPGPU (Phase 7)", TreeNodeFlags::empty()) {
+                        ui.checkbox("GPU particles", particles_on);
+                        if async_compute_supported {
+                            ui.checkbox("  - async compute queue", async_compute_on);
+                        } else {
+                            ui.text_disabled("  - async compute (no dedicated queue)");
+                        }
+                        ui.checkbox("GPU culling (indirect)", gpu_cull);
+                        if *gpu_cull {
+                            ui.checkbox("  - HZB occlusion cull", hzb_cull);
+                            if *hzb_cull {
+                                let (survived, culled) = hzb_stats.get();
+                                ui.text(format!(
+                                    "    {} total / {} vis / {} occluded",
+                                    GRID_COUNT, survived, culled
+                                ));
+                            }
+                        }
+                    }
+
+                    if rt.has_path() && (rt.has_scene() || rt.has_content_pt()) {
+                        if ui.collapsing_header("Ray tracing (Phase 8)", TreeNodeFlags::empty()) {
+                            // Live raster↔PT switch: unchecked = raster, checked = the HW path
+                            // tracer (content scene uses the live camera). Available whenever the
+                            // path-trace pipeline + a traceable scene exist (RT-capable device),
+                            // so no `P8_PATHTRACE` launch flag is needed to flip it on.
+                            ui.checkbox("Path trace (off = raster)", path_trace);
+                            if *path_trace {
+                                ui.checkbox("  - debug: instance + shadow viz", rt_debug);
+                                if !*rt_debug {
+                                    if rt.has_cornell() {
+                                        ui.checkbox("  - Cornell box", cornell);
+                                    }
+                                    if rt.has_pt_pipeline() {
+                                        ui.checkbox(
+                                            "  - pipeline + SBT (vs inline)",
+                                            path_trace_pipeline,
+                                        );
+                                    }
+                                    ui.text(format!(
+                                        "  - {} spp accumulated ({})",
+                                        rt.accum_frame().saturating_mul(path_spp),
+                                        if *path_trace_pipeline {
+                                            "pipeline"
+                                        } else {
+                                            "inline"
+                                        }
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        ui.text_disabled("Ray tracing (unsupported)");
+                    }
+
+                    if gdf.has_sdf_trace()
+                        && ui.collapsing_header(
+                            "Software ray tracing (Phase 11)",
+                            TreeNodeFlags::empty(),
+                        )
+                    {
+                        ui.checkbox("SDF sphere trace (compute, no HW RT)", sdf_trace);
+                        if *sdf_trace {
+                            ui.text_disabled("  - analytic SDF scene (Stage A)");
+                        }
+                        if gdf.has_volume() {
+                            ui.checkbox("3D volume test (fill + slice view)", volume_test);
+                            if *volume_test {
+                                ui.text_disabled("  - Stage B RHI smoke test");
+                            }
+                        }
+                        if gdf.has_bake() {
+                            if ui.checkbox("SDF bake (per-mesh, slice view)", sdf_bake) {
+                                *sdf_bake_done = false; // re-bake when re-enabled
+                            }
+                            if *sdf_bake {
+                                ui.text_disabled("  - Stage B2: baked sphere ≈ analytic");
+                            }
+                        }
+                        if gdf.has_merge() {
+                            if ui.checkbox("GDF merge (instances, slice view)", gdf_merge) {
+                                *gdf_merge_done = false; // re-merge when re-enabled
+                            }
+                            if *gdf_merge {
+                                ui.text_disabled("  - Stage B3: min-merged instances");
+                            }
+                        }
+                        if gdf.has_gdf_trace() {
+                            ui.checkbox("GDF SW ray trace (compute)", gdf_trace);
+                            if *gdf_trace {
+                                ui.text_disabled("  - Stage B4: sphere-march baked GDF");
+                            }
+                        }
+                        if gdf.has_scene_sdf() {
+                            ui.checkbox("Scene GDF (world, live camera)", scene_gdf);
+                            if *scene_gdf {
+                                ui.text_disabled("  - Stage C1: fused world scene SDF");
+                            }
+                        }
+                        if gi.has_ao() && gdf.has_scene_sdf() {
+                            ui.checkbox("GDF ambient occlusion (deferred)", gdf_ao);
+                            if *gdf_ao {
+                                ui.text_disabled("  - Stage C2: GDF AO into ambient");
+                            }
+                        }
+                        if gi.has_gi() && gdf.has_scene_sdf() {
+                            ui.checkbox("GDF diffuse GI (deferred)", gdf_gi);
+                            if *gdf_gi {
+                                ui.text_disabled("  - Stage C3: 1-bounce stochastic");
+                                if gi.has_denoise() {
+                                    ui.checkbox("  - C4 spatio-temporal denoise", gi_denoise);
+                                }
+                            }
+                        }
+                        if reflect.has_ssr() {
+                            ui.checkbox("Screen-space reflections (viz)", gdf_ssr);
+                            if *gdf_ssr {
+                                ui.text_disabled("  - Stage C5: SSR buffer (C7 composites)");
+                            }
+                        }
+                        if reflect.has_gdf_reflect() && gdf.has_scene_sdf() {
+                            ui.checkbox("GDF reflections (viz)", gdf_reflect);
+                            if *gdf_reflect {
+                                ui.text_disabled("  - Stage C6: SSR-miss fallback (sky on escape)");
+                            }
+                        }
+                        if reflect.has_composite() && gdf.has_scene_sdf() {
+                            ui.checkbox("Hybrid reflections (viz)", gdf_hybrid);
+                            if *gdf_hybrid {
+                                ui.text_disabled("  - Stage C7: SSR over GDF / sky composite");
+                            }
+                        }
+                        if reflect.has_lit_history() && gdf.has_scene_sdf() {
+                            ui.checkbox("SW-RT reflections in lighting", swrt_reflect);
+                            if *swrt_reflect {
+                                ui.text_disabled("  - Stage C7c: replaces IBL prefilter specular");
+                            }
+                        }
+                        if gdf.has_scene_albedo() {
+                            ui.checkbox("Colored GDF re-light (C8a)", gdf_color);
+                            if *gdf_color {
+                                ui.text_disabled("  - per-voxel albedo: colored GI + reflections");
+                            }
+                        }
+                        if gdf.has_surface_cache() {
+                            ui.checkbox("Surface-cache atlas (C8b1/2 viz)", cache_viz);
+                            if *cache_viz {
+                                ui.text_disabled("  - mesh cards: lit radiance (multibounce)");
+                            }
+                            if gdf.has_cache_lighting() {
+                                ui.checkbox(
+                                    "Surface cache in GI/reflections (C8b3)",
+                                    surface_cache,
+                                );
+                                if *surface_cache {
+                                    ui.text_disabled("  - cached multibounce radiance lookup");
+                                }
+                            }
+                        }
+                        ui.checkbox("Firefly clamp (reflections/GI)", firefly_clamp);
+                        if *swrt_reflect {
+                            ui.slider(
+                                "Reflection max roughness (C8d)",
+                                0.0,
+                                1.0,
+                                reflect_max_roughness,
+                            );
+                            ui.text_disabled("  - screen mirror below, GDF prefilter above");
+                            ui.checkbox(
+                                "Stochastic glossy SSR (else full-res mirror)",
+                                ssr_stochastic,
+                            );
+                        }
+                    }
+
+                    if ui.collapsing_header("Profiling & debug (Phase 9)", open) {
+                        ui.checkbox("GPU profiler", profiler_on);
+                        if *profiler_on {
+                            if gpu_timings.is_empty() {
+                                ui.text_disabled("  (measuring…)");
+                            } else {
+                                let mut total = 0.0;
+                                for (name, ms) in gpu_timings.iter() {
+                                    ui.text(format!("  {name:<9} {ms:6.3} ms"));
+                                    total += ms;
+                                }
+                                ui.text(format!("  {:<9} {total:6.3} ms", "total"));
+                            }
+                        }
+                    }
+                });
+
+            // Game UI hook (M0 seam): drawn after — and outside — the engine debug window,
+            // so a game HUD is a sibling of it rather than nested inside it. No-op with no
+            // hooks installed, and never reached by `--screenshot-clean` (no ImGui frame).
+            if let Some(h) = self.hooks.as_mut() {
+                h.draw_ui(ui, &self.world);
+            }
+        }
+
+        // This slot's previous submission is complete (waited on its fence above), so
+        // its timestamp queries are ready: read them back and turn the tick
+        // boundaries into per-pass GPU milliseconds for the profiler UI (next frame).
+        if self.profiler_on && !self.slot_pass_names[fif].is_empty() {
+            let heap = &self.query_heaps[fif];
+            let ticks = heap.read();
+            let period_ns = heap.period_ns();
+            self.gpu_timings = self.slot_pass_names[fif]
+                .iter()
+                .enumerate()
+                .map(|(i, &name)| {
+                    let dt = ticks[i + 1].saturating_sub(ticks[i]);
+                    (name, dt as f32 * period_ns * 1e-6)
+                })
+                .collect();
+            // Headless dump (screenshot mode has no UI): log per-pass GPU ms so PROFILE_GPU
+            // is useful for measuring without the interactive table.
+            if self.screenshot_mode {
+                let total: f32 = self.gpu_timings.iter().map(|(_, ms)| ms).sum();
+                let rows: String = self
+                    .gpu_timings
+                    .iter()
+                    .map(|(n, ms)| format!("  {n:<20} {ms:.4} ms"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let frame_ms =
+                    LAST_FRAME_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+                let wait_ms =
+                    LAST_WAIT_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+                // frame = full wall time; wait = fence stall on the GPU; cpu ≈ frame − wait is the
+                // CPU record/build long pole. wait≈0 with cpu>gpu ⇒ CPU-bound (the real bottleneck).
+                let cpu_ms = LAST_CPU_US.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+                // record = CPU time between fence-wait-end and present (pure graph build + encode +
+                // submit, no present pacing). This is the real CPU long pole on a CPU-bound frame.
+                tracing::info!(
+                    "GPU profile (total {total:.4} ms):\n{rows}\n  --- frame {frame_ms:.3} ms | fence-wait {wait_ms:.3} ms | cpu-record {:.3} ms | gpu-passes {total:.3} ms",
+                    (cpu_ms - wait_ms).max(0.0)
+                );
+            }
+        }
+
+        // Inline path: reset this slot's fence and open its command buffer. When the
+        // RHI thread owns the command buffers (`cmd` is `None`), the worker does the
+        // reset + begin/translate/end itself; the record thread builds `frame_list`
+        // instead and ships it.
+        let cmd: Option<&CommandBuffer> = if self.rhi_thread.is_some() {
+            None
+        } else {
+            self.in_flight[fif].reset()?;
+            // Reflection pipeline: derive the per-pass HWRT booleans from the (possibly
+            // UI-switched) mode before anything below reads them.
+            self.apply_reflect_mode();
+            let cmd = &self.command_buffers[fif];
+            cmd.begin()?;
+            Some(cmd)
+        };
+        // The whole frame's IR (capture + graph, in record order) when threaded.
+        let frame_list = CommandList::new();
+
+        // Lighting: a level supplies its own sun + point lights; otherwise the gallery's
+        // code-default sun + two coloured point lights (preserved exactly = byte-identical).
+        let r = self.model_radius;
+        let point_intensity = r * r * 8.0;
+        let (mut sun_dir, sun_intensity, mut scene_lights) = match &self.level_lighting {
+            Some(ll) => (ll.sun_dir, ll.sun_intensity, ll.points.clone()),
+            None => (
+                self.sun_dir,
+                self.sun_intensity,
+                // The gallery's two code-default lights. `radius: 0.0` = no cutoff = the exact
+                // historical inverse-square falloff, so the byte anchor is untouched.
+                vec![
+                    ClusterLight {
+                        position: [r * 2.0, r * 1.5, 0.0],
+                        radius: 0.0,
+                        color: [1.0, 0.35, 0.2],
+                        intensity: point_intensity,
+                    },
+                    ClusterLight {
+                        position: [-r * 2.0, r * 1.0, r * 1.5],
+                        radius: 0.0,
+                        color: [0.3, 0.5, 1.0],
+                        intensity: point_intensity,
+                    },
+                ],
+            ),
+        };
+        if !self.point_lights_on {
+            scene_lights.clear();
+        }
+        // Deterministic stress spawner (PR-6 scale proof / R1 cost measurement): `TEST_LIGHTS=N`
+        // appends N finite-radius point lights on a fixed grid. Appended AFTER the authored
+        // lights so their indices — and therefore the accumulation order of the authored ones —
+        // are unchanged.
+        if self.test_lights > 0 {
+            scene_lights.extend(test_light_grid(
+                self.test_lights,
+                self.scene_center,
+                self.scene_radius,
+            ));
+        }
+        cap_scene_lights(&mut scene_lights, [eye.x, eye.y, eye.z]);
+        // R1 seam. The `Globals` UBO carries four point lights; anything past that has to ride
+        // the clustered light buffer. The default is therefore **automatic**: a scene with more
+        // lights than the UBO holds engages clustered culling, and a scene that fits keeps the
+        // legacy brute-force path *bit-exactly* (not "within tolerance" — it is literally the
+        // same code path, untouched). Every golden config is at or under four lights, so the
+        // battery gates the legacy path exactly as before.
+        //
+        // `CLUSTERED_LIGHTS=1` forces the clustered path on for any light count (the A/B tool
+        // that proves the two paths agree); `CLUSTERED_LIGHTS=0` forces it off (the scalability
+        // rule's fallback seam), which truncates to four lights with a warning.
+        //
+        // `CLUSTERED_BRUTE=1` outranks the automatic decision: it is the profiling baseline that
+        // shades every light from the same storage buffer with no froxel list, so auto-engaging
+        // the froxel path would silently measure the thing it exists to be measured against.
+        let clustered = !self.clustered_brute
+            && match self.clustered_lights {
+                Some(forced) => forced,
+                None => scene_lights.len() > 4,
+            }
+            && self.cluster.is_some();
+        // The brute-force-over-storage baseline shades every uploaded light, so it is not subject
+        // to the UBO's four-light cap either — only a genuinely unavailable/disabled cluster
+        // system is.
+        if !clustered && !self.clustered_brute && scene_lights.len() > 4 {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[lights] {} point lights but clustered culling is unavailable/off — only the \
+                     first 4 are lit (the Globals UBO cap).",
+                    scene_lights.len()
+                );
+            }
+        }
+        // The four UBO slots the legacy path shades. `point_pos[i].w` is the influence radius
+        // (0 = no cutoff), read by the same `point_attenuation` the clustered path uses.
+        let point_count = scene_lights.len().min(4) as i32;
+        let mut point_pos = [[0.0f32; 4]; 4];
+        let mut point_color = [[0.0f32; 4]; 4];
+        for (i, l) in scene_lights.iter().take(4).enumerate() {
+            point_pos[i] = [l.position[0], l.position[1], l.position[2], l.radius];
+            point_color[i] = [l.color[0], l.color[1], l.color[2], l.intensity];
+        }
+
+        // Time-of-day: arc the sun across the sky from elapsed time. The atmosphere + IBL
+        // already recapture per frame (`realtime_env`), and `maybe_capture` re-marches the sky
+        // on the sun change, so the physical sky moves with the sun. Off by default (static).
+        if self.time_of_day {
+            let t = self.elapsed * 0.15; // ~40 s/day; future: bind to a day-length setting
+            let height = (t.sin() * 0.5 + 0.5) * 0.85 + 0.06; // stay above the horizon
+            let horiz = (1.0 - height * height).max(0.0).sqrt();
+            sun_dir = [t.cos() * horiz, height, t.sin() * horiz * 0.4];
+        }
+
+        // (Re)capture the environment into the "write" cube set before the main graph
+        // samples it (see `ibl.rs`). The reflection probe is fixed at the scene centre
+        // (`focus`), NOT the camera, to avoid per-surface parallax error.
+        // Deprecation: with the SW-RT specular default, the prefilter cube (its only consumer
+        // of the scene-in-cube capture) is unused — so demote the capture to sky-only (empty
+        // scene + single bounce). The diffuse irradiance (mip 2) and skybox (mip 1) are sky
+        // anyway, so this is behavior-preserving for the default path, just cheaper. Legacy
+        // IBL keeps the full scene capture for the prefilter-cube specular.
+        // Demote only when SW-RT actually feeds the specular (so the no-compute / legacy
+        // fallback, where pbr still samples the prefilter cube, keeps its scene capture).
+        let (cap_scene, cap_multibounce): (&[SceneObject], bool) = if self.swrt_reflect {
+            (&[], false)
+        } else {
+            (&scene, self.multibounce)
+        };
+        // Record the (occasional) environment capture into the same target the frame
+        // uses: the real command buffer inline, or the shipped IR list when threaded.
+        let capture_rec: &dyn Recorder = match cmd {
+            Some(c) => c,
+            None => &frame_list,
+        };
+        self.ibl.maybe_capture(
+            capture_rec,
+            self.realtime_env,
+            cap_multibounce,
+            cap_scene,
+            &self.ground_vbuf,
+            &self.ground_ibuf,
+            self.ground_count,
+            focus,
+            sun_dir,
+            sun_intensity,
+            self.ambient,
+            self.flip_y,
+            self.backend == BackendKind::Vulkan,
+            self.sky_gain,
+            self.sky_wb,
+        );
+
+        // The main lighting pass samples the most recently written set.
+        let ibl_indices = self.ibl.lighting_indices();
+
+        // Directional light view-projection: an orthographic box covering the whole
+        // scene, looking from the sun toward it. Backend-neutral (the pbr shader
+        // handles the Vulkan/D3D12 shadow-UV flip).
+        let shadow_center = if self.is_gallery {
+            Vec3::new(0.0, self.model_radius * 0.5, 0.0)
+        } else {
+            self.scene_center
+        };
+        let light_vp = light_view_proj(sun_dir, shadow_center, self.scene_radius);
+
+        // --- Cached shadow map (docs/shadow-cache-cold-start.md S1) -----------------------------
+        // The legacy directional map is camera-independent, so render it into an app-owned
+        // persistent depth (per-FIF) OUTSIDE the render graph — mirroring the IBL env capture — and
+        // freeze the re-render while the sun + geometry are unchanged; the lighting pass then
+        // re-samples the persistent depth by bindless index (survives arbitrary camera motion).
+        // CSM (camera-fit cascades) and the gallery keep the in-graph transient path.
+        let use_shadow_cache = !self.csm.enabled && self.shadow_dirty_skip;
+        let mut shadow_cache_index: Option<u32> = None;
+        if use_shadow_cache {
+            // Epoch = everything the legacy map depends on, NOT the camera. Hash `sun_dir`
+            // bit-identically to the A2 surface-cache epoch (same FNV mix) so both caches
+            // invalidate on the same frame a sun change lands.
+            let mut epoch = 0xcbf29ce484222325u64;
+            let mut mix = |v: u32| {
+                epoch = epoch.wrapping_mul(0x100_0000_01b3).wrapping_add(v as u64);
+            };
+            for b in sun_dir.iter() {
+                mix(b.to_bits());
+            }
+            for c in [
+                shadow_center.x,
+                shadow_center.y,
+                shadow_center.z,
+                self.scene_radius,
+            ] {
+                mix(c.to_bits());
+            }
+            mix(self.shadows_on as u32);
+            if epoch == self.shadow_epoch {
+                self.shadow_stable_frames = self.shadow_stable_frames.saturating_add(1);
+            } else {
+                self.shadow_epoch = epoch;
+                self.shadow_stable_frames = 0;
+            }
+            // A skinned / morph caster's depth changes every frame → that scene never freezes
+            // (correct by construction; it re-renders each frame). Fully static scenes freeze once
+            // every per-FIF depth is primed (settle floored to FRAMES_IN_FLIGHT below).
+            let has_dynamic_caster = scene
+                .iter()
+                .any(|o| o.casts_shadow && (o.skin.is_some() || o.morph.is_some()));
+            let settle = self.shadow_settle_frames.max(FRAMES_IN_FLIGHT as u32);
+            let settled = !has_dynamic_caster && self.shadow_stable_frames >= settle;
+            let depth = &self.shadow_depth[fif];
+            if !settled {
+                // Re-raster the caster set from the sun's POV into the app-owned depth; the depth
+                // persists, so a later settled frame re-samples this exact map bit-for-bit.
+                self.deferred
+                    .record_shadow_direct(capture_rec, depth, &scene, light_vp);
+            }
+            // Make the persistent depth shader-readable for this frame's lighting pass; on a skipped
+            // frame it already holds last frame's depth (no writer ⇒ unchanged).
+            capture_rec.depth_to_sampled(depth);
+            shadow_cache_index = Some(depth.bindless_index());
+        }
+
+        // PR-7 CSM: fit N cascades to the view frustum when the seam is on (single source of
+        // all shadow matrices/splits). The perspective params match the scene camera above
+        // (same `fov_y_rad`, near 0.05, far 100.0) so the cascades tile the depth range the view
+        // samples. Empty on the legacy path (byte-identical anchor).
+        let csm_slots = if self.csm.enabled {
+            csm::compute_cascades(
+                &self.csm,
+                &csm::ViewCamera {
+                    eye,
+                    target: focus,
+                    fov_y_rad,
+                    aspect: cw as f32 / ch as f32,
+                    near: 0.05,
+                    far: 100.0,
+                },
+                sun_dir,
+            )
+        } else {
+            Vec::new()
+        };
+
+        // Write this frame's globals slice.
+        let globals = Globals {
+            camera_pos: [eye.x, eye.y, eye.z, 0.0],
+            sun_direction: normalize3(sun_dir),
+            sun_color: [
+                self.sun_color[0],
+                self.sun_color[1],
+                self.sun_color[2],
+                sun_intensity,
+            ],
+            ambient: [self.ambient, self.ambient, self.ambient, self.exposure],
+            counts: [
+                // `point_lights_on` was already applied when `scene_lights` was assembled
+                // (it clears the list), so this is just the UBO-path light count.
+                point_count,
+                self.debug_view as i32,
+                (PREFILTER_MIPS - 1) as i32, // prefilter max LOD
+                self.shadows_on as i32,
+            ],
+            point_pos,
+            point_color,
+            light_view_proj: light_vp.to_cols_array(),
+            shadow: [
+                self.shadow_bias,
+                1.0 / SHADOW_SIZE as f32,
+                self.shadow_softness, // z: PCSS-lite penumbra scale (0 = hard PCF)
+                self.shadow_taps as f32, // w: soft-shadow tap count (RenderQuality; soft path only)
+            ],
+            inv_view_proj,
+            ibl: ibl_indices,
+            // Reflection-probe centre (matches the env-capture eye) + a box proxy for
+            // parallax-corrected specular IBL. The box floor sits on the ground plane
+            // (y = 0) and its walls/ceiling match the captured ground extent, so
+            // reflected-floor rays re-anchor onto the actual flat ground instead of a
+            // sphere that bent them up to the (darker) horizon.
+            probe: [focus.x, focus.y, focus.z, 1.0],
+            probe_box_min: [-self.scene_radius * 1.3, 0.0, -self.scene_radius * 1.3, 0.0],
+            probe_box_max: [
+                self.scene_radius * 1.3,
+                self.scene_radius * 2.0,
+                self.scene_radius * 1.3,
+                self.gi_multibounce, // w: GI multi-bounce energy compensation strength (pbr.slang)
+            ],
+            // Last frame's view-projection (updated end-of-frame) so the SSR history
+            // sample reprojects the world hit point into the previous frame (Stage C7b).
+            prev_view_proj: self.prev_view_proj,
+            // Clustered lighting (PR-6): row 2 of the world->view matrix so the shader can
+            // recover positive linear view depth from a G-buffer world position, plus the
+            // camera near/far for the froxel Z slicing. `view` is column-major (glam), so
+            // row 2 = the .z component of each column.
+            cluster_view_z_row: [view.x_axis.z, view.y_axis.z, view.z_axis.z, view.w_axis.z],
+            cluster_params: [CLUSTER_Z_NEAR, CLUSTER_Z_FAR, 0.0, 0.0],
+            // PR-7 CSM: filled from the fitted cascade slots when the seam is on; zero here =
+            // the legacy single-map path (the shader branches on csm_params.x == 0 → anchor).
+            csm_params: {
+                let atlas = self.csm.atlas_size as i32;
+                let tile = self.csm.tile_size() as i32;
+                [csm_slots.len() as i32, self.csm_debug as i32, tile, atlas]
+            },
+            csm_split: {
+                let mut s = [0.0f32; 4];
+                for (i, slot) in csm_slots.iter().take(4).enumerate() {
+                    s[i] = slot.split_far;
+                }
+                s
+            },
+            csm_opts: [self.csm.blend_frac, 0.0, 0.0, 0.0],
+            csm_view_proj: {
+                let mut m = [[0.0f32; 16]; 4];
+                for (i, slot) in csm_slots.iter().take(4).enumerate() {
+                    m[i] = slot.view_proj.to_cols_array();
+                }
+                m
+            },
+            csm_atlas_uv: {
+                // Per-cascade atlas UV sub-rect (xy offset, zw scale). The sampler maps the
+                // cascade clip → [0,1] tile UV → this sub-rect in the shared atlas texture.
+                let atlas = self.csm.atlas_size.max(1) as f32;
+                let mut uv = [[0.0f32; 4]; 4];
+                for (i, slot) in csm_slots.iter().take(4).enumerate() {
+                    uv[i] = [
+                        slot.rect.x as f32 / atlas,
+                        slot.rect.y as f32 / atlas,
+                        slot.rect.width as f32 / atlas,
+                        slot.rect.height as f32 / atlas,
+                    ];
+                }
+                uv
+            },
+        };
+        // PR-9 view family: the primary view is slice 0 of this frame's view block
+        // (`(fif * MAX_VIEWS + view_index) * GLOBALS_SLICE`). The content written at that offset is
+        // unchanged from the pre-PR-9 layout, and every consumer reads the same offset, so the
+        // anchor stays byte-identical; the wider stride just reserves room for the second view's
+        // camera slice.
+        let globals_offset = (fif as u64 * MAX_VIEWS) * GLOBALS_SLICE;
+        // Firefly clamp ceiling for the reflection temporal resolve. This is a max on RAW radiance,
+        // so a FIXED value only makes sense at a fixed exposure: the gallery's legacy 8.0 sits at its
+        // 0.6 exposure. A physically-lit content scene meters far darker (`exposure = 1/(1.2·2^EV100)`
+        // ≈ 4e-4 at EV100 11), so its raw radiance runs into the thousands — a raw ceiling of 8 then
+        // crushes EVERY reflection to black (a mirror in a sunlit nave reads pure black). Scale the
+        // ceiling with the scene exposure so it caps at the same ~8 EXPOSED units everywhere; the
+        // gallery keeps the exact 8.0 (byte-identical anchor). 1e30 = off.
+        let firefly_max = if !self.firefly_clamp {
+            1e30
+        } else if self.is_gallery {
+            8.0f32
+        } else {
+            8.0f32 / self.exposure.max(1e-6)
+        };
+        self.deferred
+            .write_globals(globals_offset, globals_bytes(&globals))?;
+
+        // Clustered light culling: upload this frame's point-light list (assembled above, already
+        // capped and in authored order) to the cluster/light buffer, returning the bindless indices
+        // the build + lighting passes read. Done BEFORE the graph is built (host write + possible
+        // realloc mutate `self.cluster`; the graph then borrows it immutably for the record
+        // closures).
+        //
+        // Parity note: a light's radius is its authored `range`, and `0` = no cutoff. An
+        // uncut light is binned into EVERY cluster, so the shader accumulates the same lights in
+        // the same order as the brute-force loop — byte-identical, which is what the
+        // `CLUSTERED_LIGHTS=1` A/B proves. A light with a finite range is culled out of exactly
+        // those froxels where its windowed falloff is already 0, so that stays exact too.
+        let cluster_indices: Option<(u32, u32, u32, u32)> = if let (true, Some(cluster_sys)) =
+            (clustered || self.clustered_brute, self.cluster.as_mut())
+        {
+            Some(cluster_sys.upload(&self.device, fif, &scene_lights)?)
+        } else {
+            None
+        };
+
+        // Phase 8 M4: manage the path tracer's persistent accumulation buffer and
+        // reset key BEFORE building the render graph — the fallible buffer
+        // (re)allocation must not sit on a `?` early-return path while the graph holds
+        // borrows of transient resources.
+        let pt_active = self.path_trace
+            && !self.rt_debug
+            && self.rt.has_path()
+            && (self.rt.has_instance_table() || self.rt.has_content_pt());
+        // The path tracer uses the Cornell scene (fixed front camera) when toggled,
+        // else the orbiting open scene. `pt_eye` / `pt_inv_vp` feed the trace rays.
+        let use_cornell = pt_active && self.cornell && self.rt.has_cornell();
+        let (pt_eye, pt_inv_vp) = if use_cornell {
+            RtSystem::cornell_camera(cw, ch, self.backend == BackendKind::Vulkan)
+        } else {
+            (eye, inv_view_proj)
+        };
+        self.rt.prepare(
+            &self.device,
+            pt_active,
+            use_cornell,
+            cw,
+            ch,
+            pt_eye,
+            self.sun_dir,
+            self.sun_intensity,
+        )?;
+
+        // C4: (re)allocate the GI denoiser history + reset accumulation on a lighting/
+        // quality change (NOT camera — the temporal pass reprojects). Runs before the
+        // graph, like the path-tracer's accumulation prepare.
+        let gi_denoise_active = self.gdf_gi && self.gi_denoise && self.gi.has_denoise();
+        if gi_denoise_active {
+            let mut key = 0u64;
+            for b in self.sun_dir.iter() {
+                key = key
+                    .wrapping_mul(0x100_0000_01b3)
+                    .wrapping_add(b.to_bits() as u64);
+            }
+            key = key
+                .wrapping_mul(0x100_0000_01b3)
+                .wrapping_add(self.sun_intensity.to_bits() as u64);
+            key = key
+                .wrapping_mul(0x100_0000_01b3)
+                .wrapping_add(self.gi_spp as u64);
+            // M3-C: the GI denoise (temporal + à-trous) runs at the GI TRACE res (before the
+            // bilateral upsample), so its history/scratch is sized to that res. Gallery keeps
+            // gi_half_res off ⇒ div 1 ⇒ full-res denoise = byte-identical anchor. Divisor
+            // mirrors the record path.
+            let gdiv = if self.gi_half_res {
+                self.gi_res_div.max(1)
+            } else {
+                1
+            };
+            self.gi
+                .prepare_denoise(&self.device, cw.div_ceil(gdiv), ch.div_ceil(gdiv), key)?;
+        }
+        // F6O: (re)allocate the per-pixel sky-vis temporal history at the low trace res.
+        if self.skyvis_pp_spp > 0 {
+            let sdiv = self.skyvis_pp_div.max(1);
+            self.gi
+                .prepare_skyvis_temporal(&self.device, cw.div_ceil(sdiv), ch.div_ceil(sdiv))?;
+        }
+        // P4: (re)allocate the world radiance cache atlas for the scene's clipmap level count.
+        if self.wrc || self.wrc_viz {
+            let levels = self.gdf.clip_descriptor().map(|(_, c)| c).unwrap_or(1);
+            self.gi.prepare_wrc(&self.device, levels)?;
+        }
+        // C7b: (re)allocate the lit-color history buffers for the hybrid reflection path
+        // (the standalone viz or the C7c lighting feedback).
+        if self.gdf_hybrid || self.swrt_reflect {
+            self.reflect.prepare_history(&self.device, cw, ch)?;
+        }
+        // C2b: one-shot feedback re-layout — read the desired-res feedback the reflection has
+        // been recording, re-normalise to the same texel budget, rebuild the adaptive layout and
+        // reallocate the atlas (wait_idle: no frame in flight may still read the old buffers),
+        // then force a fresh capture + reset relight so the new layout re-converges.
+        if self.cache_res_feedback_frame != 0
+            && self.frame_no == self.cache_res_feedback_frame as u64
+        {
+            self.device.wait_idle()?;
+            if self.gdf.relayout_from_feedback(&self.device)? {
+                self.scene_cache_captured = false;
+                self.scene_cache_reset = true;
+            }
+        }
+        // Stochastic SSR runs at half-res; (re)allocate its temporal accumulation buffers.
+        let (hcw, hch) = (cw.div_ceil(2), ch.div_ceil(2));
+        if self.swrt_reflect && self.ssr_stochastic && self.reflect.has_ssr_resolve() {
+            self.reflect.prepare_ssr_accum(&self.device, hcw, hch)?;
+        }
+        // C8j / M3-C: (re)allocate the stochastic GDF-reflection temporal accumulation buffers.
+        // The temporal resolve (+ A4b spatial) runs at the reflection TRACE res — before the
+        // bilateral upsample — so the buffers are sized to that res (the full-res resolve was the
+        // reflection's single largest pass; at 1/div res it costs ~1/div²). Gallery keeps
+        // `reflect_half_res` off ⇒ div 1 ⇒ full-res resolve = byte-identical anchor. Divisor
+        // mirrors the record path (P_HWRT_FULLRES forces rdiv 1 there too).
+        if self.swrt_reflect && self.reflect.has_reflect_temporal() {
+            let rdiv = if self.reflect_half_res && !(self.hwrt && self.hwrt_fullres) {
+                self.reflect_res_div.max(1)
+            } else {
+                1
+            };
+            self.reflect.prepare_reflect_accum(
+                &self.device,
+                cw.div_ceil(rdiv),
+                ch.div_ceil(rdiv),
+            )?;
+        }
+        // A3: (re)allocate the adaptive-skip ping-pong at the gdf_reflect TRACE extent (half-res when
+        // reflect_half_res). Divisor mirrors the record path (rdiv=1 when full-res).
+        if self.swrt_reflect && self.reflect_skip && self.reflect.has_gdf_reflect() {
+            // Mirror the record path: P_HWRT_FULLRES forces full-res (rdiv 1) so the skip ping-pong
+            // matches the trace extent (Phase 16 C).
+            let rdiv = if self.reflect_half_res && !(self.hwrt && self.hwrt_fullres) {
+                self.reflect_res_div.max(1)
+            } else {
+                1
+            };
+            self.reflect.prepare_reflect_skip(
+                &self.device,
+                cw.div_ceil(rdiv),
+                ch.div_ceil(rdiv),
+            )?;
+        }
+        // B2 mirror compaction: (re)allocate the pixel list + indirect args at the refine extent.
+        if self.swrt_reflect && self.reflect_compact_div > 0 && self.reflect.has_reflect_compact() {
+            let d = self.reflect_compact_div;
+            self.reflect
+                .prepare_reflect_compact(&self.device, cw.div_ceil(d), ch.div_ceil(d))?;
+        }
+        // QHD/UHD TAAU: (re)allocate the full-res (output) history.
+        if taau_active {
+            self.taau
+                .prepare(&self.device, sw, sh, 0, self.taau_packed)?;
+        }
+
+        let extent = Extent2D::new(cw, ch); // scene render extent (RENDER_RES or swapchain)
+        let swap_extent = Extent2D::new(sw, sh); // display/backbuffer extent
+        // Stage B3: the finer clipmap-level volumes each GDF pass transitions to sampled
+        // (empty for the single-level gallery). Bound before the graph so it outlives the
+        // pass closures that borrow it.
+        let scene_clip_vols = self.gdf.clip_level_volumes();
+        // S1 CPU frustum cull: the opaque G-buffer + pre-pass draws only need objects inside the
+        // camera frustum (culled ones are clipped anyway ⇒ image-identical). The cull matrix is the
+        // unjittered no-flip `cull_view_proj` (DX≡VK-stable). Shadow + view-independent GDF passes keep
+        // the full `scene`. Declared before the graph so it outlives the pass closures; zero-copy off.
+        let culled_scene: Option<Vec<SceneObject>> = if self.scene_cull {
+            let planes = frustum_planes(cull_view_proj);
+            Some(
+                scene
+                    .iter()
+                    .filter(|o| aabb_in_frustum(&planes, o.world_aabb[0], o.world_aabb[1]))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let opaque_scene: &[SceneObject] = culled_scene.as_deref().unwrap_or(&scene);
+
+        // Phase 14 renderer integration (P14_VGEO=1): route each opaque object to virtual geometry
+        // when its mesh has a cluster page; the rest are mesh-rastered. Computed (+ the visibility
+        // buffer resized, + the per-object scratch pool prepared) BEFORE the graph so all of it
+        // outlives `graph.execute`. Off / no page → the normal mesh fill (gallery byte-identical).
+        if let Some(v) = self.vgeo.as_mut() {
+            v.resize(&self.device, extent)?;
+        }
+        // `(page index, material, world transform)` per vgeo object + the mesh-rastered remainder.
+        let mut vgeo_draws: Vec<(usize, vgeo::VgeoMaterial, Mat4)> = Vec::new();
+        let mut vgeo_others: Vec<SceneObject> = Vec::new();
+        if self.vgeo_mode == 1
+            && let Some(v) = self.vgeo.as_ref()
+        {
+            for o in opaque_scene {
+                // Skinned / morphed objects deform per frame, but the vgeo cluster page is baked
+                // from the static bind pose — route them to the mesh fill (which runs the GPU
+                // skinning/morph vertex shader) so animation is never frozen. Only static opaque
+                // geometry with a page goes through virtual geometry.
+                let animated = o.skin.is_some() || o.morph.is_some();
+                match (o.kind, v.page_for(&o.mesh)) {
+                    (dreamcoast_asset::MaterialKind::Opaque, Some(page)) if !animated => {
+                        vgeo_draws.push((
+                            page,
+                            vgeo::VgeoMaterial {
+                                base_color: o.base_color,
+                                metallic: o.metallic,
+                                roughness: o.roughness,
+                                tex: o.tex,
+                                alpha_cutoff: o.alpha_cutoff,
+                                two_sided: o.two_sided,
+                            },
+                            o.transform,
+                        ));
+                    }
+                    _ => vgeo_others.push(o.clone()),
+                }
+            }
+        }
+        // Build the whole scene's instance table + work list up front (must outlive `graph.execute`).
+        // `vgeo_work` (= Σ instance clusters) sizes the single scene-wide cut/raster dispatch.
+        let vgeo_work = if !vgeo_draws.is_empty()
+            && let Some(v) = self.vgeo.as_mut()
+        {
+            v.prepare_scene(
+                &self.device,
+                self.fif,
+                &vgeo_draws,
+                cull_view_proj,
+                view_proj,
+            )?
+        } else {
+            0
+        };
+
+        let mut graph = RenderGraph::new();
+        // The backbuffer is the actual swapchain image (display extent); tonemap samples the
+        // render-extent HDR by UV, so a render≠display extent just means a downscale at present.
+        let backbuffer = graph.import_backbuffer(self.swap_format(), swap_extent);
+        let g_albedo = graph.create_color("g_albedo", GB_ALBEDO_FMT, extent);
+        let g_normal = graph.create_color("g_normal", GB_NORMAL_FMT, extent);
+        let g_material = graph.create_color("g_material", GB_MATERIAL_FMT, extent);
+        let g_position = graph.create_color("g_position", GB_POSITION_FMT, extent);
+        let g_depth = graph.create_depth("g_depth", extent);
+        // Shadow depth target. Legacy path: a single SHADOW_SIZE square map. CSM path: the
+        // atlas texture (CSM_ATLAS square, tiled into per-cascade slots). Same resource id
+        // feeds the lighting pass either way, so the sampling side re-wire is zero.
+        let shadow_map: Option<ResourceId> = if use_shadow_cache {
+            // Cached path: the map is an app-owned persistent depth rendered out-of-graph above,
+            // so there is no in-graph shadow resource this frame.
+            None
+        } else if self.csm.enabled {
+            let s = self.csm.atlas_size;
+            Some(graph.create_depth("shadow_atlas", Extent2D::new(s, s)))
+        } else {
+            Some(graph.create_depth("shadow_map", Extent2D::new(SHADOW_SIZE, SHADOW_SIZE)))
+        };
+        let hdr = graph.create_color("hdr", HDR_FORMAT, extent);
+        let gbuf = GBufferTargets {
+            albedo: g_albedo,
+            normal: g_normal,
+            material: g_material,
+            position: g_position,
+            depth: g_depth,
+        };
+
+        // Deferred backbone (see `deferred.rs`): shadow -> gbuffer -> lighting (HDR),
+        // then the optional compute-post blur. CSM path fills the atlas (one tile per
+        // cascade via per-tile viewports); the legacy path fills the single directional map.
+        if use_shadow_cache {
+            // Rendered out-of-graph into the app-owned persistent depth above (nothing here).
+        } else if self.csm.enabled {
+            self.deferred.record_shadow_atlas(
+                &mut graph,
+                shadow_map.expect("csm atlas resource"),
+                &scene,
+                &csm_slots,
+            );
+        } else {
+            self.deferred.record_shadow(
+                &mut graph,
+                shadow_map.expect("legacy shadow resource"),
+                &scene,
+                light_vp,
+            );
+        }
+        // TAA-aware texture LOD bias for the G-buffer texture fetches (Stage 7 + Stage 8). Two terms:
+        //   1. log2(internal/output): the DLSS/FSR2 resolution term — at a reduced internal
+        //      resolution the screen-space derivatives are ~2x larger and fetch blurry mips, so this
+        //      negative offset pulls them back to the full-res mip the upscaler reconstructs to.
+        //   2. taa_mip_bias (~-1, Stage 8): the PRIMARY distant-sharpness lever. With sub-pixel
+        //      jitter the temporal accumulation super-samples, so we can bias toward sharper mips and
+        //      let TAA resolve the aliasing — this is 레퍼런스 엔진/DLSS's primary approach to distant-texture
+        //      sharpness (레퍼런스 엔진 also uses hardware anisotropic filtering, but that's the grazing-surface
+        //      lever — see Stage 9 / P_ANISO — not the distance one). Applies even at native (term 1
+        //      = 0) under forced TAA. Only added with jitter (no jitter => no supersampling to hide it).
+        // Gallery (TAA off => taau_active false) keeps bias 0 => SampleBias(.,0)==Sample() => byte
+        // identical. Driver-independent LOD offset on the existing trilinear sampler (no DX≡VK risk).
+        let mip_bias = if taau_active {
+            let scale_bias = (cw as f32 / sw as f32).log2();
+            let taa_bias = if taau_jitter_active {
+                self.taa_mip_bias
+            } else {
+                0.0
+            };
+            scale_bias + taa_bias
+        } else {
+            0.0
+        };
+        // Depth pre-pass (pipeline rebaseline PR-1, opt-in `DEPTH_PREPASS=1`): render an opaque
+        // depth-only pass into `g_depth` BEFORE the G-buffer so the base pass runs EQUAL-test +
+        // write-off (Early-Z overdraw elimination) and the screen-space passes (AO/GI/SSR) sample
+        // a completed depth whose producer is now explicitly the pre-pass (the render graph orders
+        // pre-pass → G-buffer via the shared `g_depth` write, and the AO/GI/SSR reads of `g_depth`
+        // chain after it). Off by default = no pre-pass pass at all (byte-identical golden anchor).
+        if self.depth_prepass {
+            self.deferred.record_prepass(
+                &mut graph,
+                g_depth,
+                opaque_scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                mip_bias,
+            );
+        }
+        // Phase 14 renderer integration: under P14_VGEO=1 every opaque object with a cluster page is
+        // produced by virtual geometry. The mesh fill rasters the remainder + ground first (clears),
+        // then each vgeo object is resolved on top (LOAD + Less depth test → depth-composited).
+        if !vgeo_draws.is_empty() {
+            self.deferred.record_gbuffer(
+                &mut graph,
+                gbuf,
+                &vgeo_others,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj,
+                self.ambient,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                mip_bias,
+                self.depth_prepass,
+                true,
+            );
+            let v = self.vgeo.as_ref().unwrap();
+            let visbuf_ext = vgeo::VgeoSystem::import_visbuf(&mut graph);
+            // One scene-wide cut → clear → raster → (HW mesh-vis) → resolve for every vgeo object.
+            v.record_scene(
+                &mut graph,
+                gbuf,
+                self.fif,
+                vgeo_work,
+                visbuf_ext,
+                cull_view_proj,
+                eye,
+                mip_bias,
+                extent,
+                self.vgeo_hzb,
+            );
+        } else {
+            // Default / fallback: the whole scene with the ground (unchanged, gallery byte-identical).
+            self.deferred.record_gbuffer(
+                &mut graph,
+                gbuf,
+                opaque_scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj,
+                self.ambient,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                mip_bias,
+                self.depth_prepass,
+                true,
+            );
+        }
+        // Deferred surface-decal pass (decals A3): tint the G-buffer albedo for `kind == Decal`
+        // drawables after the opaque fill, before lighting. No-op (no pass) when the scene has
+        // no decals, so the gallery / non-decal scenes stay byte-identical.
+        self.deferred
+            .record_decals(&mut graph, gbuf, &scene, view_proj, mip_bias);
+        // Velocity (motion-vector) channel (pipeline re-baseline PR-2, opt-in `P_VELOCITY=1`): a
+        // separate opaque pass into an RG16Float target holding per-pixel screen motion. Uses the
+        // UNJITTERED current + previous camera matrices (`view_proj_stable` / `prev_view_proj_taau`)
+        // so no TAA jitter leaks into the motion; per-object prev pose from `prev_scene`. Consumed by
+        // the velocity-aware TAAU reprojection + the DEBUG_VIEW=11 viz. Off = no target, no pass.
+        let velocity_target = if self.velocity_on {
+            let vt = graph.create_color("velocity", velocity::VELOCITY_FMT, extent);
+            self.velocity.record(
+                &mut graph,
+                vt,
+                g_depth,
+                &scene,
+                &prev_scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                view_proj_stable,
+                Mat4::from_cols_array(&self.prev_view_proj_taau),
+            );
+            Some(vt)
+        } else {
+            None
+        };
+        // Stage C2/C3 (GDF-lighting consumers, see `gi.rs`) share the world scene GDF:
+        // import its handle once + record the one-time fused-scene bake (the volume is
+        // owned by `GdfSystem`), then AO + GI read it. Recorded before lighting so the
+        // graph orders gbuffer -> AO/GI -> lighting. The bake latch is shared with the C1
+        // trace (whichever runs first bakes).
+        let scene_gdf_vol = self.gdf.scene_gdf_volume();
+        let (scene_aabb_min, scene_aabb_max) = self.gdf.scene_aabb();
+        // Stage B: the clipmap descriptor the SW-RT shaders sample the scene field through
+        // (single level today = the legacy volume). `(0, 1)` is an inert fallback never used
+        // (the GDF passes gate on `scene_gdf_vol.is_some()`, which implies a descriptor).
+        let scene_clip = self.gdf.clip_descriptor().unwrap_or((0, 1));
+        let scene_gdf_ext = if (self.gdf_ao
+            || self.gdf_gi
+            || self.gdf_reflect
+            || self.gdf_hybrid
+            || self.swrt_reflect
+            || self.cache_viz
+            || self.surface_cache
+            || self.wrc_viz)
+            && scene_gdf_vol.is_some()
+        {
+            let ext = graph.import_external("scene_gdf");
+            if !self.scene_gdf_baked {
+                self.gdf.record_scene_bake(&mut graph, ext);
+                self.scene_gdf_baked = true;
+            }
+            Some(ext)
+        } else {
+            None
+        };
+        // Stage C8a: the per-voxel albedo volumes (colored GI + reflection re-light). Import
+        // the shared handle once + bake once (separate from the distance bake so that stays
+        // bit-identical); the re-light consumers (C3 GI, C6/C7 reflection) read it. Gated on
+        // `gdf_color` so `P11_GDF_COLOR=0` is the achromatic pre-C8a path.
+        let scene_albedo_ext = if self.gdf_color
+            && (self.gdf_gi
+                || self.gdf_reflect
+                || self.gdf_hybrid
+                || self.swrt_reflect
+                || self.cache_viz
+                || self.surface_cache)
+            && self.gdf.has_scene_albedo()
+        {
+            let ext = graph.import_external("scene_albedo");
+            if !self.scene_albedo_baked {
+                self.gdf.record_scene_albedo_bake(&mut graph, ext);
+                self.scene_albedo_baked = true;
+            }
+            Some(ext)
+        } else {
+            None
+        };
+        // The (volumes, handle) pair the re-light consumers take; `None` => constant albedo.
+        let scene_albedo = match (self.gdf.scene_albedo(), scene_albedo_ext) {
+            (Some(vols), Some(ext)) => Some((vols, ext)),
+            _ => None,
+        };
+        // C8b1: capture the mesh-card surface cache once (static geometry + albedo), reading
+        // the scene GDF (+ the C8a albedo volumes for the captured color). C8b2 then re-lights
+        // it every frame into a radiance atlas (multibounce gather from the previous frame).
+        let cache_active =
+            (self.cache_viz || self.surface_cache || self.reflect_cache || self.sc_viz)
+                && self.gdf.has_surface_cache();
+        let scene_cache_ext = match (cache_active, scene_gdf_ext) {
+            (true, Some(gdf_ext)) => {
+                let ext = graph.import_external("scene_cache");
+                // F1 Stage 3: the initial capture traces every card (dirty_only = false); a streaming
+                // frame that re-owned slots re-captures ONLY the changed cards (dirty_only = true).
+                if !self.scene_cache_captured || self.stream_recapture {
+                    self.gdf.record_cache_capture(
+                        &mut graph,
+                        gdf_ext,
+                        scene_albedo_ext,
+                        ext,
+                        self.cache_capture_occl,
+                        self.scene_cache_captured && self.stream_recapture,
+                    );
+                    self.scene_cache_captured = true;
+                }
+                Some(ext)
+            }
+            _ => None,
+        };
+        // Stage D3: period-aware temporal alpha keeps the visible cards converged within the
+        // screenshot warmup as the period rises; gallery (feedback off) keeps the legacy 0.35.
+        // The surface-cache VIEW uses a much SLOWER alpha: the multibounce gather is stochastic
+        // (random rays per frame), so a fast EMA leaves per-frame noise that reads as flicker
+        // ("new colours every frame"); a slow alpha temporally averages the gather over ~20 frames,
+        // so the (static-camera) view converges to a stable image. `P_SC_VIZ_ALPHA` overrides.
+        let relight_alpha = if self.sc_viz {
+            std::env::var("P_SC_VIZ_ALPHA")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.05)
+                .clamp(0.005, 1.0)
+        } else if self.cache_converge != 0 {
+            // CONVERGE mode (negative alpha = the seam): the relight cycles its gather jitter over K
+            // deterministic ray sets and accumulates with a running mean α = 1/(1+N) instead of the
+            // fixed-alpha EMA of fresh white noise (which has a permanent variance floor and NEVER
+            // converges — the measured freeze latch could not arm on IntelSponza). K = the window.
+            -(self.cache_converge as f32)
+        } else if self.cache_feedback {
+            (0.35 * (self.cache_relight_period as f32 / 8.0)).clamp(0.35, 0.8)
+        } else {
+            0.35
+        };
+        // This frame's reset flag, captured for the async relight (recorded in the submit section);
+        // the in-graph (sync) path consumes it inline below.
+        let cache_reset_this_frame = self.scene_cache_reset;
+        // A2-fix: derive the cache lighting/scene epoch from everything the relight depends on (sun,
+        // sky, gather params) — but NOT the camera (the cache is view-independent). An epoch change
+        // re-arms convergence. The FREEZE itself gates on MEASURED convergence (the relight's mean EMA
+        // step below `cache_conv_eps`), not a frame count: multibounce colour propagation converges at
+        // scene-dependent rates, so a fixed frame count locked an unconverged cache on IntelSponza's
+        // coloured drapes. A general engine budgets relight updates by priority rather than a frame-count
+        // freeze; this is the measured-convergence analogue that stays image-identical on any scene.
+        // Probe the previous (fence-complete) relight's mean EMA step + get this frame's write index.
+        let (cache_conv_idx, cache_conv_delta) = self
+            .gdf
+            .cache_conv_probe()
+            .unwrap_or((u32::MAX, f32::INFINITY));
+        let cache_converged = {
+            let mut epoch = 0xcbf29ce484222325u64;
+            let mut mix = |v: u32| {
+                epoch = epoch.wrapping_mul(0x100_0000_01b3).wrapping_add(v as u64);
+            };
+            for b in self.sun_dir.iter() {
+                mix(b.to_bits());
+            }
+            mix(self.sun_intensity.to_bits());
+            mix(self.sky_gain.to_bits());
+            for b in self.sky_wb.iter() {
+                mix(b.to_bits());
+            }
+            mix(self.cache_relight_spp);
+            mix(self.cache_relight_period);
+            mix(relight_alpha.to_bits());
+            mix(self.gdf_cone_k.to_bits());
+            if epoch == self.cache_epoch {
+                self.cache_stable_frames = self.cache_stable_frames.saturating_add(1);
+            } else {
+                // Lighting/geometry changed => re-converge from scratch (release the freeze latch).
+                self.cache_epoch = epoch;
+                self.cache_stable_frames = 0;
+                self.cache_conv_stable = 0;
+                self.cache_frozen = false;
+            }
+            // Arm the freeze latch on a backend-deterministic convergence horizon: while not yet
+            // frozen, require the epoch to have held for `cache_freeze_passes` amortization passes.
+            // Once latched it holds (a frozen relight stops advancing, so re-evaluating would
+            // oscillate) until the epoch changes above.
+            //
+            // CONVERGE mode (user directive): accumulation stays CONTINUOUS — never freeze. The
+            // running-mean + K-cycle jitter reach a bounded equilibrium while relight keeps running
+            // at the tier budget, so lighting keeps being tracked; and A3 reflect-skip reuse (gated
+            // on this latch) stays off — its stale-tile stagger read as visible crawl the moment the
+            // latch first armed on content ("jitter that stops when the camera moves").
+            if !self.cache_frozen && self.cache_converge == 0 {
+                // Keep tracking the measured below-eps streak — DIAGNOSTIC ONLY (it no longer gates
+                // the freeze; see the field doc for why a stochastic-gather EMA step is not backend-
+                // stable enough to trigger on).
+                if self.cache_stable_frames >= 2 && cache_conv_delta < self.cache_conv_eps {
+                    self.cache_conv_stable = self.cache_conv_stable.saturating_add(1);
+                } else {
+                    self.cache_conv_stable = 0;
+                }
+                // Freeze on a backend-deterministic convergence horizon: the lighting epoch has held
+                // for `cache_freeze_passes` amortization passes. `cache_stable_frames`, the relight
+                // period, and the pass constant are all backend-independent, so DX and VK freeze at
+                // the same frame on the same converged mean (DX≡VK-stable, unlike the old measured
+                // trigger that latched two different noise samples at frames 48 vs 8).
+                let freeze_horizon = self
+                    .cache_freeze_passes
+                    .saturating_mul(self.cache_relight_period.max(1));
+                if self.scene_cache_captured
+                    && !cache_reset_this_frame
+                    && self.cache_stable_frames >= freeze_horizon
+                {
+                    self.cache_frozen = true;
+                    // Visible confirmation that the deterministic horizon armed (relight cost drops to
+                    // zero from here until the lighting epoch changes). `step` reports how settled the
+                    // measured signal was at the horizon — a sanity check that the horizon is sized
+                    // past convergence, not a trigger.
+                    tracing::info!(
+                        frame = self.frame_no,
+                        horizon = freeze_horizon,
+                        step = cache_conv_delta,
+                        below_eps_streak = self.cache_conv_stable,
+                        "surface-cache relight FROZEN (deterministic convergence horizon)"
+                    );
+                }
+            }
+            self.cache_frozen && !cache_reset_this_frame
+        };
+        // A2 freeze: skip the relight only when dirty-skip is enabled AND the cache is measured-converged.
+        let cache_settled = self.cache_dirty_skip && cache_converged;
+        // Hand the relight its convergence probe index so it measures the EMA step — but only when we
+        // actually relight (not frozen); a frozen frame leaves the cleared slot at 0 (stays converged).
+        let relight_conv_idx = if cache_settled {
+            u32::MAX
+        } else {
+            cache_conv_idx
+        };
+        // C8b2: re-light the cache (direct sun + sky + multibounce gather from last frame). Async:
+        // the relight runs on the compute queue (submit section) and consumers read the previous
+        // frame's radiance — the graph handle is only a placeholder for the consumer reads (the
+        // cross-queue semaphore orders the data). Sync: record visibility + relight in-graph.
+        let scene_cache_lit_ext = match (scene_gdf_ext, scene_cache_ext) {
+            (Some(gdf_ext), Some(cache_ext)) if self.gdf.has_cache_lighting() => {
+                let ext = graph.import_external("scene_cache_lit");
+                // Lossless dirty-skip: a converged cache re-lights to the value it already holds, so
+                // skip the ~100-march relight and let consumers read the persisted (imported) radiance.
+                if !self.async_cache_on && !cache_settled {
+                    // Stage D2b: per-card camera visibility (Y-flip-free planes => DX≡VK).
+                    let card_vis_ext = if self.cache_feedback {
+                        // Lit-calibration probe: prev camera + lit history (the probe validates
+                        // occlusion with a TLAS ray, so it needs the content TLAS bound).
+                        let lit = self.reflect.lit_hist_read_index();
+                        let calib =
+                            if self.cache_lit_calib && self.frame_no > 0 && lit != 0x7FFF_FFFF {
+                                Some((
+                                    self.prev_view_proj,
+                                    self.prev_eye,
+                                    self.frame_no as u32,
+                                    lit,
+                                    (cw, ch),
+                                    self.flip_y,
+                                ))
+                            } else {
+                                None
+                            };
+                        self.gdf.record_cache_visibility(
+                            &mut graph,
+                            frustum_planes(cull_view_proj),
+                            calib,
+                            self.frame_no as u32,
+                        )
+                    } else {
+                        None
+                    };
+                    self.gdf.record_cache_light(
+                        &mut graph,
+                        gdf_ext,
+                        cache_ext,
+                        ext,
+                        self.sun_dir,
+                        self.sun_intensity,
+                        self.cache_relight_spp,
+                        self.frame_no as u32,
+                        cache_reset_this_frame,
+                        self.cache_relight_period,
+                        card_vis_ext,
+                        relight_alpha,
+                        self.gdf_cone_k,
+                        relight_conv_idx,
+                        self.cache_skylight_floor(),
+                        self.irradiance_cube_index(),
+                        self.cache_gather_firefly(),
+                        self.sky_gain,
+                        self.sky_wb,
+                        // Deferred-parity skylight: the previous frame's completed sky-visibility
+                        // slot (this pass records before the volume update; the 1-frame latency is
+                        // hidden by the cache EMA). Sentinel until the first update lands, or when
+                        // the knob is off — the shader then keeps the legacy sky-on-miss path.
+                        if self.cache_sky_occlude {
+                            self.gi.gi_skyvis_prev_sampled().unwrap_or(u32::MAX)
+                        } else {
+                            u32::MAX
+                        },
+                        self.skyvis_tint,
+                        self.skyvis_tint_v0,
+                        self.skyvis_min_occ,
+                        // The same AO params the screen-space GDF AO uses — the parity skylight
+                        // is occluded by the identical formula (only read in sky-occlusion mode).
+                        gi::GiSystem::ao_params(scene_aabb_min, scene_aabb_max),
+                        self.cache_hwrt_shadow,
+                        self.cache_hwrt_gather,
+                        self.cache_gather_fallback,
+                        // F6P: both halves ride one bit here — this pass is producer AND consumer
+                        // of the bent normal, and the deferred parity contract needs them together.
+                        self.skyvis_bent_fix != 0,
+                    );
+                    self.scene_cache_reset = false;
+                }
+                Some(ext)
+            }
+            _ => None,
+        };
+        // C8b3/C8g: the (indices, lit-handle) the consumers use to read the cached multibounce
+        // radiance at a hit (instead of a per-ray re-light). `None` => per-ray. Split so the
+        // reflection cache (C8g, default) is independent of the heavier per-ray GI cache (opt-in).
+        let cache_read = self.gdf.surface_cache_read();
+        // Cone-LOD: generate the surface-cache radiance MIP pyramid from the freshly-lit mip0, so a
+        // demagnified far reflection — or a distant GI hit (F1 Stage 4) — reads a coarse averaged
+        // level (smooth) instead of stair-stepped mip0 blocks. Ordered after the relight; returns a
+        // handle the consumers read after. `None` (no pyramid) → the mip0 path. Computed BEFORE the
+        // GI tuple so GI can carry the pyramid index + depend on this pass.
+        let cache_mip_ext: Option<ResourceId> = match (scene_cache_lit_ext, cache_read) {
+            (Some(lit), Some((_, _, rad, _, _)))
+                if (self.reflect_cache && self.reflect_mip) || self.gi_card_mip =>
+            {
+                self.gdf.record_cache_mipgen(&mut graph, lit, rad)
+            }
+            _ => None,
+        };
+        let gi_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
+            Some(ext) if self.surface_cache => cache_read.map(|(c, p, r, n, t)| {
+                // F1 Stage 4: pack the radiance MIP-pyramid index into num_cards bits 16..31 (+1;
+                // 0 = off) so the GI gather reads a ray-cone level. Depend on the mipgen output (which
+                // transitively depends on the relight) so GI runs after the pyramid is written. Only
+                // when the count fits in 16 bits; the gallery keeps mip off (byte-identical).
+                match (
+                    self.gi_card_mip,
+                    cache_mip_ext,
+                    self.gdf.reflect_cache_mip_info(),
+                ) {
+                    (true, Some(mext), Some((pyr, _))) if n < 0x1_0000 => {
+                        ([c, p, r, n | ((pyr + 1) << 16), t], mext)
+                    }
+                    _ => ([c, p, r, n, t], ext),
+                }
+            }),
+            _ => None,
+        };
+        // Track C card grid (opt-in `P_CACHE_GRID`, built at cache-build time): pack the grid's
+        // two bindless indices into the cards slot's spare bits — cards | (cells+1)<<8 |
+        // (pool+1)<<16 (0 = no grid; storage indices are < 64 so the low byte keeps the real
+        // cards index). Reflection-only: the GI/relight consumers keep the exact linear scan.
+        let cache_grid = self.gdf.surface_cache_grid();
+        let reflect_cache_arg: Option<([u32; 5], ResourceId)> = match scene_cache_lit_ext {
+            Some(ext) if self.reflect_cache => cache_read.map(|(c, p, r, n, t)| {
+                let c = match cache_grid {
+                    Some((cells, pool)) => c | ((cells + 1) << 8) | ((pool + 1) << 16),
+                    None => c,
+                };
+                // C2a: the reflection's cache_tile slot re-packs the tile with the MIP fields, so
+                // the adaptive layout index rides cache.x bits 24..31 instead (the shared tuple's
+                // tile carries it in bits 8..15 for every other consumer — strip to the raw edge).
+                let c = match self.gdf.surface_cache_layout() {
+                    Some(l) => c | ((l + 1) << 24),
+                    None => c,
+                };
+                // C2b: the desired-res feedback buffer rides cache.y bits 8..15 (0 = off).
+                let p = match self.gdf.card_res_feedback_index() {
+                    Some(f) => p | ((f + 1) << 8),
+                    None => p,
+                };
+                // Mirror feedback: the relight-priority mark buffer rides cache.y bits 16..23
+                // (0 = off). Gated with the B2 compaction knob — same Apple-only blast radius.
+                let p = match self.gdf.card_marks_index() {
+                    Some(m) if self.reflect_compact_div > 0 => p | ((m + 1) << 16),
+                    _ => p,
+                };
+                // Hit-lighting hybrid: the captured-albedo atlas rides cache.y bits 24..31
+                // (0 = off) so the HWRT refine can recover the card's converged lighting as
+                // radiance/albedo and re-modulate it with the true material albedo.
+                let p = match self.gdf.cache_albedo_index() {
+                    a if a != u32::MAX && self.reflect_compact_hwrt => p | ((a + 1) << 24),
+                    _ => p,
+                };
+                let t = t & 0xFF;
+                // Pack the MIP pyramid into the tile slot: tile | max_mip<<8 | mip_index<<16 (all
+                // ≤16 bits; 0xFFFF mip_index = no pyramid). Order the reflection after mipgen when
+                // the pyramid exists (its handle), else after the relight directly.
+                let (tile_packed, order) = match (self.gdf.reflect_cache_mip_info(), cache_mip_ext)
+                {
+                    (Some((mip_idx, max_mip)), Some(mip_ext)) => {
+                        (t | (max_mip << 8) | (mip_idx << 16), mip_ext)
+                    }
+                    _ => (t | (0xFFFFu32 << 16), ext),
+                };
+                // Contact-gap routing flags ride the free bits 12..13 between the max_mip
+                // nibble (8..11) and the mip index (16..): bit12 = occluder-witness routing
+                // (`P_CACHE_OCCL_ROUTE`), bit13 = validity-weighted probe interpolation
+                // (`P_REFLECT_PROBE_VALID`). Reflection-only — the shared GI/relight tuple
+                // carries a bare tile.
+                let tile_packed = tile_packed
+                    | if self.cache_occl_route { 1 << 12 } else { 0 }
+                    | if self.reflect_probe_valid { 1 << 13 } else { 0 }
+                    | if self.reflect_graze_eps { 1 << 14 } else { 0 }
+                    | if self.reflect_hit_fetch { 1 << 15 } else { 0 };
+                // Lit-calibration correction rides cache.w bits 16..23 (0 = off; the card count
+                // needs only the low 16 bits — legacy consumers of the shared tuple get it bare).
+                let n = match self.gdf.card_corr_index() {
+                    Some(ci) if self.cache_lit_calib => n | ((ci + 1) << 16),
+                    _ => n,
+                };
+                ([c, p, r, n, tile_packed], order)
+            }),
+            _ => None,
+        };
+        // Stage C2: GDF ambient occlusion, multiplied into the lighting ambient term.
+        let gdf_ao_out = match (self.gdf_ao, scene_gdf_vol, scene_gdf_ext) {
+            (true, Some(vol), Some(ext)) => {
+                // macOS/M3 perf: trace the AO at 1/div (Apple tier = half) + joint-bilateral upsample.
+                // gdf_ao.slang samples the G-buffer by normalized UV, so a coarser extent + dims trace
+                // correctly (no shader change); div=1 keeps the legacy full-res path byte-identical.
+                let adiv = self.ao_res_div.max(1);
+                let (aw, ah) = (cw.div_ceil(adiv), ch.div_ceil(adiv));
+                let ao_extent = if adiv > 1 {
+                    Extent2D::new(aw, ah)
+                } else {
+                    extent
+                };
+                let ao_traced = self.gi.record_ao(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    ao_extent,
+                    inv_view_proj,
+                    aw,
+                    ah,
+                    // bit1 = viewer-facing normal flip (F6M): match pbr's two-sided shading
+                    // contract on content scenes; the gallery shades single-sided
+                    // (`two_sided = !is_gallery`) and keeps its byte-identical anchor.
+                    // `P_GDF_FACING_FLIP=0` restores the raw-normal legacy for A/B.
+                    self.flip_y | if self.gdf_facing_flip { 2 } else { 0 },
+                    scene_clip,
+                    &scene_clip_vols,
+                );
+                Some(if adiv > 1 {
+                    self.gi.record_upsample(
+                        &mut graph,
+                        ao_traced,
+                        g_depth,
+                        g_normal,
+                        extent,
+                        inv_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        aw,
+                        ah,
+                        self.flip_y,
+                    )
+                } else {
+                    ao_traced
+                })
+            }
+            _ => None,
+        };
+        // F6O: per-pixel sky-visibility for the DEFERRED skylight occlusion. Off (`P_SKYVIS_PP=0`)
+        // → not recorded, the deferred pass keeps sampling the probe-resolution volume V (anchor).
+        // On → per-pixel GDF trace at full res (silhouette-crisp), replacing only the deferred
+        // `skyvis`; the volume still runs for the surface-cache / reflection world-space consumers.
+        // Trace + temporal accumulate the per-pixel sky-vis EARLY; the spatial denoise (which
+        // blends in the smooth volume V at far distance) runs LATER, once record_gi has produced
+        // `gi_skyvis_out`. Carry the accumulated image + its low-res dims to that point.
+        let skyvis_accum: Option<(ResourceId, u32, u32, Extent2D)> = match (
+            self.skyvis_pp_spp > 0 && self.gi.has_skyvis_pp(),
+            scene_gdf_vol,
+            scene_gdf_ext,
+        ) {
+            (true, Some(vol), Some(ext)) => {
+                // Trace at 1/div (the hemisphere march is expensive) + joint-bilateral upsample,
+                // mirroring the gdf_ao res-divisor path. gdf_skyvis samples the G-buffer by
+                // normalized UV, so a coarser extent traces correctly with no shader change.
+                let sdiv = self.skyvis_pp_div.max(1);
+                let (sw, sh) = (cw.div_ceil(sdiv), ch.div_ceil(sdiv));
+                let s_extent = if sdiv > 1 {
+                    Extent2D::new(sw, sh)
+                } else {
+                    extent
+                };
+                let traced = self.gi.record_skyvis(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    s_extent,
+                    inv_view_proj,
+                    sw,
+                    sh,
+                    self.flip_y | if self.gdf_facing_flip { 2 } else { 0 },
+                    self.skyvis_pp_spp,
+                    self.frame_no as u32,
+                    scene_clip,
+                    &scene_clip_vols,
+                    // Visibility escape needs far fewer march steps than a lighting bounce: the
+                    // cone_k LOD grows the step with distance, so ~24 steps reach the scene
+                    // diagonal. Capping here is a big cost win (the march dominates the pass).
+                    self.gi_max_steps.min(24),
+                    self.gdf_cone_k.max(0.5),
+                );
+                // Temporal accumulation (reproject prev V via prev_view_proj, world-pos-validated
+                // EMA) converges the few-ray noise toward the true V — this is what removes the
+                // door/opening sparkle+speckle. Then a cheap low-res spatial denoise cleans the
+                // residual and strips the temporal `.a` to bent 0; the deferred does the edge-aware
+                // 2x2 upscale. All at the low trace res (cheap).
+                let accumulated = self.gi.record_skyvis_temporal(
+                    &mut graph,
+                    traced,
+                    g_depth,
+                    g_normal,
+                    s_extent,
+                    inv_view_proj,
+                    self.prev_view_proj,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    sw,
+                    sh,
+                    // bit1 = sub-pixel bilinear history fetch when TAAU jitter is active (the B2
+                    // contract the GI/reflection temporals use); degenerates to flip_y when jitter
+                    // is off, so native/static anchors are unaffected. (Fable F6O review.)
+                    temporal_flip,
+                );
+                Some((accumulated, sw, sh, s_extent))
+            }
+            _ => None,
+        };
+        // Screen-space near-field AO (HBAO-lite), composed with the GDF AO in the lighting pass.
+        // proj_scale = 0.5/tan(fovY/2) from the frame's vertical FOV (perspective_rh above).
+        let ssao_out = if self.ssao {
+            self.gtao.record(
+                &mut graph,
+                g_depth,
+                g_normal,
+                extent,
+                inv_view_proj,
+                [eye.x, eye.y, eye.z],
+                cw,
+                ch,
+                self.flip_y,
+                self.ssao_params[0],
+                self.ssao_params[1],
+                self.ssao_params[2],
+                0.5 / ((fov_y_rad * 0.5).tan()),
+                self.ssao_params[3],
+            )
+        } else {
+            None
+        };
+        // Stage C3: 1-bounce diffuse GI added to the ambient term, optionally denoised (C4).
+        // Indoor skylight-occlusion image (directional sky-visibility), produced on the volume GI
+        // path and consumed by the lighting (occludes the IBL diffuse skylight). `None` otherwise.
+        let mut gi_skyvis_out: Option<ResourceId> = None;
+        // Hoisted out of the GI match arm so the reflection pass (recorded later, out of that arm's
+        // scope) can sample the SAME radiance-cache volume + reuse its exact write-order handle for
+        // the GI-lit indirect term at reflection hits. `None` unless the volume GI path runs.
+        // F4B tuple: (radiance base, sky-vis base, fine-AABB storage buffer or MAX, write handle).
+        let mut gi_reflect_arg: Option<(u32, u32, u32, ResourceId)> = None;
+        let gdf_gi_out = match (self.gdf_gi, scene_gdf_vol, scene_gdf_ext) {
+            (true, Some(vol), Some(ext)) if self.screen_probe => {
+                // Screen-space radiance probes (P1+): per-tile probe trace into an octahedral
+                // atlas + a per-pixel gather replace the GI consumption (world-volume sample /
+                // ray march). Full-res output; denoise (temporal + à-trous) for stability like the
+                // ray-march path. The gather also builds the indoor skylight occlusion (sky-vis)
+                // from the probes' per-ray sky visibility, fed to lighting like the volume path.
+                // P4: update the world radiance cache first, so escaped probe rays sample this
+                // frame's cache (off-screen / far-field / infinite bounce). `None` when disabled.
+                let wrc_arg = if self.wrc {
+                    self.gi.record_wrc_update(
+                        &mut graph,
+                        vol,
+                        ext,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        self.sun_dir,
+                        self.sun_intensity,
+                        scene_clip,
+                        &scene_clip_vols,
+                        scene_albedo,
+                        gi_cache_arg,
+                        self.gi_max_steps,
+                        self.gdf_cone_k,
+                        0.1, // EMA alpha
+                    )
+                } else {
+                    None
+                };
+                let (traced, sp_skyvis) = self.gi.record_screen_probe(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    extent,
+                    inv_view_proj,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    cw,
+                    ch,
+                    self.flip_y,
+                    self.frame_no as u32,
+                    scene_albedo,
+                    gi_cache_arg,
+                    firefly_max,
+                    scene_clip,
+                    &scene_clip_vols,
+                    self.gi_max_steps,
+                    self.gdf_cone_k,
+                    // P2 spatial cross-probe filter half-kernel (1 = 3x3; `P_SP_FILTER=0` disables).
+                    std::env::var("P_SP_FILTER")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(1)
+                        .min(4),
+                    wrc_arg,
+                );
+                gi_skyvis_out = Some(sp_skyvis);
+                let out = if gi_denoise_active {
+                    self.gi.record_denoise(
+                        &mut graph,
+                        traced,
+                        g_depth,
+                        g_normal,
+                        extent,
+                        inv_view_proj,
+                        self.prev_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        temporal_flip,
+                        self.gi_temporal_clamp,
+                        self.gi_atrous_steps,
+                    )
+                } else {
+                    traced
+                };
+                Some(out)
+            }
+            (true, Some(vol), Some(ext)) => {
+                // Stage D1: trace at half res (1/4 the rays) when enabled, then joint-bilateral
+                // upsample to full res before the denoiser. gdf_gi.slang samples the G-buffer by
+                // normalized UV, so a half extent + half dims trace correctly with no shader change.
+                // P1: trace at 1/div of the render extent (2 = legacy half, 4 = quarter probes),
+                // then the bilateral upsample (gdf_gi_upsample.slang, generic over the source dims)
+                // reconstructs full res. Content-only; the gallery is full-res (byte-identical).
+                let half_gi = self.gi_half_res;
+                let div = if half_gi { self.gi_res_div.max(1) } else { 1 };
+                let (gw, gh) = (cw.div_ceil(div), ch.div_ceil(div));
+                let gi_extent = Extent2D::new(gw, gh);
+                // 레퍼런스 엔진 GI-fidelity: update + bind the world irradiance volume (DDGI-lite). The update
+                // propagates last frame's volume into hits (multibounce), so deep interiors fill in
+                // over frames. When bound, the GI pass samples the volume instead of marching.
+                // Slab amortization: instead of the old whole-grid burst 1 frame in N + skip
+                // (the burst spiked the frame time and pumped the wall-clock auto-exposure into
+                // visible flicker), update dims.z/period z-slices EVERY frame — flat cost, every
+                // texel still refreshes once per period, and the ping-pong advances at the end
+                // of each full cycle so the EMA history stays one complete cycle behind.
+                // period = 1 is the legacy full-grid-every-frame update, bit for bit.
+                let gi_vol_period = (self.gi_volume_period as u32).clamp(1, gi::GI_VOL_DIM);
+                let gi_vol_slab = gi::GI_VOL_DIM.div_ceil(gi_vol_period);
+                // F4B: single-source schedule — (z-slab index, level y-offset, cycle length).
+                // Fine mode interleaves one level per frame at the single-level slab cost.
+                let (gi_slab_idx, gi_y_offset, gi_cycle) = self.gi_volume_schedule();
+                let gi_volume_arg = if self.gi_volume {
+                    self.gi
+                        .record_gi_volume(
+                            &mut graph,
+                            vol,
+                            ext,
+                            scene_aabb_min,
+                            scene_aabb_max,
+                            self.sun_dir,
+                            self.sun_intensity,
+                            self.sky_gain,
+                            scene_clip,
+                            &scene_clip_vols,
+                            scene_albedo,
+                            crate::GROUND_ALBEDO,
+                            // C0-fix (`P_GI_STABLE`): a FIXED jitter index ⇒ every probe traces
+                            // the same deterministic direction set each update (the reference
+                            // radiance cache disables trace jitter for stability), so a static
+                            // scene's volume is an idempotent overwrite = a fixed point instead
+                            // of a fixed-alpha EMA over fresh per-frame noise (never settles).
+                            // Slab mode folds the cycle out of the seed so a slab retraces the
+                            // same directions each cycle (the fine super-cycle, when live), not
+                            // each frame.
+                            if self.gi_stable {
+                                // F6K: K-cycle deterministic rotation (1 = the legacy pin).
+                                (self.frame_no / gi_cycle) as u32 % self.gi_dir_sets.max(1)
+                            } else {
+                                (self.frame_no / gi_cycle) as u32
+                            },
+                            self.gi_volume_spp,
+                            // F4B EMA alpha: env override, else auto — 0.2 in fine mode (the
+                            // interleave halves per-level refreshes; the stronger blend restores
+                            // the recipe-warmup convergence), 0.1 single-level (legacy).
+                            if self.gi_volume_alpha > 0.0 {
+                                self.gi_volume_alpha
+                            } else if self.gi.gi_fine_installed() {
+                                0.2
+                            } else {
+                                0.1
+                            },
+                            gi_slab_idx * gi_vol_slab,
+                            gi_vol_slab,
+                            gi_y_offset,
+                            self.gi_repair_flags,
+                            self.gi_sun_k,
+                        )
+                        .zip(self.gi.gi_volume_sampled())
+                        .map(|(vext, (rad_base, skyvis_base))| {
+                            // F4B: the fine-AABB buffer index rides the tuple so every consumer
+                            // (per-pixel GI, reflections) shares the ONE buffer + disable window.
+                            (rad_base, skyvis_base, self.gi.gi_fine_buf_index(), vext)
+                        })
+                } else {
+                    None
+                };
+                gi_reflect_arg = gi_volume_arg; // expose to the later reflection pass (same handle)
+                let (traced, skyvis) = self.gi.record_gi(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    gi_extent,
+                    inv_view_proj,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    gw,
+                    gh,
+                    // bit1 = write the bent normal into the sky-vis image (P_BENT_NORMAL); bit0 is
+                    // the clip-space Y flip. gdf_gi only masks bit0 for reconstruction, so the
+                    // upper bits are a safe side channel with zero push growth. bit2 = viewer-
+                    // facing normal flip (F6M): match pbr's two-sided shading contract on content
+                    // scenes (`two_sided = !is_gallery`); gallery stays byte-identical.
+                    // `P_GDF_FACING_FLIP=0` restores the raw-normal legacy for A/B.
+                    // bit3 = F6P producer contract (`P_SKYVIS_BENT_FIX` bit0): the bent magnitude
+                    // carries directionality x interpolation support instead of the provably-1,
+                    // scale-free factor that froze the direction over a whole probe cell.
+                    self.flip_y
+                        | if self.bent_normal { 2 } else { 0 }
+                        | if self.gdf_facing_flip { 4 } else { 0 }
+                        | if self.skyvis_bent_fix & 1 != 0 { 8 } else { 0 },
+                    self.gi_spp,
+                    self.frame_no as u32,
+                    scene_albedo,
+                    gi_cache_arg,
+                    firefly_max,
+                    scene_clip,
+                    &scene_clip_vols,
+                    self.gi_max_steps,
+                    self.gdf_cone_k,
+                    // F4: importance-sampled gather mix (0.0 on the gallery = legacy cosine anchor).
+                    self.gi_importance,
+                    // record_gi keeps the 3-tuple (it reads the fine buf from its own state).
+                    gi_volume_arg.map(|(r, s, _, e)| (r, s, e)),
+                    // F3: HW-RT gather only on the ray-march path (the volume path samples the field,
+                    // not rays). Default off (`P_HWRT_GI` unset) -> SW march -> gallery byte-identical.
+                    self.hwrt_gi && gi_volume_arg.is_none(),
+                    // Increment A: occupancy-weighted volume consumption (volume path only).
+                    // F6L bit1 (all-rejected -> ungated fallback) rides only on top of bit0 —
+                    // the shader's occ block is gated on the whole field being nonzero, so a
+                    // bare bit1 would wrongly enable the manual path with gating still applied.
+                    u32::from(self.gi_vol_occ)
+                        | (u32::from(self.gi_vol_occ) & (self.gi_repair_flags >> 3)) << 1,
+                );
+                gi_skyvis_out = skyvis;
+                // M3-C: denoise at the GI TRACE res (before the bilateral upsample), then upsample
+                // the DENOISED GI to full res — the temporal + à-trous denoise was the biggest GI
+                // cost at full res on the upsampled quarter-res probes (gdf_temporal 2.1ms +
+                // gdf_atrous 3.6ms on Apple/M3). Gallery keeps gi_half_res off ⇒ denoise runs
+                // full-res with no upsample = the old order exactly (byte-identical anchor).
+                let denoised = if gi_denoise_active {
+                    self.gi.record_denoise(
+                        &mut graph,
+                        traced,
+                        g_depth,
+                        g_normal,
+                        gi_extent,
+                        inv_view_proj,
+                        self.prev_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        gw,
+                        gh,
+                        temporal_flip,
+                        self.gi_temporal_clamp,
+                        self.gi_atrous_steps,
+                    )
+                } else {
+                    traced
+                };
+                let out = if half_gi {
+                    self.gi.record_upsample(
+                        &mut graph,
+                        denoised,
+                        g_depth,
+                        g_normal,
+                        extent,
+                        inv_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        gw,
+                        gh,
+                        self.flip_y,
+                    )
+                } else {
+                    denoised
+                };
+                Some(out)
+            }
+            _ => None,
+        };
+        // GI-on-distance-field visualization: update the world radiance cache, then march the
+        // camera into the GDF and paint each hit with the cache's stored indirect irradiance.
+        // Replaces the tonemap source (added to the `tonemap_src` chain below). `P_WRC_VIZ_MODE`
+        // 0 = irradiance grayscale, 1 = irradiance × clay; `P_WRC_VIZ_GAIN` lifts the dim indirect.
+        let wrc_view_out = match (self.wrc_viz, scene_gdf_vol, scene_gdf_ext) {
+            (true, Some(vol), Some(ext)) => self
+                .gi
+                .record_wrc_update(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    scene_clip,
+                    &scene_clip_vols,
+                    scene_albedo,
+                    gi_cache_arg,
+                    self.gi_max_steps,
+                    self.gdf_cone_k,
+                    0.1, // EMA alpha
+                )
+                .map(|(wrc_atlas, wrc_ext)| {
+                    let mode = std::env::var("P_WRC_VIZ_MODE")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(1);
+                    let gain = std::env::var("P_WRC_VIZ_GAIN")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(1.0);
+                    self.gi.record_wrc_view(
+                        &mut graph,
+                        vol,
+                        extent,
+                        eye.into(),
+                        inv_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        self.flip_y,
+                        scene_clip,
+                        &scene_clip_vols,
+                        wrc_atlas,
+                        wrc_ext,
+                        mode,
+                        gain,
+                        // Surface-cache source (P_SC_VIZ): shade from the high-res mesh cards' final
+                        // lit radiance where a card covers the hit; else fall back to the world cache.
+                        if self.sc_viz { 1 } else { 0 },
+                        if self.sc_viz {
+                            cache_read
+                                .zip(scene_cache_lit_ext)
+                                .map(|((c, p, r, n, t), ext)| ([c, p, r, n, t], ext))
+                        } else {
+                            None
+                        },
+                    )
+                }),
+            _ => None,
+        };
+        // Stage C7c: hybrid SW-RT reflection feeding the lighting specular. Built BEFORE
+        // lighting (it replaces the prefilter-cube IBL specular). SSR runs in history mode
+        // (reprojected previous-frame raw radiance) so it never reads this frame's
+        // not-yet-written HDR; the GDF reflect + composite are already raw radiance, so the
+        // composite is a drop-in for the cube `prefiltered` (pbr applies exposure once). The
+        // lit-color history for the NEXT frame's SSR is captured after lighting, below.
+        let swrt_reflect_out = match (
+            self.swrt_reflect && self.reflect.has_lit_history(),
+            scene_gdf_vol,
+            scene_gdf_ext,
+        ) {
+            (true, Some(vol), Some(ext)) => {
+                // C8d: the SSR that feeds the composite. Default = full-res screen MIRROR — the
+                // accurate on-screen source (real neighbour pixels via the reprojected lit-history;
+                // correct colour + geometry the GDF sphere-trace can't match). The composite uses
+                // it below `reflect_max_roughness` and the GDF prefilter above, with a luminance
+                // gate that routes off-screen / grazing bad hits to the GDF (also keeping the march
+                // VK≡DX-stable). `P11_SSR_STOCHASTIC` selects the half-res GGX trace + ratio-
+                // estimator resolve instead (the glossy path; it goes dark on sharp metals).
+                // B1-lite hard handoff: with the SCREEN_HIT trace on, the GDF path already
+                // carries VALIDATED on-screen colours per ray, so the separate unvalidated SSR
+                // blend would only double-count them and re-introduce its feedback wiggle — skip
+                // recording SSR entirely (the composite gets a hard cut) and save its cost.
+                let ssr = if self.reflect_screen_hit {
+                    None
+                } else if self.ssr_stochastic {
+                    let half = Extent2D::new(hcw, hch);
+                    let (ssr_a, ssr_b) = self.reflect.record_ssr(
+                        &mut graph,
+                        self.deferred.globals_buffer(),
+                        globals_offset,
+                        hdr,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        half,
+                        view_proj.to_cols_array(),
+                        inv_view_proj,
+                        eye,
+                        hcw,
+                        hch,
+                        cw,
+                        ch,
+                        self.flip_y,
+                        // CONVERGE: cycle the GGX jitter over K=12 deterministic frames (reference
+                        // NumFramesAccumulated window) so the running mean below averages a periodic
+                        // ray set instead of fresh white noise (permanent variance floor).
+                        if self.cache_converge != 0 {
+                            (self.frame_no % 12) as u32
+                        } else {
+                            self.frame_no as u32
+                        },
+                        self.scene_radius * 1.5,
+                        self.scene_radius * 0.06,
+                        true,
+                        self.firefly_clamp,
+                        true, // stochastic GGX jitter
+                    );
+                    let resolved = self.reflect.record_ssr_resolve(
+                        &mut graph,
+                        ssr_a,
+                        ssr_b,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        half,
+                        inv_view_proj,
+                        self.prev_view_proj,
+                        eye,
+                        hcw,
+                        hch,
+                        self.flip_y,
+                        self.scene_radius * 0.02,
+                        firefly_max,
+                        2.0,
+                        // B1 (CONVERGE + static camera): drop the neighbourhood clamp — it
+                        // re-injects each frame's 12-cycle jitter into the converged mean at
+                        // full amplitude regardless of α (the ripple never decays inside it).
+                        if self.cache_converge != 0 && camera_static {
+                            0
+                        } else {
+                            self.ssr_history_clamp
+                        },
+                        self.ssr_clamp_gamma,
+                        // CONVERGE: running mean α=1/(1+N) (damps the lit-history feedback into
+                        // a contraction); legacy keeps the fixed 0.15 EMA. Static camera lifts
+                        // the N→12 saturation (B1): the 12-cycled jitter is periodic, so the
+                        // unbounded running mean converges to the exact 12-set average (wiggle
+                        // → 0); any camera move collapses N back to 12 in one frame.
+                        if self.cache_converge != 0 && camera_static {
+                            -16_777_216.0
+                        } else if self.cache_converge != 0 {
+                            -12.0
+                        } else {
+                            0.15
+                        },
+                    );
+                    Some(resolved)
+                } else {
+                    let mirror = self
+                        .reflect
+                        .record_ssr(
+                            &mut graph,
+                            self.deferred.globals_buffer(),
+                            globals_offset,
+                            hdr,
+                            g_depth,
+                            g_normal,
+                            g_material,
+                            extent,
+                            view_proj.to_cols_array(),
+                            inv_view_proj,
+                            eye,
+                            cw,
+                            ch,
+                            cw,
+                            ch,
+                            self.flip_y,
+                            self.frame_no as u32,
+                            self.scene_radius * 1.5,
+                            self.scene_radius * 0.06,
+                            true, // history mode: reprojected raw-radiance previous frame
+                            self.firefly_clamp,
+                            false, // mirror ray (composite handles roughness via the GDF prefilter)
+                        )
+                        .0;
+                    Some(mirror)
+                };
+                // Stage D3 / M3-C: trace the reflection at 1/div res + bilateral upsample to full res
+                // before the temporal resolve. gdf_reflect.slang samples the G-buffer by normalized UV,
+                // so any coarser extent + dims trace correctly (no shader change). `div = 2` reproduces
+                // the legacy half-res exactly (`cw.div_ceil(2)` == the old `hcw/hch`); the Apple tier
+                // uses `div = 4` (quarter-res) — the measured single lever on gdf_reflect. Gallery keeps
+                // `reflect_half_res` off ⇒ div collapses to 1 (full-res, byte-identical anchor).
+                // Phase 16 C: `P_HWRT_FULLRES` traces the HWRT reflection at FULL resolution — removes
+                // the residual half-res blockiness on the chrome ball / floor (a crisp mirror) at ~4x
+                // cost (a quality/screenshot mode). Default HWRT keeps the half-res trace for perf.
+                let refl_half = self.reflect_half_res && !(self.hwrt && self.hwrt_fullres);
+                let rdiv = if refl_half {
+                    self.reflect_res_div.max(1)
+                } else {
+                    1
+                };
+                let (rw, rh) = (cw.div_ceil(rdiv), ch.div_ceil(rdiv));
+                let refl_extent = if refl_half {
+                    Extent2D::new(rw, rh)
+                } else {
+                    extent
+                };
+                // Jitter frame: a near-mirror takes the deterministic pure-mirror path (no jitter, so
+                // it settles to a stable sharp reflection regardless of this). GLOSSY surfaces GGX-
+                // sample one ray/frame; content uses a FIXED frame-0 jitter so the sample is temporally
+                // STABLE (the resolve reconstructs the lobe spatially) — a frame-VARYING ray never
+                // settles under the 1-ray/frame accumulation (auto-exposure + motion reject the history)
+                // and reads as sparkle. `P_REFLECT_ACCUM=1` forces frame-varying (studies convergence).
+                let refl_frame_varying = self.is_gallery
+                    || self.reflect_stochastic // A5: blue-noise needs frame-varying to converge
+                    || std::env::var_os("P_REFLECT_ACCUM").is_some();
+                let refl_traced = self.reflect.record_gdf_reflect(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    g_material,
+                    refl_extent,
+                    inv_view_proj,
+                    eye,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    rw,
+                    rh,
+                    // F6L: flip_y bit27 = the ungated fallback of the validity-weighted
+                    // GI-volume read (rides `P_GI_TRAPPED_FILL`, gi_repair_flags bit3).
+                    self.flip_y | ((self.gi_repair_flags >> 3 & 1) << 27),
+                    // Frame-VARYING GGX jitter: a different reflection ray each frame so the temporal
+                    // resolve actually ACCUMULATES (real convergence of the glossy lobe / near-mirror),
+                    // not just a spatial gather of one fixed sample. This is now the default for content
+                    // too: the fixed frame-0 jitter never converged (a permanent 1-sample blocky
+                    // pattern), and it was only chosen because the old absolute firefly clamp crushed
+                    // the accumulation — with the exposure-relative clamp the frame-varying history
+                    // resolves cleanly. Gallery already used the real frame (byte-identical anchor).
+                    // `P_REFLECT_FIXED_JITTER=1` restores the old fixed-0 behaviour.
+                    if refl_frame_varying {
+                        self.frame_no as u32
+                    } else {
+                        0
+                    },
+                    scene_albedo,
+                    reflect_cache_arg,
+                    gi_reflect_arg, // GI-lit indirect at reflection hits (radiance cache)
+                    self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
+                    scene_clip,
+                    &scene_clip_vols,
+                    // bit31 = content flag (mirror threshold); bit30 = A5 blue-noise stochastic;
+                    // bits 16..23 = B2' rough-prefilter threshold (roughness*255, 0 = off);
+                    // bits 24..29 = B2' glossy samples/pixel K. All SW trace only — HWRT's
+                    // max_steps field carries the lit-history index instead (the step cap itself
+                    // fits in bits 0..15, tiers cap it at 256).
+                    self.reflect_max_steps
+                        | if self.is_gallery { 0 } else { 0x8000_0000 }
+                        | if self.reflect_stochastic && !self.hwrt {
+                            0x4000_0000
+                        } else {
+                            0
+                        }
+                        | if !self.hwrt {
+                            // K = 1 packs as 0 (the shader floors to 1) so default runs keep a
+                            // bit-stable push block.
+                            (((self.reflect_prefilter * 255.0) as u32 & 0xFF) << 16)
+                                | (((self.reflect_glossy_spp - 1) & 0x3F) << 24)
+                        } else {
+                            0
+                        },
+                    self.gdf_cone_k,
+                    {
+                        // A3: prime the skip buffer every frame (write); enable REUSE (read) only once
+                        // the lighting + surface cache are stable, so a reused pixel equals a fresh
+                        // trace (image-identical). Camera motion is handled per-pixel by the world-pos
+                        // gate in-shader. Sentinels when the feature/buffers are off.
+                        // A2-fix: enable reflect REUSE on the same MEASURED cache convergence the
+                        // relight freeze uses (was a frame-count guess that reused stale reflections
+                        // before IntelSponza's cache/GI had converged).
+                        let stable = cache_converged;
+                        match (self.reflect_skip, self.reflect.reflect_skip_indices()) {
+                            (true, Some((r, w))) => [
+                                if stable { r } else { u32::MAX },
+                                w,
+                                self.reflect_skip_stagger,
+                                self.frame_no as u32,
+                            ],
+                            _ => [u32::MAX; 4],
+                        }
+                    },
+                    self.hwrt,
+                    self.reflect_screen_hit,
+                    self.deferred.globals_buffer(),
+                    globals_offset,
+                    self.reflect.lit_hist_read_index(),
+                    if self.hwrt_hitlighting {
+                        self.rt.content_hit_indices()
+                    } else {
+                        None
+                    },
+                );
+                // Track A1: spatial ratio-estimator resolve at TRACE res (content opt-in), BEFORE the
+                // upsample — reconstructs each glossy neighbour's GGX ray and reweights by pdf_p/pdf_q
+                // to sharpen the glossy lobe instead of the legacy box blur. Near-mirror pixels pass
+                // through. Gallery never enables it (anchor untouched). `mirror_thresh` mirrors
+                // gdf_reflect.slang's content branch (0.125). When it runs, the temporal pass drops its
+                // own box average (`resolve_ran`) so the ratio-estimated sharpness survives.
+                // A5: the stochastic bundle enables the A1 resolve + A4 denoiser alongside blue-noise.
+                let resolve_ran = (self.reflect_resolve || self.reflect_stochastic)
+                    && self.reflect.has_reflect_resolve();
+                let refl_resolved = if resolve_ran {
+                    self.reflect.record_reflect_resolve(
+                        &mut graph,
+                        refl_traced,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        refl_extent,
+                        rw,
+                        rh,
+                        inv_view_proj,
+                        eye,
+                        self.flip_y,
+                        if refl_frame_varying {
+                            self.frame_no as u32
+                        } else {
+                            0
+                        },
+                        0.125, // content mirror threshold — keep in lockstep with gdf_reflect.slang
+                        self.reflect_resolve_kernel,
+                        // bits 0..7: A5 sampler select (reconstruct blue-noise rays when stochastic);
+                        // bits 8..15: B2' glossy K-1 (reconstruct all K neighbour rays); bits
+                        // 16..23: B2' prefilter threshold (prefiltered pixels pass through and are
+                        // never borrowed — their ray was a deterministic mirror, not a GGX draw).
+                        u32::from(self.reflect_stochastic)
+                            | (((self.reflect_glossy_spp - 1) & 0xFF) << 8)
+                            | (((self.reflect_prefilter * 255.0) as u32 & 0xFF) << 16),
+                    )
+                } else {
+                    refl_traced
+                };
+                // C8j / M3-C: temporally resolve the stochastic GGX GDF reflection (레퍼런스식; the
+                // rough lobe is sampled by real rays + denoised, so it's correctly blurred without
+                // an image-space prefilter that over-brightens rough metals). The temporal resolve
+                // (+ the A4b spatial denoise below) runs at the reflection TRACE res — BEFORE the
+                // bilateral upsample — so it costs ~1/div² instead of full-res (the single largest
+                // reflection pass on Apple/M3); the upsample then lifts the DENOISED reflection to
+                // full res. It also reads the traced `.a` (hit distance for the virtual-image
+                // reprojection) directly instead of through the upsample. Gallery keeps `refl_half`
+                // off ⇒ trace res == full res + no upsample = the old order exactly.
+                //
+                // B1 (CONVERGE + static camera): lift the 64-frame history cap — the pass's
+                // `len = min(len+1, cap)` is already a running mean below the cap, so a huge cap
+                // makes α = 1/N and the accumulator truly converges (the fixed 1/64 α floor was a
+                // stationary AR(1) wiggle: per-frame GGX/TAAU jitter + the screen-hit lit-history
+                // feedback never decayed — measured flat at warmup 100 vs 400). The history clamp
+                // is dropped with it: re-clamping the converged mean into each frame's jittered
+                // 3×3 stats re-injects the very noise the mean removed. On camera motion the
+                // legacy cap/clamp return and `min(len, 64)` collapses the stored counter in one
+                // frame. Counter is a float32 — growth saturates at 2^24 (α floor 6e-8, i.e. done).
+                let refl_converge = self.cache_converge != 0 && camera_static;
+                let gdf_resolved = self.reflect.record_reflect_temporal(
+                    &mut graph,
+                    refl_resolved,
+                    g_depth,
+                    g_material,
+                    refl_extent,
+                    rw,
+                    rh,
+                    inv_view_proj,
+                    self.prev_view_proj,
+                    eye,
+                    temporal_flip,
+                    self.scene_radius * 0.02,
+                    if refl_converge { 16_777_216.0 } else { 64.0 },
+                    firefly_max,
+                    0.25, // tonemap-space range for stable HDR accumulation
+                    if refl_converge {
+                        0
+                    } else {
+                        self.reflect_history_clamp
+                    },
+                    self.reflect_clamp_gamma,
+                    resolve_ran, // A1: drop the box average when the ratio-estimator resolve ran
+                    (self.reflect_spatial || self.reflect_stochastic)
+                        && self.reflect.has_reflect_spatial(), // A4a: accumulate variance
+                );
+                let gdf_resolved = if (self.reflect_spatial || self.reflect_stochastic)
+                    && self.reflect.has_reflect_spatial()
+                {
+                    // A4b: variance-guided bilateral denoise (post-temporal, trace res — the noise
+                    // it targets lives at the trace res; depth/normal edge stops hold the contours).
+                    self.reflect.record_reflect_spatial(
+                        &mut graph,
+                        gdf_resolved,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        refl_extent,
+                        rw,
+                        rh,
+                        inv_view_proj,
+                        eye,
+                        self.flip_y,
+                        self.reflect_spatial_kernel,
+                        0.25, // tonemap-space range (matches reflect_temporal params.w)
+                    )
+                } else {
+                    gdf_resolved
+                };
+                // M3-C: the bilateral upsample lifts the DENOISED reflection to full res (last).
+                let gdf_resolved = if refl_half {
+                    self.gi.record_upsample(
+                        &mut graph,
+                        gdf_resolved,
+                        g_depth,
+                        g_normal,
+                        extent,
+                        inv_view_proj,
+                        scene_aabb_min,
+                        scene_aabb_max,
+                        cw,
+                        ch,
+                        rw,
+                        rh,
+                        self.flip_y,
+                    )
+                } else {
+                    gdf_resolved
+                };
+                // B2 mirror compaction: re-trace ONLY the near-mirror pixels dense (classify →
+                // indirect dispatch → the refine target the composite prefers below). The
+                // sparse-trace upsample cannot reconstruct a mirror image (the information was
+                // never traced — no denoiser can add it), so those pixels get real rays at
+                // 1/`reflect_compact_div` res; cost scales with the on-screen mirror area.
+                // SW path only (HWRT has its own full-res lever); content only (gallery anchor).
+                let refine = if !self.is_gallery
+                    && !self.hwrt
+                    && refl_half
+                    && self.reflect_compact_div > 0
+                    && self.reflect.has_reflect_compact()
+                {
+                    let d = self.reflect_compact_div;
+                    let (qw, qh) = (cw.div_ceil(d), ch.div_ceil(d));
+                    Some((
+                        self.reflect.record_reflect_compact(
+                            &mut graph,
+                            vol,
+                            ext,
+                            scene_aabb_min,
+                            scene_aabb_max,
+                            g_depth,
+                            g_normal,
+                            g_material,
+                            Extent2D::new(qw, qh),
+                            inv_view_proj,
+                            eye,
+                            self.sun_dir,
+                            self.sun_intensity,
+                            qw,
+                            qh,
+                            self.flip_y | ((self.gi_repair_flags >> 3 & 1) << 27),
+                            self.frame_no as u32,
+                            scene_albedo,
+                            reflect_cache_arg,
+                            gi_reflect_arg,
+                            self.irradiance_cube_index(),
+                            scene_clip,
+                            &scene_clip_vols,
+                            // Content flag (bit31) selects the 0.125 mirror threshold in-shader;
+                            // the classified pixels all take the deterministic mirror branch, so
+                            // the stochastic/prefilter/K bits are irrelevant here.
+                            self.reflect_max_steps | 0x8000_0000,
+                            self.gdf_cone_k,
+                            self.deferred.globals_buffer(),
+                            globals_offset,
+                            self.reflect.lit_hist_read_index(),
+                            0.125, // near-mirror band — lockstep with gdf_reflect.slang content
+                            self.reflect_compact_hwrt,
+                            if self.reflect_compact_hwrt {
+                                self.rt.content_hit_indices()
+                            } else {
+                                None
+                            },
+                            self.reflect_compact_screen,
+                        ),
+                        qw,
+                        qh,
+                    ))
+                } else {
+                    None
+                };
+                Some(self.reflect.record_composite(
+                    &mut graph,
+                    // B1-lite: SSR skipped under SCREEN_HIT — feed the GDF image in its slot
+                    // (never sampled; the hard cut zeroes ssr_trust in-shader).
+                    ssr.unwrap_or(gdf_resolved),
+                    gdf_resolved,
+                    g_material,
+                    extent,
+                    cw,
+                    ch,
+                    1.0,
+                    firefly_max,
+                    self.reflect_max_roughness,
+                    !self.is_gallery, // content: near-mirror uses GDF/cache, not the unreliable SSR
+                    // Roughness-blur the low-res reflection to smooth its blocky sparkle on rough
+                    // content surfaces (the floor); 0 on the gallery = byte-identical anchor.
+                    if self.is_gallery {
+                        0.0
+                    } else {
+                        self.reflect_rough_blur
+                    },
+                    ssr.is_none(), // B1-lite hard cut: GDF/screen-hit path only
+                    refine,
+                    0.125,
+                ))
+            }
+            _ => None,
+        };
+        // Clustered light culling (PR-6): build this frame's froxel light lists, then hand the
+        // buffer ids to the lighting pass. The build pass writes the grid/index externals, so the
+        // lighting pass (which reads them) sequences after it. `None` = brute-force point loop.
+        let cluster_lighting = match (cluster_indices, self.cluster.as_ref()) {
+            (Some((grid_idx, index_idx, light_idx, light_count)), Some(cluster_sys))
+                if clustered =>
+            {
+                let (grid_ext, index_ext) = ClusterSystem::import(&mut graph);
+                let view_z_row = [view.x_axis.z, view.y_axis.z, view.z_axis.z, view.w_axis.z];
+                cluster_sys.record_build(
+                    &mut graph,
+                    grid_ext,
+                    index_ext,
+                    fif,
+                    light_count,
+                    view_z_row,
+                    inv_view_proj,
+                    [eye.x, eye.y, eye.z],
+                    CLUSTER_Z_NEAR,
+                    CLUSTER_Z_FAR,
+                    cw,
+                    ch,
+                );
+                Some((
+                    grid_ext,
+                    index_ext,
+                    grid_idx,
+                    index_idx,
+                    light_idx,
+                    light_count,
+                ))
+            }
+            // Brute-force A/B: upload the light buffer but pass index_buf = MAX (loop all lights,
+            // no froxel list). Import a dummy external so the tuple shape holds; no build pass.
+            (Some((grid_idx, _, light_idx, light_count)), Some(_)) if self.clustered_brute => {
+                let (grid_ext, index_ext) = ClusterSystem::import(&mut graph);
+                Some((
+                    grid_ext,
+                    index_ext,
+                    grid_idx,
+                    u32::MAX,
+                    light_idx,
+                    light_count,
+                ))
+            }
+            _ => None,
+        };
+        // F6O: spatial denoise of the accumulated per-pixel sky-vis, blending in the smooth volume
+        // V (now produced) at far distance to kill undersampled thin-geometry speckle. Runs here so
+        // `gi_skyvis_out` is available. Off → None → deferred keeps the volume V (byte anchor).
+        let skyvis_pp_out = skyvis_accum.map(|(acc, sw, sh, se)| {
+            self.gi.record_skyvis_denoise(
+                &mut graph,
+                acc,
+                g_position,
+                gi_skyvis_out,
+                [eye.x, eye.y, eye.z],
+                se,
+                sw,
+                sh,
+            )
+        });
+        self.deferred.record_lighting(
+            &mut graph,
+            hdr,
+            gbuf,
+            shadow_map,
+            shadow_cache_index,
+            gdf_ao_out,
+            ssao_out,
+            gdf_gi_out,
+            swrt_reflect_out,
+            // F6O: the per-pixel sky-vis image supersedes the probe-volume V for the deferred
+            // skylight when `P_SKYVIS_PP>0`; else the volume path (byte-identical anchor).
+            skyvis_pp_out.or(gi_skyvis_out),
+            // Edge-aware upscale whenever the bound sky-vis image is BELOW the lighting resolution —
+            // which is a property of the image, not of which producer made it. The F6O per-pixel
+            // producer always is (it traces at 1/`skyvis_pp_div`); the VOLUME producer writes at the
+            // GI trace extent, so it is full-res only while `gi_half_res` is off. The old
+            // `skyvis_pp_out.is_some()` test encoded the second case as "always full-res", which was
+            // true when only the gallery and the full-res tiers existed — every tier that traces GI
+            // at 1/N was silently plain-bilinear-upsampling a 1/N sky-vis, bleeding open-sky V (and
+            // the bent normal) across silhouettes onto occluded stone. `gi_half_res` is off for the
+            // gallery, so the byte-identical anchor is unchanged.
+            skyvis_pp_out.is_some() || (gi_skyvis_out.is_some() && self.gi_half_res),
+            // F6P consumer half: the OcclusionTint leak stops being steered by the bent normal.
+            self.skyvis_bent_fix & 2 != 0,
+            self.skyvis_tint,
+            self.skyvis_tint_v0,
+            self.skyvis_min_occ,
+            self.skyvis_bent_floor,
+            globals_offset,
+            self.flip_y,
+            // Two-sided shading for imported scenes (single-sided walls seen from inside);
+            // the gallery stays single-sided so its baseline is byte-identical.
+            !self.is_gallery,
+            // Auto-exposure: when on, the lighting reads the adapted exposure from the metering
+            // buffer; off → sentinel (use the static globals.ambient.a, byte-identical anchor).
+            if self.auto_exposure {
+                self.deferred.exposure_buf_index().unwrap_or(u32::MAX)
+            } else {
+                u32::MAX
+            },
+            cluster_lighting,
+            self.ao_multibounce,
+            self.spec_occlusion,
+        );
+        // Auto-exposure metering: read this frame's lit HDR, adapt the exposure for next frame.
+        // After lighting (the `hdr` read orders it). `adapt` = 1-exp(-dt·speed) (eye/iris speed).
+        // Headless capture adapts on FIXED_DT, not wall-clock dt: a real-dt EMA makes the
+        // metering trajectory (and so every exposed pixel during the adaptation window)
+        // wall-clock dependent, which breaks the screenshot mode's frame-counted determinism
+        // contract — the TAAU history then bakes the run-to-run transient into the capture
+        // (the content golden gdf_ao/sc_viz SHA flicker). Interactive keeps the real-dt iris.
+        if self.auto_exposure {
+            let speed = 2.5f32;
+            // Interactive keeps the real-dt iris, but BOUNDS the per-frame adaptation step at a
+            // 30fps-equivalent dt: on a frame hitch (or a below-30fps GPU bill) an unbounded
+            // `dt` makes `adapt` jump toward 1 and the exposure staircases visibly — measured as
+            // the dominant whole-image flicker while moving through sponza_intel (13.2 -> 1.2
+            // avg/ch adjacent-frame diff with AE off; docs/lighting-ao-shadow-closure.md §3a).
+            // At >= 30fps the clamp is a no-op, so normal-play iris behavior is unchanged.
+            let ae_dt = if self.screenshot_mode {
+                FIXED_DT
+            } else {
+                dt.min(1.0 / 30.0)
+            };
+            let adapt = 1.0 - (-ae_dt * speed).exp();
+            self.deferred
+                .record_auto_exposure(&mut graph, hdr, cw, ch, 0.12, adapt, 1.0e-6, 4.0);
+        }
+        // C7c: capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
+        // Reads the lit `hdr` (not the post-blur), so it sequences after the lighting pass.
+        if swrt_reflect_out.is_some() {
+            self.reflect.record_lit_history(
+                &mut graph,
+                hdr,
+                cw,
+                ch,
+                1.0 / self.exposure.max(1e-4),
+                firefly_max,
+                if self.auto_exposure {
+                    self.deferred.exposure_buf_index().unwrap_or(u32::MAX)
+                } else {
+                    u32::MAX
+                },
+            );
+        }
+        // PR-4 (render-pipeline re-baseline track, `docs/render-pipeline-reference.md` §3):
+        // the sky/atmosphere composite slot. Sits right after the opaque scene color is
+        // final (lighting + reflections all done) and before the post chain — matching the
+        // reference pipeline's "opaque complete -> sky/fog -> translucency -> post" ordering
+        // (§1.6). The slot is unconditional in the graph's *shape*; only the pass itself is
+        // opt-in (`P_HEIGHT_FOG=1`), so leaving it off costs nothing and the gallery/
+        // regression anchors stay byte-identical.
+        let fog_src = hdr;
+        let fog_out = if self.height_fog {
+            let hdr_fog = graph.create_color("hdr_fog", HDR_FORMAT, extent);
+            self.atmosphere.record_fog(
+                &mut graph,
+                fog_src,
+                hdr_fog,
+                g_position,
+                [eye.x, eye.y, eye.z],
+                self.fog_density,
+                self.fog_height_falloff,
+                sun_dir,
+                sun_intensity,
+                self.sky_wb,
+                self.fog_inscatter_gain,
+                // `procedural_sky` returns raw (unexposed) radiance; `hdr` is already exposed
+                // (baked in by `record_lighting`), so the inscatter needs the same treatment.
+                // Uses the static EV100 exposure (not the auto-exposure adapted value) — a
+                // documented simplification; the fog is a slow-varying ambient term so a
+                // one-frame-stale exposure has no visible impact.
+                self.exposure,
+                self.flip_y,
+            );
+            Some(hdr_fog)
+        } else {
+            None
+        };
+
+        // PR-3 (render-pipeline re-baseline track, `docs/render-pipeline-reference.md` §1.7
+        // #12 / §3): the forward translucency slot. Draws sorted alpha-blended translucent
+        // geometry over the finished opaque+fog HDR (blend in place), depth-testing against the
+        // opaque `g_depth` (occluded behind solid geometry) with depth-write off (overlapping
+        // panes all blend). Sits AFTER fog and BEFORE the post chain — reference ordering. Adds
+        // no pass when `translucents` is empty (zero cost, byte-identical anchor).
+        let translucency_target = fog_out.unwrap_or(fog_src);
+        self.translucency.record(
+            &mut graph,
+            translucency_target,
+            g_depth,
+            &self.translucents,
+            view_proj,
+            eye,
+            self.deferred.globals_buffer(),
+            globals_offset,
+            self.flip_y,
+            shadow_map,
+            shadow_cache_index,
+        );
+
+        // PR-5 (render-pipeline re-baseline track): the ordered post-process chain begins
+        // here, on the finished scene HDR (lighting + reflections + the atmosphere/fog
+        // slot + translucency). Reference ordering (§1.8): motion-blur -> TAA/upscale ->
+        // auto-exposure -> bloom -> DoF -> tonemap+grading. Each node is opt-in and off =
+        // no pass recorded (byte-identical anchor).
+        //
+        // Node #13 Motion blur: a velocity-along per-pixel blur, BEFORE TAA so the temporal
+        // resolve stabilizes the streaks. Requires the PR-2 velocity target; if
+        // `P_MOTION_BLUR=1` is set without `P_VELOCITY=1` there is no velocity to consume,
+        // so it is skipped with a one-time log (documented degrade, not a hard error).
+        let opaque_hdr = translucency_target;
+        let post_hdr = if self.motion_blur_on {
+            match velocity_target {
+                Some(vt) => {
+                    let mb_out = graph.create_color("motion_blur", HDR_FORMAT, extent);
+                    self.motion_blur.record(
+                        &mut graph,
+                        opaque_hdr,
+                        mb_out,
+                        vt,
+                        self.flip_y,
+                        MOTION_BLUR_SAMPLES,
+                        MOTION_BLUR_INTENSITY,
+                        MOTION_BLUR_MAX_UV,
+                    );
+                    mb_out
+                }
+                None => {
+                    if !self.motion_blur_warned.replace(true) {
+                        tracing::warn!(
+                            "P_MOTION_BLUR=1 ignored: no velocity target (set P_VELOCITY=1)"
+                        );
+                    }
+                    opaque_hdr
+                }
+            }
+        } else {
+            opaque_hdr
+        };
+
+        // Phase 7 GPU particles: a compute pass advances the persistent particle
+        // buffer; an external graph resource sequences it before the draw pass.
+        let particles_ext = if self.particles_on {
+            Some(graph.import_external("particles"))
+        } else {
+            None
+        };
+        // This frame's ping-pong buffer indices (read the previous write). Captured
+        // before the end-of-frame `advance()` so the async-submit path and the draw
+        // pass all reference the same pair.
+        let particle_read = self.particles.read_index();
+        let particle_write = self.particles.write_index();
+        // Run the sim on the async-compute queue this frame? (Else it's a graph
+        // compute pass on the graphics queue, below.)
+        // Async cache relight owns the per-frame compute submission; particles fall back to the
+        // graph sim when it's on (avoids two consumers of the single compute command buffer).
+        let async_sim = self.particles_on
+            && self.async_compute_supported
+            && self.async_compute_on
+            && !self.async_cache_on;
+        if let (false, Some(particles_ext)) = (async_sim, particles_ext) {
+            self.particles
+                .record_sim(&mut graph, particles_ext, sim_dt, self.elapsed);
+        }
+
+        // Phase 7 GPU culling: reset the indirect args, frustum-cull the instance grid
+        // into a visible list + draw count, then draw indirectly. A compact grid
+        // floating above the scene, so the scene stays visible and orbiting the camera
+        // culls cubes off the frustum edges.
+        let grid = CullGrid {
+            spacing: self.scene_radius * 0.14,
+            height: self.scene_radius * 1.15,
+            cube_scale: self.scene_radius * 0.045,
+            cube_radius: self.scene_radius * 0.045 * 0.5 * 3.0_f32.sqrt(),
+        };
+        let cull_res = if self.gpu_cull {
+            Some(CullSystem::import(&mut graph))
+        } else {
+            None
+        };
+        // HZB occlusion culling (PR-8): when enabled, the frustum-only `record_cull` is
+        // replaced by reset + an occlusion-aware cull that also tests each instance's
+        // screen AABB against LAST frame's Hi-Z pyramid, and a build pass regenerates
+        // the pyramid from THIS frame's scene depth (for next frame). The build declares
+        // the HZB external as a WRITE and the cull as a READ, so the graph's WAR edge
+        // runs cull (last frame's data) before build (overwrite) — the canonical
+        // prev-frame-HZB scheme (conservative; no reprojection). Off => the original
+        // frustum-only path (byte-identical).
+        let hzb_active = self.hzb_cull && self.hzb.is_some();
+        if let Some((args_ext, visible_ext)) = cull_res {
+            if hzb_active {
+                let hzb = self.hzb.as_ref().unwrap();
+                let hzb_ext = HzbSystem::import(&mut graph);
+                self.cull.record_reset(
+                    &mut graph,
+                    args_ext,
+                    visible_ext,
+                    frustum_planes(cull_view_proj),
+                    &grid,
+                );
+                let (args_buf, visible_buf) = self.cull.buffers();
+                // Occlusion test disabled on the first frame (no pyramid yet), and only
+                // when the pyramid's bindless slots are consecutive (the shader indexes
+                // hzb_base + mip). Either way the frustum cull still runs.
+                let occlude = self.frame_no >= 1 && hzb.slots_are_consecutive();
+                hzb.record_cull(
+                    &mut graph,
+                    args_buf,
+                    visible_buf,
+                    args_ext,
+                    visible_ext,
+                    hzb_ext,
+                    frustum_planes(cull_view_proj),
+                    cull_view_proj.to_cols_array(),
+                    &grid,
+                    self.cull.index_count(),
+                    occlude,
+                );
+                hzb.record_build(&mut graph, g_depth, hzb_ext, extent);
+            } else {
+                self.cull.record_cull(
+                    &mut graph,
+                    args_ext,
+                    visible_ext,
+                    frustum_planes(cull_view_proj),
+                    &grid,
+                );
+            }
+        }
+
+        // PR-3 side-effect: the Phase-7 particle + GPU-culling draws move into the HDR
+        // translucency slot (alpha-blend over `translucency_target`, BEFORE tonemap), instead
+        // of drawing over the tonemapped LDR backbuffer. Both are default-off demo features
+        // (`P7_PARTICLES` / `P7_CULL`), so the default gallery/anchor output is unchanged; this
+        // only fixes the HDR-composite ordering the reference pipeline expects (§2.1-3, #21).
+        // Declared after the sim/cull compute passes so the WAR/WAW deps order them correctly;
+        // the graph schedules by resource dependency, not declaration order.
+        if let Some((args_ext, visible_ext)) = cull_res {
+            self.cull.record_draw(
+                &mut graph,
+                translucency_target,
+                extent,
+                args_ext,
+                visible_ext,
+                view_proj.to_cols_array(),
+                self.sun_dir,
+                &grid,
+                g_depth,
+                extent,
+            );
+        }
+        if let Some(particles_ext) = particles_ext {
+            self.particles.record_draw(
+                &mut graph,
+                translucency_target,
+                particles_ext,
+                view_proj.to_cols_array(),
+                cam_right,
+                cam_up,
+            );
+        }
+
+        // Phase 8 ray tracing: M4 inline path tracer (default) or the M3 trace viz
+        // (debug). The chosen compute pass writes a storage image the tonemap pass
+        // displays in place of the rasterized HDR.
+        let rt_on = self.path_trace && (self.rt.has_path() || self.rt.has_trace());
+        let rt_out = if rt_on {
+            Some(graph.create_storage_image("rt_out", HDR_FORMAT, extent))
+        } else {
+            None
+        };
+        if let Some(rt_out) = rt_out {
+            if pt_active {
+                self.rt.record_path(
+                    &mut graph,
+                    rt_out,
+                    use_cornell,
+                    self.path_trace_pipeline,
+                    pt_inv_vp,
+                    pt_eye,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    cw,
+                    ch,
+                    self.flip_y,
+                    self.path_spp,
+                    self.sky_gain,
+                    self.sky_wb,
+                );
+            } else if self.rt.has_trace() {
+                self.rt.record_trace(
+                    &mut graph,
+                    rt_out,
+                    inv_view_proj,
+                    eye,
+                    self.sun_dir,
+                    cw,
+                    ch,
+                    self.flip_y,
+                );
+            }
+        }
+
+        // Phase 11 Stage A: compute software ray trace of the analytic SDF scene,
+        // written to a storage image the tonemap pass displays in place of the HDR
+        // (mirrors the M3 `rt_trace` viz path). Only when the HW-RT path is off.
+        let sdf_out = if self.sdf_trace && rt_out.is_none() {
+            Some(self.gdf.record_sdf_trace(
+                &mut graph,
+                extent,
+                inv_view_proj,
+                eye,
+                self.sun_dir,
+                self.sun_intensity,
+                cw,
+                ch,
+                self.flip_y,
+            ))
+        } else {
+            None
+        };
+
+        // Phase 11 Stage B (B1): 3D volume smoke test — fill a storage volume, then
+        // view a trilinear-sampled Z slice. Only when the other replacements are off.
+        let vol_out = if self.volume_test && rt_out.is_none() && sdf_out.is_none() {
+            Some(self.gdf.record_volume_test(&mut graph, extent, cw, ch))
+        } else {
+            None
+        };
+
+        // Phase 11 Stage B (B2): bake a mesh's signed-distance field into the volume,
+        // then view a slice through the same `volume_view` pass B1 uses. The bake is
+        // O(voxels*tris): run it once (`sdf_bake_done`) and only re-view afterwards.
+        let bake_out =
+            if self.sdf_bake && rt_out.is_none() && sdf_out.is_none() && vol_out.is_none() {
+                let out =
+                    self.gdf
+                        .record_bake_view(&mut graph, extent, cw, ch, !self.sdf_bake_done);
+                self.sdf_bake_done = true;
+                Some(out)
+            } else {
+                None
+            };
+
+        // Phase 11 Stage B (B3): bake the per-mesh SDF, merge its instances into the
+        // global distance field, then view a slice. Bake + merge run once
+        // (`gdf_merge_done`); later frames re-view the persistent GDF. VK ≡ DX.
+        let gdf_out = if self.gdf_merge
+            && rt_out.is_none()
+            && sdf_out.is_none()
+            && vol_out.is_none()
+            && bake_out.is_none()
+        {
+            let out = self
+                .gdf
+                .record_gdf_view(&mut graph, extent, cw, ch, !self.gdf_merge_done);
+            self.gdf_merge_done = true;
+            Some(out)
+        } else {
+            None
+        };
+
+        // Phase 11 Stage B (B4): SW ray trace the merged GDF. Ensures the GDF is built
+        // (bake + merge, once — shared `gdf_merge_done` with the B3 view), then
+        // sphere-traces it from a fixed camera over the unit-cube scene.
+        // `P11_GDF_ANALYTIC` swaps in the analytic field for the reference. VK ≡ DX.
+        let gdf_trace_out = if self.gdf_trace
+            && rt_out.is_none()
+            && sdf_out.is_none()
+            && vol_out.is_none()
+            && bake_out.is_none()
+            && gdf_out.is_none()
+        {
+            let out = self.gdf.record_gdf_trace(
+                &mut graph,
+                extent,
+                cw,
+                ch,
+                self.sun_dir,
+                self.sun_intensity,
+                self.flip_y,
+                self.backend == BackendKind::Vulkan,
+                self.gdf_trace_analytic,
+                !self.gdf_merge_done,
+            );
+            self.gdf_merge_done = true;
+            Some(out)
+        } else {
+            None
+        };
+
+        // Phase 11 Stage C1: world-space scene GDF traced from the live camera (build
+        // the fused scene SDF once, then SW ray-trace it) — validates the world GDF
+        // matches the rasterized scene. Only when the other replacements are off.
+        let scene_gdf_out = if self.scene_gdf
+            && rt_out.is_none()
+            && sdf_out.is_none()
+            && vol_out.is_none()
+            && bake_out.is_none()
+            && gdf_out.is_none()
+            && gdf_trace_out.is_none()
+        {
+            let out = self.gdf.record_scene_gdf(
+                &mut graph,
+                extent,
+                eye,
+                inv_view_proj,
+                self.sun_dir,
+                self.sun_intensity,
+                cw,
+                ch,
+                self.flip_y,
+                !self.scene_gdf_baked,
+            );
+            self.scene_gdf_baked = true;
+            Some(out)
+        } else {
+            None
+        };
+
+        // Phase 11 Stage C5: screen-space reflections. Runs after lighting (samples the
+        // lit HDR) and replaces the tonemap source as a standalone viz of the reflection
+        // buffer; C7 will instead composite it into the lighting's specular term. Only
+        // when the other full-screen replacements are off.
+        let ssr_out = if self.gdf_ssr
+            && !self.gdf_hybrid
+            && !self.swrt_reflect
+            && rt_out.is_none()
+            && sdf_out.is_none()
+            && vol_out.is_none()
+            && bake_out.is_none()
+            && gdf_out.is_none()
+            && gdf_trace_out.is_none()
+            && scene_gdf_out.is_none()
+        {
+            Some(
+                self.reflect
+                    .record_ssr(
+                        &mut graph,
+                        self.deferred.globals_buffer(),
+                        globals_offset,
+                        hdr,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        extent,
+                        view_proj.to_cols_array(),
+                        inv_view_proj,
+                        eye,
+                        cw,
+                        ch,
+                        cw,
+                        ch,
+                        self.flip_y,
+                        self.frame_no as u32,
+                        self.scene_radius * 1.5,
+                        self.scene_radius * 0.06,
+                        false, // standalone C5 viz: sample the current lit HDR
+                        false, // (viz uses the current HDR, no reprojected history to clamp)
+                        false, // mirror (no stochastic jitter) for the raw-SSR viz
+                    )
+                    .0,
+            )
+        } else {
+            None
+        };
+
+        // Phase 11 Stage C6: GDF reflections (off-screen fallback). A standalone viz of
+        // the GDF-traced reflection buffer (sky on escape), raw radiance like the C1
+        // trace; C7 will composite it under SSR. Only when the other replacements are off.
+        let reflect_out = match (
+            self.gdf_reflect
+                && !self.gdf_hybrid
+                && !self.swrt_reflect
+                && rt_out.is_none()
+                && sdf_out.is_none()
+                && vol_out.is_none()
+                && bake_out.is_none()
+                && gdf_out.is_none()
+                && gdf_trace_out.is_none()
+                && scene_gdf_out.is_none()
+                && ssr_out.is_none(),
+            scene_gdf_vol,
+            scene_gdf_ext,
+        ) {
+            (true, Some(vol), Some(ext)) => Some(self.reflect.record_gdf_reflect(
+                &mut graph,
+                vol,
+                ext,
+                scene_aabb_min,
+                scene_aabb_max,
+                g_depth,
+                g_normal,
+                g_material,
+                extent,
+                inv_view_proj,
+                eye,
+                self.sun_dir,
+                self.sun_intensity,
+                cw,
+                ch,
+                self.flip_y | ((self.gi_repair_flags >> 3 & 1) << 27),
+                // Content: fixed frame (0) → stable GGX jitter; gallery: real frame (anchor).
+                if self.is_gallery {
+                    self.frame_no as u32
+                } else {
+                    0
+                },
+                scene_albedo,
+                reflect_cache_arg,
+                gi_reflect_arg, // GI-lit indirect so the reflection viz shows the real reflection
+                self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
+                scene_clip,
+                &scene_clip_vols,
+                self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
+                self.gdf_cone_k,
+                [u32::MAX; 4], // viz path: no adaptive skip
+                self.hwrt,
+                false, // viz: plain trace (no screen-hit early-out)
+                self.deferred.globals_buffer(),
+                globals_offset,
+                self.reflect.lit_hist_read_index(),
+                if self.hwrt_hitlighting {
+                    self.rt.content_hit_indices()
+                } else {
+                    None
+                },
+            )),
+            _ => None,
+        };
+
+        // Phase 11 Stage C7: hybrid reflection composite. Runs both reflection sources and
+        // blends them by SSR confidence into one raw-radiance image — the reflection that
+        // will replace the IBL prefilter-cube specular (C7c). SSR samples the previous
+        // frame's raw-radiance lit-color history (reprojected) so it can feed back into
+        // lighting without a read-before-write cycle; the GDF reflect is already raw, so the
+        // composite stays in raw radiance (gdf_scale = 1.0) and the tonemap applies exposure
+        // (like the other SW-RT viz). A copy pass then captures this frame's lit HDR into the
+        // history for the next frame. Only when the other full-screen replacements are off.
+        let hybrid_out = match (
+            self.gdf_hybrid
+                && !self.swrt_reflect
+                && self.reflect.has_lit_history()
+                && rt_out.is_none()
+                && sdf_out.is_none()
+                && vol_out.is_none()
+                && bake_out.is_none()
+                && gdf_out.is_none()
+                && gdf_trace_out.is_none()
+                && scene_gdf_out.is_none(),
+            scene_gdf_vol,
+            scene_gdf_ext,
+        ) {
+            (true, Some(vol), Some(ext)) => {
+                let ssr = self
+                    .reflect
+                    .record_ssr(
+                        &mut graph,
+                        self.deferred.globals_buffer(),
+                        globals_offset,
+                        hdr,
+                        g_depth,
+                        g_normal,
+                        g_material,
+                        extent,
+                        view_proj.to_cols_array(),
+                        inv_view_proj,
+                        eye,
+                        cw,
+                        ch,
+                        cw,
+                        ch,
+                        self.flip_y,
+                        self.frame_no as u32,
+                        self.scene_radius * 1.5,
+                        self.scene_radius * 0.06,
+                        true, // history mode: reprojected raw-radiance previous frame
+                        self.firefly_clamp,
+                        false, // mirror for the hybrid viz (no temporal resolve here)
+                    )
+                    .0;
+                let gdf_refl = self.reflect.record_gdf_reflect(
+                    &mut graph,
+                    vol,
+                    ext,
+                    scene_aabb_min,
+                    scene_aabb_max,
+                    g_depth,
+                    g_normal,
+                    g_material,
+                    extent,
+                    inv_view_proj,
+                    eye,
+                    self.sun_dir,
+                    self.sun_intensity,
+                    cw,
+                    ch,
+                    self.flip_y | ((self.gi_repair_flags >> 3 & 1) << 27),
+                    // Content: fixed frame (0) → temporally stable GGX jitter (no reflection
+                    // sparkle). Gallery: real frame → byte-identical legacy anchor.
+                    if self.is_gallery {
+                        self.frame_no as u32
+                    } else {
+                        0
+                    },
+                    scene_albedo,
+                    reflect_cache_arg,
+                    gi_reflect_arg, // GI-lit indirect so the reflection viz shows the real reflection
+                    self.irradiance_cube_index(), // IBL cube for the reflection skylight fill
+                    scene_clip,
+                    &scene_clip_vols,
+                    self.reflect_max_steps | if self.is_gallery { 0 } else { 0x8000_0000 }, // bit31 = content flag (mirror threshold)
+                    self.gdf_cone_k,
+                    [u32::MAX; 4], // standalone viz: no adaptive skip
+                    self.hwrt,
+                    false, // standalone viz: plain trace (no screen-hit early-out)
+                    self.deferred.globals_buffer(),
+                    globals_offset,
+                    self.reflect.lit_hist_read_index(),
+                    if self.hwrt_hitlighting {
+                        self.rt.content_hit_indices()
+                    } else {
+                        None
+                    },
+                );
+                // Standalone viz: no temporal resolve buffers here, so feed the GDF reflection
+                // straight into the composite (the resolve runs only in the lighting-fed path).
+                let composite = self.reflect.record_composite(
+                    &mut graph,
+                    ssr,
+                    gdf_refl,
+                    g_material,
+                    extent,
+                    cw,
+                    ch,
+                    1.0,
+                    firefly_max,
+                    self.reflect_max_roughness,
+                    false, // standalone SSR/hybrid viz — keep the full SSR blend
+                    if self.is_gallery {
+                        0.0
+                    } else {
+                        self.reflect_rough_blur
+                    },
+                    false, // viz keeps the SSR blend (no screen-hit trace here)
+                    None,  // no B2 mirror refine on the standalone viz path
+                    0.125,
+                );
+                // Capture this frame's lit HDR (as raw radiance) for next frame's SSR history.
+                self.reflect.record_lit_history(
+                    &mut graph,
+                    hdr,
+                    cw,
+                    ch,
+                    1.0 / self.exposure.max(1e-4),
+                    firefly_max,
+                    if self.auto_exposure {
+                        self.deferred.exposure_buf_index().unwrap_or(u32::MAX)
+                    } else {
+                        u32::MAX
+                    },
+                );
+                Some(composite)
+            }
+            _ => None,
+        };
+
+        // Stage C8b1/2: surface-cache atlas viz — tiles the cards across the screen, showing
+        // the lit radiance (C8b2) when lighting ran, else the captured albedo (C8b1).
+        let cache_out = match (self.cache_viz, scene_cache_lit_ext, scene_cache_ext) {
+            (true, Some(lit), _) => {
+                let rad = self
+                    .gdf
+                    .surface_cache_read()
+                    .map(|t| t.2)
+                    .unwrap_or(u32::MAX);
+                Some(
+                    self.gdf
+                        .record_cache_view(&mut graph, lit, rad, extent, cw, ch),
+                )
+            }
+            (true, None, Some(cap)) => {
+                let alb = self.gdf.cache_albedo_index();
+                Some(
+                    self.gdf
+                        .record_cache_view(&mut graph, cap, alb, extent, cw, ch),
+                )
+            }
+            _ => None,
+        };
+
+        // Tonemap samples the RT output (M4 path trace / M3 trace viz) if active, else
+        // the SW-RT SDF trace, else the Stage-B volume slice, else the Stage-C1 scene
+        // GDF, else the Stage-C5 SSR / C6 GDF-reflection viz, else the C8b1 cache atlas,
+        // else the main lit path (TAAU → bloom/DoF/grading tail), else HDR.
+        // QHD/UHD TAAU: reconstruct the full-res (output) HDR from the jittered internal-res lit
+        // image + history, before tonemap. Only the main lit path (not the debug/RT viz outputs).
+        let taau_out = if taau_active {
+            // Post-chain input: opaque HDR after the fog slot + the (optional) motion-blur
+            // node — motion blur runs BEFORE TAA so the temporal resolve stabilizes streaks.
+            let main_lit = post_hdr;
+            // Decima FXAA→TAA: spatially anti-alias the jittered internal frame first so its edges
+            // don't flicker frame to frame, then temporally upsample. Stabilizes the jitter.
+            let taau_in = if self.taau.has_fxaa() && !taau_jitter_active {
+                self.taau.record_fxaa(&mut graph, main_lit, extent, cw, ch)
+            } else {
+                main_lit
+            };
+            Some(self.taau.record(
+                &mut graph,
+                taau_in,
+                g_depth,
+                swap_extent,
+                sw,
+                sh,
+                cw,
+                ch,
+                inv_view_proj,
+                self.prev_view_proj_taau,
+                // bit2 = luminance anti-flicker (`P_TAAU_ANTIFLICKER`): damps the blend weight
+                // of a sample whose luma diverges from the history, killing the bright
+                // sub-pixel-aperture shimmer (door sky-gaps, window grilles) that the YCoCg box
+                // can't clamp because it is a bright CLUSTER. Tier-driven (`taau_antiflicker`)
+                // since the lighting-closure batch: the shimmer gate F6O wanted now exists
+                // (tools/seq-stability.py; docs/lighting-ao-shadow-closure.md measured dolly
+                // door-ROI flicker 5.88 -> 1.96 avg/ch on DX and VK), so Med ships it ON; the
+                // gallery preset keeps it OFF (native scale, TAAU inactive anyway).
+                self.flip_y | if self.taau_antiflicker { 4 } else { 0 },
+                self.scene_radius * 2.0,
+                taau_jitter_uv,
+                false,
+                velocity_target,
+                // TSR-style clamp-box expansion: widens the variance box ∝ local contrast so a static
+                // high-contrast edge's converged history isn't re-clipped each frame under jitter (the
+                // dominant upsampling shimmer). Tier-driven (`taau_clamp_expand`) — the gallery preset
+                // pins 0 = tight box = the byte-identical anchor.
+                self.taau_clamp_expand,
+                // Motion-sharpness: the Catmull-Rom history resample (+ the default-off velocity
+                // gate). Tier-driven; the gallery preset pins it off = the bilinear path bit-for-bit.
+                self.taau_motion,
+            ))
+        } else {
+            None
+        };
+        // DEBUG_VIEW=11: colour-code the velocity target (needs `P_VELOCITY=1`). Takes precedence
+        // over the lit/TAAU output so the motion vectors are visualized directly.
+        let velocity_view_out = if self.debug_view == 11 {
+            velocity_target.map(|vt| {
+                self.velocity
+                    .record_viz(&mut graph, vt, extent, cw, ch, VELOCITY_VIZ_SCALE)
+            })
+        } else {
+            None
+        };
+        // PR-5 main-lit post tail: the DoF stub (node #17) then the bloom composite (node
+        // #16). These run only on the main lit path (the TAAU result, or the pre-TAAU post
+        // HDR at native res) — never on the RT/debug viz outputs, which take precedence in
+        // the `.or()` chain below. Both are opt-in / no-op when off (byte-identical anchor).
+        // The main-lit target lives at the output extent when TAAU upscaled, else the render
+        // extent.
+        let main_lit_extent = if taau_out.is_some() {
+            swap_extent
+        } else {
+            extent
+        };
+        let mut main_lit = taau_out.unwrap_or(post_hdr);
+        // Node #17 DoF (stub passthrough). Reserves the slot; off = no pass (anchor).
+        if self.dof_on {
+            let dof_out = graph.create_color("dof", HDR_FORMAT, main_lit_extent);
+            self.dof.record(&mut graph, main_lit, dof_out, self.flip_y);
+            main_lit = dof_out;
+        }
+        // Node #16 Bloom: build the pyramid from the main-lit HDR; the mip0 result is added
+        // at the tonemap input. The pyramid extent tracks the main-lit target's extent.
+        let bloom_mip0 = if self.bloom_on {
+            Some(
+                self.bloom
+                    .record(&mut graph, main_lit, main_lit_extent, self.flip_y),
+            )
+        } else {
+            None
+        };
+        // Whether the main lit path (not an RT/debug viz) is the tonemap source — bloom +
+        // grading apply only then, so the viz captures stay unaffected.
+        let show_main_lit = velocity_view_out
+            .or(rt_out)
+            .or(wrc_view_out)
+            .or(sdf_out)
+            .or(vol_out)
+            .or(bake_out)
+            .or(gdf_out)
+            .or(gdf_trace_out)
+            .or(scene_gdf_out)
+            .or(ssr_out)
+            .or(reflect_out)
+            .or(hybrid_out)
+            .or(cache_out)
+            .is_none();
+        let tonemap_src = velocity_view_out
+            .or(rt_out)
+            .or(wrc_view_out)
+            .or(sdf_out)
+            .or(vol_out)
+            .or(bake_out)
+            .or(gdf_out)
+            .or(gdf_trace_out)
+            .or(scene_gdf_out)
+            .or(ssr_out)
+            .or(reflect_out)
+            .or(hybrid_out)
+            .or(cache_out)
+            .unwrap_or(main_lit);
+        // The rasterized HDR already bakes exposure into the lighting pass; the
+        // path-traced + SW-RT outputs carry raw scene radiance, so apply the camera
+        // exposure here before the filmic curve (else the bright sky + sun blow out).
+        let raw_radiance_src = pt_active
+            || sdf_out.is_some()
+            || gdf_trace_out.is_some()
+            || scene_gdf_out.is_some()
+            || reflect_out.is_some()
+            || hybrid_out.is_some()
+            || cache_out.is_some();
+        let tm_exposure = if raw_radiance_src { self.exposure } else { 1.0 };
+        // Raw-radiance sources (path tracer / SW-RT viz) are exposed at the tonemap; under
+        // AUTO_EXPOSURE, read the adapted exposure from the AE buffer there too so the view
+        // auto-exposes like the rasterized lighting (which bakes it into `hdr` upstream). The
+        // main-lit raster path already carries the adapted exposure, so it stays on tm=1.0.
+        let ae_exposure = raw_radiance_src && self.auto_exposure;
+        // QHD/UHD: sharpen only when the TAAU upscale produced this frame (recover crispness lost
+        // in temporal upsampling); native/debug paths get 0 = byte-identical. Tier-driven
+        // (`taau_sharpen`): it re-synthesizes an edge rather than recovering detail, so on a tier
+        // whose resolve reconstructs properly (`taau_catmull_rom`) it is pure noise amplification
+        // and the tier turns it off — see quality.rs for the measured trade.
+        let (sharpen, inv_w, inv_h) = if taau_active && taau_out.is_some() {
+            (self.taau_sharpen, 1.0 / sw as f32, 1.0 / sh as f32)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+        // PR-5 bloom composite + ASC-CDL color grade — applied at the tonemap only on the
+        // main lit path (`show_main_lit`); the RT/debug viz get the no-op form (bloom off,
+        // grading off) so those captures are unchanged.
+        let bloom = if show_main_lit { bloom_mip0 } else { None };
+        let (grade_on, cdl_slope, cdl_offset, cdl_power) = if show_main_lit && self.grade_on {
+            (1u32, self.cdl_slope, self.cdl_offset, self.cdl_power)
+        } else {
+            let (s, o, p) = push::CDL_NEUTRAL;
+            (0u32, s, o, p)
+        };
+        // Baked ACES tonemap LUT (tier knob `tonemap_aces` / `P_TONEMAP_ACES`): bake the CDL
+        // grade + the ACES 1.3 RRT+ODT into a small strip (per frame, ~110K texels) and let the
+        // tonemap replace its per-pixel curve with one strip fetch. Applied to EVERY tonemap
+        // source (main lit + path-trace/debug viz) so the PT-parity capture pipeline tonemaps
+        // both sides identically. The gallery keeps the legacy per-pixel curve (anchor).
+        let tonemap_lut =
+            if self.tonemap_aces && !self.is_gallery && self.deferred.has_tonemap_lut() {
+                let n = self.tonemap_lut_size;
+                Some((
+                    self.deferred.record_tonemap_lut_bake(
+                        &mut graph, n, grade_on, cdl_slope, cdl_offset, cdl_power,
+                    ),
+                    n,
+                ))
+            } else {
+                None
+            };
+        self.deferred.record_tonemap(
+            &mut graph,
+            backbuffer,
+            tonemap_src,
+            self.post_mode as u32,
+            self.flip_y,
+            tm_exposure,
+            sharpen,
+            inv_w,
+            inv_h,
+            bloom,
+            postfx::BloomParams::INTENSITY,
+            grade_on,
+            cdl_slope,
+            cdl_offset,
+            cdl_power,
+            tonemap_lut,
+            ae_exposure,
+        );
+
+        // PR-9 View Family (`docs/view-family.md`): render a SECOND view in the same frame against
+        // the SHARED scene resources, composited as a picture-in-picture inset. The view-INDEPENDENT
+        // passes above (shadow/CSM atlas, IBL capture, GDF/surface cache, clustered-light upload)
+        // already ran ONCE this frame; only the view-DEPENDENT chain (G-buffer → lighting → tonemap)
+        // re-runs here, parameterized by the second `SceneView`. The secondary view uses the
+        // simplified feature set (no TAAU/velocity/post/screen-space-GI — see `SceneViewFeatures`),
+        // so its temporal state can never collide with the primary view's. Off by default = no extra
+        // passes = byte-identical anchor.
+        if self.second_view {
+            // Overhead ("god's-eye") camera: straight down onto the scene centre. A genuinely
+            // different pose from the primary orbit view so the inset is visibly a distinct view.
+            let sv_center = if self.is_gallery {
+                Vec3::new(0.0, self.model_radius * 0.5, 0.0)
+            } else {
+                self.scene_center
+            };
+            let sv_eye = sv_center + Vec3::new(0.0, self.scene_radius * 3.0, 0.001);
+            let second = view::SceneView::build(
+                1,
+                sv_eye,
+                sv_center,
+                1.0, // square inset
+                60f32.to_radians(),
+                CLUSTER_Z_NEAR,
+                CLUSTER_Z_FAR,
+                self.backend,
+                (fif as u64 * MAX_VIEWS + 1) * GLOBALS_SLICE,
+                Mat4::IDENTITY.to_cols_array(),
+                view::SceneViewFeatures::secondary(),
+            );
+
+            tracing::debug!(
+                "view family: rendering view #{} (eye {:?} -> focus {:?}) against shared scene resources",
+                second.index,
+                second.eye,
+                second.focus
+            );
+            // The second view's globals slice: reuse the shared lighting/shadow/IBL fields from the
+            // primary `globals` (single source of truth — sun, shadow atlas, IBL indices, CSM are
+            // all view-independent) and override only the camera-dependent fields.
+            let mut sv_globals = globals;
+            sv_globals.camera_pos = [second.eye.x, second.eye.y, second.eye.z, 0.0];
+            sv_globals.inv_view_proj = second.inv_view_proj;
+            sv_globals.prev_view_proj = second.prev_view_proj;
+            sv_globals.cluster_view_z_row = second.cluster_view_z_row();
+            // Secondary view lights brute-force (cluster froxels were built for the primary
+            // frustum); the froxel path is a primary-view optimization, not a correctness input.
+            self.deferred
+                .write_globals(second.globals_offset, globals_bytes(&sv_globals))?;
+
+            // The inset renders at a modest square resolution; the composite scales it into the
+            // top-right backbuffer quadrant via a viewport rect.
+            let inset = (sw.min(sh) / 3).max(64);
+            let sv_extent = Extent2D::new(inset, inset);
+            let sv_albedo = graph.create_color("sv_g_albedo", GB_ALBEDO_FMT, sv_extent);
+            let sv_normal = graph.create_color("sv_g_normal", GB_NORMAL_FMT, sv_extent);
+            let sv_material = graph.create_color("sv_g_material", GB_MATERIAL_FMT, sv_extent);
+            let sv_position = graph.create_color("sv_g_position", GB_POSITION_FMT, sv_extent);
+            let sv_depth = graph.create_depth("sv_g_depth", sv_extent);
+            let sv_hdr = graph.create_color("sv_hdr", HDR_FORMAT, sv_extent);
+            let sv_gbuf = GBufferTargets {
+                albedo: sv_albedo,
+                normal: sv_normal,
+                material: sv_material,
+                position: sv_position,
+                depth: sv_depth,
+            };
+
+            // View-dependent chain for the second view, driven by THIS VIEW'S feature set (not a
+            // scattered `if second_view` — the descriptor decides). No TAAU → no jitter → no mip
+            // bias; the raster uses this view's stable (unjittered) view-projection.
+            let f = second.features;
+            // No TAAU → render on this view's stable (unjittered) grid, no upscale mip bias.
+            let sv_view_proj = if f.taau {
+                second.view_proj
+            } else {
+                second.view_proj_stable
+            };
+            let sv_mip_bias = if f.taau { self.taa_mip_bias } else { 0.0 };
+            // The secondary feature set clears `velocity`/`post`; those passes are skipped by
+            // construction. Consumed here so the descriptor — not a scattered flag — is the gate.
+            let _ = (f.velocity, f.post, second.jitter_uv);
+            self.deferred.record_gbuffer(
+                &mut graph,
+                sv_gbuf,
+                &scene,
+                &self.ground_vbuf,
+                &self.ground_ibuf,
+                self.ground_count,
+                sv_view_proj,
+                self.ambient,
+                self.override_material,
+                self.metallic_override,
+                self.roughness_override,
+                sv_mip_bias,
+                false, // no depth pre-pass
+                true,  // draw the ground (unchanged)
+            );
+            // Lighting: shares the ONCE-rendered shadow atlas + IBL; screen-space GI/AO/reflection
+            // inputs are gated on THIS VIEW'S `screen_space_gi` feature (off for the secondary view →
+            // IBL+direct only), brute-force point lights (cluster = None). A future view that opts
+            // into `screen_space_gi` would produce + thread its own AO/GI targets here.
+            debug_assert!(
+                !f.screen_space_gi,
+                "secondary view has no screen-space GI targets"
+            );
+            self.deferred.record_lighting(
+                &mut graph,
+                sv_hdr,
+                sv_gbuf,
+                shadow_map,
+                shadow_cache_index,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false, // F6O skyvis_edge_aware (no skyvis in the PiP inset)
+                false, // F6P leak-follows-n (no skyvis here either → inert)
+                self.skyvis_tint,
+                self.skyvis_tint_v0,
+                self.skyvis_min_occ,
+                self.skyvis_bent_floor,
+                second.globals_offset,
+                self.flip_y,
+                !self.is_gallery,
+                u32::MAX, // static exposure (auto-exposure meter is a primary-view resource)
+                None,
+                self.ao_multibounce,
+                self.spec_occlusion,
+            );
+            // Composite the second view as a PiP inset. A tonemap pass that LOADS (does not clear)
+            // the backbuffer and restricts its draw to the top-right inset viewport rect, so the
+            // full-screen triangle only fills that quadrant over the already-composited main view.
+            let vp = rhi::Rect2D {
+                x: (sw.saturating_sub(inset + inset / 12)) as i32,
+                y: (inset / 12) as i32,
+                width: inset,
+                height: inset,
+            };
+            self.deferred.record_tonemap_inset(
+                &mut graph,
+                backbuffer,
+                sv_hdr,
+                self.post_mode as u32,
+                self.flip_y,
+                1.0,
+                vp,
+            );
+        }
+
+        if include_ui {
+            graph.add_pass(
+                PassInfo {
+                    name: "ui",
+                    colors: vec![(backbuffer, None)],
+                    depth: None,
+                    reads: vec![],
+                },
+                |ctx| self.gui.render(&self.device, ctx.cmd(), fif),
+            );
+        }
+        // Profiler is inline-only: the threaded path's query-heap readback would need
+        // to cross the RHI-thread fence, so it's disabled under P15_RHI_THREAD.
+        let mut profiler = self
+            .profiler_on
+            .then(|| GraphProfiler::new(&self.query_heaps[fif]));
+        let threaded = cmd.is_none();
+        // Inline-path readback buffer (None when threaded — the worker owns its own).
+        let mut readback: Option<(Buffer, ReadbackLayout)> = None;
+        if let Some(cmd) = cmd {
+            graph.execute(
+                &self.device,
+                &mut self.pools[fif],
+                cmd,
+                self.swapchain.as_ref().expect("inline swapchain"),
+                image_index,
+                self.aliasing,
+                profiler.as_mut(),
+            )?;
+            // Remember this slot's scheduled pass names so the next readback (after
+            // this frame's fence) can pair them with the timestamp boundaries.
+            self.slot_pass_names[fif] = match &profiler {
+                Some(p) => p.names.clone(),
+                None => Vec::new(),
+            };
+
+            // For a screenshot, copy the just-rendered backbuffer into a readback
+            // buffer in the same command buffer (before it ends).
+            if capture_this_frame.is_some() {
+                let layout = self
+                    .device
+                    .swapchain_readback_layout(self.swapchain.as_ref().expect("inline swapchain"));
+                let buf = self.device.create_buffer(&BufferDesc {
+                    size: layout.size,
+                    usage: BufferUsage::Readback,
+                })?;
+                cmd.copy_swapchain_to_buffer(
+                    self.swapchain.as_ref().expect("inline swapchain"),
+                    image_index,
+                    &buf,
+                );
+                readback = Some((buf, layout));
+            }
+
+            cmd.end()?;
+
+            let signal = &self.render_finished[image_index as usize];
+            if async_sim {
+                // Record the particle sim into this frame's compute command buffer and run
+                // it on the compute queue (overlapping graphics), signaling `compute_done`;
+                // the graphics submit GPU-waits on it so the particle draw's vertex-stage
+                // read sees the freshly written buffer.
+                let ccmd = &self.compute_command_buffers[fif];
+                ccmd.begin()?;
+                ccmd.bind_compute_pipeline(self.particles.sim_pipeline());
+                ccmd.push_constants_compute(&particle_sim_push(
+                    self.particles.buffer_storage_index(particle_read),
+                    self.particles.buffer_storage_index(particle_write),
+                    PARTICLE_COUNT as u32,
+                    sim_dt,
+                    self.elapsed,
+                    0,
+                ));
+                ccmd.dispatch((PARTICLE_COUNT as u32).div_ceil(64), 1, 1);
+                ccmd.end()?;
+                self.compute_queue.submit(ccmd, &self.compute_done[fif])?;
+                self.queue().submit_async(
+                    cmd,
+                    &self.image_available[fif],
+                    &self.compute_done[fif],
+                    signal,
+                    &self.in_flight[fif],
+                )?;
+            } else if self.async_cache_on && scene_cache_lit_ext.is_some() && !cache_settled {
+                // Async surface-cache relight: record visibility + relight onto the compute command
+                // buffer and run it on the compute queue, overlapping this graphics frame. The graphics
+                // queue GPU-waits on the PREVIOUS frame's relight (1-frame latency) so its consumer
+                // reads of last frame's radiance are ordered; the 3-slot ring guarantees the slot this
+                // frame writes is not one an in-flight graphics frame still reads (no WAR). Submit
+                // graphics BEFORE the compute signal so D3D12's fence wait targets the previous value.
+                // The compute command buffer for this fif may still be pending from 2 frames ago (the
+                // graphics fence doesn't cover it on the cross-frame path) — wait its own fence first.
+                self.cache_compute_fence[fif].wait()?;
+                self.cache_compute_fence[fif].reset()?;
+                let ccmd = &self.compute_command_buffers[fif];
+                ccmd.begin()?;
+                self.gdf.record_cache_async(
+                    ccmd,
+                    frustum_planes(cull_view_proj),
+                    self.sun_dir,
+                    self.sun_intensity,
+                    self.cache_relight_spp,
+                    self.frame_no as u32,
+                    cache_reset_this_frame,
+                    self.cache_relight_period,
+                    relight_alpha,
+                    self.cache_feedback,
+                    self.gdf_cone_k,
+                    relight_conv_idx,
+                    self.cache_skylight_floor(),
+                    self.irradiance_cube_index(),
+                    self.cache_gather_firefly(),
+                    self.sky_gain,
+                    self.sky_wb,
+                    self.cache_gather_fallback,
+                );
+                ccmd.end()?;
+                let cur = (self.frame_no % 2) as usize;
+                if self.frame_no == 0 || self.async_cache_gap {
+                    // No previous relight to wait on (frame 0, or resuming after a dirty-skip freeze
+                    // that consumed the semaphore chain): graphics submits normally, the relight
+                    // still signals so the next frame's wait pairs up. Clear the gap latch.
+                    self.async_cache_gap = false;
+                    self.queue().submit(
+                        cmd,
+                        &self.image_available[fif],
+                        signal,
+                        &self.in_flight[fif],
+                    )?;
+                } else {
+                    let prev = ((self.frame_no + 1) % 2) as usize; // (N-1) mod 2
+                    self.queue().submit_async(
+                        cmd,
+                        &self.image_available[fif],
+                        &self.cache_done[prev],
+                        signal,
+                        &self.in_flight[fif],
+                    )?;
+                }
+                self.compute_queue.submit_fenced(
+                    ccmd,
+                    &self.cache_done[cur],
+                    &self.cache_compute_fence[fif],
+                )?;
+                self.scene_cache_reset = false;
+            } else {
+                // Plain graphics submit. If this is a frozen (settled) async frame, the compute
+                // relight was skipped — latch the gap so the next resumed relight uses the no-wait
+                // submit (the `cache_done` semaphore chain was broken by the skip).
+                if self.async_cache_on && scene_cache_lit_ext.is_some() && cache_settled {
+                    self.async_cache_gap = true;
+                }
+                self.queue().submit(
+                    cmd,
+                    &self.image_available[fif],
+                    signal,
+                    &self.in_flight[fif],
+                )?;
+            }
+        } else {
+            // Threaded: append the graph onto the frame IR (after any IBL capture) and
+            // ship it. The RHI thread acquires + translates + submits + presents, and
+            // copies/saves the capture itself, overlapping this thread's next frame.
+            // M4 B4: optionally record the graph's passes in parallel on the job
+            // workers (each builds its own IR bucket, concatenated in schedule order).
+            let jobs = self.parallel_record.then(dreamcoast_jobs::global);
+            graph.record_into(
+                &frame_list,
+                &self.device,
+                &mut self.pools[fif],
+                self.aliasing,
+                None,
+                jobs,
+            )?;
+            self.slot_pass_names[fif] = Vec::new();
+            let capture = capture_this_frame.as_ref().map(|c| rhi_thread::CaptureReq {
+                path: c.path.clone(),
+                include_ui: c.include_ui,
+            });
+            self.rhi_thread
+                .as_ref()
+                .expect("rhi thread")
+                .submit(frame_list, fif, capture);
+        }
+        // Swap the particle ping-pong parity for the next simulated frame (deferred to
+        // here so the graph's `&self` borrows have ended — see `particle.rs`).
+        if self.particles_on {
+            self.particles.advance();
+        }
+        // Bump the path tracer's progressive-accumulation counter (deferred here for
+        // the same reason: `record_path` borrowed `&rt` for the graph's lifetime).
+        if pt_active {
+            self.rt.advance_accum();
+        }
+        // C4: advance the GI denoiser accumulation (ping-pong swap) and stash this
+        // frame's view-projection for the next frame's temporal reprojection.
+        if gi_denoise_active {
+            self.gi.advance_denoise();
+        }
+        // F6O: advance the sky-vis temporal ping-pong so next frame reprojects this frame's write.
+        if self.skyvis_pp_spp > 0 {
+            self.gi.advance_skyvis_temporal();
+        }
+        // P4: advance the world radiance cache ping-pong so next frame reads this frame's write.
+        if self.wrc || self.wrc_viz {
+            self.gi.advance_wrc();
+        }
+        // C7b: advance the lit-color history ping-pong so next frame reads this frame's write.
+        if self.gdf_hybrid || self.swrt_reflect {
+            self.reflect.advance_history();
+        }
+        // Advance the stochastic-SSR temporal accumulation ping-pong (stochastic mode only).
+        if self.swrt_reflect && self.ssr_stochastic && self.reflect.has_ssr_resolve() {
+            self.reflect.advance_ssr_accum();
+        }
+        // C8j: advance the stochastic GDF-reflection temporal accumulation ping-pong.
+        if self.swrt_reflect && self.reflect.has_reflect_temporal() {
+            self.reflect.advance_reflect_accum();
+        }
+        // A3: advance the adaptive-skip ping-pong (next frame's reuse reads this frame's write).
+        if self.swrt_reflect && self.reflect_skip && self.reflect.has_reflect_skip() {
+            self.reflect.advance_reflect_skip();
+        }
+        // C8b2: advance the surface-cache radiance ping-pong (next frame reads this frame's).
+        // Frozen (settled) frames skipped the relight, so DON'T advance — keep consumers pinned to
+        // the last-lit (converged) slot for a perfectly stable image.
+        if scene_cache_lit_ext.is_some() && !cache_settled {
+            self.gdf.advance_cache();
+        }
+        // 레퍼런스 엔진 GI-fidelity: advance the world irradiance volume ping-pong (next frame reads this).
+        // Slab amortization: advance the ping-pong only when a full slab cycle completes (every
+        // texel of the write slot has been refreshed), so the EMA history the next cycle reads is
+        // one COMPLETE cycle behind — mid-cycle frames keep writing into the same slot. F4B: the
+        // cycle length comes from the SAME single-source schedule the dispatch uses (fine mode
+        // stretches it to the 2×period super-cycle covering both interleaved levels).
+        if self.gi_volume {
+            let (_, _, gi_cycle) = self.gi_volume_schedule();
+            let gi_cycle_end = self.frame_no % gi_cycle == gi_cycle - 1;
+            if gi_cycle_end {
+                self.gi.advance_gi_volume();
+            }
+            // F4B camera recentering (fine mode only, no-op otherwise): dead-zone detection
+            // every frame, state transitions only on super-cycle boundaries — a fixed camera
+            // never leaves the dead-zone, so the static capture paths stay untouched.
+            self.gi
+                .gi_fine_recenter([eye.x, eye.y, eye.z], gi_cycle_end)?;
+        }
+        // QHD/UHD TAAU: advance the history ping-pong (next frame reprojects this frame's).
+        if taau_active {
+            self.taau.advance();
+        }
+        self.prev_view_proj = view_proj.to_cols_array();
+        self.prev_view_proj_taau = view_proj_stable.to_cols_array();
+        // The lit-calibration probe re-projects card points into the lit HISTORY, so it needs the
+        // camera position that history was rendered from (paired with `prev_view_proj`).
+        self.prev_eye = eye;
+        // Velocity (PR-2): stash this frame's per-object world transforms as next frame's prev pose
+        // (single source; stable draw-list order). Only when velocity is on (else no cost / no state
+        // churn). Uses the pre-skin transform for static/Spin draws; skinned draws carry identity
+        // here and their motion comes from the palette history instead.
+        if self.velocity_on {
+            self.prev_transforms.clear();
+            self.prev_transforms
+                .extend(scene.iter().map(|o| o.transform));
+        }
+
+        // Inline present + capture readback. Threaded: the RHI thread did both (its
+        // capture readback waits the same frame fence → byte-identical + deterministic).
+        if !threaded {
+            // Wait for the GPU (copy included), read the buffer back, and save a PNG.
+            if let (Some(cap), Some((buf, layout))) =
+                (capture_this_frame.as_ref(), readback.as_ref())
+            {
+                self.in_flight[fif].wait()?;
+                let mut bytes = vec![0u8; layout.size as usize];
+                buf.read_into(&mut bytes)?;
+                save_screenshot(&cap.path, &bytes, layout)?;
+                info!(
+                    "saved screenshot {} ({}x{}, ui={})",
+                    cap.path, layout.width, layout.height, cap.include_ui
+                );
+            }
+
+            LAST_CPU_US.store(
+                _t_cpu.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let signal = &self.render_finished[image_index as usize];
+            if self.queue().present(
+                self.swapchain.as_ref().expect("inline swapchain"),
+                image_index,
+                signal,
+            )? {
+                self.needs_recreate = true;
+            }
+        }
+        // DIAG_SLOTS: bindless storage-image slot leak counter, logged only on change
+        // (steady state is silent). A reclaim leak shows as a monotonically climbing
+        // in-use count — the table overflow formerly panicked at 256 after ~20
+        // render-scale steps.
+        if self.diag_slots {
+            let slots = self.device.storage_image_slots();
+            if slots != self.diag_slots_last {
+                self.diag_slots_last = slots;
+                info!(
+                    "[slots] storage-image: {} in use, high-water {} (frame {})",
+                    slots.0, slots.1, self.frame_no
+                );
+            }
+        }
+        self.fif = (self.fif + 1) % FRAMES_IN_FLIGHT;
+        self.frame_no += 1;
+
+        // HZB cull stats (PR-8): read back the (survived, occlusion-culled) counters and
+        // log them periodically (and on the last screenshot frame). Frames-in-flight give
+        // this a small latency; it is a diagnostic, so a recent frame's numbers are fine.
+        if self.hzb_cull
+            && let Some(hzb) = self.hzb.as_ref()
+        {
+            let (survived, culled) = hzb.read_stats();
+            self.hzb_stats.set((survived, culled));
+            // Log periodically, and every frame once past the warmup in screenshot mode
+            // (so a capture run always prints the final numbers).
+            if self.frame_no.is_multiple_of(60) || (self.screenshot_mode && self.frame_no >= warmup)
+            {
+                println!(
+                    "[hzb] instances: {} total, {} survived, {} occlusion-culled",
+                    GRID_COUNT, survived, culled
+                );
+            }
+        }
+
+        // vgeo two-phase occlusion stats (`VGEO_HZB_STATS=1`): the phase-2 deferred / occlusion-
+        // culled cluster counts, accumulated MONOTONICALLY across frames (never GPU-cleared, so no
+        // frames-in-flight race). Proves the same-frame cull actually engages (and, with OFF≡ON
+        // byte-equality, that it is conservative). Diagnostic only — the per-frame average is the
+        // cumulative over the frames rendered.
+        if self.vgeo_mode == 1
+            && self.vgeo_hzb
+            && let Some(v) = self.vgeo.as_ref()
+        {
+            let (deferred, occluded) = v.read_occ_stats();
+            if (deferred | occluded) != 0
+                && (self.frame_no.is_multiple_of(60)
+                    || (self.screenshot_mode && self.frame_no >= warmup))
+            {
+                println!(
+                    "[vgeo-hzb] phase-2 cumulative over {} frames: {deferred} deferred (HZB-tested), {occluded} occlusion-culled",
+                    self.frame_no + 1
+                );
+            }
+        }
+
+        // Bridge the D3D12 debug layer into the log (it otherwise only reaches OutputDebugString).
+        // Catches validation/threading violations — e.g. the Phase 15 M4 B3 RHI submit thread's
+        // cross-thread queue submit / present. No-op on Vulkan (already bridged) / Metal.
+        self.device.drain_debug_messages();
+
+        // In screenshot mode, stop once every requested capture is saved (CAPTURE_SEQ
+        // dumps N frames, else one per requested path).
+        let total_captures = self
+            .capture_seq
+            .map(|n| n as u64)
+            .unwrap_or(self.captures.len() as u64);
+        if self.screenshot_mode && self.frame_no >= warmup + total_captures {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+/// View the globals struct as bytes for upload.
+/// Deterministic stress-test point lights (PR-6 `TEST_LIGHTS=N`): a fixed cubic-ish grid of
+/// `n` lights filling the scene's bounding volume, with a fixed rotating palette and a finite
+/// influence radius so per-cluster culling actually excludes most of them per cluster. No time
+/// dependence — the layout is a pure function of (n, center, radius), so runs are reproducible
+/// and A/B comparable (brute-force vs clustered) at identical light sets.
+fn test_light_grid(n: u32, center: Vec3, radius: f32) -> Vec<ClusterLight> {
+    // Cube-root grid dimensions (as close to equal as possible), filling [-1,1]^3 of the scene
+    // bounds scaled up a bit so lights sit among the geometry.
+    let side = (n as f32).cbrt().ceil() as u32;
+    let extent = radius * 1.4;
+    // Per-light influence radius: a couple of grid cells so neighbours overlap but distant
+    // clusters cull the light. Independent of n's exact value (deterministic).
+    let cell = (2.0 * extent) / side.max(1) as f32;
+    let light_radius = cell * 1.5;
+    // Fixed candela so N lights of this radius stay visible but bounded.
+    let intensity = radius * radius * 2.0;
+    let palette = [
+        [1.0, 0.4, 0.3],
+        [0.3, 0.6, 1.0],
+        [0.5, 1.0, 0.4],
+        [1.0, 0.9, 0.4],
+        [0.8, 0.4, 1.0],
+    ];
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let gx = i % side;
+        let gy = (i / side) % side;
+        let gz = i / (side * side);
+        let f = |g: u32| -> f32 {
+            if side <= 1 {
+                0.0
+            } else {
+                (g as f32 / (side - 1) as f32) * 2.0 - 1.0
+            }
+        };
+        out.push(ClusterLight {
+            position: [
+                center.x + f(gx) * extent,
+                center.y + f(gy) * extent,
+                center.z + f(gz) * extent,
+            ],
+            radius: light_radius,
+            color: palette[(i as usize) % palette.len()],
+            intensity,
+        });
+    }
+    out
+}
+
+fn globals_bytes(g: &Globals) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            g as *const Globals as *const u8,
+            std::mem::size_of::<Globals>(),
+        )
+    }
+}
+
+fn normalize3(v: [f32; 3]) -> [f32; 4] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-5);
+    [v[0] / len, v[1] / len, v[2] / len, 0.0]
+}
+
+/// Physical-camera exposure multiplier from an EV100 stop. `EV100 = log2(N²/t)` at ISO 100;
+/// the linear exposure that maps scene luminance to [0,1] before the filmic curve is
+/// `1 / (1.2 · 2^EV100)` (the 1.2 is the standard ISO 100 saturation-based constant, q·S/K).
+/// Higher EV100 = brighter scene / darker image (shorter exposure); sunny-16 ≈ EV15.
+fn ev100_to_exposure(ev100: f32) -> f32 {
+    1.0 / (1.2 * 2f32.powf(ev100))
+}
+
+/// Directional-light view-projection: an orthographic box centered on `center`,
+/// looking from the sun's direction toward it. Returned column-major (glam's
+/// `to_cols_array`), matching the shader's `mul(M, v)` convention. No Vulkan
+/// Y-flip — the pbr shader handles the per-backend shadow-UV flip.
+/// Parse `DIAG_LEVEL_SWAP` into `(frame, level selector)` pairs, sorted by frame.
+///
+/// Grammar: comma-separated entries, each `frame:selector` or a bare `selector` (frame 1
+/// — after one rendered frame, so the swap runs with the previous level's work in flight,
+/// which is the case the GPU-lifetime drain has to cover). The selector uses the same
+/// rules as `LEVEL` (a stem from the levels directory, or an explicit path).
+fn parse_swap_script() -> Vec<(u64, String)> {
+    let Ok(spec) = std::env::var("DIAG_LEVEL_SWAP") else {
+        return Vec::new();
+    };
+    let mut out: Vec<(u64, String)> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|entry| match entry.split_once(':') {
+            // `path/to.level` has no frame prefix but does contain ':' on no platform we
+            // target; a numeric prefix is the discriminator.
+            Some((f, sel)) if f.trim().parse::<u64>().is_ok() => {
+                (f.trim().parse().unwrap(), sel.trim().to_owned())
+            }
+            _ => (1, entry.to_owned()),
+        })
+        .collect();
+    out.sort_by_key(|(f, _)| *f);
+    if !out.is_empty() {
+        info!("DIAG_LEVEL_SWAP: {} scripted swap(s): {out:?}", out.len());
+    }
+    out
+}
+
+/// Parse a `"x,y,z"` environment variable into a `Vec3` (for the diagnostic camera).
+pub(crate) fn parse_vec3_env(name: &str) -> Option<Vec3> {
+    let v = std::env::var(name).ok()?;
+    let n: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    (n.len() == 3).then(|| Vec3::new(n[0], n[1], n[2]))
+}
+
+/// Conservative AABB-vs-frustum test (Gribb-Hartmann planes from `frustum_planes`, inside ⇒
+/// `n·p + d ≥ 0`). Returns `false` only when the AABB is fully outside one plane (safe to cull);
+/// never culls a visible object, so frustum culling on this stays image-identical.
+fn aabb_in_frustum(planes: &[[f32; 4]; 6], mn: Vec3, mx: Vec3) -> bool {
+    for pl in planes {
+        // The AABB corner farthest along the plane normal (+n); if even it is outside, all are.
+        let pv = Vec3::new(
+            if pl[0] >= 0.0 { mx.x } else { mn.x },
+            if pl[1] >= 0.0 { mx.y } else { mn.y },
+            if pl[2] >= 0.0 { mx.z } else { mn.z },
+        );
+        if pl[0] * pv.x + pl[1] * pv.y + pl[2] * pv.z + pl[3] < 0.0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn light_view_proj(sun_dir: [f32; 3], center: Vec3, radius: f32) -> Mat4 {
+    let dir = Vec3::new(sun_dir[0], sun_dir[1], sun_dir[2]).normalize_or_zero();
+    let dir = if dir == Vec3::ZERO { Vec3::Y } else { dir };
+    let dist = radius * 4.0;
+    let light_pos = center + dir * dist;
+    // Avoid a degenerate up vector when the light is near-vertical.
+    let up = if dir.dot(Vec3::Y).abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let view = Mat4::look_at_rh(light_pos, center, up);
+    let half = radius * 1.6;
+    let proj = Mat4::orthographic_rh(-half, half, -half, half, 0.1, dist + radius * 2.0);
+    proj * view
+}

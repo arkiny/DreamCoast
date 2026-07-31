@@ -31,11 +31,24 @@ use crate::to_dxgi_format;
 
 /// A device-local 3D texture registered in both bindless volume tables.
 pub struct D3d12Volume {
+    /// The device, so `drop` can return both bindless volume slots to their free-lists.
+    device: Rc<DeviceShared>,
     #[allow(dead_code)] // keeps the GPU resource alive while its views are bound
     resource: ID3D12Resource,
     sampled_index: u32,
     storage_index: u32,
     state: Cell<D3D12_RESOURCE_STATES>,
+}
+
+impl Drop for D3d12Volume {
+    /// Return both bindless volume slots. Both tables hold 64 entries and one content level's
+    /// distance fields fill most of them, so without this a level hot-swap (`App::load_level`
+    /// rebuilding the static scene) overflowed them within two swaps. Safe: the handoff
+    /// contract defers the Drop until the referencing frames retire.
+    fn drop(&mut self) {
+        self.device.free_volume(self.sampled_index);
+        self.device.free_storage_volume(self.storage_index);
+    }
 }
 
 impl D3d12Volume {
@@ -84,6 +97,7 @@ impl D3d12Volume {
             let storage_index =
                 device.register_storage_volume(&resource, desc.format, desc.depth.max(1));
             Ok(Self {
+                device,
                 resource,
                 sampled_index,
                 storage_index,
@@ -209,6 +223,7 @@ impl D3d12Volume {
             let storage_index =
                 device.register_storage_volume(&resource, desc.format, desc.depth.max(1));
             Ok(Self {
+                device,
                 resource,
                 sampled_index,
                 storage_index,

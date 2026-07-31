@@ -13,7 +13,7 @@ MIP 레벨을 선택**하게 하여 극도로 축소된(demagnified) 먼 반사�
   origin/main은 로컬 옛 main과 disjoint 히스토리 → `git pull` 금지. 이 브랜치에서 계속 작업.
 - 메모리 읽기: `dreamcoast-reflection-gi-fix.md`(전체 조사 요약 — 반드시 읽을 것),
   `dreamcoast-permesh-sdf-direct-sample.md`, `dreamcoast-vgeo-metal-atomic64.md`.
-- 게이트: gallery 골든 `af70c1a5`가 항상 byte-identical
+- 게이트: gallery 골든이 항상 byte-identical(현행 앵커는 [golden-image-regression.md](golden-image-regression.md))
   (`python3 tools/golden-image.py --only gallery --backend metal`).
 
 ## 지금까지 확정된 진단 (이번 트랙에서)
@@ -76,7 +76,7 @@ MIP 레벨을 선택**하게 하여 극도로 축소된(demagnified) 먼 반사�
    1차 구현은 생략 가능(전 카드 full mip 생성).
 
 ### 게이트 / 검증
-- **gallery `af70c1a5` byte-identical 필수** — 모든 신규 경로는 content-only(extra_tol>0 또는 별도 seam).
+- **gallery byte-identical 필수**(현행 앵커는 [golden-image-regression.md](golden-image-regression.md)) — 모든 신규 경로는 content-only(extra_tol>0 또는 별도 seam).
   primary GI gather(extra_tol=0)와 gallery는 mip0-nearest 레거시 경로 유지.
 - 검증 씬: `LEVEL=sponza_intel_chromeball EV100=11 WARMUP_FRAMES=100`, RELEASE 빌드, gitignored
   Intel Sponza 에셋 필요. 볼 crop(화면 (0.38,0.30)-(0.62,0.72))으로 중심 blockiness 비교.

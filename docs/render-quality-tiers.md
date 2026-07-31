@@ -24,8 +24,8 @@
 
 **단일-소스 리졸버 + 구조적 갤러리-락 (✅).** 모든 스케일러빌리티 노브는 하나의 베이스 프리셋에 대해
 `base = if gallery { gallery_preset() } else { preset(tier) }`로 해상되고, 소비처에서
-`env_override.unwrap_or(base.x).clamp(..)` **한 곳**에서 오버라이드+클램프한다. 갤러리(바이트 동일 PT 앵커
-`af70c1a5…`)는 활성 티어가 아니라 고정 [`gallery_preset()`](../apps/sandbox/src/quality.rs)에 대해 해상하므로,
+`env_override.unwrap_or(base.x).clamp(..)` **한 곳**에서 오버라이드+클램프한다. 갤러리(바이트 동일 PT 앵커 —
+현행 값은 [golden-image-regression.md](golden-image-regression.md))는 활성 티어가 아니라 고정 [`gallery_preset()`](../apps/sandbox/src/quality.rs)에 대해 해상하므로,
 새로 추가한 티어 노브가 per-site `if gallery_scene { .. }` 강제를 빠뜨려 앵커를 **조용히 드리프트**시키는 일이
 구조적으로 불가능하다(`render_scale`·`reflect_max_roughness`를 깼던 그 버그). `gallery_preset_locks_legacy_anchor`
 유닛 테스트가 그 앵커 값을 필드별로 잠근다 — 값이 바뀌면 갤러리 sha도 바뀐다(그게 락의 목적).

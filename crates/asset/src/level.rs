@@ -58,6 +58,16 @@ pub struct Entity {
     /// Logical asset key — the same stable reference the mesh cook is keyed on
     /// (e.g. `assets/model.glb`), resolved to a `.dcasset` at load.
     pub asset: String,
+    /// Optional scene-graph name for this placement, surfaced at load as the runtime's
+    /// `Name` component so gameplay can find the entity it authored (`"player"`,
+    /// `"exit_door"`) instead of matching on a spawn transform.
+    ///
+    /// It names the *placement*, not the asset: two entities may share an `asset` and
+    /// carry different names. `None` keeps the loader's existing behavior (an imported
+    /// glTF root is still named after its asset key; a procedural entity gets no name).
+    /// `#[serde(default)]` keeps pre-name `.level` RON forward-compatible.
+    #[serde(default)]
+    pub name: Option<String>,
     /// World transform, column-major (`glam::Mat4::to_cols_array` order).
     pub transform: [f32; 16],
     /// Optional per-instance material override (else the asset's own material).
@@ -102,6 +112,23 @@ pub struct Light {
     pub vec: [f32; 3],
     pub color: [f32; 3],
     pub intensity: f32,
+    /// Point-light influence radius in world units — the distance at which this light's
+    /// contribution reaches exactly zero. Ignored by [`LightKind::Directional`].
+    ///
+    /// **`0.0` (the default) means "no cutoff":** pure inverse-square falloff out to
+    /// infinity, which is the renderer's historical behavior and stays bit-exact for
+    /// levels authored before this field existed. A positive `range` additionally applies
+    /// the standard windowed inverse-square rolloff `(1 - (d/range)^4)^2`, so the light
+    /// reaches 0 smoothly at `range` with no visible cutoff edge.
+    ///
+    /// Authoring a finite `range` is what makes clustered light culling pay off: a light
+    /// with no cutoff has to be binned into *every* froxel (it can influence any pixel),
+    /// so a torch-lit level with dozens of unbounded lights costs the same as a brute-force
+    /// loop. Give game lights a real range (a torch: ~8-12 m).
+    ///
+    /// `#[serde(default)]` keeps pre-range `.level` RON forward-compatible.
+    #[serde(default)]
+    pub range: f32,
 }
 
 /// The level's default camera.
@@ -158,6 +185,7 @@ mod tests {
             entities: vec![
                 Entity {
                     asset: "assets/Lantern.glb".into(),
+                    name: None,
                     transform: [
                         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0,
                         1.0,
@@ -166,6 +194,7 @@ mod tests {
                 },
                 Entity {
                     asset: "sphere".into(),
+                    name: Some("player".into()),
                     transform: [0.0; 16],
                     material_override: Some(MaterialOverride {
                         base_color_factor: [0.95, 0.64, 0.54, 1.0],
@@ -179,6 +208,7 @@ mod tests {
                 vec: [-0.4, -1.0, -0.3],
                 color: [1.0, 0.95, 0.9],
                 intensity: 3.0,
+                range: 0.0,
             }],
             camera: Camera::default(),
             environment: Environment::default(),
@@ -206,5 +236,37 @@ mod tests {
         )"#;
         let parsed: LevelData = ron::from_str(text).expect("parse without deforms");
         assert!(parsed.deforms.is_empty());
+    }
+
+    /// A `.level` authored before entity names (the shipped built-ins) still parses —
+    /// the field defaults to `None`, so no entity gains a scene-graph name.
+    #[test]
+    fn ron_entity_without_name_defaults_none() {
+        let text = r#"(
+            entities: [(
+                asset: "sphere",
+                transform: (1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1),
+                material_override: None,
+            )],
+            lights: [],
+            camera: (position: (0, 1, 3), target: (0, 0, 0), fov_y_deg: 45, znear: 0.05, zfar: 100),
+            environment: (sun_dir: (-0.4, -1, -0.3), sun_intensity: 3, sky_white_balance: (1, 1, 1)),
+        )"#;
+        let parsed: LevelData = ron::from_str(text).expect("parse without entity names");
+        assert_eq!(parsed.entities[0].name, None);
+    }
+
+    /// A `.level` authored before point-light `range` still parses — the field defaults to
+    /// `0.0`, which the renderer reads as "no cutoff" = the historical inverse-square falloff.
+    #[test]
+    fn ron_light_without_range_defaults_zero() {
+        let text = r#"(
+            entities: [],
+            lights: [(kind: Point, vec: (1, 2, 3), color: (1, 0.6, 0.3), intensity: 8)],
+            camera: (position: (0, 1, 3), target: (0, 0, 0), fov_y_deg: 45, znear: 0.05, zfar: 100),
+            environment: (sun_dir: (-0.4, -1, -0.3), sun_intensity: 3, sky_white_balance: (1, 1, 1)),
+        )"#;
+        let parsed: LevelData = ron::from_str(text).expect("parse without light range");
+        assert_eq!(parsed.lights[0].range, 0.0);
     }
 }

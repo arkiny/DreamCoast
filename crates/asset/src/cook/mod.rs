@@ -324,13 +324,33 @@ fn is_static_scene(scene: &GltfScene) -> bool {
 /// Write `bytes` to `path`, creating the parent dir. Writes to a temp sibling then
 /// renames so a crash mid-write never leaves a torn `.dcasset` that would later be
 /// read as a corrupt (and thus discarded) cache. Shared by the scene bakes.
+///
+/// The temp name is unique per writer (pid + counter), not derived from the
+/// destination alone: two threads cooking the *same* cache key concurrently
+/// (identical mirrored geometry collapses to one mesh-SDF key) must not share a
+/// temp file — the loser's rename would fail `ENOENT` and a mid-rename rewrite
+/// could publish a torn file. Each writer renames its own private temp, so the
+/// last publish wins wholesale and every intermediate state at `path` is a
+/// complete file.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITER: AtomicU64 = AtomicU64::new(0);
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("dcasset.tmp");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        WRITER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = std::path::PathBuf::from(tmp);
     std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        // Don't leave the private temp to accumulate if the publish failed.
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// The asset crate has no `tracing` dependency; route the rare cook-write warning
@@ -412,5 +432,37 @@ mod tests {
         let tmp = TempDir::new("empty");
         let r = load_cooked(Path::new("nope.glb"), "nope.glb", &tmp.0, TexCompress::Off);
         assert!(r.is_err());
+    }
+
+    /// Two threads cooking the same cache key race `write_atomic` on one
+    /// destination. Every call must succeed (no shared temp file for the loser's
+    /// rename to trip over) and the destination must hold exactly the payload —
+    /// never a torn intermediate.
+    #[test]
+    fn write_atomic_survives_same_destination_races() {
+        let tmp = TempDir::new("atomic-race");
+        let dest = tmp.0.join("racing.dcasset");
+        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let (dest, payload) = (&dest, &payload);
+                s.spawn(move || {
+                    for _ in 0..25 {
+                        write_atomic(dest, payload).expect("write_atomic must not race");
+                    }
+                });
+            }
+        });
+
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+        let leftovers: Vec<_> = std::fs::read_dir(&tmp.0)
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name();
+                name.to_string_lossy().ends_with(".tmp").then_some(name)
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "stale temp files left: {leftovers:?}");
     }
 }
