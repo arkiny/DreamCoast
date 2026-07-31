@@ -81,6 +81,19 @@ fn generated_room_requested() -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
+    // This game's SDF sign policy: the probe-based inversion decision. The legacy
+    // voxel-majority flip coin-flips on this game's open-shell chunk meshes (zero
+    // enclosed volume, >60% half-space contamination) and measurably inverts room
+    // air to solid — an 80/255 AO plateau with a hard chunk-seam edge. The engine
+    // default stays legacy until the open-shell contamination work lands (the PT
+    // gates show the legacy flips still net-help IntelSponza); this is a per-app
+    // default, not a per-scene patch, and an explicit env setting still wins.
+    if std::env::var_os("P_SDF_SIGN_PROBE").is_none() {
+        // SAFETY: single-threaded here — before logging, jobs, and engine bring-up
+        // spawn any thread.
+        unsafe { std::env::set_var("P_SDF_SIGN_PROBE", "1") };
+    }
+
     // Logging first: generation and meshing below run *before* engine bring-up, and
     // their report (mesh/triangle counts, generation time) is exactly what the M1 risk
     // gate wants to read — so it has to reach the same log stream the engine uses.
