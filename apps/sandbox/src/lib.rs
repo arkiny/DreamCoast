@@ -2310,15 +2310,12 @@ impl App {
                         let (mut vol, _) = dreamcoast_asset::cook::load_or_bake_mesh_sdf(
                             &s.mvtx, &s.midx, s.dims, s.mn, s.mx, &cache_dir,
                         );
-                        // Mostly-negative DF ⇒ globally-inverted normals (open space read as "inside"):
-                        // negate so the sign is correct (removes compose poisoning + spurious AO/GI floor
-                        // blotches). The 60 % threshold only flips clearly-inverted meshes.
                         // F6H (`P_SDF_OPEN_UNSIGNED`): a non-watertight mesh bakes half-space
                         // signs — an open sheet's closest-triangle sign paints the whole half-
                         // space behind it "inside", and dozens of curtain/banner AABBs composed
                         // that into phantom solid filling the atrium air (the sky-visibility
                         // field read ~0 where the reference sees ~0.9; the 50%-negative census
-                        // is the fingerprint, invisible to the 60% auto-flip below). Such a
+                        // is the fingerprint, invisible to the auto-flip below). Such a
                         // field cannot carry a sign: take |d| — an unsigned shell still stops
                         // the march at the surface band, and the space behind stays open.
                         let open_frac = dreamcoast_asset::sdf::mesh_open_fraction(&s.midx);
@@ -2332,7 +2329,7 @@ impl App {
                         // erode by half its thin-axis atlas voxel so the band stays detectable
                         // by the marches at any sampling resolution.
                         if crate::quality::env_bool("P_SDF_OPEN_UNSIGNED", false)
-                            && open_frac > 0.05
+                            && open_frac > dreamcoast_asset::sdf::OPEN_MESH_BOUNDARY_FRAC
                         {
                             let mut vox_min = f32::MAX;
                             for a in 0..3 {
@@ -2360,8 +2357,51 @@ impl App {
                                 }
                             }
                         }
+                        // Global-inversion flip. A mesh whose normals point inward bakes an
+                        // inverted field (open space reads "inside"), which poisons the
+                        // composite and paints spurious AO/GI blotches, so such a field is
+                        // negated. Deciding WHICH fields those are has two paths:
+                        //
+                        // * legacy (default): "> 60 % of voxels negative". That measures how
+                        //   much of the AABB reads solid, which for a non-watertight mesh is
+                        //   dominated by half-space contamination (F6H), not by inversion —
+                        //   the dungeon's chunk meshes are soups of single-sided floor/wall
+                        //   quads whose negative fraction lands anywhere in 0.16 … 0.85 with
+                        //   the room layout, so 2-4 chunks per generated dungeon flip at
+                        //   random and invert occlusion for the room air the quads face.
+                        // * `P_SDF_SIGN_PROBE` seam: decide from provably-outside samples
+                        //   (`sdf::field_is_inverted` — the padded grid's outer shell, with
+                        //   open meshes never flipped). See that function for the full
+                        //   argument. It is the correct test, but it is NOT the default: it
+                        //   disagrees with the legacy test on 14 of Intel Sponza's 426 unique
+                        //   meshes (15 flips today, 1 under the probe), all of them open
+                        //   shells where the flip is currently acting as a crude mitigation
+                        //   for the F6H phantom, so flipping the default moves the byte-anchored
+                        //   content goldens and needs its own measured, reviewed landing.
                         let neg = vol.voxels.iter().filter(|&&d| d < 0.0).count();
-                        if neg * 5 > vol.voxels.len() * 3 {
+                        let decision = if crate::quality::env_bool("P_SDF_SIGN_PROBE", false) {
+                            dreamcoast_asset::sdf::field_is_inverted(&vol, open_frac)
+                        } else {
+                            neg * 5 > vol.voxels.len() * 3
+                        };
+                        if crate::quality::env_bool("DIAG_SDF_SIGN", false) {
+                            // Per-mesh sign census (the evidence the seam is judged on):
+                            // negative fraction (the legacy signal), boundary-edge fraction
+                            // (watertightness) and the provably-outside shell census.
+                            tracing::info!(
+                                "DF sign: mesh {i} tris {} dims {}x{}x{} neg {:.4} open {:.4} \
+                                 outside_neg {:.4} -> {}",
+                                s.midx.len() / 12,
+                                vol.dims[0],
+                                vol.dims[1],
+                                vol.dims[2],
+                                neg as f32 / vol.voxels.len().max(1) as f32,
+                                open_frac,
+                                dreamcoast_asset::sdf::outside_shell_neg_frac(&vol),
+                                if decision { "NEGATE" } else { "keep" },
+                            );
+                        }
+                        if decision {
                             for v in &mut vol.voxels {
                                 *v = -*v;
                             }
