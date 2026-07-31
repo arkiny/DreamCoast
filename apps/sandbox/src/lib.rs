@@ -753,6 +753,10 @@ pub struct App {
     // pending selection from the UI (applied at the next frame's start). Empty unless
     // started in level mode (`LEVEL`).
     level_paths: Vec<String>,
+    // The directory `level_paths` was discovered from — kept so a hook-requested
+    // switch (`GameHooks::next_level`) can resolve stems and register files written
+    // after bring-up (a generated next floor) with the same rules as startup.
+    levels_dir: std::path::PathBuf,
     current_level: usize,
     pending_level: Option<usize>,
     // Stage D streaming: present in world mode (`WORLD`). Owns the level graph + the
@@ -4012,6 +4016,7 @@ impl App {
             vcaches: level_vcaches,
             morphed: gltf_morphed,
             level_paths,
+            levels_dir,
             current_level,
             pending_level: None,
             streaming,
@@ -4680,6 +4685,13 @@ impl App {
         let _t_cpu = Instant::now(); // CPU record timer (stored right before present)
         // Apply a pending level hot-swap requested from the UI last frame.
         if let Some(idx) = self.pending_level.take() {
+            self.load_level(idx)?;
+        }
+        // A game-requested switch (floor progression, restart). No-op (and
+        // byte-identical) with no hooks installed. Resolution shares the startup
+        // rules, so an explicit path the game just wrote is registered on the spot.
+        if let Some(sel) = self.hooks.as_mut().and_then(|h| h.next_level()) {
+            let idx = level::resolve_selection(&sel, &self.levels_dir, &mut self.level_paths)?;
             self.load_level(idx)?;
         }
         // Pump Win32 messages ONCE per frame. A second pump_events here re-ran begin_frame (which

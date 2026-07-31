@@ -194,4 +194,17 @@ pub trait GameHooks {
     fn draw_ui(&mut self, ui: &imgui::Ui, world: &World) {
         let _ = (ui, world);
     }
+
+    /// Request a level switch. Polled once per frame, before input is pumped; `Some`
+    /// resolves the selector with the same rules as [`crate::GameConfig::level`]
+    /// (a stem against the configured levels directory, or an explicit path — which
+    /// may be a file the game wrote *after* bring-up, e.g. the next generated floor)
+    /// and hot-swaps to it that same frame. On the swap the ECS `World` and the
+    /// registries are rebuilt wholesale: every `Entity` the game cached is stale
+    /// afterwards and must be re-resolved (the hooks object itself survives — it
+    /// lives on the `App`, not in the world). A game that never switches levels
+    /// leaves the default `None` and the frame takes its usual path.
+    fn next_level(&mut self) -> Option<String> {
+        None
+    }
 }
