@@ -11,9 +11,13 @@
 //! window, a device, or a swapchain, and keeps the renderer's golden-image gates
 //! insulated from gameplay work.
 //!
-//! Modules land per milestone; M0 opens with [`input`] (action mapping + edge
-//! detection). Physics, animation state machines, camera, and combat follow in
-//! later milestones and are not stubbed out ahead of time.
+//! Modules land per milestone: M0 opened with [`input`] (action mapping + edge
+//! detection) and [`physics`] (grid collision, raycasts, combat shapes); M2 adds
+//! [`combat`] (health, the melee phase clock, the damage flow) and [`anim`] (a
+//! data-driven animation state machine). Camera follows in a later milestone and
+//! is not stubbed out ahead of time.
 
+pub mod anim;
+pub mod combat;
 pub mod input;
 pub mod physics;

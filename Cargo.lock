@@ -322,6 +322,7 @@ name = "dreamcoast-game"
 version = "0.0.0"
 dependencies = [
  "dreamcoast-platform",
+ "dreamcoast-scene",
  "glam",
  "ron",
  "serde",
