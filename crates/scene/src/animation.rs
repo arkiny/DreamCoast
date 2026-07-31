@@ -2,11 +2,20 @@
 //!
 //! An [`AnimationClip`] is a parsed glTF animation with its channels resolved to the
 //! ECS entities that [`crate::instantiate_gltf_mapped`] created for the targeted
-//! nodes. An [`AnimationPlayer`] component holds a clip + a playback clock;
-//! [`advance_animation`] is the [`crate::advance_spin`] analogue — it advances every
-//! player by `dt`, samples each channel, and writes the result into the targeted
-//! entities' [`LocalTransform`]. Run [`crate::propagate_transforms`] afterwards to
-//! push the new locals out to `WorldTransform`.
+//! nodes (or one built in code with [`ClipBuilder`]).
+//!
+//! Evaluation is split in two, so clips can be **blended** and not just played:
+//!
+//! 1. [`sample_clip`] / [`sample_clip_into`] evaluate a clip at a time into an
+//!    [`AnimPose`] — pure math, no world access.
+//! 2. [`crate::blend_poses`] crossfades two poses, and [`apply_pose`] commits one to
+//!    the targeted entities' [`crate::LocalTransform`] / [`MorphWeights`].
+//!
+//! An [`AnimationPlayer`] component holds a clip + a playback clock;
+//! [`advance_animation`] is the [`crate::advance_spin`] analogue and is now exactly
+//! `advance clock -> sample_clip -> apply_pose` for every player. Run
+//! [`crate::propagate_transforms`] afterwards to push the new locals out to
+//! `WorldTransform`.
 //!
 //! Pure CPU, deterministic given the same `dt` sequence (the engine drives it from
 //! the fixed-timestep accumulator), so headless capture sequences reproduce exactly.
@@ -15,7 +24,7 @@ use dreamcoast_asset::{ChannelData, GltfAnimation, Interpolation};
 use glam::{Quat, Vec3};
 
 use crate::ecs::{Entity, World};
-use crate::transform::LocalTransform;
+use crate::pose::{AnimPose, apply_pose};
 
 /// A keyframe track: a node's translation / rotation / scale, or a mesh's
 /// morph-target weights (`num_targets` values per keyframe, flattened).
@@ -103,6 +112,166 @@ impl AnimationClip {
     pub fn is_empty(&self) -> bool {
         self.channels.is_empty()
     }
+
+    /// Start building a clip in code — see [`ClipBuilder`].
+    pub fn builder() -> ClipBuilder {
+        ClipBuilder::new()
+    }
+
+    /// Number of channels (one per animated node × path).
+    pub fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+}
+
+/// Builds an [`AnimationClip`] from keyframes authored in code, for gameplay clips
+/// that have no glTF behind them (and for tests). Channels are evaluated in the order
+/// they are added, which is the order the resulting [`AnimPose`] lists them in.
+///
+/// ```
+/// # use dreamcoast_scene::{AnimationClip, Interpolation, LoopMode, World, sample_clip};
+/// # use glam::Quat;
+/// # let mut world = World::new();
+/// # let joint = world.spawn();
+/// let q = Quat::from_rotation_y(1.0);
+/// let clip = AnimationClip::builder()
+///     .rotation(joint, Interpolation::Linear, &[0.0, 0.5], &[Quat::IDENTITY, q])
+///     .build();
+/// assert_eq!(clip.duration, 0.5);
+/// let pose = sample_clip(&clip, 0.5, LoopMode::Clamp);
+/// assert_eq!(pose.get(joint).unwrap().trs.rotation, Some(q));
+/// ```
+#[derive(Default)]
+pub struct ClipBuilder {
+    channels: Vec<Channel>,
+    duration: Option<f32>,
+}
+
+impl ClipBuilder {
+    /// An empty builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a translation channel targeting `target`.
+    pub fn translation(
+        self,
+        target: Entity,
+        interpolation: Interpolation,
+        times: &[f32],
+        values: &[Vec3],
+    ) -> Self {
+        debug_assert_key_count(times.len(), values.len(), 1, interpolation);
+        self.push(
+            target,
+            interpolation,
+            times,
+            Track::Translation(values.to_vec()),
+        )
+    }
+
+    /// Add a rotation channel targeting `target`.
+    pub fn rotation(
+        self,
+        target: Entity,
+        interpolation: Interpolation,
+        times: &[f32],
+        values: &[Quat],
+    ) -> Self {
+        debug_assert_key_count(times.len(), values.len(), 1, interpolation);
+        self.push(
+            target,
+            interpolation,
+            times,
+            Track::Rotation(values.to_vec()),
+        )
+    }
+
+    /// Add a scale channel targeting `target`.
+    pub fn scale(
+        self,
+        target: Entity,
+        interpolation: Interpolation,
+        times: &[f32],
+        values: &[Vec3],
+    ) -> Self {
+        debug_assert_key_count(times.len(), values.len(), 1, interpolation);
+        self.push(target, interpolation, times, Track::Scale(values.to_vec()))
+    }
+
+    /// Add a morph-weight channel targeting `target`: `values` is `num_targets`
+    /// weights per keyframe, flattened (×3 for `CubicSpline` tangents).
+    pub fn weights(
+        self,
+        target: Entity,
+        interpolation: Interpolation,
+        times: &[f32],
+        num_targets: usize,
+        values: &[f32],
+    ) -> Self {
+        debug_assert_key_count(times.len(), values.len(), num_targets, interpolation);
+        self.push(
+            target,
+            interpolation,
+            times,
+            Track::Weights {
+                num_targets,
+                values: values.to_vec(),
+            },
+        )
+    }
+
+    /// Override the clip duration (default: the largest keyframe time).
+    pub fn duration(mut self, seconds: f32) -> Self {
+        self.duration = Some(seconds);
+        self
+    }
+
+    /// Finish the clip.
+    pub fn build(self) -> AnimationClip {
+        let duration = self.duration.unwrap_or_else(|| {
+            self.channels
+                .iter()
+                .filter_map(|c| c.times.last().copied())
+                .fold(0.0f32, f32::max)
+        });
+        AnimationClip {
+            channels: self.channels,
+            duration,
+        }
+    }
+
+    fn push(
+        mut self,
+        target: Entity,
+        interpolation: Interpolation,
+        times: &[f32],
+        track: Track,
+    ) -> Self {
+        self.channels.push(Channel {
+            target,
+            interpolation,
+            times: times.to_vec(),
+            track,
+        });
+        self
+    }
+}
+
+/// Debug-only shape check: `CubicSpline` stores `[in-tangent, value, out-tangent]`
+/// per key, the other modes one value per key.
+#[inline]
+fn debug_assert_key_count(keys: usize, values: usize, per_key: usize, interp: Interpolation) {
+    let stride = if interp == Interpolation::CubicSpline {
+        3
+    } else {
+        1
+    };
+    debug_assert_eq!(
+        values,
+        keys * per_key * stride,
+        "channel value count must be keys x {per_key} x {stride}"
+    );
 }
 
 /// Plays an [`AnimationClip`], looping. Attach to any entity; the clip's channels
@@ -125,50 +294,81 @@ impl AnimationPlayer {
     }
 }
 
-/// One sampled TRS write to apply to a target entity.
-struct TrsWrite {
-    target: Entity,
-    value: TrsValue,
+/// How a sample time outside the clip is interpreted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoopMode {
+    /// Wrap into `[0, duration)` — what [`AnimationPlayer`] does (a locomotion clip).
+    #[default]
+    Loop,
+    /// Clamp to `[0, duration]`: before the start holds the first keyframe, after the
+    /// end holds the last (a one-shot attack clip parked on its final pose).
+    Clamp,
 }
 
-enum TrsValue {
-    Translation(Vec3),
-    Rotation(Quat),
-    Scale(Vec3),
-    Weights(Vec<f32>),
+/// Map a raw playback time onto the clip under `mode`.
+///
+/// A zero/negative duration (or a non-finite time — unreachable from
+/// [`advance_animation`], whose clock starts at 0 and advances by a finite `dt`)
+/// samples time 0 rather than propagating NaN into every transform.
+fn normalize_time(time: f32, duration: f32, mode: LoopMode) -> f32 {
+    if duration > 0.0 && time.is_finite() {
+        match mode {
+            LoopMode::Loop => time.rem_euclid(duration),
+            LoopMode::Clamp => time.clamp(0.0, duration),
+        }
+    } else {
+        0.0
+    }
+}
+
+/// Evaluate `clip` at `time` into a fresh [`AnimPose`].
+///
+/// The channels already carry their target entities (resolved by
+/// [`AnimationClip::from_gltf`] or given to [`ClipBuilder`]), so no binding argument
+/// is needed. Use [`sample_clip_into`] on a hot path to reuse the pose's allocations.
+pub fn sample_clip(clip: &AnimationClip, time: f32, mode: LoopMode) -> AnimPose {
+    let mut pose = AnimPose::new();
+    sample_clip_into(clip, time, mode, &mut pose);
+    pose
+}
+
+/// [`sample_clip`] into a reusable pose buffer (cleared first).
+///
+/// Entries land in channel order (first touch wins the slot), so a clip's pose order
+/// is fixed by the clip, not by the sampling call.
+pub fn sample_clip_into(clip: &AnimationClip, time: f32, mode: LoopMode, pose: &mut AnimPose) {
+    pose.clear();
+    let t = normalize_time(time, clip.duration, mode);
+    for ch in &clip.channels {
+        sample_channel_into(ch, t, pose);
+    }
 }
 
 /// Advance every [`AnimationPlayer`] by `dt` (looping over the clip duration), sample
-/// its channels, and write the results into the targeted entities' [`LocalTransform`].
+/// its channels, and write the results into the targeted entities'
+/// [`crate::LocalTransform`] / [`MorphWeights`].
 ///
 /// Two passes (like [`crate::advance_spin`]): read the players to compute the new
-/// clocks + sampled writes, then apply — so no player-storage borrow is held across
-/// the `LocalTransform` write-back.
+/// clocks + sampled poses, then apply — so no player-storage borrow is held across
+/// the write-back.
 pub fn advance_animation(world: &mut World, dt: f32) {
     struct Update {
         player: Entity,
         new_time: f32,
-        writes: Vec<TrsWrite>,
+        pose: AnimPose,
     }
 
     let updates: Vec<Update> = world
         .iter::<AnimationPlayer>()
         .map(|(e, p)| {
-            let new_time = if p.clip.duration > 0.0 {
-                (p.time + p.speed * dt).rem_euclid(p.clip.duration)
-            } else {
-                0.0
-            };
-            let writes = p
-                .clip
-                .channels
-                .iter()
-                .filter_map(|ch| sample_channel(ch, new_time))
-                .collect();
+            let new_time = normalize_time(p.time + p.speed * dt, p.clip.duration, LoopMode::Loop);
+            // `new_time` is already in `[0, duration)`, so the re-normalisation inside
+            // `sample_clip` is the identity (`x.rem_euclid(d) == x` exactly for
+            // `0 <= x < d`) — the sampled values are bit-identical to sampling it raw.
             Update {
                 player: e,
                 new_time,
-                writes,
+                pose: sample_clip(&p.clip, new_time, LoopMode::Loop),
             }
         })
         .collect();
@@ -177,45 +377,37 @@ pub fn advance_animation(world: &mut World, dt: f32) {
         if let Some(p) = world.get_mut::<AnimationPlayer>(u.player) {
             p.time = u.new_time;
         }
-        for w in u.writes {
-            // Morph weights live in their own component; TRS goes to LocalTransform.
-            if let TrsValue::Weights(weights) = w.value {
-                world.insert(w.target, MorphWeights(weights));
-            } else if let Some(lt) = world.get_mut::<LocalTransform>(w.target) {
-                match w.value {
-                    TrsValue::Translation(t) => lt.translation = t,
-                    TrsValue::Rotation(r) => lt.rotation = r,
-                    TrsValue::Scale(s) => lt.scale = s,
-                    TrsValue::Weights(_) => unreachable!(),
-                }
-            }
-        }
+        apply_pose(world, &u.pose);
     }
 }
 
-/// Sample one channel at time `t` into a [`TrsWrite`] (`None` if the track is empty).
-fn sample_channel(ch: &Channel, t: f32) -> Option<TrsWrite> {
-    let value = match &ch.track {
+/// Sample one channel at time `t` into `pose` (no-op if the track has no keyframes).
+fn sample_channel_into(ch: &Channel, t: f32, pose: &mut AnimPose) {
+    match &ch.track {
         Track::Translation(v) => {
-            TrsValue::Translation(sample_vec3(&ch.times, v, ch.interpolation, t)?)
+            if let Some(x) = sample_vec3(&ch.times, v, ch.interpolation, t) {
+                pose.set_translation(ch.target, x);
+            }
         }
-        Track::Scale(v) => TrsValue::Scale(sample_vec3(&ch.times, v, ch.interpolation, t)?),
-        Track::Rotation(v) => TrsValue::Rotation(sample_quat(&ch.times, v, ch.interpolation, t)?),
+        Track::Scale(v) => {
+            if let Some(x) = sample_vec3(&ch.times, v, ch.interpolation, t) {
+                pose.set_scale(ch.target, x);
+            }
+        }
+        Track::Rotation(v) => {
+            if let Some(x) = sample_quat(&ch.times, v, ch.interpolation, t) {
+                pose.set_rotation(ch.target, x);
+            }
+        }
         Track::Weights {
             num_targets,
             values,
-        } => TrsValue::Weights(sample_weights(
-            &ch.times,
-            values,
-            *num_targets,
-            ch.interpolation,
-            t,
-        )?),
-    };
-    Some(TrsWrite {
-        target: ch.target,
-        value,
-    })
+        } => {
+            if let Some(x) = sample_weights(&ch.times, values, *num_targets, ch.interpolation, t) {
+                pose.set_weights(ch.target, x);
+            }
+        }
+    }
 }
 
 /// Sample a morph-weight track at time `t`: each of the `num_targets` weights is
@@ -381,7 +573,8 @@ mod tests {
     use super::*;
     use dreamcoast_asset::{ChannelData, GltfAnimation, GltfChannel};
 
-    use crate::transform::propagate_transforms;
+    use crate::pose::{Trs, blend_poses};
+    use crate::transform::{LocalTransform, propagate_transforms};
 
     // A 1-channel translation clip: x goes 0 -> 10 over 1s (linear).
     fn translate_clip() -> GltfAnimation {
@@ -465,5 +658,347 @@ mod tests {
             "looped translation, got {}",
             xc.x
         );
+    }
+
+    // ---- sample / blend / apply split -------------------------------------------------
+
+    /// A clip exercising every interpolation mode and every channel path:
+    /// cubic-spline translation + rotation, linear scale, step morph weights on `a`,
+    /// and a rotation-only channel on `b` (the partial-channel case).
+    fn kitchen_sink_clip(a: Entity, b: Entity) -> AnimationClip {
+        let cubic_t = [
+            // key 0: [in-tangent, value, out-tangent]
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::new(3.0, 0.0, 0.0),
+            // key 1
+            Vec3::new(1.0, 2.0, 0.0),
+            Vec3::new(4.0, 1.0, 0.0),
+            Vec3::ZERO,
+        ];
+        let cubic_r = [
+            Quat::from_xyzw(0.0, 0.0, 0.0, 0.0),
+            Quat::from_rotation_y(0.1),
+            Quat::from_xyzw(0.2, 0.0, 0.1, 0.0),
+            Quat::from_xyzw(0.05, 0.0, 0.0, 0.0),
+            Quat::from_rotation_y(1.3),
+            Quat::from_xyzw(0.0, 0.0, 0.0, 0.0),
+        ];
+        AnimationClip::builder()
+            .translation(a, Interpolation::CubicSpline, &[0.0, 0.8], &cubic_t)
+            .rotation(a, Interpolation::CubicSpline, &[0.0, 0.8], &cubic_r)
+            .scale(
+                a,
+                Interpolation::Linear,
+                &[0.0, 0.8],
+                &[Vec3::ONE, Vec3::splat(2.5)],
+            )
+            .weights(
+                a,
+                Interpolation::Step,
+                &[0.0, 0.4, 0.8],
+                2,
+                &[0.0, 1.0, 0.25, 0.75, 1.0, 0.0],
+            )
+            .rotation(
+                b,
+                Interpolation::Linear,
+                &[0.0, 0.8],
+                &[Quat::IDENTITY, Quat::from_rotation_z(0.9)],
+            )
+            .build()
+    }
+
+    /// The pre-split evaluation path, reproduced verbatim: advance the clock, then
+    /// sample each channel in channel order and write it straight to the target.
+    /// `advance_animation` must stay bit-identical to this.
+    fn legacy_advance(world: &mut World, clip: &AnimationClip, time: &mut f32, dt: f32) {
+        let new_time = if clip.duration > 0.0 {
+            (*time + 1.0 * dt).rem_euclid(clip.duration)
+        } else {
+            0.0
+        };
+        *time = new_time;
+        for ch in &clip.channels {
+            match &ch.track {
+                Track::Translation(v) => {
+                    if let Some(x) = sample_vec3(&ch.times, v, ch.interpolation, new_time)
+                        && let Some(lt) = world.get_mut::<LocalTransform>(ch.target)
+                    {
+                        lt.translation = x;
+                    }
+                }
+                Track::Scale(v) => {
+                    if let Some(x) = sample_vec3(&ch.times, v, ch.interpolation, new_time)
+                        && let Some(lt) = world.get_mut::<LocalTransform>(ch.target)
+                    {
+                        lt.scale = x;
+                    }
+                }
+                Track::Rotation(v) => {
+                    if let Some(x) = sample_quat(&ch.times, v, ch.interpolation, new_time)
+                        && let Some(lt) = world.get_mut::<LocalTransform>(ch.target)
+                    {
+                        lt.rotation = x;
+                    }
+                }
+                Track::Weights {
+                    num_targets,
+                    values,
+                } => {
+                    if let Some(x) =
+                        sample_weights(&ch.times, values, *num_targets, ch.interpolation, new_time)
+                    {
+                        world.insert(ch.target, MorphWeights(x));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every float of an entity's animated state, as raw bits (so the comparison is
+    /// exact: no epsilon, no `-0.0 == 0.0` slack).
+    fn state_bits(world: &World, e: Entity) -> Vec<u32> {
+        let lt = world.get::<LocalTransform>(e).unwrap();
+        let mut bits: Vec<u32> = lt
+            .translation
+            .to_array()
+            .into_iter()
+            .chain(lt.rotation.to_array())
+            .chain(lt.scale.to_array())
+            .map(f32::to_bits)
+            .collect();
+        if let Some(w) = world.get::<MorphWeights>(e) {
+            bits.extend(w.0.iter().copied().map(f32::to_bits));
+        }
+        bits
+    }
+
+    /// The refactor's safety net: the new `sample -> apply` path must reproduce the
+    /// old direct-write path bit-for-bit, including the cubic-spline math.
+    #[test]
+    fn advance_animation_matches_pre_split_path_bit_for_bit() {
+        // World A: driven by the real `advance_animation` (player component).
+        let mut wa = World::new();
+        let (a0, b0) = (wa.spawn(), wa.spawn());
+        wa.insert(a0, LocalTransform::IDENTITY);
+        wa.insert(b0, LocalTransform::IDENTITY);
+        let player = wa.spawn();
+        wa.insert(player, AnimationPlayer::new(kitchen_sink_clip(a0, b0)));
+
+        // World B: same entities (same spawn order -> same ids), driven by the legacy path.
+        let mut wb = World::new();
+        let (a1, b1) = (wb.spawn(), wb.spawn());
+        wb.insert(a1, LocalTransform::IDENTITY);
+        wb.insert(b1, LocalTransform::IDENTITY);
+        let clip = kitchen_sink_clip(a1, b1);
+        let mut time = 0.0f32;
+
+        // 120 steps = 2 s over a 0.8 s clip: covers both loop wraps and every segment.
+        for step in 0..120 {
+            advance_animation(&mut wa, 1.0 / 60.0);
+            legacy_advance(&mut wb, &clip, &mut time, 1.0 / 60.0);
+            assert_eq!(
+                wa.get::<AnimationPlayer>(player).unwrap().time.to_bits(),
+                time.to_bits(),
+                "clock diverged at step {step}"
+            );
+            assert_eq!(
+                state_bits(&wa, a0),
+                state_bits(&wb, a1),
+                "node a, step {step}"
+            );
+            assert_eq!(
+                state_bits(&wa, b0),
+                state_bits(&wb, b1),
+                "node b, step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_clip_reproduces_advance_animation_state() {
+        let mut w = World::new();
+        let (a, b) = (w.spawn(), w.spawn());
+        w.insert(a, LocalTransform::IDENTITY);
+        w.insert(b, LocalTransform::IDENTITY);
+        let player = w.spawn();
+        w.insert(player, AnimationPlayer::new(kitchen_sink_clip(a, b)));
+        for _ in 0..17 {
+            advance_animation(&mut w, 1.0 / 60.0);
+        }
+        let t = w.get::<AnimationPlayer>(player).unwrap().time;
+
+        // Same clip, same time, sampled + applied by hand: identical world state.
+        let mut w2 = World::new();
+        let (a2, b2) = (w2.spawn(), w2.spawn());
+        w2.insert(a2, LocalTransform::IDENTITY);
+        w2.insert(b2, LocalTransform::IDENTITY);
+        let pose = sample_clip(&kitchen_sink_clip(a2, b2), t, LoopMode::Loop);
+        apply_pose(&mut w2, &pose);
+        assert_eq!(state_bits(&w, a), state_bits(&w2, a2));
+        assert_eq!(state_bits(&w, b), state_bits(&w2, b2));
+        // Pose order follows channel order, one entry per entity.
+        let targets: Vec<Entity> = pose.entries().iter().map(|e| e.target).collect();
+        assert_eq!(targets, vec![a2, b2]);
+        // `b` is rotation-only: its other channels stay unauthored.
+        let tb = pose.get(b2).unwrap().trs;
+        assert!(tb.rotation.is_some() && tb.translation.is_none() && tb.scale.is_none());
+    }
+
+    #[test]
+    fn sample_clip_into_reuses_the_buffer() {
+        let mut w = World::new();
+        let (a, b) = (w.spawn(), w.spawn());
+        let clip = kitchen_sink_clip(a, b);
+        let mut pose = AnimPose::new();
+        sample_clip_into(&clip, 0.3, LoopMode::Loop, &mut pose);
+        let first = pose.clone();
+        // A second sample clears the buffer instead of appending duplicates.
+        sample_clip_into(&clip, 0.3, LoopMode::Loop, &mut pose);
+        assert_eq!(pose.len(), 2);
+        assert_eq!(pose, first);
+        assert_eq!(pose, sample_clip(&clip, 0.3, LoopMode::Loop));
+    }
+
+    #[test]
+    fn loop_and_clamp_disagree_only_outside_the_clip() {
+        let mut w = World::new();
+        let e = w.spawn();
+        let clip = AnimationClip::builder()
+            .translation(
+                e,
+                Interpolation::Linear,
+                &[0.0, 1.0],
+                &[Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0)],
+            )
+            .build();
+        assert_eq!(clip.duration, 1.0);
+        let x = |t: f32, m: LoopMode| {
+            sample_clip(&clip, t, m)
+                .get(e)
+                .unwrap()
+                .trs
+                .translation
+                .unwrap()
+                .x
+        };
+        // Inside the clip the modes agree.
+        assert_eq!(x(0.25, LoopMode::Loop), x(0.25, LoopMode::Clamp));
+        // Past the end: loop wraps to the start, clamp holds the last key.
+        assert_eq!(x(1.25, LoopMode::Loop), 2.5);
+        assert_eq!(x(1.25, LoopMode::Clamp), 10.0);
+        assert_eq!(x(1.0, LoopMode::Clamp), 10.0);
+        // Exactly at the duration, loop wraps to 0.
+        assert_eq!(x(1.0, LoopMode::Loop), 0.0);
+        // Before the start: loop wraps from the end, clamp holds the first key.
+        assert_eq!(x(-0.25, LoopMode::Loop), 7.5);
+        assert_eq!(x(-0.25, LoopMode::Clamp), 0.0);
+        // Degenerate inputs sample time 0 instead of poisoning the pose.
+        assert_eq!(x(f32::NAN, LoopMode::Loop), 0.0);
+        let zero_len = AnimationClip::builder()
+            .translation(
+                e,
+                Interpolation::Linear,
+                &[0.0],
+                &[Vec3::new(4.0, 0.0, 0.0)],
+            )
+            .build();
+        assert_eq!(zero_len.duration, 0.0);
+        assert_eq!(
+            sample_clip(&zero_len, 9.0, LoopMode::Loop)
+                .get(e)
+                .unwrap()
+                .trs
+                .translation
+                .unwrap()
+                .x,
+            4.0
+        );
+    }
+
+    #[test]
+    fn crossfade_between_clips_with_different_channel_subsets() {
+        let mut w = World::new();
+        let e = w.spawn();
+        w.insert(
+            e,
+            LocalTransform {
+                translation: Vec3::new(0.0, 7.0, 0.0),
+                rotation: Quat::IDENTITY,
+                scale: Vec3::splat(3.0),
+            },
+        );
+        // Clip A rotates; clip B translates. Neither authors scale.
+        let rot = AnimationClip::builder()
+            .rotation(
+                e,
+                Interpolation::Linear,
+                &[0.0, 1.0],
+                &[Quat::IDENTITY, Quat::from_rotation_y(1.0)],
+            )
+            .build();
+        let trn = AnimationClip::builder()
+            .translation(
+                e,
+                Interpolation::Linear,
+                &[0.0, 1.0],
+                &[Vec3::ZERO, Vec3::new(8.0, 0.0, 0.0)],
+            )
+            .build();
+        let pose = blend_poses(
+            &sample_clip(&rot, 0.5, LoopMode::Loop),
+            &sample_clip(&trn, 0.5, LoopMode::Loop),
+            0.5,
+        );
+        apply_pose(&mut w, &pose);
+        let lt = *w.get::<LocalTransform>(e).unwrap();
+        // Rotation from A and translation from B both land at full strength (union
+        // rule) and the un-animated scale survives untouched.
+        assert!(lt.rotation.dot(Quat::from_rotation_y(0.5)).abs() > 0.9999);
+        assert_eq!(lt.translation, Vec3::new(4.0, 0.0, 0.0));
+        assert_eq!(lt.scale, Vec3::splat(3.0));
+    }
+
+    #[test]
+    fn builder_clip_matches_the_gltf_import_of_the_same_keys() {
+        let mut w = World::new();
+        let e = w.spawn();
+        let imported = AnimationClip::from_gltf(&translate_clip(), &[Some(e)]);
+        let built = AnimationClip::builder()
+            .translation(
+                e,
+                Interpolation::Linear,
+                &[0.0, 1.0],
+                &[Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0)],
+            )
+            .duration(1.0)
+            .build();
+        assert_eq!(imported.channel_count(), built.channel_count());
+        assert_eq!(imported.duration, built.duration);
+        for t in [0.0, 0.1, 0.37, 0.9, 1.0] {
+            assert_eq!(
+                sample_clip(&imported, t, LoopMode::Clamp),
+                sample_clip(&built, t, LoopMode::Clamp),
+                "time {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_channel_less_clips_sample_to_an_empty_pose() {
+        let clip = AnimationClip::builder().build();
+        assert!(clip.is_empty());
+        assert!(sample_clip(&clip, 0.5, LoopMode::Loop).is_empty());
+        // Applying an empty pose is a no-op, not a panic.
+        let mut w = World::new();
+        let e = w.spawn();
+        w.insert(e, LocalTransform::IDENTITY);
+        apply_pose(&mut w, &AnimPose::new());
+        assert_eq!(
+            *w.get::<LocalTransform>(e).unwrap(),
+            LocalTransform::IDENTITY
+        );
+        assert_eq!(Trs::default(), Trs::EMPTY);
     }
 }
