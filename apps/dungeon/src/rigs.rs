@@ -47,11 +47,20 @@
 //!
 //! # Scope
 //!
-//! Authoring only. [`ensure_rigs`] writes the two `.glb` files next to the generated
+//! Authoring only. [`ensure_rigs`] writes the `.glb` files next to the generated
 //! levels; **nothing here is wired into a level or into gameplay** — spawning, the
 //! animation state machine and the combat hookup are the integrator's, and the clip
 //! timing they need is exported as consts here ([`WARRIOR_ATTACK1_HIT_TIME`] and
 //! friends) so the numbers have exactly one home.
+//!
+//! # Props
+//!
+//! [`potion`] is the odd one out: a **prop**, not a character — three boxes, no joints
+//! that ever rotate and no clips at all. It lives here anyway because it is the same
+//! authoring road (box meshes → [`save_glb_scene`] → the engine's importer), and giving
+//! a two-material static flask its own module would duplicate [`BoxMesh`], the winding
+//! convention and the write-if-different plumbing for 36 triangles. What *uses* it —
+//! placement, pickup, the inventory — is [`crate::items`].
 
 // Authoring surface: a few exported clip markers and helpers are read by the tests and
 // by future tuning rather than by the game loop, so this module keeps the allowance the
@@ -67,8 +76,8 @@ use dreamcoast_asset::glb::{
 };
 use glam::{Quat, Vec3};
 
-/// A character ready for the glTF writer: the node tree, the rigid meshes those nodes
-/// carry, the materials, and the clips.
+/// A character (or a prop — see the module docs) ready for the glTF writer: the node
+/// tree, the rigid meshes those nodes carry, the materials, and the clips.
 pub struct Rig {
     /// File stem inside [`crate::level::GENERATED_DIR`] (`warrior` → `warrior.glb`).
     pub name: &'static str,
@@ -91,11 +100,13 @@ impl Rig {
 // integrator reads a number that cannot drift from the animation it describes — a hit
 // window transcribed into a state-machine RON would.
 
-/// File stems (and [`Rig::name`]s) of the two shipped rigs — what
+/// File stems (and [`Rig::name`]s) of the shipped assets — what
 /// [`rig_asset_path`] turns into a `.glb` path and what [`crate::level`] references.
 pub const WARRIOR_RIG: &str = "warrior";
 /// See [`WARRIOR_RIG`].
 pub const GRUNT_RIG: &str = "grunt";
+/// See [`WARRIOR_RIG`]. The health-potion prop ([`potion`]), placed by [`crate::items`].
+pub const POTION_PROP: &str = "potion";
 
 /// Warrior clip names, in authoring order.
 pub const WARRIOR_CLIPS: [&str; 8] = [
@@ -2036,6 +2047,123 @@ fn grunt_death(b: &GruntBones) -> GlbAnimation {
         .finish()
 }
 
+// --- The health potion (a prop, not a character) --------------------------------------
+
+/// Total height of the flask, metres — cap included, sole at y = 0.
+///
+/// Waist-high on nothing: it is deliberately *small*, because a pickup that reads as
+/// furniture is a pickup the player tries to walk around. What makes it findable is the
+/// colour contrast and the cap, not the size (see [`potion_materials`]).
+pub const POTION_HEIGHT: f32 = 0.35;
+
+/// The flask's widest half-extent, metres — its footprint is `2 x` this square.
+///
+/// Exported because [`crate::items`] places these on open floor and a caller that wants
+/// to know how much room one needs should read the number from the thing that authored
+/// it, not re-measure it.
+pub const POTION_HALF_WIDTH: f32 = 0.11;
+
+/// Potion material slots, in write order.
+const MAT_POTION_GLASS: usize = 0;
+const MAT_POTION_CAP: usize = 1;
+
+/// The flask's two surfaces.
+///
+/// The whole design problem is a 0.35 m object read from a 55-degree camera 16 m up,
+/// standing on grey-brown stone (`crate::level`'s floor is `0.24, 0.23, 0.22` at
+/// roughness 0.92). So:
+///
+/// * the body is a **deep saturated red at low roughness** — the hue is the one thing on
+///   the floor that the dungeon's own palette never produces, and 0.3 roughness gives it
+///   a tight specular lobe that flares as the camera passes, which is what "glass" reads
+///   as without a transmission extension the cook does not carry;
+/// * the cap is a **bright warm metal** and is the widest thing at the top of the
+///   silhouette, so from directly above — the angle where the body foreshortens to almost
+///   nothing — the pickup is still a bright dot with a dark ring around it.
+///
+/// Two materials, not one: a single-material flask at this size is a red smudge, and the
+/// tonal split (dark saturated body / bright specular cap) is what survives being four
+/// pixels tall.
+fn potion_materials() -> Vec<GlbMaterial> {
+    vec![
+        GlbMaterial {
+            name: "potion_glass".into(),
+            base_color_factor: [0.55, 0.08, 0.10, 1.0],
+            metallic: 0.0,
+            roughness: 0.3,
+            double_sided: false,
+        },
+        GlbMaterial {
+            name: "potion_cap".into(),
+            base_color_factor: [0.93, 0.80, 0.38, 1.0],
+            metallic: 0.85,
+            roughness: 0.28,
+            double_sided: false,
+        },
+    ]
+}
+
+/// The health potion: a squat flask, a narrow neck and a bright cap, standing on y = 0.
+///
+/// Three boxes in two meshes (the body and the neck share the glass material, so they
+/// share a mesh and the draw), on three nodes: a transform-only root so the level's
+/// placement wrapper has something to be, plus one node per material. No clips — a prop
+/// is a [`Rig`] with an empty animation list, which the glTF writer handles by writing no
+/// animation block at all.
+///
+/// The cap is authored on its own node at the neck's top rather than as a third box in
+/// the flask mesh, which costs one node and buys the seam a future bob/spin animation
+/// would need (rotate `potion_cap`, or translate `potion_root`) without re-authoring the
+/// geometry.
+pub fn potion() -> Rig {
+    // Body, then neck, then cap, stacked with no gaps — each span starts where the last
+    // one ended, so the total is `POTION_HEIGHT` by construction rather than by arithmetic
+    // somebody has to redo when a number moves.
+    const BODY_TOP: f32 = 0.19;
+    const NECK_TOP: f32 = 0.29;
+    const NECK_HALF: f32 = 0.05;
+    const CAP_HALF: f32 = 0.085;
+
+    let mut b = RigBuilder::new();
+    let root = b.joint("potion_root", None, [0.0, 0.0, 0.0]);
+    b.bone(
+        "potion_flask",
+        root,
+        [0.0, 0.0, 0.0],
+        MAT_POTION_GLASS,
+        &[
+            (
+                [-POTION_HALF_WIDTH, 0.0, -POTION_HALF_WIDTH],
+                [POTION_HALF_WIDTH, BODY_TOP, POTION_HALF_WIDTH],
+            ),
+            (
+                [-NECK_HALF, BODY_TOP, -NECK_HALF],
+                [NECK_HALF, NECK_TOP, NECK_HALF],
+            ),
+        ],
+    );
+    // Joint at the neck's top, geometry above it: the cap's own origin is where it would
+    // pivot, the same rule every bone above follows.
+    b.bone(
+        "potion_cap",
+        root,
+        [0.0, NECK_TOP, 0.0],
+        MAT_POTION_CAP,
+        &[(
+            [-CAP_HALF, 0.0, -CAP_HALF],
+            [CAP_HALF, POTION_HEIGHT - NECK_TOP, CAP_HALF],
+        )],
+    );
+
+    Rig {
+        name: POTION_PROP,
+        nodes: b.nodes,
+        meshes: b.meshes,
+        materials: potion_materials(),
+        animations: Vec::new(),
+    }
+}
+
 // --- Files ---------------------------------------------------------------------------
 
 /// Path of a rig's `.glb` inside the generated-asset directory.
@@ -2043,17 +2171,21 @@ pub fn rig_asset_path(name: &str) -> PathBuf {
     Path::new(crate::level::GENERATED_DIR).join(format!("{name}.glb"))
 }
 
-/// Author both characters and write them next to the generated levels, rewriting only
-/// what changed.
+/// Author both characters **and the potion prop** and write them next to the generated
+/// levels, rewriting only what changed.
 ///
 /// The same road the dungeon geometry takes (`crate::level`): a real file, cooked and
 /// content-hash cached, so an unchanged authoring pass is a pure cache hit. Returns the
 /// written paths — placing them in a level and driving their clips is the integrator's
 /// job, not this module's.
+///
+/// The prop rides in this one call rather than a parallel `ensure_props` on purpose: the
+/// caller's contract is "author everything the level about to be written references,
+/// before writing it", and a second entry point is a second thing to forget.
 pub fn ensure_rigs() -> anyhow::Result<Vec<PathBuf>> {
     let started = std::time::Instant::now();
     let mut paths = Vec::new();
-    for rig in [warrior(), grunt()] {
+    for rig in [warrior(), grunt(), potion()] {
         let path = rig_asset_path(rig.name);
         let wrote = save_glb_scene(
             &path,
@@ -2063,7 +2195,7 @@ pub fn ensure_rigs() -> anyhow::Result<Vec<PathBuf>> {
             &rig.animations,
         )?;
         tracing::info!(
-            "dungeon: rig '{}' — {} nodes, {} meshes, {} triangles, {} clips, {} in {:.1} ms",
+            "dungeon: asset '{}' — {} nodes, {} meshes, {} triangles, {} clips, {} in {:.1} ms",
             path.display(),
             rig.nodes.len(),
             rig.meshes.len(),
@@ -2131,6 +2263,10 @@ mod tests {
         for (rig, clips) in [
             (warrior(), WARRIOR_CLIPS.as_slice()),
             (grunt(), GRUNT_CLIPS.as_slice()),
+            // The prop takes the same road with an empty clip list: a glTF with no
+            // animation block still has to survive the importer, because that is exactly
+            // what the level loader will hand it.
+            (potion(), [].as_slice()),
         ] {
             let scene = round_trip(&rig, &dir);
             let what = rig.name;
@@ -2444,6 +2580,74 @@ mod tests {
         }
     }
 
+    /// The potion prop stands on the floor at the size it advertises, is wound the same
+    /// way as everything else, and carries no clips.
+    ///
+    /// Same three properties the characters are held to, asserted separately because a
+    /// prop has no hips and no gait to hang them off.
+    #[test]
+    fn the_potion_prop_is_grounded_outward_facing_and_static() {
+        let rig = potion();
+        assert!(rig.animations.is_empty(), "a prop authors no clips");
+        assert_eq!(rig.meshes.len(), 2, "one mesh per material");
+        assert_eq!(rig.materials.len(), 2);
+
+        let names: BTreeSet<&str> = rig.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names.len(), rig.nodes.len(), "node names are unique");
+        assert!(
+            rig.nodes[0].parent.is_none(),
+            "node 0 is the placement root"
+        );
+        assert!(
+            rig.nodes[1..].iter().all(|n| n.parent == Some(0)),
+            "every part hangs off the root"
+        );
+
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(f32::MIN);
+        for (i, node) in rig.nodes.iter().enumerate() {
+            let Some(mesh) = node.mesh else { continue };
+            let mut offset = Vec3::ZERO;
+            let mut at = Some(i);
+            while let Some(n) = at {
+                offset += Vec3::from(rig.nodes[n].translation);
+                at = rig.nodes[n].parent;
+            }
+            for v in &rig.meshes[mesh].vertices {
+                let p = offset + Vec3::from(v.pos);
+                min = min.min(p);
+                max = max.max(p);
+            }
+            // Winding: every face is counter-clockwise about its own authored normal.
+            for tri in rig.meshes[mesh].indices.chunks_exact(3) {
+                let p: Vec<Vec3> = tri
+                    .iter()
+                    .map(|&i| Vec3::from(rig.meshes[mesh].vertices[i as usize].pos))
+                    .collect();
+                let geometric = (p[1] - p[0]).cross(p[2] - p[0]);
+                assert!(geometric.length() > 1e-9, "degenerate triangle");
+                let authored = Vec3::from(rig.meshes[mesh].vertices[tri[0] as usize].normal);
+                assert!(
+                    geometric.normalize().dot(authored) > 0.99,
+                    "potion/{}: face winding disagrees with its normal",
+                    rig.meshes[mesh].name
+                );
+            }
+        }
+        assert_eq!(min.y, 0.0, "the flask stands on y = 0");
+        assert!(
+            (max.y - POTION_HEIGHT).abs() < 1e-6,
+            "stands {} m, expected {POTION_HEIGHT}",
+            max.y
+        );
+        assert_eq!(
+            max.x.max(max.z),
+            POTION_HALF_WIDTH,
+            "the advertised half-width is the real one"
+        );
+        assert_eq!(min.x.min(min.z), -POTION_HALF_WIDTH);
+    }
+
     /// The whole M2 road in one test: written glTF → imported scene → ECS sub-tree →
     /// `AnimationClip::from_gltf` → `advance_animation` moving a real bone entity.
     #[test]
@@ -2504,7 +2708,11 @@ mod tests {
     /// Authoring is deterministic — the property the cook cache keys on.
     #[test]
     fn authoring_is_deterministic() {
-        for (a, b) in [(warrior(), warrior()), (grunt(), grunt())] {
+        for (a, b) in [
+            (warrior(), warrior()),
+            (grunt(), grunt()),
+            (potion(), potion()),
+        ] {
             let bytes = |r: &Rig| {
                 dreamcoast_asset::glb::write_glb_scene(
                     &r.nodes,
