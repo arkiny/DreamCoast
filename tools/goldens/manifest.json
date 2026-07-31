@@ -4,7 +4,7 @@
     "gallery": {
       "desc": "gallery anchor (default scene, byte-identity invariant; default anisotropy 16)",
       "env": {},
-      "sha256": "65d04ceca2c4dbffa0637858fc7fd0a26f4afb53f4e33412f73cb8898a668207"
+      "sha256": "2fb9c207ebd488c7049a863a78a6785b6eb4a9a6efaaaceb35c4d3c69b2fc2c9"
     },
     "sponza_gdf_ao": {
       "desc": "content: distance-field AO (DEBUG_VIEW=9)",
