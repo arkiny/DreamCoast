@@ -41,12 +41,15 @@
 //! Unknown arguments pass through the engine's own scan untouched, which is what lets a
 //! game add its own flags without the engine knowing about them.
 
+mod ai;
 mod collision;
 mod game;
 mod level;
 mod meshing;
+mod pathing;
 mod procgen;
 mod rigs;
+mod warrior;
 
 use procgen::DungeonParams;
 
