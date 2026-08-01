@@ -5938,6 +5938,25 @@ impl App {
                 mix(c.to_bits());
             }
             mix(self.shadows_on as u32);
+            // A RIGID mover — node-hierarchy animation (the dungeon's procedural rigs), a
+            // game-driven character, a future swinging door — changes the map without being
+            // skinned or morphed, which is all `has_dynamic_caster` below can see; the M3
+            // playtest shipped frozen character shadows exactly this way. Fold every
+            // caster's transform into the epoch so ANY caster motion re-renders the map,
+            // while a truly static scene still hashes bit-stable and settles.
+            // A RIGID mover — node-hierarchy animation (the dungeon's procedural rigs), a
+            // game-driven character, a future swinging door — changes the map without being
+            // skinned or morphed, which is all `has_dynamic_caster` below can see; the M3
+            // playtest shipped frozen character shadows exactly this way. Fold every
+            // caster's transform into the epoch so ANY caster motion re-renders the map,
+            // while a truly static scene still hashes bit-stable and settles.
+            for o in scene.iter() {
+                if o.casts_shadow {
+                    for f in o.transform.to_cols_array() {
+                        mix(f.to_bits());
+                    }
+                }
+            }
             if epoch == self.shadow_epoch {
                 self.shadow_stable_frames = self.shadow_stable_frames.saturating_add(1);
             } else {
