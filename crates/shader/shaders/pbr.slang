@@ -488,7 +488,17 @@ bool project_to_atlas(float4x4 vp, float4 atlas_uv, float3 world_pos, out float2
 // blend band near each boundary cross-fades to the next cascade so the resolution step isn't a
 // hard seam. `view_depth` = distance from the camera along the view direction. Returns the
 // sun-visibility [0,1]; also writes the chosen cascade index (for the debug overlay).
-float csm_shadow(float3 world_pos, float2 pix, float view_depth, out int cascade_out)
+// One cascade's shadow-map texel in WORLD units, recovered from its ortho view-projection:
+// clip.x = (view.x / half), so |row 0| = 1/half and texel = 2·half / tile. Single source —
+// no per-cascade CPU plumbing to drift against the matrices.
+float cascade_texel_world(float4x4 vp)
+{
+    float inv_half = length(vp[0].xyz);
+    return 2.0 / (max(inv_half, 1e-6) * float(max(globals.csm_params.z, 1)));
+}
+
+float csm_shadow(float3 world_pos, float3 normal, float2 pix, float view_depth,
+                 out int cascade_out)
 {
     int n = globals.csm_params.x;
     float atlas = float(max(globals.csm_params.w, 1));
@@ -500,14 +510,25 @@ float csm_shadow(float3 world_pos, float2 pix, float view_depth, out int cascade
     // for the pixel. Radial view-depth alone can route a point to a cascade whose sphere doesn't
     // contain it (perspective vs radial + the sphere overshoots the slice) → the depth-only
     // select leaves it wrongly lit; containment fixes that.
+    // Normal-offset sampling (`csm_opts.z`, in texels of the sampled cascade): project the
+    // receiver from `world_pos + normal · k·texel_world` instead of the surface point. At a
+    // depth discontinuity seen from the sun — a wall base is exactly its silhouette line — a
+    // map texel STRADDLES the edge and stores the lit side's depth, so surface points hiding
+    // just past the edge inside that texel's footprint test lit: a texel-wide LIGHT LEAK
+    // strip along every wall-floor junction (the playtest report; depth bias cannot fix it
+    // because the stored depth is beside, not behind, the receiver). Offsetting along the
+    // receiver normal slides the junction pixels' projection onto the occluder's own texels,
+    // which compare correctly. 0 = off (pre-offset behavior).
     int ci = -1;
     float2 uv = float2(0.0);
     float depth = 0.0;
     for (int i = 0; i < n; ++i)
     {
+        float3 sp = world_pos
+            + normal * (globals.csm_opts.z * cascade_texel_world(globals.csm_view_proj[i]));
         float2 tuv;
         float td;
-        if (project_to_atlas(globals.csm_view_proj[i], globals.csm_atlas_uv[i], world_pos, tuv, td))
+        if (project_to_atlas(globals.csm_view_proj[i], globals.csm_atlas_uv[i], sp, tuv, td))
         {
             ci = i;
             uv = tuv;
@@ -521,7 +542,13 @@ float csm_shadow(float3 world_pos, float2 pix, float view_depth, out int cascade
     float4 rect = globals.csm_atlas_uv[ci];
     float2 uv_min = rect.xy + texel;               // inset one texel so clamp never samples a neighbor
     float2 uv_max = rect.xy + rect.zw - texel;
-    float current = depth - globals.shadow.x;
+    // Cascade depth bias: `csm_opts.y` is the texel-proportional NDC constant the host
+    // derives from the atlas tile size (bias_texels / (2·tile)). The legacy `shadow.x` is
+    // sized for the single map's 6·scene-radius depth range; over a cascade's 4·R range a
+    // constant that big becomes tens of centimetres of world offset on wide cascades — the
+    // floating-contact playtest report. 0 (CSM off / older recipes) falls back to shadow.x.
+    float bias = globals.csm_opts.y > 0.0 ? globals.csm_opts.y : globals.shadow.x;
+    float current = depth - bias;
     float vis = shadow_filter(uv, current, pix, texel, uv_min, uv_max);
 
     // Cross-cascade blend: within the last `csm_opts.x` fraction of this cascade's view-depth
@@ -535,10 +562,13 @@ float csm_shadow(float3 world_pos, float2 pix, float view_depth, out int cascade
         float t = saturate((view_depth - (far_split - band)) / max(band, 1e-4));
         if (t > 0.0)
         {
+            float3 sp2 = world_pos
+                + normal
+                    * (globals.csm_opts.z * cascade_texel_world(globals.csm_view_proj[ci + 1]));
             float2 uv2;
             float depth2;
             if (project_to_atlas(globals.csm_view_proj[ci + 1], globals.csm_atlas_uv[ci + 1],
-                                 world_pos, uv2, depth2))
+                                 sp2, uv2, depth2))
             {
                 float4 rect2 = globals.csm_atlas_uv[ci + 1];
                 float2 uv2_min = rect2.xy + texel;
@@ -555,14 +585,15 @@ float csm_shadow(float3 world_pos, float2 pix, float view_depth, out int cascade
 // Fraction of the directional sun reaching `world_pos` (1 = fully lit, 0 = fully shadowed).
 // `view_depth` = camera-space distance (for the CSM cascade select). The CSM path is taken when
 // the seam is on (csm_params.x > 0); otherwise the legacy single-map path runs unchanged.
-float sun_shadow(float3 world_pos, float2 pix, float view_depth, out int cascade_out)
+float sun_shadow(float3 world_pos, float3 normal, float2 pix, float view_depth,
+                 out int cascade_out)
 {
     cascade_out = -1;
     if (globals.counts.w == 0)
         return 1.0;
 
     if (globals.csm_params.x > 0)
-        return csm_shadow(world_pos, pix, view_depth, cascade_out);
+        return csm_shadow(world_pos, normal, pix, view_depth, cascade_out);
 
     // Legacy single directional map (byte-identical anchor): identity atlas rect, texel =
     // globals.shadow.y, clamp bounds [0,1] (no-op) → the extracted filter reproduces the
@@ -653,7 +684,7 @@ float4 fsMain(VSOutput input) : SV_Target
         float3 l = normalize(globals.sun_direction.xyz);
         float3 radiance = globals.sun_color.rgb * globals.sun_color.a;
         lo += shade(n, v, l, radiance, albedo, metallic, roughness, f0)
-            * sun_shadow(world_pos, input.pos.xy, view_depth, cascade_idx);
+            * sun_shadow(world_pos, n, input.pos.xy, view_depth, cascade_idx);
     }
 
     // Point lights. point_color.a is the luminous intensity in CANDELA (lm/sr) — the same

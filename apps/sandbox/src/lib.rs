@@ -6071,7 +6071,25 @@ impl App {
                 }
                 s
             },
-            csm_opts: [self.csm.blend_frac, 0.0, 0.0, 0.0],
+            // y = the cascade depth bias (texel-proportional NDC constant; see
+            // `CsmConfig::bias_texels`); z = the normal-offset sampling distance in texels
+            // (`CsmConfig::normal_offset_texels`, the wall-base light-leak fix). Both 0.0
+            // with CSM off — the shader falls back to the legacy `shadow.x` + no offset,
+            // keeping the single-map path byte-identical.
+            csm_opts: [
+                self.csm.blend_frac,
+                if self.csm.enabled {
+                    self.csm.bias_ndc()
+                } else {
+                    0.0
+                },
+                if self.csm.enabled {
+                    self.csm.normal_offset_texels
+                } else {
+                    0.0
+                },
+                0.0,
+            ],
             csm_view_proj: {
                 let mut m = [[0.0f32; 16]; 4];
                 for (i, slot) in csm_slots.iter().take(4).enumerate() {

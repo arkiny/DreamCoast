@@ -83,6 +83,35 @@ pub(crate) struct CsmConfig {
     pub(crate) lambda: f32,
     /// Fraction of each cascade's far extent used as the cross-cascade blend band.
     pub(crate) blend_frac: f32,
+    /// Split-range trim (`CSM_NEAR` / `CSM_FAR`, world units along the view). The generic
+    /// scheme splits [camera.near, camera.far], which assumes receivers span that whole
+    /// range — a mostly-horizontal camera. A top-down camera's receivers occupy a narrow
+    /// depth band (the floor starts one camera-height away), so untrimmed splits waste the
+    /// near cascades on empty air and stretch the far one over the horizon (the M3 dungeon
+    /// measured ~12 cm/texel — WORSE than the legacy single map). Trimming the split range
+    /// to the receiver band restores the texel density cascades exist for. Receivers past
+    /// `CSM_FAR` fall outside every cascade and shade fully lit (the existing containment
+    /// fallback). `None` = camera near/far (byte-identical legacy behavior).
+    pub(crate) split_near: Option<f32>,
+    pub(crate) split_far: Option<f32>,
+    /// Depth-bias size in shadow texels (`CSM_BIAS`). The legacy single map biases by a
+    /// constant NDC offset (`globals.shadow.x`), which scales with the light volume's depth
+    /// range — 4·R per cascade — so a wide cascade turns 0.0015 into tens of centimetres of
+    /// world-space offset (the "wall shadows float off the floor" playtest report). The
+    /// principled size is a couple of TEXELS' worth of world space, and because the cascade
+    /// depth range (4R) and texel size (2R/tile) share R, that converts to a resolution-only
+    /// NDC constant: bias_ndc = texels / (2 · tile). Consumed via `csm_opts.y`; the legacy
+    /// single-map path keeps `shadow.x` untouched (golden anchor).
+    pub(crate) bias_texels: f32,
+    /// Normal-offset sampling distance in shadow texels (`CSM_NORMAL_OFFSET`, via
+    /// `csm_opts.z`). A map texel that STRADDLES a depth discontinuity seen from the sun —
+    /// a wall base is exactly its silhouette line — stores the lit side's depth, so
+    /// receivers hiding just past the edge inside that texel's footprint test lit: a
+    /// texel-wide LIGHT-LEAK strip along every wall-floor junction (depth bias cannot fix
+    /// it — the stored depth is beside the receiver, not behind it). Projecting the
+    /// receiver from `pos + normal · k · texel_world` slides those junction pixels onto
+    /// the occluder's own texels, which compare correctly. 0 = off.
+    pub(crate) normal_offset_texels: f32,
 }
 
 impl Default for CsmConfig {
@@ -93,6 +122,10 @@ impl Default for CsmConfig {
             atlas_size: 4096,
             lambda: 0.75,
             blend_frac: 0.1,
+            split_near: None,
+            split_far: None,
+            bias_texels: 2.0,
+            normal_offset_texels: 1.5,
         }
     }
 }
@@ -132,8 +165,25 @@ impl CsmConfig {
         if let Some(b) = env_f32("CSM_BLEND") {
             cfg.blend_frac = b.clamp(0.0, 0.5);
         }
+        if let Some(n) = env_f32("CSM_NEAR") {
+            cfg.split_near = Some(n.max(0.0));
+        }
+        if let Some(f) = env_f32("CSM_FAR") {
+            cfg.split_far = Some(f.max(0.0));
+        }
+        if let Some(t) = env_f32("CSM_BIAS") {
+            cfg.bias_texels = t.clamp(0.0, 16.0);
+        }
+        if let Some(t) = env_f32("CSM_NORMAL_OFFSET") {
+            cfg.normal_offset_texels = t.clamp(0.0, 16.0);
+        }
         cfg.cascades = cfg.cascades.clamp(1, MAX_CASCADES);
         cfg
+    }
+
+    /// The cascade depth bias as an NDC constant (see `bias_texels`): `texels / (2 · tile)`.
+    pub(crate) fn bias_ndc(&self) -> f32 {
+        self.bias_texels / (2.0 * self.tile_size() as f32)
     }
 
     /// Grid layout: cascades are packed into the smallest square-ish grid (1→1x1, 2→2x1,
@@ -179,7 +229,14 @@ pub(crate) fn compute_cascades(
     sun_dir: [f32; 3],
 ) -> Vec<ShadowSlot> {
     let (cam_eye, cam_target) = (cam.eye, cam.target);
-    let (fov_y_rad, aspect, near, far) = (cam.fov_y_rad, cam.aspect, cam.near, cam.far);
+    let (fov_y_rad, aspect) = (cam.fov_y_rad, cam.aspect);
+    // Split over the receiver band, not the whole camera range (see `split_near`/`split_far`).
+    let near = cfg
+        .split_near
+        .map_or(cam.near, |n| n.clamp(cam.near, cam.far - 1e-3));
+    let far = cfg
+        .split_far
+        .map_or(cam.far, |f| f.clamp(near + 1e-3, cam.far));
     let n = cfg.cascades.clamp(1, MAX_CASCADES);
     let tile = cfg.tile_size();
     let (cols, _rows) = cfg.grid();
