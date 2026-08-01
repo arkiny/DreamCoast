@@ -101,7 +101,10 @@ pub(crate) struct CsmConfig {
     /// principled size is a couple of TEXELS' worth of world space, and because the cascade
     /// depth range (4R) and texel size (2R/tile) share R, that converts to a resolution-only
     /// NDC constant: bias_ndc = texels / (2 · tile). Consumed via `csm_opts.y`; the legacy
-    /// single-map path keeps `shadow.x` untouched (golden anchor).
+    /// single-map path keeps `shadow.x` untouched (golden anchor). Default 1 texel: the
+    /// receiver-plane slope bias (V0, `slope_bias_scale`) covers the in-texel tilt
+    /// analytically, so the constant only absorbs raster/interp noise (acne probe measured
+    /// zero delta between 1 and 2 texels with the slope bias on).
     pub(crate) bias_texels: f32,
     /// Normal-offset sampling distance in shadow texels (`CSM_NORMAL_OFFSET`, via
     /// `csm_opts.z`). A map texel that STRADDLES a depth discontinuity seen from the sun —
@@ -112,6 +115,13 @@ pub(crate) struct CsmConfig {
     /// receiver from `pos + normal · k · texel_world` slides those junction pixels onto
     /// the occluder's own texels, which compare correctly. 0 = off.
     pub(crate) normal_offset_texels: f32,
+    /// Receiver-plane (optimal) slope-bias scale (`CSM_SLOPE_BIAS`, via `csm_opts.w`) —
+    /// the UE VSM texel-straddle correction ported as VSM plan V0
+    /// (docs/vsm-shadows-plan.md): the shader recovers the receiver plane's depth
+    /// gradient from the cascade's ortho rows and corrects the compare depth for the
+    /// offset to the fetched texel's CENTER. Analytic, per-cascade, no world-space
+    /// constants. 1.0 = UE semantics; 0 = off (the pre-V0 image).
+    pub(crate) slope_bias_scale: f32,
 }
 
 impl Default for CsmConfig {
@@ -124,8 +134,9 @@ impl Default for CsmConfig {
             blend_frac: 0.1,
             split_near: None,
             split_far: None,
-            bias_texels: 2.0,
+            bias_texels: 1.0,
             normal_offset_texels: 1.5,
+            slope_bias_scale: 1.0,
         }
     }
 }
@@ -176,6 +187,9 @@ impl CsmConfig {
         }
         if let Some(t) = env_f32("CSM_NORMAL_OFFSET") {
             cfg.normal_offset_texels = t.clamp(0.0, 16.0);
+        }
+        if let Some(s) = env_f32("CSM_SLOPE_BIAS") {
+            cfg.slope_bias_scale = s.clamp(0.0, 8.0);
         }
         cfg.cascades = cfg.cascades.clamp(1, MAX_CASCADES);
         cfg

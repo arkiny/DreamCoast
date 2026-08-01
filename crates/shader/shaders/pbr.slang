@@ -497,6 +497,33 @@ float cascade_texel_world(float4x4 vp)
     return 2.0 / (max(inv_half, 1e-6) * float(max(globals.csm_params.z, 1)));
 }
 
+// Receiver-plane (optimal) slope bias — the UE VSM texel-straddle correction, ported per
+// docs/vsm-shadows-plan.md V0 (reference: VirtualShadowMapProjectionCommon.ush,
+// ComputeVirtualShadowMapOptimalSlopeBias). The receiver plane's depth gradient per tile
+// UV is recovered from the cascade's ortho rows — they are scaled-orthogonal, so the
+// inverse-transpose is each row divided by its squared length — then dotted with the
+// offset from the sample point to the CENTER of the texel actually fetched: the compare
+// depth is corrected for where inside the (possibly straddled) texel the receiver sits.
+// Slope clamped like UE (±0.05 depth per UV) and doubled for precision margin; scaled by
+// `csm_opts.w` (0 = off, the pre-V0 image).
+float csm_optimal_slope_bias(float4x4 vp, float4 rect, float3 normal, float2 atlas_uv)
+{
+    float3 ru = vp[0].xyz;
+    float3 rv = vp[1].xyz;
+    float3 rz = vp[2].xyz;
+    float3 m = float3(dot(normal, ru) / dot(ru, ru), dot(normal, rv) / dot(rv, rv),
+                      dot(normal, rz) / max(dot(rz, rz), 1e-12));
+    float mz = abs(m.z) > 1e-8 ? m.z : (m.z >= 0.0 ? 1e-8 : -1e-8);
+    float2 dz_ndc = -m.xy / mz;
+    // Tile UV = ndc·0.5 + 0.5, y sign per backend — must match `project_to_atlas`.
+    float vy = pc.flip_y != 0 ? 2.0 : -2.0;
+    float2 slope_uv = clamp(float2(dz_ndc.x * 2.0, dz_ndc.y * vy), -0.05, 0.05);
+    float tile_px = float(max(globals.csm_params.z, 1));
+    float2 t = ((atlas_uv - rect.xy) / rect.zw) * tile_px;
+    float2 center_off = ((floor(t) + 0.5) - t) / tile_px;
+    return globals.csm_opts.w * 2.0 * max(0.0, dot(slope_uv, center_off));
+}
+
 float csm_shadow(float3 world_pos, float3 normal, float2 pix, float view_depth,
                  out int cascade_out)
 {
@@ -511,14 +538,11 @@ float csm_shadow(float3 world_pos, float3 normal, float2 pix, float view_depth,
     // contain it (perspective vs radial + the sphere overshoots the slice) → the depth-only
     // select leaves it wrongly lit; containment fixes that.
     // Normal-offset sampling (`csm_opts.z`, in texels of the sampled cascade): project the
-    // receiver from `world_pos + normal · k·texel_world` instead of the surface point. At a
-    // depth discontinuity seen from the sun — a wall base is exactly its silhouette line — a
-    // map texel STRADDLES the edge and stores the lit side's depth, so surface points hiding
-    // just past the edge inside that texel's footprint test lit: a texel-wide LIGHT LEAK
-    // strip along every wall-floor junction (the playtest report; depth bias cannot fix it
-    // because the stored depth is beside, not behind, the receiver). Offsetting along the
-    // receiver normal slides the junction pixels' projection onto the occluder's own texels,
-    // which compare correctly. 0 = off (pre-offset behavior).
+    // receiver from `world_pos + normal · k·texel_world` instead of the surface point —
+    // texel-straddle insurance at depth discontinuities seen from the sun (a receiver hiding
+    // just past a silhouette inside a straddling texel's footprint would compare against the
+    // lit side's depth). Kept small: the slope-bias below handles the receiver's own texel
+    // analytically. 0 = off.
     int ci = -1;
     float2 uv = float2(0.0);
     float depth = 0.0;
@@ -548,6 +572,7 @@ float csm_shadow(float3 world_pos, float3 normal, float2 pix, float view_depth,
     // constant that big becomes tens of centimetres of world offset on wide cascades — the
     // floating-contact playtest report. 0 (CSM off / older recipes) falls back to shadow.x.
     float bias = globals.csm_opts.y > 0.0 ? globals.csm_opts.y : globals.shadow.x;
+    bias += csm_optimal_slope_bias(globals.csm_view_proj[ci], rect, normal, uv);
     float current = depth - bias;
     float vis = shadow_filter(uv, current, pix, texel, uv_min, uv_max);
 
@@ -573,7 +598,9 @@ float csm_shadow(float3 world_pos, float3 normal, float2 pix, float view_depth,
                 float4 rect2 = globals.csm_atlas_uv[ci + 1];
                 float2 uv2_min = rect2.xy + texel;
                 float2 uv2_max = rect2.xy + rect2.zw - texel;
-                float cur2 = depth2 - globals.shadow.x;
+                float bias2 = globals.csm_opts.y > 0.0 ? globals.csm_opts.y : globals.shadow.x;
+                bias2 += csm_optimal_slope_bias(globals.csm_view_proj[ci + 1], rect2, normal, uv2);
+                float cur2 = depth2 - bias2;
                 float vis2 = shadow_filter(uv2, cur2, pix, texel, uv2_min, uv2_max);
                 vis = lerp(vis, vis2, t);
             }

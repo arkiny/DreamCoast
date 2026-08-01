@@ -6088,7 +6088,13 @@ impl App {
                 } else {
                     0.0
                 },
-                0.0,
+                // w = receiver-plane slope-bias scale (VSM plan V0; see
+                // `CsmConfig::slope_bias_scale`). Inert with CSM off.
+                if self.csm.enabled {
+                    self.csm.slope_bias_scale
+                } else {
+                    0.0
+                },
             ],
             csm_view_proj: {
                 let mut m = [[0.0f32; 16]; 4];
