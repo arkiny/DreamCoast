@@ -4991,6 +4991,16 @@ impl App {
         // Applied to the scene projection only (cull_view_proj stays unjittered = stable culling);
         // the GI/reflect denoisers reproject in world space, so the consistent jitter cancels.
         let mut taau_jitter_uv = [0.0f32, 0.0f32];
+        // D3D-orientation (flip-free) jittered projection for the clustered-light froxel
+        // build. `csBuildClusters` unprojects its tile corners with the D3D-style uv->ndc
+        // mapping on EVERY backend, so it must receive a matrix without the Vulkan clip-Y
+        // flip — handing it the flipped `inv_view_proj` vertically MIRRORS every froxel
+        // AABB on Vulkan, and each froxel then carries the light list of the mirrored
+        // tile (the R1 Windows batch measured it: torch-lit dungeon clustered-vs-brute
+        // 1.61 avg/ch on VK, froxel light-count heatmap DX≢VK). On D3D12/Metal this
+        // matrix is bit-identical to `proj` (no flip, same jitter), so their build input
+        // — and the golden anchors — are unchanged.
+        let mut proj_cluster = proj_noflip;
         if taau_active && self.taau_jitter {
             let j = ((self.frame_no % TAAU_JITTER_LEN) + 1) as u32;
             let jx = (halton(j, 2) - 0.5) * 2.0 / cw as f32; // NDC offset (±1 px in internal res)
@@ -5004,6 +5014,9 @@ impl App {
             };
             proj.z_axis.x -= jx;
             proj.z_axis.y -= jy * sy;
+            // The flip-free twin jitters in D3D orientation (sy = +1) on every backend.
+            proj_cluster.z_axis.x -= jx;
+            proj_cluster.z_axis.y -= jy;
             // UV-space shift the jitter gives the on-screen content, so the TAAU can sample the
             // internal frame at `uv + jitter_uv` to fetch the content that landed on the stable
             // output pixel. Working it through both conventions (jitter NDC shift -> rendered
@@ -5023,6 +5036,10 @@ impl App {
         let cam_up = inv_view.y_axis.truncate();
         // For reconstructing background view rays (skybox) in the lighting pass.
         let inv_view_proj = view_proj.inverse().to_cols_array();
+        // Flip-free clip -> world for the froxel build (see `proj_cluster` above). Bit-equal
+        // to `inv_view_proj` on D3D12/Metal; on Vulkan it drops the clip-Y flip the build's
+        // D3D-style unprojection must not see.
+        let cluster_inv_view_proj = (proj_cluster * view).inverse().to_cols_array();
 
         // PR-9 view family: the PRIMARY view descriptor. It captures the same view-dependent
         // camera math the passes below consume (the passes still read the individual locals for
@@ -7849,7 +7866,7 @@ impl App {
                     fif,
                     light_count,
                     view_z_row,
-                    inv_view_proj,
+                    cluster_inv_view_proj,
                     [eye.x, eye.y, eye.z],
                     CLUSTER_Z_NEAR,
                     CLUSTER_Z_FAR,

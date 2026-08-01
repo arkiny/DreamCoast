@@ -69,9 +69,13 @@ float z_slice_depth(uint slice)
 float3 screen_to_world_dir(float2 pix)
 {
     float2 uv = pix / float2(float(pc.screen_w), float(pc.screen_h));
-    // NDC. The cluster AABB is built in WORLD space, matched at shade time by the same
-    // world position, so the Vulkan/D3D12 clip-Y flip cancels: use the D3D-style
-    // (y-down-uv -> y-up-ndc) here and the identical mapping in the shade path.
+    // NDC, D3D-style (y-down uv -> y-up ndc) on EVERY backend. Contract: `pc.inv_view_proj`
+    // must therefore be the FLIP-FREE clip->world (the host passes a D3D-orientation
+    // matrix on Vulkan too). Feeding the Y-flipped Vulkan matrix here vertically mirrors
+    // every froxel AABB, and each froxel then culls against the mirrored tile's geometry —
+    // the shade path reads lists through the pixel's true (unmirrored) tile, so any
+    // vertically asymmetric light field shades wrong lights (R1 Windows batch: 1.61 avg/ch
+    // on the torch dungeon).
     float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     float4 far = mul(pc.inv_view_proj, float4(ndc, 1.0, 1.0));
     float3 world = far.xyz / far.w;

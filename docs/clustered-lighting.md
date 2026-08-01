@@ -144,17 +144,32 @@ min이 진짜 비용의 추정치로 안정적).
 | 24 횃불: 클러스터드 vs `CLUSTERED_BRUTE` (앵글 2종) | **sha256 동일** — froxel 경계 아티팩트 0 |
 | gallery 앵커 (`2fb9c207…`) | 불변 |
 
-**백엔드:** Metal만 검증(macOS M3). **DX/VK parity pending Windows verification** — 셰이더는
-3 백엔드 컴파일(Metal `NonUniformResourceIndex` 미사용, storage buffer는 스칼라 인덱스), 크로스
-백엔드 레이아웃은 기존 `Globals`/push 컨벤션(std140/cbuffer 정합, Y-flip은 월드공간 매칭으로 상쇄)을
-따른다.
+**백엔드:** Metal 검증(macOS M3) 후 **Windows 배치(2026-08-01, RTX 2070 SUPER)에서 DX≡VK
+검증 완료** — 단, 아래 §4 첫 항목의 우려가 실제 버그로 확인되어 수정 후 통과했다.
+
+### Windows DX≡VK 배치 실측 (수정 후)
+
+| 게이트 | 결과 |
+|---|---|
+| 24 테스트라이트: VK 클러스터드 vs 브루트 | avg 0.000000 / max 1 (= VK 런투런 플로어) |
+| 24 테스트라이트: DX 클러스터드 vs 브루트 | avg 0.000156 / max 4 (= DX 런투런 플로어) |
+| grid/index 버퍼 덤프 | **DX≡VK 바이트-동일** + CPU 기하 재구성과 일치 |
+| 던전(17횃불) 클러스터드 vs 브루트 (VK) | 1.614 → 0.293 (씬 자체의 wall-clock 플로어 ~0.27) |
+| `DEBUG_VIEW=11` 히트맵 DX≡VK (던전) | 18.59 → 0.29 |
+| 갤러리 앵커 (양 백엔드) | 수정 전후 런투런 플로어 이내 = 불변 |
 
 ---
 
 ## 4. 남은 리스크 / 후속
 
-- **DX≡VK 미검증** (Windows 박스 필요). froxel AABB를 월드공간에서 구성하고 셰이드도 월드
-  포지션으로 매칭하므로 clip-Y flip은 상쇄되도록 설계했으나 Windows에서 0.000/ch 확인 필요.
+- ~~**DX≡VK 미검증**~~ — **해소(Windows 배치 2026-08-01): 우려가 실제 버그였다.**
+  "clip-Y flip은 상쇄" 설계는 빌드 패스가 **무플립 행렬**을 받을 때만 성립하는데, 호스트가
+  VK Y-플립이 구워진 `inv_view_proj`를 push로 넘겨 **VK의 froxel AABB 전부가 세로 미러**
+  — 각 froxel이 미러 타일의 라이트 리스트를 담았다(라이트장이 세로 비대칭인 던전에서
+  클러스터드 vs 브루트 1.61 avg/ch, 準대칭 갤러리에선 0.004로만 발현해 잠복). 수정 =
+  클러스터 빌드 전용 플립-프리 지터 트윈 `proj_cluster`(D3D 방향 지터 포함)를 전달;
+  DX/Metal은 입력이 비트-동일이라 앵커 원천 중립. `light_cluster.slang`의
+  `screen_to_world_dir`에 행렬 계약(플립-프리 필수)을 주석으로 명문화했다.
 - **spot/area 라이트 미지원** — 현재 point만. Light 레코드에 방향/cone 추가 + AABB 컬을 cone으로
   확장하면 됨(PR-7 그림자 아틀라스와 함께 Phase 21).
 - ~~**radius 유한 컷오프**~~ — **해소(R1)**: `asset::level::Light::range`가 authored 필드로
