@@ -261,6 +261,7 @@ pub(crate) fn build_scene(
                 }
             }
             SceneObject {
+                entity: d.entity,
                 mesh,
                 transform: d.world,
                 world_aabb: [wmn, wmx],

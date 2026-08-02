@@ -143,6 +143,20 @@ fn main() -> anyhow::Result<()> {
         unsafe { std::env::set_var("VSM", "1") };
     }
 
+    // This game's motion-vector policy: VELOCITY ON. The default tier renders below
+    // the output resolution (TAAU upscale), and TAAU without a velocity target can
+    // only camera-reproject — every game-driven mover (warrior, grunts: rigid node
+    // rigs pushed by `fixed_update`) then smears a ghost trail whenever it walks.
+    // The engine's velocity pass + TAAU's per-pixel velocity reprojection remove
+    // exactly that; the engine default stays off (byte-identical gallery anchor),
+    // this is the same per-app-default seam as VSM above, and an explicit env
+    // setting still wins (`P_VELOCITY=0` reproduces the ghosting for an A/B).
+    if std::env::var_os("P_VELOCITY").is_none() {
+        // SAFETY: single-threaded here — before logging, jobs, and engine bring-up
+        // spawn any thread.
+        unsafe { std::env::set_var("P_VELOCITY", "1") };
+    }
+
     // Logging first: generation and meshing below run *before* engine bring-up, and
     // their report (mesh/triangle counts, generation time) is exactly what the M1 risk
     // gate wants to read — so it has to reach the same log stream the engine uses.

@@ -277,6 +277,11 @@ const POST_EFFECTS: [&str; 3] = ["None", "Grayscale", "Vignette"];
 /// [`registry::build_scene`]; consumed by the rasterizer, RT, and GDF passes.
 #[derive(Clone)]
 pub(crate) struct SceneObject {
+    /// The ECS entity this drawable came from — the stable cross-frame identity
+    /// (generational). Temporal per-object history (the velocity pass's prev-transform
+    /// map) is keyed on it; the draw-list index is only stable while nothing spawns or
+    /// despawns, which a game breaks constantly (deaths, pickups, level swaps).
+    pub(crate) entity: dreamcoast_scene::Entity,
     /// Shared uploaded geometry (vertex/index buffers + counts).
     pub(crate) mesh: std::rc::Rc<GpuMesh>,
     pub(crate) transform: Mat4,
@@ -1503,11 +1508,15 @@ pub struct App {
     velocity: velocity::VelocitySystem,
     velocity_on: bool,
     /// Single prev-pose source (PR-2): each drawable's PREVIOUS-frame unjittered world transform,
-    /// keyed by the frame's stable draw-list index (deterministic insertion order). The velocity
-    /// pass reads it to compute per-object screen motion for static / Spin / node-animated draws
-    /// (skinning / morph add their prev palette / weights on top). Rebuilt after each frame from the
-    /// current transforms.
-    prev_transforms: Vec<Mat4>,
+    /// keyed by its ECS entity (the stable cross-frame identity). The velocity pass reads it to
+    /// compute per-object screen motion for static / Spin / node-animated / game-driven draws
+    /// (skinning / morph add their prev palette / weights on top). Rebuilt after each frame from
+    /// the current transforms. Entity-keyed (NOT draw-list-index-keyed) because a game mutates the
+    /// scene set mid-run — a grunt death or potion pickup shifts every later index, and an
+    /// index-keyed lookup would hand each shifted drawable a *different object's* prev transform
+    /// for a frame (a full-screen one-frame velocity glitch). A drawable with no entry (fresh
+    /// spawn / first frame) falls back to its current transform = zero object motion.
+    prev_transforms: std::collections::HashMap<dreamcoast_scene::Entity, Mat4>,
     // Profiler UI state.
     profiler_on: bool,
     slot_pass_names: Vec<Vec<&'static str>>,
@@ -3840,7 +3849,7 @@ impl App {
                 .unwrap_or(quality::TAA_MIP_BIAS),
             velocity,
             velocity_on: quality::env_bool("P_VELOCITY", false),
-            prev_transforms: Vec::new(),
+            prev_transforms: std::collections::HashMap::new(),
             profiler_on,
             slot_pass_names,
             gpu_timings: Vec::new(),
@@ -4794,18 +4803,18 @@ impl App {
         };
 
         // Velocity (PR-2) single prev-pose source: seed each drawable's previous transform from
-        // last frame's stored transforms (same stable draw-list order). A newly-appeared drawable
-        // (or first frame) has no history → default (identity + current), i.e. zero object motion.
-        // Skinning / morph overwrite their entries with the prev palette / weights below. Built
-        // only when velocity is on (else an empty vec — no per-frame cost on the default path).
+        // last frame's stored transforms, matched by ECS ENTITY (the stable cross-frame key — the
+        // draw list itself is rebuilt every frame and its indices shift on any spawn/despawn). A
+        // drawable with no history (fresh spawn / first frame) seeds prev = current, i.e. zero
+        // object motion. Skinning / morph overwrite their entries with the prev palette / weights
+        // below. Built only when velocity is on (else an empty vec — no cost on the default path).
         let mut prev_scene: Vec<velocity::PrevPose> = if self.velocity_on {
             scene
                 .iter()
-                .enumerate()
-                .map(|(i, obj)| velocity::PrevPose {
+                .map(|obj| velocity::PrevPose {
                     transform: self
                         .prev_transforms
-                        .get(i)
+                        .get(&obj.entity)
                         .copied()
                         .unwrap_or(obj.transform),
                     skin_palette: 0,
@@ -9342,14 +9351,14 @@ impl App {
         // The lit-calibration probe re-projects card points into the lit HISTORY, so it needs the
         // camera position that history was rendered from (paired with `prev_view_proj`).
         self.prev_eye = eye;
-        // Velocity (PR-2): stash this frame's per-object world transforms as next frame's prev pose
-        // (single source; stable draw-list order). Only when velocity is on (else no cost / no state
-        // churn). Uses the pre-skin transform for static/Spin draws; skinned draws carry identity
-        // here and their motion comes from the palette history instead.
+        // Velocity (PR-2): stash this frame's per-object world transforms as next frame's prev
+        // pose, keyed by ECS entity (single source; survives draw-list reshuffles from
+        // spawn/despawn). Only when velocity is on (else no cost / no state churn). Skinned draws
+        // carry identity here and their motion comes from the palette history instead.
         if self.velocity_on {
             self.prev_transforms.clear();
             self.prev_transforms
-                .extend(scene.iter().map(|o| o.transform));
+                .extend(scene.iter().map(|o| (o.entity, o.transform)));
         }
 
         // Inline present + capture readback. Threaded: the RHI thread did both (its

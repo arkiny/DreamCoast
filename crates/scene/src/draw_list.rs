@@ -3,13 +3,18 @@
 use glam::Mat4;
 
 use crate::components::{MaterialHandle, MeshHandle, MeshInstance};
-use crate::ecs::World;
+use crate::ecs::{Entity, World};
 use crate::transform::WorldTransform;
 
 /// One resolved draw: a world matrix + the mesh/material handles + render flags.
 /// The renderer materializes this into actual draw calls (and TLAS instances).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Drawable {
+    /// The ECS entity this draw came from — the STABLE cross-frame identity of the
+    /// drawable (generational, so a died-and-respawned slot never aliases). Temporal
+    /// consumers (motion vectors, caches) key per-object history on it; a draw-list
+    /// index is NOT stable once anything spawns or despawns mid-run.
+    pub entity: Entity,
     pub world: Mat4,
     pub mesh: MeshHandle,
     pub material: MaterialHandle,
@@ -25,7 +30,8 @@ impl World {
     pub fn draw_list(&self) -> Vec<Drawable> {
         self.query2::<MeshInstance, WorldTransform>()
             .into_iter()
-            .map(|(_, mi, wt)| Drawable {
+            .map(|(e, mi, wt)| Drawable {
+                entity: e,
                 world: wt.0,
                 mesh: mi.mesh,
                 material: mi.material,
