@@ -54,8 +54,24 @@
 #define VSM_CONST_MISC_OFF (VSM_CONST_PARAMS_OFF + VSM_LEVELS * 16u)
 #define VSM_CONST_ORIGIN_OFF (VSM_CONST_MISC_OFF + 16u)
 #define VSM_CONST_SCROLL_OFF (VSM_CONST_ORIGIN_OFF + 16u)
-#define VSM_CONST_SIZE (VSM_CONST_SCROLL_OFF + VSM_LEVELS * 16u)
+// Dynamic-object invalidation spheres (V3): uint4 header (x = count), then
+// VSM_MAX_INVAL float4 world spheres (xyz center, w radius) — a mover contributes its
+// OLD and NEW footprint (the UE double-footprint rule). csUpdate re-renders every cached
+// page a sphere overlaps.
+#define VSM_CONST_INVAL_OFF (VSM_CONST_SCROLL_OFF + VSM_LEVELS * 16u)
+#define VSM_MAX_INVAL 64u
+#define VSM_CONST_SIZE (VSM_CONST_INVAL_OFF + 16u + VSM_MAX_INVAL * 16u)
 #define VSM_LEVEL_INVALIDATE 1u
+
+uint vsm_load_inval_count(RWByteAddressBuffer consts)
+{
+    return consts.Load(VSM_CONST_INVAL_OFF);
+}
+
+float4 vsm_load_inval_sphere(RWByteAddressBuffer consts, uint i)
+{
+    return asfloat(consts.Load4(VSM_CONST_INVAL_OFF + 16u + i * 16u));
+}
 
 float3 vsm_load_origin(RWByteAddressBuffer consts)
 {
@@ -114,13 +130,19 @@ float4 vsm_load_params(RWByteAddressBuffer consts, uint level)
     return asfloat(consts.Load4(VSM_CONST_PARAMS_OFF + level * 16u));
 }
 
-// The clipmap level whose radius (2^(i+2) m) covers a receiver at distance `d` from the
-// clipmap origin: i = floor(log2(max(d, 2))) - 1, clamped. Shared by marking + sampling
-// (the two MUST agree; a sampler asking a level marking never requested reads unmapped
-// and walks coarser).
+// The clipmap level for a receiver at distance `d` from the clipmap origin. Shared by
+// marking + sampling (the two MUST agree; a sampler asking a level marking never
+// requested reads unmapped and walks coarser).
+//
+// Calibration: level i's texel is 2^(i-9) m (4R/8192, R = 2^(i+2)); a 720p/60° screen
+// pixel spans ~d·2^-9.3 m of world. i = floor(log2(d)) puts the shadow texel at ~1.2×
+// the screen pixel footprint — the V3 bring-up ran one level finer (floor(log2 d) - 1)
+// and the ~3.5× texel oversampling marked more level-0 pages than the whole pool on
+// open floor (512-pool overflow on a solo walk). Coverage margin stays ample: level i
+// spans radius 2^(i+2) ≥ 4·d.
 uint vsm_level_for_distance(float d)
 {
-    float l = floor(log2(max(d, 2.0))) - 1.0;
+    float l = floor(log2(max(d, 2.0)));
     return (uint)clamp(l, 0.0, float(VSM_LEVELS - 1u));
 }
 

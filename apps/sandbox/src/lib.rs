@@ -6193,7 +6193,7 @@ impl App {
         // the camera focus and host-write the constants — before the graph borrows the
         // system for its passes below.
         let vsm_indices: Option<(u32, u32, u32)> = match self.vsm.as_mut() {
-            Some(v) => Some(v.update(fif, sun_dir, focus)?),
+            Some(v) => Some(v.update(fif, sun_dir, focus, &scene)?),
             None => None,
         };
 

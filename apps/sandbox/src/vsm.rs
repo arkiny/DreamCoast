@@ -45,9 +45,14 @@ const VSM_POOL_PAGES: u32 = 512;
 /// Cached pages unreferenced for this many frames are recycled (UE ages at 1000; the
 /// dungeon's working set is small, so a tighter clock keeps the free list warm).
 const VSM_MAX_PAGE_AGE: u32 = 120;
+/// Movers reported to the GPU per frame (old + new footprint spheres); past the cap the
+/// frame degrades to a full invalidate. Mirrors `VSM_MAX_INVAL` in vsm_common.slang.
+const VSM_MAX_INVAL: usize = 64;
 /// Per-frame constants blob: 6 mat4 + 6 float4 params + uint4 misc + float4 origin +
-/// 6 int4 scroll entries. Mirrors the `VSM_CONST_*` offsets in vsm_common.slang.
-const VSM_CONST_SIZE: usize = VSM_LEVELS * 64 + VSM_LEVELS * 16 + 16 + 16 + VSM_LEVELS * 16;
+/// 6 int4 scroll entries + the invalidation header/spheres. Mirrors the `VSM_CONST_*`
+/// offsets in vsm_common.slang.
+const VSM_CONST_SIZE: usize =
+    VSM_LEVELS * 64 + VSM_LEVELS * 16 + 16 + 16 + VSM_LEVELS * 16 + 16 + VSM_MAX_INVAL * 16;
 
 /// Per-level CPU cache key: where the level's snapped origin sits in its own page space,
 /// and the along-sun component its depth basis is pinned to.
@@ -58,10 +63,18 @@ struct LevelState {
     valid: bool,
 }
 
+/// Last frame's caster fingerprint (V3 invalidation): transform bits + world sphere.
+#[derive(Clone, Copy)]
+struct PrevCaster {
+    key: [u32; 16],
+    sphere: [f32; 4],
+}
+
 pub(crate) struct VsmSystem {
     clear_pipeline: ComputePipeline,
     mark_pipeline: ComputePipeline,
     update_pipeline: ComputePipeline,
+    compact_pipeline: ComputePipeline,
     alloc_pipeline: ComputePipeline,
     depth_pipeline: GraphicsPipeline,
     depth_skinned_pipeline: GraphicsPipeline,
@@ -82,6 +95,8 @@ pub(crate) struct VsmSystem {
     levels: [LevelState; VSM_LEVELS],
     sun_key: [u32; 3],
     frame_no: u32,
+    /// Last frame's shadow casters, scene order (V3 mover detection).
+    prev_casters: Vec<PrevCaster>,
 }
 
 impl VsmSystem {
@@ -129,6 +144,13 @@ impl VsmSystem {
             dreamcoast_shader::vsm_update_cs_dxil,
             dreamcoast_shader::vsm_update_cs_metallib,
             "csUpdate",
+            [64, 1, 1],
+        )?;
+        let compact_pipeline = compute(
+            dreamcoast_shader::vsm_compact_cs_spirv,
+            dreamcoast_shader::vsm_compact_cs_dxil,
+            dreamcoast_shader::vsm_compact_cs_metallib,
+            "csCompact",
             [64, 1, 1],
         )?;
         let alloc_pipeline = compute(
@@ -248,6 +270,7 @@ impl VsmSystem {
             clear_pipeline,
             mark_pipeline,
             update_pipeline,
+            compact_pipeline,
             alloc_pipeline,
             depth_pipeline,
             depth_skinned_pipeline,
@@ -263,6 +286,7 @@ impl VsmSystem {
             levels: [LevelState::default(); VSM_LEVELS],
             sun_key: [0; 3],
             frame_no: 0,
+            prev_casters: Vec::new(),
         }))
     }
 
@@ -279,8 +303,95 @@ impl VsmSystem {
         fif: usize,
         sun_dir: [f32; 3],
         focus: Vec3,
+        scene: &[SceneObject],
     ) -> anyhow::Result<(u32, u32, u32)> {
         self.frame_no = self.frame_no.wrapping_add(1);
+
+        // V3 — the track's core: movers invalidate only the pages they overlap. Diff
+        // every caster's transform against last frame; a change contributes its OLD and
+        // NEW footprint spheres (the UE double-footprint rule — miss either and you get
+        // a stale shadow or a shadowless mover). Pose-deforming casters (skin / morph /
+        // vertex-cache) re-render their pages every frame (UE HasDeformableMesh policy);
+        // caster-set changes or sphere overflow degrade to a full invalidate.
+        let mut inval: Vec<[f32; 4]> = Vec::new();
+        let mut force_invalidate = false;
+        let mut cur = Vec::with_capacity(self.prev_casters.len().max(16));
+        for obj in scene {
+            if !obj.casts_shadow {
+                continue;
+            }
+            let mut key = [0u32; 16];
+            for (k, f) in key.iter_mut().zip(obj.transform.to_cols_array()) {
+                *k = f.to_bits();
+            }
+            let c = (obj.world_aabb[0] + obj.world_aabb[1]) * 0.5;
+            let r = (obj.world_aabb[1] - obj.world_aabb[0]).length() * 0.5;
+            cur.push(PrevCaster {
+                key,
+                sphere: [c.x, c.y, c.z, r],
+            });
+        }
+        if self.prev_casters.len() != cur.len() {
+            // Casters appeared/disappeared (level swap, prop pickup): re-render it all.
+            force_invalidate = !self.prev_casters.is_empty();
+        } else {
+            let mut deforming_idx = 0usize;
+            for obj in scene {
+                if !obj.casts_shadow {
+                    continue;
+                }
+                let (p, n) = (&self.prev_casters[deforming_idx], &cur[deforming_idx]);
+                let deforming = obj.skin.is_some() || obj.morph.is_some() || obj.deform.is_some();
+                if p.key != n.key {
+                    if inval.len() + 2 > VSM_MAX_INVAL {
+                        force_invalidate = true;
+                        break;
+                    }
+                    inval.push(p.sphere);
+                    inval.push(n.sphere);
+                } else if deforming {
+                    if inval.len() + 1 > VSM_MAX_INVAL {
+                        force_invalidate = true;
+                        break;
+                    }
+                    inval.push(n.sphere);
+                }
+                deforming_idx += 1;
+            }
+        }
+        self.prev_casters = cur;
+        // A rigid-rig character is MANY SceneObjects (one per limb/plate), all moving
+        // every animated frame — pushing one sphere pair per part blows the GPU budget
+        // (7 characters overflowed 64 and degraded to full invalidates in bring-up).
+        // Greedy-merge near/overlapping spheres first: parts of one rig collapse to
+        // roughly one sphere, and distinct movers stay separate.
+        let mut merged: Vec<[f32; 4]> = Vec::new();
+        'sphere: for s in inval {
+            for m in merged.iter_mut() {
+                let d =
+                    ((s[0] - m[0]).powi(2) + (s[1] - m[1]).powi(2) + (s[2] - m[2]).powi(2)).sqrt();
+                if d < s[3] + m[3] + 1.0 {
+                    // Enclosing sphere of the pair.
+                    let r = ((d + s[3] + m[3]) * 0.5).max(s[3]).max(m[3]);
+                    if d > 1e-4 {
+                        let t = ((r - m[3]) / d).clamp(0.0, 1.0);
+                        m[0] += (s[0] - m[0]) * t;
+                        m[1] += (s[1] - m[1]) * t;
+                        m[2] += (s[2] - m[2]) * t;
+                    }
+                    m[3] = r;
+                    continue 'sphere;
+                }
+            }
+            merged.push(s);
+        }
+        let mut inval = merged;
+        if inval.len() > VSM_MAX_INVAL {
+            force_invalidate = true;
+        }
+        if force_invalidate {
+            inval.clear();
+        }
         // Light basis — identical up-vector guard to `light_view_proj` / the CSM fit.
         let dir = Vec3::new(sun_dir[0], sun_dir[1], sun_dir[2]).normalize_or_zero();
         let dir = if dir == Vec3::ZERO { Vec3::Y } else { dir };
@@ -328,7 +439,7 @@ impl VsmSystem {
             let along = focus.dot(dir);
 
             let st = &mut self.levels[i];
-            let mut invalidate = sun_moved || !st.valid;
+            let mut invalidate = sun_moved || force_invalidate || !st.valid;
             let mut scroll = [0i32, 0i32];
             if !invalidate {
                 if (along - st.pinned_along).abs() > half {
@@ -389,6 +500,13 @@ impl VsmSystem {
         for (j, f) in [focus.x, focus.y, focus.z, 0.0].iter().enumerate() {
             put(&mut bytes, origin_off + j * 4, *f);
         }
+        let inval_off = scroll_base + VSM_LEVELS * 16;
+        put_u(&mut bytes, inval_off, inval.len() as u32);
+        for (i, s) in inval.iter().enumerate() {
+            for (j, f) in s.iter().enumerate() {
+                put(&mut bytes, inval_off + 16 + i * 16 + j * 4, *f);
+            }
+        }
         self.consts[fif].write(&bytes)?;
         Ok((
             self.consts[fif].storage_index(),
@@ -428,6 +546,7 @@ impl VsmSystem {
         let clear = &self.clear_pipeline;
         let mark = &self.mark_pipeline;
         let update = &self.update_pipeline;
+        let compact = &self.compact_pipeline;
         let alloc = &self.alloc_pipeline;
         graph.add_compute_pass(
             ComputePassInfo {
@@ -466,6 +585,9 @@ impl VsmSystem {
                 cmd.dispatch(VSM_POOL_PAGES.div_ceil(64), 1, 1);
                 cmd.storage_buffer_barrier(table);
                 cmd.storage_buffer_barrier(meta);
+                cmd.bind_compute_pipeline(compact);
+                cmd.push_constants_compute(&push);
+                cmd.dispatch(VSM_POOL_PAGES.div_ceil(64), 1, 1);
                 cmd.storage_buffer_barrier(freelist);
                 cmd.bind_compute_pipeline(alloc);
                 cmd.push_constants_compute(&push);
@@ -543,10 +665,12 @@ impl VsmSystem {
     /// (pages rendered last frame, overflowed requests) — the cache-effectiveness and
     /// pool-sizing diagnostics (`lib.rs` logs them at shutdown).
     pub(crate) fn stats(&self) -> (u32, u32) {
-        let mut b = [0u8; 8];
+        let mut b = [0u8; 16];
         if self.counter.read_into(&mut b).is_err() {
             return (0, 0);
         }
+        let freed = u32::from_le_bytes(b[8..12].try_into().unwrap());
+        tracing::info!("VSM cache: {freed} freed last frame");
         (
             u32::from_le_bytes(b[0..4].try_into().unwrap()),
             u32::from_le_bytes(b[4..8].try_into().unwrap()),

@@ -17,8 +17,12 @@
 //              MAPPED|RENDER entry.
 //
 // counter buffer: [0] pages given RENDER this frame (stat), [1] overflowed requests,
-// [2] spare, [3] virgin high-water (never-yet-used pool pages; PERSISTS).
-// freelist buffer: [0] count, then page indices (PERSISTS across frames).
+// [2] pages freed this frame (stat), [3] free-list pop cursor (per frame).
+// freelist buffer: [0] count, then free page indices - REBUILT every frame from the
+// metadata by csCompact (the UE PackAvailablePages shape). A persistent mutable stack
+// popped with a decrement-and-undo pattern corrupts under contention (phantom pops
+// double-assign physical pages - the V3 bring-up collapse); rebuilding from truth each
+// frame plus a monotonic pop cursor is race-free by construction.
 
 #include "bindless.slang"
 #include "vsm_common.slang"
@@ -55,9 +59,11 @@ void csClear(uint3 tid: SV_DispatchThreadID)
     g.storage_buffers[pc.request_buf].Store(tid.x * 4u, 0u);
     if (tid.x == 0u)
     {
-        g.storage_buffers[pc.counter_buf].Store(0u, 0u); // rendered-page stat
-        g.storage_buffers[pc.counter_buf].Store(4u, 0u); // overflow stat
-        // [3] virgin high-water and the free list PERSIST — they are the cache.
+        g.storage_buffers[pc.counter_buf].Store(0u, 0u);  // rendered-page stat
+        g.storage_buffers[pc.counter_buf].Store(4u, 0u);  // overflow stat
+        g.storage_buffers[pc.counter_buf].Store(8u, 0u);  // freed stat
+        g.storage_buffers[pc.counter_buf].Store(12u, 0u); // free-list pop cursor
+        g.storage_buffers[pc.freelist_buf].Store(0u, 0u); // rebuilt by csCompact below
     }
 }
 
@@ -116,19 +122,71 @@ void csUpdate(uint3 tid: SV_DispatchThreadID)
     }
     if (drop)
     {
-        meta.Store(mo + 8u, 0u);
-        RWByteAddressBuffer freelist = g.storage_buffers[pc.freelist_buf];
-        uint slot;
-        freelist.InterlockedAdd(0u, 1u, slot);
-        freelist.Store(4u + slot * 4u, tid.x);
+        meta.Store(mo + 8u, 0u); // csCompact folds it into the free list below
+        uint _f;
+        g.storage_buffers[pc.counter_buf].InterlockedAdd(8u, 1u, _f); // freed stat
         return;
     }
     meta.Store(mo + 0u, vsm_meta_pack_addr(level, uint2(np)));
     meta.Store(mo + 4u, last);
+
+    // Dynamic-object invalidation (V3, the track's core): a cached page overlapped by any
+    // mover sphere (old OR new footprint) clears to far and re-renders this frame. The
+    // sphere is projected into the level's texel space (ortho rows are scaled-orthogonal:
+    // |row 0| = 1/half, so texels-per-metre = VIRTUAL·|row0|/2) and tested against the
+    // page's texel rect — conservative in Z (a sphere behind the wall still invalidates;
+    // correctness over precision, the page just re-renders).
+    bool rerender = false;
+    uint inval_count = min(vsm_load_inval_count(consts), VSM_MAX_INVAL);
+    if (inval_count != 0u)
+    {
+        float4x4 wc = vsm_load_world_to_clip(consts, level);
+        float texel_per_m = float(VSM_VIRTUAL_SIZE) * length(wc[0].xyz) * 0.5;
+        float2 pmin = float2(np * int2(VSM_PAGE_SIZE, VSM_PAGE_SIZE));
+        float2 pmax = pmin + float(VSM_PAGE_SIZE);
+        for (uint i = 0u; i < inval_count && !rerender; ++i)
+        {
+            float4 s = vsm_load_inval_sphere(consts, i);
+            float4 c = mul(wc, float4(s.xyz, 1.0));
+            float2 ct = vsm_ndc_to_texel(c.xy);
+            float rt = s.w * texel_per_m;
+            float2 closest = clamp(ct, pmin, pmax);
+            float2 d = closest - ct;
+            rerender = dot(d, d) <= rt * rt;
+        }
+    }
+    if (rerender)
+    {
+        RWByteAddressBuffer pool = g.storage_buffers[pc.pool_buf];
+        uint base = tid.x * VSM_PAGE_SIZE * VSM_PAGE_SIZE * 4u;
+        for (uint t = 0u; t < VSM_PAGE_SIZE * VSM_PAGE_SIZE; ++t)
+            pool.Store(base + t * 4u, 0x3f800000u); // 1.0f = far
+        g.storage_buffers[pc.table_buf].Store(vsm_pte_offset(level, uint2(np)),
+                                              VSM_PTE_MAPPED | VSM_PTE_RENDER | tid.x);
+        uint _r;
+        g.storage_buffers[pc.counter_buf].InterlockedAdd(0u, 1u, _r); // rendered-page stat
+        return;
+    }
     // Cached: mapped for sampling, NOT flagged for rendering — the raster PS discards
     // here, which is the whole point of V2.
     g.storage_buffers[pc.table_buf].Store(vsm_pte_offset(level, uint2(np)),
                                           VSM_PTE_MAPPED | tid.x);
+}
+
+// --- Compact: rebuild the free list from the metadata (one thread per physical page) ----
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void csCompact(uint3 tid: SV_DispatchThreadID)
+{
+    if (tid.x >= VSM_POOL_PAGES)
+        return;
+    if ((g.storage_buffers[pc.meta_buf].Load(tid.x * VSM_META_STRIDE + 8u) & VSM_META_VALID)
+        != 0u)
+        return;
+    RWByteAddressBuffer freelist = g.storage_buffers[pc.freelist_buf];
+    uint slot;
+    freelist.InterlockedAdd(0u, 1u, slot);
+    freelist.Store(4u + slot * 4u, tid.x);
 }
 
 // --- Allocate: one thread per page-table entry -------------------------------------------
@@ -147,35 +205,17 @@ void csAlloc(uint3 tid: SV_DispatchThreadID)
 
     RWByteAddressBuffer counter = g.storage_buffers[pc.counter_buf];
     RWByteAddressBuffer freelist = g.storage_buffers[pc.freelist_buf];
-    // Pop the free list first (recycled pages), then virgin pages, else overflow. The
-    // count is decremented optimistically and can dip negative under contention; a
-    // non-positive PREVIOUS value means empty, and the underflow is undone. Frees
-    // (csUpdate) and pops (here) are in separate barrier-ordered dispatches, so pushes
-    // never race pops.
-    uint page = 0xffffffffu;
-    uint prev;
-    freelist.InterlockedAdd(0u, 0xffffffffu, prev); // -= 1
-    if (int(prev) > 0)
+    // Race-free pop: the list was rebuilt from the metadata this frame (csCompact) and
+    // its count no longer moves; a monotonic cursor hands each claimer a unique slot.
+    uint cursor;
+    counter.InterlockedAdd(12u, 1u, cursor);
+    if (cursor >= freelist.Load(0u))
     {
-        page = freelist.Load(4u + (prev - 1u) * 4u);
+        uint _o;
+        counter.InterlockedAdd(4u, 1u, _o); // overflow stat (pool exhausted)
+        return;
     }
-    else
-    {
-        freelist.InterlockedAdd(0u, 1u, prev); // undo the underflow
-        uint virgin;
-        counter.InterlockedAdd(12u, 1u, virgin);
-        if (virgin < VSM_POOL_PAGES)
-        {
-            page = virgin;
-        }
-        else
-        {
-            counter.InterlockedAdd(12u, 0xffffffffu, virgin); // pin the high-water at cap
-            uint _o;
-            counter.InterlockedAdd(4u, 1u, _o); // overflow stat
-            return;
-        }
-    }
+    uint page = freelist.Load(4u + cursor * 4u);
 
     // New content: clear the page to far before any caster writes land.
     RWByteAddressBuffer pool = g.storage_buffers[pc.pool_buf];
