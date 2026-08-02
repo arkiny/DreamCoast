@@ -24,7 +24,7 @@ const RT_PIPELINE_DISPATCH_KEY: &str = "rt_pipeline_dispatch";
 /// editing any of them recompiles all dependents (they include no per-job tracking otherwise —
 /// an omitted entry silently ships stale bytecode). Keep in sync with the `#include`s under
 /// `shaders/` (a non-JOB `.slang` — or the RT-pipeline root-sig JSON — belongs here).
-const SHARED_INCLUDES: [&str; 16] = [
+const SHARED_INCLUDES: [&str; 17] = [
     "bindless.slang",
     "rt_common.slang",
     "rt_pipeline_metal_rootsig.json",
@@ -41,6 +41,7 @@ const SHARED_INCLUDES: [&str; 16] = [
     "hzb_test.slang",
     "reflect_ggx.slang",
     "aces.slang",
+    "vsm_common.slang",
 ];
 
 // FNV-1a 64-bit — dependency-free content hash for the shader cook cache (Phase 12
@@ -1011,6 +1012,50 @@ const JOBS: &[Job] = &[
         entry: "fsMain",
         stage: "fragment",
         key: "shadow_fs",
+    },
+    // Virtual shadow maps (docs/vsm-shadows-plan.md V1): page management compute + the
+    // attachmentless caster raster (static / skinned / morphed vertex variants).
+    Job {
+        src: "vsm_pages.slang",
+        entry: "csClear",
+        stage: "compute",
+        key: "vsm_clear_cs",
+    },
+    Job {
+        src: "vsm_pages.slang",
+        entry: "csMark",
+        stage: "compute",
+        key: "vsm_mark_cs",
+    },
+    Job {
+        src: "vsm_pages.slang",
+        entry: "csAlloc",
+        stage: "compute",
+        key: "vsm_alloc_cs",
+    },
+    Job {
+        src: "vsm_depth.slang",
+        entry: "vsMain",
+        stage: "vertex",
+        key: "vsm_depth_vs",
+    },
+    Job {
+        src: "vsm_depth.slang",
+        entry: "vsMainSkinned",
+        stage: "vertex",
+        key: "vsm_depth_skinned_vs",
+    },
+    Job {
+        src: "vsm_depth.slang",
+        entry: "vsMainMorphed",
+        stage: "vertex",
+        key: "vsm_depth_morphed_vs",
+    },
+    Job {
+        src: "vsm_depth.slang",
+        entry: "fsMain",
+        stage: "fragment",
+        key: "vsm_depth_fs",
     },
     Job {
         src: "pbr.slang",

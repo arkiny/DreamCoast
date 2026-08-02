@@ -108,6 +108,7 @@ mod translucent;
 mod velocity;
 mod vgeo;
 mod view;
+mod vsm;
 mod world;
 use app::*;
 use cluster::{ClusterLight, ClusterSystem};
@@ -781,6 +782,9 @@ pub struct App {
     /// Clustered light culling (PR-6). `None` where compute is unavailable; the feature
     /// stays off. Gated on `clustered_lights` (`CLUSTERED_LIGHTS=1`).
     cluster: Option<ClusterSystem>,
+    /// Virtual shadow maps (plan V1). `Some` only under `VSM=1` with compute available;
+    /// replaces the sun's shadow SAMPLING (legacy/CSM rasters still run in V1 bring-up).
+    vsm: Option<vsm::VsmSystem>,
     /// HZB occlusion culling (PR-8), `None` when compute is unavailable. Layered on
     /// top of `cull`'s frustum test behind `HZB_CULL=1`.
     hzb: Option<HzbSystem>,
@@ -1695,6 +1699,23 @@ impl App {
         // view-frustum froxel grid so the lighting pass loops only its cluster's lights. `None`
         // where compute is unavailable; opt-in via `CLUSTERED_LIGHTS=1` (see `cluster.rs`).
         let cluster = ClusterSystem::new(&device, backend, compute_supported)?;
+
+        // Virtual shadow maps (docs/vsm-shadows-plan.md V1). Opt-in seam: `VSM=1`. The
+        // legacy single-map / CSM paths are byte-untouched when off; on, the lighting
+        // pass samples the page-table pool instead (CSM is slated for deprecation once
+        // VSM closes V3 — the playtest track's direction).
+        let vsm_enabled = std::env::var("VSM").ok().as_deref() == Some("1");
+        let vsm = if vsm_enabled {
+            let sys = vsm::VsmSystem::new(&device, backend, compute_supported)?;
+            if sys.is_none() {
+                tracing::warn!(
+                    "VSM=1 but compute is unavailable — falling back to the legacy shadow path"
+                );
+            }
+            sys
+        } else {
+            None
+        };
 
         // HZB occlusion culling (PR-8): a max-reduced Hi-Z pyramid built from the scene
         // depth feeds an occlusion-aware variant of the cull compute. Compute-only; the
@@ -3476,6 +3497,7 @@ impl App {
             particles,
             cull,
             cluster,
+            vsm,
             hzb,
             rt,
             ibl,
@@ -4096,6 +4118,12 @@ impl App {
             self.reclaim_rhi_objects(rhi.join());
         }
         self.device.wait_idle()?;
+        if let Some(v) = &self.vsm {
+            let (allocated, overflowed) = v.stats();
+            // The pool-sizing diagnostic (docs/vsm-shadows-plan.md §4): overflowed > 0 means
+            // requested pages got no backing and fell back to coarser levels — grow the pool.
+            info!("VSM pages: {allocated} allocated, {overflowed} overflowed (last frame)");
+        }
         info!("shutting down");
         Ok(())
     }
@@ -6161,6 +6189,14 @@ impl App {
             None
         };
 
+        // Virtual shadow maps (plan V1): rebuild this frame's clipmap level matrices around
+        // the camera focus and host-write the constants — before the graph borrows the
+        // system for its passes below.
+        let vsm_indices: Option<(u32, u32, u32)> = match self.vsm.as_mut() {
+            Some(v) => Some(v.update(fif, sun_dir, focus)?),
+            None => None,
+        };
+
         // Phase 8 M4: manage the path tracer's persistent accumulation buffer and
         // reset key BEFORE building the render graph — the fallible buffer
         // (re)allocation must not sit on a `?` early-return path while the graph holds
@@ -7940,6 +7976,19 @@ impl App {
             }
             _ => None,
         };
+        // Virtual shadow maps (plan V1): page management (clear→mark→alloc) + the caster
+        // raster, then hand the sampler its buffer indices. `None` = the sun keeps the
+        // legacy/CSM sampling byte-identically.
+        let vsm_lighting: Option<(ResourceId, ResourceId, [u32; 3])> =
+            match (self.vsm.as_ref(), vsm_indices) {
+                (Some(vsys), Some((consts_idx, table_idx, pool_idx))) => {
+                    let (table_ext, pool_ext) = vsm::VsmSystem::import(&mut graph);
+                    vsys.record_pages(&mut graph, table_ext, pool_ext, g_position, fif, (cw, ch));
+                    vsys.record_raster(&mut graph, table_ext, pool_ext, &scene, self.flip_y != 0);
+                    Some((table_ext, pool_ext, [consts_idx, table_idx, pool_idx]))
+                }
+                _ => None,
+            };
         // F6O: spatial denoise of the accumulated per-pixel sky-vis, blending in the smooth volume
         // V (now produced) at far distance to kill undersampled thin-geometry speckle. Runs here so
         // `gi_skyvis_out` is available. Off → None → deferred keeps the volume V (byte anchor).
@@ -7999,6 +8048,7 @@ impl App {
             cluster_lighting,
             self.ao_multibounce,
             self.spec_occlusion,
+            vsm_lighting,
         );
         // Auto-exposure metering: read this frame's lit HDR, adapt the exposure for next frame.
         // After lighting (the `hdr` read orders it). `adapt` = 1-exp(-dt·speed) (eye/iris speed).
@@ -9012,6 +9062,9 @@ impl App {
                 None,
                 self.ao_multibounce,
                 self.spec_occlusion,
+                // VSM levels are fit to the PRIMARY camera; the inset keeps the legacy map
+                // (same policy as the clustered froxels above).
+                None,
             );
             // Composite the second view as a PiP inset. A tonemap pass that LOADS (does not clear)
             // the backbuffer and restricts its draw to the top-right inset viewport rect, so the

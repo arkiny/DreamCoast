@@ -417,6 +417,26 @@ impl VulkanCommandBuffer {
         };
     }
 
+    /// Begin dynamic rendering with NO attachments over `extent` (the VSM caster pass:
+    /// fragment-stage UAV scatter only). Legal per VK_KHR_dynamic_rendering — the render
+    /// area just bounds the rasterization domain.
+    pub fn begin_rendering_empty(&self, extent: Extent2D) {
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: extent.width,
+                    height: extent.height,
+                },
+            })
+            .layer_count(1);
+        unsafe {
+            self.device
+                .device
+                .cmd_begin_rendering(self.cmd, &rendering_info)
+        };
+    }
+
     /// End dynamic rendering.
     pub fn end_rendering(&self) {
         unsafe { self.device.device.cmd_end_rendering(self.cmd) };

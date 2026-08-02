@@ -19,6 +19,7 @@
 
 #include "bindless.slang"
 #include "light_cluster_common.slang"
+#include "vsm_common.slang"
 
 static const float PI = 3.14159265359;
 
@@ -76,6 +77,12 @@ struct PushConstants
     // clean variant for the sponza_hero banner but +0.5 sunlit block over the sealed budget,
     // so it stays a recipe knob, not a default (docs/phase-f6l-trapped-probe-fill-plan.md §4).
     float skyvis_bent_floor;
+    // Virtual shadow map (docs/vsm-shadows-plan.md V1). All 0xFFFFFFFF = VSM off — the
+    // sun samples the CSM / legacy single-map path above, byte-identically.
+    uint vsm_consts_buf; // per-frame level matrices/params/origin
+    uint vsm_table_buf;  // page table
+    uint vsm_pool_buf;   // physical depth pool
+    uint _vsm_pad;
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -609,15 +616,94 @@ float csm_shadow(float3 world_pos, float3 normal, float2 pix, float view_depth,
     return vis;
 }
 
+// Virtual-shadow-map sun visibility (plan V1). Level select mirrors the marking pass
+// (vsm_level_for_distance — the two MUST agree), then a 3x3 receiver-plane PCF where
+// EVERY tap translates virtual -> physical through the page table independently, so the
+// kernel is correct across page borders. The per-tap reference depth follows the receiver
+// plane (slope recovered from the level's flip-free ortho rows, the V0 machinery), which
+// is what lets the constant bias stay at ~one texel of the level's depth range. A pixel
+// whose level page is unmapped walks coarser levels (pool-overflow fallback); unmapped
+// everywhere = fully lit, with the overflow counter as the loud host-side signal.
+float vsm_sun_shadow(float3 world_pos, float3 normal, out int level_out)
+{
+    RWByteAddressBuffer consts = g.storage_buffers[pc.vsm_consts_buf];
+    RWByteAddressBuffer table = g.storage_buffers[pc.vsm_table_buf];
+    RWByteAddressBuffer pool = g.storage_buffers[pc.vsm_pool_buf];
+    level_out = -1;
+
+    uint first = vsm_level_for_distance(length(world_pos - vsm_load_origin(consts)));
+    for (uint level = first; level < VSM_LEVELS; ++level)
+    {
+        float4x4 wc = vsm_load_world_to_clip(consts, level);
+        float4 clip = mul(wc, float4(world_pos, 1.0));
+        float2 texel = vsm_ndc_to_texel(clip.xy);
+        if (min(texel.x, texel.y) < 1.0 || max(texel.x, texel.y) >= float(VSM_VIRTUAL_SIZE) - 1.0
+            || clip.z <= 0.0 || clip.z >= 1.0)
+            continue;
+        // The receiver's own page decides residency; border taps that land on a different
+        // unmapped page just drop out of the kernel below.
+        uint2 page = uint2(texel) / VSM_PAGE_SIZE;
+        if ((table.Load(vsm_pte_offset(level, page)) & VSM_PTE_MAPPED) == 0u)
+            continue;
+        level_out = int(level);
+
+        // Receiver-plane depth gradient per virtual UV (ortho rows are scaled-orthogonal;
+        // same derivation as csm_optimal_slope_bias, orientation fixed D3D by contract).
+        float3 ru = wc[0].xyz;
+        float3 rv = wc[1].xyz;
+        float3 rz = wc[2].xyz;
+        float3 m = float3(dot(normal, ru) / dot(ru, ru), dot(normal, rv) / dot(rv, rv),
+                          dot(normal, rz) / max(dot(rz, rz), 1e-12));
+        float mz = abs(m.z) > 1e-8 ? m.z : (m.z >= 0.0 ? 1e-8 : -1e-8);
+        float2 dz_ndc = -m.xy / mz;
+        // Slope clamp 0.1 (vs the CSM path's 0.05): VSM texels are millimetres, so grazing
+        // walls need the receiver plane followed further before the clamp caps it — the V1
+        // bring-up showed salt-and-pepper acne on sun-grazing wall faces at 0.05/1-texel.
+        float2 slope_uv = clamp(float2(dz_ndc.x * 2.0, dz_ndc.y * -2.0), -0.1, 0.1);
+        float bias = 2.0 / float(VSM_VIRTUAL_SIZE); // two texels of the level's depth range
+
+        float sum = 0.0;
+        float taps = 0.0;
+        [unroll]
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+            [unroll]
+            for (int dx = -1; dx <= 1; ++dx)
+            {
+                float2 t = texel + float2(dx, dy);
+                uint2 tp = uint2(t) / VSM_PAGE_SIZE;
+                uint pte = table.Load(vsm_pte_offset(level, tp));
+                if ((pte & VSM_PTE_MAPPED) == 0u)
+                    continue;
+                uint phys = pte & VSM_PTE_PAGE_MASK;
+                float stored =
+                    asfloat(pool.Load(vsm_pool_offset(phys, uint2(t) % VSM_PAGE_SIZE)));
+                // Reference depth at the TAP's texel center on the receiver plane — the
+                // slope term doubles as the texel-straddle correction (V0, per tap).
+                float2 duv = ((floor(t) + 0.5) - texel) / float(VSM_VIRTUAL_SIZE);
+                float reference = clip.z + dot(slope_uv, duv);
+                sum += stored < reference - bias ? 0.0 : 1.0;
+                taps += 1.0;
+            }
+        }
+        return taps > 0.0 ? sum / taps : 1.0;
+    }
+    return 1.0; // beyond the last level, or every level's page missing (overflow)
+}
+
 // Fraction of the directional sun reaching `world_pos` (1 = fully lit, 0 = fully shadowed).
-// `view_depth` = camera-space distance (for the CSM cascade select). The CSM path is taken when
-// the seam is on (csm_params.x > 0); otherwise the legacy single-map path runs unchanged.
+// `view_depth` = camera-space distance (for the CSM cascade select). The VSM path (plan V1)
+// wins when its buffers are pushed; then CSM when the seam is on (csm_params.x > 0);
+// otherwise the legacy single-map path runs unchanged.
 float sun_shadow(float3 world_pos, float3 normal, float2 pix, float view_depth,
                  out int cascade_out)
 {
     cascade_out = -1;
     if (globals.counts.w == 0)
         return 1.0;
+
+    if (pc.vsm_consts_buf != NO_TEXTURE)
+        return vsm_sun_shadow(world_pos, normal, cascade_out);
 
     if (globals.csm_params.x > 0)
         return csm_shadow(world_pos, normal, pix, view_depth, cascade_out);

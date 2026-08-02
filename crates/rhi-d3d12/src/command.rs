@@ -326,6 +326,16 @@ impl D3d12CommandBuffer {
         }
     }
 
+    /// Begin rasterization with NO attachments (the VSM caster pass: fragment-stage UAV
+    /// scatter only). `OMSetRenderTargets(0, ..)` with no DSV is the standard D3D12
+    /// target-less raster setup (as used for voxelization); the caller sizes the domain
+    /// with `set_viewport_scissor_extent`.
+    pub fn begin_rendering_empty(&self, _extent: Extent2D) {
+        unsafe {
+            self.list.OMSetRenderTargets(0, None, false, None);
+        }
+    }
+
     /// Transition a depth buffer into `DEPTH_WRITE` for writing (a shadow map
     /// reused across frames may currently be in shader-read).
     pub fn depth_to_render_target(&self, depth: &D3d12DepthBuffer) {

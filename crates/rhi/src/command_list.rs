@@ -94,6 +94,7 @@ pub trait Recorder {
     );
     fn set_globals(&self, buffer: &Buffer, offset: u64);
     fn begin_rendering_depth_only(&self, depth: &DepthBuffer);
+    fn begin_rendering_empty(&self, extent: Extent2D);
     fn depth_to_render_target(&self, depth: &DepthBuffer);
     fn depth_to_sampled(&self, depth: &DepthBuffer);
     fn cube_to_color(&self, cube: &Cubemap);
@@ -205,6 +206,9 @@ impl Recorder for CommandBuffer {
     }
     fn begin_rendering_depth_only(&self, depth: &DepthBuffer) {
         CommandBuffer::begin_rendering_depth_only(self, depth)
+    }
+    fn begin_rendering_empty(&self, extent: Extent2D) {
+        CommandBuffer::begin_rendering_empty(self, extent)
     }
     fn depth_to_render_target(&self, depth: &DepthBuffer) {
         CommandBuffer::depth_to_render_target(self, depth)
@@ -395,6 +399,9 @@ pub enum RhiCommand {
     },
     BeginRenderingDepthOnly {
         depth: ResPtr<DepthBuffer>,
+    },
+    BeginRenderingEmpty {
+        extent: Extent2D,
     },
     DepthToRenderTarget {
         depth: ResPtr<DepthBuffer>,
@@ -761,6 +768,7 @@ impl CommandList {
                 RhiCommand::BeginRenderingDepthOnly { depth } => {
                     cmd.begin_rendering_depth_only(unsafe { depth.get() })
                 }
+                RhiCommand::BeginRenderingEmpty { extent } => cmd.begin_rendering_empty(extent),
                 RhiCommand::DepthToRenderTarget { depth } => {
                     cmd.depth_to_render_target(unsafe { depth.get() })
                 }
@@ -1000,6 +1008,12 @@ impl Recorder for CommandList {
             .push(RhiCommand::BeginRenderingDepthOnly {
                 depth: ResPtr::new(depth),
             });
+    }
+    fn begin_rendering_empty(&self, extent: Extent2D) {
+        self.inner
+            .borrow_mut()
+            .cmds
+            .push(RhiCommand::BeginRenderingEmpty { extent });
     }
     fn depth_to_render_target(&self, depth: &DepthBuffer) {
         self.inner

@@ -477,7 +477,7 @@ impl DeferredRenderer {
             topology: PrimitiveTopology::TriangleList,
             vertex_layout: VertexLayout::None,
             blend: BlendMode::Opaque,
-            push_constant_size: 92, // 60-byte core + clustered bufs (16) + ao_multibounce + spec_occlusion + tint v0 + bent floor (see pbr_push)
+            push_constant_size: 108, // 92-byte pre-VSM block + vsm consts/table/pool + pad (see pbr_push)
             bindless: true,
             uniform_buffer: true,
             depth_test: false,
@@ -1241,6 +1241,10 @@ impl DeferredRenderer {
         // Opt-in bent-normal cone-cone occlusion on the prefilter-cube specular (reference
         // GetDistanceFieldAOSpecularOcclusion). SW-RT reflection is left untouched. Default false.
         spec_occlusion: bool,
+        // Virtual shadow map (docs/vsm-shadows-plan.md V1): `Some((table_ext, pool_ext,
+        // [consts, table, pool storage indices]))` orders the lighting pass after the VSM
+        // raster and routes the sun through the page-table sampler. `None` = CSM / legacy.
+        vsm: Option<(ResourceId, ResourceId, [u32; 3])>,
     ) {
         let mut reads = vec![gbuf.albedo, gbuf.normal, gbuf.material, gbuf.position];
         if let Some(sm) = shadow_map {
@@ -1249,6 +1253,10 @@ impl DeferredRenderer {
         if let Some((grid_ext, index_ext, ..)) = cluster {
             reads.push(grid_ext);
             reads.push(index_ext);
+        }
+        if let Some((table_ext, pool_ext, _)) = vsm {
+            reads.push(table_ext);
+            reads.push(pool_ext);
         }
         if let Some(ao) = gdf_ao {
             reads.push(ao);
@@ -1323,6 +1331,7 @@ impl DeferredRenderer {
                     [cl_grid, cl_index, cl_light, cl_count],
                     ao_multibounce as u32,
                     spec_occlusion as u32,
+                    vsm.map(|(_, _, idx)| idx).unwrap_or([u32::MAX; 3]),
                 ));
                 cmd.draw(3, 1);
                 Ok(())
@@ -1607,8 +1616,11 @@ fn pbr_push(
     cluster: [u32; 4],
     ao_multibounce: u32,
     spec_occlusion: u32,
-) -> [u8; 92] {
-    let mut pc = [0u8; 92];
+    // Virtual shadow map bufs: [consts, table, pool]. consts == u32::MAX = VSM off, the
+    // sun samples CSM / the legacy single map byte-identically (docs/vsm-shadows-plan.md V1).
+    vsm: [u32; 3],
+) -> [u8; 108] {
+    let mut pc = [0u8; 108];
     for (i, v) in indices.iter().enumerate() {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -1631,6 +1643,11 @@ fn pbr_push(
     pc[80..84].copy_from_slice(&spec_occlusion.to_le_bytes());
     pc[84..88].copy_from_slice(&skyvis_tint_v0.to_le_bytes());
     pc[88..92].copy_from_slice(&skyvis_bent_floor.to_le_bytes());
+    for (i, v) in vsm.iter().enumerate() {
+        let o = 92 + i * 4;
+        pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // pc[104..108] = _vsm_pad (zero)
     pc
 }
 

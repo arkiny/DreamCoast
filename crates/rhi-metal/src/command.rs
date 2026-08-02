@@ -494,6 +494,21 @@ impl MetalCommandBuffer {
         self.start_encoder(&pass);
     }
 
+    /// Begin rasterization with NO attachments over `extent` (the VSM caster pass:
+    /// fragment-stage buffer scatter only). Metal supports attachment-less passes via
+    /// `renderTargetWidth/Height` + `defaultRasterSampleCount`; the VSM bring-up on this
+    /// backend is tracked in docs/vsm-shadows-plan.md §4 and needs a macOS verify pass
+    /// before first use.
+    pub fn begin_rendering_empty(&self, extent: rhi_types::Extent2D) {
+        let pass = MTLRenderPassDescriptor::new();
+        unsafe {
+            pass.setRenderTargetWidth(extent.width as usize);
+            pass.setRenderTargetHeight(extent.height as usize);
+            pass.setDefaultRasterSampleCount(1);
+        }
+        self.start_encoder(&pass);
+    }
+
     /// Render-graph transition hooks. On Metal these toggle bindless residency:
     /// `*_to_render_target` drops a resource from the resident set before it is
     /// written as an attachment; `*_to_sampled` makes it resident before a sampling

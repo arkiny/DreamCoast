@@ -1434,6 +1434,21 @@ impl CommandBuffer {
         }
     }
 
+    /// Begin rasterization with NO attachments over an `extent`-sized area (the VSM caster
+    /// pass: the fragment shader scatters into a storage-buffer depth pool through the page
+    /// table, so the only pipeline outputs are UAV writes). The extent may exceed any real
+    /// texture the pass touches — it only sizes the viewport/scissor domain.
+    pub fn begin_rendering_empty(&self, extent: Extent2D) {
+        match self {
+            #[cfg(windows)]
+            Self::Vulkan(c) => c.begin_rendering_empty(extent),
+            #[cfg(windows)]
+            Self::D3d12(c) => c.begin_rendering_empty(extent),
+            #[cfg(target_os = "macos")]
+            Self::Metal(c) => c.begin_rendering_empty(extent),
+        }
+    }
+
     /// Transition a depth buffer into depth-attachment state for writing.
     pub fn depth_to_render_target(&self, depth: &DepthBuffer) {
         match (self, depth) {
