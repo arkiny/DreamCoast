@@ -127,36 +127,20 @@ fn main() -> anyhow::Result<()> {
         unsafe { std::env::set_var("P_SDF_SIGN_PROBE", "1") };
     }
 
-    // This game's shadow policy: camera-fit cascades (PR-7 CSM). The legacy single map
-    // stretches one shadow texture over the whole floor's bounding sphere (a 40x40 floor
-    // is R ~ 30 m, so ~5 cm texels), and its constant-NDC depth bias scales into a
-    // ~25 cm world-space offset — wall shadows visibly detach from the floor (M3
-    // playtest report). CSM re-fits texel density to the top-down camera every frame,
-    // which also re-renders movers' shadows per frame.
-    //
-    // The split range is trimmed to where this game's receivers actually live: the
-    // follow camera hangs ~14 m above the floor, so [camera.near, camera.far] splitting
-    // spends every near cascade on empty air and stretches the far one past the horizon
-    // (measured ~12 cm/texel). CSM_NEAR is a COVERAGE CONTRACT, not a tuning knob:
-    // anything nearer than it falls outside every cascade and the shader's containment
-    // fallback lights it (a 10 m trim left the WALL TOPS — camera height 14 m minus the
-    // 4 m wall — sun-bright in the playtest). 6 m clears the nearest possible receiver
-    // (wall tops ~10 m, torches ~11.5 m) with margin for camera bob; the floor itself
-    // starts at ~14 m. [6, 55] still puts ~1.5 cm texels around the warrior with
-    // 4 cascades on a 4096 atlas (2048^2 per cascade). Same per-app-default seam as the
-    // SDF sign probe above: the engine default (and the gallery anchor) stays legacy,
-    // and every explicit env setting still wins.
-    for (key, val) in [
-        ("CSM", "4"),
-        ("CSM_ATLAS", "4096"),
-        ("CSM_NEAR", "6"),
-        ("CSM_FAR", "55"),
-    ] {
-        if std::env::var_os(key).is_none() {
-            // SAFETY: single-threaded here — before logging, jobs, and engine bring-up
-            // spawn any thread.
-            unsafe { std::env::set_var(key, val) };
-        }
+    // This game's shadow policy: VIRTUAL SHADOW MAPS (docs/vsm-shadows-plan.md, V3
+    // complete): page-granular caching around the follow camera, dynamic objects
+    // invalidating only the pages they overlap, mm-scale texels at the warrior. CSM is
+    // DEPRECATED for game content — its camera-frustum split scheme needed per-scene
+    // coverage contracts (CSM_NEAR/FAR) that VSM's receiver-driven page marking makes
+    // moot; the engine keeps the CSM/legacy paths for the anchor scenes and as the
+    // `VSM=0` fallback seam (set `CSM=4 CSM_ATLAS=4096 CSM_NEAR=6 CSM_FAR=55` manually
+    // to reproduce the pre-VSM look). Same per-app-default seam as the SDF sign probe
+    // above: the engine default (and the gallery anchor) stays legacy, and an explicit
+    // env setting still wins.
+    if std::env::var_os("VSM").is_none() {
+        // SAFETY: single-threaded here — before logging, jobs, and engine bring-up
+        // spawn any thread.
+        unsafe { std::env::set_var("VSM", "1") };
     }
 
     // Logging first: generation and meshing below run *before* engine bring-up, and
