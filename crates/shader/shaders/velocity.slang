@@ -1,10 +1,13 @@
 // Per-pixel motion vectors (velocity G-buffer channel — pipeline re-baseline PR-2).
 //
-// Rasterizes the opaque scene into a single RG16Float velocity target that stores, per
+// Rasterizes the opaque scene into a single RGBA16Float velocity target that stores, per
 // pixel, the screen-space motion of that surface point between the PREVIOUS and CURRENT
-// frame: `motion = curr_ndc.xy - prev_ndc.xy` (in NDC, i.e. clip.xy / clip.w). Downstream
-// consumers (velocity-aware TAAU here; motion blur / reprojection later) read it to
-// reproject each pixel by its own motion instead of the camera-only reprojection.
+// frame: `motion = curr_ndc.xy - prev_ndc.xy` (in NDC, i.e. clip.xy / clip.w) in RG, and the
+// per-object DYNAMIC flag in B (1 = the object's own transform/pose moved — the reference
+// engine's "dynamic primitive rendered velocity here" signal, which this pass must tag
+// explicitly because it draws static geometry too). Downstream consumers (velocity-aware
+// TAAU + its dynamic anti-ghost; motion blur / reprojection later) read it to reproject each
+// pixel by its own motion instead of the camera-only reprojection.
 //
 // Two design invariants (both canonical, see docs/velocity-motion-vectors.md):
 //   • JITTER-EXCLUDED. The velocity must not carry the TAA sub-pixel camera jitter, or the
@@ -46,7 +49,7 @@ struct PushConstants
     // GPU skinning: joints / weights / palette (this frame) + joint_count. `vsMainSkinned`
     // reads them; the previous-frame palette lives in `skin_prev.x`.
     uint4 skin;           // x joints, y weights, z palette(curr), w joint_count
-    uint4 skin_prev;      // x palette(prev), yzw unused
+    uint4 skin_prev;      // x palette(prev), y dynamic-object flag (0/1), zw unused
     // GPU morph: deltas / weights(curr) + target_count + vertex_count; prev weights in
     // `morph_prev.x`. `vsMainMorphed` reads them.
     uint4 morph;          // x deltas, y weights(curr), z target_count, w vertex_count
@@ -179,9 +182,12 @@ VSOutput vsMainDeform(VSInput input, uint vid : SV_VertexID)
 }
 
 [shader("fragment")]
-float2 fsMain(VSOutput input) : SV_Target0
+float4 fsMain(VSOutput input) : SV_Target0
 {
-    return motion_ndc(input.cur_clip, input.prev_clip);
+    // RG = NDC motion; B = the dynamic-object flag (per-draw push, see PushConstants);
+    // A unused. The target clears to 0, so uncovered pixels read static / no motion.
+    return float4(motion_ndc(input.cur_clip, input.prev_clip),
+                  pc.skin_prev.y != 0u ? 1.0 : 0.0, 0.0);
 }
 
 // ---------------------------------------------------------------------------------------

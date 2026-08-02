@@ -1,8 +1,9 @@
 //! Velocity (motion-vector) G-buffer channel — pipeline re-baseline PR-2.
 //!
 //! Owns the opaque velocity pass: a separate geometry pass (opt-in `P_VELOCITY=1`) that
-//! rasterizes the scene into a single `Rg16Float` target holding, per pixel, the screen-space
-//! motion `cur_ndc.xy − prev_ndc.xy` of that surface between the previous and current frame.
+//! rasterizes the scene into a single [`VELOCITY_FMT`] target holding, per pixel, the
+//! screen-space motion `cur_ndc.xy − prev_ndc.xy` of that surface between the previous and
+//! current frame (RG) plus the dynamic-object flag (B — see [`VELOCITY_FMT`]).
 //! It is a standalone pass (not folded into `record_gbuffer`) so the 4-MRT G-buffer stays
 //! byte-identical when velocity is off — the whole feature is gated on this pass simply not
 //! being recorded (default off).
@@ -26,9 +27,22 @@ use rhi::{
 use crate::app::{load_compute_shader, load_shader_pair};
 use crate::{DEPTH_FORMAT, HDR_FORMAT, SceneObject};
 
-/// The velocity target format: RG16Float holds signed NDC motion with ample precision (the
-/// canonical motion-vector format).
-pub(crate) const VELOCITY_FMT: rhi::Format = rhi::Format::Rg16Float;
+/// The velocity target format: RG holds signed NDC motion with ample precision (the canonical
+/// motion-vector format); B carries the per-object DYNAMIC flag (1 = this pixel belongs to an
+/// object whose own transform/pose changed recently, 0 = static or camera-only motion). The
+/// flag is the engine's equivalent of the reference engine's "velocity was rendered here"
+/// signal (UE TemporalAA.usf `AA_DYNAMIC_ANTIGHOST`, where only dynamic primitives write
+/// velocity): our pass draws EVERYTHING (camera motion included), so object motion must be
+/// tagged explicitly. TAAU's dynamic anti-ghost keys on it to drop the stale history a mover
+/// leaves behind on the static background it just uncovered.
+pub(crate) const VELOCITY_FMT: rhi::Format = rhi::Format::Rgba16Float;
+
+/// Frames an object stays flagged dynamic after its transform stops changing. Without the
+/// hysteresis, the frame an object halts would read "current = static, history = dynamic" on
+/// the object itself and needlessly reject its (perfectly valid) history — one visible pop
+/// per stop. Three frames lets the stored history flags decay first (they are overwritten
+/// with the now-static flag each frame), so the anti-ghost only ever fires on the trail.
+pub(crate) const DYNAMIC_HYSTERESIS: u8 = 3;
 
 pub(crate) struct VelocitySystem {
     /// Static / Spin / node-animation motion pass.
@@ -178,6 +192,16 @@ impl VelocitySystem {
                     let prev = prev_scene.get(i).copied().unwrap_or_default();
                     let mvp = (view_proj * obj.transform).to_cols_array();
                     let prev_mvp = (prev_view_proj * prev.transform).to_cols_array();
+                    // Dynamic-object flag (velocity target B channel): the object's own
+                    // transform moved recently (game mover, node animation), or its pose
+                    // deforms every frame (skin / morph / vertex-cache — the UE
+                    // HasDeformableMesh policy: always dynamic).
+                    let dynamic = u32::from(
+                        prev.dynamic
+                            || obj.skin.is_some()
+                            || obj.morph.is_some()
+                            || obj.deform.is_some(),
+                    );
                     if obj.skin.is_some() {
                         cmd.bind_graphics_pipeline(&self.skinned_pipeline);
                     } else if obj.morph.is_some() {
@@ -193,7 +217,7 @@ impl VelocitySystem {
                         mvp,
                         prev_mvp,
                         obj.skin.unwrap_or([0; 4]),
-                        [prev.skin_palette, 0, 0, 0],
+                        [prev.skin_palette, dynamic, 0, 0],
                         obj.morph.unwrap_or([0; 4]),
                         [prev.morph_weights, 0, 0, 0],
                         [obj.deform.unwrap_or(0), 0, 0, 0],
@@ -261,6 +285,10 @@ pub(crate) struct PrevPose {
     pub(crate) skin_palette: u32,
     /// Previous-frame morph-weights bindless index (morphed drawables), else 0.
     pub(crate) morph_weights: u32,
+    /// This object's own transform changed within the last [`DYNAMIC_HYSTERESIS`] frames
+    /// (game mover / node animation). Drives the velocity target's dynamic-object flag; the
+    /// skin/morph/deform cases are OR-ed in at record time.
+    pub(crate) dynamic: bool,
 }
 
 impl Default for PrevPose {
@@ -269,6 +297,7 @@ impl Default for PrevPose {
             transform: Mat4::IDENTITY,
             skin_palette: 0,
             morph_weights: 0,
+            dynamic: false,
         }
     }
 }

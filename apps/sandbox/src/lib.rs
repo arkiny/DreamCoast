@@ -1515,8 +1515,11 @@ pub struct App {
     /// scene set mid-run — a grunt death or potion pickup shifts every later index, and an
     /// index-keyed lookup would hand each shifted drawable a *different object's* prev transform
     /// for a frame (a full-screen one-frame velocity glitch). A drawable with no entry (fresh
-    /// spawn / first frame) falls back to its current transform = zero object motion.
-    prev_transforms: std::collections::HashMap<dreamcoast_scene::Entity, Mat4>,
+    /// spawn / first frame) falls back to its current transform = zero object motion. The `u8`
+    /// is the dynamic-flag hysteresis countdown ([`velocity::DYNAMIC_HYSTERESIS`], reset on any
+    /// transform change): while non-zero the object stays tagged dynamic in the velocity
+    /// target's B channel, which is what TAAU's UE-style dynamic anti-ghost keys on.
+    prev_transforms: std::collections::HashMap<dreamcoast_scene::Entity, (Mat4, u8)>,
     // Profiler UI state.
     profiler_on: bool,
     slot_pass_names: Vec<Vec<&'static str>>,
@@ -4811,14 +4814,17 @@ impl App {
         let mut prev_scene: Vec<velocity::PrevPose> = if self.velocity_on {
             scene
                 .iter()
-                .map(|obj| velocity::PrevPose {
-                    transform: self
-                        .prev_transforms
-                        .get(&obj.entity)
-                        .copied()
-                        .unwrap_or(obj.transform),
-                    skin_palette: 0,
-                    morph_weights: 0,
+                .map(|obj| {
+                    let hist = self.prev_transforms.get(&obj.entity);
+                    velocity::PrevPose {
+                        transform: hist.map(|h| h.0).unwrap_or(obj.transform),
+                        skin_palette: 0,
+                        morph_weights: 0,
+                        // Dynamic = moved this frame, or within the hysteresis window (see
+                        // `DYNAMIC_HYSTERESIS`). A fresh spawn (no history) is dynamic too —
+                        // its pixels' history belongs to whatever it just covered.
+                        dynamic: hist.is_none_or(|h| h.0 != obj.transform || h.1 > 0),
+                    }
                 })
                 .collect()
         } else {
@@ -9354,11 +9360,21 @@ impl App {
         // Velocity (PR-2): stash this frame's per-object world transforms as next frame's prev
         // pose, keyed by ECS entity (single source; survives draw-list reshuffles from
         // spawn/despawn). Only when velocity is on (else no cost / no state churn). Skinned draws
-        // carry identity here and their motion comes from the palette history instead.
+        // carry identity here and their motion comes from the palette history instead. The
+        // countdown implements the dynamic-flag hysteresis: any transform change re-arms it, and
+        // it decays by one each still frame (see `velocity::DYNAMIC_HYSTERESIS`).
         if self.velocity_on {
-            self.prev_transforms.clear();
-            self.prev_transforms
-                .extend(scene.iter().map(|o| (o.entity, o.transform)));
+            let old = std::mem::take(&mut self.prev_transforms);
+            self.prev_transforms = scene
+                .iter()
+                .map(|o| {
+                    let countdown = match old.get(&o.entity) {
+                        Some((t, cd)) if *t == o.transform => cd.saturating_sub(1),
+                        _ => velocity::DYNAMIC_HYSTERESIS,
+                    };
+                    (o.entity, (o.transform, countdown))
+                })
+                .collect();
         }
 
         // Inline present + capture readback. Threaded: the RHI thread did both (its

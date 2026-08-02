@@ -12,8 +12,13 @@
 //     silhouettes fetch the foreground's history (kills edge ghosting on moving edges).
 //   • Luminance-weighted feedback (Lottes): bias toward more history where luma is stable
 //     (hides jitter) and toward the current sample where it changes fast (drops ghosts).
-// History: ping-pong full-res buffers — `hist` (rgb + length) and `pos` (world point + valid,
-// the disocclusion check). `reset` ignores history (first frame / resize).
+// History: ping-pong full-res buffers — `hist` (rgb + length) and `pos` (dynamic flag + valid;
+// see the dynamic anti-ghost below). `reset` ignores history (first frame / resize).
+//   • Dynamic anti-ghost (reference engine TemporalAA.usf AA_DYNAMIC_ANTIGHOST): each history
+//     texel remembers whether it was accumulated on a DYNAMIC object; history that was, fetched
+//     by a pixel that no dynamic object covers anymore, is the trail a mover left behind —
+//     rejected outright (provenance, not color, so the wide near-silhouette variance box can't
+//     save it). Active only when the velocity target is bound.
 
 #include "bindless.slang"
 
@@ -72,14 +77,33 @@ float3 clip_aabb(float3 amin, float3 amax, float3 q)
 }
 float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
+// ---- history dynamic flag --------------------------------------------------------------------
+// Alongside rgb+len, every history texel carries one bit: "this accumulation currently sits on
+// a DYNAMIC object" (the reference engine stores the same bit in its TAA history alpha —
+// TemporalAA.usf `OutputPayload.Color.a = Dynamic4 ? 1 : 0`). The unpacked layout keeps it in
+// the pos buffer's otherwise-dead `.x` (only `.w` was ever consumed); the packed layout folds
+// it into the length's fraction (+0.25 — lengths are integers 1..64, exactly representable in
+// fp16 with the fraction intact, and validity checks (`> 0.5`) are unaffected). Strip helpers:
+float packed_len_flag(float stored, out float dyn)
+{
+    float fr = frac(stored);
+    dyn = fr >= 0.125 ? 1.0 : 0.0;
+    return stored - 0.25 * dyn;
+}
+float packed_len_store(float len, float dyn)
+{
+    return len + (dyn > 0.05 ? 0.25 : 0.0);
+}
+
 // ---- fp16-packed history (packed_hist == 1) -------------------------------------------------
 // The history I/O dominates the pass at Retina-class output (hist 16B + pos 16B, ping-pong =
 // read+write ≈ 64B/px/frame). Two observations shrink it 4x with no algorithmic change:
-//   • The pos buffer's ONLY consumed field is `.w` (the "real prior surface" flag) — the world
-//     point itself is never read (the YCoCg clip replaced hard geometric disocclusion, see
-//     fetch_history_bilinear). A separate 16B/px validity buffer is pure waste: fold the flag
-//     into the history length (len == 0 = sky/no-surface, len >= 1 = valid — the accumulator
-//     never writes a fractional len below 1 for a real surface).
+//   • The pos buffer's consumed fields are `.w` (the "real prior surface" flag) and `.x` (the
+//     dynamic anti-ghost flag) — the world point it originally held is never read (the YCoCg
+//     clip replaced hard geometric disocclusion, see fetch_history_bilinear). A separate
+//     16B/px buffer for two flags is pure waste: fold both into the history length (len == 0 =
+//     sky/no-surface, len >= 1 = valid, fraction +0.25 = dynamic — the accumulator only ever
+//     writes integer lengths, exactly representable in fp16 up to the 64 cap).
 //   • The accumulated rgb comes from an RGBA16Float HDR chain, so an fp16 history holds the
 //     full input precision (the reference engine's TAA history is fp16 for the same reason).
 // Layout: uint2 per pixel = f16(r)|f16(g)<<16, f16(b)|f16(len)<<16. The unpacked path (and its
@@ -107,10 +131,12 @@ void hist_store_packed(uint buf, uint idx, float4 v)
 // test (stored world point) and dropped if it was a different surface; surviving taps are
 // re-normalized so a silhouette doesn't pull in background history. Returns rgb+len in `out_rgb` /
 // `out_len`, with `out_len <= 0` meaning "no usable history".
-void fetch_history_bilinear(float2 puv, float3 world_pos, out float3 out_rgb, out float out_len)
+void fetch_history_bilinear(float2 puv, float3 world_pos, out float3 out_rgb, out float out_len,
+                            out float out_dyn)
 {
     out_rgb = float3(0, 0, 0);
     out_len = 0.0;
+    out_dyn = 0.0;
     float2 res = float2(pc.out_width, pc.out_height);
     float2 sp = puv * res - 0.5; // texel-center convention so an exact reprojection is a no-op
     float2 base = floor(sp);
@@ -120,6 +146,7 @@ void fetch_history_bilinear(float2 puv, float3 world_pos, out float3 out_rgb, ou
 
     float3 rgb_sum = float3(0, 0, 0);
     float len_sum = 0.0;
+    float dyn_sum = 0.0;
     float wsum = 0.0;
     [unroll] for (int i = 0; i < 4; i++)
     {
@@ -132,15 +159,20 @@ void fetch_history_bilinear(float2 puv, float3 world_pos, out float3 out_rgb, ou
         // crawl), because under jitter those pixels flip sub-pixel coverage every frame and must
         // ACCUMULATE into an anti-aliased average rather than reset. The YCoCg neighborhood clip in
         // the caller is the anti-ghost for genuine (camera-motion) disocclusion — new content has a
-        // different colour and is clipped out (Karis 2014).
+        // different colour and is clipped out (Karis 2014); the DYNAMIC-object trail it cannot catch
+        // is handled by the dynamic anti-ghost in the caller (via `out_dyn`).
         if (pc.packed_hist != 0u)
         {
-            // Packed layout: validity is folded into the length (len >= 1 = real surface, 0 = sky).
+            // Packed layout: validity is folded into the length (len >= 1 = real surface, 0 = sky),
+            // the dynamic flag into the length's fraction.
             float4 ph = hist_load_packed(pc.hist_read, pidx);
             if (ph.a > 0.5)
             {
+                float dyn;
+                float plen = packed_len_flag(ph.a, dyn);
                 rgb_sum += w[i] * ph.rgb;
-                len_sum += w[i] * ph.a;
+                len_sum += w[i] * plen;
+                dyn_sum += w[i] * dyn;
                 wsum += w[i];
             }
         }
@@ -152,6 +184,7 @@ void fetch_history_bilinear(float2 puv, float3 world_pos, out float3 out_rgb, ou
                 float4 ph = asfloat(g.storage_buffers[pc.hist_read].Load4(pidx * 16u));
                 rgb_sum += w[i] * ph.rgb;
                 len_sum += w[i] * ph.a;
+                dyn_sum += w[i] * pp.x; // pos.x = the history dynamic flag
                 wsum += w[i];
             }
         }
@@ -164,6 +197,7 @@ void fetch_history_bilinear(float2 puv, float3 world_pos, out float3 out_rgb, ou
     {
         out_rgb = rgb_sum / wsum;
         out_len = len_sum / wsum;
+        out_dyn = dyn_sum / wsum;
     }
 }
 
@@ -201,10 +235,11 @@ float4 catmull_rom_weights(float f)
 // Load one history texel; returns false when the texel is out of bounds or holds no real prior
 // surface. Packed layout folds validity into the length; the unpacked layout keeps it in `pos.w`
 // (loaded as the single dword it is — the other three are never read).
-bool hist_tap(int2 p, out float3 rgb, out float len)
+bool hist_tap(int2 p, out float3 rgb, out float len, out float dyn)
 {
     rgb = float3(0, 0, 0);
     len = 0.0;
+    dyn = 0.0;
     if (p.x < 0 || p.y < 0 || p.x >= int(pc.out_width) || p.y >= int(pc.out_height))
         return false;
     uint pidx = uint(p.y) * pc.out_width + uint(p.x);
@@ -212,21 +247,25 @@ bool hist_tap(int2 p, out float3 rgb, out float len)
     {
         float4 ph = hist_load_packed(pc.hist_read, pidx);
         rgb = ph.rgb;
-        len = ph.a;
+        len = packed_len_flag(ph.a, dyn);
         return ph.a > 0.5;
     }
-    if (asfloat(g.storage_buffers[pc.pos_read].Load(pidx * 16u + 12u)) <= 0.5)
+    float4 pp = asfloat(g.storage_buffers[pc.pos_read].Load4(pidx * 16u));
+    if (pp.w <= 0.5)
         return false;
+    dyn = pp.x; // pos.x = the history dynamic flag
     float4 ph = asfloat(g.storage_buffers[pc.hist_read].Load4(pidx * 16u));
     rgb = ph.rgb;
     len = ph.a;
     return true;
 }
 
-void fetch_history_catmull_rom(float2 puv, out float3 out_rgb, out float out_len)
+void fetch_history_catmull_rom(float2 puv, out float3 out_rgb, out float out_len,
+                               out float out_dyn)
 {
     out_rgb = float3(0, 0, 0);
     out_len = 0.0;
+    out_dyn = 0.0;
     float2 res = float2(pc.out_width, pc.out_height);
     float2 sp = puv * res - 0.5; // same texel-center convention as the bilinear fetch
     float2 base = floor(sp);
@@ -240,6 +279,7 @@ void fetch_history_catmull_rom(float2 puv, out float3 out_rgb, out float out_len
     // The inner 2x2 (offsets 0,1 on both axes) doubles as the bilinear fallback + the length.
     float3 bil_rgb = float3(0, 0, 0);
     float len_sum = 0.0;
+    float dyn_sum = 0.0;
     float wsum = 0.0;
     float bilsum = 0.0;
     bool all_valid = true;
@@ -252,7 +292,8 @@ void fetch_history_catmull_rom(float2 puv, out float3 out_rgb, out float out_len
                 continue;
             float3 rgb;
             float len;
-            if (!hist_tap(int2(base) + int2(i - 1, j - 1), rgb, len))
+            float dyn;
+            if (!hist_tap(int2(base) + int2(i - 1, j - 1), rgb, len, dyn))
             {
                 all_valid = false;
                 continue;
@@ -268,6 +309,7 @@ void fetch_history_catmull_rom(float2 puv, out float3 out_rgb, out float out_len
                 float bw = (i == 1 ? 1.0 - f.x : f.x) * (j == 1 ? 1.0 - f.y : f.y);
                 bil_rgb += bw * rgb;
                 len_sum += bw * len;
+                dyn_sum += bw * dyn;
                 bilsum += bw;
             }
         }
@@ -275,6 +317,7 @@ void fetch_history_catmull_rom(float2 puv, out float3 out_rgb, out float out_len
     if (bilsum <= 1e-3)
         return; // no usable history in the footprint at all
     out_len = len_sum / bilsum;
+    out_dyn = dyn_sum / bilsum;
     out_rgb = all_valid && abs(wsum) > 1e-3 ? clamp(rgb_sum / wsum, lo, hi) : bil_rgb / bilsum;
 }
 
@@ -302,9 +345,19 @@ float3 reconstruct(float2 cuv, float depth, float sy)
 // on the stable grid: prev_uv = uv − motion. Mixing the two (reprojecting the jittered `cuv`) leaves
 // the sub-pixel jitter in the reprojection and destabilizes the history — sampling the motion at the
 // geometry while reprojecting the stable grid keeps both the motion accurate and the history aligned.
-bool velocity_reproject(float2 uv, float2 cuv, float sy, out float2 prev_uv)
+// `dyn_cur` / `dyn_center` report the velocity target's DYNAMIC-OBJECT flag (B channel):
+// `dyn_cur` = max over the 3×3 (the reference engine samples a 5-tap cross for the same
+// purpose — TemporalAA.usf AA_DYNAMIC_ANTIGHOST; the 3×3 is the loop this function already
+// runs, one texel more conservative), `dyn_center` = the center tap, which is what gets
+// STORED into this pixel's history flag (the reference engine's `Dynamic4`). Both are
+// written even when the function reprojects nothing (static pixel / early-out), because the
+// anti-ghost needs them on the camera-reprojection path too.
+bool velocity_reproject(float2 uv, float2 cuv, float sy, out float2 prev_uv,
+                        out float dyn_cur, out float dyn_center)
 {
     prev_uv = uv;
+    dyn_cur = 0.0;
+    dyn_center = 0.0;
     if (pc.velocity_index == 0xFFFFFFFFu)
         return false;
     float2 its = 1.0 / float2(pc.in_width, pc.in_height);
@@ -315,7 +368,11 @@ bool velocity_reproject(float2 uv, float2 cuv, float sy, out float2 prev_uv)
         for (int dx = -1; dx <= 1; dx++)
         {
             float2 suv = cuv + float2(dx, dy) * its;
-            float2 v = g.textures[pc.velocity_index].SampleLevel(g.samp, suv, 0.0).xy;
+            float3 s = g.textures[pc.velocity_index].SampleLevel(g.samp, suv, 0.0).xyz;
+            float2 v = s.xy;
+            dyn_cur = max(dyn_cur, s.z);
+            if (dx == 0 && dy == 0)
+                dyn_center = s.z;
             float l = dot(v, v);
             if (l > best_len)
             {
@@ -409,11 +466,18 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 
     float3 hist_rgb = float3(0, 0, 0);
     float hist_len = 0.0;
+    float hist_dyn = 0.0; // history's dynamic-object flag at the reprojected location
     // Where this pixel's surface sat last frame, on the stable output grid. `prev_uv == uv` when the
     // reprojection produced nothing usable (reset / off-screen), which reads as zero motion — inert,
     // because there is then no history for the motion policy to weigh anyway.
     float2 prev_uv = uv;
     bool cr = (pc.taau_flags & TAAU_FLAG_CATMULL_ROM) != 0u;
+    // Sampled unconditionally (cheap early-out when the velocity target is absent): the dynamic
+    // flags are needed by the anti-ghost below and by the history store even when the pixel takes
+    // the camera-reprojection path (its own motion may be zero while a mover sits nearby).
+    float2 vuv;
+    float dyn_cur, dyn_center;
+    bool vel_ok = velocity_reproject(uv, cuv, sy, vuv, dyn_cur, dyn_center);
     if (pc.reset == 0u)
     {
         // When the PR-2 motion-vector target is bound, prefer per-pixel velocity reprojection
@@ -421,16 +485,15 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         // camera-only world-space reprojection block VERBATIM so its codegen — and therefore the
         // accumulated history — is bit-identical to the pre-PR-2 pipeline (content-scene byte
         // parity; the velocity path is a strict opt-in addition, never a rewrite of the default).
-        float2 vuv;
-        if (pc.velocity_index != 0xFFFFFFFFu && velocity_reproject(uv, cuv, sy, vuv))
+        if (pc.velocity_index != 0xFFFFFFFFu && vel_ok)
         {
             if (all(vuv >= 0.0) && all(vuv <= 1.0))
             {
                 prev_uv = vuv;
                 if (cr)
-                    fetch_history_catmull_rom(vuv, hist_rgb, hist_len);
+                    fetch_history_catmull_rom(vuv, hist_rgb, hist_len, hist_dyn);
                 else
-                    fetch_history_bilinear(vuv, world_pos, hist_rgb, hist_len);
+                    fetch_history_bilinear(vuv, world_pos, hist_rgb, hist_len, hist_dyn);
             }
         }
         else
@@ -446,13 +509,28 @@ void csMain(uint3 tid: SV_DispatchThreadID)
                     // fetch_history_catmull_rom.
                     prev_uv = puv;
                     if (cr)
-                        fetch_history_catmull_rom(puv, hist_rgb, hist_len);
+                        fetch_history_catmull_rom(puv, hist_rgb, hist_len, hist_dyn);
                     else
-                        fetch_history_bilinear(puv, world_pos, hist_rgb, hist_len);
+                        fetch_history_bilinear(puv, world_pos, hist_rgb, hist_len, hist_dyn);
                 }
             }
         }
     }
+
+    // DYNAMIC ANTI-GHOST (the reference engine's TemporalAA.usf AA_DYNAMIC_ANTIGHOST, verbatim
+    // logic): if NO dynamic object covers this pixel's neighborhood NOW, but the reprojected
+    // history was accumulated ON a dynamic object, that history is the trail a mover left on the
+    // background it just uncovered — `IgnoreHistory`. This is the ghost the YCoCg clip cannot
+    // catch: next to a high-contrast mover silhouette the variance box is wide (and the content
+    // tiers widen it further via `clamp_expand`), so the mover-colored history passes the clip
+    // and smears for many frames. Rejecting on provenance instead of color is exact: the trail
+    // resets to the current frame in ONE frame and re-accumulates. The mover itself keeps its
+    // history (`dyn_cur` suppresses the reject on and around it — the reference engine's
+    // `!Dynamic` term), and a mover that stops decays its flags via the CPU-side hysteresis
+    // before its own history reads "static over dynamic history" (no pop). Velocity-absent
+    // (the default path) and static scenes never set a flag — byte-identical.
+    if (pc.velocity_index != 0xFFFFFFFFu && dyn_cur < 0.05 && hist_dyn > 0.05)
+        hist_len = 0.0;
 
     // Velocity gate (`jitter.z` = ramp in output px; 0 = OFF, which is the shipping default —
     // see the measured negative result on the history cap below). This pixel's screen motion in
@@ -531,15 +609,23 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     }
 
     accum = make_finite(accum);
+    // Store this pixel's dynamic flag with the accumulation (the reference engine's
+    // `OutputPayload.Color.a = Dynamic4` — the CENTER velocity tap, not the dilated max, so
+    // the flag marks actual mover coverage, not its neighborhood). `dyn_center` is 0 whenever
+    // the velocity target is absent, so the default path stores exactly what it always did.
     if (pc.packed_hist != 0u)
     {
-        // len >= 1 for every real surface, so the validity flag rides in the length.
-        hist_store_packed(pc.hist_write, idx, float4(accum, len));
+        // len >= 1 for every real surface, so the validity flag rides in the length (and the
+        // dynamic flag in its fraction — see packed_len_store).
+        hist_store_packed(pc.hist_write, idx, float4(accum, packed_len_store(len, dyn_center)));
     }
     else
     {
         g.storage_buffers[pc.hist_write].Store4(idx * 16u, asuint(float4(accum, len)));
-        g.storage_buffers[pc.pos_write].Store4(idx * 16u, asuint(float4(world_pos, 1.0)));
+        // pos = (dynamic flag, 0, 0, valid). The world point this buffer once held was never
+        // consumed (only .w — see fetch_history_bilinear), so .x now carries the flag.
+        g.storage_buffers[pc.pos_write].Store4(idx * 16u,
+                                               asuint(float4(dyn_center, 0.0, 0.0, 1.0)));
     }
     // Output the accumulated result: for disoccluded / no-history pixels this is `cur` (the current
     // frame), so newly-revealed regions show the live frame instead of empty (black) history.
