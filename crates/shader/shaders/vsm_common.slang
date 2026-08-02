@@ -42,18 +42,55 @@
 //   [0..VSM_LEVELS)   float4x4 world_to_clip[i]   (flip-free ortho, row-major mul(M,v))
 //   then per level     float4  params[i]: x = texel size (world m), y = 1/depth-range (unused
 //                      V1 spare), zw = spare
-//   then               uint4   misc: x = level count, y = pool pages, z/w = spare
+//   then               uint4   misc: x = level count, y = pool pages, z = frame number,
+//                              w = max page age in frames (cache eviction)
 //   then               float4  origin: xyz = clipmap origin (camera focus), w spare
+//   then per level     int4    scroll: xy = page offset this frame (prev -> current page
+//                              space), z = flags (bit 0 = invalidate the whole level),
+//                              w = spare
 // All offsets in BYTES for ByteAddressBuffer loads.
 #define VSM_CONST_MATS_OFF 0u
 #define VSM_CONST_PARAMS_OFF (VSM_LEVELS * 64u)
 #define VSM_CONST_MISC_OFF (VSM_CONST_PARAMS_OFF + VSM_LEVELS * 16u)
 #define VSM_CONST_ORIGIN_OFF (VSM_CONST_MISC_OFF + 16u)
-#define VSM_CONST_SIZE (VSM_CONST_ORIGIN_OFF + 16u)
+#define VSM_CONST_SCROLL_OFF (VSM_CONST_ORIGIN_OFF + 16u)
+#define VSM_CONST_SIZE (VSM_CONST_SCROLL_OFF + VSM_LEVELS * 16u)
+#define VSM_LEVEL_INVALIDATE 1u
 
 float3 vsm_load_origin(RWByteAddressBuffer consts)
 {
     return asfloat(consts.Load3(VSM_CONST_ORIGIN_OFF));
+}
+
+uint2 vsm_load_misc_zw(RWByteAddressBuffer consts)
+{
+    return consts.Load2(VSM_CONST_MISC_OFF + 8u);
+}
+
+int3 vsm_load_scroll(RWByteAddressBuffer consts, uint level)
+{
+    uint o = VSM_CONST_SCROLL_OFF + level * 16u;
+    return int3(asint(consts.Load(o)), asint(consts.Load(o + 4u)), asint(consts.Load(o + 8u)));
+}
+
+// Physical-page metadata (V2 cache): 16 bytes per pool page.
+//   [0] packed virtual address: level << 28 | page.y << 14 | page.x, valid bit 31... the
+//       VALID flag lives in [8] so the address stays trivially unpackable.
+//   [4] frame the page was last REQUESTED (age-out clock)
+//   [8] flags: 1 = valid
+//   [12] spare
+#define VSM_META_STRIDE 16u
+#define VSM_META_VALID 1u
+
+uint vsm_meta_pack_addr(uint level, uint2 page)
+{
+    return (level << 28u) | (page.y << 14u) | page.x;
+}
+
+void vsm_meta_unpack_addr(uint packed, out uint level, out uint2 page)
+{
+    level = packed >> 28u;
+    page = uint2(packed & 0x3fffu, (packed >> 14u) & 0x3fffu);
 }
 
 float4x4 vsm_load_world_to_clip(RWByteAddressBuffer consts, uint level)

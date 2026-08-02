@@ -1,26 +1,23 @@
-//! Virtual shadow maps — V1 static core (docs/vsm-shadows-plan.md; UE mechanism notes in
-//! docs/research/vsm_*.txt).
+//! Virtual shadow maps — V2: persistent page cache + clipmap scrolling on the V1 static
+//! core (docs/vsm-shadows-plan.md; UE mechanism notes in docs/research/vsm_*.txt).
 //!
 //! One directional sun = [`VSM_LEVELS`] clipmap levels; level i is an 8k²-virtual ortho
 //! map (64×64 pages × 128² texels) covering radius `2^(i+2)` m around the camera focus,
-//! each level's center snapped to its own page grid (V2's cache scrolling needs snap
-//! stability, so V1 snaps from day one). Per frame:
+//! each level's center snapped to its own page grid. Physical pages PERSIST across
+//! frames: the page table is rebuilt each frame from per-page metadata with the host's
+//! per-level scroll offset applied, so camera motion slides cached pages instead of
+//! invalidating them; only new / invalidated pages carry `VSM_PTE_RENDER`, and the depth
+//! raster's fragment stage writes nowhere else — a static scene's steady state
+//! re-renders ZERO shadow texels (`stats().0 == 0`).
 //!
-//!   vsm_pages (compute):  clear table/requests → mark needed pages from the G-buffer
-//!                         world-position → allocate physical pages (linear counter).
-//!   vsm_raster (graph compute-kind pass, manual attachment-less raster): every caster,
-//!                         once per level, over the full 8k viewport; the fragment stage
-//!                         translates virtual→physical through the page table and
-//!                         `InterlockedMin`s ortho depth into the pool buffer.
-//!   lighting:             `pbr.slang` `vsm_sun_shadow` — level select mirrors marking,
-//!                         3×3 receiver-plane PCF with per-tap page translation.
+//! Depth stability across scrolling: each level's view is built at an along-sun Z pinned
+//! when the level (re)based — XY snaps in whole pages keep clip XY consistent, the
+//! pinned Z keeps stored depths comparable (UE's ViewCenterZ pinning). The pin rebases —
+//! invalidating the level — only when the focus drifts a full pushback past it, and a
+//! sun-direction change invalidates every level (the UE light cache key).
 //!
-//! Everything lives in bindless storage buffers (no image atomics — the Metal risk in
-//! the plan §4 reduces to plain buffer atomics). V1 has NO caching: the table is rebuilt
-//! and every requested page re-renders each frame; the physical-page assignment order is
-//! GPU-scheduling dependent, but content follows the virtual page wherever it lands, so
-//! images stay deterministic and DX≡VK. Opt-in via `VSM=1` (`App::new`); the legacy /
-//! CSM paths are untouched when off.
+//! Everything lives in bindless storage buffers (no image atomics — the plan §4 Metal
+//! risk reduces to buffer atomics). Opt-in via `VSM=1`; legacy/CSM untouched when off.
 
 use dreamcoast_core::glam::{Mat4, Vec3};
 use dreamcoast_render::{ComputePassInfo, RenderGraph, ResourceId};
@@ -45,25 +42,46 @@ const VSM_PAGES_PER_LEVEL: u32 = VSM_TABLE_DIM * VSM_TABLE_DIM;
 /// Physical pool capacity (`VSM_POOL_PAGES` in the shader): 512 × 128² × 4 B = 32 MiB.
 /// The overflow counter (`stats().1`) is the loud signal to grow it.
 const VSM_POOL_PAGES: u32 = 512;
-/// Per-frame constants blob: 6 mat4 + 6 float4 params + uint4 misc + float4 origin.
-const VSM_CONST_SIZE: usize = VSM_LEVELS * 64 + VSM_LEVELS * 16 + 16 + 16;
+/// Cached pages unreferenced for this many frames are recycled (UE ages at 1000; the
+/// dungeon's working set is small, so a tighter clock keeps the free list warm).
+const VSM_MAX_PAGE_AGE: u32 = 120;
+/// Per-frame constants blob: 6 mat4 + 6 float4 params + uint4 misc + float4 origin +
+/// 6 int4 scroll entries. Mirrors the `VSM_CONST_*` offsets in vsm_common.slang.
+const VSM_CONST_SIZE: usize = VSM_LEVELS * 64 + VSM_LEVELS * 16 + 16 + 16 + VSM_LEVELS * 16;
+
+/// Per-level CPU cache key: where the level's snapped origin sits in its own page space,
+/// and the along-sun component its depth basis is pinned to.
+#[derive(Clone, Copy, Default)]
+struct LevelState {
+    page_loc: [i64; 2],
+    pinned_along: f32,
+    valid: bool,
+}
 
 pub(crate) struct VsmSystem {
     clear_pipeline: ComputePipeline,
     mark_pipeline: ComputePipeline,
+    update_pipeline: ComputePipeline,
     alloc_pipeline: ComputePipeline,
     depth_pipeline: GraphicsPipeline,
     depth_skinned_pipeline: GraphicsPipeline,
     depth_morphed_pipeline: GraphicsPipeline,
-    /// Per-frame-in-flight host-written constants (level matrices / params / origin).
+    /// Per-frame-in-flight host-written constants (level matrices / params / scroll).
     consts: Vec<StorageBuffer>,
     table: StorageBuffer,
     request: StorageBuffer,
     pool: StorageBuffer,
-    /// [0] = next free physical page, [1] = overflow count. Host-visible for stats.
+    /// [0] rendered pages (stat), [4] overflow (stat), [12] virgin high-water (persists).
     counter: StorageBuffer,
+    /// Physical-page metadata (virtual address / last-request frame / valid).
+    meta: StorageBuffer,
+    /// Recycled physical pages: [0] count, then indices.
+    freelist: StorageBuffer,
     /// This frame's flip-free level world→clip matrices (raster push consumption).
     level_mats: [Mat4; VSM_LEVELS],
+    levels: [LevelState; VSM_LEVELS],
+    sun_key: [u32; 3],
+    frame_no: u32,
 }
 
 impl VsmSystem {
@@ -86,7 +104,7 @@ impl VsmSystem {
             Ok(device.create_compute_pipeline(&ComputePipelineDesc {
                 compute_bytes: cs,
                 compute_entry: entry,
-                push_constant_size: 32,
+                push_constant_size: 48,
                 bindless: true,
                 uniform_buffer: false,
                 threads_per_group: threads,
@@ -105,6 +123,13 @@ impl VsmSystem {
             dreamcoast_shader::vsm_mark_cs_metallib,
             "csMark",
             [8, 8, 1],
+        )?;
+        let update_pipeline = compute(
+            dreamcoast_shader::vsm_update_cs_spirv,
+            dreamcoast_shader::vsm_update_cs_dxil,
+            dreamcoast_shader::vsm_update_cs_metallib,
+            "csUpdate",
+            [64, 1, 1],
         )?;
         let alloc_pipeline = compute(
             dreamcoast_shader::vsm_alloc_cs_spirv,
@@ -171,23 +196,36 @@ impl VsmSystem {
         )?;
 
         let entries = (VSM_LEVELS as u32 * VSM_PAGES_PER_LEVEL) as u64;
-        let table = device.create_storage_buffer(&StorageBufferDesc {
-            size: entries * 4,
-            stride: 4,
-            indirect: false,
-        })?;
-        let request = device.create_storage_buffer(&StorageBufferDesc {
-            size: entries * 4,
-            stride: 4,
-            indirect: false,
-        })?;
-        let pool = device.create_storage_buffer(&StorageBufferDesc {
-            size: (VSM_POOL_PAGES * VSM_PAGE_SIZE * VSM_PAGE_SIZE) as u64 * 4,
-            stride: 4,
-            indirect: false,
-        })?;
-        // Host-visible so `stats()` can read the allocation/overflow counters (the HZB
-        // cull-stats pattern: GPU atomics on a host-coherent buffer).
+        let storage = |size: u64| -> anyhow::Result<StorageBuffer> {
+            Ok(device.create_storage_buffer(&StorageBufferDesc {
+                size,
+                stride: 4,
+                indirect: false,
+            })?)
+        };
+        let table = storage(entries * 4)?;
+        let request = storage(entries * 4)?;
+        let pool = storage((VSM_POOL_PAGES * VSM_PAGE_SIZE * VSM_PAGE_SIZE) as u64 * 4)?;
+        // Meta + freelist are the PERSISTENT cache state and must start ZEROED (no valid
+        // pages, empty free list) — a device-local buffer's initial contents are
+        // undefined, and garbage VALID flags / a garbage free-list count hand out
+        // colliding physical pages (the V2 bring-up bug: patchy missing shadows as the
+        // clipmap scrolled onto freshly allocated pages).
+        let zeroed = |size: usize| -> anyhow::Result<StorageBuffer> {
+            Ok(device.create_storage_buffer_init(
+                &StorageBufferDesc {
+                    size: size as u64,
+                    stride: 4,
+                    indirect: false,
+                },
+                &vec![0u8; size],
+            )?)
+        };
+        let meta = zeroed(VSM_POOL_PAGES as usize * 16)?;
+        let freelist = zeroed(4 + VSM_POOL_PAGES as usize * 4)?;
+        // Host-visible so `stats()` can read the counters (the HZB cull-stats pattern:
+        // GPU atomics on a host-coherent buffer). [12] = virgin high-water, PERSISTS —
+        // it and the free list are the cache's allocator state.
         let counter = device.create_storage_buffer_host(&StorageBufferDesc {
             size: 16,
             stride: 4,
@@ -209,6 +247,7 @@ impl VsmSystem {
         Ok(Some(Self {
             clear_pipeline,
             mark_pipeline,
+            update_pipeline,
             alloc_pipeline,
             depth_pipeline,
             depth_skinned_pipeline,
@@ -218,7 +257,12 @@ impl VsmSystem {
             request,
             pool,
             counter,
+            meta,
+            freelist,
             level_mats: [Mat4::IDENTITY; VSM_LEVELS],
+            levels: [LevelState::default(); VSM_LEVELS],
+            sun_key: [0; 3],
+            frame_no: 0,
         }))
     }
 
@@ -227,7 +271,8 @@ impl VsmSystem {
         (1u32 << (i + 2)) as f32
     }
 
-    /// Rebuild this frame's level matrices around `focus` and host-write the constants.
+    /// Rebuild this frame's level matrices around `focus`, compute each level's page
+    /// scroll (or invalidation) against the cached state, and host-write the constants.
     /// Returns the (consts, table, pool) bindless storage indices for the lighting push.
     pub(crate) fn update(
         &mut self,
@@ -235,6 +280,7 @@ impl VsmSystem {
         sun_dir: [f32; 3],
         focus: Vec3,
     ) -> anyhow::Result<(u32, u32, u32)> {
+        self.frame_no = self.frame_no.wrapping_add(1);
         // Light basis — identical up-vector guard to `light_view_proj` / the CSM fit.
         let dir = Vec3::new(sun_dir[0], sun_dir[1], sun_dir[2]).normalize_or_zero();
         let dir = if dir == Vec3::ZERO { Vec3::Y } else { dir };
@@ -245,23 +291,74 @@ impl VsmSystem {
         };
         let right = up.cross(dir).normalize();
         let lup = dir.cross(right).normalize();
+        // A sun-direction change invalidates every level: cached depths were built in the
+        // old light basis (the UE per-light cache key).
+        let sun_key = [
+            sun_dir[0].to_bits(),
+            sun_dir[1].to_bits(),
+            sun_dir[2].to_bits(),
+        ];
+        let sun_moved = sun_key != self.sun_key;
+        self.sun_key = sun_key;
 
         let mut bytes = vec![0u8; VSM_CONST_SIZE];
-        let mut put = |off: usize, v: f32| {
+        fn put(bytes: &mut [u8], off: usize, v: f32) {
             bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
-        };
+        }
+        fn put_u(bytes: &mut [u8], off: usize, v: u32) {
+            bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        fn put_i(bytes: &mut [u8], off: usize, v: i32) {
+            bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+
+        let scroll_base = VSM_LEVELS * 64 + VSM_LEVELS * 16 + 16 + 16;
         for i in 0..VSM_LEVELS {
             let radius = Self::level_radius(i);
             let half = radius * 2.0; // ortho spans ±2R: casters around the receiver ring
-            // Snap the center to this level's page grid in light-plane XY so a moving
-            // camera slides the virtual address space in whole pages (V2 cache scrolling
-            // scrolls these; V1 just keeps texel assignments stable frame-to-frame).
             let page_world = (half * 2.0) / VSM_TABLE_DIM as f32;
+            // The level's location in its own page space (whole pages; i64 so a far-off
+            // world position cannot wrap the arithmetic).
             let lx = focus.dot(right);
             let ly = focus.dot(lup);
-            let center = focus
-                - right * (lx - (lx / page_world).round() * page_world)
-                - lup * (ly - (ly / page_world).round() * page_world);
+            let page_loc = [
+                (lx / page_world).round() as i64,
+                (ly / page_world).round() as i64,
+            ];
+            let along = focus.dot(dir);
+
+            let st = &mut self.levels[i];
+            let mut invalidate = sun_moved || !st.valid;
+            let mut scroll = [0i32, 0i32];
+            if !invalidate {
+                if (along - st.pinned_along).abs() > half {
+                    // Depth-pin guardband: the focus drifted a full pushback past the
+                    // basis this level's depths were built in — rebase and re-render.
+                    invalidate = true;
+                } else {
+                    let dx = page_loc[0] - st.page_loc[0];
+                    let dy = page_loc[1] - st.page_loc[1];
+                    if dx.unsigned_abs() >= VSM_TABLE_DIM as u64
+                        || dy.unsigned_abs() >= VSM_TABLE_DIM as u64
+                    {
+                        invalidate = true; // scrolled the whole table away
+                    } else {
+                        scroll = [dx as i32, dy as i32];
+                    }
+                }
+            }
+            if invalidate {
+                st.pinned_along = along;
+                st.valid = true;
+            }
+            st.page_loc = page_loc;
+
+            // Snapped level center: page-grid XY + the PINNED along-sun component, so
+            // scroll-only frames change the matrix by whole-page XY translation only and
+            // cached depths stay bit-comparable.
+            let center = right * (page_loc[0] as f32 * page_world)
+                + lup * (page_loc[1] as f32 * page_world)
+                + dir * st.pinned_along;
             let eye = center + dir * (half * 2.0);
             let view = Mat4::look_at_rh(eye, center, up);
             // Flip-free ortho on EVERY backend (vsm_common.slang orientation contract —
@@ -270,17 +367,27 @@ impl VsmSystem {
             let m = proj * view;
             self.level_mats[i] = m;
             for (j, f) in m.to_cols_array().iter().enumerate() {
-                put(i * 64 + j * 4, *f);
+                put(&mut bytes, i * 64 + j * 4, *f);
             }
             let params_off = VSM_LEVELS * 64 + i * 16;
-            put(params_off, (half * 2.0) / VSM_VIRTUAL_SIZE as f32); // texel size, metres
+            put(
+                &mut bytes,
+                params_off,
+                (half * 2.0) / VSM_VIRTUAL_SIZE as f32,
+            );
+            let so = scroll_base + i * 16;
+            put_i(&mut bytes, so, scroll[0]);
+            put_i(&mut bytes, so + 4, scroll[1]);
+            put_u(&mut bytes, so + 8, u32::from(invalidate));
         }
         let misc_off = VSM_LEVELS * 64 + VSM_LEVELS * 16;
-        bytes[misc_off..misc_off + 4].copy_from_slice(&(VSM_LEVELS as u32).to_le_bytes());
-        bytes[misc_off + 4..misc_off + 8].copy_from_slice(&VSM_POOL_PAGES.to_le_bytes());
+        put_u(&mut bytes, misc_off, VSM_LEVELS as u32);
+        put_u(&mut bytes, misc_off + 4, VSM_POOL_PAGES);
+        put_u(&mut bytes, misc_off + 8, self.frame_no);
+        put_u(&mut bytes, misc_off + 12, VSM_MAX_PAGE_AGE);
         let origin_off = misc_off + 16;
         for (j, f) in [focus.x, focus.y, focus.z, 0.0].iter().enumerate() {
-            bytes[origin_off + j * 4..origin_off + j * 4 + 4].copy_from_slice(&f.to_le_bytes());
+            put(&mut bytes, origin_off + j * 4, *f);
         }
         self.consts[fif].write(&bytes)?;
         Ok((
@@ -299,7 +406,8 @@ impl VsmSystem {
         )
     }
 
-    /// Page management: clear → mark (from the G-buffer world position) → allocate.
+    /// Page management: clear → mark (G-buffer world position) → update (scroll/keep/free
+    /// the persistent pages) → allocate (new pages from the free list, then virgin).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_pages<'a>(
         &'a self,
@@ -315,8 +423,11 @@ impl VsmSystem {
         let request = &self.request;
         let pool = &self.pool;
         let counter = &self.counter;
+        let meta = &self.meta;
+        let freelist = &self.freelist;
         let clear = &self.clear_pipeline;
         let mark = &self.mark_pipeline;
+        let update = &self.update_pipeline;
         let alloc = &self.alloc_pipeline;
         graph.add_compute_pass(
             ComputePassInfo {
@@ -332,6 +443,8 @@ impl VsmSystem {
                     request.storage_index(),
                     pool.storage_index(),
                     counter.storage_index(),
+                    meta.storage_index(),
+                    freelist.storage_index(),
                     position_index,
                     screen.0,
                     screen.1,
@@ -348,6 +461,12 @@ impl VsmSystem {
                 cmd.push_constants_compute(&push);
                 cmd.dispatch(screen.0.div_ceil(8), screen.1.div_ceil(8), 1);
                 cmd.storage_buffer_barrier(request);
+                cmd.bind_compute_pipeline(update);
+                cmd.push_constants_compute(&push);
+                cmd.dispatch(VSM_POOL_PAGES.div_ceil(64), 1, 1);
+                cmd.storage_buffer_barrier(table);
+                cmd.storage_buffer_barrier(meta);
+                cmd.storage_buffer_barrier(freelist);
                 cmd.bind_compute_pipeline(alloc);
                 cmd.push_constants_compute(&push);
                 cmd.dispatch(entries.div_ceil(64), 1, 1);
@@ -360,9 +479,10 @@ impl VsmSystem {
 
     /// Caster rasterization: every shadow caster, once per level, attachment-less over
     /// the full virtual grid (a compute-kind graph pass so the graph doesn't try to bind
-    /// attachments; rendering begins/ends manually inside). V1 draws the whole caster set
-    /// into every level — per-level culling is a V1.5 lever once caching (V2) decides how
-    /// much raster survives at steady state.
+    /// attachments; rendering begins/ends manually inside). The PS only writes pages
+    /// flagged RENDER, so with the V2 cache a static steady state costs raster/VS work
+    /// but zero pool writes. Per-level caster culling is the V1.5 lever if that VS work
+    /// shows up in profiles.
     pub(crate) fn record_raster<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
@@ -373,7 +493,6 @@ impl VsmSystem {
     ) {
         let table = &self.table;
         let pool = &self.pool;
-        let counter = &self.counter;
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "vsm_raster",
@@ -403,7 +522,6 @@ impl VsmSystem {
                             level as u32,
                             table.storage_index(),
                             pool.storage_index(),
-                            counter.storage_index(),
                             obj.skin.unwrap_or([0; 4]),
                             obj.morph.unwrap_or([0; 4]),
                         ));
@@ -422,16 +540,13 @@ impl VsmSystem {
         );
     }
 
-    /// (allocated pages, overflowed requests) from the last completed frame — the pool
-    /// sizing diagnostic (`DIAG` log consumer in `lib.rs`).
+    /// (pages rendered last frame, overflowed requests) — the cache-effectiveness and
+    /// pool-sizing diagnostics (`lib.rs` logs them at shutdown).
     pub(crate) fn stats(&self) -> (u32, u32) {
-        let mut b = [0u8; 16];
+        let mut b = [0u8; 8];
         if self.counter.read_into(&mut b).is_err() {
             return (0, 0);
         }
-        let frag = u32::from_le_bytes(b[8..12].try_into().unwrap());
-        let mapped = u32::from_le_bytes(b[12..16].try_into().unwrap());
-        tracing::info!("VSM raster probe: {frag} fragments, {mapped} on mapped pages"); // TEMP
         (
             u32::from_le_bytes(b[0..4].try_into().unwrap()),
             u32::from_le_bytes(b[4..8].try_into().unwrap()),
@@ -439,7 +554,7 @@ impl VsmSystem {
     }
 }
 
-/// Pack the vsm_pages push block (32 bytes; mirrors `PushConstants` in vsm_pages.slang).
+/// Pack the vsm_pages push block (48 bytes; mirrors `PushConstants` in vsm_pages.slang).
 #[allow(clippy::too_many_arguments)]
 fn vsm_pages_push(
     consts_buf: u32,
@@ -447,17 +562,21 @@ fn vsm_pages_push(
     request_buf: u32,
     pool_buf: u32,
     counter_buf: u32,
+    meta_buf: u32,
+    freelist_buf: u32,
     position_index: u32,
     screen_w: u32,
     screen_h: u32,
-) -> [u8; 32] {
-    let mut pc = [0u8; 32];
+) -> [u8; 48] {
+    let mut pc = [0u8; 48];
     for (i, v) in [
         consts_buf,
         table_buf,
         request_buf,
         pool_buf,
         counter_buf,
+        meta_buf,
+        freelist_buf,
         position_index,
         screen_w,
         screen_h,
@@ -480,7 +599,6 @@ fn vsm_depth_push(
     level: u32,
     table_buf: u32,
     pool_buf: u32,
-    counter_buf: u32,
     skin: [u32; 4],
     morph: [u32; 4],
 ) -> [u8; 128] {
@@ -494,8 +612,7 @@ fn vsm_depth_push(
     pc[76..80].copy_from_slice(&level.to_le_bytes());
     pc[80..84].copy_from_slice(&table_buf.to_le_bytes());
     pc[84..88].copy_from_slice(&pool_buf.to_le_bytes());
-    pc[88..92].copy_from_slice(&counter_buf.to_le_bytes()); // TEMP PROBE
-    // pc[92..96] = _pad
+    // pc[88..96] = spare (kept so the shader layout is stable)
     for (i, v) in skin.iter().enumerate() {
         let o = 96 + i * 4;
         pc[o..o + 4].copy_from_slice(&v.to_le_bytes());

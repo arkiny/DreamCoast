@@ -36,10 +36,9 @@ struct PushConstants
     float alpha_cutoff;  // |cutoff| alpha-test threshold (0 = opaque), sign ignored here
     uint flip_y;         // 1 = Vulkan (VS negates clip.y)
     uint level;          // clipmap level being rasterized
-    uint table_buf;      // page table storage index
-    uint pool_buf;       // physical pool storage index
-    uint counter_buf;    // TEMP PROBE: [2] += fragments, [3] += mapped-page fragments
-    uint _pad;
+    uint table_buf; // page table storage index
+    uint pool_buf;  // physical pool storage index
+    uint2 _pad;
     uint4 skin;  // vsMainSkinned only: joints / weights / palette / count
     uint4 morph; // vsMainMorphed only: deltas / weights / target_count / vertex_count
 };
