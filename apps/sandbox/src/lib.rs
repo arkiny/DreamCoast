@@ -82,6 +82,7 @@ mod deferred;
 mod deform;
 mod fuse;
 mod gdf;
+mod gdf_global;
 mod gi;
 mod gtao;
 pub mod hooks;
