@@ -1404,6 +1404,13 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gi_volume_cs",
     },
+    // F4B toroidal recenter: integer texel shift of the fine half (via scratch).
+    Job {
+        src: "gi_shift.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gi_shift_cs",
+    },
     // Screen-space radiance probes: per-tile probe trace into the octahedral atlas (P1).
     Job {
         src: "screen_probe_trace.slang",

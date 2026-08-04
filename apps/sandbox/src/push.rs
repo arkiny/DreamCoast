@@ -2618,3 +2618,29 @@ pub(crate) fn mat4_to_3x4(m: Mat4) -> [f32; 12] {
         c[2], c[6], c[10], c[14], // row 2
     ]
 }
+
+/// Pack the F4B fine-level shift push (48 bytes): (src base, dst base, volume count,
+/// src fine-row offset) + (shift xyz, dst fine-row offset) + dims. See gi_shift.slang.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gi_shift_push(
+    src_base: u32,
+    dst_base: u32,
+    count: u32,
+    src_y0: u32,
+    shift: [i32; 3],
+    dst_y0: u32,
+    dims: [u32; 3],
+) -> [u8; 48] {
+    let mut pc = [0u8; 48];
+    for (i, v) in [src_base, dst_base, count, src_y0].iter().enumerate() {
+        pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in shift.iter().enumerate() {
+        pc[16 + i * 4..20 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc[28..32].copy_from_slice(&(dst_y0 as i32).to_le_bytes());
+    for (i, v) in dims.iter().enumerate() {
+        pc[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc
+}

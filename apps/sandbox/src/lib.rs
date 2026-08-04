@@ -6433,6 +6433,10 @@ impl App {
             0
         };
 
+        // F4B toroidal recenter: consume an armed fine-box move BEFORE any pass borrows
+        // land in the graph — the box ring flips here, the content shift is recorded at the
+        // gi_volume site below, and both execute in this frame's timeline.
+        self.gi.gi_fine_shift_apply()?;
         let mut graph = RenderGraph::new();
         // The backbuffer is the actual swapchain image (display extent); tonemap samples the
         // render-extent HDR by UV, so a render≠display extent just means a downscale at present.
@@ -7268,6 +7272,9 @@ impl App {
                 // Fine mode interleaves one level per frame at the single-level slab cost.
                 let (gi_slab_idx, gi_y_offset, gi_cycle) = self.gi_volume_schedule();
                 let gi_volume_arg = if self.gi_volume {
+                    // F4B toroidal recenter: the content shift must precede every reader of
+                    // the volumes this frame (same external -> the graph orders/fences it).
+                    self.gi.record_gi_fine_shift(&mut graph);
                     self.gi
                         .record_gi_volume(
                             &mut graph,
@@ -9351,10 +9358,9 @@ impl App {
                 self.gi.advance_gi_volume();
             }
             // F4B camera recentering (fine mode only, no-op otherwise): dead-zone detection
-            // every frame, state transitions only on super-cycle boundaries — a fixed camera
-            // never leaves the dead-zone, so the static capture paths stay untouched.
-            self.gi
-                .gi_fine_recenter([eye.x, eye.y, eye.z], gi_cycle_end)?;
+            // every frame; the armed target is consumed by next frame's pre-graph shift —
+            // a fixed camera never leaves the dead-zone, so static captures stay untouched.
+            self.gi.gi_fine_recenter([eye.x, eye.y, eye.z]);
         }
         // QHD/UHD TAAU: advance the history ping-pong (next frame reprojects this frame's).
         if taau_active {

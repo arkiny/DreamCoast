@@ -18,10 +18,14 @@ use crate::HDR_FORMAT;
 use crate::app::load_compute_shader;
 use crate::push::{
     gdf_ao_push, gdf_atrous_push, gdf_gi_push, gdf_gi_upsample_push, gdf_skyvis_denoise_push,
-    gdf_skyvis_push, gdf_temporal_push, gi_volume_push, screen_probe_filter_push,
+    gdf_skyvis_push, gdf_temporal_push, gi_shift_push, gi_volume_push, screen_probe_filter_push,
     screen_probe_integrate_push, screen_probe_irradiance_push, screen_probe_trace_push,
     wrc_update_push, wrc_view_push,
 };
+
+/// An armed F4B recenter: the voxel-snapped new fine box `(min, max)` plus the integer
+/// fine-texel content-shift delta `(new_min - old_min) / voxel`.
+type FineRecenter = (([f32; 3], [f32; 3]), [i32; 3]);
 
 /// Screen-space radiance probe density: one probe per `SP_DOWNSAMPLE`x`SP_DOWNSAMPLE` screen
 /// tile (reference uses ~16). Tunable later via a `RenderQuality` tier.
@@ -122,16 +126,17 @@ pub(crate) struct GiSystem {
     /// GI + the reflection fall-through, same buffer) on the coarse level.
     gi_fine_buf: [Option<StorageBuffer>; 2],
     gi_fine_buf_live: usize,
-    /// F4B recentering state: 0 = Steady, 1 = Reconverging (the update traces the NEW box with
-    /// the fine-half EMA reset; consumers parked), 2 = Settling (EMA live again; consumers still
-    /// parked — they read the slot being WRITTEN this super-cycle, and the OTHER slot's fine
-    /// half is only fully rewritten after one more cycle). Transitions happen ONLY at super-
-    /// cycle boundaries so a level refresh is never split across two boxes.
-    gi_fine_state: u32,
-    /// F4B: this frame's fine-half EMA reset flag (`fine_max.w` in the update push).
-    gi_fine_reset: bool,
-    /// F4B: armed recenter target (voxel-snapped), applied at the next super-cycle boundary.
-    gi_fine_pending: Option<([f32; 3], [f32; 3])>,
+    /// F4B toroidal recenter: armed target from the dead-zone check — the voxel-snapped new
+    /// box plus the integer fine-texel delta `(new_min - old_min)/voxel` — consumed by
+    /// [`Self::gi_fine_shift_apply`] at the next frame's pre-graph point.
+    gi_fine_pending: Option<FineRecenter>,
+    /// The delta whose content-shift passes must be recorded THIS frame (set by the apply,
+    /// read by [`Self::record_gi_fine_shift`], cleared at the next apply).
+    gi_fine_shift_active: Option<[i32; 3]>,
+    /// The content-shift pipeline + the fine-sized scratch set the two-pass shift bounces
+    /// through (an in-place shift is not expressible in one parallel dispatch).
+    gi_shift_pipeline: Option<ComputePipeline>,
+    gi_shift_scratch: [Option<Volume>; GI_VOL_SH],
     /// F4B: the edge-fade margin (world metres) — kept for recenter buffer rewrites.
     gi_fine_margin: f32,
 }
@@ -244,6 +249,13 @@ impl GiSystem {
             "gi_volume",
             200, // 192 (F4 fine rows) + 4 (E-oracle repair flags) + 4 (F6F sun_k slope).
         )?;
+        let gi_shift_pipeline = compute(
+            dreamcoast_shader::gi_shift_cs_spirv,
+            dreamcoast_shader::gi_shift_cs_dxil,
+            dreamcoast_shader::gi_shift_cs_metallib,
+            "gi_shift",
+            48,
+        )?;
         let sp_trace_pipeline = compute(
             dreamcoast_shader::screen_probe_trace_cs_spirv,
             dreamcoast_shader::screen_probe_trace_cs_dxil,
@@ -293,6 +305,7 @@ impl GiSystem {
         // `base + channel*4 + coeff`, so only the base index is pushed.
         let mut gi_vol: [[Option<Volume>; GI_VOL_SH]; 2] = Default::default();
         let mut gi_skyvis: [[Option<Volume>; GI_SKYVIS_SH]; 2] = Default::default();
+        let mut gi_shift_scratch: [Option<Volume>; GI_VOL_SH] = Default::default();
         // F4: camera-anchored fine level (`P_GI_VOL_CLIP`), read once here so the volume
         // allocation below can double its height; 0 = the legacy single-level layout. Default
         // ON in lockstep with main.rs's consumption sites — when THIS site lagged at false,
@@ -322,6 +335,20 @@ impl GiSystem {
             for set in gi_skyvis.iter_mut() {
                 for ch in set.iter_mut() {
                     *ch = Some(device.create_volume(&vd)?);
+                }
+            }
+            // F4B toroidal recenter scratch: a fine-half-sized bounce set (the shift reads
+            // and writes the same slot, which one parallel dispatch cannot do in place).
+            // 12 volumes cover the radiance set; the 4-coeff sky-vis set reuses the first 4.
+            if gi_vol_fine {
+                let sd = VolumeDesc {
+                    width: GI_VOL_DIM,
+                    height: GI_VOL_DIM,
+                    depth: GI_VOL_DIM,
+                    format: Format::R32Float,
+                };
+                for ch in gi_shift_scratch.iter_mut() {
+                    *ch = Some(device.create_volume(&sd)?);
                 }
             }
             // The base-index addressing is only valid if each slot's volumes are contiguous in both
@@ -366,9 +393,10 @@ impl GiSystem {
             gi_fine_box: None,
             gi_fine_buf: [None, None],
             gi_fine_buf_live: 0,
-            gi_fine_state: 0,
-            gi_fine_reset: false,
             gi_fine_pending: None,
+            gi_fine_shift_active: None,
+            gi_shift_pipeline,
+            gi_shift_scratch,
             gi_fine_margin: 0.0,
             sp_trace_pipeline,
             sp_integrate_pipeline,
@@ -468,28 +496,21 @@ impl GiSystem {
         Ok(())
     }
 
-    /// F4B camera recentering (EMA reconverge — docs/phase-f4b-hierarchical-cache-plan.md §8).
-    /// Called once per frame AFTER the volume advance decision with this frame's camera eye and
-    /// whether a super-cycle just completed. Dead-zone: the eye leaving `half*0.5` (per axis)
-    /// of the box centre arms a recenter to the eye snapped onto the fine VOXEL lattice (so a
-    /// future toroidal upgrade can reuse history). All state transitions land on super-cycle
-    /// boundaries so a level refresh is never split across two boxes:
-    ///
-    /// Steady --(armed)--> Reconverging (update = new box + fine-half EMA reset; consumers get
-    /// an inverted box = coarse fallback) --(1 advance)--> Settling (EMA live; consumers still
-    /// parked — the slot they read next cycle has the OTHER slot's stale fine half)
-    /// --(1 advance)--> Steady (consumers re-enabled on the new box).
-    ///
-    /// A re-arm during Reconverging/Settling restarts the window with the newer target (the
-    /// dead-zone keeps that rare). A fixed camera never leaves the dead-zone, so the static
-    /// capture paths are untouched — the gate-recipe invariant.
-    pub(crate) fn gi_fine_recenter(
-        &mut self,
-        eye: [f32; 3],
-        cycle_end: bool,
-    ) -> anyhow::Result<()> {
-        if !self.gi_fine_installed() {
-            return Ok(());
+    /// F4B camera recentering, toroidal (the reference engine's radiance-cache contract:
+    /// Lumen re-snaps its clipmaps around the camera every frame and RELOCATES existing
+    /// probes through the last frame's clipmap corners — content is reused, never reset,
+    /// LumenRadianceCache.cpp UpdateRadianceCacheState + LastFrameClipmapCornerTWSAndCellSize.
+    /// Our fine volume is direct-mapped, so the equivalent of "re-key the same world
+    /// position" is an integer texel SHIFT of the content — the box snap is voxel-lattice
+    /// aligned by construction). The dead-zone exit arms a target here; the next frame's
+    /// pre-graph [`Self::gi_fine_shift_apply`] moves box and content together in one frame.
+    /// No park window, no EMA reset, no reconvergence: the old two-super-cycle coarse
+    /// fallback read as a one-blink GI pop at a fixed world position — the dead-zone
+    /// boundary (playtest report). A fixed camera never leaves the dead-zone, so the
+    /// static capture paths are untouched — the gate-recipe invariant.
+    pub(crate) fn gi_fine_recenter(&mut self, eye: [f32; 3]) {
+        if !self.gi_fine_installed() || self.gi_fine_pending.is_some() {
+            return;
         }
         let (mn, mx) = self.gi_fine_box.unwrap();
         let half = (mx[0] - mn[0]) * 0.5;
@@ -499,47 +520,122 @@ impl GiSystem {
             (mn[2] + mx[2]) * 0.5,
         ];
         let dead = half * 0.5;
-        if (eye[0] - c[0]).abs() > dead
-            || (eye[1] - c[1]).abs() > dead
-            || (eye[2] - c[2]).abs() > dead
+        if (eye[0] - c[0]).abs() <= dead
+            && (eye[1] - c[1]).abs() <= dead
+            && (eye[2] - c[2]).abs() <= dead
         {
-            // Snap the target centre onto the fine voxel lattice anchored at the CURRENT box.
-            let vox = 2.0 * half / GI_VOL_DIM as f32;
-            let snap = |e: f32, o: f32| o + ((e - o) / vox).round() * vox;
-            let nc = [snap(eye[0], c[0]), snap(eye[1], c[1]), snap(eye[2], c[2])];
-            self.gi_fine_pending = Some((
-                [nc[0] - half, nc[1] - half, nc[2] - half],
-                [nc[0] + half, nc[1] + half, nc[2] + half],
-            ));
+            return;
         }
-        if !cycle_end {
+        // Snap the target centre onto the fine voxel lattice anchored at the CURRENT box,
+        // so the content shift below is exact (integral in texels).
+        let vox = 2.0 * half / GI_VOL_DIM as f32;
+        let snap = |e: f32, o: f32| o + ((e - o) / vox).round() * vox;
+        let nc = [snap(eye[0], c[0]), snap(eye[1], c[1]), snap(eye[2], c[2])];
+        let nmn = [nc[0] - half, nc[1] - half, nc[2] - half];
+        let nmx = [nc[0] + half, nc[1] + half, nc[2] + half];
+        let delta = [
+            ((nmn[0] - mn[0]) / vox).round() as i32,
+            ((nmn[1] - mn[1]) / vox).round() as i32,
+            ((nmn[2] - mn[2]) / vox).round() as i32,
+        ];
+        self.gi_fine_pending = Some(((nmn, nmx), delta));
+    }
+
+    /// Pre-graph point of the frame: consume an armed recenter — flip the consumer box
+    /// ring to the new box and expose the delta for this frame's
+    /// [`Self::record_gi_fine_shift`]. Box and content move in the SAME frame's timeline
+    /// (the shift passes run before every consumer pass), so every reader stays coherent.
+    /// Ring safety: in-flight frames keep reading the previous slot; arms are dead-zone
+    /// spaced (metres of travel), far beyond the frames-in-flight window.
+    pub(crate) fn gi_fine_shift_apply(&mut self) -> anyhow::Result<()> {
+        self.gi_fine_shift_active = None;
+        let Some(((nmn, nmx), delta)) = self.gi_fine_pending.take() else {
             return Ok(());
-        }
-        if let Some((nmn, nmx)) = self.gi_fine_pending.take() {
-            // (Re-)enter Reconverging: the update traces the new box with the fine-half EMA
-            // reset; consumers park on the coarse level via the inverted box.
-            self.gi_fine_box = Some((nmn, nmx));
-            self.gi_fine_reset = true;
-            self.gi_fine_state = 1;
-            self.flip_fine_buf([f32::MAX; 3], [f32::MIN; 3], 0.0)?;
-            return Ok(());
-        }
-        match self.gi_fine_state {
-            1 => {
-                // One full new-box refresh has landed; the EMA history read next cycle is that
-                // fully-rewritten slot, so the blend is safe again. Consumers stay parked: the
-                // slot THEY read next cycle is the other one, whose fine half is still stale.
-                self.gi_fine_reset = false;
-                self.gi_fine_state = 2;
-            }
-            2 => {
-                let (bmn, bmx) = self.gi_fine_box.unwrap();
-                self.flip_fine_buf(bmn, bmx, self.gi_fine_margin)?;
-                self.gi_fine_state = 0;
-            }
-            _ => {}
-        }
+        };
+        self.gi_fine_box = Some((nmn, nmx));
+        self.flip_fine_buf(nmn, nmx, self.gi_fine_margin)?;
+        self.gi_fine_shift_active = Some(delta);
+        tracing::info!(
+            "GI fine recenter: content shift [{} {} {}] texels (toroidal, no reconverge)",
+            delta[0],
+            delta[1],
+            delta[2]
+        );
         Ok(())
+    }
+
+    /// Record this frame's fine-half content shift, when one was armed: per ping-pong slot
+    /// and per SH set (12 radiance + 4 sky-vis), bounce through the fine-sized scratch —
+    /// slot -> scratch applies the texel delta, scratch -> slot copies back. Each leg is
+    /// its own pass on the shared volume external, so the graph orders and fences them.
+    pub(crate) fn record_gi_fine_shift<'a>(&'a self, graph: &mut RenderGraph<'a>) {
+        let Some(delta) = self.gi_fine_shift_active else {
+            return;
+        };
+        let (Some(pipe), Some(scratch0)) = (
+            self.gi_shift_pipeline.as_ref(),
+            self.gi_shift_scratch[0].as_ref(),
+        ) else {
+            return;
+        };
+        let scratch_base = scratch0.storage_index();
+        let dims = [GI_VOL_DIM, GI_VOL_DIM, GI_VOL_DIM];
+        let groups = GI_VOL_DIM.div_ceil(4);
+        for slot in 0..2usize {
+            let sets: [(u32, u32); 2] = [
+                (
+                    match self.gi_vol[slot][0].as_ref() {
+                        Some(v) => v.storage_index(),
+                        None => return,
+                    },
+                    GI_VOL_SH as u32,
+                ),
+                (
+                    match self.gi_skyvis[slot][0].as_ref() {
+                        Some(v) => v.storage_index(),
+                        None => return,
+                    },
+                    GI_SKYVIS_SH as u32,
+                ),
+            ];
+            for (set_base, count) in sets {
+                for leg in 0..2u32 {
+                    let vol_ext = graph.import_external("gi_volume_w");
+                    let (src, src_y0, dst, dst_y0, shift) = if leg == 0 {
+                        (set_base, GI_VOL_DIM, scratch_base, 0, delta)
+                    } else {
+                        (scratch_base, 0, set_base, GI_VOL_DIM, [0, 0, 0])
+                    };
+                    let slot_vols = if count == GI_VOL_SH as u32 {
+                        &self.gi_vol[slot][..]
+                    } else {
+                        &self.gi_skyvis[slot][..]
+                    };
+                    graph.add_compute_pass(
+                        ComputePassInfo {
+                            name: "gi_fine_shift",
+                            storage_writes: vec![vol_ext],
+                            reads: vec![],
+                        },
+                        move |ctx| {
+                            let cmd = ctx.cmd();
+                            for ch in slot_vols.iter().flatten() {
+                                cmd.volume_to_storage(ch);
+                            }
+                            for ch in self.gi_shift_scratch.iter().flatten() {
+                                cmd.volume_to_storage(ch);
+                            }
+                            cmd.bind_compute_pipeline(pipe);
+                            cmd.push_constants_compute(&gi_shift_push(
+                                src, dst, count, src_y0, shift, dst_y0, dims,
+                            ));
+                            cmd.dispatch(groups, groups, groups);
+                            Ok(())
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// F4B: true when fine mode is live (double-height volumes allocated AND the camera box
@@ -636,13 +732,10 @@ impl GiSystem {
         let fine = self.gi_vol_fine.then_some(self.gi_fine_box).flatten();
         let (fine_min, fine_max) = fine.unwrap_or(([0.0; 3], [0.0; 3]));
         let fine_active = if fine.is_some() { 1.0 } else { 0.0 };
-        // F4B recentering: while the box reconverges, the fine half's EMA history and the hit
-        // reads' fine containment are invalid (old-box data at new-box coordinates).
-        let fine_reset = if fine.is_some() && self.gi_fine_reset {
-            1.0
-        } else {
-            0.0
-        };
+        // F4B toroidal recenter: box and content move together (record_gi_fine_shift), so
+        // the fine half's EMA history is ALWAYS in current-box coordinates — the reconverge
+        // reset seam stays wired for the shader's legacy path but never fires.
+        let fine_reset = 0.0;
         let vol_ext = graph.import_external("gi_volume_w");
         let mut reads = vec![scene_gdf_ext];
         if let Some((_, ext)) = albedo {
