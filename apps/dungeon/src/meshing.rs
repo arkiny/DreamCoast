@@ -368,7 +368,7 @@ fn emit_rim(
     p: &MeshParams,
 ) {
     let y = p.wall_height;
-    let mut run_emit =
+    let run_emit =
         |solid: &dyn Fn(i32) -> bool, a0: i32, a1: i32, emit: &mut dyn FnMut(i32, i32)| {
             let mut a = a0;
             while a < a1 {

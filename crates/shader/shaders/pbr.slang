@@ -783,35 +783,34 @@ float vsm_sun_shadow(float3 world_pos, float3 normal, float2 pix, float view_dep
                 }
             }
             // ---- Near-field MAP contact probe (the concave-junction sliver killer) ----
-            // 3x3 slope-corrected: an occluder stored between the receiver and the first
-            // map-march sample blocks the whole 1.1-degree disk (it sits millimetres to
-            // centimetres up the light path), so the verdict is full shadow. The neighbor
-            // reach covers the receiver's own straddle texel; the window top is the first
-            // march sample, so the probe and the march tile the ray without a hole.
+            // The receiver's OWN texel only: a directional light ray never leaves its own
+            // uv column, so only that column's stored depth can attest an occluder between
+            // the receiver and the first map-march sample (such an occluder blocks the
+            // whole 1.1-degree disk — full shadow). A 3x3 neighbor reach was measured as
+            // dithered black seams along every lit wall base and cap rim: a NEIGHBOR
+            // surface sitting closer to the light (the wall above a lit floor, the cap
+            // above a lit face) says nothing about this receiver's column. What the
+            // neighbor reach was for — silhouette-straddled own texels — is the screen
+            // pre-ray's job above, at render resolution. Probe floor: one full texel of
+            // depth range (the straddle can legally store the CONVEX-rim surface a few
+            // millimetres closer than the receiver's plane).
             {
                 float dzdt_l = abs(dot(c_rz, normalize(globals.sun_direction.xyz)));
                 float sf0 = 0.5 / smrt.y;
                 float t_first = t_start + (t_max - t_start) * sf0 * sf0;
-                [unroll]
-                for (int cdy = -1; cdy <= 1; ++cdy)
+                float ceps = 1.0 / float(VSM_VIRTUAL_SIZE);
+                uint cpte = table.Load(vsm_pte_offset(level, uint2(texel) / VSM_PAGE_SIZE));
+                if ((cpte & VSM_PTE_MAPPED) != 0u)
                 {
-                    [unroll]
-                    for (int cdx = -1; cdx <= 1; ++cdx)
+                    float cstored = asfloat(pool.Load(vsm_pool_offset(
+                        cpte & VSM_PTE_PAGE_MASK, uint2(texel) % VSM_PAGE_SIZE)));
+                    float2 cduv =
+                        ((floor(texel) + 0.5) - texel) / float(VSM_VIRTUAL_SIZE);
+                    float cref = clip.z + dot(slope_uv, cduv);
+                    if (cstored < cref - ceps && cstored > clip.z - dzdt_l * t_first)
                     {
-                        float2 ct = texel + float2(cdx, cdy);
-                        uint cpte =
-                            table.Load(vsm_pte_offset(level, uint2(ct) / VSM_PAGE_SIZE));
-                        if ((cpte & VSM_PTE_MAPPED) == 0u)
-                            continue;
-                        float cstored = asfloat(pool.Load(vsm_pool_offset(
-                            cpte & VSM_PTE_PAGE_MASK, uint2(ct) % VSM_PAGE_SIZE)));
-                        float2 cduv = ((floor(ct) + 0.5) - texel) / float(VSM_VIRTUAL_SIZE);
-                        float cref = clip.z + dot(slope_uv, cduv);
-                        if (cstored < cref - eps && cstored > clip.z - dzdt_l * t_first)
-                        {
-                            level_out = int(level);
-                            return 0.0;
-                        }
+                        level_out = int(level);
+                        return 0.0;
                     }
                 }
             }
