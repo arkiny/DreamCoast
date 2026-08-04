@@ -83,7 +83,7 @@ struct PushConstants
     uint vsm_consts_buf; // per-frame level matrices/params/origin
     uint vsm_table_buf;  // page table
     uint vsm_pool_buf;   // physical depth pool
-    uint _vsm_pad;
+    uint scene_depth_index; // G-buffer depth (VSM screen pre-ray); 0xFFFFFFFF = absent
 };
 
 static const uint NO_TEXTURE = 0xFFFFFFFF;
@@ -116,6 +116,9 @@ struct Globals
     float4 csm_opts;         // x = cross-cascade blend fraction (of the cascade depth range)
     float4x4 csm_view_proj[4]; // per-cascade world -> atlas-tile light clip
     float4 csm_atlas_uv[4];    // per-cascade atlas UV sub-rect: xy offset, zw scale
+    // Appended LAST: the subset mirrors (ssr/gdf_reflect) read only a prefix of this
+    // struct, so growth is only ever tail-growth.
+    float4x4 view_proj; // world -> CURRENT clip (VSM screen pre-ray projection)
 };
 
 [[vk::push_constant]]
@@ -673,25 +676,21 @@ float vsm_sun_shadow(float3 world_pos, float3 normal, float2 pix, float view_dep
         float4 smrt = vsm_load_smrt(consts);
         if (smrt.x >= 1.0)
         {
-            // Receiver-plane depth gradient (the V0 machinery, same derivation as the PCF
-            // path below): the receiver's own-texel compare must be slope-corrected, so
-            // the constant tolerance is only a raster-noise floor — a flat one-texel bias
-            // here is exactly the concave-junction lit seam (a perpendicular caster's
-            // occlusion path is millimetres deep at the corner, well under one texel of
-            // depth range).
-            float3 ru = wc[0].xyz;
-            float3 rv = wc[1].xyz;
-            float3 rz = wc[2].xyz;
-            float3 m = float3(dot(normal, ru) / dot(ru, ru), dot(normal, rv) / dot(rv, rv),
-                              dot(normal, rz) / max(dot(rz, rz), 1e-12));
-            float mz = abs(m.z) > 1e-8 ? m.z : (m.z >= 0.0 ? 1e-8 : -1e-8);
-            float2 dz_ndc = -m.xy / mz;
-            // Clamp 2.0 (vs the PCF path's 0.1): the contact test has no flat one-texel
-            // bias absorbing clamp residue, so the prediction must FOLLOW real slopes —
-            // a 45-degree face is already ~0.5 in this normalization, and an
-            // under-clamped prediction acnes the whole lit side at 0.25-texel margins.
-            float2 slope_uv = clamp(float2(dz_ndc.x * 2.0, dz_ndc.y * -2.0), -2.0, 2.0);
+            // March compare floor: a quarter texel of the level's depth range (raster
+            // noise only — the march starts past the near field, so no flat-bias seam).
             float eps = 0.25 / float(VSM_VIRTUAL_SIZE);
+            // Receiver-plane slope (V0 machinery) for the near-field contact probe below.
+            // Clamp 2.0: with only a quarter-texel margin the prediction must FOLLOW real
+            // slopes (a 45-degree face is ~0.5 in level normalization) or lit faces acne.
+            float3 c_ru = wc[0].xyz;
+            float3 c_rv = wc[1].xyz;
+            float3 c_rz = wc[2].xyz;
+            float3 c_m =
+                float3(dot(normal, c_ru) / dot(c_ru, c_ru), dot(normal, c_rv) / dot(c_rv, c_rv),
+                       dot(normal, c_rz) / max(dot(c_rz, c_rz), 1e-12));
+            float c_mz = abs(c_m.z) > 1e-8 ? c_m.z : (c_m.z >= 0.0 ? 1e-8 : -1e-8);
+            float2 c_dz = -c_m.xy / c_mz;
+            float2 slope_uv = clamp(float2(c_dz.x * 2.0, c_dz.y * -2.0), -2.0, 2.0);
 
             float3 L = normalize(globals.sun_direction.xyz);
             float3 U = normalize(
@@ -702,43 +701,121 @@ float vsm_sun_shadow(float3 world_pos, float3 normal, float2 pix, float view_dep
             uint steps = uint(smrt.y);
             // Ray length scales with the receiver's camera distance (the reference
             // engine's penumbra-size vs contact-detachment dial), floored so close-ups
-            // still march past their own texel.
-            float t_max = max(smrt.z * view_depth, 0.25);
+            // still march past their own texel. The march STARTS at the screen pre-ray's
+            // reach (the reference engine's RayStartOffset): the near field belongs to
+            // the fp32 screen test below — starting the map march inside it re-reads the
+            // receiver's own rough surface at sub-climb heights (sponza relief measured
+            // as wholesale speckled over-shadow on grazing walls).
+            float t_start = 0.015 * view_depth;
+            float t_max = max(smrt.z * view_depth, t_start + 0.25);
 
-            // CONTACT verdict — the [0, t_first) hole the march cannot see. The first ray
-            // sample sits t_max/(2·steps)² up-sun; an occluder crossing the receiver's
-            // column BELOW that (the concave wall-corner sliver: a few mm-cm of slab on
-            // the light path) subtends far more than the sun's 1.1° disk, so it blocks
-            // every ray — full shadow, decided once from the receiver's own texel with
-            // the slope-corrected compare. Occluders above the window are left to the
-            // rays (that is the penumbra).
-            float dzdt_l = abs(dot(rz, normalize(globals.sun_direction.xyz)));
-            float t_first = t_max * (0.5 / smrt.y) * (0.5 / smrt.y);
-            // 3x3: a receiver whose own texel is the straddle (it stored the receiver's
-            // face, not the slab) keeps the occluder's evidence in a NEIGHBOR texel —
-            // one texel of lateral reach costs at most one texel of terminator shift,
-            // against a glowing seam.
-            [unroll]
-            for (int cdy = -1; cdy <= 1; ++cdy)
+            // ---- Screen pre-ray (the reference engine's ScreenRayTrace, as a verdict) --
+            // The shadow map cannot express sub-texel occlusion (the residual corner
+            // sliver), but the scene DEPTH buffer can, at render resolution and fp32
+            // precision: march four samples toward the sun; a ray point whose pixel shows
+            // a visible surface in FRONT of it (standard Z, beyond a SELF-CALIBRATED
+            // tolerance — the receiver's own projected-z-vs-stored-depth error measured
+            // per pixel) is blocked by geometry the shadow texels quantized away. The
+            // fp16 position buffer only supplies the coarse guards: the blocker must
+            // rise above the receiver's plane (excludes the receiver's own surface at
+            // oblique views) and sit within a solid-thickness band (thin blockers must
+            // not over-extend). Blockers this near (1.5% of the camera distance) subtend
+            // far more than the sun's 1.1-degree disk, so the verdict is full shadow.
+            if (pc.scene_depth_index != NO_TEXTURE)
             {
-                [unroll]
-                for (int cdx = -1; cdx <= 1; ++cdx)
+                uint dw, dh;
+                g.textures[pc.scene_depth_index].GetDimensions(dw, dh);
+                float2 dsize = float2(dw, dh);
+                float sy = pc.flip_y != 0 ? 0.5 : -0.5;
+                // Linearize with the camera planes (cluster_params = z_near/z_far): the
+                // occlusion test needs METRIC depth — a screen sample only blocks when the
+                // ray point sits inside a THIN band behind the visible surface (standard
+                // contact-shadow thickness). A generous band shadows everything that merely
+                // passes screen-behind nearby geometry — the wall-base fringe regression.
+                float zn = max(globals.cluster_params.x, 1e-3);
+                float zf = max(globals.cluster_params.y, zn + 1e-3);
+                float4 c0 = mul(globals.view_proj, float4(world_pos, 1.0));
+                if (c0.w > 0.0)
                 {
-                    float2 ct = texel + float2(cdx, cdy);
-                    uint cpte = table.Load(vsm_pte_offset(level, uint2(ct) / VSM_PAGE_SIZE));
-                    if ((cpte & VSM_PTE_MAPPED) == 0u)
-                        continue;
-                    float cstored = asfloat(pool.Load(
-                        vsm_pool_offset(cpte & VSM_PTE_PAGE_MASK, uint2(ct) % VSM_PAGE_SIZE)));
-                    float2 cduv = ((floor(ct) + 0.5) - texel) / float(VSM_VIRTUAL_SIZE);
-                    float cref = clip.z + dot(slope_uv, cduv);
-                    if (cstored < cref - eps && cstored > clip.z - dzdt_l * t_first)
+                    float2 uv0 = float2(c0.x / c0.w * 0.5 + 0.5, c0.y / c0.w * sy + 0.5);
+                    float z0 = c0.z / c0.w;
+                    float d0 = g.textures[pc.scene_depth_index]
+                                   .Load(int3(int2(uv0 * dsize), 0))
+                                   .r;
+                    float l0 = zn * zf / max(zf - z0 * (zf - zn), 1e-4);
+                    float ld0 = zn * zf / max(zf - d0 * (zf - zn), 1e-4);
+                    // Self-calibrated slack: the receiver's own projected-vs-stored linear
+                    // depth error, measured per pixel (absorbs jitter/quantization). The
+                    // floor is fp32-depth small: the near-field slivers this test owns
+                    // (the concave corner) penetrate by millimetres-to-centimetres.
+                    float eps_l = max(0.005, abs(l0 - ld0) * 3.0);
+                    for (uint i = 1u; i <= 4u; ++i)
                     {
-                        level_out = int(level);
-                        return 0.0;
+                        // Quadratic spacing, densest at the receiver: the sliver blockers
+                        // this test exists for sit millimetres-to-centimetres up the ray.
+                        float sf = float(i) * 0.25;
+                        float3 w = sp + L * (t_start * sf * sf);
+                        float4 c = mul(globals.view_proj, float4(w, 1.0));
+                        if (c.w <= 0.0)
+                            break;
+                        float2 suv = float2(c.x / c.w * 0.5 + 0.5, c.y / c.w * sy + 0.5);
+                        if (any(suv < 0.0) || any(suv > 1.0))
+                            break;
+                        float sz = g.textures[pc.scene_depth_index]
+                                       .Load(int3(int2(suv * dsize), 0))
+                                       .r;
+                        float lray = zn * zf / max(zf - (c.z / c.w) * (zf - zn), 1e-4);
+                        float lscn = zn * zf / max(zf - sz * (zf - zn), 1e-4);
+                        // Blocked: ray point inside the thin band behind the visible
+                        // surface, and the blocker rises above the receiver's plane
+                        // (excludes the receiver's own surface at oblique views).
+                        if (lray > lscn + eps_l && lray < lscn + 0.15)
+                        {
+                            float4 scene =
+                                g.textures[pc.position_index].SampleLevel(g.samp, suv, 0.0);
+                            if (scene.w >= 0.5 && dot(scene.xyz - world_pos, normal) > 0.08)
+                            {
+                                level_out = int(level);
+                                return 0.0;
+                            }
+                        }
                     }
                 }
             }
+            // ---- Near-field MAP contact probe (the concave-junction sliver killer) ----
+            // 3x3 slope-corrected: an occluder stored between the receiver and the first
+            // map-march sample blocks the whole 1.1-degree disk (it sits millimetres to
+            // centimetres up the light path), so the verdict is full shadow. The neighbor
+            // reach covers the receiver's own straddle texel; the window top is the first
+            // march sample, so the probe and the march tile the ray without a hole.
+            {
+                float dzdt_l = abs(dot(c_rz, normalize(globals.sun_direction.xyz)));
+                float sf0 = 0.5 / smrt.y;
+                float t_first = t_start + (t_max - t_start) * sf0 * sf0;
+                [unroll]
+                for (int cdy = -1; cdy <= 1; ++cdy)
+                {
+                    [unroll]
+                    for (int cdx = -1; cdx <= 1; ++cdx)
+                    {
+                        float2 ct = texel + float2(cdx, cdy);
+                        uint cpte =
+                            table.Load(vsm_pte_offset(level, uint2(ct) / VSM_PAGE_SIZE));
+                        if ((cpte & VSM_PTE_MAPPED) == 0u)
+                            continue;
+                        float cstored = asfloat(pool.Load(vsm_pool_offset(
+                            cpte & VSM_PTE_PAGE_MASK, uint2(ct) % VSM_PAGE_SIZE)));
+                        float2 cduv = ((floor(ct) + 0.5) - texel) / float(VSM_VIRTUAL_SIZE);
+                        float cref = clip.z + dot(slope_uv, cduv);
+                        if (cstored < cref - eps && cstored > clip.z - dzdt_l * t_first)
+                        {
+                            level_out = int(level);
+                            return 0.0;
+                        }
+                    }
+                }
+            }
+
             // IGN pair, deterministic per PIXEL (frame-independent: golden captures stay
             // byte-stable), decorrelated by the offset+swap; golden-ratio strata per ray.
             float n0 = frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))));
@@ -758,13 +835,13 @@ float vsm_sun_shadow(float3 world_pos, float3 normal, float2 pix, float view_dep
                 // Analytic clip-z change per world metre along the ray (row 2 of the
                 // ortho), for the per-step compare tolerance.
                 float dzdt = abs(dot(lwc[2].xyz, rd));
-                float t_prev = 0.0;
+                float t_prev = t_start;
                 bool occluded = false;
                 bool any = false;
                 for (uint s = 0u; s < steps; ++s)
                 {
                     float f = (float(s) + 0.5) / float(steps);
-                    float t = t_max * f * f; // quadratic: densest at the receiver
+                    float t = t_start + (t_max - t_start) * f * f; // densest at the start
                     float4 c = mul(lwc, float4(sp + rd * t, 1.0));
                     float2 tx = vsm_ndc_to_texel(c.xy);
                     // The ray leaves this level's coverage sunward — hand it to coarser

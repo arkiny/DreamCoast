@@ -462,6 +462,9 @@ struct Globals {
     csm_opts: [f32; 4],   // x cross-cascade blend fraction (of the cascade depth range)
     csm_view_proj: [[f32; 16]; 4], // per-cascade world -> atlas-tile light clip
     csm_atlas_uv: [[f32; 4]; 4], // per-cascade atlas UV sub-rect: xy offset, zw scale
+    // Appended LAST: the shader-side subset mirrors (ssr/gdf_reflect) read only a prefix,
+    // so this struct only ever grows at the tail.
+    view_proj: [f32; 16], // world -> CURRENT clip (VSM screen pre-ray projection)
 }
 
 fn swapchain_desc(extent: Extent2D) -> SwapchainDesc {
@@ -6164,6 +6167,7 @@ impl App {
                 }
                 uv
             },
+            view_proj: view_proj.to_cols_array(),
         };
         // PR-9 view family: the primary view is slice 0 of this frame's view block
         // (`(fif * MAX_VIEWS + view_index) * GLOBALS_SLICE`). The content written at that offset is
@@ -8994,6 +8998,7 @@ impl App {
             sv_globals.camera_pos = [second.eye.x, second.eye.y, second.eye.z, 0.0];
             sv_globals.inv_view_proj = second.inv_view_proj;
             sv_globals.prev_view_proj = second.prev_view_proj;
+            sv_globals.view_proj = second.view_proj_stable.to_cols_array();
             sv_globals.cluster_view_z_row = second.cluster_view_z_row();
             // Secondary view lights brute-force (cluster froxels were built for the primary
             // frustum); the froxel path is a primary-view optimization, not a correctness input.

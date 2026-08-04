@@ -1257,6 +1257,9 @@ impl DeferredRenderer {
         if let Some((table_ext, pool_ext, _)) = vsm {
             reads.push(table_ext);
             reads.push(pool_ext);
+            // The V4 screen pre-ray samples the scene depth; declared only on the VSM
+            // path so non-VSM graphs (the gallery anchor) are untouched.
+            reads.push(gbuf.depth);
         }
         if let Some(ao) = gdf_ao {
             reads.push(ao);
@@ -1332,6 +1335,11 @@ impl DeferredRenderer {
                     ao_multibounce as u32,
                     spec_occlusion as u32,
                     vsm.map(|(_, _, idx)| idx).unwrap_or([u32::MAX; 3]),
+                    if vsm.is_some() {
+                        ctx.sampled_index(gbuf.depth)
+                    } else {
+                        u32::MAX
+                    },
                 ));
                 cmd.draw(3, 1);
                 Ok(())
@@ -1619,6 +1627,9 @@ fn pbr_push(
     // Virtual shadow map bufs: [consts, table, pool]. consts == u32::MAX = VSM off, the
     // sun samples CSM / the legacy single map byte-identically (docs/vsm-shadows-plan.md V1).
     vsm: [u32; 3],
+    // G-buffer depth sampled index (the VSM screen pre-ray; V4). u32::MAX = absent —
+    // non-VSM paths never bind it, keeping their graphs byte-identical.
+    scene_depth_index: u32,
 ) -> [u8; 108] {
     let mut pc = [0u8; 108];
     for (i, v) in indices.iter().enumerate() {
@@ -1647,7 +1658,7 @@ fn pbr_push(
         let o = 92 + i * 4;
         pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
     }
-    // pc[104..108] = _vsm_pad (zero)
+    pc[104..108].copy_from_slice(&scene_depth_index.to_le_bytes());
     pc
 }
 
