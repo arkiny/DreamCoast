@@ -163,7 +163,16 @@ pub fn mesh_stats(chunks: &[ChunkMesh]) -> MeshStats {
 ///
 /// A face is owned by its **walkable** tile, so a boundary that straddles two chunks
 /// produces exactly one quad, in the chunk of the tile you can stand on. Empty chunks
-/// (all rock) are skipped rather than emitted as degenerate meshes.
+/// (no geometry at all) are skipped rather than emitted as degenerate meshes.
+///
+/// 4. **caps** — the SOLID tiles (the negative of the floor set) are greedy-merged the
+///    same way and emitted at `y = wall_height` facing up: the rock between rooms is a
+///    VOLUME, not a paper boundary, and its top is what makes walls read as thick
+///    carved-slab blocks from the game's camera (and what closes the box the moment
+///    GI or a sky term looks at the level from above);
+/// 5. **rim** — the grid's outer boundary gets outward side faces on its solid tiles,
+///    so the slab is closed from every angle the camera can reach (the underside stays
+///    open: nothing looks at a dungeon from below).
 pub fn mesh_chunks(grid: &TileGrid, params: &MeshParams) -> Vec<ChunkMesh> {
     let p = params.sanitized();
     let chunks_x =
@@ -187,6 +196,9 @@ pub fn mesh_chunks(grid: &TileGrid, params: &MeshParams) -> Vec<ChunkMesh> {
             if p.ceiling {
                 emit_ceilings(&mut mesh, grid, &rects, &p);
             }
+            let caps = greedy_solid_rects(grid, x0, z0, x1, z1);
+            emit_caps(&mut mesh, grid, &caps, &p);
+            emit_rim(&mut mesh, grid, x0, z0, x1, z1, &p);
             emit_walls(&mut mesh, grid, x0, z0, x1, z1, &p);
             if !mesh.is_empty() {
                 out.push(mesh);
@@ -253,6 +265,48 @@ fn greedy_floor_rects(grid: &TileGrid, x0: i32, z0: i32, x1: i32, z1: i32) -> Ve
     rects
 }
 
+/// The same greedy pass over the SOLID tiles — the rock volume whose top becomes the
+/// wall caps. Shares [`greedy_floor_rects`]'s scan order for the same determinism.
+fn greedy_solid_rects(grid: &TileGrid, x0: i32, z0: i32, x1: i32, z1: i32) -> Vec<Rect> {
+    let (cw, ch) = ((x1 - x0).max(0), (z1 - z0).max(0));
+    if cw == 0 || ch == 0 {
+        return Vec::new();
+    }
+    let mut taken = vec![false; (cw * ch) as usize];
+    let free = |taken: &[bool], lx: i32, lz: i32| {
+        !taken[(lz * cw + lx) as usize] && grid.is_solid(x0 + lx, z0 + lz)
+    };
+
+    let mut rects = Vec::new();
+    for lz in 0..ch {
+        for lx in 0..cw {
+            if !free(&taken, lx, lz) {
+                continue;
+            }
+            let mut w = 1;
+            while lx + w < cw && free(&taken, lx + w, lz) {
+                w += 1;
+            }
+            let mut h = 1;
+            while lz + h < ch && (0..w).all(|k| free(&taken, lx + k, lz + h)) {
+                h += 1;
+            }
+            for dz in 0..h {
+                for dx in 0..w {
+                    taken[((lz + dz) * cw + lx + dx) as usize] = true;
+                }
+            }
+            rects.push(Rect {
+                x: x0 + lx,
+                z: z0 + lz,
+                w,
+                h,
+            });
+        }
+    }
+    rects
+}
+
 // ---------------------------------------------------------------------------------
 // Face emission
 // ---------------------------------------------------------------------------------
@@ -282,6 +336,107 @@ fn emit_ceilings(mesh: &mut ChunkMesh, grid: &TileGrid, rects: &[Rect], p: &Mesh
             [0.0, -1.0, 0.0],
             p.uv_scale,
         );
+    }
+}
+
+/// The rock volume's top: the solid rectangles at `y = wall_height`, facing up. Same
+/// corner order as a floor — an up-facing quad is an up-facing quad.
+fn emit_caps(mesh: &mut ChunkMesh, grid: &TileGrid, rects: &[Rect], p: &MeshParams) {
+    let y = p.wall_height;
+    for r in rects {
+        let (x0, x1) = (grid.tile_edge_x(r.x), grid.tile_edge_x(r.x + r.w));
+        let (z0, z1) = (grid.tile_edge_z(r.z), grid.tile_edge_z(r.z + r.h));
+        push_quad(
+            mesh,
+            [[x0, y, z0], [x1, y, z0], [x1, y, z1], [x0, y, z1]],
+            [0.0, 1.0, 0.0],
+            p.uv_scale,
+        );
+    }
+}
+
+/// The slab's outer skirt: outward faces on the GRID boundary's solid tiles, merged
+/// into runs like the interior walls. Normals point off the grid — these faces exist
+/// for oblique camera angles at the map edge, not for gameplay space.
+fn emit_rim(
+    mesh: &mut ChunkMesh,
+    grid: &TileGrid,
+    x0: i32,
+    z0: i32,
+    x1: i32,
+    z1: i32,
+    p: &MeshParams,
+) {
+    let y = p.wall_height;
+    let mut run_emit =
+        |solid: &dyn Fn(i32) -> bool, a0: i32, a1: i32, emit: &mut dyn FnMut(i32, i32)| {
+            let mut a = a0;
+            while a < a1 {
+                if !solid(a) {
+                    a += 1;
+                    continue;
+                }
+                let mut run = 1;
+                while a + run < a1 && solid(a + run) {
+                    run += 1;
+                }
+                emit(a, run);
+                a += run;
+            }
+        };
+    // West rim (grid x = 0): faces -X, runs along Z.
+    if x0 == 0 {
+        let x = grid.tile_edge_x(0);
+        run_emit(&|z| grid.is_solid(0, z), z0, z1, &mut |z, run| {
+            let (za, zb) = (grid.tile_edge_z(z), grid.tile_edge_z(z + run));
+            push_quad(
+                mesh,
+                [[x, 0.0, zb], [x, 0.0, za], [x, y, za], [x, y, zb]],
+                [-1.0, 0.0, 0.0],
+                p.uv_scale,
+            );
+        });
+    }
+    // East rim (grid x = width - 1): faces +X.
+    if x1 == grid.width() {
+        let tx = grid.width() - 1;
+        let x = grid.tile_edge_x(grid.width());
+        run_emit(&|z| grid.is_solid(tx, z), z0, z1, &mut |z, run| {
+            let (za, zb) = (grid.tile_edge_z(z), grid.tile_edge_z(z + run));
+            push_quad(
+                mesh,
+                [[x, 0.0, za], [x, 0.0, zb], [x, y, zb], [x, y, za]],
+                [1.0, 0.0, 0.0],
+                p.uv_scale,
+            );
+        });
+    }
+    // North rim (grid z = 0): faces -Z, runs along X.
+    if z0 == 0 {
+        let z = grid.tile_edge_z(0);
+        run_emit(&|x| grid.is_solid(x, 0), x0, x1, &mut |x, run| {
+            let (xa, xb) = (grid.tile_edge_x(x), grid.tile_edge_x(x + run));
+            push_quad(
+                mesh,
+                [[xa, 0.0, z], [xb, 0.0, z], [xb, y, z], [xa, y, z]],
+                [0.0, 0.0, -1.0],
+                p.uv_scale,
+            );
+        });
+    }
+    // South rim (grid z = height - 1): faces +Z.
+    if z1 == grid.height() {
+        let tz = grid.height() - 1;
+        let z = grid.tile_edge_z(grid.height());
+        run_emit(&|x| grid.is_solid(x, tz), x0, x1, &mut |x, run| {
+            let (xa, xb) = (grid.tile_edge_x(x), grid.tile_edge_x(x + run));
+            push_quad(
+                mesh,
+                [[xb, 0.0, z], [xa, 0.0, z], [xa, y, z], [xb, y, z]],
+                [0.0, 0.0, 1.0],
+                p.uv_scale,
+            );
+        });
     }
 }
 
@@ -516,6 +671,11 @@ mod tests {
                 if n[0].abs() > 0.5 {
                     // Plane at constant x; the run is along Z.
                     let ex = edge_index(xs[0], grid.world_min_x());
+                    // Rim faces sit on the grid's outer boundary planes, facing off the
+                    // grid — they are the slab's skirt, not wall coverage.
+                    if (n[0] < 0.0 && ex == 0) || (n[0] > 0.0 && ex == grid.width()) {
+                        continue;
+                    }
                     // normal -X => rock is east, so the walkable tile is the one before
                     // the plane; normal +X => rock is west, walkable tile starts here.
                     let (tx, dir) = if n[0] < 0.0 { (ex - 1, 0) } else { (ex, 1) };
@@ -526,6 +686,9 @@ mod tests {
                     }
                 } else {
                     let ez = edge_index(zs[0], grid.world_min_z());
+                    if (n[2] < 0.0 && ez == 0) || (n[2] > 0.0 && ez == grid.height()) {
+                        continue;
+                    }
                     let (tz, dir) = if n[2] < 0.0 { (ez - 1, 2) } else { (ez, 3) };
                     let x0 = edge_index(fmin(&xs), grid.world_min_x());
                     let x1 = edge_index(fmax(&xs), grid.world_min_x());
@@ -566,11 +729,13 @@ mod tests {
         assert_eq!(chunks.len(), 1, "10x6 tiles fits in one 16-tile chunk");
         let m = &chunks[0];
         assert_eq!(m.chunk_coord, (0, 0));
-        // 1 merged floor + 4 merged walls. Naive would be 32 + 24 = 56.
-        assert_eq!(m.quad_count(), 5);
-        assert_eq!(m.vertices.len(), 20);
-        assert_eq!(m.indices.len(), 30);
-        assert_eq!(m.triangle_count(), 10);
+        // 1 merged floor + 4 solid caps (top row / left column / right column / bottom
+        // row of the rock ring) + 4 rim faces (one per grid side) + 4 merged walls.
+        // Naive would be 32 floors + 24 walls + 28 caps + 28 rim faces = 112.
+        assert_eq!(m.quad_count(), 13);
+        assert_eq!(m.vertices.len(), 52);
+        assert_eq!(m.indices.len(), 78);
+        assert_eq!(m.triangle_count(), 26);
 
         // The floor is emitted first and spans the whole 8x4 interior in one rectangle.
         let floor: Vec<[f32; 3]> = m.vertices[..4].iter().map(|v| v.pos).collect();
@@ -591,9 +756,10 @@ mod tests {
             "world-planar XZ at 2 m per UV unit"
         );
 
-        // Walls follow in DIRS order: +X rock (west-facing), -X rock (east-facing),
+        // Caps + rim sit between the floor and the walls (fixed emission order); the
+        // walls follow in DIRS order: +X rock (west-facing), -X rock (east-facing),
         // +Z rock (north-facing), -Z rock (south-facing).
-        let wall_normals: Vec<[f32; 3]> = m.vertices[4..]
+        let wall_normals: Vec<[f32; 3]> = m.vertices[36..]
             .chunks_exact(4)
             .map(|q| q[0].normal)
             .collect();
@@ -608,7 +774,7 @@ mod tests {
         );
 
         // The east-facing wall (rock to the west, at tile column 1's left edge).
-        let west = &m.vertices[8..12];
+        let west = &m.vertices[40..44];
         assert_eq!(
             west.iter().map(|v| v.pos).collect::<Vec<_>>(),
             vec![
@@ -658,13 +824,16 @@ mod tests {
         let grid = TileGrid::from_rows(&ROOM_ROWS);
         let chunks = mesh_chunks(&grid, &MeshParams::default());
 
-        // Naive: one quad per walkable tile, one per walkable/solid boundary.
-        let naive = grid.walkable_count() + expected_wall_edges(&grid).len();
-        assert_eq!(naive, 32 + 24);
+        // Naive: one quad per walkable tile, one per walkable/solid boundary, one per
+        // solid tile (cap), one per solid border tile (rim).
+        let solid = (grid.width() * grid.height()) as usize - grid.walkable_count();
+        let rim = 2 * (grid.width() + grid.height()) as usize - 4;
+        let naive = grid.walkable_count() + expected_wall_edges(&grid).len() + solid + rim;
+        assert_eq!(naive, 32 + 24 + 28 + 28);
         let merged: usize = chunks.iter().map(ChunkMesh::quad_count).sum();
-        assert_eq!(merged, 5);
+        assert_eq!(merged, 13);
         assert!(
-            merged * 10 < naive,
+            merged * 8 < naive,
             "greedy must be a large win, not a rounding one"
         );
     }
@@ -712,8 +881,8 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(
             chunks[0].quad_count(),
-            5,
-            "1 floor + 2 long sides + 2 end caps"
+            13,
+            "1 floor + 2 long sides + 2 end walls + 4 solid caps + 4 rim faces"
         );
     }
 
@@ -790,6 +959,19 @@ mod tests {
                 if n[1].abs() > 0.5 {
                     continue;
                 }
+                // Rim faces sit on the grid's outer boundary planes and face off the
+                // grid; they have no walkable side by design.
+                let on_boundary = |v: f32, min: f32, edges: i32| {
+                    let e = edge_index(v, min);
+                    e == 0 || e == edges
+                };
+                if (n[0].abs() > 0.5
+                    && on_boundary(quad[0].pos[0], grid.world_min_x(), grid.width()))
+                    || (n[2].abs() > 0.5
+                        && on_boundary(quad[0].pos[2], grid.world_min_z(), grid.height()))
+                {
+                    continue;
+                }
                 // Step from the face's own centre along the normal: we must land on a
                 // walkable tile, and stepping the other way must land on rock.
                 let centre = [
@@ -839,8 +1021,13 @@ mod tests {
                 let n = quad[0].normal;
                 match n {
                     [0.0, 1.0, 0.0] => {
-                        floors += 1;
-                        assert!(quad.iter().all(|v| v.pos[1] == 0.0));
+                        // Up-facing quads are floors (y = 0) or solid caps (y = height).
+                        let y = quad[0].pos[1];
+                        assert!(y == 0.0 || y == WALL_HEIGHT, "up-facing quad at y = {y}");
+                        assert!(quad.iter().all(|v| v.pos[1] == y));
+                        if y == 0.0 {
+                            floors += 1;
+                        }
                     }
                     [0.0, -1.0, 0.0] => {
                         ceilings += 1;
@@ -1020,9 +1207,27 @@ mod tests {
     // -- degenerate inputs ----------------------------------------------------------
 
     #[test]
-    fn an_all_rock_grid_produces_nothing() {
+    fn an_all_rock_grid_is_a_closed_slab() {
+        // No rooms: nothing walkable, so no floors and no interior walls — but the rock
+        // volume itself still has a top and an outer skirt.
         let grid = TileGrid::solid(32, 32);
-        assert!(mesh_chunks(&grid, &MeshParams::default()).is_empty());
+        let chunks = mesh_chunks(&grid, &MeshParams::default());
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            for quad in c.vertices.chunks_exact(4) {
+                let n = quad[0].normal;
+                if n[1] > 0.5 {
+                    assert!(quad.iter().all(|v| v.pos[1] == WALL_HEIGHT), "cap only");
+                } else {
+                    // Side faces may only be the rim: on the grid's outer boundary.
+                    let on_x = quad[0].pos[0] == grid.tile_edge_x(0)
+                        || quad[0].pos[0] == grid.tile_edge_x(grid.width());
+                    let on_z = quad[0].pos[2] == grid.tile_edge_z(0)
+                        || quad[0].pos[2] == grid.tile_edge_z(grid.height());
+                    assert!(on_x || on_z, "an interior wall appeared with no rooms");
+                }
+            }
+        }
     }
 
     #[test]
