@@ -6118,7 +6118,10 @@ impl App {
             // `CsmConfig::bias_texels`); z = the normal-offset sampling distance in texels
             // (`CsmConfig::normal_offset_texels`, the wall-base light-leak fix). Both 0.0
             // with CSM off — the shader falls back to the legacy `shadow.x` + no offset,
-            // keeping the single-map path byte-identical.
+            // keeping the single-map path byte-identical. Exception: the normal offset is
+            // one dial for BOTH junction-leak consumers (`CSM_NORMAL_OFFSET`), so the VSM
+            // path keeps it live — in texels of the sampled VSM level there, which is what
+            // makes the same texel count the right scale on both maps.
             csm_opts: [
                 self.csm.blend_frac,
                 if self.csm.enabled {
@@ -6126,7 +6129,7 @@ impl App {
                 } else {
                     0.0
                 },
-                if self.csm.enabled {
+                if self.csm.enabled || self.vsm.is_some() {
                     self.csm.normal_offset_texels
                 } else {
                     0.0

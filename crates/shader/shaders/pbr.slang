@@ -635,7 +635,18 @@ float vsm_sun_shadow(float3 world_pos, float3 normal, out int level_out)
     for (uint level = first; level < VSM_LEVELS; ++level)
     {
         float4x4 wc = vsm_load_world_to_clip(consts, level);
-        float4 clip = mul(wc, float4(world_pos, 1.0));
+        // Normal-offset sampling (`csm_opts.z`, in texels of THIS level — the wall-base /
+        // corner light-leak fix, ported from the CSM path): a map texel that straddles a
+        // silhouette seen from the sun stores the far side's depth, so junction receivers
+        // inside its footprint test lit — a texel-wide bright seam no depth bias can fix
+        // (the stored depth is beside the receiver, not behind it). Projecting from
+        // `world_pos + normal · k · texel_world` slides those pixels onto the occluder's
+        // own texels. Texel size from the level's ortho rows (|row0| = 1/half), the
+        // cascade_texel_world derivation with the virtual resolution.
+        float inv_half = length(wc[0].xyz);
+        float texel_world = 2.0 / (max(inv_half, 1e-6) * float(VSM_VIRTUAL_SIZE));
+        float3 sp = world_pos + normal * (globals.csm_opts.z * texel_world);
+        float4 clip = mul(wc, float4(sp, 1.0));
         float2 texel = vsm_ndc_to_texel(clip.xy);
         if (min(texel.x, texel.y) < 1.0 || max(texel.x, texel.y) >= float(VSM_VIRTUAL_SIZE) - 1.0
             || clip.z <= 0.0 || clip.z >= 1.0)
@@ -660,7 +671,14 @@ float vsm_sun_shadow(float3 world_pos, float3 normal, out int level_out)
         // walls need the receiver plane followed further before the clamp caps it — the V1
         // bring-up showed salt-and-pepper acne on sun-grazing wall faces at 0.05/1-texel.
         float2 slope_uv = clamp(float2(dz_ndc.x * 2.0, dz_ndc.y * -2.0), -0.1, 0.1);
-        float bias = 2.0 / float(VSM_VIRTUAL_SIZE); // two texels of the level's depth range
+        // One texel of the level's depth range: the receiver-plane slope term above covers
+        // the in-texel tilt analytically (the CSM path's acne probe measured zero delta
+        // between 1 and 2 texels with it on), and every constant texel here is a texel-wide
+        // LIT seam where a perpendicular caster meets the receiver (wall corners: stored ≈
+        // reference, so the bias decides). 2→1 measured the dungeon corner strip 7.2→4.6 px
+        // with no acne; the residual strip is silhouette-straddle, the V4 SMRT target
+        // (docs/vsm-shadows-plan.md §3), not a bias artifact.
+        float bias = 1.0 / float(VSM_VIRTUAL_SIZE);
 
         float sum = 0.0;
         float taps = 0.0;
