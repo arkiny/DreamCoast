@@ -20,6 +20,7 @@
 #include "bindless.slang"
 #include "light_cluster_common.slang"
 #include "vsm_common.slang"
+#include "sky_common.slang" // SUN_COS_MAX: the ONE sun-disk geometry (SMRT ray spread)
 
 static const float PI = 3.14159265359;
 
@@ -624,7 +625,8 @@ float csm_shadow(float3 world_pos, float3 normal, float2 pix, float view_depth,
 // is what lets the constant bias stay at ~one texel of the level's depth range. A pixel
 // whose level page is unmapped walks coarser levels (pool-overflow fallback); unmapped
 // everywhere = fully lit, with the overflow counter as the loud host-side signal.
-float vsm_sun_shadow(float3 world_pos, float3 normal, out int level_out)
+float vsm_sun_shadow(float3 world_pos, float3 normal, float2 pix, float view_depth,
+                     out int level_out)
 {
     RWByteAddressBuffer consts = g.storage_buffers[pc.vsm_consts_buf];
     RWByteAddressBuffer table = g.storage_buffers[pc.vsm_table_buf];
@@ -658,6 +660,161 @@ float vsm_sun_shadow(float3 world_pos, float3 normal, out int level_out)
             continue;
         level_out = int(level);
 
+        // ---- SMRT (plan V4, reference engine SMRTTemplate.ush) --------------------------
+        // Shadow-map ray marching replaces PCF: rays toward stratified points on the sun
+        // DISK (sky_common's one sun geometry), each marched sunward with quadratic
+        // receiver-dense spacing; a ray is occluded when a sample sits behind a stored
+        // surface beyond one depth texel + the step's own reference change (the 1.05 rule).
+        // This is what retires the junction light-leak class PCF cannot express: the
+        // receiver's own silhouette-straddling texel stops being the verdict — the march
+        // walks the sun-disk spread off it within metres and reads the occluder's body,
+        // while rays that genuinely clear the caster stay lit, which is also the physical
+        // penumbra. Visibility = missed rays / traced rays.
+        float4 smrt = vsm_load_smrt(consts);
+        if (smrt.x >= 1.0)
+        {
+            // Receiver-plane depth gradient (the V0 machinery, same derivation as the PCF
+            // path below): the receiver's own-texel compare must be slope-corrected, so
+            // the constant tolerance is only a raster-noise floor — a flat one-texel bias
+            // here is exactly the concave-junction lit seam (a perpendicular caster's
+            // occlusion path is millimetres deep at the corner, well under one texel of
+            // depth range).
+            float3 ru = wc[0].xyz;
+            float3 rv = wc[1].xyz;
+            float3 rz = wc[2].xyz;
+            float3 m = float3(dot(normal, ru) / dot(ru, ru), dot(normal, rv) / dot(rv, rv),
+                              dot(normal, rz) / max(dot(rz, rz), 1e-12));
+            float mz = abs(m.z) > 1e-8 ? m.z : (m.z >= 0.0 ? 1e-8 : -1e-8);
+            float2 dz_ndc = -m.xy / mz;
+            // Clamp 2.0 (vs the PCF path's 0.1): the contact test has no flat one-texel
+            // bias absorbing clamp residue, so the prediction must FOLLOW real slopes —
+            // a 45-degree face is already ~0.5 in this normalization, and an
+            // under-clamped prediction acnes the whole lit side at 0.25-texel margins.
+            float2 slope_uv = clamp(float2(dz_ndc.x * 2.0, dz_ndc.y * -2.0), -2.0, 2.0);
+            float eps = 0.25 / float(VSM_VIRTUAL_SIZE);
+
+            float3 L = normalize(globals.sun_direction.xyz);
+            float3 U = normalize(
+                cross(L, abs(L.y) < 0.9 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0)));
+            float3 V = cross(L, U);
+            float tan_sun = sqrt(max(1.0 - SUN_COS_MAX * SUN_COS_MAX, 0.0)) / SUN_COS_MAX;
+            uint rays = uint(smrt.x);
+            uint steps = uint(smrt.y);
+            // Ray length scales with the receiver's camera distance (the reference
+            // engine's penumbra-size vs contact-detachment dial), floored so close-ups
+            // still march past their own texel.
+            float t_max = max(smrt.z * view_depth, 0.25);
+
+            // CONTACT verdict — the [0, t_first) hole the march cannot see. The first ray
+            // sample sits t_max/(2·steps)² up-sun; an occluder crossing the receiver's
+            // column BELOW that (the concave wall-corner sliver: a few mm-cm of slab on
+            // the light path) subtends far more than the sun's 1.1° disk, so it blocks
+            // every ray — full shadow, decided once from the receiver's own texel with
+            // the slope-corrected compare. Occluders above the window are left to the
+            // rays (that is the penumbra).
+            float dzdt_l = abs(dot(rz, normalize(globals.sun_direction.xyz)));
+            float t_first = t_max * (0.5 / smrt.y) * (0.5 / smrt.y);
+            // 3x3: a receiver whose own texel is the straddle (it stored the receiver's
+            // face, not the slab) keeps the occluder's evidence in a NEIGHBOR texel —
+            // one texel of lateral reach costs at most one texel of terminator shift,
+            // against a glowing seam.
+            [unroll]
+            for (int cdy = -1; cdy <= 1; ++cdy)
+            {
+                [unroll]
+                for (int cdx = -1; cdx <= 1; ++cdx)
+                {
+                    float2 ct = texel + float2(cdx, cdy);
+                    uint cpte = table.Load(vsm_pte_offset(level, uint2(ct) / VSM_PAGE_SIZE));
+                    if ((cpte & VSM_PTE_MAPPED) == 0u)
+                        continue;
+                    float cstored = asfloat(pool.Load(
+                        vsm_pool_offset(cpte & VSM_PTE_PAGE_MASK, uint2(ct) % VSM_PAGE_SIZE)));
+                    float2 cduv = ((floor(ct) + 0.5) - texel) / float(VSM_VIRTUAL_SIZE);
+                    float cref = clip.z + dot(slope_uv, cduv);
+                    if (cstored < cref - eps && cstored > clip.z - dzdt_l * t_first)
+                    {
+                        level_out = int(level);
+                        return 0.0;
+                    }
+                }
+            }
+            // IGN pair, deterministic per PIXEL (frame-independent: golden captures stay
+            // byte-stable), decorrelated by the offset+swap; golden-ratio strata per ray.
+            float n0 = frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))));
+            float n1 =
+                frac(52.9829189 * frac(dot(pix + 17.0, float2(0.00583715, 0.06711056))));
+            float missed = 0.0;
+            float traced = 0.0;
+            for (uint r = 0u; r < rays; ++r)
+            {
+                float u1 = frac(n0 + float(r) * 0.6180339887);
+                float u2 = frac(n1 + float(r) * 0.7548776662);
+                float rad = tan_sun * sqrt(u1);
+                float phi = 6.2831853 * u2;
+                float3 rd = normalize(L + (U * cos(phi) + V * sin(phi)) * rad);
+                uint lvl = level;
+                float4x4 lwc = wc;
+                // Analytic clip-z change per world metre along the ray (row 2 of the
+                // ortho), for the per-step compare tolerance.
+                float dzdt = abs(dot(lwc[2].xyz, rd));
+                float t_prev = 0.0;
+                bool occluded = false;
+                bool any = false;
+                for (uint s = 0u; s < steps; ++s)
+                {
+                    float f = (float(s) + 0.5) / float(steps);
+                    float t = t_max * f * f; // quadratic: densest at the receiver
+                    float4 c = mul(lwc, float4(sp + rd * t, 1.0));
+                    float2 tx = vsm_ndc_to_texel(c.xy);
+                    // The ray leaves this level's coverage sunward — hand it to coarser
+                    // levels (the clipmap's own fallback direction).
+                    while ((min(tx.x, tx.y) < 1.0
+                            || max(tx.x, tx.y) >= float(VSM_VIRTUAL_SIZE) - 1.0
+                            || c.z <= 0.0 || c.z >= 1.0)
+                           && lvl + 1u < VSM_LEVELS)
+                    {
+                        ++lvl;
+                        lwc = vsm_load_world_to_clip(consts, lvl);
+                        dzdt = abs(dot(lwc[2].xyz, rd));
+                        c = mul(lwc, float4(sp + rd * t, 1.0));
+                        tx = vsm_ndc_to_texel(c.xy);
+                    }
+                    if (min(tx.x, tx.y) < 1.0
+                        || max(tx.x, tx.y) >= float(VSM_VIRTUAL_SIZE) - 1.0 || c.z <= 0.0
+                        || c.z >= 1.0)
+                        break; // off the last level: no data further sunward
+                    uint pte = table.Load(vsm_pte_offset(lvl, uint2(tx) / VSM_PAGE_SIZE));
+                    if ((pte & VSM_PTE_MAPPED) == 0u)
+                    {
+                        t_prev = t;
+                        continue; // no data at this sample — skip, not a verdict
+                    }
+                    float stored = asfloat(pool.Load(
+                        vsm_pool_offset(pte & VSM_PTE_PAGE_MASK, uint2(tx) % VSM_PAGE_SIZE)));
+                    any = true;
+                    // Occluded when a surface sits strictly between this ray point and
+                    // the light along its column; the step term absorbs the reference's
+                    // own change across the (skipped-sample-aware) interval (the
+                    // reference engine's 1.05 rule).
+                    float tol = eps + dzdt * (t - t_prev) * 1.05;
+                    if (stored < c.z - tol)
+                    {
+                        occluded = true;
+                        break;
+                    }
+                    t_prev = t;
+                }
+                if (any)
+                {
+                    traced += 1.0;
+                    missed += occluded ? 0.0 : 1.0;
+                }
+            }
+            return traced > 0.0 ? missed / traced : 1.0;
+        }
+
+        // ---- 3x3 receiver-plane PCF (the `VSM_SMRT_RAYS=0` fallback seam) ----------------
         // Receiver-plane depth gradient per virtual UV (ortho rows are scaled-orthogonal;
         // same derivation as csm_optimal_slope_bias, orientation fixed D3D by contract).
         float3 ru = wc[0].xyz;
@@ -721,7 +878,7 @@ float sun_shadow(float3 world_pos, float3 normal, float2 pix, float view_depth,
         return 1.0;
 
     if (pc.vsm_consts_buf != NO_TEXTURE)
-        return vsm_sun_shadow(world_pos, normal, cascade_out);
+        return vsm_sun_shadow(world_pos, normal, pix, view_depth, cascade_out);
 
     if (globals.csm_params.x > 0)
         return csm_shadow(world_pos, normal, pix, view_depth, cascade_out);

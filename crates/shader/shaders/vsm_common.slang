@@ -60,7 +60,10 @@
 // page a sphere overlaps.
 #define VSM_CONST_INVAL_OFF (VSM_CONST_SCROLL_OFF + VSM_LEVELS * 16u)
 #define VSM_MAX_INVAL 64u
-#define VSM_CONST_SIZE (VSM_CONST_INVAL_OFF + 16u + VSM_MAX_INVAL * 16u)
+// SMRT filter config (V4): x = ray count (0 = PCF fallback), y = samples per ray,
+// z = ray length as a fraction of the receiver's camera distance, w = spare.
+#define VSM_CONST_SMRT_OFF (VSM_CONST_INVAL_OFF + 16u + VSM_MAX_INVAL * 16u)
+#define VSM_CONST_SIZE (VSM_CONST_SMRT_OFF + 16u)
 #define VSM_LEVEL_INVALIDATE 1u
 
 uint vsm_load_inval_count(RWByteAddressBuffer consts)
@@ -76,6 +79,11 @@ float4 vsm_load_inval_sphere(RWByteAddressBuffer consts, uint i)
 float3 vsm_load_origin(RWByteAddressBuffer consts)
 {
     return asfloat(consts.Load3(VSM_CONST_ORIGIN_OFF));
+}
+
+float4 vsm_load_smrt(RWByteAddressBuffer consts)
+{
+    return asfloat(consts.Load4(VSM_CONST_SMRT_OFF));
 }
 
 uint2 vsm_load_misc_zw(RWByteAddressBuffer consts)

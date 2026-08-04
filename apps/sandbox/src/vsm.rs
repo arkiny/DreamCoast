@@ -49,10 +49,10 @@ const VSM_MAX_PAGE_AGE: u32 = 120;
 /// frame degrades to a full invalidate. Mirrors `VSM_MAX_INVAL` in vsm_common.slang.
 const VSM_MAX_INVAL: usize = 64;
 /// Per-frame constants blob: 6 mat4 + 6 float4 params + uint4 misc + float4 origin +
-/// 6 int4 scroll entries + the invalidation header/spheres. Mirrors the `VSM_CONST_*`
-/// offsets in vsm_common.slang.
+/// 6 int4 scroll entries + the invalidation header/spheres + the SMRT float4. Mirrors
+/// the `VSM_CONST_*` offsets in vsm_common.slang.
 const VSM_CONST_SIZE: usize =
-    VSM_LEVELS * 64 + VSM_LEVELS * 16 + 16 + 16 + VSM_LEVELS * 16 + 16 + VSM_MAX_INVAL * 16;
+    VSM_LEVELS * 64 + VSM_LEVELS * 16 + 16 + 16 + VSM_LEVELS * 16 + 16 + VSM_MAX_INVAL * 16 + 16;
 
 /// Per-level CPU cache key: where the level's snapped origin sits in its own page space,
 /// and the along-sun component its depth basis is pinned to.
@@ -97,6 +97,10 @@ pub(crate) struct VsmSystem {
     frame_no: u32,
     /// Last frame's shadow casters, scene order (V3 mover detection).
     prev_casters: Vec<PrevCaster>,
+    /// SMRT filter config (V4): rays (0 = 3x3 PCF fallback), samples per ray, ray length
+    /// as a fraction of the receiver's camera distance. Env `VSM_SMRT_RAYS` /
+    /// `VSM_SMRT_SAMPLES` / `VSM_SMRT_LEN`; defaults = the reference engine's 7/8/1.5.
+    smrt: [f32; 3],
 }
 
 impl VsmSystem {
@@ -287,6 +291,19 @@ impl VsmSystem {
             sun_key: [0; 3],
             frame_no: 0,
             prev_casters: Vec::new(),
+            smrt: {
+                let f = |k: &str, d: f32| {
+                    std::env::var(k)
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(d)
+                };
+                [
+                    f("VSM_SMRT_RAYS", 7.0).clamp(0.0, 16.0),
+                    f("VSM_SMRT_SAMPLES", 8.0).clamp(1.0, 32.0),
+                    f("VSM_SMRT_LEN", 1.5).clamp(0.01, 16.0),
+                ]
+            },
         }))
     }
 
@@ -506,6 +523,10 @@ impl VsmSystem {
             for (j, f) in s.iter().enumerate() {
                 put(&mut bytes, inval_off + 16 + i * 16 + j * 4, *f);
             }
+        }
+        let smrt_off = inval_off + 16 + VSM_MAX_INVAL * 16;
+        for (j, f) in self.smrt.iter().enumerate() {
+            put(&mut bytes, smrt_off + j * 4, *f);
         }
         self.consts[fif].write(&bytes)?;
         Ok((
