@@ -233,10 +233,36 @@ pub fn floor_seed(run_seed: u64, floor: u32) -> u64 {
 /// game builds every later one with it, so "the dungeon you start in" and "the dungeon
 /// you descend into" cannot drift apart by a parameter.
 pub fn floor_grid(run_seed: u64, floor: u32) -> TileGrid {
-    crate::procgen::generate(
-        floor_seed(run_seed, floor),
-        &crate::procgen::DungeonParams::default(),
-    )
+    floor_grid_sized(run_seed, floor, tiles_from_env_or_default())
+}
+
+/// The `--tiles` stress seam (gdf-scale-follow-plan.md U0): `main` parses the flag and
+/// exports it via `DUNGEON_TILES` so every later floor the game generates uses the same
+/// size (the run/floor single-source rule, extended to the grid dimension).
+pub fn tiles_from_env_or_default() -> i32 {
+    std::env::var("DUNGEON_TILES")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(40)
+        .clamp(16, 512)
+}
+
+/// As [`floor_grid`], with an explicit grid size in tiles. Room counts scale with AREA
+/// (the default 6-10 rooms belong to 40x40): a 160-tile floor gets 16x the rooms, so
+/// density — and therefore instance counts per square metre — stays comparable and a
+/// stress floor stresses SCALE, not sparsity.
+pub fn floor_grid_sized(run_seed: u64, floor: u32, tiles: i32) -> TileGrid {
+    let base = crate::procgen::DungeonParams::default();
+    let scale = ((tiles as f32 / base.width as f32).powi(2)).max(0.25);
+    let params = crate::procgen::DungeonParams {
+        width: tiles,
+        height: tiles,
+        min_rooms: ((base.min_rooms as f32 * scale) as usize).max(1),
+        max_rooms: ((base.max_rooms as f32 * scale) as usize).max(2),
+        room_attempts: (base.room_attempts as f32 * scale.max(1.0)) as u32 * 2,
+        ..base
+    };
+    crate::procgen::generate(floor_seed(run_seed, floor), &params)
 }
 
 /// How many monsters a floor gets.

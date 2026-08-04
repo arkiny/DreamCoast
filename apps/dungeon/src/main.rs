@@ -183,6 +183,14 @@ fn main() -> anyhow::Result<()> {
         (game, level)
     } else {
         let seed = u64_arg("--seed", DEFAULT_SEED)?;
+        // `--tiles N`: the GDF-scaling stress seam (gdf-scale-follow-plan.md U0).
+        // Exported as env so every floor the game generates later matches (the same
+        // single-source rule the seed follows).
+        let tiles = u64_arg("--tiles", 40)?.clamp(16, 512);
+        if tiles != 40 {
+            // SAFETY(env): single-threaded startup, before any engine thread exists.
+            unsafe { std::env::set_var("DUNGEON_TILES", tiles.to_string()) };
+        }
         // An explicit `--grunts` pins the count on every floor; without it the count is
         // the floor's own (`game::grunts_for_floor`), which on floor 1 is the shipped
         // six — so an unflagged run starts exactly as it always has.
