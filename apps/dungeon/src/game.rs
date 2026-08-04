@@ -76,9 +76,11 @@
 
 use std::time::Instant;
 
+use dreamcoast_audio::{AudioSystem, Sfx};
 use dreamcoast_game::anim::AnimMachine;
 use dreamcoast_game::combat::{
-    BodyCircle, DamageEvent, DeathEvent, Health, IFrames, Team, apply_damage_events, tick_iframes,
+    AttackPhase, BodyCircle, DamageEvent, DeathEvent, Health, IFrames, Team, apply_damage_events,
+    tick_iframes,
 };
 use dreamcoast_game::input::{ActionState, BindingsConfig, InputSnapshot, InputSource};
 use glam::{Quat, Vec2, Vec3};
@@ -619,6 +621,15 @@ pub struct DungeonGame {
     /// one up on floor 2 and drinking it on floor 4) and is emptied only by a restart,
     /// with the fresh warrior it belongs to.
     inventory: Inventory,
+    /// The mixer handle (docs/game-audio-plan.md M-A2). Constructed as the silent Null
+    /// sink; [`Self::enable_audio`] opens the device — tests and headless captures never
+    /// touch CoreAudio/WASAPI.
+    audio: AudioSystem,
+    /// Footstep cadence accumulator (seconds until the next step sound).
+    foot_timer: f32,
+    /// This floor's torch positions, collision space — the loop-slot emitters
+    /// (slot `1 + i`; slot 0 is the ambience bed).
+    torch_pts: Vec<Vec2>,
     /// How many torches [`crate::level`] hung on this floor — a HUD readout, not a
     /// simulation input. Latched when the floor is installed rather than recomputed per
     /// frame, and zero on a level this game did not author ([`Self::without_floors`]).
@@ -696,8 +707,9 @@ impl DungeonGame {
         // writer places `potion_<i>` at point `i` ([`Self::potion_spawns`]) and
         // [`ItemWorld`] collects point `i`. One list, two readers.
         let potions = floor_potions(&grid, floor, &grunt_spawns);
-        let torches =
-            crate::level::torch_points(&grid, crate::level::torch_seed(grid.seed())).len();
+        let torch_list = crate::level::torch_points(&grid, crate::level::torch_seed(grid.seed()));
+        let torch_pts: Vec<Vec2> = torch_list.iter().map(|t| t.pos).collect();
+        let torches = torch_list.len();
 
         let spawn = collision::player_spawn_local(&grid);
         let focus = collision::to_world(&grid, spawn, CAMERA_FOCUS_Y);
@@ -724,6 +736,9 @@ impl DungeonGame {
             finder: Pathfinder::new(),
             items: ItemWorld::new(&potions),
             inventory: Inventory::new(),
+            audio: AudioSystem::new(false, 0),
+            foot_timer: 0.0,
+            torch_pts,
             torches,
             damage: Events::new(),
             deaths: Events::new(),
@@ -778,7 +793,32 @@ impl DungeonGame {
         // fixture grid in `new` describes a floor that was never written. Zero is what is
         // actually in that level.
         self.torches = 0;
+        self.torch_pts.clear();
         self
+    }
+
+    /// Open the real output device and start the ambience bed (docs/game-audio-plan.md
+    /// M-A2/A3). Called by `main` for interactive runs only — tests and headless
+    /// captures keep the silent Null sink from construction, so neither ever touches a
+    /// platform audio API. Volume seams: `AUDIO_MASTER` / `AUDIO_SFX` /
+    /// `AUDIO_AMBIENCE` (linear gains, default 1.0 / 1.0 / 1.0).
+    pub fn enable_audio(&mut self) {
+        /// The bank seed is CONTENT identity, not run identity: the same game must
+        /// sound the same on every seed — a re-rolled dungeon changes the map, not the
+        /// sword.
+        const SFX_BANK_SEED: u64 = 0x000D_5C0A_575F;
+        let vol = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(1.0)
+                .clamp(0.0, 4.0)
+        };
+        self.audio = AudioSystem::new(true, SFX_BANK_SEED);
+        self.audio.set_master(vol("AUDIO_MASTER"));
+        self.audio.set_bus_sfx(vol("AUDIO_SFX"));
+        self.audio.set_bus_ambience(vol("AUDIO_AMBIENCE"));
+        self.audio.loop_flat(0, Sfx::AmbienceLoop, 0.4);
     }
 
     /// Generate, mesh and write floor `floor` of this run — everything the transition
@@ -833,9 +873,15 @@ impl DungeonGame {
     /// away; that knowledge is more reliable than any probe of it.
     fn install(&mut self, next: NextFloor) {
         self.floor = next.floor;
-        self.torches =
-            crate::level::torch_points(&next.grid, crate::level::torch_seed(next.grid.seed()))
-                .len();
+        let torch_list =
+            crate::level::torch_points(&next.grid, crate::level::torch_seed(next.grid.seed()));
+        // Retarget the surviving loop slots to the new floor's brackets and silence the
+        // rest — slot indices are 1 + torch index (0 is the ambience bed).
+        for slot in (1 + torch_list.len())..=(1 + self.torch_pts.len().max(torch_list.len())) {
+            self.audio.loop_stop(slot as u8);
+        }
+        self.torch_pts = torch_list.iter().map(|t| t.pos).collect();
+        self.torches = torch_list.len();
         self.grid = next.grid;
         self.grunt_spawns = next.spawns;
         self.finder = Pathfinder::new();
@@ -910,6 +956,7 @@ impl DungeonGame {
             self.warrior.health().current,
             self.warrior.health().max,
         );
+        self.audio.play(Sfx::FloorExit, 0.8, 0.0);
         self.install(*next);
     }
 
@@ -1290,6 +1337,43 @@ impl DungeonGame {
         );
         self.prev_pos = self.pos;
         self.pos = out.position;
+        // -- 4b. what the step SOUNDS like (listener = the player, so the player's own
+        // actions are centred; spatial pan is for the world around them) ---------------
+        if matches!(
+            out.state,
+            WarriorState::Attacking {
+                phase: AttackPhase::Windup,
+                ..
+            }
+        ) && !matches!(
+            self.player_state,
+            WarriorState::Attacking {
+                phase: AttackPhase::Windup,
+                ..
+            }
+        ) {
+            self.audio.play(Sfx::SwordSwing, 0.7, 0.0);
+        }
+        let moved = self.prev_pos.distance(self.pos);
+        if moved > 1.0e-4 && !self.warrior.is_dead() {
+            self.foot_timer -= dt;
+            if self.foot_timer <= 0.0 {
+                // Cadence follows actual speed, so a sprint simply steps faster.
+                let speed = moved / dt.max(1.0e-6);
+                self.foot_timer = (1.4 / speed.max(1.0)).clamp(0.24, 0.55);
+                self.audio.play(Sfx::Footstep, 0.45, 0.0);
+            }
+        } else {
+            self.foot_timer = 0.0;
+        }
+        for hit in &out.hits {
+            // Metal-on-target crack, panned a touch toward the push direction.
+            self.audio.play(
+                Sfx::SwordHit,
+                0.85,
+                (hit.direction.x * 0.4).clamp(-0.5, 0.5),
+            );
+        }
         for hit in &out.hits {
             self.damage.send(*hit);
         }
@@ -1335,10 +1419,21 @@ impl DungeonGame {
 
         apply_damage_events(world, self.damage.iter(), &mut self.deaths);
         ai::feed_combat(&mut cast.grunts, self.damage.iter(), self.deaths.iter());
-        for entity in self.deaths.iter().map(|d| d.entity) {
+        for (i, entity) in self.deaths.iter().map(|d| d.entity).enumerate() {
+            // Cap the death-cry stack: a whirlwind triple kill is one loud moment, not
+            // three clipping ones.
+            if i < 2 {
+                self.audio.play(Sfx::GruntDeath, 0.75, 0.0);
+            }
             Self::retire_corpse(world, entity);
         }
         let report = self.warrior.take_damage(player_hits);
+        if report.taken > 0.0 {
+            self.audio.play(Sfx::GruntHit, 0.8, 0.0);
+        }
+        if report.died {
+            self.audio.play(Sfx::GruntDeath, 0.9, 0.0);
+        }
         if report.died {
             tracing::info!(
                 "dungeon: the warrior died after {} steps ({:.1} s)",
@@ -1354,6 +1449,15 @@ impl DungeonGame {
         // the flask it slid onto; before presentation, so the flask a pickup empties is
         // hidden on the same step the HUD count goes up.
         self.collect_and_drink(world);
+
+        // The torch brackets are the floor's loop emitters: retarget their gain/pan from
+        // the player's new position every step (slot 1 + i; the mixer smooths, so 60 Hz
+        // targets can't zipper). LOOP_SLOTS bounds the count with slot 0 reserved.
+        let listener = [self.pos.x, self.pos.y];
+        for (i, p) in self.torch_pts.iter().enumerate().take(31) {
+            self.audio
+                .loop_at(1 + i as u8, Sfx::TorchLoop, listener, [p.x, p.y], 0.55);
+        }
 
         // -- 7. presentation -------------------------------------------------------------
         self.pose_player(world, &mut cast, &out);
@@ -1397,11 +1501,13 @@ impl DungeonGame {
                 event.carried,
                 self.items.def().max_carry,
             );
+            self.audio.play(Sfx::PotionPickup, 0.7, 0.0);
             Self::hide_entity(world, &event.name());
         }
         if self.input.just_pressed(Action::Drink)
             && let Some(heal) = self.items.drink(&mut self.inventory)
         {
+            self.audio.play(Sfx::PotionDrink, 0.8, 0.0);
             let restored = self.warrior.heal(heal);
             tracing::info!(
                 "dungeon: drank a potion at step {} — {restored:.0} hit points restored, \

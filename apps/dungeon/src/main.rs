@@ -199,6 +199,16 @@ fn main() -> anyhow::Result<()> {
         (game, level)
     };
 
+    // Interactive runs get the real output device; anything headless (screenshot
+    // captures, driven CAPTURE_SEQ walks) or `NO_AUDIO=1` keeps the silent Null sink so
+    // no capture or test path ever touches a platform audio API.
+    let mut game = game;
+    let headless = std::env::args().any(|a| a.starts_with("--screenshot"))
+        || std::env::var_os("CAPTURE_SEQ").is_some();
+    if !headless && std::env::var("NO_AUDIO").ok().as_deref() != Some("1") {
+        game.enable_audio();
+    }
+
     sandbox::main_entry(sandbox::GameConfig {
         level: Some(level),
         // This game keeps its levels in its own directory, so the engine's built-in

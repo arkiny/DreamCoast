@@ -15,6 +15,11 @@ compatible with redistribution under MIT.
 | [`ash`](https://github.com/ash-rs/ash) | 0.38 | MIT OR Apache-2.0 |
 | [`windows`](https://github.com/microsoft/windows-rs) / `windows-core` | 0.62 | MIT OR Apache-2.0 |
 | [`objc2`](https://github.com/madsmtm/objc2) / `objc2-foundation` / `objc2-app-kit` / `objc2-metal` / `objc2-quartz-core` (macOS) | 0.6 / 0.3 | MIT OR Apache-2.0 |
+| `objc2-audio-toolbox` / `objc2-core-audio` / `objc2-core-audio-types` (macOS, via `cpal`) | 0.3 | Zlib OR Apache-2.0 OR MIT |
+| [`cpal`](https://github.com/RustAudio/cpal) (audio output) | 0.16 | Apache-2.0 |
+| [`coreaudio-rs`](https://github.com/RustAudio/coreaudio-rs) (macOS, via `cpal`) | 0.13 | MIT OR Apache-2.0 |
+| [`dasp_sample`](https://github.com/RustAudio/dasp) (via `cpal`) | 0.11 | MIT OR Apache-2.0 |
+| [`mach2`](https://github.com/JohnTitor/mach2) (macOS, via `cpal`) | 0.4 | BSD-2-Clause OR MIT OR Apache-2.0 |
 | [`glam`](https://github.com/bitshifter/glam-rs) | 0.30 | MIT OR Apache-2.0 |
 | [`imgui`](https://github.com/imgui-rs/imgui-rs) / `imgui-sys` | 0.12 | MIT OR Apache-2.0 |
 | [`gltf`](https://github.com/gltf-rs/gltf) | 1.4 | MIT OR Apache-2.0 |

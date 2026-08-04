@@ -15,6 +15,7 @@ members = [
     "crates/render",
     "crates/scene",
     "crates/game",
+    "crates/audio",
     "apps/sandbox",
     "apps/dungeon",
 ]

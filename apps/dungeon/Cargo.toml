@@ -12,6 +12,8 @@ publish.workspace = true
 sandbox = { path = "../sandbox" }
 # The reusable game framework (input action mapping today; physics/anim/camera later).
 dreamcoast-game.workspace = true
+# Device mixer + procedural SFX (docs/game-audio-plan.md). A path dep like `sandbox`.
+dreamcoast-audio = { path = "../../crates/audio" }
 # The declarative level model — this game authors its `.level` from code so the
 # spawn/extent constants gameplay reads are the same ones the level is built from.
 dreamcoast-asset.workspace = true

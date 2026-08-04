@@ -1,0 +1,15 @@
+[package]
+name = "dreamcoast-audio"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+# The one external audio dependency the game-audio plan approved: platform device
+# output (CoreAudio / WASAPI / ALSA) behind one stream API. Everything above it —
+# ring, mixer, synthesis — is this crate's own code.
+cpal = "0.16"
+tracing = "0.1"
+
+[dev-dependencies]
