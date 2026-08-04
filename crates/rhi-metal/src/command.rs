@@ -496,16 +496,13 @@ impl MetalCommandBuffer {
 
     /// Begin rasterization with NO attachments over `extent` (the VSM caster pass:
     /// fragment-stage buffer scatter only). Metal supports attachment-less passes via
-    /// `renderTargetWidth/Height` + `defaultRasterSampleCount`; the VSM bring-up on this
-    /// backend is tracked in docs/vsm-shadows-plan.md §4 and needs a macOS verify pass
-    /// before first use.
+    /// `renderTargetWidth/Height` + `defaultRasterSampleCount`; verified on macOS
+    /// (VSM=1 sponza + dungeon smoke, docs/vsm-shadows-plan.md §4).
     pub fn begin_rendering_empty(&self, extent: rhi_types::Extent2D) {
         let pass = MTLRenderPassDescriptor::new();
-        unsafe {
-            pass.setRenderTargetWidth(extent.width as usize);
-            pass.setRenderTargetHeight(extent.height as usize);
-            pass.setDefaultRasterSampleCount(1);
-        }
+        pass.setRenderTargetWidth(extent.width as usize);
+        pass.setRenderTargetHeight(extent.height as usize);
+        pass.setDefaultRasterSampleCount(1);
         self.start_encoder(&pass);
     }
 
