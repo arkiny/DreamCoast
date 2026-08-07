@@ -259,7 +259,10 @@ pub fn floor_grid_sized(run_seed: u64, floor: u32, tiles: i32) -> TileGrid {
         height: tiles,
         min_rooms: ((base.min_rooms as f32 * scale) as usize).max(1),
         max_rooms: ((base.max_rooms as f32 * scale) as usize).max(2),
-        room_attempts: (base.room_attempts as f32 * scale.max(1.0)) as u32 * 2,
+        // Attempts scale with area; the identity case (tiles == base) must reproduce
+        // the shipped defaults EXACTLY — generation consumes attempts, so any change
+        // here re-rolls every existing seed's layout.
+        room_attempts: (base.room_attempts as f32 * scale.max(1.0)) as u32,
         ..base
     };
     crate::procgen::generate(floor_seed(run_seed, floor), &params)

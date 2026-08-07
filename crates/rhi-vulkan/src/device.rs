@@ -38,10 +38,10 @@ pub(crate) const STORAGE_IMAGE_COUNT: u32 = 256;
 pub(crate) const STORAGE_BUFFER_COUNT: u32 = 2048;
 /// Size of the bindless sampled 3D-volume table (binding 6). Trilinear-sampled
 /// distance fields; separate 0-based index space (Phase 11 Stage B).
-pub(crate) const VOLUME_COUNT: u32 = 64;
+pub(crate) const VOLUME_COUNT: u32 = 128;
 /// Size of the bindless storage 3D-volume (UAV) table (binding 7). Compute bakes
 /// write these; separate 0-based index space (Phase 11 Stage B).
-pub(crate) const STORAGE_VOLUME_COUNT: u32 = 64;
+pub(crate) const STORAGE_VOLUME_COUNT: u32 = 128;
 
 /// Device-level objects shared (via `Arc`) by every GPU resource so each can
 /// destroy itself before the device is torn down.

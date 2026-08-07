@@ -658,7 +658,17 @@ pub fn dungeon_level_data(
 /// on this machine — this run's or an earlier one's — writes bytes that are already
 /// there and re-cooks nothing.
 pub fn dungeon_level_name(seed: u64) -> String {
-    format!("dungeon_{seed}")
+    // The grid size is part of the identity: a `--tiles` stress floor must not share a
+    // cache filename with the shipped 40-tile floor of the same seed (a collision loads
+    // a level whose player/geometry don't match the game's grid — the game then fails
+    // to acquire its cast and plays nothing). 40 keeps the historical name so existing
+    // caches and recipes stay valid.
+    let tiles = crate::game::tiles_from_env_or_default();
+    if tiles == 40 {
+        format!("dungeon_{seed}")
+    } else {
+        format!("dungeon_{seed}_t{tiles}")
+    }
 }
 
 /// The selector a *running* game hands [`sandbox::GameHooks::next_level`] for a seed:

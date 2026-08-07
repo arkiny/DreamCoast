@@ -2313,6 +2313,7 @@ impl App {
             scene_center,
             scene_radius,
             base: &base,
+            backend,
             loading_state: &loading_state,
         };
         let static_scene::StaticScene {
@@ -4344,6 +4345,7 @@ impl App {
             scene_center: self.scene_center,
             scene_radius: self.scene_radius,
             base: &base,
+            backend: self.backend,
             loading_state: &loading_state,
         };
         let built = static_scene::build_gdf_scene(
@@ -6361,7 +6363,16 @@ impl App {
         // Stage B3: the finer clipmap-level volumes each GDF pass transitions to sampled
         // (empty for the single-level gallery). Bound before the graph so it outlives the
         // pass closures that borrow it.
-        let scene_clip_vols = self.gdf.clip_level_volumes();
+        // Global field recenter (U1): same two-phase contract as the GI fine volume —
+        // box+scroll+latch flip here (pre any shared gdf borrow), the cull/composite
+        // batch records into the graph below in this frame's timeline.
+        if let Some(g) = self.gdf.global_mut() {
+            g.apply()?;
+        }
+        let mut scene_clip_vols = self.gdf.clip_level_volumes();
+        // Global field (U1): its level volumes ride the same sampled-transition seam,
+        // so every ms_dense consumer sees them resident. Empty when off.
+        scene_clip_vols.extend(self.gdf.global_sampled_volumes());
         // S1 CPU frustum cull: the opaque G-buffer + pre-pass draws only need objects inside the
         // camera frustum (culled ones are clipped anyway ⇒ image-identical). The cull matrix is the
         // unjittered no-flip `cull_view_proj` (DX≡VK-stable). Shadow + view-independent GDF passes keep
@@ -6439,6 +6450,9 @@ impl App {
         // gi_volume site below, and both execute in this frame's timeline.
         self.gi.gi_fine_shift_apply()?;
         let mut graph = RenderGraph::new();
+        // Global field cull/composite (U1): first passes on the `scene_gdf` external,
+        // so every GDF consumer this frame orders after the refreshed pages.
+        self.gdf.record_global(&mut graph);
         // The backbuffer is the actual swapchain image (display extent); tonemap samples the
         // render-extent HDR by UV, so a render≠display extent just means a downscale at present.
         let backbuffer = graph.import_backbuffer(self.swap_format(), swap_extent);
@@ -9362,6 +9376,11 @@ impl App {
             // every frame; the armed target is consumed by next frame's pre-graph shift —
             // a fixed camera never leaves the dead-zone, so static captures stay untouched.
             self.gi.gi_fine_recenter([eye.x, eye.y, eye.z]);
+        }
+        // Global field dead-zone check (U1): arms page deltas; a fixed camera never
+        // arms (the gate-recipe invariant), consumed by next frame's pre-graph apply.
+        if let Some(g) = self.gdf.global_mut() {
+            g.arm(eye);
         }
         // QHD/UHD TAAU: advance the history ping-pong (next frame reprojects this frame's).
         if taau_active {

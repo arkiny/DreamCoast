@@ -1411,6 +1411,19 @@ const JOBS: &[Job] = &[
         stage: "compute",
         key: "gi_shift_cs",
     },
+    // Global distance field (U1): per-clipmap instance cull + page composite.
+    Job {
+        src: "gdf_global_cull.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_global_cull_cs",
+    },
+    Job {
+        src: "gdf_global_composite.slang",
+        entry: "csMain",
+        stage: "compute",
+        key: "gdf_global_composite_cs",
+    },
     // Screen-space radiance probes: per-tile probe trace into the octahedral atlas (P1).
     Job {
         src: "screen_probe_trace.slang",

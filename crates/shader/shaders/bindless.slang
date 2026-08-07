@@ -64,9 +64,9 @@ struct Bindless
     RaytracingAccelerationStructure tlas;
     // binding 6 — sampled 3D volume textures (Phase 11 Stage B: baked distance
     // fields, trilinear-sampled by the SW ray marcher). SRVs, after the TLAS.
-    Texture3D<float> volumes[64];
+    Texture3D<float> volumes[128];
     // binding 7 — read-write 3D volume textures (UAV) the SDF bake compute writes.
-    RWTexture3D<float> storage_volumes[64];
+    RWTexture3D<float> storage_volumes[128];
     // binding 8 — REPEAT/wrap sampler for tiling material textures (floor tiles, brick
     // courses) whose glTF UVs exceed [0,1]. Declared LAST so it only appends a binding
     // (Vulkan binding 8 / D3D12 s1,space1 / Metal last arg-buffer slot) — existing layout

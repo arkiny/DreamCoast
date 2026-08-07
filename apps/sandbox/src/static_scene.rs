@@ -50,6 +50,9 @@ pub(crate) struct StaticSceneParams<'a> {
     pub scene_radius: f32,
     /// The resolved quality tier the load-time knobs default to.
     pub base: &'a QualityPreset,
+    /// The active RHI backend — the global field builds its compute pipelines here
+    /// (rebuilt with the scene on hot-swap, like every other static-scene resource).
+    pub backend: rhi::BackendKind,
     /// Loading-screen progress the per-mesh cook advances.
     pub loading_state: &'a Arc<LoadingState>,
 }
@@ -577,6 +580,32 @@ pub(crate) fn build_gdf_scene(
         let alb_ref = alb_ch
             .as_ref()
             .map(|c| [c[0].as_slice(), c[1].as_slice(), c[2].as_slice()]);
+        // Global distance field (gdf-scale-follow-plan.md U1, reference parity): the
+        // camera-centered clipmap cache replaces the static dense fallback. Created
+        // BEFORE install so the header can store the latch; content installs after,
+        // from the SAME records/atlases the direct path marches. CONTENT DEFAULT ON
+        // (user directive, 2026-08-04): world-size-independent near-field density is
+        // the shipping behavior; `P11_GDF_GLOBAL=0` is the A/B fallback seam. The
+        // gallery (fused path) never reaches this block — its anchor is untouched.
+        let global_on = crate::quality::env_bool("P11_GDF_GLOBAL", true);
+        let global = if global_on {
+            let eye = p
+                .level_view
+                .map(|(e, _)| e)
+                .unwrap_or(p.scene_center + Vec3::new(0.0, p.scene_radius, 0.0));
+            Some(crate::gdf_global::GdfGlobal::new(
+                device,
+                p.backend,
+                eye,
+                crate::FRAMES_IN_FLIGHT,
+            )?)
+        } else {
+            None
+        };
+        let latch = global
+            .as_ref()
+            .map(|g| g.indirection_index())
+            .unwrap_or(u32::MAX);
         gdf.install_mesh_sdf(
             device,
             &atlas_bytes,
@@ -585,7 +614,26 @@ pub(crate) fn build_gdf_scene(
             &build,
             alb_ref,
             crate::quality::env_bool("P11_SDF_DETAIL_REPLACE", p.base.sdf_detail_replace),
+            latch,
         )?;
+        if let Some(mut g) = global {
+            let (atlas_idx, alb_idx) = gdf.ms_atlas_indices().expect("install_mesh_sdf just ran");
+            g.set_content(
+                device,
+                build.instances.clone(),
+                build.instance_count,
+                atlas_idx,
+                alb_idx,
+                scene_diag,
+            )?;
+            info!(
+                "GDF global field: {} levels, voxel {:.2}..{:.2} m (P11_GDF_GLOBAL)",
+                crate::gdf_global::GLOBAL_LEVELS,
+                crate::gdf_global::GlobalLevel::voxel(0),
+                crate::gdf_global::GlobalLevel::voxel(crate::gdf_global::GLOBAL_LEVELS - 1),
+            );
+            gdf.set_global(g);
+        }
     }
     // Phase 12 item 3: optional GPU→CPU volume-readback round-trip check. Reads
     // the just-uploaded scene SDF back and confirms it equals the bytes we

@@ -240,6 +240,9 @@ pub(crate) struct GdfSystem {
     ms_indices: Option<StorageBuffer>,
     ms_header: Option<StorageBuffer>,
     ms_active: bool,
+    /// Global distance field (reference parity, gdf-scale-follow-plan.md): the
+    /// camera-centered clipmap cache above the object stage. `None` = legacy dense.
+    global: Option<crate::gdf_global::GdfGlobal>,
     /// Stage D: the analytic ground-plane height the SW-RT marches union with the GDF. The
     /// gallery's floor is *analytic* (y = 0, no floor geometry in the fuse); content scenes
     /// (Sponza) carry their floor as real geometry, so the analytic ground is disabled
@@ -621,6 +624,7 @@ impl GdfSystem {
             ms_indices: None,
             ms_header: None,
             ms_active: false,
+            global: None,
             scene_ground_y: 0.0,
         })
     }
@@ -869,6 +873,28 @@ impl GdfSystem {
             .map(|b| (b.storage_index(), self.clip_count))
     }
 
+    /// Install the global field (U1); called by static_scene when `P11_GDF_GLOBAL` is
+    /// on for a direct-sample content scene.
+    pub(crate) fn set_global(&mut self, g: crate::gdf_global::GdfGlobal) {
+        self.global = Some(g);
+    }
+    pub(crate) fn global_mut(&mut self) -> Option<&mut crate::gdf_global::GdfGlobal> {
+        self.global.as_mut()
+    }
+    /// Record the global field's cull/composite batch (immutable — see gdf_global.rs).
+    pub(crate) fn record_global<'a>(&'a self, graph: &mut RenderGraph<'a>) {
+        if let Some(g) = &self.global {
+            g.record(graph);
+        }
+    }
+    /// The global level volumes consumers transition to sampled (empty when off).
+    pub(crate) fn global_sampled_volumes(&self) -> Vec<&Volume> {
+        self.global
+            .as_ref()
+            .map(|g| g.sampled_volumes())
+            .unwrap_or_default()
+    }
+
     /// P1: install the per-mesh SDF **atlas** + direct-sample acceleration buffers, switching
     /// the SW-RT field source from the dense clipmap to direct per-mesh sampling. `atlas_bytes`
     /// is the packed atlas volume (`atlas_dim`), `build` the CPU instance table + cell grid
@@ -895,6 +921,9 @@ impl GdfSystem {
         // instance's atlas SDF covers a point, the atlas union IS the field — the coarse dense
         // term only answers uncovered space. See ms_geo in mesh_sdf_sample.slang.
         detail_replace: bool,
+        // Global-field latch buffer index (gdf-scale-follow-plan.md U1);
+        // `u32::MAX` = the legacy dense fallback.
+        global_latch: u32,
     ) -> anyhow::Result<()> {
         if self.scene_gdf.is_none() {
             return Ok(());
@@ -1010,7 +1039,10 @@ impl GdfSystem {
         // term — the 0.75 m dense voxels otherwise force d≈0 through contact gaps and defeat
         // the accurate atlas exactly where mirrors need it).
         pu(&mut h, u32::from(detail_replace));
-        pu(&mut h, 0);
+        // Word 116: the global-field latch buffer (gdf-scale-follow-plan.md U1) —
+        // 0xFFFFFFFF = the legacy dense fallback (0 is a VALID bindless index, so the
+        // sentinel must be explicit).
+        pu(&mut h, global_latch);
         pu(&mut h, 0);
         pu(&mut h, 0);
         let header = sbuf(&h, 16)?;
@@ -1023,6 +1055,21 @@ impl GdfSystem {
         self.ms_header = Some(header);
         self.ms_active = true;
         Ok(())
+    }
+
+    /// The per-mesh atlas sampled indices (sdf, albedo r/g/b or MAX) — the global
+    /// field's composite kernel samples the SAME atlases the direct path marches.
+    pub(crate) fn ms_atlas_indices(&self) -> Option<(u32, [u32; 3])> {
+        let sdf = self.sdf_atlas.as_ref()?.sampled_index();
+        let alb = match &self.ms_albedo_atlas {
+            Some(v) => [
+                v[0].sampled_index(),
+                v[1].sampled_index(),
+                v[2].sampled_index(),
+            ],
+            None => [u32::MAX; 3],
+        };
+        Some((sdf, alb))
     }
 
     pub(crate) fn has_scene_sdf(&self) -> bool {

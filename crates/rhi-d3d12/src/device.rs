@@ -82,11 +82,11 @@ pub(crate) const STORAGE_BUFFER_BASE: u32 = STORAGE_IMAGE_BASE + STORAGE_IMAGE_C
 pub(crate) const TLAS_SLOT: u32 = STORAGE_BUFFER_BASE + STORAGE_BUFFER_COUNT;
 /// Size of the bindless sampled 3D-volume SRV table (Phase 11 Stage B), after the
 /// TLAS slot. Shader sees it at `t{BINDLESS_COUNT+CUBE_COUNT+1}, space1`.
-pub(crate) const VOLUME_COUNT: u32 = 64;
+pub(crate) const VOLUME_COUNT: u32 = 128;
 /// Size of the bindless storage 3D-volume UAV table (Phase 11 Stage B), after the
 /// sampled volumes. Shader sees it at `u{STORAGE_IMAGE_COUNT+STORAGE_BUFFER_COUNT},
 /// space1`.
-pub(crate) const STORAGE_VOLUME_COUNT: u32 = 64;
+pub(crate) const STORAGE_VOLUME_COUNT: u32 = 128;
 /// Heap offset where the sampled-volume SRV region begins.
 pub(crate) const VOLUME_BASE: u32 = TLAS_SLOT + 1;
 /// Heap offset where the storage-volume UAV region begins.

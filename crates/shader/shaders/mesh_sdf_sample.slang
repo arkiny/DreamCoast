@@ -26,6 +26,7 @@
 //   64: float3 scene_aabb_min, _
 //   80: float3 scene_aabb_max, _
 //   96: uint4  alb_atlas_r, alb_atlas_g, alb_atlas_b, alb_atlas_active   (F5: per-mesh albedo)
+//  112: uint4  flags, global_latch, _, _   (global field: latch buffer idx, 0xFFFFFFFF = off)
 struct MeshSdfHeader
 {
     float3 grid_min;
@@ -52,6 +53,10 @@ struct MeshSdfHeader
     // bit0 = detail-replace: where any instance's atlas covers `p`, the atlas union IS the
     // field (the dense term only answers uncovered space). See ms_geo.
     uint flags;
+    // Global distance field latch (gdf-scale-follow-plan.md U1): a storage buffer whose
+    // uint4 is {live consts idx, active, res, levels}. 0xFFFFFFFF = the legacy dense
+    // scene volume below. Indirected so a recenter flip is ONE host word store.
+    uint global_latch;
 };
 
 // NOTE (lighting-closure P2, measured negative): a per-invocation `static` header cache
@@ -91,6 +96,7 @@ MeshSdfHeader ms_load_header(uint hidx)
     h.alb_atlas_b = w6.z;
     h.alb_atlas_active = w6.w;
     h.flags = w7.x;
+    h.global_latch = w7.y;
     return h;
 }
 
@@ -103,9 +109,40 @@ uint ms_cell_index(MeshSdfHeader h, float3 p)
     return uint(c.x) + h.res * (uint(c.y) + h.res * uint(c.z));
 }
 
-// The dense coarse field at `p` (trilinear over the scene AABB). The safe empty-space distance.
+// The coarse empty-space field at `p`.
+//
+// Global-field path (header.global_latch valid): the camera-centered clipmap — pick the
+// finest level containing `p` (border-shrunk by half a texel so REPEAT filtering never
+// blends the opposite WORLD edge), add the level's toroidal scroll and sample with the
+// WRAP sampler; outside every level, the analytic distance to the coarsest box keeps
+// the marcher stepping sensibly (the reference contract: contents stay put, addresses
+// scroll). Legacy path: the static dense scene volume, bit-for-bit as before.
 float ms_dense(MeshSdfHeader h, float3 p)
 {
+    if (h.global_latch != 0xFFFFFFFFu)
+    {
+        uint4 latch = g.storage_buffers[h.global_latch].Load4(0u);
+        RWByteAddressBuffer c = g.storage_buffers[latch.x];
+        float res = float(latch.z);
+        for (uint l = 0u; l < latch.w; l++)
+        {
+            float4 r0 = asfloat(c.Load4(l * 64u + 0u)); // min + voxel
+            float4 r1 = asfloat(c.Load4(l * 64u + 16u)); // max + border
+            float3 uvw = (p - r0.xyz) / (r1.xyz - r0.xyz);
+            float b = r1.w;
+            if (any(uvw < b) || any(uvw > 1.0 - b))
+                continue;
+            uint4 vols = c.Load4(l * 64u + 32u);
+            uint4 scr = c.Load4(l * 64u + 48u);
+            float3 suvw = uvw + float3(scr.xyz) / res;
+            return g.volumes[vols.x].SampleLevel(g.samp_wrap, suvw, 0.0).x;
+        }
+        uint last = latch.w - 1u;
+        float4 r0 = asfloat(c.Load4(last * 64u + 0u));
+        float4 r1 = asfloat(c.Load4(last * 64u + 16u));
+        float3 q = abs(p - 0.5 * (r0.xyz + r1.xyz)) - 0.5 * (r1.xyz - r0.xyz);
+        return max(length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0), 0.01);
+    }
     float3 u = saturate((p - h.scene_min) / max(h.scene_max - h.scene_min, float3(1e-8)));
     return g.volumes[h.dense_idx].SampleLevel(g.samp, u, 0.0).x;
 }
@@ -168,6 +205,28 @@ float ms_geo(uint hidx, float3 p, float clamp_d)
 // albedo atlas is off).
 float3 ms_albedo_dense(MeshSdfHeader h, float3 p, float fallback)
 {
+    if (h.global_latch != 0xFFFFFFFFu)
+    {
+        uint4 latch = g.storage_buffers[h.global_latch].Load4(0u);
+        RWByteAddressBuffer c = g.storage_buffers[latch.x];
+        float res = float(latch.z);
+        for (uint l = 0u; l < latch.w; l++)
+        {
+            float4 r0 = asfloat(c.Load4(l * 64u + 0u));
+            float4 r1 = asfloat(c.Load4(l * 64u + 16u));
+            float3 uvw = (p - r0.xyz) / (r1.xyz - r0.xyz);
+            float b = r1.w;
+            if (any(uvw < b) || any(uvw > 1.0 - b))
+                continue;
+            uint4 vols = c.Load4(l * 64u + 32u);
+            uint4 scr = c.Load4(l * 64u + 48u);
+            float3 suvw = uvw + float3(scr.xyz) / res;
+            return float3(g.volumes[vols.y].SampleLevel(g.samp_wrap, suvw, 0.0).x,
+                          g.volumes[vols.z].SampleLevel(g.samp_wrap, suvw, 0.0).x,
+                          g.volumes[vols.w].SampleLevel(g.samp_wrap, suvw, 0.0).x);
+        }
+        return float3(fallback, fallback, fallback);
+    }
     if (h.alb_r == 0xFFFFFFFFu)
         return float3(fallback, fallback, fallback);
     float3 u = saturate((p - h.scene_min) / max(h.scene_max - h.scene_min, float3(1e-8)));

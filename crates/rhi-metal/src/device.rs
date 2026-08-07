@@ -72,12 +72,12 @@ pub(crate) const TLAS_SLOT: u32 = STORAGE_BUFFER_BASE + STORAGE_BUFFER_COUNT;
 /// Size of the bindless sampled-volume (3D SRV) table. Matches `VOLUME_COUNT` in
 /// rhi-vulkan / rhi-d3d12 and `Bindless.volumes[64]` in `bindless.slang` (Phase 11
 /// Stage B distance fields, trilinear-sampled by the SW ray marcher).
-pub(crate) const VOLUME_COUNT: u32 = 64;
+pub(crate) const VOLUME_COUNT: u32 = 128;
 
 /// Size of the bindless storage-volume (3D UAV) table. Matches
 /// `STORAGE_VOLUME_COUNT` and `Bindless.storage_volumes[64]`; the SDF bake / GDF
 /// merge compute shaders write these.
-pub(crate) const STORAGE_VOLUME_COUNT: u32 = 64;
+pub(crate) const STORAGE_VOLUME_COUNT: u32 = 128;
 
 /// First argument-buffer slot of the sampled-volume region. The volumes follow the
 /// TLAS in declaration order, and Slang's Metal target keeps the `tlas` member in
