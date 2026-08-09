@@ -34,6 +34,10 @@
 // bit 31 = mapped (valid to sample). Unallocated = 0.
 #define VSM_PTE_MAPPED 0x80000000u
 #define VSM_PTE_RENDER 0x40000000u
+// Counter-buffer offset of the per-level RENDER-page bounds rows (16 B per level:
+// {min x, min y, max x, max y} in virtual-page coords; min > max = empty). Written by
+// the pages pass, consumed by the depth VS's whole-caster cull.
+#define VSM_BOUNDS_BASE 16u
 #define VSM_PTE_PAGE_MASK 0xffffu
 // Request flags (one u32 per page-table entry).
 #define VSM_REQ_ALLOCATE 1u

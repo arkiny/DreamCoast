@@ -31,14 +31,19 @@ struct VSOutput
 
 struct PushConstants
 {
-    float4x4 mvp;        // flip-free level world->clip x model
+    // Rows 0-2: the flip-free level world->clip x model AFFINE transform (the level
+    // projections are orthographic, so the true w row is (0,0,0,1) by construction and
+    // the VS reconstructs w = 1). Row 3 REPURPOSES that dead space as the caster's
+    // whole-draw cull key: {sphere NDC x, sphere NDC y, sphere NDC radius, unused}.
+    float4x4 mvp;
     uint base_color_tex; // masked casters: base-color bindless index (NO_TEXTURE if absent)
     float alpha_cutoff;  // |cutoff| alpha-test threshold (0 = opaque), sign ignored here
     uint flip_y;         // 1 = Vulkan (VS negates clip.y)
     uint level;          // clipmap level being rasterized
     uint table_buf; // page table storage index
     uint pool_buf;  // physical pool storage index
-    uint2 _pad;
+    uint counter_buf; // stats + per-level RENDER bounds (VSM_BOUNDS_BASE rows)
+    uint _pad;
     uint4 skin;  // vsMainSkinned only: joints / weights / palette / count
     uint4 morph; // vsMainMorphed only: deltas / weights / target_count / vertex_count
 };
@@ -46,9 +51,40 @@ struct PushConstants
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> pc : register(b0, space0);
 
+// Whole-caster cull against this frame's RENDER-page bounds (written by the pages
+// pass earlier this frame — no stale-readback shadow holes by construction). A caster
+// whose bounding sphere overlaps no RENDER page can only produce PS discards; the VS
+// collapses it instead, which removes the raster fill that made vsm_raster the top
+// pass. The decision is UNIFORM per draw (sphere and bounds are per-draw constants),
+// so triangles are collapsed whole, never partially.
+bool vsm_caster_culled()
+{
+    uint b = VSM_BOUNDS_BASE + pc.level * 16u;
+    RWByteAddressBuffer counter = g.storage_buffers[pc.counter_buf];
+    uint minx = counter.Load(b + 0u);
+    uint maxx = counter.Load(b + 8u);
+    if (minx > maxx)
+        return true; // no RENDER pages on this level this frame
+    uint miny = counter.Load(b + 4u);
+    uint maxy = counter.Load(b + 12u);
+    // Bounds pages -> NDC box (page p spans [p, p+1) / VSM_TABLE_DIM in UV).
+    float inv = 2.0 / float(VSM_TABLE_DIM);
+    float lo_x = float(minx) * inv - 1.0;
+    float hi_x = float(maxx + 1u) * inv - 1.0;
+    float lo_y = float(miny) * inv - 1.0;
+    float hi_y = float(maxy + 1u) * inv - 1.0;
+    float sx = pc.mvp[3].x;
+    float sy = pc.mvp[3].y;
+    float sr = pc.mvp[3].z;
+    return sx + sr < lo_x || sx - sr > hi_x || sy + sr < lo_y || sy - sr > hi_y;
+}
+
 float4 vsm_clip(float4 world)
 {
-    float4 clip = mul(pc.mvp, world);
+    if (vsm_caster_culled())
+        return float4(4.0, 4.0, 4.0, 1.0); // uniform: every vertex lands here -> clipped
+    // Affine rows (see PushConstants): w reconstructs to 1.
+    float4 clip = float4(dot(pc.mvp[0], world), dot(pc.mvp[1], world), dot(pc.mvp[2], world), 1.0);
     if (pc.flip_y != 0u)
         clip.y = -clip.y;
     return clip;

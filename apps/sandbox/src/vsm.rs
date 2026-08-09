@@ -255,12 +255,14 @@ impl VsmSystem {
         // Host-visible so `stats()` can read the counters (the HZB cull-stats pattern:
         // GPU atomics on a host-coherent buffer). [12] = virgin high-water, PERSISTS —
         // it and the free list are the cache's allocator state.
+        // 16 B stats/cursor + VSM_LEVELS x 16 B RENDER-page bounds rows (the depth
+        // VS's whole-caster cull key — see VSM_BOUNDS_BASE in vsm_common.slang).
         let counter = device.create_storage_buffer_host(&StorageBufferDesc {
-            size: 16,
+            size: (16 + VSM_LEVELS * 16) as u64,
             stride: 4,
             indirect: false,
         })?;
-        counter.write(&[0u8; 16])?;
+        counter.write(&[0u8; 16 + VSM_LEVELS * 16])?;
         let consts = (0..FRAMES_IN_FLIGHT)
             .map(|_| {
                 let b = device.create_storage_buffer_host(&StorageBufferDesc {
@@ -624,6 +626,7 @@ impl VsmSystem {
                 cmd.dispatch(entries.div_ceil(64), 1, 1);
                 cmd.storage_buffer_barrier(table);
                 cmd.storage_buffer_barrier(pool);
+                cmd.storage_buffer_barrier(counter); // bounds rows -> depth VS cull
                 Ok(())
             },
         );
@@ -670,28 +673,40 @@ impl VsmSystem {
                         // ortho dot products against ±(1 + r/half). Conservative in
                         // XY only (the along-sun range is generous by construction),
                         // so a skipped draw is provably contribution-free.
-                        {
+                        let sphere = {
                             let c = (obj.world_aabb[0] + obj.world_aabb[1]) * 0.5;
                             let r = (obj.world_aabb[1] - obj.world_aabb[0]).length() * 0.5;
                             let clip = *mat * c.extend(1.0);
-                            let margin = 1.0 + r * self.level_inv_half[level];
+                            let r_ndc = r * self.level_inv_half[level];
+                            let margin = 1.0 + r_ndc;
                             if clip.x.abs() > margin || clip.y.abs() > margin {
                                 continue;
                             }
-                        }
+                            [clip.x, clip.y, r_ndc]
+                        };
                         if obj.skin.is_some() {
                             cmd.bind_graphics_pipeline(&self.depth_skinned_pipeline);
                         } else if obj.morph.is_some() {
                             cmd.bind_graphics_pipeline(&self.depth_morphed_pipeline);
                         }
+                        // The level projections are affine (orthographic), so the
+                        // matrix' w row is (0,0,0,1) by construction; the VS
+                        // reconstructs w = 1 and that dead row carries the caster's
+                        // NDC cull sphere instead (vsm_depth.slang PushConstants).
+                        let mut mvp = (*mat * obj.transform).to_cols_array();
+                        mvp[3] = sphere[0];
+                        mvp[7] = sphere[1];
+                        mvp[11] = sphere[2];
+                        mvp[15] = 1.0;
                         cmd.push_constants(&vsm_depth_push(
-                            (*mat * obj.transform).to_cols_array(),
+                            mvp,
                             obj.tex[0],
                             obj.alpha_cutoff,
                             flip_y as u32,
                             level as u32,
                             table.storage_index(),
                             pool.storage_index(),
+                            self.counter.storage_index(),
                             obj.skin.unwrap_or([0; 4]),
                             obj.morph.unwrap_or([0; 4]),
                         ));
@@ -771,6 +786,7 @@ fn vsm_depth_push(
     level: u32,
     table_buf: u32,
     pool_buf: u32,
+    counter_buf: u32,
     skin: [u32; 4],
     morph: [u32; 4],
 ) -> [u8; 128] {
@@ -784,7 +800,8 @@ fn vsm_depth_push(
     pc[76..80].copy_from_slice(&level.to_le_bytes());
     pc[80..84].copy_from_slice(&table_buf.to_le_bytes());
     pc[84..88].copy_from_slice(&pool_buf.to_le_bytes());
-    // pc[88..96] = spare (kept so the shader layout is stable)
+    pc[88..92].copy_from_slice(&counter_buf.to_le_bytes());
+    // pc[92..96] = spare (kept so the shader layout is stable)
     for (i, v) in skin.iter().enumerate() {
         let o = 96 + i * 4;
         pc[o..o + 4].copy_from_slice(&v.to_le_bytes());

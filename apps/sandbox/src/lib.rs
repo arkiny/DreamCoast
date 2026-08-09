@@ -1561,6 +1561,12 @@ pub struct App {
     /// formerly overflowed the 256-slot storage-image table after ~20 steps).
     diag_scale_cycle: Option<u64>,
     last: Instant,
+    /// `FRAME_CAP=<fps>`: soft frame pacing — sleep the remainder of `1/fps` at the
+    /// top of each loop iteration. Display-decoupled (pairs with `NO_VSYNC=1` to hold
+    /// rates a fixed-refresh panel cannot pace, e.g. 40 fps on a 60 Hz laptop) and a
+    /// thermal-headroom lever on fanless hardware. None = uncapped (the default).
+    frame_cap: Option<std::time::Duration>,
+    cap_last: Instant,
     elapsed: f32,
     angle: f32,
     /// Previous frame's orbit `angle`, kept so the rendered camera can interpolate
@@ -3912,6 +3918,12 @@ impl App {
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|&n| n > 0),
             last: Instant::now(),
+            frame_cap: std::env::var("FRAME_CAP")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|f| *f > 1.0 && f.is_finite())
+                .map(|fps| std::time::Duration::from_secs_f32(1.0 / fps)),
+            cap_last: Instant::now(),
             elapsed: 0.0,
             // Fixed view in screenshot mode for reproducible output; `DIAG_ANGLE`
             // overrides it (degrees) for capturing the chosen object from a fixed side.
@@ -4160,6 +4172,16 @@ impl App {
             if self.hooks.as_mut().is_some_and(|h| h.wants_exit()) {
                 info!("game requested exit");
                 break;
+            }
+            // Soft frame cap (`FRAME_CAP`): pace the LOOP, not the display — sleep off
+            // the remainder of the target period. Screenshot mode ignores it (captures
+            // are frame-counted, not paced).
+            if let (Some(cap), false) = (self.frame_cap, self.screenshot_mode) {
+                let elapsed = self.cap_last.elapsed();
+                if elapsed < cap {
+                    std::thread::sleep(cap - elapsed);
+                }
+                self.cap_last = Instant::now();
             }
             #[cfg(windows)]
             if let Some(rd) = rdoc.as_mut()

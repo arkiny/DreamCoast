@@ -65,6 +65,29 @@ void csClear(uint3 tid: SV_DispatchThreadID)
         g.storage_buffers[pc.counter_buf].Store(12u, 0u); // free-list pop cursor
         g.storage_buffers[pc.freelist_buf].Store(0u, 0u); // rebuilt by csCompact below
     }
+    // Per-level RENDER-page bounds (VSM_BOUNDS_BASE rows): reset to the empty
+    // sentinel (min > max). csUpdate/csAlloc Min/Max every page they flag RENDER;
+    // the depth VS culls whole casters against the result — same frame, no
+    // stale-readback shadow holes.
+    if (tid.x < VSM_LEVELS)
+    {
+        uint b = VSM_BOUNDS_BASE + tid.x * 16u;
+        g.storage_buffers[pc.counter_buf].Store(b + 0u, 0xFFFFFFFFu); // min x
+        g.storage_buffers[pc.counter_buf].Store(b + 4u, 0xFFFFFFFFu); // min y
+        g.storage_buffers[pc.counter_buf].Store(b + 8u, 0u);          // max x
+        g.storage_buffers[pc.counter_buf].Store(b + 12u, 0u);         // max y
+    }
+}
+
+// A page just flagged RENDER on `level` grows that level's caster-cull bounds.
+void vsm_bounds_grow(uint level, uint2 vpage)
+{
+    uint b = VSM_BOUNDS_BASE + level * 16u;
+    uint _o;
+    g.storage_buffers[pc.counter_buf].InterlockedMin(b + 0u, vpage.x, _o);
+    g.storage_buffers[pc.counter_buf].InterlockedMin(b + 4u, vpage.y, _o);
+    g.storage_buffers[pc.counter_buf].InterlockedMax(b + 8u, vpage.x, _o);
+    g.storage_buffers[pc.counter_buf].InterlockedMax(b + 12u, vpage.y, _o);
 }
 
 // --- Mark: one thread per screen pixel ---------------------------------------------------
@@ -165,6 +188,7 @@ void csUpdate(uint3 tid: SV_DispatchThreadID)
                                               VSM_PTE_MAPPED | VSM_PTE_RENDER | tid.x);
         uint _r;
         g.storage_buffers[pc.counter_buf].InterlockedAdd(0u, 1u, _r); // rendered-page stat
+        vsm_bounds_grow(level, uint2(np));
         return;
     }
     // Cached: mapped for sampling, NOT flagged for rendering — the raster PS discards
@@ -235,4 +259,5 @@ void csAlloc(uint3 tid: SV_DispatchThreadID)
     g.storage_buffers[pc.table_buf].Store(off, VSM_PTE_MAPPED | VSM_PTE_RENDER | page);
     uint _r;
     counter.InterlockedAdd(0u, 1u, _r); // rendered-page stat
+    vsm_bounds_grow(level, vpage);
 }

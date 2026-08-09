@@ -156,6 +156,26 @@ fn main() -> anyhow::Result<()> {
         unsafe { std::env::set_var("P_GI_VOLUME_PERIOD", "8") };
     }
 
+    // This game's macOS present policy: 40 fps paced, display-decoupled. A 60 Hz
+    // panel under vsync can pace only 60/30/20; the floor's ~24 ms GPU frame is a
+    // 40+ fps frame that vsync would quantize DOWN to 30 (and to a visible 20 fps
+    // beat whenever load touched 33 ms — the corridor report). macOS composites
+    // windows, so an immediate present does not tear; the soft cap holds a steady
+    // 40 and leaves thermal headroom on fanless hardware (this machine's spec
+    // target). Windows keeps vsync — immediate present tears there, and the pacing
+    // policy for that platform rides the DX/VK verification batch. Env still wins.
+    #[cfg(target_os = "macos")]
+    {
+        if std::env::var_os("NO_VSYNC").is_none() {
+            // SAFETY: single-threaded here — same window as the seams above.
+            unsafe { std::env::set_var("NO_VSYNC", "1") };
+        }
+        if std::env::var_os("FRAME_CAP").is_none() {
+            // SAFETY: single-threaded here — same window as the seams above.
+            unsafe { std::env::set_var("FRAME_CAP", "40") };
+        }
+    }
+
     // This game's motion-vector policy: VELOCITY ON. The default tier renders below
     // the output resolution (TAAU upscale), and TAAU without a velocity target can
     // only camera-reproject — every game-driven mover (warrior, grunts: rigid node
