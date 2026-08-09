@@ -57,6 +57,7 @@ mod ai;
 mod characters;
 mod collision;
 mod game;
+mod hud;
 mod items;
 mod level;
 mod meshing;
@@ -223,5 +224,17 @@ fn main() -> anyhow::Result<()> {
         // `.level` files are neither written into it nor listed in its hot-swap menu.
         levels_dir: Some(level::GENERATED_DIR.into()),
         hooks: Some(Box::new(game)),
+        // The HUD's typeface (game-ui-plan.md M-U2): Alegreya SC, embedded under the
+        // SIL OFL 1.1 (license copy beside the file; THIRD_PARTY_LICENSES.md entry).
+        // Two atlas sizes: HUD body and overlay titles.
+        ui_fonts: vec![sandbox::UiFont {
+            bytes: include_bytes!("../assets/fonts/AlegreyaSC-Regular.ttf"),
+            sizes_px: vec![
+                crate::hud::FONT_BODY_PX,
+                crate::hud::FONT_BODY_LG_PX,
+                crate::hud::FONT_TITLE_PX,
+                crate::hud::FONT_TITLE_LG_PX,
+            ],
+        }],
     })
 }

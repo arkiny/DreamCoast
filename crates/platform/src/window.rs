@@ -32,6 +32,9 @@ struct WindowState {
     /// Pointer-lock (fly-camera capture): cursor hidden + recentered every pump, raw motion
     /// derived from the recenter diff (see `set_cursor_captured`).
     captured: bool,
+    /// Whether Escape requests close (the dev-tool default). A game that owns Escape
+    /// (pause menu) turns this off and drives shutdown through its own quit path.
+    close_on_escape: bool,
 }
 
 /// An open application window.
@@ -81,6 +84,7 @@ impl Window {
 
             let mut state = Box::new(WindowState {
                 size: (width, height),
+                close_on_escape: true,
                 ..Default::default()
             });
             let state_ptr = state.as_mut() as *mut WindowState;
@@ -176,6 +180,12 @@ impl Window {
         self.state.should_close
     }
 
+    /// Whether Escape requests close (default true — the dev-tool behaviour). A game
+    /// that owns Escape (pause menu) turns this off; the close button and quit still work.
+    pub fn set_close_on_escape(&mut self, on: bool) {
+        self.state.close_on_escape = on;
+    }
+
     /// Current client-area size in pixels.
     #[inline]
     pub fn size(&self) -> (u32, u32) {
@@ -256,7 +266,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_KEYDOWN => {
                 let vk = wparam.0 & 0xFF;
                 state.input.set_key(vk, true);
-                if vk == VK_ESCAPE.0 as usize {
+                if vk == VK_ESCAPE.0 as usize && state.close_on_escape {
                     state.should_close = true;
                 }
                 LRESULT(0)

@@ -131,6 +131,15 @@ separately.
 
 The RenderDoc MCP setup is documented in [`docs/renderdoc-mcp.md`](docs/renderdoc-mcp.md).
 
+## Fonts (committed, embedded into the game binary)
+
+| Font | Source | License |
+|------|--------|---------|
+| [Alegreya SC](https://github.com/huertatipografica/Alegreya) (`apps/dungeon/assets/fonts/AlegreyaSC-Regular.ttf`) | © 2011 The Alegreya Project Authors | [SIL OFL 1.1](apps/dungeon/assets/fonts/OFL-AlegreyaSC.txt) |
+
+The OFL license text ships beside the font file and applies to the font software
+only; it does not extend to the rest of this repository.
+
 ## Sample assets
 
 CC0 / public-domain sample models may be fetched at runtime into the gitignored

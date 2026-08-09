@@ -24,6 +24,16 @@ struct FrameBuffers {
     idx_cap: u64,
 }
 
+/// A TTF a game asks the engine to bake into the font atlas at given pixel sizes —
+/// one atlas font per size. The atlas is built once at [`Gui::new`], so fonts arrive
+/// through construction (via `GameConfig`), not at runtime.
+pub struct UiFont {
+    /// TTF file bytes (typically `include_bytes!` from the game crate).
+    pub bytes: &'static [u8],
+    /// Pixel sizes to bake; each yields one [`imgui::FontId`], in this order.
+    pub sizes_px: Vec<f32>,
+}
+
 /// The ImGui context + its RHI renderer.
 pub struct Gui {
     ctx: Context,
@@ -33,18 +43,39 @@ pub struct Gui {
     _slot0_guard: Texture,
     backend: BackendKind,
     frames: Vec<FrameBuffers>,
+    /// The game fonts baked into the atlas, one id per requested (font, size), in
+    /// request order — handed to the game once via `GameHooks::register_fonts`.
+    game_fonts: Vec<imgui::FontId>,
 }
 
 impl Gui {
     /// Create the context, upload the font atlas as a bindless texture, and
     /// build the ImGui pipeline. `frames_in_flight` matches the renderer's.
+    /// `game_fonts` are baked into the same one-time atlas after the default font.
     pub fn new(
         device: &Device,
         color_format: Format,
         frames_in_flight: usize,
+        game_fonts: &[UiFont],
     ) -> Result<Self, EngineError> {
         let mut ctx = Context::create();
         ctx.set_ini_filename(None);
+        let mut game_font_ids = Vec::new();
+        if !game_fonts.is_empty() {
+            // Adding any font suppresses imgui's implicit default, so pin the default
+            // first explicitly — the debug overlay keeps its face and stays font 0.
+            ctx.fonts()
+                .add_font(&[imgui::FontSource::DefaultFontData { config: None }]);
+            for f in game_fonts {
+                for &size in &f.sizes_px {
+                    game_font_ids.push(ctx.fonts().add_font(&[imgui::FontSource::TtfData {
+                        data: f.bytes,
+                        size_pixels: size,
+                        config: None,
+                    }]));
+                }
+            }
+        }
 
         // imgui reserves texture id 0 as the NULL texture (`ImTextureID` 0 = "no texture"). Our
         // bindless allocator hands out slot 0 as a normal slot, so if the font atlas lands there the
@@ -129,7 +160,13 @@ impl Gui {
             _slot0_guard: slot0_guard,
             backend,
             frames,
+            game_fonts: game_font_ids,
         })
+    }
+
+    /// The game fonts baked at construction, in `(font, size)` request order.
+    pub fn game_fonts(&self) -> &[imgui::FontId] {
+        &self.game_fonts
     }
 
     /// Whether ImGui wants the mouse this frame (cursor over / interacting with a UI

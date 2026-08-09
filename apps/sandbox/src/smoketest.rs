@@ -315,7 +315,7 @@ pub(crate) fn run_mesh_test(
         }
     };
 
-    let mut gui = Gui::new(device, swapchain.format(), FRAMES_IN_FLIGHT)?;
+    let mut gui = Gui::new(device, swapchain.format(), FRAMES_IN_FLIGHT, &[])?;
 
     let (mut w, mut h) = window.size();
     let mut depth = device.create_depth_buffer(Extent2D::new(w.max(1), h.max(1)))?;

@@ -134,7 +134,7 @@ pub use hooks::{CameraPose, GameHooks};
 // `Input`, `imgui::Ui`, `glam` vectors) without re-deriving this crate's exact
 // dependency versions. Single source: they are this crate's own dependencies.
 pub use dreamcoast_core::glam;
-pub use dreamcoast_gui::imgui;
+pub use dreamcoast_gui::{UiFont, imgui};
 pub use dreamcoast_platform as platform;
 pub use dreamcoast_scene as scene;
 
@@ -163,6 +163,10 @@ pub struct GameConfig {
     pub levels_dir: Option<std::path::PathBuf>,
     /// Game callbacks. `None` = no injection at all (bit-for-bit the stock frame).
     pub hooks: Option<Box<dyn GameHooks>>,
+    /// Game TTFs to bake into the one-time ImGui font atlas (see [`gui::UiFont`]).
+    /// The resulting [`imgui::FontId`]s are delivered once via
+    /// [`GameHooks::register_fonts`]. Empty = the stock atlas, bit-for-bit.
+    pub ui_fonts: Vec<dreamcoast_gui::UiFont>,
 }
 
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -1615,7 +1619,7 @@ fn halton(mut i: u32, base: u32) -> f32 {
 impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        window: Window,
+        mut window: Window,
         instance: Instance,
         device: Device,
         swapchain: Swapchain,
@@ -1625,7 +1629,7 @@ impl App {
         screenshot_mode: bool,
         captures: Vec<Capture>,
         validation_on: bool,
-        config: GameConfig,
+        mut config: GameConfig,
     ) -> anyhow::Result<Self> {
         // `P14_VGEO` routes every eligible opaque static object through virtual geometry (the
         // `VgeoSystem` is built below from the mesh registry). Resolved after `gallery_scene` and
@@ -1643,7 +1647,24 @@ impl App {
         // per-frame globals uniform buffer.
         let deferred = DeferredRenderer::new(&device, backend, swapchain.format())?;
 
-        let gui = Gui::new(&device, swapchain.format(), FRAMES_IN_FLIGHT)?;
+        // A game owns Escape (pause menu, quit item — see `GameHooks::wants_exit`);
+        // the stock sandbox keeps the dev-tool Esc-to-close.
+        if config.hooks.is_some() {
+            window.set_close_on_escape(false);
+        }
+        let gui = Gui::new(
+            &device,
+            swapchain.format(),
+            FRAMES_IN_FLIGHT,
+            &config.ui_fonts,
+        )?;
+        // One-time font-id delivery (the atlas is immutable from here on): the game
+        // stores the ids and pushes them in `draw_ui`.
+        if !gui.game_fonts().is_empty()
+            && let Some(h) = config.hooks.as_mut()
+        {
+            h.register_fonts(gui.game_fonts());
+        }
 
         // ── Slate-style loading screen (docs/loading-screen-thread.md). From HERE the cold cook can
         // run for minutes (Intel New Sponza), so hand the swapchain to a dedicated thread that
@@ -4116,6 +4137,12 @@ impl App {
         #[cfg(windows)]
         let mut rdoc_triggered = false;
         while !self.window.should_close() {
+            // Game-requested shutdown (a quit menu item): same clean path as the
+            // window close button.
+            if self.hooks.as_mut().is_some_and(|h| h.wants_exit()) {
+                info!("game requested exit");
+                break;
+            }
             #[cfg(windows)]
             if let Some(rd) = rdoc.as_mut()
                 && !rdoc_triggered

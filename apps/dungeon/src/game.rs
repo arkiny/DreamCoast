@@ -117,6 +117,11 @@ enum Action {
     /// Start the run again from the first floor. Only read while the warrior is dead —
     /// see [`DungeonGame::restart_requested`].
     Restart,
+    /// Toggle the pause menu (game-ui-plan.md M-U3). The engine's dev-tool
+    /// Esc-to-close is disabled for hooked games, so Escape is this game's.
+    Pause,
+    /// Activate the focused menu item (menus only — gameplay never reads it).
+    Confirm,
 }
 
 impl Action {
@@ -132,6 +137,8 @@ impl Action {
             "Dodge" => Self::Dodge,
             "Drink" => Self::Drink,
             "Restart" => Self::Restart,
+            "Pause" => Self::Pause,
+            "Confirm" => Self::Confirm,
             _ => return None,
         })
     }
@@ -437,6 +444,10 @@ const CAMERA_DISTANCE: f32 = 16.0;
 /// feet, so the character sits nearer the middle of the frame than the bottom of it.
 const CAMERA_FOCUS_Y: f32 = 0.9;
 
+/// World height a grunt's overhead HP bar anchors at — just over the rig's head, so
+/// the bar reads as the monster's without covering it.
+const GRUNT_OVERHEAD_Y: f32 = 2.05;
+
 /// Sim-step budget, milliseconds. Above this the fixed step is eating into the frame,
 /// and the HUD says so (and the log says so once).
 const SIM_BUDGET_MS: f32 = 2.0;
@@ -698,6 +709,23 @@ pub struct DungeonGame {
     sim_ms_peak: f32,
     /// Whether the over-budget warning has already been logged (once, not per step).
     budget_warned: bool,
+
+    // --- The HUD and menus (game-ui-plan.md) --------------------------------------------
+    /// Step-keyed presentation memory (damage ghost, hit pulse, overhead fades).
+    hud: crate::hud::HudState,
+    /// Game font ids, delivered once by the engine ([`GameHooks::register_fonts`]).
+    hud_fonts: crate::hud::HudFonts,
+    /// Whether the pause menu is up. While true, [`DungeonGame::simulate`] is not
+    /// called — the fixed loop consumes steps but the simulation does not advance
+    /// (M-U3's "pause = no sim step" rule).
+    paused: bool,
+    /// Focused item of whichever menu is up (pause or game-over).
+    menu_focus: usize,
+    /// Latched by the quit menu items; the engine polls it ([`GameHooks::wants_exit`]).
+    exit_requested: bool,
+    /// Set by a menu's Restart activation (mouse clicks land on render frames); the
+    /// next fixed step consumes it exactly like a held `R` — one deterministic path.
+    menu_restart: bool,
 }
 
 impl DungeonGame {
@@ -783,6 +811,12 @@ impl DungeonGame {
             sim_ms: 0.0,
             sim_ms_peak: 0.0,
             budget_warned: false,
+            hud: crate::hud::HudState::default(),
+            hud_fonts: crate::hud::HudFonts::default(),
+            paused: false,
+            menu_focus: 0,
+            exit_requested: false,
+            menu_restart: false,
         })
     }
 
@@ -1012,6 +1046,8 @@ impl DungeonGame {
                     self.run_seed,
                     self.steps,
                 );
+                // Fresh warrior, fresh presentation: no ghost, no pulse, no glimpses.
+                self.hud.reset();
                 self.install(next);
             }
             Err(e) => tracing::error!("dungeon: cannot restart run {}: {e:#}", self.run_seed),
@@ -1457,6 +1493,19 @@ impl DungeonGame {
             Self::retire_corpse(world, entity);
         }
         let report = self.warrior.take_damage(player_hits);
+        // HUD presentation memory (game-ui-plan.md): step-keyed, derived, write-only
+        // from the sim's point of view — the ghost bar, the hit pulse, and each
+        // grunt's overhead visibility window advance here and nowhere else.
+        self.hud.step(
+            self.steps,
+            self.warrior.health().fraction(),
+            report.taken > 0.0,
+        );
+        for (i, brain) in cast.grunts.iter().enumerate() {
+            let active = matches!(brain.state(), GruntState::Chase | GruntState::Attack);
+            self.hud
+                .note_grunt(cast.grunts.len(), i, self.steps, active, brain.is_dead());
+        }
         if report.taken > 0.0 {
             self.audio.play(Sfx::GruntHit, 0.8, 0.0);
         }
@@ -1688,7 +1737,42 @@ fn clip_loops(machine: &AnimMachine, clip: &str) -> bool {
 
 impl GameHooks for DungeonGame {
     fn fixed_update(&mut self, world: &mut World, input: &InputSnapshot, dt: f32) {
+        // Pause = the fixed loop keeps consuming steps but the SIMULATION does not
+        // advance (game-ui-plan.md M-U3). Input still stages every step so the menu's
+        // edges (navigate, confirm, unpause) work — `stage_input` runs exactly once per
+        // step on either branch, which is what keeps edge detection sound.
+        if self.paused {
+            self.stage_input(input);
+            self.menu_tick_paused();
+            return;
+        }
+        // A menu Restart click (a render-frame event) is consumed HERE, on the fixed
+        // step, through the same restart path as the R key — one deterministic route.
+        if std::mem::take(&mut self.menu_restart)
+            && self.floors_enabled
+            && matches!(self.progression, Progression::Playing)
+        {
+            self.restart();
+        }
         self.simulate(world, input, dt);
+        if self.input.just_pressed(Action::Pause)
+            && !self.warrior.is_dead()
+            && matches!(self.progression, Progression::Playing)
+        {
+            self.paused = true;
+            self.menu_focus = 0;
+        }
+        // Game-over menu keyboard: navigation edges live on fixed steps like every
+        // other input; activation routes through the same flags the mouse path sets.
+        if self.warrior.is_dead() && matches!(self.progression, Progression::Playing) {
+            self.menu_nav(2);
+            if self.input.just_pressed(Action::Confirm) || self.input.just_pressed(Action::Attack) {
+                match self.menu_focus {
+                    0 => self.menu_restart = true,
+                    _ => self.exit_requested = true,
+                }
+            }
+        }
     }
 
     /// Push the *rendered* root transforms onto the characters, once per frame, right
@@ -1772,10 +1856,240 @@ impl GameHooks for DungeonGame {
     }
 
     fn draw_ui(&mut self, ui: &imgui::Ui, world: &World) {
+        // The game HUD (game-ui-plan.md M-U0/M-U1): windowless, on the background
+        // draw list, under any debug windows.
+        self.draw_hud(ui, world);
+        // The dev panel is a toggle now, not the HUD (`DUNGEON_DEBUG_UI=1`).
+        if std::env::var_os("DUNGEON_DEBUG_UI").is_some() {
+            self.draw_debug_panel(ui, world);
+        }
+        // Menus last, on the foreground list, over everything.
+        if self.paused {
+            self.draw_pause_menu(ui);
+        } else if self.warrior.is_dead() && matches!(self.progression, Progression::Playing) {
+            self.draw_game_over(ui);
+        }
+    }
+
+    fn register_fonts(&mut self, fonts: &[imgui::FontId]) {
+        self.hud_fonts.register(fonts);
+    }
+
+    fn wants_exit(&mut self) -> bool {
+        self.exit_requested
+    }
+}
+
+impl DungeonGame {
+    /// The windowless HUD compositor (game-ui-plan.md M-U0/M-U1): player vitals
+    /// bottom-left, the run line top-left, overhead bars over engaged grunts, the hit
+    /// pulse, and the descent banner — all on the background draw list, in the game
+    /// face when the engine baked one.
+    fn draw_hud(&mut self, ui: &imgui::Ui, world: &World) {
+        use crate::hud;
+        let display = ui.io().display_size;
+        if display[0] <= 0.0 || display[1] <= 0.0 {
+            return;
+        }
+        let dl = ui.get_background_draw_list();
+        hud::border_pulse(&dl, display, self.hud.pulse(self.steps));
+
+        let s = hud::ui_scale(display[1]);
+        let m = 18.0 * s;
+        let font = self.hud_fonts.body(display[1]).map(|id| ui.push_font(id));
+
+        // The run line, top-RIGHT (top-left is the engine debug overlay's corner):
+        // where you are, and what's left standing.
+        let (alive, total) = self.grunt_tally();
+        let floor_line = format!("FLOOR {}", self.floor);
+        let run_line = format!("run {}   grunts {alive}/{total}", self.run_seed);
+        let fw = ui.calc_text_size(&floor_line)[0];
+        let rw = ui.calc_text_size(&run_line)[0];
+        let lh = ui.current_font_size() + 5.0 * s;
+        hud::shadow_text(&dl, [display[0] - m - fw, m], hud::TEXT_ACCENT, &floor_line);
+        hud::shadow_text(&dl, [display[0] - m - rw, m + lh], hud::TEXT_DIM, &run_line);
+
+        // Vitals, bottom-left: the layered bar + the potion pocket under it.
+        let health = self.warrior.health();
+        hud::health_bar(
+            ui,
+            &dl,
+            [m, display[1] - 74.0 * s],
+            [300.0 * s, 24.0 * s],
+            health.fraction(),
+            self.hud.ghost(),
+            health.current,
+            health.max,
+            "VITALITY",
+        );
+        hud::potion_pips(
+            &dl,
+            [m, display[1] - 40.0 * s],
+            s,
+            self.inventory.potions,
+            self.items.def().max_carry,
+            self.items.remaining(),
+        );
+
+        // Overhead bars (M-U1): projected game-side from the same look-at pose +
+        // 60° FOV the engine renders with (screen x/y are clip-plane independent).
+        if let Some(cast) = &self.cast {
+            let focus = self.prev_focus.lerp(self.focus, self.render_alpha);
+            let eye = focus + camera_offset();
+            for (i, brain) in cast.grunts.iter().enumerate() {
+                let alpha = self.hud.overhead_alpha(i, self.steps);
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let fraction = cast
+                    .grunt_anims
+                    .get(i)
+                    .and_then(|a| world.get::<Health>(a.root))
+                    .map_or(0.0, Health::fraction);
+                let anchor = collision::to_world(&self.grid, brain.position(), GRUNT_OVERHEAD_Y);
+                if let Some(p) = hud::project(anchor, eye, focus, 60f32.to_radians(), display) {
+                    hud::overhead_bar(&dl, p, fraction, alpha, s);
+                }
+            }
+        }
+
+        // Where the run is going (the descent banner / the between-floors veil).
+        match &self.progression {
+            Progression::Playing => {}
+            Progression::Descending { left, next } => hud::banner(
+                ui,
+                &dl,
+                &self.hud_fonts,
+                display,
+                &format!("descending {:.1} s - floor {}", left.max(0.0), next.floor),
+            ),
+            Progression::Handoff { .. } | Progression::Awaiting => hud::banner(
+                ui,
+                &dl,
+                &self.hud_fonts,
+                display,
+                &format!("loading floor {}...", self.floor),
+            ),
+        }
+
+        if let Some(tok) = font {
+            tok.pop();
+        }
+    }
+
+    /// The pause menu (M-U3). Keyboard navigation/confirm happened on the fixed step
+    /// ([`Self::menu_tick_paused`]); the mouse resolves here and routes through the
+    /// same activation.
+    fn draw_pause_menu(&mut self, ui: &imgui::Ui) {
+        use crate::hud;
+        let display = ui.io().display_size;
+        let dl = ui.get_foreground_draw_list();
+        hud::overlay_title(
+            ui,
+            &dl,
+            &self.hud_fonts,
+            display,
+            "PAUSED",
+            hud::TEXT_MAIN,
+            Some("Escape resumes"),
+        );
+        if let Some(item) = hud::menu(
+            ui,
+            &dl,
+            &self.hud_fonts,
+            display,
+            &["RESUME", "RESTART RUN", "QUIT TO DESKTOP"],
+            &mut self.menu_focus,
+            false,
+        ) {
+            self.menu_activate(item);
+        }
+    }
+
+    /// The game-over screen (M-U3): the death title plus the same menu machinery.
+    fn draw_game_over(&mut self, ui: &imgui::Ui) {
+        use crate::hud;
+        let display = ui.io().display_size;
+        let dl = ui.get_foreground_draw_list();
+        let sub = if self.floors_enabled {
+            format!(
+                "run {}  -  floor {}  -  R restarts",
+                self.run_seed, self.floor
+            )
+        } else {
+            "this harness level has no run to restart".to_string()
+        };
+        hud::overlay_title(
+            ui,
+            &dl,
+            &self.hud_fonts,
+            display,
+            "YOU DIED",
+            hud::DEATH_RED,
+            Some(&sub),
+        );
+        if !self.floors_enabled {
+            return;
+        }
+        if let Some(item) = hud::menu(
+            ui,
+            &dl,
+            &self.hud_fonts,
+            display,
+            &["RESTART RUN", "QUIT TO DESKTOP"],
+            &mut self.menu_focus,
+            false,
+        ) {
+            match item {
+                0 => self.menu_restart = true,
+                _ => self.exit_requested = true,
+            }
+        }
+    }
+
+    /// Shared menu focus movement on fixed-step edges (W/S and the arrow bindings).
+    fn menu_nav(&mut self, items: usize) {
+        if self.input.just_pressed(Action::MoveForward) {
+            self.menu_focus = (self.menu_focus + items - 1) % items;
+        }
+        if self.input.just_pressed(Action::MoveBack) {
+            self.menu_focus = (self.menu_focus + 1) % items;
+        }
+    }
+
+    /// One paused fixed step: menu navigation + activation edges (input was staged by
+    /// the caller). Escape resumes.
+    fn menu_tick_paused(&mut self) {
+        if self.input.just_pressed(Action::Pause) {
+            self.paused = false;
+            return;
+        }
+        self.menu_nav(3);
+        if self.input.just_pressed(Action::Confirm) || self.input.just_pressed(Action::Attack) {
+            self.menu_activate(self.menu_focus);
+        }
+    }
+
+    /// Route one pause-menu activation. Restart is *flagged*, not executed — the next
+    /// fixed step consumes it (mouse clicks land on render frames; the flag keeps the
+    /// state change on the deterministic path).
+    fn menu_activate(&mut self, item: usize) {
+        match item {
+            0 => self.paused = false,
+            1 => {
+                self.paused = false;
+                self.menu_restart = true;
+            }
+            _ => self.exit_requested = true,
+        }
+    }
+
+    /// The dev panel — the old HUD window, now behind `DUNGEON_DEBUG_UI=1`.
+    fn draw_debug_panel(&mut self, ui: &imgui::Ui, world: &World) {
         let dt_ms = ui.io().delta_time * 1000.0;
         ui.window("Dungeon")
             // Below the engine's debug window (which opens at the top-left corner at
-            // 320 px tall), so the HUD is a readable sibling rather than a cover.
+            // 320 px tall), so the panel is a readable sibling rather than a cover.
             .position([16.0, 372.0], imgui::Condition::FirstUseEver)
             .size([360.0, 340.0], imgui::Condition::FirstUseEver)
             .build(|| {
@@ -1796,9 +2110,7 @@ impl GameHooks for DungeonGame {
                 );
             });
     }
-}
 
-impl DungeonGame {
     /// Hit points and the death banner.
     fn draw_vitals(&self, ui: &imgui::Ui) {
         let health = self.warrior.health();
@@ -3373,6 +3685,144 @@ mod tests {
             "a fixed step peaked at {:.2} ms with {DEFAULT_GRUNTS} grunts",
             g.sim_ms_peak
         );
+    }
+
+    /// The HUD's presentation memory follows the fight (game-ui-plan.md M-U0/M-U1):
+    /// a claw that lands lights the hit pulse and holds the damage ghost above the
+    /// real fraction, and the engaged grunt's overhead bar is visible while it
+    /// fights — all read from step-keyed state, so this is also the determinism
+    /// argument (no wall clock anywhere in the chain).
+    #[test]
+    fn the_hud_presentation_follows_the_fight() {
+        let (mut g, mut world, _) = duel();
+        let idle = InputSnapshot::default();
+        frame(&mut g, &mut world, &idle, 1);
+
+        // Stand still until the grunt's claw lands.
+        let mut hurt_step = None;
+        for _ in 0..600 {
+            g.simulate(&mut world, &idle, FIXED_DT);
+            if g.warrior.health().current < g.warrior.health().max {
+                hurt_step = Some(g.steps);
+                break;
+            }
+        }
+        let hurt_step = hurt_step.expect("a grunt 1.5 m away lands a claw within 10 s");
+        assert!(
+            g.hud.pulse(hurt_step) > 0.9,
+            "the hit pulse lights on the step the claw lands"
+        );
+        assert!(
+            g.hud.overhead_alpha(0, hurt_step) > 0.99,
+            "an attacking grunt's overhead bar is fully visible"
+        );
+
+        // The ghost holds while the fraction drops, then drains back to it.
+        let frac = g.warrior.health().fraction();
+        assert!(
+            g.hud.ghost() >= frac,
+            "the ghost never reads below the real fraction"
+        );
+        frame(&mut g, &mut world, &idle, 1);
+        assert!(g.hud.ghost() > 0.0);
+    }
+
+    /// Pause is "the loop keeps stepping, the simulation does not" (M-U3): Escape
+    /// stops `steps` from advancing, menu focus moves on fixed-step edges, Escape
+    /// again resumes exactly where the run stopped.
+    #[test]
+    fn pause_stops_the_sim_and_escape_resumes() {
+        const ESC: u16 = 0x1B;
+        let (mut g, mut world, _) = duel();
+        let idle = InputSnapshot::default();
+        frame(&mut g, &mut world, &idle, 2);
+
+        let esc = InputSnapshot::default().with_key(ESC, true);
+        g.fixed_update(&mut world, &esc, FIXED_DT);
+        assert!(g.paused, "Escape pauses");
+        let frozen = g.steps;
+
+        g.fixed_update(&mut world, &idle, FIXED_DT);
+        g.fixed_update(&mut world, &idle, FIXED_DT);
+        assert_eq!(g.steps, frozen, "paused steps must not simulate");
+
+        // Menu focus moves on the S edge (down), wraps on W (up).
+        let down = InputSnapshot::default().with_key(S, true);
+        g.fixed_update(&mut world, &down, FIXED_DT);
+        assert_eq!(g.menu_focus, 1);
+        let up = InputSnapshot::default().with_key(W, true);
+        g.fixed_update(&mut world, &up, FIXED_DT);
+        assert_eq!(g.menu_focus, 0);
+
+        g.fixed_update(&mut world, &esc, FIXED_DT);
+        assert!(!g.paused, "Escape resumes");
+        g.fixed_update(&mut world, &idle, FIXED_DT);
+        assert_eq!(
+            g.steps,
+            frozen + 1,
+            "the resumed sim picks up where it stopped"
+        );
+    }
+
+    /// The pause menu's quit item reaches the engine through `wants_exit`, and the
+    /// restart item routes through the same fixed-step restart path as the R key.
+    #[test]
+    fn menu_quit_and_restart_route_through_the_hooks() {
+        const ESC: u16 = 0x1B;
+        const ENTER: u16 = 0x0D;
+        let grid = dungeon(7);
+        let mut g = game(grid);
+        let mut world = test_world(&g);
+        let idle = InputSnapshot::default();
+        frame(&mut g, &mut world, &idle, 2);
+
+        // Pause, walk the focus to QUIT (item 2), confirm.
+        g.fixed_update(
+            &mut world,
+            &InputSnapshot::default().with_key(ESC, true),
+            FIXED_DT,
+        );
+        assert!(g.paused);
+        let down = InputSnapshot::default().with_key(S, true);
+        g.fixed_update(&mut world, &down, FIXED_DT);
+        g.fixed_update(&mut world, &idle, FIXED_DT); // release: a press is an edge
+        g.fixed_update(
+            &mut world,
+            &InputSnapshot::default().with_key(S, true),
+            FIXED_DT,
+        );
+        assert_eq!(g.menu_focus, 2);
+        g.fixed_update(
+            &mut world,
+            &InputSnapshot::default().with_key(ENTER, true),
+            FIXED_DT,
+        );
+        assert!(g.wants_exit(), "QUIT reaches the engine's exit poll");
+
+        // Restart from the pause menu: focus item 1, confirm, and the NEXT fixed step
+        // rebuilds floor 1 (the deterministic consumption path).
+        let mut g = game(dungeon(7));
+        let mut world = test_world(&g);
+        frame(&mut g, &mut world, &idle, 2);
+        g.fixed_update(
+            &mut world,
+            &InputSnapshot::default().with_key(ESC, true),
+            FIXED_DT,
+        );
+        g.fixed_update(
+            &mut world,
+            &InputSnapshot::default().with_key(S, true),
+            FIXED_DT,
+        );
+        g.fixed_update(
+            &mut world,
+            &InputSnapshot::default().with_key(ENTER, true),
+            FIXED_DT,
+        );
+        assert!(!g.paused, "restart activation unpauses");
+        assert!(g.menu_restart, "restart is flagged for the next fixed step");
+        g.fixed_update(&mut world, &idle, FIXED_DT);
+        assert!(!g.menu_restart, "the flag is consumed exactly once");
     }
 
     /// The simulation is deterministic: the same inputs give the same fight, which is

@@ -323,6 +323,9 @@ pub struct Window {
     /// Pointer-lock (fly-camera capture): cursor hidden + disassociated from mouse motion,
     /// so the raw per-event deltas keep flowing with no screen-edge limit.
     captured: bool,
+    /// Whether Escape requests close (the dev-tool default). A game that owns Escape
+    /// (pause menu) turns this off and drives shutdown through its own quit path.
+    close_on_escape: bool,
 }
 
 // Pointer-lock plumbing: freezing the on-screen cursor while the hardware deltas keep
@@ -391,6 +394,7 @@ impl Window {
             scale,
             input: crate::Input::default(),
             captured: false,
+            close_on_escape: true,
         })
     }
 
@@ -433,7 +437,7 @@ impl Window {
                 if let Some(vk) = mac_keycode_to_vk(kc) {
                     self.input.set_key(vk as usize, true);
                 }
-                if kc == KEY_ESCAPE {
+                if kc == KEY_ESCAPE && self.close_on_escape {
                     self.should_close = true;
                 }
                 // Feed typed characters (for text input / ImGui), skipping
@@ -514,6 +518,12 @@ impl Window {
     #[inline]
     pub fn should_close(&self) -> bool {
         self.should_close
+    }
+
+    /// Whether Escape requests close (default true — the dev-tool behaviour). A game
+    /// that owns Escape (pause menu) turns this off; the close button and quit still work.
+    pub fn set_close_on_escape(&mut self, on: bool) {
+        self.close_on_escape = on;
     }
 
     /// Current client-area size in physical pixels.

@@ -19,4 +19,6 @@
     "Dodge": ["Space"],
     "Drink": ["Q"],
     "Restart": ["R"],
+    "Pause": ["Escape"],
+    "Confirm": ["Enter"],
 })

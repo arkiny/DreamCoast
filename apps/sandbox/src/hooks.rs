@@ -195,6 +195,21 @@ pub trait GameHooks {
         let _ = (ui, world);
     }
 
+    /// One-time delivery of the game fonts baked into the ImGui atlas, in the
+    /// `(font, size)` order of [`crate::GameConfig::ui_fonts`] — called once after GUI
+    /// bring-up, before the first [`Self::draw_ui`]. A game keeps the ids and pushes
+    /// them in `draw_ui`; with no `ui_fonts` configured this is never called.
+    fn register_fonts(&mut self, fonts: &[imgui::FontId]) {
+        let _ = fonts;
+    }
+
+    /// Polled once per frame at the top of the loop: `true` requests a clean engine
+    /// shutdown (the same path as the window close button) — how a game's quit menu
+    /// item exits. Default `false` = never.
+    fn wants_exit(&mut self) -> bool {
+        false
+    }
+
     /// Request a level switch. Polled once per frame, before input is pumped; `Some`
     /// resolves the selector with the same rules as [`crate::GameConfig::level`]
     /// (a stem against the configured levels directory, or an explicit path — which
