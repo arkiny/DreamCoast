@@ -1536,6 +1536,8 @@ pub struct App {
     // Loop bookkeeping.
     fif: usize,
     frame_no: u64,
+    /// `DIAG_FRAME_CSV`: open sink for the per-frame timing series (any mode).
+    frame_csv: Option<std::io::BufWriter<std::fs::File>>,
     f2_prev: bool,
     needs_recreate: bool,
     /// The internal render extent the pooled transients were last built for.
@@ -1743,7 +1745,17 @@ impl App {
         // VSM closes V3 — the playtest track's direction).
         let vsm_enabled = std::env::var("VSM").ok().as_deref() == Some("1");
         let vsm = if vsm_enabled {
-            let sys = vsm::VsmSystem::new(&device, backend, compute_supported)?;
+            // SMRT defaults from the active tier (the gallery never runs VSM, so the
+            // plain tier resolve is correct here even before `base` is computed below).
+            let q = quality::preset(quality::RenderQuality::from_env_for_device(
+                &device.device_info(),
+            ));
+            let sys = vsm::VsmSystem::new(
+                &device,
+                backend,
+                compute_supported,
+                (q.vsm_smrt_rays, q.vsm_smrt_samples),
+            )?;
             if sys.is_none() {
                 tracing::warn!(
                     "VSM=1 but compute is unavailable — falling back to the legacy shadow path"
@@ -3884,6 +3896,12 @@ impl App {
             gpu_timings: Vec::new(),
             fif: 0,
             frame_no: 0,
+            frame_csv: std::env::var("DIAG_FRAME_CSV").ok().and_then(|p| {
+                std::fs::File::create(&p)
+                    .inspect_err(|e| tracing::warn!("DIAG_FRAME_CSV '{p}': {e}"))
+                    .ok()
+                    .map(std::io::BufWriter::new)
+            }),
             f2_prev: false,
             needs_recreate: false,
             pool_render_extent: (0, 0),
@@ -4639,6 +4657,21 @@ impl App {
         let dt = (now - self.last).as_secs_f32();
         self.last = now;
         LAST_FRAME_US.store((dt * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
+        // `DIAG_FRAME_CSV=<path>`: append one `frame_no,frame_us,wait_us,record_us`
+        // row per frame, in ANY mode (the PROFILE_GPU dump is screenshot-only, and a
+        // windowed frame-drop needs a series, not a snapshot). Wait≈GPU long pole,
+        // record≈CPU long pole — the same split the PROFILE_CPU comment explains.
+        if let Some(csv) = self.frame_csv.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(
+                csv,
+                "{},{},{},{}",
+                self.frame_no,
+                LAST_FRAME_US.load(std::sync::atomic::Ordering::Relaxed),
+                LAST_WAIT_US.load(std::sync::atomic::Ordering::Relaxed),
+                LAST_CPU_US.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
 
         // --- Fixed-timestep simulation (M2) ---------------------------------------
         // The sim advances in whole `FIXED_DT` steps so motion is framerate-

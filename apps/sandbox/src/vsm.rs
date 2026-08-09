@@ -92,6 +92,8 @@ pub(crate) struct VsmSystem {
     freelist: StorageBuffer,
     /// This frame's flip-free level world→clip matrices (raster push consumption).
     level_mats: [Mat4; VSM_LEVELS],
+    /// `1 / half` per level — the world→NDC radius scale the V1.5 raster cull uses.
+    level_inv_half: [f32; VSM_LEVELS],
     levels: [LevelState; VSM_LEVELS],
     sun_key: [u32; 3],
     frame_no: u32,
@@ -109,6 +111,7 @@ impl VsmSystem {
         device: &Device,
         backend: BackendKind,
         compute_supported: bool,
+        smrt_defaults: (u32, u32),
     ) -> anyhow::Result<Option<Self>> {
         if !compute_supported {
             return Ok(None);
@@ -287,6 +290,7 @@ impl VsmSystem {
             meta,
             freelist,
             level_mats: [Mat4::IDENTITY; VSM_LEVELS],
+            level_inv_half: [0.0; VSM_LEVELS],
             levels: [LevelState::default(); VSM_LEVELS],
             sun_key: [0; 3],
             frame_no: 0,
@@ -298,9 +302,13 @@ impl VsmSystem {
                         .and_then(|v| v.parse::<f32>().ok())
                         .unwrap_or(d)
                 };
+                // Defaults come from the quality tier (the V4 landing's deferred
+                // "quality.rs 티어" knob — SMRT is the lighting pass's biggest term,
+                // measured 6.2→3.6 ms going 7x8→4x6 on the Apple tier); the env vars
+                // stay the per-run override they always were.
                 [
-                    f("VSM_SMRT_RAYS", 7.0).clamp(0.0, 16.0),
-                    f("VSM_SMRT_SAMPLES", 8.0).clamp(1.0, 32.0),
+                    f("VSM_SMRT_RAYS", smrt_defaults.0 as f32).clamp(0.0, 16.0),
+                    f("VSM_SMRT_SAMPLES", smrt_defaults.1 as f32).clamp(1.0, 32.0),
                     f("VSM_SMRT_LEN", 1.5).clamp(0.01, 16.0),
                 ]
             },
@@ -494,6 +502,7 @@ impl VsmSystem {
             let proj = Mat4::orthographic_rh(-half, half, -half, half, 0.0, half * 4.0);
             let m = proj * view;
             self.level_mats[i] = m;
+            self.level_inv_half[i] = 1.0 / half;
             for (j, f) in m.to_cols_array().iter().enumerate() {
                 put(&mut bytes, i * 64 + j * 4, *f);
             }
@@ -651,6 +660,24 @@ impl VsmSystem {
                     for obj in scene {
                         if !obj.casts_shadow {
                             continue;
+                        }
+                        // V1.5 per-level caster culling (the lever the module doc
+                        // reserved for "when that VS work shows up in profiles" — it
+                        // did: 4.6 ms of every-caster×every-level draws on the dungeon
+                        // floor). A caster whose bounding sphere lies outside this
+                        // level's ortho window cannot touch any of its pages: the
+                        // level matrix maps the window to NDC ±1, so the test is two
+                        // ortho dot products against ±(1 + r/half). Conservative in
+                        // XY only (the along-sun range is generous by construction),
+                        // so a skipped draw is provably contribution-free.
+                        {
+                            let c = (obj.world_aabb[0] + obj.world_aabb[1]) * 0.5;
+                            let r = (obj.world_aabb[1] - obj.world_aabb[0]).length() * 0.5;
+                            let clip = *mat * c.extend(1.0);
+                            let margin = 1.0 + r * self.level_inv_half[level];
+                            if clip.x.abs() > margin || clip.y.abs() > margin {
+                                continue;
+                            }
                         }
                         if obj.skin.is_some() {
                             cmd.bind_graphics_pipeline(&self.depth_skinned_pipeline);

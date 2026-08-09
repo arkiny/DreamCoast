@@ -482,6 +482,16 @@ pub struct QualityPreset {
     /// uncovered space. Reference-engine structure: detail traces replace the global field.
     #[serde(default)]
     pub sdf_detail_replace: bool,
+    /// VSM SMRT sun-shadow filter: rays per receiver texel (`VSM_SMRT_RAYS` overrides;
+    /// 0 = the 3x3 PCF fallback). The reference default is 7; the Apple tier ships 4 —
+    /// the lighting pass's biggest term (measured 6.2 -> 3.6 ms at 4 rays x 6 samples on
+    /// the dungeon floor, the vsync-cliff margin the frame needed). VSM-off scenes (the
+    /// sponza/golden anchors) never read it.
+    #[serde(default = "default_vsm_smrt_rays")]
+    pub vsm_smrt_rays: u32,
+    /// Samples along each SMRT ray (`VSM_SMRT_SAMPLES` overrides). Reference 8, Apple 6.
+    #[serde(default = "default_vsm_smrt_samples")]
+    pub vsm_smrt_samples: u32,
     /// Global-field clipmap resolution per level axis (`P11_GDF_GLOBAL_RES` overrides;
     /// page-clamped to multiples of 8 in [16, 128]). 48 = 1 m finest voxels — the shipping
     /// baseline every tier uses today; the dial exists so a future high tier can buy 0.75 m
@@ -537,6 +547,12 @@ fn default_taau_clamp_expand() -> f32 {
 }
 fn default_gdf_global_res() -> u32 {
     crate::gdf_global::GLOBAL_RES_DEFAULT
+}
+fn default_vsm_smrt_rays() -> u32 {
+    7
+}
+fn default_vsm_smrt_samples() -> u32 {
+    8
 }
 fn default_taau_sharpen() -> f32 {
     0.25
@@ -709,6 +725,8 @@ pub fn gallery_preset() -> QualityPreset {
         gdf_ao: false,      // gallery runs no GDF AO
         ssao: false,        // gallery runs no screen-space AO
         gdf_global_res: 48, // unused: the gallery's fused path never builds the global field
+        vsm_smrt_rays: 7,   // unused: the gallery never runs VSM
+        vsm_smrt_samples: 8,
         firefly_clamp: true,
         shadow_softness: 0.0,
         shadow_taps: 16,
