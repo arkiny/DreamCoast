@@ -1539,6 +1539,9 @@ pub struct App {
     /// `DIAG_FRAME_CSV`: open sink for the per-frame timing series (any mode).
     frame_csv: Option<std::io::BufWriter<std::fs::File>>,
     f2_prev: bool,
+    /// Interactive-capture toast: (message, when) — drawn top-centre for a moment so
+    /// the player knows the F2 shot landed without checking the log.
+    shot_toast: Option<(String, Instant)>,
     needs_recreate: bool,
     /// The internal render extent the pooled transients were last built for.
     /// `ResourcePool` reuses by exact desc (extent included), so when the per-frame
@@ -3909,6 +3912,7 @@ impl App {
                     .map(std::io::BufWriter::new)
             }),
             f2_prev: false,
+            shot_toast: None,
             needs_recreate: false,
             pool_render_extent: (0, 0),
             diag_slots: quality::env_bool("DIAG_SLOTS", false),
@@ -5836,6 +5840,30 @@ impl App {
             // hooks installed, and never reached by `--screenshot-clean` (no ImGui frame).
             if let Some(h) = self.hooks.as_mut() {
                 h.draw_ui(ui, &self.world);
+            }
+            // F2 toast: top-centre for 2.5 s with a tail fade. Presentation-only and
+            // interactive-only (scripted captures never set it), so determinism gates
+            // are untouched.
+            if let Some((msg, at)) = &self.shot_toast {
+                let age = at.elapsed().as_secs_f32();
+                if age > 2.5 {
+                    self.shot_toast = None;
+                } else {
+                    let alpha = (1.0 - (age - 1.8) / 0.7).clamp(0.0, 1.0);
+                    let dl = ui.get_foreground_draw_list();
+                    let size = ui.calc_text_size(msg);
+                    let display = ui.io().display_size;
+                    let pos = [display[0] * 0.5 - size[0] * 0.5, 24.0];
+                    dl.add_rect(
+                        [pos[0] - 10.0, pos[1] - 6.0],
+                        [pos[0] + size[0] + 10.0, pos[1] + size[1] + 6.0],
+                        [0.08, 0.07, 0.06, 0.75 * alpha],
+                    )
+                    .filled(true)
+                    .rounding(4.0)
+                    .build();
+                    dl.add_text(pos, [0.95, 0.9, 0.75, alpha], msg);
+                }
             }
         }
 
@@ -9521,6 +9549,12 @@ impl App {
                     "saved screenshot {} ({}x{}, ui={})",
                     cap.path, layout.width, layout.height, cap.include_ui
                 );
+                // Interactive (F2) shots get an on-screen toast; scripted capture
+                // modes exit on their own schedule and have no one watching.
+                if !self.screenshot_mode {
+                    self.shot_toast =
+                        Some((format!("screenshot saved: {}", cap.path), Instant::now()));
+                }
             }
 
             LAST_CPU_US.store(
