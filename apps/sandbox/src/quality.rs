@@ -482,6 +482,12 @@ pub struct QualityPreset {
     /// uncovered space. Reference-engine structure: detail traces replace the global field.
     #[serde(default)]
     pub sdf_detail_replace: bool,
+    /// Global-field clipmap resolution per level axis (`P11_GDF_GLOBAL_RES` overrides;
+    /// page-clamped to multiples of 8 in [16, 128]). 48 = 1 m finest voxels — the shipping
+    /// baseline every tier uses today; the dial exists so a future high tier can buy 0.75 m
+    /// (64³) with its own measured PT/golden landing (docs/gdf-scale-follow-plan.md U3).
+    #[serde(default = "default_gdf_global_res")]
+    pub gdf_global_res: u32,
     /// Lit-calibration feedback (`P_CACHE_LIT_CALIB`): the card-visibility pass probes each
     /// on-screen card's lit/cache luminance ratio — one projected point, TLAS-occlusion-checked
     /// against the lit history — into a per-card EMA the REFLECTION sampler multiplies in
@@ -528,6 +534,9 @@ fn default_taau_motion_max_hist() -> f32 {
 /// tier that does not opt into the Catmull-Rom resample renders exactly as before.
 fn default_taau_clamp_expand() -> f32 {
     2.0
+}
+fn default_gdf_global_res() -> u32 {
+    crate::gdf_global::GLOBAL_RES_DEFAULT
 }
 fn default_taau_sharpen() -> f32 {
     0.25
@@ -697,8 +706,9 @@ pub fn gallery_preset() -> QualityPreset {
         surface_cache: false,
         ssr_stochastic: false, // full-res mirror SSR (does not affect the gallery image)
         reflect_max_roughness: 0.5,
-        gdf_ao: false, // gallery runs no GDF AO
-        ssao: false,   // gallery runs no screen-space AO
+        gdf_ao: false,      // gallery runs no GDF AO
+        ssao: false,        // gallery runs no screen-space AO
+        gdf_global_res: 48, // unused: the gallery's fused path never builds the global field
         firefly_clamp: true,
         shadow_softness: 0.0,
         shadow_taps: 16,

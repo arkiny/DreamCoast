@@ -152,6 +152,11 @@ pub(crate) fn build_gdf_scene(
     let permesh_albedo = use_permesh && crate::quality::env_bool("F5_PERMESH_ALBEDO", false);
     let mut mesh_albedos: Vec<dreamcoast_asset::sdf::AlbedoVolumes> = Vec::new();
     let mut compose_objects: Vec<crate::compose::ComposeObject> = Vec::new();
+    // Parallel to `compose_objects`: each instance's ECS entity + world transform —
+    // the global field's U2 dynamic sync tracks records by entity and re-encodes from
+    // the world matrix (ComposeObject only retains the inverse).
+    let mut compose_entities: Vec<(dreamcoast_scene::Entity, dreamcoast_core::glam::Mat4)> =
+        Vec::new();
     if use_permesh {
         use std::collections::HashMap;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -177,7 +182,11 @@ pub(crate) fn build_gdf_scene(
             albedo: Option<([f32; 3], usize)>, // (material colour, triangle count)
         }
         let mut specs: Vec<BakeSpec> = Vec::new();
-        let mut draw_refs: Vec<(dreamcoast_core::glam::Mat4, usize)> = Vec::new();
+        // (entity, world, unique-mesh index) — the ENTITY rides along so the global
+        // field's per-frame dynamic sync (U2) can key its tracked records on the stable
+        // cross-frame identity (draw order shifts on any despawn).
+        let mut draw_refs: Vec<(dreamcoast_scene::Entity, dreamcoast_core::glam::Mat4, usize)> =
+            Vec::new();
         let mut mesh_index: HashMap<u32, usize> = HashMap::new();
         let mut culled = 0u32;
         for d in world.draw_list() {
@@ -207,7 +216,7 @@ pub(crate) fn build_gdf_scene(
                 });
                 i
             });
-            draw_refs.push((d.world, mi));
+            draw_refs.push((d.entity, d.world, mi));
         }
 
         // Parallel per-mesh bake on the job-system workers — the expensive step (a full CPU
@@ -362,12 +371,13 @@ pub(crate) fn build_gdf_scene(
                 mesh_albedos.push(av);
             }
         }
-        for &(world_m, mi) in &draw_refs {
+        for &(entity, world_m, mi) in &draw_refs {
             compose_objects.push(crate::compose::ComposeObject::new(
                 world_m,
                 mi,
                 &mesh_sdfs[mi],
             ));
+            compose_entities.push((entity, world_m));
         }
         info!(
             "per-mesh DF: {} unique meshes, {} instances ({} culled < {:.2} m radius, \
@@ -593,11 +603,18 @@ pub(crate) fn build_gdf_scene(
                 .level_view
                 .map(|(e, _)| e)
                 .unwrap_or(p.scene_center + Vec3::new(0.0, p.scene_radius, 0.0));
+            // U3 tier dial: the preset's `gdf_global_res` (env `P11_GDF_GLOBAL_RES`
+            // overrides), page-clamped inside `GdfGlobal::new`.
+            let res = std::env::var("P11_GDF_GLOBAL_RES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(p.base.gdf_global_res);
             Some(crate::gdf_global::GdfGlobal::new(
                 device,
                 p.backend,
                 eye,
                 crate::FRAMES_IN_FLIGHT,
+                res,
             )?)
         } else {
             None
@@ -618,19 +635,31 @@ pub(crate) fn build_gdf_scene(
         )?;
         if let Some(mut g) = global {
             let (atlas_idx, alb_idx) = gdf.ms_atlas_indices().expect("install_mesh_sdf just ran");
+            let tracked: Vec<_> = compose_entities
+                .iter()
+                .zip(&compose_objects)
+                .map(|(&(entity, world), o)| (entity, world, o.mesh))
+                .collect();
             g.set_content(
                 device,
-                build.instances.clone(),
-                build.instance_count,
+                tracked,
+                crate::mesh_sdf::tile_maps(&atlas),
+                &build.instances,
                 atlas_idx,
                 alb_idx,
                 scene_diag,
             )?;
             info!(
-                "GDF global field: {} levels, voxel {:.2}..{:.2} m (P11_GDF_GLOBAL)",
+                "GDF global field: {} levels, {}^3, voxel {:.2}..{:.2} m (P11_GDF_GLOBAL, \
+                 dynamic sync {})",
                 crate::gdf_global::GLOBAL_LEVELS,
-                crate::gdf_global::GlobalLevel::voxel(0),
-                crate::gdf_global::GlobalLevel::voxel(crate::gdf_global::GLOBAL_LEVELS - 1),
+                g.res(),
+                crate::gdf_global::GlobalLevel::voxel(0, g.res()),
+                crate::gdf_global::GlobalLevel::voxel(
+                    crate::gdf_global::GLOBAL_LEVELS - 1,
+                    g.res()
+                ),
+                if g.wants_sync() { "on" } else { "off" },
             );
             gdf.set_global(g);
         }

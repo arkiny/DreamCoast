@@ -54,8 +54,13 @@ impl ComposeObject {
     /// scene fuse) the DF's 8 local-AABB corners to get the world broad-phase AABB and
     /// reads the uniform scale from the matrix' first column.
     pub(crate) fn new(world: Mat4, mesh: usize, df: &SdfVolume) -> Self {
+        Self::from_local_aabb(world, mesh, df.aabb_min, df.aabb_max)
+    }
+
+    /// Same construction from explicit padded local bounds — the U2 runtime re-encode
+    /// path, which retains the per-mesh `TileMap` instead of the baked volume.
+    pub(crate) fn from_local_aabb(world: Mat4, mesh: usize, mn: [f32; 3], mx: [f32; 3]) -> Self {
         let scale = world.x_axis.truncate().length().max(1e-8);
-        let (mn, mx) = (df.aabb_min, df.aabb_max);
         let mut wmin = [f32::MAX; 3];
         let mut wmax = [f32::MIN; 3];
         for cx in [mn[0], mx[0]] {

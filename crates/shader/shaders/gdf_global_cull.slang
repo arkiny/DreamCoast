@@ -1,24 +1,28 @@
-// Global distance field — per-clipmap instance cull (gdf-scale-follow-plan.md U1).
+// Global distance field — per-clipmap instance cull (gdf-scale-follow-plan.md U1/U2).
 //
-// One thread per instance: test the instance's world AABB against each clipmap level's
-// box (grown by the level's own voxel so a surface just outside still influences border
-// voxels) and append its index to that level's candidate list. The composite kernel
-// then iterates only the survivors — the reference engine's CullObjectsToClipmapCS
-// stage at our scale (its per-page object grid is the U3 refinement if counts demand).
+// One thread per instance of the pushed RANGE: test the instance's WORLD AABB against
+// each clipmap level's box (grown by the level's own voxel so a surface just outside
+// still influences border voxels) and append its index to that level's candidate list.
+// The composite kernel then iterates only the survivors — the reference engine's
+// clipmap-cull stage at our scale (its per-page object grid is the U3 refinement if
+// counts demand).
 //
-// Instance records are the SAME 112-byte layout `mesh_sdf_sample.slang` reads (rows of
-// world→local + world AABB + tile map), re-uploaded every frame from the draw list —
-// the dynamic-game seam: a mover's transform reaches this cull the frame it moves.
+// U2 splits the instance table into a static block and a movable block ([static..]
+// [movable..], re-partitioned on membership change): the static range culls only on
+// batch frames into the static list section, the movable range culls into its own
+// section whenever movers have work. World AABBs live in a parallel 32-byte side
+// table — the 112-byte record's rows 3/4 are the tile's LOCAL bounds (the composite's
+// sampling frame), which are NOT a world-space cull box for a transformed instance.
 
 #include "bindless.slang"
 
 struct GdfCullPush
 {
-    // x = instance buffer (112 B records), y = instance count, z = culled list buffer,
-    // w = level count.
+    // x = instance world-AABB table (32 B rows: min.xyz pad, max.xyz pad), y = range
+    // instance count, z = culled list buffer, w = level count.
     uint4 a;
-    // Level boxes, xyz min / xyz max packed as two float4 rows per level follow in the
-    // CONSTS buffer at `b.x`; b.y = per-level list capacity. b.zw spare.
+    // x = consts buffer (level boxes at 64 B/level), y = per-level list capacity,
+    // z = range base instance index, w = culled list section offset (u32 words).
     uint4 b;
 };
 
@@ -26,22 +30,25 @@ struct GdfCullPush
 ConstantBuffer<GdfCullPush> pc : register(b0, space0);
 
 // Culled list layout: per level, [0] = count (atomic), then capacity indices.
-uint list_base(uint level, uint capacity)
+uint list_base(uint section, uint level, uint capacity)
 {
-    return level * (capacity + 1u);
+    return section + level * (capacity + 1u);
 }
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void csMain(uint3 tid: SV_DispatchThreadID)
 {
-    uint i = tid.x;
-    if (i >= pc.a.y)
+    if (tid.x >= pc.a.y)
         return;
-    RWByteAddressBuffer inst = g.storage_buffers[pc.a.x];
-    uint base = i * 112u;
-    float3 wmin = asfloat(inst.Load4(base + 48u)).xyz;
-    float3 wmax = asfloat(inst.Load4(base + 64u)).xyz;
+    uint i = pc.b.z + tid.x;
+    RWByteAddressBuffer aabbs = g.storage_buffers[pc.a.x];
+    float3 wmin = asfloat(aabbs.Load4(i * 32u + 0u)).xyz;
+    float3 wmax = asfloat(aabbs.Load4(i * 32u + 16u)).xyz;
+    // A retired record (a despawned mover) keeps its slot with an inverted AABB — it
+    // fails every overlap test below and never reaches a list.
+    if (any(wmin > wmax))
+        return;
 
     RWByteAddressBuffer consts = g.storage_buffers[pc.b.x];
     RWByteAddressBuffer list = g.storage_buffers[pc.a.z];
@@ -55,8 +62,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         if (any(wmax < lmin.xyz - grow) || any(wmin > lmax.xyz + grow))
             continue;
         uint slot;
-        list.InterlockedAdd(list_base(l, pc.b.y) * 4u, 1u, slot);
+        list.InterlockedAdd(list_base(pc.b.w, l, pc.b.y) * 4u, 1u, slot);
         if (slot < pc.b.y)
-            list.Store((list_base(l, pc.b.y) + 1u + slot) * 4u, i);
+            list.Store((list_base(pc.b.w, l, pc.b.y) + 1u + slot) * 4u, i);
     }
 }

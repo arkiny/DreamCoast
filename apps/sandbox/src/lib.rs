@@ -6363,10 +6363,18 @@ impl App {
         // Stage B3: the finer clipmap-level volumes each GDF pass transitions to sampled
         // (empty for the single-level gallery). Bound before the graph so it outlives the
         // pass closures that borrow it.
-        // Global field recenter (U1): same two-phase contract as the GI fine volume —
-        // box+scroll+latch flip here (pre any shared gdf borrow), the cull/composite
-        // batch records into the graph below in this frame's timeline.
+        // Global field recenter (U1) + dynamic sync (U2): same two-phase contract as
+        // the GI fine volume — mutation here (pre any shared gdf borrow), the
+        // cull/composite batch records into the graph below in this frame's timeline.
+        // The sync diffs this frame's entity→world set against the tracked records, so
+        // a mover's (or a despawned pickup's) footprint recomposites THIS frame — the
+        // dynamic-game directive's contract.
         if let Some(g) = self.gdf.global_mut() {
+            if g.wants_sync() {
+                let worlds: std::collections::HashMap<_, _> =
+                    scene.iter().map(|o| (o.entity, o.transform)).collect();
+                g.sync_dynamic(&worlds);
+            }
             g.apply()?;
         }
         let mut scene_clip_vols = self.gdf.clip_level_volumes();

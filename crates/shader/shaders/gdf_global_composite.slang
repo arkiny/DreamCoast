@@ -10,6 +10,13 @@
 // Albedo composes in the same pass from the per-mesh albedo atlas at the nearest
 // instance (constant where uncovered / atlas absent) — one culled list walk feeds all
 // four channel writes.
+//
+// U2 dual layer: with a SEED source (`seed.x` valid), the union starts from the static
+// cache's value at the same toroidal memory voxel instead of `empty`, and the culled
+// list holds only the MOVABLE block — a mover's dirty pages recomposite by seeding the
+// cached static result and unioning the movers on top, never re-walking static content
+// (the reference's mostly-static / movable page split). Without a seed the pass IS the
+// static layer composite (or the U1 single-layer full composite).
 
 #include "bindless.slang"
 
@@ -26,11 +33,15 @@ struct GdfCompositePush
     uint4 box0;
     // xyz = refresh box extents (voxels), w = level res.
     uint4 ext;
-    // xyz = level content scroll in VOXELS (already reduced mod res), w = spare.
+    // xyz = level content scroll in VOXELS (already reduced mod res), w = culled list
+    // section offset (u32 words; 0 = the static section).
     uint4 scroll;
     // x = empty distance (the level's open-space value), y = constant albedo fallback,
     // zw spare.
     float4 params;
+    // x = seed sdf volume (storage; 0xFFFFFFFF = no seed → start from `empty`),
+    // y/z/w = seed albedo r/g/b volumes (valid iff x is).
+    uint4 seed;
 };
 
 [[vk::push_constant]]
@@ -53,11 +64,12 @@ void csMain(uint3 tid: SV_DispatchThreadID)
 
     // Culled list for this level: [0] count, then indices (see gdf_global_cull.slang).
     RWByteAddressBuffer list = g.storage_buffers[pc.a.y];
-    uint lbase = l * (pc.box0.w + 1u);
+    uint lbase = pc.scroll.w + l * (pc.box0.w + 1u);
     uint count = min(list.Load(lbase * 4u), pc.box0.w);
 
+    uint3 mem = (world + pc.scroll.xyz) % res;
     RWByteAddressBuffer inst = g.storage_buffers[pc.a.x];
-    float best = pc.params.x;
+    float best = pc.seed.x != 0xFFFFFFFFu ? g.storage_volumes[pc.seed.x][mem] : pc.params.x;
     float best_abs = abs(best);
     uint best_i = 0xFFFFFFFFu;
     float3 best_uvw = float3(0.0, 0.0, 0.0);
@@ -93,12 +105,20 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         }
     }
 
-    uint3 mem = (world + pc.scroll.xyz) % res;
     g.storage_volumes[pc.dst.x][mem] = best;
 
     if (pc.dst.y != 0xFFFFFFFFu)
     {
+        // Albedo precedence mirrors the distance: a winning instance samples its atlas
+        // tile; otherwise a seeded pass carries the static cache's albedo through, and
+        // an unseeded pass falls back to the constant.
         float3 alb = float3(pc.params.y, pc.params.y, pc.params.y);
+        if (best_i == 0xFFFFFFFFu && pc.seed.x != 0xFFFFFFFFu)
+        {
+            alb = float3(g.storage_volumes[pc.seed.y][mem],
+                         g.storage_volumes[pc.seed.z][mem],
+                         g.storage_volumes[pc.seed.w][mem]);
+        }
         if (best_i != 0xFFFFFFFFu && pc.atlas.y != 0xFFFFFFFFu)
         {
             alb = float3(g.volumes[pc.atlas.y].SampleLevel(g.samp, best_uvw, 0.0).x,

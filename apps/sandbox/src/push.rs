@@ -2645,46 +2645,46 @@ pub(crate) fn gi_shift_push(
     pc
 }
 
-/// Pack the global-field cull push (32 bytes): (instances, count, culled list, levels)
-/// + (consts, capacity, 0, 0). See gdf_global_cull.slang.
+/// Pack the global-field cull push (32 bytes): (world-AABB table, range count, culled
+/// list, levels) + (consts, capacity, range base, list section). See gdf_global_cull.slang.
+#[allow(clippy::too_many_arguments)] // one argument per shader push word — a struct would just rename them
 pub(crate) fn gdf_global_cull_push(
-    instances: u32,
+    aabbs: u32,
     count: u32,
     culled: u32,
     levels: u32,
     consts: u32,
     capacity: u32,
+    base: u32,
+    section: u32,
 ) -> [u8; 32] {
     let mut pc = [0u8; 32];
-    for (i, v) in [instances, count, culled, levels, consts, capacity, 0, 0]
-        .iter()
-        .enumerate()
+    for (i, v) in [
+        aabbs, count, culled, levels, consts, capacity, base, section,
+    ]
+    .iter()
+    .enumerate()
     {
         pc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
     pc
 }
 
-/// Pack the global-field composite push (112 bytes): six uint4 rows + one float4 row,
-/// mirroring GdfCompositePush. See gdf_global_composite.slang.
+/// Pack the global-field composite push (128 bytes): six uint4 rows + one float4 row +
+/// the seed uint4 row, mirroring GdfCompositePush. See gdf_global_composite.slang.
+#[allow(clippy::too_many_arguments)] // one row per shader push row — a struct would just rename them
 pub(crate) fn gdf_global_composite_push(
     a: [u32; 4],
     dst: [u32; 4],
     atlas: [u32; 4],
     box0: [u32; 4],
     ext: [u32; 4],
-    scroll: [u32; 3],
+    scroll: [u32; 4],
     params: [f32; 4],
-) -> [u8; 112] {
-    let mut pc = [0u8; 112];
-    let rows = [
-        a,
-        dst,
-        atlas,
-        box0,
-        ext,
-        [scroll[0], scroll[1], scroll[2], 0],
-    ];
+    seed: [u32; 4],
+) -> [u8; 128] {
+    let mut pc = [0u8; 128];
+    let rows = [a, dst, atlas, box0, ext, scroll];
     for (r, row) in rows.iter().enumerate() {
         for (i, v) in row.iter().enumerate() {
             let o = r * 16 + i * 4;
@@ -2693,6 +2693,10 @@ pub(crate) fn gdf_global_composite_push(
     }
     for (i, v) in params.iter().enumerate() {
         let o = 96 + i * 4;
+        pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    for (i, v) in seed.iter().enumerate() {
+        let o = 112 + i * 4;
         pc[o..o + 4].copy_from_slice(&v.to_le_bytes());
     }
     pc

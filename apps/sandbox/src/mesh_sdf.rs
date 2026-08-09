@@ -68,11 +68,37 @@ fn affine_rows(m: Mat4) -> [[f32; 4]; 3] {
     ]
 }
 
+/// One unique mesh's transform-independent record fields: the padded local AABB the tile
+/// was baked over + its atlas UVW mapping. U2 retains these per mesh so a mover's record
+/// can be re-encoded from its new world transform alone.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TileMap {
+    pub(crate) aabb_min: [f32; 3],
+    pub(crate) aabb_max: [f32; 3],
+    pub(crate) uvw_bias: [f32; 3],
+    pub(crate) uvw_scale: [f32; 3],
+}
+
+/// The per-unique-mesh [`TileMap`]s, in atlas tile order.
+pub(crate) fn tile_maps(atlas: &SdfAtlas) -> Vec<TileMap> {
+    (0..atlas.tiles.len())
+        .map(|m| {
+            let (bias, scale) = atlas.tile_uvw(m);
+            let t = &atlas.tiles[m];
+            TileMap {
+                aabb_min: t.aabb_min,
+                aabb_max: t.aabb_max,
+                uvw_bias: bias,
+                uvw_scale: scale,
+            }
+        })
+        .collect()
+}
+
 /// Pack one instance record (see `INSTANCE_STRIDE`): inv_world rows, local AABB + dist scale,
-/// atlas UVW bias + scale.
-fn push_instance(out: &mut Vec<u8>, o: &ComposeObject, atlas: &SdfAtlas) {
-    let (bias, scale) = atlas.tile_uvw(o.mesh);
-    let t = &atlas.tiles[o.mesh];
+/// atlas UVW bias + scale. The single encoder both the load-time build and the U2 runtime
+/// re-encode go through — a mover's refreshed record is byte-identical to a load-time one.
+pub(crate) fn encode_record(out: &mut Vec<u8>, o: &ComposeObject, t: &TileMap) {
     let rows = affine_rows(o.inv_world);
     let start = out.len();
     push_f32(out, &rows[0]);
@@ -80,9 +106,24 @@ fn push_instance(out: &mut Vec<u8>, o: &ComposeObject, atlas: &SdfAtlas) {
     push_f32(out, &rows[2]);
     push_f32(out, &[t.aabb_min[0], t.aabb_min[1], t.aabb_min[2], o.scale]);
     push_f32(out, &[t.aabb_max[0], t.aabb_max[1], t.aabb_max[2], 0.0]);
-    push_f32(out, &[bias[0], bias[1], bias[2], 0.0]);
-    push_f32(out, &[scale[0], scale[1], scale[2], 0.0]);
+    push_f32(out, &[t.uvw_bias[0], t.uvw_bias[1], t.uvw_bias[2], 0.0]);
+    push_f32(out, &[t.uvw_scale[0], t.uvw_scale[1], t.uvw_scale[2], 0.0]);
     debug_assert_eq!(out.len() - start, INSTANCE_STRIDE as usize);
+}
+
+fn push_instance(out: &mut Vec<u8>, o: &ComposeObject, atlas: &SdfAtlas) {
+    let (bias, scale) = atlas.tile_uvw(o.mesh);
+    let t = &atlas.tiles[o.mesh];
+    encode_record(
+        out,
+        o,
+        &TileMap {
+            aabb_min: t.aabb_min,
+            aabb_max: t.aabb_max,
+            uvw_bias: bias,
+            uvw_scale: scale,
+        },
+    );
 }
 
 /// The inclusive `[lo, hi]` cell range a world AABB `[mn, mx]` overlaps (clamped to the grid).
