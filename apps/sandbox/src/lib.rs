@@ -4685,13 +4685,18 @@ impl App {
         // record≈CPU long pole — the same split the PROFILE_CPU comment explains.
         if let Some(csv) = self.frame_csv.as_mut() {
             use std::io::Write;
+            // Column 5: VSM pages rendered last frame (0 when VSM is off) — the
+            // scroll-thrash / invalidation-storm witness alongside the timing series.
+            let (vsm_pages, vsm_overflow) = self.vsm.as_ref().map_or((0, 0), |v| v.stats());
             let _ = writeln!(
                 csv,
-                "{},{},{},{}",
+                "{},{},{},{},{},{}",
                 self.frame_no,
                 LAST_FRAME_US.load(std::sync::atomic::Ordering::Relaxed),
                 LAST_WAIT_US.load(std::sync::atomic::Ordering::Relaxed),
                 LAST_CPU_US.load(std::sync::atomic::Ordering::Relaxed),
+                vsm_pages,
+                vsm_overflow,
             );
         }
 

@@ -67,12 +67,16 @@ bool vsm_caster_culled()
         return true; // no RENDER pages on this level this frame
     uint miny = counter.Load(b + 4u);
     uint maxy = counter.Load(b + 12u);
-    // Bounds pages -> NDC box (page p spans [p, p+1) / VSM_TABLE_DIM in UV).
+    // Bounds pages -> NDC box (page p spans [p, p+1) / VSM_TABLE_DIM of the grid).
+    // Page X grows WITH ndc x, but page Y is INVERTED (vsm_ndc_to_texel: ndc.y = +1
+    // is row 0) — mirror the Y interval or the test culls against the wrong half,
+    // which truncated character self-shadows in play (their RENDER pages sit at the
+    // true y, the un-mirrored sphere landed at the mirrored one).
     float inv = 2.0 / float(VSM_TABLE_DIM);
     float lo_x = float(minx) * inv - 1.0;
     float hi_x = float(maxx + 1u) * inv - 1.0;
-    float lo_y = float(miny) * inv - 1.0;
-    float hi_y = float(maxy + 1u) * inv - 1.0;
+    float lo_y = 1.0 - float(maxy + 1u) * inv;
+    float hi_y = 1.0 - float(miny) * inv;
     float sx = pc.mvp[3].x;
     float sy = pc.mvp[3].y;
     float sr = pc.mvp[3].z;

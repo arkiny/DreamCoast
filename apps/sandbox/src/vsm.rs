@@ -99,6 +99,9 @@ pub(crate) struct VsmSystem {
     frame_no: u32,
     /// Last frame's shadow casters, scene order (V3 mover detection).
     prev_casters: Vec<PrevCaster>,
+    /// `VSM_BOUNDS_CULL=0` seam: disable the render-bounds whole-caster cull (A/B
+    /// fallback, the rule every non-trivial lever ships with).
+    bounds_cull: bool,
     /// SMRT filter config (V4): rays (0 = 3x3 PCF fallback), samples per ray, ray length
     /// as a fraction of the receiver's camera distance. Env `VSM_SMRT_RAYS` /
     /// `VSM_SMRT_SAMPLES` / `VSM_SMRT_LEN`; defaults = the reference engine's 7/8/1.5.
@@ -297,6 +300,7 @@ impl VsmSystem {
             sun_key: [0; 3],
             frame_no: 0,
             prev_casters: Vec::new(),
+            bounds_cull: std::env::var("VSM_BOUNDS_CULL").ok().as_deref() != Some("0"),
             smrt: {
                 let f = |k: &str, d: f32| {
                     std::env::var(k)
@@ -696,7 +700,8 @@ impl VsmSystem {
                         let mut mvp = (*mat * obj.transform).to_cols_array();
                         mvp[3] = sphere[0];
                         mvp[7] = sphere[1];
-                        mvp[11] = sphere[2];
+                        // A giant radius makes the VS test always pass — the off seam.
+                        mvp[11] = if self.bounds_cull { sphere[2] } else { 1.0e9 };
                         mvp[15] = 1.0;
                         cmd.push_constants(&vsm_depth_push(
                             mvp,
@@ -733,7 +738,7 @@ impl VsmSystem {
             return (0, 0);
         }
         let freed = u32::from_le_bytes(b[8..12].try_into().unwrap());
-        tracing::info!("VSM cache: {freed} freed last frame");
+        tracing::debug!("VSM cache: {freed} freed last frame");
         (
             u32::from_le_bytes(b[0..4].try_into().unwrap()),
             u32::from_le_bytes(b[4..8].try_into().unwrap()),
