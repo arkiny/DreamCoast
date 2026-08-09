@@ -246,7 +246,7 @@ bool hist_tap(int2 p, out float3 rgb, out float len, out float dyn)
     if (pc.packed_hist != 0u)
     {
         float4 ph = hist_load_packed(pc.hist_read, pidx);
-        rgb = ph.rgb;
+        rgb = make_finite(ph.rgb); // heal a poisoned texel instead of spreading it
         len = packed_len_flag(ph.a, dyn);
         return ph.a > 0.5;
     }
@@ -255,7 +255,7 @@ bool hist_tap(int2 p, out float3 rgb, out float len, out float dyn)
         return false;
     dyn = pp.x; // pos.x = the history dynamic flag
     float4 ph = asfloat(g.storage_buffers[pc.hist_read].Load4(pidx * 16u));
-    rgb = ph.rgb;
+    rgb = make_finite(ph.rgb);
     len = ph.a;
     return true;
 }
@@ -408,7 +408,11 @@ void csMain(uint3 tid: SV_DispatchThreadID)
     // output pixel sits at `uv + jitter` in the internal image (lands every frame on the stable grid).
     float2 cuv = uv + pc.jitter.xy;
     float depth = g.textures[pc.depth_index].SampleLevel(g.samp, cuv, 0.0).r;
-    float3 cur = g.textures[pc.hdr_index].SampleLevel(g.samp, cuv, 0.0).rgb;
+    // NaN/Inf guard (make_finite, bindless.slang): TAAU is a temporal ACCUMULATOR —
+    // one non-finite lit pixel entering the history spreads through the variance
+    // boxes and repaints the whole frame black within seconds (observed in play).
+    // Finite values pass through unchanged, so the anchors stay byte-identical.
+    float3 cur = make_finite(g.textures[pc.hdr_index].SampleLevel(g.samp, cuv, 0.0).rgb);
 
     if (depth >= 1.0)
     {
@@ -439,7 +443,8 @@ void csMain(uint3 tid: SV_DispatchThreadID)
         for (int dx = -1; dx <= 1; dx++)
         {
             float2 suv = cuv + float2(dx, dy) * its;
-            float3 c = rgb_to_ycocg(g.textures[pc.hdr_index].SampleLevel(g.samp, suv, 0.0).rgb);
+            float3 c =
+                rgb_to_ycocg(make_finite(g.textures[pc.hdr_index].SampleLevel(g.samp, suv, 0.0).rgb));
             m1 += c;
             m2 += c * c;
         }

@@ -60,7 +60,10 @@ void csHistogram(uint3 dtid: SV_DispatchThreadID, uint gi: SV_GroupIndex)
 
     if (dtid.x < hp.width && dtid.y < hp.height)
     {
-        float3 c = g.textures[hp.hdr_index].Load(int3(dtid.xy, 0)).rgb;
+        // NaN/Inf guard (make_finite): one non-finite pixel must not poison the
+        // exposure statistics — a NaN luminance's bin is backend-defined and an Inf
+        // would shift the percentile trim. Finite pixels pass through unchanged.
+        float3 c = make_finite(g.textures[hp.hdr_index].Load(int3(dtid.xy, 0)).rgb);
         float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
         // log2 bin; the darkest pixels (lum→0) fall in bin 0 and are trimmed in the resolve.
         float ln = (log2(max(lum, 1e-8)) - AE_MIN_LOG) / (AE_MAX_LOG - AE_MIN_LOG);
