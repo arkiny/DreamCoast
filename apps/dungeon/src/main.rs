@@ -56,6 +56,7 @@
 mod ai;
 mod characters;
 mod collision;
+mod doors;
 mod game;
 mod hud;
 mod items;
@@ -142,6 +143,17 @@ fn main() -> anyhow::Result<()> {
         // SAFETY: single-threaded here — before logging, jobs, and engine bring-up
         // spawn any thread.
         unsafe { std::env::set_var("VSM", "1") };
+    }
+
+    // This game's GI-volume cadence: refresh period 8 (4 z-slabs/frame instead of 8 —
+    // measured 4.9 -> 3.5 ms on this floor). The dungeon's lighting is torch-static and
+    // its dynamic GI events (doors, movers) ride the field/volume EMA anyway, so the
+    // ~0.27 s full-refresh latency is invisible in play; the ENGINE tier keeps period 4
+    // (the golden/PT anchors resolve against the tier, and this is a per-app pacing
+    // policy, not a per-scene patch). An explicit env setting still wins, as everywhere.
+    if std::env::var_os("P_GI_VOLUME_PERIOD").is_none() {
+        // SAFETY: single-threaded here — same window as the seams above.
+        unsafe { std::env::set_var("P_GI_VOLUME_PERIOD", "8") };
     }
 
     // This game's motion-vector policy: VELOCITY ON. The default tier renders below

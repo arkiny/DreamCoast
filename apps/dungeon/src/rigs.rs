@@ -2303,6 +2303,100 @@ pub fn torch() -> Rig {
     }
 }
 
+/// The asset key `crate::level` uses for the doorway door prop.
+pub const DOOR_PROP: &str = "door";
+
+/// The door's frame opening, metres — authored to fill one doorway tile exactly
+/// (`crate::level` asserts this against its tile size, so the two cannot drift).
+pub const DOOR_OPENING: f32 = 2.0;
+/// Frame post thickness along the span, metres.
+pub const DOOR_POST: f32 = 0.12;
+/// The node an open/close swing rotates ([`crate::game`] binds it by this name).
+pub const DOOR_PANEL_NODE: &str = "door_panel";
+
+/// Door material slots, in write order.
+const MAT_DOOR_IRON: usize = 0;
+const MAT_DOOR_WOOD: usize = 1;
+
+/// The door's two surfaces: the torch's dark iron for the frame (one dungeon, one
+/// ironwork) and a warm rough oak for the panel.
+fn door_materials() -> Vec<GlbMaterial> {
+    vec![
+        GlbMaterial {
+            name: "door_iron".into(),
+            base_color_factor: [0.09, 0.08, 0.075, 1.0],
+            metallic: 0.7,
+            roughness: 0.55,
+            double_sided: false,
+        },
+        GlbMaterial {
+            name: "door_wood".into(),
+            base_color_factor: [0.30, 0.20, 0.12, 1.0],
+            metallic: 0.0,
+            roughness: 0.85,
+            double_sided: false,
+        },
+    ]
+}
+
+/// A doorway door: an iron frame (two posts + lintel) and a swinging oak panel.
+///
+/// **Authored spanning +X, hinge post at the origin.** The root sits on the floor at
+/// the hinge-side edge of the doorway; the frame reaches `DOOR_OPENING` along +X and
+/// the wall plane is X (thickness ±Z) — one yaw about Y aims it along either doorway
+/// axis (`crate::level::door_spots` computes it). The PANEL is its own node
+/// ([`DOOR_PANEL_NODE`]) translated to the hinge post's inner face, its geometry
+/// growing along +X from the node origin — so a Y-rotation **on that node** is the
+/// swing, about the hinge, with no pivot arithmetic anywhere else. The swing sweeps
+/// the corridor axis (±Z here), which a doorway guarantees walkable on both sides,
+/// so an opening panel can never sweep into rock.
+///
+/// The panel being its own node also makes it its own drawable ENTITY — which is what
+/// the global distance field's dynamic sync tracks (U2): the frame stays a static
+/// instance, the panel is promoted to the movable layer on its first swing.
+pub fn door() -> Rig {
+    const HEIGHT: f32 = 2.30;
+    const LINTEL_TOP: f32 = 2.50;
+    const HALF_T: f32 = 0.06;
+    const PANEL_T: f32 = 0.04;
+    let far = DOOR_OPENING - DOOR_POST;
+
+    let mut b = RigBuilder::new();
+    let root = b.joint("door_root", None, [0.0, 0.0, 0.0]);
+    b.bone(
+        "door_frame",
+        root,
+        [0.0, 0.0, 0.0],
+        MAT_DOOR_IRON,
+        &[
+            // Hinge post, latch post, lintel — the static surround.
+            ([0.0, 0.0, -HALF_T], [DOOR_POST, LINTEL_TOP, HALF_T]),
+            ([far, 0.0, -HALF_T], [DOOR_OPENING, LINTEL_TOP, HALF_T]),
+            ([DOOR_POST, HEIGHT, -HALF_T], [far, LINTEL_TOP, HALF_T]),
+        ],
+    );
+    b.bone(
+        DOOR_PANEL_NODE,
+        root,
+        [DOOR_POST, 0.0, 0.0],
+        MAT_DOOR_WOOD,
+        &[(
+            // Slightly clear of the floor and the lintel so the swing never z-fights
+            // either; spans post to post.
+            [0.0, 0.03, -PANEL_T],
+            [far - DOOR_POST, HEIGHT - 0.02, PANEL_T],
+        )],
+    );
+
+    Rig {
+        name: DOOR_PROP,
+        nodes: b.nodes,
+        meshes: b.meshes,
+        materials: door_materials(),
+        animations: Vec::new(),
+    }
+}
+
 // --- Files ---------------------------------------------------------------------------
 
 /// Path of a rig's `.glb` inside the generated-asset directory.
@@ -2324,7 +2418,7 @@ pub fn rig_asset_path(name: &str) -> PathBuf {
 pub fn ensure_rigs() -> anyhow::Result<Vec<PathBuf>> {
     let started = std::time::Instant::now();
     let mut paths = Vec::new();
-    for rig in [warrior(), grunt(), potion(), torch()] {
+    for rig in [warrior(), grunt(), potion(), torch(), door()] {
         let path = rig_asset_path(rig.name);
         let wrote = save_glb_scene(
             &path,

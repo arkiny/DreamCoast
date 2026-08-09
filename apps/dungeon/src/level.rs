@@ -72,7 +72,7 @@ use glam::{Mat4, Quat, Vec2, Vec3};
 use crate::collision::{CHARACTER_Y, player_spawn, to_world};
 use crate::items;
 use crate::meshing::{ChunkMesh, MeshParams, mesh_chunks, mesh_stats};
-use crate::procgen::{ROOM_NONE, Rng, TILE_SIZE, TileGrid};
+use crate::procgen::{ROOM_NONE, Rng, TILE_SIZE, Tile, TileGrid};
 use crate::rigs;
 
 /// Where this game's generated levels + assets are written, relative to the working
@@ -313,6 +313,88 @@ pub fn torch_seed(dungeon_seed: u64) -> u64 {
 /// whole file.
 pub fn torch_name(index: usize) -> String {
     format!("torch_{index}")
+}
+
+/// Positional like [`grunt_name`]: `door_<i>` is the door at [`door_spots`]` [i]`,
+/// in both the written level and the game's [`crate::doors::DoorWorld`].
+pub fn door_name(index: usize) -> String {
+    format!("door_{index}")
+}
+
+/// One doorway's door placement: the hinge-side edge of its [`Tile::Door`] tile, plus
+/// the yaw that spans the prop's +X frame across the pierced wall's axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DoorSpot {
+    pub tile: (i32, i32),
+    /// Root position, **collision space** — the hinge post's floor corner.
+    pub hinge: Vec2,
+    /// Rotation about +Y aiming the frame's +X span, radians.
+    pub yaw: f32,
+}
+
+/// Every doorway's door, in scan order — a PURE function of the grid (no rng), so the
+/// level writer and the game's simulation derive the same list independently and agree
+/// by construction (the same contract [`crate::procgen`]'s determinism gives the walls).
+///
+/// The span axis is the one whose neighbours are SOLID (the pierced wall ring): the
+/// panel fills the wall's gap and blocks passage along the crossing corridor axis. A
+/// doorway with walls on neither axis cannot exist ([`crate::procgen`]'s door test
+/// requires a crossing), but is skipped defensively rather than mis-spanned.
+pub fn door_spots(grid: &TileGrid) -> Vec<DoorSpot> {
+    // The prop is authored against this exact opening; a tile-size change must be a
+    // conscious door redesign, not a silent stretch.
+    debug_assert!((rigs::DOOR_OPENING - TILE_SIZE).abs() < 1.0e-6);
+    let mut out = Vec::new();
+    for z in 0..grid.height() {
+        for x in 0..grid.width() {
+            if grid.get(x, z) != Tile::Door {
+                continue;
+            }
+            let solid_x = grid.get(x - 1, z).is_solid() && grid.get(x + 1, z).is_solid();
+            let solid_z = grid.get(x, z - 1).is_solid() && grid.get(x, z + 1).is_solid();
+            let (hinge, yaw) = if solid_x {
+                // Wall runs along X: span X from the tile's min-X edge, centred in Z.
+                (
+                    Vec2::new(x as f32 * TILE_SIZE, (z as f32 + 0.5) * TILE_SIZE),
+                    0.0,
+                )
+            } else if solid_z {
+                // Wall runs along Z: span +X rotated onto +Z (yaw −90° about +Y maps
+                // +X → +Z), from the tile's min-Z edge, centred in X.
+                (
+                    Vec2::new((x as f32 + 0.5) * TILE_SIZE, z as f32 * TILE_SIZE),
+                    -std::f32::consts::FRAC_PI_2,
+                )
+            } else {
+                continue;
+            };
+            out.push(DoorSpot {
+                tile: (x, z),
+                hinge,
+                yaw,
+            });
+        }
+    }
+    out
+}
+
+/// The door entities for a floor, `door_<i>` at [`door_spots`] order.
+fn door_entities(grid: &TileGrid, spots: &[DoorSpot]) -> Vec<Entity> {
+    let asset = rig_asset_key(rigs::DOOR_PROP);
+    spots
+        .iter()
+        .enumerate()
+        .map(|(i, spot)| Entity {
+            asset: asset.clone(),
+            name: Some(door_name(i)),
+            transform: Mat4::from_rotation_translation(
+                Quat::from_rotation_y(spot.yaw),
+                to_world(grid, spot.hinge, 0.0),
+            )
+            .to_cols_array(),
+            material_override: None,
+        })
+        .collect()
 }
 
 /// Which wall a torch on tile `(x, z)` hangs on, and where that puts it — or `None` when
@@ -637,6 +719,7 @@ pub fn dungeon_level_data(
         &items::potion_asset_key(),
     ));
     entities.extend(torch_entities(grid, &torches));
+    entities.extend(door_entities(grid, &door_spots(grid)));
 
     let mut lights = vec![sun()];
     lights.extend(torch_lights(grid, &torches));
@@ -1187,10 +1270,11 @@ mod tests {
             let torches = torch_points(&grid, torch_seed(grid.seed()));
 
             let level = dungeon_level_data(&grid, "cache/generated/x.glb", &spawns, &potions);
-            // [geometry, player, grunt_0 .., potion_0 .., torch_0 ..]
+            // [geometry, player, grunt_0 .., potion_0 .., torch_0 .., door_0 ..]
+            let doors = door_spots(&grid);
             assert_eq!(
                 level.entities.len(),
-                2 + spawns.len() + potions.len() + torches.len(),
+                2 + spawns.len() + potions.len() + torches.len() + doors.len(),
                 "seed {seed}"
             );
 
@@ -1376,9 +1460,10 @@ mod tests {
         let torches = torch_points(&grid, torch_seed(grid.seed()));
         let level = dungeon_level_data(&grid, "x.glb", &[], &[]);
 
-        // [geometry, player, torch_0 ..] — no grunts, no potions in this fixture.
+        // [geometry, player, torch_0 .., door_0 ..] — no grunts/potions here.
+        let doors = door_spots(&grid);
         let props = &level.entities[2..];
-        assert_eq!(props.len(), torches.len());
+        assert_eq!(props.len(), torches.len() + doors.len());
         assert_eq!(level.lights.len(), 1 + torches.len());
 
         let asset = rig_asset_key(rigs::TORCH_PROP);

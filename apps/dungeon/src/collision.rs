@@ -96,6 +96,13 @@ pub fn collision(grid: &TileGrid) -> GridCollision<'_, TileGrid> {
     GridCollision::new(grid, TILE_SIZE)
 }
 
+/// As [`collision`], over any solid map — how the movers collide against the grid
+/// PLUS its doors ([`crate::doors::DoorMap`]) without a second tile-size source.
+#[inline]
+pub fn collision_over<M: SolidMap + ?Sized>(map: &M) -> GridCollision<'_, M> {
+    GridCollision::new(map, TILE_SIZE)
+}
+
 /// Tile containing a collision-space point. Because collision space and grid space share
 /// an origin, this **is** the grid tile index (it may be out of bounds; the grid reads
 /// out-of-bounds as solid).

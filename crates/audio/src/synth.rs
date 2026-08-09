@@ -33,10 +33,14 @@ pub enum Sfx {
     TorchLoop,
     /// Loopable low room-tone bed.
     AmbienceLoop,
+    /// A doorway door starting its swing (hinge creak).
+    DoorOpen,
+    /// A doorway door latching shut (wood-on-frame thud).
+    DoorClose,
 }
 
 /// Number of bank entries (the enum is dense from 0).
-pub const SFX_COUNT: usize = 10;
+pub const SFX_COUNT: usize = 12;
 
 /// Whether a bank entry is authored as a seamless loop.
 pub fn is_loop(sfx: Sfx) -> bool {
@@ -389,6 +393,47 @@ fn ambience_loop(seed: u64) -> Vec<f32> {
     v
 }
 
+/// A door's hinge creak: a slow squeaky rising tone with rough amplitude — a low
+/// resonant oscillator whose pitch wobbles as the hinge sticks and slips.
+fn door_open(seed: u64) -> Vec<f32> {
+    let mut rng = Pcg::new(seed);
+    let n = seconds(0.42);
+    let mut out = vec![0.0f32; n];
+    let mut phase = 0.0f32;
+    for (i, o) in out.iter_mut().enumerate() {
+        let t = i as f32 / n as f32;
+        // Stick-slip: the base rises 160→240 Hz with a jittery 13 Hz wobble.
+        let wobble = 1.0 + 0.16 * fast_sin(13.0 * t + 0.35 * rng.bipolar());
+        let hz = (160.0 + 80.0 * t) * wobble;
+        phase += hz / COOK_RATE as f32;
+        // Square-ish edge (creaks are harmonically rich): sign-shaped sine, softened.
+        let s = fast_sin(phase);
+        let edge = s + 0.35 * fast_sin(2.0 * phase) + 0.18 * fast_sin(3.0 * phase);
+        // Grain + a fade that leaves the swing audible for most of the 0.35 s.
+        *o = edge * (0.55 + 0.45 * fast_sin(29.0 * t)) * fast_exp(-3.2 * t);
+    }
+    normalize(&mut out, 0.55);
+    out
+}
+
+/// A door latching: a deep wood thud with a short frame rattle.
+fn door_close(seed: u64) -> Vec<f32> {
+    let mut rng = Pcg::new(seed);
+    let n = seconds(0.22);
+    let mut out = vec![0.0f32; n];
+    let rattle = noise_burst(&mut rng, 0.22, 900.0, 350.0, 0.6, 30.0, 1);
+    let mut phase = 0.0f32;
+    for (i, o) in out.iter_mut().enumerate() {
+        let t = i as f32 / n as f32;
+        // Body 90→48 Hz drop — heavier than the sword hit's 150→70 (a door is a slab).
+        let hz = 90.0 - 42.0 * t;
+        phase += hz / COOK_RATE as f32;
+        *o = 1.0 * fast_sin(phase) * fast_exp(-14.0 * t) + 0.35 * rattle[i];
+    }
+    normalize(&mut out, 0.9);
+    out
+}
+
 /// Synthesize the whole bank, indexed by [`Sfx`] discriminant. Pure function of the
 /// seed — the determinism gate hashes exactly this.
 pub fn bank(seed: u64) -> Vec<Vec<f32>> {
@@ -403,6 +448,8 @@ pub fn bank(seed: u64) -> Vec<Vec<f32>> {
         floor_exit(seed ^ 0x08),
         torch_loop(seed ^ 0x09),
         ambience_loop(seed ^ 0x0a),
+        door_open(seed ^ 0x0b),
+        door_close(seed ^ 0x0c),
     ]
 }
 

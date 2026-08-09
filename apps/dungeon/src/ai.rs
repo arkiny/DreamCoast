@@ -654,8 +654,10 @@ pub fn separation_for(class: &GruntClass, grunts: &[GruntBrain], index: usize) -
 /// them move, separation reads only those latched positions, and everything after that is
 /// a per-grunt function of `(grid, class, player, dt)` plus its own state. The same inputs
 /// give the same tick, on any machine, whatever order the slice happens to be in.
+#[allow(clippy::too_many_arguments)] // the world-state fan-in; TickCtx bundles it right below
 pub fn tick_grunts(
     grid: &TileGrid,
+    doors: &crate::doors::DoorWorld,
     class: &GruntClass,
     finder: &mut Pathfinder,
     grunts: &mut [GruntBrain],
@@ -673,6 +675,7 @@ pub fn tick_grunts(
     }
     let ctx = TickCtx {
         grid,
+        door_map: crate::doors::DoorMap { grid, doors },
         class,
         player,
         dt,
@@ -693,16 +696,20 @@ pub fn tick_grunts(
 /// visible at every internal call site instead of a wall of arguments.
 struct TickCtx<'a> {
     grid: &'a TileGrid,
+    /// The grid with its doors overlaid — what MOVEMENT (and sight) collide against.
+    /// A* stays on the plain grid: a closed door is an eventuality auto-open resolves
+    /// in a swing's time, not a wall worth re-planning around (doors.rs).
+    door_map: crate::doors::DoorMap<'a>,
     class: &'a GruntClass,
     player: PlayerView,
     dt: f32,
 }
 
-impl TickCtx<'_> {
-    /// The collision handle for this tick's grid.
+impl<'a> TickCtx<'a> {
+    /// The collision handle for this tick's grid + door state.
     #[inline]
-    fn map(&self) -> GridCollision<'_, TileGrid> {
-        collision::collision(self.grid)
+    fn map(&self) -> GridCollision<'_, crate::doors::DoorMap<'a>> {
+        collision::collision_over(&self.door_map)
     }
 }
 
@@ -1197,7 +1204,8 @@ mod tests {
         let mut damage: Events<DamageEvent> = Events::new();
         let mut deaths: Events<DeathEvent> = Events::new();
         tick_iframes(world, DT);
-        tick_grunts(grid, class, finder, grunts, player, DT, &mut damage);
+        let doors = crate::doors::DoorWorld::default(); // doorless fixtures
+        tick_grunts(grid, &doors, class, finder, grunts, player, DT, &mut damage);
         apply_damage_events(world, damage.iter(), &mut deaths);
         feed_combat(grunts, damage.iter(), deaths.iter());
         damage.iter().copied().collect()
@@ -1852,6 +1860,7 @@ mod tests {
             tick_iframes(&mut world, DT);
             tick_grunts(
                 &grid,
+                &crate::doors::DoorWorld::default(),
                 &class,
                 &mut finder,
                 &mut grunts,

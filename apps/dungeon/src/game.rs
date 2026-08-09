@@ -670,6 +670,15 @@ pub struct DungeonGame {
     /// This floor's torch positions, collision space — the loop-slot emitters
     /// (slot `1 + i`; slot 0 is the ambience bed).
     torch_pts: Vec<Vec2>,
+    /// This floor's doorway doors (docs/door-props-plan.md): swing states + the
+    /// door-aware collision overlay. Derived from the grid, like the level's
+    /// `door_<i>` entities — one pure function, two consumers.
+    doors: crate::doors::DoorWorld,
+    /// The swinging panel entity per door (+ its authored translation), bound at
+    /// acquire like the cast; `None` where a level carries no such prop.
+    door_panels: Vec<Option<(Entity, Vec3)>>,
+    /// Scratch for [`crate::doors::DoorWorld::tick`]'s events (no per-step alloc).
+    door_events: Vec<crate::doors::DoorEvent>,
     /// How many torches [`crate::level`] hung on this floor — a HUD readout, not a
     /// simulation input. Latched when the floor is installed rather than recomputed per
     /// frame, and zero on a level this game did not author ([`Self::without_floors`]).
@@ -770,6 +779,7 @@ impl DungeonGame {
 
         let spawn = collision::player_spawn_local(&grid);
         let focus = collision::to_world(&grid, spawn, CAMERA_FOCUS_Y);
+        let doors = crate::doors::DoorWorld::new(&grid);
         Ok(Self {
             input: ActionState::new(map),
             grid,
@@ -783,6 +793,9 @@ impl DungeonGame {
             forced: held_sources_from_env(),
             taps: taps_from_env(),
             warrior: WarriorController::new(),
+            doors,
+            door_panels: Vec::new(),
+            door_events: Vec::new(),
             prev_pos: spawn,
             pos: spawn,
             prev_yaw: 0.0,
@@ -946,6 +959,8 @@ impl DungeonGame {
         self.torch_pts = torch_list.iter().map(|t| t.pos).collect();
         self.torches = torch_list.len();
         self.grid = next.grid;
+        self.doors = crate::doors::DoorWorld::new(&self.grid);
+        self.door_panels.clear();
         self.grunt_spawns = next.spawns;
         self.finder = Pathfinder::new();
         self.cast = None;
@@ -1143,6 +1158,29 @@ impl DungeonGame {
             grunt_anims,
             grunt_views: views,
         });
+        // The doors' swinging panels, bound like the cast: `door_<i>` wrapper by name,
+        // then the panel NODE inside its sub-tree. A level without door props (an older
+        // `.level` for this seed) simply fields unbound slots — physics still works,
+        // the swing just has nothing to draw.
+        self.door_panels = (0..self.doors.len())
+            .map(|i| {
+                let root = Self::find_named(world, &crate::level::door_name(i))?;
+                let panel = index.subtree(root).into_iter().find(|&e| {
+                    world
+                        .get::<Name>(e)
+                        .is_some_and(|n| n.0 == rigs::DOOR_PANEL_NODE)
+                })?;
+                let base = world.get::<LocalTransform>(panel)?.translation;
+                Some((panel, base))
+            })
+            .collect();
+        let bound = self.door_panels.iter().flatten().count();
+        if bound < self.doors.len() {
+            tracing::warn!(
+                "dungeon: {bound}/{} door panels bound (level older than the door prop?)",
+                self.doors.len()
+            );
+        }
         // A new run gets a new warrior; a descent keeps the one that walked down the
         // stairs, hit points and all. `reset_warrior` returns to its default afterwards
         // so an *unrequested* reload (the engine's hot-swap dropdown) is a fresh start
@@ -1387,13 +1425,48 @@ impl DungeonGame {
         // -- 3. i-frames -----------------------------------------------------------------
         tick_iframes(world, dt);
 
+        // -- 3b. the doors ----------------------------------------------------------------
+        // Ticked BEFORE the movers with last step's positions, so both movers collide
+        // against one coherent door state this step. Auto-open serves everyone —
+        // monsters included — which is why A* stays door-blind (doors.rs).
+        let mut occupants: Vec<Vec2> = Vec::with_capacity(1 + cast.grunts.len());
+        if !self.warrior.is_dead() {
+            occupants.push(self.pos);
+        }
+        occupants.extend(
+            cast.grunts
+                .iter()
+                .filter(|g| !g.is_dead())
+                .map(|g| g.position()),
+        );
+        self.door_events.clear();
+        self.doors.tick(&occupants, &mut self.door_events);
+        let listener = [self.pos.x, self.pos.y];
+        for event in self.door_events.drain(..) {
+            match event {
+                crate::doors::DoorEvent::Opening(i) => {
+                    let c = self.doors.centre(i);
+                    self.audio.play_at(Sfx::DoorOpen, listener, [c.x, c.y], 0.7);
+                }
+                crate::doors::DoorEvent::Closed(i) => {
+                    let c = self.doors.centre(i);
+                    self.audio
+                        .play_at(Sfx::DoorClose, listener, [c.x, c.y], 0.8);
+                }
+            }
+        }
+        let door_map = crate::doors::DoorMap {
+            grid: &self.grid,
+            doors: &self.doors,
+        };
+
         // -- 4. the player ---------------------------------------------------------------
         let targets = self.targets(&cast);
         let out = self.warrior.tick(
             self.warrior_input(),
             dt,
             WarriorCtx {
-                collision: collision::collision(&self.grid),
+                collision: collision::collision_over(&door_map),
                 position: self.pos,
                 radius: PLAYER_RADIUS,
                 attacker: cast.player,
@@ -1459,6 +1532,7 @@ impl DungeonGame {
         let view = self.player_view(&cast);
         ai::tick_grunts(
             &self.grid,
+            &self.doors,
             &self.grunt_class,
             &mut self.finder,
             &mut cast.grunts,
@@ -1540,6 +1614,7 @@ impl DungeonGame {
         // -- 7. presentation -------------------------------------------------------------
         self.pose_player(world, &mut cast, &out);
         self.pose_grunts(world, &mut cast);
+        self.pose_doors(world);
         self.prev_yaw = self.yaw;
         self.yaw = out.facing_radians;
         self.player_state = out.state;
@@ -1658,6 +1733,20 @@ impl DungeonGame {
     /// name is the clip key with no mapping (the warrior needs one — see
     /// [`crate::warrior::WarriorClip`] — because its graph is named after swings and its
     /// rig after slots).
+    /// Write this step's swing onto every bound panel entity. The panel node's
+    /// authored translation IS the hinge (rigs.rs authors its geometry growing from
+    /// the node origin), so the swing is one local Y-rotation — no pivot arithmetic.
+    fn pose_doors(&mut self, world: &mut World) {
+        for (i, slot) in self.door_panels.iter().enumerate() {
+            let Some((panel, base)) = slot else { continue };
+            let Some(t) = world.get_mut::<LocalTransform>(*panel) else {
+                continue;
+            };
+            t.translation = *base;
+            t.rotation = Quat::from_rotation_y(self.doors.angle(i));
+        }
+    }
+
     fn pose_grunts(&mut self, world: &mut World, cast: &mut Cast) {
         for (i, grunt) in cast.grunts.iter().enumerate() {
             let (Some(anim), Some(view)) =
