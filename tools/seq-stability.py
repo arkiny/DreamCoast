@@ -36,6 +36,7 @@ Usage:
 Multiple bases print one summary row each (A/B comparison table).
 """
 
+from __future__ import annotations
 import argparse
 import csv
 import glob

@@ -4867,7 +4867,14 @@ impl App {
         // Decide whether this frame produces a screenshot: a scheduled capture in
         // screenshot mode (after warmup), or an F2 rising edge interactively.
         let f2 = self.window.input().key_down(VK_F2);
-        let f2_pressed = f2 && !self.f2_prev;
+        // `DIAG_SHOT_EVERY=<n>`: interactive-mode auto-shot every n frames — a windowed
+        // self-capture seam for artifacts that headless capture (which serializes the
+        // GPU per frame) structurally hides. Scripted probes pair it with DUNGEON_HOLD.
+        let auto_shot = std::env::var("DIAG_SHOT_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|n| n > 0 && self.frame_no > 0 && self.frame_no.is_multiple_of(n));
+        let f2_pressed = (f2 && !self.f2_prev) || auto_shot;
         self.f2_prev = f2;
         // `T` = timestamp marker: logs + toasts, no capture cost. The field protocol
         // for one-frame visual incidents (shadow pops): the player taps T, and the log
