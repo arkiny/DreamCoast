@@ -766,10 +766,22 @@ float vsm_sun_shadow(float3 world_pos, float3 normal, float2 pix, float view_dep
                                        .r;
                         float lray = zn * zf / max(zf - (c.z / c.w) * (zf - zn), 1e-4);
                         float lscn = zn * zf / max(zf - sz * (zf - zn), 1e-4);
-                        // Blocked: ray point inside the thin band behind the visible
-                        // surface, and the blocker rises above the receiver's plane
-                        // (excludes the receiver's own surface at oblique views).
-                        if (lray > lscn + eps_l && lray < lscn + 0.15)
+                        // Blocked: ray point inside the band behind the visible surface,
+                        // and the blocker rises above the receiver's plane (excludes the
+                        // receiver's own surface at oblique views).
+                        //
+                        // The band grows with the sample's RAY DISTANCE (floor 0.15 m):
+                        // a SOLID low blocker (a character's boot over its contact
+                        // shadow) puts the ray point 0.2+ m below its visible top — a
+                        // flat thin band rejected exactly the near-field occluders this
+                        // test exists for, which detached every character shadow from
+                        // its feet (the reported "legs cut off"). Scaling by t keeps the
+                        // far-sample band bounded (~2x t_start), far under the flat
+                        // 0.8 m that regressed wall bases (rejected-ledger #5): the
+                        // fringe's false blockers pass SCREEN-behind walls by metres,
+                        // and stay rejected at every scale this produces.
+                        float band = max(0.15, (t_start * sf * sf) * 1.5);
+                        if (lray > lscn + eps_l && lray < lscn + band)
                         {
                             float4 scene =
                                 g.textures[pc.position_index].SampleLevel(g.samp, suv, 0.0);
