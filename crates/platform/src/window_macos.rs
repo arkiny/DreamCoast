@@ -383,6 +383,11 @@ impl Window {
         view.setLayer(Some(&layer));
 
         window.makeKeyAndOrderFront(None);
+        // AppKit's default is NO: without this, `NSEventType::MouseMoved` never
+        // reaches the pump, the cursor position only updates during drags, and every
+        // hover/click UI (ImGui, game menus) tests against a STALE position — clicks
+        // land nowhere. The fly camera masked it for months by using raw deltas.
+        window.setAcceptsMouseMovedEvents(true);
         app.activate();
 
         Ok(Self {
@@ -418,7 +423,20 @@ impl Window {
             };
             let Some(event) = event else { break };
             self.handle_event(&event);
-            app.sendEvent(&event);
+            // Plain key events are CONSUMED here: we already read them into `input`,
+            // and forwarding them lands in the responder chain with no handler —
+            // AppKit then beeps on every WASD press ("system alert on movement", as
+            // reported from play). Command-modified keys still forward so app-level
+            // equivalents (Cmd+Q, Cmd+H, ...) keep working; everything else forwards
+            // for window chrome and services.
+            let ty = event.r#type();
+            let plain_key = matches!(ty, NSEventType::KeyDown | NSEventType::KeyUp)
+                && !event
+                    .modifierFlags()
+                    .contains(objc2_app_kit::NSEventModifierFlags::Command);
+            if !plain_key {
+                app.sendEvent(&event);
+            }
         }
 
         // The window may have been closed (ordered out) by the chrome's close
@@ -463,7 +481,16 @@ impl Window {
                     self.input.set_key(vk as usize, down);
                 }
             }
-            NSEventType::LeftMouseDown => self.input.set_button(0, true),
+            NSEventType::LeftMouseDown => {
+                // Refresh the position on the press itself: a click without a
+                // preceding move (or one raced by the pump) still lands where the
+                // cursor actually is.
+                let p = event.locationInWindow();
+                let h = self.size.1 as f64 / self.scale;
+                self.input
+                    .set_mouse_pos((p.x * self.scale) as i32, ((h - p.y) * self.scale) as i32);
+                self.input.set_button(0, true);
+            }
             NSEventType::LeftMouseUp => self.input.set_button(0, false),
             NSEventType::RightMouseDown => self.input.set_button(1, true),
             NSEventType::RightMouseUp => self.input.set_button(1, false),
