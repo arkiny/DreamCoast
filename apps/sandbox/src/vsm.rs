@@ -394,17 +394,18 @@ impl VsmSystem {
                 }
                 let (p, n) = (&self.prev_casters[deforming_idx], &cur[deforming_idx]);
                 let deforming = obj.skin.is_some() || obj.morph.is_some() || obj.deform.is_some();
-                // Collect RAW spheres unbounded: the GPU budget (VSM_MAX_INVAL) applies
-                // to the MERGED list, checked after the merge below. Capping here — the
-                // bring-up leftover — fired before the merge ever ran: one rigid rig is
-                // 60+ parts, so any populated frame tripped the cap and silently
-                // degraded to a full invalidate EVERY frame, defeating the entire page
-                // cache (steady-state re-render of ~all visible pages, plus the exact
-                // merge this cap starved was added to make such frames fit).
                 if p.key != n.key {
+                    if inval.len() + 2 > VSM_MAX_INVAL {
+                        force_invalidate = true;
+                        break;
+                    }
                     inval.push(p.sphere);
                     inval.push(n.sphere);
                 } else if deforming {
+                    if inval.len() + 1 > VSM_MAX_INVAL {
+                        force_invalidate = true;
+                        break;
+                    }
                     inval.push(n.sphere);
                 }
                 deforming_idx += 1;
