@@ -1224,11 +1224,19 @@ struct PooledDepth {
 }
 
 /// A realized transient-aliasing plan: a heap plus the placed targets, cached
-/// while the plan is unchanged. `targets` is declared before `heap` so the
-/// placed targets drop first.
+/// while the PHYSICAL layout is unchanged. Identity deliberately excludes
+/// `ResourceId`s: ids are reassigned every frame the graph is rebuilt, so two
+/// frames with an identical heap layout routinely disagree on ids — comparing
+/// them thrashed a full `wait_idle` + heap/target rebuild every few frames of
+/// play (and, before sampled-slot reclaim existed, leaked the bindless table
+/// dry). `entries` is declared before `heap` so the placed targets drop first.
 struct AliasedSet {
-    plan: AliasPlan,
-    targets: HashMap<ResourceId, RenderTarget>,
+    heap_size: u64,
+    /// The realized targets with their physical identity: (desc, heap offset,
+    /// needs-alias-barrier). Matched as a multiset against each frame's plan.
+    entries: Vec<(RenderTargetDesc, u64, bool, RenderTarget)>,
+    /// This frame's binding of graph ids onto `entries` (rebuilt every realize).
+    targets: HashMap<ResourceId, usize>,
     #[allow(dead_code)] // owns the heap memory the targets are placed into
     heap: TransientHeap,
 }
@@ -1260,11 +1268,34 @@ impl ResourcePool {
         self.aliased = None;
     }
 
-    /// Ensure the pool's transient heap + placed targets match `plan`, rebuilding
-    /// (after a GPU idle) only when the plan changed.
+    /// Ensure the pool's transient heap + placed targets can serve `plan`,
+    /// rebuilding (after a GPU idle) only when the physical layout changed. A plan
+    /// whose layout matches the realized set — the common case, even when the
+    /// frame's ResourceIds shifted — only rebinds ids to the existing targets.
     fn realize_aliased(&mut self, device: &Device, plan: AliasPlan) -> Result<(), EngineError> {
-        if self.aliased.as_ref().is_some_and(|set| set.plan == plan) {
-            return Ok(());
+        if let Some(set) = self.aliased.as_mut()
+            && set.heap_size == plan.heap_size
+            && set.entries.len() == plan.placements.len()
+        {
+            let mut used = vec![false; set.entries.len()];
+            let mut binds = Vec::with_capacity(plan.placements.len());
+            let matched = plan.placements.iter().all(|p| {
+                set.entries.iter().enumerate().any(|(i, e)| {
+                    let hit = !used[i]
+                        && e.0 == p.desc
+                        && e.1 == p.offset
+                        && e.2 == p.needs_alias_barrier;
+                    if hit {
+                        used[i] = true;
+                        binds.push((p.id, i));
+                    }
+                    hit
+                })
+            });
+            if matched {
+                set.targets = binds.into_iter().collect();
+                return Ok(());
+            }
         }
         // The old heap/targets may still be referenced by in-flight frames.
         device.wait_idle()?;
@@ -1275,15 +1306,20 @@ impl ResourcePool {
             plan.placements.len(),
         );
         let heap = device.create_transient_heap(plan.heap_size)?;
+        let mut entries = Vec::with_capacity(plan.placements.len());
         let mut targets = HashMap::new();
         for p in &plan.placements {
-            targets.insert(
-                p.id,
+            targets.insert(p.id, entries.len());
+            entries.push((
+                p.desc,
+                p.offset,
+                p.needs_alias_barrier,
                 device.create_aliased_target(&heap, p.offset, &p.desc)?,
-            );
+            ));
         }
         self.aliased = Some(AliasedSet {
-            plan,
+            heap_size: plan.heap_size,
+            entries,
             targets,
             heap,
         });
@@ -1340,7 +1376,8 @@ impl ResourcePool {
         match loc {
             ColorLoc::Pooled(slot) => &self.colors[*slot].rt,
             ColorLoc::Aliased(id) => {
-                &self.aliased.as_ref().expect("aliased set realized").targets[id]
+                let set = self.aliased.as_ref().expect("aliased set realized");
+                &set.entries[set.targets[id]].3
             }
         }
     }
