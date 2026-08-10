@@ -162,6 +162,36 @@ uint vsm_level_for_distance(float d)
     return (uint)clamp(l, 0.0, float(VSM_LEVELS - 1u));
 }
 
+// The clipmap origin follows the camera focus, so each level's band boundary (a ring at
+// d = 2^i) SWEEPS the world as the player moves: a shadow straddling a moving boundary
+// hard-switches level — its texel footprint and SMRT penumbra double in one frame (the
+// in-play "shadow suddenly enlarges then recovers" pop, reproduced only under a moving
+// camera). The top VSM_LEVEL_BLEND_BAND fraction of each log2 band instead DITHERS to
+// the coarser level per pixel (interleaved-gradient noise, TAA-resolved), dissolving
+// the hard ring into a gradual transition.
+#define VSM_LEVEL_BLEND_BAND 0.25
+
+// Whether `d` sits inside the dither band of its level (marking requests BOTH levels
+// there — the shared-fn contract: a sampler asking a level marking never requested
+// reads unmapped and walks coarser, which is exactly the pop this exists to remove).
+bool vsm_level_in_blend_band(float d)
+{
+    float lf = log2(max(d, 2.0));
+    return lf - floor(lf) > 1.0 - VSM_LEVEL_BLEND_BAND;
+}
+
+// Sampling-side level pick: base level, stochastically promoted one coarser inside the
+// blend band. `noise` is a per-pixel hash in [0,1) (stable across the frame).
+uint vsm_level_for_distance_dithered(float d, float noise)
+{
+    float lf = log2(max(d, 2.0));
+    float base = floor(lf);
+    float t = (lf - base - (1.0 - VSM_LEVEL_BLEND_BAND)) / VSM_LEVEL_BLEND_BAND;
+    if (t > 0.0 && noise < t)
+        base += 1.0;
+    return (uint)clamp(base, 0.0, float(VSM_LEVELS - 1u));
+}
+
 // Flip-free NDC -> virtual texel coordinates (D3D orientation: ndc.y up = row 0 at top).
 // The single source for marking, the raster PS reverse-check and sampling.
 float2 vsm_ndc_to_texel(float2 ndc)

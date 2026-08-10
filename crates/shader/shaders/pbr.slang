@@ -636,7 +636,14 @@ float vsm_sun_shadow(float3 world_pos, float3 normal, float2 pix, float view_dep
     RWByteAddressBuffer pool = g.storage_buffers[pc.vsm_pool_buf];
     level_out = -1;
 
-    uint first = vsm_level_for_distance(length(world_pos - vsm_load_origin(consts)));
+    // Dithered level pick (see vsm_common): inside a band boundary's transition zone
+    // the pixel stochastically promotes to the coarser level, so the boundary ring the
+    // camera-following origin sweeps through the world resolves as TAA-averaged noise
+    // instead of a whole-region texel/penumbra doubling pop. IGN matches the SMRT
+    // stratification's per-pixel decorrelation source.
+    float vsm_ign = frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))));
+    uint first = vsm_level_for_distance_dithered(length(world_pos - vsm_load_origin(consts)),
+                                                 vsm_ign);
     for (uint level = first; level < VSM_LEVELS; ++level)
     {
         float4x4 wc = vsm_load_world_to_clip(consts, level);

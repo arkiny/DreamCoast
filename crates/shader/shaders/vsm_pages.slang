@@ -101,13 +101,22 @@ void csMark(uint3 tid: SV_DispatchThreadID)
     if (pos.w < 0.5)
         return; // sky / no geometry
     RWByteAddressBuffer consts = g.storage_buffers[pc.consts_buf];
-    uint level = vsm_level_for_distance(length(pos.xyz - vsm_load_origin(consts)));
-    float4 clip = mul(vsm_load_world_to_clip(consts, level), float4(pos.xyz, 1.0));
-    float2 texel = vsm_ndc_to_texel(clip.xy);
-    if (min(texel.x, texel.y) < 0.0 || max(texel.x, texel.y) >= float(VSM_VIRTUAL_SIZE))
-        return;
-    uint2 page = uint2(texel) / VSM_PAGE_SIZE;
-    g.storage_buffers[pc.request_buf].InterlockedOr(vsm_pte_offset(level, page), VSM_REQ_ALLOCATE);
+    float d = length(pos.xyz - vsm_load_origin(consts));
+    uint level = vsm_level_for_distance(d);
+    // Inside the blend band the sampler dithers between this level and the next
+    // coarser one, so request BOTH (the shared-fn contract: a sampler asking a level
+    // marking never requested reads unmapped and walks coarser).
+    uint last = vsm_level_in_blend_band(d) ? min(level + 1u, VSM_LEVELS - 1u) : level;
+    for (uint l = level; l <= last; ++l)
+    {
+        float4 clip = mul(vsm_load_world_to_clip(consts, l), float4(pos.xyz, 1.0));
+        float2 texel = vsm_ndc_to_texel(clip.xy);
+        if (min(texel.x, texel.y) < 0.0 || max(texel.x, texel.y) >= float(VSM_VIRTUAL_SIZE))
+            continue;
+        uint2 page = uint2(texel) / VSM_PAGE_SIZE;
+        g.storage_buffers[pc.request_buf].InterlockedOr(vsm_pte_offset(l, page),
+                                                        VSM_REQ_ALLOCATE);
+    }
 }
 
 // --- Update: one thread per PHYSICAL page (the cache heart) ------------------------------
