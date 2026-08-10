@@ -511,6 +511,11 @@ impl VsmSystem {
                 }
             }
             if invalidate {
+                // Field witness for the pop investigation: a rebase re-renders the
+                // whole level and shifts every receiver's level-selection distance —
+                // one of the two candidate mechanisms behind the reported one-frame
+                // "shadow enlarges" incident.
+                tracing::info!("VSM level {i} rebased (full re-render)");
                 st.pinned_along = along;
                 st.valid = true;
             }

@@ -1539,6 +1539,9 @@ pub struct App {
     /// `DIAG_FRAME_CSV`: open sink for the per-frame timing series (any mode).
     frame_csv: Option<std::io::BufWriter<std::fs::File>>,
     f2_prev: bool,
+    /// `T` rising-edge latch — the plain-key diag marker (F2 needs the fn chord on a
+    /// Mac laptop keyboard, too slow to tag a one-frame visual event).
+    t_prev: bool,
     /// Interactive-capture toast: (message, when) — drawn top-centre for a moment so
     /// the player knows the F2 shot landed without checking the log.
     shot_toast: Option<(String, Instant)>,
@@ -1601,6 +1604,8 @@ pub struct App {
 }
 
 const VK_F2: u16 = 0x71;
+/// Plain `T` (Win32 VK == ASCII) — the diag timestamp marker.
+const VK_T: u16 = 0x54;
 const VK_TAB: u16 = 0x09;
 const VK_M: u16 = 0x4D;
 const SCREENSHOT_WARMUP: u64 = 3;
@@ -3912,6 +3917,7 @@ impl App {
                     .map(std::io::BufWriter::new)
             }),
             f2_prev: false,
+            t_prev: false,
             shot_toast: None,
             needs_recreate: false,
             pool_render_extent: (0, 0),
@@ -4863,6 +4869,15 @@ impl App {
         let f2 = self.window.input().key_down(VK_F2);
         let f2_pressed = f2 && !self.f2_prev;
         self.f2_prev = f2;
+        // `T` = timestamp marker: logs + toasts, no capture cost. The field protocol
+        // for one-frame visual incidents (shadow pops): the player taps T, and the log
+        // timestamp cross-references the DIAG_FRAME_CSV rows around the event.
+        let t_key = self.window.input().key_down(VK_T);
+        if t_key && !self.t_prev && !self.screenshot_mode {
+            info!("DIAG marker (T) at frame {}", self.frame_no);
+            self.shot_toast = Some(("diag marker".to_string(), Instant::now()));
+        }
+        self.t_prev = t_key;
         let capture_this_frame: Option<Capture> = if self.screenshot_mode {
             match self.capture_seq {
                 // CAPTURE_SEQ: frames [warmup, warmup+N) each dump to `<path>.NNNN.png`.
