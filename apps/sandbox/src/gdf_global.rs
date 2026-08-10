@@ -498,14 +498,13 @@ impl GdfGlobal {
         if !self.wants_sync() {
             return;
         }
-        // A recenter is armed for THIS frame: sit the sync out. Mover boxes queued
-        // now would need the scroll translation (and any residual coordinate-frame
-        // subtlety there compounds into field rot over long play); skipping costs
-        // nothing — next frame's transform diff spans both footprints, and a mover
-        // travels well under the one-voxel dirty pad per frame.
-        if !self.pending.is_empty() {
-            return;
-        }
+        // Mover boxes queued while a recenter is armed for this frame are fine:
+        // apply_pending translates them into the post-scroll window. (A skip here —
+        // once used as a belt-and-braces guard while a "residual corruption" was
+        // hunted — cost a one-frame lag on every mover's field footprint whenever a
+        // recenter fired, read in play as the door's contact shadow popping while
+        // walking. The corruption turned out to be the bindless-table exhaustion +
+        // alias-plan thrash, not this path; the translated sync is correct.)
         for i in 0..self.tracked.len() {
             let t = &self.tracked[i];
             if !t.alive {
