@@ -721,6 +721,33 @@ impl GdfGlobal {
                 pages[1] * PAGE_SIZE as i32,
                 pages[2] * PAGE_SIZE as i32,
             ];
+            // Jobs queued EARLIER this frame (the dynamic sync runs before the
+            // recenter) hold box coords relative to the PRE-scroll window. The window
+            // is about to move by `vox_delta`, so translate them into the new frame —
+            // compositing them un-shifted would refresh a region offset by the whole
+            // scroll (stale content left where the mover actually is, plus a wrongly
+            // rewritten patch elsewhere), and a long walk with per-frame movers turns
+            // every recenter into another corrupt blotch (observed in play as
+            // accumulating colour/field corruption + runaway march cost).
+            for jobs in [&mut self.jobs_static, &mut self.jobs_merge] {
+                jobs.retain_mut(|job| {
+                    if job.level != i {
+                        return true;
+                    }
+                    for (a, dv) in vox_delta.iter().enumerate() {
+                        let lo = job.box0[a] as i64 - *dv as i64;
+                        let hi = lo + job.ext[a] as i64; // exclusive
+                        let lo_c = lo.clamp(0, res as i64);
+                        let hi_c = hi.clamp(0, res as i64);
+                        if hi_c <= lo_c {
+                            return false; // scrolled fully out of the window
+                        }
+                        job.box0[a] = lo_c as u32;
+                        job.ext[a] = (hi_c - lo_c) as u32;
+                    }
+                    true
+                });
+            }
             let vsize = GlobalLevel::voxel(i, res);
             let lv = &mut self.levels[i];
             for (a, dv) in vox_delta.iter().enumerate() {
