@@ -210,6 +210,11 @@ pub(crate) struct GdfGlobal {
     records_dirty: bool,
     /// Per-frame dynamic sync enable (`P11_GDF_DYNAMIC`, default on — the directive).
     dynamic_on: bool,
+    /// `P11_GDF_REFRESH=<frames>`: periodic FULL recomposite of both layers (0 = off).
+    /// A divergence probe first (incremental-update rot shows as a sawtooth instead of
+    /// a climb) and a stopgap self-heal while a divergence is being hunted.
+    refresh_period: u64,
+    frame_no: u64,
     /// Atlas sampled indices for the composite push.
     atlas_idx: u32,
     alb_atlas_idx: [u32; 3],
@@ -334,6 +339,11 @@ impl GdfGlobal {
             movable_count: 0,
             records_dirty: false,
             dynamic_on: crate::quality::env_bool("P11_GDF_DYNAMIC", true),
+            refresh_period: std::env::var("P11_GDF_REFRESH")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0),
+            frame_no: 0,
             atlas_idx: u32::MAX,
             alb_atlas_idx: [u32::MAX; 3],
             empty: 100.0,
@@ -480,6 +490,14 @@ impl GdfGlobal {
     /// the next content install — the documented U-follow-up.
     pub(crate) fn sync_dynamic(&mut self, worlds: &HashMap<Entity, Mat4>) {
         if !self.wants_sync() {
+            return;
+        }
+        // A recenter is armed for THIS frame: sit the sync out. Mover boxes queued
+        // now would need the scroll translation (and any residual coordinate-frame
+        // subtlety there compounds into field rot over long play); skipping costs
+        // nothing — next frame's transform diff spans both footprints, and a mover
+        // travels well under the one-voxel dirty pad per frame.
+        if !self.pending.is_empty() {
             return;
         }
         for i in 0..self.tracked.len() {
@@ -660,6 +678,21 @@ impl GdfGlobal {
     /// HERE, so [`Self::record`] is purely immutable).
     pub(crate) fn apply(&mut self) -> anyhow::Result<()> {
         self.batch = None;
+        self.frame_no += 1;
+        if self.refresh_period > 0
+            && self.frame_no.is_multiple_of(self.refresh_period)
+            && !self.tracked.is_empty()
+        {
+            for level in 0..GLOBAL_LEVELS {
+                let full = CompositeJob {
+                    level,
+                    box0: [0; 3],
+                    ext: [self.res; 3],
+                };
+                self.jobs_static.push(full);
+                self.jobs_merge.push(full);
+            }
+        }
         if !self.pending.is_empty() {
             self.apply_pending()?;
         }

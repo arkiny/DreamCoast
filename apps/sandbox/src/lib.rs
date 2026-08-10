@@ -4708,7 +4708,7 @@ impl App {
             );
             // Flush every second: a BufWriter tail dies with the process, and the
             // frames around an incident are exactly the ones a kill would lose.
-            if self.frame_no % 60 == 0 {
+            if self.frame_no.is_multiple_of(60) {
                 let _ = csv.get_mut().sync_data();
                 let _ = std::io::Write::flush(csv);
             }
