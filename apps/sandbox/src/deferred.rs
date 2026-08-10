@@ -562,14 +562,16 @@ impl DeferredRenderer {
             )?;
             let seed = [1.0e-4f32, 0.0f32];
             let bytes: Vec<u8> = seed.iter().flat_map(|f| f.to_le_bytes()).collect();
-            let expo = device.create_storage_buffer_init(
-                &StorageBufferDesc {
-                    size: bytes.len() as u64,
-                    stride: 4,
-                    indirect: false,
-                },
-                &bytes,
-            )?;
+            // HOST-visible (the VSM-counter pattern: GPU writes + host telemetry
+            // reads): DIAG_FRAME_CSV logs the adapted exposure per frame, which is
+            // what separates "the scene went dark and AE blew out" from "the lit
+            // content itself is wrong" when a colour incident is reported from play.
+            let expo = device.create_storage_buffer_host(&StorageBufferDesc {
+                size: bytes.len() as u64,
+                stride: 4,
+                indirect: false,
+            })?;
+            expo.write(&bytes)?;
             Ok((hist_pipe, resolve_pipe, hist, expo))
         })();
         let (ae_histogram_pipeline, ae_resolve_pipeline, ae_hist_buf, exposure_buf) = match ae {
@@ -634,6 +636,14 @@ impl DeferredRenderer {
 
     /// The bindless storage-buffer index of the adapted-exposure buffer (lighting reads it when
     /// auto-exposure is on). `None` if the metering pipeline failed to build.
+    /// The adapted exposure the AE resolve wrote (host telemetry; None = AE off).
+    pub(crate) fn exposure_value(&self) -> Option<f32> {
+        let buf = self.exposure_buf.as_ref()?;
+        let mut b = [0u8; 4];
+        buf.read_into(&mut b).ok()?;
+        Some(f32::from_le_bytes(b))
+    }
+
     pub(crate) fn exposure_buf_index(&self) -> Option<u32> {
         self.exposure_buf.as_ref().map(|b| b.storage_index())
     }

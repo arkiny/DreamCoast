@@ -4692,15 +4692,19 @@ impl App {
             // Column 5: VSM pages rendered last frame (0 when VSM is off) — the
             // scroll-thrash / invalidation-storm witness alongside the timing series.
             let (vsm_pages, vsm_overflow) = self.vsm.as_ref().map_or((0, 0), |v| v.stats());
+            // Column 7: adapted auto-exposure x 1e6 (0 = AE off) — the colour-incident
+            // discriminator (runaway exposure vs corrupted lit content).
+            let expo = self.deferred.exposure_value().unwrap_or(0.0);
             let _ = writeln!(
                 csv,
-                "{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{}",
                 self.frame_no,
                 LAST_FRAME_US.load(std::sync::atomic::Ordering::Relaxed),
                 LAST_WAIT_US.load(std::sync::atomic::Ordering::Relaxed),
                 LAST_CPU_US.load(std::sync::atomic::Ordering::Relaxed),
                 vsm_pages,
                 vsm_overflow,
+                (expo.clamp(0.0, 1.0e6) * 1.0e6) as u64,
             );
         }
 
