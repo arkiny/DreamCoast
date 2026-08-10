@@ -56,3 +56,19 @@ BLAS/TLAS 재빌드 → vgeo 클러스터 DAG 쿡 → GDF 글로벌 설치. 목�
 golden byte-PASS(헤드리스 동기 경로 불변) · clippy -D warnings · 층 전환 10회
 반복 윈도우드 프로브(DIAG_FRAME_CSV >60 ms 프레임 0, DIAG_SLOTS 순증 0) ·
 무거운 작업 1개씩(팬리스 M3 Air).
+
+## 4. H0 착수 정찰 (2026-08-11, 구현 진입점)
+
+- `lib.rs::load_level`(4312) 체인: RHI 워커 드레인 → wait_idle → `level::load`(IO/파스)
+  → `level::build_level`(메시/머티리얼/텍스처 — GPU 업로드 혼재) → transform 전파
+  → `rebuild_static_scene`(4406) → 워커 재스폰 지연 처리(기존 주석의 FIF 스크래치
+  주의사항 참조 — 비동기화 시에도 동일 계약 유지 필요).
+- `static_scene.rs::build_gdf_scene`(75~842)의 페이즈 구조:
+  - **A(디바이스-프리 확인됨)**: specs 수집(dedup, 레지스트리를 소유 바이트로 인코딩
+    — "borrows no registry" 주석, 이미 Send-호환) + parallel_cook per-mesh SDF/알베도
+    베이크(172~370). → `bake_mesh_fields()` 순수 함수로 추출이 H0 1호 커밋.
+  - **B(혼재)**: 컴포즈/씬 볼륨/아틀라스/글로벌 필드/서피스 캐시 — device 터치포인트
+    ~10곳(434 set_clip_levels, 539/553/570 볼륨 생성, 750 카드 캡처 등). CPU 산출물
+    구조체로 감아 업로드 함수와 분리하는 것이 H0 2호.
+- vgeo DAG 쿡·BLAS/TLAS는 별도 모듈(vgeo.rs/rt.rs) — H1에서 같은 PendingScene에 합류.
+- 주의: 스왑 시 sun/카메라/level_lighting 등 앱 상태 갱신은 스왑 프레임에 원자 적용.
