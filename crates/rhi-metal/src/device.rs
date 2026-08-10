@@ -134,6 +134,10 @@ pub(crate) struct DeviceShared {
     /// Next free bindless texture slot. `Cell`: the Metal backend is single-threaded
     /// (`Rc`, not `Arc`), so no atomics are needed.
     tex_next: Cell<u32>,
+    /// Freed sampled-texture slots for reuse (render targets return theirs on Drop —
+    /// the transient-alias plan rebuilds on any pass-set change, and an unreclaimed
+    /// table overflows into the sampler/cube handles within a long play session).
+    tex_free: RefCell<Vec<u32>>,
     /// Next free bindless cube slot (0-based; the handle lands at argument-buffer
     /// slot `BINDLESS_COUNT + 1 + index`).
     cube_next: Cell<u32>,
@@ -226,8 +230,22 @@ impl DeviceShared {
     /// `resident`, it is also tracked for `useResource` (sampled textures); depth
     /// attachments pass `false`.
     fn register(&self, texture: Retained<ProtocolObject<dyn MTLTexture>>, resident: bool) -> u32 {
-        let index = self.tex_next.get();
-        self.tex_next.set(index + 1);
+        // Reuse a freed slot before bumping the high-water mark. Without this, every
+        // transient-alias plan rebuild (any frame whose pass set changes: a GI shift,
+        // a GDF recenter, a screenshot) leaked its whole target set here permanently;
+        // a long play session marched `tex_next` past the table, overwrote the
+        // sampler / cube / storage handles that live after it (the escalating in-play
+        // colour corruption), and finally SIGBUS'd off the argument buffer's end.
+        let index = self.tex_free.borrow_mut().pop().unwrap_or_else(|| {
+            let i = self.tex_next.get();
+            self.tex_next.set(i + 1);
+            i
+        });
+        assert!(
+            index < BINDLESS_COUNT,
+            "bindless sampled-texture table overflow (> {BINDLESS_COUNT}); raise \
+             BINDLESS_COUNT across bindless.slang + all three backends"
+        );
         self.write_handle(index, texture.gpuResourceID());
         {
             let mut textures = self.sampled_textures.borrow_mut();
@@ -335,6 +353,17 @@ impl DeviceShared {
             *slot = None;
         }
         self.storage_img_free.borrow_mut().push(index);
+    }
+
+    /// Return a sampled-texture slot to the free list (the [`Self::register`]
+    /// counterpart, mirroring [`Self::free_storage_image`]). Callers uphold the
+    /// handoff contract: the Drop that reaches here is deferred until no in-flight
+    /// frame still references the slot.
+    pub(crate) fn free_texture(&self, index: u32) {
+        if let Some(slot) = self.sampled_textures.borrow_mut().get_mut(index as usize) {
+            *slot = None;
+        }
+        self.tex_free.borrow_mut().push(index);
     }
 
     /// Register a 3D volume texture in the bindless sampled-volume table
@@ -623,6 +652,7 @@ impl MetalInstance {
             sampler,
             sampler_wrap,
             tex_next: Cell::new(0),
+            tex_free: RefCell::new(Vec::new()),
             cube_next: Cell::new(0),
             storage_img_next: Cell::new(0),
             storage_buf_next: Cell::new(0),

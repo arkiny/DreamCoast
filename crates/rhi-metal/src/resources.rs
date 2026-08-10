@@ -236,13 +236,18 @@ impl MetalRenderTarget {
 }
 
 impl Drop for MetalRenderTarget {
-    /// Return the bindless storage-image slot so recreating storage targets (resize) does not leak
-    /// the 64-slot UAV table. The sampled `index` (large table) is not yet reclaimed. Safe: the
-    /// handoff contract defers the Drop until the referencing frames retire.
+    /// Return BOTH bindless slots — the storage-image slot (UAV table) and the sampled
+    /// slot. The sampled table was long unreclaimed on the theory that targets are
+    /// recreated only on resize; the transient-alias heap in fact rebuilds its whole
+    /// target set on ANY pass-set change (GI shift, GDF recenter, screenshot frames),
+    /// so a play session leaked the 1024-entry table dry and marched into the handles
+    /// behind it. Safe: the handoff contract defers the Drop until the referencing
+    /// frames retire.
     fn drop(&mut self) {
         if let Some(idx) = self.storage_index {
             self.shared.free_storage_image(idx);
         }
+        self.shared.free_texture(self.index);
     }
 }
 
