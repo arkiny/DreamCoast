@@ -4706,6 +4706,12 @@ impl App {
                 vsm_overflow,
                 (expo.clamp(0.0, 1.0e6) * 1.0e6) as u64,
             );
+            // Flush every second: a BufWriter tail dies with the process, and the
+            // frames around an incident are exactly the ones a kill would lose.
+            if self.frame_no % 60 == 0 {
+                let _ = csv.get_mut().sync_data();
+                let _ = std::io::Write::flush(csv);
+            }
         }
 
         // --- Fixed-timestep simulation (M2) ---------------------------------------
