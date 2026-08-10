@@ -104,7 +104,9 @@ pub(crate) struct VsmSystem {
     bounds_cull: bool,
     /// SMRT filter config (V4): rays (0 = 3x3 PCF fallback), samples per ray, ray length
     /// as a fraction of the receiver's camera distance. Env `VSM_SMRT_RAYS` /
-    /// `VSM_SMRT_SAMPLES` / `VSM_SMRT_LEN`; defaults = the reference engine's 7/8/1.5.
+    /// `VSM_SMRT_SAMPLES` / `VSM_SMRT_LEN`; rays/samples default from the quality tier,
+    /// length defaults 0.3 (recalibrated — see `new`'s comment; 1.5 detached contact
+    /// shadows by starving the contact zone of quadratic samples).
     smrt: [f32; 3],
 }
 
@@ -315,7 +317,14 @@ impl VsmSystem {
                 [
                     f("VSM_SMRT_RAYS", smrt_defaults.0 as f32).clamp(0.0, 16.0),
                     f("VSM_SMRT_SAMPLES", smrt_defaults.1 as f32).clamp(1.0, 32.0),
-                    f("VSM_SMRT_LEN", 1.5).clamp(0.01, 16.0),
+                    // 0.3 x view depth (recalibrated from 1.5): the march budget is a
+                    // handful of QUADRATIC samples, and a ray reaching 150% of the
+                    // camera distance (~24 m in play) leaves ONE sample inside the
+                    // whole contact zone — character shadows detached from the feet
+                    // (measured; PCF attached, len 0.3 attached, wall penumbrae
+                    // unchanged). 0.3 still reaches ~5 m of occluders at the game
+                    // camera — the dungeon's whole occluder scale.
+                    f("VSM_SMRT_LEN", 0.3).clamp(0.01, 16.0),
                 ]
             },
         }))
