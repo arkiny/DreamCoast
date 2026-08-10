@@ -4692,12 +4692,16 @@ impl App {
             // Column 5: VSM pages rendered last frame (0 when VSM is off) — the
             // scroll-thrash / invalidation-storm witness alongside the timing series.
             let (vsm_pages, vsm_overflow) = self.vsm.as_ref().map_or((0, 0), |v| v.stats());
+            // Column 8: coarse-fallback pixels (FIF-delayed harvest) — the direct
+            // witness of the "shadow enlarges for a frame" pop (a marked level read
+            // unmapped and the sampler walked coarser).
+            let vsm_fallback = self.vsm.as_ref().map_or(0, |v| v.fallback_px());
             // Column 7: adapted auto-exposure x 1e6 (0 = AE off) — the colour-incident
             // discriminator (runaway exposure vs corrupted lit content).
             let expo = self.deferred.exposure_value().unwrap_or(0.0);
             let _ = writeln!(
                 csv,
-                "{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{}",
                 self.frame_no,
                 LAST_FRAME_US.load(std::sync::atomic::Ordering::Relaxed),
                 LAST_WAIT_US.load(std::sync::atomic::Ordering::Relaxed),
@@ -4705,6 +4709,7 @@ impl App {
                 vsm_pages,
                 vsm_overflow,
                 (expo.clamp(0.0, 1.0e6) * 1.0e6) as u64,
+                vsm_fallback,
             );
             // Flush every second: a BufWriter tail dies with the process, and the
             // frames around an incident are exactly the ones a kill would lose.

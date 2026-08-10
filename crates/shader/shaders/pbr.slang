@@ -660,7 +660,18 @@ float vsm_sun_shadow(float3 world_pos, float3 normal, float2 pix, float view_dep
         // unmapped page just drop out of the kernel below.
         uint2 page = uint2(texel) / VSM_PAGE_SIZE;
         if ((table.Load(vsm_pte_offset(level, page)) & VSM_PTE_MAPPED) == 0u)
+        {
+            // A receiver whose OWN marked level is unmapped this frame walks coarser —
+            // the visible one-frame "shadow enlarges" pop. Count first-level misses for
+            // the host (the diag word rides this FIF slot's consts; the rewrite when the
+            // slot cycles back is the reset).
+            if (level == first)
+            {
+                uint _d;
+                consts.InterlockedAdd(VSM_CONST_DIAG_OFF, 1u, _d);
+            }
             continue;
+        }
         level_out = int(level);
 
         // ---- SMRT (plan V4, reference engine SMRTTemplate.ush) --------------------------

@@ -51,8 +51,15 @@ const VSM_MAX_INVAL: usize = 64;
 /// Per-frame constants blob: 6 mat4 + 6 float4 params + uint4 misc + float4 origin +
 /// 6 int4 scroll entries + the invalidation header/spheres + the SMRT float4. Mirrors
 /// the `VSM_CONST_*` offsets in vsm_common.slang.
-const VSM_CONST_SIZE: usize =
-    VSM_LEVELS * 64 + VSM_LEVELS * 16 + 16 + 16 + VSM_LEVELS * 16 + 16 + VSM_MAX_INVAL * 16 + 16;
+const VSM_CONST_SIZE: usize = VSM_LEVELS * 64
+    + VSM_LEVELS * 16
+    + 16
+    + 16
+    + VSM_LEVELS * 16
+    + 16
+    + VSM_MAX_INVAL * 16
+    + 16
+    + 16; // diag tail: [0] coarse-fallback pixel count (see vsm_common.slang)
 
 /// Per-level CPU cache key: where the level's snapped origin sits in its own page space,
 /// and the along-sun component its depth basis is pinned to.
@@ -97,6 +104,10 @@ pub(crate) struct VsmSystem {
     levels: [LevelState; VSM_LEVELS],
     sun_key: [u32; 3],
     frame_no: u32,
+    /// Coarse-fallback pixels harvested from the last cycled consts slot (the diag
+    /// tail): >0 on a frame whose receivers found their marked level unmapped — the
+    /// visible one-frame "shadow enlarges" pop. Exposed to DIAG_FRAME_CSV.
+    last_fallback_px: u32,
     /// Last frame's shadow casters, scene order (V3 mover detection).
     prev_casters: Vec<PrevCaster>,
     /// `VSM_BOUNDS_CULL=0` seam: disable the render-bounds whole-caster cull (A/B
@@ -301,6 +312,7 @@ impl VsmSystem {
             levels: [LevelState::default(); VSM_LEVELS],
             sun_key: [0; 3],
             frame_no: 0,
+            last_fallback_px: 0,
             prev_casters: Vec::new(),
             bounds_cull: std::env::var("VSM_BOUNDS_CULL").ok().as_deref() != Some("0"),
             smrt: {
@@ -552,6 +564,19 @@ impl VsmSystem {
         for (j, f) in self.smrt.iter().enumerate() {
             put(&mut bytes, smrt_off + j * 4, *f);
         }
+        // Harvest the diag tail this slot accumulated the last time it was in flight
+        // (coarse-fallback pixel count — the "shadow enlarges for a frame" pop signal),
+        // then the full-blob write below rezeroes it for this frame's run.
+        let mut prev = vec![0u8; VSM_CONST_SIZE];
+        self.last_fallback_px = if self.consts[fif].read_into(&mut prev).is_ok() {
+            u32::from_le_bytes(
+                prev[VSM_CONST_SIZE - 16..VSM_CONST_SIZE - 12]
+                    .try_into()
+                    .unwrap(),
+            )
+        } else {
+            0
+        };
         self.consts[fif].write(&bytes)?;
         Ok((
             self.consts[fif].storage_index(),
@@ -741,6 +766,11 @@ impl VsmSystem {
 
     /// (pages rendered last frame, overflowed requests) — the cache-effectiveness and
     /// pool-sizing diagnostics (`lib.rs` logs them at shutdown).
+    /// Coarse-fallback pixels from the last harvested frame (see `last_fallback_px`).
+    pub(crate) fn fallback_px(&self) -> u32 {
+        self.last_fallback_px
+    }
+
     pub(crate) fn stats(&self) -> (u32, u32) {
         let mut b = [0u8; 16];
         if self.counter.read_into(&mut b).is_err() {
