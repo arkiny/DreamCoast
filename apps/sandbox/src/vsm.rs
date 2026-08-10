@@ -509,24 +509,17 @@ impl VsmSystem {
 
             let st = &mut self.levels[i];
             let mut invalidate = sun_moved || force_invalidate || !st.valid;
-            let mut scroll = [0i32, 0i32];
-            if !invalidate {
-                if (along - st.pinned_along).abs() > half {
-                    // Depth-pin guardband: the focus drifted a full pushback past the
-                    // basis this level's depths were built in — rebase and re-render.
-                    invalidate = true;
-                } else {
-                    let dx = page_loc[0] - st.page_loc[0];
-                    let dy = page_loc[1] - st.page_loc[1];
-                    if dx.unsigned_abs() >= VSM_TABLE_DIM as u64
-                        || dy.unsigned_abs() >= VSM_TABLE_DIM as u64
-                    {
-                        invalidate = true; // scrolled the whole table away
-                    } else {
-                        scroll = [dx as i32, dy as i32];
-                    }
-                }
+            if !invalidate && (along - st.pinned_along).abs() > half {
+                // Depth-pin guardband: the focus drifted a full pushback past the
+                // basis this level's depths were built in — rebase and re-render.
+                invalidate = true;
             }
+            // (R1) No per-frame scroll DELTA any more: the consts carry the level's
+            // ABSOLUTE origin (wrapped, below) and csUpdate re-derives each cached
+            // page's window position from scratch every frame. A whole-table jump
+            // needs no special case — every page lands outside the window test and
+            // drops naturally — and a skipped/aborted frame can no longer desync the
+            // GPU's incremental state from the CPU's (the delta chain is gone).
             if invalidate {
                 // Field witness for the pop investigation: a rebase re-renders the
                 // whole level and shifts every receiver's level-selection distance —
@@ -561,9 +554,13 @@ impl VsmSystem {
                 params_off,
                 (half * 2.0) / VSM_VIRTUAL_SIZE as f32,
             );
+            // (R1) xy = the level's ABSOLUTE origin in page units, wrapped into the
+            // meta address field's 14-bit space. Modular subtraction on the GPU gives
+            // the window-relative position; page age-out (120 frames) retires any page
+            // long before real drift could alias across the 16384-page wrap.
             let so = scroll_base + i * 16;
-            put_i(&mut bytes, so, scroll[0]);
-            put_i(&mut bytes, so + 4, scroll[1]);
+            put_i(&mut bytes, so, page_loc[0].rem_euclid(16384) as i32);
+            put_i(&mut bytes, so + 4, page_loc[1].rem_euclid(16384) as i32);
             put_u(&mut bytes, so + 8, u32::from(invalidate));
         }
         let misc_off = VSM_LEVELS * 64 + VSM_LEVELS * 16;

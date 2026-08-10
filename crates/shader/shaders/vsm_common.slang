@@ -49,9 +49,12 @@
 //   then               uint4   misc: x = level count, y = pool pages, z = frame number,
 //                              w = max page age in frames (cache eviction)
 //   then               float4  origin: xyz = clipmap origin (camera focus), w spare
-//   then per level     int4    scroll: xy = page offset this frame (prev -> current page
-//                              space), z = flags (bit 0 = invalidate the whole level),
-//                              w = spare
+//   then per level     int4    scroll: xy = the level's ABSOLUTE origin in page units,
+//                              wrapped to the meta address field's 14-bit space (R1:
+//                              cached pages store absolute addresses and csUpdate
+//                              re-derives window positions by modular difference — no
+//                              incremental delta chain for a dropped frame to desync),
+//                              z = flags (bit 0 = invalidate the whole level), w = spare
 // All offsets in BYTES for ByteAddressBuffer loads.
 #define VSM_CONST_MATS_OFF 0u
 #define VSM_CONST_PARAMS_OFF (VSM_LEVELS * 64u)

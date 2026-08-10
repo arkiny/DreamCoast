@@ -133,14 +133,18 @@ void csUpdate(uint3 tid: SV_DispatchThreadID)
 
     RWByteAddressBuffer consts = g.storage_buffers[pc.consts_buf];
     uint level;
-    uint2 page;
+    uint2 page; // (R1) ABSOLUTE page coords, wrapped to the address field's 14 bits
     vsm_meta_unpack_addr(meta.Load(mo), level, page);
-    int3 scroll = vsm_load_scroll(consts, level);
-    uint2 misc_zw = vsm_load_misc_zw(consts); // z = frame_no, w = max_age
-    int2 np = int2(page) - scroll.xy;         // the level slid; its content stays put
+    int3 origin = vsm_load_scroll(consts, level); // xy = level's absolute origin (wrapped)
+    uint2 misc_zw = vsm_load_misc_zw(consts);     // z = frame_no, w = max_age
+    // Window-relative position re-derived FROM SCRATCH each frame (modular difference
+    // in the 14-bit space): there is no incremental delta chain a skipped or aborted
+    // frame could desync, and a whole-table jump just fails the window test below.
+    uint2 rel = (page - uint2(origin.xy)) & 0x3fffu;
+    int2 np = int2(rel);
 
-    bool drop = (uint(scroll.z) & VSM_LEVEL_INVALIDATE) != 0u || np.x < 0 || np.y < 0
-             || np.x >= int(VSM_TABLE_DIM) || np.y >= int(VSM_TABLE_DIM);
+    bool drop = (uint(origin.z) & VSM_LEVEL_INVALIDATE) != 0u || rel.x >= VSM_TABLE_DIM
+             || rel.y >= VSM_TABLE_DIM;
     uint last = meta.Load(mo + 4u);
     uint requested = 0u;
     if (!drop)
@@ -159,7 +163,7 @@ void csUpdate(uint3 tid: SV_DispatchThreadID)
         g.storage_buffers[pc.counter_buf].InterlockedAdd(8u, 1u, _f); // freed stat
         return;
     }
-    meta.Store(mo + 0u, vsm_meta_pack_addr(level, uint2(np)));
+    // (R1) The stored address is absolute — nothing to rewrite as the window slides.
     meta.Store(mo + 4u, last);
 
     // Dynamic-object invalidation (V3, the track's core): a cached page overlapped by any
@@ -277,7 +281,10 @@ void csAlloc(uint3 tid: SV_DispatchThreadID)
     RWByteAddressBuffer meta = g.storage_buffers[pc.meta_buf];
     uint mo = page * VSM_META_STRIDE;
     RWByteAddressBuffer consts = g.storage_buffers[pc.consts_buf];
-    meta.Store(mo + 0u, vsm_meta_pack_addr(level, vpage));
+    // (R1) Store the ABSOLUTE page address (window position + the level's absolute
+    // origin, wrapped): csUpdate re-derives the window position from it every frame.
+    uint2 apage = (vpage + uint2(vsm_load_scroll(consts, level).xy)) & 0x3fffu;
+    meta.Store(mo + 0u, vsm_meta_pack_addr(level, apage));
     meta.Store(mo + 4u, vsm_load_misc_zw(consts).x);
     meta.Store(mo + 8u, VSM_META_VALID);
     g.storage_buffers[pc.table_buf].Store(off, VSM_PTE_MAPPED | VSM_PTE_RENDER | page);
