@@ -140,7 +140,14 @@ void csUpdate(uint3 tid: SV_DispatchThreadID)
     // Window-relative position re-derived FROM SCRATCH each frame (modular difference
     // in the 14-bit space): there is no incremental delta chain a skipped or aborted
     // frame could desync, and a whole-table jump just fails the window test below.
-    uint2 rel = (page - uint2(origin.xy)) & 0x3fffu;
+    //
+    // AXIS HANDEDNESS: texel space inverts Y against light-space up (`vsm_ndc_to_texel`
+    // puts row 0 at ndc.y = +1), so when the window's centre moves +1 page along light
+    // up, a cached page's table ROW moves +1 (its column moves -1 for +right). The
+    // original V2 slide used the X sign for both axes — invisible while the pre-merge
+    // invalidation cap kept the cache dead, and the actual corruption behind the
+    // 'cached shadows land on the wrong geometry' regressions when it first woke up.
+    uint2 rel = uint2((page.x - uint(origin.x)) & 0x3fffu, (page.y + uint(origin.y)) & 0x3fffu);
     int2 np = int2(rel);
 
     bool drop = (uint(origin.z) & VSM_LEVEL_INVALIDATE) != 0u || rel.x >= VSM_TABLE_DIM
@@ -281,9 +288,13 @@ void csAlloc(uint3 tid: SV_DispatchThreadID)
     RWByteAddressBuffer meta = g.storage_buffers[pc.meta_buf];
     uint mo = page * VSM_META_STRIDE;
     RWByteAddressBuffer consts = g.storage_buffers[pc.consts_buf];
-    // (R1) Store the ABSOLUTE page address (window position + the level's absolute
-    // origin, wrapped): csUpdate re-derives the window position from it every frame.
-    uint2 apage = (vpage + uint2(vsm_load_scroll(consts, level).xy)) & 0x3fffu;
+    // (R1) Store the ABSOLUTE page address (window position resolved against the
+    // level's absolute origin, wrapped): csUpdate re-derives the window position from
+    // it every frame. Y folds with the OPPOSITE sign — texel rows run against light-
+    // space up (see csUpdate's axis-handedness note).
+    int3 origin_a = vsm_load_scroll(consts, level);
+    uint2 apage = uint2((vpage.x + uint(origin_a.x)) & 0x3fffu,
+                        (vpage.y - uint(origin_a.y)) & 0x3fffu);
     meta.Store(mo + 0u, vsm_meta_pack_addr(level, apage));
     meta.Store(mo + 4u, vsm_load_misc_zw(consts).x);
     meta.Store(mo + 8u, VSM_META_VALID);
