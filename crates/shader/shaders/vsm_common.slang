@@ -67,9 +67,12 @@
 // SMRT filter config (V4): x = ray count (0 = PCF fallback), y = samples per ray,
 // z = ray length as a fraction of the receiver's camera distance, w = spare.
 #define VSM_CONST_SMRT_OFF (VSM_CONST_INVAL_OFF + 16u + VSM_MAX_INVAL * 16u)
-// Diag tail: [0] = pixels that walked past their marked level this frame (coarse
-// fallback = the visible "shadow enlarges for a frame" pop; atomically bumped by the
-// lighting sampler, read + rezeroed by the host when this FIF slot cycles back).
+// Diag tail (per-FIF, host-harvested when the slot cycles back — the ONLY trustworthy
+// per-frame stats channel; the raw counter readback races the in-flight GPU):
+//   [0] pixels that walked past their marked level (coarse-fallback pop witness,
+//       atomically bumped by the lighting sampler)
+//   [4] pages given RENDER this frame (csStats copy of counter[0])
+//   [8] overflowed requests this frame (csStats copy of counter[4])
 #define VSM_CONST_DIAG_OFF (VSM_CONST_SMRT_OFF + 16u)
 #define VSM_CONST_SIZE (VSM_CONST_DIAG_OFF + 16u)
 #define VSM_LEVEL_INVALIDATE 1u

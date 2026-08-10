@@ -1046,6 +1046,12 @@ const JOBS: &[Job] = &[
         key: "vsm_alloc_cs",
     },
     Job {
+        src: "vsm_pages.slang",
+        entry: "csStats",
+        stage: "compute",
+        key: "vsm_stats_cs",
+    },
+    Job {
         src: "vsm_depth.slang",
         entry: "vsMain",
         stage: "vertex",

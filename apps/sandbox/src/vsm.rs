@@ -83,6 +83,9 @@ pub(crate) struct VsmSystem {
     update_pipeline: ComputePipeline,
     compact_pipeline: ComputePipeline,
     alloc_pipeline: ComputePipeline,
+    /// One-thread tail dispatch: snapshots the counter's pages/overflow words into the
+    /// per-FIF consts diag tail (the trustworthy stats channel; see `harvest`).
+    stats_pipeline: ComputePipeline,
     depth_pipeline: GraphicsPipeline,
     depth_skinned_pipeline: GraphicsPipeline,
     depth_morphed_pipeline: GraphicsPipeline,
@@ -108,6 +111,10 @@ pub(crate) struct VsmSystem {
     /// tail): >0 on a frame whose receivers found their marked level unmapped — the
     /// visible one-frame "shadow enlarges" pop. Exposed to DIAG_FRAME_CSV.
     last_fallback_px: u32,
+    /// csStats-harvested pages-rendered / overflow for the last cycled slot's frame
+    /// (see the harvest in [`Self::update`]) — the values [`Self::stats`] reports.
+    last_pages: u32,
+    last_overflow: u32,
     /// Last frame's shadow casters, scene order (V3 mover detection).
     prev_casters: Vec<PrevCaster>,
     /// `VSM_BOUNDS_CULL=0` seam: disable the render-bounds whole-caster cull (A/B
@@ -175,6 +182,13 @@ impl VsmSystem {
             dreamcoast_shader::vsm_compact_cs_metallib,
             "csCompact",
             [64, 1, 1],
+        )?;
+        let stats_pipeline = compute(
+            dreamcoast_shader::vsm_stats_cs_spirv,
+            dreamcoast_shader::vsm_stats_cs_dxil,
+            dreamcoast_shader::vsm_stats_cs_metallib,
+            "csStats",
+            [1, 1, 1],
         )?;
         let alloc_pipeline = compute(
             dreamcoast_shader::vsm_alloc_cs_spirv,
@@ -297,6 +311,7 @@ impl VsmSystem {
             update_pipeline,
             compact_pipeline,
             alloc_pipeline,
+            stats_pipeline,
             depth_pipeline,
             depth_skinned_pipeline,
             depth_morphed_pipeline,
@@ -313,6 +328,8 @@ impl VsmSystem {
             sun_key: [0; 3],
             frame_no: 0,
             last_fallback_px: 0,
+            last_pages: 0,
+            last_overflow: 0,
             prev_casters: Vec::new(),
             bounds_cull: std::env::var("VSM_BOUNDS_CULL").ok().as_deref() != Some("0"),
             smrt: {
@@ -573,15 +590,18 @@ impl VsmSystem {
         // (coarse-fallback pixel count — the "shadow enlarges for a frame" pop signal),
         // then the full-blob write below rezeroes it for this frame's run.
         let mut prev = vec![0u8; VSM_CONST_SIZE];
-        self.last_fallback_px = if self.consts[fif].read_into(&mut prev).is_ok() {
-            u32::from_le_bytes(
-                prev[VSM_CONST_SIZE - 16..VSM_CONST_SIZE - 12]
-                    .try_into()
-                    .unwrap(),
-            )
+        let diag = VSM_CONST_SIZE - 16;
+        if self.consts[fif].read_into(&mut prev).is_ok() {
+            let word =
+                |o: usize| u32::from_le_bytes(prev[diag + o..diag + o + 4].try_into().unwrap());
+            self.last_fallback_px = word(0);
+            // csStats snapshot: frame-accurate pages/overflow (the raw counter
+            // readback races the in-flight GPU — phantom 0/partial "collapse" blips).
+            self.last_pages = word(4);
+            self.last_overflow = word(8);
         } else {
-            0
-        };
+            self.last_fallback_px = 0;
+        }
         self.consts[fif].write(&bytes)?;
         Ok((
             self.consts[fif].storage_index(),
@@ -623,6 +643,7 @@ impl VsmSystem {
         let update = &self.update_pipeline;
         let compact = &self.compact_pipeline;
         let alloc = &self.alloc_pipeline;
+        let stats = &self.stats_pipeline;
         graph.add_compute_pass(
             ComputePassInfo {
                 name: "vsm_pages",
@@ -670,6 +691,11 @@ impl VsmSystem {
                 cmd.storage_buffer_barrier(table);
                 cmd.storage_buffer_barrier(pool);
                 cmd.storage_buffer_barrier(counter); // bounds rows -> depth VS cull
+                // Stats snapshot LAST: the frame's final pages/overflow words land in
+                // the per-FIF consts diag tail for the host's FIF-safe harvest.
+                cmd.bind_compute_pipeline(stats);
+                cmd.push_constants_compute(&push);
+                cmd.dispatch(1, 1, 1);
                 Ok(())
             },
         );
@@ -776,17 +802,12 @@ impl VsmSystem {
         self.last_fallback_px
     }
 
+    /// (pages rendered, overflowed requests) for the last HARVESTED frame — the
+    /// csStats/diag-tail channel (FIF-delayed, frame-accurate). The old direct counter
+    /// readback raced whatever the in-flight GPU was mid-writing and reported phantom
+    /// 0/partial collapses that derailed an entire investigation; it is gone.
     pub(crate) fn stats(&self) -> (u32, u32) {
-        let mut b = [0u8; 16];
-        if self.counter.read_into(&mut b).is_err() {
-            return (0, 0);
-        }
-        let freed = u32::from_le_bytes(b[8..12].try_into().unwrap());
-        tracing::debug!("VSM cache: {freed} freed last frame");
-        (
-            u32::from_le_bytes(b[0..4].try_into().unwrap()),
-            u32::from_le_bytes(b[4..8].try_into().unwrap()),
-        )
+        (self.last_pages, self.last_overflow)
     }
 }
 

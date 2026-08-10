@@ -206,6 +206,21 @@ void csUpdate(uint3 tid: SV_DispatchThreadID)
                                           VSM_PTE_MAPPED | tid.x);
 }
 
+// --- Stats: snapshot the frame's counter words into the per-FIF consts diag tail ---------
+// One thread, dispatched LAST in the pages pass (after csAlloc): the host harvests the
+// tail when this FIF slot cycles back, giving frame-accurate pages/overflow stats — the
+// raw counter readback races whatever the in-flight GPU is mid-writing (observed as
+// phantom 0/partial "page collapse" blips that polluted a whole investigation).
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void csStats(uint3 tid: SV_DispatchThreadID)
+{
+    RWByteAddressBuffer counter = g.storage_buffers[pc.counter_buf];
+    RWByteAddressBuffer consts = g.storage_buffers[pc.consts_buf];
+    consts.Store(VSM_CONST_DIAG_OFF + 4u, counter.Load(0u));
+    consts.Store(VSM_CONST_DIAG_OFF + 8u, counter.Load(4u));
+}
+
 // --- Compact: rebuild the free list from the metadata (one thread per physical page) ----
 [shader("compute")]
 [numthreads(64, 1, 1)]
