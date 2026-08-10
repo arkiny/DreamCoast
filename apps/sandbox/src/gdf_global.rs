@@ -197,8 +197,13 @@ pub(crate) struct GdfGlobal {
     instances_next: usize,
     /// Per-level culled index lists, TWO sections ([static | movable]), each
     /// [count, idx...] × levels. Host-visible so the count words zero without a
-    /// clear pass.
-    culled: StorageBuffer,
+    /// clear pass — and a per-FIF ring like `instances`: the zeroing is an IMMEDIATE
+    /// host write, so a single buffer would be wiped while the previous frame's GPU
+    /// cull/composite still reads it (frames-in-flight overlap). That race hit
+    /// mid-composite on recenter frames (the one time the GDF passes run long) and
+    /// unioned `empty` into freshly scrolled static-cache rows — the long-play field
+    /// rot observed as accumulating colour corruption.
+    culled: Vec<StorageBuffer>,
     /// Tracked instances (CPU mirror) + per-unique-mesh tile maps for re-encoding.
     tracked: Vec<Tracked>,
     tiles: Vec<TileMap>,
@@ -296,15 +301,16 @@ impl GdfGlobal {
             stride: 16,
             indirect: false,
         })?;
-        let culled = device.create_storage_buffer_host(&StorageBufferDesc {
-            size: 2 * (GLOBAL_LEVELS as u64) * (CULL_CAP as u64 + 1) * 4,
-            stride: 4,
-            indirect: false,
-        })?;
         let fif = frames_in_flight.max(1);
+        let mut culled = Vec::with_capacity(fif);
         let mut instances = Vec::with_capacity(fif);
         let mut aabbs = Vec::with_capacity(fif);
         for _ in 0..fif {
+            culled.push(device.create_storage_buffer_host(&StorageBufferDesc {
+                size: 2 * (GLOBAL_LEVELS as u64) * (CULL_CAP as u64 + 1) * 4,
+                stride: 4,
+                indirect: false,
+            })?);
             instances.push(device.create_storage_buffer_host(&StorageBufferDesc {
                 size: crate::mesh_sdf::INSTANCE_STRIDE as u64,
                 stride: crate::mesh_sdf::INSTANCE_STRIDE,
@@ -714,11 +720,13 @@ impl GdfGlobal {
             self.instances_next = (self.instances_next + 1) % self.instances.len();
             self.instances[slot].write(&self.record_bytes)?;
             self.aabbs[slot].write(&self.aabb_bytes)?;
-            // Zero both culled sections (16 KB): the count words must reset and the
-            // stale indices past each count are never read. Batch frames re-run the
-            // culls they need before any composite reads a section.
+            // Zero both culled sections (16 KB) of THIS slot's buffer: the count words
+            // must reset and the stale indices past each count are never read. Batch
+            // frames re-run the culls they need before any composite reads a section.
+            // (Slot ring, not a single buffer — the host write is immediate and the
+            // previous frame's GPU passes may still be reading their own slot.)
             let zeros = vec![0u8; 2 * GLOBAL_LEVELS * (CULL_CAP as usize + 1) * 4];
-            self.culled.write(&zeros)?;
+            self.culled[slot].write(&zeros)?;
             if crate::quality::env_bool("DIAG_GDF_GLOBAL", false) {
                 tracing::info!(
                     "GDF global batch: static {} voxels / merge {} voxels, {} static + {} \
@@ -834,7 +842,7 @@ impl GdfGlobal {
         };
         let aabb_idx = this.aabbs[batch.slot].storage_index();
         let inst_idx = this.instances[batch.slot].storage_index();
-        let culled_idx = this.culled.storage_index();
+        let culled_idx = this.culled[batch.slot].storage_index();
         let consts_idx = this.consts[this.consts_live].storage_index();
         let cull_pipe = &this.cull_pipeline;
         let comp_pipe = &this.composite_pipeline;
