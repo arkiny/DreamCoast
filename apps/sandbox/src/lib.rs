@@ -5113,6 +5113,7 @@ impl App {
         if !self.stream_obj_aabb.is_empty() {
             let card_cam = fuse::CardCamera::from_look(eye, focus);
             self.stream_recapture = self.gdf.stream_residency(
+                &self.device,
                 &self.stream_obj_aabb,
                 &self.stream_obj_albedo,
                 &card_cam,

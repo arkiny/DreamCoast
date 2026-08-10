@@ -145,6 +145,10 @@ pub(crate) struct GdfSystem {
     /// geometry changed this frame (a newly-admitted drawable), so the capture pass re-traces it;
     /// 0 = keep the existing atlas texels. Written only on frames that change residency.
     slot_dirty: Option<StorageBuffer>,
+    /// Streaming re-own graveyard: `(frames-left, buffer)` for cards / albedo / dirty
+    /// buffers replaced by an allocation swap. A replaced buffer may still be bound by
+    /// the in-flight frame, so it lives here for [`STREAM_RETIRE_FRAMES`] ticks.
+    stream_retired: Vec<(u32, StorageBuffer)>,
     /// C2b: per-card desired-resolution feedback (host-visible u32/card). The reflection's cone
     /// sampler InterlockedMax-es the pow2 resolution each footprint wanted; the host reads it
     /// back once (`P11_CACHE_RES_FEEDBACK` frame) and re-layouts the adaptive atlas around what
@@ -270,6 +274,9 @@ pub(crate) struct ClipLevelData<'a> {
 
 /// Surface-cache card atlas tile edge (texels per card side). 6 cards / object.
 const CARD_TILE: u32 = 32;
+/// Frames a swapped-out streaming buffer stays alive after replacement: one per possible
+/// in-flight frame still binding it, plus one of slack (`FRAMES_IN_FLIGHT` is 2).
+const STREAM_RETIRE_FRAMES: u32 = 3;
 
 /// Scene-GDF volume edge length (cube). Coarser than `VOLUME_DIM`: the fused
 /// brute-force bake is O(voxels·tris) over the whole scene, so a 48³ grid keeps the
@@ -594,6 +601,7 @@ impl GdfSystem {
             stream: false,
             stream_slot_draw: Vec::new(),
             slot_dirty: None,
+            stream_retired: Vec::new(),
             card_res_feedback: None,
             cache_pos: None,
             cache_albedo: None,
@@ -1379,10 +1387,17 @@ impl GdfSystem {
     /// is the current card count, so a within-budget scene never streams (target == all drawables).
     pub(crate) fn stream_residency(
         &mut self,
+        device: &Device,
         drawable_aabb: &[([f32; 3], [f32; 3])],
         drawable_albedo: &[[f32; 3]],
         cam: &crate::fuse::CardCamera,
     ) -> anyhow::Result<bool> {
+        // Age out buffers retired by an earlier re-own: once every in-flight frame that
+        // could still bind them has drained, they are safe to destroy.
+        self.stream_retired.retain_mut(|(ttl, _)| {
+            *ttl -= 1;
+            *ttl > 0
+        });
         if !self.stream || self.cards.is_none() || self.stream_slot_draw.is_empty() {
             return Ok(false);
         }
@@ -1447,9 +1462,30 @@ impl GdfSystem {
                 );
             }
         }
-        self.cards.as_ref().unwrap().write(&cards_bytes)?;
-        if let Some(alb) = &self.card_src_albedo {
-            alb.write(&alb_bytes)?;
+        // Publish via ALLOCATION SWAP, never an in-place host write: these buffers are
+        // read by the PREVIOUS frame's GPU passes (cone sampling, and — worst — the
+        // capture pass, which bakes what it reads into atlas tiles that then persist).
+        // An immediate unified-memory write while that frame is in flight hands the
+        // capture torn card transforms, and the poisoned tiles feed GI from then on —
+        // the long-play colour-rot class (same defect as the gdf_global culled ring).
+        // Fresh buffers get fresh bindless slots; the in-flight frame keeps its old
+        // binding, and the old buffer sits in `stream_retired` until it drains.
+        let publish = |bytes: &[u8], stride: u32| -> anyhow::Result<StorageBuffer> {
+            let b = device.create_storage_buffer_host(&StorageBufferDesc {
+                size: bytes.len() as u64,
+                stride,
+                indirect: false,
+            })?;
+            b.write(bytes)?;
+            Ok(b)
+        };
+        if let Some(old) = self.cards.replace(publish(&cards_bytes, 16)?) {
+            self.stream_retired.push((STREAM_RETIRE_FRAMES, old));
+        }
+        if self.card_src_albedo.is_some()
+            && let Some(old) = self.card_src_albedo.replace(publish(&alb_bytes, 4)?)
+        {
+            self.stream_retired.push((STREAM_RETIRE_FRAMES, old));
         }
         // slot_dirty: 1 for each changed slot's 6 cards, 0 elsewhere.
         let num_cards = self.num_cards as usize;
@@ -1462,8 +1498,13 @@ impl GdfSystem {
                 }
             }
         }
-        if let Some(sd) = &self.slot_dirty {
-            sd.write(&dirty)?;
+        if self.slot_dirty.is_some() {
+            // Same swap discipline: last frame's capture may still be early-outing on
+            // the old dirty set; overwriting it in place re-scopes THAT capture too.
+            let fresh = publish(&dirty, 4)?;
+            if let Some(old) = self.slot_dirty.replace(fresh) {
+                self.stream_retired.push((STREAM_RETIRE_FRAMES, old));
+            }
         }
         tracing::debug!(
             "surface cache stream: {} slots re-owned ({} resident)",
