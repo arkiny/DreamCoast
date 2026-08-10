@@ -68,6 +68,12 @@ struct LevelState {
     page_loc: [i64; 2],
     pinned_along: f32,
     valid: bool,
+    /// Invalidation epoch — bumped on every full-level invalidation and carried in the
+    /// consts (scroll.w); cached pages record their birth epoch and csUpdate drops on
+    /// mismatch every frame. A one-shot flag could be swallowed by a frame whose GPU
+    /// work never ran (the ~300 ms synchronous level hot-swap frame), leaving the
+    /// previous floor's shadows cached across the new one.
+    epoch: u32,
 }
 
 /// Last frame's caster fingerprint (V3 invalidation): transform bits + world sphere.
@@ -527,6 +533,7 @@ impl VsmSystem {
                 tracing::info!("VSM level {i} rebased (full re-render)");
                 st.pinned_along = along;
                 st.valid = true;
+                st.epoch = st.epoch.wrapping_add(1);
             }
             st.page_loc = page_loc;
 
@@ -561,6 +568,7 @@ impl VsmSystem {
             put_i(&mut bytes, so, page_loc[0].rem_euclid(16384) as i32);
             put_i(&mut bytes, so + 4, page_loc[1].rem_euclid(16384) as i32);
             put_u(&mut bytes, so + 8, u32::from(invalidate));
+            put_u(&mut bytes, so + 12, st.epoch); // absolute invalidation state
         }
         let misc_off = VSM_LEVELS * 64 + VSM_LEVELS * 16;
         put_u(&mut bytes, misc_off, VSM_LEVELS as u32);

@@ -105,10 +105,18 @@ uint2 vsm_load_misc_zw(RWByteAddressBuffer consts)
     return consts.Load2(VSM_CONST_MISC_OFF + 8u);
 }
 
-int3 vsm_load_scroll(RWByteAddressBuffer consts, uint level)
+// xy = absolute origin (wrapped), z = flags, w = the level's INVALIDATION EPOCH: a
+// monotonic counter the host bumps on every full-level invalidation (sun move, pin
+// rebase, caster-set change). Cached pages record the epoch they were rendered under;
+// csUpdate drops on mismatch EVERY frame — an invalidation can no longer be swallowed
+// by a frame whose GPU work never ran (the level hot-swap frame stalls ~300 ms in
+// synchronous loading, exactly such a frame; a one-shot flag consumed there left the
+// PREVIOUS floor's shadows cached across the new one).
+int4 vsm_load_scroll(RWByteAddressBuffer consts, uint level)
 {
     uint o = VSM_CONST_SCROLL_OFF + level * 16u;
-    return int3(asint(consts.Load(o)), asint(consts.Load(o + 4u)), asint(consts.Load(o + 8u)));
+    return int4(asint(consts.Load(o)), asint(consts.Load(o + 4u)), asint(consts.Load(o + 8u)),
+                asint(consts.Load(o + 12u)));
 }
 
 // Physical-page metadata (V2 cache): 16 bytes per pool page.

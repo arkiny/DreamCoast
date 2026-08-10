@@ -135,7 +135,7 @@ void csUpdate(uint3 tid: SV_DispatchThreadID)
     uint level;
     uint2 page; // (R1) ABSOLUTE page coords, wrapped to the address field's 14 bits
     vsm_meta_unpack_addr(meta.Load(mo), level, page);
-    int3 origin = vsm_load_scroll(consts, level); // xy = level's absolute origin (wrapped)
+    int4 origin = vsm_load_scroll(consts, level); // xy = absolute origin, w = epoch
     uint2 misc_zw = vsm_load_misc_zw(consts);     // z = frame_no, w = max_age
     // Window-relative position re-derived FROM SCRATCH each frame (modular difference
     // in the 14-bit space): there is no incremental delta chain a skipped or aborted
@@ -150,7 +150,10 @@ void csUpdate(uint3 tid: SV_DispatchThreadID)
     uint2 rel = uint2((page.x - uint(origin.x)) & 0x3fffu, (page.y + uint(origin.y)) & 0x3fffu);
     int2 np = int2(rel);
 
-    bool drop = (uint(origin.z) & VSM_LEVEL_INVALIDATE) != 0u || rel.x >= VSM_TABLE_DIM
+    // Epoch mismatch = the level was invalidated some frame after this page rendered
+    // — evaluated EVERY frame, so a swallowed invalidation frame changes nothing (the
+    // absolute-state principle, same as the addressing above).
+    bool drop = meta.Load(mo + 12u) != uint(origin.w) || rel.x >= VSM_TABLE_DIM
              || rel.y >= VSM_TABLE_DIM;
     uint last = meta.Load(mo + 4u);
     uint requested = 0u;
@@ -292,12 +295,13 @@ void csAlloc(uint3 tid: SV_DispatchThreadID)
     // level's absolute origin, wrapped): csUpdate re-derives the window position from
     // it every frame. Y folds with the OPPOSITE sign — texel rows run against light-
     // space up (see csUpdate's axis-handedness note).
-    int3 origin_a = vsm_load_scroll(consts, level);
+    int4 origin_a = vsm_load_scroll(consts, level);
     uint2 apage = uint2((vpage.x + uint(origin_a.x)) & 0x3fffu,
                         (vpage.y - uint(origin_a.y)) & 0x3fffu);
     meta.Store(mo + 0u, vsm_meta_pack_addr(level, apage));
     meta.Store(mo + 4u, vsm_load_misc_zw(consts).x);
     meta.Store(mo + 8u, VSM_META_VALID);
+    meta.Store(mo + 12u, uint(origin_a.w)); // birth epoch (see csUpdate's drop test)
     g.storage_buffers[pc.table_buf].Store(off, VSM_PTE_MAPPED | VSM_PTE_RENDER | page);
     uint _r;
     counter.InterlockedAdd(0u, 1u, _r); // rendered-page stat
